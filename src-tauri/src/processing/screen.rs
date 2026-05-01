@@ -44,6 +44,7 @@ pub struct Cell {
 #[derive(Debug, Default)]
 pub struct Row {
     pub cells: Vec<Option<Cell>>,
+    #[allow(dead_code)] // future stability gating
     pub last_modified: Option<Instant>,
 }
 
@@ -148,12 +149,21 @@ impl Screen {
     }
 
     #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn cursor(&self) -> (usize, usize) {
         (self.cursor_row, self.cursor_col)
     }
 
     pub fn has_pending(&self) -> bool {
         self.raw_emitted_offset < self.raw_buffer.len()
+    }
+
+    /// Append-only raw byte stream, including all ANSI sequences. The tag
+    /// scanner reads from this rather than the cell-derived rendered text:
+    /// raw bytes are accurate to what Claude actually emitted, while cells
+    /// can carry stale chars in cursor-skipped positions.
+    pub fn raw_view(&self) -> &[u8] {
+        &self.raw_buffer
     }
 
     /// Push raw bytes into the parser. Each byte is mirrored into `raw_buffer`
@@ -267,36 +277,39 @@ fn tail_might_be_opener_prefix(rendered: &str) -> bool {
     PREFIXES.iter().any(|p| rendered.ends_with(p))
 }
 
+/// Replace `[[TTS]]` (7 bytes) and `[[/TTS]]` (8 bytes) markers in the
+/// outgoing byte stream so the user doesn't see them in the terminal.
+///
+/// Naive stripping (removing the bytes outright) shifts everything to the
+/// left of where Claude expected, so subsequent cursor-relative motions like
+/// `\x1b[1C` land on different absolute columns. In Claude Code's TUI those
+/// motions sit between words; in our window the post-shift skipped cells
+/// land on stale spinner/status content from earlier frames, painting
+/// adjacent words together (`kinds` + stale `t` + `of` -> `kindstof`).
+///
+/// Instead we substitute each marker with `\x1b[<n>X\x1b[<n>C`: erase N
+/// cells starting at cursor, then advance the cursor N. Cursor ends in the
+/// same column Claude expected, and the cells under the marker are cleared
+/// so nothing stale leaks through.
 fn strip_marker_bytes(slice: &[u8]) -> Vec<u8> {
     const OPEN: &[u8] = b"[[TTS]]";
     const CLOSE: &[u8] = b"[[/TTS]]";
+    const OPEN_SUB: &[u8] = b"\x1b[7X\x1b[7C";
+    const CLOSE_SUB: &[u8] = b"\x1b[8X\x1b[8C";
     let n = slice.len();
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut out = Vec::with_capacity(n);
     let mut i = 0;
     while i < n {
         if i + OPEN.len() <= n && &slice[i..i + OPEN.len()] == OPEN {
-            ranges.push((i, i + OPEN.len()));
+            out.extend_from_slice(OPEN_SUB);
             i += OPEN.len();
         } else if i + CLOSE.len() <= n && &slice[i..i + CLOSE.len()] == CLOSE {
-            ranges.push((i, i + CLOSE.len()));
+            out.extend_from_slice(CLOSE_SUB);
             i += CLOSE.len();
         } else {
+            out.push(slice[i]);
             i += 1;
         }
-    }
-    if ranges.is_empty() {
-        return slice.to_vec();
-    }
-    let mut out = Vec::with_capacity(n);
-    let mut cursor = 0;
-    for (s, e) in &ranges {
-        if *s > cursor {
-            out.extend_from_slice(&slice[cursor..*s]);
-        }
-        cursor = *e;
-    }
-    if cursor < n {
-        out.extend_from_slice(&slice[cursor..]);
     }
     out
 }

@@ -34,6 +34,8 @@ mod tags;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::processing::screen::Screen;
@@ -65,10 +67,14 @@ pub struct ProcessingLayer {
 
 impl ProcessingLayer {
     pub fn new() -> Self {
+        Self::with_user_typed_filter(Arc::new(Mutex::new(HashSet::new())))
+    }
+
+    pub fn with_user_typed_filter(user_typed: Arc<Mutex<HashSet<String>>>) -> Self {
         Self {
             parser: vte::Parser::new(),
             screen: Screen::new(),
-            scanner: TagScanner::new(),
+            scanner: TagScanner::with_user_typed_filter(user_typed),
             oldest_pending_at: None,
         }
     }
@@ -91,9 +97,6 @@ impl ProcessingLayer {
         }
         self.screen.set_now(now);
         self.screen.feed(&mut self.parser, bytes);
-        // Detect newly-completed tags as soon as bytes arrive (immediate-emit trigger
-        // for the close tag — minimizes time-to-first-audio).
-        let _ = now;
         self.collect_events(/*allow_close_emit=*/ true, /*force=*/ false)
     }
 
@@ -110,11 +113,12 @@ impl ProcessingLayer {
         let mut events = Vec::new();
 
         if allow_close_emit {
-            // Run a tag scan over the full screen first so newly-closed tags
-            // are extracted and queued for TTS, regardless of row stability.
+            // Scan the raw byte stream for newly-closed tags. We use raw
+            // bytes (not the cell-rendered view) so cursor-skip cells with
+            // stale spinner content can't run adjacent words together.
             let new_tts: Vec<String> = self
                 .scanner
-                .scan_for_new_tags(&self.screen)
+                .scan_for_new_tags(self.screen.raw_view())
                 .into_iter()
                 .collect();
             for content in new_tts {
@@ -143,7 +147,7 @@ impl ProcessingLayer {
                     target: "tts_stub",
                     "[[TTS]] tag exceeded max-hold without close; treating as literal"
                 );
-                self.scanner.recover_unclosed(&self.screen);
+                self.scanner.recover_unclosed(self.screen.raw_view());
             }
         }
 

@@ -9,9 +9,15 @@
     ptyStart,
     ptyWrite,
     ptyResize,
+    ttsTest,
     onPtyExit,
     decodeBase64,
   } from './ipc';
+
+  // Expose a global helper so we can test TTS directly from the WebView
+  // DevTools console: `window.ttsTest("hello world")`.
+  // @ts-expect-error - dev-only debug surface
+  window.ttsTest = (text: string) => ttsTest(text).catch(console.error);
 
   let containerEl: HTMLDivElement;
   let statusEl: HTMLDivElement;

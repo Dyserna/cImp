@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -42,6 +43,8 @@ impl PtyManager {
         extra_args: Vec<String>,
         initial_rows: u16,
         initial_cols: u16,
+        tts_segments: tokio::sync::mpsc::Sender<String>,
+        user_typed_tts: Arc<StdMutex<HashSet<String>>>,
     ) -> AppResult<()> {
         let mut guard = self.inner.lock().await;
         if guard.is_some() {
@@ -62,6 +65,12 @@ impl PtyManager {
             .map_err(|e| AppError::Pty(format!("openpty: {e}")))?;
 
         let mut cmd = CommandBuilder::new(&claude_path);
+        // Inject the TTS markup convention as an appended system prompt. This
+        // is a runtime-only thing — we don't ship a CLAUDE.md, so the user's
+        // own project context (whatever directory they launch cctts from)
+        // stays untouched and the embedded claude still knows about the tags.
+        cmd.arg("--append-system-prompt");
+        cmd.arg(crate::tts::RUNTIME_SYSTEM_PROMPT);
         for arg in &extra_args {
             cmd.arg(arg);
         }
@@ -94,7 +103,13 @@ impl PtyManager {
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(256);
 
         tasks::spawn_reader(reader, bytes_tx, cancel.clone());
-        tasks::spawn_processor(bytes_rx, output_channel, cancel.clone());
+        tasks::spawn_processor(
+            bytes_rx,
+            output_channel,
+            tts_segments,
+            cancel.clone(),
+            user_typed_tts,
+        );
         tasks::spawn_waiter(child, app, cancel.clone());
 
         *guard = Some(PtyHandle {

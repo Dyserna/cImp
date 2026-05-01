@@ -23,6 +23,10 @@ export async function ptyResize(rows: number, cols: number): Promise<void> {
   await invoke('pty_resize', { rows, cols });
 }
 
+export async function ttsTest(text: string): Promise<void> {
+  await invoke('tts_test', { text });
+}
+
 export function onPtyExit(handler: (payload: string) => void): Promise<UnlistenFn> {
   return listen<string>('pty-exit', (event) => handler(event.payload));
 }

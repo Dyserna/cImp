@@ -156,10 +156,11 @@ fn complete_tag_emits_tts_and_strips_markers() {
     let tts: Vec<String> = collect_tts(&events);
     assert_eq!(tts, vec!["hello".to_string()]);
 
-    // Smart flush: tag is closed, tail is "[[/TTS]]" (not an opener prefix),
-    // so terminal bytes flush on the same ingest call.
+    // Markers replaced with erase-N + cursor-forward-N: keeps cursor in the
+    // column Claude expected and wipes stale cells where the marker would
+    // otherwise have rendered.
     let term = collect_terminal_bytes(&events);
-    assert_eq!(term, b"hello".to_vec());
+    assert_eq!(term, b"\x1b[7X\x1b[7Chello\x1b[8X\x1b[8C".to_vec());
 }
 
 #[test]
@@ -171,7 +172,10 @@ fn cross_chunk_tag_still_detected() {
     let events = layer.ingest_at(b"TS]]", now);
     let tts = collect_tts(&events);
     assert_eq!(tts, vec!["hello".to_string()]);
-    assert_eq!(collect_terminal_bytes(&events), b"hello".to_vec());
+    assert_eq!(
+        collect_terminal_bytes(&events),
+        b"\x1b[7X\x1b[7Chello\x1b[8X\x1b[8C".to_vec()
+    );
 }
 
 #[test]
@@ -201,8 +205,11 @@ fn styled_tag_content_strips_markers_keeps_styling() {
     assert_eq!(tts[0], "hello world.");
 
     let term = collect_terminal_bytes(&events);
-    // Markers stripped; ANSI bytes preserved verbatim.
-    assert_eq!(term, b"hello \x1b[1mworld\x1b[0m.".to_vec());
+    // Markers substituted with erase+advance; inner ANSI styling preserved.
+    assert_eq!(
+        term,
+        b"\x1b[7X\x1b[7Chello \x1b[1mworld\x1b[0m.\x1b[8X\x1b[8C".to_vec()
+    );
 }
 
 #[test]
@@ -215,7 +222,10 @@ fn double_tag_in_one_response() {
     );
     let tts = collect_tts(&events);
     assert_eq!(tts, vec!["first.".to_string(), "second.".to_string()]);
-    assert_eq!(collect_terminal_bytes(&events), b"first. code second.".to_vec());
+    assert_eq!(
+        collect_terminal_bytes(&events),
+        b"\x1b[7X\x1b[7Cfirst.\x1b[8X\x1b[8C code \x1b[7X\x1b[7Csecond.\x1b[8X\x1b[8C".to_vec()
+    );
 }
 
 #[test]
@@ -257,5 +267,10 @@ fn empty_tag_block_does_nothing() {
     let now = t0();
     let events = layer.ingest_at(b"[[TTS]][[/TTS]]", now);
     assert!(collect_tts(&events).is_empty());
-    assert_eq!(collect_terminal_bytes(&events), Vec::<u8>::new());
+    // Empty tag block still produces marker substitutions for cursor
+    // bookkeeping; nothing visually rendered, but the bytes go out.
+    assert_eq!(
+        collect_terminal_bytes(&events),
+        b"\x1b[7X\x1b[7C\x1b[8X\x1b[8C".to_vec()
+    );
 }

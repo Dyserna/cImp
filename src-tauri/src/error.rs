@@ -24,6 +24,15 @@ pub enum AppError {
 
     #[error("PTY session already started")]
     AlreadyStarted,
+
+    #[error("audio error: {0}")]
+    Audio(String),
+
+    #[error("TTS error: {0}")]
+    Tts(String),
+
+    #[error("model file not found: {0}")]
+    ModelNotFound(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

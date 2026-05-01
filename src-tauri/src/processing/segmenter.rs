@@ -15,7 +15,9 @@ const ABBREVS: &[&str] = &[
 ];
 
 pub fn segment_sentences(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
+    let cleaned = sanitize_for_tts(text);
+    let bytes = cleaned.as_bytes();
+    let text = cleaned.as_str();
     let n = bytes.len();
     let mut sentences: Vec<String> = Vec::new();
     let mut start: usize = 0;
@@ -83,6 +85,27 @@ fn push_trim(sentences: &mut Vec<String>, s: &str) {
     if !trimmed.is_empty() {
         sentences.push(trimmed.to_string());
     }
+}
+
+/// Strip characters that confuse the phonemizer's word tokenizer. Claude
+/// Code's TUI lays out responses with cursor-skip sequences (`\x1b[1C`) and
+/// our cell model can carry stale spinner/status chars (box-drawing,
+/// braille, arrows) in those skipped positions. Those chars get pulled into
+/// the rendered TTS content and run two adjacent words together as one
+/// unfamiliar token, which misaki-rs then falls back to spelling letter by
+/// letter. We replace anything that's not a letter, digit, ASCII
+/// punctuation, or normal whitespace with a single space — leaving real
+/// word boundaries intact.
+fn sanitize_for_tts(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_ascii_punctuation() || c == ' ' || c == '\n' || c == '\t' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect()
 }
 
 /// The `.` at byte index `dot_idx` is preceded by a word; check whether that

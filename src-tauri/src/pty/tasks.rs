@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::io::Read;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use base64::prelude::*;
@@ -35,6 +37,20 @@ pub fn spawn_reader(
                     break;
                 }
                 Ok(n) => {
+                    // Log raw PTY input (pre-processing) when `pty_in` target
+                    // is enabled. Lets us see what claude actually outputs vs
+                    // what reaches xterm after marker stripping.
+                    if tracing::enabled!(target: "pty_in", tracing::Level::DEBUG) {
+                        let pretty: String = String::from_utf8_lossy(&buf[..n])
+                            .chars()
+                            .map(|c| if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                                format!("\\x{:02x}", c as u32)
+                            } else {
+                                c.to_string()
+                            })
+                            .collect();
+                        debug!(target: "pty_in", len = n, bytes = %pretty);
+                    }
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         debug!("pty reader: forwarder dropped");
                         break;
@@ -57,8 +73,7 @@ pub fn spawn_reader(
 /// and a steady 50 ms flush tick, and dispatches resulting events:
 ///
 /// - `TerminalBytes` → base64-encoded and pushed through the Tauri Channel.
-/// - `TtsSegment` → logged at INFO with `target = "tts_stub"` (M3 swaps this
-///   for the real synthesizer).
+/// - `TtsSegment` → forwarded to the TTS worker via the segment mpsc.
 /// - `Stalled` → diagnostic warning.
 ///
 /// Single-owner pattern: the layer is `&mut` only inside this task, so no
@@ -66,10 +81,12 @@ pub fn spawn_reader(
 pub fn spawn_processor(
     mut rx: mpsc::Receiver<Vec<u8>>,
     channel: Channel<String>,
+    tts_segments: mpsc::Sender<String>,
     cancel: CancellationToken,
+    user_typed_tts: Arc<StdMutex<HashSet<String>>>,
 ) {
     tokio::spawn(async move {
-        let mut layer = ProcessingLayer::new();
+        let mut layer = ProcessingLayer::with_user_typed_filter(user_typed_tts);
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -83,7 +100,7 @@ pub fn spawn_processor(
                     match maybe {
                         Some(bytes) => {
                             let events = layer.ingest(&bytes);
-                            if dispatch_events(events, &channel).is_err() {
+                            if dispatch_events(events, &channel, &tts_segments).await.is_err() {
                                 break;
                             }
                         }
@@ -95,7 +112,7 @@ pub fn spawn_processor(
                 }
                 _ = tick.tick() => {
                     let events = layer.flush_pending();
-                    if dispatch_events(events, &channel).is_err() {
+                    if dispatch_events(events, &channel, &tts_segments).await.is_err() {
                         break;
                     }
                 }
@@ -105,21 +122,42 @@ pub fn spawn_processor(
     });
 }
 
-fn dispatch_events(events: Vec<ProcessingEvent>, channel: &Channel<String>) -> Result<(), ()> {
+async fn dispatch_events(
+    events: Vec<ProcessingEvent>,
+    channel: &Channel<String>,
+    tts_segments: &mpsc::Sender<String>,
+) -> Result<(), ()> {
     for ev in events {
         match ev {
             ProcessingEvent::TerminalBytes(bytes) => {
                 if bytes.is_empty() {
                     continue;
                 }
+                // Debug visibility: dump emitted bytes as a printable string with
+                // ANSI/CTRL escapes shown, so we can compare against what xterm
+                // renders and pinpoint corruption.
+                if tracing::enabled!(target: "pty_emit", tracing::Level::DEBUG) {
+                    let pretty: String = String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .map(|c| if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                            format!("\\x{:02x}", c as u32)
+                        } else {
+                            c.to_string()
+                        })
+                        .collect();
+                    debug!(target: "pty_emit", len = bytes.len(), bytes = %pretty);
+                }
                 let encoded = BASE64_STANDARD.encode(&bytes);
                 if let Err(e) = channel.send(encoded) {
-                    warn!(error = %e, "pty processor: channel send failed");
+                    warn!(error = %e, "pty processor: terminal channel send failed");
                     return Err(());
                 }
             }
             ProcessingEvent::TtsSegment(text) => {
-                info!(target: "tts_stub", text = %text, "would speak");
+                info!(target: "tts_stub", text = %text, "extracted TTS segment");
+                if tts_segments.send(text).await.is_err() {
+                    debug!("pty processor: TTS segment channel closed (worker not running)");
+                }
             }
             ProcessingEvent::Stalled => {
                 warn!("pty processor: stalled");

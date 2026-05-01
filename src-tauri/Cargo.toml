@@ -27,6 +27,19 @@ base64 = "0.22"
 which = "6"
 vte = "0.13"
 
+# TTS (Kokoro via ONNX Runtime, pure-Rust phonemization)
+misaki-rs = { version = "0.3", default-features = false }
+ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "cuda"] }
+ndarray = "0.16"
+bytemuck = "1"
+
+# Audio output
+cpal = "0.15"
+rodio = "0.20"
+
+# Filesystem paths
+dirs = "5"
+
 [profile.release]
 codegen-units = 1
 lto = true

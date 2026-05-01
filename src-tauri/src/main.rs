@@ -2,6 +2,7 @@
 
 mod error;
 mod ipc;
+mod processing;
 mod pty;
 
 use std::path::PathBuf;

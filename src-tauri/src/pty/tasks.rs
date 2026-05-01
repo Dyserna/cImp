@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::time::Duration;
 
 use base64::prelude::*;
 use portable_pty::Child;
@@ -6,7 +7,13 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+use crate::processing::{ProcessingEvent, ProcessingLayer};
+
+/// Tick interval for the processing flush timer. Short enough that the
+/// 200ms stability and 500ms max-hold thresholds fire promptly.
+const FLUSH_TICK: Duration = Duration::from_millis(50);
 
 /// Reader task. Lives on the blocking pool because PTY reads block on most platforms.
 /// Sends raw byte chunks to an mpsc receiver consumed by `spawn_forwarder`.
@@ -46,39 +53,80 @@ pub fn spawn_reader(
     });
 }
 
-/// Forwarder task. Single emit site for `pty-output`. M2 replaces the body
-/// with `processing_layer.ingest(bytes)` and dispatches `ProcessingEvent`s.
-pub fn spawn_forwarder(
+/// Processor task. Owns a `ProcessingLayer`, drives it from the PTY byte stream
+/// and a steady 50 ms flush tick, and dispatches resulting events:
+///
+/// - `TerminalBytes` → base64-encoded and pushed through the Tauri Channel.
+/// - `TtsSegment` → logged at INFO with `target = "tts_stub"` (M3 swaps this
+///   for the real synthesizer).
+/// - `Stalled` → diagnostic warning.
+///
+/// Single-owner pattern: the layer is `&mut` only inside this task, so no
+/// extra locking is required.
+pub fn spawn_processor(
     mut rx: mpsc::Receiver<Vec<u8>>,
     channel: Channel<String>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
+        let mut layer = ProcessingLayer::new();
+        let mut tick = tokio::time::interval(FLUSH_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    debug!("pty forwarder: cancelled");
+                    debug!("pty processor: cancelled");
                     break;
                 }
                 maybe = rx.recv() => {
                     match maybe {
                         Some(bytes) => {
-                            let encoded = BASE64_STANDARD.encode(&bytes);
-                            if let Err(e) = channel.send(encoded) {
-                                warn!(error = %e, "pty forwarder: channel send failed");
+                            let events = layer.ingest(&bytes);
+                            if dispatch_events(events, &channel).is_err() {
                                 break;
                             }
                         }
                         None => {
-                            debug!("pty forwarder: bytes channel closed");
+                            debug!("pty processor: bytes channel closed");
                             break;
                         }
                     }
                 }
+                _ = tick.tick() => {
+                    let events = layer.flush_pending();
+                    if dispatch_events(events, &channel).is_err() {
+                        break;
+                    }
+                }
             }
         }
-        debug!("pty forwarder task exiting");
+        debug!("pty processor task exiting");
     });
+}
+
+fn dispatch_events(events: Vec<ProcessingEvent>, channel: &Channel<String>) -> Result<(), ()> {
+    for ev in events {
+        match ev {
+            ProcessingEvent::TerminalBytes(bytes) => {
+                if bytes.is_empty() {
+                    continue;
+                }
+                let encoded = BASE64_STANDARD.encode(&bytes);
+                if let Err(e) = channel.send(encoded) {
+                    warn!(error = %e, "pty processor: channel send failed");
+                    return Err(());
+                }
+            }
+            ProcessingEvent::TtsSegment(text) => {
+                info!(target: "tts_stub", text = %text, "would speak");
+            }
+            ProcessingEvent::Stalled => {
+                warn!("pty processor: stalled");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Waiter task. Blocks on child.wait(), emits `pty-exit` on the AppHandle, and

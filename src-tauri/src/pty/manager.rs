@@ -94,7 +94,7 @@ impl PtyManager {
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(256);
 
         tasks::spawn_reader(reader, bytes_tx, cancel.clone());
-        tasks::spawn_forwarder(bytes_rx, output_channel, cancel.clone());
+        tasks::spawn_processor(bytes_rx, output_channel, cancel.clone());
         tasks::spawn_waiter(child, app, cancel.clone());
 
         *guard = Some(PtyHandle {

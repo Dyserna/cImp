@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider};
+use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 
@@ -41,28 +41,50 @@ impl TtsEngine {
             return Err(AppError::ModelNotFound(model_path.display().to_string()));
         }
 
-        // Try CUDA first; fall back to CPU silently if CUDA isn't available
-        // at runtime (driver missing, no GPU, ort built without CUDA EP, etc).
-        // ort's `with_execution_providers` records EPs in priority order;
-        // CPU is always implicitly available as the final fallback.
-        let providers = [
-            CUDAExecutionProvider::default().build(),
-            CPUExecutionProvider::default().build(),
-        ];
-
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .map_err(|e| AppError::Tts(format!("session builder: {e}")))?
-            .with_execution_providers(providers)
-            .map_err(|e| AppError::Tts(format!("execution providers: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| AppError::Tts(format!("opt level: {e}")))?
+            .map_err(|e| AppError::Tts(format!("opt level: {e}")))?;
+
+        // CPU is the default; opt in to CUDA via `CCTTS_GPU=cuda`. The CUDA
+        // path works on Pascal/Volta/Turing/Ampere/Ada NVIDIA cards but is
+        // broken on Blackwell (sm_120) with ORT 1.20's prebuilt — see
+        // MAINTENANCE.md. Re-test both EPs when `ort` bumps to ORT 1.21+.
+        let bound_ep = match std::env::var("CCTTS_GPU").ok().as_deref() {
+            Some("cuda") => match CUDAExecutionProvider::default().register(&mut builder) {
+                Ok(()) => "GPU (CUDA)",
+                Err(e) => {
+                    tracing::warn!(error = %e, "CUDA EP unavailable; falling back to CPU");
+                    CPUExecutionProvider::default()
+                        .register(&mut builder)
+                        .map_err(|e| AppError::Tts(format!("CPU EP register: {e}")))?;
+                    "CPU"
+                }
+            },
+            Some(other) if !other.is_empty() => {
+                tracing::warn!(value = %other, "unknown CCTTS_GPU value; using CPU");
+                CPUExecutionProvider::default()
+                    .register(&mut builder)
+                    .map_err(|e| AppError::Tts(format!("CPU EP register: {e}")))?;
+                "CPU"
+            }
+            _ => {
+                CPUExecutionProvider::default()
+                    .register(&mut builder)
+                    .map_err(|e| AppError::Tts(format!("CPU EP register: {e}")))?;
+                "CPU"
+            }
+        };
+
+        let session = builder
             .commit_from_file(model_path)
             .map_err(|e| AppError::Tts(format!("load {}: {e}", model_path.display())))?;
         let voice = VoicePack::load(voice_path)?;
         let phonemizer = Phonemizer::new();
         tracing::info!(
             voice = voice.name(),
-            "TTS engine ready (CUDA EP requested; ort falls back to CPU if unavailable)"
+            bound = bound_ep,
+            "TTS engine ready"
         );
         Ok(Self {
             session,

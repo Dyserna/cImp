@@ -248,6 +248,18 @@ pub async fn compose_content_changed(
     Ok(())
 }
 
+/// User dismissed the error banner. Drops the avatar back to Idle on the
+/// next state transition. Recovery for SubprocessExited is the separate
+/// `request_claude_code_restart` path — this command just clears the
+/// Error pin so the avatar returns to its normal flow.
+#[tauri::command]
+pub async fn acknowledge_error(state: State<'_, AppState>) -> AppResult<()> {
+    let _ = state
+        .state_signals
+        .try_send(StateSignal::ErrorAcknowledged);
+    Ok(())
+}
+
 // --- settings IPC -----------------------------------------------------------
 
 #[tauri::command]

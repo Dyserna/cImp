@@ -1,10 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
   import Terminal from './lib/Terminal.svelte';
   import AvatarOverlay from './lib/AvatarOverlay.svelte';
   import WaveformOverlay from './lib/WaveformOverlay.svelte';
   import ComposeOverlay from './lib/ComposeOverlay.svelte';
+  import ErrorBanner from './lib/ErrorBanner.svelte';
+  import { avatarState } from './lib/avatarState';
   import { initSettings, settings } from './lib/settings/store';
   import { openSettingsWindow } from './lib/settings/ipc';
   import {
@@ -28,6 +31,7 @@
   // otherwise the keypress flows to xterm.js as normal.
   let unsubSettings: (() => void) | undefined;
   let unsubContent: (() => void) | undefined;
+  let unsubTitle: (() => void) | undefined;
 
   onMount(() => {
     void (async () => {
@@ -55,6 +59,17 @@
           },
         });
       });
+      // Reflect avatar state in the OS window title so the user can see
+      // what's happening in the taskbar / Alt-Tab / window list without
+      // looking at the avatar itself.
+      const win = getCurrentWindow();
+      unsubTitle = avatarState.subscribe((s) => {
+        const label = s === 'Idle' ? 'Claude' : `Claude — ${s}`;
+        void win.setTitle(label).catch((e) =>
+          console.warn('setTitle failed:', e),
+        );
+      });
+
       // Edge-trigger the compose-content state-machine signal: emit only
       // when the empty/non-empty state actually flips. Avoids spamming the
       // signal channel on every keystroke.
@@ -72,6 +87,7 @@
     return () => {
       unsubSettings?.();
       unsubContent?.();
+      unsubTitle?.();
     };
   });
 </script>
@@ -84,6 +100,7 @@
        reasoning. -->
   <WaveformOverlay />
   <ComposeOverlay />
+  <ErrorBanner />
 </main>
 
 <style>

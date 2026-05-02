@@ -8,6 +8,40 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ErrorKind {
+    SubprocessExited,
+    TtsError,
+    AudioError,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ErrorInfo {
+    pub kind: ErrorKind,
+    pub message: &'static str,
+}
+
+impl ErrorInfo {
+    fn from_signal(s: StateSignal) -> Option<Self> {
+        match s {
+            StateSignal::SubprocessExited => Some(Self {
+                kind: ErrorKind::SubprocessExited,
+                message: "Claude Code stopped.",
+            }),
+            StateSignal::TtsError => Some(Self {
+                kind: ErrorKind::TtsError,
+                message: "Text-to-speech is unavailable.",
+            }),
+            StateSignal::AudioError => Some(Self {
+                kind: ErrorKind::AudioError,
+                message: "Audio output is unavailable.",
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Auto-leave Listening when the input has been empty AND idle this long.
 /// Matches the user's stated rule: "if I clear the input and don't type
 /// for 5 seconds, switch to Idle." Stays in Listening if there's still
@@ -143,6 +177,15 @@ async fn run(
                     info!(from = ?current, to = ?next, ?signal, "avatar state");
                     current = next;
                     emit(&app, current);
+                    // When we just entered Error, also emit details so the
+                    // frontend banner can pick the right message + recovery
+                    // action. Clearing happens implicitly when state leaves
+                    // Error (frontend listens on avatar-state for that).
+                    if next == AvatarState::Error {
+                        if let Some(info) = ErrorInfo::from_signal(signal) {
+                            emit_error(&app, &info);
+                        }
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -242,6 +285,12 @@ fn transition(
 fn emit(app: &AppHandle, state: AvatarState) {
     if let Err(e) = app.emit("avatar-state", state) {
         warn!(error = %e, "failed to emit avatar-state");
+    }
+}
+
+fn emit_error(app: &AppHandle, info: &ErrorInfo) {
+    if let Err(e) = app.emit("avatar-error", info) {
+        warn!(error = %e, "failed to emit avatar-error");
     }
 }
 

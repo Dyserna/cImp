@@ -9,7 +9,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::processing::{ProcessingEvent, ProcessingLayer};
 use crate::settings::SettingsHandle;
@@ -246,7 +246,11 @@ async fn dispatch_events(
                 }
             }
             ProcessingEvent::TtsSegment(text) => {
-                info!(target: "tts_stub", text = %text, "extracted TTS segment");
+                // Per-segment log; debug-level so a normal session at the
+                // default `info` filter doesn't spam one line per sentence.
+                // Bump filter to `cctts=debug` (default) or `tts_stub=debug`
+                // explicitly to see the extracted text.
+                debug!(target: "tts_stub", text = %text, "extracted TTS segment");
                 if tts_segments.send(text).await.is_err() {
                     debug!("pty processor: TTS segment channel closed (worker not running)");
                 }

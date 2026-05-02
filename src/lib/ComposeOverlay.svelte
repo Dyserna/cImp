@@ -44,6 +44,26 @@
     adjustHeight();
   }
 
+  // Tab key inserts a literal tab character at the caret instead of
+  // shifting focus out of the sheet. Multi-line code paste workflows expect
+  // it. Shift+Tab is left alone (default focus-cycle behavior preserved).
+  function handleKeydown(e: KeyboardEvent): void {
+    if (e.key !== 'Tab' || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) {
+      return;
+    }
+    e.preventDefault();
+    const ta = textareaEl;
+    if (!ta) return;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const value = ta.value;
+    ta.value = value.slice(0, start) + '\t' + value.slice(end);
+    ta.selectionStart = ta.selectionEnd = start + 1;
+    // Mirror the change into the bound store so submitCompose sees it.
+    composeContent.set(ta.value);
+    adjustHeight();
+  }
+
   function handleFocus(): void {
     composeFocused.set(true);
   }
@@ -69,6 +89,7 @@
       bind:this={textareaEl}
       bind:value={$composeContent}
       oninput={handleInput}
+      onkeydown={handleKeydown}
       onfocus={handleFocus}
       onblur={handleBlur}
       spellcheck="true"

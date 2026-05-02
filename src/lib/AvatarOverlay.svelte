@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
+  import { fade } from 'svelte/transition';
   import {
     avatarState,
     avatarVisible,
@@ -15,6 +16,11 @@
     isVideoSrc,
   } from './avatarConfig';
   import { openSettingsWindow } from './settings/ipc';
+
+  /// Default crossfade duration when the user has disabled video transitions
+  /// (empty path or duration_ms=0). Short enough to feel snappy, long enough
+  /// to read as a smooth swap rather than a flicker.
+  const FADE_MS = 150;
 
   let displayedSrc = $state<string>('');
   let displayedState: AvatarState = 'Idle';
@@ -107,11 +113,12 @@
 <div class="avatar-container {positionClass}" style={positionStyles}>
   {#if $avatarVisible}
     <div class="avatar-overlay">
-      {#if isVideoSrc(displayedSrc)}
-        <!-- {#key} remounts the element on src change so autoplay restarts
-             playback. Without this, swapping src on an existing <video>
-             does not reliably reset currentTime back to 0. -->
-        {#key displayedSrc}
+      <!-- {#key} remounts the element on src change so video autoplay
+           restarts and image swaps get the fade transition. Both branches
+           are absolute-positioned so the old + new elements briefly overlap
+           during the fade — giving a true crossfade rather than a flicker. -->
+      {#key displayedSrc}
+        {#if isVideoSrc(displayedSrc)}
           <video
             src={displayedSrc}
             class="avatar-image"
@@ -119,15 +126,22 @@
             loop
             muted
             playsinline
+            transition:fade={{ duration: FADE_MS }}
           ></video>
-        {/key}
-      {:else}
-        <img src={displayedSrc} alt="Avatar" class="avatar-image" />
-      {/if}
+        {:else}
+          <img
+            src={displayedSrc}
+            alt="Avatar"
+            class="avatar-image"
+            transition:fade={{ duration: FADE_MS }}
+          />
+        {/if}
+      {/key}
       <button
         class="settings-button"
         onclick={() => void openSettingsWindow()}
         aria-label="Settings"
+        title="Settings"
       >
         ⚙
       </button>
@@ -137,6 +151,7 @@
     class="toggle-button"
     onclick={toggleAvatarVisible}
     aria-label={$avatarVisible ? 'Hide avatar' : 'Show avatar'}
+    title={$avatarVisible ? 'Hide avatar' : 'Show avatar'}
   >
     {$avatarVisible ? '›' : '‹'}
   </button>
@@ -183,6 +198,11 @@
   }
 
   .avatar-image {
+    /* Absolute fill so the old and new key'd elements occupy the same box
+       during a fade — without this, the new mount would push the old one
+       sideways before its out-transition completes. */
+    position: absolute;
+    inset: 0;
     width: 100%;
     height: 100%;
     object-fit: contain;

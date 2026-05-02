@@ -39,6 +39,10 @@ export async function composeContentChanged(nonEmpty: boolean): Promise<void> {
   await invoke('compose_content_changed', { nonEmpty });
 }
 
+export async function acknowledgeError(): Promise<void> {
+  await invoke('acknowledge_error');
+}
+
 export function onPtyExit(handler: (payload: string) => void): Promise<UnlistenFn> {
   return listen<string>('pty-exit', (event) => handler(event.payload));
 }

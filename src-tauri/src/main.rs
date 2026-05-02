@@ -22,9 +22,9 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{
-    close_settings_window, compose_content_changed, list_voices, open_settings_window,
-    pty_resize, pty_restart, pty_start, pty_write, request_claude_code_restart,
-    settings_get, settings_update, tts_test,
+    acknowledge_error, close_settings_window, compose_content_changed, list_voices,
+    open_settings_window, pty_resize, pty_restart, pty_start, pty_write,
+    request_claude_code_restart, settings_get, settings_update, tts_test,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::pty::PtyManager;
@@ -133,6 +133,7 @@ fn main() {
             close_settings_window,
             request_claude_code_restart,
             compose_content_changed,
+            acknowledge_error,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

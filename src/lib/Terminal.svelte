@@ -17,6 +17,7 @@
     type BytesChannel,
   } from './ipc';
   import { display as displaySettings } from './settings/store';
+  import { setTerminalFocuser } from './terminalFocus';
 
   // Expose a global helper so we can test TTS directly from the WebView
   // DevTools console: `window.ttsTest("hello world")`.
@@ -136,6 +137,9 @@
       status = 'running';
 
       term.focus();
+      // Publish a focus handle so callers like the compose overlay can
+      // restore focus to the terminal after they close.
+      setTerminalFocuser(() => term?.focus());
     } catch (e) {
       const msg = e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e);
       status = `ERROR: ${msg}`;
@@ -150,6 +154,7 @@
     unlistenExit?.();
     unlistenRestart?.();
     unsubFont?.();
+    setTerminalFocuser(null);
     term?.dispose();
   });
 </script>

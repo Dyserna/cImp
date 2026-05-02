@@ -35,6 +35,10 @@ export async function ttsTest(text: string): Promise<void> {
   await invoke('tts_test', { text });
 }
 
+export async function composeContentChanged(nonEmpty: boolean): Promise<void> {
+  await invoke('compose_content_changed', { nonEmpty });
+}
+
 export function onPtyExit(handler: (payload: string) => void): Promise<UnlistenFn> {
   return listen<string>('pty-exit', (event) => handler(event.payload));
 }

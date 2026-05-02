@@ -233,6 +233,21 @@ pub async fn pty_resize(state: State<'_, AppState>, rows: u16, cols: u16) -> App
     state.pty.resize(rows, cols).await
 }
 
+/// Notify the state machine that the compose-overlay textarea crossed the
+/// empty/non-empty edge. Frontend only fires on the edge; the state machine
+/// promotes Idle→Listening on `non_empty=true` and pins Listening for as
+/// long as the flag is set.
+#[tauri::command]
+pub async fn compose_content_changed(
+    state: State<'_, AppState>,
+    non_empty: bool,
+) -> AppResult<()> {
+    let _ = state
+        .state_signals
+        .try_send(StateSignal::ComposeContentChanged { non_empty });
+    Ok(())
+}
+
 // --- settings IPC -----------------------------------------------------------
 
 #[tauri::command]

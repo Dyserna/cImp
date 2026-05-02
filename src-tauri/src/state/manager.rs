@@ -62,6 +62,11 @@ pub enum StateSignal {
     /// signal vocabulary, and so we have an obvious hook if a future
     /// model wants it.
     ClaudeOutputStarted,
+    /// Compose-overlay textarea content crossed the empty/non-empty edge.
+    /// Acts like `UserKeystroke` for promotion (Idle → Listening) and as a
+    /// keep-alive for Listening while non-empty; an empty edge alone never
+    /// downgrades — the existing rules (input length + idle timeout) decide.
+    ComposeContentChanged { non_empty: bool },
 }
 
 /// Spawn the state-manager task. The channel is created at app startup so
@@ -90,6 +95,11 @@ async fn run(
     // Drives the (Speaking → ?) decision when TTS ends: if the user has
     // unsent input we resume to Listening rather than dropping to Idle.
     let mut has_unsent_input = false;
+    // True while the compose-overlay textarea has non-empty content.
+    // Companion condition to `has_unsent_input`: pins Listening (idle-
+    // timeout tick won't drop), and contributes to the Speaking→Listening
+    // resume after TTS ends.
+    let mut composing = false;
     // Most recent keystroke timestamp. Drives the auto-leave-Listening
     // tick: we only drop Listening → Idle when the input is empty AND
     // there's been no typing for EMPTY_INPUT_IDLE.
@@ -118,9 +128,17 @@ async fn run(
                         has_unsent_input = false;
                         last_keystroke_at = Some(Instant::now());
                     }
+                    StateSignal::ComposeContentChanged { non_empty } => {
+                        composing = non_empty;
+                        // A non-empty edge counts as fresh activity so the
+                        // 5s idle timer doesn't fire mid-composition.
+                        if non_empty {
+                            last_keystroke_at = Some(Instant::now());
+                        }
+                    }
                     _ => {}
                 }
-                let next = transition(current, signal, has_unsent_input);
+                let next = transition(current, signal, has_unsent_input, composing);
                 if next != current {
                     info!(from = ?current, to = ?next, ?signal, "avatar state");
                     current = next;
@@ -129,6 +147,7 @@ async fn run(
             }
             _ = tick.tick() => {
                 if current == AvatarState::Listening
+                    && !composing
                     && input_length.load(Ordering::Relaxed) == 0
                     && last_keystroke_at
                         .map(|t| t.elapsed() >= EMPTY_INPUT_IDLE)
@@ -160,6 +179,7 @@ fn transition(
     current: AvatarState,
     signal: StateSignal,
     has_unsent_input: bool,
+    composing: bool,
 ) -> AvatarState {
     use AvatarState::*;
     use StateSignal::*;
@@ -169,16 +189,27 @@ fn transition(
         return Error;
     }
 
+    // ComposeContentChanged behaves like a UserKeystroke for promotion: it
+    // can promote Idle→Listening when going non-empty, but never preempts a
+    // higher-priority state, and the empty edge never transitions on its
+    // own (the tick + existing rules handle the drop back to Idle).
+    if let ComposeContentChanged { non_empty } = signal {
+        if non_empty && current == Idle {
+            return Listening;
+        }
+        return current;
+    }
+
     match (current, signal) {
         // Error sticks until explicitly acknowledged.
         (Error, ErrorAcknowledged) => Idle,
         (Error, _) => Error,
 
         // Speaking only ends when TTS playback ends. If the user has been
-        // typing during/before the TTS clip and hasn't submitted, resume
-        // to Listening rather than blinking through Idle. Otherwise Idle.
+        // typing during/before the TTS clip and hasn't submitted, OR is
+        // mid-compose, resume to Listening rather than blinking through Idle.
         (Speaking, TtsPlaybackStopped) => {
-            if has_unsent_input {
+            if has_unsent_input || composing {
                 Listening
             } else {
                 Idle
@@ -221,11 +252,15 @@ mod tests {
     use StateSignal::*;
 
     fn t(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, signal, false)
+        transition(current, signal, false, false)
     }
 
     fn t_with_input(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, signal, true)
+        transition(current, signal, true, false)
+    }
+
+    fn t_composing(current: AvatarState, signal: StateSignal) -> AvatarState {
+        transition(current, signal, false, true)
     }
 
     #[test]
@@ -292,6 +327,36 @@ mod tests {
             assert_eq!(t(s, AudioError), Error);
             assert_eq!(t(s, TtsError), Error);
         }
+    }
+
+    #[test]
+    fn idle_compose_non_empty_listens() {
+        assert_eq!(
+            t(Idle, ComposeContentChanged { non_empty: true }),
+            Listening,
+        );
+    }
+
+    #[test]
+    fn idle_compose_empty_stays_idle() {
+        assert_eq!(t(Idle, ComposeContentChanged { non_empty: false }), Idle);
+    }
+
+    #[test]
+    fn compose_does_not_preempt_higher_states() {
+        assert_eq!(
+            t(Thinking, ComposeContentChanged { non_empty: true }),
+            Thinking,
+        );
+        assert_eq!(
+            t(Speaking, ComposeContentChanged { non_empty: true }),
+            Speaking,
+        );
+    }
+
+    #[test]
+    fn speaking_tts_stop_resumes_listening_when_composing() {
+        assert_eq!(t_composing(Speaking, TtsPlaybackStopped), Listening);
     }
 
     #[test]

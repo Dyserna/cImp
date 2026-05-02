@@ -11,7 +11,16 @@ import type { ShortcutSettings } from '../settings/types';
 
 export type ShortcutAction = 'open_compose' | 'submit_compose' | 'cancel_compose' | 'open_settings';
 
-export type ShortcutHandlers = Partial<Record<ShortcutAction, () => void>>;
+/// A shortcut binding can be a bare function (always fires when matched) or
+/// an object with an `active` predicate. When `active()` returns false the
+/// dispatcher does NOT preventDefault — the keypress flows to xterm.js or
+/// the focused element as usual. This is how `submit_compose` (Ctrl+Enter)
+/// avoids swallowing the key when focus is in the terminal.
+export type ShortcutHandler =
+  | (() => void)
+  | { handler: () => void; active?: () => boolean };
+
+export type ShortcutHandlers = Partial<Record<ShortcutAction, ShortcutHandler>>;
 
 let predicates: Partial<Record<ShortcutAction, ShortcutPredicate | null>> = {};
 let handlers: ShortcutHandlers = {};
@@ -52,14 +61,17 @@ function onKeyDown(event: KeyboardEvent): void {
   if (suppressed) return;
   for (const name of Object.keys(predicates) as ShortcutAction[]) {
     const pred = predicates[name];
-    if (pred && matches(event, pred)) {
-      const handler = handlers[name];
-      if (handler) {
-        event.preventDefault();
-        event.stopPropagation();
-        handler();
-      }
-      return;
-    }
+    if (!pred || !matches(event, pred)) continue;
+    const binding = handlers[name];
+    if (!binding) return;
+    const fn = typeof binding === 'function' ? binding : binding.handler;
+    const active = typeof binding === 'function' ? null : binding.active;
+    // If an `active` predicate is provided and returns false we do nothing —
+    // not even preventDefault — so the key continues to its normal target.
+    if (active && !active()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    fn();
+    return;
   }
 }

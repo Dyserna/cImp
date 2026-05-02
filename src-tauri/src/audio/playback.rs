@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::audio::amplitude::{AmplitudeTap, RingBuffer, RING_CAPACITY};
 use crate::error::{AppError, AppResult};
+use crate::settings::SettingsHandle;
 use crate::state::StateSignal;
 
 /// How often the audio thread polls for sink-empty transitions while
@@ -29,7 +30,6 @@ const PLAYBACK_POLL: Duration = Duration::from_millis(50);
 enum AudioCommand {
     Enqueue { samples: Vec<f32>, sample_rate: u32 },
     StopAll,
-    #[allow(dead_code)] // M6 settings hook.
     SetVolume(f32),
 }
 
@@ -45,7 +45,10 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
-    pub fn new(state_signals: tokio_mpsc::Sender<StateSignal>) -> AppResult<Self> {
+    pub fn new(
+        state_signals: tokio_mpsc::Sender<StateSignal>,
+        settings: SettingsHandle,
+    ) -> AppResult<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let amplitude = Arc::new(RwLock::new(RingBuffer::new(RING_CAPACITY)));
         let playing = Arc::new(AtomicBool::new(false));
@@ -53,6 +56,7 @@ impl AudioOutput {
         let (init_tx, init_rx) = mpsc::sync_channel::<AppResult<()>>(1);
         let amp_for_thread = amplitude.clone();
         let playing_for_thread = playing.clone();
+        let initial_volume = effective_volume(&settings.current().tts);
 
         std::thread::Builder::new()
             .name("cctts-audio".into())
@@ -63,12 +67,16 @@ impl AudioOutput {
                     playing_for_thread,
                     init_tx,
                     state_signals,
+                    initial_volume,
                 )
             })
             .map_err(|e| AppError::Audio(format!("spawn audio thread: {e}")))?;
 
         match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self { cmd_tx, amplitude, playing }),
+            Ok(Ok(())) => {
+                spawn_volume_subscriber(cmd_tx.clone(), settings);
+                Ok(Self { cmd_tx, amplitude, playing })
+            }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(AppError::Audio("audio thread died during init".into())),
         }
@@ -95,15 +103,48 @@ impl AudioOutput {
         self.playing.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)] // Interrupt-on-input (M6 / M7).
     pub fn stop_all(&self) {
         let _ = self.cmd_tx.send(AudioCommand::StopAll);
     }
 
-    #[allow(dead_code)] // Settings (M6).
+    #[allow(dead_code)] // Direct setter; settings broadcast is the usual path.
     pub fn set_volume(&self, volume: f32) {
         let _ = self.cmd_tx.send(AudioCommand::SetVolume(volume));
     }
+}
+
+/// Mute folds into volume: muted means volume = 0, unmuted means the
+/// configured volume. The audio thread doesn't need to know about mute as a
+/// separate concept.
+fn effective_volume(tts: &crate::settings::TtsSettings) -> f32 {
+    if tts.mute {
+        0.0
+    } else {
+        tts.volume.clamp(0.0, 1.0)
+    }
+}
+
+/// Subscribe to settings updates and forward volume/mute changes to the
+/// audio thread. Lives for the process lifetime — when the broadcast
+/// channel closes the loop ends naturally.
+fn spawn_volume_subscriber(cmd_tx: mpsc::Sender<AudioCommand>, settings: SettingsHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut rx = settings.subscribe();
+        let mut last = effective_volume(&settings.current().tts);
+        loop {
+            match rx.recv().await {
+                Ok(s) => {
+                    let v = effective_volume(&s.tts);
+                    if (v - last).abs() > f32::EPSILON {
+                        last = v;
+                        let _ = cmd_tx.send(AudioCommand::SetVolume(v));
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 fn run_audio_thread(
@@ -112,6 +153,7 @@ fn run_audio_thread(
     playing: Arc<AtomicBool>,
     init_tx: SyncSender<AppResult<()>>,
     state_signals: tokio_mpsc::Sender<StateSignal>,
+    initial_volume: f32,
 ) {
     // Open the device on this thread so the cpal::Stream stays bound here.
     let (stream, handle) = match OutputStream::try_default() {
@@ -128,6 +170,7 @@ fn run_audio_thread(
             return;
         }
     };
+    sink.set_volume(initial_volume);
 
     info!("audio thread ready");
     let _ = init_tx.send(Ok(()));

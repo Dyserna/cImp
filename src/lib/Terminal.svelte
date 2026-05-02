@@ -3,16 +3,20 @@
   import { Terminal } from '@xterm/xterm';
   import { FitAddon } from '@xterm/addon-fit';
   import '@xterm/xterm/css/xterm.css';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
   import {
     createBytesChannel,
     ptyStart,
+    ptyRestart,
     ptyWrite,
     ptyResize,
     ttsTest,
     onPtyExit,
     decodeBase64,
+    type BytesChannel,
   } from './ipc';
+  import { display as displaySettings } from './settings/store';
 
   // Expose a global helper so we can test TTS directly from the WebView
   // DevTools console: `window.ttsTest("hello world")`.
@@ -25,15 +29,38 @@
   let fitAddon: FitAddon | undefined;
   let resizeObserver: ResizeObserver | undefined;
   let unlistenExit: (() => void) | undefined;
+  let unlistenRestart: UnlistenFn | undefined;
   let resizeTimer: ReturnType<typeof setTimeout> | undefined;
   let status = $state('booting…');
+
+  let initialFontFamily = 'Consolas, Menlo, "DejaVu Sans Mono", monospace';
+  let initialFontSize = 14;
+  // Capture initial values synchronously before xterm boot so the first
+  // paint already uses the persisted settings rather than the placeholder.
+  const unsubInit = displaySettings.subscribe((d) => {
+    initialFontFamily = d.terminal_font_family;
+    initialFontSize = d.terminal_font_size;
+  });
+  unsubInit();
+
+  // Subscribe live so font changes apply on the fly. We keep the
+  // unsubscribe handle and tear it down in onDestroy.
+  let unsubFont: (() => void) | undefined;
+
+  function rebindBytesChannel(): BytesChannel {
+    const channel = createBytesChannel();
+    channel.onmessage = (encoded) => {
+      if (term) term.write(decodeBase64(encoded));
+    };
+    return channel;
+  }
 
   onMount(async () => {
     try {
       status = 'creating xterm';
       term = new Terminal({
-        fontFamily: 'Consolas, Menlo, "DejaVu Sans Mono", monospace',
-        fontSize: 14,
+        fontFamily: initialFontFamily,
+        fontSize: initialFontSize,
         cursorBlink: true,
         allowProposedApi: true,
         theme: {
@@ -46,11 +73,25 @@
       term.open(containerEl);
       fitAddon.fit();
 
+      // Apply font changes whenever display settings update. xterm exposes
+      // `options` for live changes; after a font swap we re-fit so the
+      // grid re-measures to the new metrics.
+      unsubFont = displaySettings.subscribe((d) => {
+        if (!term || !fitAddon) return;
+        if (
+          term.options.fontFamily !== d.terminal_font_family ||
+          term.options.fontSize !== d.terminal_font_size
+        ) {
+          term.options.fontFamily = d.terminal_font_family;
+          term.options.fontSize = d.terminal_font_size;
+          fitAddon.fit();
+          const { rows, cols } = term;
+          ptyResize(rows, cols).catch((e) => console.error('pty_resize failed:', e));
+        }
+      });
+
       status = 'wiring channel';
-      const bytesChannel = createBytesChannel();
-      bytesChannel.onmessage = (encoded) => {
-        if (term) term.write(decodeBase64(encoded));
-      };
+      let bytesChannel = rebindBytesChannel();
 
       term.onData((data) => {
         ptyWrite(data).catch((e) => console.error('pty_write failed:', e));
@@ -60,14 +101,26 @@
         if (term) term.write(`\r\n[claude exited: ${payload}]\r\n`);
       });
 
+      // Settings asks for a Claude Code restart by emitting this event;
+      // we own the channel/rows/cols so the actual reconnect happens here.
+      unlistenRestart = await listen('claude-code-restart', async () => {
+        if (!term || !fitAddon) return;
+        try {
+          term.write('\r\n[restarting claude…]\r\n');
+          // Drop the old channel handler — once `pty_restart` returns,
+          // bytes will flow through the new one.
+          bytesChannel = rebindBytesChannel();
+          const { rows, cols } = term;
+          await ptyRestart(bytesChannel, rows, cols);
+          term.focus();
+        } catch (e) {
+          console.error('pty_restart failed:', e);
+          term.write(`\r\n[restart failed: ${(e as Error).message ?? e}]\r\n`);
+        }
+      });
+
       resizeObserver = new ResizeObserver(() => {
         if (resizeTimer) clearTimeout(resizeTimer);
-        // 250ms debounce: long enough that a window drag across DPI
-        // boundaries (which can fire many micro-resizes) settles into a
-        // single ptyResize, short enough that intentional resizes still
-        // feel responsive. A shorter window let mid-drag jitter chain
-        // PTY redraws into a sustained byte burst, which the avatar
-        // state detector misread as claude output.
         resizeTimer = setTimeout(() => {
           if (!term || !fitAddon) return;
           fitAddon.fit();
@@ -95,6 +148,8 @@
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeObserver?.disconnect();
     unlistenExit?.();
+    unlistenRestart?.();
+    unsubFont?.();
     term?.dispose();
   });
 </script>

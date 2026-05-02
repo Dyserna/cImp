@@ -5,24 +5,30 @@ mod error;
 mod ipc;
 mod processing;
 mod pty;
+mod settings;
 mod state;
 mod tts;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use tauri::{AppHandle, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
-use crate::ipc::commands::{pty_resize, pty_start, pty_write, tts_test};
+use crate::ipc::commands::{
+    close_settings_window, list_voices, open_settings_window, pty_resize, pty_restart,
+    pty_start, pty_write, request_claude_code_restart, settings_get, settings_update,
+    tts_test,
+};
 use crate::ipc::{AppState, LaunchContext};
 use crate::pty::PtyManager;
+use crate::settings::{Settings, SettingsHandle};
 use crate::state::{spawn_state_manager, StateSignal};
 use crate::tts::{spawn_tts_worker, TtsEngine};
 
@@ -38,6 +44,11 @@ fn main() {
         args = ?extra_args,
         "cctts starting"
     );
+
+    // Settings store. Always succeeds — missing/corrupt files become defaults
+    // (and are written back). Cheap to clone (Arc inside) so each subsystem
+    // gets its own handle.
+    let settings_handle = settings::init();
 
     // TTS / audio pipeline. Failures are non-fatal — the app launches with
     // TTS silent and a warning logged. The processor task always has a live
@@ -58,6 +69,8 @@ fn main() {
     // through the signal channel.
     let input_length = Arc::new(AtomicI32::new(0));
 
+    let audio_slot: Arc<RwLock<Option<Arc<AudioOutput>>>> = Arc::new(RwLock::new(None));
+
     let state = AppState {
         pty: PtyManager::new(),
         launch: LaunchContext {
@@ -68,13 +81,17 @@ fn main() {
         user_typed_tts: Arc::new(Mutex::new(HashSet::new())),
         state_signals: state_tx.clone(),
         input_length: input_length.clone(),
+        settings: settings_handle.clone(),
+        audio: audio_slot.clone(),
     };
 
     let tts_rx_for_setup = tts_rx_slot.clone();
     let state_rx_for_setup = state_rx_slot.clone();
     let audio_state_tx = state_tx.clone();
     let input_length_for_setup = input_length.clone();
+    let settings_for_setup = settings_handle.clone();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .setup(move |app| {
             if let Some(rx) = state_rx_for_setup
@@ -89,13 +106,41 @@ fn main() {
                 .ok()
                 .and_then(|mut g| g.take())
             {
-                init_tts_pipeline(app.handle().clone(), rx, audio_state_tx.clone());
+                init_tts_pipeline(
+                    app.handle().clone(),
+                    rx,
+                    audio_state_tx.clone(),
+                    settings_for_setup.clone(),
+                    audio_slot.clone(),
+                );
             }
+            // Mirror settings broadcasts onto a frontend event so every
+            // window (main, settings) updates reactively without
+            // round-tripping through a manual fetch.
+            spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![pty_start, pty_write, pty_resize, tts_test])
+        .invoke_handler(tauri::generate_handler![
+            pty_start,
+            pty_restart,
+            pty_write,
+            pty_resize,
+            tts_test,
+            settings_get,
+            settings_update,
+            list_voices,
+            open_settings_window,
+            close_settings_window,
+            request_claude_code_restart,
+        ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
+                let label = window.label().to_string();
+                if label != "main" {
+                    // Non-main windows close normally and don't shut down
+                    // the PTY. Default behavior is fine here.
+                    return;
+                }
                 api.prevent_close();
                 let window = window.clone();
                 let app = window.app_handle().clone();
@@ -127,8 +172,10 @@ fn init_tts_pipeline(
     app: AppHandle,
     tts_rx: mpsc::Receiver<String>,
     state_signals: mpsc::Sender<StateSignal>,
+    settings: SettingsHandle,
+    audio_slot: Arc<RwLock<Option<Arc<AudioOutput>>>>,
 ) {
-    let audio = match AudioOutput::new(state_signals.clone()) {
+    let audio = match AudioOutput::new(state_signals.clone(), settings.clone()) {
         Ok(a) => Arc::new(a),
         Err(e) => {
             warn!(error = %e, "audio output unavailable; TTS will be silent");
@@ -139,6 +186,11 @@ fn init_tts_pipeline(
             return;
         }
     };
+
+    // Publish the audio handle so pty_write can react to interrupt-on-input.
+    if let Ok(mut slot) = audio_slot.write() {
+        *slot = Some(audio.clone());
+    }
 
     // Start the M5 amplitude streamer as soon as the audio device is up,
     // independent of whether the TTS engine succeeds. If the engine fails
@@ -153,7 +205,8 @@ fn init_tts_pipeline(
             return;
         }
     };
-    let voice_path = match tts::default_voice_path(tts::DEFAULT_VOICE) {
+    let initial_voice = settings.current().tts.voice;
+    let voice_path = match tts::default_voice_path(&initial_voice) {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "cannot resolve voice path");
@@ -164,7 +217,7 @@ fn init_tts_pipeline(
 
     match TtsEngine::new(&model_path, &voice_path) {
         Ok(engine) => {
-            spawn_tts_worker(engine, audio, tts_rx, state_signals);
+            spawn_tts_worker(engine, audio, tts_rx, state_signals, settings);
         }
         Err(AppError::ModelNotFound(_)) => {
             tts::report_missing_model_files();
@@ -176,4 +229,27 @@ fn init_tts_pipeline(
             drop(tts_rx);
         }
     }
+}
+
+/// Subscribe to the settings broadcast and re-emit each update as a
+/// `settings-changed` Tauri event. The frontend listens on every window so
+/// any open UI (main pane, settings window) stays in sync.
+fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut rx = settings.subscribe();
+        // Emit the current value once so any window that opens after init
+        // gets the up-to-date state without an extra `settings_get` call.
+        let _ = app.emit("settings-changed", settings.current());
+        loop {
+            match rx.recv().await {
+                Ok(s) => {
+                    let _ = app.emit::<Settings>("settings-changed", s);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "settings broadcast lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }

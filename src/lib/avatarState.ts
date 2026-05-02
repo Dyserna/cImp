@@ -1,13 +1,25 @@
-import { writable } from 'svelte/store';
+import { writable, derived, get, type Readable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { settings, applySettings } from './settings/store';
 
 export type AvatarState = 'Idle' | 'Listening' | 'Thinking' | 'Speaking' | 'Error';
 
 export const avatarState = writable<AvatarState>('Idle');
 
-// In-memory only for M4 — persistence lands in M6 along with the rest of
-// the settings store.
-export const avatarVisible = writable<boolean>(true);
+/// Visibility is now backed by `settings.avatar.visible`. The toggle button
+/// and the settings UI are two views of the same source of truth — toggling
+/// either updates the persisted setting, which broadcasts back to all
+/// subscribers (including this derived store).
+export const avatarVisible: Readable<boolean> = derived(
+  settings,
+  (s) => s.avatar.visible,
+);
+
+/// Flip the visibility flag. Used by the toggle button next to the avatar.
+export function toggleAvatarVisible(): void {
+  const s = get(settings);
+  void applySettings({ ...s, avatar: { ...s.avatar, visible: !s.avatar.visible } });
+}
 
 let unlistenPromise: Promise<UnlistenFn> | null = null;
 

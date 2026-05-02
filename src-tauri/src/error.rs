@@ -33,6 +33,9 @@ pub enum AppError {
 
     #[error("model file not found: {0}")]
     ModelNotFound(String),
+
+    #[error("settings error: {0}")]
+    Settings(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

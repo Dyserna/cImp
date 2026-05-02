@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::mpsc;
 
+use crate::audio::AudioOutput;
 use crate::pty::PtyManager;
+use crate::settings::SettingsHandle;
 use crate::state::StateSignal;
 
 pub struct AppState {
@@ -35,6 +37,14 @@ pub struct AppState {
     /// add one, backspace removes one, Ctrl+U/Ctrl+K reset to zero,
     /// Ctrl+W is treated as removing four). Saturating, never negative.
     pub input_length: Arc<AtomicI32>,
+    /// Live-updating settings store. Cheap clone; subscribers call
+    /// `subscribe()` to receive a `broadcast::Receiver<Settings>`.
+    pub settings: SettingsHandle,
+    /// Audio output handle. Populated from the Tauri setup hook once the
+    /// audio device is up; remains `None` if init failed (TTS silent mode).
+    /// `pty_write` reads this to honor the `interrupt_on_input` setting —
+    /// typing during playback stops the sink when enabled.
+    pub audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
 }
 
 #[derive(Clone)]

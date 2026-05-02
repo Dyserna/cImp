@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::processing::{ProcessingEvent, ProcessingLayer};
+use crate::settings::SettingsHandle;
 use crate::state::StateSignal;
 
 /// Tick interval for the processing flush timer. Short enough that the
@@ -97,9 +98,14 @@ pub fn spawn_processor(
     cancel: CancellationToken,
     user_typed_tts: Arc<StdMutex<HashSet<String>>>,
     state_signals: mpsc::Sender<StateSignal>,
+    settings: SettingsHandle,
 ) {
     tokio::spawn(async move {
         let mut layer = ProcessingLayer::with_user_typed_filter(user_typed_tts);
+        layer.set_max_hold(Duration::from_millis(
+            settings.current().processing.max_hold_ms as u64,
+        ));
+        let mut settings_rx = settings.subscribe();
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -122,6 +128,19 @@ pub fn spawn_processor(
                 _ = cancel.cancelled() => {
                     debug!("pty processor: cancelled");
                     break;
+                }
+                changed = settings_rx.recv() => {
+                    match changed {
+                        Ok(s) => {
+                            layer.set_max_hold(Duration::from_millis(
+                                s.processing.max_hold_ms as u64,
+                            ));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            debug!("pty processor: settings channel closed");
+                        }
+                    }
                 }
                 maybe = rx.recv() => {
                     match maybe {

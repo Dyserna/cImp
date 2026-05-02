@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use crate::processing::segmenter::segment_sentences;
-use crate::processing::{ProcessingEvent, ProcessingLayer, MAX_HOLD};
+use crate::processing::{ProcessingEvent, ProcessingLayer, DEFAULT_MAX_HOLD};
 
 fn t0() -> Instant {
     Instant::now()
@@ -143,7 +143,7 @@ fn tail_with_partial_opener_force_flushes_at_max_hold() {
     assert_eq!(collect_terminal_bytes(&mid), Vec::<u8>::new());
 
     // After max-hold — force-flush emits the literal.
-    let post = layer.flush_pending_at(now + MAX_HOLD + Duration::from_millis(10));
+    let post = layer.flush_pending_at(now + DEFAULT_MAX_HOLD + Duration::from_millis(10));
     assert_eq!(collect_terminal_bytes(&post), b"hello [".to_vec());
 }
 
@@ -240,7 +240,7 @@ fn unclosed_tag_recovered_at_max_hold() {
     assert!(collect_tts(&mid).is_empty());
 
     // After max-hold — emit literal, no TTS.
-    let post = layer.flush_pending_at(now + MAX_HOLD + Duration::from_millis(10));
+    let post = layer.flush_pending_at(now + DEFAULT_MAX_HOLD + Duration::from_millis(10));
     let term = collect_terminal_bytes(&post);
     assert_eq!(term, b"[[TTS]]some text".to_vec());
     assert!(collect_tts(&post).is_empty());

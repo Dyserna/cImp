@@ -42,9 +42,11 @@ use crate::processing::screen::Screen;
 use crate::processing::segmenter::segment_sentences;
 use crate::processing::tags::TagScanner;
 
-/// Max time to wait for an open `[[TTS]]` tag to close before giving up and
-/// emitting the buffered content as literal terminal text.
-pub const MAX_HOLD: Duration = Duration::from_millis(500);
+/// Default max-hold for an open `[[TTS]]` tag — used until the layer is
+/// reconfigured via [`ProcessingLayer::set_max_hold`]. Beyond this, the
+/// buffered content is emitted as literal terminal text and the open-tag
+/// state is reset.
+pub const DEFAULT_MAX_HOLD: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessingEvent {
@@ -63,6 +65,8 @@ pub struct ProcessingLayer {
     scanner: TagScanner,
     /// Earliest unflushed byte timestamp; reset after each flush.
     oldest_pending_at: Option<Instant>,
+    /// Tunable max-hold; reconfigured live from settings.
+    max_hold: Duration,
 }
 
 impl ProcessingLayer {
@@ -76,7 +80,12 @@ impl ProcessingLayer {
             screen: Screen::new(),
             scanner: TagScanner::with_user_typed_filter(user_typed),
             oldest_pending_at: None,
+            max_hold: DEFAULT_MAX_HOLD,
         }
+    }
+
+    pub fn set_max_hold(&mut self, max_hold: Duration) {
+        self.max_hold = max_hold;
     }
 
     pub fn ingest(&mut self, bytes: &[u8]) -> Vec<ProcessingEvent> {
@@ -104,7 +113,7 @@ impl ProcessingLayer {
         self.screen.set_now(now);
         let force = self
             .oldest_pending_at
-            .map(|t| now.saturating_duration_since(t) >= MAX_HOLD)
+            .map(|t| now.saturating_duration_since(t) >= self.max_hold)
             .unwrap_or(false);
         self.collect_events(/*allow_close_emit=*/ true, force)
     }

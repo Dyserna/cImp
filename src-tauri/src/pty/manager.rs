@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tauri::ipc::Channel;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -47,6 +47,7 @@ impl PtyManager {
         output_channel: Channel<String>,
         working_dir: &Path,
         extra_args: Vec<String>,
+        system_prompt: String,
         initial_rows: u16,
         initial_cols: u16,
         tts_segments: tokio::sync::mpsc::Sender<String>,
@@ -72,12 +73,14 @@ impl PtyManager {
             .map_err(|e| AppError::Pty(format!("openpty: {e}")))?;
 
         let mut cmd = CommandBuilder::new(&claude_path);
-        // Inject the TTS markup convention as an appended system prompt. This
-        // is a runtime-only thing — we don't ship a CLAUDE.md, so the user's
-        // own project context (whatever directory they launch cctts from)
-        // stays untouched and the embedded claude still knows about the tags.
+        // Inject the TTS markup convention as an appended system prompt. The
+        // caller resolves the prompt text from settings (claude_md_path
+        // override) or falls back to the embedded RUNTIME_SYSTEM_PROMPT, so
+        // the user's own project context (whatever directory they launch
+        // cctts from) stays untouched and the embedded claude still knows
+        // about the tags.
         cmd.arg("--append-system-prompt");
-        cmd.arg(crate::tts::RUNTIME_SYSTEM_PROMPT);
+        cmd.arg(&system_prompt);
         for arg in &extra_args {
             cmd.arg(arg);
         }
@@ -110,6 +113,11 @@ impl PtyManager {
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(256);
 
         tasks::spawn_reader(reader, bytes_tx, cancel.clone());
+        // Pull the live settings handle from the Tauri-managed AppState so
+        // the processor can react to processing.max_hold_ms changes without
+        // a restart. We accept it via the AppState rather than threading it
+        // through `start`'s argument list since this is the only call site.
+        let settings = app.state::<crate::ipc::AppState>().settings.clone();
         tasks::spawn_processor(
             bytes_rx,
             output_channel,
@@ -117,6 +125,7 @@ impl PtyManager {
             cancel.clone(),
             user_typed_tts,
             state_signals.clone(),
+            settings,
         );
         tasks::spawn_waiter(child, app, cancel.clone(), state_signals);
 

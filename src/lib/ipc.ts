@@ -15,6 +15,14 @@ export async function ptyStart(
   await invoke('pty_start', { channel, rows, cols });
 }
 
+export async function ptyRestart(
+  channel: BytesChannel,
+  rows: number,
+  cols: number
+): Promise<void> {
+  await invoke('pty_restart', { channel, rows, cols });
+}
+
 export async function ptyWrite(input: string): Promise<void> {
   await invoke('pty_write', { input });
 }

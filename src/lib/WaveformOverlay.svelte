@@ -2,32 +2,58 @@
   import { onMount, onDestroy } from 'svelte';
   import { latestSamples, startAmplitudeListener } from './audioStream';
   import { avatarVisible } from './avatarState';
-  import { avatarConfig } from './avatarConfig';
+  import { avatar as avatarSettings, waveform as waveformSettings } from './settings/store';
 
   let canvasEl: HTMLCanvasElement;
   let ctx: CanvasRenderingContext2D | null = null;
   let animationId = 0;
   let dpr = 1;
 
-  // Hardcoded in M5; Milestone 6 wires these to the settings store.
-  const config = {
-    color: '#bb55ff',
-    lineWidth: 2,
-    glowIntensity: 0.6,
-    opacity: 0.85,
-    bufferSize: 1024,
-  };
-
-  const scrollBuffer = new Float32Array(config.bufferSize);
+  const BUFFER_SIZE = 1024;
+  const scrollBuffer = new Float32Array(BUFFER_SIZE);
 
   // Mirror the visibility store into a plain local so the render loop can
   // read it synchronously without per-frame `get(store)` calls. The
   // waveform follows the avatar's hide/show toggle but no longer gates on
   // Speaking — when there's no audio, fresh packets stop arriving and the
   // visualizer scrolls in zeros, settling to a flat line.
-  let avatarOn = true;
+  let avatarOn = $state(true);
   const unsubVisible = avatarVisible.subscribe((v) => (avatarOn = v));
   let lastSeenSeq = 0;
+
+  // Mirror waveform settings into local state so the render loop reads them
+  // synchronously. Updates fire a redraw on the next animation frame.
+  let waveColor = '#bb55ff';
+  let waveLineWidth = 2;
+  let waveGlow = 0.6;
+  let waveOpacity = 0.85;
+  const unsubWave = waveformSettings.subscribe((w) => {
+    waveColor = w.color;
+    waveLineWidth = w.line_width;
+    waveGlow = w.glow_intensity;
+    waveOpacity = w.opacity;
+  });
+
+  // Layout values mirror the avatar's so the waveform sits inside the
+  // avatar's image area regardless of resize/reposition.
+  let avatarWidthPx = $state(240);
+  let avatarHeightPx = $state(240);
+  let avatarMarginPx = $state(16);
+  let avatarPositionClass = $state<string>('top-right');
+  const unsubAvatar = avatarSettings.subscribe((a) => {
+    avatarWidthPx = a.size.width_px;
+    avatarHeightPx = a.size.height_px;
+    avatarMarginPx = a.margin_px;
+    avatarPositionClass = a.position;
+  });
+
+  const positionStyles = $derived(
+    [
+      `--avatar-width: ${avatarWidthPx}px`,
+      `--avatar-height: ${avatarHeightPx}px`,
+      `--avatar-margin: ${avatarMarginPx}px`,
+    ].join(';'),
+  );
 
   onMount(() => {
     ctx = canvasEl.getContext('2d');
@@ -41,6 +67,8 @@
     cancelAnimationFrame(animationId);
     window.removeEventListener('resize', resizeCanvas);
     unsubVisible();
+    unsubWave();
+    unsubAvatar();
   });
 
   function resizeCanvas() {
@@ -59,9 +87,6 @@
       lastSeenSeq = latestSamples.seq;
 
       if (fresh && latestSamples.current.length > 0) {
-        // Take a thin slice from the freshest packet. The backend ring is
-        // wider than one frame's worth of samples, so older values age
-        // out naturally as we scroll left.
         const newSamples = latestSamples.current;
         const step = Math.max(1, Math.floor(newSamples.length / samplesPerFrame));
         for (let i = 0; i < samplesPerFrame; i++) {
@@ -72,9 +97,6 @@
           }
         }
       } else {
-        // No new packet this frame → audio is silent. Scroll in zeros so
-        // the waveform settles to a flat line instead of looping the last
-        // packet's samples through the buffer indefinitely.
         for (let i = 0; i < samplesPerFrame; i++) {
           scrollBuffer.copyWithin(0, 1);
           scrollBuffer[scrollBuffer.length - 1] = 0;
@@ -91,11 +113,11 @@
     const h = canvasEl.height / dpr;
     ctx.clearRect(0, 0, w, h);
 
-    ctx.globalAlpha = config.opacity;
-    ctx.strokeStyle = config.color;
-    ctx.lineWidth = config.lineWidth;
-    ctx.shadowColor = config.color;
-    ctx.shadowBlur = 12 * config.glowIntensity;
+    ctx.globalAlpha = waveOpacity;
+    ctx.strokeStyle = waveColor;
+    ctx.lineWidth = waveLineWidth;
+    ctx.shadowColor = waveColor;
+    ctx.shadowBlur = 12 * waveGlow;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
@@ -110,21 +132,6 @@
     }
     ctx.stroke();
   }
-
-  // Layout mirrors AvatarOverlay so the waveform sits inside the avatar's
-  // image area. The toggle button lives outside .avatar-overlay so we
-  // offset by 16 px on the toggle side to stay aligned with the image,
-  // not the image+toggle combined footprint.
-  const positionStyles = (() => {
-    const { widthPx, heightPx, marginPx } = avatarConfig.layout;
-    return [
-      `--avatar-width: ${widthPx}px`,
-      `--avatar-height: ${heightPx}px`,
-      `--avatar-margin: ${marginPx}px`,
-    ].join(';');
-  })();
-
-  const positionClass = avatarConfig.layout.position;
 </script>
 
 <!--
@@ -135,7 +142,7 @@
   avatar in App.svelte.
 -->
 <div
-  class="waveform-container {positionClass}"
+  class="waveform-container {avatarPositionClass}"
   style={positionStyles}
   class:hidden={!avatarOn}
 >

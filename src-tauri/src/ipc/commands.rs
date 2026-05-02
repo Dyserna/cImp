@@ -1,10 +1,12 @@
 use std::sync::atomic::Ordering;
 
 use tauri::ipc::Channel;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, EventTarget, State};
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
+use crate::ipc::windows::{open_or_focus_settings, SETTINGS_LABEL};
 use crate::ipc::AppState;
+use crate::settings::Settings;
 use crate::state::StateSignal;
 
 #[tauri::command]
@@ -16,13 +18,62 @@ pub async fn pty_start(
     cols: u16,
 ) -> AppResult<()> {
     let cwd = state.launch.cwd.clone();
-    let args = state.launch.extra_args.clone();
+    let settings = state.settings.current();
+    let extra_args = combine_extra_args(&state.launch.extra_args, &settings);
+    let system_prompt = resolve_system_prompt(&settings);
     let tts_tx = state.tts_segments.clone();
     let user_typed = state.user_typed_tts.clone();
     let state_signals = state.state_signals.clone();
     state
         .pty
-        .start(app, channel, &cwd, args, rows, cols, tts_tx, user_typed, state_signals)
+        .start(
+            app,
+            channel,
+            &cwd,
+            extra_args,
+            system_prompt,
+            rows,
+            cols,
+            tts_tx,
+            user_typed,
+            state_signals,
+        )
+        .await
+}
+
+/// Tear down + bring up the PTY with the latest settings (CLI flags +
+/// CLAUDE.md path). Frontend supplies a fresh Channel (the previous one is
+/// gone with the previous session) and the current term size.
+#[tauri::command]
+pub async fn pty_restart(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    channel: Channel<String>,
+    rows: u16,
+    cols: u16,
+) -> AppResult<()> {
+    state.pty.shutdown().await?;
+    let cwd = state.launch.cwd.clone();
+    let settings = state.settings.current();
+    let extra_args = combine_extra_args(&state.launch.extra_args, &settings);
+    let system_prompt = resolve_system_prompt(&settings);
+    let tts_tx = state.tts_segments.clone();
+    let user_typed = state.user_typed_tts.clone();
+    let state_signals = state.state_signals.clone();
+    state
+        .pty
+        .start(
+            app,
+            channel,
+            &cwd,
+            extra_args,
+            system_prompt,
+            rows,
+            cols,
+            tts_tx,
+            user_typed,
+            state_signals,
+        )
         .await
 }
 
@@ -56,6 +107,18 @@ pub async fn pty_write(state: State<'_, AppState>, input: String) -> AppResult<(
         } else {
             apply_input_delta(&input, &state.input_length);
             let _ = state.state_signals.try_send(StateSignal::UserKeystroke);
+            // interrupt-on-input: typing during TTS playback aborts the
+            // current speech so the user can take over. Lookup-only fast
+            // path — if either flag is off or audio is silent, no-op.
+            if state.settings.current().behavior.interrupt_on_input {
+                if let Ok(slot) = state.audio.read() {
+                    if let Some(audio) = slot.as_ref() {
+                        if audio.is_playing() {
+                            audio.stop_all();
+                        }
+                    }
+                }
+            }
         }
     }
     state.pty.write_input(input.into_bytes()).await
@@ -161,13 +224,118 @@ pub async fn tts_test(state: State<'_, AppState>, text: String) -> AppResult<()>
         .tts_segments
         .send(text)
         .await
-        .map_err(|e| crate::error::AppError::Tts(format!("tts_test send: {e}")))?;
+        .map_err(|e| AppError::Tts(format!("tts_test send: {e}")))?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn pty_resize(state: State<'_, AppState>, rows: u16, cols: u16) -> AppResult<()> {
     state.pty.resize(rows, cols).await
+}
+
+// --- settings IPC -----------------------------------------------------------
+
+#[tauri::command]
+pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Settings> {
+    Ok(state.settings.current())
+}
+
+/// Replace the full settings struct. Backend broadcasts the new value to
+/// every subscriber and triggers a debounced disk save.
+#[tauri::command]
+pub async fn settings_update(
+    state: State<'_, AppState>,
+    settings: Settings,
+) -> AppResult<()> {
+    state.settings.set(settings);
+    Ok(())
+}
+
+/// Enumerate available Kokoro voices by scanning the voicepack directory.
+/// Returns names without the `.bin` extension. An empty list means no
+/// voicepacks are installed (or the directory is missing) — callers should
+/// fall back to a single-entry list with the default voice.
+#[tauri::command]
+pub async fn list_voices() -> AppResult<Vec<String>> {
+    let dir = match crate::tts::default_model_dir() {
+        Ok(d) => d.join("voices"),
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    let read = match std::fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()),
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            out.push(stem.to_string());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn open_settings_window(app: AppHandle) -> AppResult<()> {
+    open_or_focus_settings(&app)
+}
+
+/// Close the settings window if it's open. Used by the close button inside
+/// the settings UI itself.
+#[tauri::command]
+pub async fn close_settings_window(app: AppHandle) -> AppResult<()> {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window(SETTINGS_LABEL) {
+        let _ = w.close();
+    }
+    Ok(())
+}
+
+/// Trigger a Claude Code subprocess restart. Implemented as an event
+/// emitted to the main window — the Terminal component owns the channel and
+/// rows/cols, so it does the actual `pty_restart` invocation. Decoupling it
+/// this way means the settings window doesn't need access to the terminal
+/// state.
+#[tauri::command]
+pub async fn request_claude_code_restart(app: AppHandle) -> AppResult<()> {
+    app.emit_to(
+        EventTarget::webview_window("main"),
+        "claude-code-restart",
+        (),
+    )
+    .map_err(|e| AppError::Ipc(format!("emit restart: {e}")))?;
+    Ok(())
+}
+
+fn combine_extra_args(launch: &[String], settings: &Settings) -> Vec<String> {
+    launch
+        .iter()
+        .chain(settings.claude_code.extra_cli_args.iter())
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .collect()
+}
+
+fn resolve_system_prompt(settings: &Settings) -> String {
+    if let Some(p) = settings.claude_code.claude_md_path.as_ref() {
+        if p.exists() {
+            match std::fs::read_to_string(p) {
+                Ok(text) => return text,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    path = %p.display(),
+                    "claude_md_path read failed; using embedded prompt"
+                ),
+            }
+        } else {
+            tracing::warn!(path = %p.display(), "claude_md_path does not exist; using embedded prompt");
+        }
+    }
+    crate::tts::RUNTIME_SYSTEM_PROMPT.to_string()
 }
 
 #[cfg(test)]

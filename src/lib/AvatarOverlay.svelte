@@ -1,26 +1,63 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { get } from 'svelte/store';
   import {
     avatarState,
     avatarVisible,
+    toggleAvatarVisible,
     startAvatarStateListener,
     type AvatarState,
   } from './avatarState';
-  import { avatarConfig } from './avatarConfig';
+  import { avatar as avatarSettings } from './settings/store';
+  import {
+    resolveImageSrc,
+    resolveTransitionSrc,
+    isVideoSrc,
+  } from './avatarConfig';
+  import { openSettingsWindow } from './settings/ipc';
 
-  let displayedSrc = $state<string>(avatarConfig.images.Idle);
+  let displayedSrc = $state<string>('');
   let displayedState: AvatarState = 'Idle';
   let transitionTimer: ReturnType<typeof setTimeout> | null = null;
   let isFirstRender = true;
   let unlisten: (() => void) | undefined;
 
-  // Track the latest state via subscription so we can run transition logic
-  // imperatively (which a `$:`-style block in Svelte 5 wouldn't give us).
+  // Derived layout values for the inline style bag. These re-evaluate
+  // automatically when any avatar setting changes (size/position/margin/
+  // opacity), driving the live-update acceptance criteria 14–17.
+  const positionStyles = $derived(
+    [
+      `--avatar-width: ${$avatarSettings.size.width_px}px`,
+      `--avatar-height: ${$avatarSettings.size.height_px}px`,
+      `--avatar-margin: ${$avatarSettings.margin_px}px`,
+      `--avatar-opacity: ${$avatarSettings.opacity}`,
+    ].join(';'),
+  );
+
+  const positionClass = $derived($avatarSettings.position);
+
+  // When the underlying avatar image setting changes (e.g. user picks a new
+  // Idle.png), re-resolve the displayed src for the *current* state.
+  // Transitions only apply on state changes, not on settings changes —
+  // settings updates are treated as instant swaps.
+  $effect(() => {
+    // Read the images slice so the effect re-runs on any image-setting change.
+    const _ = $avatarSettings.images;
+    if (transitionTimer === null) {
+      const next = resolveImageSrc(_, displayedState);
+      if (next !== displayedSrc) {
+        displayedSrc = next;
+      }
+    }
+  });
+
   const unsubState = avatarState.subscribe((newState) => {
     handleStateChange(newState);
   });
 
   onMount(async () => {
+    // Initialize displayedSrc from current settings on first paint.
+    displayedSrc = resolveImageSrc(get(avatarSettings).images, 'Idle');
     unlisten = await startAvatarStateListener();
   });
 
@@ -31,18 +68,15 @@
   });
 
   function handleStateChange(newState: AvatarState) {
-    // Spec rule 22: no transition on the very first render — the avatar
+    // Spec rule (M4): no transition on the very first render — the avatar
     // appears directly in its starting state.
     if (isFirstRender) {
       isFirstRender = false;
       displayedState = newState;
-      displayedSrc = avatarConfig.images[newState] ?? avatarConfig.images.Idle;
+      displayedSrc = resolveImageSrc(get(avatarSettings).images, newState);
       return;
     }
 
-    // No-op if the state didn't actually change AND we aren't currently
-    // mid-transition. Mid-transition + same state shouldn't happen, but if
-    // it ever does we let the running transition complete on its own.
     if (newState === displayedState && transitionTimer === null) return;
 
     if (transitionTimer !== null) {
@@ -50,55 +84,23 @@
       transitionTimer = null;
     }
 
-    const transition = avatarConfig.transition;
-    const stateImage = avatarConfig.images[newState] ?? avatarConfig.images.Idle;
+    const settings = get(avatarSettings);
+    const transitionSrc = resolveTransitionSrc(settings.transition);
+    const stateImage = resolveImageSrc(settings.images, newState);
 
-    if (transition.path && transition.durationMs > 0) {
-      // Cache-bust the transition asset so an animated GIF/WebP restarts
-      // its animation each time it plays — without this, the second play
-      // can render the last frame instantly because the browser keeps the
-      // animation paused at end.
-      displayedSrc = `${transition.path}?t=${Date.now()}`;
+    if (transitionSrc && settings.transition.duration_ms > 0) {
+      // Cache-bust so animated assets restart their playback when reused.
+      displayedSrc = `${transitionSrc}?t=${Date.now()}`;
       transitionTimer = setTimeout(() => {
         displayedSrc = stateImage;
         displayedState = newState;
         transitionTimer = null;
-      }, transition.durationMs);
+      }, settings.transition.duration_ms);
       displayedState = newState;
     } else {
       displayedSrc = stateImage;
       displayedState = newState;
     }
-  }
-
-  function toggleVisibility() {
-    avatarVisible.update((v) => !v);
-  }
-
-  function openSettings() {
-    // M6: open settings window. M4 placeholder.
-    console.log('settings clicked');
-  }
-
-  // CSS variable bag for the configured layout. Recomputed if layout ever
-  // becomes reactive (M6 settings live-update); for now this only runs once.
-  const positionStyles = (() => {
-    const { widthPx, heightPx, marginPx, opacity } = avatarConfig.layout;
-    return [
-      `--avatar-width: ${widthPx}px`,
-      `--avatar-height: ${heightPx}px`,
-      `--avatar-margin: ${marginPx}px`,
-      `--avatar-opacity: ${opacity}`,
-    ].join(';');
-  })();
-
-  const positionClass = avatarConfig.layout.position;
-
-  // Choose <video> vs <img> per asset so the same config slot can hold either
-  // kind. Strip the cache-bust query before checking the extension.
-  function isVideoSrc(src: string): boolean {
-    const path = src.split('?')[0].toLowerCase();
-    return path.endsWith('.mp4') || path.endsWith('.webm') || path.endsWith('.mov');
   }
 </script>
 
@@ -124,7 +126,7 @@
       {/if}
       <button
         class="settings-button"
-        onclick={openSettings}
+        onclick={() => void openSettingsWindow()}
         aria-label="Settings"
       >
         ⚙
@@ -133,7 +135,7 @@
   {/if}
   <button
     class="toggle-button"
-    onclick={toggleVisibility}
+    onclick={toggleAvatarVisible}
     aria-label={$avatarVisible ? 'Hide avatar' : 'Show avatar'}
   >
     {$avatarVisible ? '›' : '‹'}

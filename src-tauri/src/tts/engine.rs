@@ -94,6 +94,22 @@ impl TtsEngine {
         })
     }
 
+    /// Reload the voicepack from disk. Used by the worker on a settings
+    /// change; engine retains the current voice if reload fails.
+    pub fn set_voice(&mut self, path: &Path) -> AppResult<()> {
+        let new = VoicePack::load(path)?;
+        self.voice = new;
+        Ok(())
+    }
+
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = speed.max(0.1);
+    }
+
+    pub fn current_voice_name(&self) -> &str {
+        self.voice.name()
+    }
+
     pub fn synthesize(&mut self, req: TtsRequest) -> AppResult<TtsResponse> {
         let phonemes = self.phonemizer.phonemize(&req.text)?;
         if phonemes.raw_count == 0 {

@@ -1,0 +1,4 @@
+[env]
+# bindgen needs libclang.dll to generate FFI bindings for espeak-rs-sys
+# (pulled in by misaki-rs's default features). Required for every build.
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"

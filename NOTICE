@@ -1,0 +1,19 @@
+cctts
+Copyright 2026 Amir Amashe
+
+The source code of cctts is licensed under the Apache License, Version
+2.0 — see LICENSE for the full text.
+
+------------------------------------------------------------------------
+
+The compiled binary statically links espeak-ng (via misaki-rs), which
+is licensed under the GNU General Public License version 3 or later
+(GPLv3+). Per GPLv3 §5, the combined binary distribution is governed
+by the GPLv3+; the source code of cctts itself remains under the
+Apache License 2.0 above.
+
+espeak-ng:
+  Copyright (C) 1995-2014 Jonathan Duddington
+  Copyright (C) 2015-2024 Reece H. Dunn and contributors
+  Source: https://github.com/espeak-ng/espeak-ng
+  License: GNU GPL v3+ — https://www.gnu.org/licenses/gpl-3.0.html

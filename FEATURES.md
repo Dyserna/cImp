@@ -12,17 +12,11 @@ Ideas and enhancements deferred past the current milestone. Each item: what, why
 - **Trigger to act:** if anyone besides the dev box reports the "registered but no audio" symptom on Blackwell, OR when `ort` upgrades to a version that adds new GPU support and we want the probe to handle the next-gen-GPU regression class generally.
 - **Related:** `MAINTENANCE.md` "ort / ONNX Runtime" entry tracks the underlying ORT 1.20 + Blackwell mismatch.
 
-## Espeak fallback for out-of-vocabulary words
+## ~~Espeak fallback for out-of-vocabulary words~~ — shipped (default)
 
-- **What:** Add espeak-ng as a secondary G2P backend behind `misaki-rs`. When misaki returns its letter-by-letter fallback (signaling an OOV word), route the word through espeak instead and substitute the resulting phonemes back into the sequence.
-- **Why:** Current pipeline uses `misaki-rs` with `default-features = false` (pure Rust, no espeak). Unknown words — proper nouns, acronyms, code identifiers — degrade to letter-by-letter spelling (e.g. "eBook" → "i bi o o keɪ"). Espeak has a real G2P for unknown words and would dramatically improve pronunciation quality on technical content.
-- **Costs we already weighed (M3 decision, see `memory/project_phonemizer_choice.md`):**
-  - License: espeak-ng is GPLv3 → distributed binary becomes GPLv3 (project source can stay Apache 2.0). User accepts this since the project will always be open source.
-  - Not single-binary: bundled espeak adds `libespeak-ng.dll` plus a phoneme data dir alongside `cctts.exe`, breaking the v1 "one bundled binary" goal.
-  - Windows MSVC build of `espeak-rs-sys` (the bundled Rust wrapper from piper-rs) is untested in public CI; budget a day or two to get it building cleanly.
-- **Trigger to act:** real Claude output (not synthetic test cases) demonstrates that OOV pronunciation is a recurring annoyance. Until then, defer.
-- **Implementation sketch when picked up:**
-  - Add `espeak-rs-sys` (bundled variant) as an optional dependency behind a `cargo` feature flag.
-  - In `src-tauri/src/tts/phonemize.rs`, detect misaki's letter-by-letter fallback (check whether each character was emitted as its own token) and re-phonemize that word via espeak.
-  - Update bundling to ship `libespeak-ng.dll` + phoneme data dir; relax the single-binary constraint in `memory/project_constraints.md`.
-  - Update `LICENSE` / `NOTICE` to reflect GPLv3 propagation in the binary distribution.
+Always on — `misaki-rs` is pulled in with default features, which includes its
+`espeak` fallback. espeak-ng is statically linked, so no `libespeak-ng.dll` is
+shipped, but `espeak-ng-data/` (~7.5 MB) sits next to `cctts.exe` (auto-copied
+by `build.rs`). The compiled binary is GPLv3 (see `NOTICE`); cctts source stays
+Apache-2.0. Builds need `libclang.dll` for bindgen — pinned via
+`src-tauri/.cargo/config.toml`. Verified end-to-end: `"eBook" → "ˈi bˈʊk."`.

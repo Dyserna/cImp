@@ -248,4 +248,39 @@ mod tests {
         assert_eq!(toks.padded_ids.last(), Some(&0));
         assert_eq!(toks.padded_ids.len(), toks.raw_count + 2);
     }
+
+    /// Run with: `cargo test --bin cctts -- --ignored --nocapture espeak_fallback`.
+    /// espeak-ng (statically linked via misaki-rs's default features) handles
+    /// out-of-vocabulary words. The check is that "eBook" doesn't degrade to
+    /// misaki's letter-by-letter pattern (stress-marked individual letters).
+    #[test]
+    #[ignore]
+    fn espeak_fallback_engages_on_oov() {
+        // Point espeak-rs at the data dir copied by build.rs.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let data = manifest.join("target").join(profile).join("espeak-ng-data");
+        assert!(
+            data.is_dir(),
+            "espeak-ng-data not at {} — run `cargo build --features espeak` first",
+            data.display()
+        );
+        std::env::set_var("PIPER_ESPEAKNG_DATA_DIRECTORY", &data);
+
+        let p = Phonemizer::new();
+        let toks = p.phonemize("eBook").unwrap();
+        eprintln!("eBook → {:?}", toks.phonemes);
+
+        // Letter-by-letter fallback emits each letter's name with primary stress
+        // (e.g. "i bˈi oˈʊ ʊ kˈeɪ"). Real espeak G2P produces a single compact
+        // pronunciation. Count primary-stress markers as a proxy: ≥3 means
+        // letter-spelling, <3 means a real word.
+        let stresses = toks.phonemes.matches('ˈ').count();
+        assert!(
+            stresses < 3,
+            "eBook still letter-spelled: {:?} ({} stress marks)",
+            toks.phonemes,
+            stresses
+        );
+    }
 }

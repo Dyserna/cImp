@@ -1,0 +1,28 @@
+import { listen } from '@tauri-apps/api/event';
+
+// Mutable ref rather than a Svelte store: the visualizer reads this from
+// requestAnimationFrame at display rate, and stores would force a reactive
+// dependency chain we don't want firing at 60 Hz. `seq` lets the consumer
+// distinguish a fresh packet from a re-read of the previous one — without
+// it, the visualizer can't tell silence from "no new event yet" and keeps
+// scrolling the last packet through the buffer forever after audio ends.
+export const latestSamples: { current: Float32Array; seq: number } = {
+  current: new Float32Array(0),
+  seq: 0,
+};
+
+let started = false;
+
+/// Attach the backend amplitude listener exactly once for the lifetime of
+/// the page. Deliberately does NOT return an unlisten — the listener is a
+/// process-lifetime singleton, and earlier we returned a cached UnlistenFn
+/// which the first onDestroy (e.g. an HMR remount) would tear down,
+/// silently breaking every subsequent component instance.
+export function startAmplitudeListener(): void {
+  if (started) return;
+  started = true;
+  void listen<number[]>('audio-amplitude', (event) => {
+    latestSamples.current = new Float32Array(event.payload);
+    latestSamples.seq++;
+  });
+}

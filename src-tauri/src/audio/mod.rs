@@ -1,6 +1,6 @@
 mod amplitude;
 mod playback;
+mod streaming;
 
-#[allow(unused_imports)] // reserved for M5 visualizer
-pub use amplitude::AmplitudeTap;
 pub use playback::AudioOutput;
+pub use streaming::spawn_amplitude_streamer;

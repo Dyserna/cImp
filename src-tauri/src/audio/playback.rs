@@ -7,6 +7,7 @@
 //! commands off a `std::sync::mpsc` channel. The public type is just the
 //! command sender plus a shared amplitude ring.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -36,27 +37,38 @@ pub struct AudioOutput {
     cmd_tx: mpsc::Sender<AudioCommand>,
     /// Shared with the audio thread so the visualizer (M5) can read recent
     /// samples post-resampling without going through the audio output path.
-    #[allow(dead_code)]
     amplitude: Arc<RwLock<RingBuffer>>,
+    /// Mirrors the audio thread's `speaking` edge so the M5 amplitude
+    /// streamer can skip IPC when the sink is empty without blocking on
+    /// the audio thread itself.
+    playing: Arc<AtomicBool>,
 }
 
 impl AudioOutput {
     pub fn new(state_signals: tokio_mpsc::Sender<StateSignal>) -> AppResult<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let amplitude = Arc::new(RwLock::new(RingBuffer::new(RING_CAPACITY)));
+        let playing = Arc::new(AtomicBool::new(false));
 
         let (init_tx, init_rx) = mpsc::sync_channel::<AppResult<()>>(1);
         let amp_for_thread = amplitude.clone();
+        let playing_for_thread = playing.clone();
 
         std::thread::Builder::new()
             .name("cctts-audio".into())
             .spawn(move || {
-                run_audio_thread(cmd_rx, amp_for_thread, init_tx, state_signals)
+                run_audio_thread(
+                    cmd_rx,
+                    amp_for_thread,
+                    playing_for_thread,
+                    init_tx,
+                    state_signals,
+                )
             })
             .map_err(|e| AppError::Audio(format!("spawn audio thread: {e}")))?;
 
         match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self { cmd_tx, amplitude }),
+            Ok(Ok(())) => Ok(Self { cmd_tx, amplitude, playing }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(AppError::Audio("audio thread died during init".into())),
         }
@@ -71,9 +83,16 @@ impl AudioOutput {
         }
     }
 
-    #[allow(dead_code)] // M5 visualizer hook
     pub fn amplitude_tap(&self) -> AmplitudeTap {
         AmplitudeTap::from_arc(self.amplitude.clone())
+    }
+
+    /// True while the audio thread has audio queued in the sink. Mirrored
+    /// off the same edge that fires TtsPlaybackStarted/Stopped, so the
+    /// streamer's "skip when silent" check stays in sync with what the
+    /// state machine sees.
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::Relaxed)
     }
 
     #[allow(dead_code)] // Interrupt-on-input (M6 / M7).
@@ -90,6 +109,7 @@ impl AudioOutput {
 fn run_audio_thread(
     cmd_rx: Receiver<AudioCommand>,
     amplitude: Arc<RwLock<RingBuffer>>,
+    playing: Arc<AtomicBool>,
     init_tx: SyncSender<AppResult<()>>,
     state_signals: tokio_mpsc::Sender<StateSignal>,
 ) {
@@ -137,9 +157,11 @@ fn run_audio_thread(
         let now_speaking = !sink.empty();
         if now_speaking && !speaking {
             speaking = true;
+            playing.store(true, Ordering::Relaxed);
             let _ = state_signals.try_send(StateSignal::TtsPlaybackStarted);
         } else if !now_speaking && speaking {
             speaking = false;
+            playing.store(false, Ordering::Relaxed);
             let _ = state_signals.try_send(StateSignal::TtsPlaybackStopped);
         }
     }

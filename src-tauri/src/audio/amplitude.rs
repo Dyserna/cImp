@@ -42,7 +42,6 @@ impl RingBuffer {
         }
     }
 
-    #[allow(dead_code)] // M5 visualizer hook
     pub fn recent(&self, count: usize) -> Vec<f32> {
         let cap = self.samples.len();
         let available = if self.filled { cap } else { self.head };
@@ -69,13 +68,11 @@ impl RingBuffer {
     }
 }
 
-#[allow(dead_code)] // M5 visualizer hook
 #[derive(Clone)]
 pub struct AmplitudeTap {
     inner: Arc<RwLock<RingBuffer>>,
 }
 
-#[allow(dead_code)] // M5 visualizer hook
 impl AmplitudeTap {
     pub(crate) fn from_arc(inner: Arc<RwLock<RingBuffer>>) -> Self {
         Self { inner }
@@ -88,6 +85,7 @@ impl AmplitudeTap {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)] // alternate visualizer mode hook
     pub fn current_amplitude_rms(&self) -> f32 {
         // 1024 samples ≈ 42 ms at 24 kHz — a typical visualizer frame window.
         self.inner.read().map(|b| b.rms(1024)).unwrap_or(0.0)

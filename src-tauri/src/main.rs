@@ -13,12 +13,12 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
-use tauri::{Manager, WindowEvent};
+use tauri::{AppHandle, Manager, WindowEvent};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::audio::AudioOutput;
+use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{pty_resize, pty_start, pty_write, tts_test};
 use crate::ipc::{AppState, LaunchContext};
@@ -89,7 +89,7 @@ fn main() {
                 .ok()
                 .and_then(|mut g| g.take())
             {
-                init_tts_pipeline(rx, audio_state_tx.clone());
+                init_tts_pipeline(app.handle().clone(), rx, audio_state_tx.clone());
             }
             Ok(())
         })
@@ -124,6 +124,7 @@ fn init_tracing() {
 /// otherwise it is dropped and any subsequent `Sender::send` from the
 /// processor will fail benignly.
 fn init_tts_pipeline(
+    app: AppHandle,
     tts_rx: mpsc::Receiver<String>,
     state_signals: mpsc::Sender<StateSignal>,
 ) {
@@ -138,6 +139,11 @@ fn init_tts_pipeline(
             return;
         }
     };
+
+    // Start the M5 amplitude streamer as soon as the audio device is up,
+    // independent of whether the TTS engine succeeds. If the engine fails
+    // there's never any audio so the streamer just sits idle.
+    spawn_amplitude_streamer(app, audio.clone());
 
     let model_path = match tts::default_model_path() {
         Ok(p) => p,

@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::audio::AudioOutput;
+use crate::state::StateSignal;
 use crate::tts::engine::{TtsEngine, TtsRequest};
 
 /// Shutdown signal: the worker exits when the segment channel is closed,
@@ -23,6 +24,7 @@ pub fn spawn_tts_worker(
     mut engine: TtsEngine,
     audio: Arc<AudioOutput>,
     mut rx: mpsc::Receiver<String>,
+    state_signals: mpsc::Sender<StateSignal>,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut next_id: u64 = 0;
@@ -42,6 +44,12 @@ pub fn spawn_tts_worker(
                     audio.enqueue(resp.samples, resp.sample_rate);
                 }
                 Err(e) => {
+                    // Per-segment failures are recoverable: the worker keeps
+                    // accepting subsequent segments. We don't fire TtsError
+                    // here (which would park the avatar in Error with no
+                    // acknowledgment UI in M4). Engine init failures fire
+                    // TtsError separately from main.rs.
+                    let _ = &state_signals; // keep param: future fatal-error path
                     warn!(error = %e, "tts synthesis failed; skipping segment");
                 }
             }

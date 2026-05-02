@@ -62,12 +62,18 @@
 
       resizeObserver = new ResizeObserver(() => {
         if (resizeTimer) clearTimeout(resizeTimer);
+        // 250ms debounce: long enough that a window drag across DPI
+        // boundaries (which can fire many micro-resizes) settles into a
+        // single ptyResize, short enough that intentional resizes still
+        // feel responsive. A shorter window let mid-drag jitter chain
+        // PTY redraws into a sustained byte burst, which the avatar
+        // state detector misread as claude output.
         resizeTimer = setTimeout(() => {
           if (!term || !fitAddon) return;
           fitAddon.fit();
           const { rows, cols } = term;
           ptyResize(rows, cols).catch((e) => console.error('pty_resize failed:', e));
-        }, 50);
+        }, 250);
       });
       resizeObserver.observe(containerEl);
 

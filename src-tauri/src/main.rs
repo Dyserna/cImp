@@ -5,10 +5,12 @@ mod error;
 mod ipc;
 mod processing;
 mod pty;
+mod state;
 mod tts;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
 use tauri::{Manager, WindowEvent};
@@ -21,6 +23,7 @@ use crate::error::AppError;
 use crate::ipc::commands::{pty_resize, pty_start, pty_write, tts_test};
 use crate::ipc::{AppState, LaunchContext};
 use crate::pty::PtyManager;
+use crate::state::{spawn_state_manager, StateSignal};
 use crate::tts::{spawn_tts_worker, TtsEngine};
 
 fn main() {
@@ -44,6 +47,17 @@ fn main() {
     let (tts_tx, tts_rx) = mpsc::channel::<String>(64);
     let tts_rx_slot = Arc::new(Mutex::new(Some(tts_rx)));
 
+    // State-machine input channel. Created up-front so AppState can hold a
+    // sender; the receiver gets handed to the manager from the Tauri setup
+    // hook (which is where we first have an AppHandle for emitting events).
+    let (state_tx, state_rx) = mpsc::channel::<StateSignal>(64);
+    let state_rx_slot = Arc::new(Mutex::new(Some(state_rx)));
+
+    // Shared input-length tracker. AppState owns it; the state manager
+    // gets a clone so it can poll it on its tick without a round-trip
+    // through the signal channel.
+    let input_length = Arc::new(AtomicI32::new(0));
+
     let state = AppState {
         pty: PtyManager::new(),
         launch: LaunchContext {
@@ -52,18 +66,30 @@ fn main() {
         },
         tts_segments: tts_tx,
         user_typed_tts: Arc::new(Mutex::new(HashSet::new())),
+        state_signals: state_tx.clone(),
+        input_length: input_length.clone(),
     };
 
     let tts_rx_for_setup = tts_rx_slot.clone();
+    let state_rx_for_setup = state_rx_slot.clone();
+    let audio_state_tx = state_tx.clone();
+    let input_length_for_setup = input_length.clone();
     tauri::Builder::default()
         .manage(state)
-        .setup(move |_app| {
+        .setup(move |app| {
+            if let Some(rx) = state_rx_for_setup
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+            {
+                spawn_state_manager(app.handle().clone(), rx, input_length_for_setup.clone());
+            }
             if let Some(rx) = tts_rx_for_setup
                 .lock()
                 .ok()
                 .and_then(|mut g| g.take())
             {
-                init_tts_pipeline(rx);
+                init_tts_pipeline(rx, audio_state_tx.clone());
             }
             Ok(())
         })
@@ -97,11 +123,17 @@ fn init_tracing() {
 /// only if both the audio device and the model files are available;
 /// otherwise it is dropped and any subsequent `Sender::send` from the
 /// processor will fail benignly.
-fn init_tts_pipeline(tts_rx: mpsc::Receiver<String>) {
-    let audio = match AudioOutput::new() {
+fn init_tts_pipeline(
+    tts_rx: mpsc::Receiver<String>,
+    state_signals: mpsc::Sender<StateSignal>,
+) {
+    let audio = match AudioOutput::new(state_signals.clone()) {
         Ok(a) => Arc::new(a),
         Err(e) => {
             warn!(error = %e, "audio output unavailable; TTS will be silent");
+            // Audio init failure is itself an error condition for the
+            // state machine — flag it so the avatar surfaces the problem.
+            let _ = state_signals.try_send(StateSignal::AudioError);
             drop(tts_rx);
             return;
         }
@@ -126,7 +158,7 @@ fn init_tts_pipeline(tts_rx: mpsc::Receiver<String>) {
 
     match TtsEngine::new(&model_path, &voice_path) {
         Ok(engine) => {
-            spawn_tts_worker(engine, audio, tts_rx);
+            spawn_tts_worker(engine, audio, tts_rx, state_signals);
         }
         Err(AppError::ModelNotFound(_)) => {
             tts::report_missing_model_files();
@@ -134,6 +166,7 @@ fn init_tts_pipeline(tts_rx: mpsc::Receiver<String>) {
         }
         Err(e) => {
             warn!(error = %e, "TTS engine init failed; TTS disabled");
+            let _ = state_signals.try_send(StateSignal::TtsError);
             drop(tts_rx);
         }
     }

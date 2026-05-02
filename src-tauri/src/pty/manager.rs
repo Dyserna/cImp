@@ -12,6 +12,7 @@ use tracing::{debug, info};
 
 use crate::error::{AppError, AppResult};
 use crate::pty::tasks;
+use crate::state::StateSignal;
 
 fn resolve_claude_path() -> AppResult<PathBuf> {
     which::which("claude").map_err(|_| AppError::ClaudeNotFound)
@@ -26,6 +27,11 @@ struct PtyHandle {
     master: Arc<StdMutex<Box<dyn MasterPty + Send>>>,
     killer: Arc<StdMutex<Box<dyn ChildKiller + Send + Sync>>>,
     cancel: CancellationToken,
+    /// Last (rows, cols) we forwarded to the PTY. Lets `resize` short-
+    /// circuit a no-op call so a same-size resize event from the WebView
+    /// (e.g. mid-drag across DPI boundaries) doesn't pulse SIGWINCH at
+    /// claude and trigger a TUI redraw.
+    last_size: Arc<StdMutex<(u16, u16)>>,
 }
 
 impl PtyManager {
@@ -45,6 +51,7 @@ impl PtyManager {
         initial_cols: u16,
         tts_segments: tokio::sync::mpsc::Sender<String>,
         user_typed_tts: Arc<StdMutex<HashSet<String>>>,
+        state_signals: tokio::sync::mpsc::Sender<StateSignal>,
     ) -> AppResult<()> {
         let mut guard = self.inner.lock().await;
         if guard.is_some() {
@@ -109,14 +116,16 @@ impl PtyManager {
             tts_segments,
             cancel.clone(),
             user_typed_tts,
+            state_signals.clone(),
         );
-        tasks::spawn_waiter(child, app, cancel.clone());
+        tasks::spawn_waiter(child, app, cancel.clone(), state_signals);
 
         *guard = Some(PtyHandle {
             writer,
             master,
             killer,
             cancel,
+            last_size: Arc::new(StdMutex::new((initial_rows.max(1), initial_cols.max(1)))),
         });
         info!(
             rows = initial_rows,
@@ -148,19 +157,35 @@ impl PtyManager {
     }
 
     pub async fn resize(&self, rows: u16, cols: u16) -> AppResult<()> {
-        let master = {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+
+        let (master, last_size) = {
             let guard = self.inner.lock().await;
             let handle = guard.as_ref().ok_or(AppError::NotStarted)?;
-            handle.master.clone()
+            (handle.master.clone(), handle.last_size.clone())
         };
+
+        // Same-size resize → skip. This filters the chain of micro-resize
+        // events Windows fires when a window crosses a DPI boundary (and
+        // any other ResizeObserver event where the terminal grid happens
+        // to match what we already had).
+        {
+            let last = last_size
+                .lock()
+                .map_err(|e| AppError::Pty(format!("last_size poisoned: {e}")))?;
+            if *last == (rows, cols) {
+                return Ok(());
+            }
+        }
 
         tokio::task::spawn_blocking(move || -> AppResult<()> {
             let m = master
                 .lock()
                 .map_err(|e| AppError::Pty(format!("master poisoned: {e}")))?;
             m.resize(PtySize {
-                rows: rows.max(1),
-                cols: cols.max(1),
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -169,6 +194,10 @@ impl PtyManager {
         })
         .await
         .map_err(|e| AppError::Pty(format!("blocking task: {e}")))??;
+
+        if let Ok(mut last) = last_size.lock() {
+            *last = (rows, cols);
+        }
         Ok(())
     }
 

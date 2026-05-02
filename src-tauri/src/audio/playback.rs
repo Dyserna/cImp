@@ -7,15 +7,22 @@
 //! commands off a `std::sync::mpsc` channel. The public type is just the
 //! command sender plus a shared amplitude ring.
 
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rodio::{OutputStream, Sink, Source};
+use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, info, warn};
 
 use crate::audio::amplitude::{AmplitudeTap, RingBuffer, RING_CAPACITY};
 use crate::error::{AppError, AppResult};
+use crate::state::StateSignal;
+
+/// How often the audio thread polls for sink-empty transitions while
+/// playback is in flight. 50 ms is well under perceptual latency for the
+/// avatar transition and cheap.
+const PLAYBACK_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 enum AudioCommand {
@@ -34,7 +41,7 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
-    pub fn new() -> AppResult<Self> {
+    pub fn new(state_signals: tokio_mpsc::Sender<StateSignal>) -> AppResult<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let amplitude = Arc::new(RwLock::new(RingBuffer::new(RING_CAPACITY)));
 
@@ -43,7 +50,9 @@ impl AudioOutput {
 
         std::thread::Builder::new()
             .name("cctts-audio".into())
-            .spawn(move || run_audio_thread(cmd_rx, amp_for_thread, init_tx))
+            .spawn(move || {
+                run_audio_thread(cmd_rx, amp_for_thread, init_tx, state_signals)
+            })
             .map_err(|e| AppError::Audio(format!("spawn audio thread: {e}")))?;
 
         match init_rx.recv() {
@@ -82,6 +91,7 @@ fn run_audio_thread(
     cmd_rx: Receiver<AudioCommand>,
     amplitude: Arc<RwLock<RingBuffer>>,
     init_tx: SyncSender<AppResult<()>>,
+    state_signals: tokio_mpsc::Sender<StateSignal>,
 ) {
     // Open the device on this thread so the cpal::Stream stays bound here.
     let (stream, handle) = match OutputStream::try_default() {
@@ -102,14 +112,35 @@ fn run_audio_thread(
     info!("audio thread ready");
     let _ = init_tx.send(Ok(()));
 
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            AudioCommand::Enqueue { samples, sample_rate } => {
-                let source = TappedSource::new(samples, sample_rate, amplitude.clone());
-                sink.append(source);
+    // Track sink-empty edges so we emit TtsPlaybackStarted/Stopped exactly
+    // once per stretch of audio. We poll via recv_timeout so playback edges
+    // can be detected even when no command arrives.
+    let mut speaking = false;
+    loop {
+        let cmd = match cmd_rx.recv_timeout(PLAYBACK_POLL) {
+            Ok(c) => Some(c),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
+        if let Some(cmd) = cmd {
+            match cmd {
+                AudioCommand::Enqueue { samples, sample_rate } => {
+                    let source = TappedSource::new(samples, sample_rate, amplitude.clone());
+                    sink.append(source);
+                }
+                AudioCommand::StopAll => sink.clear(),
+                AudioCommand::SetVolume(v) => sink.set_volume(v),
             }
-            AudioCommand::StopAll => sink.clear(),
-            AudioCommand::SetVolume(v) => sink.set_volume(v),
+        }
+
+        let now_speaking = !sink.empty();
+        if now_speaking && !speaking {
+            speaking = true;
+            let _ = state_signals.try_send(StateSignal::TtsPlaybackStarted);
+        } else if !now_speaking && speaking {
+            speaking = false;
+            let _ = state_signals.try_send(StateSignal::TtsPlaybackStopped);
         }
     }
     debug!("audio thread exiting");

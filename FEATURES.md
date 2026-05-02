@@ -26,3 +26,19 @@ Ideas and enhancements deferred past the current milestone. Each item: what, why
   - In `src-tauri/src/tts/phonemize.rs`, detect misaki's letter-by-letter fallback (check whether each character was emitted as its own token) and re-phonemize that word via espeak.
   - Update bundling to ship `libespeak-ng.dll` + phoneme data dir; relax the single-binary constraint in `memory/project_constraints.md`.
   - Update `LICENSE` / `NOTICE` to reflect GPLv3 propagation in the binary distribution.
+
+## Video render support for avatar states
+
+- **What:** Render `<video autoplay loop muted playsinline>` for state assets whose extension indicates video (`.mp4`, `.webm`, `.mov`), keeping `<img>` for raster formats. The avatar component picks the element type per-asset based on file extension, so the same config slot can hold either kind.
+- **Why:** The `Art/` folder already ships MP4 versions of every state (`Idle.mp4`, `Speaking.mp4`, etc.) plus a `Transistion.mp4`. M4 wired only the static PNGs because the design doc explicitly enumerates `<img>`-friendly formats (PNG/JPG/GIF/animated WebP). Animated WebP works, but MP4 is what the user actually has and is much more efficient than animated PNG/WebP for the same length/quality. Adding a small video branch unlocks the existing assets without a re-export.
+- **Costs to weigh:**
+  - Two element types means two code paths for transition cache-busting (URL `?t=` query works for both, but `<video>` needs `currentTime = 0` + `play()` on swap to actually restart, since the `?t=` trick alone doesn't restart playback once the element is mounted).
+  - Settings UI (M6) needs a file picker that accepts both image and video extensions, and the schema validator should reject other formats early.
+  - Cross-platform codec coverage: WebView2 plays H.264 MP4 fine; WebKitGTK depends on GStreamer plugins on the host. Document a minimum-codec requirement or recommend WebM/VP9 for Linux.
+- **Trigger to act:** any of (a) the user wants to actually use the MP4 art they generated, (b) M6 settings UI lands and the user picks a video file, (c) animated WebP rendering produces visible artifacts on either platform.
+- **Implementation sketch when picked up:**
+  - In `src/lib/AvatarOverlay.svelte`, branch on `displayedSrc` extension: render `<video>` for video extensions, `<img>` otherwise. Both elements share `width: 100%; height: 100%; object-fit: contain`.
+  - On state change, after assigning `displayedSrc`, if the new element is a `<video>`, set `currentTime = 0` and call `play()` in a `tick()` callback so the element exists.
+  - Update `avatarConfig.ts` defaults to point at the MP4s the user has (`/avatar/Idle.mp4`, `/avatar/Speaking.mp4`, …, `/avatar/Transistion.mp4` — note the existing typo on disk; either match it or rename the source file).
+  - Copy the MP4s into `public/avatar/` alongside the PNGs (or replace).
+  - Confirm the spec carve-out: DESIGN.md currently lists only PNG/JPG/GIF/animated WebP for state assets. Update DESIGN.md to add MP4/WebM as a supported format, since this is a real architectural extension, not a hidden detail.

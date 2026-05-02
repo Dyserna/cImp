@@ -12,10 +12,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::processing::{ProcessingEvent, ProcessingLayer};
+use crate::state::StateSignal;
 
 /// Tick interval for the processing flush timer. Short enough that the
 /// 200ms stability and 500ms max-hold thresholds fire promptly.
 const FLUSH_TICK: Duration = Duration::from_millis(50);
+
+/// Output-burst duration before we consider claude to be actually
+/// generating. Real responses sustain bytes for seconds; per-keystroke
+/// TUI input-box redraws are tens of ms; a chain of TUI redraws caused
+/// by mid-drag window jitter rarely lasts beyond ~1s. Anything shorter
+/// is treated as churn and ignored.
+const CLAUDE_BURST_MIN: Duration = Duration::from_millis(1000);
+
+/// Quiet interval that closes a burst. After this much silence we fire
+/// ClaudeOutputStopped (if Started was fired) and reset the burst tracker.
+const CLAUDE_QUIET: Duration = Duration::from_millis(500);
 
 /// Reader task. Lives on the blocking pool because PTY reads block on most platforms.
 /// Sends raw byte chunks to an mpsc receiver consumed by `spawn_forwarder`.
@@ -84,11 +96,26 @@ pub fn spawn_processor(
     tts_segments: mpsc::Sender<String>,
     cancel: CancellationToken,
     user_typed_tts: Arc<StdMutex<HashSet<String>>>,
+    state_signals: mpsc::Sender<StateSignal>,
 ) {
     tokio::spawn(async move {
         let mut layer = ProcessingLayer::with_user_typed_filter(user_typed_tts);
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Output-activity tracking. Two timers:
+        //   - `burst_start`: when bytes first appeared in the current
+        //     burst. If the burst sustains for CLAUDE_BURST_MIN, we
+        //     consider claude to be actually generating and fire Started.
+        //     This filters out per-keystroke TUI input-box redraws (~50
+        //     bytes over a few ms) from real responses (seconds of
+        //     continuous tokens).
+        //   - `last_byte_time`: most recent byte. If it's been quiet for
+        //     CLAUDE_QUIET, the burst is over — fire Stopped if Started
+        //     was fired, then reset both timers.
+        let mut output_active = false;
+        let mut burst_start: Option<tokio::time::Instant> = None;
+        let mut last_byte_time: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -100,8 +127,19 @@ pub fn spawn_processor(
                     match maybe {
                         Some(bytes) => {
                             let events = layer.ingest(&bytes);
+                            let saw_terminal_bytes = events.iter().any(|e| matches!(
+                                e,
+                                ProcessingEvent::TerminalBytes(b) if !b.is_empty()
+                            ));
                             if dispatch_events(events, &channel, &tts_segments).await.is_err() {
                                 break;
+                            }
+                            if saw_terminal_bytes {
+                                let now = tokio::time::Instant::now();
+                                if burst_start.is_none() {
+                                    burst_start = Some(now);
+                                }
+                                last_byte_time = Some(now);
                             }
                         }
                         None => {
@@ -112,8 +150,43 @@ pub fn spawn_processor(
                 }
                 _ = tick.tick() => {
                     let events = layer.flush_pending();
+                    let saw_terminal_bytes = events.iter().any(|e| matches!(
+                        e,
+                        ProcessingEvent::TerminalBytes(b) if !b.is_empty()
+                    ));
                     if dispatch_events(events, &channel, &tts_segments).await.is_err() {
                         break;
+                    }
+                    if saw_terminal_bytes {
+                        let now = tokio::time::Instant::now();
+                        if burst_start.is_none() {
+                            burst_start = Some(now);
+                        }
+                        last_byte_time = Some(now);
+                    }
+
+                    // Promote a sustained burst to ClaudeOutputStarted.
+                    if !output_active {
+                        if let Some(start) = burst_start {
+                            if start.elapsed() >= CLAUDE_BURST_MIN {
+                                output_active = true;
+                                let _ = state_signals
+                                    .try_send(StateSignal::ClaudeOutputStarted);
+                            }
+                        }
+                    }
+
+                    // Quiet → close the burst.
+                    if let Some(t) = last_byte_time {
+                        if t.elapsed() >= CLAUDE_QUIET {
+                            if output_active {
+                                output_active = false;
+                                let _ = state_signals
+                                    .try_send(StateSignal::ClaudeOutputStopped);
+                            }
+                            burst_start = None;
+                            last_byte_time = None;
+                        }
                     }
                 }
             }
@@ -173,6 +246,7 @@ pub fn spawn_waiter(
     mut child: Box<dyn Child + Send + Sync>,
     app: AppHandle,
     cancel: CancellationToken,
+    state_signals: mpsc::Sender<StateSignal>,
 ) {
     tokio::task::spawn_blocking(move || {
         let exit = child.wait();
@@ -181,6 +255,10 @@ pub fn spawn_waiter(
             Ok(status) => format!("{:?}", status),
             Err(e) => format!("error: {}", e),
         };
+        // Push the avatar into Error before the frontend hears about the
+        // exit — the IPC event below is informational, the state signal
+        // actually drives the UI.
+        let _ = state_signals.try_send(StateSignal::SubprocessExited);
         if let Err(e) = app.emit("pty-exit", payload) {
             warn!(error = %e, "failed to emit pty-exit");
         }

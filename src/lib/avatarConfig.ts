@@ -21,14 +21,14 @@ export interface AvatarConfig {
 // and bundles into `dist/avatar/...` for builds.
 export const avatarConfig: AvatarConfig = {
   images: {
-    Idle: '/avatar/Idle.png',
-    Listening: '/avatar/Listening.png',
-    Thinking: '/avatar/Thinking.png',
-    Speaking: '/avatar/Speaking.png',
-    Error: '/avatar/Error.png',
+    Idle: '/avatar/Idle.mp4',
+    Listening: '/avatar/Listening.mp4',
+    Thinking: '/avatar/Thinking.mp4',
+    Speaking: '/avatar/Speaking.mp4',
+    Error: '/avatar/Error.mp4',
   },
   transition: {
-    path: '/avatar/transition.png',
+    path: '/avatar/Transition.mp4',
     durationMs: 400,
   },
   layout: {

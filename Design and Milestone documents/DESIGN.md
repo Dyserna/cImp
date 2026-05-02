@@ -53,7 +53,7 @@ A single technical user running on their main desktop (Windows, RTX 5090) with a
 - **Svelte** as the component framework (chosen for low overhead, good reactive performance for the visualizer's high-frequency redraws, and modest learning curve)
 - **xterm.js** for terminal rendering inside the embedded webview
 - **Canvas 2D** for the waveform visualizer (sufficient performance, simpler than WebGL for this use case)
-- Native browser `<img>` elements for avatar display (handles PNG, JPG, GIF, and animated WebP without additional libraries)
+- Native browser `<img>` and `<video>` elements for avatar display: `<img>` handles PNG, JPG, GIF, and animated WebP; `<video autoplay loop muted playsinline>` handles MP4, WebM, and MOV — no additional libraries either way. The avatar component picks the element type per-asset based on file extension.
 - Native browser `<textarea>` with `spellcheck="true"` for the compose overlay
 
 ### Why this stack
@@ -277,7 +277,7 @@ The avatar is a floating overlay on top of the full-window terminal, configurabl
 
 #### State images
 
-Each of the five states has a configured image asset (any of PNG, JPG, GIF, or animated WebP). Animated formats loop while the state is active. If a state has no image configured, fall back to the Idle image. Source images with alpha channels (transparent backgrounds) render with their transparency intact, allowing the terminal to show through wherever the artwork doesn't reach.
+Each of the five states has a configured asset (any of PNG, JPG, GIF, animated WebP, MP4, WebM, or MOV). Animated formats and videos loop while the state is active. Videos render via `<video autoplay loop muted playsinline>`; everything else renders via `<img>`. The element type is chosen per-asset from the file extension, so the same config slot can hold either kind. If a state has no asset configured, fall back to the Idle asset. Source assets with alpha channels (transparent backgrounds) render with their transparency intact, allowing the terminal to show through wherever the artwork doesn't reach. Cross-platform note: WebView2 plays H.264 MP4 natively; WebKitGTK depends on the host's GStreamer plugins, so on Linux prefer WebM/VP9 if codec coverage is uncertain.
 
 Image fitting strategy: **contain** (letterbox if needed). The image scales to fit within the configured area while preserving its aspect ratio. If the configured dimensions don't match the image's aspect ratio, empty space appears around the image. Because the avatar overlay is on a transparent base, this empty space simply shows the terminal underneath.
 

@@ -93,12 +93,35 @@
   })();
 
   const positionClass = avatarConfig.layout.position;
+
+  // Choose <video> vs <img> per asset so the same config slot can hold either
+  // kind. Strip the cache-bust query before checking the extension.
+  function isVideoSrc(src: string): boolean {
+    const path = src.split('?')[0].toLowerCase();
+    return path.endsWith('.mp4') || path.endsWith('.webm') || path.endsWith('.mov');
+  }
 </script>
 
 <div class="avatar-container {positionClass}" style={positionStyles}>
   {#if $avatarVisible}
     <div class="avatar-overlay">
-      <img src={displayedSrc} alt="Avatar" class="avatar-image" />
+      {#if isVideoSrc(displayedSrc)}
+        <!-- {#key} remounts the element on src change so autoplay restarts
+             playback. Without this, swapping src on an existing <video>
+             does not reliably reset currentTime back to 0. -->
+        {#key displayedSrc}
+          <video
+            src={displayedSrc}
+            class="avatar-image"
+            autoplay
+            loop
+            muted
+            playsinline
+          ></video>
+        {/key}
+      {:else}
+        <img src={displayedSrc} alt="Avatar" class="avatar-image" />
+      {/if}
       <button
         class="settings-button"
         onclick={openSettings}

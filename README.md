@@ -11,7 +11,7 @@ Local, offline-after-install, no audio leaves the machine.
 ## System Requirements
 
 - **OS:** Windows 10/11 (primary). Linux is feasible but not part of the
-  v1 validation matrix — see `Design and Milestone documents/MILESTONE-08-polish.md`.
+  v1 validation matrix — see `docs/MILESTONE-08-polish.md`.
 - **GPU:** optional. The app defaults to CPU inference (Kokoro is small
   enough for near-real-time CPU). NVIDIA CUDA 12.x can be opted into via
   `setx CCTTS_GPU cuda` and a restart — see `MAINTENANCE.md` for the
@@ -113,7 +113,7 @@ Settings persist to `%APPDATA%\cctts\settings.json` (debounced save).
 - Linux is not part of v1 validation; behavior is best-effort.
 - Kokoro model is user-provided, not bundled.
 
-See `Design and Milestone documents/MILESTONE-08-polish.md` "After Milestone 8"
+See `docs/MILESTONE-08-polish.md` "After Milestone 8"
 for the post-v1 parking lot.
 
 ## License

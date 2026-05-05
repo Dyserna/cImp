@@ -148,6 +148,25 @@ impl Screen {
         &self.rows
     }
 
+    /// Build a rendered tail of up to `max_chars` characters, walking rows
+    /// from the bottom up. Used by the permission detector — it scans the
+    /// recently-visible text for known prompt substrings without paying for
+    /// the full scrollback.
+    pub fn recent_rendered(&self, max_chars: usize) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut total: usize = 0;
+        for row in self.rows.iter().rev() {
+            let line = row.rendered();
+            total += line.len() + 1;
+            parts.push(line);
+            if total >= max_chars {
+                break;
+            }
+        }
+        parts.reverse();
+        parts.join("\n")
+    }
+
     #[allow(dead_code)]
     #[allow(dead_code)]
     pub fn cursor(&self) -> (usize, usize) {

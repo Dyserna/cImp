@@ -11,10 +11,18 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::processing::permission::{
+    PermissionDetector, PermissionDetectorResult, CLAUDE_PERMISSION_PATTERNS, NO_PATTERNS,
+};
 use crate::processing::{ProcessingEvent, ProcessingLayer};
 use crate::settings::SettingsHandle;
 use crate::state::{StateSignal, TabId};
 use crate::tts::TtsRequest;
+
+/// Tail size scanned by the permission detector after each ingest/flush.
+/// Large enough for multi-line prompt UIs, small enough not to cost real
+/// CPU on every tick.
+const PERMISSION_SCAN_TAIL: usize = 1000;
 
 /// Tick interval for the processing flush timer. Short enough that the
 /// 200ms stability and 500ms max-hold thresholds fire promptly.
@@ -108,6 +116,16 @@ pub fn spawn_processor(
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Permission detector. Aider patterns are deferred — pass an empty
+        // slice for that tab so the detector is a no-op without special-casing
+        // it in the loop. When aider patterns are characterized, swap NO_PATTERNS
+        // for the aider pattern set.
+        let detector_patterns = match tab {
+            TabId::Claude => CLAUDE_PERMISSION_PATTERNS,
+            TabId::Aider => NO_PATTERNS,
+        };
+        let mut detector = PermissionDetector::new(detector_patterns);
+
         let mut output_active = false;
         let mut burst_start: Option<tokio::time::Instant> = None;
         let mut last_byte_time: Option<tokio::time::Instant> = None;
@@ -148,6 +166,7 @@ pub fn spawn_processor(
                                     burst_start = Some(now);
                                 }
                                 last_byte_time = Some(now);
+                                run_permission_check(tab, &mut detector, &layer, &state_signals);
                             }
                         }
                         None => {
@@ -171,6 +190,7 @@ pub fn spawn_processor(
                             burst_start = Some(now);
                         }
                         last_byte_time = Some(now);
+                        run_permission_check(tab, &mut detector, &layer, &state_signals);
                     }
 
                     if !output_active {
@@ -199,6 +219,36 @@ pub fn spawn_processor(
         }
         debug!(?tab, "pty processor task exiting");
     });
+}
+
+/// Scan the rendered tail for permission prompts and forward edge transitions
+/// to the state manager. No-op for tabs configured with empty patterns.
+fn run_permission_check(
+    tab: TabId,
+    detector: &mut PermissionDetector,
+    layer: &ProcessingLayer,
+    state_signals: &mpsc::Sender<StateSignal>,
+) {
+    let rendered = layer.recent_rendered(PERMISSION_SCAN_TAIL);
+    // Opt-in capture for pattern characterization. Enable with
+    // RUST_LOG=perm_capture=debug to dump the exact rendered tail the detector
+    // is matching against; pick distinctive substrings from the dump and put
+    // them in CLAUDE_PERMISSION_PATTERNS.
+    if tracing::enabled!(target: "perm_capture", tracing::Level::DEBUG) {
+        let escaped = rendered.replace('\n', "\\n");
+        tracing::debug!(target: "perm_capture", ?tab, rendered = %escaped, "perm capture");
+    }
+    match detector.check(&rendered) {
+        PermissionDetectorResult::Detected { pattern_name } => {
+            debug!(?tab, pattern = pattern_name, "permission prompt detected");
+            let _ = state_signals.try_send(StateSignal::PermissionPromptDetected { tab });
+        }
+        PermissionDetectorResult::Resolved => {
+            debug!(?tab, "permission prompt resolved");
+            let _ = state_signals.try_send(StateSignal::PermissionPromptResolved { tab });
+        }
+        PermissionDetectorResult::None => {}
+    }
 }
 
 async fn dispatch_events(

@@ -27,6 +27,7 @@
 //!   or a complete TTS tag is detected. Returns events as a `Vec` so the
 //!   layer is easy to unit-test without async machinery.
 
+pub mod permission;
 mod screen;
 mod segmenter;
 mod tags;
@@ -86,6 +87,13 @@ impl ProcessingLayer {
 
     pub fn set_max_hold(&mut self, max_hold: Duration) {
         self.max_hold = max_hold;
+    }
+
+    /// Rendered tail of the screen, capped to roughly `max_chars`. Permission
+    /// detection consumes this — small enough to scan cheaply, large enough to
+    /// catch multi-line prompts.
+    pub fn recent_rendered(&self, max_chars: usize) -> String {
+        self.screen.recent_rendered(max_chars)
     }
 
     pub fn ingest(&mut self, bytes: &[u8]) -> Vec<ProcessingEvent> {

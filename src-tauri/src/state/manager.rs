@@ -94,6 +94,13 @@ pub enum StateSignal {
     /// User activated a tab (click or Ctrl+N). Updates `active` and
     /// broadcasts so the frontend can swap avatar/terminal visuals.
     TabActivated { tab: TabId },
+    /// Permission detector saw a known prompt pattern in the rendered tail.
+    /// Sets `awaiting_permission` on the tab; does NOT drive the avatar
+    /// state machine.
+    PermissionPromptDetected { tab: TabId },
+    /// Permission detector observed the previously-matched pattern leave the
+    /// rendered tail. Clears `awaiting_permission`.
+    PermissionPromptResolved { tab: TabId },
 }
 
 impl StateSignal {
@@ -110,7 +117,9 @@ impl StateSignal {
             | Self::TtsError { tab }
             | Self::ErrorAcknowledged { tab }
             | Self::ComposeContentChanged { tab, .. }
-            | Self::TabActivated { tab } => tab,
+            | Self::TabActivated { tab }
+            | Self::PermissionPromptDetected { tab }
+            | Self::PermissionPromptResolved { tab } => tab,
         }
     }
 }
@@ -120,10 +129,15 @@ impl StateSignal {
 /// the internal signal vocabulary.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-#[allow(dead_code)] // ActiveTabChanged is consumed by the frontend tab store
+#[allow(dead_code)] // some variants are consumed only by the frontend
+// Variant names are the IPC wire format (kebab-case after serde); renaming
+// to satisfy the lint would break the frontend contract.
+#[allow(clippy::enum_variant_names)]
 pub enum StateEvent {
     StateChanged { tab: TabId, state: AvatarState },
     ActiveTabChanged { tab: TabId },
+    AwaitingPermissionChanged { tab: TabId, awaiting: bool },
+    DoneWhileAwayChanged { tab: TabId, done: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +146,12 @@ struct TabState {
     has_unsent_input: bool,
     composing: bool,
     last_keystroke_at: Option<Instant>,
+    /// Set by permission detection; cleared on detector-resolve, user input,
+    /// or tab activation triggering Claude to emit further output.
+    awaiting_permission: bool,
+    /// UI-derived: tab transitioned to Idle while inactive. Cleared on
+    /// activation. Independent of `avatar_state` and `awaiting_permission`.
+    done_while_away: bool,
 }
 
 impl TabState {
@@ -141,6 +161,8 @@ impl TabState {
             has_unsent_input: false,
             composing: false,
             last_keystroke_at: None,
+            awaiting_permission: false,
+            done_while_away: false,
         }
     }
 }
@@ -195,6 +217,40 @@ async fn run(
                         info!(from = ?active, to = ?tab, "active tab");
                         active = tab;
                         emit_active_tab(&app, active);
+                        // Clear DoneWhileAway on the newly-active tab — the
+                        // user's now looking at it, so the "you missed
+                        // something" hint has served its purpose.
+                        if let Some(ts) = tabs.get_mut(&tab) {
+                            if ts.done_while_away {
+                                ts.done_while_away = false;
+                                emit_done_while_away(&app, tab, false);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Permission-prompt edges are independent of the avatar state
+                // machine — they only flip `awaiting_permission`. Resolved
+                // and user-input both clear; the input clearing path below
+                // handles UserKeystroke / UserSubmit.
+                if let StateSignal::PermissionPromptDetected { tab } = signal {
+                    if let Some(ts) = tabs.get_mut(&tab) {
+                        if !ts.awaiting_permission {
+                            ts.awaiting_permission = true;
+                            info!(?tab, "awaiting permission: set");
+                            emit_awaiting_permission(&app, tab, true);
+                        }
+                    }
+                    continue;
+                }
+                if let StateSignal::PermissionPromptResolved { tab } = signal {
+                    if let Some(ts) = tabs.get_mut(&tab) {
+                        if ts.awaiting_permission {
+                            ts.awaiting_permission = false;
+                            info!(?tab, "awaiting permission: cleared (resolved)");
+                            emit_awaiting_permission(&app, tab, false);
+                        }
                     }
                     continue;
                 }
@@ -228,15 +284,41 @@ async fn run(
                     _ => {}
                 }
 
-                let next = transition(ts.avatar_state, signal, ts.has_unsent_input, ts.composing);
-                if next != ts.avatar_state {
-                    info!(tab = ?target_tab, from = ?ts.avatar_state, to = ?next, ?signal, "avatar state");
+                // Input-driven clearing of awaiting_permission. Either the
+                // user typed a yes/no into the prompt, or they're typing
+                // unrelated text on a tab that wasn't actually prompting —
+                // clearing an already-false flag below is a no-op.
+                if matches!(
+                    signal,
+                    StateSignal::UserKeystroke { .. } | StateSignal::UserSubmit { .. }
+                ) && ts.awaiting_permission
+                {
+                    ts.awaiting_permission = false;
+                    info!(tab = ?target_tab, "awaiting permission: cleared (input)");
+                    emit_awaiting_permission(&app, target_tab, false);
+                }
+
+                let prev_state = ts.avatar_state;
+                let next = transition(prev_state, signal, ts.has_unsent_input, ts.composing);
+                if next != prev_state {
+                    info!(tab = ?target_tab, from = ?prev_state, to = ?next, ?signal, "avatar state");
                     ts.avatar_state = next;
                     emit_state(&app, target_tab, next);
                     if next == AvatarState::Error {
                         if let Some(info) = ErrorInfo::from_signal(signal) {
                             emit_error(&app, &info);
                         }
+                    }
+                    // DoneWhileAway: a transition INTO Idle on an inactive tab
+                    // raises the flag. Same rule applies on the tick-arm
+                    // Listening→Idle sweep below.
+                    if next == AvatarState::Idle
+                        && target_tab != active
+                        && !ts.done_while_away
+                    {
+                        ts.done_while_away = true;
+                        info!(tab = ?target_tab, "done while away: set");
+                        emit_done_while_away(&app, target_tab, true);
                     }
                 }
             }
@@ -260,6 +342,11 @@ async fn run(
                     ts.avatar_state = AvatarState::Idle;
                     ts.has_unsent_input = false;
                     emit_state(&app, tab, ts.avatar_state);
+                    if tab != active && !ts.done_while_away {
+                        ts.done_while_away = true;
+                        info!(?tab, "done while away: set (tick)");
+                        emit_done_while_away(&app, tab, true);
+                    }
                 }
             }
         }
@@ -339,6 +426,24 @@ fn emit_active_tab(app: &AppHandle, tab: TabId) {
 fn emit_error(app: &AppHandle, info: &ErrorInfo) {
     if let Err(e) = app.emit("avatar-error", info) {
         warn!(error = %e, "failed to emit avatar-error");
+    }
+}
+
+fn emit_awaiting_permission(app: &AppHandle, tab: TabId, awaiting: bool) {
+    if let Err(e) = app.emit(
+        "avatar-state",
+        StateEvent::AwaitingPermissionChanged { tab, awaiting },
+    ) {
+        warn!(error = %e, "failed to emit awaiting-permission-changed");
+    }
+}
+
+fn emit_done_while_away(app: &AppHandle, tab: TabId, done: bool) {
+    if let Err(e) = app.emit(
+        "avatar-state",
+        StateEvent::DoneWhileAwayChanged { tab, done },
+    ) {
+        warn!(error = %e, "failed to emit done-while-away-changed");
     }
 }
 
@@ -473,5 +578,16 @@ mod tests {
         assert_eq!(t(Error, UserSubmit { tab: T }), Error);
         assert_eq!(t(Error, TtsPlaybackStarted { tab: T }), Error);
         assert_eq!(t(Error, ErrorAcknowledged { tab: T }), Idle);
+    }
+
+    #[test]
+    fn permission_signals_dont_drive_avatar() {
+        // Defensive: PermissionPromptDetected/Resolved short-circuit before
+        // the run loop calls `transition()`, but if they ever reached it
+        // they should be no-ops in every state.
+        for s in [Idle, Listening, Thinking, Speaking, Error] {
+            assert_eq!(t(s, PermissionPromptDetected { tab: T }), s);
+            assert_eq!(t(s, PermissionPromptResolved { tab: T }), s);
+        }
     }
 }

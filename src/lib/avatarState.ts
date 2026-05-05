@@ -14,12 +14,16 @@ export interface AvatarErrorInfo {
   message: string;
 }
 
-// Backend wire format for the `avatar-state` event. Two shapes:
+// Backend wire format for the `avatar-state` event. Four shapes:
 // - StateChanged: { type: 'state-changed', tab, state }
 // - ActiveTabChanged: { type: 'active-tab-changed', tab }
+// - AwaitingPermissionChanged: { type: 'awaiting-permission-changed', tab, awaiting }
+// - DoneWhileAwayChanged: { type: 'done-while-away-changed', tab, done }
 type StateEvent =
   | { type: 'state-changed'; tab: TabId; state: AvatarState }
-  | { type: 'active-tab-changed'; tab: TabId };
+  | { type: 'active-tab-changed'; tab: TabId }
+  | { type: 'awaiting-permission-changed'; tab: TabId; awaiting: boolean }
+  | { type: 'done-while-away-changed'; tab: TabId; done: boolean };
 
 // Per-tab avatar state cache. The displayed avatar is a derived view over
 // (this map, activeTab) — switching tabs immediately re-renders without an
@@ -28,6 +32,27 @@ const perTabState = writable<Record<TabId, AvatarState>>({
   claude: 'Idle',
   aider: 'Idle',
 });
+
+/// Per-tab AwaitingPermission flag. Driven by backend permission detection.
+/// Exposed for the TabBar's per-tab indicator rendering.
+export const perTabAwaitingPermission = writable<Record<TabId, boolean>>({
+  claude: false,
+  aider: false,
+});
+
+/// Per-tab DoneWhileAway flag. Set by the backend when a tab transitions to
+/// Idle while inactive; cleared on tab activation.
+export const perTabDoneWhileAway = writable<Record<TabId, boolean>>({
+  claude: false,
+  aider: false,
+});
+
+/// Per-tab avatar state map exposed for TabBar (it needs all tabs at once,
+/// not just the active one).
+export const perTabAvatarState: Readable<Record<TabId, AvatarState>> = derived(
+  perTabState,
+  (s) => s,
+);
 
 /// Active tab's avatar state. Components that show the avatar subscribe to
 /// this; it recomputes whenever either the per-tab cache or the active tab
@@ -81,6 +106,10 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
         }
       } else if (e.type === 'active-tab-changed') {
         activeTab.set(e.tab);
+      } else if (e.type === 'awaiting-permission-changed') {
+        perTabAwaitingPermission.update((m) => ({ ...m, [e.tab]: e.awaiting }));
+      } else if (e.type === 'done-while-away-changed') {
+        perTabDoneWhileAway.update((m) => ({ ...m, [e.tab]: e.done }));
       }
     });
   }

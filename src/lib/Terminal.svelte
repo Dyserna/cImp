@@ -19,6 +19,8 @@
   import { setTerminalFocuser } from './terminalFocus';
   import { activeTab } from './tabs/state';
   import type { TabId } from './tabs/types';
+  import { setTabError, clearTabError } from './tabs/errorState';
+  import TabErrorOverlay from './TabErrorOverlay.svelte';
 
   let { tabId }: { tabId: TabId } = $props();
 
@@ -49,6 +51,45 @@
       if (term) term.write(decodeBase64(encoded));
     };
     return channel;
+  }
+
+  function displayNameFor(t: TabId): string {
+    return t === 'claude' ? 'Claude Code' : 'Aider';
+  }
+
+  let bytesChannel: BytesChannel;
+
+  /// Attempt to (re)spawn the tab's subprocess. On the initial mount we
+  /// pass `restart=false` so the manager errors if a session already
+  /// exists. The overlay's Retry button passes `restart=true` so the
+  /// manager idempotently shuts down any stale handle (e.g. after a
+  /// mid-session exit) before respawning.
+  async function attemptSpawn(restart: boolean): Promise<void> {
+    if (!term || !fitAddon) return;
+    bytesChannel = rebindBytesChannel();
+    const { rows, cols } = term;
+    try {
+      if (restart) {
+        await ptyRestart(tabId, bytesChannel, rows, cols);
+      } else {
+        await ptyStart(tabId, bytesChannel, rows, cols);
+      }
+      clearTabError(tabId);
+      status = 'running';
+      term.focus();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // Don't crash the rest of the app — surface the error via the
+      // overlay so the user sees what went wrong with a Retry button
+      // (V2-01 acceptance #10: aider missing must not break Claude;
+      // V2-02 acceptance #8/#10: retry path).
+      setTabError(tabId, {
+        headline: `${displayNameFor(tabId)} failed to start.`,
+        raw: msg,
+      });
+      status = `start failed: ${msg}`;
+      console.error(`pty_start failed for ${tabId}:`, e);
+    }
   }
 
   /// True when the container has real layout (not in a `display: none`
@@ -109,7 +150,6 @@
       });
 
       status = 'wiring channel';
-      let bytesChannel = rebindBytesChannel();
 
       term.onData((data) => {
         ptyWrite(tabId, data).catch((e) => console.error('pty_write failed:', e));
@@ -118,26 +158,23 @@
       unlistenExit = await onPtyExit((payload) => {
         if (payload.tab !== tabId) return;
         if (term) term.write(`\r\n[${tabId} exited: ${payload.exit}]\r\n`);
+        // Surface the exit as an in-tab error overlay so the user has a
+        // Retry path. The avatar Error banner stays as a separate signal.
+        setTabError(tabId, {
+          headline: `${displayNameFor(tabId)} exited unexpectedly.`,
+          raw: payload.exit,
+        });
       });
 
-      // Restart event is Claude-only in v2 — the existing settings UI flow
-      // for Claude flags / instruction overrides triggers it. Aider tab
-      // ignores the event.
-      if (tabId === 'claude') {
-        unlistenRestart = await listen('claude-code-restart', async () => {
-          if (!term || !fitAddon) return;
-          try {
-            term.write('\r\n[restarting claude…]\r\n');
-            bytesChannel = rebindBytesChannel();
-            const { rows, cols } = term;
-            await ptyRestart(tabId, bytesChannel, rows, cols);
-            term.focus();
-          } catch (e) {
-            console.error('pty_restart failed:', e);
-            term.write(`\r\n[restart failed: ${(e as Error).message ?? e}]\r\n`);
-          }
-        });
-      }
+      // Tab-restart is generic in V2-02 (Settings → Tabs has a Restart
+      // button per tab). Each Terminal instance listens and acts only when
+      // the event payload matches its own tabId.
+      unlistenRestart = await listen<TabId>('tab-restart-requested', async (event) => {
+        if (event.payload !== tabId) return;
+        if (!term || !fitAddon) return;
+        term.write(`\r\n[restarting ${tabId}…]\r\n`);
+        await attemptSpawn(true);
+      });
 
       resizeObserver = new ResizeObserver(() => {
         if (resizeTimer) clearTimeout(resizeTimer);
@@ -154,19 +191,7 @@
       resizeObserver.observe(containerEl);
 
       status = 'starting pty';
-      const { rows, cols } = term;
-      try {
-        await ptyStart(tabId, bytesChannel, rows, cols);
-        status = 'running';
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        // Don't crash the rest of the app — surface the error in the
-        // tab's terminal so the user sees what went wrong (per V2-01
-        // acceptance #10: aider missing must not break Claude).
-        term.write(`\r\n[${tabId} failed to start: ${msg}]\r\n`);
-        status = `start failed: ${msg}`;
-        console.error(`pty_start failed for ${tabId}:`, e);
-      }
+      await attemptSpawn(false);
 
       // Register this tab's focus function. Re-focus when the active tab
       // becomes this one — display:none → display:block doesn't
@@ -213,6 +238,7 @@
 <div class="wrap">
   <div bind:this={containerEl} class="terminal-container"></div>
   <div bind:this={statusEl} class="status">{status}</div>
+  <TabErrorOverlay {tabId} onretry={() => attemptSpawn(true)} />
 </div>
 
 <style>

@@ -72,14 +72,22 @@ impl PtyManager {
         info!(?tab, path = %spec.binary.display(), "spawning subprocess");
 
         let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: initial_rows.max(1),
-                cols: initial_cols.max(1),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| AppError::Pty(format!("openpty: {e}")))?;
+        let pair = match pty_system.openpty(PtySize {
+            rows: initial_rows.max(1),
+            cols: initial_cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                // The waiter task (which normally emits SubprocessExited) is
+                // never spawned on the spawn-error path; emit it here so the
+                // state machine pins the tab to Error and the avatar reflects
+                // the failure.
+                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab });
+                return Err(AppError::Pty(format!("openpty: {e}")));
+            }
+        };
 
         let mut cmd = CommandBuilder::new(&spec.binary);
         for arg in &spec.pre_args {
@@ -90,10 +98,13 @@ impl PtyManager {
         }
         cmd.cwd(&spec.working_dir);
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| AppError::Spawn(format!("{e}")))?;
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab });
+                return Err(AppError::Spawn(format!("{e}")));
+            }
+        };
         let killer = child.clone_killer();
 
         // Drop the slave end in the parent; the child inherits its own reference.

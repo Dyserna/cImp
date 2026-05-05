@@ -253,6 +253,10 @@ pub struct TabSettings {
     pub extra_cli_flags: Vec<String>,
     pub tts_injection: TtsInjection,
     pub notifications: NotificationsSettings,
+    /// Set to true once the user has dismissed the per-tab first-launch
+    /// notice. Only the aider tab's notice is shown today; the field exists
+    /// per-tab so future tabs can opt in without a schema change.
+    pub first_launch_notice_dismissed: bool,
 }
 
 impl TabSettings {
@@ -269,6 +273,9 @@ impl TabSettings {
                 awaiting_permission: "Claude is awaiting permission".to_string(),
                 error: "Claude encountered an error".to_string(),
             },
+            // Claude has no first-launch notice; pre-dismissed so the
+            // overlay code can use a single per-tab predicate.
+            first_launch_notice_dismissed: true,
         }
     }
 
@@ -285,6 +292,7 @@ impl TabSettings {
                 awaiting_permission: "Aider is awaiting permission".to_string(),
                 error: "Aider encountered an error".to_string(),
             },
+            first_launch_notice_dismissed: false,
         }
     }
 }
@@ -300,6 +308,7 @@ impl Default for TabSettings {
             extra_cli_flags: Vec::new(),
             tts_injection: TtsInjection::default(),
             notifications: NotificationsSettings::default(),
+            first_launch_notice_dismissed: false,
         }
     }
 }

@@ -76,7 +76,20 @@ impl TabRegistry {
             .get(&tab)
             .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
         let snap = settings.current();
-        let spec = build_launch_spec(tab, &snap, launch_cwd, invocation_args)?;
+        // resolve_command (inside build_launch_spec) is the most common
+        // failure surface — "aider not on PATH". Emit SubprocessExited so
+        // the state machine pins the tab to Error and the avatar reflects
+        // it; the frontend also gets the raw error back from the Tauri
+        // call to render its in-tab overlay.
+        let spec = match build_launch_spec(tab, &snap, launch_cwd, invocation_args) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = self
+                    .state_signals
+                    .try_send(StateSignal::SubprocessExited { tab });
+                return Err(e);
+            }
+        };
         manager
             .start(
                 app,
@@ -114,7 +127,15 @@ impl TabRegistry {
             .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
         manager.shutdown().await?;
         let snap = settings.current();
-        let spec = build_launch_spec(tab, &snap, launch_cwd, invocation_args)?;
+        let spec = match build_launch_spec(tab, &snap, launch_cwd, invocation_args) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = self
+                    .state_signals
+                    .try_send(StateSignal::SubprocessExited { tab });
+                return Err(e);
+            }
+        };
         manager
             .start(
                 app,

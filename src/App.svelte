@@ -8,6 +8,7 @@
   import WaveformOverlay from './lib/WaveformOverlay.svelte';
   import ComposeOverlay from './lib/ComposeOverlay.svelte';
   import ErrorBanner from './lib/ErrorBanner.svelte';
+  import AiderFirstLaunchNotice from './lib/AiderFirstLaunchNotice.svelte';
   import { avatarState, startAvatarStateListener } from './lib/avatarState';
   import { initSettings, settings } from './lib/settings/store';
   import { openSettingsWindow } from './lib/settings/ipc';
@@ -111,6 +112,7 @@
     <WaveformOverlay />
     <ComposeOverlay />
     <ErrorBanner />
+    <AiderFirstLaunchNotice />
   </div>
 </main>
 

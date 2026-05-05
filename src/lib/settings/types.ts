@@ -91,6 +91,7 @@ export interface TabSettings {
   extra_cli_flags: string[];
   tts_injection: TtsInjection;
   notifications: NotificationsSettings;
+  first_launch_notice_dismissed: boolean;
 }
 
 export interface TabsSettings {
@@ -173,6 +174,7 @@ export function defaultSettings(): Settings {
           awaiting_permission: 'Claude is awaiting permission',
           error: 'Claude encountered an error',
         },
+        first_launch_notice_dismissed: true,
       },
       aider: {
         command: 'aider',
@@ -183,6 +185,7 @@ export function defaultSettings(): Settings {
           awaiting_permission: 'Aider is awaiting permission',
           error: 'Aider encountered an error',
         },
+        first_launch_notice_dismissed: false,
       },
     },
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },

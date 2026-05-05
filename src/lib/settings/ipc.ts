@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Settings } from './types';
+import type { Settings, TabSettings } from './types';
+import type { TabId } from '../tabs/types';
 
 export async function settingsGet(): Promise<Settings> {
   return invoke('settings_get');
@@ -21,6 +22,10 @@ export async function closeSettingsWindow(): Promise<void> {
   await invoke('close_settings_window');
 }
 
-export async function requestClaudeCodeRestart(): Promise<void> {
-  await invoke('request_claude_code_restart');
+export async function requestTabRestart(tab: TabId): Promise<void> {
+  await invoke('request_tab_restart', { tab });
+}
+
+export async function tabDefaultSettings(tab: TabId): Promise<TabSettings> {
+  return invoke('tab_default_settings', { tab });
 }

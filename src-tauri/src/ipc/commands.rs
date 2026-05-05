@@ -6,7 +6,7 @@ use tauri::{AppHandle, Emitter, EventTarget, State};
 use crate::error::{AppError, AppResult};
 use crate::ipc::windows::{open_or_focus_settings, SETTINGS_LABEL};
 use crate::ipc::AppState;
-use crate::settings::Settings;
+use crate::settings::{Settings, TabSettings};
 use crate::state::{StateSignal, TabId};
 
 #[tauri::command]
@@ -249,6 +249,17 @@ pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Settings> {
     Ok(state.settings.current())
 }
 
+/// Per-tab default `TabSettings`. Used by the Settings window's "Reset to
+/// default" buttons so the frontend doesn't have to mirror Rust-side
+/// constants (notably `RUNTIME_SYSTEM_PROMPT` for Claude's TTS instructions).
+#[tauri::command]
+pub async fn tab_default_settings(tab: TabId) -> AppResult<TabSettings> {
+    Ok(match tab {
+        TabId::Claude => TabSettings::default_claude(),
+        TabId::Aider => TabSettings::default_aider(),
+    })
+}
+
 #[tauri::command]
 pub async fn settings_update(
     state: State<'_, AppState>,
@@ -296,15 +307,16 @@ pub async fn close_settings_window(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-/// Trigger a Claude tab restart. Implemented as a frontend event because the
-/// Terminal component owns the channel and sizing — it does the actual
-/// `pty_restart` invocation on the Claude tab specifically.
+/// Trigger a tab restart from another window (typically settings). The
+/// Terminal component for the targeted tab owns the channel and sizing —
+/// it does the actual `pty_restart` invocation. Routed as a frontend event
+/// so the main window can keep all PTY-touching IPC in one place.
 #[tauri::command]
-pub async fn request_claude_code_restart(app: AppHandle) -> AppResult<()> {
+pub async fn request_tab_restart(app: AppHandle, tab: TabId) -> AppResult<()> {
     app.emit_to(
         EventTarget::webview_window("main"),
-        "claude-code-restart",
-        (),
+        "tab-restart-requested",
+        tab,
     )
     .map_err(|e| AppError::Ipc(format!("emit restart: {e}")))?;
     Ok(())

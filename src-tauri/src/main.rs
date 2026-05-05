@@ -23,8 +23,8 @@ use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, close_settings_window, compose_content_changed, list_voices,
-    open_settings_window, pty_resize, pty_restart, pty_start, pty_write,
-    request_claude_code_restart, settings_get, settings_update, tab_activate, tts_test,
+    open_settings_window, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
+    settings_get, settings_update, tab_activate, tab_default_settings, tts_test,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{Settings, SettingsHandle};
@@ -138,10 +138,11 @@ fn main() {
             tts_test,
             settings_get,
             settings_update,
+            tab_default_settings,
             list_voices,
             open_settings_window,
             close_settings_window,
-            request_claude_code_restart,
+            request_tab_restart,
             compose_content_changed,
             acknowledge_error,
             tab_activate,

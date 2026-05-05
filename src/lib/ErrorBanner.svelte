@@ -1,7 +1,7 @@
 <script lang="ts">
   import { avatarError, clearAvatarError } from './avatarState';
   import { acknowledgeError } from './ipc';
-  import { requestClaudeCodeRestart } from './settings/ipc';
+  import { requestTabRestart } from './settings/ipc';
 
   // The displayed banner is for the active tab (avatarError is a derived
   // store over (per-tab error map, activeTab)). Acknowledgement is routed
@@ -10,8 +10,8 @@
     const info = $avatarError;
     if (!info) return;
     try {
-      if (info.kind === 'subprocess-exited' && info.tab === 'claude') {
-        await requestClaudeCodeRestart();
+      if (info.kind === 'subprocess-exited') {
+        await requestTabRestart(info.tab);
       }
     } catch (e) {
       console.error('recovery failed:', e);
@@ -35,7 +35,7 @@
 {#if $avatarError}
   <div class="banner" role="alert">
     <span class="msg">{$avatarError.message}</span>
-    {#if $avatarError.kind === 'subprocess-exited' && $avatarError.tab === 'claude'}
+    {#if $avatarError.kind === 'subprocess-exited'}
       <button class="primary" onclick={handleRecover}>Restart</button>
     {/if}
     <button class="ghost" onclick={handleDismiss} aria-label="Dismiss">

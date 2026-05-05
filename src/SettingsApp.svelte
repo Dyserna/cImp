@@ -9,15 +9,31 @@
   } from './lib/settings/store';
   import {
     listVoices,
-    requestClaudeCodeRestart,
+    requestTabRestart,
+    tabDefaultSettings,
   } from './lib/settings/ipc';
-  import type { Settings } from './lib/settings/types';
+  import type { Settings, TabSettings } from './lib/settings/types';
+  import type { TabId } from './lib/tabs/types';
+  import { ALL_TABS, TAB_META } from './lib/tabs/types';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
+  import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
 
   let voices = $state<string[]>([]);
-  // The "applied" baseline for the Claude tab — used to show the Restart
-  // Required banner when subprocess-affecting fields change.
-  let claudeBaseline = $state<Settings['tabs']['claude'] | null>(null);
+  // Per-tab "applied" baselines — used to compute the Restart Required
+  // indicator when subprocess-affecting fields drift from the spawn-time
+  // settings. Notification text and first-launch dismissal are NOT in
+  // the diff because they apply live without restart.
+  let tabBaselines = $state<Record<TabId, TabSettings | null>>({
+    claude: null,
+    aider: null,
+  });
+  // Per-tab default settings, fetched from the backend so "Reset to default"
+  // buttons match the Rust-side defaults exactly (in particular the embedded
+  // RUNTIME_SYSTEM_PROMPT for Claude's TTS instructions).
+  let tabDefaults = $state<Record<TabId, TabSettings | null>>({
+    claude: null,
+    aider: null,
+  });
   let snapshot = $state<Settings | null>(null);
 
   // Keep `snapshot` in sync with the global store. Every input mutates
@@ -25,10 +41,18 @@
   // overwrites `snapshot` (which is fine — same value, no churn).
   let unsub: (() => void) | undefined;
 
+  function captureBaseline(tab: TabId) {
+    if (!snapshot) return;
+    tabBaselines = {
+      ...tabBaselines,
+      [tab]: structuredClone($state.snapshot(snapshot.tabs[tab])),
+    };
+  }
+
   onMount(async () => {
     await initSettings();
     snapshot = structuredClone(get(settings));
-    claudeBaseline = structuredClone(snapshot.tabs.claude);
+    for (const t of ALL_TABS) captureBaseline(t);
     unsub = settings.subscribe((s) => {
       snapshot = structuredClone(s);
     });
@@ -37,6 +61,13 @@
         voices = v.length > 0 ? v : [snapshot?.tts.voice ?? 'af_heart'];
       })
       .catch((e) => console.warn('list_voices failed', e));
+    for (const t of ALL_TABS) {
+      tabDefaultSettings(t)
+        .then((d) => {
+          tabDefaults = { ...tabDefaults, [t]: d };
+        })
+        .catch((e) => console.warn(`tab_default_settings(${t}) failed`, e));
+    }
   });
 
   onDestroy(() => unsub?.());
@@ -51,10 +82,33 @@
     void applySettings(next);
   }
 
+  // Restart-affecting subset: command + flags + TTS injection. Notifications
+  // and first_launch_notice_dismissed apply live and are excluded.
+  function restartShape(t: TabSettings) {
+    return {
+      command: t.command,
+      extra_cli_flags: t.extra_cli_flags,
+      tts_injection: t.tts_injection,
+    };
+  }
+
   const restartRequired = $derived.by(() => {
-    if (!snapshot || !claudeBaseline) return false;
-    return JSON.stringify(snapshot.tabs.claude) !== JSON.stringify(claudeBaseline);
+    const out: Record<TabId, boolean> = { claude: false, aider: false };
+    if (!snapshot) return out;
+    for (const t of ALL_TABS) {
+      const baseline = tabBaselines[t];
+      if (!baseline) continue;
+      out[t] =
+        JSON.stringify(restartShape(snapshot.tabs[t])) !==
+        JSON.stringify(restartShape(baseline));
+    }
+    return out;
   });
+
+  async function restartTab(tab: TabId) {
+    await requestTabRestart(tab);
+    captureBaseline(tab);
+  }
 
   async function pickFile(
     name: string,
@@ -106,11 +160,6 @@
     });
   }
 
-  async function doRestart() {
-    await requestClaudeCodeRestart();
-    if (snapshot) claudeBaseline = structuredClone(snapshot.tabs.claude);
-  }
-
   function basename(p: string | null): string {
     if (!p) return '— not set —';
     return p.split(/[/\\]/).pop() ?? p;
@@ -124,12 +173,6 @@
     <div class="inner">
     <header>
       <h1>Settings</h1>
-      {#if restartRequired}
-        <div class="restart-banner">
-          <span>Claude Code restart required for these changes.</span>
-          <button onclick={doRestart}>Restart Claude Code</button>
-        </div>
-      {/if}
     </header>
 
     <section>
@@ -506,27 +549,30 @@
     </section>
 
     <section>
-      <h2>Claude Code</h2>
-      <label>
-        <span>Extra CLI flags (one per line)</span>
-        <textarea
-          rows="3"
-          value={snapshot.tabs.claude.extra_cli_flags.join('\n')}
-          onchange={(e) =>
-            patch((s) => {
-              const v = (e.currentTarget as HTMLTextAreaElement).value;
-              s.tabs.claude.extra_cli_flags = v
-                .split('\n')
-                .map((x) => x.trim())
-                .filter((x) => x.length > 0);
-            })}
-        ></textarea>
-      </label>
+      <h2>Tabs</h2>
       <small class="hint">
-        Persistent flags appended to every Claude tab spawn. The per-tab TTS
-        injection editor (and the Aider tab settings) ship in the next
-        milestone (V2-02).
+        Per-tab subprocess configuration. Changes to command, CLI flags, or
+        TTS injection require a restart of the affected tab to take effect.
       </small>
+      <div class="tabs-grid">
+        {#each TAB_META as meta (meta.id)}
+          <details open>
+            <summary>{meta.label}</summary>
+            <TabSettingsSection
+              tabId={meta.id}
+              displayName={meta.label}
+              bind:settings={
+                () => snapshot!.tabs[meta.id],
+                (v) => patch((s) => (s.tabs[meta.id] = v))
+              }
+              defaults={tabDefaults[meta.id]}
+              restartRequired={restartRequired[meta.id]}
+              onchange={() => {}}
+              onrestart={() => restartTab(meta.id)}
+            />
+          </details>
+        {/each}
+      </div>
     </section>
 
     <section>
@@ -648,8 +694,7 @@
   }
   input[type='text'],
   input[type='number'],
-  select,
-  textarea {
+  select {
     width: 100%;
     background: #2a2a2a;
     border: 1px solid #444;
@@ -669,10 +714,6 @@
     border: 1px solid #444;
     background: #2a2a2a;
     border-radius: 4px;
-  }
-  textarea {
-    resize: vertical;
-    font-family: monospace;
   }
   .row {
     display: flex;
@@ -728,24 +769,34 @@
     font-size: 11px;
     margin: -8px 0 12px 0;
   }
-  .restart-banner {
-    background: #2a1f3a;
-    border: 1px solid #6f42a8;
-    color: #ddd;
-    padding: 8px 12px;
-    border-radius: 4px;
-    margin-top: 8px;
+  .tabs-grid {
     display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 8px;
   }
-  .restart-banner button {
-    background: #6f42a8;
-    border-color: #6f42a8;
-    color: #fff;
+  details {
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    background: #181818;
   }
-  .restart-banner button:hover {
-    background: #835ac5;
+  details[open] {
+    background: #1a1a1a;
+  }
+  summary {
+    cursor: pointer;
+    padding: 8px 12px;
+    color: #ddd;
+    font-weight: 600;
+    font-size: 12px;
+    user-select: none;
+    border-radius: 6px;
+  }
+  summary:hover {
+    background: #222;
+  }
+  details[open] > summary {
+    border-bottom: 1px solid #2a2a2a;
+    border-radius: 6px 6px 0 0;
   }
 </style>

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -169,20 +169,26 @@ impl TabState {
 
 /// Spawn the state-manager task. The channel is created at app startup so
 /// AppState can hold a clone of the sender before the AppHandle exists.
+///
+/// `state_events` receives the same `StateEvent`s emitted to the frontend,
+/// so in-process subscribers (e.g. the notification manager) can react to
+/// state edges without going through the IPC layer.
 pub fn spawn_state_manager(
     app: AppHandle,
     rx: mpsc::Receiver<StateSignal>,
+    state_events: broadcast::Sender<StateEvent>,
     input_lengths: HashMap<TabId, Arc<AtomicI32>>,
     initial_active: TabId,
 ) {
     tauri::async_runtime::spawn(async move {
-        run(app, rx, input_lengths, initial_active).await;
+        run(app, rx, state_events, input_lengths, initial_active).await;
     });
 }
 
 async fn run(
     app: AppHandle,
     mut rx: mpsc::Receiver<StateSignal>,
+    state_events: broadcast::Sender<StateEvent>,
     input_lengths: HashMap<TabId, Arc<AtomicI32>>,
     initial_active: TabId,
 ) {
@@ -199,9 +205,9 @@ async fn run(
     // any signal arrives. The avatar component skips its first-render
     // transition so this doesn't play an unwanted animation.
     for (&tab, ts) in &tabs {
-        emit_state(&app, tab, ts.avatar_state);
+        emit_state(&app, &state_events, tab, ts.avatar_state);
     }
-    emit_active_tab(&app, active);
+    emit_active_tab(&app, &state_events, active);
 
     loop {
         tokio::select! {
@@ -216,14 +222,14 @@ async fn run(
                     if active != tab {
                         info!(from = ?active, to = ?tab, "active tab");
                         active = tab;
-                        emit_active_tab(&app, active);
+                        emit_active_tab(&app, &state_events, active);
                         // Clear DoneWhileAway on the newly-active tab — the
                         // user's now looking at it, so the "you missed
                         // something" hint has served its purpose.
                         if let Some(ts) = tabs.get_mut(&tab) {
                             if ts.done_while_away {
                                 ts.done_while_away = false;
-                                emit_done_while_away(&app, tab, false);
+                                emit_done_while_away(&app, &state_events, tab, false);
                             }
                         }
                     }
@@ -239,7 +245,7 @@ async fn run(
                         if !ts.awaiting_permission {
                             ts.awaiting_permission = true;
                             info!(?tab, "awaiting permission: set");
-                            emit_awaiting_permission(&app, tab, true);
+                            emit_awaiting_permission(&app, &state_events, tab, true);
                         }
                     }
                     continue;
@@ -249,7 +255,7 @@ async fn run(
                         if ts.awaiting_permission {
                             ts.awaiting_permission = false;
                             info!(?tab, "awaiting permission: cleared (resolved)");
-                            emit_awaiting_permission(&app, tab, false);
+                            emit_awaiting_permission(&app, &state_events, tab, false);
                         }
                     }
                     continue;
@@ -295,7 +301,7 @@ async fn run(
                 {
                     ts.awaiting_permission = false;
                     info!(tab = ?target_tab, "awaiting permission: cleared (input)");
-                    emit_awaiting_permission(&app, target_tab, false);
+                    emit_awaiting_permission(&app, &state_events, target_tab, false);
                 }
 
                 let prev_state = ts.avatar_state;
@@ -303,7 +309,7 @@ async fn run(
                 if next != prev_state {
                     info!(tab = ?target_tab, from = ?prev_state, to = ?next, ?signal, "avatar state");
                     ts.avatar_state = next;
-                    emit_state(&app, target_tab, next);
+                    emit_state(&app, &state_events, target_tab, next);
                     if next == AvatarState::Error {
                         if let Some(info) = ErrorInfo::from_signal(signal) {
                             emit_error(&app, &info);
@@ -318,7 +324,7 @@ async fn run(
                     {
                         ts.done_while_away = true;
                         info!(tab = ?target_tab, "done while away: set");
-                        emit_done_while_away(&app, target_tab, true);
+                        emit_done_while_away(&app, &state_events, target_tab, true);
                     }
                 }
             }
@@ -341,11 +347,11 @@ async fn run(
                     info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "EmptyInputTimeout", "avatar state");
                     ts.avatar_state = AvatarState::Idle;
                     ts.has_unsent_input = false;
-                    emit_state(&app, tab, ts.avatar_state);
+                    emit_state(&app, &state_events, tab, ts.avatar_state);
                     if tab != active && !ts.done_while_away {
                         ts.done_while_away = true;
                         info!(?tab, "done while away: set (tick)");
-                        emit_done_while_away(&app, tab, true);
+                        emit_done_while_away(&app, &state_events, tab, true);
                     }
                 }
             }
@@ -408,19 +414,27 @@ fn transition(
     }
 }
 
-fn emit_state(app: &AppHandle, tab: TabId, state: AvatarState) {
-    if let Err(e) = app.emit(
-        "avatar-state",
-        StateEvent::StateChanged { tab, state },
-    ) {
+/// Frontend `app.emit` + in-process broadcast share the same event payload.
+/// `broadcast::send` returns Err only when there are zero subscribers, which
+/// is the normal case at startup, so we drop that result silently.
+fn dispatch(app: &AppHandle, bcast: &broadcast::Sender<StateEvent>, event: StateEvent) {
+    if let Err(e) = app.emit("avatar-state", &event) {
         warn!(error = %e, "failed to emit avatar-state");
     }
+    let _ = bcast.send(event);
 }
 
-fn emit_active_tab(app: &AppHandle, tab: TabId) {
-    if let Err(e) = app.emit("avatar-state", StateEvent::ActiveTabChanged { tab }) {
-        warn!(error = %e, "failed to emit active-tab-changed");
-    }
+fn emit_state(
+    app: &AppHandle,
+    bcast: &broadcast::Sender<StateEvent>,
+    tab: TabId,
+    state: AvatarState,
+) {
+    dispatch(app, bcast, StateEvent::StateChanged { tab, state });
+}
+
+fn emit_active_tab(app: &AppHandle, bcast: &broadcast::Sender<StateEvent>, tab: TabId) {
+    dispatch(app, bcast, StateEvent::ActiveTabChanged { tab });
 }
 
 fn emit_error(app: &AppHandle, info: &ErrorInfo) {
@@ -429,22 +443,22 @@ fn emit_error(app: &AppHandle, info: &ErrorInfo) {
     }
 }
 
-fn emit_awaiting_permission(app: &AppHandle, tab: TabId, awaiting: bool) {
-    if let Err(e) = app.emit(
-        "avatar-state",
-        StateEvent::AwaitingPermissionChanged { tab, awaiting },
-    ) {
-        warn!(error = %e, "failed to emit awaiting-permission-changed");
-    }
+fn emit_awaiting_permission(
+    app: &AppHandle,
+    bcast: &broadcast::Sender<StateEvent>,
+    tab: TabId,
+    awaiting: bool,
+) {
+    dispatch(app, bcast, StateEvent::AwaitingPermissionChanged { tab, awaiting });
 }
 
-fn emit_done_while_away(app: &AppHandle, tab: TabId, done: bool) {
-    if let Err(e) = app.emit(
-        "avatar-state",
-        StateEvent::DoneWhileAwayChanged { tab, done },
-    ) {
-        warn!(error = %e, "failed to emit done-while-away-changed");
-    }
+fn emit_done_while_away(
+    app: &AppHandle,
+    bcast: &broadcast::Sender<StateEvent>,
+    tab: TabId,
+    done: bool,
+) {
+    dispatch(app, bcast, StateEvent::DoneWhileAwayChanged { tab, done });
 }
 
 #[cfg(test)]

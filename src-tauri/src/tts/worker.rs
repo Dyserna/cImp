@@ -43,17 +43,25 @@ pub fn spawn_tts_worker(
                 }
                 seg = rx.recv() => {
                     let Some(req) = seg else { break };
-                    let TtsRequest::Synthesize { tab, text } = req;
 
-                    // Background-tab gate: if the request's tab is no longer
-                    // active by the time we pick it up, drop it. This is the
-                    // single-shared-channel filter the v2 design specifies —
-                    // simpler than per-tab queues and avoids retaining stale
-                    // segments to discard later.
-                    let active_tab = *active.read().expect("active tab poisoned");
-                    if tab != active_tab {
-                        debug!(?tab, ?active_tab, "tts: dropping segment for inactive tab");
-                        continue;
+                    let (tab, text, is_notification) = match req {
+                        TtsRequest::Synthesize { tab, text } => (tab, text, false),
+                        TtsRequest::SynthesizeNotification { tab, text } => (tab, text, true),
+                    };
+
+                    if !is_notification {
+                        // Background-tab gate: if the request's tab is no longer
+                        // active by the time we pick it up, drop it. This is the
+                        // single-shared-channel filter the v2 design specifies —
+                        // simpler than per-tab queues and avoids retaining stale
+                        // segments to discard later. Notifications skip this
+                        // gate by design: they exist precisely to announce
+                        // events on tabs the user isn't currently looking at.
+                        let active_tab = *active.read().expect("active tab poisoned");
+                        if tab != active_tab {
+                            debug!(?tab, ?active_tab, "tts: dropping segment for inactive tab");
+                            continue;
+                        }
                     }
 
                     next_id += 1;
@@ -66,6 +74,7 @@ pub fn spawn_tts_worker(
                                 request_id = resp.request_id,
                                 samples = resp.samples.len(),
                                 elapsed_ms,
+                                kind = if is_notification { "notification" } else { "segment" },
                                 "tts synthesis ok"
                             );
                             audio.enqueue(resp.samples, resp.sample_rate);

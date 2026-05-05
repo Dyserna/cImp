@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import Terminal from './lib/Terminal.svelte';
   import TabBar from './lib/TabBar.svelte';
+  import StatusBar from './lib/StatusBar.svelte';
   import AvatarOverlay from './lib/AvatarOverlay.svelte';
   import WaveformOverlay from './lib/WaveformOverlay.svelte';
   import ComposeOverlay from './lib/ComposeOverlay.svelte';
@@ -114,6 +115,7 @@
     <ErrorBanner />
     <AiderFirstLaunchNotice />
   </div>
+  <StatusBar />
 </main>
 
 <style>

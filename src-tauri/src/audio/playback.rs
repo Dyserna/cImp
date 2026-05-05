@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rodio::{OutputStream, Sink, Source};
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, Notify};
 use tracing::{debug, info, warn};
 
 use crate::audio::amplitude::{AmplitudeTap, RingBuffer, RING_CAPACITY};
@@ -43,6 +43,10 @@ pub struct AudioOutput {
     /// streamer can skip IPC when the sink is empty without blocking on
     /// the audio thread itself.
     playing: Arc<AtomicBool>,
+    /// Fired by the audio thread on every speaking → idle edge. The
+    /// notification manager (V2-04) waits on this so it can drain queued
+    /// announcements right when current TTS finishes.
+    idle_notify: Arc<Notify>,
 }
 
 impl AudioOutput {
@@ -54,10 +58,12 @@ impl AudioOutput {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let amplitude = Arc::new(RwLock::new(RingBuffer::new(RING_CAPACITY)));
         let playing = Arc::new(AtomicBool::new(false));
+        let idle_notify = Arc::new(Notify::new());
 
         let (init_tx, init_rx) = mpsc::sync_channel::<AppResult<()>>(1);
         let amp_for_thread = amplitude.clone();
         let playing_for_thread = playing.clone();
+        let idle_notify_for_thread = idle_notify.clone();
         let initial_volume = effective_volume(&settings.current().tts);
 
         std::thread::Builder::new()
@@ -67,6 +73,7 @@ impl AudioOutput {
                     cmd_rx,
                     amp_for_thread,
                     playing_for_thread,
+                    idle_notify_for_thread,
                     init_tx,
                     state_signals,
                     initial_volume,
@@ -78,7 +85,7 @@ impl AudioOutput {
         match init_rx.recv() {
             Ok(Ok(())) => {
                 spawn_volume_subscriber(cmd_tx.clone(), settings);
-                Ok(Self { cmd_tx, amplitude, playing })
+                Ok(Self { cmd_tx, amplitude, playing, idle_notify })
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(AppError::Audio("audio thread died during init".into())),
@@ -104,6 +111,15 @@ impl AudioOutput {
     /// state machine sees.
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::Relaxed)
+    }
+
+    /// Wake-up primitive fired on every speaking → idle edge. Subscribers
+    /// `await` `notify.notified()`; one notify per edge. `is_playing()`
+    /// answers "are we idle right now"; this answers "tell me when we
+    /// next become idle." The combination lets the notification manager
+    /// re-check at the right moment without polling.
+    pub fn idle_notify(&self) -> Arc<Notify> {
+        self.idle_notify.clone()
     }
 
     pub fn stop_all(&self) {
@@ -164,6 +180,7 @@ fn run_audio_thread(
     cmd_rx: Receiver<AudioCommand>,
     amplitude: Arc<RwLock<RingBuffer>>,
     playing: Arc<AtomicBool>,
+    idle_notify: Arc<Notify>,
     init_tx: SyncSender<AppResult<()>>,
     state_signals: tokio_mpsc::Sender<StateSignal>,
     initial_volume: f32,
@@ -231,6 +248,10 @@ fn run_audio_thread(
             playing.store(false, Ordering::Relaxed);
             let tab = current_active(&active);
             let _ = state_signals.try_send(StateSignal::TtsPlaybackStopped { tab });
+            // Wake any task waiting on the next idle edge. `playing` is
+            // already false above, so a `try_drain` running on this notify
+            // will see `is_playing() == false` and proceed.
+            idle_notify.notify_waiters();
         }
     }
     debug!("audio thread exiting");

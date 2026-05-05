@@ -25,9 +25,15 @@ pub const RUNTIME_SYSTEM_PROMPT: &str = include_str!("runtime_prompt.md");
 /// processing layer to the single TTS worker. The worker filters by the
 /// shared `active` cell — requests for inactive tabs are dropped, satisfying
 /// the v2 design's "active tab speaks; others are silent" rule.
+///
+/// `SynthesizeNotification` bypasses the active-tab filter: notifications
+/// are *for* inactive tabs by definition (V2-04). The notification manager
+/// is the only producer; regular processing-layer segments stay on the
+/// `Synthesize` path.
 #[derive(Debug)]
 pub enum TtsRequest {
     Synthesize { tab: TabId, text: String },
+    SynthesizeNotification { tab: TabId, text: String },
 }
 
 /// Shared active-tab cell, read on every TTS request (worker) and on every

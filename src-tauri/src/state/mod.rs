@@ -8,4 +8,4 @@
 
 mod manager;
 
-pub use manager::{spawn_state_manager, StateSignal, TabId};
+pub use manager::{spawn_state_manager, AvatarState, StateEvent, StateSignal, TabId};

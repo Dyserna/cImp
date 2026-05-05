@@ -3,6 +3,7 @@
 mod audio;
 mod error;
 mod ipc;
+mod notifications;
 mod processing;
 mod pty;
 mod settings;
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
-use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -28,7 +29,7 @@ use crate::ipc::commands::{
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{Settings, SettingsHandle};
-use crate::state::{spawn_state_manager, StateSignal, TabId};
+use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, TtsEngine, TtsRequest};
 
@@ -55,6 +56,13 @@ fn main() {
     let (state_tx, state_rx) = mpsc::channel::<StateSignal>(64);
     let state_rx_slot = Arc::new(Mutex::new(Some(state_rx)));
 
+    // In-process broadcast of every StateEvent the manager emits to the
+    // frontend. Subscribed by the notification manager (V2-04) so it can
+    // queue announcements off the same edges the avatar reacts to. Capacity
+    // 64 matches the input channel; lag here means a notification missed an
+    // edge, which the next event recovers naturally.
+    let (state_event_tx, _) = broadcast::channel::<StateEvent>(64);
+
     // Per-tab unsent-input length counters.
     let input_lengths = crate::tabs::registry::make_input_lengths();
 
@@ -76,6 +84,11 @@ fn main() {
     );
     let tabs_handle: TabRegistryHandle = Arc::new(TokioMutex::new(registry));
 
+    // Clone the TTS sender once for the notification manager — AppState
+    // gets the original. Both producers race to put work on the same mpsc;
+    // the worker filters/synthesizes serially.
+    let tts_tx_for_notifications = tts_tx.clone();
+
     let state = AppState {
         tabs: tabs_handle.clone(),
         launch: LaunchContext {
@@ -92,10 +105,14 @@ fn main() {
 
     let tts_rx_for_setup = tts_rx_slot.clone();
     let state_rx_for_setup = state_rx_slot.clone();
+    let state_events_for_setup = state_event_tx.clone();
+    let state_events_for_notifications = state_event_tx.clone();
     let audio_state_tx = state_tx.clone();
     let input_lengths_for_setup = input_lengths.clone();
     let settings_for_setup = settings_handle.clone();
+    let settings_for_notifications = settings_handle.clone();
     let tts_active_for_setup = tts_active.clone();
+    let tts_active_for_notifications = tts_active.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
@@ -108,6 +125,7 @@ fn main() {
                 spawn_state_manager(
                     app.handle().clone(),
                     rx,
+                    state_events_for_setup.clone(),
                     input_lengths_for_setup.clone(),
                     initial_active,
                 );
@@ -126,6 +144,24 @@ fn main() {
                     tts_active_for_setup.clone(),
                     initial_active,
                 );
+                // Notification manager piggybacks on the audio output we
+                // just built. If audio init failed above, audio_slot is
+                // None and we skip — without audio there's nothing to
+                // play and nothing to wait on.
+                if let Some(audio) = audio_slot
+                    .read()
+                    .ok()
+                    .and_then(|g| g.as_ref().cloned())
+                {
+                    notifications::spawn_notification_manager(
+                        state_events_for_notifications.subscribe(),
+                        audio,
+                        tts_tx_for_notifications.clone(),
+                        settings_for_notifications.clone(),
+                        tts_active_for_notifications.clone(),
+                        initial_active,
+                    );
+                }
             }
             spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
             Ok(())

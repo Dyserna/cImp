@@ -15,14 +15,17 @@ use crate::tts::voice::VoicePack;
 
 pub const SAMPLE_RATE: u32 = 24_000;
 
+/// Engine-level synthesis request. Distinct from the worker-channel
+/// [`crate::tts::TtsRequest`] (which carries a `TabId` for active-tab
+/// filtering); this struct is what the engine itself consumes.
 #[derive(Debug)]
-pub struct TtsRequest {
+pub struct SynthesisRequest {
     pub text: String,
     pub request_id: u64,
 }
 
 #[derive(Debug)]
-pub struct TtsResponse {
+pub struct SynthesisResponse {
     pub request_id: u64,
     pub samples: Vec<f32>,
     pub sample_rate: u32,
@@ -110,11 +113,11 @@ impl TtsEngine {
         self.voice.name()
     }
 
-    pub fn synthesize(&mut self, req: TtsRequest) -> AppResult<TtsResponse> {
+    pub fn synthesize(&mut self, req: SynthesisRequest) -> AppResult<SynthesisResponse> {
         let phonemes = self.phonemizer.phonemize(&req.text)?;
         if phonemes.raw_count == 0 {
             tracing::debug!(text = %req.text, "empty phoneme sequence; emitting silence");
-            return Ok(TtsResponse {
+            return Ok(SynthesisResponse {
                 request_id: req.request_id,
                 samples: Vec::new(),
                 sample_rate: SAMPLE_RATE,
@@ -145,7 +148,7 @@ impl TtsEngine {
             .try_extract_tensor::<f32>()
             .map_err(|e| AppError::Tts(format!("extract output: {e}")))?;
 
-        Ok(TtsResponse {
+        Ok(SynthesisResponse {
             request_id: req.request_id,
             samples: samples.to_vec(),
             sample_rate: SAMPLE_RATE,

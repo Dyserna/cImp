@@ -70,10 +70,7 @@ export const shortcuts: Readable<Settings['shortcuts']> = derived(
   settings,
   (s) => s.shortcuts,
 );
-export const claudeCode: Readable<Settings['claude_code']> = derived(
-  settings,
-  (s) => s.claude_code,
-);
+export const tabs: Readable<Settings['tabs']> = derived(settings, (s) => s.tabs);
 export const processing: Readable<Settings['processing']> = derived(
   settings,
   (s) => s.processing,

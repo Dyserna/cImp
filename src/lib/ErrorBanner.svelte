@@ -1,38 +1,41 @@
 <script lang="ts">
-  import { avatarError } from './avatarState';
+  import { avatarError, clearAvatarError } from './avatarState';
   import { acknowledgeError } from './ipc';
   import { requestClaudeCodeRestart } from './settings/ipc';
 
-  // Recovery action varies by kind: SubprocessExited gets a restart button;
-  // TTS/audio errors are advisory and dismissable. We don't auto-clear on
-  // backend recovery (e.g. successful TTS retry) — those clear themselves
-  // once state leaves Error, which the avatar listener handles.
+  // The displayed banner is for the active tab (avatarError is a derived
+  // store over (per-tab error map, activeTab)). Acknowledgement is routed
+  // back to the same tab so the backend drops that tab's Error pin.
   async function handleRecover() {
     const info = $avatarError;
     if (!info) return;
     try {
-      if (info.kind === 'subprocess-exited') {
+      if (info.kind === 'subprocess-exited' && info.tab === 'claude') {
         await requestClaudeCodeRestart();
       }
     } catch (e) {
       console.error('recovery failed:', e);
     }
-    await acknowledgeError().catch((e) =>
+    await acknowledgeError(info.tab).catch((e) =>
       console.error('acknowledge_error failed:', e),
     );
+    clearAvatarError(info.tab);
   }
 
   async function handleDismiss() {
-    await acknowledgeError().catch((e) =>
+    const info = $avatarError;
+    if (!info) return;
+    await acknowledgeError(info.tab).catch((e) =>
       console.error('acknowledge_error failed:', e),
     );
+    clearAvatarError(info.tab);
   }
 </script>
 
 {#if $avatarError}
   <div class="banner" role="alert">
     <span class="msg">{$avatarError.message}</span>
-    {#if $avatarError.kind === 'subprocess-exited'}
+    {#if $avatarError.kind === 'subprocess-exited' && $avatarError.tab === 'claude'}
       <button class="primary" onclick={handleRecover}>Restart</button>
     {/if}
     <button class="ghost" onclick={handleDismiss} aria-label="Dismiss">

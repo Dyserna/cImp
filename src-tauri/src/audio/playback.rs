@@ -19,7 +19,8 @@ use tracing::{debug, info, warn};
 use crate::audio::amplitude::{AmplitudeTap, RingBuffer, RING_CAPACITY};
 use crate::error::{AppError, AppResult};
 use crate::settings::SettingsHandle;
-use crate::state::StateSignal;
+use crate::state::{StateSignal, TabId};
+use crate::tts::ActiveTab;
 
 /// How often the audio thread polls for sink-empty transitions while
 /// playback is in flight. 50 ms is well under perceptual latency for the
@@ -48,6 +49,7 @@ impl AudioOutput {
     pub fn new(
         state_signals: tokio_mpsc::Sender<StateSignal>,
         settings: SettingsHandle,
+        active: ActiveTab,
     ) -> AppResult<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let amplitude = Arc::new(RwLock::new(RingBuffer::new(RING_CAPACITY)));
@@ -68,6 +70,7 @@ impl AudioOutput {
                     init_tx,
                     state_signals,
                     initial_volume,
+                    active,
                 )
             })
             .map_err(|e| AppError::Audio(format!("spawn audio thread: {e}")))?;
@@ -113,6 +116,16 @@ impl AudioOutput {
     }
 }
 
+/// Read the active-tab cell synchronously. Falls back to Claude on a
+/// poisoned lock — that's the v2 default and we only consult this on
+/// playback edges, so a benign default keeps the avatar pipeline alive.
+fn current_active(active: &ActiveTab) -> TabId {
+    active
+        .read()
+        .map(|g| *g)
+        .unwrap_or(TabId::Claude)
+}
+
 /// Mute folds into volume: muted means volume = 0, unmuted means the
 /// configured volume. The audio thread doesn't need to know about mute as a
 /// separate concept.
@@ -154,6 +167,7 @@ fn run_audio_thread(
     init_tx: SyncSender<AppResult<()>>,
     state_signals: tokio_mpsc::Sender<StateSignal>,
     initial_volume: f32,
+    active: ActiveTab,
 ) {
     // Open the device on this thread so the cpal::Stream stays bound here.
     let (stream, handle) = match OutputStream::try_default() {
@@ -192,7 +206,16 @@ fn run_audio_thread(
                     let source = TappedSource::new(samples, sample_rate, amplitude.clone());
                     sink.append(source);
                 }
-                AudioCommand::StopAll => sink.clear(),
+                AudioCommand::StopAll => {
+                    // rodio's `clear()` ALSO pauses the sink. Without an
+                    // explicit `play()` after, the next `append()` lands in a
+                    // paused queue — synthesized samples sit there forever
+                    // and the user hears nothing. v2's tab-switch path makes
+                    // this trivially reproducible (switch tab during/after
+                    // TTS, switch back, ask for more TTS → silent).
+                    sink.clear();
+                    sink.play();
+                }
                 AudioCommand::SetVolume(v) => sink.set_volume(v),
             }
         }
@@ -201,11 +224,13 @@ fn run_audio_thread(
         if now_speaking && !speaking {
             speaking = true;
             playing.store(true, Ordering::Relaxed);
-            let _ = state_signals.try_send(StateSignal::TtsPlaybackStarted);
+            let tab = current_active(&active);
+            let _ = state_signals.try_send(StateSignal::TtsPlaybackStarted { tab });
         } else if !now_speaking && speaking {
             speaking = false;
             playing.store(false, Ordering::Relaxed);
-            let _ = state_signals.try_send(StateSignal::TtsPlaybackStopped);
+            let tab = current_active(&active);
+            let _ = state_signals.try_send(StateSignal::TtsPlaybackStopped { tab });
         }
     }
     debug!("audio thread exiting");

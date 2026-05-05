@@ -1,12 +1,27 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
+
+/// Identifier for one of the multi-tab subprocesses cctts owns. Closed enum
+/// in v2 (Claude + Aider only); v3 will likely widen this to allow arbitrary
+/// user-managed tabs.
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabId {
+    Claude,
+    Aider,
+}
+
+impl TabId {
+    pub const ALL: [TabId; 2] = [TabId::Claude, TabId::Aider];
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -18,39 +33,32 @@ pub enum ErrorKind {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ErrorInfo {
+    pub tab: TabId,
     pub kind: ErrorKind,
     pub message: &'static str,
 }
 
 impl ErrorInfo {
     fn from_signal(s: StateSignal) -> Option<Self> {
-        match s {
-            StateSignal::SubprocessExited => Some(Self {
-                kind: ErrorKind::SubprocessExited,
-                message: "Claude Code stopped.",
-            }),
-            StateSignal::TtsError => Some(Self {
-                kind: ErrorKind::TtsError,
-                message: "Text-to-speech is unavailable.",
-            }),
-            StateSignal::AudioError => Some(Self {
-                kind: ErrorKind::AudioError,
-                message: "Audio output is unavailable.",
-            }),
-            _ => None,
-        }
+        let (kind, message) = match s {
+            StateSignal::SubprocessExited { .. } => (ErrorKind::SubprocessExited, "Subprocess stopped."),
+            StateSignal::TtsError { .. } => (ErrorKind::TtsError, "Text-to-speech is unavailable."),
+            StateSignal::AudioError { .. } => (ErrorKind::AudioError, "Audio output is unavailable."),
+            _ => return None,
+        };
+        Some(Self {
+            tab: s.tab(),
+            kind,
+            message,
+        })
     }
 }
 
 /// Auto-leave Listening when the input has been empty AND idle this long.
-/// Matches the user's stated rule: "if I clear the input and don't type
-/// for 5 seconds, switch to Idle." Stays in Listening if there's still
-/// pending text in the input box, regardless of how long it's been.
+/// Same rule as v1, applied per-tab.
 const EMPTY_INPUT_IDLE: Duration = Duration::from_secs(5);
 
-/// How often we poll the auto-leave condition. Cheap (an atomic load),
-/// and the latency it introduces (≤500ms after the 5s threshold) is
-/// imperceptible.
+/// Tick rate for the auto-leave-Listening sweep across all tabs.
 const TICK: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -62,125 +70,169 @@ pub enum AvatarState {
     Error,
 }
 
-/// Signals consumed by the state machine. The model is priority-based:
-/// Error > Speaking > Thinking > Listening > Idle. A signal that would
-/// drop to a lower-priority state is ignored.
+/// Signals consumed by the state machine. Every variant carries the tab it
+/// originated from (or, for `TabActivated`, the tab that's becoming active).
+/// Transition logic mirrors v1's per-state-machine rules; the manager just
+/// runs them per tab and routes events back tagged with the same TabId.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // some variants reserved for later milestones
 pub enum StateSignal {
-    /// Any non-Enter keystroke. Promotes Idle → Listening; ignored from
-    /// higher states.
-    UserKeystroke,
-    /// Enter key (or input ending in CR). Promotes Listening → Thinking;
-    /// ignored from higher states or from Idle (no message to submit).
-    UserSubmit,
-    /// Real claude response burst ended (the processor's burst detector
-    /// fires this only after a sustained ≥1s byte stream goes quiet for
-    /// 500ms — so it's specific to actual responses, not TUI churn).
-    /// Drops Thinking → Idle.
-    ClaudeOutputStopped,
-    /// TTS audio started playing. Promotes anything below Error to
-    /// Speaking.
-    TtsPlaybackStarted,
-    /// TTS audio finished. Drops Speaking → Idle.
-    TtsPlaybackStopped,
-    /// Engine/process failures — interrupt anything below Error.
-    SubprocessExited,
-    AudioError,
-    TtsError,
-    /// User dismissed the error (no UI for this in M4; here for symmetry
-    /// and for later milestones).
-    ErrorAcknowledged,
-    /// Reserved for the byte-burst detector. Currently unused by the
-    /// state machine — kept so the processor doesn't have to learn a new
-    /// signal vocabulary, and so we have an obvious hook if a future
-    /// model wants it.
-    ClaudeOutputStarted,
+    UserKeystroke { tab: TabId },
+    UserSubmit { tab: TabId },
+    ClaudeOutputStarted { tab: TabId },
+    ClaudeOutputStopped { tab: TabId },
+    TtsPlaybackStarted { tab: TabId },
+    TtsPlaybackStopped { tab: TabId },
+    SubprocessExited { tab: TabId },
+    AudioError { tab: TabId },
+    TtsError { tab: TabId },
+    ErrorAcknowledged { tab: TabId },
     /// Compose-overlay textarea content crossed the empty/non-empty edge.
-    /// Acts like `UserKeystroke` for promotion (Idle → Listening) and as a
-    /// keep-alive for Listening while non-empty; an empty edge alone never
-    /// downgrades — the existing rules (input length + idle timeout) decide.
-    ComposeContentChanged { non_empty: bool },
+    /// Always routed to the active tab (compose targets whoever is on
+    /// screen).
+    ComposeContentChanged { tab: TabId, non_empty: bool },
+    /// User activated a tab (click or Ctrl+N). Updates `active` and
+    /// broadcasts so the frontend can swap avatar/terminal visuals.
+    TabActivated { tab: TabId },
+}
+
+impl StateSignal {
+    pub fn tab(&self) -> TabId {
+        match *self {
+            Self::UserKeystroke { tab }
+            | Self::UserSubmit { tab }
+            | Self::ClaudeOutputStarted { tab }
+            | Self::ClaudeOutputStopped { tab }
+            | Self::TtsPlaybackStarted { tab }
+            | Self::TtsPlaybackStopped { tab }
+            | Self::SubprocessExited { tab }
+            | Self::AudioError { tab }
+            | Self::TtsError { tab }
+            | Self::ErrorAcknowledged { tab }
+            | Self::ComposeContentChanged { tab, .. }
+            | Self::TabActivated { tab } => tab,
+        }
+    }
+}
+
+/// Frontend-facing events emitted via the Tauri AppHandle. Kept distinct from
+/// the input `StateSignal` so the wire format can evolve without disturbing
+/// the internal signal vocabulary.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+#[allow(dead_code)] // ActiveTabChanged is consumed by the frontend tab store
+pub enum StateEvent {
+    StateChanged { tab: TabId, state: AvatarState },
+    ActiveTabChanged { tab: TabId },
+}
+
+#[derive(Clone, Debug)]
+struct TabState {
+    avatar_state: AvatarState,
+    has_unsent_input: bool,
+    composing: bool,
+    last_keystroke_at: Option<Instant>,
+}
+
+impl TabState {
+    fn new() -> Self {
+        Self {
+            avatar_state: AvatarState::Idle,
+            has_unsent_input: false,
+            composing: false,
+            last_keystroke_at: None,
+        }
+    }
 }
 
 /// Spawn the state-manager task. The channel is created at app startup so
-/// AppState can hold a clone of the sender before the AppHandle exists; this
-/// function is called from the Tauri `setup` hook with the deferred receiver.
+/// AppState can hold a clone of the sender before the AppHandle exists.
 pub fn spawn_state_manager(
     app: AppHandle,
     rx: mpsc::Receiver<StateSignal>,
-    input_length: Arc<AtomicI32>,
+    input_lengths: HashMap<TabId, Arc<AtomicI32>>,
+    initial_active: TabId,
 ) {
     tauri::async_runtime::spawn(async move {
-        run(app, rx, input_length).await;
+        run(app, rx, input_lengths, initial_active).await;
     });
 }
 
 async fn run(
     app: AppHandle,
     mut rx: mpsc::Receiver<StateSignal>,
-    input_length: Arc<AtomicI32>,
+    input_lengths: HashMap<TabId, Arc<AtomicI32>>,
+    initial_active: TabId,
 ) {
-    let mut current = AvatarState::Idle;
-    // Tracks whether the user has typed at least one keystroke since the
-    // last submit. We can't see Claude's input box from here, so this is
-    // an approximation — it'll be true if the box has content, but also
-    // stays true if the user backspaced everything without sending.
-    // Drives the (Speaking → ?) decision when TTS ends: if the user has
-    // unsent input we resume to Listening rather than dropping to Idle.
-    let mut has_unsent_input = false;
-    // True while the compose-overlay textarea has non-empty content.
-    // Companion condition to `has_unsent_input`: pins Listening (idle-
-    // timeout tick won't drop), and contributes to the Speaking→Listening
-    // resume after TTS ends.
-    let mut composing = false;
-    // Most recent keystroke timestamp. Drives the auto-leave-Listening
-    // tick: we only drop Listening → Idle when the input is empty AND
-    // there's been no typing for EMPTY_INPUT_IDLE.
-    let mut last_keystroke_at: Option<Instant> = None;
+    let mut tabs: HashMap<TabId, TabState> = TabId::ALL
+        .iter()
+        .map(|&t| (t, TabState::new()))
+        .collect();
+    let mut active = initial_active;
 
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Emit the initial Idle so the frontend store mirrors backend truth even
-    // before any signal arrives. The avatar component knows not to play a
-    // transition for the very first state assignment.
-    emit(&app, current);
+    // Emit the initial Idle for each tab so the frontend has a baseline before
+    // any signal arrives. The avatar component skips its first-render
+    // transition so this doesn't play an unwanted animation.
+    for (&tab, ts) in &tabs {
+        emit_state(&app, tab, ts.avatar_state);
+    }
+    emit_active_tab(&app, active);
 
     loop {
         tokio::select! {
             maybe = rx.recv() => {
-                let Some(signal) = maybe else {
-                    break;
+                let Some(signal) = maybe else { break };
+
+                // TabActivated isn't a per-tab transition — it just moves the
+                // active pointer and re-broadcasts. We DON'T re-emit the new
+                // tab's state here; the frontend listens for ActiveTabChanged
+                // and re-derives from the per-tab cache it already has.
+                if let StateSignal::TabActivated { tab } = signal {
+                    if active != tab {
+                        info!(from = ?active, to = ?tab, "active tab");
+                        active = tab;
+                        emit_active_tab(&app, active);
+                    }
+                    continue;
+                }
+
+                // Compose signals always target the active tab (the compose
+                // overlay submits to whoever is on screen). The signal
+                // arrives tagged with `active` from the IPC handler, but we
+                // re-resolve here defensively in case anything ever changes.
+                let target_tab = match signal {
+                    StateSignal::ComposeContentChanged { .. } => active,
+                    other => other.tab(),
                 };
+
+                let Some(ts) = tabs.get_mut(&target_tab) else { continue };
+
                 match signal {
-                    StateSignal::UserKeystroke => {
-                        has_unsent_input = true;
-                        last_keystroke_at = Some(Instant::now());
+                    StateSignal::UserKeystroke { .. } => {
+                        ts.has_unsent_input = true;
+                        ts.last_keystroke_at = Some(Instant::now());
                     }
-                    StateSignal::UserSubmit => {
-                        has_unsent_input = false;
-                        last_keystroke_at = Some(Instant::now());
+                    StateSignal::UserSubmit { .. } => {
+                        ts.has_unsent_input = false;
+                        ts.last_keystroke_at = Some(Instant::now());
                     }
-                    StateSignal::ComposeContentChanged { non_empty } => {
-                        composing = non_empty;
-                        // A non-empty edge counts as fresh activity so the
-                        // 5s idle timer doesn't fire mid-composition.
+                    StateSignal::ComposeContentChanged { non_empty, .. } => {
+                        ts.composing = non_empty;
                         if non_empty {
-                            last_keystroke_at = Some(Instant::now());
+                            ts.last_keystroke_at = Some(Instant::now());
                         }
                     }
                     _ => {}
                 }
-                let next = transition(current, signal, has_unsent_input, composing);
-                if next != current {
-                    info!(from = ?current, to = ?next, ?signal, "avatar state");
-                    current = next;
-                    emit(&app, current);
-                    // When we just entered Error, also emit details so the
-                    // frontend banner can pick the right message + recovery
-                    // action. Clearing happens implicitly when state leaves
-                    // Error (frontend listens on avatar-state for that).
+
+                let next = transition(ts.avatar_state, signal, ts.has_unsent_input, ts.composing);
+                if next != ts.avatar_state {
+                    info!(tab = ?target_tab, from = ?ts.avatar_state, to = ?next, ?signal, "avatar state");
+                    ts.avatar_state = next;
+                    emit_state(&app, target_tab, next);
                     if next == AvatarState::Error {
                         if let Some(info) = ErrorInfo::from_signal(signal) {
                             emit_error(&app, &info);
@@ -189,22 +241,25 @@ async fn run(
                 }
             }
             _ = tick.tick() => {
-                if current == AvatarState::Listening
-                    && !composing
-                    && input_length.load(Ordering::Relaxed) == 0
-                    && last_keystroke_at
+                // Per-tab idle-Listening sweep. Each tab's input-length
+                // counter is independent.
+                for (&tab, ts) in tabs.iter_mut() {
+                    if ts.avatar_state != AvatarState::Listening { continue; }
+                    if ts.composing { continue; }
+                    let len = input_lengths
+                        .get(&tab)
+                        .map(|c| c.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    if len != 0 { continue; }
+                    let idle_long_enough = ts
+                        .last_keystroke_at
                         .map(|t| t.elapsed() >= EMPTY_INPUT_IDLE)
-                        .unwrap_or(true)
-                {
-                    info!(
-                        from = ?current,
-                        to = ?AvatarState::Idle,
-                        signal = "EmptyInputTimeout",
-                        "avatar state"
-                    );
-                    current = AvatarState::Idle;
-                    has_unsent_input = false;
-                    emit(&app, current);
+                        .unwrap_or(true);
+                    if !idle_long_enough { continue; }
+                    info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "EmptyInputTimeout", "avatar state");
+                    ts.avatar_state = AvatarState::Idle;
+                    ts.has_unsent_input = false;
+                    emit_state(&app, tab, ts.avatar_state);
                 }
             }
         }
@@ -213,11 +268,9 @@ async fn run(
     debug!("state manager: signal channel closed; exiting");
 }
 
-/// Priority-based transitions: Error > Speaking > Thinking > Listening
-/// > Idle. A signal that would drop to a lower-priority state is
-/// ignored, except for the explicit "downgrade" signals (TtsPlaybackStopped
-/// from Speaking → Idle/Listening, ClaudeOutputStopped from Thinking → Idle,
-/// and ErrorAcknowledged from Error → Idle).
+/// Priority-based transitions, identical to v1's logic. The `tab` carried by
+/// each signal is consumed by the caller (it routes the signal to the right
+/// per-tab `TabState` before invoking this).
 fn transition(
     current: AvatarState,
     signal: StateSignal,
@@ -227,16 +280,14 @@ fn transition(
     use AvatarState::*;
     use StateSignal::*;
 
-    // Errors always interrupt — they're the top of the priority stack.
-    if matches!(signal, SubprocessExited | AudioError | TtsError) {
+    if matches!(
+        signal,
+        SubprocessExited { .. } | AudioError { .. } | TtsError { .. }
+    ) {
         return Error;
     }
 
-    // ComposeContentChanged behaves like a UserKeystroke for promotion: it
-    // can promote Idle→Listening when going non-empty, but never preempts a
-    // higher-priority state, and the empty edge never transitions on its
-    // own (the tick + existing rules handle the drop back to Idle).
-    if let ComposeContentChanged { non_empty } = signal {
+    if let ComposeContentChanged { non_empty, .. } = signal {
         if non_empty && current == Idle {
             return Listening;
         }
@@ -244,14 +295,10 @@ fn transition(
     }
 
     match (current, signal) {
-        // Error sticks until explicitly acknowledged.
-        (Error, ErrorAcknowledged) => Idle,
+        (Error, ErrorAcknowledged { .. }) => Idle,
         (Error, _) => Error,
 
-        // Speaking only ends when TTS playback ends. If the user has been
-        // typing during/before the TTS clip and hasn't submitted, OR is
-        // mid-compose, resume to Listening rather than blinking through Idle.
-        (Speaking, TtsPlaybackStopped) => {
+        (Speaking, TtsPlaybackStopped { .. }) => {
             if has_unsent_input || composing {
                 Listening
             } else {
@@ -260,31 +307,32 @@ fn transition(
         }
         (Speaking, _) => Speaking,
 
-        // Thinking can be promoted to Speaking by TTS, or downgraded to
-        // Idle by the burst-detector signaling a real response is done.
-        // Typing/Enter while Thinking are ignored (per priority rule).
-        (Thinking, TtsPlaybackStarted) => Speaking,
-        (Thinking, ClaudeOutputStopped) => Idle,
+        (Thinking, TtsPlaybackStarted { .. }) => Speaking,
+        (Thinking, ClaudeOutputStopped { .. }) => Idle,
         (Thinking, _) => Thinking,
 
-        // Listening is left only by Enter (→ Thinking) or TTS (→ Speaking).
-        // No 2-second auto-timeout: stays until the user submits or
-        // something higher-priority happens.
-        (Listening, UserSubmit) => Thinking,
-        (Listening, TtsPlaybackStarted) => Speaking,
+        (Listening, UserSubmit { .. }) => Thinking,
+        (Listening, TtsPlaybackStarted { .. }) => Speaking,
         (Listening, _) => Listening,
 
-        // Idle: typing promotes to Listening; TTS promotes to Speaking.
-        // A bare Enter on an empty input box does nothing.
-        (Idle, UserKeystroke) => Listening,
-        (Idle, TtsPlaybackStarted) => Speaking,
+        (Idle, UserKeystroke { .. }) => Listening,
+        (Idle, TtsPlaybackStarted { .. }) => Speaking,
         (Idle, _) => Idle,
     }
 }
 
-fn emit(app: &AppHandle, state: AvatarState) {
-    if let Err(e) = app.emit("avatar-state", state) {
+fn emit_state(app: &AppHandle, tab: TabId, state: AvatarState) {
+    if let Err(e) = app.emit(
+        "avatar-state",
+        StateEvent::StateChanged { tab, state },
+    ) {
         warn!(error = %e, "failed to emit avatar-state");
+    }
+}
+
+fn emit_active_tab(app: &AppHandle, tab: TabId) {
+    if let Err(e) = app.emit("avatar-state", StateEvent::ActiveTabChanged { tab }) {
+        warn!(error = %e, "failed to emit active-tab-changed");
     }
 }
 
@@ -300,6 +348,8 @@ mod tests {
     use AvatarState::*;
     use StateSignal::*;
 
+    const T: TabId = TabId::Claude;
+
     fn t(current: AvatarState, signal: StateSignal) -> AvatarState {
         transition(current, signal, false, false)
     }
@@ -314,105 +364,114 @@ mod tests {
 
     #[test]
     fn idle_keystroke_listens() {
-        assert_eq!(t(Idle, UserKeystroke), Listening);
+        assert_eq!(t(Idle, UserKeystroke { tab: T }), Listening);
     }
 
     #[test]
     fn idle_bare_enter_stays_idle() {
-        assert_eq!(t(Idle, UserSubmit), Idle);
+        assert_eq!(t(Idle, UserSubmit { tab: T }), Idle);
     }
 
     #[test]
     fn listening_enter_thinks() {
-        assert_eq!(t(Listening, UserSubmit), Thinking);
+        assert_eq!(t(Listening, UserSubmit { tab: T }), Thinking);
     }
 
     #[test]
     fn listening_more_typing_stays() {
-        assert_eq!(t(Listening, UserKeystroke), Listening);
+        assert_eq!(t(Listening, UserKeystroke { tab: T }), Listening);
     }
 
     #[test]
     fn listening_tts_speaks() {
-        assert_eq!(t(Listening, TtsPlaybackStarted), Speaking);
+        assert_eq!(t(Listening, TtsPlaybackStarted { tab: T }), Speaking);
     }
 
     #[test]
     fn thinking_tts_speaks() {
-        assert_eq!(t(Thinking, TtsPlaybackStarted), Speaking);
+        assert_eq!(t(Thinking, TtsPlaybackStarted { tab: T }), Speaking);
     }
 
     #[test]
     fn thinking_claude_done_returns_idle() {
-        assert_eq!(t(Thinking, ClaudeOutputStopped), Idle);
+        assert_eq!(t(Thinking, ClaudeOutputStopped { tab: T }), Idle);
     }
 
     #[test]
     fn thinking_typing_or_enter_ignored() {
-        assert_eq!(t(Thinking, UserKeystroke), Thinking);
-        assert_eq!(t(Thinking, UserSubmit), Thinking);
+        assert_eq!(t(Thinking, UserKeystroke { tab: T }), Thinking);
+        assert_eq!(t(Thinking, UserSubmit { tab: T }), Thinking);
     }
 
     #[test]
     fn speaking_tts_stop_returns_idle_when_no_pending_input() {
-        assert_eq!(t(Speaking, TtsPlaybackStopped), Idle);
+        assert_eq!(t(Speaking, TtsPlaybackStopped { tab: T }), Idle);
     }
 
     #[test]
     fn speaking_tts_stop_resumes_listening_when_user_typed() {
-        assert_eq!(t_with_input(Speaking, TtsPlaybackStopped), Listening);
+        assert_eq!(
+            t_with_input(Speaking, TtsPlaybackStopped { tab: T }),
+            Listening
+        );
     }
 
     #[test]
     fn speaking_typing_or_enter_ignored() {
-        assert_eq!(t(Speaking, UserKeystroke), Speaking);
-        assert_eq!(t(Speaking, UserSubmit), Speaking);
+        assert_eq!(t(Speaking, UserKeystroke { tab: T }), Speaking);
+        assert_eq!(t(Speaking, UserSubmit { tab: T }), Speaking);
     }
 
     #[test]
     fn errors_interrupt_any_state() {
         for s in [Idle, Listening, Thinking, Speaking] {
-            assert_eq!(t(s, SubprocessExited), Error);
-            assert_eq!(t(s, AudioError), Error);
-            assert_eq!(t(s, TtsError), Error);
+            assert_eq!(t(s, SubprocessExited { tab: T }), Error);
+            assert_eq!(t(s, AudioError { tab: T }), Error);
+            assert_eq!(t(s, TtsError { tab: T }), Error);
         }
     }
 
     #[test]
     fn idle_compose_non_empty_listens() {
         assert_eq!(
-            t(Idle, ComposeContentChanged { non_empty: true }),
+            t(Idle, ComposeContentChanged { tab: T, non_empty: true }),
             Listening,
         );
     }
 
     #[test]
     fn idle_compose_empty_stays_idle() {
-        assert_eq!(t(Idle, ComposeContentChanged { non_empty: false }), Idle);
+        assert_eq!(
+            t(Idle, ComposeContentChanged { tab: T, non_empty: false }),
+            Idle
+        );
     }
 
     #[test]
     fn compose_does_not_preempt_higher_states() {
         assert_eq!(
-            t(Thinking, ComposeContentChanged { non_empty: true }),
+            t(Thinking, ComposeContentChanged { tab: T, non_empty: true }),
             Thinking,
         );
         assert_eq!(
-            t(Speaking, ComposeContentChanged { non_empty: true }),
+            t(Speaking, ComposeContentChanged { tab: T, non_empty: true }),
             Speaking,
         );
     }
 
     #[test]
     fn speaking_tts_stop_resumes_listening_when_composing() {
-        assert_eq!(t_composing(Speaking, TtsPlaybackStopped), Listening);
+        assert_eq!(
+            t_composing(Speaking, TtsPlaybackStopped { tab: T }),
+            Listening
+        );
     }
 
     #[test]
     fn error_sticks_until_acknowledged() {
-        assert_eq!(t(Error, UserKeystroke), Error);
-        assert_eq!(t(Error, UserSubmit), Error);
-        assert_eq!(t(Error, TtsPlaybackStarted), Error);
-        assert_eq!(t(Error, ErrorAcknowledged), Idle);
+        assert_eq!(t(Error, UserKeystroke { tab: T }), Error);
+        assert_eq!(t(Error, UserSubmit { tab: T }), Error);
+        assert_eq!(t(Error, TtsPlaybackStarted { tab: T }), Error);
+        assert_eq!(t(Error, ErrorAcknowledged { tab: T }), Idle);
     }
 }

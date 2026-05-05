@@ -1,4 +1,4 @@
 mod manager;
 mod tasks;
 
-pub use manager::PtyManager;
+pub use manager::{resolve_command, PtyLaunchSpec, PtyManager};

@@ -7,11 +7,11 @@ pub enum AppError {
     #[error("PTY operation failed: {0}")]
     Pty(String),
 
-    #[error("failed to spawn `claude`: {0}")]
+    #[error("failed to spawn subprocess: {0}")]
     Spawn(String),
 
-    #[error("`claude` executable not found on PATH")]
-    ClaudeNotFound,
+    #[error("`{0}` executable not found on PATH")]
+    CommandNotFound(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

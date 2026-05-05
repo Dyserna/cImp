@@ -9,7 +9,13 @@
 import { parseShortcut, matches, type ShortcutPredicate } from './parser';
 import type { ShortcutSettings } from '../settings/types';
 
-export type ShortcutAction = 'open_compose' | 'submit_compose' | 'cancel_compose' | 'open_settings';
+export type ShortcutAction =
+  | 'open_compose'
+  | 'submit_compose'
+  | 'cancel_compose'
+  | 'open_settings'
+  | 'switch_to_tab_1'
+  | 'switch_to_tab_2';
 
 /// A shortcut binding can be a bare function (always fires when matched) or
 /// an object with an `active` predicate. When `active()` returns false the
@@ -37,6 +43,8 @@ export function configureShortcuts(s: ShortcutSettings, h: ShortcutHandlers): vo
     submit_compose: parseShortcut(s.submit_compose),
     cancel_compose: parseShortcut(s.cancel_compose),
     open_settings: parseShortcut(s.open_settings),
+    switch_to_tab_1: parseShortcut(s.switch_to_tab_1),
+    switch_to_tab_2: parseShortcut(s.switch_to_tab_2),
   };
   handlers = h;
 }

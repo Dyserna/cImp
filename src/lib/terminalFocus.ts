@@ -1,14 +1,25 @@
-// Cross-component handle for "focus the xterm.js terminal." Terminal.svelte
-// installs the focus function on mount and clears it on destroy; the compose
-// overlay (and any future caller) invokes it without needing a direct
-// reference to the xterm instance.
+// Cross-component handle for "focus the active tab's xterm.js terminal."
+// Each Terminal instance registers its tab-keyed focus function on mount
+// and clears it on destroy. Callers (compose overlay, tab-switch handler)
+// invoke the active tab's focuser without touching xterm directly.
 
-let focusFn: (() => void) | null = null;
+import { get } from 'svelte/store';
+import { activeTab } from './tabs/state';
+import type { TabId } from './tabs/types';
 
-export function setTerminalFocuser(fn: (() => void) | null): void {
-  focusFn = fn;
+const focusers: Partial<Record<TabId, () => void>> = {};
+
+export function setTerminalFocuser(tab: TabId, fn: (() => void) | null): void {
+  if (fn) {
+    focusers[tab] = fn;
+  } else {
+    delete focusers[tab];
+  }
 }
 
+/// Focus the currently-active tab's terminal. No-op if the active tab has
+/// no registered focuser (e.g. before its Terminal component has mounted).
 export function focusTerminal(): void {
-  focusFn?.();
+  const tab = get(activeTab);
+  focusers[tab]?.();
 }

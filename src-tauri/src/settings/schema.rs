@@ -1,7 +1,7 @@
 //! Settings schema. Every struct uses `#[serde(default)]` so loading a JSON
 //! file written by a future or past version still succeeds: missing fields
-//! get defaults, unknown fields are ignored. This is the v1 schema; no
-//! migration logic exists, just additive evolution.
+//! get defaults, unknown fields are ignored. v2 schema; the v1 → v2 migration
+//! lives in `persistence.rs` and runs once on first load of an old file.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ pub struct Settings {
     pub behavior: BehaviorSettings,
     pub compose: ComposeSettings,
     pub shortcuts: ShortcutSettings,
-    pub claude_code: ClaudeCodeSettings,
+    pub tabs: TabsSettings,
     pub processing: ProcessingSettings,
 }
 
@@ -174,6 +174,7 @@ pub struct BehaviorSettings {
     pub interrupt_on_input: bool,
     pub auto_speak: bool,
     pub fallback_silent: bool,
+    pub announcements_enabled: bool,
 }
 
 impl Default for BehaviorSettings {
@@ -182,6 +183,7 @@ impl Default for BehaviorSettings {
             interrupt_on_input: true,
             auto_speak: true,
             fallback_silent: true,
+            announcements_enabled: true,
         }
     }
 }
@@ -209,6 +211,8 @@ pub struct ShortcutSettings {
     pub submit_compose: Option<String>,
     pub cancel_compose: Option<String>,
     pub open_settings: Option<String>,
+    pub switch_to_tab_1: Option<String>,
+    pub switch_to_tab_2: Option<String>,
 }
 
 impl Default for ShortcutSettings {
@@ -218,15 +222,101 @@ impl Default for ShortcutSettings {
             submit_compose: Some("Ctrl+Enter".to_string()),
             cancel_compose: Some("Escape".to_string()),
             open_settings: Some("Ctrl+,".to_string()),
+            switch_to_tab_1: Some("Ctrl+1".to_string()),
+            switch_to_tab_2: Some("Ctrl+2".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct TabsSettings {
+    #[serde(default = "TabSettings::default_claude")]
+    pub claude: TabSettings,
+    #[serde(default = "TabSettings::default_aider")]
+    pub aider: TabSettings,
+}
+
+impl Default for TabsSettings {
+    fn default() -> Self {
+        Self {
+            claude: TabSettings::default_claude(),
+            aider: TabSettings::default_aider(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct TabSettings {
+    pub command: String,
+    pub extra_cli_flags: Vec<String>,
+    pub tts_injection: TtsInjection,
+    pub notifications: NotificationsSettings,
+}
+
+impl TabSettings {
+    pub fn default_claude() -> Self {
+        Self {
+            command: "claude".to_string(),
+            extra_cli_flags: Vec::new(),
+            tts_injection: TtsInjection {
+                enabled: true,
+                instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
+            },
+            notifications: NotificationsSettings {
+                idle: "Claude is idle".to_string(),
+                awaiting_permission: "Claude is awaiting permission".to_string(),
+                error: "Claude encountered an error".to_string(),
+            },
+        }
+    }
+
+    pub fn default_aider() -> Self {
+        Self {
+            command: "aider".to_string(),
+            extra_cli_flags: Vec::new(),
+            tts_injection: TtsInjection {
+                enabled: false,
+                instructions: String::new(),
+            },
+            notifications: NotificationsSettings {
+                idle: "Aider is idle".to_string(),
+                awaiting_permission: "Aider is awaiting permission".to_string(),
+                error: "Aider encountered an error".to_string(),
+            },
+        }
+    }
+}
+
+// Neutral default for the field-level `#[serde(default)]` fallback when a
+// caller manually edits the file and partially deletes a tab object. The
+// per-tab defaults from `default_claude` / `default_aider` cover the
+// missing-whole-object case.
+impl Default for TabSettings {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            extra_cli_flags: Vec::new(),
+            tts_injection: TtsInjection::default(),
+            notifications: NotificationsSettings::default(),
         }
     }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
-pub struct ClaudeCodeSettings {
-    pub extra_cli_args: Vec<String>,
-    pub claude_md_path: Option<PathBuf>,
+pub struct TtsInjection {
+    pub enabled: bool,
+    pub instructions: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct NotificationsSettings {
+    pub idle: String,
+    pub awaiting_permission: String,
+    pub error: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

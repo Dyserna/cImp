@@ -1,7 +1,6 @@
 // Frontend mirror of the Rust Settings schema. Field names use snake_case to
-// match the JSON serde output (no need for a serde rename pass on the
-// backend). Optional fields come through as `null` over JSON, never as
-// `undefined`.
+// match the JSON serde output. Optional fields come through as `null` over
+// JSON, never as `undefined`.
 
 export type AvatarPosition = 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left';
 
@@ -59,6 +58,7 @@ export interface BehaviorSettings {
   interrupt_on_input: boolean;
   auto_speak: boolean;
   fallback_silent: boolean;
+  announcements_enabled: boolean;
 }
 
 export interface ComposeSettings {
@@ -71,11 +71,31 @@ export interface ShortcutSettings {
   submit_compose: string | null;
   cancel_compose: string | null;
   open_settings: string | null;
+  switch_to_tab_1: string | null;
+  switch_to_tab_2: string | null;
 }
 
-export interface ClaudeCodeSettings {
-  extra_cli_args: string[];
-  claude_md_path: string | null;
+export interface TtsInjection {
+  enabled: boolean;
+  instructions: string;
+}
+
+export interface NotificationsSettings {
+  idle: string;
+  awaiting_permission: string;
+  error: string;
+}
+
+export interface TabSettings {
+  command: string;
+  extra_cli_flags: string[];
+  tts_injection: TtsInjection;
+  notifications: NotificationsSettings;
+}
+
+export interface TabsSettings {
+  claude: TabSettings;
+  aider: TabSettings;
 }
 
 export interface ProcessingSettings {
@@ -90,13 +110,14 @@ export interface Settings {
   behavior: BehaviorSettings;
   compose: ComposeSettings;
   shortcuts: ShortcutSettings;
-  claude_code: ClaudeCodeSettings;
+  tabs: TabsSettings;
   processing: ProcessingSettings;
 }
 
-// Defaults must exactly match `impl Default for Settings` on the backend.
-// They're used as the initial store value so subscribers get sane shapes
-// before the first `settings-changed` event arrives.
+// Defaults must match `impl Default for Settings` on the backend. They're
+// the initial store value so subscribers get sane shapes before the first
+// `settings-changed` event arrives. The backend re-broadcasts on init so
+// this value is short-lived in practice.
 export function defaultSettings(): Settings {
   return {
     tts: { voice: 'af_heart', speed: 1.0, volume: 1.0, mute: false },
@@ -131,6 +152,7 @@ export function defaultSettings(): Settings {
       interrupt_on_input: true,
       auto_speak: true,
       fallback_silent: true,
+      announcements_enabled: true,
     },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {
@@ -138,8 +160,31 @@ export function defaultSettings(): Settings {
       submit_compose: 'Ctrl+Enter',
       cancel_compose: 'Escape',
       open_settings: 'Ctrl+,',
+      switch_to_tab_1: 'Ctrl+1',
+      switch_to_tab_2: 'Ctrl+2',
     },
-    claude_code: { extra_cli_args: [], claude_md_path: null },
+    tabs: {
+      claude: {
+        command: 'claude',
+        extra_cli_flags: [],
+        tts_injection: { enabled: true, instructions: '' },
+        notifications: {
+          idle: 'Claude is idle',
+          awaiting_permission: 'Claude is awaiting permission',
+          error: 'Claude encountered an error',
+        },
+      },
+      aider: {
+        command: 'aider',
+        extra_cli_flags: [],
+        tts_injection: { enabled: false, instructions: '' },
+        notifications: {
+          idle: 'Aider is idle',
+          awaiting_permission: 'Aider is awaiting permission',
+          error: 'Aider encountered an error',
+        },
+      },
+    },
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
   };
 }

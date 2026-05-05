@@ -13,25 +13,30 @@ use tracing::{debug, warn};
 
 use crate::processing::{ProcessingEvent, ProcessingLayer};
 use crate::settings::SettingsHandle;
-use crate::state::StateSignal;
+use crate::state::{StateSignal, TabId};
+use crate::tts::TtsRequest;
 
 /// Tick interval for the processing flush timer. Short enough that the
 /// 200ms stability and 500ms max-hold thresholds fire promptly.
 const FLUSH_TICK: Duration = Duration::from_millis(50);
 
-/// Output-burst duration before we consider claude to be actually
+/// Output-burst duration before we consider the child to be actually
 /// generating. Real responses sustain bytes for seconds; per-keystroke
-/// TUI input-box redraws are tens of ms; a chain of TUI redraws caused
-/// by mid-drag window jitter rarely lasts beyond ~1s. Anything shorter
-/// is treated as churn and ignored.
+/// TUI input-box redraws are tens of ms. Anything shorter is treated as
+/// churn and ignored.
 const CLAUDE_BURST_MIN: Duration = Duration::from_millis(1000);
 
 /// Quiet interval that closes a burst. After this much silence we fire
 /// ClaudeOutputStopped (if Started was fired) and reset the burst tracker.
 const CLAUDE_QUIET: Duration = Duration::from_millis(500);
 
+#[derive(serde::Serialize, Clone)]
+struct PtyExitPayload {
+    tab: TabId,
+    exit: String,
+}
+
 /// Reader task. Lives on the blocking pool because PTY reads block on most platforms.
-/// Sends raw byte chunks to an mpsc receiver consumed by `spawn_forwarder`.
 pub fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     tx: mpsc::Sender<Vec<u8>>,
@@ -50,9 +55,6 @@ pub fn spawn_reader(
                     break;
                 }
                 Ok(n) => {
-                    // Log raw PTY input (pre-processing) when `pty_in` target
-                    // is enabled. Lets us see what claude actually outputs vs
-                    // what reaches xterm after marker stripping.
                     if tracing::enabled!(target: "pty_in", tracing::Level::DEBUG) {
                         let pretty: String = String::from_utf8_lossy(&buf[..n])
                             .chars()
@@ -83,18 +85,15 @@ pub fn spawn_reader(
 }
 
 /// Processor task. Owns a `ProcessingLayer`, drives it from the PTY byte stream
-/// and a steady 50 ms flush tick, and dispatches resulting events:
-///
-/// - `TerminalBytes` → base64-encoded and pushed through the Tauri Channel.
-/// - `TtsSegment` → forwarded to the TTS worker via the segment mpsc.
-/// - `Stalled` → diagnostic warning.
-///
-/// Single-owner pattern: the layer is `&mut` only inside this task, so no
-/// extra locking is required.
+/// and a steady 50 ms flush tick, and dispatches resulting events. Each
+/// emitted state signal is tagged with the owning tab so the manager can
+/// route it to the correct per-tab `TabState`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_processor(
+    tab: TabId,
     mut rx: mpsc::Receiver<Vec<u8>>,
     channel: Channel<String>,
-    tts_segments: mpsc::Sender<String>,
+    tts_segments: mpsc::Sender<TtsRequest>,
     cancel: CancellationToken,
     user_typed_tts: Arc<StdMutex<HashSet<String>>>,
     state_signals: mpsc::Sender<StateSignal>,
@@ -109,16 +108,6 @@ pub fn spawn_processor(
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // Output-activity tracking. Two timers:
-        //   - `burst_start`: when bytes first appeared in the current
-        //     burst. If the burst sustains for CLAUDE_BURST_MIN, we
-        //     consider claude to be actually generating and fire Started.
-        //     This filters out per-keystroke TUI input-box redraws (~50
-        //     bytes over a few ms) from real responses (seconds of
-        //     continuous tokens).
-        //   - `last_byte_time`: most recent byte. If it's been quiet for
-        //     CLAUDE_QUIET, the burst is over — fire Stopped if Started
-        //     was fired, then reset both timers.
         let mut output_active = false;
         let mut burst_start: Option<tokio::time::Instant> = None;
         let mut last_byte_time: Option<tokio::time::Instant> = None;
@@ -126,7 +115,7 @@ pub fn spawn_processor(
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    debug!("pty processor: cancelled");
+                    debug!(?tab, "pty processor: cancelled");
                     break;
                 }
                 changed = settings_rx.recv() => {
@@ -150,7 +139,7 @@ pub fn spawn_processor(
                                 e,
                                 ProcessingEvent::TerminalBytes(b) if !b.is_empty()
                             ));
-                            if dispatch_events(events, &channel, &tts_segments).await.is_err() {
+                            if dispatch_events(tab, events, &channel, &tts_segments).await.is_err() {
                                 break;
                             }
                             if saw_terminal_bytes {
@@ -162,7 +151,7 @@ pub fn spawn_processor(
                             }
                         }
                         None => {
-                            debug!("pty processor: bytes channel closed");
+                            debug!(?tab, "pty processor: bytes channel closed");
                             break;
                         }
                     }
@@ -173,7 +162,7 @@ pub fn spawn_processor(
                         e,
                         ProcessingEvent::TerminalBytes(b) if !b.is_empty()
                     ));
-                    if dispatch_events(events, &channel, &tts_segments).await.is_err() {
+                    if dispatch_events(tab, events, &channel, &tts_segments).await.is_err() {
                         break;
                     }
                     if saw_terminal_bytes {
@@ -184,24 +173,22 @@ pub fn spawn_processor(
                         last_byte_time = Some(now);
                     }
 
-                    // Promote a sustained burst to ClaudeOutputStarted.
                     if !output_active {
                         if let Some(start) = burst_start {
                             if start.elapsed() >= CLAUDE_BURST_MIN {
                                 output_active = true;
                                 let _ = state_signals
-                                    .try_send(StateSignal::ClaudeOutputStarted);
+                                    .try_send(StateSignal::ClaudeOutputStarted { tab });
                             }
                         }
                     }
 
-                    // Quiet → close the burst.
                     if let Some(t) = last_byte_time {
                         if t.elapsed() >= CLAUDE_QUIET {
                             if output_active {
                                 output_active = false;
                                 let _ = state_signals
-                                    .try_send(StateSignal::ClaudeOutputStopped);
+                                    .try_send(StateSignal::ClaudeOutputStopped { tab });
                             }
                             burst_start = None;
                             last_byte_time = None;
@@ -210,14 +197,15 @@ pub fn spawn_processor(
                 }
             }
         }
-        debug!("pty processor task exiting");
+        debug!(?tab, "pty processor task exiting");
     });
 }
 
 async fn dispatch_events(
+    tab: TabId,
     events: Vec<ProcessingEvent>,
     channel: &Channel<String>,
-    tts_segments: &mpsc::Sender<String>,
+    tts_segments: &mpsc::Sender<TtsRequest>,
 ) -> Result<(), ()> {
     for ev in events {
         match ev {
@@ -225,9 +213,6 @@ async fn dispatch_events(
                 if bytes.is_empty() {
                     continue;
                 }
-                // Debug visibility: dump emitted bytes as a printable string with
-                // ANSI/CTRL escapes shown, so we can compare against what xterm
-                // renders and pinpoint corruption.
                 if tracing::enabled!(target: "pty_emit", tracing::Level::DEBUG) {
                     let pretty: String = String::from_utf8_lossy(&bytes)
                         .chars()
@@ -246,17 +231,14 @@ async fn dispatch_events(
                 }
             }
             ProcessingEvent::TtsSegment(text) => {
-                // Per-segment log; debug-level so a normal session at the
-                // default `info` filter doesn't spam one line per sentence.
-                // Bump filter to `cctts=debug` (default) or `tts_stub=debug`
-                // explicitly to see the extracted text.
-                debug!(target: "tts_stub", text = %text, "extracted TTS segment");
-                if tts_segments.send(text).await.is_err() {
+                debug!(target: "tts_stub", ?tab, text = %text, "extracted TTS segment");
+                let req = TtsRequest::Synthesize { tab, text };
+                if tts_segments.send(req).await.is_err() {
                     debug!("pty processor: TTS segment channel closed (worker not running)");
                 }
             }
             ProcessingEvent::Stalled => {
-                warn!("pty processor: stalled");
+                warn!(?tab, "pty processor: stalled");
             }
         }
     }
@@ -264,8 +246,9 @@ async fn dispatch_events(
 }
 
 /// Waiter task. Blocks on child.wait(), emits `pty-exit` on the AppHandle, and
-/// cancels sibling tasks so the reader/forwarder unwind cleanly.
+/// cancels sibling tasks so the reader/processor unwind cleanly.
 pub fn spawn_waiter(
+    tab: TabId,
     mut child: Box<dyn Child + Send + Sync>,
     app: AppHandle,
     cancel: CancellationToken,
@@ -274,17 +257,20 @@ pub fn spawn_waiter(
     tokio::task::spawn_blocking(move || {
         let exit = child.wait();
         cancel.cancel();
-        let payload = match exit {
+        let exit_str = match exit {
             Ok(status) => format!("{:?}", status),
             Err(e) => format!("error: {}", e),
         };
-        // Push the avatar into Error before the frontend hears about the
-        // exit — the IPC event below is informational, the state signal
-        // actually drives the UI.
-        let _ = state_signals.try_send(StateSignal::SubprocessExited);
-        if let Err(e) = app.emit("pty-exit", payload) {
+        let _ = state_signals.try_send(StateSignal::SubprocessExited { tab });
+        if let Err(e) = app.emit(
+            "pty-exit",
+            PtyExitPayload {
+                tab,
+                exit: exit_str,
+            },
+        ) {
             warn!(error = %e, "failed to emit pty-exit");
         }
-        debug!("pty waiter task exiting");
+        debug!(?tab, "pty waiter task exiting");
     });
 }

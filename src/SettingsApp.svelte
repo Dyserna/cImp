@@ -15,9 +15,9 @@
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
 
   let voices = $state<string[]>([]);
-  // The "applied" baseline for Claude Code settings — used to show the
-  // Restart Required banner when subprocess-affecting fields change.
-  let claudeBaseline = $state<Settings['claude_code'] | null>(null);
+  // The "applied" baseline for the Claude tab — used to show the Restart
+  // Required banner when subprocess-affecting fields change.
+  let claudeBaseline = $state<Settings['tabs']['claude'] | null>(null);
   let snapshot = $state<Settings | null>(null);
 
   // Keep `snapshot` in sync with the global store. Every input mutates
@@ -28,7 +28,7 @@
   onMount(async () => {
     await initSettings();
     snapshot = structuredClone(get(settings));
-    claudeBaseline = structuredClone(snapshot.claude_code);
+    claudeBaseline = structuredClone(snapshot.tabs.claude);
     unsub = settings.subscribe((s) => {
       snapshot = structuredClone(s);
     });
@@ -53,7 +53,7 @@
 
   const restartRequired = $derived.by(() => {
     if (!snapshot || !claudeBaseline) return false;
-    return JSON.stringify(snapshot.claude_code) !== JSON.stringify(claudeBaseline);
+    return JSON.stringify(snapshot.tabs.claude) !== JSON.stringify(claudeBaseline);
   });
 
   async function pickFile(
@@ -106,17 +106,9 @@
     });
   }
 
-  async function pickClaudeMd() {
-    const p = await pickFile('Markdown / Text', ['md', 'markdown', 'txt']);
-    if (p === null) return;
-    patch((s) => {
-      s.claude_code.claude_md_path = p;
-    });
-  }
-
   async function doRestart() {
     await requestClaudeCodeRestart();
-    if (snapshot) claudeBaseline = structuredClone(snapshot.claude_code);
+    if (snapshot) claudeBaseline = structuredClone(snapshot.tabs.claude);
   }
 
   function basename(p: string | null): string {
@@ -493,6 +485,24 @@
           }
         />
       </label>
+      <label>
+        <span>Switch to Claude tab</span>
+        <ShortcutCapture
+          bind:value={
+            () => snapshot!.shortcuts.switch_to_tab_1,
+            (v) => patch((s) => (s.shortcuts.switch_to_tab_1 = v))
+          }
+        />
+      </label>
+      <label>
+        <span>Switch to Aider tab</span>
+        <ShortcutCapture
+          bind:value={
+            () => snapshot!.shortcuts.switch_to_tab_2,
+            (v) => patch((s) => (s.shortcuts.switch_to_tab_2 = v))
+          }
+        />
+      </label>
     </section>
 
     <section>
@@ -501,34 +511,21 @@
         <span>Extra CLI flags (one per line)</span>
         <textarea
           rows="3"
-          value={snapshot.claude_code.extra_cli_args.join('\n')}
+          value={snapshot.tabs.claude.extra_cli_flags.join('\n')}
           onchange={(e) =>
             patch((s) => {
               const v = (e.currentTarget as HTMLTextAreaElement).value;
-              s.claude_code.extra_cli_args = v
+              s.tabs.claude.extra_cli_flags = v
                 .split('\n')
                 .map((x) => x.trim())
                 .filter((x) => x.length > 0);
             })}
         ></textarea>
       </label>
-      <div class="file-row">
-        <span class="state-label">CLAUDE.md</span>
-        <span class="filename" title={snapshot.claude_code.claude_md_path ?? ''}>
-          {basename(snapshot.claude_code.claude_md_path)}
-        </span>
-        <button onclick={pickClaudeMd}>Pick…</button>
-        <button
-          class="ghost"
-          onclick={() => patch((s) => (s.claude_code.claude_md_path = null))}
-          disabled={snapshot.claude_code.claude_md_path === null}
-        >
-          Clear
-        </button>
-      </div>
       <small class="hint">
-        Overrides the default appended system prompt. Empty = use the
-        embedded default with TTS markup instructions.
+        Persistent flags appended to every Claude tab spawn. The per-tab TTS
+        injection editor (and the Aider tab settings) ship in the next
+        milestone (V2-02).
       </small>
     </section>
 

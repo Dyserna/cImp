@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -12,10 +12,21 @@ use tracing::{debug, info};
 
 use crate::error::{AppError, AppResult};
 use crate::pty::tasks;
-use crate::state::StateSignal;
+use crate::state::{StateSignal, TabId};
+use crate::tts::TtsRequest;
 
-fn resolve_claude_path() -> AppResult<PathBuf> {
-    which::which("claude").map_err(|_| AppError::ClaudeNotFound)
+/// Per-tab launch parameters resolved by the registry before spawning. Keeps
+/// the PtyManager binary-agnostic so each tab can plug in its own command.
+pub struct PtyLaunchSpec {
+    pub tab: TabId,
+    /// Path to the resolved binary on disk (already passed through `which`).
+    pub binary: std::path::PathBuf,
+    /// Arguments inserted before `extra_args`. Used for `--append-system-
+    /// prompt <content>` on the Claude tab.
+    pub pre_args: Vec<String>,
+    /// User-supplied flags + cctts invocation args.
+    pub extra_args: Vec<String>,
+    pub working_dir: std::path::PathBuf,
 }
 
 pub struct PtyManager {
@@ -29,8 +40,8 @@ struct PtyHandle {
     cancel: CancellationToken,
     /// Last (rows, cols) we forwarded to the PTY. Lets `resize` short-
     /// circuit a no-op call so a same-size resize event from the WebView
-    /// (e.g. mid-drag across DPI boundaries) doesn't pulse SIGWINCH at
-    /// claude and trigger a TUI redraw.
+    /// (e.g. mid-drag across DPI boundaries) doesn't pulse SIGWINCH at the
+    /// child and trigger a TUI redraw.
     last_size: Arc<StdMutex<(u16, u16)>>,
 }
 
@@ -44,23 +55,21 @@ impl PtyManager {
     pub async fn start(
         &self,
         app: AppHandle,
+        spec: PtyLaunchSpec,
         output_channel: Channel<String>,
-        working_dir: &Path,
-        extra_args: Vec<String>,
-        system_prompt: String,
         initial_rows: u16,
         initial_cols: u16,
-        tts_segments: tokio::sync::mpsc::Sender<String>,
+        tts_segments: mpsc::Sender<TtsRequest>,
         user_typed_tts: Arc<StdMutex<HashSet<String>>>,
-        state_signals: tokio::sync::mpsc::Sender<StateSignal>,
+        state_signals: mpsc::Sender<StateSignal>,
     ) -> AppResult<()> {
         let mut guard = self.inner.lock().await;
         if guard.is_some() {
             return Err(AppError::AlreadyStarted);
         }
 
-        let claude_path = resolve_claude_path()?;
-        info!(path = %claude_path.display(), "resolved claude binary");
+        let tab = spec.tab;
+        info!(?tab, path = %spec.binary.display(), "spawning subprocess");
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -72,19 +81,14 @@ impl PtyManager {
             })
             .map_err(|e| AppError::Pty(format!("openpty: {e}")))?;
 
-        let mut cmd = CommandBuilder::new(&claude_path);
-        // Inject the TTS markup convention as an appended system prompt. The
-        // caller resolves the prompt text from settings (claude_md_path
-        // override) or falls back to the embedded RUNTIME_SYSTEM_PROMPT, so
-        // the user's own project context (whatever directory they launch
-        // cctts from) stays untouched and the embedded claude still knows
-        // about the tags.
-        cmd.arg("--append-system-prompt");
-        cmd.arg(&system_prompt);
-        for arg in &extra_args {
+        let mut cmd = CommandBuilder::new(&spec.binary);
+        for arg in &spec.pre_args {
             cmd.arg(arg);
         }
-        cmd.cwd(working_dir);
+        for arg in &spec.extra_args {
+            cmd.arg(arg);
+        }
+        cmd.cwd(&spec.working_dir);
 
         let child = pair
             .slave
@@ -113,12 +117,9 @@ impl PtyManager {
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(256);
 
         tasks::spawn_reader(reader, bytes_tx, cancel.clone());
-        // Pull the live settings handle from the Tauri-managed AppState so
-        // the processor can react to processing.max_hold_ms changes without
-        // a restart. We accept it via the AppState rather than threading it
-        // through `start`'s argument list since this is the only call site.
         let settings = app.state::<crate::ipc::AppState>().settings.clone();
         tasks::spawn_processor(
+            tab,
             bytes_rx,
             output_channel,
             tts_segments,
@@ -127,7 +128,7 @@ impl PtyManager {
             state_signals.clone(),
             settings,
         );
-        tasks::spawn_waiter(child, app, cancel.clone(), state_signals);
+        tasks::spawn_waiter(tab, child, app, cancel.clone(), state_signals);
 
         *guard = Some(PtyHandle {
             writer,
@@ -137,9 +138,9 @@ impl PtyManager {
             last_size: Arc::new(StdMutex::new((initial_rows.max(1), initial_cols.max(1)))),
         });
         info!(
+            ?tab,
             rows = initial_rows,
             cols = initial_cols,
-            args = ?extra_args,
             "PTY session started"
         );
         Ok(())
@@ -175,10 +176,6 @@ impl PtyManager {
             (handle.master.clone(), handle.last_size.clone())
         };
 
-        // Same-size resize → skip. This filters the chain of micro-resize
-        // events Windows fires when a window crosses a DPI boundary (and
-        // any other ResizeObserver event where the terminal grid happens
-        // to match what we already had).
         {
             let last = last_size
                 .lock()
@@ -229,10 +226,21 @@ impl PtyManager {
         }
         Ok(())
     }
+
 }
 
 impl Default for PtyManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Resolve a command name (e.g. "claude", "aider") via PATH.
+pub fn resolve_command(name: &str) -> AppResult<std::path::PathBuf> {
+    which::which(name).map_err(|_| AppError::CommandNotFound(name.to_string()))
+}
+
+#[allow(dead_code)] // kept for parity with v1; current callers go via `resolve_command`
+pub fn working_dir_from(path: &Path) -> std::path::PathBuf {
+    path.to_path_buf()
 }

@@ -1,7 +1,8 @@
-//! TTS worker task. Receives plain text segments from the processing layer,
-//! runs them through the [`TtsEngine`], and pushes resulting PCM into the
-//! shared [`AudioOutput`]. Synthesis errors are logged and skipped — a single
-//! bad segment does not take down the pipeline.
+//! TTS worker task. Receives [`TtsRequest`]s from the per-tab processing
+//! layers, filters by the shared active-tab cell (background-tab synthesis is
+//! dropped — v2 design rule "TTS reflects what's currently shown"), runs the
+//! survivor through [`TtsEngine`], and pushes resulting PCM into the shared
+//! [`AudioOutput`].
 //!
 //! The worker also subscribes to [`SettingsHandle`] updates so a voice or
 //! speed change applies to the very next synthesis (no engine restart).
@@ -14,28 +15,20 @@ use tracing::{debug, info, warn};
 use crate::audio::AudioOutput;
 use crate::settings::{Settings, SettingsHandle};
 use crate::state::StateSignal;
-use crate::tts::engine::{TtsEngine, TtsRequest};
+use crate::tts::engine::{SynthesisRequest, TtsEngine};
+use crate::tts::{ActiveTab, TtsRequest};
 
-/// Shutdown signal: the worker exits when the segment channel is closed,
-/// which happens automatically when the last `Sender` (held by `AppState`)
-/// is dropped during app teardown. No cancellation token needed at this
-/// scope.
-///
-/// Uses `tauri::async_runtime::spawn` rather than `tokio::spawn` directly so
-/// the call site doesn't have to be inside an active tokio runtime — Tauri
-/// owns the runtime and exposes a runtime-agnostic spawn entry point.
 pub fn spawn_tts_worker(
     mut engine: TtsEngine,
     audio: Arc<AudioOutput>,
-    mut rx: mpsc::Receiver<String>,
+    mut rx: mpsc::Receiver<TtsRequest>,
     state_signals: mpsc::Sender<StateSignal>,
     settings: SettingsHandle,
+    active: ActiveTab,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut next_id: u64 = 0;
         let mut settings_rx = settings.subscribe();
-        // Apply the current snapshot up front in case the user changed
-        // speed/voice between init and the first segment.
         apply_settings(&mut engine, &settings.current());
 
         loop {
@@ -49,11 +42,24 @@ pub fn spawn_tts_worker(
                     }
                 }
                 seg = rx.recv() => {
-                    let Some(text) = seg else { break };
+                    let Some(req) = seg else { break };
+                    let TtsRequest::Synthesize { tab, text } = req;
+
+                    // Background-tab gate: if the request's tab is no longer
+                    // active by the time we pick it up, drop it. This is the
+                    // single-shared-channel filter the v2 design specifies —
+                    // simpler than per-tab queues and avoids retaining stale
+                    // segments to discard later.
+                    let active_tab = *active.read().expect("active tab poisoned");
+                    if tab != active_tab {
+                        debug!(?tab, ?active_tab, "tts: dropping segment for inactive tab");
+                        continue;
+                    }
+
                     next_id += 1;
-                    let req = TtsRequest { text, request_id: next_id };
+                    let synth_req = SynthesisRequest { text, request_id: next_id };
                     let started = std::time::Instant::now();
-                    match engine.synthesize(req) {
+                    match engine.synthesize(synth_req) {
                         Ok(resp) => {
                             let elapsed_ms = started.elapsed().as_millis();
                             debug!(
@@ -65,12 +71,7 @@ pub fn spawn_tts_worker(
                             audio.enqueue(resp.samples, resp.sample_rate);
                         }
                         Err(e) => {
-                            // Per-segment failures are recoverable: the worker keeps
-                            // accepting subsequent segments. We don't fire TtsError
-                            // here (which would park the avatar in Error with no
-                            // acknowledgment UI in M4). Engine init failures fire
-                            // TtsError separately from main.rs.
-                            let _ = &state_signals; // keep param: future fatal-error path
+                            let _ = &state_signals; // future fatal-error path
                             warn!(error = %e, "tts synthesis failed; skipping segment");
                         }
                     }

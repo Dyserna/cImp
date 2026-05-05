@@ -279,6 +279,13 @@ When current TTS finishes, the queue is filtered to most-recent-per-tab: drops "
 
 This preserves the most useful information per tab without piling up redundant announcements.
 
+#### Edge-case rules (V2-04 implementation)
+
+Two refinements to the queue logic above, added to handle event orderings the simple "most-recent-per-tab" rule doesn't catch on its own:
+
+- **Idle is suppressed while `awaiting_permission` is set on the same tab.** When Claude stops printing to ask for permission, the avatar state machine drops the tab to Idle (output-stopped) at roughly the same instant the permission detector fires. Without this rule the user hears both announcements ("X is awaiting permission" *and* "X is idle") for the same logical event. The check runs at enqueue time against the manager's most-recent-known `awaiting_permission` flag for the tab; the Idle notification is dropped silently if that flag is currently true.
+- **Drain is debounced ~200 ms after the first enqueue.** When something gets queued and audio is currently idle, the manager waits a short window before draining. This gives closely-spaced related events (e.g. an Idle that arrives microseconds before the AwaitingPermission for the same logical edge, or vice versa) a chance to land in the queue together so dedup can collapse them. Audio idle-edges drain immediately on the next pulse; the debounce only applies to the cold-start case where no idle edge is forthcoming. If new events arrive during the window, the existing deadline stands — they ride the same drain.
+
 #### Configuration toggles
 
 - **Global "announcements enabled" toggle**: master on/off in settings. Default: ON. When OFF, no notifications fire regardless of state changes.

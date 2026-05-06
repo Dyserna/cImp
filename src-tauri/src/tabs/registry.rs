@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
@@ -11,22 +10,10 @@ use tracing::{debug, info, warn};
 use crate::audio::AudioOutput;
 use crate::error::{AppError, AppResult};
 use crate::pty::PtyManager;
-use crate::settings::SettingsHandle;
-use crate::shell::ShellSpec;
+use crate::settings::{SettingsHandle, AIDER_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID};
 use crate::state::{InputLengths, StateSignal, TabId, TabKind};
 use crate::tabs::config::build_launch_spec;
 use crate::tts::{ActiveTab, TtsRequest};
-
-/// Per-Shell-tab launch configuration. M2 keeps this in-memory only — M3
-/// of v3 reshapes the settings schema to persist it. Each user-created
-/// Shell tab gets its own entry; the M1 launch-seed Shell-1 is seeded with
-/// the auto-detected `default_shell`.
-#[derive(Clone, Debug)]
-pub struct ShellTabConfig {
-    pub spec: ShellSpec,
-    pub cwd: Option<PathBuf>,
-    pub env: HashMap<String, String>,
-}
 
 /// Wire-format tab metadata for the `list_tabs` IPC. Mirrors the fields
 /// the frontend's `tabs` store reads on mount; runtime mutations come via
@@ -42,34 +29,26 @@ pub struct TabMetaWire {
 /// Owns one PtyManager per TabId plus the shared resources tabs read on
 /// activation (audio output, active-tab cell, state signal channel). All
 /// public methods are async because PtyManager.start/shutdown are.
+///
+/// V3-M3 removed the per-Shell-tab `shell_configs` side table — settings is
+/// now the single source of truth for spawn config. The registry only owns
+/// runtime state (PtyManagers, tab order, names) plus the routing handles.
 pub struct TabRegistry {
-    /// User-visible tab order. Mutated by `add_tab` (append) and
-    /// `remove_tab`. The state-manager-side ordering mirrors this via the
-    /// `position` carried on `StateSignal::TabAdded`; the registry is the
-    /// source of truth.
+    /// User-visible tab order. Mutated by `insert_user_shell_tab` (append)
+    /// and `remove_user_shell_tab`. The state-manager-side ordering mirrors
+    /// this via the `position` carried on `StateSignal::TabAdded`; the
+    /// registry is the source of truth for runtime order.
     tab_order: Vec<TabId>,
     managers: HashMap<TabId, PtyManager>,
-    /// Per-tab display name. The state manager's `TabState` carries the
-    /// same name for transition-time bookkeeping; the registry mirror is
-    /// what the IPC `list_tabs` command reads on frontend mount (the state
-    /// manager doesn't currently expose a synchronous query). Renames
-    /// update both via the state-signal flow.
+    /// Per-tab display name. Renames mutate this; the IPC `list_tabs`
+    /// command reads it on frontend mount.
     names: HashMap<TabId, String>,
     active: TabId,
-    /// Per-Shell-tab spawn config. Looked up by `build_launch_spec` for
-    /// any `TabId::Shell(_)`. Builtins (Claude/Aider) do not appear here.
-    shell_configs: HashMap<TabId, ShellTabConfig>,
     /// Shared with the TTS worker so it can filter by active tab on every
     /// request. Updated under write-lock from `activate`.
     tts_active: ActiveTab,
     audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
     state_signals: mpsc::Sender<StateSignal>,
-    /// Resolved at app startup by `shell::detect::default_shell()` and
-    /// shared with every Shell-tab launch path. Cloned cheaply (Arc) into
-    /// the per-tab `PtyLaunchSpec` so each spawn has the binary + args
-    /// without re-running detection. M2 uses this as the default seed for
-    /// new user Shell tabs (the dialog can override before submission).
-    default_shell: Arc<ShellSpec>,
     /// Shared input-length counter map. Mutated by the state manager on
     /// TabAdded/TabRemoved; the registry only reads it (indirectly, via
     /// the IPC layer).
@@ -78,50 +57,38 @@ pub struct TabRegistry {
 
 pub type TabRegistryHandle = Arc<TokioMutex<TabRegistry>>;
 
+/// True when `id` is one of the three reserved tab ids that the integrity
+/// check protects (claude, aider, shell-default-1). User-created Shell tabs
+/// use uuid-based ids that never collide with these.
+fn is_builtin_id(id: &str) -> bool {
+    matches!(id, CLAUDE_TAB_ID | AIDER_TAB_ID | SHELL_DEFAULT_TAB_ID)
+}
+
 impl TabRegistry {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         seed: Vec<crate::state::TabMeta>,
         initial_active: TabId,
         tts_active: ActiveTab,
         audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
         state_signals: mpsc::Sender<StateSignal>,
-        default_shell: Arc<ShellSpec>,
         input_lengths: InputLengths,
     ) -> Self {
         let mut managers = HashMap::new();
-        let mut shell_configs = HashMap::new();
         let mut names = HashMap::new();
         let mut tab_order = Vec::with_capacity(seed.len());
         for meta in &seed {
             tab_order.push(meta.id.clone());
             names.insert(meta.id.clone(), meta.name.clone());
             managers.insert(meta.id.clone(), PtyManager::new());
-            // Seed every Shell tab in the launch list with the auto-
-            // detected default config. The M1 launch seed has exactly one
-            // Shell tab (`shell-1`); future seeds (M3 settings load) will
-            // carry per-tab configs and override this.
-            if matches!(meta.kind, TabKind::Shell) {
-                shell_configs.insert(
-                    meta.id.clone(),
-                    ShellTabConfig {
-                        spec: (*default_shell).clone(),
-                        cwd: None,
-                        env: HashMap::new(),
-                    },
-                );
-            }
         }
         Self {
             tab_order,
             managers,
             names,
             active: initial_active,
-            shell_configs,
             tts_active,
             audio,
             state_signals,
-            default_shell,
             input_lengths,
         }
     }
@@ -140,7 +107,7 @@ impl TabRegistry {
                     .get(id)
                     .cloned()
                     .unwrap_or_else(|| id.as_str().to_string()),
-                builtin: matches!(id, TabId::Claude | TabId::Aider),
+                builtin: is_builtin_id(id.as_str()),
             })
             .collect()
     }
@@ -149,17 +116,6 @@ impl TabRegistry {
     /// echo the order back to the frontend (e.g. `list_tabs`).
     pub fn tab_order(&self) -> Vec<TabId> {
         self.tab_order.clone()
-    }
-
-    /// Per-tab Shell config lookup. Returns `None` for AI tabs and for
-    /// unknown ids. Call sites that need the config to spawn a process
-    /// must hold the TabRegistry lock for the lookup duration.
-    pub fn shell_config(&self, tab: &TabId) -> Option<&ShellTabConfig> {
-        self.shell_configs.get(tab)
-    }
-
-    pub fn default_shell(&self) -> Arc<ShellSpec> {
-        self.default_shell.clone()
     }
 
     pub fn active(&self) -> TabId {
@@ -195,35 +151,22 @@ impl TabRegistry {
         self.names.insert(tab.clone(), name.to_string());
     }
 
-    /// Replace a Shell tab's spawn config. Only valid for Shell-kind ids;
-    /// callers (the IPC handler) gate this with a kind check.
-    pub fn replace_shell_config(&mut self, tab: &TabId, config: ShellTabConfig) {
-        if !matches!(tab.kind(), TabKind::Shell) {
-            return;
-        }
-        self.shell_configs.insert(tab.clone(), config);
-    }
-
     /// Append a new user-managed Shell tab to the registry. Returns the
     /// resulting position in `tab_order`. Idempotent on duplicate ids: the
-    /// existing entry's name + config are overwritten and the original
-    /// position is returned.
-    pub fn insert_user_shell_tab(
-        &mut self,
-        tab: TabId,
-        name: String,
-        config: ShellTabConfig,
-    ) -> usize {
+    /// existing entry's name is overwritten and the original position is
+    /// returned.
+    ///
+    /// V3-M3: the spawn config now lives in settings — callers persist the
+    /// `TabConfig::Shell` entry separately via `SettingsHandle::set`.
+    pub fn insert_user_shell_tab(&mut self, tab: TabId, name: String) -> usize {
         if let Some(idx) = self.tab_order.iter().position(|t| t == &tab) {
-            self.names.insert(tab.clone(), name);
-            self.shell_configs.insert(tab, config);
+            self.names.insert(tab, name);
             return idx;
         }
         let position = self.tab_order.len();
         self.tab_order.push(tab.clone());
         self.managers.insert(tab.clone(), PtyManager::new());
-        self.names.insert(tab.clone(), name);
-        self.shell_configs.insert(tab, config);
+        self.names.insert(tab, name);
         position
     }
 
@@ -231,7 +174,7 @@ impl TabRegistry {
     /// with `BuiltinNotClosable` first. Returns `true` if the tab was
     /// found and removed.
     pub async fn remove_user_shell_tab(&mut self, tab: &TabId) -> bool {
-        if matches!(tab, TabId::Claude | TabId::Aider) {
+        if is_builtin_id(tab.as_str()) {
             return false;
         }
         let Some(idx) = self.tab_order.iter().position(|t| t == tab) else {
@@ -243,7 +186,6 @@ impl TabRegistry {
                 warn!(?tab, error = %e, "remove_user_shell_tab: shutdown failed");
             }
         }
-        self.shell_configs.remove(tab);
         self.names.remove(tab);
         true
     }
@@ -269,23 +211,17 @@ impl TabRegistry {
             .get(&tab)
             .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
         let snap = settings.current();
-        // resolve_command (inside build_launch_spec) is the most common
-        // failure surface — "aider not on PATH". Emit SubprocessExited so
-        // the state machine pins the tab to Error and the avatar reflects
-        // it; the frontend also gets the raw error back from the Tauri
-        // call to render its in-tab overlay.
-        let spec = match build_launch_spec(
-            tab.clone(),
-            &snap,
-            self.shell_configs.get(&tab),
-            launch_cwd,
-            invocation_args,
-        ) {
+        // build_launch_spec resolves the command via PATH; "binary not on
+        // PATH" is the most common failure surface. Shell tabs route this
+        // to a dedicated `ShellLaunchFailed` signal that pins the tab to
+        // the closed sub-state with a "command not found" message — Enter
+        // on that overlay opens the Configure dialog rather than retrying
+        // the spawn (which would just fail again). AI tabs and other
+        // failure types fall back to the generic SubprocessExited path.
+        let spec = match build_launch_spec(tab.clone(), &snap, launch_cwd, invocation_args) {
             Ok(s) => s,
             Err(e) => {
-                let _ = self
-                    .state_signals
-                    .try_send(StateSignal::SubprocessExited { tab, code: None });
+                emit_launch_failure(&self.state_signals, &tab, &e);
                 return Err(e);
             }
         };
@@ -335,18 +271,10 @@ impl TabRegistry {
             .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
         manager.shutdown().await?;
         let snap = settings.current();
-        let spec = match build_launch_spec(
-            tab.clone(),
-            &snap,
-            self.shell_configs.get(&tab),
-            launch_cwd,
-            invocation_args,
-        ) {
+        let spec = match build_launch_spec(tab.clone(), &snap, launch_cwd, invocation_args) {
             Ok(s) => s,
             Err(e) => {
-                let _ = self
-                    .state_signals
-                    .try_send(StateSignal::SubprocessExited { tab, code: None });
+                emit_launch_failure(&self.state_signals, &tab, &e);
                 return Err(e);
             }
         };
@@ -454,6 +382,31 @@ impl TabRegistry {
     }
 }
 
+/// Translate a launch-time `AppError` into the right state-machine signal.
+/// Shell tabs with a `CommandNotFound` get a dedicated `ShellLaunchFailed`
+/// signal so the closed overlay can show a "command not found" message and
+/// route Enter to Configure instead of restart. Everything else (AI tabs,
+/// other Shell failure modes) goes through the generic SubprocessExited
+/// path that turns into Error / a regular closed overlay.
+fn emit_launch_failure(state_signals: &mpsc::Sender<StateSignal>, tab: &TabId, err: &AppError) {
+    if matches!(tab.kind(), TabKind::Shell) {
+        if let AppError::CommandNotFound(name) = err {
+            let message = format!(
+                "Shell command not found: {name}. Reconfigure or close this tab."
+            );
+            let _ = state_signals.try_send(StateSignal::ShellLaunchFailed {
+                tab: tab.clone(),
+                message,
+            });
+            return;
+        }
+    }
+    let _ = state_signals.try_send(StateSignal::SubprocessExited {
+        tab: tab.clone(),
+        code: None,
+    });
+}
+
 /// Per-tab input-length counters for the state manager's auto-leave-Listening
 /// tick. Seeded with the launch tab list; the state manager grows/shrinks
 /// the map at runtime on TabAdded/TabRemoved signals (see `state::manager`).
@@ -465,4 +418,3 @@ pub fn make_input_lengths(seed: &[TabId]) -> InputLengths {
         .collect();
     Arc::new(RwLock::new(map))
 }
-

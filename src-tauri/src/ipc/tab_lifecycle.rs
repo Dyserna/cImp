@@ -1,7 +1,13 @@
-//! Tab-lifecycle IPC commands for V3 Milestone 2: create / close / rename
-//! / reconfigure user-managed Shell tabs. Each command returns a
-//! `TabLifecycleError` with a serde-tagged shape so the frontend dialog
-//! can render inline field errors keyed off the variant.
+//! Tab-lifecycle IPC commands for V3: create / close / rename / reconfigure
+//! user-managed Shell tabs. Each command returns a `TabLifecycleError`
+//! with a serde-tagged shape so the frontend dialog can render inline
+//! field errors keyed off the variant.
+//!
+//! V3-M3: every command persists its mutation to settings via
+//! `SettingsHandle::set`, which broadcasts the new state to all listeners
+//! and triggers a debounced disk write. Settings is the single source of
+//! truth for tab identity, name, and spawn config — there is no per-tab
+//! side table any more.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,9 +18,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::ipc::AppState;
-use crate::shell::{detect, ShellSpec};
+use crate::settings::{ShellTabConfig as ShellTabSettings, TabConfig};
+use crate::shell::detect;
 use crate::state::{StateSignal, TabId, TabKind, TabMeta};
-use crate::tabs::ShellTabConfig;
 
 /// Wire-format error for the tab-lifecycle commands. Internally tagged so
 /// each variant becomes `{ "kind": "...", ...fields }` on the JSON side.
@@ -35,8 +41,7 @@ pub enum TabLifecycleError {
     CwdNotFound { path: String },
     /// The target tab id does not exist in the registry.
     TabNotFound { tab: String },
-    /// Attempt to close a builtin (Claude / Aider). Builtins are pinned in
-    /// V3; closing requires a different milestone.
+    /// Attempt to close a builtin (Claude / Aider / shell-default-1).
     BuiltinNotClosable,
     /// `reconfigure_shell_tab` was called on a non-Shell tab.
     WrongKind,
@@ -58,14 +63,13 @@ impl TabLifecycleError {
     }
 }
 
-/// Validated input for `create_shell_tab`. Frontend dialog sends raw
-/// strings; backend resolves command, splits args via `shlex`, and only
-/// then constructs this struct. Lives here rather than in the command
-/// signature so callers (tests, future REST surface, etc.) can reuse the
-/// validation pipeline.
+/// Validated input for `create_shell_tab` / `reconfigure_shell_tab`.
+/// Frontend dialog sends raw strings; backend resolves command, splits
+/// args via `shlex`, and only then constructs this struct.
 struct ValidatedShellInput {
     name: String,
-    spec: ShellSpec,
+    command: PathBuf,
+    args: Vec<String>,
     cwd: Option<PathBuf>,
     env: HashMap<String, String>,
 }
@@ -111,18 +115,33 @@ fn validate_inputs(
 
     Ok(ValidatedShellInput {
         name: trimmed_name,
-        spec: ShellSpec {
-            command: resolved,
-            args,
-        },
+        command: resolved,
+        args,
         cwd: cwd_path,
         env,
     })
 }
 
-/// Create a new user-managed Shell tab. Validates the inputs, spawns a
-/// fresh PTY, registers it with the registry + state manager, and emits
-/// `TabCreated` so the frontend mirrors the addition into its tabs store.
+fn validated_to_shell_config(
+    id: String,
+    builtin: bool,
+    input: &ValidatedShellInput,
+) -> ShellTabSettings {
+    ShellTabSettings {
+        id,
+        builtin,
+        name: input.name.clone(),
+        command: input.command.to_string_lossy().into_owned(),
+        args: input.args.clone(),
+        cwd: input.cwd.clone(),
+        env: input.env.clone(),
+        notifications: Default::default(),
+    }
+}
+
+/// Create a new user-managed Shell tab. Validates the inputs, registers it
+/// in the registry, appends a `TabConfig::Shell` to settings, and emits
+/// `TabAdded` so the frontend mirrors the addition into its tabs store.
 #[tauri::command]
 pub async fn create_shell_tab(
     app: AppHandle,
@@ -133,11 +152,6 @@ pub async fn create_shell_tab(
     cwd: Option<String>,
     env: HashMap<String, String>,
 ) -> Result<TabId, TabLifecycleError> {
-    // Args arrive as a single string (the dialog has a single text input
-    // for them, with shell-style quoting). Splitting here so the dialog
-    // doesn't have to depend on a JS shell-lex implementation; failures
-    // fall through to an empty arg vector, mirroring portable-pty's
-    // tolerant parser.
     let args = shlex::split(&args_string).unwrap_or_default();
     let validated = validate_inputs(name, command, args, cwd, env)?;
 
@@ -148,30 +162,32 @@ pub async fn create_shell_tab(
         name: validated.name.clone(),
     };
 
-    // Mutate the registry: install a fresh PtyManager and the shell
-    // config, append to tab_order, capture the new position. We do NOT
-    // spawn the PTY here — frontend's Terminal.svelte calls `pty_start`
-    // on its first mount, same path as the launch-seed tabs use. The
-    // `TabCreated` event triggers that mount.
+    // Persist to settings BEFORE registering with the registry. This way,
+    // when the registry's start_tab path runs (post TabAdded → frontend
+    // mount → pty_start), `build_launch_spec` can find the entry. The
+    // broadcast triggered by `set` is also what the frontend's settings
+    // store consumes to reflect the new entry in the Tabs section.
+    {
+        let mut snap = state.settings.current();
+        let entry = TabConfig::Shell(validated_to_shell_config(
+            tab.as_str().to_string(),
+            false,
+            &validated,
+        ));
+        // Idempotent on duplicate id (matches the registry's behavior).
+        if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == tab.as_str()) {
+            *existing = entry;
+        } else {
+            snap.tabs.push(entry);
+        }
+        state.settings.set(snap);
+    }
+
     let position = {
         let mut registry = state.tabs.lock().await;
-        registry.insert_user_shell_tab(
-            tab.clone(),
-            validated.name.clone(),
-            ShellTabConfig {
-                spec: validated.spec,
-                cwd: validated.cwd,
-                env: validated.env,
-            },
-        )
+        registry.insert_user_shell_tab(tab.clone(), validated.name.clone())
     };
 
-    // Tell the state manager the new tab exists. It allocates a
-    // `TabState` entry, an input-length counter, emits `TabCreated`
-    // (frontend) + initial `StateChanged { Idle }`. Failure to send is a
-    // hard internal error — we already mutated the registry, but
-    // returning Err here lets the frontend retry; on a successful retry
-    // the registry's idempotent `insert_user_shell_tab` will overwrite.
     if let Err(e) = state
         .state_signals
         .send(StateSignal::TabAdded {
@@ -184,7 +200,6 @@ pub async fn create_shell_tab(
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
 
-    // Activate the new tab so the frontend switches to it on next render.
     {
         let mut registry = state.tabs.lock().await;
         if let Err(e) = registry.activate(tab.clone()).await {
@@ -197,16 +212,25 @@ pub async fn create_shell_tab(
     Ok(tab)
 }
 
-/// Close a user-managed Shell tab. Builtins (Claude/Aider) reject. The
-/// PTY is killed, the registry entry dropped, and `TabClosed` is emitted.
+/// Close a user-managed Shell tab. Builtins (Claude/Aider/shell-default-1)
+/// reject. The PTY is killed, the registry entry dropped, the settings
+/// entry removed, and `TabRemoved` is emitted.
 #[tauri::command]
 pub async fn close_tab(
     state: State<'_, AppState>,
     tab: TabId,
 ) -> Result<(), TabLifecycleError> {
-    if matches!(tab, TabId::Claude | TabId::Aider) {
-        return Err(TabLifecycleError::BuiltinNotClosable);
+    {
+        // Snapshot the entry to gate on builtin status. Settings is the
+        // canonical builtin marker; the id-based heuristic is a fallback.
+        let snap = state.settings.current();
+        if let Some(entry) = snap.find_tab(tab.as_str()) {
+            if entry.builtin() {
+                return Err(TabLifecycleError::BuiltinNotClosable);
+            }
+        }
     }
+
     let prev_tab = {
         let registry = state.tabs.lock().await;
         if !registry.has_tab(&tab) {
@@ -232,11 +256,6 @@ pub async fn close_tab(
         }
     }
 
-    // Drop the PTY + registry entry. The PtyManager.shutdown() kills the
-    // child if it's still running; the waiter task converts the kill into
-    // a `SubprocessExited` signal but the state manager will discard it
-    // (the tab no longer has a TabState by then) — the explicit
-    // `TabRemoved` we send below is the canonical lifecycle event.
     let removed = {
         let mut registry = state.tabs.lock().await;
         registry.remove_user_shell_tab(&tab).await
@@ -245,6 +264,18 @@ pub async fn close_tab(
         return Err(TabLifecycleError::TabNotFound {
             tab: tab.as_str().to_string(),
         });
+    }
+
+    // Remove the settings entry. Drop the active_tab_id pointer if it
+    // referenced this tab — the frontend will set a new one on its next
+    // tab-switch event.
+    {
+        let mut snap = state.settings.current();
+        snap.tabs.retain(|t| t.id() != tab.as_str());
+        if snap.session.active_tab_id.as_deref() == Some(tab.as_str()) {
+            snap.session.active_tab_id = None;
+        }
+        state.settings.set(snap);
     }
 
     if let Err(e) = state
@@ -281,6 +312,13 @@ pub async fn rename_tab(
         }
         registry.set_name(&tab, &trimmed);
     }
+    {
+        let mut snap = state.settings.current();
+        if let Some(entry) = snap.find_tab_mut(tab.as_str()) {
+            entry.set_name(trimmed.clone());
+        }
+        state.settings.set(snap);
+    }
     if let Err(e) = state
         .state_signals
         .send(StateSignal::TabRenameRequested {
@@ -315,29 +353,43 @@ pub async fn reconfigure_shell_tab(
     let validated = validate_inputs(name, command, args, cwd, env)?;
 
     let name_changed: bool = {
-        let mut registry = state.tabs.lock().await;
+        let registry = state.tabs.lock().await;
         if !registry.has_tab(&tab) {
             return Err(TabLifecycleError::TabNotFound {
                 tab: tab.as_str().to_string(),
             });
         }
-        let prev = registry.name_of(&tab);
-        let changed = prev.as_deref() != Some(validated.name.as_str());
-        registry.replace_shell_config(
-            &tab,
-            ShellTabConfig {
-                spec: validated.spec.clone(),
-                cwd: validated.cwd.clone(),
-                env: validated.env.clone(),
-            },
-        );
-        if changed {
-            registry.set_name(&tab, &validated.name);
-        }
-        changed
+        registry
+            .name_of(&tab)
+            .as_deref()
+            .map(|n| n != validated.name.as_str())
+            .unwrap_or(true)
     };
 
+    {
+        let mut snap = state.settings.current();
+        let Some(entry) = snap.find_tab_mut(tab.as_str()) else {
+            return Err(TabLifecycleError::TabNotFound {
+                tab: tab.as_str().to_string(),
+            });
+        };
+        let TabConfig::Shell(cfg) = entry else {
+            return Err(TabLifecycleError::WrongKind);
+        };
+        cfg.name = validated.name.clone();
+        cfg.command = validated.command.to_string_lossy().into_owned();
+        cfg.args = validated.args.clone();
+        cfg.cwd = validated.cwd.clone();
+        cfg.env = validated.env.clone();
+        // notifications/builtin/id stay as they were.
+        state.settings.set(snap);
+    }
+
     if name_changed {
+        {
+            let mut registry = state.tabs.lock().await;
+            registry.set_name(&tab, &validated.name);
+        }
         if let Err(e) = state
             .state_signals
             .send(StateSignal::TabRenameRequested {
@@ -378,7 +430,7 @@ pub struct DefaultShellWire {
 
 /// Wire-format snapshot of a Shell tab's current spawn config. Returned
 /// by `get_shell_tab_config` so the Configure dialog can pre-fill from
-/// the live registry state (rather than just the platform default).
+/// the live settings state.
 #[derive(Debug, Serialize)]
 pub struct ShellTabConfigWire {
     pub name: String,
@@ -388,8 +440,8 @@ pub struct ShellTabConfigWire {
     pub env: HashMap<String, String>,
 }
 
-/// Look up the current Shell-tab config. Returns `WrongKind` for AI tabs
-/// and `TabNotFound` for unknown ids.
+/// Look up the current Shell-tab config from settings. Returns `WrongKind`
+/// for AI tabs and `TabNotFound` for unknown ids.
 #[tauri::command]
 pub async fn get_shell_tab_config(
     state: State<'_, AppState>,
@@ -398,22 +450,20 @@ pub async fn get_shell_tab_config(
     if !matches!(tab.kind(), TabKind::Shell) {
         return Err(TabLifecycleError::WrongKind);
     }
-    let registry = state.tabs.lock().await;
-    let cfg = registry
-        .shell_config(&tab)
+    let snap = state.settings.current();
+    let entry = snap
+        .find_tab(tab.as_str())
         .ok_or_else(|| TabLifecycleError::TabNotFound {
             tab: tab.as_str().to_string(),
-        })?
-        .clone();
-    let name = registry
-        .name_of(&tab)
-        .unwrap_or_else(|| tab.as_str().to_string());
+        })?;
+    let TabConfig::Shell(cfg) = entry else {
+        return Err(TabLifecycleError::WrongKind);
+    };
     Ok(ShellTabConfigWire {
-        name,
-        command: cfg.spec.command.to_string_lossy().into_owned(),
-        args: cfg.spec.args.join(" "),
-        cwd: cfg.cwd.map(|p| p.to_string_lossy().into_owned()),
-        env: cfg.env,
+        name: cfg.name.clone(),
+        command: cfg.command.clone(),
+        args: cfg.args.join(" "),
+        cwd: cfg.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        env: cfg.env.clone(),
     })
 }
-

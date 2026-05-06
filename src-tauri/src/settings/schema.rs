@@ -1,10 +1,21 @@
 //! Settings schema. Every struct uses `#[serde(default)]` so loading a JSON
 //! file written by a future or past version still succeeds: missing fields
-//! get defaults, unknown fields are ignored. v2 schema; the v1 → v2 migration
-//! lives in `persistence.rs` and runs once on first load of an old file.
+//! get defaults, unknown fields are ignored. v1.2 schema; the v1 → v2 and
+//! v1.1 → v1.2 migrations live in `migration.rs` and run once on first load.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+
+use crate::shell::ShellSpec;
+
+/// Reserved IDs the integrity check protects. Hand-edited settings files
+/// cannot make these disappear — they are restored with defaults if missing
+/// and forced to `builtin: true` regardless of what the file claims.
+pub const CLAUDE_TAB_ID: &str = "claude";
+pub const AIDER_TAB_ID: &str = "aider";
+pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
@@ -15,16 +26,264 @@ pub struct Settings {
     pub behavior: BehaviorSettings,
     pub compose: ComposeSettings,
     pub shortcuts: ShortcutSettings,
-    pub tabs: TabsSettings,
+    /// Ordered list of tabs. The first user-created shell tab appears after
+    /// the two AI builtins (claude/aider) and the default shell tab. Order
+    /// is user-visible (tab bar) and persisted across launches. The startup
+    /// integrity check ensures the three reserved-id entries are present;
+    /// hand-edits that delete them are repaired at load time.
+    pub tabs: Vec<TabConfig>,
     pub processing: ProcessingSettings,
-    /// Interim home for the M1 Shell-1 tab's mutable bits (name + notification
-    /// strings). Phase 8 of MILESTONE-V3-01 places it here under a leading-
-    /// underscore key to advertise its temporary nature; M3 of v3 reshapes
-    /// `tabs` into an array and folds Shell-tab settings in alongside the
-    /// AI builtins, dropping this field via migration.
-    #[serde(rename = "_shell_1_tmp", default)]
-    pub shell_1_tmp: Shell1Interim,
+    /// Last-active tab pointer, restored on launch. None on a fresh install
+    /// (falls back to the first tab); set whenever the user switches tabs.
+    pub session: SessionState,
 }
+
+impl Settings {
+    /// Lookup a tab entry by id. Returns None for ids that don't exist —
+    /// callers (launch flow, lifecycle commands) treat this as "tab gone"
+    /// rather than constructing a default.
+    pub fn find_tab(&self, id: &str) -> Option<&TabConfig> {
+        self.tabs.iter().find(|t| t.id() == id)
+    }
+
+    pub fn find_tab_mut(&mut self, id: &str) -> Option<&mut TabConfig> {
+        self.tabs.iter_mut().find(|t| t.id() == id)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct SessionState {
+    pub active_tab_id: Option<String>,
+}
+
+/// Discriminated tab config. The `kind` field is the JSON discriminator
+/// (`"ai_tool"` or `"shell"`), produced by serde's internally-tagged
+/// representation. Each variant carries the fields specific to its kind —
+/// AI tabs have `tts_injection` and three notification slots; Shell tabs
+/// have two notification slots and no TTS hook.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TabConfig {
+    AiTool(AiToolTabConfig),
+    Shell(ShellTabConfig),
+}
+
+impl TabConfig {
+    pub fn id(&self) -> &str {
+        match self {
+            TabConfig::AiTool(c) => &c.id,
+            TabConfig::Shell(c) => &c.id,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            TabConfig::AiTool(c) => &c.name,
+            TabConfig::Shell(c) => &c.name,
+        }
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        match self {
+            TabConfig::AiTool(c) => c.name = name,
+            TabConfig::Shell(c) => c.name = name,
+        }
+    }
+
+    pub fn builtin(&self) -> bool {
+        match self {
+            TabConfig::AiTool(c) => c.builtin,
+            TabConfig::Shell(c) => c.builtin,
+        }
+    }
+
+    pub fn set_builtin(&mut self, value: bool) {
+        match self {
+            TabConfig::AiTool(c) => c.builtin = value,
+            TabConfig::Shell(c) => c.builtin = value,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct AiToolTabConfig {
+    pub id: String,
+    pub ai_tool_kind: AiToolKindWire,
+    pub builtin: bool,
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub tts_injection: TtsInjection,
+    pub notifications: AiNotificationConfig,
+    /// Mirrors v1.1's per-tab `first_launch_notice_dismissed`. Carried
+    /// through migration verbatim so the aider banner doesn't re-appear for
+    /// existing users.
+    pub first_launch_notice_dismissed: bool,
+}
+
+impl Default for AiToolTabConfig {
+    fn default() -> Self {
+        // Neutral default — only used when serde encounters a malformed
+        // entry mid-array. Real defaults come from the constructors below.
+        Self {
+            id: String::new(),
+            ai_tool_kind: AiToolKindWire::ClaudeCode,
+            builtin: false,
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            env: HashMap::new(),
+            tts_injection: TtsInjection::default(),
+            notifications: AiNotificationConfig::default(),
+            first_launch_notice_dismissed: false,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct ShellTabConfig {
+    pub id: String,
+    pub builtin: bool,
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub notifications: ShellNotificationConfig,
+}
+
+impl Default for ShellTabConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            builtin: false,
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            env: HashMap::new(),
+            notifications: ShellNotificationConfig::default(),
+        }
+    }
+}
+
+/// Wire-format mirror of `state::AiToolKind`. The state-side enum lives in
+/// `state::manager` for use with the runtime state machine; this serde-aware
+/// twin is the on-disk discriminator. The `From` impls below keep them in
+/// lockstep.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiToolKindWire {
+    ClaudeCode,
+    Aider,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct AiNotificationConfig {
+    pub idle: String,
+    pub awaiting_permission: String,
+    pub error: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct ShellNotificationConfig {
+    pub error: String,
+    /// `{code}` placeholder is interpolated with the actual exit code in M4.
+    pub exited: String,
+}
+
+impl Default for ShellNotificationConfig {
+    fn default() -> Self {
+        Self {
+            error: "Shell encountered an error".to_string(),
+            exited: "Shell exited (code {code})".to_string(),
+        }
+    }
+}
+
+// --- Builtin defaults -------------------------------------------------------
+//
+// Used by:
+//   1. The migration step to fill in missing entries (e.g. an aider entry
+//      absent from a hand-edited v1.1 file).
+//   2. The integrity check at load time to restore deleted builtins.
+//   3. `Settings::default()` to seed a fresh-install file before the first
+//      save.
+
+pub fn default_claude_tab() -> TabConfig {
+    TabConfig::AiTool(AiToolTabConfig {
+        id: CLAUDE_TAB_ID.to_string(),
+        ai_tool_kind: AiToolKindWire::ClaudeCode,
+        builtin: true,
+        name: "Claude".to_string(),
+        command: "claude".to_string(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        tts_injection: TtsInjection {
+            enabled: true,
+            instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
+        },
+        notifications: AiNotificationConfig {
+            idle: "Claude is idle".to_string(),
+            awaiting_permission: "Claude is awaiting permission".to_string(),
+            error: "Claude encountered an error".to_string(),
+        },
+        // Claude has no first-launch notice; pre-dismissed so the overlay
+        // code can use a single per-tab predicate.
+        first_launch_notice_dismissed: true,
+    })
+}
+
+pub fn default_aider_tab() -> TabConfig {
+    TabConfig::AiTool(AiToolTabConfig {
+        id: AIDER_TAB_ID.to_string(),
+        ai_tool_kind: AiToolKindWire::Aider,
+        builtin: true,
+        name: "Aider".to_string(),
+        command: "aider".to_string(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        tts_injection: TtsInjection {
+            enabled: false,
+            instructions: String::new(),
+        },
+        notifications: AiNotificationConfig {
+            idle: "Aider is idle".to_string(),
+            awaiting_permission: "Aider is awaiting permission".to_string(),
+            error: "Aider encountered an error".to_string(),
+        },
+        first_launch_notice_dismissed: false,
+    })
+}
+
+/// Default Shell-1 entry. Takes the resolved platform default shell so the
+/// `command` and `args` fields land on the right binary for the host. The
+/// reserved id keeps the integrity check able to identify "the original
+/// Shell 1" across launches.
+pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: SHELL_DEFAULT_TAB_ID.to_string(),
+        builtin: true,
+        name: "Shell 1".to_string(),
+        command: default_shell.command.to_string_lossy().into_owned(),
+        args: default_shell.args.clone(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+    })
+}
+
+// --- Other settings sub-structs (unchanged from v2) -------------------------
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
@@ -220,9 +479,6 @@ pub struct ShortcutSettings {
     pub open_settings: Option<String>,
     pub switch_to_tab_1: Option<String>,
     pub switch_to_tab_2: Option<String>,
-    /// MILESTONE-V3-01 shortcut for the third tab (Shell-1 in M1). M2
-    /// extends the shortcut set up to `switch_to_tab_9` per the design
-    /// doc, position-bound (1-indexed in the live tab order).
     pub switch_to_tab_3: Option<String>,
     pub switch_to_tab_4: Option<String>,
     pub switch_to_tab_5: Option<String>,
@@ -259,142 +515,11 @@ impl Default for ShortcutSettings {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-#[serde(default)]
-pub struct TabsSettings {
-    #[serde(default = "TabSettings::default_claude")]
-    pub claude: TabSettings,
-    #[serde(default = "TabSettings::default_aider")]
-    pub aider: TabSettings,
-}
-
-impl Default for TabsSettings {
-    fn default() -> Self {
-        Self {
-            claude: TabSettings::default_claude(),
-            aider: TabSettings::default_aider(),
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-#[serde(default)]
-pub struct TabSettings {
-    pub command: String,
-    pub extra_cli_flags: Vec<String>,
-    pub tts_injection: TtsInjection,
-    pub notifications: NotificationsSettings,
-    /// Set to true once the user has dismissed the per-tab first-launch
-    /// notice. Only the aider tab's notice is shown today; the field exists
-    /// per-tab so future tabs can opt in without a schema change.
-    pub first_launch_notice_dismissed: bool,
-}
-
-impl TabSettings {
-    pub fn default_claude() -> Self {
-        Self {
-            command: "claude".to_string(),
-            extra_cli_flags: Vec::new(),
-            tts_injection: TtsInjection {
-                enabled: true,
-                instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
-            },
-            notifications: NotificationsSettings {
-                idle: "Claude is idle".to_string(),
-                awaiting_permission: "Claude is awaiting permission".to_string(),
-                error: "Claude encountered an error".to_string(),
-            },
-            // Claude has no first-launch notice; pre-dismissed so the
-            // overlay code can use a single per-tab predicate.
-            first_launch_notice_dismissed: true,
-        }
-    }
-
-    pub fn default_aider() -> Self {
-        Self {
-            command: "aider".to_string(),
-            extra_cli_flags: Vec::new(),
-            tts_injection: TtsInjection {
-                enabled: false,
-                instructions: String::new(),
-            },
-            notifications: NotificationsSettings {
-                idle: "Aider is idle".to_string(),
-                awaiting_permission: "Aider is awaiting permission".to_string(),
-                error: "Aider encountered an error".to_string(),
-            },
-            first_launch_notice_dismissed: false,
-        }
-    }
-}
-
-// Neutral default for the field-level `#[serde(default)]` fallback when a
-// caller manually edits the file and partially deletes a tab object. The
-// per-tab defaults from `default_claude` / `default_aider` cover the
-// missing-whole-object case.
-impl Default for TabSettings {
-    fn default() -> Self {
-        Self {
-            command: String::new(),
-            extra_cli_flags: Vec::new(),
-            tts_injection: TtsInjection::default(),
-            notifications: NotificationsSettings::default(),
-            first_launch_notice_dismissed: false,
-        }
-    }
-}
-
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct TtsInjection {
     pub enabled: bool,
     pub instructions: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
-#[serde(default)]
-pub struct NotificationsSettings {
-    pub idle: String,
-    pub awaiting_permission: String,
-    pub error: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-#[serde(default)]
-pub struct Shell1Interim {
-    pub name: String,
-    pub notifications: ShellNotifications,
-}
-
-impl Default for Shell1Interim {
-    fn default() -> Self {
-        Self {
-            name: "Shell 1".to_string(),
-            notifications: ShellNotifications::default(),
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-#[serde(default)]
-pub struct ShellNotifications {
-    /// Spoken when a Shell tab transitions to the avatar Error state. Empty
-    /// disables the announcement (per the existing notification convention).
-    pub error: String,
-    /// Spoken when a Shell tab's subprocess exits while the user is on a
-    /// different tab. The literal `{code}` placeholder is interpolated with
-    /// the actual exit code in M4 of v3-01; in M1 the placeholder appears
-    /// verbatim if present.
-    pub exited: String,
-}
-
-impl Default for ShellNotifications {
-    fn default() -> Self {
-        Self {
-            error: "Shell encountered an error".to_string(),
-            exited: "Shell exited (code {code})".to_string(),
-        }
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

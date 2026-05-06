@@ -1,12 +1,12 @@
 <script lang="ts">
-  import type { NotificationsSettings } from './types';
+  import type { AiNotificationConfig } from './types';
 
   // Three labeled rows (idle, awaiting permission, error) with a per-row
   // reset. Defaults come from a prop so the same component renders for any
   // tab. Notification firing logic itself ships in V2-04; this is just the
   // configuration surface.
   let {
-    notifications = $bindable<NotificationsSettings>({
+    notifications = $bindable<AiNotificationConfig>({
       idle: '',
       awaiting_permission: '',
       error: '',
@@ -14,12 +14,12 @@
     defaults,
     onchange,
   }: {
-    notifications: NotificationsSettings;
-    defaults: NotificationsSettings;
+    notifications: AiNotificationConfig;
+    defaults: AiNotificationConfig;
     onchange?: () => void;
   } = $props();
 
-  type RowKey = keyof NotificationsSettings;
+  type RowKey = keyof AiNotificationConfig;
   const rows: { key: RowKey; label: string }[] = [
     { key: 'idle', label: 'When tab becomes idle while you’re on another tab' },
     {

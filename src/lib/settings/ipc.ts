@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Settings, TabSettings } from './types';
+import type { AiToolTabConfig, Settings } from './types';
 import type { TabId } from '../tabs/types';
 
 export async function settingsGet(): Promise<Settings> {
@@ -26,6 +26,16 @@ export async function requestTabRestart(tab: TabId): Promise<void> {
   await invoke('request_tab_restart', { tab });
 }
 
-export async function tabDefaultSettings(tab: TabId): Promise<TabSettings> {
-  return invoke('tab_default_settings', { tab });
+/// Per-AI-tab default config from the backend. Used by the Settings
+/// window's "Reset to default" buttons to match the Rust-side defaults
+/// exactly (notably the embedded RUNTIME_SYSTEM_PROMPT for Claude's TTS
+/// instructions). Returns an error from the backend for non-AI ids.
+export async function aiToolTabDefaults(tab: TabId): Promise<AiToolTabConfig> {
+  return invoke('ai_tool_tab_defaults', { tab });
+}
+
+/// Activate a tab AND persist its id as `session.active_tab_id` so it's
+/// restored on next launch. Backend debounces the save.
+export async function setActiveTab(tab: TabId): Promise<void> {
+  await invoke('set_active_tab', { tab });
 }

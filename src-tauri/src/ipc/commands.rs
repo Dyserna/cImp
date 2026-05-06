@@ -6,7 +6,10 @@ use tauri::{AppHandle, Emitter, EventTarget, State};
 use crate::error::{AppError, AppResult};
 use crate::ipc::windows::{open_or_focus_settings, SETTINGS_LABEL};
 use crate::ipc::AppState;
-use crate::settings::{Settings, TabSettings};
+use crate::settings::{
+    default_aider_tab, default_claude_tab, AiToolTabConfig, Settings, TabConfig, AIDER_TAB_ID,
+    CLAUDE_TAB_ID,
+};
 use crate::state::{StateSignal, TabId};
 
 #[tauri::command]
@@ -246,11 +249,31 @@ pub async fn acknowledge_error(state: State<'_, AppState>, tab: TabId) -> AppRes
 
 /// Activate a tab. Frontend calls this on click and on Ctrl+1/Ctrl+2; the
 /// state manager broadcasts an `ActiveTabChanged` event so all subscribers
-/// reconcile from a single source of truth.
+/// reconcile from a single source of truth. Does NOT persist the active
+/// tab to settings — use `set_active_tab` for that.
 #[tauri::command]
 pub async fn tab_activate(state: State<'_, AppState>, tab: TabId) -> AppResult<()> {
     let mut registry = state.tabs.lock().await;
     registry.activate(tab).await
+}
+
+/// Activate a tab AND persist its id as `session.active_tab_id`. Used by
+/// the frontend's tab-switch handler (click, Ctrl+1..9) so the user's
+/// last-active tab is restored on next launch. The settings write is
+/// debounced so a fast Ctrl+1/Ctrl+2 burst doesn't hammer the disk.
+#[tauri::command]
+pub async fn set_active_tab(state: State<'_, AppState>, tab: TabId) -> AppResult<()> {
+    let id_string = tab.as_str().to_string();
+    {
+        let mut registry = state.tabs.lock().await;
+        registry.activate(tab).await?;
+    }
+    let mut snap = state.settings.current();
+    if snap.session.active_tab_id.as_deref() != Some(id_string.as_str()) {
+        snap.session.active_tab_id = Some(id_string);
+        state.settings.set(snap);
+    }
+    Ok(())
 }
 
 /// Snapshot the live tab list. Frontend calls this once on App mount to
@@ -271,23 +294,31 @@ pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Settings> {
     Ok(state.settings.current())
 }
 
-/// Per-tab default `TabSettings`. Used by the Settings window's "Reset to
+/// Per-AI-tab default config. Used by the Settings window's "Reset to
 /// default" buttons so the frontend doesn't have to mirror Rust-side
 /// constants (notably `RUNTIME_SYSTEM_PROMPT` for Claude's TTS instructions).
 ///
-/// Only AI builtins are valid here in M1; Shell tabs use a separate
-/// settings shape (Phase 8) and never exercise this command.
+/// Only AI tabs have a meaningful "default" in v1.2 — Shell tab defaults
+/// depend on the host platform's auto-detected shell, and "reset" on a
+/// user-created Shell tab is not a meaningful UX (use the New Shell Tab
+/// dialog to spawn a fresh one). Shell ids return an error.
 #[tauri::command]
-pub async fn tab_default_settings(tab: TabId) -> AppResult<TabSettings> {
-    Ok(match &tab {
-        TabId::Claude => TabSettings::default_claude(),
-        TabId::Aider => TabSettings::default_aider(),
-        TabId::Shell(id) => {
+pub async fn ai_tool_tab_defaults(tab: TabId) -> AppResult<AiToolTabConfig> {
+    let config = match tab.as_str() {
+        CLAUDE_TAB_ID => default_claude_tab(),
+        AIDER_TAB_ID => default_aider_tab(),
+        other => {
             return Err(AppError::Pty(format!(
-                "tab_default_settings: shell tab {id} has no TabSettings shape"
+                "ai_tool_tab_defaults: tab {other} has no AI defaults"
             )))
         }
-    })
+    };
+    match config {
+        TabConfig::AiTool(c) => Ok(c),
+        TabConfig::Shell(_) => Err(AppError::Pty(
+            "ai_tool_tab_defaults: reserved id resolved to a shell config".into(),
+        )),
+    }
 }
 
 #[tauri::command]

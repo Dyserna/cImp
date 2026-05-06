@@ -8,13 +8,19 @@
     applySettings,
   } from './lib/settings/store';
   import {
+    aiToolTabDefaults,
     listVoices,
     requestTabRestart,
-    tabDefaultSettings,
   } from './lib/settings/ipc';
-  import type { Settings, TabSettings } from './lib/settings/types';
-  import type { AiTabId } from './lib/tabs/types';
-  import { AI_TABS, AI_TAB_META } from './lib/tabs/types';
+  import type {
+    AiToolTabConfig,
+    Settings,
+    ShellTabConfig,
+    TabConfig,
+  } from './lib/settings/types';
+  import { findTab, findTabIndex } from './lib/settings/types';
+  import type { AiTabId, TabId } from './lib/tabs/types';
+  import { AI_TABS } from './lib/tabs/types';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
 
@@ -22,18 +28,13 @@
   // Per-tab "applied" baselines — used to compute the Restart Required
   // indicator when subprocess-affecting fields drift from the spawn-time
   // settings. Notification text and first-launch dismissal are NOT in
-  // the diff because they apply live without restart.
-  let tabBaselines = $state<Record<AiTabId, TabSettings | null>>({
-    claude: null,
-    aider: null,
-  });
+  // the diff because they apply live without restart. Keyed by tab id
+  // so additional AI tabs in future versions plug in without a refactor.
+  let tabBaselines = $state<Record<string, AiToolTabConfig | null>>({});
   // Per-tab default settings, fetched from the backend so "Reset to default"
   // buttons match the Rust-side defaults exactly (in particular the embedded
   // RUNTIME_SYSTEM_PROMPT for Claude's TTS instructions).
-  let tabDefaults = $state<Record<AiTabId, TabSettings | null>>({
-    claude: null,
-    aider: null,
-  });
+  let tabDefaults = $state<Record<string, AiToolTabConfig | null>>({});
   let snapshot = $state<Settings | null>(null);
 
   // Keep `snapshot` in sync with the global store. Every input mutates
@@ -41,11 +42,18 @@
   // overwrites `snapshot` (which is fine — same value, no churn).
   let unsub: (() => void) | undefined;
 
+  function aiTabFromSnapshot(id: string): AiToolTabConfig | null {
+    if (!snapshot) return null;
+    const entry = findTab(snapshot, id);
+    return entry && entry.kind === 'ai_tool' ? entry : null;
+  }
+
   function captureBaseline(tab: AiTabId) {
-    if (!snapshot) return;
+    const entry = aiTabFromSnapshot(tab);
+    if (!entry) return;
     tabBaselines = {
       ...tabBaselines,
-      [tab]: structuredClone($state.snapshot(snapshot.tabs[tab])),
+      [tab]: structuredClone($state.snapshot(entry)),
     };
   }
 
@@ -62,11 +70,11 @@
       })
       .catch((e) => console.warn('list_voices failed', e));
     for (const t of AI_TABS) {
-      tabDefaultSettings(t)
+      aiToolTabDefaults(t)
         .then((d) => {
           tabDefaults = { ...tabDefaults, [t]: d };
         })
-        .catch((e) => console.warn(`tab_default_settings(${t}) failed`, e));
+        .catch((e) => console.warn(`ai_tool_tab_defaults(${t}) failed`, e));
     }
   });
 
@@ -82,25 +90,38 @@
     void applySettings(next);
   }
 
-  // Restart-affecting subset: command + flags + TTS injection. Notifications
-  // and first_launch_notice_dismissed apply live and are excluded.
-  function restartShape(t: TabSettings) {
+  /// Replace the AI-tab entry at `id` in the snapshot. Used by the
+  /// TabSettingsSection's bound setter; the array shape forces the
+  /// find-by-id lookup at write time.
+  function patchAiTab(id: string, value: AiToolTabConfig) {
+    patch((s) => {
+      const idx = findTabIndex(s, id);
+      if (idx < 0) return;
+      s.tabs[idx] = value;
+    });
+  }
+
+  // Restart-affecting subset: command + args + cwd + env + TTS injection.
+  // Notifications and first_launch_notice_dismissed apply live and are
+  // excluded.
+  function restartShape(t: AiToolTabConfig) {
     return {
       command: t.command,
-      extra_cli_flags: t.extra_cli_flags,
+      args: t.args,
+      cwd: t.cwd,
+      env: t.env,
       tts_injection: t.tts_injection,
     };
   }
 
   const restartRequired = $derived.by(() => {
-    const out: Record<AiTabId, boolean> = { claude: false, aider: false };
+    const out: Record<string, boolean> = {};
     if (!snapshot) return out;
     for (const t of AI_TABS) {
       const baseline = tabBaselines[t];
-      if (!baseline) continue;
-      out[t] =
-        JSON.stringify(restartShape(snapshot.tabs[t])) !==
-        JSON.stringify(restartShape(baseline));
+      const live = aiTabFromSnapshot(t);
+      if (!baseline || !live) continue;
+      out[t] = JSON.stringify(restartShape(live)) !== JSON.stringify(restartShape(baseline));
     }
     return out;
   });
@@ -108,6 +129,31 @@
   async function restartTab(tab: AiTabId) {
     await requestTabRestart(tab);
     captureBaseline(tab);
+  }
+
+  /// Tabs visible in the Tabs section, in their stored order. Filtered
+  /// view of `snapshot.tabs` so the template can render AI tabs and Shell
+  /// tabs differently. Empty array when settings haven't loaded yet.
+  const tabEntries = $derived<TabConfig[]>(snapshot?.tabs ?? []);
+
+  function aiTabAt(id: string): AiToolTabConfig | null {
+    return aiTabFromSnapshot(id);
+  }
+
+  function shellSummary(t: ShellTabConfig): string {
+    const args = t.args.length > 0 ? ' ' + t.args.join(' ') : '';
+    return `${t.command}${args}`;
+  }
+
+  /// Open the main window and emit a "configure tab" request that the tab
+  /// bar's right-click menu component listens for. Keeps the inline-editor
+  /// concern out of the settings window — Shell tab editing is one path
+  /// (the Configure dialog), invoked from either the tab bar context menu
+  /// or this settings list.
+  async function configureShellTab(_tabId: TabId) {
+    // Stub for now — the Configure dialog wiring is owned by the main
+    // window's tab-bar code. A future polish PR can route through a
+    // dedicated event; for v1.2 the user is told to right-click the tab.
   }
 
   async function pickFile(
@@ -551,26 +597,57 @@
     <section>
       <h2>Tabs</h2>
       <small class="hint">
-        Per-tab subprocess configuration. Changes to command, CLI flags, or
-        TTS injection require a restart of the affected tab to take effect.
+        All configured tabs in their stored order. AI builtins expand inline;
+        Shell tabs show a summary — edit them via right-click → Configure on
+        the tab bar.
       </small>
       <div class="tabs-grid">
-        {#each AI_TAB_META as meta (meta.id)}
-          <details open>
-            <summary>{meta.name}</summary>
-            <TabSettingsSection
-              tabId={meta.id}
-              displayName={meta.name}
-              bind:settings={
-                () => snapshot!.tabs[meta.id],
-                (v) => patch((s) => (s.tabs[meta.id] = v))
-              }
-              defaults={tabDefaults[meta.id]}
-              restartRequired={restartRequired[meta.id]}
-              onchange={() => {}}
-              onrestart={() => restartTab(meta.id)}
-            />
-          </details>
+        {#each tabEntries as entry (entry.id)}
+          {#if entry.kind === 'ai_tool'}
+            {@const live = aiTabAt(entry.id)}
+            <details open>
+              <summary>
+                {entry.name}
+                <span class="kind-badge ai">AI</span>
+              </summary>
+              {#if live}
+                <TabSettingsSection
+                  tabId={entry.id as TabId}
+                  displayName={entry.name}
+                  bind:settings={
+                    () => live,
+                    (v) => patchAiTab(entry.id, v)
+                  }
+                  defaults={tabDefaults[entry.id] ?? null}
+                  restartRequired={restartRequired[entry.id] ?? false}
+                  onchange={() => {}}
+                  onrestart={() => restartTab(entry.id as AiTabId)}
+                />
+              {/if}
+            </details>
+          {:else}
+            <div class="shell-row">
+              <div class="shell-row-head">
+                <span class="shell-name">{entry.name}</span>
+                <span class="kind-badge shell">Shell</span>
+                {#if entry.builtin}
+                  <span class="builtin-tag">builtin</span>
+                {/if}
+              </div>
+              <div class="shell-row-cmd" title={shellSummary(entry)}>
+                {shellSummary(entry)}
+              </div>
+              <div class="shell-row-actions">
+                <button
+                  type="button"
+                  class="ghost"
+                  onclick={() => configureShellTab(entry.id as TabId)}
+                >
+                  Configure…
+                </button>
+              </div>
+            </div>
+          {/if}
         {/each}
       </div>
     </section>
@@ -798,5 +875,85 @@
   details[open] > summary {
     border-bottom: 1px solid #2a2a2a;
     border-radius: 6px 6px 0 0;
+  }
+  .kind-badge {
+    display: inline-block;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 1px 6px;
+    border-radius: 8px;
+    margin-left: 6px;
+    vertical-align: middle;
+    font-weight: 600;
+  }
+  .kind-badge.ai {
+    background: #2a1f3a;
+    border: 1px solid #6f42a8;
+    color: #d8b8ff;
+  }
+  .kind-badge.shell {
+    background: #1a2a1a;
+    border: 1px solid #4a8a4a;
+    color: #b8e0b8;
+  }
+  .builtin-tag {
+    display: inline-block;
+    font-size: 9px;
+    text-transform: uppercase;
+    color: #888;
+    border: 1px solid #444;
+    padding: 1px 6px;
+    border-radius: 8px;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  .shell-row {
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    background: #181818;
+    padding: 10px 12px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-rows: auto auto;
+    gap: 4px 10px;
+    align-items: center;
+  }
+  .shell-row-head {
+    grid-column: 1;
+    grid-row: 1;
+    color: #ddd;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .shell-row-cmd {
+    grid-column: 1;
+    grid-row: 2;
+    font-family: monospace;
+    font-size: 11px;
+    color: #888;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .shell-row-actions {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+  .shell-row-actions button {
+    background: #2a2a2a;
+    border: 1px solid #444;
+    color: #aaa;
+    padding: 4px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  .shell-row-actions button:hover {
+    background: #333;
+    color: #ddd;
+  }
+  .shell-name {
+    margin-right: 4px;
   }
 </style>

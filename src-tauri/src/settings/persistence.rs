@@ -1,23 +1,25 @@
-//! JSON load/save with corruption recovery + v1→v2 migration.
+//! JSON load/save with corruption recovery + version migrations.
 //!
-//! On-disk format is a single JSON object matching `Settings` (v2). v1 files
-//! can be detected by the presence of the `claude_code` key (gone in v2):
-//! when we see one, we route through `migrate_v1_to_v2` and rewrite the file
-//! in v2 schema so subsequent loads are pure v2.
+//! On-disk format is a single JSON object matching `Settings` (v1.2). Older
+//! shapes are detected by their discriminator fields and routed through the
+//! `migration` module. After the optional migration step, an integrity
+//! check ensures the three reserved-id tab entries (claude, aider,
+//! shell-default-1) exist with `builtin: true` — hand-edited files that
+//! deleted them are repaired transparently.
 //!
 //! Either way `load` always returns a usable `Settings` — missing/corrupt
-//! files become defaults (and are written back).
+//! files become defaults (the corrupt original is moved aside as a `.bak`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
 use crate::error::{AppError, AppResult};
+use crate::settings::migration;
 use crate::settings::schema::{
-    BehaviorSettings, ComposeSettings, DisplaySettings, ProcessingSettings, Settings,
-    ShortcutSettings, TabSettings, TabsSettings, TtsSettings,
+    default_aider_tab, default_claude_tab, default_shell_1_tab, AiToolKindWire, Settings,
+    TabConfig, AIDER_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID,
 };
+use crate::shell::ShellSpec;
 
 const FILE_NAME: &str = "settings.json";
 
@@ -30,18 +32,19 @@ pub fn config_path() -> AppResult<PathBuf> {
 }
 
 /// Always returns a `Settings`. Defaults are written to disk when the file
-/// is absent or corrupt; v1 files are migrated and rewritten in v2 schema.
-pub fn load() -> Settings {
+/// is absent or corrupt; v1 / v1.1 files are migrated and rewritten in v1.2
+/// shape with a backup of the original alongside.
+pub fn load(default_shell: &ShellSpec) -> Settings {
     let path = match config_path() {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "settings: cannot resolve config path; using defaults");
-            return Settings::default();
+            return seeded_defaults(default_shell);
         }
     };
 
     if !path.exists() {
-        let s = Settings::default();
+        let s = seeded_defaults(default_shell);
         if let Err(e) = save_to(&path, &s) {
             tracing::warn!(error = %e, path = %path.display(), "settings: write defaults failed");
         } else {
@@ -54,70 +57,77 @@ pub fn load() -> Settings {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "settings: read failed; using defaults");
-            return Settings::default();
+            return seeded_defaults(default_shell);
         }
     };
 
-    // Branch on schema version. v1 had a top-level `claude_code` object that
-    // no longer exists in v2; v2 has a top-level `tabs` object that didn't
-    // exist in v1. We use the raw Value to make the discriminator explicit
-    // — relying on serde fallthrough order would mis-route any v1 file
-    // whose claude_code section happens to be missing.
-    let raw: serde_json::Value = match serde_json::from_str(&text) {
+    let mut value: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
-                "settings: parse failed; reverting to defaults"
+                "settings: parse failed; quarantining file and resetting to defaults"
             );
-            let s = Settings::default();
+            migration::quarantine_corrupt_file(&path);
+            let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
             return s;
         }
     };
 
-    let looks_v1 = raw.get("claude_code").is_some() && raw.get("tabs").is_none();
-    if looks_v1 {
-        match serde_json::from_value::<V1Settings>(raw) {
-            Ok(v1) => {
-                let migrated = migrate_v1_to_v2(v1);
-                if let Err(e) = save_to(&path, &migrated) {
-                    tracing::warn!(error = %e, "settings: writing migrated v2 file failed");
-                } else {
-                    tracing::info!(path = %path.display(), "settings: migrated v1 -> v2");
-                }
-                return migrated;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "settings: v1 parse failed; reverting to defaults"
-                );
-                let s = Settings::default();
-                let _ = save_to(&path, &s);
-                return s;
-            }
+    let migrated = match migration::migrate_if_needed(&mut value, &path, default_shell) {
+        Ok(b) => b,
+        Err(e) => {
+            // Backup write failed — don't proceed with the migration since
+            // we'd lose the user's original. Surface defaults in-memory so
+            // the app still launches; the file on disk is untouched.
+            tracing::error!(
+                error = %e,
+                path = %path.display(),
+                "settings: migration aborted (backup failed); using defaults in-session"
+            );
+            return seeded_defaults(default_shell);
         }
-    }
+    };
 
-    match serde_json::from_str::<Settings>(&text) {
-        Ok(s) => {
-            tracing::info!(path = %path.display(), "settings: loaded");
-            s
-        }
+    let mut settings: Settings = match serde_json::from_value(value) {
+        Ok(s) => s,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
-                "settings: v2 parse failed; reverting to defaults"
+                "settings: typed parse failed (post-migration); quarantining and resetting"
             );
-            let s = Settings::default();
+            migration::quarantine_corrupt_file(&path);
+            let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            s
+            return s;
         }
+    };
+
+    let repaired = integrity_check(&mut settings, default_shell);
+
+    if migrated || repaired {
+        if let Err(e) = save_to(&path, &settings) {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "settings: post-migration save failed (in-memory state retained)"
+            );
+        } else {
+            tracing::info!(
+                path = %path.display(),
+                migrated,
+                repaired,
+                "settings: file refreshed after migration/integrity"
+            );
+        }
+    } else {
+        tracing::info!(path = %path.display(), "settings: loaded");
     }
+
+    settings
 }
 
 pub fn save(settings: &Settings) -> AppResult<()> {
@@ -134,158 +144,185 @@ fn save_to(path: &Path, settings: &Settings) -> AppResult<()> {
     fs::write(path, text).map_err(AppError::Io)
 }
 
-// --- v1 → v2 migration ------------------------------------------------------
-
-/// Minimal mirror of the v1 schema, just enough to read a v1 file and copy
-/// preserved fields forward. `#[serde(default)]` everywhere so a v1 file
-/// missing some sections (or one we never knew it had) still parses.
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct V1Settings {
-    tts: TtsSettings,
-    avatar: crate::settings::schema::AvatarSettings,
-    display: DisplaySettings,
-    behavior: V1BehaviorSettings,
-    compose: ComposeSettings,
-    shortcuts: V1ShortcutSettings,
-    claude_code: V1ClaudeCodeSettings,
-    processing: ProcessingSettings,
+/// `Settings::default()` with the three reserved-id tab entries seeded for
+/// the host platform. Used on fresh installs and as the recovery fallback
+/// when the file is unrecoverable. Equivalent to running the integrity
+/// check against an empty `tabs` array.
+fn seeded_defaults(default_shell: &ShellSpec) -> Settings {
+    let mut s = Settings::default();
+    integrity_check(&mut s, default_shell);
+    s
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct V1BehaviorSettings {
-    interrupt_on_input: Option<bool>,
-    auto_speak: Option<bool>,
-    fallback_silent: Option<bool>,
-}
+/// Ensure the three reserved-id tab entries are present and marked as
+/// builtins. Returns true if anything was changed (caller may want to
+/// write back to disk). Logged as a warning when an entry has to be
+/// restored — the typical cause is a hand-edited file.
+///
+/// The order is deterministic: claude first, then aider, then
+/// shell-default-1, with each restored entry inserted at its canonical
+/// position (front, after-claude, after-aider). User-created Shell tabs
+/// retain their relative ordering after the three pinned entries.
+pub fn integrity_check(settings: &mut Settings, default_shell: &ShellSpec) -> bool {
+    let mut changed = false;
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct V1ShortcutSettings {
-    open_compose: Option<String>,
-    submit_compose: Option<String>,
-    cancel_compose: Option<String>,
-    open_settings: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct V1ClaudeCodeSettings {
-    extra_cli_args: Vec<String>,
-    /// Read but discarded — v2's TTS injection mechanism is `--append-system-
-    /// prompt` driven by `tabs.claude.tts_injection.instructions`, not a
-    /// CLAUDE.md file path. The user's per-tab instructions can be edited in
-    /// the v2 settings UI (Milestone V2-02).
-    #[allow(dead_code)]
-    claude_md_path: Option<PathBuf>,
-}
-
-fn migrate_v1_to_v2(v1: V1Settings) -> Settings {
-    let defaults = Settings::default();
-
-    // Carry `claude_code.extra_cli_args` into `tabs.claude.extra_cli_flags`.
-    // Everything else under `tabs` gets the v2 defaults (in particular,
-    // `tts_injection.instructions` becomes the embedded RUNTIME_SYSTEM_PROMPT
-    // — which is what the user had implicitly in v1 anyway).
-    let claude_tab = TabSettings {
-        extra_cli_flags: v1.claude_code.extra_cli_args,
-        ..TabSettings::default_claude()
-    };
-
-    Settings {
-        tts: v1.tts,
-        avatar: v1.avatar,
-        display: v1.display,
-        behavior: BehaviorSettings {
-            interrupt_on_input: v1
-                .behavior
-                .interrupt_on_input
-                .unwrap_or(defaults.behavior.interrupt_on_input),
-            auto_speak: v1.behavior.auto_speak.unwrap_or(defaults.behavior.auto_speak),
-            fallback_silent: v1
-                .behavior
-                .fallback_silent
-                .unwrap_or(defaults.behavior.fallback_silent),
-            announcements_enabled: defaults.behavior.announcements_enabled,
-        },
-        compose: v1.compose,
-        shortcuts: ShortcutSettings {
-            open_compose: v1.shortcuts.open_compose.or(defaults.shortcuts.open_compose),
-            submit_compose: v1
-                .shortcuts
-                .submit_compose
-                .or(defaults.shortcuts.submit_compose),
-            cancel_compose: v1
-                .shortcuts
-                .cancel_compose
-                .or(defaults.shortcuts.cancel_compose),
-            open_settings: v1
-                .shortcuts
-                .open_settings
-                .or(defaults.shortcuts.open_settings),
-            switch_to_tab_1: defaults.shortcuts.switch_to_tab_1,
-            switch_to_tab_2: defaults.shortcuts.switch_to_tab_2,
-            switch_to_tab_3: defaults.shortcuts.switch_to_tab_3,
-            switch_to_tab_4: defaults.shortcuts.switch_to_tab_4,
-            switch_to_tab_5: defaults.shortcuts.switch_to_tab_5,
-            switch_to_tab_6: defaults.shortcuts.switch_to_tab_6,
-            switch_to_tab_7: defaults.shortcuts.switch_to_tab_7,
-            switch_to_tab_8: defaults.shortcuts.switch_to_tab_8,
-            switch_to_tab_9: defaults.shortcuts.switch_to_tab_9,
-            new_shell_tab: defaults.shortcuts.new_shell_tab,
-            close_tab: defaults.shortcuts.close_tab,
-        },
-        tabs: TabsSettings {
-            claude: claude_tab,
-            aider: TabSettings::default_aider(),
-        },
-        processing: v1.processing,
-        shell_1_tmp: defaults.shell_1_tmp,
+    // 1. Force builtin: true on the three reserved ids if they exist with
+    //    builtin: false. Defends against hand-edits trying to flip the flag.
+    let reserved = [CLAUDE_TAB_ID, AIDER_TAB_ID, SHELL_DEFAULT_TAB_ID];
+    for tab in settings.tabs.iter_mut() {
+        if reserved.contains(&tab.id()) && !tab.builtin() {
+            tab.set_builtin(true);
+            changed = true;
+            tracing::warn!(id = tab.id(), "integrity: forced builtin: true on reserved tab");
+        }
     }
+
+    // 2. Coerce the AI builtins' ai_tool_kind in case a hand-edit set them
+    //    to the wrong value (e.g. swapped claude/aider). The id is the
+    //    canonical key; ai_tool_kind must follow.
+    for tab in settings.tabs.iter_mut() {
+        if let TabConfig::AiTool(c) = tab {
+            let expected = match c.id.as_str() {
+                CLAUDE_TAB_ID => Some(AiToolKindWire::ClaudeCode),
+                AIDER_TAB_ID => Some(AiToolKindWire::Aider),
+                _ => None,
+            };
+            if let Some(want) = expected {
+                if c.ai_tool_kind != want {
+                    c.ai_tool_kind = want;
+                    changed = true;
+                    tracing::warn!(
+                        id = c.id,
+                        "integrity: corrected ai_tool_kind on reserved AI tab"
+                    );
+                }
+            }
+        }
+    }
+
+    // 3. Restore missing reserved entries at canonical positions. Inserting
+    //    in the order claude(0), aider(1), shell-default-1(after aider)
+    //    works because each insert shifts later positions consistently.
+    if !settings.tabs.iter().any(|t| t.id() == CLAUDE_TAB_ID) {
+        settings.tabs.insert(0, default_claude_tab());
+        changed = true;
+        tracing::warn!("integrity: restored missing claude tab");
+    }
+
+    if !settings.tabs.iter().any(|t| t.id() == AIDER_TAB_ID) {
+        let pos = settings
+            .tabs
+            .iter()
+            .position(|t| t.id() == CLAUDE_TAB_ID)
+            .map(|p| p + 1)
+            .unwrap_or(1);
+        settings.tabs.insert(pos, default_aider_tab());
+        changed = true;
+        tracing::warn!("integrity: restored missing aider tab");
+    }
+
+    if !settings.tabs.iter().any(|t| t.id() == SHELL_DEFAULT_TAB_ID) {
+        let pos = settings
+            .tabs
+            .iter()
+            .position(|t| t.id() == AIDER_TAB_ID)
+            .map(|p| p + 1)
+            .unwrap_or(2);
+        settings
+            .tabs
+            .insert(pos, default_shell_1_tab(default_shell));
+        changed = true;
+        tracing::warn!("integrity: restored missing default shell tab");
+    }
+
+    changed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    #[test]
-    fn migrate_v1_carries_extra_cli_args() {
-        let v1_json = r#"{
-            "claude_code": { "extra_cli_args": ["--foo", "--bar"], "claude_md_path": null },
-            "tts": { "voice": "af_heart", "speed": 1.0, "volume": 1.0, "mute": false }
-        }"#;
-        let raw: serde_json::Value = serde_json::from_str(v1_json).unwrap();
-        let v1: V1Settings = serde_json::from_value(raw).unwrap();
-        let v2 = migrate_v1_to_v2(v1);
-        assert_eq!(v2.tabs.claude.extra_cli_flags, vec!["--foo", "--bar"]);
-        assert!(v2.tabs.claude.tts_injection.enabled);
-        assert!(!v2.tabs.aider.tts_injection.enabled);
-        assert_eq!(v2.tabs.aider.command, "aider");
-        assert!(v2.behavior.announcements_enabled);
-        assert_eq!(v2.shortcuts.switch_to_tab_1.as_deref(), Some("Ctrl+1"));
+    fn fake_default_shell() -> ShellSpec {
+        ShellSpec {
+            command: PathBuf::from("/bin/bash"),
+            args: vec!["-i".to_string()],
+        }
     }
 
     #[test]
-    fn v2_file_round_trips() {
-        let v2 = Settings::default();
-        let text = serde_json::to_string(&v2).unwrap();
+    fn integrity_seeds_three_reserved_tabs_on_empty() {
+        let mut s = Settings::default();
+        let shell = fake_default_shell();
+        let changed = integrity_check(&mut s, &shell);
+        assert!(changed);
+        assert_eq!(s.tabs.len(), 3);
+        assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
+        assert_eq!(s.tabs[1].id(), AIDER_TAB_ID);
+        assert_eq!(s.tabs[2].id(), SHELL_DEFAULT_TAB_ID);
+        for t in &s.tabs {
+            assert!(t.builtin(), "{} should be builtin", t.id());
+        }
+    }
+
+    #[test]
+    fn integrity_forces_builtin_true_on_reserved_ids() {
+        let mut s = Settings::default();
+        let shell = fake_default_shell();
+        integrity_check(&mut s, &shell);
+        // Tamper: flip claude's builtin to false.
+        if let TabConfig::AiTool(c) = &mut s.tabs[0] {
+            c.builtin = false;
+        }
+        let changed = integrity_check(&mut s, &shell);
+        assert!(changed);
+        assert!(s.tabs[0].builtin());
+    }
+
+    #[test]
+    fn integrity_preserves_user_tabs() {
+        let mut s = Settings::default();
+        let shell = fake_default_shell();
+        integrity_check(&mut s, &shell);
+        // Insert a user shell tab.
+        s.tabs.push(TabConfig::Shell(crate::settings::schema::ShellTabConfig {
+            id: "shell-user-1".to_string(),
+            builtin: false,
+            name: "Build Watch".to_string(),
+            command: "/bin/bash".to_string(),
+            args: vec!["-i".to_string()],
+            cwd: None,
+            env: Default::default(),
+            notifications: Default::default(),
+        }));
+        let user_pos_before = s.tabs.len() - 1;
+
+        // Delete claude — integrity should restore it without disturbing
+        // the user tab's relative position.
+        s.tabs.retain(|t| t.id() != CLAUDE_TAB_ID);
+        let changed = integrity_check(&mut s, &shell);
+        assert!(changed);
+        assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
+        let user_pos_after = s
+            .tabs
+            .iter()
+            .position(|t| t.id() == "shell-user-1")
+            .unwrap();
+        // User tab should still be at the end.
+        assert_eq!(user_pos_after, s.tabs.len() - 1);
+        let _ = user_pos_before;
+    }
+
+    #[test]
+    fn v1_2_round_trip() {
+        let shell = fake_default_shell();
+        let mut s = Settings::default();
+        integrity_check(&mut s, &shell);
+        let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed.tabs.claude.command, "claude");
-        assert_eq!(parsed.tabs.aider.command, "aider");
-        assert!(!parsed.tabs.aider.tts_injection.enabled);
-    }
-
-    #[test]
-    fn v1_detection_skips_files_with_tabs_already() {
-        // A handcrafted file that has BOTH `claude_code` and `tabs` is treated
-        // as v2 (already-migrated). `claude_code` is silently ignored by serde.
-        let mixed = r#"{
-            "claude_code": { "extra_cli_args": ["--legacy"] },
-            "tabs": { "claude": { "command": "claude", "extra_cli_flags": ["--new"] } }
-        }"#;
-        let raw: serde_json::Value = serde_json::from_str(mixed).unwrap();
-        let looks_v1 = raw.get("claude_code").is_some() && raw.get("tabs").is_none();
-        assert!(!looks_v1);
+        assert_eq!(parsed.tabs.len(), 3);
+        assert_eq!(parsed.tabs[0].id(), CLAUDE_TAB_ID);
+        assert_eq!(parsed.tabs[1].id(), AIDER_TAB_ID);
+        assert_eq!(parsed.tabs[2].id(), SHELL_DEFAULT_TAB_ID);
     }
 }

@@ -1,12 +1,12 @@
 // Frontend mirror of `state::TabId`. JSON-serialized as a string —
-// `"claude"` / `"aider"` for the AI builtins, or any user-managed shell ID
-// (`"shell-1"` for the M1 hardcoded one, `shell-<uuid>` for user-created).
-// The union shape preserves autocomplete on the well-known IDs while leaving
-// room for the dynamic shell IDs M2 introduces at runtime.
+// `"claude"` / `"aider"` for the AI builtins, `"shell-default-1"` for the
+// reserved default Shell tab, or `shell-<uuid>` for user-created shell
+// tabs. The union shape preserves autocomplete on the well-known IDs
+// while leaving room for the dynamic shell IDs created at runtime.
 
 export type TabId = 'claude' | 'aider' | (string & {});
 
-/// Type guard for shell tabs — currently every non-builtin ID is a shell.
+/// Type guard for shell tabs — every non-AI-builtin ID is a shell.
 export function isShellTab(id: TabId): boolean {
   return id !== 'claude' && id !== 'aider';
 }
@@ -14,15 +14,15 @@ export function isShellTab(id: TabId): boolean {
 /// True for tabs that ship with the app and cannot be closed/removed.
 /// Mirrors the backend's `builtin: true` field on the `TabCreated` event;
 /// useful when the event payload isn't in scope (e.g., quick lookups in
-/// the title-bar or shortcut-dispatcher paths).
+/// the title-bar or shortcut-dispatcher paths). The default Shell tab
+/// (shell-default-1) is also a builtin in v1.2.
 export function isBuiltinTab(id: TabId): boolean {
-  return id === 'claude' || id === 'aider';
+  return id === 'claude' || id === 'aider' || id === 'shell-default-1';
 }
 
 /// Subset of TabId covering only the AI builtins. Used by call sites that
-/// touch the v1.1-shaped `Settings.tabs` map (which still keys by the
-/// `claude`/`aider` field names — Shell tabs live under the separate
-/// `_shell_1_tmp` field until M3).
+/// need to iterate over just the AI tabs (e.g. the Settings window's
+/// "Reset to default" wiring, which is meaningful only for AI tabs).
 export type AiTabId = 'claude' | 'aider';
 export const AI_TABS: readonly AiTabId[] = ['claude', 'aider'] as const;
 

@@ -1,8 +1,8 @@
 <script lang="ts">
   // Edits an array of strings as one row per item with add/remove buttons.
-  // Used for `extra_cli_flags` in the Tabs settings; the v1 newline-textarea
-  // pattern was brittle around whitespace and didn't surface "this row is
-  // one flag" clearly.
+  // Used for the per-tab `args` array in the Tabs settings; the v1
+  // newline-textarea pattern was brittle around whitespace and didn't
+  // surface "this row is one arg" clearly.
   let {
     items = $bindable<string[]>([]),
     placeholder = '',

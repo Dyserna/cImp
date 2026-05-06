@@ -89,43 +89,56 @@ export interface TtsInjection {
   instructions: string;
 }
 
-export interface NotificationsSettings {
+export interface AiNotificationConfig {
   idle: string;
   awaiting_permission: string;
   error: string;
 }
 
-export interface TabSettings {
+export interface ShellNotificationConfig {
+  error: string;
+  /// `{code}` placeholder is interpolated with the actual exit code in M4.
+  exited: string;
+}
+
+export type AiToolKindWire = 'claude_code' | 'aider';
+
+export interface AiToolTabConfig {
+  kind: 'ai_tool';
+  id: string;
+  ai_tool_kind: AiToolKindWire;
+  builtin: boolean;
+  name: string;
   command: string;
-  extra_cli_flags: string[];
+  args: string[];
+  cwd: string | null;
+  env: Record<string, string>;
   tts_injection: TtsInjection;
-  notifications: NotificationsSettings;
+  notifications: AiNotificationConfig;
   first_launch_notice_dismissed: boolean;
 }
 
-export interface TabsSettings {
-  claude: TabSettings;
-  aider: TabSettings;
+export interface ShellTabConfig {
+  kind: 'shell';
+  id: string;
+  builtin: boolean;
+  name: string;
+  command: string;
+  args: string[];
+  cwd: string | null;
+  env: Record<string, string>;
+  notifications: ShellNotificationConfig;
+}
+
+export type TabConfig = AiToolTabConfig | ShellTabConfig;
+
+export interface SessionState {
+  active_tab_id: string | null;
 }
 
 export interface ProcessingSettings {
   stability_timeout_ms: number;
   max_hold_ms: number;
-}
-
-/// Notification text for Shell tabs. The `{code}` placeholder in `exited`
-/// is interpolated with the actual exit code in M4 of v3-01; M1 leaves it
-/// as a literal substring.
-export interface ShellNotifications {
-  error: string;
-  exited: string;
-}
-
-/// Interim Shell-1 settings — see `Settings._shell_1_tmp` on the backend.
-/// M3 of v3 reshapes the entire `tabs` schema and migrates this away.
-export interface Shell1Interim {
-  name: string;
-  notifications: ShellNotifications;
 }
 
 export interface Settings {
@@ -135,15 +148,35 @@ export interface Settings {
   behavior: BehaviorSettings;
   compose: ComposeSettings;
   shortcuts: ShortcutSettings;
-  tabs: TabsSettings;
+  /// Ordered tab configs. Reserved ids (claude, aider, shell-default-1) are
+  /// guaranteed to be present after the backend's startup integrity check.
+  tabs: TabConfig[];
   processing: ProcessingSettings;
-  _shell_1_tmp: Shell1Interim;
+  session: SessionState;
 }
 
-// Defaults must match `impl Default for Settings` on the backend. They're
-// the initial store value so subscribers get sane shapes before the first
-// `settings-changed` event arrives. The backend re-broadcasts on init so
-// this value is short-lived in practice.
+/// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
+/// User-created shell tabs use uuid-based ids that never collide with these.
+export const CLAUDE_TAB_ID = 'claude';
+export const AIDER_TAB_ID = 'aider';
+export const SHELL_DEFAULT_TAB_ID = 'shell-default-1';
+
+/// Look up a tab entry by id. Returns undefined for unknown ids; callers
+/// treat that as a transient state (tab gone).
+export function findTab(settings: Settings, id: string): TabConfig | undefined {
+  return settings.tabs.find((t) => t.id === id);
+}
+
+/// Index of the tab entry; useful when callers need to mutate via array
+/// index (e.g. spreading the new entry into a new array for state setters).
+export function findTabIndex(settings: Settings, id: string): number {
+  return settings.tabs.findIndex((t) => t.id === id);
+}
+
+// Defaults must match `impl Default for Settings` + the integrity check on
+// the backend. They're the initial store value so subscribers get sane
+// shapes before the first `settings-changed` event arrives. The backend
+// re-broadcasts on init so this value is short-lived in practice.
 export function defaultSettings(): Settings {
   return {
     tts: { voice: 'af_heart', speed: 1.0, volume: 1.0, mute: false },
@@ -198,10 +231,17 @@ export function defaultSettings(): Settings {
       new_shell_tab: 'Ctrl+T',
       close_tab: 'Ctrl+W',
     },
-    tabs: {
-      claude: {
+    tabs: [
+      {
+        kind: 'ai_tool',
+        id: CLAUDE_TAB_ID,
+        ai_tool_kind: 'claude_code',
+        builtin: true,
+        name: 'Claude',
         command: 'claude',
-        extra_cli_flags: [],
+        args: [],
+        cwd: null,
+        env: {},
         tts_injection: { enabled: true, instructions: '' },
         notifications: {
           idle: 'Claude is idle',
@@ -210,9 +250,16 @@ export function defaultSettings(): Settings {
         },
         first_launch_notice_dismissed: true,
       },
-      aider: {
+      {
+        kind: 'ai_tool',
+        id: AIDER_TAB_ID,
+        ai_tool_kind: 'aider',
+        builtin: true,
+        name: 'Aider',
         command: 'aider',
-        extra_cli_flags: [],
+        args: [],
+        cwd: null,
+        env: {},
         tts_injection: { enabled: false, instructions: '' },
         notifications: {
           idle: 'Aider is idle',
@@ -221,14 +268,8 @@ export function defaultSettings(): Settings {
         },
         first_launch_notice_dismissed: false,
       },
-    },
+    ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
-    _shell_1_tmp: {
-      name: 'Shell 1',
-      notifications: {
-        error: 'Shell encountered an error',
-        exited: 'Shell exited (code {code})',
-      },
-    },
+    session: { active_tab_id: null },
   };
 }

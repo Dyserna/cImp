@@ -24,18 +24,22 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{
-    acknowledge_error, close_settings_window, compose_content_changed, list_tabs, list_voices,
-    open_settings_window, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
-    restart_shell_tab, settings_get, settings_update, tab_activate, tab_default_settings,
-    tts_test,
+    acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
+    list_tabs, list_voices, open_settings_window, pty_resize, pty_restart, pty_start, pty_write,
+    request_tab_restart, restart_shell_tab, set_active_tab, settings_get, settings_update,
+    tab_activate, tts_test,
 };
 use crate::ipc::tab_lifecycle::{
     close_tab, create_shell_tab, default_shell_spec, get_shell_tab_config, reconfigure_shell_tab,
     rename_tab,
 };
 use crate::ipc::{AppState, LaunchContext};
-use crate::settings::{Settings, SettingsHandle};
-use crate::state::{spawn_state_manager, AiToolKind, StateEvent, StateSignal, TabId, TabKind, TabMeta};
+use crate::settings::{
+    Settings, SettingsHandle, TabConfig, AIDER_TAB_ID, CLAUDE_TAB_ID,
+};
+use crate::state::{
+    spawn_state_manager, AiToolKind, StateEvent, StateSignal, TabId, TabKind, TabMeta,
+};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, TtsEngine, TtsRequest};
 
@@ -56,7 +60,12 @@ fn main() {
     // re-running detection.
     let default_shell = Arc::new(shell::detect::default_shell());
 
-    let settings_handle = settings::init();
+    // Settings load runs migration (v1 / v1.1 → v1.2) and an integrity
+    // check that ensures the three reserved-id tab entries exist. The
+    // resolved default shell is needed to fill in Shell-1's command on
+    // fresh installs and during the v1.1 → v1.2 transform that consumes
+    // the legacy `_shell_1_tmp` interim key.
+    let settings_handle = settings::init(&default_shell);
 
     // TTS / audio pipeline. Failures are non-fatal — the app launches with
     // TTS silent and a warning logged. Init is deferred to the Tauri `setup`
@@ -75,10 +84,13 @@ fn main() {
     // edge, which the next event recovers naturally.
     let (state_event_tx, _) = broadcast::channel::<StateEvent>(64);
 
-    // Launch-seed tab list. M2 supports runtime add/remove via the
-    // state-manager's `TabAdded`/`TabRemoved` signals; this list only
-    // determines which tabs spawn at app launch. M3 reads it from settings.
-    let seed_tabs: Vec<TabId> = TabId::launch_seed();
+    // Launch-seed tab list comes from settings now. The integrity check
+    // guarantees claude / aider / shell-default-1 are present; user-
+    // created Shell tabs that have been persisted across launches are
+    // appended in their stored order. Each entry's name reflects the
+    // user's last-seen edit (rename, configure dialog, settings window).
+    let tab_metas: Vec<TabMeta> = build_tab_metas_from_settings(&settings_handle.current());
+    let seed_tabs: Vec<TabId> = tab_metas.iter().map(|m| m.id.clone()).collect();
 
     // Per-tab unsent-input length counters. Shared (Arc<RwLock<...>>) so
     // the state manager can grow/shrink the map at runtime while the IPC
@@ -91,31 +103,28 @@ fn main() {
     // synthesis requests) and the audio thread (tags TtsPlaybackStarted/
     // Stopped signals with the speaking tab). Synchronous so both consumers
     // can read it without runtime gymnastics.
-    let initial_active = TabId::Claude;
+    //
+    // The persisted active tab id (session.active_tab_id) wins if it points
+    // at a known tab; otherwise we fall back to the first tab in order
+    // (always Claude after integrity).
+    let initial_active = settings_handle
+        .current()
+        .session
+        .active_tab_id
+        .as_deref()
+        .and_then(|id| {
+            tab_metas
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .map(|m| m.id.clone())
+        })
+        .unwrap_or_else(|| {
+            tab_metas
+                .first()
+                .map(|m| m.id.clone())
+                .unwrap_or(TabId::Claude)
+        });
     let tts_active: ActiveTab = Arc::new(RwLock::new(initial_active.clone()));
-
-    // Static tab metadata for the launch seed. M2 keeps the same three
-    // tabs at startup; runtime additions arrive via `create_shell_tab`.
-    // The Shell-1 name comes from the interim `_shell_1_tmp` key so
-    // user-edited names are honored on launch.
-    let shell_1_name = settings_handle.current().shell_1_tmp.name.clone();
-    let tab_metas: Vec<TabMeta> = vec![
-        TabMeta {
-            id: TabId::Claude,
-            kind: TabKind::AiTool(AiToolKind::ClaudeCode),
-            name: "Claude".to_string(),
-        },
-        TabMeta {
-            id: TabId::Aider,
-            kind: TabKind::AiTool(AiToolKind::Aider),
-            name: "Aider".to_string(),
-        },
-        TabMeta {
-            id: TabId::Shell("shell-1".to_string()),
-            kind: TabKind::Shell,
-            name: shell_1_name,
-        },
-    ];
 
     // Tab registry — one PtyManager per tab, lazy-spawn at frontend mount.
     let registry = TabRegistry::new(
@@ -124,7 +133,6 @@ fn main() {
         tts_active.clone(),
         audio_slot.clone(),
         state_tx.clone(),
-        default_shell.clone(),
         input_lengths.clone(),
     );
     let tabs_handle: TabRegistryHandle = Arc::new(TokioMutex::new(registry));
@@ -223,7 +231,7 @@ fn main() {
             tts_test,
             settings_get,
             settings_update,
-            tab_default_settings,
+            ai_tool_tab_defaults,
             list_voices,
             list_tabs,
             open_settings_window,
@@ -233,6 +241,7 @@ fn main() {
             compose_content_changed,
             acknowledge_error,
             tab_activate,
+            set_active_tab,
             create_shell_tab,
             close_tab,
             rename_tab,
@@ -260,6 +269,38 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to launch tauri app");
+}
+
+/// Build the launch-seed `Vec<TabMeta>` from a settings snapshot. Reserved
+/// ids (claude / aider) map to their corresponding `TabId` variants;
+/// everything else is a Shell tab. The integrity check has already
+/// guaranteed claude / aider / shell-default-1 are present, so the result
+/// always has at least three entries.
+fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
+    settings
+        .tabs
+        .iter()
+        .map(|cfg| {
+            let id = cfg.id();
+            let tab_id = match id {
+                CLAUDE_TAB_ID => TabId::Claude,
+                AIDER_TAB_ID => TabId::Aider,
+                other => TabId::Shell(other.to_string()),
+            };
+            let kind = match cfg {
+                TabConfig::AiTool(c) => match c.id.as_str() {
+                    AIDER_TAB_ID => TabKind::AiTool(AiToolKind::Aider),
+                    _ => TabKind::AiTool(AiToolKind::ClaudeCode),
+                },
+                TabConfig::Shell(_) => TabKind::Shell,
+            };
+            TabMeta {
+                id: tab_id,
+                kind,
+                name: cfg.name().to_string(),
+            }
+        })
+        .collect()
 }
 
 fn init_tracing() {

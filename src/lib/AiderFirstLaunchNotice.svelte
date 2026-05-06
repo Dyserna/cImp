@@ -2,20 +2,28 @@
   import { get } from 'svelte/store';
   import { activeTab } from './tabs/state';
   import { settings, applySettings } from './settings/store';
+  import { AIDER_TAB_ID, findTab, findTabIndex } from './settings/types';
 
   // One-time notice shown the first time the user activates the aider tab,
   // explaining that TTS output is silent because aider has no system-prompt
   // injection mechanism yet (see docs/FUTURE-FEATURES.md). Dismissal sets
-  // `tabs.aider.first_launch_notice_dismissed` so the notice never reappears.
+  // the aider tab entry's `first_launch_notice_dismissed` flag so the notice
+  // never reappears.
 
-  const visible = $derived(
-    $activeTab === 'aider' && !$settings.tabs.aider.first_launch_notice_dismissed,
-  );
+  const visible = $derived.by(() => {
+    if ($activeTab !== AIDER_TAB_ID) return false;
+    const aider = findTab($settings, AIDER_TAB_ID);
+    return !!aider && aider.kind === 'ai_tool' && !aider.first_launch_notice_dismissed;
+  });
 
   function dismiss() {
     const current = get(settings);
     const next = structuredClone(current);
-    next.tabs.aider.first_launch_notice_dismissed = true;
+    const idx = findTabIndex(next, AIDER_TAB_ID);
+    if (idx < 0) return;
+    const entry = next.tabs[idx];
+    if (entry.kind !== 'ai_tool') return;
+    next.tabs[idx] = { ...entry, first_launch_notice_dismissed: true };
     void applySettings(next);
   }
 </script>

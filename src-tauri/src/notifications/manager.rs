@@ -218,6 +218,7 @@ impl NotificationManager {
                 tab,
                 closed,
                 exit_code: _,
+                closed_message: _,
             } => {
                 // Only the closed=true edge fires a notification; the
                 // closed=false edge (restart) is a UI-only transition.
@@ -324,34 +325,29 @@ fn notification_text(
     tab: &TabId,
     event: NotificationEvent,
 ) -> String {
-    match tab {
-        TabId::Claude | TabId::Aider => {
-            let tab_settings = if matches!(tab, TabId::Claude) {
-                &settings.tabs.claude
-            } else {
-                &settings.tabs.aider
-            };
-            match event {
-                NotificationEvent::Idle => tab_settings.notifications.idle.clone(),
-                NotificationEvent::AwaitingPermission => {
-                    tab_settings.notifications.awaiting_permission.clone()
-                }
-                NotificationEvent::Error => tab_settings.notifications.error.clone(),
-                NotificationEvent::Exited => String::new(), // disallowed; defensive
-            }
+    use crate::settings::TabConfig;
+
+    let Some(entry) = settings.find_tab(tab.as_str()) else {
+        // Tab without a settings entry is a transient state (e.g. closed
+        // mid-flight). Returning an empty string suppresses the
+        // announcement, which is the right behavior — there's nothing
+        // sensible to say about a tab that no longer exists.
+        return String::new();
+    };
+
+    match (entry, event) {
+        (TabConfig::AiTool(c), NotificationEvent::Idle) => c.notifications.idle.clone(),
+        (TabConfig::AiTool(c), NotificationEvent::AwaitingPermission) => {
+            c.notifications.awaiting_permission.clone()
         }
-        TabId::Shell(_) => {
-            // M1 has a single hardcoded Shell tab (`shell-1`); the interim
-            // settings field carries its strings. M3 swaps to per-tab
-            // lookup against the unified `tabs` array. The `{code}`
-            // placeholder is intentionally NOT interpolated yet — M4
-            // delivers that.
-            match event {
-                NotificationEvent::Error => settings.shell_1_tmp.notifications.error.clone(),
-                NotificationEvent::Exited => settings.shell_1_tmp.notifications.exited.clone(),
-                NotificationEvent::Idle | NotificationEvent::AwaitingPermission => String::new(),
-            }
-        }
+        (TabConfig::AiTool(c), NotificationEvent::Error) => c.notifications.error.clone(),
+        // AI tabs don't fire Exited; defensive empty.
+        (TabConfig::AiTool(_), NotificationEvent::Exited) => String::new(),
+        (TabConfig::Shell(c), NotificationEvent::Error) => c.notifications.error.clone(),
+        (TabConfig::Shell(c), NotificationEvent::Exited) => c.notifications.exited.clone(),
+        // Shell tabs don't fire Idle / AwaitingPermission; defensive empty.
+        (TabConfig::Shell(_), NotificationEvent::Idle)
+        | (TabConfig::Shell(_), NotificationEvent::AwaitingPermission) => String::new(),
     }
 }
 

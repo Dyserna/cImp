@@ -6,4 +6,4 @@
 mod config;
 pub mod registry;
 
-pub use registry::{ShellTabConfig, TabMetaWire, TabRegistry, TabRegistryHandle};
+pub use registry::{TabMetaWire, TabRegistry, TabRegistryHandle};

@@ -3,15 +3,22 @@
   import { perTabClosedState } from './avatarState';
   import { activeTab } from './tabs/state';
   import { restartShellTab } from './ipc';
+  import { openConfigureTabDialog } from './dialog/store';
 
-  // Shown when a Shell tab's subprocess has exited. The card displays the
-  // exit code and a Restart button; pressing Enter while this tab is active
-  // also triggers the restart (the parent Terminal forwards the keypress —
-  // this component just owns the visible affordance + IPC call).
+  // Shown when a Shell tab's subprocess has exited or its launch failed.
+  // The card displays the exit code (or a custom message for launch
+  // failures like command-not-found) and a primary action button. The
+  // host Terminal forwards the Enter keypress to `pressedEnter`; when the
+  // closed state has a `closed_message`, Enter opens the Configure dialog
+  // (so the user can fix the broken command) instead of attempting a
+  // restart that would fail the same way.
   let { tabId }: { tabId: TabId } = $props();
 
   const closedState = $derived($perTabClosedState[tabId]);
   const isActive = $derived($activeTab === tabId);
+  const launchFailed = $derived(
+    !!closedState?.closed && !!closedState.closed_message,
+  );
   let restarting = $state(false);
 
   async function restart() {
@@ -26,12 +33,18 @@
     }
   }
 
+  function configure() {
+    openConfigureTabDialog(tabId);
+  }
+
   // The host Terminal's keydown handler invokes this when the user presses
-  // Enter while this overlay is visible. Exporting via the global `window`
-  // would be ugly; instead we expose a small handler directly to the host
-  // through the parent's wiring.
+  // Enter while this overlay is visible. Routes to Configure for launch
+  // failures, restart otherwise.
   export function pressedEnter() {
-    if (closedState?.closed && isActive) {
+    if (!closedState?.closed || !isActive) return;
+    if (launchFailed) {
+      configure();
+    } else {
       void restart();
     }
   }
@@ -43,20 +56,29 @@
 {#if closedState?.closed}
   <div class="overlay" role="status" aria-live="polite">
     <div class="card">
-      <h2>Shell exited</h2>
-      <p class="detail">
-        {#if code === null}
-          (no exit code reported)
-        {:else}
-          exit code <span class:error={codeIsError}>{code}</span>
-        {/if}
-      </p>
-      <p class="hint">Press Enter to restart, or close this tab.</p>
-      <div class="actions">
-        <button class="primary" onclick={restart} disabled={restarting}>
-          {restarting ? 'Restarting…' : 'Restart'}
-        </button>
-      </div>
+      {#if launchFailed}
+        <h2>Shell launch failed</h2>
+        <p class="detail launch-failed">{closedState.closed_message}</p>
+        <p class="hint">Press Enter to configure this tab.</p>
+        <div class="actions">
+          <button class="primary" onclick={configure}>Configure…</button>
+        </div>
+      {:else}
+        <h2>Shell exited</h2>
+        <p class="detail">
+          {#if code === null}
+            (no exit code reported)
+          {:else}
+            exit code <span class:error={codeIsError}>{code}</span>
+          {/if}
+        </p>
+        <p class="hint">Press Enter to restart, or close this tab.</p>
+        <div class="actions">
+          <button class="primary" onclick={restart} disabled={restarting}>
+            {restarting ? 'Restarting…' : 'Restart'}
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}
@@ -96,6 +118,12 @@
     font-family: monospace;
     font-size: 13px;
     color: #c0c0c0;
+  }
+  .detail.launch-failed {
+    color: #ff8080;
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    line-height: 1.4;
   }
   .detail .error {
     color: #ff8080;

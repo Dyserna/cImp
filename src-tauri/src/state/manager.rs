@@ -50,20 +50,6 @@ impl TabId {
         }
     }
 
-    /// Initial seed list of tabs at app launch. M1 shipped three; M2 keeps
-    /// the same launch set but tabs can now be added/removed at runtime via
-    /// `create_shell_tab` / `close_tab`. Runtime code paths must NOT rely on
-    /// this list as authoritative — consult the registry's live `tab_order`
-    /// instead. The function is retained for startup wiring (registry seed,
-    /// tab metas for state manager) and for the test suite.
-    pub fn launch_seed() -> Vec<TabId> {
-        vec![
-            TabId::Claude,
-            TabId::Aider,
-            TabId::Shell("shell-1".to_string()),
-        ]
-    }
-
     /// Pure mapping from id to runtime kind. Stable across milestones —
     /// `Claude`/`Aider` are always AI tabs; any `Shell(_)` id is a Shell
     /// tab. Lets call sites that don't carry `TabKind` explicitly (PTY
@@ -227,6 +213,14 @@ pub enum StateSignal {
     /// `reconfigure_shell_tab`). The state manager updates its name and
     /// emits `StateEvent::TabRenamed`.
     TabRenameRequested { tab: TabId, name: String },
+    /// A Shell tab's spawn failed at launch in a way that is not a runtime
+    /// crash — typically the configured command no longer resolves on PATH
+    /// or its file no longer exists. Routes the tab to the closed sub-
+    /// state with a custom message that the frontend overlay shows in
+    /// place of "Shell exited (code N)". M3 of v3 fires this from the
+    /// registry's start path when `build_launch_spec` returns a
+    /// `CommandNotFound`.
+    ShellLaunchFailed { tab: TabId, message: String },
 }
 
 impl StateSignal {
@@ -248,7 +242,8 @@ impl StateSignal {
             | Self::PermissionPromptResolved { tab }
             | Self::ShellRestarted { tab }
             | Self::TabRemoved { tab }
-            | Self::TabRenameRequested { tab, .. } => tab.clone(),
+            | Self::TabRenameRequested { tab, .. }
+            | Self::ShellLaunchFailed { tab, .. } => tab.clone(),
             Self::TabAdded { meta, .. } => meta.id.clone(),
         }
     }
@@ -271,11 +266,15 @@ pub enum StateEvent {
     /// Shell tab's `closed` UI flag flipped. `closed: true` is fired when
     /// the subprocess exits; `closed: false` when the user restarts it.
     /// `exit_code` is `None` for spawn-time failures or for `closed: false`
-    /// events.
+    /// events. `closed_message` is `Some` only for command-not-found-style
+    /// launch failures — the frontend overlay shows it in place of the
+    /// standard "Shell exited (code N)" line and routes Enter to the
+    /// Configure dialog instead of restart.
     TabClosedStateChanged {
         tab: TabId,
         closed: bool,
         exit_code: Option<i32>,
+        closed_message: Option<String>,
     },
     /// A new tab was added to the runtime. Frontend appends to its tabs
     /// store; notification manager seeds its per-tab caches. `position` is
@@ -339,6 +338,12 @@ struct TabState {
     /// restart. Stays false on AI tabs (their exit path goes to Error).
     closed: bool,
     closed_exit_code: Option<i32>,
+    /// Shell-only: a non-runtime spawn failure (currently command-not-
+    /// found at launch). When set, the frontend overlay renders this
+    /// message instead of the standard "Shell exited (code N)" line, and
+    /// Enter routes to the Configure dialog instead of restart. Cleared
+    /// on `ShellRestarted`.
+    closed_message: Option<String>,
 }
 
 impl TabState {
@@ -354,6 +359,7 @@ impl TabState {
             done_while_away: false,
             closed: false,
             closed_exit_code: None,
+            closed_message: None,
         }
     }
 }
@@ -550,11 +556,18 @@ async fn run(
                         .unwrap_or(false);
                     if route_to_closed {
                         if let Some(ts) = tabs.get_mut(&tab) {
+                            // A SubprocessExited landing on a tab that already
+                            // has a closed_message (from ShellLaunchFailed)
+                            // means the same launch failure is bubbling up
+                            // twice — preserve the message so the user still
+                            // sees "command not found" rather than the
+                            // generic "exited" overlay.
                             if !ts.closed {
                                 ts.closed = true;
                                 ts.closed_exit_code = code;
+                                let msg = ts.closed_message.clone();
                                 info!(?tab, ?code, "shell tab: closed");
-                                emit_tab_closed_state(&app, &state_events, tab, true, code);
+                                emit_tab_closed_state(&app, &state_events, tab, true, code, msg);
                             }
                         }
                         continue;
@@ -563,17 +576,45 @@ async fn run(
                     // the signal into transition() which produces Error.
                 }
 
+                // Shell tab launch-failure: spawn-time error that should NOT
+                // be retried by Enter (e.g. command not found). Routes to
+                // the closed sub-state and stamps a custom message that the
+                // frontend overlay displays in place of the standard text.
+                if let StateSignal::ShellLaunchFailed { tab, message } = &signal {
+                    let tab = tab.clone();
+                    let message = message.clone();
+                    if let Some(ts) = tabs.get_mut(&tab) {
+                        if matches!(ts.kind, TabKind::Shell) {
+                            ts.closed = true;
+                            ts.closed_exit_code = None;
+                            ts.closed_message = Some(message.clone());
+                            info!(?tab, message = %message, "shell tab: launch failed");
+                            emit_tab_closed_state(
+                                &app,
+                                &state_events,
+                                tab,
+                                true,
+                                None,
+                                Some(message),
+                            );
+                        }
+                    }
+                    continue;
+                }
+
                 // Shell tab restart (Phase 6 emits this after a fresh PTY
-                // has been bound). Clears the closed flag so the overlay
-                // hides; AI tabs ignore.
+                // has been bound). Clears the closed flag (and any custom
+                // launch-failure message) so the overlay hides; AI tabs
+                // ignore.
                 if let StateSignal::ShellRestarted { tab } = &signal {
                     let tab = tab.clone();
                     if let Some(ts) = tabs.get_mut(&tab) {
                         if matches!(ts.kind, TabKind::Shell) && ts.closed {
                             ts.closed = false;
                             ts.closed_exit_code = None;
+                            ts.closed_message = None;
                             info!(?tab, "shell tab: restarted");
-                            emit_tab_closed_state(&app, &state_events, tab, false, None);
+                            emit_tab_closed_state(&app, &state_events, tab, false, None, None);
                         }
                     }
                     continue;
@@ -812,6 +853,7 @@ fn emit_tab_closed_state(
     tab: TabId,
     closed: bool,
     exit_code: Option<i32>,
+    closed_message: Option<String>,
 ) {
     dispatch(
         app,
@@ -820,6 +862,7 @@ fn emit_tab_closed_state(
             tab,
             closed,
             exit_code,
+            closed_message,
         },
     );
 }

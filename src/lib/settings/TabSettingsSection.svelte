@@ -1,11 +1,11 @@
 <script lang="ts">
   import type { TabId } from '../tabs/types';
-  import type { TabSettings } from './types';
+  import type { AiToolTabConfig } from './types';
   import ArrayEditor from './ArrayEditor.svelte';
   import TextAreaWithReset from './TextAreaWithReset.svelte';
   import NotificationEditor from './NotificationEditor.svelte';
 
-  // Renders the per-tab settings form: command (read-only), CLI flags,
+  // Renders the per-AI-tab settings form: command (read-only), CLI args,
   // TTS injection toggle + instructions, notification texts, and a Restart
   // Tab button. The parent owns baseline tracking and computes
   // `restartRequired`; this component just shows the indicator and routes
@@ -13,7 +13,7 @@
   let {
     tabId,
     displayName,
-    settings = $bindable<TabSettings>(),
+    settings = $bindable<AiToolTabConfig>(),
     defaults,
     restartRequired,
     onchange,
@@ -21,14 +21,14 @@
   }: {
     tabId: TabId;
     displayName: string;
-    settings: TabSettings;
-    defaults: TabSettings | null;
+    settings: AiToolTabConfig;
+    defaults: AiToolTabConfig | null;
     restartRequired: boolean;
     onchange: () => void;
     onrestart: () => void;
   } = $props();
 
-  function update<K extends keyof TabSettings>(key: K, value: TabSettings[K]) {
+  function update<K extends keyof AiToolTabConfig>(key: K, value: AiToolTabConfig[K]) {
     settings = { ...settings, [key]: value };
     onchange();
   }
@@ -58,20 +58,20 @@
 
   <label>
     <span>
-      Persistent CLI flags
+      Persistent CLI args
       {#if restartRequired}
         <span class="restart-tag">restart required</span>
       {/if}
     </span>
     <ArrayEditor
       bind:items={
-        () => settings.extra_cli_flags,
-        (v) => update('extra_cli_flags', v)
+        () => settings.args,
+        (v) => update('args', v)
       }
       placeholder="--flag or --key=value"
     />
     <small class="hint">
-      Appended to every spawn of this tab. One flag per row.
+      Appended to every spawn of this tab. One arg per row.
     </small>
   </label>
 

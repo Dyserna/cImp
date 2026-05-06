@@ -24,6 +24,11 @@ export interface AvatarErrorInfo {
 export interface TabClosedState {
   closed: boolean;
   exit_code: number | null;
+  /// Custom overlay message (set by the backend on a launch failure like
+  /// command-not-found). When non-null, the overlay shows this in place
+  /// of the standard "Shell exited (code N)" line and Enter routes to
+  /// the Configure dialog instead of restart.
+  closed_message: string | null;
 }
 
 // Backend wire format for the `avatar-state` event. Includes the runtime
@@ -35,7 +40,13 @@ type StateEvent =
   | { type: 'active-tab-changed'; tab: TabId }
   | { type: 'awaiting-permission-changed'; tab: TabId; awaiting: boolean }
   | { type: 'done-while-away-changed'; tab: TabId; done: boolean }
-  | { type: 'tab-closed-state-changed'; tab: TabId; closed: boolean; exit_code: number | null }
+  | {
+      type: 'tab-closed-state-changed';
+      tab: TabId;
+      closed: boolean;
+      exit_code: number | null;
+      closed_message: string | null;
+    }
   | ({ type: 'tab-created' } & TabCreatedEvent)
   | { type: 'tab-closed'; tab: TabId }
   | { type: 'tab-renamed'; tab: TabId; name: string };
@@ -69,7 +80,9 @@ export function seedPerTabEntries(tab: TabId): void {
   perTabAwaitingPermission.update((m) => (tab in m ? m : { ...m, [tab]: false }));
   perTabDoneWhileAway.update((m) => (tab in m ? m : { ...m, [tab]: false }));
   perTabClosedState.update((m) =>
-    tab in m ? m : { ...m, [tab]: { closed: false, exit_code: null } },
+    tab in m
+      ? m
+      : { ...m, [tab]: { closed: false, exit_code: null, closed_message: null } },
   );
 }
 
@@ -160,7 +173,11 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
       } else if (e.type === 'tab-closed-state-changed') {
         perTabClosedState.update((m) => ({
           ...m,
-          [e.tab]: { closed: e.closed, exit_code: e.exit_code },
+          [e.tab]: {
+            closed: e.closed,
+            exit_code: e.exit_code,
+            closed_message: e.closed_message,
+          },
         }));
       } else if (e.type === 'tab-created') {
         // Seed per-tab caches BEFORE applying to the tabs store so any

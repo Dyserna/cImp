@@ -24,7 +24,8 @@
   import TabErrorOverlay from './TabErrorOverlay.svelte';
   import ClosedShellOverlay from './ClosedShellOverlay.svelte';
   import { isShellTab, type TabId } from './tabs/types';
-  import type { PaneNode } from './layout/types';
+  import { tabs } from './tabs/store';
+  import type { LayoutNode, PaneNode } from './layout/types';
 
   let { pane }: { pane: PaneNode } = $props();
 
@@ -80,6 +81,37 @@
 
   const focused = $derived($layout.focused_pane_id === pane.id);
 
+  // Compute "Pane N of M, contains <active tab name> and K more tabs"
+  // for screen readers. Walks the layout tree once per render — cheap
+  // for the small tree sizes we ever expect (typically <8 panes). The
+  // active-tab name comes from the live tabs store so renames are
+  // reflected immediately.
+  const ariaLabel = $derived.by(() => {
+    const panes: PaneNode[] = [];
+    const visit = (node: LayoutNode): void => {
+      if (node.type === 'pane') {
+        panes.push(node);
+        return;
+      }
+      visit(node.first);
+      visit(node.second);
+    };
+    visit($layout.tree);
+    const index = panes.findIndex((p) => p.id === pane.id);
+    const ordinal = index < 0 ? 1 : index + 1;
+    const total = panes.length;
+    const activeId = pane.active_tab_id;
+    const active = activeId ? $tabs.find((t) => t.id === activeId) : null;
+    const others = Math.max(0, pane.tab_ids.length - 1);
+    if (!active) {
+      return `Pane ${ordinal} of ${total}, empty`;
+    }
+    if (others === 0) {
+      return `Pane ${ordinal} of ${total}, contains ${active.name}`;
+    }
+    return `Pane ${ordinal} of ${total}, contains ${active.name} and ${others} more tab${others === 1 ? '' : 's'}`;
+  });
+
   // When the pane becomes focused, refocus its terminal. Without this a
   // pane-to-pane focus shift via click on the bar (or the M3 keyboard
   // shortcuts) wouldn't move keyboard focus to the new pane's xterm,
@@ -105,7 +137,8 @@
 <div
   class="pane"
   class:focused
-  role="presentation"
+  role="group"
+  aria-label={ariaLabel}
   bind:this={paneEl}
   onmousedowncapture={handlePaneMouseDown}
 >
@@ -144,15 +177,23 @@
     position: absolute;
     inset: 0;
   }
-  /* Focused-pane indicator: a 2px accent line at the bottom of the
-     focused pane's tab bar. The base TabBar declares a 1px border;
-     overriding both width and color here gives a clearly-distinct cue
-     in multi-pane layouts without bleeding noise into the single-pane
-     case (still rendered, but the unfocused-pane comparison is what
-     makes it readable; with one pane it just looks like a thicker
-     separator line). */
+  /* Focused-pane indicator: a 2px accent line along the top edge of
+     the focused pane's tab bar. Top placement (not bottom) so it
+     doesn't visually merge with the active-tab underline, which is
+     also #4a90e2 — when both rendered at the bottom they read as one
+     continuous line and the focused-vs-active distinction blurs.
+     Single-pane layouts still render it; with no unfocused pane to
+     compare against it just looks like a top accent on the bar. */
   .pane.focused :global(.tab-bar) {
-    border-bottom-color: #4a90e2;
-    border-bottom-width: 2px;
+    box-shadow: inset 0 2px 0 0 #4a90e2;
+  }
+  /* Keyboard focus traversal: the pane root receives focus via
+     Ctrl+Alt+Arrow (which calls setFocusedPane). Tab key doesn't
+     reach the pane root because the role is group, but :focus-visible
+     on the inner xterm host is good enough — for ARIA traversal the
+     aria-label on the .pane element above is what gets announced. */
+  .pane:focus-visible {
+    outline: 2px solid #4a90e2;
+    outline-offset: -2px;
   }
 </style>

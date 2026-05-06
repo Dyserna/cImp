@@ -17,6 +17,7 @@
   {#if meta}
     <div
       class="drag-ghost"
+      aria-hidden="true"
       style:left="{$dragState.cursorX + offsetX}px"
       style:top="{$dragState.cursorY + offsetY}px"
     >

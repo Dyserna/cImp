@@ -255,6 +255,25 @@
     align-items: center;
     gap: 8px;
     position: relative;
+    /* Don't shrink below the content / min width — overflow on the
+       parent .tab-list scrolls instead. The min-width keeps short
+       labels readable when the bar is wide; the max-width clips long
+       ones with ellipsis on .label so a single huge tab can't
+       monopolize the bar. */
+    flex: 0 0 auto;
+    min-width: 80px;
+    max-width: 200px;
+  }
+  .tab:focus-visible {
+    outline: 2px solid #4a90e2;
+    outline-offset: -2px;
+  }
+  .label {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    flex: 1 1 auto;
+    min-width: 0;
   }
   .tab:active {
     cursor: grabbing;

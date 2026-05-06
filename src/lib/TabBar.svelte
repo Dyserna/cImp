@@ -48,6 +48,10 @@
   // registry stores the element; rects are read live so resizes and
   // splitter moves stay correct without re-registering.
   let barEl: HTMLDivElement | undefined = $state();
+  let listEl: HTMLDivElement | undefined = $state();
+  let canScrollLeft = $state(false);
+  let canScrollRight = $state(false);
+
   $effect(() => {
     if (!barEl) return;
     const id = pane.id;
@@ -55,6 +59,54 @@
     return () => {
       paneRegistry.setTabBarElement(id, null);
     };
+  });
+
+  // Recompute edge-fade visibility from the scroll state. Driven by
+  // (1) scroll events on the list, (2) ResizeObserver on the list (the
+  // pane width can change via splitter drag without firing a scroll),
+  // and (3) reactive re-runs whenever pane.tab_ids changes (adding /
+  // removing tabs changes scrollWidth without scrolling).
+  function updateScrollEdges(): void {
+    if (!listEl) return;
+    const scrollLeft = listEl.scrollLeft;
+    const maxScroll = listEl.scrollWidth - listEl.clientWidth;
+    canScrollLeft = scrollLeft > 0;
+    canScrollRight = scrollLeft < maxScroll - 1;
+  }
+
+  $effect(() => {
+    if (!listEl) return;
+    const el = listEl;
+    updateScrollEdges();
+    el.addEventListener('scroll', updateScrollEdges, { passive: true });
+    const ro = new ResizeObserver(() => updateScrollEdges());
+    ro.observe(el);
+    return () => {
+      el.removeEventListener('scroll', updateScrollEdges);
+      ro.disconnect();
+    };
+  });
+
+  // Re-evaluate when the tab list changes (add / remove / rename can
+  // shift scrollWidth without firing scroll). Reading pane.tab_ids and
+  // .length wires the reactive dependency.
+  $effect(() => {
+    pane.tab_ids.length;
+    queueMicrotask(updateScrollEdges);
+  });
+
+  // Scroll the active tab into view whenever it changes. Catches
+  // Ctrl+N switching to a tab that's off-screen in an overflowed bar
+  // and click-on-truncated-tab activating one. `inline: 'nearest'`
+  // avoids unnecessary movement when the active tab is already fully
+  // visible.
+  $effect(() => {
+    const id = pane.active_tab_id;
+    if (!id || !listEl) return;
+    queueMicrotask(() => {
+      const tabEl = listEl?.querySelector<HTMLElement>(`[data-tab-id="${CSS.escape(id)}"]`);
+      tabEl?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+    });
   });
 
   function onTabClick(tabId: TabId): void {
@@ -123,43 +175,52 @@
   bind:this={barEl}
   oncontextmenu={onBarContextMenu}
 >
-  {#each pane.tab_ids as id (id)}
-    {@const meta = $tabs.find((m) => m.id === id)}
-    {#if meta}
-      <Tab
-        tabId={id}
-        label={meta.name}
-        active={pane.active_tab_id === id}
-        builtin={meta.builtin}
-        canSkipCloseConfirm={$perTabClosedState[id]?.closed ?? false}
-        avatarState={$perTabAvatarState[id] ?? 'Idle'}
-        awaitingPermission={$perTabAwaitingPermission[id] ?? false}
-        doneWhileAway={$perTabDoneWhileAway[id] ?? false}
-        bind:renaming={
-          () => renamingTab === id,
-          (v) => {
-            if (v) renamingTab = id;
-            else if (renamingTab === id) renamingTab = null;
-          }
-        }
-        onclick={() => onTabClick(id)}
-        onclose={meta.builtin ? undefined : () => onCloseTab(id)}
-        oncontextmenu={(e) => onTabContextMenu(id, meta.builtin, e)}
-        onpointerdowndrag={(e) => beginDrag(id, pane.id, e)}
-        onrename={(newName) => onRenameTab(id, newName)}
-      />
-    {/if}
-  {/each}
-  <button
-    type="button"
-    class="new-tab"
-    aria-label="New shell tab"
-    title="New shell tab (Ctrl+T)"
-    onclick={onNewShellTab}
-    oncontextmenu={onNewTabContextMenu}
+  <div
+    class="tab-list"
+    class:fade-left={canScrollLeft}
+    class:fade-right={canScrollRight}
+    bind:this={listEl}
   >
-    +
-  </button>
+    {#each pane.tab_ids as id (id)}
+      {@const meta = $tabs.find((m) => m.id === id)}
+      {#if meta}
+        <Tab
+          tabId={id}
+          label={meta.name}
+          active={pane.active_tab_id === id}
+          builtin={meta.builtin}
+          canSkipCloseConfirm={$perTabClosedState[id]?.closed ?? false}
+          avatarState={$perTabAvatarState[id] ?? 'Idle'}
+          awaitingPermission={$perTabAwaitingPermission[id] ?? false}
+          doneWhileAway={$perTabDoneWhileAway[id] ?? false}
+          bind:renaming={
+            () => renamingTab === id,
+            (v) => {
+              if (v) renamingTab = id;
+              else if (renamingTab === id) renamingTab = null;
+            }
+          }
+          onclick={() => onTabClick(id)}
+          onclose={meta.builtin ? undefined : () => onCloseTab(id)}
+          oncontextmenu={(e) => onTabContextMenu(id, meta.builtin, e)}
+          onpointerdowndrag={(e) => beginDrag(id, pane.id, e)}
+          onrename={(newName) => onRenameTab(id, newName)}
+        />
+      {/if}
+    {/each}
+  </div>
+  <div class="tab-bar-end">
+    <button
+      type="button"
+      class="new-tab"
+      aria-label="New shell tab"
+      title="New shell tab (Ctrl+T)"
+      onclick={onNewShellTab}
+      oncontextmenu={onNewTabContextMenu}
+    >
+      +
+    </button>
+  </div>
 </div>
 
 {#if menu}
@@ -189,6 +250,68 @@
     background: #2a2a2a;
     border-bottom: 1px solid #444;
     flex: 0 0 32px;
+    /* Outer is non-scrolling; .tab-list owns the horizontal scroll so
+       the + button stays pinned at the right and the bottom border
+       isn't fragmented by a scrollbar gutter. */
+    overflow: hidden;
+    position: relative;
+  }
+  .tab-list {
+    display: flex;
+    flex-direction: row;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    /* Thin scrollbar so the per-pane bar (narrower than v1.2's
+       full-width one) doesn't lose much vertical space when overflow
+       kicks in. */
+    scrollbar-width: thin;
+    scrollbar-color: #555 transparent;
+  }
+  .tab-list::-webkit-scrollbar {
+    height: 4px;
+  }
+  .tab-list::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 2px;
+  }
+  .tab-list::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  /* Edge-fade gradients: pseudo-elements positioned over the .tab-bar
+     (not the scrollable list) so they don't move with scroll. Visibility
+     is class-toggled by the reactive scroll-state effect, so a fully
+     in-view bar shows neither fade. The gradients fade out the leftmost
+     / rightmost few px of tabs, telling the user "more content here". */
+  .tab-list.fade-left::before,
+  .tab-list.fade-right::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 16px;
+    pointer-events: none;
+    z-index: 1;
+  }
+  .tab-list.fade-left::before {
+    left: 0;
+    background: linear-gradient(to right, #2a2a2a, transparent);
+  }
+  .tab-list.fade-right::after {
+    /* Anchored to the right edge of the scrollable list — which sits
+       just inside .tab-bar-end. The list's flex: 1 1 auto means its
+       right edge moves with the bar's available width, so right: 0
+       relative to the list's positioned ancestor (the .tab-bar) lands
+       at the end of the list, not the end of the bar. The +button's
+       width is accounted for by the flex layout. */
+    right: 32px;
+    background: linear-gradient(to left, #2a2a2a, transparent);
+  }
+  .tab-bar-end {
+    display: flex;
+    flex: 0 0 auto;
+    border-left: 1px solid #444;
   }
   .new-tab {
     appearance: none;
@@ -202,10 +325,13 @@
     line-height: 30px;
     padding: 0;
     user-select: none;
-    border-right: 1px solid #2a2a2a;
   }
   .new-tab:hover {
     background: #303030;
     color: #e0e0e0;
+  }
+  .new-tab:focus-visible {
+    outline: 2px solid #4a90e2;
+    outline-offset: -2px;
   }
 </style>

@@ -38,7 +38,9 @@ TTS, no permission detection, and a reduced notification set (`error` and
 - **Close:** click the `×` on the tab, or press `Ctrl+W` while the tab is
   active. Builtin tabs (Claude, Aider) cannot be closed.
 - **Switch by position:** `Ctrl+1`..`Ctrl+9` switch to the tab at that
-  ordinal position. `Ctrl+9` with fewer than 9 tabs is a silent no-op.
+  ordinal position **within the focused pane** (v1.3 change — see
+  *Multi-pane Layout* below). `Ctrl+9` with fewer than 9 tabs in the focused
+  pane is a silent no-op.
 
 ### Default shell per platform
 
@@ -90,7 +92,107 @@ Common alternatives, paste into Configure → command + arguments:
   `config.json.v1.1.bak` on first migration. For other corruption,
   delete `settings.json` and the app writes a fresh default on next launch.
 
-### Aider tab and the TTS limitation
+## Multi-pane Layout (v1.3+)
+
+The terminal area is a recursive tree of panes — split horizontally or
+vertically, drag tabs between them, save named layouts. The avatar, audio
+playback, and the compose overlay all follow the **focused pane's active
+tab**; switching pane focus retargets all three.
+
+### Splitting
+
+- **Drag a tab to a pane edge** (left / right 25 %, top / bottom 25 %, below
+  the tab bar) to tear it into a new sibling pane in that direction. The new
+  pane gets focus.
+- **`Ctrl+\`** splits the focused pane horizontally (side-by-side) with a
+  fresh Shell tab on the right.
+- **`Ctrl+Shift+\`** splits vertically (stacked) with a fresh Shell tab below.
+- **Right-click the tab bar background** (not on a tab) for a context menu
+  with Split horizontally / Split vertically and other pane operations.
+
+### Moving tabs
+
+- **Drag a tab to a different pane's tab bar** (or its center) to move it
+  there. The tab keeps its xterm.js state, scrollback, and PTY connection —
+  the underlying DOM element is just re-parented.
+- **Drag within the same tab bar** to reorder.
+- **Pane context menu → Move all tabs to →** moves every tab from one pane
+  into another and collapses the source.
+
+### Closing panes
+
+- **Drag the last tab out** of a pane and the pane auto-collapses (its
+  parent split is replaced by the surviving sibling).
+- **`Ctrl+Shift+W`** closes the focused pane; its tabs migrate to the
+  surviving sibling subtree's leftmost leaf, then the empty pane collapses.
+  No-op when the focused pane is the root.
+
+### Resizing
+
+Drag the 4 px line between any split's two children. Min sizes apply
+(200 px wide, 100 px tall) — neither pane can shrink past them. Window
+shrink re-clamps visually but doesn't overwrite your stored ratio; window
+re-grow restores it.
+
+### Focus
+
+- **Click any pane** to focus it. The avatar / audio / compose follow.
+- **`Ctrl+Alt+Arrow`** moves focus to the geometrically-adjacent pane in
+  that direction. Hits the closest one whose perpendicular axis overlaps
+  the focused pane's; no-op if no pane lies in that direction.
+- The focused pane shows a 2 px accent line along the top of its tab bar.
+
+### Layout presets
+
+Save the current pane arrangement under a name from the **Layouts** popover
+in the bottom-left of the status bar.
+
+- **Save current layout as…** prompts for a name. Same-name save replaces.
+- **Recent presets** lists the five most recent by save time; click to restore.
+- **Manage presets…** opens a dialog with inline rename and confirm-delete.
+- Presets store the tree only — focus follows your next click after restore.
+- Restoring a preset adapts to the current tab list: tabs created since the
+  preset was saved land in the focused pane; tabs deleted since are skipped.
+
+### Keyboard shortcuts
+
+| Action                       | Default              |
+|------------------------------|----------------------|
+| Switch to tab N in focused pane | `Ctrl+1` … `Ctrl+9`  |
+| New shell tab in focused pane   | `Ctrl+T`             |
+| Close active tab in focused pane| `Ctrl+W`             |
+| Split focused pane horizontally | `Ctrl+\`             |
+| Split focused pane vertically   | `Ctrl+Shift+\`       |
+| Close focused pane              | `Ctrl+Shift+W`       |
+| Focus pane left / right / up / down | `Ctrl+Alt+Arrow` |
+| Open compose                    | `Ctrl+Shift+E`       |
+| Submit compose                  | `Ctrl+Enter`         |
+| Open settings                   | `Ctrl+,`             |
+
+All shortcuts are rebindable in *Settings → Shortcuts*.
+
+### Known shortcut conflicts
+
+- **`Ctrl+Shift+W` may collide with WebView2's "close window"** on some
+  Windows configurations — if the press closes the app instead of the pane,
+  remap `close_pane` to e.g. `Ctrl+Q` or `Ctrl+Alt+W`.
+- **`Ctrl+Alt+Arrow` may collide with GNOME / KDE workspace switching** on
+  Linux. Remap `focus_pane_*` to `Ctrl+Shift+Arrow` if needed.
+
+Defaults aren't changed for either — different setups have different
+conflicts; the rebind path covers them.
+
+### Migrating from v1.2
+
+On first v1.3 launch, an existing v1.2 settings file gets migrated to a
+single root pane containing every tab in order, with the previously-active
+tab focused. A `settings.json.v1.2.bak` backup is written alongside before
+the rewrite. All v1.2 features (tabs, settings, notifications, presets,
+TTS, avatar) carry over unchanged. The only behavior change is that
+`Ctrl+1`..`Ctrl+9` are now **scoped to the focused pane** rather than the
+global tab list.
+
+## Aider tab and the TTS limitation
 
 Aider runs as a fully functional second tab — input, output, status,
 notifications, and the avatar all work normally. **Spoken TTS is silent

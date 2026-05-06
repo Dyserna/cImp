@@ -9,6 +9,7 @@ import { get } from 'svelte/store';
 import { layout } from './store';
 import { settings } from '../settings/store';
 import { tabs as tabsStore } from '../settings/store';
+import { cancelDrag } from '../dnd/drag';
 import {
   deleteLayoutPreset as deletePresetIpc,
   renameLayoutPreset as renamePresetIpc,
@@ -51,6 +52,11 @@ export function restoreLayoutPreset(name: string): void {
     console.warn(`restoreLayoutPreset: no preset named '${name}'`);
     return;
   }
+  // A drag in flight references the live tree's pane ids; replacing
+  // the tree wholesale would strand sourcePaneId. Cancelling the drag
+  // first is cheaper than threading "tree may have changed" checks
+  // through every pointermove handler.
+  cancelDrag();
   const persisted: LayoutPersisted = {
     tree: preset.tree,
     focused_pane_id: leftmostLeafPaneId(preset.tree),

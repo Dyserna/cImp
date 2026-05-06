@@ -168,13 +168,19 @@
     pointer-events: none;
     z-index: 10;
   }
+  /* Top-positioned variants add 32px (one per-pane tab bar height,
+     declared in TabBar.svelte) on top of the user's margin so the
+     avatar clears the focused pane's tab bar instead of obscuring it.
+     Without this, top-right / top-left avatars sit over the tab bar
+     of whichever pane occupies that corner. Bottom-* positions don't
+     need clearance — panes have no bottom bar. */
   .avatar-container.top-right {
-    top: var(--avatar-margin);
+    top: calc(var(--avatar-margin) + 32px);
     right: var(--avatar-margin);
     flex-direction: row;
   }
   .avatar-container.top-left {
-    top: var(--avatar-margin);
+    top: calc(var(--avatar-margin) + 32px);
     left: var(--avatar-margin);
     flex-direction: row-reverse;
   }

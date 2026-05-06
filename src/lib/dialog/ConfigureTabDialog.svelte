@@ -20,6 +20,8 @@
   let command = $state('');
   let argsString = $state('');
   let cwd = $state('');
+  let notificationsError = $state('');
+  let notificationsExited = $state('');
   let error = $state<TabLifecycleError | null>(null);
   let busy = $state(false);
 
@@ -48,6 +50,8 @@
       command = cfg.command;
       argsString = cfg.args;
       cwd = cfg.cwd ?? '';
+      notificationsError = cfg.notifications_error;
+      notificationsExited = cfg.notifications_exited;
     } catch (e) {
       console.error('get_shell_tab_config failed:', e);
       // Fall back to empty fields on read failure; the user can re-enter.
@@ -55,6 +59,8 @@
       command = '';
       argsString = '';
       cwd = '';
+      notificationsError = '';
+      notificationsExited = '';
     }
   }
 
@@ -74,6 +80,8 @@
         argsString,
         cwd: cwd.trim() === '' ? null : cwd,
         env: {},
+        notificationsError,
+        notificationsExited,
       });
       closeDialog();
     } catch (e) {
@@ -117,6 +125,8 @@
       bind:command
       bind:argsString
       bind:cwd
+      bind:notificationsError
+      bind:notificationsExited
       {error}
     />
     {#if error && !['empty-name', 'command-not-found', 'cwd-not-found'].includes(error.kind)}

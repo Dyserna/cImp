@@ -78,11 +78,16 @@ export type TabLifecycleError =
 
 /// Default shell + args returned by `default_shell_spec`. Args are
 /// pre-joined with spaces; the dialog drops them into a text input
-/// verbatim and the backend re-splits via `shlex` on submit.
+/// verbatim and the backend re-splits via `shlex` on submit. The two
+/// `notifications_*` fields carry the platform-default notification
+/// text so the New Shell Tab dialog can pre-fill them — keeping the
+/// defaults source-of-truth on the backend (M4).
 export interface DefaultShellWire {
   command: string;
   args: string;
   git_bash_found: boolean;
+  notifications_error: string;
+  notifications_exited: string;
 }
 
 export async function defaultShellSpec(): Promise<DefaultShellWire> {
@@ -95,6 +100,8 @@ export interface ShellTabConfigWire {
   args: string;
   cwd: string | null;
   env: Record<string, string>;
+  notifications_error: string;
+  notifications_exited: string;
 }
 
 export async function getShellTabConfig(tab: TabId): Promise<ShellTabConfigWire> {
@@ -111,6 +118,8 @@ export interface CreateShellTabInput {
   argsString: string;
   cwd: string | null;
   env: Record<string, string>;
+  notificationsError: string;
+  notificationsExited: string;
 }
 
 export async function createShellTab(input: CreateShellTabInput): Promise<TabId> {
@@ -132,6 +141,8 @@ export interface ReconfigureShellTabInput {
   argsString: string;
   cwd: string | null;
   env: Record<string, string>;
+  notificationsError: string;
+  notificationsExited: string;
 }
 
 export async function reconfigureShellTab(input: ReconfigureShellTabInput): Promise<void> {

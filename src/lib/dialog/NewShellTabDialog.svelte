@@ -14,6 +14,8 @@
   let command = $state('');
   let argsString = $state('');
   let cwd = $state('');
+  let notificationsError = $state('');
+  let notificationsExited = $state('');
   let error = $state<TabLifecycleError | null>(null);
   let busy = $state(false);
   let showGitBashBanner = $state(false);
@@ -42,6 +44,8 @@
       const spec = await defaultShellSpec();
       command = spec.command;
       argsString = spec.args;
+      notificationsError = spec.notifications_error;
+      notificationsExited = spec.notifications_exited;
       // Banner only on Windows when Git Bash detection failed.
       const isWindows = typeof navigator !== 'undefined'
         && navigator.userAgent.toLowerCase().includes('windows');
@@ -50,6 +54,10 @@
       console.error('default_shell_spec failed:', e);
       command = '';
       argsString = '';
+      // Hardcoded fallbacks mirror the backend's ShellNotificationConfig::default()
+      // — only used if the IPC fetch failed (rare).
+      notificationsError = 'Shell encountered an error';
+      notificationsExited = 'Shell exited (code {code})';
       showGitBashBanner = false;
     }
     cwd = '';
@@ -70,6 +78,8 @@
         argsString,
         cwd: cwd.trim() === '' ? null : cwd,
         env: {},
+        notificationsError,
+        notificationsExited,
       });
       closeDialog();
     } catch (e) {
@@ -117,6 +127,8 @@
       bind:command
       bind:argsString
       bind:cwd
+      bind:notificationsError
+      bind:notificationsExited
       {error}
       {showGitBashBanner}
     />

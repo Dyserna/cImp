@@ -145,15 +145,22 @@
     return `${t.command}${args}`;
   }
 
-  /// Open the main window and emit a "configure tab" request that the tab
-  /// bar's right-click menu component listens for. Keeps the inline-editor
-  /// concern out of the settings window — Shell tab editing is one path
-  /// (the Configure dialog), invoked from either the tab bar context menu
-  /// or this settings list.
-  async function configureShellTab(_tabId: TabId) {
-    // Stub for now — the Configure dialog wiring is owned by the main
-    // window's tab-bar code. A future polish PR can route through a
-    // dedicated event; for v1.2 the user is told to right-click the tab.
+  /// Replace the Shell-tab entry's notification config in the snapshot.
+  /// Inline-editable in the Settings window (M4) — notifications apply
+  /// live, no restart needed, so the existing settings broadcast flow is
+  /// all we need. Spawn-affecting fields (command/args/cwd) are read-only
+  /// here; the user changes them via the tab bar's right-click → Configure.
+  function patchShellNotifications(
+    id: string,
+    next: ShellTabConfig['notifications'],
+  ) {
+    patch((s) => {
+      const idx = findTabIndex(s, id);
+      if (idx < 0) return;
+      const entry = s.tabs[idx];
+      if (entry.kind !== 'shell') return;
+      s.tabs[idx] = { ...entry, notifications: next };
+    });
   }
 
   async function pickFile(
@@ -626,27 +633,59 @@
               {/if}
             </details>
           {:else}
-            <div class="shell-row">
-              <div class="shell-row-head">
-                <span class="shell-name">{entry.name}</span>
+            <details>
+              <summary>
+                {entry.name}
                 <span class="kind-badge shell">Shell</span>
                 {#if entry.builtin}
                   <span class="builtin-tag">builtin</span>
                 {/if}
+              </summary>
+              <div class="shell-edit">
+                <label>
+                  <span>Command</span>
+                  <input type="text" value={shellSummary(entry)} disabled readonly />
+                  <small class="hint">
+                    To change the command, args, or working directory,
+                    right-click the tab in the tab bar and choose
+                    Configure…
+                  </small>
+                </label>
+                <label>
+                  <span>Error notification text</span>
+                  <input
+                    type="text"
+                    value={entry.notifications.error}
+                    oninput={(e) =>
+                      patchShellNotifications(entry.id, {
+                        ...entry.notifications,
+                        error: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                  <small class="hint">
+                    Spoken when this tab errors while you're on a different
+                    tab. Leave blank to disable.
+                  </small>
+                </label>
+                <label>
+                  <span>Exited notification text</span>
+                  <input
+                    type="text"
+                    value={entry.notifications.exited}
+                    oninput={(e) =>
+                      patchShellNotifications(entry.id, {
+                        ...entry.notifications,
+                        exited: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                  <small class="hint">
+                    Spoken when this shell exits while you're on a different
+                    tab. Use <code>{'{code}'}</code> to insert the exit code.
+                    Leave blank to disable.
+                  </small>
+                </label>
               </div>
-              <div class="shell-row-cmd" title={shellSummary(entry)}>
-                {shellSummary(entry)}
-              </div>
-              <div class="shell-row-actions">
-                <button
-                  type="button"
-                  class="ghost"
-                  onclick={() => configureShellTab(entry.id as TabId)}
-                >
-                  Configure…
-                </button>
-              </div>
-            </div>
+            </details>
           {/if}
         {/each}
       </div>
@@ -908,52 +947,40 @@
     margin-left: 6px;
     vertical-align: middle;
   }
-  .shell-row {
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    background: #181818;
-    padding: 10px 12px;
-    display: grid;
-    grid-template-columns: 1fr auto;
-    grid-template-rows: auto auto;
-    gap: 4px 10px;
-    align-items: center;
+  .shell-edit {
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
   }
-  .shell-row-head {
-    grid-column: 1;
-    grid-row: 1;
-    color: #ddd;
+  .shell-edit label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
     font-size: 12px;
-    font-weight: 600;
+    color: #b0b0b0;
   }
-  .shell-row-cmd {
-    grid-column: 1;
-    grid-row: 2;
-    font-family: monospace;
-    font-size: 11px;
-    color: #888;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .shell-row-actions {
-    grid-column: 2;
-    grid-row: 1 / span 2;
-  }
-  .shell-row-actions button {
-    background: #2a2a2a;
+  .shell-edit input[type="text"] {
+    background: #1f1f1f;
     border: 1px solid #444;
-    color: #aaa;
-    padding: 4px 12px;
-    border-radius: 4px;
-    cursor: pointer;
+    color: #e0e0e0;
+    padding: 6px 8px;
+    border-radius: 3px;
+    font-family: Consolas, Menlo, monospace;
+    font-size: 13px;
+  }
+  .shell-edit input[type="text"]:focus {
+    outline: none;
+    border-color: #4a90e2;
+  }
+  .shell-edit input[disabled] {
+    color: #888;
+    background: #181818;
+  }
+  .shell-edit code {
+    background: #1f1f1f;
+    padding: 1px 4px;
+    border-radius: 2px;
     font-size: 11px;
-  }
-  .shell-row-actions button:hover {
-    background: #333;
-    color: #ddd;
-  }
-  .shell-name {
-    margin-right: 4px;
   }
 </style>

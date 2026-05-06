@@ -42,6 +42,11 @@
   // over its initial value at mount time — sees the latest state without
   // re-binding xterm. Only Shell tabs flip this; AI tabs leave it false.
   let isClosed = false;
+  // Guards the `tab-restart-requested` listener against the dual-trigger
+  // race: closed-overlay Enter and the M4 context-menu "Restart shell" can
+  // both fire in quick succession; without a guard, two `rebindBytesChannel`
+  // calls would race on which channel the backend's start arm binds to.
+  let restarting = false;
 
   let initialFontFamily = 'Consolas, Menlo, "DejaVu Sans Mono", monospace';
   let initialFontSize = 14;
@@ -201,12 +206,20 @@
 
       // Tab-restart is generic in V2-02 (Settings → Tabs has a Restart
       // button per tab). Each Terminal instance listens and acts only when
-      // the event payload matches its own tabId.
+      // the event payload matches its own tabId. The `restarting` guard
+      // collapses concurrent triggers (M4: closed-overlay Enter + the
+      // context-menu Restart entry can both fire) into a single restart.
       unlistenRestart = await listen<TabId>('tab-restart-requested', async (event) => {
         if (event.payload !== tabId) return;
         if (!term || !fitAddon) return;
-        term.write(`\r\n[restarting ${tabId}…]\r\n`);
-        await attemptSpawn(true);
+        if (restarting) return;
+        restarting = true;
+        try {
+          term.write(`\r\n[restarting ${tabId}…]\r\n`);
+          await attemptSpawn(true);
+        } finally {
+          restarting = false;
+        }
       });
 
       resizeObserver = new ResizeObserver(() => {

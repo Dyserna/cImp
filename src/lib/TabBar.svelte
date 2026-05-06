@@ -9,9 +9,13 @@
     perTabClosedState,
     perTabDoneWhileAway,
   } from './avatarState';
-  import { closeTab as closeTabIpc, renameTab as renameTabIpc } from './ipc';
+  import {
+    closeTab as closeTabIpc,
+    renameTab as renameTabIpc,
+    restartShellTab,
+  } from './ipc';
   import { openConfigureTabDialog, openNewShellTabDialog } from './dialog/store';
-  import type { TabId } from './tabs/types';
+  import { isShellTab, type TabId } from './tabs/types';
 
   // Per-tab rename mode flag. The `Tab` component two-way binds to this
   // value; flipping it true here (on the context menu's Rename action)
@@ -25,6 +29,12 @@
   function onCloseTab(tab: TabId): void {
     void closeTabIpc(tab).catch((e) => {
       console.error('close_tab failed:', e);
+    });
+  }
+
+  function onRestartTab(tab: TabId): void {
+    void restartShellTab(tab).catch((e) => {
+      console.error('restart_shell_tab failed:', e);
     });
   }
 
@@ -78,15 +88,21 @@
 </div>
 
 {#if menu}
+  {@const isShell = isShellTab(menu.tab)}
+  {@const closed = $perTabClosedState[menu.tab]?.closed ?? false}
   <TabContextMenu
     x={menu.x}
     y={menu.y}
     builtin={menu.builtin}
+    canRestart={isShell && !closed}
     onRename={() => {
       if (menu) renamingTab = menu.tab;
     }}
     onConfigure={() => {
       if (menu) openConfigureTabDialog(menu.tab);
+    }}
+    onRestart={() => {
+      if (menu) onRestartTab(menu.tab);
     }}
     onClose={() => {
       if (menu) onCloseTab(menu.tab);

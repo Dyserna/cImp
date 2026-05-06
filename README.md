@@ -17,6 +17,79 @@ Local, offline-after-install, no audio leaves the machine.
   in. They run independently — switching tabs doesn't stop either one.
 - The compose overlay submits to whichever tab is currently active.
 
+## Shell Tabs (v1.2+)
+
+In addition to the two AI builtins, cctts hosts **Shell tabs** — plain
+configurable terminal sessions running alongside Claude and Aider, with no
+TTS, no permission detection, and a reduced notification set (`error` and
+`exited` only).
+
+### Creating and managing Shell tabs
+
+- **Create:** click the `+` button at the right end of the tab bar, or press
+  `Ctrl+T`. The New Shell Tab dialog pre-fills the platform default shell.
+- **Rename:** right-click a tab → *Rename*, or double-click the tab name.
+- **Configure:** right-click a Shell tab → *Configure…* to change command,
+  args, working directory, or notification text. Spawn-affecting changes
+  apply on the next shell restart.
+- **Restart shell:** right-click → *Restart shell* kills the running
+  subprocess and respawns it with the current configuration. Useful after
+  changing the command in Configure.
+- **Close:** click the `×` on the tab, or press `Ctrl+W` while the tab is
+  active. Builtin tabs (Claude, Aider) cannot be closed.
+- **Switch by position:** `Ctrl+1`..`Ctrl+9` switch to the tab at that
+  ordinal position. `Ctrl+9` with fewer than 9 tabs is a silent no-op.
+
+### Default shell per platform
+
+| Platform | Default                                                       |
+|----------|---------------------------------------------------------------|
+| Windows  | Git Bash (auto-detected) — falls back to PowerShell           |
+| Linux    | `$SHELL` env var — falls back to `/bin/bash`, then `/bin/sh`  |
+
+Git Bash auto-detection on Windows probes, in order:
+
+1. `C:\Program Files\Git\bin\bash.exe`
+2. `C:\Program Files (x86)\Git\bin\bash.exe`
+3. `HKLM\SOFTWARE\GitForWindows\InstallPath` (registry)
+4. `bash.exe` resolvable on `PATH`
+
+If none match, the new-tab dialog shows a banner explaining the fallback to
+PowerShell and how to enable Git Bash by default.
+
+### Using an alternative shell
+
+Common alternatives, paste into Configure → command + arguments:
+
+| Shell             | Command                | Arguments      |
+|-------------------|------------------------|----------------|
+| WSL (Windows)     | `wsl.exe`              | `-d Ubuntu`    |
+| PowerShell Core   | `pwsh.exe`             | `-NoLogo`      |
+| Windows cmd       | `cmd.exe`              | `/K`           |
+| zsh on Linux      | `/usr/bin/zsh`         | `-i`           |
+
+### Shell tab troubleshooting
+
+- **My Shell tab on Windows opens PowerShell, not Git Bash.** Git for
+  Windows isn't installed at a standard location and isn't on `PATH`.
+  Install Git for Windows from gitforwindows.org, or set the command
+  manually in *Configure*.
+- **The shell exits immediately when I create a new tab.** Usually a
+  quoting issue in the args field, or a missing dependency. Use double
+  quotes around args containing spaces (`--config "C:\My Folder\x"`), and
+  verify the command runs from a normal terminal first.
+- **Linux tools (grep, nano) aren't found in my Shell tab.** The shell is
+  PowerShell or cmd, which don't ship with these. Switch to Git Bash or
+  WSL via *Configure*.
+- **My Shell tab's config changes don't take effect.** Spawn-affecting
+  changes apply on next shell restart. Right-click → *Restart shell*, or
+  type `exit` and press Enter on the closed-shell overlay.
+- **How do I delete a Shell tab?** Hover the tab and click `×`, or press
+  `Ctrl+W` while the tab is active. Builtin tabs can't be closed.
+- **My settings.json got corrupted.** v1.2 backs up the v1.1 file as
+  `config.json.v1.1.bak` on first migration. For other corruption,
+  delete `settings.json` and the app writes a fresh default on next launch.
+
 ### Aider tab and the TTS limitation
 
 Aider runs as a fully functional second tab — input, output, status,

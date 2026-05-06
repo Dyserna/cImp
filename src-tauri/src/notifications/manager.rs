@@ -217,7 +217,7 @@ impl NotificationManager {
             StateEvent::TabClosedStateChanged {
                 tab,
                 closed,
-                exit_code: _,
+                exit_code,
                 closed_message: _,
             } => {
                 // Only the closed=true edge fires a notification; the
@@ -229,7 +229,7 @@ impl NotificationManager {
                 if tab == active_tab {
                     return;
                 }
-                self.try_enqueue(tab, NotificationEvent::Exited)
+                self.try_enqueue_with_code(tab, NotificationEvent::Exited, exit_code)
             }
             StateEvent::TabCreated { tab, .. } => {
                 // Seed per-tab caches so the first real StateChanged /
@@ -268,6 +268,15 @@ impl NotificationManager {
     }
 
     fn try_enqueue(&mut self, tab: TabId, event: NotificationEvent) -> bool {
+        self.try_enqueue_with_code(tab, event, None)
+    }
+
+    fn try_enqueue_with_code(
+        &mut self,
+        tab: TabId,
+        event: NotificationEvent,
+        exit_code: Option<i32>,
+    ) -> bool {
         let settings = self.settings.current();
         if !settings.behavior.announcements_enabled {
             return false;
@@ -276,7 +285,7 @@ impl NotificationManager {
             debug!(?tab, ?event, "notifications: dropped (disallowed for kind)");
             return false;
         }
-        let text = notification_text(&settings, &tab, event);
+        let text = notification_text(&settings, &tab, event, exit_code);
         if text.is_empty() {
             // Per design: empty text disables the (tab, event) announcement.
             return false;
@@ -324,6 +333,7 @@ fn notification_text(
     settings: &crate::settings::Settings,
     tab: &TabId,
     event: NotificationEvent,
+    exit_code: Option<i32>,
 ) -> String {
     use crate::settings::TabConfig;
 
@@ -335,7 +345,7 @@ fn notification_text(
         return String::new();
     };
 
-    match (entry, event) {
+    let template = match (entry, event) {
         (TabConfig::AiTool(c), NotificationEvent::Idle) => c.notifications.idle.clone(),
         (TabConfig::AiTool(c), NotificationEvent::AwaitingPermission) => {
             c.notifications.awaiting_permission.clone()
@@ -348,7 +358,24 @@ fn notification_text(
         // Shell tabs don't fire Idle / AwaitingPermission; defensive empty.
         (TabConfig::Shell(_), NotificationEvent::Idle)
         | (TabConfig::Shell(_), NotificationEvent::AwaitingPermission) => String::new(),
+    };
+
+    interpolate_code(&template, exit_code)
+}
+
+/// Replace `{code}` with the exit code (or `?` when none was reported).
+/// `String::replace` handles zero, one, or multiple occurrences. The `?`
+/// fallback only matters defensively for templates that use `{code}` outside
+/// the Exited slot — Shell exits always carry an exit code in practice.
+fn interpolate_code(template: &str, exit_code: Option<i32>) -> String {
+    if !template.contains("{code}") {
+        return template.to_string();
     }
+    let replacement = match exit_code {
+        Some(c) => c.to_string(),
+        None => "?".to_string(),
+    };
+    template.replace("{code}", &replacement)
 }
 
 /// Per-tab dedup at play-time: keep only the most recent notification per
@@ -453,5 +480,55 @@ mod tests {
         assert!(allowed_for(&kind, NotificationEvent::Exited));
         assert!(!allowed_for(&kind, NotificationEvent::Idle));
         assert!(!allowed_for(&kind, NotificationEvent::AwaitingPermission));
+    }
+
+    #[test]
+    fn interpolate_replaces_single_code_token() {
+        assert_eq!(
+            interpolate_code("Shell exited (code {code})", Some(0)),
+            "Shell exited (code 0)"
+        );
+        assert_eq!(
+            interpolate_code("Shell exited (code {code})", Some(137)),
+            "Shell exited (code 137)"
+        );
+    }
+
+    #[test]
+    fn interpolate_handles_negative_code() {
+        // SIGSEGV-style synthesized negatives can flow through on Unix when
+        // a child is killed by signal — verify we render them faithfully.
+        assert_eq!(
+            interpolate_code("exit {code}", Some(-1)),
+            "exit -1"
+        );
+    }
+
+    #[test]
+    fn interpolate_replaces_all_occurrences() {
+        assert_eq!(
+            interpolate_code("{code} {code}", Some(2)),
+            "2 2"
+        );
+    }
+
+    #[test]
+    fn interpolate_falls_back_to_question_mark_when_code_missing() {
+        assert_eq!(
+            interpolate_code("exit {code}", None),
+            "exit ?"
+        );
+    }
+
+    #[test]
+    fn interpolate_passes_through_when_no_token() {
+        assert_eq!(
+            interpolate_code("Shell encountered an error", Some(1)),
+            "Shell encountered an error"
+        );
+        assert_eq!(
+            interpolate_code("Shell encountered an error", None),
+            "Shell encountered an error"
+        );
     }
 }

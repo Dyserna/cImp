@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::ipc::AppState;
-use crate::settings::{ShellTabConfig as ShellTabSettings, TabConfig};
+use crate::settings::{ShellNotificationConfig, ShellTabConfig as ShellTabSettings, TabConfig};
 use crate::shell::detect;
 use crate::state::{StateSignal, TabId, TabKind, TabMeta};
 
@@ -126,6 +126,7 @@ fn validated_to_shell_config(
     id: String,
     builtin: bool,
     input: &ValidatedShellInput,
+    notifications: ShellNotificationConfig,
 ) -> ShellTabSettings {
     ShellTabSettings {
         id,
@@ -135,8 +136,16 @@ fn validated_to_shell_config(
         args: input.args.clone(),
         cwd: input.cwd.clone(),
         env: input.env.clone(),
-        notifications: Default::default(),
+        notifications,
     }
+}
+
+/// Build a `ShellNotificationConfig` from the dialog's two strings. An empty
+/// string is intentional disable-this-notification (the manager treats empty
+/// as "skip"); the dialog is responsible for pre-filling the defaults so the
+/// user has to actively clear a field to disable it.
+fn notifications_from_dialog(error: String, exited: String) -> ShellNotificationConfig {
+    ShellNotificationConfig { error, exited }
 }
 
 /// Create a new user-managed Shell tab. Validates the inputs, registers it
@@ -151,9 +160,12 @@ pub async fn create_shell_tab(
     args_string: String,
     cwd: Option<String>,
     env: HashMap<String, String>,
+    notifications_error: String,
+    notifications_exited: String,
 ) -> Result<TabId, TabLifecycleError> {
     let args = shlex::split(&args_string).unwrap_or_default();
     let validated = validate_inputs(name, command, args, cwd, env)?;
+    let notifications = notifications_from_dialog(notifications_error, notifications_exited);
 
     let tab = TabId::Shell(format!("shell-{}", Uuid::new_v4()));
     let tab_meta = TabMeta {
@@ -173,6 +185,7 @@ pub async fn create_shell_tab(
             tab.as_str().to_string(),
             false,
             &validated,
+            notifications,
         ));
         // Idempotent on duplicate id (matches the registry's behavior).
         if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == tab.as_str()) {
@@ -345,12 +358,15 @@ pub async fn reconfigure_shell_tab(
     args_string: String,
     cwd: Option<String>,
     env: HashMap<String, String>,
+    notifications_error: String,
+    notifications_exited: String,
 ) -> Result<(), TabLifecycleError> {
     if !matches!(tab.kind(), TabKind::Shell) {
         return Err(TabLifecycleError::WrongKind);
     }
     let args = shlex::split(&args_string).unwrap_or_default();
     let validated = validate_inputs(name, command, args, cwd, env)?;
+    let notifications = notifications_from_dialog(notifications_error, notifications_exited);
 
     let name_changed: bool = {
         let registry = state.tabs.lock().await;
@@ -381,7 +397,8 @@ pub async fn reconfigure_shell_tab(
         cfg.args = validated.args.clone();
         cfg.cwd = validated.cwd.clone();
         cfg.env = validated.env.clone();
-        // notifications/builtin/id stay as they were.
+        cfg.notifications = notifications;
+        // builtin/id stay as they were.
         state.settings.set(snap);
     }
 
@@ -406,14 +423,19 @@ pub async fn reconfigure_shell_tab(
 }
 
 /// Query the platform default shell spec. Frontend's New Shell Tab
-/// dialog calls this to populate the command + args defaults.
+/// dialog calls this to populate the command + args defaults plus the
+/// platform-default notification text (used to pre-fill the new fields
+/// added in M4).
 #[tauri::command]
 pub fn default_shell_spec() -> DefaultShellWire {
     let (spec, _source) = detect::default_shell_resolution();
+    let notif_defaults = ShellNotificationConfig::default();
     DefaultShellWire {
         command: spec.command.to_string_lossy().into_owned(),
         args: spec.args.join(" "),
         git_bash_found: detect::was_default_git_bash_found(),
+        notifications_error: notif_defaults.error,
+        notifications_exited: notif_defaults.exited,
     }
 }
 
@@ -426,6 +448,8 @@ pub struct DefaultShellWire {
     pub command: String,
     pub args: String,
     pub git_bash_found: bool,
+    pub notifications_error: String,
+    pub notifications_exited: String,
 }
 
 /// Wire-format snapshot of a Shell tab's current spawn config. Returned
@@ -438,6 +462,8 @@ pub struct ShellTabConfigWire {
     pub args: String,
     pub cwd: Option<String>,
     pub env: HashMap<String, String>,
+    pub notifications_error: String,
+    pub notifications_exited: String,
 }
 
 /// Look up the current Shell-tab config from settings. Returns `WrongKind`
@@ -465,5 +491,7 @@ pub async fn get_shell_tab_config(
         args: cfg.args.join(" "),
         cwd: cfg.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
         env: cfg.env.clone(),
+        notifications_error: cfg.notifications.error.clone(),
+        notifications_exited: cfg.notifications.exited.clone(),
     })
 }

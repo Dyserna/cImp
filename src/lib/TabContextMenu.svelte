@@ -2,7 +2,11 @@
   // Tab context menu. Triggered by right-click on a tab; rendered as a
   // popover at the click coordinates. Kind-aware entries:
   //   builtin tabs        → Rename
-  //   user Shell tabs     → Rename, Configure…, Close
+  //   user Shell tabs     → Rename, Configure…, [Restart shell], Close
+  // Restart shell is hidden when the tab is in a closed state — the
+  // closed overlay's Enter affordance is the equivalent action there, and
+  // a restart on a launch-failed tab would just fail again (the user
+  // needs Configure to fix the broken command).
   // Click outside or Escape closes the menu without firing an action.
   import { onMount } from 'svelte';
 
@@ -10,21 +14,35 @@
     x,
     y,
     builtin,
+    canRestart = false,
     onRename,
     onConfigure,
+    onRestart,
     onClose,
     onDismiss,
   }: {
     x: number;
     y: number;
     builtin: boolean;
+    /// True for user Shell tabs whose subprocess is currently running.
+    /// Hides the Restart entry when the tab is in a closed state (the
+    /// closed overlay's Enter is the equivalent affordance).
+    canRestart?: boolean;
     onRename: () => void;
     onConfigure: () => void;
+    onRestart?: () => void;
     onClose: () => void;
     onDismiss: () => void;
   } = $props();
 
-  function onWindowMouseDown(): void {
+  let menuEl: HTMLDivElement | undefined = $state();
+
+  function onWindowMouseDown(e: MouseEvent): void {
+    // Only dismiss when the click started outside the menu. Without this
+    // check, mousedown on a menu entry unmounts the menu before its
+    // click event fires, so none of the entries ever trigger their action.
+    const target = e.target as Node | null;
+    if (target && menuEl && menuEl.contains(target)) return;
     onDismiss();
   }
 
@@ -59,6 +77,7 @@
 </script>
 
 <div
+  bind:this={menuEl}
   class="menu"
   style="left: {x}px; top: {y}px;"
   role="menu"
@@ -70,6 +89,11 @@
     <button type="button" class="entry" role="menuitem" onclick={fire(onConfigure)}>
       Configure…
     </button>
+    {#if canRestart && onRestart}
+      <button type="button" class="entry" role="menuitem" onclick={fire(onRestart)}>
+        Restart shell
+      </button>
+    {/if}
     <div class="separator"></div>
     <button type="button" class="entry danger" role="menuitem" onclick={fire(onClose)}>
       Close

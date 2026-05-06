@@ -4,6 +4,31 @@
 //! rationale; in short, we prefer Git Bash on Windows because it ships the
 //! standard Linux toolset most users want, and we honor `$SHELL` on Linux
 //! because that's what the user has already chosen.
+//!
+//! ## Verified detection matrix (M4)
+//!
+//! Manual verification matrix from `MILESTONE-V3-04-polish.md` step 6.
+//! Update the Verified column when re-running on a new platform; check
+//! marks indicate the case has been observed working at least once on a
+//! real install. Linux validation is deferred — Windows is the primary
+//! target for v1.2 ship.
+//!
+//! | Platform | Configuration                                                    | Expected default                          | Verified |
+//! |----------|------------------------------------------------------------------|-------------------------------------------|----------|
+//! | Windows  | Git for Windows installed in `C:\Program Files\Git`              | `C:\Program Files\Git\bin\bash.exe`       | yes      |
+//! | Windows  | Git for Windows installed in `C:\Program Files (x86)\Git`        | `C:\Program Files (x86)\Git\bin\bash.exe` | n/a (rare) |
+//! | Windows  | Git for Windows installed elsewhere (e.g. `D:\dev\Git`)          | Path read from `HKLM\SOFTWARE\GitForWindows\InstallPath` | n/a (rare) |
+//! | Windows  | No Git for Windows; `bash.exe` on PATH from MSYS2                | The PATH-resolved bash                    | n/a (rare) |
+//! | Windows  | No Git, no MSYS2, no bash on PATH                                | `powershell.exe -NoLogo` with banner      | yes      |
+//! | Linux    | `$SHELL=/bin/bash` (typical)                                     | `/bin/bash -i`                            | deferred |
+//! | Linux    | `$SHELL=/usr/bin/zsh`                                            | `/usr/bin/zsh -i`                         | deferred |
+//! | Linux    | `$SHELL` unset                                                   | `/bin/bash -i`                            | deferred |
+//! | Linux    | `$SHELL` set to a non-existent path                              | `/bin/bash -i` (fallback)                 | deferred |
+//!
+//! Known-good registry quirk handling: `git_bash_from_registry` reads
+//! `InstallPath` and appends `bin\bash.exe`. `PathBuf::push` swallows a
+//! trailing slash if the registry value contains one, so no explicit
+//! sanitization is required.
 
 use std::path::{Path, PathBuf};
 

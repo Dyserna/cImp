@@ -12,6 +12,8 @@
     command = $bindable(),
     argsString = $bindable(),
     cwd = $bindable(),
+    notificationsError = $bindable(),
+    notificationsExited = $bindable(),
     error = null,
     showGitBashBanner = false,
   }: {
@@ -19,6 +21,8 @@
     command: string;
     argsString: string;
     cwd: string;
+    notificationsError: string;
+    notificationsExited: string;
     error?: TabLifecycleError | null;
     showGitBashBanner?: boolean;
   } = $props();
@@ -140,6 +144,32 @@
     <button type="button" class="browse" onclick={browseCwd}>Browse…</button>
   </div>
   {#if cwdError}<small class="field-error">{cwdError}</small>{/if}
+</div>
+
+<div class="field">
+  <label for="shell-tab-notif-error">Error notification text</label>
+  <input
+    id="shell-tab-notif-error"
+    type="text"
+    bind:value={notificationsError}
+  />
+  <small class="hint">
+    Spoken when this tab errors while you're on a different tab. Leave blank
+    to disable.
+  </small>
+</div>
+
+<div class="field">
+  <label for="shell-tab-notif-exited">Exited notification text</label>
+  <input
+    id="shell-tab-notif-exited"
+    type="text"
+    bind:value={notificationsExited}
+  />
+  <small class="hint">
+    Spoken when this shell exits while you're on a different tab. Use
+    <code>{'{code}'}</code> to insert the exit code. Leave blank to disable.
+  </small>
 </div>
 
 <style>

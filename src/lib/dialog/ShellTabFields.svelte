@@ -174,23 +174,23 @@
 
 <style>
   .banner {
-    background: #3a2a1a;
-    border: 1px solid #5a4020;
-    color: #e0c090;
-    padding: 8px 12px;
-    border-radius: 4px;
-    font-size: 12px;
-    margin-bottom: 12px;
+    background: var(--surface-warning-deep);
+    border: 1px solid var(--border-warning);
+    color: var(--text-warning-bright);
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-sm);
+    margin-bottom: var(--space-3);
   }
   .field {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    margin-bottom: 12px;
+    gap: var(--space-1);
+    margin-bottom: var(--space-3);
   }
   .field label {
-    font-size: 12px;
-    color: #b0b0b0;
+    font-size: var(--font-size-sm);
+    color: var(--text-quiet);
   }
   .row {
     display: flex;
@@ -201,45 +201,53 @@
     min-width: 0;
   }
   input[type="text"] {
-    background: #1f1f1f;
-    border: 1px solid #444;
-    color: #e0e0e0;
-    padding: 6px 8px;
-    border-radius: 3px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 6px var(--space-2);
+    border-radius: var(--radius-md);
     font-family: Consolas, Menlo, monospace;
-    font-size: 13px;
+    font-size: var(--font-size-md);
+    transition: border-color var(--motion-fast) var(--easing-standard);
   }
   input[type="text"]:focus {
     outline: none;
-    border-color: #4a90e2;
+    border-color: var(--accent);
   }
   input.error {
-    border-color: #e74c3c;
+    border-color: var(--danger);
   }
   .browse {
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #c0c0c0;
-    padding: 6px 12px;
-    border-radius: 3px;
+    background: var(--surface-4);
+    border: 1px solid var(--border-default);
+    color: var(--text-secondary);
+    padding: 6px var(--space-3);
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
   }
   .browse:hover {
-    background: #383838;
-    color: #e0e0e0;
+    background: var(--surface-input);
+    color: var(--text-primary);
+  }
+  .browse:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .field-error {
-    color: #e74c3c;
-    font-size: 11px;
+    color: var(--danger);
+    font-size: var(--font-size-xs);
   }
   .hint {
-    color: #808080;
-    font-size: 11px;
+    color: var(--text-tertiary);
+    font-size: var(--font-size-xs);
   }
   code {
-    background: #1f1f1f;
-    padding: 1px 4px;
-    border-radius: 2px;
+    background: var(--surface-sunken);
+    padding: 1px var(--space-1);
+    border-radius: var(--radius-sm);
   }
 </style>

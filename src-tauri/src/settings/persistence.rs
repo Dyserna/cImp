@@ -403,4 +403,23 @@ mod tests {
         assert_eq!(parsed.tabs[1].id(), AIDER_TAB_ID);
         assert_eq!(parsed.tabs[2].id(), SHELL_DEFAULT_TAB_ID);
     }
+
+    #[test]
+    fn ui_theme_round_trip_and_default() {
+        // Default file has ui.theme = "modern-dark".
+        let s = Settings::default();
+        assert_eq!(s.ui.theme, "modern-dark");
+
+        // Round-trip preserves a hand-edited value.
+        let mut s = Settings::default();
+        s.ui.theme = "future-light".to_string();
+        let text = serde_json::to_string(&s).unwrap();
+        let parsed: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.ui.theme, "future-light");
+
+        // A v1.3 file without the `ui` field still parses (serde(default)).
+        let v1_3_json = r#"{"tabs":[]}"#;
+        let parsed: Settings = serde_json::from_str(v1_3_json).unwrap();
+        assert_eq!(parsed.ui.theme, "modern-dark");
+    }
 }

@@ -98,62 +98,63 @@
   .card {
     max-width: 460px;
     width: 100%;
-    background: #1a1a1a;
-    border: 1px solid #555;
-    color: #ddd;
-    border-radius: 6px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    border-radius: var(--radius-lg);
     padding: 18px 20px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    box-shadow: var(--shadow-lg);
     font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
     text-align: center;
   }
   h2 {
-    margin: 0 0 8px 0;
+    margin: 0 0 var(--space-2) 0;
     font-size: 14px;
     font-weight: 600;
-    color: #f0f0f0;
+    color: var(--text-bright);
   }
   .detail {
-    margin: 0 0 12px 0;
+    margin: 0 0 var(--space-3) 0;
     font-family: monospace;
-    font-size: 13px;
-    color: #c0c0c0;
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
   }
   .detail.launch-failed {
-    color: #ff8080;
+    color: var(--text-danger-bright);
     font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.4;
   }
   .detail .error {
-    color: #ff8080;
+    color: var(--text-danger-bright);
     font-weight: 600;
   }
   .hint {
     margin: 0 0 14px 0;
-    font-size: 12px;
-    color: #a0a0a0;
+    font-size: var(--font-size-sm);
+    color: var(--text-quiet-strong);
   }
   .actions {
     display: flex;
     justify-content: center;
   }
   button {
-    border: 1px solid #555;
-    background: #2a2a2a;
-    color: #ddd;
+    border: 1px solid var(--border-default);
+    background: var(--surface-4);
+    color: var(--text-primary);
     padding: 6px 14px;
-    border-radius: 4px;
-    font-size: 12px;
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-sm);
     cursor: pointer;
+    transition: background var(--motion-fast) var(--easing-standard);
   }
   button.primary {
-    background: #4a6fa5;
-    color: #fff;
-    border-color: #4a6fa5;
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
   }
   button.primary:hover:not(:disabled) {
-    background: #5a85c1;
+    background: var(--accent-hover);
   }
   button:disabled {
     opacity: 0.5;

@@ -4,6 +4,7 @@
   import ArrayEditor from './ArrayEditor.svelte';
   import TextAreaWithReset from './TextAreaWithReset.svelte';
   import NotificationEditor from './NotificationEditor.svelte';
+  import Pill from '../Pill.svelte';
 
   // Renders the per-AI-tab settings form: command (read-only), CLI args,
   // TTS injection toggle + instructions, notification texts, and a Restart
@@ -60,7 +61,7 @@
     <span>
       Persistent CLI args
       {#if restartRequired}
-        <span class="restart-tag">restart required</span>
+        <Pill variant="orange" size="xs">restart required</Pill>
       {/if}
     </span>
     <ArrayEditor
@@ -88,7 +89,7 @@
     <span>
       TTS markup injection enabled
       {#if restartRequired}
-        <span class="restart-tag">restart required</span>
+        <Pill variant="orange" size="xs">restart required</Pill>
       {/if}
     </span>
   </label>
@@ -151,66 +152,62 @@
 
 <style>
   .tab-section {
-    padding: 12px 14px;
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
+    padding: var(--space-3) 14px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
   }
   h3 {
-    margin: 0 0 12px 0;
-    font-size: 13px;
+    margin: 0 0 var(--space-3) 0;
+    font-size: var(--font-size-md);
     font-weight: 600;
-    color: #ddd;
-  }
-  .restart-tag {
-    display: inline-block;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: #d8b8ff;
-    background: #3a2a55;
-    border: 1px solid #6f42a8;
-    padding: 1px 6px;
-    border-radius: 8px;
-    margin-left: 6px;
-    vertical-align: middle;
+    color: var(--text-primary);
   }
   .warn {
-    margin: -6px 0 12px 0;
-    padding: 8px 10px;
-    background: #2a230f;
-    border: 1px solid #6a571a;
-    border-radius: 4px;
-    color: #e0d090;
-    font-size: 11px;
+    margin: -6px 0 var(--space-3) 0;
+    padding: var(--space-2) 10px;
+    background: var(--surface-warning-faint);
+    border: 1px solid var(--border-warning);
+    border-radius: var(--radius-md);
+    color: var(--text-warning-bright);
+    font-size: var(--font-size-xs);
     line-height: 1.4;
   }
   .warn code {
-    background: #1a1a1a;
-    padding: 1px 4px;
-    border-radius: 3px;
-    font-size: 11px;
+    background: var(--surface-sunken);
+    padding: 1px var(--space-1);
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-xs);
   }
   small.hint.inline {
     margin: 0 0 0 10px;
-    color: #777;
+    color: var(--text-faint);
   }
   .restart-row {
     display: flex;
     align-items: center;
-    margin-top: 8px;
+    margin-top: var(--space-2);
   }
   .restart-btn {
-    background: #6f42a8;
-    border: 1px solid #6f42a8;
-    color: #fff;
+    background: var(--border-info);
+    border: 1px solid var(--border-info);
+    color: var(--text-bright);
     padding: 6px 14px;
-    border-radius: 4px;
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
   }
   .restart-btn:hover:not(:disabled) {
-    background: #835ac5;
+    background: var(--text-info-quiet);
+    border-color: var(--text-info-quiet);
+  }
+  .restart-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .restart-btn:disabled {
     opacity: 0.4;

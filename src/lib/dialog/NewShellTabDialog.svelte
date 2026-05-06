@@ -166,56 +166,66 @@
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    background: #2a2a2a;
-    border: 1px solid #444;
-    border-radius: 6px;
-    padding: 20px 24px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 20px var(--space-5);
     width: 480px;
     max-width: calc(100vw - 40px);
-    color: #e0e0e0;
+    color: var(--text-primary);
     z-index: 101;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    box-shadow: var(--shadow-lg);
   }
   h2 {
-    margin: 0 0 16px;
+    margin: 0 0 var(--space-4);
     font-size: 16px;
     font-weight: 600;
   }
   .actions {
     display: flex;
     justify-content: flex-end;
-    gap: 8px;
-    margin-top: 16px;
+    gap: var(--space-2);
+    margin-top: var(--space-4);
   }
   .actions button {
-    padding: 6px 16px;
-    border-radius: 3px;
+    padding: 6px var(--space-4);
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 13px;
-    border: 1px solid #444;
+    font-size: var(--font-size-md);
+    border: 1px solid var(--border-default);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
+  }
+  .actions button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .cancel {
-    background: #2a2a2a;
-    color: #c0c0c0;
+    background: var(--surface-4);
+    color: var(--text-secondary);
   }
   .cancel:hover:not([disabled]) {
-    background: #383838;
+    background: var(--surface-input);
+    color: var(--text-primary);
   }
   .primary {
-    background: #4a90e2;
-    color: white;
-    border-color: #4a90e2;
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+    font-weight: var(--font-weight-semibold);
   }
   .primary:hover:not([disabled]) {
-    background: #5aa0f2;
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
   }
   button[disabled] {
     opacity: 0.6;
     cursor: not-allowed;
   }
   .generic-error {
-    color: #e74c3c;
-    font-size: 12px;
+    color: var(--danger);
+    font-size: var(--font-size-sm);
     margin-top: -6px;
     margin-bottom: 8px;
   }

@@ -153,6 +153,14 @@ export interface ProcessingSettings {
   max_hold_ms: number;
 }
 
+export interface UiSettings {
+  /// Active UI chrome theme. V5-01 ships only `"modern-dark"`; the field
+  /// exists so future themes (light, high-contrast) plug in without UI
+  /// plumbing churn. Distinct from `display.theme`, which governs the
+  /// xterm.js terminal palette inside each tab.
+  theme: string;
+}
+
 /// Persisted layout state (V4-04). Mirrors the in-memory `LayoutState`
 /// 1:1 — `LayoutNode` is the same `'split' | 'pane'`-discriminated tree
 /// the frontend already uses, so serialize/deserialize is identity work.
@@ -191,6 +199,8 @@ export interface Settings {
   /// Saved layout presets. Empty by default; populated via the Layouts
   /// menu. Order is insertion order; the popover sorts by `created_at`.
   layout_presets: LayoutPreset[];
+  /// UI chrome theme settings (V5).
+  ui: UiSettings;
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
@@ -318,5 +328,6 @@ export function defaultSettings(): Settings {
     session: { active_tab_id: null },
     layout: null,
     layout_presets: [],
+    ui: { theme: 'modern-dark' },
   };
 }

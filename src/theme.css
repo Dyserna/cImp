@@ -1,0 +1,159 @@
+/* V5 design tokens. The single source of truth for cctts UI chrome colors,
+   spacing, radii, motion, and typography. Components reference `var(--*)`
+   so changing values here updates everything.
+
+   V5-02 ships the modern dark theme: cool slate-blue surfaces, mint/teal
+   accent, coral semantics, generous radii, soft shadows. Token NAMES are
+   stable from V5-01; only the values changed. */
+
+:root,
+[data-theme="modern-dark"] {
+  /* Surfaces — cool slate-blue, layered from darkest to lightest. Tight
+     contrast between layers; depth comes from accent + shadow, not from
+     extreme bg differences. */
+  --surface-0:       #14161c;   /* body / app background */
+  --surface-1:       #1c1f27;   /* panes, base elevated */
+  --surface-2:       #252934;   /* tab bar, dialog body, popover body */
+  --surface-3:       #303644;   /* hover-elevated, active-tab fill */
+  --surface-4:       #3a4051;   /* deeper hover, alt-input bg in dialogs */
+
+  /* Sunken — for content inset into a panel/dialog */
+  --surface-sunken:  #181b22;   /* input bg in dialogs/settings */
+  --surface-deep:    #131519;   /* details summary, deeply-recessed bg */
+  --surface-input:   #2d3240;   /* alt input bg (capture / hover-on-input) */
+
+  /* Text — gradations preserved from V5-01 names; values retuned. */
+  --text-primary:    #f1f3f5;
+  --text-bright:     #ffffff;
+  --text-on-accent:  #0d1117;   /* dark text on mint fills (high contrast) */
+  --text-secondary:  #b6bdc7;
+  --text-quiet:      #a0a8b3;
+  --text-quiet-strong: #8e95a0;
+  --text-tertiary:   #6f7682;
+  --text-faint:      #5d6470;
+  --text-disabled:   #4d5460;
+  --text-disabled-deep: #404652;
+
+  /* Accent — purple, matching the default avatar / waveform color. The
+     two-tier active-state pattern reserves accent fill for filters /
+     toggles / CTAs; section selection uses surface elevation instead. */
+  --accent:          #bb55ff;
+  --accent-hover:    #c977ff;
+  --accent-bright:   #d8a0ff;
+  --accent-soft:     #6f42a8;   /* desaturated purple border for muted CTAs */
+  --accent-soft-hover: #835ac5;
+  --accent-info:     #6699cc;   /* secondary blue (compose textarea focus) */
+  --accent-fg:       #ffffff;   /* white text reads cleanly on purple */
+  --accent-muted:    rgba(187, 85, 255, 0.15);
+
+  /* Semantics — `--success` stays green so "done" indicators remain
+     visually distinct from the now-purple accent. */
+  --success:         #4caf50;
+  --warning:         #f0a020;
+  --danger:          #f06080;           /* coral, not red */
+  --awaiting:        var(--warning);
+
+  /* Danger surface/text shades — coral-tinted slate. Used by destructive
+     hover, confirmation buttons, error banners, error overlays. */
+  --surface-danger:         #3a2a32;
+  --surface-danger-strong:  #4a2730;
+  --surface-danger-hover:   #6a3645;
+  --surface-danger-bg:      #2e1c24;
+  --surface-danger-deep:    #1f1218;
+  --surface-danger-soft:    #38202a;
+  --surface-danger-faint:   #1a1118;
+  --text-danger-soft:       #ffb0c0;
+  --text-danger-strong:     #ffd0d8;
+  --text-danger-bright:     #ff8090;
+  --text-danger-quiet:      #c46070;
+  --text-danger-faint:      #b05060;
+  --text-danger-pale:       #f0aab8;
+  --text-danger-pastel:     #f0c0c8;
+  --text-danger-extra:      #f0d0d6;
+  --text-danger-mute:       #e0c0c4;
+  --border-danger-strong:   #6a3040;
+  --border-danger:          #5a3038;
+  --border-danger-soft:     #4a2832;
+
+  /* Warning — amber kept (reads cleanly on slate). */
+  --surface-warning:        #4a3820;
+  --surface-warning-deep:   #322318;
+  --surface-warning-faint:  #261f10;
+  --text-warning:           #f0c060;
+  --text-warning-bright:    #e0c090;
+  --border-warning:         #6a571a;
+
+  /* Success — mint family on slate. */
+  --surface-success:        #1a2e26;
+  --text-success:           #b8e0d0;
+  --text-success-bright:    #4a8a76;
+
+  /* Info / AI accent shades — purple kept as a distinct kind-color.
+     Tinted slightly slate so it sits on the new palette. */
+  --surface-info:           #2e2540;
+  --surface-info-deep:      #221c30;
+  --surface-info-faint:     #15102a;
+  --text-info:              #d8b8ff;
+  --text-info-bright:       #e0d8f0;
+  --text-info-quiet:        #835ac5;
+  --border-info:            #6f42a8;
+  --border-info-soft:       #3a2a55;
+  --accent-purple:          #bb55ff;
+
+  /* Borders */
+  --border-faint:    #2a2f3a;
+  --border-subtle:   #2f3441;
+  --border-default:  #3f4554;
+  --border-strong:   #565d6e;
+  --border-focus:    var(--accent);
+
+  /* Radii — minimal curving, almost square. Just enough rounding to
+     soften pixel edges without reading as a "soft" UI. Pill stays
+     fully rounded for toggles and tag badges. */
+  --radius-sm:    2px;          /* small chips, badges, indicator dots */
+  --radius-md:    3px;          /* buttons, inputs, tabs, popover items */
+  --radius-lg:    4px;          /* dialogs, cards, panels */
+  --radius-pill: 999px;         /* toggles, status pills, tag pills */
+
+  /* Elevation — soft, dark shadows tuned for the slate palette. */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.55);
+
+  /* Spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* Motion */
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --easing-standard: cubic-bezier(0.4, 0.0, 0.2, 1);
+
+  /* Typography */
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+  --font-size-lg: 15px;
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --line-height-tight: 1.3;
+  --line-height-normal: 1.5;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-base: 0ms;
+  }
+}
+
+/* Utility: tabular numerics for numeric displays (volume %, counts). */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}

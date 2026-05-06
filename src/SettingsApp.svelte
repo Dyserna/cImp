@@ -446,6 +446,24 @@
     </section>
 
     <section>
+      <h2>Appearance</h2>
+      <label>
+        <span>UI theme</span>
+        <select
+          value={snapshot.ui.theme}
+          onchange={(e) =>
+            patch((s) => (s.ui.theme = (e.currentTarget as HTMLSelectElement).value))}
+        >
+          <option value="modern-dark">Modern Dark</option>
+        </select>
+      </label>
+      <small class="hint">
+        Governs the cctts chrome — tab bar, status bar, dialogs. Distinct
+        from the terminal palette below.
+      </small>
+    </section>
+
+    <section>
       <h2>Display</h2>
       <label>
         <span>Terminal font family</span>
@@ -726,10 +744,10 @@
 
 <style>
   :global(html, body) {
-    background: #1a1a1a;
-    color: #ddd;
+    background: var(--surface-sunken);
+    color: var(--text-primary);
     font-family: system-ui, -apple-system, sans-serif;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
   /* The settings page lives inside #app, which app.css pins to the
      viewport. Rather than fight the shared global with overrides (whose
@@ -748,17 +766,17 @@
     margin: 0 auto;
   }
   .loading {
-    padding: 32px;
+    padding: var(--space-6);
     text-align: center;
-    color: #888;
+    color: var(--text-tertiary);
   }
   header {
     position: sticky;
     top: 0;
-    background: #1a1a1a;
-    border-bottom: 1px solid #333;
-    padding-bottom: 8px;
-    margin-bottom: 16px;
+    background: var(--surface-sunken);
+    border-bottom: 1px solid var(--border-faint);
+    padding-bottom: var(--space-2);
+    margin-bottom: var(--space-4);
     z-index: 1;
   }
   h1 {
@@ -769,33 +787,37 @@
   h2 {
     font-size: 14px;
     font-weight: 600;
-    margin: 0 0 12px 0;
-    color: #bb55ff;
+    margin: 0 0 var(--space-3) 0;
+    color: var(--accent-purple);
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
   h3 {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
-    margin: 16px 0 6px 0;
-    color: #aaa;
+    margin: var(--space-4) 0 6px 0;
+    color: var(--text-quiet-strong);
   }
   section {
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    padding: 16px;
-    margin-bottom: 16px;
-    background: #1f1f1f;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-4);
+    margin-bottom: var(--space-4);
+    background: var(--surface-1);
   }
   label {
     display: block;
-    margin-bottom: 12px;
+    margin-bottom: var(--space-3);
   }
   label > span:first-child {
     display: block;
-    margin-bottom: 4px;
-    color: #aaa;
-    font-size: 12px;
+    margin-bottom: var(--space-1);
+    color: var(--text-quiet-strong);
+    font-size: var(--font-size-sm);
+    /* Tabular numerics so slider value labels (e.g. "Speed: 1.20×")
+       don't jitter the label width as the value changes. */
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
   }
   label.checkbox {
     display: flex;
@@ -812,65 +834,80 @@
   input[type='number'],
   select {
     width: 100%;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #ddd;
-    padding: 6px 8px;
-    border-radius: 4px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 6px var(--space-2);
+    border-radius: var(--radius-md);
     font-family: inherit;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     box-sizing: border-box;
+    transition: border-color var(--motion-fast) var(--easing-standard);
+  }
+  input[type='text']:focus,
+  input[type='number']:focus,
+  select:focus {
+    outline: none;
+    border-color: var(--accent);
   }
   input[type='range'] {
     width: 100%;
+    accent-color: var(--accent);
   }
   input[type='color'] {
     height: 32px;
     padding: 0;
-    border: 1px solid #444;
-    background: #2a2a2a;
-    border-radius: 4px;
+    border: 1px solid var(--border-default);
+    background: var(--surface-2);
+    border-radius: var(--radius-md);
   }
   .row {
     display: flex;
-    gap: 12px;
+    gap: var(--space-3);
   }
   .row > label {
     flex: 1;
   }
   .file-row {
     display: flex;
-    gap: 8px;
+    gap: var(--space-2);
     align-items: center;
     margin-bottom: 6px;
   }
   .state-label {
     width: 80px;
-    color: #aaa;
-    font-size: 12px;
+    color: var(--text-quiet-strong);
+    font-size: var(--font-size-sm);
     text-transform: capitalize;
   }
   .filename {
     flex: 1;
-    color: #ddd;
+    color: var(--text-primary);
     font-family: monospace;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   button {
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #ddd;
-    padding: 6px 12px;
-    border-radius: 4px;
-    font-size: 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 6px var(--space-3);
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-sm);
     cursor: pointer;
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
   }
   button:hover:not(:disabled) {
-    background: #333;
-    border-color: #555;
+    background: var(--surface-input);
+    border-color: var(--border-strong);
+  }
+  button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   button:disabled {
     opacity: 0.4;
@@ -881,39 +918,40 @@
   }
   small.hint {
     display: block;
-    color: #888;
-    font-size: 11px;
-    margin: -8px 0 12px 0;
+    color: var(--text-tertiary);
+    font-size: var(--font-size-xs);
+    margin: -8px 0 var(--space-3) 0;
   }
   .tabs-grid {
     display: flex;
     flex-direction: column;
     gap: 10px;
-    margin-top: 8px;
+    margin-top: var(--space-2);
   }
   details {
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    background: #181818;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    background: var(--surface-deep);
   }
   details[open] {
-    background: #1a1a1a;
+    background: var(--surface-sunken);
   }
   summary {
     cursor: pointer;
-    padding: 8px 12px;
-    color: #ddd;
+    padding: var(--space-2) var(--space-3);
+    color: var(--text-primary);
     font-weight: 600;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     user-select: none;
-    border-radius: 6px;
+    border-radius: var(--radius-md);
+    transition: background var(--motion-fast) var(--easing-standard);
   }
   summary:hover {
-    background: #222;
+    background: var(--surface-1);
   }
   details[open] > summary {
-    border-bottom: 1px solid #2a2a2a;
-    border-radius: 6px 6px 0 0;
+    border-bottom: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
   }
   .kind-badge {
     display: inline-block;
@@ -927,60 +965,66 @@
     font-weight: 600;
   }
   .kind-badge.ai {
-    background: #2a1f3a;
-    border: 1px solid #6f42a8;
-    color: #d8b8ff;
+    background: var(--surface-info);
+    border: 1px solid var(--border-info);
+    color: var(--text-info);
   }
   .kind-badge.shell {
-    background: #1a2a1a;
-    border: 1px solid #4a8a4a;
-    color: #b8e0b8;
+    background: var(--surface-success);
+    border: 1px solid var(--text-success-bright);
+    color: var(--text-success);
+  }
+  .kind-badge {
+    border-radius: var(--radius-pill);
   }
   .builtin-tag {
     display: inline-block;
     font-size: 9px;
+    font-weight: var(--font-weight-medium);
     text-transform: uppercase;
-    color: #888;
-    border: 1px solid #444;
+    letter-spacing: 0.05em;
+    color: var(--text-tertiary);
+    border: 1px solid var(--border-default);
     padding: 1px 6px;
-    border-radius: 8px;
+    border-radius: var(--radius-pill);
     margin-left: 6px;
     vertical-align: middle;
   }
   .shell-edit {
-    padding: 12px 14px;
+    padding: var(--space-3) 14px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: var(--space-3);
   }
   .shell-edit label {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    font-size: 12px;
-    color: #b0b0b0;
+    gap: var(--space-1);
+    font-size: var(--font-size-sm);
+    color: var(--text-quiet);
   }
   .shell-edit input[type="text"] {
-    background: #1f1f1f;
-    border: 1px solid #444;
-    color: #e0e0e0;
-    padding: 6px 8px;
-    border-radius: 3px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 6px var(--space-2);
+    border-radius: var(--radius-md);
     font-family: Consolas, Menlo, monospace;
-    font-size: 13px;
+    font-size: var(--font-size-md);
+    transition: border-color var(--motion-fast) var(--easing-standard);
   }
   .shell-edit input[type="text"]:focus {
     outline: none;
-    border-color: #4a90e2;
+    border-color: var(--accent);
   }
   .shell-edit input[disabled] {
-    color: #888;
-    background: #181818;
+    color: var(--text-tertiary);
+    background: var(--surface-deep);
   }
   .shell-edit code {
-    background: #1f1f1f;
-    padding: 1px 4px;
-    border-radius: 2px;
-    font-size: 11px;
+    background: var(--surface-1);
+    padding: 1px var(--space-1);
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-xs);
   }
 </style>

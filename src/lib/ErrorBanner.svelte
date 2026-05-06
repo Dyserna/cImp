@@ -50,18 +50,18 @@
     top: 0;
     left: 50%;
     transform: translateX(-50%);
-    margin-top: 12px;
-    background: #3a1f1f;
-    border: 1px solid #a85050;
-    color: #f0d0d0;
-    padding: 8px 12px;
-    border-radius: 4px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    margin-top: var(--space-3);
+    background: var(--surface-danger-bg);
+    border: 1px solid var(--border-danger);
+    color: var(--text-danger-extra);
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: var(--space-3);
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     z-index: 100;
     max-width: 80vw;
   }
@@ -71,24 +71,26 @@
     text-overflow: ellipsis;
   }
   button {
-    border: 1px solid #a85050;
-    background: #2a1515;
-    color: #f0d0d0;
-    padding: 4px 10px;
-    border-radius: 3px;
-    font-size: 12px;
+    border: 1px solid var(--border-danger);
+    background: var(--surface-danger-deep);
+    color: var(--text-danger-extra);
+    padding: var(--space-1) 10px;
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-sm);
     cursor: pointer;
+    transition:
+      background var(--motion-fast) var(--easing-standard);
   }
   button:hover {
-    background: #3a1f1f;
+    background: var(--surface-danger-bg);
   }
   button.primary {
-    background: #a85050;
-    color: #fff;
-    border-color: #a85050;
+    background: var(--text-danger-faint);
+    color: var(--text-on-accent);
+    border-color: var(--text-danger-faint);
   }
   button.primary:hover {
-    background: #c46060;
+    background: var(--text-danger-quiet);
   }
   button.ghost {
     background: transparent;

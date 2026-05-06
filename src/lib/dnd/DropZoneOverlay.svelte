@@ -93,9 +93,10 @@
     position: fixed;
     z-index: 9999;
     pointer-events: none;
-    background: rgba(74, 144, 226, 0.22);
-    border: 2px solid rgba(74, 144, 226, 0.6);
-    border-radius: 2px;
+    background: var(--accent-muted);
+    border: 2px dashed var(--accent);
+    border-radius: var(--radius-md);
+    box-shadow: inset 0 0 24px rgba(62, 221, 182, 0.18);
     transition:
       left 80ms ease-out,
       top 80ms ease-out,
@@ -103,9 +104,10 @@
       height 80ms ease-out;
   }
   .drop-zone.line {
-    background: #4a90e2;
+    background: var(--accent);
     border: none;
     border-radius: 1px;
+    box-shadow: 0 0 6px var(--accent);
     /* Reorder lines are thin and shouldn't animate width — animation
        would lag the cursor across rapid tab-by-tab moves. */
     transition: left 80ms ease-out, top 80ms ease-out;

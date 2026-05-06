@@ -70,64 +70,65 @@
   .card {
     max-width: 560px;
     width: 100%;
-    background: #1f1414;
-    border: 1px solid #a85050;
-    color: #f0d0d0;
-    border-radius: 6px;
-    padding: 16px 18px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    background: var(--surface-danger-faint);
+    border: 1px solid var(--border-danger);
+    color: var(--text-danger-extra);
+    border-radius: var(--radius-lg);
+    padding: var(--space-4) 18px;
+    box-shadow: var(--shadow-lg);
     font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
   }
   h2 {
     margin: 0 0 10px 0;
     font-size: 14px;
     font-weight: 600;
-    color: #ffd0d0;
+    color: var(--text-danger-strong);
   }
   .raw {
     margin: 0 0 10px 0;
-    padding: 8px 10px;
-    background: #150a0a;
-    border: 1px solid #6a3030;
-    border-radius: 4px;
-    color: #f0c0c0;
+    padding: var(--space-2) 10px;
+    background: var(--surface-danger-deep);
+    border: 1px solid var(--border-danger-strong);
+    border-radius: var(--radius-sm);
+    color: var(--text-danger-pastel);
     font-family: monospace;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     white-space: pre-wrap;
     word-break: break-word;
     max-height: 200px;
     overflow-y: auto;
   }
   .hint {
-    margin: 0 0 12px 0;
-    font-size: 12px;
+    margin: 0 0 var(--space-3) 0;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
-    color: #e0c0c0;
+    color: var(--text-danger-mute);
   }
   .actions {
     display: flex;
     justify-content: flex-end;
-    gap: 8px;
+    gap: var(--space-2);
   }
   button {
-    border: 1px solid #a85050;
-    background: #2a1515;
-    color: #f0d0d0;
+    border: 1px solid var(--border-danger);
+    background: var(--surface-danger-deep);
+    color: var(--text-danger-extra);
     padding: 6px 14px;
-    border-radius: 4px;
-    font-size: 12px;
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-sm);
     cursor: pointer;
+    transition: background var(--motion-fast) var(--easing-standard);
   }
   button:hover:not(:disabled) {
-    background: #3a1f1f;
+    background: var(--surface-danger-bg);
   }
   button.primary {
-    background: #a85050;
-    color: #fff;
-    border-color: #a85050;
+    background: var(--text-danger-faint);
+    color: var(--text-on-accent);
+    border-color: var(--text-danger-faint);
   }
   button.primary:hover:not(:disabled) {
-    background: #c46060;
+    background: var(--text-danger-quiet);
   }
   button:disabled {
     opacity: 0.5;

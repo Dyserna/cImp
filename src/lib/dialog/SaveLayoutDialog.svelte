@@ -153,85 +153,96 @@
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    background: #2a2a2a;
-    border: 1px solid #444;
-    border-radius: 6px;
-    padding: 20px 24px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 20px var(--space-5);
     width: 360px;
     max-width: calc(100vw - 40px);
-    color: #e0e0e0;
+    color: var(--text-primary);
     z-index: 101;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    box-shadow: var(--shadow-lg);
   }
   h2 {
-    margin: 0 0 16px;
+    margin: 0 0 var(--space-4);
     font-size: 16px;
     font-weight: 600;
   }
   .field {
     display: block;
-    margin-bottom: 12px;
+    margin-bottom: var(--space-3);
   }
   .label {
     display: block;
-    font-size: 12px;
-    color: #c0c0c0;
-    margin-bottom: 4px;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    margin-bottom: var(--space-1);
   }
   input[type='text'] {
     width: 100%;
-    background: #1a1a1a;
-    border: 1px solid #444;
-    border-radius: 3px;
-    padding: 6px 8px;
-    color: #e0e0e0;
-    font-size: 13px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    padding: 6px var(--space-2);
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
     box-sizing: border-box;
+    transition: border-color var(--motion-fast) var(--easing-standard);
   }
   input[type='text']:focus {
     outline: none;
-    border-color: #4a90e2;
+    border-color: var(--accent);
   }
   .actions {
     display: flex;
     justify-content: flex-end;
-    gap: 8px;
-    margin-top: 16px;
+    gap: var(--space-2);
+    margin-top: var(--space-4);
   }
   .actions button {
-    padding: 6px 16px;
-    border-radius: 3px;
+    padding: 6px var(--space-4);
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 13px;
-    border: 1px solid #444;
+    font-size: var(--font-size-md);
+    border: 1px solid var(--border-default);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
+  }
+  .actions button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .cancel {
-    background: #2a2a2a;
-    color: #c0c0c0;
+    background: var(--surface-4);
+    color: var(--text-secondary);
   }
   .cancel:hover:not([disabled]) {
-    background: #383838;
+    background: var(--surface-input);
+    color: var(--text-primary);
   }
   .primary {
-    background: #4a90e2;
-    color: white;
-    border-color: #4a90e2;
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+    font-weight: var(--font-weight-semibold);
   }
   .primary:hover:not([disabled]) {
-    background: #5aa0f2;
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
   }
   button[disabled] {
     opacity: 0.6;
     cursor: not-allowed;
   }
   .confirm {
-    color: #f0c060;
-    font-size: 12px;
-    margin-bottom: 8px;
+    color: var(--text-warning);
+    font-size: var(--font-size-sm);
+    margin-bottom: var(--space-2);
   }
   .error {
-    color: #e74c3c;
-    font-size: 12px;
-    margin-bottom: 8px;
+    color: var(--danger);
+    font-size: var(--font-size-sm);
+    margin-bottom: var(--space-2);
   }
 </style>

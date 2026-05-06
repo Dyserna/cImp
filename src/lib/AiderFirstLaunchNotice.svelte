@@ -64,46 +64,47 @@
   .card {
     max-width: 520px;
     width: 100%;
-    background: #1f1a2a;
-    border: 1px solid #6f42a8;
-    color: #e0d8f0;
-    border-radius: 6px;
+    background: var(--surface-info-deep);
+    border: 1px solid var(--border-info);
+    color: var(--text-info-bright);
+    border-radius: var(--radius-lg);
     padding: 18px 20px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    box-shadow: var(--shadow-lg);
     font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
   }
   h2 {
-    margin: 0 0 12px 0;
+    margin: 0 0 var(--space-3) 0;
     font-size: 14px;
     font-weight: 600;
-    color: #d8b8ff;
+    color: var(--text-info);
   }
   p {
-    margin: 0 0 12px 0;
-    font-size: 12px;
+    margin: 0 0 var(--space-3) 0;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
   }
   code {
-    background: #150f1f;
-    padding: 1px 4px;
-    border-radius: 3px;
-    font-size: 11px;
+    background: var(--surface-info-faint);
+    padding: 1px var(--space-1);
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-xs);
   }
   .actions {
     display: flex;
     justify-content: flex-end;
-    margin-top: 8px;
+    margin-top: var(--space-2);
   }
   button.primary {
-    background: #6f42a8;
-    color: #fff;
-    border: 1px solid #6f42a8;
+    background: var(--border-info);
+    color: var(--text-bright);
+    border: 1px solid var(--border-info);
     padding: 6px 18px;
-    border-radius: 4px;
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
+    transition: background var(--motion-fast) var(--easing-standard);
   }
   button.primary:hover {
-    background: #835ac5;
+    background: var(--text-info-quiet);
   }
 </style>

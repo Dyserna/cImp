@@ -66,43 +66,63 @@
   }
   .row input {
     flex: 1;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #ddd;
-    padding: 6px 8px;
-    border-radius: 4px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 6px var(--space-2);
+    border-radius: var(--radius-md);
     font-family: monospace;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
+    transition: border-color var(--motion-fast) var(--easing-standard);
+  }
+  .row input:focus {
+    outline: none;
+    border-color: var(--accent);
   }
   .remove {
     width: 28px;
     padding: 0;
     line-height: 24px;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #aaa;
-    border-radius: 4px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-default);
+    color: var(--text-quiet-strong);
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-size: 16px;
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
   }
   .remove:hover {
-    background: #3a2020;
-    color: #f0aaaa;
-    border-color: #6a3030;
+    background: var(--surface-danger-bg);
+    color: var(--text-danger-pale);
+    border-color: var(--border-danger-strong);
+  }
+  .remove:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .add {
     align-self: flex-start;
-    margin-top: 4px;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #aaa;
-    padding: 4px 10px;
-    border-radius: 4px;
+    margin-top: var(--space-1);
+    background: var(--surface-2);
+    border: 1px solid var(--border-default);
+    color: var(--text-quiet-strong);
+    padding: var(--space-1) 10px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
   }
   .add:hover {
-    background: #333;
-    color: #ddd;
+    background: var(--surface-input);
+    color: var(--text-primary);
+  }
+  .add:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 </style>

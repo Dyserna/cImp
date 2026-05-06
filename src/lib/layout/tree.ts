@@ -215,7 +215,7 @@ export function splitPane(
 /// the root or not in the tree, the tree is returned unchanged.
 ///
 /// Also returns `next_focus`: the deepest-leftmost leaf of the
-/// surviving sibling subtree (per DESIGN-V4's focus-on-collapse rule),
+/// surviving sibling subtree (per DESIGN.md's focus-on-collapse rule),
 /// or `null` when the close was a no-op. Callers that need to refocus
 /// after a collapse use this directly; `firstPane(tree)` would pick
 /// the leftmost pane of the *whole* tree, which jumps focus much

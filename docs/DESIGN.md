@@ -881,6 +881,28 @@ Cargo test count at v1.3 ship: 89 backend tests, 69 frontend tests.
 - IPC: typed event names, request/response via Tauri commands, fire-and-forget via Tauri events
 - No external CSS framework; hand-written CSS scoped to components
 
+### Visual language
+
+`src/theme.css` is the single source of truth for chrome colors, spacing, radii, motion, and typography. Components reference `var(--*)` tokens; never hardcode hex literals in `<style>` blocks. Adding a new color value means adding (or reusing) a token first.
+
+The active theme is selected via `<html data-theme="modern-dark">`, set synchronously at module top of `src/main.ts` and `src/settings_main.ts`. Future themes plug in as additional `[data-theme="..."]` blocks in the same file; the picker in Settings → Appearance writes the chosen theme to `settings.ui.theme`.
+
+Token surface:
+
+- **Surfaces.** Layered slate-blue from `--surface-0` (darkest, body bg) to `--surface-4` (lightest, hover-on-elevated). Sunken variants (`--surface-sunken`, `--surface-deep`, `--surface-input`) are for content inset into a panel — input backgrounds, details summaries.
+- **Text.** Five-tier scale: `--text-primary` (default), `--text-bright` (headings), `--text-secondary` / `--text-quiet` / `--text-tertiary` for descending emphasis, `--text-disabled` for inactive.
+- **Accent.** Mint/teal `--accent`. Reserved for filter/toggle active states, primary CTAs, drop-zone glows, focus rings. Section selection uses surface elevation, not accent fill — the *two-tier active-state pattern*.
+- **Semantics.** `--success` (mint, aliased to `--accent`), `--warning` (amber `#f0a020`), `--danger` (coral `#f06080`). Each has a shade family (e.g. `--surface-danger-bg`, `--text-danger-soft`, `--border-danger`) for banners, error overlays, destructive buttons.
+- **Borders.** `--border-subtle` (faint dividers), `--border-default` (input/button borders), `--border-strong` (high-contrast).
+- **Radii.** `--radius-sm: 6px` (chips, badges), `--radius-md: 10px` (buttons, inputs, popover items), `--radius-lg: 14px` (dialogs, cards), `--radius-pill: 999px` (toggles, status pills).
+- **Elevation.** `--shadow-sm` / `--shadow-md` / `--shadow-lg` for popovers, dialogs, sheets respectively.
+- **Motion.** `--motion-fast: 120ms` for color/background hover, `--motion-base: 180ms` for surface/transform changes. `--easing-standard` is the standard cubic-bezier. A `prefers-reduced-motion` media query zeroes both durations.
+- **Typography.** `--font-size-xs..lg`, `--font-weight-{regular,medium,semibold}`. The `.tnum` utility class enables tabular numerics for value displays that update frequently.
+
+`src/lib/Pill.svelte` is the reusable tag/badge primitive — supports `default | mint | coral | orange | accent-fill` variants and `xs | sm | md` sizes. Use for kind labels, severity tags, restart-required indicators.
+
+The avatar overlay, waveform visualizer, and xterm.js terminal interior are explicitly *not* themed by this system — those surfaces have their own visual logic (user-supplied images, user-tunable waveform color, xterm.js's own `ITheme` for the per-tab terminal palette).
+
 ---
 
 ## Glossary

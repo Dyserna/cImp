@@ -75,8 +75,8 @@
     gap: 3px;
   }
   .label {
-    color: #888;
-    font-size: 11px;
+    color: var(--text-tertiary);
+    font-size: var(--font-size-xs);
   }
   .controls {
     display: flex;
@@ -85,25 +85,37 @@
   }
   .controls input {
     flex: 1;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #ddd;
-    padding: 6px 8px;
-    border-radius: 4px;
-    font-size: 12px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 6px var(--space-2);
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-sm);
+    transition: border-color var(--motion-fast) var(--easing-standard);
+  }
+  .controls input:focus {
+    outline: none;
+    border-color: var(--accent);
   }
   .reset {
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #aaa;
-    padding: 4px 10px;
-    border-radius: 4px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-default);
+    color: var(--text-quiet-strong);
+    padding: var(--space-1) 10px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
   }
   .reset:hover:not(:disabled) {
-    background: #333;
-    color: #ddd;
+    background: var(--surface-input);
+    color: var(--text-primary);
+  }
+  .reset:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .reset:disabled {
     opacity: 0.4;

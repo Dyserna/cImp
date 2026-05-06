@@ -253,29 +253,29 @@
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    background: #2a2a2a;
-    border: 1px solid #444;
-    border-radius: 6px;
-    padding: 20px 24px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 20px var(--space-5);
     width: 520px;
     max-width: calc(100vw - 40px);
     max-height: calc(100vh - 80px);
-    color: #e0e0e0;
+    color: var(--text-primary);
     z-index: 101;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    box-shadow: var(--shadow-lg);
     display: flex;
     flex-direction: column;
   }
   h2 {
-    margin: 0 0 12px;
+    margin: 0 0 var(--space-3);
     font-size: 16px;
     font-weight: 600;
   }
   .empty {
-    color: #888;
+    color: var(--text-tertiary);
     font-style: italic;
-    font-size: 13px;
-    padding: 24px 0;
+    font-size: var(--font-size-md);
+    padding: var(--space-5) 0;
     text-align: center;
   }
   .list {
@@ -291,9 +291,9 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 4px;
-    border-bottom: 1px solid #333;
-    gap: 12px;
+    padding: var(--space-2) var(--space-1);
+    border-bottom: 1px solid var(--border-faint);
+    gap: var(--space-3);
   }
   .row:last-child {
     border-bottom: none;
@@ -306,32 +306,33 @@
     gap: 2px;
   }
   .name {
-    font-size: 13px;
-    color: #e0e0e0;
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .timestamp {
-    font-size: 11px;
-    color: #888;
+    font-size: var(--font-size-xs);
+    color: var(--text-tertiary);
   }
   .edit-input {
     width: 100%;
-    background: #1a1a1a;
-    border: 1px solid #4a90e2;
-    border-radius: 3px;
-    padding: 4px 6px;
-    color: #e0e0e0;
-    font-size: 13px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-md);
+    padding: var(--space-1) 6px;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
     box-sizing: border-box;
+    transition: border-color var(--motion-fast) var(--easing-standard);
   }
   .edit-input:focus {
     outline: none;
   }
   .row-error {
-    color: #e74c3c;
-    font-size: 11px;
+    color: var(--danger);
+    font-size: var(--font-size-xs);
   }
   .row-actions {
     display: inline-flex;
@@ -340,47 +341,64 @@
     flex: 0 0 auto;
   }
   .row-actions button {
-    padding: 4px 10px;
-    border-radius: 3px;
+    padding: var(--space-1) 10px;
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 12px;
-    border: 1px solid #444;
-    background: #2a2a2a;
-    color: #c0c0c0;
+    font-size: var(--font-size-sm);
+    border: 1px solid var(--border-default);
+    background: var(--surface-4);
+    color: var(--text-secondary);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
   }
   .row-actions button:hover:not([disabled]) {
-    background: #383838;
+    background: var(--surface-input);
+    color: var(--text-primary);
+  }
+  .row-actions button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .row-actions .danger {
-    color: #e74c3c;
-    border-color: #5a3030;
+    color: var(--danger);
+    border-color: var(--border-danger);
   }
   .row-actions .danger:hover:not([disabled]) {
-    background: #4a2828;
+    background: var(--border-danger-soft);
   }
   button[disabled] {
     opacity: 0.4;
     cursor: not-allowed;
   }
   .confirm-label {
-    font-size: 12px;
-    color: #f0c060;
+    font-size: var(--font-size-sm);
+    color: var(--text-warning);
   }
   .actions {
     display: flex;
     justify-content: flex-end;
-    margin-top: 16px;
+    margin-top: var(--space-4);
   }
   .primary {
-    padding: 6px 16px;
-    border-radius: 3px;
+    padding: 6px var(--space-4);
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 13px;
-    border: 1px solid #4a90e2;
-    background: #4a90e2;
-    color: white;
+    font-size: var(--font-size-md);
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-weight: var(--font-weight-semibold);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
   }
   .primary:hover {
-    background: #5aa0f2;
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+  }
+  .primary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 </style>

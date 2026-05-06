@@ -223,7 +223,7 @@
     right: 8px;
     background: rgba(0, 0, 0, 0.5);
     border: none;
-    color: #fff;
+    color: var(--text-on-accent);
     width: 32px;
     height: 32px;
     border-radius: 4px;
@@ -243,7 +243,7 @@
     height: var(--avatar-height);
     background: rgba(0, 0, 0, 0.4);
     border: none;
-    color: #fff;
+    color: var(--text-on-accent);
     cursor: pointer;
     pointer-events: auto;
     font-size: 14px;

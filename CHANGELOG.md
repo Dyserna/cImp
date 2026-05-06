@@ -5,6 +5,57 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — Unreleased
+
+### Added
+
+- **Modern Dark theme.** Refreshed visual language: cool slate-blue surfaces,
+  mint/teal accent (`#3eddb6`), coral semantics (`#f06080`), generous rounded
+  corners (10/14/pill scale), and soft elevation shadows on dialogs / popovers
+  / sheets.
+- **Centralized design tokens.** `src/theme.css` defines the full token
+  surface (surfaces, text, accent, semantics, borders, radii, shadows,
+  spacing, motion, typography). Components reference `var(--*)` everywhere;
+  no more component-local hex literals.
+- **Settings → Appearance → UI theme.** A theme picker for the cctts chrome,
+  distinct from the per-tab terminal palette under Display. Initial release
+  ships only "Modern Dark"; the entry exists so future themes (light,
+  high-contrast) plug in without UI plumbing churn. Persisted as
+  `settings.ui.theme`.
+- **Pill-shaped active tabs.** Active tab now reads as an elevated rounded
+  pill (`--surface-3` fill on `--surface-2` bar) instead of a flush rectangle
+  with a bottom-border accent. The two-tier active-state pattern reserves
+  mint accent fill for filter toggles and primary CTAs; section selection
+  uses surface elevation.
+- **`<Pill>` primitive** (`src/lib/Pill.svelte`) — reusable tag/badge with
+  `default | mint | coral | orange | accent-fill` variants and three sizes.
+  First use site: the "restart required" indicator in Settings.
+- **`prefers-reduced-motion` support.** Hover / focus transitions become
+  instant when the OS-level reduce-motion preference is enabled.
+- **Tabular numerics** on settings value labels (Speed, Volume, Opacity,
+  Glow, Line width) so the label width doesn't jitter as the slider moves.
+
+### Changed
+
+- **`settings.json` shape.** New top-level `ui: { theme: string }` block,
+  defaulted to `"modern-dark"`. Existing v1.3 files load unchanged via
+  serde defaults; the field is added on next save. No explicit migration
+  required.
+- **DropZoneOverlay** — switched from a flat blue fill to a mint dashed
+  border with a soft inner glow, more visible against dark terminal panes.
+- **Dialog elevation** — dialogs now use `--shadow-lg` and `--radius-lg`
+  (14 px corners). Inputs sit on `--surface-sunken` with a mint accent
+  border on focus.
+- **Status bar toggles** (mute, announcements) — pill-shaped with
+  `accent-muted` bg + accent border + accent text when active, indicating
+  "filter engaged."
+
+### Migration
+
+v1.3 → v1.4 is purely additive: the new `ui` field arrives with its
+default on first launch and persists on next save. No data is touched.
+Old settings files round-trip cleanly.
+
 ## [1.3.0] — 2026-05-06
 
 ### Added

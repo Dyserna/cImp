@@ -7,7 +7,7 @@
 // wrapper pulls live geometry from `paneRegistry` (which reads
 // `getBoundingClientRect` on demand) and delegates.
 //
-// Zone math (matches DESIGN-V4 / VS Code):
+// Zone math (matches DESIGN.md / VS Code):
 //   - Tab bar takes priority over content-area edges. The tab-bar zone
 //     means "reorder" if the source pane is the same; otherwise
 //     "moveToPane" — the user is dragging onto a different pane's tab

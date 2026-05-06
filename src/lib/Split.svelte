@@ -169,7 +169,7 @@
     overflow: hidden;
   }
   .splitter {
-    background: #2a2a2a;
+    background: var(--surface-2);
     flex-shrink: 0;
     user-select: none;
   }
@@ -182,11 +182,11 @@
     cursor: row-resize;
   }
   .splitter:hover {
-    background: #4a90e2;
+    background: var(--accent);
   }
   .splitter:focus-visible {
-    background: #4a90e2;
-    outline: 2px solid #6ab0ff;
+    background: var(--accent);
+    outline: 2px solid var(--accent-bright);
     outline-offset: -1px;
   }
 </style>

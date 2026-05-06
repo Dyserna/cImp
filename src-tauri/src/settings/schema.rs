@@ -47,6 +47,11 @@ pub struct Settings {
     /// menu's "Save current layout as..." entry. Restoring a preset
     /// replaces the live tree wholesale; the preset itself is unchanged.
     pub layout_presets: Vec<LayoutPreset>,
+    /// UI chrome theme settings (V5). The `theme` field selects the
+    /// design-token block applied to the cctts chrome (tab bar, status
+    /// bar, dialogs, settings). Distinct from `display.theme`, which
+    /// governs the xterm.js terminal palette inside each tab.
+    pub ui: UiSettings,
 }
 
 impl Settings {
@@ -100,7 +105,7 @@ pub enum LayoutNodePersisted {
 
 /// Direction of a Split node. Naming matches CSS flexbox: `Horizontal`
 /// arranges children side-by-side (vertical splitter between them);
-/// `Vertical` stacks them top-to-bottom. See DESIGN-V4.md for the
+/// `Vertical` stacks them top-to-bottom. See DESIGN.md for the
 /// rationale for this convention.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -516,6 +521,22 @@ impl Default for BehaviorSettings {
             auto_speak: true,
             fallback_silent: true,
             announcements_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct UiSettings {
+    /// Active UI chrome theme. V5-01 ships only `"modern-dark"`; future
+    /// themes (light, high-contrast) plug in here as additional values.
+    pub theme: String,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            theme: "modern-dark".to_string(),
         }
     }
 }

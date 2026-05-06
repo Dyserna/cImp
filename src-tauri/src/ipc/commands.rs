@@ -82,11 +82,16 @@ pub async fn pty_write(
 ) -> AppResult<()> {
     // Pre-register any TTS markers in the user's input so they don't fire
     // when echoed back by the TUI. Content-based; no per-tab scoping needed.
+    // The set stores whitespace-normalized content so a width-driven echo
+    // rewrap still matches.
     let typed_tags = extract_tts_contents(&input);
     if !typed_tags.is_empty() {
         if let Ok(mut set) = state.user_typed_tts.lock() {
             for content in typed_tags {
-                set.insert(content);
+                let key = crate::processing::normalize_for_dedup(&content);
+                if !key.is_empty() {
+                    set.insert(key);
+                }
             }
         }
     }

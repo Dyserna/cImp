@@ -32,6 +32,8 @@ mod screen;
 mod segmenter;
 mod tags;
 
+pub use tags::normalize_for_dedup;
+
 #[cfg(test)]
 mod tests;
 

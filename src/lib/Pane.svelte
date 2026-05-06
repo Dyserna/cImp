@@ -144,10 +144,15 @@
     position: absolute;
     inset: 0;
   }
-  /* Subtle focused-pane indicator: a colored line under the active
-     tab's row of the tab bar. Picked low-saturation so multi-pane
-     layouts don't shout — just enough to read at a glance. */
+  /* Focused-pane indicator: a 2px accent line at the bottom of the
+     focused pane's tab bar. The base TabBar declares a 1px border;
+     overriding both width and color here gives a clearly-distinct cue
+     in multi-pane layouts without bleeding noise into the single-pane
+     case (still rendered, but the unfocused-pane comparison is what
+     makes it readable; with one pane it just looks like a thicker
+     separator line). */
   .pane.focused :global(.tab-bar) {
     border-bottom-color: #4a90e2;
+    border-bottom-width: 2px;
   }
 </style>

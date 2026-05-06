@@ -23,6 +23,7 @@ import {
   insertTabIntoPane,
   removeTab,
   setActiveTabId,
+  setSplitRatio as setSplitRatioOp,
   splitPane as splitPaneOp,
 } from './tree';
 import {
@@ -32,7 +33,9 @@ import {
   type PaneId,
   type PaneNode,
   type SplitDirection,
+  type SplitId,
 } from './types';
+import { paneRegistry } from './registry';
 
 /// The id of the initial root pane. Stable across the run because the
 /// store creates the pane once at module load; persistence (M4) is what
@@ -86,41 +89,101 @@ function* paneIter(root: LayoutNode): Generator<PaneNode> {
   yield* paneIter(root.second);
 }
 
-/// The pane that the next `tab-created` event should land in. Set by
-/// the `+` button before opening the new-shell-tab dialog; consumed
-/// (cleared) on the next tab-created. If unset, new tabs land in the
-/// focused pane. Two `+` clicks in different panes can't realistically
-/// race because the dialog is modal — but if they ever did, the second
-/// would clobber the first, which is acceptable for M1.
-export const pendingTabTargetPane: Writable<PaneId | null> = writable(null);
+/// Where the next `tab-created` event should place its tab.
+///
+///   * `kind: 'pane'` — append to an existing pane. Set by the `+`
+///     button on a pane's tab bar (so the new tab lands in the clicked
+///     pane rather than the focused one) and cleared after consumption.
+///   * `kind: 'split'` — split `sourcePaneId` and put the new tab in
+///     the new sibling pane. Set by the `Ctrl+\` / `Ctrl+Shift+\`
+///     pane-split shortcuts and the pane-context-menu's split entries
+///     in M3. The source pane's tabs and active id are preserved.
+///
+/// If unset, new tabs append to the focused pane (the v1.2-equivalent
+/// behavior). Two simultaneous requests would clobber each other; in
+/// practice the dialog and the keyboard shortcuts are mutually
+/// exclusive (the dialog is modal, and the shortcuts complete
+/// synchronously before the user can chain another).
+export type PendingTabPlacement =
+  | { kind: 'pane'; paneId: PaneId }
+  | {
+      kind: 'split';
+      sourcePaneId: PaneId;
+      direction: SplitDirection;
+      placeOn: 'first' | 'second';
+    };
 
-/// Note that the next created tab should be placed into `paneId`.
+export const pendingTabPlacement: Writable<PendingTabPlacement | null> = writable(null);
+
+/// Note that the next created tab should be placed into `paneId`. Used
+/// by the per-pane `+` button.
 export function requestTabIntoPane(paneId: PaneId): void {
-  pendingTabTargetPane.set(paneId);
+  pendingTabPlacement.set({ kind: 'pane', paneId });
 }
 
-/// Append a newly-created tab to its target pane. Routing rules:
-///   1. If `pendingTabTargetPane` is set and that pane still exists,
-///      use it (and clear the cell).
-///   2. Else use the currently focused pane.
-///   3. Else (defensive) use the first pane in document order.
-/// The newly-added tab becomes the target pane's active tab and the
-/// target pane becomes focused — matching v1.2's "switch to the new tab
-/// on creation" behavior, scoped to a pane.
+/// Note that the next created tab should land in a fresh pane created
+/// by splitting `sourcePaneId`. Used by the keyboard split shortcuts
+/// and the pane context menu's split entries.
+export function requestTabIntoSplit(
+  sourcePaneId: PaneId,
+  direction: SplitDirection,
+  placeOn: 'first' | 'second',
+): void {
+  pendingTabPlacement.set({ kind: 'split', sourcePaneId, direction, placeOn });
+}
+
+/// Place a newly-created tab into the layout. Routing rules:
+///
+///   1. If `pendingTabPlacement` is `{ kind: 'split', ... }` and the
+///      source pane still exists, split it and place the new tab in
+///      the new sibling pane. Source pane's tab list and active tab
+///      are preserved verbatim. Focus moves to the new pane.
+///   2. If `pendingTabPlacement` is `{ kind: 'pane', ... }` and the
+///      pane still exists, append to that pane and focus it.
+///   3. Otherwise append to the focused pane (or, defensively, the
+///      first pane in document order). Focus is unchanged unless the
+///      target was the first-pane fallback, in which case it follows.
+///
+/// In all cases the new tab becomes the target pane's active tab,
+/// matching v1.2's "switch to the new tab on creation" behavior scoped
+/// to a pane. The placement cell is consumed (cleared) on every call,
+/// regardless of which branch fires, so a subsequent unguided
+/// `tab-created` event can't accidentally use stale routing.
 export function applyTabCreatedToLayout(tabId: TabId): void {
   layout.update((state) => {
-    let targetId = get(pendingTabTargetPane);
-    if (targetId) {
-      pendingTabTargetPane.set(null);
-      // Check the requested pane still exists; if not, fall through.
-      let stillExists = false;
-      for (const p of paneIter(state.tree)) {
-        if (p.id === targetId) {
-          stillExists = true;
-          break;
+    const placement = get(pendingTabPlacement);
+    pendingTabPlacement.set(null);
+
+    if (placement && placement.kind === 'split') {
+      const source = findPaneInTree(state.tree, placement.sourcePaneId);
+      if (source) {
+        // splitPane is tolerant of a draggedTabId not present in the
+        // target pane: in that case the target is preserved verbatim
+        // and the new sibling pane gets the (brand-new) tab as its
+        // only entry. This is exactly what we want for shortcut-driven
+        // splits.
+        const result = splitPaneOp(
+          state.tree,
+          placement.sourcePaneId,
+          placement.direction,
+          tabId,
+          { placeOn: placement.placeOn },
+        );
+        if (result) {
+          return { tree: result.tree, focused_pane_id: result.newPaneId };
         }
       }
-      if (!stillExists) targetId = null;
+      // Source pane vanished between the request and the tab-created
+      // event (rare — would require a near-simultaneous structural
+      // mutation). Fall through to the default routing.
+    }
+
+    let targetId: PaneId | null = null;
+    if (placement && placement.kind === 'pane') {
+      // Check the requested pane still exists; if not, fall through.
+      if (findPaneInTree(state.tree, placement.paneId)) {
+        targetId = placement.paneId;
+      }
     }
     if (!targetId) {
       // Use focused pane if it still exists, else first pane.
@@ -353,5 +416,201 @@ export function commitDrop(
     const result = splitPaneOp(collapsed, target.paneId, direction, tabId, { placeOn });
     if (!result) return state;
     return { tree: result.tree, focused_pane_id: result.newPaneId };
+  });
+}
+
+/// Update a split's ratio. Thin wrapper around the tree op so the
+/// splitter drag handler can call it without importing tree.ts
+/// directly. Clamping to `[0.05, 0.95]` happens in the tree op; the
+/// drag handler also applies a min-pixel clamp on top of that to
+/// guarantee neither pane shrinks below MIN_PANE_*_PX.
+export function setSplitRatio(splitId: SplitId, ratio: number): void {
+  layout.update((state) => {
+    const tree = setSplitRatioOp(state.tree, splitId, ratio);
+    if (tree === state.tree) return state;
+    return { ...state, tree };
+  });
+}
+
+/// Close the focused pane: move all of its tabs into the leftmost-leaf
+/// pane of the surviving sibling subtree (preserving order; the source's
+/// active tab becomes the destination's active tab so the user's
+/// "current thread" stays current), then collapse the now-empty source.
+/// No-op when the focused pane is the root — there is nowhere for the
+/// tabs to go.
+///
+/// Builtin tabs (Claude/aider) come along automatically because they
+/// are normal entries in `tab_ids`; the close-tab IPC's
+/// `builtin-not-closable` guard doesn't apply here — we are moving the
+/// tab, not closing it.
+export function closeFocusedPane(): void {
+  layout.update((state) => {
+    const focusedId = state.focused_pane_id;
+    const focused = findPaneInTree(state.tree, focusedId);
+    if (!focused) return state;
+    // Root pane has no sibling — nothing to merge into.
+    if (state.tree.type === 'pane') return state;
+
+    // Find the surviving sibling subtree's leftmost leaf so the moved
+    // tabs land somewhere predictable and close to where the user just
+    // was. closePane returns this id as `next_focus`, but we need it
+    // *before* the close so we can move the tabs into it first.
+    const tabsToMove = [...focused.tab_ids];
+    const previousActive = focused.active_tab_id;
+
+    // Snapshot the sibling subtree to compute its leftmost leaf.
+    let parentSplit: { first: LayoutNode; second: LayoutNode } | null = null;
+    for (const node of nodeIter(state.tree)) {
+      if (node.type !== 'split') continue;
+      if (
+        (node.first.type === 'pane' && node.first.id === focusedId) ||
+        (node.second.type === 'pane' && node.second.id === focusedId)
+      ) {
+        parentSplit = node;
+        break;
+      }
+    }
+    if (!parentSplit) return state;
+    const sibling = parentSplit.first.type === 'pane' && parentSplit.first.id === focusedId
+      ? parentSplit.second
+      : parentSplit.first;
+    const targetPaneId = firstPane(sibling).id;
+
+    // Move tabs one at a time so each call's tree update is consistent.
+    let tree: LayoutNode = state.tree;
+    for (const tabId of tabsToMove) {
+      const { tree: afterRemove } = removeTab(tree, tabId);
+      const target = findPaneInTree(afterRemove, targetPaneId);
+      if (!target) {
+        // Defensive: target vanished. Stop here; the layer below will
+        // collapse whatever's left.
+        tree = afterRemove;
+        break;
+      }
+      tree = insertTabIntoPane(afterRemove, targetPaneId, tabId, target.tab_ids.length, {
+        activate: false,
+      });
+    }
+
+    // Restore the source's previously-active tab as the destination's
+    // active tab so the user's current thread keeps the spotlight.
+    if (previousActive !== null) {
+      tree = setActiveTabId(tree, targetPaneId, previousActive);
+    }
+
+    // Collapse the now-empty source pane via the standard rebalance.
+    const { tree: collapsed } = closePane(tree, focusedId);
+    return { tree: collapsed, focused_pane_id: targetPaneId };
+  });
+}
+
+/// Yield every node (splits + panes) in the tree in document order.
+/// Internal helper for `closeFocusedPane`'s parent-finding walk.
+function* nodeIter(root: LayoutNode): Generator<LayoutNode> {
+  yield root;
+  if (root.type === 'split') {
+    yield* nodeIter(root.first);
+    yield* nodeIter(root.second);
+  }
+}
+
+/// Move keyboard focus to the geometrically-adjacent pane in the given
+/// direction. Adjacency is computed against the live `getBoundingClientRect`
+/// of every registered pane: candidates must be in the named direction
+/// (their leading edge >= the focused pane's trailing edge, with a 1px
+/// tolerance for floating-point splitter widths) AND must overlap the
+/// focused pane's perpendicular axis. Among qualifying candidates, the
+/// closest one wins. No-op when no candidate exists in that direction.
+export function focusPaneInDirection(direction: 'left' | 'right' | 'up' | 'down'): void {
+  const state = get(layout);
+  const focusedRect = paneRegistry.getPaneRect(state.focused_pane_id);
+  if (!focusedRect) return;
+
+  let bestPane: PaneId | null = null;
+  let bestDistance = Infinity;
+  let bestOverlap = -Infinity;
+
+  for (const pane of paneIter(state.tree)) {
+    if (pane.id === state.focused_pane_id) continue;
+    const r = paneRegistry.getPaneRect(pane.id);
+    if (!r) continue;
+
+    let inDirection: boolean;
+    let distance: number;
+    let overlap: number;
+    switch (direction) {
+      case 'left':
+        inDirection = r.right <= focusedRect.left + 1;
+        distance = focusedRect.left - r.right;
+        overlap = Math.max(0, Math.min(r.bottom, focusedRect.bottom) - Math.max(r.top, focusedRect.top));
+        break;
+      case 'right':
+        inDirection = r.left >= focusedRect.right - 1;
+        distance = r.left - focusedRect.right;
+        overlap = Math.max(0, Math.min(r.bottom, focusedRect.bottom) - Math.max(r.top, focusedRect.top));
+        break;
+      case 'up':
+        inDirection = r.bottom <= focusedRect.top + 1;
+        distance = focusedRect.top - r.bottom;
+        overlap = Math.max(0, Math.min(r.right, focusedRect.right) - Math.max(r.left, focusedRect.left));
+        break;
+      case 'down':
+        inDirection = r.top >= focusedRect.bottom - 1;
+        distance = r.top - focusedRect.bottom;
+        overlap = Math.max(0, Math.min(r.right, focusedRect.right) - Math.max(r.left, focusedRect.left));
+        break;
+    }
+    if (!inDirection) continue;
+    if (overlap <= 0) continue;
+
+    // Tie-break: smallest distance wins; among equal-distance
+    // candidates, prefer the one with the largest perpendicular
+    // overlap (most "in line" with the focused pane).
+    if (distance < bestDistance || (distance === bestDistance && overlap > bestOverlap)) {
+      bestDistance = distance;
+      bestOverlap = overlap;
+      bestPane = pane.id;
+    }
+  }
+
+  if (bestPane) setFocusedPane(bestPane);
+}
+
+/// Move all of `sourcePaneId`'s tabs into `targetPaneId`, then collapse
+/// the source. Used by the pane context menu's "Move all tabs to →"
+/// submenu. The source pane's active tab becomes the destination's
+/// active tab. Focus moves to the destination.
+///
+/// No-op when source and target are the same, when either pane doesn't
+/// exist, or when the source is the root pane (root cannot be
+/// collapsed).
+export function moveAllTabsToPane(sourcePaneId: PaneId, targetPaneId: PaneId): void {
+  if (sourcePaneId === targetPaneId) return;
+  layout.update((state) => {
+    const source = findPaneInTree(state.tree, sourcePaneId);
+    const target = findPaneInTree(state.tree, targetPaneId);
+    if (!source || !target) return state;
+    if (state.tree.type === 'pane') return state;
+
+    const tabsToMove = [...source.tab_ids];
+    const previousActive = source.active_tab_id;
+
+    let tree: LayoutNode = state.tree;
+    for (const tabId of tabsToMove) {
+      const { tree: afterRemove } = removeTab(tree, tabId);
+      const t = findPaneInTree(afterRemove, targetPaneId);
+      if (!t) {
+        tree = afterRemove;
+        break;
+      }
+      tree = insertTabIntoPane(afterRemove, targetPaneId, tabId, t.tab_ids.length, {
+        activate: false,
+      });
+    }
+    if (previousActive !== null) {
+      tree = setActiveTabId(tree, targetPaneId, previousActive);
+    }
+    const { tree: collapsed } = closePane(tree, sourcePaneId);
+    return { tree: collapsed, focused_pane_id: targetPaneId };
   });
 }

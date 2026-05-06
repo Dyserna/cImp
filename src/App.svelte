@@ -25,15 +25,19 @@
   import { initSettings, settings } from './lib/settings/store';
   import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
-  import { applyTabCreated, tabMeta, tabs } from './lib/tabs/store';
+  import { applyTabCreated, tabMeta } from './lib/tabs/store';
   import {
     applyTabCreatedToLayout,
+    closeFocusedPane,
     focusedActiveTabId,
+    focusedPane,
+    focusPaneInDirection,
     layout,
     resetLayoutToSinglePane,
     setFocusedPaneActiveTab,
-    splitFocusedPane,
+    setPaneActiveTab,
   } from './lib/layout/store';
+  import { splitFocusedPaneWithNewShell } from './lib/layout/actions';
   import { createTerminal } from './lib/terminals';
   import { listTabs } from './lib/ipc';
   import {
@@ -100,11 +104,19 @@
       );
       installDispatcher();
       // Position-bound tab-switch handler: 1-indexed lookup against the
-      // live tabs store. No-op when fewer than N tabs exist.
+      // *focused pane's* tab list (V4-03 reinterpretation of v1.2's
+      // global Ctrl+N). No-op when the focused pane has fewer than N
+      // tabs. The closest analogs are iTerm2 and VS Code, both of which
+      // scope Cmd+N / Ctrl+N to the current group / pane.
       const switchToPosition = (n: number) => () => {
-        const list = get(tabs);
-        const target = list[n - 1];
-        if (target) void switchTab(target.id);
+        const pane = get(focusedPane);
+        const target = pane.tab_ids[n - 1];
+        if (!target) return;
+        setPaneActiveTab(pane.id, target);
+        // Mirror to the backend so audio / avatar / window-title
+        // routing follows. switchTab is the v1.2 call that updates
+        // session.active_tab_id and broadcasts ActiveTabChanged.
+        void switchTab(target);
       };
       // Active-tab close handler. Builtins surface a transient toast
       // since closing them is rejected by the backend; the toast keeps
@@ -150,6 +162,17 @@
           switch_to_tab_9: switchToPosition(9),
           new_shell_tab: openNewShellTabDialog,
           close_tab: closeActiveTab,
+          focus_pane_left: () => focusPaneInDirection('left'),
+          focus_pane_right: () => focusPaneInDirection('right'),
+          focus_pane_up: () => focusPaneInDirection('up'),
+          focus_pane_down: () => focusPaneInDirection('down'),
+          split_pane_horizontal: () => {
+            void splitFocusedPaneWithNewShell('horizontal');
+          },
+          split_pane_vertical: () => {
+            void splitFocusedPaneWithNewShell('vertical');
+          },
+          close_pane: closeFocusedPane,
         });
       });
       // Window title reflects the active tab's avatar state. Switching
@@ -193,28 +216,38 @@
           console.error('set_active_tab failed:', e),
         );
       });
-      // Back-sync: when the backend broadcasts ActiveTabChanged from a
-      // legacy v1.2-style switch (Ctrl+1..9 or other origins that don't
-      // know about panes), reflect that into the layout store so the
-      // focused pane and its active tab stay coherent. Loop is broken
-      // because both setters are no-ops when state already matches.
+      // Back-sync: when the backend broadcasts ActiveTabChanged,
+      // reflect that into the focused pane's active-tab field so any
+      // legacy v1.2-style switch path stays coherent with the layout.
+      //
+      // Pane-scoped guard: only mirror the broadcast when the new id
+      // lives in the *currently focused* pane. The backend's
+      // close-tab fallback walks the global tab list to pick the
+      // previous tab; in a multi-pane layout that fallback can land
+      // in a different pane than the user is operating in. Reflecting
+      // those broadcasts via `setFocusedPaneActiveTab` would search
+      // the tree for the new id, force the holding pane's active to
+      // it, and steal focus there — yanking the user's "current
+      // thread" to a tab they didn't ask for. Ignoring out-of-pane
+      // broadcasts keeps the unrelated pane's active tab stable; the
+      // backend's active-tab cell self-corrects on the next
+      // focusedActiveTabId.subscribe push (which fires when
+      // applyTabClosedFromLayout lands).
       unsubActiveTabBack = activeTab.subscribe((t) => {
-        setFocusedPaneActiveTab(t);
+        const pane = get(focusedPane);
+        if (!pane.tab_ids.includes(t)) return;
+        if (pane.active_tab_id === t) return;
+        setPaneActiveTab(pane.id, t);
       });
 
-      // Debug shortcuts for M1: split / reset layout. Bypass the
-      // configurable shortcut dispatcher because these don't belong in
-      // user-facing settings yet — M3 will add proper bindings for the
-      // user-facing variants of split (Ctrl+\) and remove these.
+      // Debug shortcut: Ctrl+Shift+F3 collapses every split into a
+      // single root pane. Bypasses the configurable dispatcher because
+      // it's a QA / recovery hatch, not a user-facing binding. The
+      // M1-era F1 / F2 split keys were retired in V4-03 — Ctrl+\ /
+      // Ctrl+Shift+\ now do the user-facing split with a fresh shell.
       const onDebugKey = (e: KeyboardEvent) => {
         if (!e.ctrlKey || !e.shiftKey) return;
-        if (e.code === 'F1') {
-          e.preventDefault();
-          splitFocusedPane('horizontal');
-        } else if (e.code === 'F2') {
-          e.preventDefault();
-          splitFocusedPane('vertical');
-        } else if (e.code === 'F3') {
+        if (e.code === 'F3') {
           e.preventDefault();
           resetLayoutToSinglePane();
         }

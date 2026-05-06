@@ -406,3 +406,94 @@ describe('eachPane / firstPane / findPaneContainingTab', () => {
     expect(findPaneContainingTab(root, 'missing')).toBeNull();
   });
 });
+
+describe('move-all-tabs-to-sibling composition (V4-03 closeFocusedPane / moveAllTabsToPane)', () => {
+  // The store helpers compose removeTab + insertTabIntoPane + closePane.
+  // These tests pin the composition behavior so refactors that touch
+  // the underlying ops surface regressions before runtime.
+
+  test('moves every tab from source pane into target, preserving order', () => {
+    const root = split(
+      's1',
+      'horizontal',
+      0.5,
+      pane('source', ['s-a', 's-b', 's-c'], 's-b'),
+      pane('target', ['t-x'], 't-x'),
+    );
+    let tree: LayoutNode = root;
+    const tabsToMove = ['s-a', 's-b', 's-c'];
+    for (const tabId of tabsToMove) {
+      const { tree: afterRemove } = removeTab(tree, tabId);
+      const t = findPane(afterRemove, 'target')!;
+      tree = insertTabIntoPane(afterRemove, 'target', tabId, t.tab_ids.length, {
+        activate: false,
+      });
+    }
+    tree = setActiveTabId(tree, 'target', 's-b');
+    const { tree: collapsed } = closePane(tree, 'source');
+    // After collapse, the root is just the target pane.
+    expect(collapsed.type).toBe('pane');
+    const finalPane = collapsed as PaneNode;
+    expect(finalPane.id).toBe('target');
+    expect(finalPane.tab_ids).toEqual(['t-x', 's-a', 's-b', 's-c']);
+    expect(finalPane.active_tab_id).toBe('s-b');
+  });
+
+  test("preserves source's active tab as destination's active tab", () => {
+    const root = split(
+      's1',
+      'horizontal',
+      0.5,
+      pane('source', ['a', 'b'], 'b'),
+      pane('target', ['x', 'y'], 'x'),
+    );
+    let tree: LayoutNode = root;
+    for (const tabId of ['a', 'b']) {
+      const { tree: afterRemove } = removeTab(tree, tabId);
+      const t = findPane(afterRemove, 'target')!;
+      tree = insertTabIntoPane(afterRemove, 'target', tabId, t.tab_ids.length, {
+        activate: false,
+      });
+    }
+    tree = setActiveTabId(tree, 'target', 'b');
+    const { tree: collapsed } = closePane(tree, 'source');
+    expect((collapsed as PaneNode).active_tab_id).toBe('b');
+  });
+
+  test('collapsing source rebalances correctly when target is in a deeper subtree', () => {
+    // Tree: s1 ┐
+    //         ├─ source [a, b]
+    //         └─ s2 ┐
+    //              ├─ target [x]
+    //              └─ p3 [y]
+    // Moving source's tabs into target then closing source must
+    // promote s2 to root.
+    const inner = split('s2', 'vertical', 0.5, pane('target', ['x']), pane('p3', ['y']));
+    const root = split('s1', 'horizontal', 0.5, pane('source', ['a', 'b'], 'a'), inner);
+    let tree: LayoutNode = root;
+    for (const tabId of ['a', 'b']) {
+      const { tree: afterRemove } = removeTab(tree, tabId);
+      const t = findPane(afterRemove, 'target')!;
+      tree = insertTabIntoPane(afterRemove, 'target', tabId, t.tab_ids.length, {
+        activate: false,
+      });
+    }
+    const { tree: collapsed } = closePane(tree, 'source');
+    expect(collapsed.type).toBe('split');
+    const promotedSplit = collapsed as SplitNode;
+    expect(promotedSplit.id).toBe('s2');
+    const targetPane = findPane(promotedSplit, 'target') as PaneNode;
+    expect(targetPane.tab_ids).toEqual(['x', 'a', 'b']);
+  });
+
+  test('next_focus from closePane points to the deepest-leftmost leaf of the surviving subtree', () => {
+    // Confirms the focus-recovery contract that closeFocusedPane in
+    // the store relies on: when source's sibling is itself a split,
+    // next_focus points into it (leftmost), not back to root's first
+    // pane.
+    const inner = split('s2', 'vertical', 0.5, pane('p-deep-left', ['x']), pane('p-deep-right', ['y']));
+    const root = split('s1', 'horizontal', 0.5, pane('source', ['a']), inner);
+    const { next_focus } = closePane(root, 'source');
+    expect(next_focus).toBe('p-deep-left');
+  });
+});

@@ -491,6 +491,16 @@ pub struct ShortcutSettings {
     pub new_shell_tab: Option<String>,
     /// Close the active tab. No-op (with a transient toast) on builtins.
     pub close_tab: Option<String>,
+    /// V4-03 pane shortcuts. Optional so v1.2 settings files round-trip
+    /// without migration; the frontend defaults supply working bindings
+    /// when these are missing.
+    pub focus_pane_left: Option<String>,
+    pub focus_pane_right: Option<String>,
+    pub focus_pane_up: Option<String>,
+    pub focus_pane_down: Option<String>,
+    pub split_pane_horizontal: Option<String>,
+    pub split_pane_vertical: Option<String>,
+    pub close_pane: Option<String>,
 }
 
 impl Default for ShortcutSettings {
@@ -511,6 +521,13 @@ impl Default for ShortcutSettings {
             switch_to_tab_9: Some("Ctrl+9".to_string()),
             new_shell_tab: Some("Ctrl+T".to_string()),
             close_tab: Some("Ctrl+W".to_string()),
+            focus_pane_left: Some("Ctrl+Alt+Left".to_string()),
+            focus_pane_right: Some("Ctrl+Alt+Right".to_string()),
+            focus_pane_up: Some("Ctrl+Alt+Up".to_string()),
+            focus_pane_down: Some("Ctrl+Alt+Down".to_string()),
+            split_pane_horizontal: Some("Ctrl+\\".to_string()),
+            split_pane_vertical: Some("Ctrl+Shift+\\".to_string()),
+            close_pane: Some("Ctrl+Shift+W".to_string()),
         }
     }
 }

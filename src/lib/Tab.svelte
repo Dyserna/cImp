@@ -140,6 +140,11 @@
   function onContextMenuInternal(e: MouseEvent): void {
     if (!oncontextmenu) return;
     e.preventDefault();
+    // Stop propagation so the tab-bar background's contextmenu handler
+    // doesn't also fire and open a second (overlapping) pane menu.
+    // Tab right-click owns the event; the merged tab+pane menu lives
+    // in TabContextMenu when tab info is supplied.
+    e.stopPropagation();
     oncontextmenu(e);
   }
 </script>

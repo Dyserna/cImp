@@ -82,6 +82,16 @@ export interface ShortcutSettings {
   switch_to_tab_9: string | null;
   new_shell_tab: string | null;
   close_tab: string | null;
+  /// V4-03 pane shortcuts. All optional/nullable so a hand-edited
+  /// settings file from v1.2 still parses; missing fields fall back to
+  /// the defaults below at runtime.
+  focus_pane_left: string | null;
+  focus_pane_right: string | null;
+  focus_pane_up: string | null;
+  focus_pane_down: string | null;
+  split_pane_horizontal: string | null;
+  split_pane_vertical: string | null;
+  close_pane: string | null;
 }
 
 export interface TtsInjection {
@@ -230,6 +240,13 @@ export function defaultSettings(): Settings {
       switch_to_tab_9: 'Ctrl+9',
       new_shell_tab: 'Ctrl+T',
       close_tab: 'Ctrl+W',
+      focus_pane_left: 'Ctrl+Alt+Left',
+      focus_pane_right: 'Ctrl+Alt+Right',
+      focus_pane_up: 'Ctrl+Alt+Up',
+      focus_pane_down: 'Ctrl+Alt+Down',
+      split_pane_horizontal: 'Ctrl+\\',
+      split_pane_vertical: 'Ctrl+Shift+\\',
+      close_pane: 'Ctrl+Shift+W',
     },
     tabs: [
       {

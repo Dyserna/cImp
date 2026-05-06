@@ -1,24 +1,145 @@
 <script lang="ts">
-  // Internal node of the layout tree: two children with a divider
-  // between them. M1 renders the divider but it isn't draggable yet —
-  // the resize handler lands in M3.
+  // Internal node of the layout tree: two children with a draggable
+  // splitter between them. M3 wires:
+  //
+  //   * mousedown-driven resize: dragging the splitter line adjusts the
+  //     split's `ratio` in the layout store. Min-size constraints clamp
+  //     during drag so neither pane can shrink below MIN_PANE_*_PX.
+  //
+  //   * Visual-only render clamp: when the application window resizes
+  //     such that a stored ratio would violate min sizes, the ratio is
+  //     clamped *on render* but never written back. When the window grows
+  //     again, the original user-chosen ratio is honored. Without this,
+  //     a transient narrow window would silently rewrite the user's
+  //     preference.
+  //
+  // The drag handler stops mousedown propagation so it doesn't also
+  // trigger the focus-on-mousedown handler in Pane.svelte (which would
+  // flicker focus to whichever pane the splitter happens to be inside
+  // of).
 
   import LayoutNodeRenderer from './LayoutNodeRenderer.svelte';
+  import { setSplitRatio } from './layout/store';
+  import {
+    MIN_PANE_HEIGHT_PX,
+    MIN_PANE_WIDTH_PX,
+  } from './layout/constants';
   import type { SplitNode } from './layout/types';
 
   let { split }: { split: SplitNode } = $props();
+
+  let containerEl: HTMLDivElement | undefined = $state();
+  let containerSize = $state({ width: 0, height: 0 });
+
+  // Track the container's live size via ResizeObserver. The render
+  // clamp below depends on the container's geometry — without a live
+  // observer, a window resize would not re-render the clamp and the
+  // splits would visually break the min-size invariant until the next
+  // unrelated layout-store mutation.
+  $effect(() => {
+    if (!containerEl) return;
+    const el = containerEl;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const r = entry.contentRect;
+        if (r.width !== containerSize.width || r.height !== containerSize.height) {
+          containerSize = { width: r.width, height: r.height };
+        }
+      }
+    });
+    observer.observe(el);
+    // Initial measurement so the first render after mount uses the real
+    // size rather than the {0, 0} placeholder.
+    const r = el.getBoundingClientRect();
+    containerSize = { width: r.width, height: r.height };
+    return () => observer.disconnect();
+  });
+
+  // Visual-only ratio clamp. When the container is too small for two
+  // min-sized children, fall back to 0.5 (each child gets half of an
+  // already-too-small space — degraded but consistent). Otherwise clamp
+  // to [minRatio, 1 - minRatio]. The original `split.ratio` is preserved
+  // in the store so growing the window restores the user's preference.
+  const clampedRatio = $derived.by(() => {
+    const isHorizontal = split.direction === 'horizontal';
+    const total = isHorizontal ? containerSize.width : containerSize.height;
+    if (total <= 0) return split.ratio;
+    const minPx = isHorizontal ? MIN_PANE_WIDTH_PX : MIN_PANE_HEIGHT_PX;
+    if (total < 2 * minPx) return 0.5;
+    const minRatio = minPx / total;
+    return Math.max(minRatio, Math.min(1 - minRatio, split.ratio));
+  });
+
+  function onSplitterMouseDown(event: MouseEvent): void {
+    if (event.button !== 0) return;
+    if (!containerEl) return;
+    event.preventDefault();
+    // Stop propagation: without it, the parent Pane.svelte's
+    // mousedown-capture focus handler would briefly flicker focus to
+    // whichever pane the cursor is currently over (the cursor is on the
+    // splitter line, which is between two panes — paneRegistry's
+    // findUnderCursor would pick one of them deterministically, but the
+    // user didn't ask for that). We're handling the splitter at the
+    // capture phase explicitly anyway.
+    event.stopPropagation();
+
+    const splitEl = containerEl;
+    const startRect = splitEl.getBoundingClientRect();
+    const isHorizontal = split.direction === 'horizontal';
+
+    const total = isHorizontal ? startRect.width : startRect.height;
+    const start = isHorizontal ? startRect.left : startRect.top;
+    if (total <= 0) return;
+
+    const minPx = isHorizontal ? MIN_PANE_WIDTH_PX : MIN_PANE_HEIGHT_PX;
+    const minRatio = total < 2 * minPx ? 0 : minPx / total;
+    const maxRatio = total < 2 * minPx ? 1 : 1 - minRatio;
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = isHorizontal ? 'col-resize' : 'row-resize';
+    // Disabling text selection during drag prevents the cursor from
+    // grabbing arbitrary tab labels under it as the pointer moves.
+    document.body.style.userSelect = 'none';
+
+    const splitId = split.id;
+
+    function onMove(e: MouseEvent): void {
+      const offset = (isHorizontal ? e.clientX : e.clientY) - start;
+      const raw = offset / total;
+      const next = Math.max(minRatio, Math.min(maxRatio, raw));
+      setSplitRatio(splitId, next);
+    }
+
+    function onUp(): void {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    }
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
 </script>
 
 <div
   class="split"
   class:horizontal={split.direction === 'horizontal'}
   class:vertical={split.direction === 'vertical'}
+  bind:this={containerEl}
 >
-  <div class="split-child" style:flex={`${split.ratio} 1 0%`}>
+  <div class="split-child" style:flex={`${clampedRatio} 1 0%`}>
     <LayoutNodeRenderer node={split.first} />
   </div>
-  <div class="splitter" aria-hidden="true"></div>
-  <div class="split-child" style:flex={`${1 - split.ratio} 1 0%`}>
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="splitter"
+    role="separator"
+    aria-orientation={split.direction === 'horizontal' ? 'vertical' : 'horizontal'}
+    onmousedown={onSplitterMouseDown}
+  ></div>
+  <div class="split-child" style:flex={`${1 - clampedRatio} 1 0%`}>
     <LayoutNodeRenderer node={split.second} />
   </div>
 </div>
@@ -47,6 +168,7 @@
   .splitter {
     background: #2a2a2a;
     flex-shrink: 0;
+    user-select: none;
   }
   .split.horizontal > .splitter {
     width: 4px;

@@ -29,13 +29,17 @@ use crate::ipc::commands::{
     request_tab_restart, restart_shell_tab, set_active_tab, settings_get, settings_update,
     tab_activate, tts_test,
 };
+use crate::ipc::layout::{
+    delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
+};
 use crate::ipc::tab_lifecycle::{
     close_tab, create_shell_tab, default_shell_spec, get_shell_tab_config, reconfigure_shell_tab,
     rename_tab,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
-    Settings, SettingsHandle, TabConfig, AIDER_TAB_ID, CLAUDE_TAB_ID,
+    LayoutNodePersisted, LayoutPersisted, Settings, SettingsHandle, TabConfig, AIDER_TAB_ID,
+    CLAUDE_TAB_ID,
 };
 use crate::state::{
     spawn_state_manager, AiToolKind, StateEvent, StateSignal, TabId, TabKind, TabMeta,
@@ -104,13 +108,23 @@ fn main() {
     // Stopped signals with the speaking tab). Synchronous so both consumers
     // can read it without runtime gymnastics.
     //
-    // The persisted active tab id (session.active_tab_id) wins if it points
-    // at a known tab; otherwise we fall back to the first tab in order
-    // (always Claude after integrity).
-    let initial_active = settings_handle
-        .current()
-        .session
-        .active_tab_id
+    // Resolution order:
+    //   1. The layout's focused-pane active tab (V4-04) — this is the v1.3
+    //      source of truth. After the v1.2 → v1.3 migration session.active_tab_id
+    //      is dropped from settings, so on its own that field is None for
+    //      migrated users; without consulting the layout here we'd start
+    //      Claude-active while the frontend hydrates the layout to the
+    //      user's actual last tab, and the two would ping-pong on launch.
+    //   2. session.active_tab_id (legacy / fresh-install path).
+    //   3. First tab in order (post-integrity that's always Claude).
+    let snap = settings_handle.current();
+    let layout_active_id: Option<String> = snap
+        .layout
+        .as_ref()
+        .and_then(|l| layout_focused_active_tab_id(l));
+    let session_active_id: Option<&str> = snap.session.active_tab_id.as_deref();
+    let resolved_id: Option<String> = layout_active_id.or_else(|| session_active_id.map(String::from));
+    let initial_active = resolved_id
         .as_deref()
         .and_then(|id| {
             tab_metas
@@ -124,6 +138,7 @@ fn main() {
                 .map(|m| m.id.clone())
                 .unwrap_or(TabId::Claude)
         });
+    drop(snap);
     let tts_active: ActiveTab = Arc::new(RwLock::new(initial_active.clone()));
 
     // Tab registry — one PtyManager per tab, lazy-spawn at frontend mount.
@@ -248,6 +263,10 @@ fn main() {
             reconfigure_shell_tab,
             default_shell_spec,
             get_shell_tab_config,
+            save_layout,
+            save_layout_preset,
+            delete_layout_preset,
+            rename_layout_preset,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -269,6 +288,31 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to launch tauri app");
+}
+
+/// Find the persisted layout's focused pane and return its active tab
+/// id. Returns `None` if the focused-pane id doesn't match any pane
+/// (the integrity check at load time normally repairs this) or if the
+/// focused pane has no active tab (transient empty pane).
+fn layout_focused_active_tab_id(layout: &LayoutPersisted) -> Option<String> {
+    fn find<'a>(node: &'a LayoutNodePersisted, target: &str) -> Option<&'a Option<String>> {
+        match node {
+            LayoutNodePersisted::Pane {
+                id, active_tab_id, ..
+            } => {
+                if id == target {
+                    Some(active_tab_id)
+                } else {
+                    None
+                }
+            }
+            LayoutNodePersisted::Split { first, second, .. } => {
+                find(first, target).or_else(|| find(second, target))
+            }
+        }
+    }
+    find(&layout.tree, &layout.focused_pane_id)
+        .and_then(|opt| opt.clone())
 }
 
 /// Build the launch-seed `Vec<TabMeta>` from a settings snapshot. Reserved

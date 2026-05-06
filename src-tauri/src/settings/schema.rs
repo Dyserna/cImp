@@ -36,6 +36,17 @@ pub struct Settings {
     /// Last-active tab pointer, restored on launch. None on a fresh install
     /// (falls back to the first tab); set whenever the user switches tabs.
     pub session: SessionState,
+    /// Persisted layout tree + focused-pane id (V4-04). `None` on fresh
+    /// installs and on the first launch after a v1.2 → v1.3 migration that
+    /// detected the file but couldn't synthesize a layout (defensive — the
+    /// migration normally always builds a single-pane layout). The frontend
+    /// builds a default single-root-pane tree containing every tab when
+    /// this is `None`.
+    pub layout: Option<LayoutPersisted>,
+    /// Named layout presets. Empty by default; populated via the Layouts
+    /// menu's "Save current layout as..." entry. Restoring a preset
+    /// replaces the live tree wholesale; the preset itself is unchanged.
+    pub layout_presets: Vec<LayoutPreset>,
 }
 
 impl Settings {
@@ -55,6 +66,61 @@ impl Settings {
 #[serde(default)]
 pub struct SessionState {
     pub active_tab_id: Option<String>,
+}
+
+/// Persisted layout state. Mirrors the frontend's `LayoutState` 1:1 — the
+/// `type` discriminator on `LayoutNodePersisted` matches the frontend's
+/// `'split' | 'pane'` shape, so serialize/deserialize is identity work
+/// across the IPC boundary.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct LayoutPersisted {
+    pub tree: LayoutNodePersisted,
+    pub focused_pane_id: String,
+}
+
+/// Recursive layout-tree node. Splits are internal (two children + ratio +
+/// direction); panes are leaves (ordered tab id list + per-pane active tab
+/// id).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LayoutNodePersisted {
+    Split {
+        id: String,
+        direction: SplitDirection,
+        ratio: f32,
+        first: Box<LayoutNodePersisted>,
+        second: Box<LayoutNodePersisted>,
+    },
+    Pane {
+        id: String,
+        tab_ids: Vec<String>,
+        active_tab_id: Option<String>,
+    },
+}
+
+/// Direction of a Split node. Naming matches CSS flexbox: `Horizontal`
+/// arranges children side-by-side (vertical splitter between them);
+/// `Vertical` stacks them top-to-bottom. See DESIGN-V4.md for the
+/// rationale for this convention.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+/// A named layout preset. The tree is the layout-only payload — focus and
+/// the live `focused_pane_id` are intentionally not persisted with the
+/// preset, since restoring a preset is "set up panes this way" and focus
+/// follows the user's next click.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct LayoutPreset {
+    pub name: String,
+    /// RFC 3339 / ISO 8601 timestamp (UTC, second precision). Used to
+    /// order the popover's "Recent presets" list. Renames do not refresh
+    /// this — it remains the original creation time.
+    pub created_at: String,
+    pub tree: LayoutNodePersisted,
 }
 
 /// Discriminated tab config. The `kind` field is the JSON discriminator

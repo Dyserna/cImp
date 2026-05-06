@@ -6,10 +6,13 @@
   import MuteButton from './status/MuteButton.svelte';
   import AnnouncementsButton from './status/AnnouncementsButton.svelte';
   import VolumeSlider from './status/VolumeSlider.svelte';
+  import LayoutsPopover from './status/LayoutsPopover.svelte';
 </script>
 
 <div class="status-bar">
-  <div class="status-bar-left"></div>
+  <div class="status-bar-left">
+    <LayoutsPopover />
+  </div>
   <div class="status-bar-right">
     <MuteButton />
     <AnnouncementsButton />

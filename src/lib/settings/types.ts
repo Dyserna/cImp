@@ -2,6 +2,8 @@
 // match the JSON serde output. Optional fields come through as `null` over
 // JSON, never as `undefined`.
 
+import type { LayoutNode } from '../layout/types';
+
 export type AvatarPosition = 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left';
 
 export interface AvatarSize {
@@ -151,6 +153,25 @@ export interface ProcessingSettings {
   max_hold_ms: number;
 }
 
+/// Persisted layout state (V4-04). Mirrors the in-memory `LayoutState`
+/// 1:1 — `LayoutNode` is the same `'split' | 'pane'`-discriminated tree
+/// the frontend already uses, so serialize/deserialize is identity work.
+export interface LayoutPersisted {
+  tree: LayoutNode;
+  focused_pane_id: string;
+}
+
+/// A named layout preset. The tree is the layout-only payload — focus
+/// is intentionally not persisted with the preset, since restoring it
+/// is "set up panes this way" and the user's next click decides focus.
+export interface LayoutPreset {
+  name: string;
+  /// RFC 3339 / ISO 8601 timestamp (UTC). Used to order the popover's
+  /// "Recent presets" list. Renames do not refresh this.
+  created_at: string;
+  tree: LayoutNode;
+}
+
 export interface Settings {
   tts: TtsSettings;
   avatar: AvatarSettings;
@@ -163,6 +184,13 @@ export interface Settings {
   tabs: TabConfig[];
   processing: ProcessingSettings;
   session: SessionState;
+  /// Persisted layout. `null` on fresh installs (frontend builds a
+  /// single-root-pane default) or when the v1.2 → v1.3 migration was
+  /// skipped for some reason. The hydration code handles both cases.
+  layout: LayoutPersisted | null;
+  /// Saved layout presets. Empty by default; populated via the Layouts
+  /// menu. Order is insertion order; the popover sorts by `created_at`.
+  layout_presets: LayoutPreset[];
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
@@ -288,5 +316,7 @@ export function defaultSettings(): Settings {
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
     session: { active_tab_id: null },
+    layout: null,
+    layout_presets: [],
   };
 }

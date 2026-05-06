@@ -11,6 +11,8 @@
   import AiderFirstLaunchNotice from './lib/AiderFirstLaunchNotice.svelte';
   import NewShellTabDialog from './lib/dialog/NewShellTabDialog.svelte';
   import ConfigureTabDialog from './lib/dialog/ConfigureTabDialog.svelte';
+  import SaveLayoutDialog from './lib/dialog/SaveLayoutDialog.svelte';
+  import ManagePresetsDialog from './lib/dialog/ManagePresetsDialog.svelte';
   import Toast from './lib/Toast.svelte';
   import DragGhost from './lib/dnd/DragGhost.svelte';
   import DropZoneOverlay from './lib/dnd/DropZoneOverlay.svelte';
@@ -38,6 +40,10 @@
     setPaneActiveTab,
   } from './lib/layout/store';
   import { splitFocusedPaneWithNewShell } from './lib/layout/actions';
+  import {
+    installLayoutPersistence,
+    validateAndRepairLayout,
+  } from './lib/layout/persistence';
   import { createTerminal } from './lib/terminals';
   import { listTabs } from './lib/ipc';
   import {
@@ -60,6 +66,7 @@
   let unsubFocusedTab: (() => void) | undefined;
   let unsubActiveTabBack: (() => void) | undefined;
   let removeDebugKeys: (() => void) | undefined;
+  let unsubLayoutSave: (() => void) | undefined;
 
   onMount(() => {
     void (async () => {
@@ -72,6 +79,11 @@
       // overwrite name/kind in place.
       try {
         const snapshot = await listTabs();
+        const persistedLayout = get(settings).layout;
+        // Seed every tab's per-tab state (avatar entries, tabs store,
+        // terminal DOM host) regardless of layout source. The layout
+        // tree references tabs by id; the tabs store + terminals
+        // registry are what actually own the per-tab data.
         snapshot.forEach((m, position) => {
           seedPerTabEntries(m.id);
           applyTabCreated({
@@ -82,19 +94,38 @@
             position,
           });
           createTerminal(m.id);
-          applyTabCreatedToLayout(m.id);
         });
-        // Restore the previously-active tab into the (single) root pane
-        // so the avatar/audio/compose routing picks up where the user
-        // left off. The backend persists session.active_tab_id, but the
-        // settings store already has it loaded by this point.
-        const sessionActive = get(settings).session.active_tab_id;
-        if (sessionActive) {
-          setFocusedPaneActiveTab(sessionActive);
+
+        if (persistedLayout) {
+          // V4-04: hydrate the layout tree from settings. The integrity
+          // sieve adapts the persisted shape to the live tab list —
+          // dropping tabs the user deleted between launches and placing
+          // newly-created tabs as orphans in the focused pane.
+          const repaired = validateAndRepairLayout(
+            persistedLayout,
+            get(settings).tabs,
+          );
+          layout.set(repaired);
+        } else {
+          // Fresh-install / pre-V4-04 path: every tab goes into the
+          // store-built single root pane via `applyTabCreatedToLayout`,
+          // and the previously-active tab (if any) is restored from
+          // the legacy session.active_tab_id field.
+          snapshot.forEach((m) => applyTabCreatedToLayout(m.id));
+          const sessionActive = get(settings).session.active_tab_id;
+          if (sessionActive) {
+            setFocusedPaneActiveTab(sessionActive);
+          }
         }
       } catch (e) {
         console.error('list_tabs failed:', e);
       }
+      // Install the debounced save subscription AFTER hydration so the
+      // first emission (the just-set layout from settings) is the one
+      // it swallows. If we install earlier, the subscription would
+      // round-trip the hydrated layout straight back to the backend on
+      // launch — harmless (would write the same state) but wasteful.
+      unsubLayoutSave = installLayoutPersistence();
       // Start the backend state listener early — it drives both the
       // per-tab avatar cache AND the activeTab store (via the
       // ActiveTabChanged event), so it must run regardless of whether
@@ -233,7 +264,27 @@
       // backend's active-tab cell self-corrects on the next
       // focusedActiveTabId.subscribe push (which fires when
       // applyTabClosedFromLayout lands).
+      //
+      // First-emission swallow: Svelte writables fire on subscribe
+      // with their current value. The activeTab store starts at the
+      // backend's launch-active id (set by `ActiveTabChanged` events
+      // and pre-populated to a default in `tabs/state.ts`). Treating
+      // that initial firing as a "real" change would race with the
+      // forward-sync above (`unsubFocusedTab` pushes the layout's
+      // focused-pane active tab to the backend on its own first
+      // emission). Without this guard, when the two values disagree
+      // — common after V4-04 migration where session.active_tab_id
+      // is dropped and the backend falls back to Claude while the
+      // hydrated layout has e.g. Aider active — the two
+      // subscriptions ping-pong correcting each other across async
+      // backend round-trips, flapping the active tab dozens of
+      // times on launch.
+      let activeTabFirstEmission = true;
       unsubActiveTabBack = activeTab.subscribe((t) => {
+        if (activeTabFirstEmission) {
+          activeTabFirstEmission = false;
+          return;
+        }
         const pane = get(focusedPane);
         if (!pane.tab_ids.includes(t)) return;
         if (pane.active_tab_id === t) return;
@@ -262,6 +313,7 @@
       unsubFocusedTab?.();
       unsubActiveTabBack?.();
       removeDebugKeys?.();
+      unsubLayoutSave?.();
     };
   });
 </script>
@@ -294,6 +346,8 @@
   <StatusBar />
   <NewShellTabDialog />
   <ConfigureTabDialog />
+  <SaveLayoutDialog />
+  <ManagePresetsDialog />
   <Toast />
 </main>
 

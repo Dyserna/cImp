@@ -13,8 +13,15 @@
     tabDefaultSettings,
   } from './lib/settings/ipc';
   import type { Settings, TabSettings } from './lib/settings/types';
-  import type { TabId } from './lib/tabs/types';
-  import { ALL_TABS, TAB_META } from './lib/tabs/types';
+  import type { AiTabId } from './lib/tabs/types';
+  import { AI_TABS, TAB_META } from './lib/tabs/types';
+
+  // Shell-tab settings live under `_shell_1_tmp` and don't share the
+  // TabSettings shape, so M1's Settings window still scopes to AI tabs
+  // only. M4 of v3-01 adds Shell-tab settings rows.
+  const AI_TAB_META = TAB_META.filter(
+    (m): m is { id: AiTabId; label: string } => m.id === 'claude' || m.id === 'aider',
+  );
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
 
@@ -23,14 +30,14 @@
   // indicator when subprocess-affecting fields drift from the spawn-time
   // settings. Notification text and first-launch dismissal are NOT in
   // the diff because they apply live without restart.
-  let tabBaselines = $state<Record<TabId, TabSettings | null>>({
+  let tabBaselines = $state<Record<AiTabId, TabSettings | null>>({
     claude: null,
     aider: null,
   });
   // Per-tab default settings, fetched from the backend so "Reset to default"
   // buttons match the Rust-side defaults exactly (in particular the embedded
   // RUNTIME_SYSTEM_PROMPT for Claude's TTS instructions).
-  let tabDefaults = $state<Record<TabId, TabSettings | null>>({
+  let tabDefaults = $state<Record<AiTabId, TabSettings | null>>({
     claude: null,
     aider: null,
   });
@@ -41,7 +48,7 @@
   // overwrites `snapshot` (which is fine — same value, no churn).
   let unsub: (() => void) | undefined;
 
-  function captureBaseline(tab: TabId) {
+  function captureBaseline(tab: AiTabId) {
     if (!snapshot) return;
     tabBaselines = {
       ...tabBaselines,
@@ -52,7 +59,7 @@
   onMount(async () => {
     await initSettings();
     snapshot = structuredClone(get(settings));
-    for (const t of ALL_TABS) captureBaseline(t);
+    for (const t of AI_TABS) captureBaseline(t);
     unsub = settings.subscribe((s) => {
       snapshot = structuredClone(s);
     });
@@ -61,7 +68,7 @@
         voices = v.length > 0 ? v : [snapshot?.tts.voice ?? 'af_heart'];
       })
       .catch((e) => console.warn('list_voices failed', e));
-    for (const t of ALL_TABS) {
+    for (const t of AI_TABS) {
       tabDefaultSettings(t)
         .then((d) => {
           tabDefaults = { ...tabDefaults, [t]: d };
@@ -93,9 +100,9 @@
   }
 
   const restartRequired = $derived.by(() => {
-    const out: Record<TabId, boolean> = { claude: false, aider: false };
+    const out: Record<AiTabId, boolean> = { claude: false, aider: false };
     if (!snapshot) return out;
-    for (const t of ALL_TABS) {
+    for (const t of AI_TABS) {
       const baseline = tabBaselines[t];
       if (!baseline) continue;
       out[t] =
@@ -105,7 +112,7 @@
     return out;
   });
 
-  async function restartTab(tab: TabId) {
+  async function restartTab(tab: AiTabId) {
     await requestTabRestart(tab);
     captureBaseline(tab);
   }
@@ -555,7 +562,7 @@
         TTS injection require a restart of the affected tab to take effect.
       </small>
       <div class="tabs-grid">
-        {#each TAB_META as meta (meta.id)}
+        {#each AI_TAB_META as meta (meta.id)}
           <details open>
             <summary>{meta.label}</summary>
             <TabSettingsSection

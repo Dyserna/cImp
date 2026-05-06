@@ -73,6 +73,7 @@ export interface ShortcutSettings {
   open_settings: string | null;
   switch_to_tab_1: string | null;
   switch_to_tab_2: string | null;
+  switch_to_tab_3: string | null;
 }
 
 export interface TtsInjection {
@@ -104,6 +105,21 @@ export interface ProcessingSettings {
   max_hold_ms: number;
 }
 
+/// Notification text for Shell tabs. The `{code}` placeholder in `exited`
+/// is interpolated with the actual exit code in M4 of v3-01; M1 leaves it
+/// as a literal substring.
+export interface ShellNotifications {
+  error: string;
+  exited: string;
+}
+
+/// Interim Shell-1 settings — see `Settings._shell_1_tmp` on the backend.
+/// M3 of v3 reshapes the entire `tabs` schema and migrates this away.
+export interface Shell1Interim {
+  name: string;
+  notifications: ShellNotifications;
+}
+
 export interface Settings {
   tts: TtsSettings;
   avatar: AvatarSettings;
@@ -113,6 +129,7 @@ export interface Settings {
   shortcuts: ShortcutSettings;
   tabs: TabsSettings;
   processing: ProcessingSettings;
+  _shell_1_tmp: Shell1Interim;
 }
 
 // Defaults must match `impl Default for Settings` on the backend. They're
@@ -163,6 +180,7 @@ export function defaultSettings(): Settings {
       open_settings: 'Ctrl+,',
       switch_to_tab_1: 'Ctrl+1',
       switch_to_tab_2: 'Ctrl+2',
+      switch_to_tab_3: 'Ctrl+3',
     },
     tabs: {
       claude: {
@@ -189,5 +207,12 @@ export function defaultSettings(): Settings {
       },
     },
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
+    _shell_1_tmp: {
+      name: 'Shell 1',
+      notifications: {
+        error: 'Shell encountered an error',
+        exited: 'Shell exited (code {code})',
+      },
+    },
   };
 }

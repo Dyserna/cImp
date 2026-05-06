@@ -138,7 +138,7 @@ impl AudioOutput {
 fn current_active(active: &ActiveTab) -> TabId {
     active
         .read()
-        .map(|g| *g)
+        .map(|g| g.clone())
         .unwrap_or(TabId::Claude)
 }
 

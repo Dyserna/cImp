@@ -16,7 +16,7 @@ use crate::processing::permission::{
 };
 use crate::processing::{ProcessingEvent, ProcessingLayer};
 use crate::settings::SettingsHandle;
-use crate::state::{StateSignal, TabId};
+use crate::state::{AiToolKind, StateSignal, TabId, TabKind};
 use crate::tts::TtsRequest;
 
 /// Tail size scanned by the permission detector after each ingest/flush.
@@ -96,6 +96,14 @@ pub fn spawn_reader(
 /// and a steady 50 ms flush tick, and dispatches resulting events. Each
 /// emitted state signal is tagged with the owning tab so the manager can
 /// route it to the correct per-tab `TabState`.
+///
+/// Per-kind gating (Phase 3 of MILESTONE-V3-01):
+/// - AI tabs: full pipeline — permission detection, claude-output burst
+///   tracker, TTS dispatch.
+/// - Shell tabs: bypass all three. The vte parser still runs (xterm.js needs
+///   correctly-rendered bytes) but no TTS request is ever sent, no permission
+///   pattern is scanned, and `ClaudeOutputStarted/Stopped` never fires for
+///   them.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_processor(
     tab: TabId,
@@ -108,6 +116,9 @@ pub fn spawn_processor(
     settings: SettingsHandle,
 ) {
     tokio::spawn(async move {
+        let kind = tab.kind();
+        let is_shell = matches!(kind, TabKind::Shell);
+
         let mut layer = ProcessingLayer::with_user_typed_filter(user_typed_tts);
         layer.set_max_hold(Duration::from_millis(
             settings.current().processing.max_hold_ms as u64,
@@ -116,13 +127,14 @@ pub fn spawn_processor(
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // Permission detector. Aider patterns are deferred — pass an empty
-        // slice for that tab so the detector is a no-op without special-casing
-        // it in the loop. When aider patterns are characterized, swap NO_PATTERNS
-        // for the aider pattern set.
-        let detector_patterns = match tab {
-            TabId::Claude => CLAUDE_PERMISSION_PATTERNS,
-            TabId::Aider => NO_PATTERNS,
+        // Permission detector. Aider patterns are deferred (NO_PATTERNS keeps
+        // the detector loop a no-op for that tab without special-casing in the
+        // hot path). Shell tabs go through the no-op path too, and the
+        // detector itself is never invoked for them — see `is_shell` below.
+        let detector_patterns = match kind {
+            TabKind::AiTool(AiToolKind::ClaudeCode) => CLAUDE_PERMISSION_PATTERNS,
+            TabKind::AiTool(AiToolKind::Aider) => NO_PATTERNS,
+            TabKind::Shell => NO_PATTERNS,
         };
         let mut detector = PermissionDetector::new(detector_patterns);
 
@@ -157,16 +169,16 @@ pub fn spawn_processor(
                                 e,
                                 ProcessingEvent::TerminalBytes(b) if !b.is_empty()
                             ));
-                            if dispatch_events(tab, events, &channel, &tts_segments).await.is_err() {
+                            if dispatch_events(&tab, is_shell, events, &channel, &tts_segments).await.is_err() {
                                 break;
                             }
-                            if saw_terminal_bytes {
+                            if saw_terminal_bytes && !is_shell {
                                 let now = tokio::time::Instant::now();
                                 if burst_start.is_none() {
                                     burst_start = Some(now);
                                 }
                                 last_byte_time = Some(now);
-                                run_permission_check(tab, &mut detector, &layer, &state_signals);
+                                run_permission_check(&tab, &mut detector, &layer, &state_signals);
                             }
                         }
                         None => {
@@ -181,37 +193,39 @@ pub fn spawn_processor(
                         e,
                         ProcessingEvent::TerminalBytes(b) if !b.is_empty()
                     ));
-                    if dispatch_events(tab, events, &channel, &tts_segments).await.is_err() {
+                    if dispatch_events(&tab, is_shell, events, &channel, &tts_segments).await.is_err() {
                         break;
                     }
-                    if saw_terminal_bytes {
+                    if saw_terminal_bytes && !is_shell {
                         let now = tokio::time::Instant::now();
                         if burst_start.is_none() {
                             burst_start = Some(now);
                         }
                         last_byte_time = Some(now);
-                        run_permission_check(tab, &mut detector, &layer, &state_signals);
+                        run_permission_check(&tab, &mut detector, &layer, &state_signals);
                     }
 
-                    if !output_active {
+                    if !is_shell && !output_active {
                         if let Some(start) = burst_start {
                             if start.elapsed() >= CLAUDE_BURST_MIN {
                                 output_active = true;
                                 let _ = state_signals
-                                    .try_send(StateSignal::ClaudeOutputStarted { tab });
+                                    .try_send(StateSignal::ClaudeOutputStarted { tab: tab.clone() });
                             }
                         }
                     }
 
-                    if let Some(t) = last_byte_time {
-                        if t.elapsed() >= CLAUDE_QUIET {
-                            if output_active {
-                                output_active = false;
-                                let _ = state_signals
-                                    .try_send(StateSignal::ClaudeOutputStopped { tab });
+                    if !is_shell {
+                        if let Some(t) = last_byte_time {
+                            if t.elapsed() >= CLAUDE_QUIET {
+                                if output_active {
+                                    output_active = false;
+                                    let _ = state_signals
+                                        .try_send(StateSignal::ClaudeOutputStopped { tab: tab.clone() });
+                                }
+                                burst_start = None;
+                                last_byte_time = None;
                             }
-                            burst_start = None;
-                            last_byte_time = None;
                         }
                     }
                 }
@@ -224,7 +238,7 @@ pub fn spawn_processor(
 /// Scan the rendered tail for permission prompts and forward edge transitions
 /// to the state manager. No-op for tabs configured with empty patterns.
 fn run_permission_check(
-    tab: TabId,
+    tab: &TabId,
     detector: &mut PermissionDetector,
     layer: &ProcessingLayer,
     state_signals: &mpsc::Sender<StateSignal>,
@@ -241,18 +255,19 @@ fn run_permission_check(
     match detector.check(&rendered) {
         PermissionDetectorResult::Detected { pattern_name } => {
             debug!(?tab, pattern = pattern_name, "permission prompt detected");
-            let _ = state_signals.try_send(StateSignal::PermissionPromptDetected { tab });
+            let _ = state_signals.try_send(StateSignal::PermissionPromptDetected { tab: tab.clone() });
         }
         PermissionDetectorResult::Resolved => {
             debug!(?tab, "permission prompt resolved");
-            let _ = state_signals.try_send(StateSignal::PermissionPromptResolved { tab });
+            let _ = state_signals.try_send(StateSignal::PermissionPromptResolved { tab: tab.clone() });
         }
         PermissionDetectorResult::None => {}
     }
 }
 
 async fn dispatch_events(
-    tab: TabId,
+    tab: &TabId,
+    is_shell: bool,
     events: Vec<ProcessingEvent>,
     channel: &Channel<String>,
     tts_segments: &mpsc::Sender<TtsRequest>,
@@ -281,8 +296,15 @@ async fn dispatch_events(
                 }
             }
             ProcessingEvent::TtsSegment(text) => {
+                if is_shell {
+                    // Shell tabs never speak. The vte parser still ran (we
+                    // need it for xterm bytes), but any tag content the
+                    // scanner picked out is dropped on the floor.
+                    debug!(target: "tts_stub", ?tab, text = %text, "shell tab: dropping TTS segment");
+                    continue;
+                }
                 debug!(target: "tts_stub", ?tab, text = %text, "extracted TTS segment");
-                let req = TtsRequest::Synthesize { tab, text };
+                let req = TtsRequest::Synthesize { tab: tab.clone(), text };
                 if tts_segments.send(req).await.is_err() {
                     debug!("pty processor: TTS segment channel closed (worker not running)");
                 }
@@ -307,15 +329,19 @@ pub fn spawn_waiter(
     tokio::task::spawn_blocking(move || {
         let exit = child.wait();
         cancel.cancel();
-        let exit_str = match exit {
-            Ok(status) => format!("{:?}", status),
-            Err(e) => format!("error: {}", e),
+        let (exit_str, code) = match &exit {
+            // `portable_pty::ExitStatus::exit_code()` is u32; the bit pattern
+            // round-trips through i32 cleanly for display, and this matches
+            // how shells (and the Tauri-side overlay) usually print exit
+            // codes.
+            Ok(status) => (format!("{:?}", status), Some(status.exit_code() as i32)),
+            Err(e) => (format!("error: {}", e), None),
         };
-        let _ = state_signals.try_send(StateSignal::SubprocessExited { tab });
+        let _ = state_signals.try_send(StateSignal::SubprocessExited { tab: tab.clone(), code });
         if let Err(e) = app.emit(
             "pty-exit",
             PtyExitPayload {
-                tab,
+                tab: tab.clone(),
                 exit: exit_str,
             },
         ) {

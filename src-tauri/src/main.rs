@@ -7,6 +7,7 @@ mod notifications;
 mod processing;
 mod pty;
 mod settings;
+mod shell;
 mod state;
 mod tabs;
 mod tts;
@@ -25,11 +26,12 @@ use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, close_settings_window, compose_content_changed, list_voices,
     open_settings_window, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
-    settings_get, settings_update, tab_activate, tab_default_settings, tts_test,
+    restart_shell_tab, settings_get, settings_update, tab_activate, tab_default_settings,
+    tts_test,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{Settings, SettingsHandle};
-use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId};
+use crate::state::{spawn_state_manager, AiToolKind, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, TtsEngine, TtsRequest};
 
@@ -43,6 +45,12 @@ fn main() {
         args = ?extra_args,
         "cctts starting"
     );
+
+    // Probe the platform default shell once and cache it for every Shell
+    // tab launch path. The cache is an `Arc` so the registry, settings
+    // window, and the new-shell-tab dialog (M2) can all share it without
+    // re-running detection.
+    let default_shell = Arc::new(shell::detect::default_shell());
 
     let settings_handle = settings::init();
 
@@ -73,14 +81,38 @@ fn main() {
     // Stopped signals with the speaking tab). Synchronous so both consumers
     // can read it without runtime gymnastics.
     let initial_active = TabId::Claude;
-    let tts_active: ActiveTab = Arc::new(RwLock::new(initial_active));
+    let tts_active: ActiveTab = Arc::new(RwLock::new(initial_active.clone()));
+
+    // Static tab metadata for M1 — two AI builtins plus the hardcoded
+    // Shell-1. M3 reads the array from settings instead of building it
+    // inline. The Shell-1 name comes from the interim `_shell_1_tmp` key
+    // on settings so user-edited names are honored on launch.
+    let shell_1_name = settings_handle.current().shell_1_tmp.name.clone();
+    let tab_metas: Vec<TabMeta> = vec![
+        TabMeta {
+            id: TabId::Claude,
+            kind: TabKind::AiTool(AiToolKind::ClaudeCode),
+            name: "Claude".to_string(),
+        },
+        TabMeta {
+            id: TabId::Aider,
+            kind: TabKind::AiTool(AiToolKind::Aider),
+            name: "Aider".to_string(),
+        },
+        TabMeta {
+            id: TabId::Shell("shell-1".to_string()),
+            kind: TabKind::Shell,
+            name: shell_1_name,
+        },
+    ];
 
     // Tab registry — one PtyManager per tab, lazy-spawn at frontend mount.
     let registry = TabRegistry::new(
-        initial_active,
+        initial_active.clone(),
         tts_active.clone(),
         audio_slot.clone(),
         state_tx.clone(),
+        default_shell.clone(),
     );
     let tabs_handle: TabRegistryHandle = Arc::new(TokioMutex::new(registry));
 
@@ -113,6 +145,9 @@ fn main() {
     let settings_for_notifications = settings_handle.clone();
     let tts_active_for_setup = tts_active.clone();
     let tts_active_for_notifications = tts_active.clone();
+    let initial_active_for_state = initial_active.clone();
+    let initial_active_for_tts = initial_active.clone();
+    let initial_active_for_notifications = initial_active.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
@@ -127,7 +162,8 @@ fn main() {
                     rx,
                     state_events_for_setup.clone(),
                     input_lengths_for_setup.clone(),
-                    initial_active,
+                    tab_metas.clone(),
+                    initial_active_for_state,
                 );
             }
             if let Some(rx) = tts_rx_for_setup
@@ -142,7 +178,7 @@ fn main() {
                     settings_for_setup.clone(),
                     audio_slot.clone(),
                     tts_active_for_setup.clone(),
-                    initial_active,
+                    initial_active_for_tts,
                 );
                 // Notification manager piggybacks on the audio output we
                 // just built. If audio init failed above, audio_slot is
@@ -159,7 +195,7 @@ fn main() {
                         tts_tx_for_notifications.clone(),
                         settings_for_notifications.clone(),
                         tts_active_for_notifications.clone(),
-                        initial_active,
+                        initial_active_for_notifications,
                     );
                 }
             }
@@ -179,6 +215,7 @@ fn main() {
             open_settings_window,
             close_settings_window,
             request_tab_restart,
+            restart_shell_tab,
             compose_content_changed,
             acknowledge_error,
             tab_activate,
@@ -227,7 +264,7 @@ fn init_tts_pipeline(
         Ok(a) => Arc::new(a),
         Err(e) => {
             warn!(error = %e, "audio output unavailable; TTS will be silent");
-            let _ = state_signals.try_send(StateSignal::AudioError { tab: initial_active });
+            let _ = state_signals.try_send(StateSignal::AudioError { tab: initial_active.clone() });
             drop(tts_rx);
             return;
         }
@@ -267,7 +304,7 @@ fn init_tts_pipeline(
         }
         Err(e) => {
             warn!(error = %e, "TTS engine init failed; TTS disabled");
-            let _ = state_signals.try_send(StateSignal::TtsError { tab: initial_active });
+            let _ = state_signals.try_send(StateSignal::TtsError { tab: initial_active.clone() });
             drop(tts_rx);
         }
     }

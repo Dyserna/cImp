@@ -12,7 +12,8 @@ use crate::audio::AudioOutput;
 use crate::error::{AppError, AppResult};
 use crate::pty::PtyManager;
 use crate::settings::SettingsHandle;
-use crate::state::{StateSignal, TabId};
+use crate::shell::ShellSpec;
+use crate::state::{StateSignal, TabId, TabKind};
 use crate::tabs::config::build_launch_spec;
 use crate::tts::{ActiveTab, TtsRequest};
 
@@ -27,6 +28,13 @@ pub struct TabRegistry {
     tts_active: ActiveTab,
     audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
     state_signals: mpsc::Sender<StateSignal>,
+    /// Resolved at app startup by `shell::detect::default_shell()` and
+    /// shared with every Shell-tab launch path. Cloned cheaply (Arc) into
+    /// the per-tab `PtyLaunchSpec` so each spawn has the binary + args
+    /// without re-running detection. M2/M3 widen this so user-managed Shell
+    /// tabs can override per tab; M1 has the single Shell-1 hardcoded to
+    /// the auto-detected default.
+    default_shell: Arc<ShellSpec>,
 }
 
 pub type TabRegistryHandle = Arc<TokioMutex<TabRegistry>>;
@@ -37,9 +45,10 @@ impl TabRegistry {
         tts_active: ActiveTab,
         audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
         state_signals: mpsc::Sender<StateSignal>,
+        default_shell: Arc<ShellSpec>,
     ) -> Self {
         let mut managers = HashMap::new();
-        for tab in TabId::ALL {
+        for tab in TabId::all() {
             managers.insert(tab, PtyManager::new());
         }
         Self {
@@ -48,11 +57,12 @@ impl TabRegistry {
             tts_active,
             audio,
             state_signals,
+            default_shell,
         }
     }
 
     pub fn active(&self) -> TabId {
-        self.active
+        self.active.clone()
     }
 
     /// Spawn the subprocess for `tab` and bind it to `output_channel`. Each
@@ -81,16 +91,22 @@ impl TabRegistry {
         // the state machine pins the tab to Error and the avatar reflects
         // it; the frontend also gets the raw error back from the Tauri
         // call to render its in-tab overlay.
-        let spec = match build_launch_spec(tab, &snap, launch_cwd, invocation_args) {
+        let spec = match build_launch_spec(
+            tab.clone(),
+            &snap,
+            &self.default_shell,
+            launch_cwd,
+            invocation_args,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let _ = self
                     .state_signals
-                    .try_send(StateSignal::SubprocessExited { tab });
+                    .try_send(StateSignal::SubprocessExited { tab, code: None });
                 return Err(e);
             }
         };
-        manager
+        let result = manager
             .start(
                 app,
                 spec,
@@ -101,7 +117,16 @@ impl TabRegistry {
                 user_typed_tts,
                 self.state_signals.clone(),
             )
-            .await
+            .await;
+        // On a successful Shell spawn, broadcast `ShellRestarted` so the
+        // state manager clears the closed flag (no-op when the tab was
+        // never closed — covers both first-mount and restart paths).
+        if result.is_ok() && matches!(tab.kind(), TabKind::Shell) {
+            let _ = self
+                .state_signals
+                .try_send(StateSignal::ShellRestarted { tab });
+        }
+        result
     }
 
     /// Tear down + bring up the subprocess for `tab`. The frontend supplies a
@@ -127,16 +152,22 @@ impl TabRegistry {
             .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
         manager.shutdown().await?;
         let snap = settings.current();
-        let spec = match build_launch_spec(tab, &snap, launch_cwd, invocation_args) {
+        let spec = match build_launch_spec(
+            tab.clone(),
+            &snap,
+            &self.default_shell,
+            launch_cwd,
+            invocation_args,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let _ = self
                     .state_signals
-                    .try_send(StateSignal::SubprocessExited { tab });
+                    .try_send(StateSignal::SubprocessExited { tab, code: None });
                 return Err(e);
             }
         };
-        manager
+        let result = manager
             .start(
                 app,
                 spec,
@@ -147,7 +178,13 @@ impl TabRegistry {
                 user_typed_tts,
                 self.state_signals.clone(),
             )
-            .await
+            .await;
+        if result.is_ok() && matches!(tab.kind(), TabKind::Shell) {
+            let _ = self
+                .state_signals
+                .try_send(StateSignal::ShellRestarted { tab });
+        }
+        result
     }
 
     pub async fn write(&self, tab: TabId, bytes: Vec<u8>) -> AppResult<()> {
@@ -189,7 +226,7 @@ impl TabRegistry {
             return Ok(());
         }
 
-        let prev = self.active;
+        let prev = self.active.clone();
 
         // Step 1 + 2: stop audio, with a synchronous stop signal first if
         // playback is in flight. The audio thread's own edge will later
@@ -201,7 +238,7 @@ impl TabRegistry {
                 if audio.is_playing() {
                     let _ = self
                         .state_signals
-                        .try_send(StateSignal::TtsPlaybackStopped { tab: prev });
+                        .try_send(StateSignal::TtsPlaybackStopped { tab: prev.clone() });
                 }
                 audio.stop_all();
             }
@@ -209,11 +246,11 @@ impl TabRegistry {
 
         // Step 3: flip TTS gate.
         if let Ok(mut g) = self.tts_active.write() {
-            *g = tab;
+            *g = tab.clone();
         }
 
         // Step 4: update local pointer.
-        self.active = tab;
+        self.active = tab.clone();
         info!(?prev, ?tab, "tab activated");
 
         // Step 5: tell the state manager so it can broadcast ActiveTabChanged.
@@ -235,11 +272,12 @@ impl TabRegistry {
 }
 
 /// Per-tab input-length counters for the state manager's auto-leave-Listening
-/// tick. Allocated up-front since the TabId set is static in v2.
+/// tick. Allocated up-front; uses the same dynamic tab listing as the rest
+/// of the registry.
 pub fn make_input_lengths() -> HashMap<TabId, Arc<AtomicI32>> {
-    TabId::ALL
-        .iter()
-        .map(|&t| (t, Arc::new(AtomicI32::new(0))))
+    TabId::all()
+        .into_iter()
+        .map(|t| (t, Arc::new(AtomicI32::new(0))))
         .collect()
 }
 

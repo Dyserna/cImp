@@ -13,14 +13,17 @@
     ptyResize,
     onPtyExit,
     decodeBase64,
+    restartShellTab,
     type BytesChannel,
   } from './ipc';
   import { display as displaySettings } from './settings/store';
   import { setTerminalFocuser } from './terminalFocus';
   import { activeTab } from './tabs/state';
-  import type { TabId } from './tabs/types';
+  import { isShellTab, type TabId } from './tabs/types';
   import { setTabError, clearTabError } from './tabs/errorState';
+  import { perTabClosedState } from './avatarState';
   import TabErrorOverlay from './TabErrorOverlay.svelte';
+  import ClosedShellOverlay from './ClosedShellOverlay.svelte';
 
   let { tabId }: { tabId: TabId } = $props();
 
@@ -32,8 +35,13 @@
   let unlistenExit: (() => void) | undefined;
   let unlistenRestart: UnlistenFn | undefined;
   let unsubActive: (() => void) | undefined;
+  let unsubClosed: (() => void) | undefined;
   let resizeTimer: ReturnType<typeof setTimeout> | undefined;
   let status = $state('booting…');
+  // Mirror the Shell-tab closed flag so the onData handler — which closes
+  // over its initial value at mount time — sees the latest state without
+  // re-binding xterm. Only Shell tabs flip this; AI tabs leave it false.
+  let isClosed = false;
 
   let initialFontFamily = 'Consolas, Menlo, "DejaVu Sans Mono", monospace';
   let initialFontSize = 14;
@@ -54,7 +62,9 @@
   }
 
   function displayNameFor(t: TabId): string {
-    return t === 'claude' ? 'Claude Code' : 'Aider';
+    if (t === 'claude') return 'Claude Code';
+    if (t === 'aider') return 'Aider';
+    return 'Shell';
   }
 
   let bytesChannel: BytesChannel;
@@ -152,14 +162,37 @@
       status = 'wiring channel';
 
       term.onData((data) => {
+        // Shell-tab closed-state intercept: while the closed overlay is
+        // showing, Enter triggers a restart, all other input is dropped on
+        // the floor (the PTY is gone, writing would error).
+        if (isClosed) {
+          if (data === '\r' || data === '\n' || data === '\r\n') {
+            void restartShellTab(tabId).catch((e) =>
+              console.error('restart_shell_tab failed:', e),
+            );
+          }
+          return;
+        }
         ptyWrite(tabId, data).catch((e) => console.error('pty_write failed:', e));
       });
+
+      // Track the closed flag for this tab so the onData handler sees the
+      // latest value without rewiring the xterm callback. Shell tabs only
+      // — AI tabs never enter the closed state.
+      if (isShellTab(tabId)) {
+        unsubClosed = perTabClosedState.subscribe((m) => {
+          isClosed = m[tabId]?.closed ?? false;
+        });
+      }
 
       unlistenExit = await onPtyExit((payload) => {
         if (payload.tab !== tabId) return;
         if (term) term.write(`\r\n[${tabId} exited: ${payload.exit}]\r\n`);
-        // Surface the exit as an in-tab error overlay so the user has a
-        // Retry path. The avatar Error banner stays as a separate signal.
+        // Shell tabs render the ClosedShellOverlay (driven by the backend's
+        // TabClosedStateChanged event) for exits, so we skip the AI-style
+        // error overlay here to avoid double-rendering. AI tabs keep the
+        // existing "exited unexpectedly" + Retry path.
+        if (isShellTab(tabId)) return;
         setTabError(tabId, {
           headline: `${displayNameFor(tabId)} exited unexpectedly.`,
           raw: payload.exit,
@@ -230,6 +263,7 @@
     unlistenRestart?.();
     unsubFont?.();
     unsubActive?.();
+    unsubClosed?.();
     setTerminalFocuser(tabId, null);
     term?.dispose();
   });
@@ -239,6 +273,9 @@
   <div bind:this={containerEl} class="terminal-container"></div>
   <div bind:this={statusEl} class="status">{status}</div>
   <TabErrorOverlay {tabId} onretry={() => attemptSpawn(true)} />
+  {#if isShellTab(tabId)}
+    <ClosedShellOverlay {tabId} />
+  {/if}
 </div>
 
 <style>

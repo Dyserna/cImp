@@ -96,12 +96,12 @@ pub async fn pty_write(
     if !is_automatic_terminal_response(&input) {
         if contains_enter(&input) {
             len_counter.store(0, Ordering::Relaxed);
-            let _ = state.state_signals.try_send(StateSignal::UserSubmit { tab });
+            let _ = state.state_signals.try_send(StateSignal::UserSubmit { tab: tab.clone() });
         } else {
             apply_input_delta(&input, len_counter);
             let _ = state
                 .state_signals
-                .try_send(StateSignal::UserKeystroke { tab });
+                .try_send(StateSignal::UserKeystroke { tab: tab.clone() });
             // Interrupt-on-input only fires when the typed-into tab is the
             // one actually playing. The audio output is shared; we only
             // need the active-tab check at the registry level (the audio
@@ -235,6 +235,8 @@ pub async fn acknowledge_error(state: State<'_, AppState>, tab: TabId) -> AppRes
     Ok(())
 }
 
+
+
 /// Activate a tab. Frontend calls this on click and on Ctrl+1/Ctrl+2; the
 /// state manager broadcasts an `ActiveTabChanged` event so all subscribers
 /// reconcile from a single source of truth.
@@ -252,11 +254,19 @@ pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Settings> {
 /// Per-tab default `TabSettings`. Used by the Settings window's "Reset to
 /// default" buttons so the frontend doesn't have to mirror Rust-side
 /// constants (notably `RUNTIME_SYSTEM_PROMPT` for Claude's TTS instructions).
+///
+/// Only AI builtins are valid here in M1; Shell tabs use a separate
+/// settings shape (Phase 8) and never exercise this command.
 #[tauri::command]
 pub async fn tab_default_settings(tab: TabId) -> AppResult<TabSettings> {
-    Ok(match tab {
+    Ok(match &tab {
         TabId::Claude => TabSettings::default_claude(),
         TabId::Aider => TabSettings::default_aider(),
+        TabId::Shell(id) => {
+            return Err(AppError::Pty(format!(
+                "tab_default_settings: shell tab {id} has no TabSettings shape"
+            )))
+        }
     })
 }
 
@@ -313,6 +323,28 @@ pub async fn close_settings_window(app: AppHandle) -> AppResult<()> {
 /// so the main window can keep all PTY-touching IPC in one place.
 #[tauri::command]
 pub async fn request_tab_restart(app: AppHandle, tab: TabId) -> AppResult<()> {
+    app.emit_to(
+        EventTarget::webview_window("main"),
+        "tab-restart-requested",
+        tab,
+    )
+    .map_err(|e| AppError::Ipc(format!("emit restart: {e}")))?;
+    Ok(())
+}
+
+/// Restart a closed Shell tab. Driven by the closed-state overlay's
+/// Enter-to-restart affordance (Phase 7). Reuses the existing
+/// `tab-restart-requested` plumbing so the frontend Terminal can rebind
+/// the bytes channel exactly as it does for the settings-window restart
+/// path. The state manager clears the closed flag on the subsequent
+/// `ShellRestarted` signal emitted from `TabRegistry::restart_tab`.
+#[tauri::command]
+pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
+    if !matches!(tab.kind(), crate::state::TabKind::Shell) {
+        return Err(AppError::Ipc(format!(
+            "restart_shell_tab: not a shell tab: {tab:?}"
+        )));
+    }
     app.emit_to(
         EventTarget::webview_window("main"),
         "tab-restart-requested",

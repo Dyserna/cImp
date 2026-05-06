@@ -23,7 +23,7 @@ const DRAIN_DEBOUNCE: Duration = Duration::from_millis(200);
 
 use crate::audio::AudioOutput;
 use crate::settings::SettingsHandle;
-use crate::state::{AvatarState, StateEvent, TabId};
+use crate::state::{AvatarState, StateEvent, TabId, TabKind};
 use crate::tts::{ActiveTab, TtsRequest};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -31,6 +31,27 @@ pub enum NotificationEvent {
     Idle,
     AwaitingPermission,
     Error,
+    /// Shell-only: subprocess exited while the user was on a different tab.
+    /// Phase 5 of MILESTONE-V3-01.
+    Exited,
+}
+
+/// Per-kind allowlist of notification triggers. AI tabs get the v1.1 trio;
+/// Shell tabs get only `Error` and the new `Exited`. Defense-in-depth: the
+/// upstream code already won't generate Idle/AwaitingPermission for Shell
+/// tabs (the avatar machine's per-kind gating in Phase 4 makes those edges
+/// unreachable), but the explicit gate makes the rule grep-able.
+fn allowed_for(kind: &TabKind, event: NotificationEvent) -> bool {
+    match (kind, event) {
+        (TabKind::AiTool(_), NotificationEvent::Idle) => true,
+        (TabKind::AiTool(_), NotificationEvent::AwaitingPermission) => true,
+        (TabKind::AiTool(_), NotificationEvent::Error) => true,
+        (TabKind::AiTool(_), NotificationEvent::Exited) => false,
+        (TabKind::Shell, NotificationEvent::Error) => true,
+        (TabKind::Shell, NotificationEvent::Exited) => true,
+        (TabKind::Shell, NotificationEvent::Idle) => false,
+        (TabKind::Shell, NotificationEvent::AwaitingPermission) => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -95,8 +116,8 @@ impl NotificationManager {
     ) -> Self {
         let mut last_avatar = HashMap::new();
         let mut last_awaiting = HashMap::new();
-        for &t in &TabId::ALL {
-            last_avatar.insert(t, AvatarState::Idle);
+        for t in TabId::all() {
+            last_avatar.insert(t.clone(), AvatarState::Idle);
             last_awaiting.insert(t, false);
         }
         let _ = initial_active; // reserved; not currently used outside `active`.
@@ -154,12 +175,12 @@ impl NotificationManager {
             StateEvent::StateChanged { tab, state } => {
                 let prev = self
                     .last_avatar
-                    .insert(tab, state)
+                    .insert(tab.clone(), state)
                     .unwrap_or(AvatarState::Idle);
                 if prev == state {
                     return;
                 }
-                let active_tab = *self.active.read().expect("active tab poisoned");
+                let active_tab = self.active.read().expect("active tab poisoned").clone();
                 if tab == active_tab {
                     return;
                 }
@@ -184,15 +205,31 @@ impl NotificationManager {
                 self.try_enqueue(tab, nev)
             }
             StateEvent::AwaitingPermissionChanged { tab, awaiting } => {
-                let prev = self.last_awaiting.insert(tab, awaiting).unwrap_or(false);
+                let prev = self.last_awaiting.insert(tab.clone(), awaiting).unwrap_or(false);
                 if prev == awaiting || !awaiting {
                     return;
                 }
-                let active_tab = *self.active.read().expect("active tab poisoned");
+                let active_tab = self.active.read().expect("active tab poisoned").clone();
                 if tab == active_tab {
                     return;
                 }
                 self.try_enqueue(tab, NotificationEvent::AwaitingPermission)
+            }
+            StateEvent::TabClosedStateChanged {
+                tab,
+                closed,
+                exit_code: _,
+            } => {
+                // Only the closed=true edge fires a notification; the
+                // closed=false edge (restart) is a UI-only transition.
+                if !closed {
+                    return;
+                }
+                let active_tab = self.active.read().expect("active tab poisoned").clone();
+                if tab == active_tab {
+                    return;
+                }
+                self.try_enqueue(tab, NotificationEvent::Exited)
             }
             StateEvent::ActiveTabChanged { .. } | StateEvent::DoneWhileAwayChanged { .. } => {
                 return;
@@ -214,7 +251,11 @@ impl NotificationManager {
         if !settings.behavior.announcements_enabled {
             return false;
         }
-        let text = notification_text(&settings, tab, event);
+        if !allowed_for(&tab.kind(), event) {
+            debug!(?tab, ?event, "notifications: dropped (disallowed for kind)");
+            return false;
+        }
+        let text = notification_text(&settings, &tab, event);
         if text.is_empty() {
             // Per design: empty text disables the (tab, event) announcement.
             return false;
@@ -260,19 +301,37 @@ impl NotificationManager {
 
 fn notification_text(
     settings: &crate::settings::Settings,
-    tab: TabId,
+    tab: &TabId,
     event: NotificationEvent,
 ) -> String {
-    let tab_settings = match tab {
-        TabId::Claude => &settings.tabs.claude,
-        TabId::Aider => &settings.tabs.aider,
-    };
-    match event {
-        NotificationEvent::Idle => tab_settings.notifications.idle.clone(),
-        NotificationEvent::AwaitingPermission => {
-            tab_settings.notifications.awaiting_permission.clone()
+    match tab {
+        TabId::Claude | TabId::Aider => {
+            let tab_settings = if matches!(tab, TabId::Claude) {
+                &settings.tabs.claude
+            } else {
+                &settings.tabs.aider
+            };
+            match event {
+                NotificationEvent::Idle => tab_settings.notifications.idle.clone(),
+                NotificationEvent::AwaitingPermission => {
+                    tab_settings.notifications.awaiting_permission.clone()
+                }
+                NotificationEvent::Error => tab_settings.notifications.error.clone(),
+                NotificationEvent::Exited => String::new(), // disallowed; defensive
+            }
         }
-        NotificationEvent::Error => tab_settings.notifications.error.clone(),
+        TabId::Shell(_) => {
+            // M1 has a single hardcoded Shell tab (`shell-1`); the interim
+            // settings field carries its strings. M3 swaps to per-tab
+            // lookup against the unified `tabs` array. The `{code}`
+            // placeholder is intentionally NOT interpolated yet — M4
+            // delivers that.
+            match event {
+                NotificationEvent::Error => settings.shell_1_tmp.notifications.error.clone(),
+                NotificationEvent::Exited => settings.shell_1_tmp.notifications.exited.clone(),
+                NotificationEvent::Idle | NotificationEvent::AwaitingPermission => String::new(),
+            }
+        }
     }
 }
 
@@ -284,7 +343,7 @@ fn dedup_per_tab(queue: &[Queued]) -> Vec<Queued> {
     let mut latest: HashMap<TabId, &Queued> = HashMap::new();
     for q in queue {
         latest
-            .entry(q.tab)
+            .entry(q.tab.clone())
             .and_modify(|cur| {
                 if q.timestamp > cur.timestamp {
                     *cur = q;
@@ -295,7 +354,7 @@ fn dedup_per_tab(queue: &[Queued]) -> Vec<Queued> {
     let mut out = Vec::with_capacity(latest.len());
     let mut emitted: HashSet<TabId> = HashSet::new();
     for q in queue {
-        if emitted.insert(q.tab) {
+        if emitted.insert(q.tab.clone()) {
             if let Some(winner) = latest.get(&q.tab) {
                 out.push((*winner).clone());
             }
@@ -360,5 +419,23 @@ mod tests {
     fn dedup_handles_empty_queue() {
         let out = dedup_per_tab(&[]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn allowlist_ai_tabs_get_v1_trio_only() {
+        let kind = TabKind::AiTool(crate::state::AiToolKind::ClaudeCode);
+        assert!(allowed_for(&kind, NotificationEvent::Idle));
+        assert!(allowed_for(&kind, NotificationEvent::AwaitingPermission));
+        assert!(allowed_for(&kind, NotificationEvent::Error));
+        assert!(!allowed_for(&kind, NotificationEvent::Exited));
+    }
+
+    #[test]
+    fn allowlist_shell_tabs_get_error_and_exited() {
+        let kind = TabKind::Shell;
+        assert!(allowed_for(&kind, NotificationEvent::Error));
+        assert!(allowed_for(&kind, NotificationEvent::Exited));
+        assert!(!allowed_for(&kind, NotificationEvent::Idle));
+        assert!(!allowed_for(&kind, NotificationEvent::AwaitingPermission));
     }
 }

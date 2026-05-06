@@ -57,7 +57,7 @@ pub fn spawn_tts_worker(
                         // segments to discard later. Notifications skip this
                         // gate by design: they exist precisely to announce
                         // events on tabs the user isn't currently looking at.
-                        let active_tab = *active.read().expect("active tab poisoned");
+                        let active_tab = active.read().expect("active tab poisoned").clone();
                         if tab != active_tab {
                             debug!(?tab, ?active_tab, "tts: dropping segment for inactive tab");
                             continue;

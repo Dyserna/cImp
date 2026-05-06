@@ -68,7 +68,7 @@ impl PtyManager {
             return Err(AppError::AlreadyStarted);
         }
 
-        let tab = spec.tab;
+        let tab = spec.tab.clone();
         info!(?tab, path = %spec.binary.display(), "spawning subprocess");
 
         let pty_system = native_pty_system();
@@ -84,7 +84,7 @@ impl PtyManager {
                 // never spawned on the spawn-error path; emit it here so the
                 // state machine pins the tab to Error and the avatar reflects
                 // the failure.
-                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab });
+                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
                 return Err(AppError::Pty(format!("openpty: {e}")));
             }
         };
@@ -101,7 +101,7 @@ impl PtyManager {
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
             Err(e) => {
-                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab });
+                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
                 return Err(AppError::Spawn(format!("{e}")));
             }
         };
@@ -130,7 +130,7 @@ impl PtyManager {
         tasks::spawn_reader(reader, bytes_tx, cancel.clone());
         let settings = app.state::<crate::ipc::AppState>().settings.clone();
         tasks::spawn_processor(
-            tab,
+            tab.clone(),
             bytes_rx,
             output_channel,
             tts_segments,
@@ -139,7 +139,7 @@ impl PtyManager {
             state_signals.clone(),
             settings,
         );
-        tasks::spawn_waiter(tab, child, app, cancel.clone(), state_signals);
+        tasks::spawn_waiter(tab.clone(), child, app, cancel.clone(), state_signals);
 
         *guard = Some(PtyHandle {
             writer,

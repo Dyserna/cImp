@@ -226,12 +226,14 @@ fn migrate_v1_to_v2(v1: V1Settings) -> Settings {
                 .or(defaults.shortcuts.open_settings),
             switch_to_tab_1: defaults.shortcuts.switch_to_tab_1,
             switch_to_tab_2: defaults.shortcuts.switch_to_tab_2,
+            switch_to_tab_3: defaults.shortcuts.switch_to_tab_3,
         },
         tabs: TabsSettings {
             claude: claude_tab,
             aider: TabSettings::default_aider(),
         },
         processing: v1.processing,
+        shell_1_tmp: defaults.shell_1_tmp,
     }
 }
 

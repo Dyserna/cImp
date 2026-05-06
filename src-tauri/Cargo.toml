@@ -42,6 +42,10 @@ rodio = "0.20"
 # Filesystem paths
 dirs = "5"
 
+# Windows-only: registry probe for Git Bash auto-detection in shell::detect.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
 [profile.release]
 codegen-units = 1
 lto = true

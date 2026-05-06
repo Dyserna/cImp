@@ -62,6 +62,7 @@
           },
           switch_to_tab_1: () => void switchTab('claude'),
           switch_to_tab_2: () => void switchTab('aider'),
+          switch_to_tab_3: () => void switchTab('shell-1'),
         });
       });
       // Window title reflects the active tab's avatar state. Switching
@@ -70,7 +71,10 @@
       const win = getCurrentWindow();
       unsubTitle = avatarState.subscribe((s) => {
         const tab = get(activeTab);
-        const tabLabel = tab === 'claude' ? 'Claude' : 'Aider';
+        let tabLabel: string;
+        if (tab === 'claude') tabLabel = 'Claude';
+        else if (tab === 'aider') tabLabel = 'Aider';
+        else tabLabel = 'Shell';
         const label = s === 'Idle' ? tabLabel : `${tabLabel} — ${s}`;
         void win.setTitle(label).catch((e) =>
           console.warn('setTitle failed:', e),

@@ -2,7 +2,7 @@ import { writable, derived, get, type Readable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { settings, applySettings } from './settings/store';
 import { activeTab } from './tabs/state';
-import type { TabId } from './tabs/types';
+import { ALL_TABS, type TabId } from './tabs/types';
 
 export type AvatarState = 'Idle' | 'Listening' | 'Thinking' | 'Speaking' | 'Error';
 
@@ -14,38 +14,49 @@ export interface AvatarErrorInfo {
   message: string;
 }
 
-// Backend wire format for the `avatar-state` event. Four shapes:
-// - StateChanged: { type: 'state-changed', tab, state }
-// - ActiveTabChanged: { type: 'active-tab-changed', tab }
-// - AwaitingPermissionChanged: { type: 'awaiting-permission-changed', tab, awaiting }
-// - DoneWhileAwayChanged: { type: 'done-while-away-changed', tab, done }
+export interface TabClosedState {
+  closed: boolean;
+  exit_code: number | null;
+}
+
+// Backend wire format for the `avatar-state` event.
 type StateEvent =
   | { type: 'state-changed'; tab: TabId; state: AvatarState }
   | { type: 'active-tab-changed'; tab: TabId }
   | { type: 'awaiting-permission-changed'; tab: TabId; awaiting: boolean }
-  | { type: 'done-while-away-changed'; tab: TabId; done: boolean };
+  | { type: 'done-while-away-changed'; tab: TabId; done: boolean }
+  | { type: 'tab-closed-state-changed'; tab: TabId; closed: boolean; exit_code: number | null };
+
+function defaultRecord<V>(value: V): Record<TabId, V> {
+  const out: Record<TabId, V> = {} as Record<TabId, V>;
+  for (const t of ALL_TABS) out[t] = value;
+  return out;
+}
 
 // Per-tab avatar state cache. The displayed avatar is a derived view over
 // (this map, activeTab) — switching tabs immediately re-renders without an
 // extra backend round-trip.
-const perTabState = writable<Record<TabId, AvatarState>>({
-  claude: 'Idle',
-  aider: 'Idle',
-});
+const perTabState = writable<Record<TabId, AvatarState>>(defaultRecord<AvatarState>('Idle'));
 
 /// Per-tab AwaitingPermission flag. Driven by backend permission detection.
-/// Exposed for the TabBar's per-tab indicator rendering.
-export const perTabAwaitingPermission = writable<Record<TabId, boolean>>({
-  claude: false,
-  aider: false,
-});
+/// Exposed for the TabBar's per-tab indicator rendering. Always false for
+/// Shell tabs (the detector never runs for them).
+export const perTabAwaitingPermission = writable<Record<TabId, boolean>>(
+  defaultRecord<boolean>(false),
+);
 
 /// Per-tab DoneWhileAway flag. Set by the backend when a tab transitions to
 /// Idle while inactive; cleared on tab activation.
-export const perTabDoneWhileAway = writable<Record<TabId, boolean>>({
-  claude: false,
-  aider: false,
-});
+export const perTabDoneWhileAway = writable<Record<TabId, boolean>>(
+  defaultRecord<boolean>(false),
+);
+
+/// Per-tab Shell-only closed state. Driven by the backend's
+/// `tab-closed-state-changed` event; the ClosedShellOverlay component
+/// subscribes to render the "Shell exited (code N)" message.
+export const perTabClosedState = writable<Record<TabId, TabClosedState>>(
+  defaultRecord<TabClosedState>({ closed: false, exit_code: null }),
+);
 
 /// Per-tab avatar state map exposed for TabBar (it needs all tabs at once,
 /// not just the active one).
@@ -64,10 +75,9 @@ export const avatarState: Readable<AvatarState> = derived(
 
 /// Per-tab error info. Like `avatarState`, the displayed banner is the
 /// active tab's error.
-const perTabError = writable<Record<TabId, AvatarErrorInfo | null>>({
-  claude: null,
-  aider: null,
-});
+const perTabError = writable<Record<TabId, AvatarErrorInfo | null>>(
+  defaultRecord<AvatarErrorInfo | null>(null),
+);
 
 export const avatarError: Readable<AvatarErrorInfo | null> = derived(
   [perTabError, activeTab],
@@ -110,6 +120,11 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
         perTabAwaitingPermission.update((m) => ({ ...m, [e.tab]: e.awaiting }));
       } else if (e.type === 'done-while-away-changed') {
         perTabDoneWhileAway.update((m) => ({ ...m, [e.tab]: e.done }));
+      } else if (e.type === 'tab-closed-state-changed') {
+        perTabClosedState.update((m) => ({
+          ...m,
+          [e.tab]: { closed: e.closed, exit_code: e.exit_code },
+        }));
       }
     });
   }

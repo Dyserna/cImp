@@ -9,18 +9,108 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-/// Identifier for one of the multi-tab subprocesses cctts owns. Closed enum
-/// in v2 (Claude + Aider only); v3 will likely widen this to allow arbitrary
-/// user-managed tabs.
-#[derive(Clone, Copy, Hash, Eq, PartialEq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// Identifier for one of the multi-tab subprocesses cctts owns. Two
+/// reserved variants (`Claude`, `Aider`) cover the v1 builtins; `Shell(id)`
+/// carries the user-managed tab IDs introduced in v3 (M1 has a hardcoded
+/// "shell-1"; M2/M3 generalize). The runtime kind discriminator is
+/// [`TabKind`], not this — `TabId` is purely an opaque identity used as
+/// HashMap key and IPC payload.
+///
+/// Wire format: a single string. Reserved IDs serialize as `"claude"` /
+/// `"aider"`; `Shell(s)` serializes as the inner string verbatim. Round-
+/// tripping any other string yields a `Shell` variant.
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub enum TabId {
     Claude,
     Aider,
+    Shell(String),
 }
 
 impl TabId {
-    pub const ALL: [TabId; 2] = [TabId::Claude, TabId::Aider];
+    pub fn as_str(&self) -> &str {
+        match self {
+            TabId::Claude => "claude",
+            TabId::Aider => "aider",
+            TabId::Shell(s) => s.as_str(),
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "claude" => TabId::Claude,
+            "aider" => TabId::Aider,
+            other => TabId::Shell(other.to_string()),
+        }
+    }
+
+    /// Every tab the app currently owns. M1 ships three — the two AI
+    /// builtins plus the hardcoded Shell-1. M2/M3 generalize this to
+    /// reflect user-managed tabs from settings.
+    pub fn all() -> Vec<TabId> {
+        vec![
+            TabId::Claude,
+            TabId::Aider,
+            TabId::Shell("shell-1".to_string()),
+        ]
+    }
+
+    /// Pure mapping from id to runtime kind. Stable across milestones —
+    /// `Claude`/`Aider` are always AI tabs; any `Shell(_)` id is a Shell
+    /// tab. Lets call sites that don't carry `TabKind` explicitly (PTY
+    /// processor, launch-spec builder) branch without threading a separate
+    /// metadata table.
+    pub fn kind(&self) -> TabKind {
+        match self {
+            TabId::Claude => TabKind::AiTool(AiToolKind::ClaudeCode),
+            TabId::Aider => TabKind::AiTool(AiToolKind::Aider),
+            TabId::Shell(_) => TabKind::Shell,
+        }
+    }
+}
+
+impl Serialize for TabId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TabId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(TabId::from_str(&s))
+    }
+}
+
+/// Discriminator for which kind of subprocess a tab runs. Gates per-kind
+/// behavior in the state machine, the processing layer, and the
+/// notification system. M1 ships two AI builtins plus one hardcoded Shell
+/// tab; M2/M3 add user-managed Shell tabs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TabKind {
+    AiTool(AiToolKind),
+    Shell,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiToolKind {
+    ClaudeCode,
+    Aider,
+}
+
+impl TabKind {
+    pub fn is_shell(&self) -> bool {
+        matches!(self, TabKind::Shell)
+    }
+}
+
+/// Static metadata describing one tab at registration time. Plumbed into the
+/// state manager and notification manager so per-kind behavior is decided
+/// without round-tripping through settings on every signal.
+#[derive(Clone, Debug)]
+pub struct TabMeta {
+    pub id: TabId,
+    pub kind: TabKind,
+    pub name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -39,7 +129,7 @@ pub struct ErrorInfo {
 }
 
 impl ErrorInfo {
-    fn from_signal(s: StateSignal) -> Option<Self> {
+    fn from_signal(s: &StateSignal) -> Option<Self> {
         let (kind, message) = match s {
             StateSignal::SubprocessExited { .. } => (ErrorKind::SubprocessExited, "Subprocess stopped."),
             StateSignal::TtsError { .. } => (ErrorKind::TtsError, "Text-to-speech is unavailable."),
@@ -74,7 +164,11 @@ pub enum AvatarState {
 /// originated from (or, for `TabActivated`, the tab that's becoming active).
 /// Transition logic mirrors v1's per-state-machine rules; the manager just
 /// runs them per tab and routes events back tagged with the same TabId.
-#[derive(Debug, Clone, Copy)]
+///
+/// Not `Copy` because `TabId::Shell` carries a `String`. The cost — one
+/// small string clone per signal touch — is paid only on cross-thread sends
+/// and the per-signal route step in the run loop, never in tight loops.
+#[derive(Debug, Clone)]
 #[allow(dead_code)] // some variants reserved for later milestones
 pub enum StateSignal {
     UserKeystroke { tab: TabId },
@@ -83,7 +177,12 @@ pub enum StateSignal {
     ClaudeOutputStopped { tab: TabId },
     TtsPlaybackStarted { tab: TabId },
     TtsPlaybackStopped { tab: TabId },
-    SubprocessExited { tab: TabId },
+    /// Subprocess for `tab` exited with the given exit code (`None` if the
+    /// child wait returned an error, or if we synthesize the signal from a
+    /// spawn-time failure where there is no process to exit). Phase 4 routes
+    /// this per-kind: AI tabs go to Error, Shell tabs go to the closed
+    /// sub-state with the code surfaced in the overlay.
+    SubprocessExited { tab: TabId, code: Option<i32> },
     AudioError { tab: TabId },
     TtsError { tab: TabId },
     ErrorAcknowledged { tab: TabId },
@@ -101,25 +200,30 @@ pub enum StateSignal {
     /// Permission detector observed the previously-matched pattern leave the
     /// rendered tail. Clears `awaiting_permission`.
     PermissionPromptResolved { tab: TabId },
+    /// A Shell tab's subprocess has been (re)spawned after a previous exit.
+    /// Clears the `closed` flag and emits `TabClosedStateChanged { closed:
+    /// false }`. AI tabs don't use this — they have no closed sub-state.
+    ShellRestarted { tab: TabId },
 }
 
 impl StateSignal {
     pub fn tab(&self) -> TabId {
-        match *self {
+        match self {
             Self::UserKeystroke { tab }
             | Self::UserSubmit { tab }
             | Self::ClaudeOutputStarted { tab }
             | Self::ClaudeOutputStopped { tab }
             | Self::TtsPlaybackStarted { tab }
             | Self::TtsPlaybackStopped { tab }
-            | Self::SubprocessExited { tab }
+            | Self::SubprocessExited { tab, .. }
             | Self::AudioError { tab }
             | Self::TtsError { tab }
             | Self::ErrorAcknowledged { tab }
             | Self::ComposeContentChanged { tab, .. }
             | Self::TabActivated { tab }
             | Self::PermissionPromptDetected { tab }
-            | Self::PermissionPromptResolved { tab } => tab,
+            | Self::PermissionPromptResolved { tab }
+            | Self::ShellRestarted { tab } => tab.clone(),
         }
     }
 }
@@ -138,31 +242,52 @@ pub enum StateEvent {
     ActiveTabChanged { tab: TabId },
     AwaitingPermissionChanged { tab: TabId, awaiting: bool },
     DoneWhileAwayChanged { tab: TabId, done: bool },
+    /// Shell tab's `closed` UI flag flipped. `closed: true` is fired when
+    /// the subprocess exits; `closed: false` when the user restarts it.
+    /// `exit_code` is `None` for spawn-time failures or for `closed: false`
+    /// events.
+    TabClosedStateChanged {
+        tab: TabId,
+        closed: bool,
+        exit_code: Option<i32>,
+    },
 }
 
 #[derive(Clone, Debug)]
 struct TabState {
+    kind: TabKind,
+    #[allow(dead_code)] // Phase 1 only stores it; Phase 6 surfaces it in events.
+    name: String,
     avatar_state: AvatarState,
     has_unsent_input: bool,
     composing: bool,
     last_keystroke_at: Option<Instant>,
     /// Set by permission detection; cleared on detector-resolve, user input,
-    /// or tab activation triggering Claude to emit further output.
+    /// or tab activation triggering Claude to emit further output. Always
+    /// false for Shell tabs (the detector is a no-op for them).
     awaiting_permission: bool,
     /// UI-derived: tab transitioned to Idle while inactive. Cleared on
     /// activation. Independent of `avatar_state` and `awaiting_permission`.
     done_while_away: bool,
+    /// Shell-only: subprocess has exited and is awaiting user-initiated
+    /// restart. Stays false on AI tabs (their exit path goes to Error).
+    closed: bool,
+    closed_exit_code: Option<i32>,
 }
 
 impl TabState {
-    fn new() -> Self {
+    fn new(kind: TabKind, name: String) -> Self {
         Self {
+            kind,
+            name,
             avatar_state: AvatarState::Idle,
             has_unsent_input: false,
             composing: false,
             last_keystroke_at: None,
             awaiting_permission: false,
             done_while_away: false,
+            closed: false,
+            closed_exit_code: None,
         }
     }
 }
@@ -173,15 +298,19 @@ impl TabState {
 /// `state_events` receives the same `StateEvent`s emitted to the frontend,
 /// so in-process subscribers (e.g. the notification manager) can react to
 /// state edges without going through the IPC layer.
+///
+/// `tab_metas` defines every tab the manager tracks (kind + name); the
+/// manager keys its per-tab state map by `TabId` from this list.
 pub fn spawn_state_manager(
     app: AppHandle,
     rx: mpsc::Receiver<StateSignal>,
     state_events: broadcast::Sender<StateEvent>,
     input_lengths: HashMap<TabId, Arc<AtomicI32>>,
+    tab_metas: Vec<TabMeta>,
     initial_active: TabId,
 ) {
     tauri::async_runtime::spawn(async move {
-        run(app, rx, state_events, input_lengths, initial_active).await;
+        run(app, rx, state_events, input_lengths, tab_metas, initial_active).await;
     });
 }
 
@@ -190,11 +319,12 @@ async fn run(
     mut rx: mpsc::Receiver<StateSignal>,
     state_events: broadcast::Sender<StateEvent>,
     input_lengths: HashMap<TabId, Arc<AtomicI32>>,
+    tab_metas: Vec<TabMeta>,
     initial_active: TabId,
 ) {
-    let mut tabs: HashMap<TabId, TabState> = TabId::ALL
-        .iter()
-        .map(|&t| (t, TabState::new()))
+    let mut tabs: HashMap<TabId, TabState> = tab_metas
+        .into_iter()
+        .map(|m| (m.id, TabState::new(m.kind, m.name)))
         .collect();
     let mut active = initial_active;
 
@@ -204,10 +334,10 @@ async fn run(
     // Emit the initial Idle for each tab so the frontend has a baseline before
     // any signal arrives. The avatar component skips its first-render
     // transition so this doesn't play an unwanted animation.
-    for (&tab, ts) in &tabs {
-        emit_state(&app, &state_events, tab, ts.avatar_state);
+    for (tab, ts) in &tabs {
+        emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
     }
-    emit_active_tab(&app, &state_events, active);
+    emit_active_tab(&app, &state_events, active.clone());
 
     loop {
         tokio::select! {
@@ -218,11 +348,12 @@ async fn run(
                 // active pointer and re-broadcasts. We DON'T re-emit the new
                 // tab's state here; the frontend listens for ActiveTabChanged
                 // and re-derives from the per-tab cache it already has.
-                if let StateSignal::TabActivated { tab } = signal {
+                if let StateSignal::TabActivated { tab } = &signal {
+                    let tab = tab.clone();
                     if active != tab {
                         info!(from = ?active, to = ?tab, "active tab");
-                        active = tab;
-                        emit_active_tab(&app, &state_events, active);
+                        active = tab.clone();
+                        emit_active_tab(&app, &state_events, tab.clone());
                         // Clear DoneWhileAway on the newly-active tab — the
                         // user's now looking at it, so the "you missed
                         // something" hint has served its purpose.
@@ -240,7 +371,8 @@ async fn run(
                 // machine — they only flip `awaiting_permission`. Resolved
                 // and user-input both clear; the input clearing path below
                 // handles UserKeystroke / UserSubmit.
-                if let StateSignal::PermissionPromptDetected { tab } = signal {
+                if let StateSignal::PermissionPromptDetected { tab } = &signal {
+                    let tab = tab.clone();
                     if let Some(ts) = tabs.get_mut(&tab) {
                         if !ts.awaiting_permission {
                             ts.awaiting_permission = true;
@@ -250,7 +382,8 @@ async fn run(
                     }
                     continue;
                 }
-                if let StateSignal::PermissionPromptResolved { tab } = signal {
+                if let StateSignal::PermissionPromptResolved { tab } = &signal {
+                    let tab = tab.clone();
                     if let Some(ts) = tabs.get_mut(&tab) {
                         if ts.awaiting_permission {
                             ts.awaiting_permission = false;
@@ -261,18 +394,62 @@ async fn run(
                     continue;
                 }
 
+                // Shell tabs route SubprocessExited to the closed sub-state
+                // instead of Error (per DESIGN-V3.md § "Subprocess Exit
+                // Handling for Shell Tabs"). AI tabs fall through to the
+                // generic transition path below where the existing v1 logic
+                // turns the signal into Error. Spawn-time failures with
+                // `code = None` still hit this same branch.
+                if let StateSignal::SubprocessExited { tab, code } = &signal {
+                    let tab = tab.clone();
+                    let code = *code;
+                    let route_to_closed = tabs
+                        .get(&tab)
+                        .map(|ts| matches!(ts.kind, TabKind::Shell))
+                        .unwrap_or(false);
+                    if route_to_closed {
+                        if let Some(ts) = tabs.get_mut(&tab) {
+                            if !ts.closed {
+                                ts.closed = true;
+                                ts.closed_exit_code = code;
+                                info!(?tab, ?code, "shell tab: closed");
+                                emit_tab_closed_state(&app, &state_events, tab, true, code);
+                            }
+                        }
+                        continue;
+                    }
+                    // AI tab: fall through; the generic routing below feeds
+                    // the signal into transition() which produces Error.
+                }
+
+                // Shell tab restart (Phase 6 emits this after a fresh PTY
+                // has been bound). Clears the closed flag so the overlay
+                // hides; AI tabs ignore.
+                if let StateSignal::ShellRestarted { tab } = &signal {
+                    let tab = tab.clone();
+                    if let Some(ts) = tabs.get_mut(&tab) {
+                        if matches!(ts.kind, TabKind::Shell) && ts.closed {
+                            ts.closed = false;
+                            ts.closed_exit_code = None;
+                            info!(?tab, "shell tab: restarted");
+                            emit_tab_closed_state(&app, &state_events, tab, false, None);
+                        }
+                    }
+                    continue;
+                }
+
                 // Compose signals always target the active tab (the compose
                 // overlay submits to whoever is on screen). The signal
                 // arrives tagged with `active` from the IPC handler, but we
                 // re-resolve here defensively in case anything ever changes.
-                let target_tab = match signal {
-                    StateSignal::ComposeContentChanged { .. } => active,
+                let target_tab = match &signal {
+                    StateSignal::ComposeContentChanged { .. } => active.clone(),
                     other => other.tab(),
                 };
 
                 let Some(ts) = tabs.get_mut(&target_tab) else { continue };
 
-                match signal {
+                match &signal {
                     StateSignal::UserKeystroke { .. } => {
                         ts.has_unsent_input = true;
                         ts.last_keystroke_at = Some(Instant::now());
@@ -282,8 +459,8 @@ async fn run(
                         ts.last_keystroke_at = Some(Instant::now());
                     }
                     StateSignal::ComposeContentChanged { non_empty, .. } => {
-                        ts.composing = non_empty;
-                        if non_empty {
+                        ts.composing = *non_empty;
+                        if *non_empty {
                             ts.last_keystroke_at = Some(Instant::now());
                         }
                     }
@@ -301,28 +478,36 @@ async fn run(
                 {
                     ts.awaiting_permission = false;
                     info!(tab = ?target_tab, "awaiting permission: cleared (input)");
-                    emit_awaiting_permission(&app, &state_events, target_tab, false);
+                    emit_awaiting_permission(&app, &state_events, target_tab.clone(), false);
                 }
 
                 let prev_state = ts.avatar_state;
-                let next = transition(prev_state, signal, ts.has_unsent_input, ts.composing);
+                // Shell tabs short-circuit transition — only Idle ↔ Error
+                // is reachable for them, and SubprocessExited has already
+                // been routed elsewhere. The remaining error edges
+                // (AudioError, TtsError, ErrorAcknowledged) come through
+                // here and use the same logic as AI tabs.
+                let is_shell = matches!(ts.kind, TabKind::Shell);
+                let next = if is_shell && !is_error_edge(&signal) {
+                    prev_state
+                } else {
+                    transition(prev_state, &signal, ts.has_unsent_input, ts.composing)
+                };
                 if next != prev_state {
                     info!(tab = ?target_tab, from = ?prev_state, to = ?next, ?signal, "avatar state");
                     ts.avatar_state = next;
-                    emit_state(&app, &state_events, target_tab, next);
+                    let inactive = target_tab != active;
+                    let bump_done_while_away = next == AvatarState::Idle && inactive && !ts.done_while_away;
+                    if bump_done_while_away {
+                        ts.done_while_away = true;
+                    }
+                    emit_state(&app, &state_events, target_tab.clone(), next);
                     if next == AvatarState::Error {
-                        if let Some(info) = ErrorInfo::from_signal(signal) {
+                        if let Some(info) = ErrorInfo::from_signal(&signal) {
                             emit_error(&app, &info);
                         }
                     }
-                    // DoneWhileAway: a transition INTO Idle on an inactive tab
-                    // raises the flag. Same rule applies on the tick-arm
-                    // Listening→Idle sweep below.
-                    if next == AvatarState::Idle
-                        && target_tab != active
-                        && !ts.done_while_away
-                    {
-                        ts.done_while_away = true;
+                    if bump_done_while_away {
                         info!(tab = ?target_tab, "done while away: set");
                         emit_done_while_away(&app, &state_events, target_tab, true);
                     }
@@ -331,11 +516,11 @@ async fn run(
             _ = tick.tick() => {
                 // Per-tab idle-Listening sweep. Each tab's input-length
                 // counter is independent.
-                for (&tab, ts) in tabs.iter_mut() {
+                for (tab, ts) in tabs.iter_mut() {
                     if ts.avatar_state != AvatarState::Listening { continue; }
                     if ts.composing { continue; }
                     let len = input_lengths
-                        .get(&tab)
+                        .get(tab)
                         .map(|c| c.load(Ordering::Relaxed))
                         .unwrap_or(0);
                     if len != 0 { continue; }
@@ -347,11 +532,11 @@ async fn run(
                     info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "EmptyInputTimeout", "avatar state");
                     ts.avatar_state = AvatarState::Idle;
                     ts.has_unsent_input = false;
-                    emit_state(&app, &state_events, tab, ts.avatar_state);
-                    if tab != active && !ts.done_while_away {
+                    emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
+                    if *tab != active && !ts.done_while_away {
                         ts.done_while_away = true;
                         info!(?tab, "done while away: set (tick)");
-                        emit_done_while_away(&app, &state_events, tab, true);
+                        emit_done_while_away(&app, &state_events, tab.clone(), true);
                     }
                 }
             }
@@ -361,12 +546,25 @@ async fn run(
     debug!("state manager: signal channel closed; exiting");
 }
 
+/// True when the signal is one of the cross-cutting error edges that apply
+/// to every tab regardless of kind. `SubprocessExited` is intentionally NOT
+/// in this set — Shell tabs route it to the closed sub-state, AI tabs hit
+/// it via `transition()` directly.
+fn is_error_edge(signal: &StateSignal) -> bool {
+    matches!(
+        signal,
+        StateSignal::AudioError { .. }
+            | StateSignal::TtsError { .. }
+            | StateSignal::ErrorAcknowledged { .. }
+    )
+}
+
 /// Priority-based transitions, identical to v1's logic. The `tab` carried by
 /// each signal is consumed by the caller (it routes the signal to the right
 /// per-tab `TabState` before invoking this).
 fn transition(
     current: AvatarState,
-    signal: StateSignal,
+    signal: &StateSignal,
     has_unsent_input: bool,
     composing: bool,
 ) -> AvatarState {
@@ -381,7 +579,7 @@ fn transition(
     }
 
     if let ComposeContentChanged { non_empty, .. } = signal {
-        if non_empty && current == Idle {
+        if *non_empty && current == Idle {
             return Listening;
         }
         return current;
@@ -461,99 +659,119 @@ fn emit_done_while_away(
     dispatch(app, bcast, StateEvent::DoneWhileAwayChanged { tab, done });
 }
 
+fn emit_tab_closed_state(
+    app: &AppHandle,
+    bcast: &broadcast::Sender<StateEvent>,
+    tab: TabId,
+    closed: bool,
+    exit_code: Option<i32>,
+) {
+    dispatch(
+        app,
+        bcast,
+        StateEvent::TabClosedStateChanged {
+            tab,
+            closed,
+            exit_code,
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use AvatarState::*;
     use StateSignal::*;
 
-    const T: TabId = TabId::Claude;
+    fn tab() -> TabId {
+        TabId::Claude
+    }
 
     fn t(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, signal, false, false)
+        transition(current, &signal, false, false)
     }
 
     fn t_with_input(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, signal, true, false)
+        transition(current, &signal, true, false)
     }
 
     fn t_composing(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, signal, false, true)
+        transition(current, &signal, false, true)
     }
 
     #[test]
     fn idle_keystroke_listens() {
-        assert_eq!(t(Idle, UserKeystroke { tab: T }), Listening);
+        assert_eq!(t(Idle, UserKeystroke { tab: tab() }), Listening);
     }
 
     #[test]
     fn idle_bare_enter_stays_idle() {
-        assert_eq!(t(Idle, UserSubmit { tab: T }), Idle);
+        assert_eq!(t(Idle, UserSubmit { tab: tab() }), Idle);
     }
 
     #[test]
     fn listening_enter_thinks() {
-        assert_eq!(t(Listening, UserSubmit { tab: T }), Thinking);
+        assert_eq!(t(Listening, UserSubmit { tab: tab() }), Thinking);
     }
 
     #[test]
     fn listening_more_typing_stays() {
-        assert_eq!(t(Listening, UserKeystroke { tab: T }), Listening);
+        assert_eq!(t(Listening, UserKeystroke { tab: tab() }), Listening);
     }
 
     #[test]
     fn listening_tts_speaks() {
-        assert_eq!(t(Listening, TtsPlaybackStarted { tab: T }), Speaking);
+        assert_eq!(t(Listening, TtsPlaybackStarted { tab: tab() }), Speaking);
     }
 
     #[test]
     fn thinking_tts_speaks() {
-        assert_eq!(t(Thinking, TtsPlaybackStarted { tab: T }), Speaking);
+        assert_eq!(t(Thinking, TtsPlaybackStarted { tab: tab() }), Speaking);
     }
 
     #[test]
     fn thinking_claude_done_returns_idle() {
-        assert_eq!(t(Thinking, ClaudeOutputStopped { tab: T }), Idle);
+        assert_eq!(t(Thinking, ClaudeOutputStopped { tab: tab() }), Idle);
     }
 
     #[test]
     fn thinking_typing_or_enter_ignored() {
-        assert_eq!(t(Thinking, UserKeystroke { tab: T }), Thinking);
-        assert_eq!(t(Thinking, UserSubmit { tab: T }), Thinking);
+        assert_eq!(t(Thinking, UserKeystroke { tab: tab() }), Thinking);
+        assert_eq!(t(Thinking, UserSubmit { tab: tab() }), Thinking);
     }
 
     #[test]
     fn speaking_tts_stop_returns_idle_when_no_pending_input() {
-        assert_eq!(t(Speaking, TtsPlaybackStopped { tab: T }), Idle);
+        assert_eq!(t(Speaking, TtsPlaybackStopped { tab: tab() }), Idle);
     }
 
     #[test]
     fn speaking_tts_stop_resumes_listening_when_user_typed() {
         assert_eq!(
-            t_with_input(Speaking, TtsPlaybackStopped { tab: T }),
+            t_with_input(Speaking, TtsPlaybackStopped { tab: tab() }),
             Listening
         );
     }
 
     #[test]
     fn speaking_typing_or_enter_ignored() {
-        assert_eq!(t(Speaking, UserKeystroke { tab: T }), Speaking);
-        assert_eq!(t(Speaking, UserSubmit { tab: T }), Speaking);
+        assert_eq!(t(Speaking, UserKeystroke { tab: tab() }), Speaking);
+        assert_eq!(t(Speaking, UserSubmit { tab: tab() }), Speaking);
     }
 
     #[test]
     fn errors_interrupt_any_state() {
         for s in [Idle, Listening, Thinking, Speaking] {
-            assert_eq!(t(s, SubprocessExited { tab: T }), Error);
-            assert_eq!(t(s, AudioError { tab: T }), Error);
-            assert_eq!(t(s, TtsError { tab: T }), Error);
+            assert_eq!(t(s, SubprocessExited { tab: tab(), code: None }), Error);
+            assert_eq!(t(s, AudioError { tab: tab() }), Error);
+            assert_eq!(t(s, TtsError { tab: tab() }), Error);
         }
     }
 
     #[test]
     fn idle_compose_non_empty_listens() {
         assert_eq!(
-            t(Idle, ComposeContentChanged { tab: T, non_empty: true }),
+            t(Idle, ComposeContentChanged { tab: tab(), non_empty: true }),
             Listening,
         );
     }
@@ -561,7 +779,7 @@ mod tests {
     #[test]
     fn idle_compose_empty_stays_idle() {
         assert_eq!(
-            t(Idle, ComposeContentChanged { tab: T, non_empty: false }),
+            t(Idle, ComposeContentChanged { tab: tab(), non_empty: false }),
             Idle
         );
     }
@@ -569,11 +787,11 @@ mod tests {
     #[test]
     fn compose_does_not_preempt_higher_states() {
         assert_eq!(
-            t(Thinking, ComposeContentChanged { tab: T, non_empty: true }),
+            t(Thinking, ComposeContentChanged { tab: tab(), non_empty: true }),
             Thinking,
         );
         assert_eq!(
-            t(Speaking, ComposeContentChanged { tab: T, non_empty: true }),
+            t(Speaking, ComposeContentChanged { tab: tab(), non_empty: true }),
             Speaking,
         );
     }
@@ -581,17 +799,17 @@ mod tests {
     #[test]
     fn speaking_tts_stop_resumes_listening_when_composing() {
         assert_eq!(
-            t_composing(Speaking, TtsPlaybackStopped { tab: T }),
+            t_composing(Speaking, TtsPlaybackStopped { tab: tab() }),
             Listening
         );
     }
 
     #[test]
     fn error_sticks_until_acknowledged() {
-        assert_eq!(t(Error, UserKeystroke { tab: T }), Error);
-        assert_eq!(t(Error, UserSubmit { tab: T }), Error);
-        assert_eq!(t(Error, TtsPlaybackStarted { tab: T }), Error);
-        assert_eq!(t(Error, ErrorAcknowledged { tab: T }), Idle);
+        assert_eq!(t(Error, UserKeystroke { tab: tab() }), Error);
+        assert_eq!(t(Error, UserSubmit { tab: tab() }), Error);
+        assert_eq!(t(Error, TtsPlaybackStarted { tab: tab() }), Error);
+        assert_eq!(t(Error, ErrorAcknowledged { tab: tab() }), Idle);
     }
 
     #[test]
@@ -600,8 +818,59 @@ mod tests {
         // the run loop calls `transition()`, but if they ever reached it
         // they should be no-ops in every state.
         for s in [Idle, Listening, Thinking, Speaking, Error] {
-            assert_eq!(t(s, PermissionPromptDetected { tab: T }), s);
-            assert_eq!(t(s, PermissionPromptResolved { tab: T }), s);
+            assert_eq!(t(s, PermissionPromptDetected { tab: tab() }), s);
+            assert_eq!(t(s, PermissionPromptResolved { tab: tab() }), s);
         }
+    }
+
+    #[test]
+    fn tab_id_serde_round_trips() {
+        for id in [
+            TabId::Claude,
+            TabId::Aider,
+            TabId::Shell("shell-1".to_string()),
+            TabId::Shell("user-bash".to_string()),
+        ] {
+            let s = serde_json::to_string(&id).unwrap();
+            let back: TabId = serde_json::from_str(&s).unwrap();
+            assert_eq!(id, back);
+        }
+    }
+
+    #[test]
+    fn tab_id_wire_format_preserved() {
+        assert_eq!(serde_json::to_string(&TabId::Claude).unwrap(), "\"claude\"");
+        assert_eq!(serde_json::to_string(&TabId::Aider).unwrap(), "\"aider\"");
+        assert_eq!(
+            serde_json::to_string(&TabId::Shell("shell-1".to_string())).unwrap(),
+            "\"shell-1\""
+        );
+    }
+
+    #[test]
+    fn tab_id_kind_mapping() {
+        assert_eq!(
+            TabId::Claude.kind(),
+            TabKind::AiTool(AiToolKind::ClaudeCode)
+        );
+        assert_eq!(TabId::Aider.kind(), TabKind::AiTool(AiToolKind::Aider));
+        assert_eq!(TabId::Shell("anything".into()).kind(), TabKind::Shell);
+    }
+
+    #[test]
+    fn is_error_edge_covers_the_universal_signals() {
+        assert!(is_error_edge(&AudioError { tab: tab() }));
+        assert!(is_error_edge(&TtsError { tab: tab() }));
+        assert!(is_error_edge(&ErrorAcknowledged { tab: tab() }));
+        // SubprocessExited is intentionally NOT in the set — Shell tabs
+        // route it to the closed sub-state in the run loop, AI tabs hit
+        // it via transition() directly.
+        assert!(!is_error_edge(&SubprocessExited {
+            tab: tab(),
+            code: None
+        }));
+        assert!(!is_error_edge(&UserKeystroke { tab: tab() }));
+        assert!(!is_error_edge(&UserSubmit { tab: tab() }));
+        assert!(!is_error_edge(&TtsPlaybackStarted { tab: tab() }));
     }
 }

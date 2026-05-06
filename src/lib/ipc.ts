@@ -50,6 +50,14 @@ export async function tabActivate(tab: TabId): Promise<void> {
   await invoke('tab_activate', { tab });
 }
 
+/// Restart a closed Shell tab. Backend validates the tab kind/state and
+/// emits `tab-restart-requested` so Terminal.svelte rebinds its bytes
+/// channel via `pty_restart`. The `TabClosedStateChanged { closed: false }`
+/// event clears the overlay once the new PTY has spawned.
+export async function restartShellTab(tab: TabId): Promise<void> {
+  await invoke('restart_shell_tab', { tab });
+}
+
 export interface PtyExitPayload {
   tab: TabId;
   exit: string;

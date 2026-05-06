@@ -15,7 +15,8 @@ export type ShortcutAction =
   | 'cancel_compose'
   | 'open_settings'
   | 'switch_to_tab_1'
-  | 'switch_to_tab_2';
+  | 'switch_to_tab_2'
+  | 'switch_to_tab_3';
 
 /// A shortcut binding can be a bare function (always fires when matched) or
 /// an object with an `active` predicate. When `active()` returns false the
@@ -45,6 +46,7 @@ export function configureShortcuts(s: ShortcutSettings, h: ShortcutHandlers): vo
     open_settings: parseShortcut(s.open_settings),
     switch_to_tab_1: parseShortcut(s.switch_to_tab_1),
     switch_to_tab_2: parseShortcut(s.switch_to_tab_2),
+    switch_to_tab_3: parseShortcut(s.switch_to_tab_3),
   };
   handlers = h;
 }

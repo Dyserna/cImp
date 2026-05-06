@@ -17,6 +17,13 @@ pub struct Settings {
     pub shortcuts: ShortcutSettings,
     pub tabs: TabsSettings,
     pub processing: ProcessingSettings,
+    /// Interim home for the M1 Shell-1 tab's mutable bits (name + notification
+    /// strings). Phase 8 of MILESTONE-V3-01 places it here under a leading-
+    /// underscore key to advertise its temporary nature; M3 of v3 reshapes
+    /// `tabs` into an array and folds Shell-tab settings in alongside the
+    /// AI builtins, dropping this field via migration.
+    #[serde(rename = "_shell_1_tmp", default)]
+    pub shell_1_tmp: Shell1Interim,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -213,6 +220,9 @@ pub struct ShortcutSettings {
     pub open_settings: Option<String>,
     pub switch_to_tab_1: Option<String>,
     pub switch_to_tab_2: Option<String>,
+    /// MILESTONE-V3-01 shortcut for the third tab (Shell-1 in M1). M2/M3
+    /// extend the shortcut set up to `switch_to_tab_9` per the design doc.
+    pub switch_to_tab_3: Option<String>,
 }
 
 impl Default for ShortcutSettings {
@@ -224,6 +234,7 @@ impl Default for ShortcutSettings {
             open_settings: Some("Ctrl+,".to_string()),
             switch_to_tab_1: Some("Ctrl+1".to_string()),
             switch_to_tab_2: Some("Ctrl+2".to_string()),
+            switch_to_tab_3: Some("Ctrl+3".to_string()),
         }
     }
 }
@@ -326,6 +337,44 @@ pub struct NotificationsSettings {
     pub idle: String,
     pub awaiting_permission: String,
     pub error: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct Shell1Interim {
+    pub name: String,
+    pub notifications: ShellNotifications,
+}
+
+impl Default for Shell1Interim {
+    fn default() -> Self {
+        Self {
+            name: "Shell 1".to_string(),
+            notifications: ShellNotifications::default(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct ShellNotifications {
+    /// Spoken when a Shell tab transitions to the avatar Error state. Empty
+    /// disables the announcement (per the existing notification convention).
+    pub error: String,
+    /// Spoken when a Shell tab's subprocess exits while the user is on a
+    /// different tab. The literal `{code}` placeholder is interpolated with
+    /// the actual exit code in M4 of v3-01; in M1 the placeholder appears
+    /// verbatim if present.
+    pub exited: String,
+}
+
+impl Default for ShellNotifications {
+    fn default() -> Self {
+        Self {
+            error: "Shell encountered an error".to_string(),
+            exited: "Shell exited (code {code})".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

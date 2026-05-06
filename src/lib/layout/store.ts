@@ -15,6 +15,7 @@
 
 import { derived, get, writable, type Readable, type Writable } from 'svelte/store';
 import type { TabId } from '../tabs/types';
+import type { DropTarget } from '../dnd/types';
 import {
   closePane,
   findPaneContainingTab,
@@ -161,14 +162,15 @@ export function applyTabClosedFromLayout(tabId: TabId): void {
     }
     const pane = findPaneInTree(afterRemove, paneId);
     if (pane && pane.tab_ids.length === 0 && afterRemove.type !== 'pane') {
-      // Non-root empty pane → collapse.
-      const collapsed = closePane(afterRemove, paneId);
-      // Refocus: if the collapsed pane held focus, pick the new tree's
-      // first pane. Otherwise keep current focus if it still exists.
+      // Non-root empty pane → collapse. closePane returns the
+      // deepest-leftmost leaf of the surviving sibling subtree as
+      // `next_focus`; prefer that over a tree-wide firstPane so focus
+      // stays close to where the user just was.
+      const { tree: collapsed, next_focus } = closePane(afterRemove, paneId);
       let nextFocus = state.focused_pane_id;
       const focusedStillExists = findPaneInTree(collapsed, nextFocus) !== null;
       if (!focusedStillExists || nextFocus === paneId) {
-        nextFocus = firstPane(collapsed).id;
+        nextFocus = next_focus ?? firstPane(collapsed).id;
       }
       return { tree: collapsed, focused_pane_id: nextFocus };
     }
@@ -241,4 +243,115 @@ export function setFocusedPaneActiveTab(tabId: TabId): void {
   const pane = findPaneContainingTab(state.tree, tabId);
   if (!pane) return;
   setPaneActiveTab(pane.id, tabId);
+}
+
+/// If the named pane exists, has zero tabs, and is not the root,
+/// collapse it via the standard rebalance. Returns the (possibly
+/// unchanged) tree. Caller composes this between a removeTab and
+/// the next structural op when handling a drag drop.
+function collapseIfEmpty(tree: LayoutNode, paneId: PaneId): LayoutNode {
+  const pane = findPaneInTree(tree, paneId);
+  if (!pane) return tree;
+  if (pane.tab_ids.length > 0) return tree;
+  if (tree.type === 'pane') return tree;
+  const { tree: collapsed } = closePane(tree, paneId);
+  return collapsed;
+}
+
+/// Apply a committed drag drop to the layout. Three branches:
+///
+///   * `reorder`: same-pane index move. Adjusts the insert index for
+///     the gap left by removal so "drop on the original spot" is a
+///     no-op rather than a left-shift.
+///   * `moveToPane`: cross-pane move. Removes from source, collapses
+///     the source if it was the source's last tab and source is not
+///     root, appends to destination.
+///   * `split`: edge drop. Same-pane edges call splitPane directly so
+///     the kept pane and the new sibling are produced atomically; if
+///     the dragged tab was the source's only one, the kept side is
+///     empty and gets collapsed (which dissolves the just-created
+///     split, leaving a clean replacement). Cross-pane edges remove
+///     from source first (with optional collapse) and then split the
+///     destination.
+///
+/// Focus follows the dropped tab in every branch — to the same pane
+/// for reorder, to the destination for moveToPane, to the new pane
+/// for split.
+export function commitDrop(
+  tabId: TabId,
+  sourcePaneId: PaneId,
+  target: DropTarget,
+): void {
+  layout.update((state) => {
+    if (target.kind === 'reorder') {
+      if (target.paneId !== sourcePaneId) return state;
+      const sourcePane = findPaneInTree(state.tree, sourcePaneId);
+      if (!sourcePane) return state;
+      const oldIndex = sourcePane.tab_ids.indexOf(tabId);
+      if (oldIndex < 0) return state;
+      // Shift the insert index down by one if the removal happens to
+      // its left, so dragging a tab a few slots forward lands at the
+      // expected position rather than one short.
+      let insertIndex = target.insertIndex;
+      if (insertIndex > oldIndex) insertIndex -= 1;
+      if (insertIndex === oldIndex) return state;
+      const { tree: afterRemove } = removeTab(state.tree, tabId);
+      const tree = insertTabIntoPane(afterRemove, sourcePaneId, tabId, insertIndex, {
+        activate: true,
+      });
+      return { tree, focused_pane_id: sourcePaneId };
+    }
+
+    if (target.kind === 'moveToPane') {
+      if (target.paneId === sourcePaneId) return state;
+      const { tree: afterRemove } = removeTab(state.tree, tabId);
+      const collapsed = collapseIfEmpty(afterRemove, sourcePaneId);
+      const targetPane = findPaneInTree(collapsed, target.paneId);
+      if (!targetPane) return state;
+      const tree = insertTabIntoPane(
+        collapsed,
+        target.paneId,
+        tabId,
+        targetPane.tab_ids.length,
+        { activate: true },
+      );
+      return { tree, focused_pane_id: target.paneId };
+    }
+
+    // split
+    const direction: SplitDirection =
+      target.direction === 'left' || target.direction === 'right'
+        ? 'horizontal'
+        : 'vertical';
+    const placeOn: 'first' | 'second' =
+      target.direction === 'left' || target.direction === 'top' ? 'first' : 'second';
+
+    if (target.paneId === sourcePaneId) {
+      // Same-pane edge drop. splitPane sees the tab in target.tab_ids
+      // and removes it from the kept side as part of the split.
+      const result = splitPaneOp(state.tree, target.paneId, direction, tabId, { placeOn });
+      if (!result) return state;
+      let tree = result.tree;
+      // If the dragged tab was the source's only one, the kept side
+      // is empty after splitPane. Collapsing it dissolves the brand-new
+      // split; the new pane (with the dragged tab) becomes the
+      // replacement of the original target.
+      const kept = findPaneInTree(tree, sourcePaneId);
+      if (kept && kept.tab_ids.length === 0 && tree.type !== 'pane') {
+        const { tree: collapsed } = closePane(tree, sourcePaneId);
+        tree = collapsed;
+      }
+      return { tree, focused_pane_id: result.newPaneId };
+    }
+
+    // Cross-pane split: source ≠ target. Remove from source, collapse
+    // if source emptied, then split the destination with the imported
+    // tab. splitPane's tolerant contract (M2 step 1 change) means it
+    // accepts a draggedTabId not present in the target.
+    const { tree: afterRemove } = removeTab(state.tree, tabId);
+    const collapsed = collapseIfEmpty(afterRemove, sourcePaneId);
+    const result = splitPaneOp(collapsed, target.paneId, direction, tabId, { placeOn });
+    if (!result) return state;
+    return { tree: result.tree, focused_pane_id: result.newPaneId };
+  });
 }

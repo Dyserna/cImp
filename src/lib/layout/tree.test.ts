@@ -232,9 +232,16 @@ describe('splitPane', () => {
     expect((newSplit.second as PaneNode).tab_ids).toEqual(['c']);
   });
 
-  test('returns null when the dragged tab is not in the target pane', () => {
+  test('preserves the target verbatim when the dragged tab is not in it', () => {
+    // Cross-pane drag-to-split: the M2 commit flow removes the tab
+    // from its source pane before calling splitPane on the target,
+    // so by the time splitPane runs the tab isn't in the target.
     const root = pane('p1', ['a']);
-    expect(splitPane(root, 'p1', 'horizontal', 'missing')).toBeNull();
+    const result = splitPane(root, 'p1', 'horizontal', 'b');
+    expect(result).not.toBeNull();
+    const tree = result!.tree as SplitNode;
+    expect((tree.first as PaneNode).tab_ids).toEqual(['a']);
+    expect((tree.second as PaneNode).tab_ids).toEqual(['b']);
   });
 
   test('returns null when the target pane does not exist', () => {
@@ -248,20 +255,85 @@ describe('splitPane', () => {
     const left = (result!.tree as SplitNode).first as PaneNode;
     expect(left.active_tab_id).toBe('a');
   });
+
+  test('placeOn: "first" puts the new pane on the left/top', () => {
+    const root = pane('p1', ['a', 'b'], 'a');
+    const result = splitPane(root, 'p1', 'horizontal', 'b', { placeOn: 'first' });
+    const tree = result!.tree as SplitNode;
+    const left = tree.first as PaneNode;
+    const right = tree.second as PaneNode;
+    expect(left.tab_ids).toEqual(['b']);
+    expect(left.id).toBe(result!.newPaneId);
+    expect(right.tab_ids).toEqual(['a']);
+    expect(right.id).toBe('p1');
+  });
+
+  test('placeOn: "second" matches default — new pane on the right/bottom', () => {
+    const root = pane('p1', ['a', 'b'], 'a');
+    const explicit = splitPane(root, 'p1', 'horizontal', 'b', { placeOn: 'second' });
+    const def = splitPane(root, 'p1', 'horizontal', 'b');
+    // Same structural shape (ids differ because each call mints fresh
+    // pane/split ids; compare tab placement instead).
+    const explicitTree = explicit!.tree as SplitNode;
+    const defTree = def!.tree as SplitNode;
+    expect((explicitTree.first as PaneNode).tab_ids).toEqual(['a']);
+    expect((explicitTree.second as PaneNode).tab_ids).toEqual(['b']);
+    expect((defTree.first as PaneNode).tab_ids).toEqual(['a']);
+    expect((defTree.second as PaneNode).tab_ids).toEqual(['b']);
+  });
+
+  test('cross-pane split with placeOn: "first" places imported tab in new first child', () => {
+    // Drag tab `c` from p2 to the *left* edge of p1: removeTab first
+    // (p2 keeps just `b`), then splitPane on p1 with placeOn 'first'
+    // puts the new pane (containing `c`) on the left.
+    const root = split('s1', 'horizontal', 0.5, pane('p1', ['a']), pane('p2', ['b', 'c'], 'c'));
+    const { tree: afterRemove } = removeTab(root, 'c');
+    const result = splitPane(afterRemove, 'p1', 'horizontal', 'c', { placeOn: 'first' });
+    const tree = result!.tree as SplitNode;
+    // Outer split: still s1 / p1's container is now a nested split.
+    const innerSplit = tree.first as SplitNode;
+    expect(innerSplit.type).toBe('split');
+    expect((innerSplit.first as PaneNode).tab_ids).toEqual(['c']);
+    expect((innerSplit.second as PaneNode).tab_ids).toEqual(['a']);
+    expect((tree.second as PaneNode).tab_ids).toEqual(['b']);
+  });
 });
 
 describe('closePane', () => {
   test('returns tree unchanged when paneId is the root', () => {
     const root = pane('p1', ['a']);
-    expect(closePane(root, 'p1')).toBe(root);
+    const { tree, next_focus } = closePane(root, 'p1');
+    expect(tree).toBe(root);
+    expect(next_focus).toBeNull();
   });
 
   test('replaces parent split with the surviving sibling', () => {
     const left = pane('p1', ['a']);
     const right = pane('p2', ['b']);
     const root = split('s1', 'horizontal', 0.5, left, right);
-    expect(closePane(root, 'p1')).toBe(right);
-    expect(closePane(root, 'p2')).toBe(left);
+    expect(closePane(root, 'p1').tree).toBe(right);
+    expect(closePane(root, 'p2').tree).toBe(left);
+  });
+
+  test('next_focus points at the surviving sibling when sibling is a leaf', () => {
+    const left = pane('p1', ['a']);
+    const right = pane('p2', ['b']);
+    const root = split('s1', 'horizontal', 0.5, left, right);
+    expect(closePane(root, 'p1').next_focus).toBe('p2');
+    expect(closePane(root, 'p2').next_focus).toBe('p1');
+  });
+
+  test('next_focus points at the deepest-leftmost leaf when sibling is a split', () => {
+    // Closing p1 leaves the inner split as the new root; focus should
+    // land on its leftmost leaf (p2), not on whatever firstPane of the
+    // *whole* tree would have picked.
+    const innerLeft = pane('p2', ['x']);
+    const innerRight = pane('p3', ['y']);
+    const inner = split('s2', 'vertical', 0.4, innerLeft, innerRight);
+    const root = split('s1', 'horizontal', 0.5, pane('p1', ['a']), inner);
+    const { tree, next_focus } = closePane(root, 'p1');
+    expect(tree).toBe(inner);
+    expect(next_focus).toBe('p2');
   });
 
   test('rebalances a deeper subtree, preserving sibling layout', () => {
@@ -269,15 +341,31 @@ describe('closePane', () => {
     const innerRight = pane('p3', ['y']);
     const inner = split('s2', 'vertical', 0.4, innerLeft, innerRight);
     const root = split('s1', 'horizontal', 0.5, pane('p1', ['a']), inner);
-    const next = closePane(root, 'p2') as SplitNode;
+    const next = closePane(root, 'p2').tree as SplitNode;
     expect(next.id).toBe('s1');
     expect(next.first).toEqual(pane('p1', ['a']));
     expect(next.second).toBe(innerRight);
   });
 
+  test('next_focus on a deep close points into the surviving sibling subtree', () => {
+    // Tree: s1 ┐
+    //         ├─ p1
+    //         └─ s2 ┐
+    //              ├─ p2
+    //              └─ p3
+    // Close p2: parent s2 is replaced by its other child p3. Focus
+    // moves to p3, not jumping back to p1.
+    const inner = split('s2', 'vertical', 0.4, pane('p2', ['x']), pane('p3', ['y']));
+    const root = split('s1', 'horizontal', 0.5, pane('p1', ['a']), inner);
+    const { next_focus } = closePane(root, 'p2');
+    expect(next_focus).toBe('p3');
+  });
+
   test('returns tree unchanged when paneId is not in the tree', () => {
     const root = split('s1', 'horizontal', 0.5, pane('p1', ['a']), pane('p2', ['b']));
-    expect(closePane(root, 'pX')).toBe(root);
+    const { tree, next_focus } = closePane(root, 'pX');
+    expect(tree).toBe(root);
+    expect(next_focus).toBeNull();
   });
 });
 

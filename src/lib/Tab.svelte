@@ -7,6 +7,7 @@
   import type { AvatarState } from './avatarState';
 
   let {
+    tabId,
     label,
     active = false,
     builtin = false,
@@ -18,8 +19,13 @@
     onclick,
     onclose,
     oncontextmenu,
+    onpointerdowndrag,
     onrename,
   }: {
+    /// Stable tab id, surfaced as `data-tab-id` so the M2 drop-target
+    /// hit-tester can resolve reorder insertion indices by walking
+    /// the tab bar's children.
+    tabId: string;
     label: string;
     active?: boolean;
     builtin?: boolean;
@@ -42,6 +48,10 @@
     /// can position a menu at the cursor; preventDefault is the caller's
     /// responsibility.
     oncontextmenu?: (e: MouseEvent) => void;
+    /// Invoked on pointerdown so the M2 drag layer can begin a
+    /// pending drag. The handler decides itself whether to promote
+    /// the pending state to a real drag (4px threshold).
+    onpointerdowndrag?: (e: PointerEvent) => void;
     /// Invoked when the user submits a rename. Empty / whitespace-only
     /// strings are filtered upstream — by the time this fires the parent
     /// can call rename_tab directly.
@@ -138,7 +148,9 @@
   type="button"
   class="tab"
   class:active
+  data-tab-id={tabId}
   {onclick}
+  onpointerdown={onpointerdowndrag}
   oncontextmenu={onContextMenuInternal}
   aria-pressed={active}
 >
@@ -229,7 +241,7 @@
     font-size: 13px;
     padding: 0 16px 0 12px;
     height: 100%;
-    cursor: pointer;
+    cursor: grab;
     border-right: 1px solid #2a2a2a;
     border-bottom: 2px solid transparent;
     line-height: 30px;
@@ -238,6 +250,9 @@
     align-items: center;
     gap: 8px;
     position: relative;
+  }
+  .tab:active {
+    cursor: grabbing;
   }
   .tab:hover {
     background: #303030;

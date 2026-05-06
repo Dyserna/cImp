@@ -1,7 +1,7 @@
 <script lang="ts">
   import Tab from './Tab.svelte';
   import TabContextMenu from './TabContextMenu.svelte';
-  import { tabMeta } from './tabs/store';
+  import { tabs } from './tabs/store';
   import { switchTab } from './tabs/state';
   import {
     perTabAvatarState,
@@ -17,6 +17,8 @@
   import { openConfigureTabDialog, openNewShellTabDialog } from './dialog/store';
   import { isShellTab, type TabId } from './tabs/types';
   import { requestTabIntoPane, setPaneActiveTab } from './layout/store';
+  import { paneRegistry } from './layout/registry';
+  import { beginDrag } from './dnd/drag';
   import type { PaneNode } from './layout/types';
 
   // Pane-scoped tab bar. Renders only the tabs that belong to this
@@ -31,6 +33,21 @@
   let renamingTab = $state<TabId | null>(null);
 
   let menu = $state<{ tab: TabId; builtin: boolean; x: number; y: number } | null>(null);
+
+  // The tab bar's root element, registered with the DOM registry so
+  // the M2 drop-target hit-tester can distinguish "drop on tab bar"
+  // (reorder / move-to-pane) from "drop in content area" (split). The
+  // registry stores the element; rects are read live so resizes and
+  // splitter moves stay correct without re-registering.
+  let barEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (!barEl) return;
+    const id = pane.id;
+    paneRegistry.setTabBarElement(id, barEl);
+    return () => {
+      paneRegistry.setTabBarElement(id, null);
+    };
+  });
 
   function onTabClick(tabId: TabId): void {
     setPaneActiveTab(pane.id, tabId);
@@ -72,11 +89,12 @@
   }
 </script>
 
-<div class="tab-bar" role="tablist">
+<div class="tab-bar" role="tablist" bind:this={barEl}>
   {#each pane.tab_ids as id (id)}
-    {@const meta = tabMeta(id)}
+    {@const meta = $tabs.find((m) => m.id === id)}
     {#if meta}
       <Tab
+        tabId={id}
         label={meta.name}
         active={pane.active_tab_id === id}
         builtin={meta.builtin}
@@ -94,6 +112,7 @@
         onclick={() => onTabClick(id)}
         onclose={meta.builtin ? undefined : () => onCloseTab(id)}
         oncontextmenu={(e) => onTabContextMenu(id, meta.builtin, e)}
+        onpointerdowndrag={(e) => beginDrag(id, pane.id, e)}
         onrename={(newName) => onRenameTab(id, newName)}
       />
     {/if}

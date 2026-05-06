@@ -12,6 +12,7 @@
   // before they update its active tab.
 
   import { layout, setFocusedPane } from './layout/store';
+  import { paneRegistry } from './layout/registry';
   import {
     attachTerminal,
     detachTerminal,
@@ -27,8 +28,23 @@
 
   let { pane }: { pane: PaneNode } = $props();
 
+  let paneEl: HTMLDivElement | undefined = $state();
   let slotEl: HTMLDivElement | undefined = $state();
   let mountedTab: TabId | null = $state(null);
+
+  // Register this pane's root element with the DOM registry so the
+  // M2 drag-and-drop hit-tester can find it. Cleanup runs on unmount
+  // and (defensively) when the pane id changes — in practice id is
+  // stable for a pane's lifetime, but the cleanup captures the prior
+  // id from the closure so an id change wouldn't strand a stale entry.
+  $effect(() => {
+    if (!paneEl) return;
+    const id = pane.id;
+    paneRegistry.setPaneElement(id, paneEl);
+    return () => {
+      paneRegistry.setPaneElement(id, null);
+    };
+  });
 
   // Track the currently mounted tab so we can detach it on the next
   // active-tab change (or on unmount). Both detach calls pass `slotEl`
@@ -90,6 +106,7 @@
   class="pane"
   class:focused
   role="presentation"
+  bind:this={paneEl}
   onmousedowncapture={handlePaneMouseDown}
 >
   <TabBar {pane} />

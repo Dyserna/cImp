@@ -12,6 +12,8 @@
   import NewShellTabDialog from './lib/dialog/NewShellTabDialog.svelte';
   import ConfigureTabDialog from './lib/dialog/ConfigureTabDialog.svelte';
   import Toast from './lib/Toast.svelte';
+  import DragGhost from './lib/dnd/DragGhost.svelte';
+  import DropZoneOverlay from './lib/dnd/DropZoneOverlay.svelte';
   import { dialogState, openNewShellTabDialog } from './lib/dialog/store';
   import { closeTab as closeTabIpc } from './lib/ipc';
   import { showToast } from './lib/toast';
@@ -247,6 +249,14 @@
     <ComposeOverlay />
     <ErrorBanner />
     <AiderFirstLaunchNotice />
+    <!--
+      DnD overlays mounted here so they layer above panes but below
+      modal dialogs (which render outside .terminal-area). The ghost
+      and drop-zone are pointer-events: none so they never intercept
+      the in-flight drag's pointermove/up.
+    -->
+    <DropZoneOverlay />
+    <DragGhost />
   </div>
   <StatusBar />
   <NewShellTabDialog />

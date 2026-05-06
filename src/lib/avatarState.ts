@@ -8,6 +8,11 @@ import {
   applyTabRenamed,
   type TabCreatedEvent,
 } from './tabs/store';
+import {
+  applyTabClosedFromLayout,
+  applyTabCreatedToLayout,
+} from './layout/store';
+import { createTerminal, destroyTerminal } from './terminals';
 import { clearTabError } from './tabs/errorState';
 import { type TabId } from './tabs/types';
 
@@ -191,8 +196,12 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
           builtin: e.builtin,
           position: e.position,
         });
+        createTerminal(e.tab);
+        applyTabCreatedToLayout(e.tab);
       } else if (e.type === 'tab-closed') {
         applyTabClosed(e.tab);
+        applyTabClosedFromLayout(e.tab);
+        destroyTerminal(e.tab);
         dropPerTabEntries(e.tab);
         perTabError.update((m) => {
           if (!(e.tab in m)) return m;

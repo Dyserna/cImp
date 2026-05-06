@@ -262,6 +262,35 @@ fn rewrite_doesnt_double_emit_tts() {
 }
 
 #[test]
+fn rewrap_doesnt_double_emit_tts() {
+    // A column-count change (e.g. multi-pane horizontal split) makes the
+    // TUI rewrap. The redrawn bytes use cursor-positioning that
+    // strip_ansi turns into newlines, splitting the content across
+    // lines. The dedup key normalizes whitespace runs so the wrap
+    // doesn't bypass the cache.
+    let mut layer = ProcessingLayer::new();
+    let now = t0();
+    let e1 = layer.ingest_at(b"[[TTS]]hello world this is a sentence[[/TTS]]\r\n", now);
+    let tts1 = collect_tts(&e1);
+    assert_eq!(tts1, vec!["hello world this is a sentence".to_string()]);
+
+    // Simulate a redraw that wraps the content: cursor moves between
+    // words insert `\n` into the stripped output. Without normalization,
+    // the dedup key would differ from the original "hello world this
+    // is a sentence" because of the embedded newline.
+    let e2 = layer.ingest_at(
+        b"\x1b[A[[TTS]]hello world\x1b[Bthis is a sentence[[/TTS]]",
+        now,
+    );
+    let tts2 = collect_tts(&e2);
+    assert!(
+        tts2.is_empty(),
+        "rewrapped duplicate should not be re-emitted: got {:?}",
+        tts2,
+    );
+}
+
+#[test]
 fn empty_tag_block_does_nothing() {
     let mut layer = ProcessingLayer::new();
     let now = t0();

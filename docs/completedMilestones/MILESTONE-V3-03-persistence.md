@@ -6,7 +6,7 @@ Reshape the `tabs` settings schema from v1.1's two-key object (`tabs.claude` / `
 
 The Settings window's Tabs section also lands here — the canonical place to view and edit tab configuration in detail. The right-click → Configure dialog from M2 remains as a shortcut into the same UI.
 
-Read `DESIGN-V3.md` (especially the "Settings Schema Changes" and "Tab Persistence" sections), `MILESTONE-V3-01`, and `MILESTONE-V3-02` first.
+Read `DESIGN.md` (especially the "Settings Schema Changes" and "Tab Persistence" sections), `MILESTONE-V3-01`, and `MILESTONE-V3-02` first.
 
 ## What This Milestone Delivers
 

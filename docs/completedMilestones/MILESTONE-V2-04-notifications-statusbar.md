@@ -538,7 +538,7 @@ v2 is feature-complete after this milestone. Polish items (UI refinements, addit
 
 ## After v2
 
-The application is feature-complete for v2. Future work falls into the parking lot from `DESIGN-V2.md`:
+The application is feature-complete for v2. Future work falls into the parking lot from `DESIGN.md`:
 
 - Aider TTS markup injection (pending upstream support — see FUTURE-FEATURES.md)
 - Aider permission prompt detection (Phase 2 of permission detection)

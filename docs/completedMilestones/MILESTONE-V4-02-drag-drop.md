@@ -8,7 +8,7 @@ The substrate exists from M1 (layout tree, panes, focus model, portal mounting).
 
 Pane lifecycle (close-collapse-rebalance) lands in this milestone too because it is needed when a drag empties the source pane.
 
-Read `DESIGN-V4.md` and `MILESTONE-V4-01-layout-foundation.md` first.
+Read `DESIGN.md` and `MILESTONE-V4-01-layout-foundation.md` first.
 
 ## What This Milestone Delivers
 
@@ -294,7 +294,7 @@ function collapseIfEmpty(tree: LayoutNode, paneId: PaneId): LayoutNode {
 }
 ```
 
-Focus handling on collapse: if the focused pane is the one being collapsed, focus moves to the surviving sibling (deepest leftmost leaf, per `DESIGN-V4`).
+Focus handling on collapse: if the focused pane is the one being collapsed, focus moves to the surviving sibling (deepest leftmost leaf, per `DESIGN.md`).
 
 Update `closePane` in `tree.ts` to also surface which pane the focus should move to (return both the new tree and a `next_focus: PaneId`). Update `collapseIfEmpty` callers to use it.
 

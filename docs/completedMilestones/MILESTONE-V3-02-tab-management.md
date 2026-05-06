@@ -6,7 +6,7 @@ Add the user-facing UI for managing Shell tabs: a `+` button on the tab bar that
 
 Persistence is *not* part of this milestone. Tabs created via this UI live in memory only and are lost when the app is restarted. M3 layers persistence on top. This split is intentional — proving the UI flow first, without the complications of schema migration, makes both milestones easier to reason about and easier to ship.
 
-Read `DESIGN-V3.md` and `MILESTONE-V3-01-tab-kinds.md` first.
+Read `DESIGN.md` and `MILESTONE-V3-01-tab-kinds.md` first.
 
 ## What This Milestone Delivers
 
@@ -114,7 +114,7 @@ Allowed for both builtin and user tabs (renaming a builtin doesn't change its `c
 3. Update the tab's name and the per-tab spawn config in the side table.
 4. Broadcast `TabReconfigured { tab, name }` (the rest of the config is internal).
 
-Per `DESIGN-V3.md`, this does *not* respawn the running shell. The new config takes effect on next restart (manual via the closed overlay, or automatic on subprocess exit).
+Per `DESIGN.md`, this does *not* respawn the running shell. The new config takes effect on next restart (manual via the closed overlay, or automatic on subprocess exit).
 
 ### 6. New Shell Tab dialog component
 

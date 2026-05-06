@@ -6,7 +6,7 @@ Make splitters draggable to resize, add the keyboard shortcuts for split/focus/c
 
 After this milestone, the user can do everything via keyboard that they can do via mouse: split panes, move focus between them, close panes, switch tabs within a pane.
 
-Read `DESIGN-V4.md`, M1, M2 first.
+Read `DESIGN.md`, M1, M2 first.
 
 ## What This Milestone Delivers
 

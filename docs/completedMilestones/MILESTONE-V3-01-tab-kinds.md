@@ -6,7 +6,7 @@ Introduce the `TabKind` abstraction that distinguishes AI-tool tabs from Shell t
 
 This is the architectural lift of v1.2. UI work and persistence depend on this milestone landing cleanly. Subsequent milestones layer UI (M2), persistence (M3), and polish (M4) on top of the abstraction established here.
 
-Read `DESIGN-V3.md` first; this document assumes its terminology.
+Read `DESIGN.md` first; this document assumes its terminology.
 
 ## What This Milestone Delivers
 
@@ -55,7 +55,7 @@ pub enum TabKind {
 }
 ```
 
-The `serde` tag layout is chosen to match the v1.2 settings schema described in `DESIGN-V3.md`. M3 will leverage this; M1 only uses it internally.
+The `serde` tag layout is chosen to match the v1.2 settings schema described in `DESIGN.md`. M3 will leverage this; M1 only uses it internally.
 
 ### 2. Extend `TabState`
 
@@ -91,7 +91,7 @@ pub struct ShellSpec {
 }
 ```
 
-In `src/shell/detect.rs`, implement `pub fn default_shell() -> ShellSpec`. Behavior per `DESIGN-V3.md`:
+In `src/shell/detect.rs`, implement `pub fn default_shell() -> ShellSpec`. Behavior per `DESIGN.md`:
 
 - **Linux**: read `$SHELL`. If set and the binary exists, return it with `["-i"]`. Else `/bin/bash` with `["-i"]`. Else `/bin/sh` with `["-i"]`.
 - **Windows**: probe in order:
@@ -239,7 +239,7 @@ The notification text for `Exited` is read from a per-tab setting field (see ste
 
 ### 11. Wire `Ctrl+3` shortcut
 
-The shortcut store already handles `switch_to_tab_1` and `switch_to_tab_2`. Add `switch_to_tab_3` with default `Ctrl+3`. The shortcut is bound to *position* (1-indexed) in the tab order, not a tab ID — see `DESIGN-V3.md`. Since M1 has a fixed three-tab order, this collapses to "switch to the Shell tab" but the position-based design is what M2/M4 generalize.
+The shortcut store already handles `switch_to_tab_1` and `switch_to_tab_2`. Add `switch_to_tab_3` with default `Ctrl+3`. The shortcut is bound to *position* (1-indexed) in the tab order, not a tab ID — see `DESIGN.md`. Since M1 has a fixed three-tab order, this collapses to "switch to the Shell tab" but the position-based design is what M2/M4 generalize.
 
 ### 12. Settings schema additions (interim)
 

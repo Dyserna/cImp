@@ -249,7 +249,7 @@ These came up during v1.3 design as out-of-scope. Listed roughly by impact-to-ef
 
 ## v1.2 deferrals still pending
 
-Items from `DESIGN-V3.md` that didn't get picked up in v1.3:
+Items deferred during v1.2 design that didn't get picked up in v1.3:
 
 ### Per-shell-tab environment variable UI
 

@@ -1,8 +1,8 @@
 <script lang="ts">
   import Tab from './Tab.svelte';
   import TabContextMenu from './TabContextMenu.svelte';
-  import { tabMeta } from './tabs/store';
-  import { switchTab } from './tabs/state';
+  import { activeTab, switchTab } from './tabs/state';
+  import { tabs } from './tabs/store';
   import {
     perTabAvatarState,
     perTabAwaitingPermission,
@@ -16,29 +16,15 @@
   } from './ipc';
   import { openConfigureTabDialog, openNewShellTabDialog } from './dialog/store';
   import { isShellTab, type TabId } from './tabs/types';
-  import { requestTabIntoPane, setPaneActiveTab } from './layout/store';
-  import type { PaneNode } from './layout/types';
 
-  // Pane-scoped tab bar. Renders only the tabs that belong to this
-  // pane, drives active state from the pane's own active_tab_id, and
-  // routes the `+` button to land its newly-created tab here (via the
-  // layout store's `pendingTabTargetPane` cell, consumed by the next
-  // tab-created event).
-
-  let { pane }: { pane: PaneNode } = $props();
-
-  // Per-pane rename mode flag. Two-way bound on each Tab instance.
+  // Per-tab rename mode flag. The `Tab` component two-way binds to this
+  // value; flipping it true here (on the context menu's Rename action)
+  // puts that tab into rename mode.
   let renamingTab = $state<TabId | null>(null);
 
+  // Live context-menu state. Coordinates pin it to the cursor; the
+  // builtin flag drives kind-aware entries.
   let menu = $state<{ tab: TabId; builtin: boolean; x: number; y: number } | null>(null);
-
-  function onTabClick(tabId: TabId): void {
-    setPaneActiveTab(pane.id, tabId);
-    // Mirror to the backend so audio / avatar / compose routing follows
-    // the pane's new active tab. switchTab is the v1.2 call that
-    // updates session.active_tab_id and broadcasts ActiveTabChanged.
-    void switchTab(tabId);
-  }
 
   function onCloseTab(tab: TabId): void {
     void closeTabIpc(tab).catch((e) => {
@@ -65,45 +51,37 @@
   function dismissMenu(): void {
     menu = null;
   }
-
-  function onNewShellTab(): void {
-    requestTabIntoPane(pane.id);
-    openNewShellTabDialog();
-  }
 </script>
 
 <div class="tab-bar" role="tablist">
-  {#each pane.tab_ids as id (id)}
-    {@const meta = tabMeta(id)}
-    {#if meta}
-      <Tab
-        label={meta.name}
-        active={pane.active_tab_id === id}
-        builtin={meta.builtin}
-        canSkipCloseConfirm={$perTabClosedState[id]?.closed ?? false}
-        avatarState={$perTabAvatarState[id] ?? 'Idle'}
-        awaitingPermission={$perTabAwaitingPermission[id] ?? false}
-        doneWhileAway={$perTabDoneWhileAway[id] ?? false}
-        bind:renaming={
-          () => renamingTab === id,
-          (v) => {
-            if (v) renamingTab = id;
-            else if (renamingTab === id) renamingTab = null;
-          }
+  {#each $tabs as meta (meta.id)}
+    <Tab
+      label={meta.name}
+      active={$activeTab === meta.id}
+      builtin={meta.builtin}
+      canSkipCloseConfirm={$perTabClosedState[meta.id]?.closed ?? false}
+      avatarState={$perTabAvatarState[meta.id] ?? 'Idle'}
+      awaitingPermission={$perTabAwaitingPermission[meta.id] ?? false}
+      doneWhileAway={$perTabDoneWhileAway[meta.id] ?? false}
+      bind:renaming={
+        () => renamingTab === meta.id,
+        (v) => {
+          if (v) renamingTab = meta.id;
+          else if (renamingTab === meta.id) renamingTab = null;
         }
-        onclick={() => onTabClick(id)}
-        onclose={meta.builtin ? undefined : () => onCloseTab(id)}
-        oncontextmenu={(e) => onTabContextMenu(id, meta.builtin, e)}
-        onrename={(newName) => onRenameTab(id, newName)}
-      />
-    {/if}
+      }
+      onclick={() => void switchTab(meta.id)}
+      onclose={meta.builtin ? undefined : () => onCloseTab(meta.id)}
+      oncontextmenu={(e) => onTabContextMenu(meta.id, meta.builtin, e)}
+      onrename={(newName) => onRenameTab(meta.id, newName)}
+    />
   {/each}
   <button
     type="button"
     class="new-tab"
     aria-label="New shell tab"
     title="New shell tab (Ctrl+T)"
-    onclick={onNewShellTab}
+    onclick={openNewShellTabDialog}
   >
     +
   </button>

@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import LayoutNodeRenderer from './lib/LayoutNodeRenderer.svelte';
+  import Terminal from './lib/Terminal.svelte';
+  import TabBar from './lib/TabBar.svelte';
   import StatusBar from './lib/StatusBar.svelte';
   import AvatarOverlay from './lib/AvatarOverlay.svelte';
   import WaveformOverlay from './lib/WaveformOverlay.svelte';
@@ -21,18 +22,9 @@
     startAvatarStateListener,
   } from './lib/avatarState';
   import { initSettings, settings } from './lib/settings/store';
-  import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
+  import { openSettingsWindow } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
   import { applyTabCreated, tabMeta, tabs } from './lib/tabs/store';
-  import {
-    applyTabCreatedToLayout,
-    focusedActiveTabId,
-    layout,
-    resetLayoutToSinglePane,
-    setFocusedPaneActiveTab,
-    splitFocusedPane,
-  } from './lib/layout/store';
-  import { createTerminal } from './lib/terminals';
   import { listTabs } from './lib/ipc';
   import {
     configureShortcuts,
@@ -51,9 +43,6 @@
   let unsubSettings: (() => void) | undefined;
   let unsubContent: (() => void) | undefined;
   let unsubTitle: (() => void) | undefined;
-  let unsubFocusedTab: (() => void) | undefined;
-  let unsubActiveTabBack: (() => void) | undefined;
-  let removeDebugKeys: (() => void) | undefined;
 
   onMount(() => {
     void (async () => {
@@ -75,17 +64,7 @@
             builtin: m.builtin,
             position,
           });
-          createTerminal(m.id);
-          applyTabCreatedToLayout(m.id);
         });
-        // Restore the previously-active tab into the (single) root pane
-        // so the avatar/audio/compose routing picks up where the user
-        // left off. The backend persists session.active_tab_id, but the
-        // settings store already has it loaded by this point.
-        const sessionActive = get(settings).session.active_tab_id;
-        if (sessionActive) {
-          setFocusedPaneActiveTab(sessionActive);
-        }
       } catch (e) {
         console.error('list_tabs failed:', e);
       }
@@ -175,73 +154,28 @@
           );
         }
       });
-
-      // Sync the focused pane's active tab to the backend's "active
-      // tab" cell. The backend gates audio routing on this id (TTS
-      // worker drops samples for non-active tabs), and the rest of the
-      // frontend reads `activeTab` for avatar / compose / window title
-      // routing. Initial value lands here so the first render reflects
-      // the restored session.active_tab_id.
-      let lastSyncedActive: string | null = null;
-      unsubFocusedTab = focusedActiveTabId.subscribe((id) => {
-        if (id === lastSyncedActive) return;
-        lastSyncedActive = id;
-        if (id === null) return;
-        void setActiveTabIpc(id).catch((e) =>
-          console.error('set_active_tab failed:', e),
-        );
-      });
-      // Back-sync: when the backend broadcasts ActiveTabChanged from a
-      // legacy v1.2-style switch (Ctrl+1..9 or other origins that don't
-      // know about panes), reflect that into the layout store so the
-      // focused pane and its active tab stay coherent. Loop is broken
-      // because both setters are no-ops when state already matches.
-      unsubActiveTabBack = activeTab.subscribe((t) => {
-        setFocusedPaneActiveTab(t);
-      });
-
-      // Debug shortcuts for M1: split / reset layout. Bypass the
-      // configurable shortcut dispatcher because these don't belong in
-      // user-facing settings yet — M3 will add proper bindings for the
-      // user-facing variants of split (Ctrl+\) and remove these.
-      const onDebugKey = (e: KeyboardEvent) => {
-        if (!e.ctrlKey || !e.shiftKey) return;
-        if (e.code === 'F1') {
-          e.preventDefault();
-          splitFocusedPane('horizontal');
-        } else if (e.code === 'F2') {
-          e.preventDefault();
-          splitFocusedPane('vertical');
-        } else if (e.code === 'F3') {
-          e.preventDefault();
-          resetLayoutToSinglePane();
-        }
-      };
-      window.addEventListener('keydown', onDebugKey, true);
-      removeDebugKeys = () => window.removeEventListener('keydown', onDebugKey, true);
     })();
     return () => {
       unsubSettings?.();
       unsubContent?.();
       unsubTitle?.();
-      unsubFocusedTab?.();
-      unsubActiveTabBack?.();
-      removeDebugKeys?.();
     };
   });
 </script>
 
 <main>
+  <TabBar />
   <!--
-    The layout tree replaces v1.2's single TabBar + per-tab Terminal
-    block. Each leaf Pane renders its own tab bar and portals in its
-    active tab's xterm host from the registry. Avatar/compose/error
-    overlays remain at app root, layered over the entire content area;
-    they subscribe to `activeTab`-derived stores which are kept in
-    sync with the focused pane's active tab.
+    The avatar overlay positions itself absolutely against `.terminal-area`
+    rather than the window root so it sits inside the visible terminal
+    region (below the tab bar). This is per V2-01 acceptance #8.
   -->
   <div class="terminal-area">
-    <LayoutNodeRenderer node={$layout.tree} />
+    {#each $tabs as meta (meta.id)}
+      <div class="terminal-pane" class:hidden={$activeTab !== meta.id}>
+        <Terminal tabId={meta.id} />
+      </div>
+    {/each}
     <AvatarOverlay />
     <WaveformOverlay />
     <ComposeOverlay />
@@ -272,8 +206,15 @@
     position: relative;
     flex: 1 1 auto;
     min-height: 0;
-    min-width: 0;
     overflow: hidden;
-    display: flex;
+  }
+  .terminal-pane {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+  .hidden {
+    display: none;
   }
 </style>

@@ -19,13 +19,8 @@ const OPEN: &[u8] = b"[[TTS]]";
 const CLOSE: &[u8] = b"[[/TTS]]";
 
 pub struct TagScanner {
-    /// Whitespace-normalized tag contents already emitted as TTS segments.
-    /// Normalizing the dedup key (collapsing runs of whitespace including
-    /// newlines into a single space) makes the cache wrap-tolerant: when
-    /// a column-count change forces a TUI redraw, the rewrapped content
-    /// produces different `\n` placement in the stripped byte stream but
-    /// the same key here, so the segment is correctly recognized as a
-    /// repeat instead of replaying.
+    /// Tag contents already emitted as TTS segments. Used to dedupe identical
+    /// content that may reappear if upstream redraws the same region.
     spoken: HashSet<String>,
     /// Was the last scan unable to match an opener with a closer?
     open_tag: bool,
@@ -33,13 +28,11 @@ pub struct TagScanner {
     /// call. Advances past closed pairs and (on max-hold) past recovered
     /// literal openers. Append-only, so this is monotone in practice.
     scan_offset: usize,
-    /// Whitespace-normalized tag contents the user typed or pasted into
-    /// the input box. The scanner suppresses TTS emission for matching
-    /// content (the user echoed their own markers; we don't want to read
-    /// them back). Shared with the `pty_write` IPC command so this list
-    /// is filled BEFORE the echo bytes arrive — content-based, no timing
-    /// window required. Normalization mirrors `spoken`'s, since echoed
-    /// content can also be reflowed by terminal width changes.
+    /// Tag contents the user typed or pasted into the input box. The scanner
+    /// suppresses TTS emission for matching content (the user echoed their
+    /// own markers; we don't want to read them back). Shared with the
+    /// `pty_write` IPC command so this list is filled BEFORE the echo bytes
+    /// arrive — content-based, no timing window required.
     user_typed: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -90,19 +83,18 @@ impl TagScanner {
                     let content_end = content_start + rel_close;
                     let content_bytes = &scan[content_start..content_end];
                     let content = strip_ansi(content_bytes).trim().to_string();
-                    let key = normalize_for_dedup(&content);
-                    if key.is_empty() {
+                    if content.is_empty() {
                         self.spoken.insert(String::new());
-                    } else if !self.spoken.contains(&key) {
+                    } else if !self.spoken.contains(&content) {
                         let user_echo = self
                             .user_typed
                             .lock()
-                            .map(|s| s.contains(&key))
+                            .map(|s| s.contains(&content))
                             .unwrap_or(false);
                         if !user_echo {
                             new_speech.push(content.clone());
                         }
-                        self.spoken.insert(key);
+                        self.spoken.insert(content);
                     }
                     i = content_end + CLOSE.len();
                     last_consumed = i;
@@ -144,15 +136,6 @@ impl Default for TagScanner {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Collapse runs of whitespace (spaces, tabs, newlines) in `s` into a
-/// single ASCII space and trim. The resulting string is the dedup key
-/// for `spoken` and the lookup key for `user_typed`. Two pieces of
-/// content that differ only in line-wrap whitespace produce the same
-/// key, so a column-driven TUI redraw doesn't bypass the cache.
-pub fn normalize_for_dedup(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Walk all rows from row 0 up to (and including) the last non-empty row,

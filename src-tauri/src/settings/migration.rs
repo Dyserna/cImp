@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
+use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::settings::schema::{
@@ -54,6 +55,17 @@ pub fn migrate_if_needed(
         changed = true;
     }
 
+    // v1.2 → v1.3: detected as "tabs is array" (post-v1.2-shape) plus
+    // "no `layout` field present". Either of the v1.0 / v1.1 branches
+    // above coerces tabs into an array, so this branch is the second
+    // pass for files that came in as v1.0 or v1.1 too — they get one
+    // file rewrite, not two backup files.
+    if looks_v1_2(value) {
+        write_backup(path, "v1.2", value)?;
+        migrate_v1_2_to_v1_3(value);
+        changed = true;
+    }
+
     Ok(changed)
 }
 
@@ -63,6 +75,24 @@ fn looks_v1(value: &Value) -> bool {
 
 fn looks_v1_1(value: &Value) -> bool {
     matches!(value.get("tabs"), Some(Value::Object(_)))
+}
+
+/// Is this a v1.2 file (post-v1.2 tabs-array shape) that lacks the v1.3
+/// `layout` field entirely? Triggers only when the `layout` key is
+/// absent from the top-level object — files that already have
+/// `"layout": null` (fresh-install defaults written by v1.3) skip
+/// re-migration so the user doesn't accumulate `.v1.2.bak.<ts>` files
+/// on every launch.
+fn looks_v1_2(value: &Value) -> bool {
+    let tabs_is_array = value
+        .get("tabs")
+        .map(|v| v.is_array())
+        .unwrap_or(false);
+    let layout_field_absent = !value
+        .as_object()
+        .map(|o| o.contains_key("layout"))
+        .unwrap_or(false);
+    tabs_is_array && layout_field_absent
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -291,6 +321,72 @@ fn migrate_v1_to_v1_2(value: &mut Value, default_shell: &ShellSpec) {
     );
 }
 
+// --- v1.2 → v1.3 ------------------------------------------------------------
+//
+// v1.3 introduces the layout tree: a recursive split/pane structure that
+// replaces v1.2's "all tabs in one tab bar" with arbitrary multi-pane
+// arrangements. Migration builds a single root pane containing every tab
+// in their existing order, with the focused-pane's active tab set from
+// the v1.2 `session.active_tab_id` (or the first tab if absent). Drops
+// `session.active_tab_id` afterwards because the layout owns it now.
+
+fn migrate_v1_2_to_v1_3(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    // Pull tab ids in document order. Tabs missing an `id` field are
+    // skipped — the integrity check at load time will repair the file
+    // by re-inserting the reserved-id builtins.
+    let tab_ids: Vec<Value> = root
+        .get("tabs")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("id").and_then(Value::as_str))
+                .map(|s| Value::String(s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Pick the active tab: prefer v1.2's session.active_tab_id, fall
+    // back to the first tab in order. `null` is fine when the tab list
+    // is empty (defensive — integrity will repopulate it).
+    let session_active = root
+        .get("session")
+        .and_then(|s| s.get("active_tab_id"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    let first_tab_id = tab_ids
+        .first()
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let active_tab_id = session_active.or(first_tab_id);
+
+    let pane_id = format!("pane-{}", Uuid::new_v4());
+    let mut pane = Map::new();
+    pane.insert("type".to_string(), Value::String("pane".to_string()));
+    pane.insert("id".to_string(), Value::String(pane_id.clone()));
+    pane.insert("tab_ids".to_string(), Value::Array(tab_ids));
+    pane.insert(
+        "active_tab_id".to_string(),
+        active_tab_id.map(Value::String).unwrap_or(Value::Null),
+    );
+
+    let mut layout = Map::new();
+    layout.insert("tree".to_string(), Value::Object(pane));
+    layout.insert("focused_pane_id".to_string(), Value::String(pane_id));
+
+    root.insert("layout".to_string(), Value::Object(layout));
+    root.entry("layout_presets".to_string())
+        .or_insert(Value::Array(Vec::new()));
+
+    // Drop the redundant session.active_tab_id; the layout owns it now.
+    if let Some(session) = root.get_mut("session").and_then(Value::as_object_mut) {
+        session.remove("active_tab_id");
+    }
+}
+
 // --- Backup helpers ---------------------------------------------------------
 
 /// Write `<path>.<from_version>.bak` next to the settings file. If that name
@@ -489,6 +585,106 @@ mod tests {
         // After migration, the v1.1 detector should not re-fire on this
         // value (tabs is now an array).
         assert!(!looks_v1_1(&v));
+    }
+
+    #[test]
+    fn v1_2_to_v1_3_builds_single_pane_with_all_tabs() {
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [
+                    { "kind": "ai_tool", "id": "claude", "name": "Claude" },
+                    { "kind": "ai_tool", "id": "aider", "name": "Aider" },
+                    { "kind": "shell", "id": "shell-default-1", "name": "Shell 1" }
+                ],
+                "session": { "active_tab_id": "aider" }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(looks_v1_2(&v));
+        migrate_v1_2_to_v1_3(&mut v);
+
+        let layout = v.get("layout").expect("layout inserted");
+        let tree = layout.get("tree").expect("tree present");
+        assert_eq!(tree.get("type").unwrap(), "pane");
+        let tab_ids = tree.get("tab_ids").unwrap().as_array().unwrap();
+        assert_eq!(tab_ids.len(), 3);
+        assert_eq!(tab_ids[0], "claude");
+        assert_eq!(tab_ids[1], "aider");
+        assert_eq!(tab_ids[2], "shell-default-1");
+        assert_eq!(tree.get("active_tab_id").unwrap(), "aider");
+
+        let pane_id = tree.get("id").unwrap().as_str().unwrap();
+        let focused = layout.get("focused_pane_id").unwrap().as_str().unwrap();
+        assert_eq!(focused, pane_id);
+
+        // session.active_tab_id is dropped (the layout owns it now).
+        assert!(v
+            .get("session")
+            .and_then(|s| s.get("active_tab_id"))
+            .is_none());
+
+        // layout_presets initialised to empty array.
+        assert_eq!(
+            v.get("layout_presets").unwrap().as_array().unwrap().len(),
+            0
+        );
+
+        // Re-running migration is a no-op (layout key now present).
+        assert!(!looks_v1_2(&v));
+    }
+
+    #[test]
+    fn v1_2_to_v1_3_falls_back_to_first_tab_when_no_session() {
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [
+                    { "kind": "ai_tool", "id": "claude", "name": "Claude" },
+                    { "kind": "shell", "id": "shell-default-1", "name": "Shell 1" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        migrate_v1_2_to_v1_3(&mut v);
+        let active = v
+            .get("layout")
+            .and_then(|l| l.get("tree"))
+            .and_then(|t| t.get("active_tab_id"))
+            .unwrap();
+        assert_eq!(active, "claude");
+    }
+
+    #[test]
+    fn v1_3_file_is_not_re_detected() {
+        let v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [{ "kind": "ai_tool", "id": "claude", "name": "Claude" }],
+                "layout": {
+                    "tree": { "type": "pane", "id": "pane-1", "tab_ids": ["claude"], "active_tab_id": "claude" },
+                    "focused_pane_id": "pane-1"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(!looks_v1_2(&v));
+    }
+
+    #[test]
+    fn v1_3_with_null_layout_field_is_not_re_migrated() {
+        // Fresh-install file written by v1.3: layout serialized as null
+        // (Option::None → null in serde_json). The detector must skip
+        // this so we don't pile up `.v1.2.bak.<ts>` files on every
+        // launch of an app that hasn't yet been multi-paned.
+        let v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [{ "kind": "ai_tool", "id": "claude", "name": "Claude" }],
+                "layout": null,
+                "layout_presets": []
+            }"#,
+        )
+        .unwrap();
+        assert!(!looks_v1_2(&v));
     }
 
     #[test]

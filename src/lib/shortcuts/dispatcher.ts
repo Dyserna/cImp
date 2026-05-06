@@ -24,7 +24,14 @@ export type ShortcutAction =
   | 'switch_to_tab_8'
   | 'switch_to_tab_9'
   | 'new_shell_tab'
-  | 'close_tab';
+  | 'close_tab'
+  | 'focus_pane_left'
+  | 'focus_pane_right'
+  | 'focus_pane_up'
+  | 'focus_pane_down'
+  | 'split_pane_horizontal'
+  | 'split_pane_vertical'
+  | 'close_pane';
 
 /// A shortcut binding can be a bare function (always fires when matched) or
 /// an object with an `active` predicate. When `active()` returns false the
@@ -63,6 +70,13 @@ export function configureShortcuts(s: ShortcutSettings, h: ShortcutHandlers): vo
     switch_to_tab_9: parseShortcut(s.switch_to_tab_9),
     new_shell_tab: parseShortcut(s.new_shell_tab),
     close_tab: parseShortcut(s.close_tab),
+    focus_pane_left: parseShortcut(s.focus_pane_left),
+    focus_pane_right: parseShortcut(s.focus_pane_right),
+    focus_pane_up: parseShortcut(s.focus_pane_up),
+    focus_pane_down: parseShortcut(s.focus_pane_down),
+    split_pane_horizontal: parseShortcut(s.split_pane_horizontal),
+    split_pane_vertical: parseShortcut(s.split_pane_vertical),
+    close_pane: parseShortcut(s.close_pane),
   };
   handlers = h;
 }

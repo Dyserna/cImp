@@ -11,7 +11,11 @@
   import AiderFirstLaunchNotice from './lib/AiderFirstLaunchNotice.svelte';
   import NewShellTabDialog from './lib/dialog/NewShellTabDialog.svelte';
   import ConfigureTabDialog from './lib/dialog/ConfigureTabDialog.svelte';
+  import SaveLayoutDialog from './lib/dialog/SaveLayoutDialog.svelte';
+  import ManagePresetsDialog from './lib/dialog/ManagePresetsDialog.svelte';
   import Toast from './lib/Toast.svelte';
+  import DragGhost from './lib/dnd/DragGhost.svelte';
+  import DropZoneOverlay from './lib/dnd/DropZoneOverlay.svelte';
   import { dialogState, openNewShellTabDialog } from './lib/dialog/store';
   import { closeTab as closeTabIpc } from './lib/ipc';
   import { showToast } from './lib/toast';
@@ -23,15 +27,23 @@
   import { initSettings, settings } from './lib/settings/store';
   import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
-  import { applyTabCreated, tabMeta, tabs } from './lib/tabs/store';
+  import { applyTabCreated, tabMeta } from './lib/tabs/store';
   import {
     applyTabCreatedToLayout,
+    closeFocusedPane,
     focusedActiveTabId,
+    focusedPane,
+    focusPaneInDirection,
     layout,
     resetLayoutToSinglePane,
     setFocusedPaneActiveTab,
-    splitFocusedPane,
+    setPaneActiveTab,
   } from './lib/layout/store';
+  import { splitFocusedPaneWithNewShell } from './lib/layout/actions';
+  import {
+    installLayoutPersistence,
+    validateAndRepairLayout,
+  } from './lib/layout/persistence';
   import { createTerminal } from './lib/terminals';
   import { listTabs } from './lib/ipc';
   import {
@@ -54,6 +66,7 @@
   let unsubFocusedTab: (() => void) | undefined;
   let unsubActiveTabBack: (() => void) | undefined;
   let removeDebugKeys: (() => void) | undefined;
+  let unsubLayoutSave: (() => void) | undefined;
 
   onMount(() => {
     void (async () => {
@@ -66,6 +79,11 @@
       // overwrite name/kind in place.
       try {
         const snapshot = await listTabs();
+        const persistedLayout = get(settings).layout;
+        // Seed every tab's per-tab state (avatar entries, tabs store,
+        // terminal DOM host) regardless of layout source. The layout
+        // tree references tabs by id; the tabs store + terminals
+        // registry are what actually own the per-tab data.
         snapshot.forEach((m, position) => {
           seedPerTabEntries(m.id);
           applyTabCreated({
@@ -76,19 +94,38 @@
             position,
           });
           createTerminal(m.id);
-          applyTabCreatedToLayout(m.id);
         });
-        // Restore the previously-active tab into the (single) root pane
-        // so the avatar/audio/compose routing picks up where the user
-        // left off. The backend persists session.active_tab_id, but the
-        // settings store already has it loaded by this point.
-        const sessionActive = get(settings).session.active_tab_id;
-        if (sessionActive) {
-          setFocusedPaneActiveTab(sessionActive);
+
+        if (persistedLayout) {
+          // V4-04: hydrate the layout tree from settings. The integrity
+          // sieve adapts the persisted shape to the live tab list —
+          // dropping tabs the user deleted between launches and placing
+          // newly-created tabs as orphans in the focused pane.
+          const repaired = validateAndRepairLayout(
+            persistedLayout,
+            get(settings).tabs,
+          );
+          layout.set(repaired);
+        } else {
+          // Fresh-install / pre-V4-04 path: every tab goes into the
+          // store-built single root pane via `applyTabCreatedToLayout`,
+          // and the previously-active tab (if any) is restored from
+          // the legacy session.active_tab_id field.
+          snapshot.forEach((m) => applyTabCreatedToLayout(m.id));
+          const sessionActive = get(settings).session.active_tab_id;
+          if (sessionActive) {
+            setFocusedPaneActiveTab(sessionActive);
+          }
         }
       } catch (e) {
         console.error('list_tabs failed:', e);
       }
+      // Install the debounced save subscription AFTER hydration so the
+      // first emission (the just-set layout from settings) is the one
+      // it swallows. If we install earlier, the subscription would
+      // round-trip the hydrated layout straight back to the backend on
+      // launch — harmless (would write the same state) but wasteful.
+      unsubLayoutSave = installLayoutPersistence();
       // Start the backend state listener early — it drives both the
       // per-tab avatar cache AND the activeTab store (via the
       // ActiveTabChanged event), so it must run regardless of whether
@@ -98,11 +135,19 @@
       );
       installDispatcher();
       // Position-bound tab-switch handler: 1-indexed lookup against the
-      // live tabs store. No-op when fewer than N tabs exist.
+      // *focused pane's* tab list (V4-03 reinterpretation of v1.2's
+      // global Ctrl+N). No-op when the focused pane has fewer than N
+      // tabs. The closest analogs are iTerm2 and VS Code, both of which
+      // scope Cmd+N / Ctrl+N to the current group / pane.
       const switchToPosition = (n: number) => () => {
-        const list = get(tabs);
-        const target = list[n - 1];
-        if (target) void switchTab(target.id);
+        const pane = get(focusedPane);
+        const target = pane.tab_ids[n - 1];
+        if (!target) return;
+        setPaneActiveTab(pane.id, target);
+        // Mirror to the backend so audio / avatar / window-title
+        // routing follows. switchTab is the v1.2 call that updates
+        // session.active_tab_id and broadcasts ActiveTabChanged.
+        void switchTab(target);
       };
       // Active-tab close handler. Builtins surface a transient toast
       // since closing them is rejected by the backend; the toast keeps
@@ -148,6 +193,17 @@
           switch_to_tab_9: switchToPosition(9),
           new_shell_tab: openNewShellTabDialog,
           close_tab: closeActiveTab,
+          focus_pane_left: () => focusPaneInDirection('left'),
+          focus_pane_right: () => focusPaneInDirection('right'),
+          focus_pane_up: () => focusPaneInDirection('up'),
+          focus_pane_down: () => focusPaneInDirection('down'),
+          split_pane_horizontal: () => {
+            void splitFocusedPaneWithNewShell('horizontal');
+          },
+          split_pane_vertical: () => {
+            void splitFocusedPaneWithNewShell('vertical');
+          },
+          close_pane: closeFocusedPane,
         });
       });
       // Window title reflects the active tab's avatar state. Switching
@@ -191,28 +247,58 @@
           console.error('set_active_tab failed:', e),
         );
       });
-      // Back-sync: when the backend broadcasts ActiveTabChanged from a
-      // legacy v1.2-style switch (Ctrl+1..9 or other origins that don't
-      // know about panes), reflect that into the layout store so the
-      // focused pane and its active tab stay coherent. Loop is broken
-      // because both setters are no-ops when state already matches.
+      // Back-sync: when the backend broadcasts ActiveTabChanged,
+      // reflect that into the focused pane's active-tab field so any
+      // legacy v1.2-style switch path stays coherent with the layout.
+      //
+      // Pane-scoped guard: only mirror the broadcast when the new id
+      // lives in the *currently focused* pane. The backend's
+      // close-tab fallback walks the global tab list to pick the
+      // previous tab; in a multi-pane layout that fallback can land
+      // in a different pane than the user is operating in. Reflecting
+      // those broadcasts via `setFocusedPaneActiveTab` would search
+      // the tree for the new id, force the holding pane's active to
+      // it, and steal focus there — yanking the user's "current
+      // thread" to a tab they didn't ask for. Ignoring out-of-pane
+      // broadcasts keeps the unrelated pane's active tab stable; the
+      // backend's active-tab cell self-corrects on the next
+      // focusedActiveTabId.subscribe push (which fires when
+      // applyTabClosedFromLayout lands).
+      //
+      // First-emission swallow: Svelte writables fire on subscribe
+      // with their current value. The activeTab store starts at the
+      // backend's launch-active id (set by `ActiveTabChanged` events
+      // and pre-populated to a default in `tabs/state.ts`). Treating
+      // that initial firing as a "real" change would race with the
+      // forward-sync above (`unsubFocusedTab` pushes the layout's
+      // focused-pane active tab to the backend on its own first
+      // emission). Without this guard, when the two values disagree
+      // — common after V4-04 migration where session.active_tab_id
+      // is dropped and the backend falls back to Claude while the
+      // hydrated layout has e.g. Aider active — the two
+      // subscriptions ping-pong correcting each other across async
+      // backend round-trips, flapping the active tab dozens of
+      // times on launch.
+      let activeTabFirstEmission = true;
       unsubActiveTabBack = activeTab.subscribe((t) => {
-        setFocusedPaneActiveTab(t);
+        if (activeTabFirstEmission) {
+          activeTabFirstEmission = false;
+          return;
+        }
+        const pane = get(focusedPane);
+        if (!pane.tab_ids.includes(t)) return;
+        if (pane.active_tab_id === t) return;
+        setPaneActiveTab(pane.id, t);
       });
 
-      // Debug shortcuts for M1: split / reset layout. Bypass the
-      // configurable shortcut dispatcher because these don't belong in
-      // user-facing settings yet — M3 will add proper bindings for the
-      // user-facing variants of split (Ctrl+\) and remove these.
+      // Debug shortcut: Ctrl+Shift+F3 collapses every split into a
+      // single root pane. Bypasses the configurable dispatcher because
+      // it's a QA / recovery hatch, not a user-facing binding. The
+      // M1-era F1 / F2 split keys were retired in V4-03 — Ctrl+\ /
+      // Ctrl+Shift+\ now do the user-facing split with a fresh shell.
       const onDebugKey = (e: KeyboardEvent) => {
         if (!e.ctrlKey || !e.shiftKey) return;
-        if (e.code === 'F1') {
-          e.preventDefault();
-          splitFocusedPane('horizontal');
-        } else if (e.code === 'F2') {
-          e.preventDefault();
-          splitFocusedPane('vertical');
-        } else if (e.code === 'F3') {
+        if (e.code === 'F3') {
           e.preventDefault();
           resetLayoutToSinglePane();
         }
@@ -227,6 +313,7 @@
       unsubFocusedTab?.();
       unsubActiveTabBack?.();
       removeDebugKeys?.();
+      unsubLayoutSave?.();
     };
   });
 </script>
@@ -247,10 +334,20 @@
     <ComposeOverlay />
     <ErrorBanner />
     <AiderFirstLaunchNotice />
+    <!--
+      DnD overlays mounted here so they layer above panes but below
+      modal dialogs (which render outside .terminal-area). The ghost
+      and drop-zone are pointer-events: none so they never intercept
+      the in-flight drag's pointermove/up.
+    -->
+    <DropZoneOverlay />
+    <DragGhost />
   </div>
   <StatusBar />
   <NewShellTabDialog />
   <ConfigureTabDialog />
+  <SaveLayoutDialog />
+  <ManagePresetsDialog />
   <Toast />
 </main>
 

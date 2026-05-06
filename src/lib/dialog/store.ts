@@ -10,7 +10,9 @@ import type { TabId } from '../tabs/types';
 export type DialogState =
   | { kind: 'none' }
   | { kind: 'new-shell-tab' }
-  | { kind: 'configure-tab'; tab: TabId };
+  | { kind: 'configure-tab'; tab: TabId }
+  | { kind: 'save-layout' }
+  | { kind: 'manage-presets' };
 
 export const dialogState: Writable<DialogState> = writable({ kind: 'none' });
 
@@ -20,6 +22,20 @@ export function openNewShellTabDialog(): void {
 
 export function openConfigureTabDialog(tab: TabId): void {
   dialogState.set({ kind: 'configure-tab', tab });
+}
+
+/// Opened from the Layouts popover's "Save current layout as..." entry.
+/// The dialog itself snapshots the live layout on submit, so no payload
+/// is needed in the dialog state.
+export function openSaveLayoutDialog(): void {
+  dialogState.set({ kind: 'save-layout' });
+}
+
+/// Opened from the Layouts popover's "Manage presets..." entry. The
+/// dialog renders from the live `settings.layout_presets` reactive
+/// store; no payload needed.
+export function openManagePresetsDialog(): void {
+  dialogState.set({ kind: 'manage-presets' });
 }
 
 export function closeDialog(): void {

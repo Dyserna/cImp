@@ -12,6 +12,7 @@
   // before they update its active tab.
 
   import { layout, setFocusedPane } from './layout/store';
+  import { paneRegistry } from './layout/registry';
   import {
     attachTerminal,
     detachTerminal,
@@ -27,8 +28,23 @@
 
   let { pane }: { pane: PaneNode } = $props();
 
+  let paneEl: HTMLDivElement | undefined = $state();
   let slotEl: HTMLDivElement | undefined = $state();
   let mountedTab: TabId | null = $state(null);
+
+  // Register this pane's root element with the DOM registry so the
+  // M2 drag-and-drop hit-tester can find it. Cleanup runs on unmount
+  // and (defensively) when the pane id changes — in practice id is
+  // stable for a pane's lifetime, but the cleanup captures the prior
+  // id from the closure so an id change wouldn't strand a stale entry.
+  $effect(() => {
+    if (!paneEl) return;
+    const id = pane.id;
+    paneRegistry.setPaneElement(id, paneEl);
+    return () => {
+      paneRegistry.setPaneElement(id, null);
+    };
+  });
 
   // Track the currently mounted tab so we can detach it on the next
   // active-tab change (or on unmount). Both detach calls pass `slotEl`
@@ -90,6 +106,7 @@
   class="pane"
   class:focused
   role="presentation"
+  bind:this={paneEl}
   onmousedowncapture={handlePaneMouseDown}
 >
   <TabBar {pane} />
@@ -127,10 +144,15 @@
     position: absolute;
     inset: 0;
   }
-  /* Subtle focused-pane indicator: a colored line under the active
-     tab's row of the tab bar. Picked low-saturation so multi-pane
-     layouts don't shout — just enough to read at a glance. */
+  /* Focused-pane indicator: a 2px accent line at the bottom of the
+     focused pane's tab bar. The base TabBar declares a 1px border;
+     overriding both width and color here gives a clearly-distinct cue
+     in multi-pane layouts without bleeding noise into the single-pane
+     case (still rendered, but the unfocused-pane comparison is what
+     makes it readable; with one pane it just looks like a thicker
+     separator line). */
   .pane.focused :global(.tab-bar) {
     border-bottom-color: #4a90e2;
+    border-bottom-width: 2px;
   }
 </style>

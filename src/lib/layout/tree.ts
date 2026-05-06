@@ -145,11 +145,18 @@ export function setActiveTabId(root: LayoutNode, paneId: PaneId, tabId: TabId): 
   });
 }
 
-/// Split a pane in the given direction, moving `draggedTabId` from the
-/// pane (it must already be in the pane's `tab_ids`) into a new sibling
-/// pane. The new pane goes to the *right* (horizontal) or *bottom*
-/// (vertical) of the existing pane by convention; the M2 DnD layer will
-/// override this when the user explicitly drops on a different edge.
+/// Split a pane in the given direction, creating a new sibling pane
+/// that holds `draggedTabId`. If the tab is currently in the target
+/// pane, it is removed from the kept side first; if it's elsewhere in
+/// the tree (the cross-pane drag-to-split case), the caller is
+/// expected to have already removed it from its source pane and the
+/// target is preserved verbatim.
+///
+/// `placeOn` controls which side of the new split the *new* pane lands
+/// on. Default `'second'` keeps the legacy convention (new pane to the
+/// right for horizontal, bottom for vertical) used by the M1 debug
+/// menu and the M3 keyboard splits. M2's DnD layer flips it to
+/// `'first'` for left/top edge drops.
 ///
 /// Returns the new tree, the id of the new pane, and the id of the
 /// containing split. The caller (typically the layout store) decides
@@ -159,21 +166,26 @@ export function splitPane(
   paneId: PaneId,
   direction: SplitDirection,
   draggedTabId: TabId,
+  options: { placeOn?: 'first' | 'second' } = {},
 ): { tree: LayoutNode; newPaneId: PaneId; splitId: SplitId } | null {
   const target = findPane(root, paneId);
   if (!target) return null;
-  if (!target.tab_ids.includes(draggedTabId)) return null;
 
-  const remainingTabIds = target.tab_ids.filter((id) => id !== draggedTabId);
-  const remainingActive =
-    target.active_tab_id === draggedTabId
-      ? (remainingTabIds[0] ?? null)
-      : target.active_tab_id;
-  const keptPane: PaneNode = {
-    ...target,
-    tab_ids: remainingTabIds,
-    active_tab_id: remainingActive,
-  };
+  let keptPane: PaneNode;
+  if (target.tab_ids.includes(draggedTabId)) {
+    const remainingTabIds = target.tab_ids.filter((id) => id !== draggedTabId);
+    const remainingActive =
+      target.active_tab_id === draggedTabId
+        ? (remainingTabIds[0] ?? null)
+        : target.active_tab_id;
+    keptPane = {
+      ...target,
+      tab_ids: remainingTabIds,
+      active_tab_id: remainingActive,
+    };
+  } else {
+    keptPane = target;
+  }
 
   const newPaneIdValue = newPaneId();
   const newPane: PaneNode = {
@@ -183,14 +195,15 @@ export function splitPane(
     active_tab_id: draggedTabId,
   };
 
+  const placeOn = options.placeOn ?? 'second';
   const splitId = newSplitId();
   const split: SplitNode = {
     type: 'split',
     id: splitId,
     direction,
     ratio: 0.5,
-    first: keptPane,
-    second: newPane,
+    first: placeOn === 'first' ? newPane : keptPane,
+    second: placeOn === 'first' ? keptPane : newPane,
   };
 
   const tree = replaceNode(root, target, split);
@@ -198,16 +211,27 @@ export function splitPane(
 }
 
 /// Remove a pane from the tree. The parent Split is replaced by the
-/// surviving sibling (standard binary-tree-deletion). If `paneId` is the
-/// root, the tree is returned unchanged — the root pane cannot be closed.
-export function closePane(root: LayoutNode, paneId: PaneId): LayoutNode {
-  if (root.type === 'pane') return root;
+/// surviving sibling (standard binary-tree-deletion). If `paneId` is
+/// the root or not in the tree, the tree is returned unchanged.
+///
+/// Also returns `next_focus`: the deepest-leftmost leaf of the
+/// surviving sibling subtree (per DESIGN-V4's focus-on-collapse rule),
+/// or `null` when the close was a no-op. Callers that need to refocus
+/// after a collapse use this directly; `firstPane(tree)` would pick
+/// the leftmost pane of the *whole* tree, which jumps focus much
+/// further than the user expects.
+export function closePane(
+  root: LayoutNode,
+  paneId: PaneId,
+): { tree: LayoutNode; next_focus: PaneId | null } {
+  if (root.type === 'pane') return { tree: root, next_focus: null };
   const parent = findSplitContaining(root, paneId);
-  if (!parent) return root;
+  if (!parent) return { tree: root, next_focus: null };
   const sibling = parent.first.type === 'pane' && parent.first.id === paneId
     ? parent.second
     : parent.first;
-  return replaceNode(root, parent, sibling);
+  const tree = replaceNode(root, parent, sibling);
+  return { tree, next_focus: firstPane(sibling).id };
 }
 
 /// Update a split's ratio, clamped to `[0.05, 0.95]` to prevent panes

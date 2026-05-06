@@ -2,6 +2,8 @@
 // match the JSON serde output. Optional fields come through as `null` over
 // JSON, never as `undefined`.
 
+import type { LayoutNode } from '../layout/types';
+
 export type AvatarPosition = 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left';
 
 export interface AvatarSize {
@@ -82,6 +84,16 @@ export interface ShortcutSettings {
   switch_to_tab_9: string | null;
   new_shell_tab: string | null;
   close_tab: string | null;
+  /// V4-03 pane shortcuts. All optional/nullable so a hand-edited
+  /// settings file from v1.2 still parses; missing fields fall back to
+  /// the defaults below at runtime.
+  focus_pane_left: string | null;
+  focus_pane_right: string | null;
+  focus_pane_up: string | null;
+  focus_pane_down: string | null;
+  split_pane_horizontal: string | null;
+  split_pane_vertical: string | null;
+  close_pane: string | null;
 }
 
 export interface TtsInjection {
@@ -141,6 +153,25 @@ export interface ProcessingSettings {
   max_hold_ms: number;
 }
 
+/// Persisted layout state (V4-04). Mirrors the in-memory `LayoutState`
+/// 1:1 — `LayoutNode` is the same `'split' | 'pane'`-discriminated tree
+/// the frontend already uses, so serialize/deserialize is identity work.
+export interface LayoutPersisted {
+  tree: LayoutNode;
+  focused_pane_id: string;
+}
+
+/// A named layout preset. The tree is the layout-only payload — focus
+/// is intentionally not persisted with the preset, since restoring it
+/// is "set up panes this way" and the user's next click decides focus.
+export interface LayoutPreset {
+  name: string;
+  /// RFC 3339 / ISO 8601 timestamp (UTC). Used to order the popover's
+  /// "Recent presets" list. Renames do not refresh this.
+  created_at: string;
+  tree: LayoutNode;
+}
+
 export interface Settings {
   tts: TtsSettings;
   avatar: AvatarSettings;
@@ -153,6 +184,13 @@ export interface Settings {
   tabs: TabConfig[];
   processing: ProcessingSettings;
   session: SessionState;
+  /// Persisted layout. `null` on fresh installs (frontend builds a
+  /// single-root-pane default) or when the v1.2 → v1.3 migration was
+  /// skipped for some reason. The hydration code handles both cases.
+  layout: LayoutPersisted | null;
+  /// Saved layout presets. Empty by default; populated via the Layouts
+  /// menu. Order is insertion order; the popover sorts by `created_at`.
+  layout_presets: LayoutPreset[];
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
@@ -230,6 +268,13 @@ export function defaultSettings(): Settings {
       switch_to_tab_9: 'Ctrl+9',
       new_shell_tab: 'Ctrl+T',
       close_tab: 'Ctrl+W',
+      focus_pane_left: 'Ctrl+Alt+Left',
+      focus_pane_right: 'Ctrl+Alt+Right',
+      focus_pane_up: 'Ctrl+Alt+Up',
+      focus_pane_down: 'Ctrl+Alt+Down',
+      split_pane_horizontal: 'Ctrl+\\',
+      split_pane_vertical: 'Ctrl+Shift+\\',
+      close_pane: 'Ctrl+Shift+W',
     },
     tabs: [
       {
@@ -271,5 +316,7 @@ export function defaultSettings(): Settings {
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
     session: { active_tab_id: null },
+    layout: null,
+    layout_presets: [],
   };
 }

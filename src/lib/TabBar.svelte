@@ -1,7 +1,7 @@
 <script lang="ts">
   import Tab from './Tab.svelte';
   import TabContextMenu from './TabContextMenu.svelte';
-  import { tabMeta } from './tabs/store';
+  import { tabs } from './tabs/store';
   import { switchTab } from './tabs/state';
   import {
     perTabAvatarState,
@@ -16,7 +16,9 @@
   } from './ipc';
   import { openConfigureTabDialog, openNewShellTabDialog } from './dialog/store';
   import { isShellTab, type TabId } from './tabs/types';
-  import { requestTabIntoPane, setPaneActiveTab } from './layout/store';
+  import { requestTabIntoPane, setFocusedPane, setPaneActiveTab } from './layout/store';
+  import { paneRegistry } from './layout/registry';
+  import { beginDrag } from './dnd/drag';
   import type { PaneNode } from './layout/types';
 
   // Pane-scoped tab bar. Renders only the tabs that belong to this
@@ -30,7 +32,30 @@
   // Per-pane rename mode flag. Two-way bound on each Tab instance.
   let renamingTab = $state<TabId | null>(null);
 
-  let menu = $state<{ tab: TabId; builtin: boolean; x: number; y: number } | null>(null);
+  // Unified context-menu state. `tab === null` means right-click on
+  // bar background (pane-only menu); `tab !== null` means right-click
+  // on a specific tab (tab + pane menu in one). The two cases share
+  // one TabContextMenu instance so they can never overlap.
+  let menu = $state<{
+    x: number;
+    y: number;
+    tab: { id: TabId; builtin: boolean } | null;
+  } | null>(null);
+
+  // The tab bar's root element, registered with the DOM registry so
+  // the M2 drop-target hit-tester can distinguish "drop on tab bar"
+  // (reorder / move-to-pane) from "drop in content area" (split). The
+  // registry stores the element; rects are read live so resizes and
+  // splitter moves stay correct without re-registering.
+  let barEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (!barEl) return;
+    const id = pane.id;
+    paneRegistry.setTabBarElement(id, barEl);
+    return () => {
+      paneRegistry.setTabBarElement(id, null);
+    };
+  });
 
   function onTabClick(tabId: TabId): void {
     setPaneActiveTab(pane.id, tabId);
@@ -59,11 +84,31 @@
   }
 
   function onTabContextMenu(tab: TabId, builtin: boolean, e: MouseEvent): void {
-    menu = { tab, builtin, x: e.clientX, y: e.clientY };
+    menu = { x: e.clientX, y: e.clientY, tab: { id: tab, builtin } };
   }
 
   function dismissMenu(): void {
     menu = null;
+  }
+
+  /// Right-click on the tab bar's background. Tab.svelte stops
+  /// propagation on its own contextmenu handler, so by the time this
+  /// fires we know the click really did land on the bar background
+  /// (not on a tab) — open the pane-only variant of the menu. The `+`
+  /// button silences its own contextmenu separately. Focusing the pane
+  /// on open mirrors what a left-click does — the user almost
+  /// certainly wants to act on this pane next.
+  function onBarContextMenu(e: MouseEvent): void {
+    e.preventDefault();
+    setFocusedPane(pane.id);
+    menu = { x: e.clientX, y: e.clientY, tab: null };
+  }
+
+  /// Suppress the browser's default context menu on the `+` button —
+  /// neither the tab menu nor the pane menu applies there.
+  function onNewTabContextMenu(e: MouseEvent): void {
+    e.preventDefault();
+    e.stopPropagation();
   }
 
   function onNewShellTab(): void {
@@ -72,11 +117,17 @@
   }
 </script>
 
-<div class="tab-bar" role="tablist">
+<div
+  class="tab-bar"
+  role="tablist"
+  bind:this={barEl}
+  oncontextmenu={onBarContextMenu}
+>
   {#each pane.tab_ids as id (id)}
-    {@const meta = tabMeta(id)}
+    {@const meta = $tabs.find((m) => m.id === id)}
     {#if meta}
       <Tab
+        tabId={id}
         label={meta.name}
         active={pane.active_tab_id === id}
         builtin={meta.builtin}
@@ -94,6 +145,7 @@
         onclick={() => onTabClick(id)}
         onclose={meta.builtin ? undefined : () => onCloseTab(id)}
         oncontextmenu={(e) => onTabContextMenu(id, meta.builtin, e)}
+        onpointerdowndrag={(e) => beginDrag(id, pane.id, e)}
         onrename={(newName) => onRenameTab(id, newName)}
       />
     {/if}
@@ -104,31 +156,27 @@
     aria-label="New shell tab"
     title="New shell tab (Ctrl+T)"
     onclick={onNewShellTab}
+    oncontextmenu={onNewTabContextMenu}
   >
     +
   </button>
 </div>
 
 {#if menu}
-  {@const isShell = isShellTab(menu.tab)}
-  {@const closed = $perTabClosedState[menu.tab]?.closed ?? false}
+  {@const t = menu.tab}
+  {@const isShell = t ? isShellTab(t.id) : false}
+  {@const closed = t ? ($perTabClosedState[t.id]?.closed ?? false) : false}
   <TabContextMenu
     x={menu.x}
     y={menu.y}
-    builtin={menu.builtin}
-    canRestart={isShell && !closed}
-    onRename={() => {
-      if (menu) renamingTab = menu.tab;
-    }}
-    onConfigure={() => {
-      if (menu) openConfigureTabDialog(menu.tab);
-    }}
-    onRestart={() => {
-      if (menu) onRestartTab(menu.tab);
-    }}
-    onClose={() => {
-      if (menu) onCloseTab(menu.tab);
-    }}
+    paneId={pane.id}
+    tab={t
+      ? { id: t.id, builtin: t.builtin, canRestart: isShell && !closed }
+      : null}
+    onRename={t ? () => (renamingTab = t.id) : undefined}
+    onConfigure={t ? () => openConfigureTabDialog(t.id) : undefined}
+    onRestart={t ? () => onRestartTab(t.id) : undefined}
+    onClose={t ? () => onCloseTab(t.id) : undefined}
     onDismiss={dismissMenu}
   />
 {/if}

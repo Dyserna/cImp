@@ -1,20 +1,44 @@
 <script lang="ts">
-  // Tab context menu. Triggered by right-click on a tab; rendered as a
-  // popover at the click coordinates. Kind-aware entries:
-  //   builtin tabs        → Rename
-  //   user Shell tabs     → Rename, Configure…, [Restart shell], Close
-  // Restart shell is hidden when the tab is in a closed state — the
-  // closed overlay's Enter affordance is the equivalent action there, and
-  // a restart on a launch-failed tab would just fail again (the user
-  // needs Configure to fix the broken command).
-  // Click outside or Escape closes the menu without firing an action.
+  // Combined tab + pane context menu. One menu component handles both
+  // the right-click-on-tab case and the right-click-on-tab-bar-background
+  // case so the two menus can never overlap each other (which they did
+  // when split across two components and the tab event was allowed to
+  // bubble).
+  //
+  // Sections:
+  //   * Tab section — only when `tab` is provided. Rename for every
+  //     tab; for non-builtin Shell tabs also Configure / Restart /
+  //     Close.
+  //   * Separator (only when both sections are present).
+  //   * Pane section — Split horizontally / Split vertically, then a
+  //     separator, then Close pane and Move all tabs to →. Always
+  //     present so even a bare tab right-click can pivot to "actually
+  //     I want to split this pane".
+  //
+  // Pane actions wire into the layout store directly (no callbacks
+  // from the parent) because they have no per-call configuration —
+  // close-focused-pane and split-with-new-shell don't need to know
+  // which tab the user right-clicked on.
+  //
+  // Click outside or Escape dismisses without firing.
   import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
+  import {
+    closeFocusedPane,
+    layout,
+    moveAllTabsToPane,
+  } from './layout/store';
+  import { splitFocusedPaneWithNewShell } from './layout/actions';
+  import { eachPane } from './layout/tree';
+  import { tabs } from './tabs/store';
+  import type { PaneId } from './layout/types';
+  import type { TabId } from './tabs/types';
 
   let {
     x,
     y,
-    builtin,
-    canRestart = false,
+    paneId,
+    tab,
     onRename,
     onConfigure,
     onRestart,
@@ -23,24 +47,58 @@
   }: {
     x: number;
     y: number;
-    builtin: boolean;
-    /// True for user Shell tabs whose subprocess is currently running.
-    /// Hides the Restart entry when the tab is in a closed state (the
-    /// closed overlay's Enter is the equivalent affordance).
-    canRestart?: boolean;
-    onRename: () => void;
-    onConfigure: () => void;
+    /// Owning pane — used to populate the Move-all-tabs-to submenu
+    /// (excluded from the candidate list) and to scope pane actions.
+    paneId: PaneId;
+    /// When provided, the tab section renders. When null, only the
+    /// pane section shows (right-click on the bar background).
+    tab: { id: TabId; builtin: boolean; canRestart: boolean } | null;
+    /// Tab actions. Required when `tab` is non-null; ignored otherwise.
+    /// Optional in the type to make the bar-background callsite
+    /// boilerplate-free.
+    onRename?: () => void;
+    onConfigure?: () => void;
     onRestart?: () => void;
-    onClose: () => void;
+    onClose?: () => void;
     onDismiss: () => void;
   } = $props();
 
   let menuEl: HTMLDivElement | undefined = $state();
+  let submenuOpen = $state(false);
+
+  // Other panes for the Move-all-tabs-to submenu, with friendly labels
+  // derived from each pane's active tab. Snapshotted at mount; the
+  // menu is short-lived (single user action then dismiss) so a live
+  // subscription would just add bookkeeping.
+  type OtherPane = { id: PaneId; label: string };
+  const layoutSnapshot = get(layout);
+  const tabsSnapshot = get(tabs);
+  const otherPanes: OtherPane[] = (() => {
+    const out: OtherPane[] = [];
+    for (const pane of eachPane(layoutSnapshot.tree)) {
+      if (pane.id === paneId) continue;
+      const activeId = pane.active_tab_id;
+      const activeMeta = activeId
+        ? tabsSnapshot.find((tt) => tt.id === activeId)
+        : null;
+      const head = activeMeta?.name ?? '(empty pane)';
+      const extra = pane.tab_ids.length > 1 ? pane.tab_ids.length - 1 : 0;
+      const label = extra > 0 ? `${head} + ${extra} more` : head;
+      out.push({ id: pane.id, label });
+    }
+    return out;
+  })();
+
+  // The pane is closeable only when it has a sibling — i.e. when the
+  // root is a Split. A bare-root pane has nothing to merge its tabs
+  // into and the menu entry is disabled.
+  const closeable = layoutSnapshot.tree.type !== 'pane';
 
   function onWindowMouseDown(e: MouseEvent): void {
-    // Only dismiss when the click started outside the menu. Without this
-    // check, mousedown on a menu entry unmounts the menu before its
-    // click event fires, so none of the entries ever trigger their action.
+    // Only dismiss when the click started outside the menu. Without
+    // this check, mousedown on a menu entry unmounts the menu before
+    // its click event fires, so none of the entries ever trigger their
+    // action.
     const target = e.target as Node | null;
     if (target && menuEl && menuEl.contains(target)) return;
     onDismiss();
@@ -53,12 +111,26 @@
     }
   }
 
-  function fire(action: () => void) {
+  function fire(action: (() => void) | undefined) {
     return (e: MouseEvent) => {
+      if (!action) return;
       e.stopPropagation();
       action();
       onDismiss();
     };
+  }
+
+  function onSplitHorizontal(): void {
+    void splitFocusedPaneWithNewShell('horizontal');
+  }
+  function onSplitVertical(): void {
+    void splitFocusedPaneWithNewShell('vertical');
+  }
+  function onClosePane(): void {
+    closeFocusedPane();
+  }
+  function onMoveAllTo(targetId: PaneId): void {
+    moveAllTabsToPane(paneId, targetId);
   }
 
   onMount(() => {
@@ -82,22 +154,84 @@
   style="left: {x}px; top: {y}px;"
   role="menu"
 >
-  <button type="button" class="entry" role="menuitem" onclick={fire(onRename)}>
-    Rename
-  </button>
-  {#if !builtin}
-    <button type="button" class="entry" role="menuitem" onclick={fire(onConfigure)}>
-      Configure…
+  {#if tab}
+    <button type="button" class="entry" role="menuitem" onclick={fire(onRename)}>
+      Rename
     </button>
-    {#if canRestart && onRestart}
-      <button type="button" class="entry" role="menuitem" onclick={fire(onRestart)}>
-        Restart shell
+    {#if !tab.builtin}
+      <button type="button" class="entry" role="menuitem" onclick={fire(onConfigure)}>
+        Configure…
+      </button>
+      {#if tab.canRestart && onRestart}
+        <button type="button" class="entry" role="menuitem" onclick={fire(onRestart)}>
+          Restart shell
+        </button>
+      {/if}
+      <div class="separator"></div>
+      <button type="button" class="entry danger" role="menuitem" onclick={fire(onClose)}>
+        Close
       </button>
     {/if}
     <div class="separator"></div>
-    <button type="button" class="entry danger" role="menuitem" onclick={fire(onClose)}>
-      Close
-    </button>
+  {/if}
+  <button
+    type="button"
+    class="entry"
+    role="menuitem"
+    onclick={fire(onSplitHorizontal)}
+  >
+    Split horizontally
+  </button>
+  <button
+    type="button"
+    class="entry"
+    role="menuitem"
+    onclick={fire(onSplitVertical)}
+  >
+    Split vertically
+  </button>
+  <div class="separator"></div>
+  <button
+    type="button"
+    class="entry"
+    class:disabled={!closeable}
+    role="menuitem"
+    disabled={!closeable}
+    onclick={closeable ? fire(onClosePane) : undefined}
+  >
+    Close pane
+  </button>
+  {#if otherPanes.length > 0}
+    <div class="entry submenu-host" role="menuitem">
+      <button
+        type="button"
+        class="submenu-trigger"
+        onmouseenter={() => (submenuOpen = true)}
+        onfocus={() => (submenuOpen = true)}
+      >
+        Move all tabs to
+        <span class="submenu-arrow">▶</span>
+      </button>
+      {#if submenuOpen}
+        <!-- svelte-ignore a11y_interactive_supports_focus -->
+        <div
+          class="submenu"
+          role="menu"
+          onmouseleave={() => (submenuOpen = false)}
+        >
+          {#each otherPanes as p (p.id)}
+            <button
+              type="button"
+              class="entry"
+              role="menuitem"
+              onclick={fire(() => onMoveAllTo(p.id))}
+            >
+              {p.label}
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
   {/if}
 </div>
 
@@ -109,7 +243,7 @@
     border-radius: 4px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
     padding: 4px 0;
-    min-width: 140px;
+    min-width: 180px;
     z-index: 200;
   }
   .entry {
@@ -124,16 +258,61 @@
     font-family: inherit;
     cursor: pointer;
   }
-  .entry:hover {
+  .entry:hover:not(.disabled):not(.submenu-host):not([disabled]) {
     background: #383838;
   }
   .entry.danger:hover {
     background: #4a2a2a;
     color: #ffaaaa;
   }
+  .entry.disabled,
+  .entry[disabled] {
+    color: #666;
+    cursor: default;
+  }
   .separator {
     height: 1px;
     background: #444;
     margin: 4px 0;
+  }
+  .submenu-host {
+    position: relative;
+    padding: 0;
+  }
+  .submenu-trigger {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    width: 100%;
+    text-align: left;
+    padding: 6px 16px;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .submenu-host:hover .submenu-trigger,
+  .submenu-trigger:focus {
+    background: #383838;
+  }
+  .submenu-arrow {
+    font-size: 9px;
+    color: #888;
+    margin-left: 8px;
+  }
+  .submenu {
+    position: absolute;
+    left: 100%;
+    top: -5px;
+    background: #2a2a2a;
+    border: 1px solid #444;
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    padding: 4px 0;
+    min-width: 180px;
+    max-height: 320px;
+    overflow-y: auto;
   }
 </style>

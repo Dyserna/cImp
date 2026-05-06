@@ -4,7 +4,6 @@
 
 import { writable } from 'svelte/store';
 import type { TabId } from './types';
-import { ALL_TABS } from './types';
 
 export interface TabError {
   // One-line user-facing summary, e.g. "Aider failed to start." or
@@ -16,20 +15,22 @@ export interface TabError {
   hint?: string;
 }
 
-type ErrorMap = Record<TabId, TabError | null>;
+type ErrorMap = Partial<Record<TabId, TabError | null>>;
 
-function emptyMap(): ErrorMap {
-  const out = {} as ErrorMap;
-  for (const t of ALL_TABS) out[t] = null;
-  return out;
-}
-
-export const tabErrors = writable<ErrorMap>(emptyMap());
+/// Starts empty; entries are added on `setTabError` and removed on
+/// `clearTabError` or when the owning tab is closed (the avatarState
+/// listener calls `clearTabError` on `tab-closed`).
+export const tabErrors = writable<ErrorMap>({});
 
 export function setTabError(tab: TabId, err: TabError) {
   tabErrors.update((m) => ({ ...m, [tab]: err }));
 }
 
 export function clearTabError(tab: TabId) {
-  tabErrors.update((m) => ({ ...m, [tab]: null }));
+  tabErrors.update((m) => {
+    if (!(tab in m)) return m;
+    const next = { ...m };
+    delete next[tab];
+    return next;
+  });
 }

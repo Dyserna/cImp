@@ -16,7 +16,15 @@ export type ShortcutAction =
   | 'open_settings'
   | 'switch_to_tab_1'
   | 'switch_to_tab_2'
-  | 'switch_to_tab_3';
+  | 'switch_to_tab_3'
+  | 'switch_to_tab_4'
+  | 'switch_to_tab_5'
+  | 'switch_to_tab_6'
+  | 'switch_to_tab_7'
+  | 'switch_to_tab_8'
+  | 'switch_to_tab_9'
+  | 'new_shell_tab'
+  | 'close_tab';
 
 /// A shortcut binding can be a bare function (always fires when matched) or
 /// an object with an `active` predicate. When `active()` returns false the
@@ -47,6 +55,14 @@ export function configureShortcuts(s: ShortcutSettings, h: ShortcutHandlers): vo
     switch_to_tab_1: parseShortcut(s.switch_to_tab_1),
     switch_to_tab_2: parseShortcut(s.switch_to_tab_2),
     switch_to_tab_3: parseShortcut(s.switch_to_tab_3),
+    switch_to_tab_4: parseShortcut(s.switch_to_tab_4),
+    switch_to_tab_5: parseShortcut(s.switch_to_tab_5),
+    switch_to_tab_6: parseShortcut(s.switch_to_tab_6),
+    switch_to_tab_7: parseShortcut(s.switch_to_tab_7),
+    switch_to_tab_8: parseShortcut(s.switch_to_tab_8),
+    switch_to_tab_9: parseShortcut(s.switch_to_tab_9),
+    new_shell_tab: parseShortcut(s.new_shell_tab),
+    close_tab: parseShortcut(s.close_tab),
   };
   handlers = h;
 }

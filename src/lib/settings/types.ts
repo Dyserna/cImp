@@ -74,6 +74,14 @@ export interface ShortcutSettings {
   switch_to_tab_1: string | null;
   switch_to_tab_2: string | null;
   switch_to_tab_3: string | null;
+  switch_to_tab_4: string | null;
+  switch_to_tab_5: string | null;
+  switch_to_tab_6: string | null;
+  switch_to_tab_7: string | null;
+  switch_to_tab_8: string | null;
+  switch_to_tab_9: string | null;
+  new_shell_tab: string | null;
+  close_tab: string | null;
 }
 
 export interface TtsInjection {
@@ -181,6 +189,14 @@ export function defaultSettings(): Settings {
       switch_to_tab_1: 'Ctrl+1',
       switch_to_tab_2: 'Ctrl+2',
       switch_to_tab_3: 'Ctrl+3',
+      switch_to_tab_4: 'Ctrl+4',
+      switch_to_tab_5: 'Ctrl+5',
+      switch_to_tab_6: 'Ctrl+6',
+      switch_to_tab_7: 'Ctrl+7',
+      switch_to_tab_8: 'Ctrl+8',
+      switch_to_tab_9: 'Ctrl+9',
+      new_shell_tab: 'Ctrl+T',
+      close_tab: 'Ctrl+W',
     },
     tabs: {
       claude: {

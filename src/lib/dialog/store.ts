@@ -1,0 +1,27 @@
+// Single global dialog store. Only one dialog is visible at a time;
+// opening a new one while another is open replaces the existing dialog
+// (the previous dialog's transient state is discarded). Dialog
+// components subscribe to `dialogState` and render when the discriminator
+// matches their kind.
+
+import { writable, type Writable } from 'svelte/store';
+import type { TabId } from '../tabs/types';
+
+export type DialogState =
+  | { kind: 'none' }
+  | { kind: 'new-shell-tab' }
+  | { kind: 'configure-tab'; tab: TabId };
+
+export const dialogState: Writable<DialogState> = writable({ kind: 'none' });
+
+export function openNewShellTabDialog(): void {
+  dialogState.set({ kind: 'new-shell-tab' });
+}
+
+export function openConfigureTabDialog(tab: TabId): void {
+  dialogState.set({ kind: 'configure-tab', tab });
+}
+
+export function closeDialog(): void {
+  dialogState.set({ kind: 'none' });
+}

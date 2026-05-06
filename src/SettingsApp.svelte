@@ -14,14 +14,7 @@
   } from './lib/settings/ipc';
   import type { Settings, TabSettings } from './lib/settings/types';
   import type { AiTabId } from './lib/tabs/types';
-  import { AI_TABS, TAB_META } from './lib/tabs/types';
-
-  // Shell-tab settings live under `_shell_1_tmp` and don't share the
-  // TabSettings shape, so M1's Settings window still scopes to AI tabs
-  // only. M4 of v3-01 adds Shell-tab settings rows.
-  const AI_TAB_META = TAB_META.filter(
-    (m): m is { id: AiTabId; label: string } => m.id === 'claude' || m.id === 'aider',
-  );
+  import { AI_TABS, AI_TAB_META } from './lib/tabs/types';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
 
@@ -564,10 +557,10 @@
       <div class="tabs-grid">
         {#each AI_TAB_META as meta (meta.id)}
           <details open>
-            <summary>{meta.label}</summary>
+            <summary>{meta.name}</summary>
             <TabSettingsSection
               tabId={meta.id}
-              displayName={meta.label}
+              displayName={meta.name}
               bind:settings={
                 () => snapshot!.tabs[meta.id],
                 (v) => patch((s) => (s.tabs[meta.id] = v))

@@ -24,10 +24,14 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{
-    acknowledge_error, close_settings_window, compose_content_changed, list_voices,
+    acknowledge_error, close_settings_window, compose_content_changed, list_tabs, list_voices,
     open_settings_window, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
     restart_shell_tab, settings_get, settings_update, tab_activate, tab_default_settings,
     tts_test,
+};
+use crate::ipc::tab_lifecycle::{
+    close_tab, create_shell_tab, default_shell_spec, get_shell_tab_config, reconfigure_shell_tab,
+    rename_tab,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{Settings, SettingsHandle};
@@ -71,8 +75,15 @@ fn main() {
     // edge, which the next event recovers naturally.
     let (state_event_tx, _) = broadcast::channel::<StateEvent>(64);
 
-    // Per-tab unsent-input length counters.
-    let input_lengths = crate::tabs::registry::make_input_lengths();
+    // Launch-seed tab list. M2 supports runtime add/remove via the
+    // state-manager's `TabAdded`/`TabRemoved` signals; this list only
+    // determines which tabs spawn at app launch. M3 reads it from settings.
+    let seed_tabs: Vec<TabId> = TabId::launch_seed();
+
+    // Per-tab unsent-input length counters. Shared (Arc<RwLock<...>>) so
+    // the state manager can grow/shrink the map at runtime while the IPC
+    // layer reads counter Arcs by tab id.
+    let input_lengths = crate::tabs::registry::make_input_lengths(&seed_tabs);
 
     let audio_slot: Arc<RwLock<Option<Arc<AudioOutput>>>> = Arc::new(RwLock::new(None));
 
@@ -83,10 +94,10 @@ fn main() {
     let initial_active = TabId::Claude;
     let tts_active: ActiveTab = Arc::new(RwLock::new(initial_active.clone()));
 
-    // Static tab metadata for M1 — two AI builtins plus the hardcoded
-    // Shell-1. M3 reads the array from settings instead of building it
-    // inline. The Shell-1 name comes from the interim `_shell_1_tmp` key
-    // on settings so user-edited names are honored on launch.
+    // Static tab metadata for the launch seed. M2 keeps the same three
+    // tabs at startup; runtime additions arrive via `create_shell_tab`.
+    // The Shell-1 name comes from the interim `_shell_1_tmp` key so
+    // user-edited names are honored on launch.
     let shell_1_name = settings_handle.current().shell_1_tmp.name.clone();
     let tab_metas: Vec<TabMeta> = vec![
         TabMeta {
@@ -108,11 +119,13 @@ fn main() {
 
     // Tab registry — one PtyManager per tab, lazy-spawn at frontend mount.
     let registry = TabRegistry::new(
+        tab_metas.clone(),
         initial_active.clone(),
         tts_active.clone(),
         audio_slot.clone(),
         state_tx.clone(),
         default_shell.clone(),
+        input_lengths.clone(),
     );
     let tabs_handle: TabRegistryHandle = Arc::new(TokioMutex::new(registry));
 
@@ -212,6 +225,7 @@ fn main() {
             settings_update,
             tab_default_settings,
             list_voices,
+            list_tabs,
             open_settings_window,
             close_settings_window,
             request_tab_restart,
@@ -219,6 +233,12 @@ fn main() {
             compose_content_changed,
             acknowledge_error,
             tab_activate,
+            create_shell_tab,
+            close_tab,
+            rename_tab,
+            reconfigure_shell_tab,
+            default_shell_spec,
+            get_shell_tab_config,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

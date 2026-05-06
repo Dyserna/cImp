@@ -1,13 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::mpsc;
 
 use crate::audio::AudioOutput;
 use crate::settings::SettingsHandle;
-use crate::state::{StateSignal, TabId};
+use crate::state::{InputLengths, StateSignal};
 use crate::tabs::TabRegistryHandle;
 use crate::tts::TtsRequest;
 
@@ -27,8 +26,9 @@ pub struct AppState {
     pub state_signals: mpsc::Sender<StateSignal>,
     /// Per-tab unsent-input length counters. Each tab's counter is read by
     /// the state manager on every tick to decide whether to drop that tab's
-    /// Listening → Idle.
-    pub input_lengths: HashMap<TabId, Arc<AtomicI32>>,
+    /// Listening → Idle. The map grows/shrinks at runtime — IPC handlers
+    /// must clone the counter Arc out before relying on it across awaits.
+    pub input_lengths: InputLengths,
     pub settings: SettingsHandle,
     pub audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
 }

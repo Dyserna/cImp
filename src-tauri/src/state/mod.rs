@@ -9,5 +9,6 @@
 mod manager;
 
 pub use manager::{
-    spawn_state_manager, AiToolKind, AvatarState, StateEvent, StateSignal, TabId, TabKind, TabMeta,
+    spawn_state_manager, AiToolKind, AvatarState, InputLengths, StateEvent, StateSignal, TabId,
+    TabKind, TabKindWire, TabMeta,
 };

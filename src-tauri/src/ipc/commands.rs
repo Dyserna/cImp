@@ -88,17 +88,24 @@ pub async fn pty_write(
         }
     }
 
-    let len_counter = state
-        .input_lengths
-        .get(&tab)
-        .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
+    // Clone the counter Arc out so we don't hold the read lock across the
+    // subsequent .await on the registry. Counters are cheap to clone.
+    let len_counter = {
+        let map = state
+            .input_lengths
+            .read()
+            .map_err(|e| AppError::Pty(format!("input_lengths poisoned: {e}")))?;
+        map.get(&tab)
+            .cloned()
+            .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?
+    };
 
     if !is_automatic_terminal_response(&input) {
         if contains_enter(&input) {
             len_counter.store(0, Ordering::Relaxed);
             let _ = state.state_signals.try_send(StateSignal::UserSubmit { tab: tab.clone() });
         } else {
-            apply_input_delta(&input, len_counter);
+            apply_input_delta(&input, &len_counter);
             let _ = state
                 .state_signals
                 .try_send(StateSignal::UserKeystroke { tab: tab.clone() });
@@ -244,6 +251,19 @@ pub async fn acknowledge_error(state: State<'_, AppState>, tab: TabId) -> AppRes
 pub async fn tab_activate(state: State<'_, AppState>, tab: TabId) -> AppResult<()> {
     let mut registry = state.tabs.lock().await;
     registry.activate(tab).await
+}
+
+/// Snapshot the live tab list. Frontend calls this once on App mount to
+/// seed its tabs store; subsequent runtime mutations arrive via the
+/// `tab-created`/`tab-closed`/`tab-renamed` events broadcast through the
+/// `avatar-state` channel. Avoids the race where setup-time TabCreated
+/// emissions could fire before the webview's listener attaches.
+#[tauri::command]
+pub async fn list_tabs(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::tabs::TabMetaWire>> {
+    let registry = state.tabs.lock().await;
+    Ok(registry.list())
 }
 
 #[tauri::command]

@@ -27,6 +27,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
 which = "6"
 vte = "0.13"
+shlex = "1"
+uuid = { version = "1", features = ["v4"] }
 
 # TTS (Kokoro via ONNX Runtime). misaki-rs default features include espeak-ng
 # fallback for OOV words; the resulting binary is GPLv3 (see NOTICE).

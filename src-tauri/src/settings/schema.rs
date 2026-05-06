@@ -220,9 +220,21 @@ pub struct ShortcutSettings {
     pub open_settings: Option<String>,
     pub switch_to_tab_1: Option<String>,
     pub switch_to_tab_2: Option<String>,
-    /// MILESTONE-V3-01 shortcut for the third tab (Shell-1 in M1). M2/M3
-    /// extend the shortcut set up to `switch_to_tab_9` per the design doc.
+    /// MILESTONE-V3-01 shortcut for the third tab (Shell-1 in M1). M2
+    /// extends the shortcut set up to `switch_to_tab_9` per the design
+    /// doc, position-bound (1-indexed in the live tab order).
     pub switch_to_tab_3: Option<String>,
+    pub switch_to_tab_4: Option<String>,
+    pub switch_to_tab_5: Option<String>,
+    pub switch_to_tab_6: Option<String>,
+    pub switch_to_tab_7: Option<String>,
+    pub switch_to_tab_8: Option<String>,
+    pub switch_to_tab_9: Option<String>,
+    /// Open the New Shell Tab dialog. Identical to clicking the `+`
+    /// button on the tab bar.
+    pub new_shell_tab: Option<String>,
+    /// Close the active tab. No-op (with a transient toast) on builtins.
+    pub close_tab: Option<String>,
 }
 
 impl Default for ShortcutSettings {
@@ -235,6 +247,14 @@ impl Default for ShortcutSettings {
             switch_to_tab_1: Some("Ctrl+1".to_string()),
             switch_to_tab_2: Some("Ctrl+2".to_string()),
             switch_to_tab_3: Some("Ctrl+3".to_string()),
+            switch_to_tab_4: Some("Ctrl+4".to_string()),
+            switch_to_tab_5: Some("Ctrl+5".to_string()),
+            switch_to_tab_6: Some("Ctrl+6".to_string()),
+            switch_to_tab_7: Some("Ctrl+7".to_string()),
+            switch_to_tab_8: Some("Ctrl+8".to_string()),
+            switch_to_tab_9: Some("Ctrl+9".to_string()),
+            new_shell_tab: Some("Ctrl+T".to_string()),
+            close_tab: Some("Ctrl+W".to_string()),
         }
     }
 }

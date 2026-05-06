@@ -8,13 +8,13 @@ use std::path::Path;
 use crate::error::AppResult;
 use crate::pty::{resolve_command, PtyLaunchSpec};
 use crate::settings::{Settings, TabSettings};
-use crate::shell::ShellSpec;
+use crate::tabs::ShellTabConfig;
 use crate::state::TabId;
 
 pub fn build_launch_spec(
     tab: TabId,
     settings: &Settings,
-    default_shell: &ShellSpec,
+    shell_config: Option<&ShellTabConfig>,
     launch_cwd: &Path,
     invocation_args: &[String],
 ) -> AppResult<PtyLaunchSpec> {
@@ -34,19 +34,32 @@ pub fn build_launch_spec(
                 pre_args,
                 extra_args,
                 working_dir: launch_cwd.to_path_buf(),
+                env: std::collections::HashMap::new(),
             })
         }
-        TabId::Shell(_) => Ok(PtyLaunchSpec {
-            tab,
-            // The detection module already verified the binary exists at
-            // resolution time on every probe path, so we trust it here
-            // (M3 will re-verify once user-managed paths land — those can
-            // change between settings save and spawn).
-            binary: default_shell.command.clone(),
-            pre_args: Vec::new(),
-            extra_args: default_shell.args.clone(),
-            working_dir: launch_cwd.to_path_buf(),
-        }),
+        TabId::Shell(id) => {
+            let cfg = shell_config.ok_or_else(|| {
+                crate::error::AppError::Pty(format!(
+                    "shell tab {id} has no launch config"
+                ))
+            })?;
+            // The detection module verified the default binary; user-
+            // supplied paths from the New Shell Tab dialog are validated
+            // up-front in `create_shell_tab` (M2 Phase B), so we trust the
+            // config here.
+            let working_dir = cfg
+                .cwd
+                .clone()
+                .unwrap_or_else(|| launch_cwd.to_path_buf());
+            Ok(PtyLaunchSpec {
+                tab,
+                binary: cfg.spec.command.clone(),
+                pre_args: Vec::new(),
+                extra_args: cfg.spec.args.clone(),
+                working_dir,
+                env: cfg.env.clone(),
+            })
+        }
     }
 }
 

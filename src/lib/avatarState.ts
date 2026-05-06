@@ -2,7 +2,14 @@ import { writable, derived, get, type Readable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { settings, applySettings } from './settings/store';
 import { activeTab } from './tabs/state';
-import { ALL_TABS, type TabId } from './tabs/types';
+import {
+  applyTabClosed,
+  applyTabCreated,
+  applyTabRenamed,
+  type TabCreatedEvent,
+} from './tabs/store';
+import { clearTabError } from './tabs/errorState';
+import { type TabId } from './tabs/types';
 
 export type AvatarState = 'Idle' | 'Listening' | 'Thinking' | 'Speaking' | 'Error';
 
@@ -19,69 +26,99 @@ export interface TabClosedState {
   exit_code: number | null;
 }
 
-// Backend wire format for the `avatar-state` event.
+// Backend wire format for the `avatar-state` event. Includes the runtime
+// tab-lifecycle events (`tab-created`, `tab-closed`, `tab-renamed`); the
+// listener fans them out to both the per-tab caches here and the `tabs`
+// store in `tabs/store.ts` so a single subscription drives everything.
 type StateEvent =
   | { type: 'state-changed'; tab: TabId; state: AvatarState }
   | { type: 'active-tab-changed'; tab: TabId }
   | { type: 'awaiting-permission-changed'; tab: TabId; awaiting: boolean }
   | { type: 'done-while-away-changed'; tab: TabId; done: boolean }
-  | { type: 'tab-closed-state-changed'; tab: TabId; closed: boolean; exit_code: number | null };
-
-function defaultRecord<V>(value: V): Record<TabId, V> {
-  const out: Record<TabId, V> = {} as Record<TabId, V>;
-  for (const t of ALL_TABS) out[t] = value;
-  return out;
-}
+  | { type: 'tab-closed-state-changed'; tab: TabId; closed: boolean; exit_code: number | null }
+  | ({ type: 'tab-created' } & TabCreatedEvent)
+  | { type: 'tab-closed'; tab: TabId }
+  | { type: 'tab-renamed'; tab: TabId; name: string };
 
 // Per-tab avatar state cache. The displayed avatar is a derived view over
 // (this map, activeTab) — switching tabs immediately re-renders without an
 // extra backend round-trip.
-const perTabState = writable<Record<TabId, AvatarState>>(defaultRecord<AvatarState>('Idle'));
+const perTabState = writable<Partial<Record<TabId, AvatarState>>>({});
 
 /// Per-tab AwaitingPermission flag. Driven by backend permission detection.
 /// Exposed for the TabBar's per-tab indicator rendering. Always false for
 /// Shell tabs (the detector never runs for them).
-export const perTabAwaitingPermission = writable<Record<TabId, boolean>>(
-  defaultRecord<boolean>(false),
-);
+export const perTabAwaitingPermission = writable<Partial<Record<TabId, boolean>>>({});
 
 /// Per-tab DoneWhileAway flag. Set by the backend when a tab transitions to
 /// Idle while inactive; cleared on tab activation.
-export const perTabDoneWhileAway = writable<Record<TabId, boolean>>(
-  defaultRecord<boolean>(false),
-);
+export const perTabDoneWhileAway = writable<Partial<Record<TabId, boolean>>>({});
 
 /// Per-tab Shell-only closed state. Driven by the backend's
 /// `tab-closed-state-changed` event; the ClosedShellOverlay component
 /// subscribes to render the "Shell exited (code N)" message.
-export const perTabClosedState = writable<Record<TabId, TabClosedState>>(
-  defaultRecord<TabClosedState>({ closed: false, exit_code: null }),
-);
+export const perTabClosedState = writable<Partial<Record<TabId, TabClosedState>>>({});
+
+/// Default per-tab values used when a `TabCreated` event arrives. Per-tab
+/// records here key by id, so we just `set` the entry instead of merging
+/// in a fresh map (preserves any concurrent updates that arrived first).
+/// Exposed for `App.svelte`'s startup snapshot path so the per-tab caches
+/// have entries before any event arrives.
+export function seedPerTabEntries(tab: TabId): void {
+  perTabState.update((m) => (tab in m ? m : { ...m, [tab]: 'Idle' }));
+  perTabAwaitingPermission.update((m) => (tab in m ? m : { ...m, [tab]: false }));
+  perTabDoneWhileAway.update((m) => (tab in m ? m : { ...m, [tab]: false }));
+  perTabClosedState.update((m) =>
+    tab in m ? m : { ...m, [tab]: { closed: false, exit_code: null } },
+  );
+}
+
+function dropPerTabEntries(tab: TabId): void {
+  const drop = (m: Record<TabId, unknown>) => {
+    if (!(tab in m)) return m;
+    const next = { ...m };
+    delete next[tab];
+    return next;
+  };
+  perTabState.update(
+    drop as (m: Partial<Record<TabId, AvatarState>>) => Partial<Record<TabId, AvatarState>>,
+  );
+  perTabAwaitingPermission.update(
+    drop as (m: Partial<Record<TabId, boolean>>) => Partial<Record<TabId, boolean>>,
+  );
+  perTabDoneWhileAway.update(
+    drop as (m: Partial<Record<TabId, boolean>>) => Partial<Record<TabId, boolean>>,
+  );
+  perTabClosedState.update(
+    drop as (m: Partial<Record<TabId, TabClosedState>>) => Partial<Record<TabId, TabClosedState>>,
+  );
+}
 
 /// Per-tab avatar state map exposed for TabBar (it needs all tabs at once,
-/// not just the active one).
-export const perTabAvatarState: Readable<Record<TabId, AvatarState>> = derived(
+/// not just the active one). Entries are added on `TabCreated` and removed
+/// on `TabClosed`; readers should fall back to `Idle` when an id is absent
+/// during the brief window between mount and the first event arrival.
+export const perTabAvatarState: Readable<Partial<Record<TabId, AvatarState>>> = derived(
   perTabState,
   (s) => s,
 );
 
 /// Active tab's avatar state. Components that show the avatar subscribe to
 /// this; it recomputes whenever either the per-tab cache or the active tab
-/// changes.
+/// changes. Defaults to Idle if the active tab's entry hasn't been seeded
+/// yet (TabCreated arrives slightly after the listener attaches).
 export const avatarState: Readable<AvatarState> = derived(
   [perTabState, activeTab],
-  ([s, t]) => s[t],
+  ([s, t]) => s[t] ?? 'Idle',
 );
 
 /// Per-tab error info. Like `avatarState`, the displayed banner is the
 /// active tab's error.
-const perTabError = writable<Record<TabId, AvatarErrorInfo | null>>(
-  defaultRecord<AvatarErrorInfo | null>(null),
-);
+const perTabError = writable<Partial<Record<TabId, AvatarErrorInfo | null>>>({});
 
 export const avatarError: Readable<AvatarErrorInfo | null> = derived(
   [perTabError, activeTab],
-  ([s, t]) => s[t],
+  ([s, t]) => s[t] ?? null,
 );
 
 export const avatarVisible: Readable<boolean> = derived(
@@ -125,6 +162,33 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
           ...m,
           [e.tab]: { closed: e.closed, exit_code: e.exit_code },
         }));
+      } else if (e.type === 'tab-created') {
+        // Seed per-tab caches BEFORE applying to the tabs store so any
+        // subscriber that reacts to `tabs` changes (e.g., TabBar
+        // rendering) finds non-stale per-tab data on first paint.
+        seedPerTabEntries(e.tab);
+        applyTabCreated({
+          tab: e.tab,
+          kind: e.kind,
+          name: e.name,
+          builtin: e.builtin,
+          position: e.position,
+        });
+      } else if (e.type === 'tab-closed') {
+        applyTabClosed(e.tab);
+        dropPerTabEntries(e.tab);
+        perTabError.update((m) => {
+          if (!(e.tab in m)) return m;
+          const next = { ...m };
+          delete next[e.tab];
+          return next;
+        });
+        // Also drop the in-tab error-overlay entry so a fresh tab
+        // re-using the same id (unlikely with UUIDs, but possible if
+        // M3 settings load mirrors a stable id) starts clean.
+        clearTabError(e.tab);
+      } else if (e.type === 'tab-renamed') {
+        applyTabRenamed(e.tab, e.name);
       }
     });
   }
@@ -136,3 +200,7 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
   }
   return unlistenStatePromise;
 }
+
+/// Read-only access to `tabs` for callers that import from this module.
+/// Re-exported here because most callers already import from this file.
+export { tabs } from './tabs/store';

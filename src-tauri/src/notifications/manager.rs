@@ -114,12 +114,11 @@ impl NotificationManager {
         active: ActiveTab,
         initial_active: TabId,
     ) -> Self {
-        let mut last_avatar = HashMap::new();
-        let mut last_awaiting = HashMap::new();
-        for t in TabId::all() {
-            last_avatar.insert(t.clone(), AvatarState::Idle);
-            last_awaiting.insert(t, false);
-        }
+        // Per-tab caches start empty; `TabCreated` events seed them. The
+        // state manager emits one `TabCreated` per launch-seed tab during
+        // startup, so by the time any `StateChanged` arrives the relevant
+        // entry is in place. Runtime-added Shell tabs (M2) extend the
+        // caches the same way.
         let _ = initial_active; // reserved; not currently used outside `active`.
         Self {
             state_events,
@@ -128,8 +127,8 @@ impl NotificationManager {
             settings,
             active,
             queue: Vec::new(),
-            last_avatar,
-            last_awaiting,
+            last_avatar: HashMap::new(),
+            last_awaiting: HashMap::new(),
             drain_deadline: None,
         }
     }
@@ -231,7 +230,28 @@ impl NotificationManager {
                 }
                 self.try_enqueue(tab, NotificationEvent::Exited)
             }
-            StateEvent::ActiveTabChanged { .. } | StateEvent::DoneWhileAwayChanged { .. } => {
+            StateEvent::TabCreated { tab, .. } => {
+                // Seed per-tab caches so the first real StateChanged /
+                // AwaitingPermissionChanged event compares against an
+                // explicit baseline instead of relying on `unwrap_or`
+                // fallbacks. Idempotent — re-seeding is a no-op if the tab
+                // already had cached state.
+                self.last_avatar.entry(tab.clone()).or_insert(AvatarState::Idle);
+                self.last_awaiting.entry(tab).or_insert(false);
+                return;
+            }
+            StateEvent::TabClosed { tab } => {
+                self.last_avatar.remove(&tab);
+                self.last_awaiting.remove(&tab);
+                // Drop any queued notifications targeting the closed tab —
+                // playing them after close would refer to a tab that no
+                // longer exists in the UI.
+                self.queue.retain(|q| q.tab != tab);
+                return;
+            }
+            StateEvent::ActiveTabChanged { .. }
+            | StateEvent::DoneWhileAwayChanged { .. }
+            | StateEvent::TabRenamed { .. } => {
                 return;
             }
         };

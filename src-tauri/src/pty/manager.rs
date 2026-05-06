@@ -27,6 +27,10 @@ pub struct PtyLaunchSpec {
     /// User-supplied flags + cctts invocation args.
     pub extra_args: Vec<String>,
     pub working_dir: std::path::PathBuf,
+    /// Environment additions/overrides applied on top of the inherited
+    /// environment. Empty for AI builtins; user Shell tabs may set per-tab
+    /// vars (the M2 dialog leaves env empty — schema reserved, UI deferred).
+    pub env: std::collections::HashMap<String, String>,
 }
 
 pub struct PtyManager {
@@ -97,6 +101,9 @@ impl PtyManager {
             cmd.arg(arg);
         }
         cmd.cwd(&spec.working_dir);
+        for (key, value) in &spec.env {
+            cmd.env(key, value);
+        }
 
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,

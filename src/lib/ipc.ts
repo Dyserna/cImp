@@ -1,6 +1,6 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { TabId } from './tabs/types';
+import type { TabId, TabKind } from './tabs/types';
 
 export type BytesChannel = Channel<string>;
 
@@ -48,6 +48,94 @@ export async function acknowledgeError(tab: TabId): Promise<void> {
 
 export async function tabActivate(tab: TabId): Promise<void> {
   await invoke('tab_activate', { tab });
+}
+
+export interface TabMetaWire {
+  id: TabId;
+  kind: TabKind;
+  name: string;
+  builtin: boolean;
+}
+
+/// Snapshot the live tab list. Called once from `App.svelte`'s onMount to
+/// seed the tabs store deterministically; runtime add/remove arrives via
+/// `tab-created`/`tab-closed` events afterward.
+export async function listTabs(): Promise<TabMetaWire[]> {
+  return invoke<TabMetaWire[]>('list_tabs');
+}
+
+/// Wire shape of the backend's `TabLifecycleError`. Internally tagged on
+/// `kind`; struct variants flatten their fields alongside.
+export type TabLifecycleError =
+  | { kind: 'empty-name' }
+  | { kind: 'command-not-found'; tried: string }
+  | { kind: 'cwd-not-found'; path: string }
+  | { kind: 'tab-not-found'; tab: TabId }
+  | { kind: 'builtin-not-closable' }
+  | { kind: 'wrong-kind' }
+  | { kind: 'spawn-failed'; message: string }
+  | { kind: 'internal'; message: string };
+
+/// Default shell + args returned by `default_shell_spec`. Args are
+/// pre-joined with spaces; the dialog drops them into a text input
+/// verbatim and the backend re-splits via `shlex` on submit.
+export interface DefaultShellWire {
+  command: string;
+  args: string;
+  git_bash_found: boolean;
+}
+
+export async function defaultShellSpec(): Promise<DefaultShellWire> {
+  return invoke<DefaultShellWire>('default_shell_spec');
+}
+
+export interface ShellTabConfigWire {
+  name: string;
+  command: string;
+  args: string;
+  cwd: string | null;
+  env: Record<string, string>;
+}
+
+export async function getShellTabConfig(tab: TabId): Promise<ShellTabConfigWire> {
+  return invoke<ShellTabConfigWire>('get_shell_tab_config', { tab });
+}
+
+// Tauri v2 converts Rust snake_case parameter names to camelCase on the
+// JS side. The `argsString` field below maps to the backend's
+// `args_string: String` parameter; the dialog still sends raw shell-style
+// strings and the backend re-splits via `shlex` on receive.
+export interface CreateShellTabInput {
+  name: string;
+  command: string;
+  argsString: string;
+  cwd: string | null;
+  env: Record<string, string>;
+}
+
+export async function createShellTab(input: CreateShellTabInput): Promise<TabId> {
+  return invoke<TabId>('create_shell_tab', input as unknown as Record<string, unknown>);
+}
+
+export async function closeTab(tab: TabId): Promise<void> {
+  await invoke('close_tab', { tab });
+}
+
+export async function renameTab(tab: TabId, newName: string): Promise<void> {
+  await invoke('rename_tab', { tab, newName });
+}
+
+export interface ReconfigureShellTabInput {
+  tab: TabId;
+  name: string;
+  command: string;
+  argsString: string;
+  cwd: string | null;
+  env: Record<string, string>;
+}
+
+export async function reconfigureShellTab(input: ReconfigureShellTabInput): Promise<void> {
+  await invoke('reconfigure_shell_tab', input as unknown as Record<string, unknown>);
 }
 
 /// Restart a closed Shell tab. Backend validates the tab kind/state and

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,13 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
+
+/// Shared, runtime-mutable per-tab input-length counter map. The state
+/// manager mutates it on TabAdded/TabRemoved; the IPC `pty_write` handler
+/// reads a counter Arc per-write. `RwLock` rather than `DashMap` because
+/// mutations are rare (tab create/close) while reads are also rare (one per
+/// keystroke per tab); a plain RwLock is simpler than a third dependency.
+pub type InputLengths = Arc<RwLock<HashMap<TabId, Arc<AtomicI32>>>>;
 
 /// Identifier for one of the multi-tab subprocesses cctts owns. Two
 /// reserved variants (`Claude`, `Aider`) cover the v1 builtins; `Shell(id)`
@@ -43,10 +50,13 @@ impl TabId {
         }
     }
 
-    /// Every tab the app currently owns. M1 ships three — the two AI
-    /// builtins plus the hardcoded Shell-1. M2/M3 generalize this to
-    /// reflect user-managed tabs from settings.
-    pub fn all() -> Vec<TabId> {
+    /// Initial seed list of tabs at app launch. M1 shipped three; M2 keeps
+    /// the same launch set but tabs can now be added/removed at runtime via
+    /// `create_shell_tab` / `close_tab`. Runtime code paths must NOT rely on
+    /// this list as authoritative — consult the registry's live `tab_order`
+    /// instead. The function is retained for startup wiring (registry seed,
+    /// tab metas for state manager) and for the test suite.
+    pub fn launch_seed() -> Vec<TabId> {
         vec![
             TabId::Claude,
             TabId::Aider,
@@ -204,6 +214,19 @@ pub enum StateSignal {
     /// Clears the `closed` flag and emits `TabClosedStateChanged { closed:
     /// false }`. AI tabs don't use this — they have no closed sub-state.
     ShellRestarted { tab: TabId },
+    /// A new tab has been registered with the runtime (M2's
+    /// `create_shell_tab`). The state manager allocates a `TabState`
+    /// entry, an input-length counter, and emits `StateEvent::TabCreated`
+    /// so the frontend mirrors the addition into its tabs store.
+    TabAdded { meta: TabMeta, position: usize },
+    /// A tab has been removed from the runtime (M2's `close_tab`). The
+    /// state manager drops its `TabState`, drops the input-length counter,
+    /// and emits `StateEvent::TabClosed`.
+    TabRemoved { tab: TabId },
+    /// A tab's display name was changed (M2's `rename_tab` /
+    /// `reconfigure_shell_tab`). The state manager updates its name and
+    /// emits `StateEvent::TabRenamed`.
+    TabRenameRequested { tab: TabId, name: String },
 }
 
 impl StateSignal {
@@ -223,7 +246,10 @@ impl StateSignal {
             | Self::TabActivated { tab }
             | Self::PermissionPromptDetected { tab }
             | Self::PermissionPromptResolved { tab }
-            | Self::ShellRestarted { tab } => tab.clone(),
+            | Self::ShellRestarted { tab }
+            | Self::TabRemoved { tab }
+            | Self::TabRenameRequested { tab, .. } => tab.clone(),
+            Self::TabAdded { meta, .. } => meta.id.clone(),
         }
     }
 }
@@ -251,6 +277,46 @@ pub enum StateEvent {
         closed: bool,
         exit_code: Option<i32>,
     },
+    /// A new tab was added to the runtime. Frontend appends to its tabs
+    /// store; notification manager seeds its per-tab caches. `position` is
+    /// the tab's index in the live tab order. `builtin: false` for every
+    /// runtime-added tab (only the launch seed contains builtins, and they
+    /// are emitted via this event during startup-replay too).
+    TabCreated {
+        tab: TabId,
+        kind: TabKindWire,
+        name: String,
+        builtin: bool,
+        position: usize,
+    },
+    /// A tab was removed from the runtime. Frontend drops it from the tabs
+    /// store; per-tab cached state (avatar, error, closed-state) is also
+    /// dropped on this edge.
+    TabClosed { tab: TabId },
+    /// A tab's display name was updated. Triggered by both `rename_tab` and
+    /// `reconfigure_shell_tab` when the latter's `name` field changed.
+    TabRenamed { tab: TabId, name: String },
+}
+
+/// Wire-format projection of `TabKind` for the `TabCreated` event. We avoid
+/// serializing `TabKind` directly because the inner `AiToolKind` only
+/// matters at the backend layer (permission patterns, TTS injection); the
+/// frontend just needs to know whether a tab is a Shell or an AI tool to
+/// gate close-button rendering and similar UI affordances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TabKindWire {
+    AiTool,
+    Shell,
+}
+
+impl From<&TabKind> for TabKindWire {
+    fn from(k: &TabKind) -> Self {
+        match k {
+            TabKind::AiTool(_) => TabKindWire::AiTool,
+            TabKind::Shell => TabKindWire::Shell,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -305,7 +371,7 @@ pub fn spawn_state_manager(
     app: AppHandle,
     rx: mpsc::Receiver<StateSignal>,
     state_events: broadcast::Sender<StateEvent>,
-    input_lengths: HashMap<TabId, Arc<AtomicI32>>,
+    input_lengths: InputLengths,
     tab_metas: Vec<TabMeta>,
     initial_active: TabId,
 ) {
@@ -318,12 +384,16 @@ async fn run(
     app: AppHandle,
     mut rx: mpsc::Receiver<StateSignal>,
     state_events: broadcast::Sender<StateEvent>,
-    input_lengths: HashMap<TabId, Arc<AtomicI32>>,
+    input_lengths: InputLengths,
     tab_metas: Vec<TabMeta>,
     initial_active: TabId,
 ) {
-    let mut tabs: HashMap<TabId, TabState> = tab_metas
-        .into_iter()
+    // Preserve tab_metas order so the startup TabCreated emit positions
+    // match the registry's tab order (registry uses the same launch_seed).
+    let seed_metas: Vec<TabMeta> = tab_metas;
+    let mut tabs: HashMap<TabId, TabState> = seed_metas
+        .iter()
+        .cloned()
         .map(|m| (m.id, TabState::new(m.kind, m.name)))
         .collect();
     let mut active = initial_active;
@@ -333,7 +403,21 @@ async fn run(
 
     // Emit the initial Idle for each tab so the frontend has a baseline before
     // any signal arrives. The avatar component skips its first-render
-    // transition so this doesn't play an unwanted animation.
+    // transition so this doesn't play an unwanted animation. We also emit a
+    // `TabCreated` for each seed tab so the frontend's tabs store has one
+    // event-driven source of truth — no static frontend list needs to mirror
+    // the backend's launch seed.
+    for (position, meta) in seed_metas.iter().enumerate() {
+        emit_tab_created(
+            &app,
+            &state_events,
+            meta.id.clone(),
+            (&meta.kind).into(),
+            meta.name.clone(),
+            matches!(meta.id, TabId::Claude | TabId::Aider),
+            position,
+        );
+    }
     for (tab, ts) in &tabs {
         emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
     }
@@ -343,6 +427,63 @@ async fn run(
         tokio::select! {
             maybe = rx.recv() => {
                 let Some(signal) = maybe else { break };
+
+                // Runtime tab lifecycle (TabAdded / TabRemoved /
+                // TabRenameRequested) is handled before the per-tab
+                // transition routing because (a) the target TabState may
+                // not exist yet (TabAdded) or any longer (TabRemoved), and
+                // (b) the frontend needs the events emitted regardless of
+                // any avatar-state side effects. The registry computes the
+                // `position` field; we just relay it.
+                if let StateSignal::TabAdded { meta, position } = &signal {
+                    let meta = meta.clone();
+                    let position = *position;
+                    if !tabs.contains_key(&meta.id) {
+                        tabs.insert(
+                            meta.id.clone(),
+                            TabState::new(meta.kind.clone(), meta.name.clone()),
+                        );
+                        if let Ok(mut g) = input_lengths.write() {
+                            g.entry(meta.id.clone())
+                                .or_insert_with(|| Arc::new(AtomicI32::new(0)));
+                        }
+                        info!(tab = ?meta.id, position, "tab added");
+                        emit_state(&app, &state_events, meta.id.clone(), AvatarState::Idle);
+                        emit_tab_created(
+                            &app,
+                            &state_events,
+                            meta.id.clone(),
+                            (&meta.kind).into(),
+                            meta.name,
+                            matches!(meta.id, TabId::Claude | TabId::Aider),
+                            position,
+                        );
+                    }
+                    continue;
+                }
+                if let StateSignal::TabRemoved { tab } = &signal {
+                    let tab = tab.clone();
+                    if tabs.remove(&tab).is_some() {
+                        if let Ok(mut g) = input_lengths.write() {
+                            g.remove(&tab);
+                        }
+                        info!(?tab, "tab removed");
+                        emit_tab_closed_event(&app, &state_events, tab);
+                    }
+                    continue;
+                }
+                if let StateSignal::TabRenameRequested { tab, name } = &signal {
+                    let tab = tab.clone();
+                    let name = name.clone();
+                    if let Some(ts) = tabs.get_mut(&tab) {
+                        if ts.name != name {
+                            ts.name = name.clone();
+                            info!(?tab, name = %name, "tab renamed");
+                            emit_tab_renamed(&app, &state_events, tab, name);
+                        }
+                    }
+                    continue;
+                }
 
                 // TabActivated isn't a per-tab transition — it just moves the
                 // active pointer and re-broadcasts. We DON'T re-emit the new
@@ -515,11 +656,17 @@ async fn run(
             }
             _ = tick.tick() => {
                 // Per-tab idle-Listening sweep. Each tab's input-length
-                // counter is independent.
+                // counter is independent. The RwLock read lock is held only
+                // long enough to clone the per-tab `Arc<AtomicI32>`s — the
+                // map is never mutated under it during the sweep.
+                let snapshot: HashMap<TabId, Arc<AtomicI32>> = match input_lengths.read() {
+                    Ok(g) => g.clone(),
+                    Err(_) => continue,
+                };
                 for (tab, ts) in tabs.iter_mut() {
                     if ts.avatar_state != AvatarState::Listening { continue; }
                     if ts.composing { continue; }
-                    let len = input_lengths
+                    let len = snapshot
                         .get(tab)
                         .map(|c| c.load(Ordering::Relaxed))
                         .unwrap_or(0);
@@ -675,6 +822,45 @@ fn emit_tab_closed_state(
             exit_code,
         },
     );
+}
+
+fn emit_tab_created(
+    app: &AppHandle,
+    bcast: &broadcast::Sender<StateEvent>,
+    tab: TabId,
+    kind: TabKindWire,
+    name: String,
+    builtin: bool,
+    position: usize,
+) {
+    dispatch(
+        app,
+        bcast,
+        StateEvent::TabCreated {
+            tab,
+            kind,
+            name,
+            builtin,
+            position,
+        },
+    );
+}
+
+fn emit_tab_closed_event(
+    app: &AppHandle,
+    bcast: &broadcast::Sender<StateEvent>,
+    tab: TabId,
+) {
+    dispatch(app, bcast, StateEvent::TabClosed { tab });
+}
+
+fn emit_tab_renamed(
+    app: &AppHandle,
+    bcast: &broadcast::Sender<StateEvent>,
+    tab: TabId,
+    name: String,
+) {
+    dispatch(app, bcast, StateEvent::TabRenamed { tab, name });
 }
 
 #[cfg(test)]

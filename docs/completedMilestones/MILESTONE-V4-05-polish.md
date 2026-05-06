@@ -6,7 +6,7 @@ Round out v1.3 with cross-platform DnD validation, focused-pane indicator tuning
 
 This is the smallest of the v1.3 milestones in scope but the most validation-heavy. Mouse-event behavior between WebView2 (Windows) and WebKitGTK (Linux) has known differences; M5 is where those get found and fixed.
 
-Read `DESIGN-V4.md` and M1 through M4 first.
+Read `DESIGN.md` and M1 through M4 first.
 
 ## What This Milestone Delivers
 

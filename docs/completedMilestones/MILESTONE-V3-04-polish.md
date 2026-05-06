@@ -6,7 +6,7 @@ Round out v1.2 with the remaining items deferred from M1–M3: notification text
 
 This is the smallest of the four milestones in scope but the most validation-heavy. The work here ensures v1.2 ships in a state where a user with a fresh install on either Windows or Linux can productively use Shell tabs without surprises.
 
-Read `DESIGN-V3.md`, M1, M2, M3 first.
+Read `DESIGN.md`, M1, M2, M3 first.
 
 ## What This Milestone Delivers
 

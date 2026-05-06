@@ -144,6 +144,18 @@ function onKeyDown(event: KeyboardEvent): void {
   cleanup(state.kind === 'dragging');
 }
 
+/// Forcibly cancel any in-flight drag (pending or dragging) without
+/// committing a drop. Called by external state mutations that yank the
+/// ground out from under the drag — e.g. restoring a layout preset
+/// while a tab is mid-drag, where the source pane id may no longer
+/// exist after `layout.set(...)`. Idempotent: a no-op when state is
+/// already idle.
+export function cancelDrag(): void {
+  const state = get(dragState);
+  if (state.kind === 'idle') return;
+  cleanup(false);
+}
+
 function cleanup(suppressClick: boolean): void {
   const state = get(dragState);
   if (state.kind !== 'idle') {

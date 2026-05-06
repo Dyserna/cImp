@@ -6,7 +6,7 @@ Persist the layout tree and focused-pane ID to settings, restore them on app lau
 
 After this milestone, splits and arrangements survive app restarts. The user can also save their favorite arrangements as named presets and switch between them with one click.
 
-Read `DESIGN-V4.md`, M1, M2, M3 first.
+Read `DESIGN.md`, M1, M2, M3 first.
 
 ## What This Milestone Delivers
 

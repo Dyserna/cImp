@@ -344,7 +344,17 @@ export function destroyTerminal(tabId: TabId): void {
   entry.unsubFont();
   entry.unsubClosed?.();
   setTerminalFocuser(tabId, null);
-  entry.term.dispose();
+  // xterm.dispose() can throw if internal state was already partially
+  // torn down by a rapid create-then-destroy or by a host element
+  // removed out from under it. Registry entry is already deleted above,
+  // so a swallowed error here can't leave dangling references — but an
+  // uncaught throw bubbles to the console as an unhandled error. Trace
+  // log instead.
+  try {
+    entry.term.dispose();
+  } catch (e) {
+    console.warn(`xterm dispose for ${tabId} threw:`, e);
+  }
   if (entry.host.parentElement) {
     entry.host.parentElement.removeChild(entry.host);
   }

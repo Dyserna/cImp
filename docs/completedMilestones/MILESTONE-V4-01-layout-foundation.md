@@ -11,7 +11,7 @@ This milestone ships *without* drag-and-drop. To validate the rendering and rout
 
 This is the architectural lift. The visible feature (drag) lands in M2; M1 is making sure the substrate works.
 
-Read `DESIGN-V4.md` first; this document assumes its terminology.
+Read `DESIGN.md` first; this document assumes its terminology.
 
 ## What This Milestone Delivers
 

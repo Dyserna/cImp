@@ -133,10 +133,13 @@
     <LayoutNodeRenderer node={split.first} />
   </div>
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div
     class="splitter"
     role="separator"
     aria-orientation={split.direction === 'horizontal' ? 'vertical' : 'horizontal'}
+    aria-label="Resize panes"
+    tabindex="0"
     onmousedown={onSplitterMouseDown}
   ></div>
   <div class="split-child" style:flex={`${1 - clampedRatio} 1 0%`}>
@@ -180,5 +183,10 @@
   }
   .splitter:hover {
     background: #4a90e2;
+  }
+  .splitter:focus-visible {
+    background: #4a90e2;
+    outline: 2px solid #6ab0ff;
+    outline-offset: -1px;
   }
 </style>

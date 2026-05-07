@@ -26,10 +26,11 @@ if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(target)) {
 }
 
 const pkgPath = join(repo, 'package.json');
+const lockPath = join(repo, 'package-lock.json');
 const cargoPath = join(repo, 'src-tauri', 'Cargo.toml');
 const confPath = join(repo, 'src-tauri', 'tauri.conf.json');
 
-for (const p of [pkgPath, cargoPath, confPath]) {
+for (const p of [pkgPath, lockPath, cargoPath, confPath]) {
   if (!existsSync(p)) {
     console.error(`error: missing ${p}`);
     process.exit(1);
@@ -41,6 +42,17 @@ const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
 const prevPkg = pkg.version;
 pkg.version = target;
 writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+
+// package-lock.json — root version appears twice: top-level and inside
+// packages[""]. `npm ci` is strict about this matching package.json, so
+// touching both is non-optional.
+const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+const prevLock = lock.version;
+lock.version = target;
+if (lock.packages && lock.packages['']) {
+  lock.packages[''].version = target;
+}
+writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n');
 
 // Cargo.toml — only the [package] version line. We avoid a full TOML parse
 // dep; the regex anchors on `^version = "..."` inside [package].
@@ -75,10 +87,11 @@ try {
 
 console.log(`\nbumped:`);
 console.log(`  package.json              ${prevPkg} -> ${target}`);
+console.log(`  package-lock.json         ${prevLock} -> ${target}`);
 console.log(`  src-tauri/Cargo.toml      ${prevCargo} -> ${target}`);
 console.log(`  src-tauri/tauri.conf.json ${prevConf} -> ${target}`);
 console.log(`\nnext:`);
-console.log(`  git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock`);
+console.log(`  git add package.json package-lock.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock`);
 console.log(`  git commit -m "Release v${target}"`);
 console.log(`  git tag v${target}`);
 console.log(`  git push && git push --tags`);

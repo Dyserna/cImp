@@ -8,6 +8,7 @@
   // restart — per design, the new config takes effect on next restart.
   // A footer note communicates this to the user.
   import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
   import { closeDialog, dialogState } from './store';
   import {
     getShellTabConfig,
@@ -15,6 +16,14 @@
     type TabLifecycleError,
   } from '../ipc';
   import ShellTabFields from './ShellTabFields.svelte';
+  import { settings as settingsStore } from '../settings/store';
+  import type {
+    TerminalThemeSettings,
+    ThemeColorsWire,
+  } from '../settings/types';
+  import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from '../themes';
+  import ThemeSwatch from '../settings/ThemeSwatch.svelte';
+  import CustomThemeEditor from '../settings/CustomThemeEditor.svelte';
 
   let name = $state('');
   let command = $state('');
@@ -22,8 +31,21 @@
   let cwd = $state('');
   let notificationsError = $state('');
   let notificationsExited = $state('');
+  let themeOverride = $state<TerminalThemeSettings | null>(null);
   let error = $state<TabLifecycleError | null>(null);
   let busy = $state(false);
+
+  // Live global theme name, used for the "Use global default (current: X)"
+  // entry label. Reactive via $derived so changes elsewhere reflect.
+  let globalThemeName = $derived($settingsStore.terminal.theme.name);
+
+  // Override-row dropdown value:
+  //   '__inherit'      → themeOverride = null
+  //   bundled name     → themeOverride = { name, custom: null }
+  //   'Custom'         → themeOverride = { name: 'Custom', custom: ... }
+  let overrideSelection = $derived(
+    themeOverride === null ? '__inherit' : themeOverride.name,
+  );
 
   let isOpen = $derived($dialogState.kind === 'configure-tab');
   let targetTab = $derived(
@@ -44,6 +66,12 @@
   async function initFields(tab: string): Promise<void> {
     error = null;
     busy = false;
+    // Read theme_override from the live settings store. The IPC's
+    // `get_shell_tab_config` doesn't carry it (kept narrow for M2's
+    // shell-fields shape); the store is canonical and always in sync
+    // because the backend broadcasts on change.
+    const liveTab = get(settingsStore).tabs.find((t) => t.id === tab);
+    themeOverride = liveTab?.theme_override ?? null;
     try {
       const cfg = await getShellTabConfig(tab);
       name = cfg.name;
@@ -64,6 +92,33 @@
     }
   }
 
+  /// Translate the dropdown selection into a `theme_override` value.
+  /// Seeds the Custom block from the previously-effective palette so
+  /// the user opens the editor with sensible starting colors.
+  function selectOverride(value: string): void {
+    if (value === '__inherit') {
+      themeOverride = null;
+      return;
+    }
+    if (value === 'Custom') {
+      // Determine seed source: the previously-effective theme is either
+      // the prior override (if any) or the global theme.
+      const liveGlobal = get(settingsStore).terminal.theme;
+      const previousName =
+        themeOverride === null ? liveGlobal.name : themeOverride.name;
+      const seed =
+        previousName === 'Custom'
+          ? BUNDLED_THEMES.Default
+          : resolveBundledTheme(previousName);
+      themeOverride = {
+        name: 'Custom',
+        custom: { ...seed } as ThemeColorsWire,
+      };
+      return;
+    }
+    themeOverride = { name: value, custom: null };
+  }
+
   function cancel(): void {
     closeDialog();
   }
@@ -82,6 +137,7 @@
         env: {},
         notificationsError,
         notificationsExited,
+        themeOverride,
       });
       closeDialog();
     } catch (e) {
@@ -142,8 +198,39 @@
         {/if}
       </div>
     {/if}
+
+    <h3 class="section-h">Appearance</h3>
+    <label class="appearance-row">
+      <span>Terminal palette</span>
+      <select
+        value={overrideSelection}
+        onchange={(e) =>
+          selectOverride((e.currentTarget as HTMLSelectElement).value)}
+      >
+        <option value="__inherit">Use global default (current: {globalThemeName})</option>
+        {#each BUNDLED_THEME_NAMES as paletteName}
+          <option value={paletteName}>{paletteName}</option>
+        {/each}
+        <option value="Custom">Custom…</option>
+      </select>
+      {#if themeOverride !== null}
+        <ThemeSwatch name={themeOverride.name} custom={themeOverride.custom} />
+      {/if}
+    </label>
+    {#if themeOverride && themeOverride.name === 'Custom' && themeOverride.custom}
+      <CustomThemeEditor
+        value={themeOverride.custom}
+        onchange={(next) => {
+          themeOverride = themeOverride
+            ? { ...themeOverride, custom: next }
+            : null;
+        }}
+      />
+    {/if}
+
     <small class="footer-note">
-      Changes apply on next shell restart.
+      Changes apply on next shell restart. Palette changes apply
+      immediately.
     </small>
     <div class="actions">
       <button type="button" class="cancel" onclick={cancel} disabled={busy}>
@@ -182,6 +269,28 @@
     margin: 0 0 var(--space-4);
     font-size: 16px;
     font-weight: 600;
+  }
+  .section-h {
+    margin: var(--space-4) 0 var(--space-2) 0;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .appearance-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+  }
+  .appearance-row span {
+    flex: 0 0 140px;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+  }
+  .appearance-row select {
+    flex: 1;
   }
   .footer-note {
     color: var(--text-tertiary);

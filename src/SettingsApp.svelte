@@ -23,6 +23,10 @@
   import { AI_TABS } from './lib/tabs/types';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
+  import ThemeSwatch from './lib/settings/ThemeSwatch.svelte';
+  import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
+  import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from './lib/themes';
+  import type { ThemeColorsWire } from './lib/settings/types';
 
   let voices = $state<string[]>([]);
   // Per-tab "applied" baselines — used to compute the Restart Required
@@ -461,6 +465,63 @@
         Governs the cctts chrome — tab bar, status bar, dialogs. Distinct
         from the terminal palette below.
       </small>
+
+      <label class="palette-row">
+        <span>Terminal palette</span>
+        <select
+          value={snapshot.terminal.theme.name}
+          onchange={(e) => {
+            const name = (e.currentTarget as HTMLSelectElement).value;
+            patch((s) => {
+              // Read the previous name from `s` itself — `patch`'s
+              // working copy holds the pre-update value at entry, which
+              // is what we want for seeding.
+              const previousName = s.terminal.theme.name;
+              s.terminal.theme.name = name;
+              if (name === 'Custom') {
+                // Seed custom from the previously-active palette so the
+                // user opens the editor with sensible starting colors
+                // rather than 22 black squares. The seed is a snapshot;
+                // edits afterwards diverge naturally.
+                if (!s.terminal.theme.custom) {
+                  const seed =
+                    previousName === 'Custom'
+                      ? BUNDLED_THEMES.Default
+                      : resolveBundledTheme(previousName);
+                  s.terminal.theme.custom = { ...seed } as ThemeColorsWire;
+                }
+              } else {
+                // Drop any custom block when leaving Custom — avoids a
+                // stale custom payload sitting in settings.json.
+                s.terminal.theme.custom = null;
+              }
+            });
+          }}
+        >
+          {#each BUNDLED_THEME_NAMES as name}
+            <option value={name}>{name}</option>
+          {/each}
+          <option value="Custom">Custom…</option>
+        </select>
+        <ThemeSwatch
+          name={snapshot.terminal.theme.name}
+          custom={snapshot.terminal.theme.custom}
+        />
+      </label>
+      <small class="hint">
+        Colors used inside terminal tabs. Each tab can override this in
+        its Configure dialog.
+      </small>
+
+      {#if snapshot.terminal.theme.name === 'Custom' && snapshot.terminal.theme.custom}
+        <CustomThemeEditor
+          value={snapshot.terminal.theme.custom}
+          onchange={(next) =>
+            patch((s) => {
+              s.terminal.theme.custom = next;
+            })}
+        />
+      {/if}
     </section>
 
     <section>
@@ -484,17 +545,6 @@
           onchange={(e) =>
             patch((s) => (s.display.terminal_font_size = Math.max(8, +(e.currentTarget as HTMLInputElement).value)))}
         />
-      </label>
-      <label>
-        <span>Theme</span>
-        <select
-          value={snapshot.display.theme}
-          onchange={(e) =>
-            patch((s) => (s.display.theme = (e.currentTarget as HTMLSelectElement).value))}
-        >
-          <option value="dark">Dark</option>
-          <option value="light">Light</option>
-        </select>
       </label>
       <label class="checkbox">
         <input

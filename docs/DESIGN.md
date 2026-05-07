@@ -611,8 +611,13 @@ The on-disk JSON shape, current as of v1.3:
   "display": {
     "terminal_font_family": "Consolas, Menlo, \"DejaVu Sans Mono\", monospace",
     "terminal_font_size": 14,
-    "theme": "dark",
     "show_tts_markup": false
+  },
+  "terminal": {
+    "theme": {
+      "name": "Default",
+      "custom": null
+    }
   },
   "behavior": {
     "interrupt_on_input": true,
@@ -656,7 +661,8 @@ The on-disk JSON shape, current as of v1.3:
         "awaiting_permission": "Claude is awaiting permission",
         "error": "Claude encountered an error"
       },
-      "first_launch_notice_dismissed": true
+      "first_launch_notice_dismissed": true,
+      "theme_override": null
     },
     {
       "kind": "ai_tool",
@@ -670,7 +676,8 @@ The on-disk JSON shape, current as of v1.3:
       "env": {},
       "tts_injection": { "enabled": false, "instructions": "" },
       "notifications": { "...": "..." },
-      "first_launch_notice_dismissed": false
+      "first_launch_notice_dismissed": false,
+      "theme_override": { "name": "Solarized Dark", "custom": null }
     },
     {
       "kind": "shell",
@@ -684,7 +691,8 @@ The on-disk JSON shape, current as of v1.3:
       "notifications": {
         "error": "Shell encountered an error",
         "exited": "Shell exited (code {code})"
-      }
+      },
+      "theme_override": null
     }
   ],
   "processing": { "stability_timeout_ms": 200, "max_hold_ms": 500 },

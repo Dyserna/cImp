@@ -66,6 +66,17 @@ pub fn migrate_if_needed(
         changed = true;
     }
 
+    // v1.3 → v1.4: V1.4-01 adds the top-level `terminal` group (with a
+    // `theme` sub-group) and a per-tab `theme_override` field. Detected
+    // as "post-v1.3 (layout key present) but no `terminal` key". The
+    // dead `display.theme` field is dropped at the same time. Cascades
+    // naturally for files coming through earlier branches.
+    if looks_v1_3(value) {
+        write_backup(path, "v1.3", value)?;
+        migrate_v1_3_to_v1_4(value);
+        changed = true;
+    }
+
     Ok(changed)
 }
 
@@ -93,6 +104,20 @@ fn looks_v1_2(value: &Value) -> bool {
         .map(|o| o.contains_key("layout"))
         .unwrap_or(false);
     tabs_is_array && layout_field_absent
+}
+
+/// Is this a v1.3 file that lacks the v1.4 `terminal` field? V1.4-01's
+/// schema-bump check. The `layout` key (added by the v1.2→v1.3 branch
+/// above) must be present so we don't false-positive on v1.0/v1.1/v1.2
+/// inputs already on their way through the cascade — those land in
+/// `looks_v1_2` first, get rewritten with a `layout`, then this branch
+/// fires on the same value before flush. A fresh-install v1.4 file has
+/// `terminal` populated and skips this branch.
+fn looks_v1_3(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    obj.contains_key("layout") && !obj.contains_key("terminal")
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -384,6 +409,49 @@ fn migrate_v1_2_to_v1_3(value: &mut Value) {
     // Drop the redundant session.active_tab_id; the layout owns it now.
     if let Some(session) = root.get_mut("session").and_then(Value::as_object_mut) {
         session.remove("active_tab_id");
+    }
+}
+
+// --- v1.3 → v1.4 ------------------------------------------------------------
+
+/// V1.4-01: add the `terminal.theme` group, stamp `theme_override: null`
+/// on every existing tab, and drop the now-dead `display.theme` field
+/// (the xterm.js construction in `terminals.ts` ignored it pre-V1.4-01;
+/// the new `terminal.theme.name` supersedes it under a clearer name).
+///
+/// Idempotent on second pass because the inserted `terminal` key makes
+/// `looks_v1_3` return false next time.
+fn migrate_v1_3_to_v1_4(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    // Drop dead `display.theme`.
+    if let Some(display) = root.get_mut("display").and_then(Value::as_object_mut) {
+        display.remove("theme");
+    }
+
+    // Insert default `terminal.theme` group. Matches the Default impl
+    // on `TerminalThemeSettings` in schema.rs — keep these in sync.
+    root.insert(
+        "terminal".to_string(),
+        json!({
+            "theme": {
+                "name": "Default",
+                "custom": null
+            }
+        }),
+    );
+
+    // Stamp `theme_override: null` on every existing tab so the on-disk
+    // file is self-describing. `serde(default)` would cover the absence
+    // anyway, but explicit fields make hand-editing less surprising.
+    if let Some(tabs) = root.get_mut("tabs").and_then(Value::as_array_mut) {
+        for tab in tabs.iter_mut() {
+            if let Some(obj) = tab.as_object_mut() {
+                obj.insert("theme_override".to_string(), Value::Null);
+            }
+        }
     }
 }
 
@@ -685,6 +753,99 @@ mod tests {
         )
         .unwrap();
         assert!(!looks_v1_2(&v));
+    }
+
+    #[test]
+    fn v1_3_to_v1_4_adds_terminal_group_and_stamps_overrides() {
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "display": { "terminal_font_size": 14, "theme": "dark" },
+                "tabs": [
+                    { "kind": "ai_tool", "id": "claude", "name": "Claude" },
+                    { "kind": "shell", "id": "shell-default-1", "name": "Shell 1" }
+                ],
+                "layout": {
+                    "tree": { "type": "pane", "id": "pane-1", "tab_ids": ["claude", "shell-default-1"], "active_tab_id": "claude" },
+                    "focused_pane_id": "pane-1"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(looks_v1_3(&v));
+        migrate_v1_3_to_v1_4(&mut v);
+
+        // terminal.theme.name == "Default"
+        let term_theme = v
+            .get("terminal")
+            .and_then(|t| t.get("theme"))
+            .expect("terminal.theme inserted");
+        assert_eq!(term_theme.get("name").unwrap(), "Default");
+        assert!(term_theme.get("custom").unwrap().is_null());
+
+        // display.theme dropped
+        assert!(v
+            .get("display")
+            .and_then(|d| d.get("theme"))
+            .is_none());
+
+        // Every tab has theme_override: null
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        for tab in tabs {
+            let key = tab
+                .as_object()
+                .and_then(|o| o.get("theme_override"))
+                .expect("theme_override stamped");
+            assert!(key.is_null());
+        }
+
+        // Re-detection is false after migration.
+        assert!(!looks_v1_3(&v));
+    }
+
+    #[test]
+    fn v1_4_file_is_not_re_detected() {
+        // Fresh-install v1.4 file: `terminal` key is present.
+        let v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [{ "kind": "ai_tool", "id": "claude", "theme_override": null }],
+                "layout": null,
+                "terminal": { "theme": { "name": "Default", "custom": null } }
+            }"#,
+        )
+        .unwrap();
+        assert!(!looks_v1_3(&v));
+    }
+
+    #[test]
+    fn v1_2_cascades_through_v1_3_and_v1_4() {
+        // A v1.2 file (tabs array, no layout) coming in cold should
+        // exit migration as a v1.4 file: layout populated, terminal
+        // group populated, theme_override stamped on every tab.
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "display": { "theme": "dark" },
+                "tabs": [
+                    { "kind": "ai_tool", "id": "claude", "name": "Claude" },
+                    { "kind": "shell", "id": "shell-default-1", "name": "Shell 1" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        // Simulate the dispatcher's two passes.
+        assert!(looks_v1_2(&v));
+        migrate_v1_2_to_v1_3(&mut v);
+        assert!(looks_v1_3(&v));
+        migrate_v1_3_to_v1_4(&mut v);
+
+        // Final state: layout from v1.2→v1.3, terminal from v1.3→v1.4.
+        assert!(v.get("layout").is_some());
+        assert!(v.get("terminal").is_some());
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        for tab in tabs {
+            assert!(tab.get("theme_override").unwrap().is_null());
+        }
     }
 
     #[test]

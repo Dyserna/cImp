@@ -289,8 +289,16 @@ Open with `Ctrl+,` or the cog button on the avatar.
   overrides, transition video + duration. Empty transition path or
   `duration = 0` falls back to a 150 ms crossfade.
 - **Waveform:** color, line width, glow, opacity.
-- **Display:** terminal font family + size, theme, toggle to render TTS
-  markup verbatim in the terminal (debug aid).
+- **Display:** terminal font family + size, toggle to render TTS markup
+  verbatim in the terminal (debug aid).
+- **Appearance:** UI chrome theme (Modern Dark) and **terminal palette** —
+  12 bundled palettes (Default, Dracula, Solarized Dark/Light, Nord,
+  Tomorrow Night, Gruvbox Dark/Light, One Dark, Monokai, Tokyo Night,
+  GitHub Dark) plus a 22-color Custom editor for foreground, background,
+  cursor, selection, ANSI 8, and bright 8. Each tab can override the
+  global palette via Configure Tab → Appearance — useful for color-coding
+  Claude vs. aider vs. shells. Per-tab overrides travel with the tab
+  through drag-and-drop.
 - **Behavior:** interrupt TTS on input, auto-speak detected segments.
 - **Compose:** min/max sheet height for the slide-up compose overlay.
 - **Shortcuts:** rebindable open/submit/cancel for compose, open settings,

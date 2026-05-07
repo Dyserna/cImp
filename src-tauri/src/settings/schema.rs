@@ -49,9 +49,13 @@ pub struct Settings {
     pub layout_presets: Vec<LayoutPreset>,
     /// UI chrome theme settings (V5). The `theme` field selects the
     /// design-token block applied to the cctts chrome (tab bar, status
-    /// bar, dialogs, settings). Distinct from `display.theme`, which
+    /// bar, dialogs, settings). Distinct from `terminal.theme`, which
     /// governs the xterm.js terminal palette inside each tab.
     pub ui: UiSettings,
+    /// Terminal-pane settings (V1.4-01+): xterm.js theme today, plus
+    /// the V1.4-02 background image/color group when that ships.
+    /// Distinct from `ui`, which themes the cctts chrome.
+    pub terminal: TerminalSettings,
 }
 
 impl Settings {
@@ -194,6 +198,12 @@ pub struct AiToolTabConfig {
     /// through migration verbatim so the aider banner doesn't re-appear for
     /// existing users.
     pub first_launch_notice_dismissed: bool,
+    /// V1.4-01 per-tab terminal palette override. `None` means inherit
+    /// the global `terminal.theme`; `Some(_)` replaces it with the
+    /// override's bundled name (or Custom block) for this tab only.
+    /// The override travels with the tab through drag-and-drop because
+    /// it lives on the tab itself, not on a pane.
+    pub theme_override: Option<TerminalThemeSettings>,
 }
 
 impl Default for AiToolTabConfig {
@@ -212,6 +222,7 @@ impl Default for AiToolTabConfig {
             tts_injection: TtsInjection::default(),
             notifications: AiNotificationConfig::default(),
             first_launch_notice_dismissed: false,
+            theme_override: None,
         }
     }
 }
@@ -227,6 +238,10 @@ pub struct ShellTabConfig {
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub notifications: ShellNotificationConfig,
+    /// V1.4-01 per-tab terminal palette override. `None` means inherit
+    /// the global `terminal.theme`; `Some(_)` replaces it for this tab.
+    /// See `AiToolTabConfig::theme_override` for the full rationale.
+    pub theme_override: Option<TerminalThemeSettings>,
 }
 
 impl Default for ShellTabConfig {
@@ -240,6 +255,7 @@ impl Default for ShellTabConfig {
             cwd: None,
             env: HashMap::new(),
             notifications: ShellNotificationConfig::default(),
+            theme_override: None,
         }
     }
 }
@@ -311,6 +327,7 @@ pub fn default_claude_tab() -> TabConfig {
         // Claude has no first-launch notice; pre-dismissed so the overlay
         // code can use a single per-tab predicate.
         first_launch_notice_dismissed: true,
+        theme_override: None,
     })
 }
 
@@ -334,6 +351,7 @@ pub fn default_aider_tab() -> TabConfig {
             error: "Aider encountered an error".to_string(),
         },
         first_launch_notice_dismissed: false,
+        theme_override: None,
     })
 }
 
@@ -351,6 +369,7 @@ pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
         cwd: None,
         env: HashMap::new(),
         notifications: ShellNotificationConfig::default(),
+        theme_override: None,
     })
 }
 
@@ -489,7 +508,6 @@ impl Default for WaveformSettings {
 pub struct DisplaySettings {
     pub terminal_font_family: String,
     pub terminal_font_size: u32,
-    pub theme: String,
     pub show_tts_markup: bool,
 }
 
@@ -499,7 +517,6 @@ impl Default for DisplaySettings {
             terminal_font_family: "Consolas, Menlo, \"DejaVu Sans Mono\", monospace"
                 .to_string(),
             terminal_font_size: 14,
-            theme: "dark".to_string(),
             show_tts_markup: false,
         }
     }
@@ -537,6 +554,39 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             theme: "modern-dark".to_string(),
+        }
+    }
+}
+
+/// Terminal-pane settings (V1.4-01+). Currently holds the xterm.js
+/// palette config; V1.4-02 will add a `background` sub-group to this
+/// same struct for image and solid-color background support.
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct TerminalSettings {
+    pub theme: TerminalThemeSettings,
+}
+
+/// Terminal palette setting. `name` is either a bundled theme name
+/// (e.g., "Default", "Dracula") or "Custom" — in which case `custom`
+/// carries the user's chosen 22-color override map.
+///
+/// The `custom` block is kept untyped on the Rust side because its
+/// values are pure data the frontend forwards to xterm.js. Missing or
+/// malformed keys are tolerated by the resolver, which merges the
+/// custom map over the bundled "Default" theme.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct TerminalThemeSettings {
+    pub name: String,
+    pub custom: Option<HashMap<String, String>>,
+}
+
+impl Default for TerminalThemeSettings {
+    fn default() -> Self {
+        Self {
+            name: "Default".to_string(),
+            custom: None,
         }
     }
 }

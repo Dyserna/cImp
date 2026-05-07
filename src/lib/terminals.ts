@@ -44,7 +44,11 @@ import {
   restartShellTab,
   type BytesChannel,
 } from './ipc';
-import { display as displaySettings } from './settings/store';
+import {
+  display as displaySettings,
+  settings as settingsStore,
+} from './settings/store';
+import { effectiveTheme, themeFromSetting } from './themes/resolve';
 import { setTerminalFocuser } from './terminalFocus';
 import { perTabClosedState } from './avatarState';
 import { clearTabError, setTabError } from './tabs/errorState';
@@ -90,9 +94,14 @@ interface TerminalEntry {
   /// destroy.
   unlistenRestart: UnlistenFn | null;
   /// Subscribers to the display + closed-state stores. Run at create
-  /// time; both unsub at destroy.
+  /// time; all unsub at destroy.
   unsubFont: () => void;
   unsubClosed: (() => void) | null;
+  /// Subscribes to the full settings store and keeps the xterm theme in
+  /// sync with the global `terminal.theme` plus this tab's
+  /// `theme_override`. xterm.js supports `term.options.theme = ...` as
+  /// a live update; no recreation needed.
+  unsubTheme: () => void;
   /// Mirrors the closed flag for this tab so the onData handler — which
   /// closes over its initial value — sees the latest state without
   /// rebinding xterm.
@@ -185,6 +194,16 @@ export function createTerminal(tabId: TabId): void {
 
   const offscreen = ensureOffscreen();
 
+  // Resolve the tab's effective theme — global terminal.theme plus this
+  // tab's theme_override, if any. The tab may not be in `settings.tabs`
+  // yet during the snapshot/event race at startup; in that case we fall
+  // back to the global theme alone.
+  const initialSettings = get(settingsStore);
+  const initialTab = initialSettings.tabs.find((t) => t.id === tabId);
+  const initialTheme = initialTab
+    ? effectiveTheme(initialTab, initialSettings.terminal.theme)
+    : themeFromSetting(initialSettings.terminal.theme);
+
   const host = document.createElement('div');
   host.className = 'terminal-host';
   host.dataset.tabId = tabId;
@@ -192,7 +211,7 @@ export function createTerminal(tabId: TabId): void {
   host.style.height = '100%';
   host.style.boxSizing = 'border-box';
   host.style.padding = '4px';
-  host.style.background = '#000';
+  host.style.background = initialTheme.background ?? '#000';
   offscreen.appendChild(host);
 
   const display = get(displaySettings);
@@ -201,10 +220,7 @@ export function createTerminal(tabId: TabId): void {
     fontSize: display.terminal_font_size,
     cursorBlink: true,
     allowProposedApi: true,
-    theme: {
-      background: '#000000',
-      foreground: '#e0e0e0',
-    },
+    theme: initialTheme,
   });
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
@@ -224,6 +240,7 @@ export function createTerminal(tabId: TabId): void {
     unlistenRestart: null,
     unsubFont: () => {},
     unsubClosed: null,
+    unsubTheme: () => {},
     isClosed: false,
     restarting: false,
     resizeTimer: null,
@@ -249,6 +266,28 @@ export function createTerminal(tabId: TabId): void {
       term.options.fontFamily = d.terminal_font_family;
       term.options.fontSize = d.terminal_font_size;
       fitAndResize(entry);
+    }
+  });
+
+  // Live theme subscription — recomputes the effective theme on every
+  // settings change and reassigns `term.options.theme` if it differs.
+  // xterm.js diffs colors internally; identical themes are a no-op so
+  // it's safe to subscribe to the full settings store rather than a
+  // narrow derived. Skips the initial dispatch (xterm was constructed
+  // with `initialTheme` above).
+  let firstTheme = true;
+  entry.unsubTheme = settingsStore.subscribe((s) => {
+    if (firstTheme) {
+      firstTheme = false;
+      return;
+    }
+    const tab = s.tabs.find((t) => t.id === tabId);
+    const next = tab
+      ? effectiveTheme(tab, s.terminal.theme)
+      : themeFromSetting(s.terminal.theme);
+    term.options.theme = next;
+    if (next.background) {
+      host.style.background = next.background;
     }
   });
 
@@ -343,6 +382,7 @@ export function destroyTerminal(tabId: TabId): void {
   entry.unlistenRestart?.();
   entry.unsubFont();
   entry.unsubClosed?.();
+  entry.unsubTheme();
   setTerminalFocuser(tabId, null);
   // xterm.dispose() can throw if internal state was already partially
   // torn down by a rapid create-then-destroy or by a host element

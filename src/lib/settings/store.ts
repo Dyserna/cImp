@@ -75,3 +75,7 @@ export const processing: Readable<Settings['processing']> = derived(
   settings,
   (s) => s.processing,
 );
+export const terminal: Readable<Settings['terminal']> = derived(
+  settings,
+  (s) => s.terminal,
+);

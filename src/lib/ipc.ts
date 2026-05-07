@@ -143,6 +143,10 @@ export interface ReconfigureShellTabInput {
   env: Record<string, string>;
   notificationsError: string;
   notificationsExited: string;
+  /// V1.4-01 per-tab terminal palette override. `null` inherits the
+  /// global `terminal.theme`. The backend stamps it onto
+  /// `tabs[].theme_override` in the same write that updates command/args.
+  themeOverride: import('./settings/types').TerminalThemeSettings | null;
 }
 
 export async function reconfigureShellTab(input: ReconfigureShellTabInput): Promise<void> {

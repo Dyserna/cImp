@@ -1,10 +1,15 @@
 <script lang="ts">
+  import { get } from 'svelte/store';
   import type { TabId } from '../tabs/types';
-  import type { AiToolTabConfig } from './types';
+  import type { AiToolTabConfig, ThemeColorsWire } from './types';
   import ArrayEditor from './ArrayEditor.svelte';
   import TextAreaWithReset from './TextAreaWithReset.svelte';
   import NotificationEditor from './NotificationEditor.svelte';
   import Pill from '../Pill.svelte';
+  import ThemeSwatch from './ThemeSwatch.svelte';
+  import CustomThemeEditor from './CustomThemeEditor.svelte';
+  import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from '../themes';
+  import { settings as settingsStore } from './store';
 
   // Renders the per-AI-tab settings form: command (read-only), CLI args,
   // TTS injection toggle + instructions, notification texts, and a Restart
@@ -43,6 +48,43 @@
       tts_injection: { ...settings.tts_injection, [key]: value },
     };
     onchange();
+  }
+
+  // Live global theme name for the "Use global default (current: X)"
+  // dropdown entry. Reactive via $derived so it tracks Settings changes.
+  let globalThemeName = $derived($settingsStore.terminal.theme.name);
+
+  let overrideSelection = $derived(
+    settings.theme_override === null ? '__inherit' : settings.theme_override.name,
+  );
+
+  function selectThemeOverride(value: string): void {
+    if (value === '__inherit') {
+      update('theme_override', null);
+      return;
+    }
+    if (value === 'Custom') {
+      const liveGlobal = get(settingsStore).terminal.theme;
+      const previousName =
+        settings.theme_override === null
+          ? liveGlobal.name
+          : settings.theme_override.name;
+      const seed =
+        previousName === 'Custom'
+          ? BUNDLED_THEMES.Default
+          : resolveBundledTheme(previousName);
+      update('theme_override', {
+        name: 'Custom',
+        custom: { ...seed } as ThemeColorsWire,
+      });
+      return;
+    }
+    update('theme_override', { name: value, custom: null });
+  }
+
+  function updateCustomColors(next: ThemeColorsWire): void {
+    if (!settings.theme_override) return;
+    update('theme_override', { ...settings.theme_override, custom: next });
   }
 </script>
 
@@ -133,6 +175,37 @@
       ships in V2-04; the configuration is wired now.
     </small>
   </label>
+
+  <label class="palette-row">
+    <span>Terminal palette</span>
+    <select
+      value={overrideSelection}
+      onchange={(e) =>
+        selectThemeOverride((e.currentTarget as HTMLSelectElement).value)}
+    >
+      <option value="__inherit">Use global default (current: {globalThemeName})</option>
+      {#each BUNDLED_THEME_NAMES as paletteName}
+        <option value={paletteName}>{paletteName}</option>
+      {/each}
+      <option value="Custom">Custom…</option>
+    </select>
+    {#if settings.theme_override !== null}
+      <ThemeSwatch
+        name={settings.theme_override.name}
+        custom={settings.theme_override.custom}
+      />
+    {/if}
+  </label>
+  {#if settings.theme_override && settings.theme_override.name === 'Custom' && settings.theme_override.custom}
+    <CustomThemeEditor
+      value={settings.theme_override.custom}
+      onchange={updateCustomColors}
+    />
+  {/if}
+  <small class="hint">
+    Override the global terminal palette for this tab. Applied
+    immediately — no restart needed.
+  </small>
 
   <div class="restart-row">
     <button

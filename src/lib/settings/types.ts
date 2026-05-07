@@ -52,7 +52,6 @@ export interface TtsSettings {
 export interface DisplaySettings {
   terminal_font_family: string;
   terminal_font_size: number;
-  theme: string;
   show_tts_markup: boolean;
 }
 
@@ -128,6 +127,9 @@ export interface AiToolTabConfig {
   tts_injection: TtsInjection;
   notifications: AiNotificationConfig;
   first_launch_notice_dismissed: boolean;
+  /// V1.4-01 per-tab terminal palette override. `null` inherits the
+  /// global `terminal.theme`; non-null replaces it for this tab.
+  theme_override: TerminalThemeSettings | null;
 }
 
 export interface ShellTabConfig {
@@ -140,6 +142,9 @@ export interface ShellTabConfig {
   cwd: string | null;
   env: Record<string, string>;
   notifications: ShellNotificationConfig;
+  /// V1.4-01 per-tab terminal palette override. `null` inherits the
+  /// global `terminal.theme`; non-null replaces it for this tab.
+  theme_override: TerminalThemeSettings | null;
 }
 
 export type TabConfig = AiToolTabConfig | ShellTabConfig;
@@ -156,9 +161,30 @@ export interface ProcessingSettings {
 export interface UiSettings {
   /// Active UI chrome theme. V5-01 ships only `"modern-dark"`; the field
   /// exists so future themes (light, high-contrast) plug in without UI
-  /// plumbing churn. Distinct from `display.theme`, which governs the
+  /// plumbing churn. Distinct from `terminal.theme`, which governs the
   /// xterm.js terminal palette inside each tab.
   theme: string;
+}
+
+/// On-wire shape of a custom palette block. Mirrors the Rust
+/// `HashMap<String, String>`. The 22 valid keys match xterm.js's
+/// `ITheme`; missing keys are filled in from the bundled "Default"
+/// theme by `themeFromSetting` in `src/lib/themes/resolve.ts`.
+export type ThemeColorsWire = Record<string, string>;
+
+/// Terminal palette setting. `name` is either a bundled theme name
+/// (Default, Dracula, Solarized Dark, …) or "Custom" — in which case
+/// `custom` carries the user's chosen color overrides.
+export interface TerminalThemeSettings {
+  name: string;
+  custom: ThemeColorsWire | null;
+}
+
+/// V1.4-01: terminal-pane settings. Currently holds the xterm.js
+/// palette config; V1.4-02 extends with `background` for image and
+/// solid-color background support.
+export interface TerminalSettings {
+  theme: TerminalThemeSettings;
 }
 
 /// Persisted layout state (V4-04). Mirrors the in-memory `LayoutState`
@@ -201,6 +227,9 @@ export interface Settings {
   layout_presets: LayoutPreset[];
   /// UI chrome theme settings (V5).
   ui: UiSettings;
+  /// Terminal-pane settings (V1.4-01+): xterm.js palette today, plus
+  /// the V1.4-02 background sub-group when that ships.
+  terminal: TerminalSettings;
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
@@ -252,7 +281,6 @@ export function defaultSettings(): Settings {
     display: {
       terminal_font_family: 'Consolas, Menlo, "DejaVu Sans Mono", monospace',
       terminal_font_size: 14,
-      theme: 'dark',
       show_tts_markup: false,
     },
     behavior: {
@@ -304,6 +332,7 @@ export function defaultSettings(): Settings {
           error: 'Claude encountered an error',
         },
         first_launch_notice_dismissed: true,
+        theme_override: null,
       },
       {
         kind: 'ai_tool',
@@ -322,6 +351,7 @@ export function defaultSettings(): Settings {
           error: 'Aider encountered an error',
         },
         first_launch_notice_dismissed: false,
+        theme_override: null,
       },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
@@ -329,5 +359,6 @@ export function defaultSettings(): Settings {
     layout: null,
     layout_presets: [],
     ui: { theme: 'modern-dark' },
+    terminal: { theme: { name: 'Default', custom: null } },
   };
 }

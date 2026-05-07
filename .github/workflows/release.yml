@@ -1,0 +1,255 @@
+name: Release portable Windows zip
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re-)build, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write   # needed by `gh release create`
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      # Pin to a HuggingFace ref. `main` floats; replace with a commit SHA
+      # once you've cut a release you want bit-identical reproductions of.
+      KOKORO_REF: main
+      KOKORO_BASE: https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve
+
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ref="${{ inputs.tag }}"
+          else
+            ref="${{ github.ref_name }}"
+          fi
+          if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::tag '$ref' does not match v<X>.<Y>.<Z>"
+            exit 1
+          fi
+          version="${ref#v}"
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "stage_dir=cctts-portable-win-x64-$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          # full history so the "previous tag" lookup in the release-notes
+          # step finds prior tags
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Verify version triple matches tag
+        shell: bash
+        run: |
+          set -e
+          expected="${{ steps.tag.outputs.version }}"
+
+          pkg=$(node -p "require('./package.json').version")
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          cargo=$(grep -m1 -E '^version\s*=\s*"' src-tauri/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+
+          echo "expected (tag):       $expected"
+          echo "package.json:         $pkg"
+          echo "tauri.conf.json:      $conf"
+          echo "src-tauri/Cargo.toml: $cargo"
+
+          fail=0
+          for v in "$pkg" "$conf" "$cargo"; do
+            if [ "$v" != "$expected" ]; then fail=1; fi
+          done
+          if [ $fail -eq 1 ]; then
+            echo "::error::version mismatch — run scripts/bump-version.mjs $expected and re-tag"
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Cache Kokoro download
+        id: kokoro-cache
+        uses: actions/cache@v4
+        with:
+          path: download/
+          key: kokoro-${{ env.KOKORO_REF }}-v1
+
+      - name: Download Kokoro model + voicepack
+        if: steps.kokoro-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path download | Out-Null
+          $base = "${{ env.KOKORO_BASE }}/${{ env.KOKORO_REF }}"
+          Write-Host "Downloading kokoro-v1.0.onnx from $base/onnx/model.onnx ..."
+          Invoke-WebRequest -Uri "$base/onnx/model.onnx" -OutFile download/kokoro-v1.0.onnx
+          Write-Host "Downloading af_heart.bin from $base/voices/af_heart.bin ..."
+          Invoke-WebRequest -Uri "$base/voices/af_heart.bin" -OutFile download/af_heart.bin
+
+      - name: Verify SHA-256 against models/CHECKSUMS.txt (if pinned)
+        shell: pwsh
+        run: |
+          function Compute-Sha256($path) {
+            (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
+          }
+          $modelSha = Compute-Sha256 download/kokoro-v1.0.onnx
+          $voiceSha = Compute-Sha256 download/af_heart.bin
+          Write-Host "computed sha  $modelSha  kokoro-v1.0.onnx"
+          Write-Host "computed sha  $voiceSha  af_heart.bin"
+
+          $checksums = Get-Content models/CHECKSUMS.txt -ErrorAction SilentlyContinue |
+            Where-Object { $_ -and $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$' }
+
+          $fail = 0
+          foreach ($line in $checksums) {
+            $parts = $line -split '\s+', 2
+            if ($parts.Count -lt 2) { continue }
+            $expected = $parts[0].ToLower()
+            $name = $parts[1].Trim()
+            $actual = switch ($name) {
+              'kokoro-v1.0.onnx' { $modelSha }
+              'af_heart.bin'     { $voiceSha }
+              default            { $null }
+            }
+            if ($null -eq $actual) {
+              Write-Host "::warning::CHECKSUMS.txt mentions unknown file '$name'"
+              continue
+            }
+            if ($expected -ne $actual) {
+              Write-Host "::error::SHA-256 mismatch for $name (expected $expected, got $actual)"
+              $fail = 1
+            } else {
+              Write-Host "verified  $name  $expected"
+            }
+          }
+          if ($fail -eq 1) { exit 1 }
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Tauri build (release)
+        shell: pwsh
+        env:
+          # bindgen / clang-sys for misaki-rs -> espeak-ng-sys
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+        run: npm run tauri build -- --no-bundle
+
+      - name: Stage portable layout
+        shell: pwsh
+        run: |
+          $stage = "${{ steps.tag.outputs.stage_dir }}"
+          New-Item -ItemType Directory -Force -Path "$stage/bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/models/voices" | Out-Null
+
+          # cctts.exe + ORT runtime DLLs (the `ort` crate's download-binaries
+          # feature drops these into target/release at build time).
+          Copy-Item src-tauri/target/release/cctts.exe "$stage/bin/"
+          Get-ChildItem src-tauri/target/release -Filter 'onnxruntime*.dll' |
+            ForEach-Object { Copy-Item $_.FullName "$stage/bin/" }
+
+          # Models (downloaded above)
+          Copy-Item download/kokoro-v1.0.onnx "$stage/models/"
+          Copy-Item download/af_heart.bin "$stage/models/voices/"
+
+          # Top-level docs
+          Copy-Item LICENSE "$stage/"
+          Copy-Item NOTICE "$stage/"
+          Copy-Item scripts/portable-readme.txt "$stage/README.txt"
+
+          Write-Host "Staged contents:"
+          Get-ChildItem -Recurse $stage | Select-Object FullName, Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Zip
+        id: zip
+        shell: pwsh
+        run: |
+          $stage = "${{ steps.tag.outputs.stage_dir }}"
+          $zip = "$stage.zip"
+          Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          $size = (Get-Item $zip).Length
+          Write-Host "zip:  $zip ($size bytes)"
+          Write-Host "sha256: $sha"
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build release notes (CHANGELOG section if present, else autogen)
+        id: notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          version="${{ steps.tag.outputs.version }}"
+          tag="${{ steps.tag.outputs.tag }}"
+          out=release-notes.md
+
+          if grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "found CHANGELOG section for $version"
+            awk -v ver="$version" '
+              $0 ~ "^## \\[" ver "\\]" { found=1; print; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md > "$out"
+          else
+            echo "no CHANGELOG.md section for $version — using gh-generated notes"
+            # `gh api` returns JSON; pluck the .body. Use the previous tag if
+            # we can find one, otherwise let GitHub pick.
+            prev_tag=$(git tag --sort=-v:refname | grep -v "^$tag$" | head -n1 || true)
+            if [ -n "$prev_tag" ]; then
+              gh api repos/${{ github.repository }}/releases/generate-notes \
+                -f tag_name="$tag" \
+                -f previous_tag_name="$prev_tag" \
+                -q .body > "$out" || echo "(release notes for $tag)" > "$out"
+            else
+              gh api repos/${{ github.repository }}/releases/generate-notes \
+                -f tag_name="$tag" \
+                -q .body > "$out" || echo "(release notes for $tag)" > "$out"
+            fi
+          fi
+
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "**Portable zip SHA-256:** \`${{ steps.zip.outputs.sha }}\`"
+          } >> "$out"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -e
+          tag="${{ steps.tag.outputs.tag }}"
+          zip="${{ steps.zip.outputs.zip }}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists — refreshing notes and uploading asset"
+            gh release edit "$tag" --notes-file release-notes.md
+            gh release upload "$tag" "$zip" --clobber
+          else
+            gh release create "$tag" "$zip" \
+              --title "$tag" \
+              --notes-file release-notes.md
+          fi

@@ -1,0 +1,18 @@
+# SHA-256 checksums for the assets the release workflow downloads from
+# HuggingFace and bundles into the portable Windows zip.
+#
+# Format: one `<sha256>  <filename>` per line. Matches `sha256sum`'s output
+# so the workflow can pipe directly into `sha256sum -c` if desired.
+#
+# To pin: run the release workflow once with these blank, copy the
+# "computed sha" lines from the log, paste here, commit. After that, any
+# upstream change at the resolved URL fails the build instead of silently
+# shipping a different binary.
+#
+# Source: https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX
+#
+# Model file (kokoro-v1.0.onnx): renamed from onnx/model.onnx in the repo.
+# Voicepack (af_heart.bin): voices/af_heart.bin in the repo.
+
+# <sha256>  kokoro-v1.0.onnx
+# <sha256>  af_heart.bin

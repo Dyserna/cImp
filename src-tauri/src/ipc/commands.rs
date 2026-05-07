@@ -406,26 +406,31 @@ pub async fn settings_update(
 
 #[tauri::command]
 pub async fn list_voices() -> AppResult<Vec<String>> {
-    let dir = match crate::tts::default_model_dir() {
-        Ok(d) => d.join("voices"),
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut out = Vec::new();
-    let read = match std::fs::read_dir(&dir) {
-        Ok(r) => r,
-        Err(_) => return Ok(Vec::new()),
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("bin") {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            out.push(stem.to_string());
+    use std::collections::BTreeSet;
+    let mut out = BTreeSet::<String>::new();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(d) = crate::tts::default_model_dir() {
+        dirs.push(d.join("voices"));
+    }
+    if let Some(d) = crate::tts::portable_model_dir() {
+        dirs.push(d.join("voices"));
+    }
+    for dir in dirs {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                out.insert(stem.to_string());
+            }
         }
     }
-    out.sort();
-    Ok(out)
+    Ok(out.into_iter().collect())
 }
 
 #[tauri::command]

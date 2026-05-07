@@ -17,3 +17,17 @@ espeak-ng:
   Copyright (C) 2015-2024 Reece H. Dunn and contributors
   Source: https://github.com/espeak-ng/espeak-ng
   License: GNU GPL v3+ — https://www.gnu.org/licenses/gpl-3.0.html
+
+------------------------------------------------------------------------
+
+The portable Windows zip distribution of cctts bundles the Kokoro 82M
+ONNX model and the af_heart voicepack. These files are not included in
+the source repository and are downloaded at build time from the
+onnx-community mirror on HuggingFace; their license is independent of
+the cctts source license above.
+
+Kokoro-82M-v1.0-ONNX:
+  Source: https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX
+  Files bundled: onnx/model.onnx (renamed kokoro-v1.0.onnx),
+                 voices/af_heart.bin
+  License: Apache License 2.0 — same text as cctts's own LICENSE file.

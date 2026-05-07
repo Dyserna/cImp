@@ -21,7 +21,7 @@
     TabConfig,
   } from './lib/settings/types';
   import { findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
-  import type { AiTabId, TabId } from './lib/tabs/types';
+  import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
@@ -74,6 +74,17 @@
     { id: 'advanced', label: 'Advanced' },
   ];
 
+  // Sub-tab nav within the Tabs section. The two AI builtins each get
+  // their own sub-tab; every Shell tab is grouped under 'shells'. Keeps
+  // the previously-collapsible <details> wall navigable.
+  type TabsSubSection = 'claude' | 'claude-local' | 'shells';
+  let tabsSubSection = $state<TabsSubSection>('claude');
+  function subSectionForTabId(tabId: string): TabsSubSection {
+    if (tabId === 'claude') return 'claude';
+    if (tabId === 'claude-local') return 'claude-local';
+    return 'shells';
+  }
+
   // Keep `snapshot` in sync with the global store. Every input mutates
   // `snapshot` and pushes via `applySettings`; the broadcast comes back and
   // overwrites `snapshot` (which is fine — same value, no churn).
@@ -101,14 +112,15 @@
   let unlistenDeepLink: (() => void) | undefined;
 
   function scrollToTabSection(tabId: string): void {
-    // Sidebar nav hides every other group, so flip to 'tabs' before
-    // looking up the inner <details> — otherwise the element wouldn't
-    // be in the DOM yet on a cold open.
+    // Sidebar nav + sub-tabs both hide content, so flip both before
+    // looking up the inner element — otherwise it wouldn't be in the
+    // DOM yet on a cold open.
     activeSection = 'tabs';
+    tabsSubSection = subSectionForTabId(tabId);
     queueMicrotask(() => {
       const el = document.getElementById(`tab-section-${tabId}`);
       if (!el) return;
-      // Force the <details> open so the section is visible.
+      // Force any wrapping <details> open so the section is visible.
       if (el instanceof HTMLDetailsElement) el.open = true;
       el.scrollIntoView({ block: 'start', behavior: 'smooth' });
     });
@@ -879,94 +891,152 @@
           </div>
         </section>
       {:else if activeSection === 'tabs'}
+        {@const claudeLive = aiTabAt('claude')}
+        {@const claudeLocalLive = aiTabAt('claude-local')}
+        {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
         <section>
           <h2>Tabs</h2>
-          <small class="hint top">
-            All configured tabs in their stored order. AI builtins expand inline;
-            Shell tabs show a summary — edit them via right-click → Configure on
-            the tab bar.
-          </small>
-          <div class="tabs-grid">
-            {#each tabEntries as entry (entry.id)}
-              {#if entry.kind === 'ai_tool'}
-                {@const live = aiTabAt(entry.id)}
-                <details open id="tab-section-{entry.id}">
-                  <summary>
-                    {entry.name}
-                    <span class="kind-badge ai">AI</span>
-                  </summary>
-                  {#if live}
-                    <TabSettingsSection
-                      tabId={entry.id as TabId}
-                      displayName={entry.name}
-                      bind:settings={
-                        () => live,
-                        (v) => patchAiTab(entry.id, v)
-                      }
-                      defaults={tabDefaults[entry.id] ?? null}
-                      restartRequired={restartRequired[entry.id] ?? false}
-                      onchange={() => {}}
-                      onrestart={() => restartTab(entry.id as AiTabId)}
-                    />
-                  {/if}
-                </details>
-              {:else}
-                <details id="tab-section-{entry.id}">
-                  <summary>
-                    {entry.name}
-                    <span class="kind-badge shell">Shell</span>
-                    {#if entry.builtin}
-                      <span class="builtin-tag">builtin</span>
-                    {/if}
-                  </summary>
-                  <div class="shell-edit">
-                    <label>
-                      <span>Command</span>
-                      <input type="text" value={shellSummary(entry)} disabled readonly />
-                      <small class="hint">
-                        To change the command, args, or working directory,
-                        right-click the tab in the tab bar and choose
-                        Configure…
-                      </small>
-                    </label>
-                    <label>
-                      <span>Error notification text</span>
-                      <input
-                        type="text"
-                        value={entry.notifications.error}
-                        oninput={(e) =>
-                          patchShellNotifications(entry.id, {
-                            ...entry.notifications,
-                            error: (e.currentTarget as HTMLInputElement).value,
-                          })}
-                      />
-                      <small class="hint">
-                        Spoken when this tab errors while you're on a different
-                        tab. Leave blank to disable.
-                      </small>
-                    </label>
-                    <label>
-                      <span>Exited notification text</span>
-                      <input
-                        type="text"
-                        value={entry.notifications.exited}
-                        oninput={(e) =>
-                          patchShellNotifications(entry.id, {
-                            ...entry.notifications,
-                            exited: (e.currentTarget as HTMLInputElement).value,
-                          })}
-                      />
-                      <small class="hint">
-                        Spoken when this shell exits while you're on a different
-                        tab. Use <code>{'{code}'}</code> to insert the exit code.
-                        Leave blank to disable.
-                      </small>
-                    </label>
-                  </div>
-                </details>
+          <div class="sub-tabs" role="tablist" aria-label="Tabs sub-sections">
+            <button
+              type="button"
+              role="tab"
+              class:active={tabsSubSection === 'claude'}
+              aria-selected={tabsSubSection === 'claude'}
+              onclick={() => (tabsSubSection = 'claude')}
+            >
+              Claude
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={tabsSubSection === 'claude-local'}
+              aria-selected={tabsSubSection === 'claude-local'}
+              onclick={() => (tabsSubSection = 'claude-local')}
+            >
+              Claude (local)
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={tabsSubSection === 'shells'}
+              aria-selected={tabsSubSection === 'shells'}
+              onclick={() => (tabsSubSection = 'shells')}
+            >
+              Shells
+              {#if shellEntries.length > 0}
+                <span class="sub-tab-count">{shellEntries.length}</span>
               {/if}
-            {/each}
+            </button>
           </div>
+
+          {#if tabsSubSection === 'claude'}
+            <div id="tab-section-claude">
+              {#if claudeLive}
+                <TabSettingsSection
+                  tabId={'claude'}
+                  displayName={'Claude'}
+                  bind:settings={
+                    () => claudeLive,
+                    (v) => patchAiTab('claude', v)
+                  }
+                  defaults={tabDefaults['claude'] ?? null}
+                  restartRequired={restartRequired['claude'] ?? false}
+                  onchange={() => {}}
+                  onrestart={() => restartTab('claude')}
+                />
+              {:else}
+                <small class="hint top">Claude tab not configured.</small>
+              {/if}
+            </div>
+          {:else if tabsSubSection === 'claude-local'}
+            <div id="tab-section-claude-local">
+              {#if claudeLocalLive}
+                <TabSettingsSection
+                  tabId={'claude-local'}
+                  displayName={'Claude (local)'}
+                  bind:settings={
+                    () => claudeLocalLive,
+                    (v) => patchAiTab('claude-local', v)
+                  }
+                  defaults={tabDefaults['claude-local'] ?? null}
+                  restartRequired={restartRequired['claude-local'] ?? false}
+                  onchange={() => {}}
+                  onrestart={() => restartTab('claude-local')}
+                />
+              {:else}
+                <small class="hint top">Claude (local) tab not configured.</small>
+              {/if}
+            </div>
+          {:else}
+            <small class="hint top">
+              Shell tabs in their stored order. Each row shows notification
+              text — edit command / args / cwd via right-click → Configure
+              on the tab bar.
+            </small>
+            {#if shellEntries.length === 0}
+              <small class="hint top">No shell tabs configured.</small>
+            {:else}
+              <div class="tabs-grid">
+                {#each shellEntries as entry (entry.id)}
+                  {#if entry.kind === 'shell'}
+                    <details id="tab-section-{entry.id}">
+                      <summary>
+                        {entry.name}
+                        <span class="kind-badge shell">Shell</span>
+                        {#if entry.builtin}
+                          <span class="builtin-tag">builtin</span>
+                        {/if}
+                      </summary>
+                      <div class="shell-edit">
+                        <label>
+                          <span>Command</span>
+                          <input type="text" value={shellSummary(entry)} disabled readonly />
+                          <small class="hint">
+                            To change the command, args, or working directory,
+                            right-click the tab in the tab bar and choose
+                            Configure…
+                          </small>
+                        </label>
+                        <label>
+                          <span>Error notification text</span>
+                          <input
+                            type="text"
+                            value={entry.notifications.error}
+                            oninput={(e) =>
+                              patchShellNotifications(entry.id, {
+                                ...entry.notifications,
+                                error: (e.currentTarget as HTMLInputElement).value,
+                              })}
+                          />
+                          <small class="hint">
+                            Spoken when this tab errors while you're on a different
+                            tab. Leave blank to disable.
+                          </small>
+                        </label>
+                        <label>
+                          <span>Exited notification text</span>
+                          <input
+                            type="text"
+                            value={entry.notifications.exited}
+                            oninput={(e) =>
+                              patchShellNotifications(entry.id, {
+                                ...entry.notifications,
+                                exited: (e.currentTarget as HTMLInputElement).value,
+                              })}
+                          />
+                          <small class="hint">
+                            Spoken when this shell exits while you're on a different
+                            tab. Use <code>{'{code}'}</code> to insert the exit code.
+                            Leave blank to disable.
+                          </small>
+                        </label>
+                      </div>
+                    </details>
+                  {/if}
+                {/each}
+              </div>
+            {/if}
+          {/if}
         </section>
       {:else if activeSection === 'shortcuts'}
         <section>
@@ -1427,6 +1497,64 @@
   .palette-row > span:first-child {
     grid-column: 1 / -1;
   }
+  .sub-tabs {
+    display: flex;
+    gap: 2px;
+    margin: 0 0 var(--space-4) 0;
+    padding: 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .sub-tabs button {
+    appearance: none;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-quiet);
+    cursor: pointer;
+    padding: 8px 14px;
+    font-size: var(--font-size-sm);
+    font-weight: 500;
+    border-radius: 0;
+    margin-bottom: -1px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition:
+      color var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
+  }
+  .sub-tabs button:hover:not(.active) {
+    color: var(--text-primary);
+    background: transparent;
+  }
+  .sub-tabs button.active {
+    color: var(--accent-purple);
+    border-bottom-color: var(--accent-purple);
+    font-weight: 600;
+    background: transparent;
+  }
+  .sub-tabs button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .sub-tab-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: var(--radius-pill);
+    background: var(--surface-2);
+    color: var(--text-tertiary);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1;
+  }
+  .sub-tabs button.active .sub-tab-count {
+    background: var(--accent-muted);
+    color: var(--accent-purple);
+  }
   .tabs-grid {
     display: flex;
     flex-direction: column;
@@ -1468,11 +1596,6 @@
     margin-left: 6px;
     vertical-align: middle;
     font-weight: 600;
-  }
-  .kind-badge.ai {
-    background: var(--surface-info);
-    border: 1px solid var(--border-info);
-    color: var(--text-info);
   }
   .kind-badge.shell {
     background: var(--surface-success);

@@ -171,7 +171,7 @@
     flex: 1 1 auto;
     min-width: 0;
     min-height: 0;
-    background: #000;
+    background: var(--surface-0);
   }
   .terminal-slot {
     position: absolute;
@@ -180,12 +180,12 @@
   /* Focused-pane indicator: a 2px accent line along the top edge of
      the focused pane's tab bar. Top placement (not bottom) so it
      doesn't visually merge with the active-tab underline, which is
-     also #4a90e2 — when both rendered at the bottom they read as one
-     continuous line and the focused-vs-active distinction blurs.
-     Single-pane layouts still render it; with no unfocused pane to
-     compare against it just looks like a top accent on the bar. */
+     also the accent color — when both rendered at the bottom they
+     read as one continuous line and the focused-vs-active distinction
+     blurs. Single-pane layouts still render it; with no unfocused
+     pane to compare against it just looks like a top accent on the bar. */
   .pane.focused :global(.tab-bar) {
-    box-shadow: inset 0 2px 0 0 #4a90e2;
+    box-shadow: inset 0 2px 0 0 var(--accent);
   }
   /* Keyboard focus traversal: the pane root receives focus via
      Ctrl+Alt+Arrow (which calls setFocusedPane). Tab key doesn't
@@ -193,7 +193,7 @@
      on the inner xterm host is good enough — for ARIA traversal the
      aria-label on the .pane element above is what gets announced. */
   .pane:focus-visible {
-    outline: 2px solid #4a90e2;
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 </style>

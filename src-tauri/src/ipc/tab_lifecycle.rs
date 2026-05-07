@@ -137,6 +137,8 @@ fn validated_to_shell_config(
         cwd: input.cwd.clone(),
         env: input.env.clone(),
         notifications,
+        theme_override: None,
+        background_override: None,
     }
 }
 
@@ -279,6 +281,14 @@ pub async fn close_tab(
         });
     }
 
+    // V1.4-04 D.6: drop any persisted scrollback file for the closed
+    // tab. The orphan-prune sweep at next launch would also catch it,
+    // but cleaning up immediately keeps the disk-state consistent
+    // with the user's mental model.
+    if let Err(e) = crate::pty::scrollback::delete(&tab) {
+        warn!(?tab, error = %e, "close_tab: scrollback delete failed");
+    }
+
     // Remove the settings entry. Drop the active_tab_id pointer if it
     // referenced this tab — the frontend will set a new one on its next
     // tab-switch event.
@@ -360,6 +370,8 @@ pub async fn reconfigure_shell_tab(
     env: HashMap<String, String>,
     notifications_error: String,
     notifications_exited: String,
+    theme_override: Option<crate::settings::TerminalThemeSettings>,
+    background_override: Option<crate::settings::BackgroundOverride>,
 ) -> Result<(), TabLifecycleError> {
     if !matches!(tab.kind(), TabKind::Shell) {
         return Err(TabLifecycleError::WrongKind);
@@ -398,6 +410,8 @@ pub async fn reconfigure_shell_tab(
         cfg.cwd = validated.cwd.clone();
         cfg.env = validated.env.clone();
         cfg.notifications = notifications;
+        cfg.theme_override = theme_override;
+        cfg.background_override = background_override;
         // builtin/id stay as they were.
         state.settings.set(snap);
     }

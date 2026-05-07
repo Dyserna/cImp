@@ -105,10 +105,13 @@
     bottom: 0;
     left: 0;
     right: 0;
-    background: #1e1e1e;
-    border-top: 1px solid #444;
-    box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.3);
-    padding: 12px;
+    background: var(--surface-2);
+    border-top: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    box-shadow: var(--shadow-lg);
+    padding: var(--space-3);
+    /* Mask any subpixel artifacts at the rounded top corners. */
+    overflow: hidden;
     /* Above the terminal but below the avatar (z-index: 10) and below the
        settings window. The avatar sits in a corner so the overlap is
        tolerable; if it ever conflicts visually, raise this. */
@@ -122,17 +125,18 @@
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
     font-size: 14px;
     line-height: 1.4;
-    color: #e0e0e0;
-    background: #2a2a2a;
-    border: 1px solid #555;
-    border-radius: 4px;
+    color: var(--text-primary);
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
     padding: 10px;
     resize: none;
     outline: none;
     overflow-y: auto;
+    transition: border-color var(--motion-fast) var(--easing-standard);
   }
 
   textarea:focus {
-    border-color: #6699cc;
+    border-color: var(--accent);
   }
 </style>

@@ -28,9 +28,9 @@
     justify-content: space-between;
     height: 28px;
     flex: 0 0 28px;
-    background: #1a1a1a;
-    border-top: 1px solid #444;
-    padding: 0 8px;
+    background: var(--surface-sunken);
+    border-top: 1px solid var(--border-subtle);
+    padding: 0 var(--space-3);
     box-sizing: border-box;
   }
   .status-bar-left {
@@ -40,7 +40,7 @@
     display: inline-flex;
     flex-direction: row;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-2);
     flex: 0 0 auto;
   }
 </style>

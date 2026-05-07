@@ -142,20 +142,33 @@
   }
   .trigger {
     background: transparent;
-    color: #c0c0c0;
+    color: var(--text-secondary);
     border: 1px solid transparent;
-    padding: 2px 8px;
-    border-radius: 3px;
-    font-size: 12px;
+    padding: 2px var(--space-3);
+    border-radius: var(--radius-pill);
+    font-size: var(--font-size-sm);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--space-1);
     height: 22px;
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
   }
   .trigger:hover {
-    background: #2a2a2a;
-    border-color: #444;
+    background: var(--surface-3);
+    color: var(--text-primary);
+  }
+  .trigger[aria-expanded="true"] {
+    background: var(--surface-3);
+    color: var(--text-primary);
+    border-color: var(--border-subtle);
+  }
+  .trigger:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .caret {
     font-size: 10px;
@@ -163,31 +176,38 @@
   }
   .popover {
     position: absolute;
-    bottom: calc(100% + 6px);
+    bottom: calc(100% + 8px);
     left: 0;
-    min-width: 200px;
+    min-width: 220px;
     max-width: 320px;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    border-radius: 4px;
-    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.5);
-    padding: 4px 0;
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    padding: var(--space-1) 0;
     z-index: 50;
   }
   .entry {
     display: block;
-    width: 100%;
+    width: calc(100% - 8px);
+    margin: 0 var(--space-1);
     text-align: left;
     background: transparent;
-    color: #e0e0e0;
+    color: var(--text-primary);
     border: none;
-    padding: 6px 12px;
-    font-size: 12px;
+    padding: 6px var(--space-3);
+    font-size: var(--font-size-sm);
     cursor: pointer;
     box-sizing: border-box;
+    border-radius: var(--radius-sm);
+    transition: background var(--motion-fast) var(--easing-standard);
   }
   .entry:hover {
-    background: #383838;
+    background: var(--surface-4);
+  }
+  .entry:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .preset-name {
     overflow: hidden;
@@ -196,20 +216,20 @@
   }
   .separator {
     height: 1px;
-    background: #444;
-    margin: 4px 0;
+    background: var(--border-subtle);
+    margin: var(--space-1) var(--space-2);
   }
   .section-label {
-    color: #888;
+    color: var(--text-tertiary);
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    padding: 4px 12px 2px;
+    padding: var(--space-1) var(--space-3) 2px;
   }
   .empty {
-    color: #888;
-    font-size: 11px;
+    color: var(--text-tertiary);
+    font-size: var(--font-size-xs);
     font-style: italic;
-    padding: 6px 12px;
+    padding: 6px var(--space-3);
   }
 </style>

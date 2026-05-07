@@ -247,8 +247,8 @@
     display: flex;
     flex-direction: row;
     height: 32px;
-    background: #2a2a2a;
-    border-bottom: 1px solid #444;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--border-subtle);
     flex: 0 0 32px;
     /* Outer is non-scrolling; .tab-list owns the horizontal scroll so
        the + button stays pinned at the right and the bottom border
@@ -267,13 +267,13 @@
        full-width one) doesn't lose much vertical space when overflow
        kicks in. */
     scrollbar-width: thin;
-    scrollbar-color: #555 transparent;
+    scrollbar-color: var(--text-disabled) transparent;
   }
   .tab-list::-webkit-scrollbar {
     height: 4px;
   }
   .tab-list::-webkit-scrollbar-thumb {
-    background: #555;
+    background: var(--text-disabled);
     border-radius: 2px;
   }
   .tab-list::-webkit-scrollbar-track {
@@ -296,7 +296,7 @@
   }
   .tab-list.fade-left::before {
     left: 0;
-    background: linear-gradient(to right, #2a2a2a, transparent);
+    background: linear-gradient(to right, var(--surface-2), transparent);
   }
   .tab-list.fade-right::after {
     /* Anchored to the right edge of the scrollable list — which sits
@@ -306,18 +306,18 @@
        at the end of the list, not the end of the bar. The +button's
        width is accounted for by the flex layout. */
     right: 32px;
-    background: linear-gradient(to left, #2a2a2a, transparent);
+    background: linear-gradient(to left, var(--surface-2), transparent);
   }
   .tab-bar-end {
     display: flex;
     flex: 0 0 auto;
-    border-left: 1px solid #444;
+    border-left: 1px solid var(--border-subtle);
   }
   .new-tab {
     appearance: none;
     border: none;
     background: transparent;
-    color: #888;
+    color: var(--text-tertiary);
     font-size: 18px;
     width: 32px;
     height: 100%;
@@ -325,13 +325,16 @@
     line-height: 30px;
     padding: 0;
     user-select: none;
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
   }
   .new-tab:hover {
-    background: #303030;
-    color: #e0e0e0;
+    background: var(--surface-3);
+    color: var(--text-primary);
   }
   .new-tab:focus-visible {
-    outline: 2px solid #4a90e2;
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 </style>

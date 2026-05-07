@@ -47,6 +47,15 @@ pub struct Settings {
     /// menu's "Save current layout as..." entry. Restoring a preset
     /// replaces the live tree wholesale; the preset itself is unchanged.
     pub layout_presets: Vec<LayoutPreset>,
+    /// UI chrome theme settings (V5). The `theme` field selects the
+    /// design-token block applied to the cctts chrome (tab bar, status
+    /// bar, dialogs, settings). Distinct from `terminal.theme`, which
+    /// governs the xterm.js terminal palette inside each tab.
+    pub ui: UiSettings,
+    /// Terminal-pane settings (V1.4-01+): xterm.js theme today, plus
+    /// the V1.4-02 background image/color group when that ships.
+    /// Distinct from `ui`, which themes the cctts chrome.
+    pub terminal: TerminalSettings,
 }
 
 impl Settings {
@@ -100,7 +109,7 @@ pub enum LayoutNodePersisted {
 
 /// Direction of a Split node. Naming matches CSS flexbox: `Horizontal`
 /// arranges children side-by-side (vertical splitter between them);
-/// `Vertical` stacks them top-to-bottom. See DESIGN-V4.md for the
+/// `Vertical` stacks them top-to-bottom. See DESIGN.md for the
 /// rationale for this convention.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -189,6 +198,17 @@ pub struct AiToolTabConfig {
     /// through migration verbatim so the aider banner doesn't re-appear for
     /// existing users.
     pub first_launch_notice_dismissed: bool,
+    /// V1.4-01 per-tab terminal palette override. `None` means inherit
+    /// the global `terminal.theme`; `Some(_)` replaces it with the
+    /// override's bundled name (or Custom block) for this tab only.
+    /// The override travels with the tab through drag-and-drop because
+    /// it lives on the tab itself, not on a pane.
+    pub theme_override: Option<TerminalThemeSettings>,
+    /// V1.4-02 per-tab background override (three-state). `None` means
+    /// inherit the global `terminal.background`; `Some(Disabled)` means
+    /// opt out (theme bg only); `Some(Custom(cfg))` replaces the global
+    /// background wholesale for this tab.
+    pub background_override: Option<BackgroundOverride>,
 }
 
 impl Default for AiToolTabConfig {
@@ -207,6 +227,8 @@ impl Default for AiToolTabConfig {
             tts_injection: TtsInjection::default(),
             notifications: AiNotificationConfig::default(),
             first_launch_notice_dismissed: false,
+            theme_override: None,
+            background_override: None,
         }
     }
 }
@@ -222,6 +244,13 @@ pub struct ShellTabConfig {
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub notifications: ShellNotificationConfig,
+    /// V1.4-01 per-tab terminal palette override. `None` means inherit
+    /// the global `terminal.theme`; `Some(_)` replaces it for this tab.
+    /// See `AiToolTabConfig::theme_override` for the full rationale.
+    pub theme_override: Option<TerminalThemeSettings>,
+    /// V1.4-02 per-tab background override (three-state). See
+    /// `AiToolTabConfig::background_override`.
+    pub background_override: Option<BackgroundOverride>,
 }
 
 impl Default for ShellTabConfig {
@@ -235,6 +264,8 @@ impl Default for ShellTabConfig {
             cwd: None,
             env: HashMap::new(),
             notifications: ShellNotificationConfig::default(),
+            theme_override: None,
+            background_override: None,
         }
     }
 }
@@ -306,6 +337,8 @@ pub fn default_claude_tab() -> TabConfig {
         // Claude has no first-launch notice; pre-dismissed so the overlay
         // code can use a single per-tab predicate.
         first_launch_notice_dismissed: true,
+        theme_override: None,
+        background_override: None,
     })
 }
 
@@ -329,6 +362,8 @@ pub fn default_aider_tab() -> TabConfig {
             error: "Aider encountered an error".to_string(),
         },
         first_launch_notice_dismissed: false,
+        theme_override: None,
+        background_override: None,
     })
 }
 
@@ -346,6 +381,8 @@ pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
         cwd: None,
         env: HashMap::new(),
         notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
     })
 }
 
@@ -484,7 +521,6 @@ impl Default for WaveformSettings {
 pub struct DisplaySettings {
     pub terminal_font_family: String,
     pub terminal_font_size: u32,
-    pub theme: String,
     pub show_tts_markup: bool,
 }
 
@@ -494,7 +530,6 @@ impl Default for DisplaySettings {
             terminal_font_family: "Consolas, Menlo, \"DejaVu Sans Mono\", monospace"
                 .to_string(),
             terminal_font_size: 14,
-            theme: "dark".to_string(),
             show_tts_markup: false,
         }
     }
@@ -516,6 +551,301 @@ impl Default for BehaviorSettings {
             auto_speak: true,
             fallback_silent: true,
             announcements_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct UiSettings {
+    /// Active UI chrome theme. V5-01 ships only `"modern-dark"`; future
+    /// themes (light, high-contrast) plug in here as additional values.
+    pub theme: String,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            theme: "modern-dark".to_string(),
+        }
+    }
+}
+
+/// Terminal-pane settings (V1.4-01+). Holds the xterm.js palette config
+/// (V1.4-01) and the background image / solid-color sub-group (V1.4-02).
+/// Distinct from `ui`, which themes the cctts chrome.
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct TerminalSettings {
+    pub theme: TerminalThemeSettings,
+    /// V1.4-02 background configuration. Image, color, and the
+    /// opacity/blur/size/position controls that apply only when an
+    /// image is set. See `MILESTONE-V1.4-02-terminal-background.md`
+    /// for the four-cell rendering matrix and the three-state
+    /// override semantics.
+    pub background: TerminalBackgroundSettings,
+    /// V1.4-04 D: cross-restart scrollback buffer. PTY output is
+    /// captured into a per-tab ring buffer (`ring_bytes` cap, 256 KB
+    /// default), persisted to disk on graceful exit, and replayed on
+    /// next launch.
+    pub scrollback: ScrollbackSettings,
+}
+
+/// Terminal palette setting. `name` is either a bundled theme name
+/// (e.g., "Default", "Dracula") or "Custom" — in which case `custom`
+/// carries the user's chosen 22-color override map.
+///
+/// The `custom` block is kept untyped on the Rust side because its
+/// values are pure data the frontend forwards to xterm.js. Missing or
+/// malformed keys are tolerated by the resolver, which merges the
+/// custom map over the bundled "Default" theme.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct TerminalThemeSettings {
+    pub name: String,
+    pub custom: Option<HashMap<String, String>>,
+}
+
+impl Default for TerminalThemeSettings {
+    fn default() -> Self {
+        Self {
+            name: "Default".to_string(),
+            custom: None,
+        }
+    }
+}
+
+/// V1.4-02 terminal background configuration. `image` and `color` are
+/// independent (sibling fields, not a discriminated union) — both can be
+/// `Some` simultaneously, in which case `color` becomes the dimming-overlay
+/// tint atop `image`. `opacity`, `blur`, `size`, and `position` apply only
+/// when `image` is `Some`; when only `color` is set, the resolver
+/// rewrites the theme background and the renderer stays on the canvas
+/// fast path with no transparency cost.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct TerminalBackgroundSettings {
+    /// Absolute path to the background image. `None` means "no image".
+    /// Invalid paths surface a settings error and resolve to the
+    /// no-image rendering path; the `color` field, if set, still applies.
+    pub image: Option<PathBuf>,
+    /// Hex color (e.g., `"#1a2b3c"`). When `image` is `None`, this
+    /// replaces the resolved theme's background field. When `image` is
+    /// `Some`, this drives the dimming-overlay tint (default black if
+    /// `None`).
+    pub color: Option<String>,
+    /// Image-mode dimming-overlay alpha. 0.0-1.0. Ignored when `image`
+    /// is `None`.
+    pub opacity: f32,
+    /// Image-mode CSS `backdrop-filter: blur(...)` radius in pixels.
+    /// Ignored when `image` is `None`.
+    pub blur: u32,
+    /// Image-mode CSS `background-size` strategy. Ignored when `image`
+    /// is `None`.
+    pub size: BackgroundSize,
+    /// Image-mode CSS `background-position` value. Ignored when `image`
+    /// is `None`.
+    pub position: String,
+    /// V1.4-04 A.1 snapshot cap. Number of scrollback rows to capture
+    /// when `serializeAddon.serialize({ scrollback })` runs on a
+    /// renderer-category flip. Bounds JS-heap allocation under
+    /// long-scrollback (50k+ lines) edge cases. Existing v1.5 files
+    /// without this field deserialize to the default via serde-default
+    /// — no migration version bump.
+    pub snapshot_lines: u32,
+    /// V1.4-04 B: named presets the user has saved. The recursion is
+    /// blocked by the sister-struct `BackgroundPresetConfig` (presets
+    /// can't contain presets). Migration v1.5 → v1.6 stamps `[]`; older
+    /// files deserialize to `[]` via serde-default. When a per-tab
+    /// `BackgroundOverride::Custom(...)` round-trips, this field rides
+    /// along as `[]` — that's harmless wire-format growth and avoided
+    /// the wire-format break that switching `Custom` to wrap
+    /// `BackgroundPresetConfig` would have caused.
+    pub presets: Vec<BackgroundPreset>,
+    /// V1.4-04 C.4: when `false`, per-tab Configure dialog edits that
+    /// would flip renderer category (image ↔ no-image) are deferred to
+    /// Save. In-place changes (color / opacity / blur / size /
+    /// position / tint) preview live regardless. Default `true`. Older
+    /// files deserialize to `true` via serde-default; the v1.6 → v1.7
+    /// migration (Phase D) stamps it explicitly.
+    pub preview_category_flips: bool,
+}
+
+impl Default for TerminalBackgroundSettings {
+    fn default() -> Self {
+        Self {
+            image: None,
+            color: None,
+            opacity: 0.4,
+            blur: 0,
+            size: BackgroundSize::Cover,
+            position: "center".to_string(),
+            snapshot_lines: 2000,
+            presets: Vec::new(),
+            preview_category_flips: true,
+        }
+    }
+}
+
+/// V1.4-04 B: a saved preset. `name` is the user-facing label;
+/// `config` carries the same fields as `TerminalBackgroundSettings`
+/// minus the `presets` field itself (the sister-struct
+/// `BackgroundPresetConfig` makes the "presets don't contain presets"
+/// invariant structural rather than runtime-enforced).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct BackgroundPreset {
+    pub name: String,
+    pub config: BackgroundPresetConfig,
+}
+
+/// V1.4-04 B: the payload of a `BackgroundPreset` — same fields as
+/// `TerminalBackgroundSettings` except for the recursive `presets`
+/// field. `From`/`Into` impls bridge the two so the editor UI can hand
+/// either shape into `composeTheme` etc. The `BackgroundOverride::Custom`
+/// variant deliberately stays wrapped around `TerminalBackgroundSettings`
+/// rather than this struct — see the doc note on
+/// `TerminalBackgroundSettings.presets`.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct BackgroundPresetConfig {
+    pub image: Option<PathBuf>,
+    pub color: Option<String>,
+    pub opacity: f32,
+    pub blur: u32,
+    pub size: BackgroundSize,
+    pub position: String,
+    pub snapshot_lines: u32,
+}
+
+impl Default for BackgroundPresetConfig {
+    fn default() -> Self {
+        Self {
+            image: None,
+            color: None,
+            opacity: 0.4,
+            blur: 0,
+            size: BackgroundSize::Cover,
+            position: "center".to_string(),
+            snapshot_lines: 2000,
+        }
+    }
+}
+
+impl From<&TerminalBackgroundSettings> for BackgroundPresetConfig {
+    fn from(s: &TerminalBackgroundSettings) -> Self {
+        Self {
+            image: s.image.clone(),
+            color: s.color.clone(),
+            opacity: s.opacity,
+            blur: s.blur,
+            size: s.size,
+            position: s.position.clone(),
+            snapshot_lines: s.snapshot_lines,
+        }
+    }
+}
+
+impl From<BackgroundPresetConfig> for TerminalBackgroundSettings {
+    fn from(p: BackgroundPresetConfig) -> Self {
+        Self {
+            image: p.image,
+            color: p.color,
+            opacity: p.opacity,
+            blur: p.blur,
+            size: p.size,
+            position: p.position,
+            snapshot_lines: p.snapshot_lines,
+            presets: Vec::new(),
+            // V1.4-04 C.4: a preset doesn't carry the dialog
+            // preview-opt-out flag (it's a global UI behavior, not a
+            // background-config attribute). Lifting a preset back into
+            // a `TerminalBackgroundSettings` defaults to the same
+            // value as `Default`.
+            preview_category_flips: true,
+        }
+    }
+}
+
+/// CSS `background-size` strategy. `Tile` is mapped to
+/// `background-repeat: repeat` + `background-size: auto` on the
+/// frontend; `Cover` and `Contain` map directly to their CSS values.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundSize {
+    Cover,
+    Contain,
+    Tile,
+}
+
+impl Default for BackgroundSize {
+    fn default() -> Self {
+        Self::Cover
+    }
+}
+
+/// V1.4-02 three-state per-tab override. Encodes:
+///   - `None` (the field is `null` on disk, or the override variant is
+///     `None`): inherit the global `terminal.background`.
+///   - `Some(BackgroundOverride::Disabled)` (`"disabled"` on disk):
+///     opt out of any background — render with theme bg only,
+///     ignoring both global image and global color.
+///   - `Some(BackgroundOverride::Custom(cfg))` (full object on disk):
+///     this tab's background config replaces the global one wholesale.
+///
+/// Custom (de)serialize because `serde(untagged)` can't express the
+/// literal-string `"disabled"` cleanly alongside an object variant.
+#[derive(Clone, Debug)]
+pub enum BackgroundOverride {
+    Disabled,
+    Custom(TerminalBackgroundSettings),
+}
+
+impl Serialize for BackgroundOverride {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Disabled => s.serialize_str("disabled"),
+            Self::Custom(c) => c.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BackgroundOverride {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::String(ref s) if s == "disabled" => Ok(Self::Disabled),
+            serde_json::Value::Object(_) => serde_json::from_value(v)
+                .map(Self::Custom)
+                .map_err(D::Error::custom),
+            _ => Err(D::Error::custom(
+                "background_override: expected \"disabled\" string or background config object",
+            )),
+        }
+    }
+}
+
+/// V1.4-04 D: cross-restart scrollback configuration. The ring
+/// buffer is per-tab and capped at `ring_bytes`. `persist` toggles
+/// disk persistence on graceful exit (`tauri::RunEvent::ExitRequested`);
+/// `restore_on_launch` toggles the read-back at next `pty_start`.
+/// Both default `true`. Defaults match the milestone doc — 256 KB per
+/// tab is roughly 600 lines of dense ANSI, enough for "what was I
+/// doing yesterday" continuity without ballooning disk usage.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct ScrollbackSettings {
+    pub ring_bytes: usize,
+    pub persist: bool,
+    pub restore_on_launch: bool,
+}
+
+impl Default for ScrollbackSettings {
+    fn default() -> Self {
+        Self {
+            ring_bytes: 262_144,
+            persist: true,
+            restore_on_launch: true,
         }
     }
 }
@@ -618,5 +948,148 @@ impl Default for ProcessingSettings {
             stability_timeout_ms: 200,
             max_hold_ms: 500,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn background_override_null_round_trips_as_none() {
+        // Field-level: serializing/deserializing the Option<BackgroundOverride>
+        // with `None` produces a JSON `null`.
+        let none: Option<BackgroundOverride> = None;
+        let v = serde_json::to_value(&none).unwrap();
+        assert_eq!(v, Value::Null);
+        let parsed: Option<BackgroundOverride> = serde_json::from_value(Value::Null).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn background_override_disabled_string_round_trips() {
+        let disabled = Some(BackgroundOverride::Disabled);
+        let v = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(v, json!("disabled"));
+        let parsed: Option<BackgroundOverride> = serde_json::from_value(json!("disabled")).unwrap();
+        assert!(matches!(parsed, Some(BackgroundOverride::Disabled)));
+    }
+
+    #[test]
+    fn background_override_custom_object_round_trips() {
+        let cfg = TerminalBackgroundSettings {
+            image: Some(PathBuf::from("/tmp/bg.png")),
+            color: Some("#1a2b3c".to_string()),
+            opacity: 0.7,
+            blur: 12,
+            size: BackgroundSize::Contain,
+            position: "top left".to_string(),
+            snapshot_lines: 2000,
+            presets: Vec::new(),
+            preview_category_flips: true,
+        };
+        let custom = Some(BackgroundOverride::Custom(cfg.clone()));
+        let v = serde_json::to_value(&custom).unwrap();
+        assert!(v.is_object(), "custom override should serialize as an object");
+        let parsed: Option<BackgroundOverride> = serde_json::from_value(v).unwrap();
+        match parsed {
+            Some(BackgroundOverride::Custom(out)) => {
+                assert_eq!(out.image, cfg.image);
+                assert_eq!(out.color, cfg.color);
+                assert!((out.opacity - cfg.opacity).abs() < f32::EPSILON);
+                assert_eq!(out.blur, cfg.blur);
+                assert_eq!(out.size, cfg.size);
+                assert_eq!(out.position, cfg.position);
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_override_rejects_garbage() {
+        // Numbers, arrays, and arbitrary strings all fail with the
+        // explicit error message — the only valid string is "disabled".
+        for v in [json!(42), json!([1, 2, 3]), json!("random")] {
+            let result: Result<BackgroundOverride, _> = serde_json::from_value(v);
+            assert!(result.is_err(), "expected error for invalid override input");
+        }
+    }
+
+    #[test]
+    fn background_settings_default_matches_milestone_doc() {
+        // Sanity check on the values the migration writes — opacity 0.4,
+        // blur 0, size cover, position center, no image, no color.
+        let d = TerminalBackgroundSettings::default();
+        assert!(d.image.is_none());
+        assert!(d.color.is_none());
+        assert!((d.opacity - 0.4).abs() < f32::EPSILON);
+        assert_eq!(d.blur, 0);
+        assert_eq!(d.size, BackgroundSize::Cover);
+        assert_eq!(d.position, "center");
+        assert_eq!(d.snapshot_lines, 2000);
+        assert!(d.presets.is_empty());
+    }
+
+    #[test]
+    fn background_preset_config_round_trips() {
+        let p = BackgroundPresetConfig {
+            image: Some(PathBuf::from("/tmp/frost.jpg")),
+            color: Some("#0011aa".to_string()),
+            opacity: 0.55,
+            blur: 8,
+            size: BackgroundSize::Tile,
+            position: "top right".to_string(),
+            snapshot_lines: 5000,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        let parsed: BackgroundPresetConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.image, p.image);
+        assert_eq!(parsed.color, p.color);
+        assert!((parsed.opacity - p.opacity).abs() < f32::EPSILON);
+        assert_eq!(parsed.blur, p.blur);
+        assert_eq!(parsed.size, p.size);
+        assert_eq!(parsed.position, p.position);
+        assert_eq!(parsed.snapshot_lines, p.snapshot_lines);
+    }
+
+    #[test]
+    fn background_preset_config_from_settings_strips_presets() {
+        // From<&TerminalBackgroundSettings> for BackgroundPresetConfig
+        // copies the shared fields; presets has no analogue on the sister
+        // struct, so it is dropped.
+        let mut s = TerminalBackgroundSettings::default();
+        s.color = Some("#101010".to_string());
+        s.presets.push(BackgroundPreset {
+            name: "noise".to_string(),
+            config: BackgroundPresetConfig::default(),
+        });
+        let p: BackgroundPresetConfig = (&s).into();
+        assert_eq!(p.color, s.color);
+        // The round-trip back through Into<TerminalBackgroundSettings>
+        // produces a fresh `presets: []` regardless of what `s` had.
+        let s2: TerminalBackgroundSettings = p.into();
+        assert!(s2.presets.is_empty());
+    }
+
+    #[test]
+    fn background_preset_round_trips() {
+        let preset = BackgroundPreset {
+            name: "Frosted glass".to_string(),
+            config: BackgroundPresetConfig {
+                image: Some(PathBuf::from("C:\\images\\frost.jpg")),
+                color: None,
+                opacity: 0.4,
+                blur: 12,
+                size: BackgroundSize::Cover,
+                position: "center".to_string(),
+                snapshot_lines: 2000,
+            },
+        };
+        let v = serde_json::to_value(&preset).unwrap();
+        let parsed: BackgroundPreset = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.name, preset.name);
+        assert_eq!(parsed.config.image, preset.config.image);
+        assert_eq!(parsed.config.blur, preset.config.blur);
     }
 }

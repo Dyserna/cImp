@@ -1,7 +1,7 @@
 // Layout-tree node types. The content area renders a binary tree where
 // internal nodes are splits (with a direction and ratio) and leaves are
 // panes (each with its own ordered tab list and active tab). See
-// docs/DESIGN-V4.md "Layout Tree" for the contract this enforces.
+// docs/DESIGN.md "Layout System" for the contract this enforces.
 //
 // Direction convention: `horizontal` arranges children side-by-side (a
 // vertical splitter between them, matching CSS `flex-direction: row`).

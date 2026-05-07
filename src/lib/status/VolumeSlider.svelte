@@ -32,8 +32,8 @@
   .volume-control {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    color: #c0c0c0;
+    gap: var(--space-1);
+    color: var(--text-secondary);
   }
   .glyph {
     font-size: 14px;
@@ -42,7 +42,7 @@
   input[type='range'] {
     width: 90px;
     height: 16px;
-    accent-color: #4a90e2;
+    accent-color: var(--accent);
     cursor: pointer;
   }
 </style>

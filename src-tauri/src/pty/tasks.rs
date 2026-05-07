@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -15,6 +15,7 @@ use crate::processing::permission::{
     PermissionDetector, PermissionDetectorResult, CLAUDE_PERMISSION_PATTERNS, NO_PATTERNS,
 };
 use crate::processing::{ProcessingEvent, ProcessingLayer};
+use super::manager::ProcessorControl;
 use crate::settings::SettingsHandle;
 use crate::state::{AiToolKind, StateSignal, TabId, TabKind};
 use crate::tts::TtsRequest;
@@ -45,10 +46,21 @@ struct PtyExitPayload {
 }
 
 /// Reader task. Lives on the blocking pool because PTY reads block on most platforms.
+///
+/// V1.4-04 D: the reader also feeds the per-tab scrollback ring buffer.
+/// `scrollback` is shared with `PtyManager` so persistence and the
+/// `pty_get_scrollback` Tauri command can snapshot the same bytes. The
+/// ring is bounded at `scrollback_cap` — surplus is dropped from the
+/// front via `pop_front`. Lock contention is minimal: only this reader
+/// writes; the snapshot/persist paths are rare reads. `StdMutex` keeps
+/// every critical section tight (no awaits) and avoids the awkward
+/// blocking-pool-vs-tokio-mutex interplay.
 pub fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     tx: mpsc::Sender<Vec<u8>>,
     cancel: CancellationToken,
+    scrollback: Arc<StdMutex<VecDeque<u8>>>,
+    scrollback_cap: usize,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
@@ -73,6 +85,20 @@ pub fn spawn_reader(
                             })
                             .collect();
                         debug!(target: "pty_in", len = n, bytes = %pretty);
+                    }
+                    // V1.4-04 D: append to the cross-restart ring
+                    // before forwarding. Doing it before the
+                    // `blocking_send` means the ring captures every
+                    // byte even if the processor is back-pressured;
+                    // doing it after would risk losing bytes if the
+                    // forwarder drops mid-read.
+                    if scrollback_cap > 0 {
+                        if let Ok(mut ring) = scrollback.lock() {
+                            ring.extend(&buf[..n]);
+                            while ring.len() > scrollback_cap {
+                                ring.pop_front();
+                            }
+                        }
                     }
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         debug!("pty reader: forwarder dropped");
@@ -109,6 +135,7 @@ pub fn spawn_processor(
     tab: TabId,
     mut rx: mpsc::Receiver<Vec<u8>>,
     channel: Channel<String>,
+    mut control_rx: mpsc::Receiver<ProcessorControl>,
     tts_segments: mpsc::Sender<TtsRequest>,
     cancel: CancellationToken,
     user_typed_tts: Arc<StdMutex<HashSet<String>>>,
@@ -116,6 +143,13 @@ pub fn spawn_processor(
     settings: SettingsHandle,
 ) {
     tokio::spawn(async move {
+        // V1.4-03: `channel` is `mut` so the `ProcessorControl::ChannelChange`
+        // arm can swap it out when the JS-side xterm is recreated for a
+        // renderer-flip. Bytes pending in `rx` during the swap remain there
+        // (mpsc is FIFO; cancel-safe across select polls) and dispatch to
+        // the new channel on the next iteration.
+        let mut channel = channel;
+
         let kind = tab.kind();
         let is_shell = matches!(kind, TabKind::Shell);
 
@@ -158,6 +192,27 @@ pub fn spawn_processor(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             debug!("pty processor: settings channel closed");
+                        }
+                    }
+                }
+                ctrl = control_rx.recv() => {
+                    match ctrl {
+                        Some(ProcessorControl::ChannelChange(next)) => {
+                            // V1.4-03: swap output channel without
+                            // restarting the PTY. No replay here — bytes
+                            // that arrived during the rebind window are
+                            // queued in `rx` and dispatch against the
+                            // new channel on the next iteration.
+                            // Frontend handles visual continuity via the
+                            // serialize-snapshot replay.
+                            debug!(?tab, "pty processor: channel rebind");
+                            channel = next;
+                        }
+                        None => {
+                            // Sender dropped — only happens if PtyHandle
+                            // is freed without going through `shutdown`,
+                            // which would also cancel us. Defensive.
+                            debug!(?tab, "pty processor: control channel closed");
                         }
                     }
                 }

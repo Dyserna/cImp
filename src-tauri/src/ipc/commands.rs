@@ -12,6 +12,18 @@ use crate::settings::{
 };
 use crate::state::{StateSignal, TabId};
 
+/// V1.4-04 D: pty_start now returns the persisted-scrollback bytes
+/// from the previous session (if any). The frontend writes them to the
+/// new xterm before the live channel binds so the user sees their
+/// previous shell output above the fresh prompt. The bytes are also
+/// seeded into the new ring buffer so a subsequent crash-restart
+/// preserves continuity (capped at the ring size, naturally).
+///
+/// Returns `None` when:
+///   - `terminal.scrollback.restore_on_launch` is `false`
+///   - no persisted file exists for this tab (cold install, or
+///     already consumed earlier in this session)
+///   - reading the file failed (logged at warn; treated as cold start)
 #[tauri::command]
 pub async fn pty_start(
     app: AppHandle,
@@ -20,17 +32,19 @@ pub async fn pty_start(
     channel: Channel<String>,
     rows: u16,
     cols: u16,
-) -> AppResult<()> {
+) -> AppResult<Option<Vec<u8>>> {
     let cwd = state.launch.cwd.clone();
     let invocation_args = state.launch.extra_args.clone();
     let tts_tx = state.tts_segments.clone();
     let user_typed = state.user_typed_tts.clone();
     let settings = state.settings.clone();
+    let restore_on_launch = settings.current().terminal.scrollback.restore_on_launch;
+
     let registry = state.tabs.lock().await;
     registry
         .start_tab(
             app,
-            tab,
+            tab.clone(),
             channel,
             rows,
             cols,
@@ -40,7 +54,24 @@ pub async fn pty_start(
             user_typed,
             settings,
         )
-        .await
+        .await?;
+
+    // V1.4-04 D.5: read-and-consume any persisted scrollback for this
+    // tab. Done after a successful start so a spawn failure doesn't
+    // burn the persisted bytes.
+    if !restore_on_launch {
+        return Ok(None);
+    }
+    let restored = crate::pty::scrollback::take(&tab);
+    if let Some(bytes) = &restored {
+        // Seed the new ring with the restored bytes so a subsequent
+        // crash-restart still has them. Logging-only on error: the
+        // user-visible replay (the returned bytes) succeeds regardless.
+        if let Err(e) = registry.seed_scrollback(&tab, bytes).await {
+            tracing::warn!(?tab, error = %e, "scrollback seed failed");
+        }
+    }
+    Ok(restored)
 }
 
 #[tauri::command]
@@ -58,10 +89,10 @@ pub async fn pty_restart(
     let user_typed = state.user_typed_tts.clone();
     let settings = state.settings.clone();
     let registry = state.tabs.lock().await;
-    registry
+    let result = registry
         .restart_tab(
             app,
-            tab,
+            tab.clone(),
             channel,
             rows,
             cols,
@@ -71,7 +102,45 @@ pub async fn pty_restart(
             user_typed,
             settings,
         )
-        .await
+        .await;
+    // V1.4-04 D.6: on user-initiated restart, the prior session's
+    // scrollback is no longer relevant. Clear the in-memory ring so
+    // the next graceful-exit persist doesn't include stale bytes from
+    // before the restart. Done regardless of whether the restart
+    // succeeded — the user explicitly asked for a clean shell.
+    if let Err(e) = registry.clear_scrollback(&tab).await {
+        tracing::warn!(?tab, error = %e, "scrollback clear after restart failed");
+    }
+    result
+}
+
+/// V1.4-03: re-point a still-running PTY's bytes at a fresh JS-side
+/// `Channel<String>` without restarting the shell. The frontend invokes
+/// this when the xterm.js Terminal is destroyed and recreated for a
+/// renderer-category flip (background image toggled on or off). The
+/// shell session, env, cwd, and any in-flight processes survive; only
+/// the IPC channel is replaced.
+#[tauri::command]
+pub async fn pty_rebind_channel(
+    state: State<'_, AppState>,
+    tab: TabId,
+    channel: Channel<String>,
+) -> AppResult<()> {
+    let registry = state.tabs.lock().await;
+    registry.rebind_channel(tab, channel).await
+}
+
+/// V1.4-04 D.3: snapshot a tab's PTY scrollback as raw bytes. Exposed
+/// for diagnostics and external use; the launch-replay path uses an
+/// internal API (`pty_start` returning `Option<Vec<u8>>`) for
+/// efficiency. Returns `NotStarted` if the tab has no live PTY.
+#[tauri::command]
+pub async fn pty_get_scrollback(
+    state: State<'_, AppState>,
+    tab: TabId,
+) -> AppResult<Vec<u8>> {
+    let registry = state.tabs.lock().await;
+    registry.scrollback_snapshot(tab).await
 }
 
 #[tauri::command]

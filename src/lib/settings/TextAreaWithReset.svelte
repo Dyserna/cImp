@@ -56,15 +56,20 @@
   }
   textarea {
     width: 100%;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #ddd;
-    padding: 6px 8px;
-    border-radius: 4px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 6px var(--space-2);
+    border-radius: var(--radius-md);
     font-family: monospace;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     resize: vertical;
     box-sizing: border-box;
+    transition: border-color var(--motion-fast) var(--easing-standard);
+  }
+  textarea:focus {
+    outline: none;
+    border-color: var(--accent);
   }
   textarea:disabled {
     opacity: 0.5;
@@ -72,17 +77,24 @@
   }
   .reset {
     align-self: flex-end;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #aaa;
+    background: var(--surface-2);
+    border: 1px solid var(--border-default);
+    color: var(--text-quiet-strong);
     padding: 3px 10px;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
   }
   .reset:hover:not(:disabled) {
-    background: #333;
-    color: #ddd;
+    background: var(--surface-input);
+    color: var(--text-primary);
+  }
+  .reset:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .reset:disabled {
     opacity: 0.4;

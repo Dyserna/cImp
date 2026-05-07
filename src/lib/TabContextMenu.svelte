@@ -238,42 +238,48 @@
 <style>
   .menu {
     position: fixed;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    border-radius: 4px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-    padding: 4px 0;
-    min-width: 180px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    padding: var(--space-1);
+    min-width: 200px;
     z-index: 200;
   }
   .entry {
     appearance: none;
     border: none;
     background: transparent;
-    color: #e0e0e0;
+    color: var(--text-primary);
     text-align: left;
     width: 100%;
-    padding: 6px 16px;
-    font-size: 13px;
+    padding: 6px var(--space-3);
+    font-size: var(--font-size-md);
     font-family: inherit;
     cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: background var(--motion-fast) var(--easing-standard);
   }
   .entry:hover:not(.disabled):not(.submenu-host):not([disabled]) {
-    background: #383838;
+    background: var(--surface-4);
+  }
+  .entry:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .entry.danger:hover {
-    background: #4a2a2a;
-    color: #ffaaaa;
+    background: var(--surface-danger-soft);
+    color: var(--text-danger-soft);
   }
   .entry.disabled,
   .entry[disabled] {
-    color: #666;
+    color: var(--text-disabled);
     cursor: default;
   }
   .separator {
     height: 1px;
-    background: #444;
-    margin: 4px 0;
+    background: var(--border-default);
+    margin: var(--space-1) 0;
   }
   .submenu-host {
     position: relative;
@@ -287,31 +293,33 @@
     font: inherit;
     width: 100%;
     text-align: left;
-    padding: 6px 16px;
+    padding: 6px var(--space-3);
     cursor: pointer;
     display: flex;
     justify-content: space-between;
     align-items: center;
+    border-radius: var(--radius-sm);
+    transition: background var(--motion-fast) var(--easing-standard);
   }
   .submenu-host:hover .submenu-trigger,
   .submenu-trigger:focus {
-    background: #383838;
+    background: var(--surface-4);
   }
   .submenu-arrow {
     font-size: 9px;
-    color: #888;
-    margin-left: 8px;
+    color: var(--text-tertiary);
+    margin-left: var(--space-2);
   }
   .submenu {
     position: absolute;
     left: 100%;
     top: -5px;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    border-radius: 4px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-    padding: 4px 0;
-    min-width: 180px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    padding: var(--space-1);
+    min-width: 200px;
     max-height: 320px;
     overflow-y: auto;
   }

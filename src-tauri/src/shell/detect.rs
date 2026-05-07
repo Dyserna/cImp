@@ -1,6 +1,6 @@
 //! Default-shell auto-detection per platform.
 //!
-//! See `DESIGN-V3.md` § "Auto-detection on Windows" for the probe order and
+//! See `DESIGN.md` § "Cross-Platform Considerations" for the probe order and
 //! rationale; in short, we prefer Git Bash on Windows because it ships the
 //! standard Linux toolset most users want, and we honor `$SHELL` on Linux
 //! because that's what the user has already chosen.
@@ -133,7 +133,7 @@ fn resolve_unix() -> (ShellSpec, ShellSource) {
 
 #[cfg(windows)]
 fn resolve_windows() -> (ShellSpec, ShellSource) {
-    // Probe order matches DESIGN-V3.md.
+    // Probe order matches DESIGN.md.
     let standard_paths = [
         r"C:\Program Files\Git\bin\bash.exe",
         r"C:\Program Files (x86)\Git\bin\bash.exe",

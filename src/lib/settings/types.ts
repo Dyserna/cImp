@@ -52,7 +52,6 @@ export interface TtsSettings {
 export interface DisplaySettings {
   terminal_font_family: string;
   terminal_font_size: number;
-  theme: string;
   show_tts_markup: boolean;
 }
 
@@ -128,6 +127,13 @@ export interface AiToolTabConfig {
   tts_injection: TtsInjection;
   notifications: AiNotificationConfig;
   first_launch_notice_dismissed: boolean;
+  /// V1.4-01 per-tab terminal palette override. `null` inherits the
+  /// global `terminal.theme`; non-null replaces it for this tab.
+  theme_override: TerminalThemeSettings | null;
+  /// V1.4-02 per-tab background override (three-state). `null` inherits
+  /// the global `terminal.background`; `"disabled"` opts out (theme bg
+  /// only); a full settings object replaces the global wholesale.
+  background_override: BackgroundOverrideWire | null;
 }
 
 export interface ShellTabConfig {
@@ -140,6 +146,12 @@ export interface ShellTabConfig {
   cwd: string | null;
   env: Record<string, string>;
   notifications: ShellNotificationConfig;
+  /// V1.4-01 per-tab terminal palette override. `null` inherits the
+  /// global `terminal.theme`; non-null replaces it for this tab.
+  theme_override: TerminalThemeSettings | null;
+  /// V1.4-02 per-tab background override (three-state). See
+  /// `AiToolTabConfig.background_override`.
+  background_override: BackgroundOverrideWire | null;
 }
 
 export type TabConfig = AiToolTabConfig | ShellTabConfig;
@@ -151,6 +163,136 @@ export interface SessionState {
 export interface ProcessingSettings {
   stability_timeout_ms: number;
   max_hold_ms: number;
+}
+
+export interface UiSettings {
+  /// Active UI chrome theme. V5-01 ships only `"modern-dark"`; the field
+  /// exists so future themes (light, high-contrast) plug in without UI
+  /// plumbing churn. Distinct from `terminal.theme`, which governs the
+  /// xterm.js terminal palette inside each tab.
+  theme: string;
+}
+
+/// On-wire shape of a custom palette block. Mirrors the Rust
+/// `HashMap<String, String>`. The 22 valid keys match xterm.js's
+/// `ITheme`; missing keys are filled in from the bundled "Default"
+/// theme by `themeFromSetting` in `src/lib/themes/resolve.ts`.
+export type ThemeColorsWire = Record<string, string>;
+
+/// Terminal palette setting. `name` is either a bundled theme name
+/// (Default, Dracula, Solarized Dark, …) or "Custom" — in which case
+/// `custom` carries the user's chosen color overrides.
+export interface TerminalThemeSettings {
+  name: string;
+  custom: ThemeColorsWire | null;
+}
+
+/// V1.4-02: CSS `background-size` strategy. `tile` is mapped on the
+/// frontend to `background-repeat: repeat` + `background-size: auto`;
+/// `cover` and `contain` map directly to their CSS values.
+export type BackgroundSize = 'cover' | 'contain' | 'tile';
+
+/// V1.4-02 terminal background config. `image` and `color` are
+/// independent — both can be set, in which case `color` becomes the
+/// dimming-overlay tint atop the image. The opacity / blur / size /
+/// position fields apply only when `image` is set; the resolver in
+/// `src/lib/terminal/background.ts` enforces this.
+export interface TerminalBackgroundSettings {
+  image: string | null;
+  color: string | null;
+  opacity: number;
+  blur: number;
+  size: BackgroundSize;
+  position: string;
+  /// V1.4-04 A.1: scrollback rows captured by `serializeAddon.serialize`
+  /// on a renderer-category flip. Bounds JS-heap allocation; default
+  /// 2000.
+  snapshot_lines: number;
+  /// V1.4-04 B: named presets the user has saved. The recursive shape
+  /// is blocked by `BackgroundPresetConfigWire` (preset configs don't
+  /// contain a `presets` field), so a preset can never reference
+  /// presets-of-presets. Migration v1.5 → v1.6 stamps `[]`.
+  presets: BackgroundPresetWire[];
+  /// V1.4-04 C.4: when false, per-tab dialog edits that flip renderer
+  /// category (image ↔ no-image) are deferred to Save. In-place
+  /// changes preview live regardless. Default true. Phase D's
+  /// v1.6 → v1.7 migration stamps this explicitly; older files
+  /// serde-default to `true`.
+  preview_category_flips: boolean;
+}
+
+/// V1.4-04 B: payload of a saved preset. Same fields as
+/// `TerminalBackgroundSettings` minus the recursive `presets` field.
+/// Mirrors Rust's `BackgroundPresetConfig`.
+export interface BackgroundPresetConfigWire {
+  image: string | null;
+  color: string | null;
+  opacity: number;
+  blur: number;
+  size: BackgroundSize;
+  position: string;
+  snapshot_lines: number;
+}
+
+/// V1.4-04 B: a named preset entry. `name` is the user-facing label
+/// shown in the "Load preset…" dropdown and Manage modal. Mirrors
+/// Rust's `BackgroundPreset`.
+export interface BackgroundPresetWire {
+  name: string;
+  config: BackgroundPresetConfigWire;
+}
+
+/// Project the shared subset of a `TerminalBackgroundSettings` into a
+/// `BackgroundPresetConfigWire`. The reverse is achieved by spreading
+/// the preset config into a `TerminalBackgroundSettings` with a fresh
+/// `presets: []`, which the editor's `loadPreset` does inline.
+export function toPresetConfig(
+  s: TerminalBackgroundSettings,
+): BackgroundPresetConfigWire {
+  return {
+    image: s.image,
+    color: s.color,
+    opacity: s.opacity,
+    blur: s.blur,
+    size: s.size,
+    position: s.position,
+    snapshot_lines: s.snapshot_lines,
+  };
+}
+
+/// V1.4-02 three-state per-tab override on the wire. The literal
+/// `'disabled'` string opts the tab out of any background; an object
+/// is a full per-tab config; `null` (handled at the field level on the
+/// containing tab type) inherits the global setting.
+export type BackgroundOverrideWire = 'disabled' | TerminalBackgroundSettings;
+
+/// Type guard: distinguishes the `'disabled'` literal from the object
+/// branch so callers can narrow safely without struct-vs-string runtime
+/// checks scattered around the codebase.
+export function isBackgroundDisabled(
+  o: BackgroundOverrideWire | null,
+): o is 'disabled' {
+  return o === 'disabled';
+}
+
+/// V1.4-04 D: cross-restart scrollback config. The PTY ring buffer is
+/// capped at `ring_bytes` per tab; on graceful exit each tab's ring is
+/// written to `<config-dir>/scrollback/<tab-id>.bin`; on next launch
+/// `pty_start` returns the persisted bytes for the new xterm to replay
+/// before live PTY output resumes.
+export interface ScrollbackSettings {
+  ring_bytes: number;
+  persist: boolean;
+  restore_on_launch: boolean;
+}
+
+/// V1.4-01+: terminal-pane settings. Holds the xterm.js palette config
+/// (V1.4-01), the V1.4-02 background sub-group, and the V1.4-04 D
+/// cross-restart scrollback group.
+export interface TerminalSettings {
+  theme: TerminalThemeSettings;
+  background: TerminalBackgroundSettings;
+  scrollback: ScrollbackSettings;
 }
 
 /// Persisted layout state (V4-04). Mirrors the in-memory `LayoutState`
@@ -191,6 +333,11 @@ export interface Settings {
   /// Saved layout presets. Empty by default; populated via the Layouts
   /// menu. Order is insertion order; the popover sorts by `created_at`.
   layout_presets: LayoutPreset[];
+  /// UI chrome theme settings (V5).
+  ui: UiSettings;
+  /// Terminal-pane settings (V1.4-01+): xterm.js palette today, plus
+  /// the V1.4-02 background sub-group when that ships.
+  terminal: TerminalSettings;
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
@@ -242,7 +389,6 @@ export function defaultSettings(): Settings {
     display: {
       terminal_font_family: 'Consolas, Menlo, "DejaVu Sans Mono", monospace',
       terminal_font_size: 14,
-      theme: 'dark',
       show_tts_markup: false,
     },
     behavior: {
@@ -294,6 +440,8 @@ export function defaultSettings(): Settings {
           error: 'Claude encountered an error',
         },
         first_launch_notice_dismissed: true,
+        theme_override: null,
+        background_override: null,
       },
       {
         kind: 'ai_tool',
@@ -312,11 +460,33 @@ export function defaultSettings(): Settings {
           error: 'Aider encountered an error',
         },
         first_launch_notice_dismissed: false,
+        theme_override: null,
+        background_override: null,
       },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
     session: { active_tab_id: null },
     layout: null,
     layout_presets: [],
+    ui: { theme: 'modern-dark' },
+    terminal: {
+      theme: { name: 'Default', custom: null },
+      background: {
+        image: null,
+        color: null,
+        opacity: 0.4,
+        blur: 0,
+        size: 'cover',
+        position: 'center',
+        snapshot_lines: 2000,
+        presets: [],
+        preview_category_flips: true,
+      },
+      scrollback: {
+        ring_bytes: 262144,
+        persist: true,
+        restore_on_launch: true,
+      },
+    },
   };
 }

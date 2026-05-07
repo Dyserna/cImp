@@ -1,9 +1,20 @@
 <script lang="ts">
+  import { get } from 'svelte/store';
   import type { TabId } from '../tabs/types';
-  import type { AiToolTabConfig } from './types';
+  import type {
+    AiToolTabConfig,
+    TerminalBackgroundSettings,
+    ThemeColorsWire,
+  } from './types';
   import ArrayEditor from './ArrayEditor.svelte';
   import TextAreaWithReset from './TextAreaWithReset.svelte';
   import NotificationEditor from './NotificationEditor.svelte';
+  import Pill from '../Pill.svelte';
+  import ThemeSwatch from './ThemeSwatch.svelte';
+  import CustomThemeEditor from './CustomThemeEditor.svelte';
+  import BackgroundConfigEditor from './BackgroundConfigEditor.svelte';
+  import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from '../themes';
+  import { settings as settingsStore } from './store';
 
   // Renders the per-AI-tab settings form: command (read-only), CLI args,
   // TTS injection toggle + instructions, notification texts, and a Restart
@@ -43,6 +54,95 @@
     };
     onchange();
   }
+
+  // Live global theme name for the "Use global default (current: X)"
+  // dropdown entry. Reactive via $derived so it tracks Settings changes.
+  let globalThemeName = $derived($settingsStore.terminal.theme.name);
+
+  let overrideSelection = $derived(
+    settings.theme_override === null ? '__inherit' : settings.theme_override.name,
+  );
+
+  // V1.4-03: per-tab background override. Three states mirror the shell-
+  // tab dialog's BgOverrideMode: '__inherit' / '__disabled' / '__custom'.
+  type BgOverrideMode = '__inherit' | '__disabled' | '__custom';
+  let bgOverrideSelection = $derived<BgOverrideMode>(
+    settings.background_override === null
+      ? '__inherit'
+      : settings.background_override === 'disabled'
+        ? '__disabled'
+        : '__custom',
+  );
+
+  let globalBgSummary = $derived(
+    globalBgSummaryOf($settingsStore.terminal.background),
+  );
+
+  function globalBgSummaryOf(bg: TerminalBackgroundSettings): string {
+    if (bg.image) {
+      const filename = bg.image.split(/[\\/]/).pop() ?? bg.image;
+      return `image: ${filename}`;
+    }
+    if (bg.color) return `solid ${bg.color}`;
+    return 'theme background';
+  }
+
+  function selectBgOverride(value: BgOverrideMode): void {
+    if (value === '__inherit') {
+      update('background_override', null);
+      return;
+    }
+    if (value === '__disabled') {
+      update('background_override', 'disabled');
+      return;
+    }
+    // '__custom' — already custom: preserve.
+    if (
+      settings.background_override !== null &&
+      settings.background_override !== 'disabled' &&
+      typeof settings.background_override === 'object'
+    ) {
+      return;
+    }
+    // V1.4-04 B/C: strip the global presets list when descending into
+    // an override (presets live globally; the embedded list inside an
+    // override is harmless wire-format growth we'd rather avoid).
+    const liveGlobal = get(settingsStore).terminal.background;
+    update('background_override', { ...liveGlobal, presets: [] });
+  }
+
+  function updateCustomBg(next: TerminalBackgroundSettings): void {
+    update('background_override', next);
+  }
+
+  function selectThemeOverride(value: string): void {
+    if (value === '__inherit') {
+      update('theme_override', null);
+      return;
+    }
+    if (value === 'Custom') {
+      const liveGlobal = get(settingsStore).terminal.theme;
+      const previousName =
+        settings.theme_override === null
+          ? liveGlobal.name
+          : settings.theme_override.name;
+      const seed =
+        previousName === 'Custom'
+          ? BUNDLED_THEMES.Default
+          : resolveBundledTheme(previousName);
+      update('theme_override', {
+        name: 'Custom',
+        custom: { ...seed } as ThemeColorsWire,
+      });
+      return;
+    }
+    update('theme_override', { name: value, custom: null });
+  }
+
+  function updateCustomColors(next: ThemeColorsWire): void {
+    if (!settings.theme_override) return;
+    update('theme_override', { ...settings.theme_override, custom: next });
+  }
 </script>
 
 <div class="tab-section">
@@ -60,7 +160,7 @@
     <span>
       Persistent CLI args
       {#if restartRequired}
-        <span class="restart-tag">restart required</span>
+        <Pill variant="orange" size="xs">restart required</Pill>
       {/if}
     </span>
     <ArrayEditor
@@ -88,7 +188,7 @@
     <span>
       TTS markup injection enabled
       {#if restartRequired}
-        <span class="restart-tag">restart required</span>
+        <Pill variant="orange" size="xs">restart required</Pill>
       {/if}
     </span>
   </label>
@@ -133,6 +233,70 @@
     </small>
   </label>
 
+  <label class="palette-row">
+    <span>Terminal palette</span>
+    <select
+      value={overrideSelection}
+      onchange={(e) =>
+        selectThemeOverride((e.currentTarget as HTMLSelectElement).value)}
+    >
+      <option value="__inherit">Use global default (current: {globalThemeName})</option>
+      {#each BUNDLED_THEME_NAMES as paletteName}
+        <option value={paletteName}>{paletteName}</option>
+      {/each}
+      <option value="Custom">Custom…</option>
+    </select>
+    {#if settings.theme_override !== null}
+      <ThemeSwatch
+        name={settings.theme_override.name}
+        custom={settings.theme_override.custom}
+      />
+    {/if}
+  </label>
+  {#if settings.theme_override && settings.theme_override.name === 'Custom' && settings.theme_override.custom}
+    <CustomThemeEditor
+      value={settings.theme_override.custom}
+      onchange={updateCustomColors}
+    />
+  {/if}
+  <small class="hint">
+    Override the global terminal palette for this tab. Applied
+    immediately — no restart needed.
+  </small>
+
+  <label class="palette-row">
+    <span>Terminal background</span>
+    <select
+      value={bgOverrideSelection}
+      onchange={(e) =>
+        selectBgOverride(
+          (e.currentTarget as HTMLSelectElement).value as BgOverrideMode,
+        )}
+    >
+      <option value="__inherit"
+        >Use global default (current: {globalBgSummary})</option
+      >
+      <option value="__disabled"
+        >Disabled — use theme background only</option
+      >
+      <option value="__custom">Custom for this tab</option>
+    </select>
+  </label>
+  {#if bgOverrideSelection === '__disabled'}
+    <small class="hint">
+      No observable effect when the global background is also "Theme
+      default."
+    </small>
+  {/if}
+  {#if bgOverrideSelection === '__custom' && settings.background_override !== null && settings.background_override !== 'disabled' && typeof settings.background_override === 'object'}
+    <BackgroundConfigEditor
+      bind:config={
+        () => settings.background_override as TerminalBackgroundSettings,
+        (v) => updateCustomBg(v)
+      }
+    />
+  {/if}
+
   <div class="restart-row">
     <button
       type="button"
@@ -151,66 +315,62 @@
 
 <style>
   .tab-section {
-    padding: 12px 14px;
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
+    padding: var(--space-3) 14px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
   }
   h3 {
-    margin: 0 0 12px 0;
-    font-size: 13px;
+    margin: 0 0 var(--space-3) 0;
+    font-size: var(--font-size-md);
     font-weight: 600;
-    color: #ddd;
-  }
-  .restart-tag {
-    display: inline-block;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: #d8b8ff;
-    background: #3a2a55;
-    border: 1px solid #6f42a8;
-    padding: 1px 6px;
-    border-radius: 8px;
-    margin-left: 6px;
-    vertical-align: middle;
+    color: var(--text-primary);
   }
   .warn {
-    margin: -6px 0 12px 0;
-    padding: 8px 10px;
-    background: #2a230f;
-    border: 1px solid #6a571a;
-    border-radius: 4px;
-    color: #e0d090;
-    font-size: 11px;
+    margin: -6px 0 var(--space-3) 0;
+    padding: var(--space-2) 10px;
+    background: var(--surface-warning-faint);
+    border: 1px solid var(--border-warning);
+    border-radius: var(--radius-md);
+    color: var(--text-warning-bright);
+    font-size: var(--font-size-xs);
     line-height: 1.4;
   }
   .warn code {
-    background: #1a1a1a;
-    padding: 1px 4px;
-    border-radius: 3px;
-    font-size: 11px;
+    background: var(--surface-sunken);
+    padding: 1px var(--space-1);
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-xs);
   }
   small.hint.inline {
     margin: 0 0 0 10px;
-    color: #777;
+    color: var(--text-faint);
   }
   .restart-row {
     display: flex;
     align-items: center;
-    margin-top: 8px;
+    margin-top: var(--space-2);
   }
   .restart-btn {
-    background: #6f42a8;
-    border: 1px solid #6f42a8;
-    color: #fff;
+    background: var(--border-info);
+    border: 1px solid var(--border-info);
+    color: var(--text-bright);
     padding: 6px 14px;
-    border-radius: 4px;
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
   }
   .restart-btn:hover:not(:disabled) {
-    background: #835ac5;
+    background: var(--text-info-quiet);
+    border-color: var(--text-info-quiet);
+  }
+  .restart-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .restart-btn:disabled {
     opacity: 0.4;

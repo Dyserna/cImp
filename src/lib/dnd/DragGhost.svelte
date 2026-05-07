@@ -31,15 +31,16 @@
     position: fixed;
     z-index: 10000;
     pointer-events: none;
-    background: #1f1f1f;
-    color: #ffffff;
-    border: 1px solid #4a90e2;
-    border-radius: 4px;
-    padding: 4px 12px;
-    font-size: 13px;
+    background: var(--surface-3);
+    color: var(--text-bright);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-md);
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--font-size-md);
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    opacity: 0.85;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    opacity: 0.92;
+    box-shadow: var(--shadow-md);
+    transform: rotate(-1.5deg);
     user-select: none;
     white-space: nowrap;
   }

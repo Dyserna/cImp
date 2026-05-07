@@ -23,15 +23,15 @@
     pointer-events: none;
   }
   .toast {
-    background: rgba(40, 40, 40, 0.95);
-    border: 1px solid #555;
-    color: #f0f0f0;
-    padding: 8px 16px;
-    border-radius: 4px;
-    font-size: 13px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+    background: var(--surface-3);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-bright);
+    padding: var(--space-2) var(--space-4);
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-md);
+    box-shadow: var(--shadow-md);
     pointer-events: auto;
-    animation: toast-in 0.16s ease;
+    animation: toast-in var(--motion-base) var(--easing-standard);
   }
   @keyframes toast-in {
     from { opacity: 0; transform: translateY(8px); }

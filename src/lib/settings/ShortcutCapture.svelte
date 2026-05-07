@@ -64,37 +64,51 @@
   .capture {
     flex: 1;
     padding: 6px 10px;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #ddd;
-    border-radius: 4px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    border-radius: var(--radius-md);
     font-family: monospace;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     cursor: pointer;
     text-align: left;
     min-height: 30px;
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
   }
   .capture.capturing {
-    border-color: #bb55ff;
-    color: #bb55ff;
+    background: var(--accent-muted);
+    border-color: var(--accent);
+    color: var(--accent);
   }
   .capture:hover:not(.capturing) {
-    background: #333;
+    background: var(--surface-input);
+  }
+  .capture:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .clear {
     padding: 6px 10px;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #ddd;
-    border-radius: 4px;
-    font-size: 13px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-md);
     cursor: pointer;
+    transition: background var(--motion-fast) var(--easing-standard);
   }
   .clear:disabled {
     opacity: 0.5;
     cursor: not-allowed;
   }
   .clear:hover:not(:disabled) {
-    background: #333;
+    background: var(--surface-input);
+  }
+  .clear:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 </style>

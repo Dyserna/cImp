@@ -289,8 +289,25 @@ Open with `Ctrl+,` or the cog button on the avatar.
   overrides, transition video + duration. Empty transition path or
   `duration = 0` falls back to a 150 ms crossfade.
 - **Waveform:** color, line width, glow, opacity.
-- **Display:** terminal font family + size, theme, toggle to render TTS
-  markup verbatim in the terminal (debug aid).
+- **Display:** terminal font family + size, toggle to render TTS markup
+  verbatim in the terminal (debug aid).
+- **Appearance:** UI chrome theme (Modern Dark) and **terminal palette** —
+  12 bundled palettes (Default, Dracula, Solarized Dark/Light, Nord,
+  Tomorrow Night, Gruvbox Dark/Light, One Dark, Monokai, Tokyo Night,
+  GitHub Dark) plus a 22-color Custom editor for foreground, background,
+  cursor, selection, ANSI 8, and bright 8. Each tab can override the
+  global palette via Configure Tab → Appearance — useful for color-coding
+  Claude vs. aider vs. shells. Per-tab overrides travel with the tab
+  through drag-and-drop. Plus **terminal background** — a solid color or
+  user-supplied image rendered beneath the terminal text. Solid color
+  has no performance cost; image mode forces the slower DOM renderer
+  (2-5× slower for high-throughput output like `tail -F`). Toggling the
+  image switches xterm.js renderers cleanly — your shell session,
+  scrollback, and running processes all survive the switch (V1.4-03).
+  Image mode adds opacity, blur, size, position, and an optional tint
+  color for the dimming overlay. **Per-tab Background row** in Configure
+  Tab gives each tab its own image/color or a "Disabled" opt-out that
+  forces plain theme background regardless of the global setting.
 - **Behavior:** interrupt TTS on input, auto-speak detected segments.
 - **Compose:** min/max sheet height for the slide-up compose overlay.
 - **Shortcuts:** rebindable open/submit/cancel for compose, open settings,

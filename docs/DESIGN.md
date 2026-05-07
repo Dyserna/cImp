@@ -611,8 +611,21 @@ The on-disk JSON shape, current as of v1.3:
   "display": {
     "terminal_font_family": "Consolas, Menlo, \"DejaVu Sans Mono\", monospace",
     "terminal_font_size": 14,
-    "theme": "dark",
     "show_tts_markup": false
+  },
+  "terminal": {
+    "theme": {
+      "name": "Default",
+      "custom": null
+    },
+    "background": {
+      "image": null,
+      "color": null,
+      "opacity": 0.4,
+      "blur": 0,
+      "size": "cover",
+      "position": "center"
+    }
   },
   "behavior": {
     "interrupt_on_input": true,
@@ -656,7 +669,9 @@ The on-disk JSON shape, current as of v1.3:
         "awaiting_permission": "Claude is awaiting permission",
         "error": "Claude encountered an error"
       },
-      "first_launch_notice_dismissed": true
+      "first_launch_notice_dismissed": true,
+      "theme_override": null,
+      "background_override": null
     },
     {
       "kind": "ai_tool",
@@ -670,7 +685,9 @@ The on-disk JSON shape, current as of v1.3:
       "env": {},
       "tts_injection": { "enabled": false, "instructions": "" },
       "notifications": { "...": "..." },
-      "first_launch_notice_dismissed": false
+      "first_launch_notice_dismissed": false,
+      "theme_override": { "name": "Solarized Dark", "custom": null },
+      "background_override": "disabled"
     },
     {
       "kind": "shell",
@@ -684,7 +701,9 @@ The on-disk JSON shape, current as of v1.3:
       "notifications": {
         "error": "Shell encountered an error",
         "exited": "Shell exited (code {code})"
-      }
+      },
+      "theme_override": null,
+      "background_override": null
     }
   ],
   "processing": { "stability_timeout_ms": 200, "max_hold_ms": 500 },
@@ -717,6 +736,9 @@ Notes:
 - Reserved tab ids — `claude`, `aider`, `shell-default-1` — cannot disappear. The integrity check restores them with `builtin: true` and the right `ai_tool_kind` if a hand-edited file deletes or corrupts them. User-created Shell tab ids are uuid-based and never collide.
 - `session.active_tab_id` is a legacy field. It still exists in the struct and is updated by the runtime on tab activation, but the v1.2 → v1.3 migration drops it from the file (the layout's per-pane `active_tab_id` plus `focused_pane_id` are the source of truth for active-tab state). Cleanup of the runtime write path is deferred.
 - `layout: null` on fresh installs and on the very first hydration after migration if for some reason no layout was synthesized; the frontend's `defaultLayoutForTabs` handles the null case by building a single root pane.
+- `terminal.background` (V1.4-02) has independent `image` and `color` fields plus opacity/blur/size/position controls that apply only when an image is set. The four-cell rendering matrix (image × color, each Some/None) drives a discriminated `RenderingMode` — `'none'` and `'color'` use xterm.js's canvas renderer (fast); `'image'` uses the in-core DOM renderer with `allowTransparency: true` and CSS layering on the host. Toggling between fast and image categories triggers a debounced Terminal recreate; same-category changes (color tweak, slider drag) apply in place. Per-tab `background_override` is three-state: `null` inherits the global, `"disabled"` opts out (theme bg only), an object replaces the global wholesale. The Configure Tab dialog (shell tabs) and the per-AI-tab Settings section both surface the override row, both reusing the shared `BackgroundConfigEditor` component. See `MILESTONE-V1.4-02-terminal-background.md` and `MILESTONE-V1.4-03-terminal-background.md`.
+
+- **PTY rebind protocol (V1.4-03).** xterm.js's renderer is decided at `Terminal` construction (`allowTransparency` and the canvas vs. DOM split are constructor-only), so toggling the image background requires destroying the xterm Terminal and constructing a new one. To preserve the shell session across this destroy/create cycle, cctts uses `pty_rebind_channel` — the PTY and its child stay alive; only the IPC `Channel<String>` is swapped. Implementation: a per-PTY `mpsc::Sender<ProcessorControl>` (capacity 4) lets the manager push `ChannelChange(new_channel)` to the processor task's select loop, where the existing `mpsc::Receiver::recv` cancel-safety guarantee keeps byte ordering intact. `@xterm/addon-serialize` captures a snapshot of the visible scrollback before destroy and replays it into the new xterm via `term.write` *before* `pty_rebind_channel` resolves; xterm's FIFO write queue ensures the snapshot lands ahead of any live byte arriving after the rebind. The new `Terminal` is constructed with the previous instance's `rows`/`cols` so replayed cursor positions align with the new grid. Cross-app-restart scrollback is *not* in scope (it requires a backend ring buffer; deferred).
 
 ---
 
@@ -880,6 +902,28 @@ Cargo test count at v1.3 ship: 89 backend tests, 69 frontend tests.
 - State management via Svelte stores (writable / derived / readable as appropriate)
 - IPC: typed event names, request/response via Tauri commands, fire-and-forget via Tauri events
 - No external CSS framework; hand-written CSS scoped to components
+
+### Visual language
+
+`src/theme.css` is the single source of truth for chrome colors, spacing, radii, motion, and typography. Components reference `var(--*)` tokens; never hardcode hex literals in `<style>` blocks. Adding a new color value means adding (or reusing) a token first.
+
+The active theme is selected via `<html data-theme="modern-dark">`, set synchronously at module top of `src/main.ts` and `src/settings_main.ts`. Future themes plug in as additional `[data-theme="..."]` blocks in the same file; the picker in Settings → Appearance writes the chosen theme to `settings.ui.theme`.
+
+Token surface:
+
+- **Surfaces.** Layered slate-blue from `--surface-0` (darkest, body bg) to `--surface-4` (lightest, hover-on-elevated). Sunken variants (`--surface-sunken`, `--surface-deep`, `--surface-input`) are for content inset into a panel — input backgrounds, details summaries.
+- **Text.** Five-tier scale: `--text-primary` (default), `--text-bright` (headings), `--text-secondary` / `--text-quiet` / `--text-tertiary` for descending emphasis, `--text-disabled` for inactive.
+- **Accent.** Mint/teal `--accent`. Reserved for filter/toggle active states, primary CTAs, drop-zone glows, focus rings. Section selection uses surface elevation, not accent fill — the *two-tier active-state pattern*.
+- **Semantics.** `--success` (mint, aliased to `--accent`), `--warning` (amber `#f0a020`), `--danger` (coral `#f06080`). Each has a shade family (e.g. `--surface-danger-bg`, `--text-danger-soft`, `--border-danger`) for banners, error overlays, destructive buttons.
+- **Borders.** `--border-subtle` (faint dividers), `--border-default` (input/button borders), `--border-strong` (high-contrast).
+- **Radii.** `--radius-sm: 6px` (chips, badges), `--radius-md: 10px` (buttons, inputs, popover items), `--radius-lg: 14px` (dialogs, cards), `--radius-pill: 999px` (toggles, status pills).
+- **Elevation.** `--shadow-sm` / `--shadow-md` / `--shadow-lg` for popovers, dialogs, sheets respectively.
+- **Motion.** `--motion-fast: 120ms` for color/background hover, `--motion-base: 180ms` for surface/transform changes. `--easing-standard` is the standard cubic-bezier. A `prefers-reduced-motion` media query zeroes both durations.
+- **Typography.** `--font-size-xs..lg`, `--font-weight-{regular,medium,semibold}`. The `.tnum` utility class enables tabular numerics for value displays that update frequently.
+
+`src/lib/Pill.svelte` is the reusable tag/badge primitive — supports `default | mint | coral | orange | accent-fill` variants and `xs | sm | md` sizes. Use for kind labels, severity tags, restart-required indicators.
+
+The avatar overlay, waveform visualizer, and xterm.js terminal interior are explicitly *not* themed by this system — those surfaces have their own visual logic (user-supplied images, user-tunable waveform color, xterm.js's own `ITheme` for the per-tab terminal palette).
 
 ---
 

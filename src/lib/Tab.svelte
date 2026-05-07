@@ -241,19 +241,20 @@
     appearance: none;
     border: none;
     background: transparent;
-    color: #c0c0c0;
+    color: var(--text-secondary);
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    font-size: 13px;
-    padding: 0 16px 0 12px;
-    height: 100%;
+    font-size: var(--font-size-md);
+    padding: 0 var(--space-3);
+    height: calc(100% - 8px);
+    margin: 4px 2px;
     cursor: grab;
-    border-right: 1px solid #2a2a2a;
-    border-bottom: 2px solid transparent;
-    line-height: 30px;
+    border: none;
+    border-radius: var(--radius-md);
+    line-height: 24px;
     user-select: none;
     display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-2);
     position: relative;
     /* Don't shrink below the content / min width — overflow on the
        parent .tab-list scrolls instead. The min-width keeps short
@@ -263,10 +264,13 @@
     flex: 0 0 auto;
     min-width: 80px;
     max-width: 200px;
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
   }
   .tab:focus-visible {
-    outline: 2px solid #4a90e2;
-    outline-offset: -2px;
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .label {
     overflow: hidden;
@@ -279,13 +283,15 @@
     cursor: grabbing;
   }
   .tab:hover {
-    background: #303030;
-    color: #e0e0e0;
+    background: var(--surface-3);
+    color: var(--text-primary);
   }
   .tab.active {
-    color: #ffffff;
-    background: #1f1f1f;
-    border-bottom-color: #4a90e2;
+    /* Two-tier active-state pattern: section selection uses surface
+       elevation + bright text. No border accent; the elevated pill
+       IS the indicator. */
+    color: var(--text-bright);
+    background: var(--surface-3);
   }
   .indicator {
     display: inline-block;
@@ -300,14 +306,14 @@
     animation: pulse-subtle 1.6s ease-in-out infinite;
   }
   .indicator-awaiting {
-    background: #f0a020;
+    background: var(--awaiting);
     animation: pulse-strong 1s ease-in-out infinite;
   }
   .indicator-done {
-    background: #4caf50;
+    background: var(--success);
   }
   .indicator-error {
-    background: #e74c3c;
+    background: var(--danger);
   }
   .close {
     display: inline-flex;
@@ -315,13 +321,13 @@
     justify-content: center;
     width: 16px;
     height: 16px;
-    border-radius: 3px;
-    color: #888;
+    border-radius: var(--radius-sm);
+    color: var(--text-tertiary);
     font-size: 14px;
     line-height: 1;
-    margin-left: 4px;
+    margin-left: var(--space-1);
     opacity: 0;
-    transition: opacity 0.1s ease;
+    transition: opacity var(--motion-fast) var(--easing-standard);
     cursor: pointer;
   }
   .tab:hover .close,
@@ -329,48 +335,48 @@
     opacity: 1;
   }
   .close:hover {
-    background: #4a3a3a;
-    color: #ffaaaa;
+    background: var(--surface-danger);
+    color: var(--text-danger-soft);
   }
   .confirm-label {
-    color: #e0e0e0;
-    font-size: 12px;
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
   }
   .confirm-actions {
     display: inline-flex;
-    gap: 4px;
+    gap: var(--space-1);
     align-items: center;
   }
   .confirm-btn {
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 3px;
+    font-size: var(--font-size-xs);
+    padding: 2px var(--space-2);
+    border-radius: var(--radius-sm);
     cursor: pointer;
     user-select: none;
   }
   .confirm-yes {
-    background: #5a2a2a;
-    color: #ffaaaa;
+    background: var(--surface-danger-strong);
+    color: var(--text-danger-soft);
   }
   .confirm-yes:hover {
-    background: #7a3030;
-    color: #ffd0d0;
+    background: var(--surface-danger-hover);
+    color: var(--text-danger-strong);
   }
   .confirm-no {
-    background: #2a2a2a;
-    color: #c0c0c0;
+    background: var(--surface-2);
+    color: var(--text-secondary);
   }
   .confirm-no:hover {
-    background: #3a3a3a;
-    color: #e0e0e0;
+    background: var(--surface-4);
+    color: var(--text-primary);
   }
   .rename-input {
-    background: #1f1f1f;
-    border: 1px solid #4a90e2;
-    color: #ffffff;
+    background: var(--surface-1);
+    border: 1px solid var(--accent);
+    color: var(--text-bright);
     padding: 2px 6px;
-    border-radius: 3px;
-    font-size: 13px;
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-md);
     font-family: inherit;
     min-width: 80px;
     max-width: 200px;

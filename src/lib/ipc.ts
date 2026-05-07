@@ -8,13 +8,33 @@ export function createBytesChannel(): BytesChannel {
   return new Channel<string>();
 }
 
+/// V1.4-04 D.5: `pty_start` now returns the persisted-scrollback bytes
+/// (if any) from the previous session. The caller writes them to the
+/// new xterm before binding the live channel so the user sees their
+/// last shell output above a fresh prompt. Returns `null` when:
+///   - `terminal.scrollback.restore_on_launch` is `false`
+///   - no persisted file exists (cold install, or already consumed
+///     earlier in this session)
+///   - the persisted-file read failed (logged backend-side; the
+///     spawn proceeds either way)
+///
+/// Tauri serializes Rust `Vec<u8>` as `number[]`. Callers convert to
+/// `Uint8Array` + `TextDecoder` to feed `term.write`.
 export async function ptyStart(
   tab: TabId,
   channel: BytesChannel,
   rows: number,
-  cols: number
-): Promise<void> {
-  await invoke('pty_start', { tab, channel, rows, cols });
+  cols: number,
+): Promise<number[] | null> {
+  return invoke<number[] | null>('pty_start', { tab, channel, rows, cols });
+}
+
+/// V1.4-04 D.3: snapshot the current PTY scrollback ring as raw bytes.
+/// Diagnostic-only — the launch-replay path uses `pty_start`'s return
+/// value, not this command. Errors with `NotStarted` if the tab has no
+/// live PTY.
+export async function ptyGetScrollback(tab: TabId): Promise<number[]> {
+  return invoke<number[]>('pty_get_scrollback', { tab });
 }
 
 export async function ptyRestart(
@@ -24,6 +44,18 @@ export async function ptyRestart(
   cols: number
 ): Promise<void> {
   await invoke('pty_restart', { tab, channel, rows, cols });
+}
+
+/// V1.4-03: re-point a still-running PTY's bytes at a fresh channel.
+/// Used by the renderer-flip recreate path so the shell session, env,
+/// cwd, and running processes survive the xterm.js destroy/create
+/// cycle. Errors when the PTY isn't registered or has already exited
+/// — the caller handles the fallback to `ptyStart`.
+export async function ptyRebindChannel(
+  tab: TabId,
+  channel: BytesChannel,
+): Promise<void> {
+  await invoke('pty_rebind_channel', { tab, channel });
 }
 
 export async function ptyWrite(tab: TabId, input: string): Promise<void> {
@@ -143,6 +175,18 @@ export interface ReconfigureShellTabInput {
   env: Record<string, string>;
   notificationsError: string;
   notificationsExited: string;
+  /// V1.4-01 per-tab terminal palette override. `null` inherits the
+  /// global `terminal.theme`. The backend stamps it onto
+  /// `tabs[].theme_override` in the same write that updates command/args.
+  themeOverride: import('./settings/types').TerminalThemeSettings | null;
+  /// V1.4-03 per-tab terminal background override. Three-state:
+  ///   `null`        → inherit global `terminal.background`
+  ///   `'disabled'`  → opt this tab out, even if global has an image/color
+  ///   `{...config}` → use this config for this tab specifically
+  /// Stamped onto `tabs[].background_override` in the same write.
+  backgroundOverride:
+    | import('./settings/types').BackgroundOverrideWire
+    | null;
 }
 
 export async function reconfigureShellTab(input: ReconfigureShellTabInput): Promise<void> {

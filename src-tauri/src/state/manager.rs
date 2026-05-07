@@ -542,8 +542,8 @@ async fn run(
                 }
 
                 // Shell tabs route SubprocessExited to the closed sub-state
-                // instead of Error (per DESIGN-V3.md § "Subprocess Exit
-                // Handling for Shell Tabs"). AI tabs fall through to the
+                // instead of Error (per DESIGN.md § "Shell-Tab Closed
+                // Sub-State"). AI tabs fall through to the
                 // generic transition path below where the existing v1 logic
                 // turns the signal into Error. Spawn-time failures with
                 // `code = None` still hit this same branch.

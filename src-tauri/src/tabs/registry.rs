@@ -64,6 +64,21 @@ fn is_builtin_id(id: &str) -> bool {
     matches!(id, CLAUDE_TAB_ID | AIDER_TAB_ID | SHELL_DEFAULT_TAB_ID)
 }
 
+/// V1.4-04 D: replicate the filename-sanitization done by
+/// `pty::scrollback::scrollback_file_for`. Has to be in sync — the
+/// orphan prune compares filenames against this set.
+fn sanitize_tab_id_for_filename(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 impl TabRegistry {
     pub fn new(
         seed: Vec<crate::state::TabMeta>,
@@ -298,12 +313,84 @@ impl TabRegistry {
         result
     }
 
+    /// V1.4-03: rebind the PTY's output channel to a fresh
+    /// `Channel<String>` without restarting the shell. Used when the
+    /// JS-side xterm is destroyed and recreated for a renderer-category
+    /// flip (image ↔ fast). Errors propagate from `PtyManager::rebind_channel`
+    /// — `NotStarted` if the PTY never spawned, `Pty("processor task gone")`
+    /// if the child has exited and the processor task already cleaned up.
+    /// In either case the caller (frontend `attemptSpawn(entry, 'rebind')`)
+    /// falls back to a fresh `pty_start`.
+    pub async fn rebind_channel(
+        &self,
+        tab: TabId,
+        new_channel: Channel<String>,
+    ) -> AppResult<()> {
+        let manager = self
+            .managers
+            .get(&tab)
+            .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
+        manager.rebind_channel(new_channel).await
+    }
+
     pub async fn write(&self, tab: TabId, bytes: Vec<u8>) -> AppResult<()> {
         let manager = self
             .managers
             .get(&tab)
             .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
         manager.write_input(bytes).await
+    }
+
+    /// V1.4-04 D: snapshot a tab's scrollback ring as raw bytes. Used
+    /// by graceful-exit persistence (one snapshot per tab) and the
+    /// `pty_get_scrollback` Tauri command (diagnostic).
+    pub async fn scrollback_snapshot(&self, tab: TabId) -> AppResult<Vec<u8>> {
+        let manager = self
+            .managers
+            .get(&tab)
+            .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
+        manager.scrollback_snapshot().await
+    }
+
+    /// V1.4-04 D: seed a tab's scrollback ring with bytes restored
+    /// from the previous session. Called by `pty_start` after the new
+    /// PTY has spawned successfully.
+    pub async fn seed_scrollback(&self, tab: &TabId, bytes: &[u8]) -> AppResult<()> {
+        let manager = self
+            .managers
+            .get(tab)
+            .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
+        manager.seed_scrollback(bytes).await
+    }
+
+    /// V1.4-04 D: drop a tab's scrollback ring. Called on
+    /// user-initiated `pty_restart` because the user explicitly asked
+    /// for a clean shell.
+    pub async fn clear_scrollback(&self, tab: &TabId) -> AppResult<()> {
+        let manager = self
+            .managers
+            .get(tab)
+            .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
+        manager.clear_scrollback().await
+    }
+
+    /// V1.4-04 D: snapshot the set of known tab IDs (sanitized to the
+    /// scrollback-file form). Used by the orphan-prune sweep at app
+    /// startup so files for tabs deleted between sessions get cleaned
+    /// up.
+    pub fn known_scrollback_ids(&self) -> HashSet<String> {
+        self.tab_order
+            .iter()
+            .map(|t| sanitize_tab_id_for_filename(t.as_str()))
+            .collect()
+    }
+
+    /// V1.4-04 D.4: snapshot of the live tab order. Used by the
+    /// graceful-exit handler in `main.rs` to walk every tab and
+    /// persist its ring buffer. Returning an owned `Vec` avoids
+    /// holding the registry's lock across the loop.
+    pub fn tab_order_snapshot(&self) -> Vec<TabId> {
+        self.tab_order.clone()
     }
 
     pub async fn resize(&self, tab: TabId, rows: u16, cols: u16) -> AppResult<()> {

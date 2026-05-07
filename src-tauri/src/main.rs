@@ -25,9 +25,9 @@ use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
-    list_tabs, list_voices, open_settings_window, pty_resize, pty_restart, pty_start, pty_write,
-    request_tab_restart, restart_shell_tab, set_active_tab, settings_get, settings_update,
-    tab_activate, tts_test,
+    list_tabs, list_voices, open_settings_window, pty_get_scrollback, pty_rebind_channel,
+    pty_resize, pty_restart, pty_start, pty_write, request_tab_restart, restart_shell_tab,
+    set_active_tab, settings_get, settings_update, tab_activate, tts_test,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -236,11 +236,29 @@ fn main() {
                 }
             }
             spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
+
+            // V1.4-04 D.6: orphan-prune the scrollback dir so files
+            // for tabs deleted between sessions don't accumulate. We
+            // ask the registry for its sanitized known IDs (matches
+            // exactly what `pty::scrollback::scrollback_file_for`
+            // writes).
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app_handle.state::<AppState>();
+                    let registry = state.tabs.lock().await;
+                    let known = registry.known_scrollback_ids();
+                    drop(registry);
+                    crate::pty::scrollback::prune_orphans(&known);
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             pty_start,
             pty_restart,
+            pty_rebind_channel,
+            pty_get_scrollback,
             pty_write,
             pty_resize,
             tts_test,
@@ -279,7 +297,32 @@ fn main() {
                 let app = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppState>();
+                    // V1.4-04 D.4: persist each tab's scrollback ring
+                    // before shutting down. Best-effort — a failed
+                    // persist for one tab doesn't block the others or
+                    // the shutdown. Hard kills (SIGKILL, taskkill,
+                    // power loss) bypass this entirely; that's the
+                    // documented contract.
+                    let persist_enabled = state.settings.current().terminal.scrollback.persist;
                     let registry = state.tabs.lock().await;
+                    if persist_enabled {
+                        let tab_ids: Vec<TabId> = registry.tab_order_snapshot();
+                        for tab in tab_ids {
+                            match registry.scrollback_snapshot(tab.clone()).await {
+                                Ok(bytes) if !bytes.is_empty() => {
+                                    if let Err(e) =
+                                        crate::pty::scrollback::persist_to_disk(&tab, &bytes)
+                                    {
+                                        tracing::warn!(?tab, error = %e, "scrollback persist failed");
+                                    }
+                                }
+                                Ok(_) => {} // empty ring; skip
+                                Err(e) => {
+                                    tracing::debug!(?tab, error = %e, "no live PTY to snapshot");
+                                }
+                            }
+                        }
+                    }
                     registry.shutdown_all().await;
                     drop(registry);
                     let _ = window.destroy();

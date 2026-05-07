@@ -1,7 +1,13 @@
 import { mount } from 'svelte';
 import App from './App.svelte';
 import { ttsTest } from './lib/ipc';
+import './theme.css';
 import './app.css';
+
+// Set the active theme synchronously before Svelte mounts so the first
+// paint already reflects token values — avoids FOUC. The static
+// `data-theme` attribute on <html> is a defense-in-depth fallback.
+document.documentElement.dataset.theme = 'modern-dark';
 
 // Dev-only TTS test handle: `window.ttsTest("hello")` from DevTools synth-
 // esizes through the active tab's pipeline. The backend routes the request

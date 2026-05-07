@@ -160,24 +160,24 @@
     transition: opacity 200ms ease;
     z-index: 11;
   }
-  /* Top-* positions match AvatarOverlay's 32px tab-bar clearance so
-     the waveform stays aligned with the avatar above whichever pane's
-     tab bar is in that corner. Bottom-* unchanged. */
+  /* Mirrors AvatarOverlay's positioning exactly so the waveform sits
+     centred over the avatar's image area. Top-* positions add the same
+     32px tab-bar clearance the avatar uses. */
   .waveform-container.top-right {
     top: calc(var(--avatar-margin) + 32px);
-    right: calc(var(--avatar-margin) + 16px);
+    right: var(--avatar-margin);
   }
   .waveform-container.top-left {
     top: calc(var(--avatar-margin) + 32px);
-    left: calc(var(--avatar-margin) + 16px);
+    left: var(--avatar-margin);
   }
   .waveform-container.bottom-right {
     bottom: var(--avatar-margin);
-    right: calc(var(--avatar-margin) + 16px);
+    right: var(--avatar-margin);
   }
   .waveform-container.bottom-left {
     bottom: var(--avatar-margin);
-    left: calc(var(--avatar-margin) + 16px);
+    left: var(--avatar-margin);
   }
   .hidden {
     opacity: 0;

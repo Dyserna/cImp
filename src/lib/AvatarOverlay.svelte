@@ -5,7 +5,6 @@
   import {
     avatarState,
     avatarVisible,
-    toggleAvatarVisible,
     startAvatarStateListener,
     type AvatarState,
   } from './avatarState';
@@ -15,7 +14,6 @@
     resolveTransitionSrc,
     isVideoSrc,
   } from './avatarConfig';
-  import { openSettingsWindow } from './settings/ipc';
 
   /// Default crossfade duration when the user has disabled video transitions
   /// (empty path or duration_ms=0). Short enough to feel snappy, long enough
@@ -137,24 +135,8 @@
           />
         {/if}
       {/key}
-      <button
-        class="settings-button"
-        onclick={() => void openSettingsWindow()}
-        aria-label="Settings"
-        title="Settings"
-      >
-        ⚙
-      </button>
     </div>
   {/if}
-  <button
-    class="toggle-button"
-    onclick={toggleAvatarVisible}
-    aria-label={$avatarVisible ? 'Hide avatar' : 'Show avatar'}
-    title={$avatarVisible ? 'Hide avatar' : 'Show avatar'}
-  >
-    {$avatarVisible ? '›' : '‹'}
-  </button>
 </div>
 
 <style>
@@ -162,9 +144,8 @@
     position: absolute;
     display: flex;
     align-items: stretch;
-    /* Container itself doesn't capture clicks — only its interactive
-       children. Empty space (e.g. between the avatar and the toggle button
-       in a different layout) passes clicks through to the terminal. */
+    /* Container itself doesn't capture clicks — only the avatar image.
+       Empty space passes clicks through to the terminal underneath. */
     pointer-events: none;
     z-index: 10;
   }
@@ -217,46 +198,4 @@
     -webkit-user-drag: none;
   }
 
-  .settings-button {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    background: rgba(0, 0, 0, 0.5);
-    border: none;
-    color: var(--text-on-accent);
-    width: 32px;
-    height: 32px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 18px;
-    line-height: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .settings-button:hover {
-    background: rgba(0, 0, 0, 0.7);
-  }
-
-  .toggle-button {
-    width: 16px;
-    height: var(--avatar-height);
-    background: rgba(0, 0, 0, 0.4);
-    border: none;
-    color: var(--text-on-accent);
-    cursor: pointer;
-    pointer-events: auto;
-    font-size: 14px;
-    /* Toggle sits OUTSIDE .avatar-overlay so M5's waveform sibling can have
-       independent opacity. We still apply --avatar-opacity here so the
-       toggle visually matches the avatar. One-line change to decouple. */
-    opacity: var(--avatar-opacity);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-  }
-  .toggle-button:hover {
-    background: rgba(0, 0, 0, 0.65);
-  }
 </style>

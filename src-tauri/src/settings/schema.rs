@@ -578,6 +578,10 @@ pub struct BehaviorSettings {
     pub auto_speak: bool,
     pub fallback_silent: bool,
     pub announcements_enabled: bool,
+    /// When true, `tts.mute` follows `avatar.visible` — hiding the avatar
+    /// auto-mutes, showing it auto-unmutes. The frontend handles the sync
+    /// (App.svelte settings subscriber); the backend just persists the flag.
+    pub follow_avatar: bool,
 }
 
 impl Default for BehaviorSettings {
@@ -587,6 +591,7 @@ impl Default for BehaviorSettings {
             auto_speak: true,
             fallback_silent: true,
             announcements_enabled: true,
+            follow_avatar: false,
         }
     }
 }

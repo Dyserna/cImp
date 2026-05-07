@@ -60,6 +60,9 @@ export interface BehaviorSettings {
   auto_speak: boolean;
   fallback_silent: boolean;
   announcements_enabled: boolean;
+  /// When true, the frontend keeps `tts.mute` in sync with the inverse of
+  /// `avatar.visible` — hide → mute, show → unmute. Wired in App.svelte.
+  follow_avatar: boolean;
 }
 
 export interface ComposeSettings {
@@ -416,6 +419,7 @@ export function defaultSettings(): Settings {
       auto_speak: true,
       fallback_silent: true,
       announcements_enabled: true,
+      follow_avatar: false,
     },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {

@@ -48,6 +48,32 @@
   let tabDefaults = $state<Record<string, AiToolTabConfig | null>>({});
   let snapshot = $state<Settings | null>(null);
 
+  // Sidebar nav: which group is visible. The template gates each <section>
+  // on this so only one group renders at a time. Default lands on 'audio'
+  // (TTS sat at the top of the original single-scroll layout).
+  type SectionId =
+    | 'audio'
+    | 'avatar'
+    | 'theme'
+    | 'background'
+    | 'display'
+    | 'tabs'
+    | 'shortcuts'
+    | 'local-llm'
+    | 'advanced';
+  let activeSection = $state<SectionId>('audio');
+  const SECTIONS: { id: SectionId; label: string }[] = [
+    { id: 'audio', label: 'Audio' },
+    { id: 'avatar', label: 'Avatar' },
+    { id: 'theme', label: 'Theme' },
+    { id: 'background', label: 'Background' },
+    { id: 'display', label: 'Display' },
+    { id: 'tabs', label: 'Tabs' },
+    { id: 'shortcuts', label: 'Shortcuts' },
+    { id: 'local-llm', label: 'Local LLM' },
+    { id: 'advanced', label: 'Advanced' },
+  ];
+
   // Keep `snapshot` in sync with the global store. Every input mutates
   // `snapshot` and pushes via `applySettings`; the broadcast comes back and
   // overwrites `snapshot` (which is fine — same value, no churn).
@@ -75,10 +101,10 @@
   let unlistenDeepLink: (() => void) | undefined;
 
   function scrollToTabSection(tabId: string): void {
-    // Each Tabs-section <details> wrapper has id `tab-section-<tabId>`.
-    // Use a microtask to give the {#each} a chance to render after the
-    // settings snapshot lands (covers the cold-open case where this
-    // runs before the section exists in the DOM).
+    // Sidebar nav hides every other group, so flip to 'tabs' before
+    // looking up the inner <details> — otherwise the element wouldn't
+    // be in the DOM yet on a cold open.
+    activeSection = 'tabs';
     queueMicrotask(() => {
       const el = document.getElementById(`tab-section-${tabId}`);
       if (!el) return;
@@ -344,735 +370,777 @@
   <div class="loading">Loading settings…</div>
 {:else}
   <div class="root">
-    <div class="inner">
-    <header>
-      <h1>Settings</h1>
-    </header>
-
-    <section>
-      <h2>TTS</h2>
-      <label>
-        <span>Voice</span>
-        <select
-          value={snapshot.tts.voice}
-          onchange={(e) => patch((s) => (s.tts.voice = (e.currentTarget as HTMLSelectElement).value))}
+    <nav class="sidebar" aria-label="Settings sections">
+      <div class="sidebar-title">Settings</div>
+      {#each SECTIONS as s}
+        <button
+          type="button"
+          class:active={activeSection === s.id}
+          onclick={() => (activeSection = s.id)}
         >
-          {#each voices as v}
-            <option value={v}>{v}</option>
-          {/each}
-        </select>
-      </label>
-      <label>
-        <span>Speed: {snapshot.tts.speed.toFixed(2)}×</span>
-        <input
-          type="range"
-          min="0.5"
-          max="2"
-          step="0.05"
-          value={snapshot.tts.speed}
-          oninput={(e) =>
-            patch((s) => (s.tts.speed = +(e.currentTarget as HTMLInputElement).value))}
-        />
-      </label>
-      <label>
-        <span>Volume: {Math.round(snapshot.tts.volume * 100)}%</span>
-        <input
-          type="range"
-          min="0"
-          max="1"
-          step="0.01"
-          value={snapshot.tts.volume}
-          oninput={(e) =>
-            patch((s) => (s.tts.volume = +(e.currentTarget as HTMLInputElement).value))}
-        />
-      </label>
-      <label class="checkbox">
-        <input
-          type="checkbox"
-          checked={snapshot.tts.mute}
-          onchange={(e) =>
-            patch((s) => (s.tts.mute = (e.currentTarget as HTMLInputElement).checked))}
-        />
-        <span>Mute</span>
-      </label>
-    </section>
-
-    <section>
-      <h2>Avatar</h2>
-      <label class="checkbox">
-        <input
-          type="checkbox"
-          checked={snapshot.avatar.visible}
-          onchange={(e) =>
-            patch((s) => (s.avatar.visible = (e.currentTarget as HTMLInputElement).checked))}
-        />
-        <span>Visible</span>
-      </label>
-      <label>
-        <span>Position</span>
-        <select
-          value={snapshot.avatar.position}
-          onchange={(e) =>
-            patch((s) => (s.avatar.position = (e.currentTarget as HTMLSelectElement).value as Settings['avatar']['position']))}
-        >
-          <option value="top-right">Top Right</option>
-          <option value="top-left">Top Left</option>
-          <option value="bottom-right">Bottom Right</option>
-          <option value="bottom-left">Bottom Left</option>
-        </select>
-      </label>
-      <div class="row">
-        <label>
-          <span>Width (px)</span>
-          <input
-            type="number"
-            min="50"
-            max="1200"
-            value={snapshot.avatar.size.width_px}
-            onchange={(e) =>
-              patch((s) => (s.avatar.size.width_px = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
-          />
-        </label>
-        <label>
-          <span>Height (px)</span>
-          <input
-            type="number"
-            min="50"
-            max="1200"
-            value={snapshot.avatar.size.height_px}
-            onchange={(e) =>
-              patch((s) => (s.avatar.size.height_px = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
-          />
-        </label>
-      </div>
-      <label>
-        <span>Margin (px)</span>
-        <input
-          type="number"
-          min="0"
-          max="200"
-          value={snapshot.avatar.margin_px}
-          onchange={(e) =>
-            patch((s) => (s.avatar.margin_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
-        />
-      </label>
-      <label>
-        <span>Opacity: {Math.round(snapshot.avatar.opacity * 100)}%</span>
-        <input
-          type="range"
-          min="0.3"
-          max="1"
-          step="0.01"
-          value={snapshot.avatar.opacity}
-          oninput={(e) =>
-            patch((s) => (s.avatar.opacity = +(e.currentTarget as HTMLInputElement).value))}
-        />
-      </label>
-
-      <h3>Per-state images</h3>
-      {#each ['idle', 'listening', 'thinking', 'speaking', 'error'] as const as state}
-        <div class="file-row">
-          <span class="state-label">{state}</span>
-          <span class="filename" title={snapshot.avatar.images[state] ?? ''}>
-            {basename(snapshot.avatar.images[state])}
-          </span>
-          <button onclick={imagePicker(state)}>Pick…</button>
-          <button
-            class="ghost"
-            onclick={() => patch((s) => (s.avatar.images[state] = null))}
-            disabled={snapshot.avatar.images[state] === null}
-          >
-            Reset
-          </button>
-        </div>
+          {s.label}
+        </button>
       {/each}
+    </nav>
 
-      <h3>Transition</h3>
-      <div class="file-row">
-        <span class="state-label">Path</span>
-        <span class="filename" title={snapshot.avatar.transition.path ?? ''}>
-          {basename(snapshot.avatar.transition.path)}
-        </span>
-        <button onclick={pickTransition}>Pick…</button>
-        <button
-          class="ghost"
-          onclick={() => patch((s) => (s.avatar.transition.path = null))}
-          disabled={snapshot.avatar.transition.path === null}
-        >
-          Clear
-        </button>
-      </div>
-      <small class="hint">An empty path disables transitions (states snap directly).</small>
-      <label>
-        <span>Duration (ms)</span>
-        <input
-          type="number"
-          min="0"
-          max="5000"
-          step="50"
-          value={snapshot.avatar.transition.duration_ms}
-          onchange={(e) =>
-            patch((s) => (s.avatar.transition.duration_ms = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
-        />
-      </label>
-    </section>
+    <div class="content">
+      <div class="inner">
 
-    <section>
-      <h2>Waveform</h2>
-      <label>
-        <span>Color</span>
-        <input
-          type="color"
-          value={snapshot.avatar.waveform.color}
-          oninput={(e) =>
-            patch((s) => (s.avatar.waveform.color = (e.currentTarget as HTMLInputElement).value))}
-        />
-      </label>
-      <label>
-        <span>Line width: {snapshot.avatar.waveform.line_width.toFixed(1)}</span>
-        <input
-          type="range"
-          min="0.5"
-          max="8"
-          step="0.5"
-          value={snapshot.avatar.waveform.line_width}
-          oninput={(e) =>
-            patch((s) => (s.avatar.waveform.line_width = +(e.currentTarget as HTMLInputElement).value))}
-        />
-      </label>
-      <label>
-        <span>Glow: {Math.round(snapshot.avatar.waveform.glow_intensity * 100)}%</span>
-        <input
-          type="range"
-          min="0"
-          max="1"
-          step="0.05"
-          value={snapshot.avatar.waveform.glow_intensity}
-          oninput={(e) =>
-            patch((s) => (s.avatar.waveform.glow_intensity = +(e.currentTarget as HTMLInputElement).value))}
-        />
-      </label>
-      <label>
-        <span>Opacity: {Math.round(snapshot.avatar.waveform.opacity * 100)}%</span>
-        <input
-          type="range"
-          min="0"
-          max="1"
-          step="0.01"
-          value={snapshot.avatar.waveform.opacity}
-          oninput={(e) =>
-            patch((s) => (s.avatar.waveform.opacity = +(e.currentTarget as HTMLInputElement).value))}
-        />
-      </label>
-    </section>
+      {#if activeSection === 'audio'}
+        <section>
+          <h2>TTS</h2>
+          <label>
+            <span>Voice</span>
+            <select
+              value={snapshot.tts.voice}
+              onchange={(e) => patch((s) => (s.tts.voice = (e.currentTarget as HTMLSelectElement).value))}
+            >
+              {#each voices as v}
+                <option value={v}>{v}</option>
+              {/each}
+            </select>
+          </label>
+          <label>
+            <span>Speed: {snapshot.tts.speed.toFixed(2)}×</span>
+            <input
+              type="range"
+              min="0.5"
+              max="2"
+              step="0.05"
+              value={snapshot.tts.speed}
+              oninput={(e) =>
+                patch((s) => (s.tts.speed = +(e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+          <label>
+            <span>Volume: {Math.round(snapshot.tts.volume * 100)}%</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.01"
+              value={snapshot.tts.volume}
+              oninput={(e) =>
+                patch((s) => (s.tts.volume = +(e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.tts.mute}
+              onchange={(e) =>
+                patch((s) => (s.tts.mute = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Mute</span>
+          </label>
+        </section>
 
-    <section>
-      <h2>Appearance</h2>
-      <label>
-        <span>UI theme</span>
-        <select
-          value={snapshot.ui.theme}
-          onchange={(e) =>
-            patch((s) => (s.ui.theme = (e.currentTarget as HTMLSelectElement).value))}
-        >
-          <option value="modern-dark">Modern Dark</option>
-        </select>
-      </label>
-      <small class="hint">
-        Governs the cctts chrome — tab bar, status bar, dialogs. Distinct
-        from the terminal palette below.
-      </small>
+        <section>
+          <h2>Behavior</h2>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.interrupt_on_input}
+              onchange={(e) =>
+                patch((s) => (s.behavior.interrupt_on_input = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Interrupt TTS when typing</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.auto_speak}
+              onchange={(e) =>
+                patch((s) => (s.behavior.auto_speak = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Auto-speak detected segments</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.follow_avatar}
+              onchange={(e) =>
+                patch((s) => (s.behavior.follow_avatar = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Follow avatar visibility</span>
+          </label>
+          <small class="hint">
+            When on, hiding the avatar mutes TTS and showing it unmutes —
+            the Mute toggle tracks the avatar. Turn this off to control
+            mute independently.
+          </small>
+          <label class="checkbox disabled">
+            <input type="checkbox" checked={snapshot.behavior.fallback_silent} disabled />
+            <span>Fallback silent on TTS error (always on in v1)</span>
+          </label>
+        </section>
+      {:else if activeSection === 'avatar'}
+        <section>
+          <h2>Avatar</h2>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.avatar.visible}
+              onchange={(e) =>
+                patch((s) => (s.avatar.visible = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Visible</span>
+          </label>
+          <label>
+            <span>Position</span>
+            <select
+              value={snapshot.avatar.position}
+              onchange={(e) =>
+                patch((s) => (s.avatar.position = (e.currentTarget as HTMLSelectElement).value as Settings['avatar']['position']))}
+            >
+              <option value="top-right">Top Right</option>
+              <option value="top-left">Top Left</option>
+              <option value="bottom-right">Bottom Right</option>
+              <option value="bottom-left">Bottom Left</option>
+            </select>
+          </label>
+          <div class="row">
+            <label>
+              <span>Width (px)</span>
+              <input
+                type="number"
+                min="50"
+                max="1200"
+                value={snapshot.avatar.size.width_px}
+                onchange={(e) =>
+                  patch((s) => (s.avatar.size.width_px = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+            <label>
+              <span>Height (px)</span>
+              <input
+                type="number"
+                min="50"
+                max="1200"
+                value={snapshot.avatar.size.height_px}
+                onchange={(e) =>
+                  patch((s) => (s.avatar.size.height_px = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+          </div>
+          <label>
+            <span>Margin (px)</span>
+            <input
+              type="number"
+              min="0"
+              max="200"
+              value={snapshot.avatar.margin_px}
+              onchange={(e) =>
+                patch((s) => (s.avatar.margin_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
+            />
+          </label>
+          <label>
+            <span>Opacity: {Math.round(snapshot.avatar.opacity * 100)}%</span>
+            <input
+              type="range"
+              min="0.3"
+              max="1"
+              step="0.01"
+              value={snapshot.avatar.opacity}
+              oninput={(e) =>
+                patch((s) => (s.avatar.opacity = +(e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
 
-      <label class="palette-row">
-        <span>Terminal palette</span>
-        <select
-          value={snapshot.terminal.theme.name}
-          onchange={(e) => {
-            const name = (e.currentTarget as HTMLSelectElement).value;
-            patch((s) => {
-              // Read the previous name from `s` itself — `patch`'s
-              // working copy holds the pre-update value at entry, which
-              // is what we want for seeding.
-              const previousName = s.terminal.theme.name;
-              s.terminal.theme.name = name;
-              if (name === 'Custom') {
-                // Seed custom from the previously-active palette so the
-                // user opens the editor with sensible starting colors
-                // rather than 22 black squares. The seed is a snapshot;
-                // edits afterwards diverge naturally.
-                if (!s.terminal.theme.custom) {
-                  const seed =
-                    previousName === 'Custom'
-                      ? BUNDLED_THEMES.Default
-                      : resolveBundledTheme(previousName);
-                  s.terminal.theme.custom = { ...seed } as ThemeColorsWire;
-                }
-              } else {
-                // Drop any custom block when leaving Custom — avoids a
-                // stale custom payload sitting in settings.json.
-                s.terminal.theme.custom = null;
-              }
-            });
-          }}
-        >
-          {#each BUNDLED_THEME_NAMES as name}
-            <option value={name}>{name}</option>
+          <h3>Per-state images</h3>
+          {#each ['idle', 'listening', 'thinking', 'speaking', 'error'] as const as state}
+            <div class="file-row">
+              <span class="state-label">{state}</span>
+              <span class="filename" title={snapshot.avatar.images[state] ?? ''}>
+                {basename(snapshot.avatar.images[state])}
+              </span>
+              <button onclick={imagePicker(state)}>Pick…</button>
+              <button
+                class="ghost"
+                onclick={() => patch((s) => (s.avatar.images[state] = null))}
+                disabled={snapshot.avatar.images[state] === null}
+              >
+                Reset
+              </button>
+            </div>
           {/each}
-          <option value="Custom">Custom…</option>
-        </select>
-        <ThemeSwatch
-          name={snapshot.terminal.theme.name}
-          custom={snapshot.terminal.theme.custom}
-        />
-      </label>
-      <small class="hint">
-        Colors used inside terminal tabs. Each tab can override this in
-        its Configure dialog.
-      </small>
 
-      {#if snapshot.terminal.theme.name === 'Custom' && snapshot.terminal.theme.custom}
-        <CustomThemeEditor
-          value={snapshot.terminal.theme.custom}
-          onchange={(next) =>
-            patch((s) => {
-              s.terminal.theme.custom = next;
-            })}
-        />
-      {/if}
+          <h3>Transition</h3>
+          <div class="file-row">
+            <span class="state-label">Path</span>
+            <span class="filename" title={snapshot.avatar.transition.path ?? ''}>
+              {basename(snapshot.avatar.transition.path)}
+            </span>
+            <button onclick={pickTransition}>Pick…</button>
+            <button
+              class="ghost"
+              onclick={() => patch((s) => (s.avatar.transition.path = null))}
+              disabled={snapshot.avatar.transition.path === null}
+            >
+              Clear
+            </button>
+          </div>
+          <small class="hint">An empty path disables transitions (states snap directly).</small>
+          <label>
+            <span>Duration (ms)</span>
+            <input
+              type="number"
+              min="0"
+              max="5000"
+              step="50"
+              value={snapshot.avatar.transition.duration_ms}
+              onchange={(e) =>
+                patch((s) => (s.avatar.transition.duration_ms = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
+            />
+          </label>
+        </section>
 
-      <h3>Terminal background</h3>
-      <BackgroundConfigEditor
-        bind:config={
-          () => snapshot!.terminal.background,
-          (v) =>
-            patch((s) => {
-              s.terminal.background = v;
-            })
-        }
-      />
+        <section>
+          <h2>Waveform</h2>
+          <label>
+            <span>Color</span>
+            <input
+              type="color"
+              value={snapshot.avatar.waveform.color}
+              oninput={(e) =>
+                patch((s) => (s.avatar.waveform.color = (e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+          <label>
+            <span>Line width: {snapshot.avatar.waveform.line_width.toFixed(1)}</span>
+            <input
+              type="range"
+              min="0.5"
+              max="8"
+              step="0.5"
+              value={snapshot.avatar.waveform.line_width}
+              oninput={(e) =>
+                patch((s) => (s.avatar.waveform.line_width = +(e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+          <label>
+            <span>Glow: {Math.round(snapshot.avatar.waveform.glow_intensity * 100)}%</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={snapshot.avatar.waveform.glow_intensity}
+              oninput={(e) =>
+                patch((s) => (s.avatar.waveform.glow_intensity = +(e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+          <label>
+            <span>Opacity: {Math.round(snapshot.avatar.waveform.opacity * 100)}%</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.01"
+              value={snapshot.avatar.waveform.opacity}
+              oninput={(e) =>
+                patch((s) => (s.avatar.waveform.opacity = +(e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+        </section>
+      {:else if activeSection === 'theme'}
+        <section>
+          <h2>Theme</h2>
 
-      <div class="preset-actions">
-        <button type="button" onclick={startSavePreset}>Save as preset…</button>
-        <button
-          type="button"
-          onclick={() => (managingPresets = !managingPresets)}
-        >
-          {managingPresets ? 'Done managing' : 'Manage presets…'}
-        </button>
-      </div>
+          <h3>UI theme</h3>
+          <small class="hint top">
+            Governs the cctts chrome — tab bar, status bar, dialogs.
+            Distinct from the terminal palette below.
+          </small>
+          <label>
+            <span>Theme</span>
+            <select
+              value={snapshot.ui.theme}
+              onchange={(e) =>
+                patch((s) => (s.ui.theme = (e.currentTarget as HTMLSelectElement).value))}
+            >
+              <option value="modern-dark">Modern Dark</option>
+            </select>
+          </label>
 
-      <label class="checkbox">
-        <input
-          type="checkbox"
-          checked={snapshot.terminal.background.preview_category_flips}
-          onchange={(e) =>
-            patch(
-              (s) =>
-                (s.terminal.background.preview_category_flips = (
-                  e.currentTarget as HTMLInputElement
-                ).checked),
-            )}
-        />
-        <span>Preview image / category changes in Configure Tab dialog</span>
-      </label>
-      <small class="hint">
-        When off, image-toggle and category-flip changes wait for Save in
-        the Configure Tab dialog. Color, opacity, blur, size, position,
-        and tint always preview live.
-      </small>
-
-      {#if savingPreset}
-        <div class="preset-save">
-          <input
-            type="text"
-            placeholder="Preset name"
-            bind:value={newPresetName}
-            onkeydown={(e) => {
-              if (e.key === 'Enter') commitSavePreset();
-              if (e.key === 'Escape') cancelSavePreset();
-            }}
-          />
-          <button type="button" onclick={commitSavePreset}>Save</button>
-          <button type="button" onclick={cancelSavePreset}>Cancel</button>
-          {#if savePresetError}
-            <small class="error">{savePresetError}</small>
-          {/if}
-        </div>
-        <small class="hint">
-          Presets reference image paths by absolute location — moving an
-          image file breaks any preset that uses it.
-        </small>
-      {/if}
-
-      {#if managingPresets}
-        {#if snapshot.terminal.background.presets.length === 0}
-          <small class="hint">No presets saved yet.</small>
-        {:else}
-          <ul class="preset-list">
-            {#each snapshot.terminal.background.presets as p (p.name)}
-              <li>
-                <input
-                  type="text"
-                  value={p.name}
-                  onchange={(e) =>
-                    renamePreset(
-                      p.name,
-                      (e.currentTarget as HTMLInputElement).value,
-                    )}
-                />
-                <button type="button" onclick={() => deletePreset(p.name)}>
-                  Delete
-                </button>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      {/if}
-    </section>
-
-    <section>
-      <h2>Display</h2>
-      <label>
-        <span>Terminal font family</span>
-        <input
-          type="text"
-          value={snapshot.display.terminal_font_family}
-          onchange={(e) =>
-            patch((s) => (s.display.terminal_font_family = (e.currentTarget as HTMLInputElement).value))}
-        />
-      </label>
-      <label>
-        <span>Terminal font size (px)</span>
-        <input
-          type="number"
-          min="8"
-          max="48"
-          value={snapshot.display.terminal_font_size}
-          onchange={(e) =>
-            patch((s) => (s.display.terminal_font_size = Math.max(8, +(e.currentTarget as HTMLInputElement).value)))}
-        />
-      </label>
-      <label class="checkbox">
-        <input
-          type="checkbox"
-          checked={snapshot.display.show_tts_markup}
-          onchange={(e) =>
-            patch((s) => (s.display.show_tts_markup = (e.currentTarget as HTMLInputElement).checked))}
-        />
-        <span>Show TTS markup in terminal (debug)</span>
-      </label>
-    </section>
-
-    <section>
-      <h2>Behavior</h2>
-      <label class="checkbox">
-        <input
-          type="checkbox"
-          checked={snapshot.behavior.interrupt_on_input}
-          onchange={(e) =>
-            patch((s) => (s.behavior.interrupt_on_input = (e.currentTarget as HTMLInputElement).checked))}
-        />
-        <span>Interrupt TTS when typing</span>
-      </label>
-      <label class="checkbox">
-        <input
-          type="checkbox"
-          checked={snapshot.behavior.auto_speak}
-          onchange={(e) =>
-            patch((s) => (s.behavior.auto_speak = (e.currentTarget as HTMLInputElement).checked))}
-        />
-        <span>Auto-speak detected segments</span>
-      </label>
-      <label class="checkbox disabled">
-        <input type="checkbox" checked={snapshot.behavior.fallback_silent} disabled />
-        <span>Fallback silent on TTS error (always on in v1)</span>
-      </label>
-    </section>
-
-    <section>
-      <h2>Compose</h2>
-      <div class="row">
-        <label>
-          <span>Min height (px)</span>
-          <input
-            type="number"
-            min="40"
-            max="400"
-            value={snapshot.compose.min_height_px}
-            onchange={(e) =>
-              patch((s) => (s.compose.min_height_px = Math.max(40, +(e.currentTarget as HTMLInputElement).value)))}
-          />
-        </label>
-        <label>
-          <span>Max height (px)</span>
-          <input
-            type="number"
-            min="60"
-            max="800"
-            value={snapshot.compose.max_height_px}
-            onchange={(e) =>
-              patch((s) => (s.compose.max_height_px = Math.max(60, +(e.currentTarget as HTMLInputElement).value)))}
-          />
-        </label>
-      </div>
-    </section>
-
-    <section>
-      <h2>Shortcuts</h2>
-      <label>
-        <span>Open compose</span>
-        <ShortcutCapture
-          bind:value={
-            () => snapshot!.shortcuts.open_compose,
-            (v) => patch((s) => (s.shortcuts.open_compose = v))
-          }
-        />
-      </label>
-      <label>
-        <span>Submit compose</span>
-        <ShortcutCapture
-          bind:value={
-            () => snapshot!.shortcuts.submit_compose,
-            (v) => patch((s) => (s.shortcuts.submit_compose = v))
-          }
-        />
-      </label>
-      <label>
-        <span>Cancel compose</span>
-        <ShortcutCapture
-          bind:value={
-            () => snapshot!.shortcuts.cancel_compose,
-            (v) => patch((s) => (s.shortcuts.cancel_compose = v))
-          }
-        />
-      </label>
-      <label>
-        <span>Open settings</span>
-        <ShortcutCapture
-          bind:value={
-            () => snapshot!.shortcuts.open_settings,
-            (v) => patch((s) => (s.shortcuts.open_settings = v))
-          }
-        />
-      </label>
-      <label>
-        <span>Switch to Claude tab</span>
-        <ShortcutCapture
-          bind:value={
-            () => snapshot!.shortcuts.switch_to_tab_1,
-            (v) => patch((s) => (s.shortcuts.switch_to_tab_1 = v))
-          }
-        />
-      </label>
-      <label>
-        <span>Switch to Claude (local) tab</span>
-        <ShortcutCapture
-          bind:value={
-            () => snapshot!.shortcuts.switch_to_tab_2,
-            (v) => patch((s) => (s.shortcuts.switch_to_tab_2 = v))
-          }
-        />
-      </label>
-    </section>
-
-    <section>
-      <h2>Local LLM provider</h2>
-      <small class="hint">
-        Settings for AI tabs that have <em>Use local LLM provider</em>
-        enabled. Run a LiteLLM (or compatible) proxy that translates the
-        Anthropic Messages API to your local model — cctts does not start
-        the proxy. See the
-        <a
-          href="https://docs.litellm.ai/docs/proxy/quick_start"
-          target="_blank"
-          rel="noopener noreferrer">LiteLLM docs</a
-        >.
-      </small>
-      <label>
-        <span>Proxy URL</span>
-        <input
-          type="text"
-          value={snapshot?.claude_local.base_url ?? ''}
-          oninput={(e) =>
-            patch(
-              (s) =>
-                (s.claude_local.base_url = (
-                  e.currentTarget as HTMLInputElement
-                ).value),
-            )}
-          placeholder="http://localhost:4000"
-        />
-        <small class="hint">
-          Becomes <code>ANTHROPIC_BASE_URL</code> on launch.
-        </small>
-      </label>
-      <label>
-        <span>Auth token</span>
-        <input
-          type={showLocalToken ? 'text' : 'password'}
-          value={snapshot?.claude_local.auth_token ?? ''}
-          oninput={(e) =>
-            patch(
-              (s) =>
-                (s.claude_local.auth_token = (
-                  e.currentTarget as HTMLInputElement
-                ).value),
-            )}
-          placeholder="sk-dummy"
-        />
-        <button
-          type="button"
-          class="secondary"
-          onclick={() => (showLocalToken = !showLocalToken)}
-        >
-          {showLocalToken ? 'Hide' : 'Show'}
-        </button>
-        <small class="hint">
-          Becomes <code>ANTHROPIC_AUTH_TOKEN</code>. Stored cleartext;
-          local proxies usually accept dummy tokens.
-        </small>
-      </label>
-      <label>
-        <span>Model alias (optional)</span>
-        <input
-          type="text"
-          value={snapshot?.claude_local.model_alias ?? ''}
-          oninput={(e) =>
-            patch(
-              (s) =>
-                (s.claude_local.model_alias = (
-                  e.currentTarget as HTMLInputElement
-                ).value),
-            )}
-          placeholder=""
-        />
-        <small class="hint">
-          When non-empty, becomes <code>ANTHROPIC_MODEL</code>. Most
-          users leave this blank and configure model mapping inside
-          their LiteLLM proxy config.
-        </small>
-      </label>
-    </section>
-
-    <section>
-      <h2>Tabs</h2>
-      <small class="hint">
-        All configured tabs in their stored order. AI builtins expand inline;
-        Shell tabs show a summary — edit them via right-click → Configure on
-        the tab bar.
-      </small>
-      <div class="tabs-grid">
-        {#each tabEntries as entry (entry.id)}
-          {#if entry.kind === 'ai_tool'}
-            {@const live = aiTabAt(entry.id)}
-            <details open id="tab-section-{entry.id}">
-              <summary>
-                {entry.name}
-                <span class="kind-badge ai">AI</span>
-              </summary>
-              {#if live}
-                <TabSettingsSection
-                  tabId={entry.id as TabId}
-                  displayName={entry.name}
-                  bind:settings={
-                    () => live,
-                    (v) => patchAiTab(entry.id, v)
+          <h3>Terminal palette</h3>
+          <small class="hint top">
+            Colors used inside terminal tabs. Each tab can override this in
+            its Configure dialog.
+          </small>
+          <label class="palette-row">
+            <span>Palette</span>
+            <select
+              value={snapshot.terminal.theme.name}
+              onchange={(e) => {
+                const name = (e.currentTarget as HTMLSelectElement).value;
+                patch((s) => {
+                  // Read the previous name from `s` itself — `patch`'s
+                  // working copy holds the pre-update value at entry,
+                  // which is what we want for seeding.
+                  const previousName = s.terminal.theme.name;
+                  s.terminal.theme.name = name;
+                  if (name === 'Custom') {
+                    if (!s.terminal.theme.custom) {
+                      const seed =
+                        previousName === 'Custom'
+                          ? BUNDLED_THEMES.Default
+                          : resolveBundledTheme(previousName);
+                      s.terminal.theme.custom = { ...seed } as ThemeColorsWire;
+                    }
+                  } else {
+                    s.terminal.theme.custom = null;
                   }
-                  defaults={tabDefaults[entry.id] ?? null}
-                  restartRequired={restartRequired[entry.id] ?? false}
-                  onchange={() => {}}
-                  onrestart={() => restartTab(entry.id as AiTabId)}
-                />
-              {/if}
-            </details>
-          {:else}
-            <details id="tab-section-{entry.id}">
-              <summary>
-                {entry.name}
-                <span class="kind-badge shell">Shell</span>
-                {#if entry.builtin}
-                  <span class="builtin-tag">builtin</span>
-                {/if}
-              </summary>
-              <div class="shell-edit">
-                <label>
-                  <span>Command</span>
-                  <input type="text" value={shellSummary(entry)} disabled readonly />
-                  <small class="hint">
-                    To change the command, args, or working directory,
-                    right-click the tab in the tab bar and choose
-                    Configure…
-                  </small>
-                </label>
-                <label>
-                  <span>Error notification text</span>
-                  <input
-                    type="text"
-                    value={entry.notifications.error}
-                    oninput={(e) =>
-                      patchShellNotifications(entry.id, {
-                        ...entry.notifications,
-                        error: (e.currentTarget as HTMLInputElement).value,
-                      })}
-                  />
-                  <small class="hint">
-                    Spoken when this tab errors while you're on a different
-                    tab. Leave blank to disable.
-                  </small>
-                </label>
-                <label>
-                  <span>Exited notification text</span>
-                  <input
-                    type="text"
-                    value={entry.notifications.exited}
-                    oninput={(e) =>
-                      patchShellNotifications(entry.id, {
-                        ...entry.notifications,
-                        exited: (e.currentTarget as HTMLInputElement).value,
-                      })}
-                  />
-                  <small class="hint">
-                    Spoken when this shell exits while you're on a different
-                    tab. Use <code>{'{code}'}</code> to insert the exit code.
-                    Leave blank to disable.
-                  </small>
-                </label>
-              </div>
-            </details>
-          {/if}
-        {/each}
-      </div>
-    </section>
+                });
+              }}
+            >
+              {#each BUNDLED_THEME_NAMES as name}
+                <option value={name}>{name}</option>
+              {/each}
+              <option value="Custom">Custom…</option>
+            </select>
+            <ThemeSwatch
+              name={snapshot.terminal.theme.name}
+              custom={snapshot.terminal.theme.custom}
+            />
+          </label>
 
-    <section>
-      <h2>Processing</h2>
-      <div class="row">
-        <label>
-          <span>Stability timeout (ms)</span>
-          <input
-            type="number"
-            min="0"
-            max="2000"
-            step="10"
-            value={snapshot.processing.stability_timeout_ms}
-            onchange={(e) =>
-              patch((s) => (s.processing.stability_timeout_ms = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
+          {#if snapshot.terminal.theme.name === 'Custom' && snapshot.terminal.theme.custom}
+            <CustomThemeEditor
+              value={snapshot.terminal.theme.custom}
+              onchange={(next) =>
+                patch((s) => {
+                  s.terminal.theme.custom = next;
+                })}
+            />
+          {/if}
+        </section>
+      {:else if activeSection === 'background'}
+        <section>
+          <h2>Terminal background</h2>
+          <small class="hint top">
+            Image, color, and gradient options applied behind every
+            terminal tab. Per-tab overrides live in each tab's Configure
+            dialog.
+          </small>
+
+          <BackgroundConfigEditor
+            bind:config={
+              () => snapshot!.terminal.background,
+              (v) =>
+                patch((s) => {
+                  s.terminal.background = v;
+                })
+            }
           />
-        </label>
-        <label>
-          <span>Max hold (ms)</span>
-          <input
-            type="number"
-            min="50"
-            max="5000"
-            step="50"
-            value={snapshot.processing.max_hold_ms}
-            onchange={(e) =>
-              patch((s) => (s.processing.max_hold_ms = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
-          />
-        </label>
+
+          <h3>Presets</h3>
+          <div class="preset-actions">
+            <button type="button" onclick={startSavePreset}>Save as preset…</button>
+            <button
+              type="button"
+              onclick={() => (managingPresets = !managingPresets)}
+            >
+              {managingPresets ? 'Done managing' : 'Manage presets…'}
+            </button>
+          </div>
+
+          {#if savingPreset}
+            <div class="preset-save">
+              <input
+                type="text"
+                placeholder="Preset name"
+                bind:value={newPresetName}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') commitSavePreset();
+                  if (e.key === 'Escape') cancelSavePreset();
+                }}
+              />
+              <button type="button" onclick={commitSavePreset}>Save</button>
+              <button type="button" onclick={cancelSavePreset}>Cancel</button>
+              {#if savePresetError}
+                <small class="error">{savePresetError}</small>
+              {/if}
+            </div>
+            <small class="hint">
+              Presets reference image paths by absolute location — moving an
+              image file breaks any preset that uses it.
+            </small>
+          {/if}
+
+          {#if managingPresets}
+            {#if snapshot.terminal.background.presets.length === 0}
+              <small class="hint">No presets saved yet.</small>
+            {:else}
+              <ul class="preset-list">
+                {#each snapshot.terminal.background.presets as p (p.name)}
+                  <li>
+                    <input
+                      type="text"
+                      value={p.name}
+                      onchange={(e) =>
+                        renamePreset(
+                          p.name,
+                          (e.currentTarget as HTMLInputElement).value,
+                        )}
+                    />
+                    <button type="button" onclick={() => deletePreset(p.name)}>
+                      Delete
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          {/if}
+
+          <h3>Preview</h3>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.terminal.background.preview_category_flips}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.terminal.background.preview_category_flips = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Preview image / category changes in Configure Tab dialog</span>
+          </label>
+          <small class="hint">
+            When off, image-toggle and category-flip changes wait for Save in
+            the Configure Tab dialog. Color, opacity, blur, size, position,
+            and tint always preview live.
+          </small>
+        </section>
+      {:else if activeSection === 'display'}
+        <section>
+          <h2>Display</h2>
+          <label>
+            <span>Terminal font family</span>
+            <input
+              type="text"
+              value={snapshot.display.terminal_font_family}
+              onchange={(e) =>
+                patch((s) => (s.display.terminal_font_family = (e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+          <label>
+            <span>Terminal font size (px)</span>
+            <input
+              type="number"
+              min="8"
+              max="48"
+              value={snapshot.display.terminal_font_size}
+              onchange={(e) =>
+                patch((s) => (s.display.terminal_font_size = Math.max(8, +(e.currentTarget as HTMLInputElement).value)))}
+            />
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.display.show_tts_markup}
+              onchange={(e) =>
+                patch((s) => (s.display.show_tts_markup = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Show TTS markup in terminal (debug)</span>
+          </label>
+        </section>
+
+        <section>
+          <h2>Compose</h2>
+          <small class="hint top">
+            Sizing of the multi-line compose box that opens for prompts.
+          </small>
+          <div class="row">
+            <label>
+              <span>Min height (px)</span>
+              <input
+                type="number"
+                min="40"
+                max="400"
+                value={snapshot.compose.min_height_px}
+                onchange={(e) =>
+                  patch((s) => (s.compose.min_height_px = Math.max(40, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+            <label>
+              <span>Max height (px)</span>
+              <input
+                type="number"
+                min="60"
+                max="800"
+                value={snapshot.compose.max_height_px}
+                onchange={(e) =>
+                  patch((s) => (s.compose.max_height_px = Math.max(60, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+          </div>
+        </section>
+      {:else if activeSection === 'tabs'}
+        <section>
+          <h2>Tabs</h2>
+          <small class="hint top">
+            All configured tabs in their stored order. AI builtins expand inline;
+            Shell tabs show a summary — edit them via right-click → Configure on
+            the tab bar.
+          </small>
+          <div class="tabs-grid">
+            {#each tabEntries as entry (entry.id)}
+              {#if entry.kind === 'ai_tool'}
+                {@const live = aiTabAt(entry.id)}
+                <details open id="tab-section-{entry.id}">
+                  <summary>
+                    {entry.name}
+                    <span class="kind-badge ai">AI</span>
+                  </summary>
+                  {#if live}
+                    <TabSettingsSection
+                      tabId={entry.id as TabId}
+                      displayName={entry.name}
+                      bind:settings={
+                        () => live,
+                        (v) => patchAiTab(entry.id, v)
+                      }
+                      defaults={tabDefaults[entry.id] ?? null}
+                      restartRequired={restartRequired[entry.id] ?? false}
+                      onchange={() => {}}
+                      onrestart={() => restartTab(entry.id as AiTabId)}
+                    />
+                  {/if}
+                </details>
+              {:else}
+                <details id="tab-section-{entry.id}">
+                  <summary>
+                    {entry.name}
+                    <span class="kind-badge shell">Shell</span>
+                    {#if entry.builtin}
+                      <span class="builtin-tag">builtin</span>
+                    {/if}
+                  </summary>
+                  <div class="shell-edit">
+                    <label>
+                      <span>Command</span>
+                      <input type="text" value={shellSummary(entry)} disabled readonly />
+                      <small class="hint">
+                        To change the command, args, or working directory,
+                        right-click the tab in the tab bar and choose
+                        Configure…
+                      </small>
+                    </label>
+                    <label>
+                      <span>Error notification text</span>
+                      <input
+                        type="text"
+                        value={entry.notifications.error}
+                        oninput={(e) =>
+                          patchShellNotifications(entry.id, {
+                            ...entry.notifications,
+                            error: (e.currentTarget as HTMLInputElement).value,
+                          })}
+                      />
+                      <small class="hint">
+                        Spoken when this tab errors while you're on a different
+                        tab. Leave blank to disable.
+                      </small>
+                    </label>
+                    <label>
+                      <span>Exited notification text</span>
+                      <input
+                        type="text"
+                        value={entry.notifications.exited}
+                        oninput={(e) =>
+                          patchShellNotifications(entry.id, {
+                            ...entry.notifications,
+                            exited: (e.currentTarget as HTMLInputElement).value,
+                          })}
+                      />
+                      <small class="hint">
+                        Spoken when this shell exits while you're on a different
+                        tab. Use <code>{'{code}'}</code> to insert the exit code.
+                        Leave blank to disable.
+                      </small>
+                    </label>
+                  </div>
+                </details>
+              {/if}
+            {/each}
+          </div>
+        </section>
+      {:else if activeSection === 'shortcuts'}
+        <section>
+          <h2>Shortcuts</h2>
+          <label>
+            <span>Open compose</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.open_compose,
+                (v) => patch((s) => (s.shortcuts.open_compose = v))
+              }
+            />
+          </label>
+          <label>
+            <span>Submit compose</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.submit_compose,
+                (v) => patch((s) => (s.shortcuts.submit_compose = v))
+              }
+            />
+          </label>
+          <label>
+            <span>Cancel compose</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.cancel_compose,
+                (v) => patch((s) => (s.shortcuts.cancel_compose = v))
+              }
+            />
+          </label>
+          <label>
+            <span>Open settings</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.open_settings,
+                (v) => patch((s) => (s.shortcuts.open_settings = v))
+              }
+            />
+          </label>
+          <label>
+            <span>Switch to Claude tab</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.switch_to_tab_1,
+                (v) => patch((s) => (s.shortcuts.switch_to_tab_1 = v))
+              }
+            />
+          </label>
+          <label>
+            <span>Switch to Claude (local) tab</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.switch_to_tab_2,
+                (v) => patch((s) => (s.shortcuts.switch_to_tab_2 = v))
+              }
+            />
+          </label>
+        </section>
+      {:else if activeSection === 'local-llm'}
+        <section>
+          <h2>Local LLM provider</h2>
+          <small class="hint top">
+            Settings for AI tabs that have <em>Use local LLM provider</em>
+            enabled. Run a LiteLLM (or compatible) proxy that translates the
+            Anthropic Messages API to your local model — cctts does not start
+            the proxy. See the
+            <a
+              href="https://docs.litellm.ai/docs/proxy/quick_start"
+              target="_blank"
+              rel="noopener noreferrer">LiteLLM docs</a
+            >.
+          </small>
+          <label>
+            <span>Proxy URL</span>
+            <input
+              type="text"
+              value={snapshot?.claude_local.base_url ?? ''}
+              oninput={(e) =>
+                patch(
+                  (s) =>
+                    (s.claude_local.base_url = (
+                      e.currentTarget as HTMLInputElement
+                    ).value),
+                )}
+              placeholder="http://localhost:4000"
+            />
+            <small class="hint">
+              Becomes <code>ANTHROPIC_BASE_URL</code> on launch.
+            </small>
+          </label>
+          <label>
+            <span>Auth token</span>
+            <input
+              type={showLocalToken ? 'text' : 'password'}
+              value={snapshot?.claude_local.auth_token ?? ''}
+              oninput={(e) =>
+                patch(
+                  (s) =>
+                    (s.claude_local.auth_token = (
+                      e.currentTarget as HTMLInputElement
+                    ).value),
+                )}
+              placeholder="sk-dummy"
+            />
+            <button
+              type="button"
+              class="secondary"
+              onclick={() => (showLocalToken = !showLocalToken)}
+            >
+              {showLocalToken ? 'Hide' : 'Show'}
+            </button>
+            <small class="hint">
+              Becomes <code>ANTHROPIC_AUTH_TOKEN</code>. Stored cleartext;
+              local proxies usually accept dummy tokens.
+            </small>
+          </label>
+          <label>
+            <span>Model alias (optional)</span>
+            <input
+              type="text"
+              value={snapshot?.claude_local.model_alias ?? ''}
+              oninput={(e) =>
+                patch(
+                  (s) =>
+                    (s.claude_local.model_alias = (
+                      e.currentTarget as HTMLInputElement
+                    ).value),
+                )}
+              placeholder=""
+            />
+            <small class="hint">
+              When non-empty, becomes <code>ANTHROPIC_MODEL</code>. Most
+              users leave this blank and configure model mapping inside
+              their LiteLLM proxy config.
+            </small>
+          </label>
+        </section>
+      {:else if activeSection === 'advanced'}
+        <section>
+          <h2>Processing</h2>
+          <small class="hint top">
+            Stream-stability tuning for the segmenter. Increase if speech
+            chops mid-sentence; decrease if reactions feel sluggish.
+          </small>
+          <div class="row">
+            <label>
+              <span>Stability timeout (ms)</span>
+              <input
+                type="number"
+                min="0"
+                max="2000"
+                step="10"
+                value={snapshot.processing.stability_timeout_ms}
+                onchange={(e) =>
+                  patch((s) => (s.processing.stability_timeout_ms = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+            <label>
+              <span>Max hold (ms)</span>
+              <input
+                type="number"
+                min="50"
+                max="5000"
+                step="50"
+                value={snapshot.processing.max_hold_ms}
+                onchange={(e) =>
+                  patch((s) => (s.processing.max_hold_ms = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+          </div>
+        </section>
+      {/if}
       </div>
-    </section>
     </div>
   </div>
 {/if}
@@ -1084,13 +1152,66 @@
     font-family: system-ui, -apple-system, sans-serif;
     font-size: var(--font-size-md);
   }
-  /* The settings page lives inside #app, which app.css pins to the
-     viewport. Rather than fight the shared global with overrides (whose
-     load-order winning isn't guaranteed across HMR/build), make .root
-     the scroll container and size it to fill #app. The sticky header
-     stays pinned to the top of this container as it scrolls. */
+  /* Two-column layout: fixed sidebar on the left, scrollable content on
+     the right. The settings page lives inside #app, which app.css pins to
+     the viewport — sizing .root to 100vh fills that frame. */
   .root {
+    display: flex;
     height: 100vh;
+    overflow: hidden;
+  }
+  .sidebar {
+    width: 184px;
+    flex-shrink: 0;
+    overflow-y: auto;
+    background: var(--surface-deep);
+    border-right: 1px solid var(--border-faint);
+    padding: 16px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    box-sizing: border-box;
+  }
+  .sidebar-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-tertiary);
+    padding: 4px 12px var(--space-2);
+  }
+  .sidebar button {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 7px 12px;
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--text-quiet);
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
+  }
+  .sidebar button:hover:not(.active) {
+    background: var(--surface-1);
+    color: var(--text-primary);
+  }
+  .sidebar button.active {
+    background: var(--surface-1);
+    color: var(--accent-purple);
+    font-weight: 600;
+    border-color: var(--border-subtle);
+  }
+  .sidebar button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .content {
+    flex: 1;
+    min-width: 0;
     overflow-y: auto;
     overflow-x: hidden;
     padding: 16px 20px 32px;
@@ -1105,20 +1226,6 @@
     text-align: center;
     color: var(--text-tertiary);
   }
-  header {
-    position: sticky;
-    top: 0;
-    background: var(--surface-sunken);
-    border-bottom: 1px solid var(--border-faint);
-    padding-bottom: var(--space-2);
-    margin-bottom: var(--space-4);
-    z-index: 1;
-  }
-  h1 {
-    margin: 0;
-    font-size: 18px;
-    font-weight: 600;
-  }
   h2 {
     font-size: 14px;
     font-weight: 600;
@@ -1127,11 +1234,23 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
+  /* Sub-headings inside a section get a bit more weight + breathing room
+     than the original — used to separate distinct logical groups inside
+     a single section (e.g. UI theme vs Terminal palette in Theme). */
   h3 {
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-md);
     font-weight: 600;
-    margin: var(--space-4) 0 6px 0;
-    color: var(--text-quiet-strong);
+    margin: var(--space-5) 0 var(--space-2) 0;
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-faint);
+    color: var(--text-primary);
+  }
+  /* The first h3 in a section sits right under the h2 — skip the divider
+     so we don't double-up with the section's top edge. */
+  section > h3:first-of-type {
+    margin-top: var(--space-3);
+    padding-top: 0;
+    border-top: none;
   }
   section {
     border: 1px solid var(--border-subtle);
@@ -1167,6 +1286,7 @@
   }
   input[type='text'],
   input[type='number'],
+  input[type='password'],
   select {
     width: 100%;
     background: var(--surface-sunken);
@@ -1181,6 +1301,7 @@
   }
   input[type='text']:focus,
   input[type='number']:focus,
+  input[type='password']:focus,
   select:focus {
     outline: none;
     border-color: var(--accent);
@@ -1257,6 +1378,55 @@
     font-size: var(--font-size-xs);
     margin: -8px 0 var(--space-3) 0;
   }
+  /* hint placed directly under an h3 (rather than tucked under a label)
+     needs normal top margin — it has no preceding label to overlap. */
+  small.hint.top {
+    margin-top: 0;
+    margin-bottom: var(--space-3);
+  }
+  .preset-actions {
+    display: flex;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+  }
+  .preset-save {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+    margin-bottom: var(--space-2);
+  }
+  .preset-save input[type='text'] {
+    flex: 1;
+  }
+  small.error {
+    color: var(--text-error);
+    font-size: var(--font-size-xs);
+  }
+  .preset-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .preset-list li {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+  }
+  .preset-list li input[type='text'] {
+    flex: 1;
+  }
+  .palette-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-column-gap: var(--space-2);
+    align-items: end;
+  }
+  .palette-row > span:first-child {
+    grid-column: 1 / -1;
+  }
   .tabs-grid {
     display: flex;
     flex-direction: column;
@@ -1294,7 +1464,7 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
     padding: 1px 6px;
-    border-radius: 8px;
+    border-radius: var(--radius-pill);
     margin-left: 6px;
     vertical-align: middle;
     font-weight: 600;
@@ -1308,9 +1478,6 @@
     background: var(--surface-success);
     border: 1px solid var(--text-success-bright);
     color: var(--text-success);
-  }
-  .kind-badge {
-    border-radius: var(--radius-pill);
   }
   .builtin-tag {
     display: inline-block;
@@ -1361,5 +1528,31 @@
     padding: 1px var(--space-1);
     border-radius: var(--radius-sm);
     font-size: var(--font-size-xs);
+  }
+
+  /* Narrow window: collapse sidebar to a horizontal strip on top so the
+     content area still gets full width. The Settings window can resize
+     down to ~480px on common installs. */
+  @media (max-width: 640px) {
+    .root {
+      flex-direction: column;
+    }
+    .sidebar {
+      width: 100%;
+      flex-direction: row;
+      flex-wrap: wrap;
+      gap: 4px;
+      border-right: none;
+      border-bottom: 1px solid var(--border-faint);
+      padding: 10px 12px;
+    }
+    .sidebar-title {
+      width: 100%;
+      padding: 0 0 var(--space-1);
+    }
+    .sidebar button {
+      width: auto;
+      padding: 5px 10px;
+    }
   }
 </style>

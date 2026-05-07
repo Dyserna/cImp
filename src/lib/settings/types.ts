@@ -204,6 +204,60 @@ export interface TerminalBackgroundSettings {
   blur: number;
   size: BackgroundSize;
   position: string;
+  /// V1.4-04 A.1: scrollback rows captured by `serializeAddon.serialize`
+  /// on a renderer-category flip. Bounds JS-heap allocation; default
+  /// 2000.
+  snapshot_lines: number;
+  /// V1.4-04 B: named presets the user has saved. The recursive shape
+  /// is blocked by `BackgroundPresetConfigWire` (preset configs don't
+  /// contain a `presets` field), so a preset can never reference
+  /// presets-of-presets. Migration v1.5 → v1.6 stamps `[]`.
+  presets: BackgroundPresetWire[];
+  /// V1.4-04 C.4: when false, per-tab dialog edits that flip renderer
+  /// category (image ↔ no-image) are deferred to Save. In-place
+  /// changes preview live regardless. Default true. Phase D's
+  /// v1.6 → v1.7 migration stamps this explicitly; older files
+  /// serde-default to `true`.
+  preview_category_flips: boolean;
+}
+
+/// V1.4-04 B: payload of a saved preset. Same fields as
+/// `TerminalBackgroundSettings` minus the recursive `presets` field.
+/// Mirrors Rust's `BackgroundPresetConfig`.
+export interface BackgroundPresetConfigWire {
+  image: string | null;
+  color: string | null;
+  opacity: number;
+  blur: number;
+  size: BackgroundSize;
+  position: string;
+  snapshot_lines: number;
+}
+
+/// V1.4-04 B: a named preset entry. `name` is the user-facing label
+/// shown in the "Load preset…" dropdown and Manage modal. Mirrors
+/// Rust's `BackgroundPreset`.
+export interface BackgroundPresetWire {
+  name: string;
+  config: BackgroundPresetConfigWire;
+}
+
+/// Project the shared subset of a `TerminalBackgroundSettings` into a
+/// `BackgroundPresetConfigWire`. The reverse is achieved by spreading
+/// the preset config into a `TerminalBackgroundSettings` with a fresh
+/// `presets: []`, which the editor's `loadPreset` does inline.
+export function toPresetConfig(
+  s: TerminalBackgroundSettings,
+): BackgroundPresetConfigWire {
+  return {
+    image: s.image,
+    color: s.color,
+    opacity: s.opacity,
+    blur: s.blur,
+    size: s.size,
+    position: s.position,
+    snapshot_lines: s.snapshot_lines,
+  };
 }
 
 /// V1.4-02 three-state per-tab override on the wire. The literal
@@ -221,11 +275,24 @@ export function isBackgroundDisabled(
   return o === 'disabled';
 }
 
+/// V1.4-04 D: cross-restart scrollback config. The PTY ring buffer is
+/// capped at `ring_bytes` per tab; on graceful exit each tab's ring is
+/// written to `<config-dir>/scrollback/<tab-id>.bin`; on next launch
+/// `pty_start` returns the persisted bytes for the new xterm to replay
+/// before live PTY output resumes.
+export interface ScrollbackSettings {
+  ring_bytes: number;
+  persist: boolean;
+  restore_on_launch: boolean;
+}
+
 /// V1.4-01+: terminal-pane settings. Holds the xterm.js palette config
-/// (V1.4-01) and the V1.4-02 background sub-group.
+/// (V1.4-01), the V1.4-02 background sub-group, and the V1.4-04 D
+/// cross-restart scrollback group.
 export interface TerminalSettings {
   theme: TerminalThemeSettings;
   background: TerminalBackgroundSettings;
+  scrollback: ScrollbackSettings;
 }
 
 /// Persisted layout state (V4-04). Mirrors the in-memory `LayoutState`
@@ -411,6 +478,14 @@ export function defaultSettings(): Settings {
         blur: 0,
         size: 'cover',
         position: 'center',
+        snapshot_lines: 2000,
+        presets: [],
+        preview_category_flips: true,
+      },
+      scrollback: {
+        ring_bytes: 262144,
+        persist: true,
+        restore_on_launch: true,
       },
     },
   };

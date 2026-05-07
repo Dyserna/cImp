@@ -58,6 +58,7 @@ import {
   categoryOf,
   composeTheme,
   effectiveBackgroundMode,
+  recreateDebounceDelay,
 } from './terminal/background';
 import { setTerminalFocuser } from './terminalFocus';
 import { perTabClosedState } from './avatarState';
@@ -206,12 +207,30 @@ async function attemptSpawn(entry: TerminalEntry, mode: SpawnMode): Promise<void
           `pty_rebind fell back to pty_start for ${entry.tabId}:`,
           rebindErr,
         );
+        // V1.4-04 D.5: pty_start returns persisted scrollback bytes.
+        // Discard them on the rebind-fallback path — the new xterm
+        // already has the V1.4-03 serialize-replay drawn into it,
+        // and writing the persisted bytes would land them after the
+        // fresher session content (out of chronological order).
+        // The bytes are gone after this call (consumed server-side);
+        // that's acceptable for the rare fallback case.
         await ptyStart(entry.tabId, channel, rows, cols);
       }
     } else if (mode === 'restart') {
       await ptyRestart(entry.tabId, channel, rows, cols);
     } else {
-      await ptyStart(entry.tabId, channel, rows, cols);
+      // V1.4-04 D.5: cold-start path. If the previous session
+      // persisted scrollback for this tab on graceful exit, the
+      // backend returns it here; we replay it into the new xterm
+      // *before* the next microtask cycle so the bytes land before
+      // any live PTY output that arrives via the bound channel.
+      const restored = await ptyStart(entry.tabId, channel, rows, cols);
+      if (restored && restored.length > 0) {
+        const text = new TextDecoder('utf-8', { fatal: false }).decode(
+          new Uint8Array(restored),
+        );
+        entry.term.write(text);
+      }
     }
     clearTabError(entry.tabId);
     entry.term.focus();
@@ -513,6 +532,13 @@ const recreateTimers = new Map<TabId, ReturnType<typeof setTimeout>>();
 function queueRecreate(tabId: TabId): void {
   const existing = recreateTimers.get(tabId);
   if (existing) clearTimeout(existing);
+
+  // V1.4-04 A.3: per-tab debounce stagger. Formula and rationale live
+  // in `recreateDebounceDelay` in `terminal/background.ts`.
+  const delay = recreateDebounceDelay(
+    Array.from(entries.keys()).indexOf(tabId),
+  );
+
   recreateTimers.set(
     tabId,
     setTimeout(() => {
@@ -531,7 +557,20 @@ function queueRecreate(tabId: TabId): void {
       // same rows/cols so the replayed cursor positions land on the
       // right cells; xterm's default 24×80 would wrap a 60×200
       // snapshot badly.
-      const snapshot = old.serializeAddon.serialize();
+      //
+      // V1.4-04 A.1/A.2: bound the snapshot at `snapshot_lines` rows
+      // (default 2000) to cap JS-heap allocation under 50k+ scrollback.
+      // Skip capture entirely when the alt-screen buffer is active —
+      // serializeAddon's replay of alt-screen state can land mid-screen
+      // with the alt buffer's content laid over the main buffer's blank
+      // canvas, which is worse than a blank canvas the user can fix
+      // with Ctrl+L. The PTY rebind preserves the live shell session
+      // either way; only the alt-buffer's visible content is dropped.
+      const wasAltScreen = old.term.buffer.active.type === 'alternate';
+      const cap = get(settingsStore).terminal.background.snapshot_lines;
+      const snapshot = wasAltScreen
+        ? undefined
+        : old.serializeAddon.serialize({ scrollback: cap });
       const { rows, cols } = old.term;
 
       // V1.4-03: capture the old host's slot before destroy so the
@@ -560,7 +599,7 @@ function queueRecreate(tabId: TabId): void {
       if (previousSlot) {
         attachTerminal(tabId, previousSlot);
       }
-    }, 120),
+    }, delay),
   );
 }
 

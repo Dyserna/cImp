@@ -75,6 +75,18 @@ export function categoryOf(mode: RenderingMode): 'fast' | 'image' {
   return mode.kind === 'image' ? 'image' : 'fast';
 }
 
+/// V1.4-04 A.3: per-tab debounce stagger for `queueRecreate`. With 6+
+/// tabs all flipping category from a single global setting change, a
+/// flat-debounce path used to fire every timer in the same animation
+/// frame and produce visible stutter. Spread firings across two
+/// frames at 60 Hz; cap stagger at idx=5 so a 20-tab worst case is
+/// ~330 ms instead of 720 ms. Negative or unknown indices fall back
+/// to the base delay.
+export function recreateDebounceDelay(idx: number): number {
+  const clamped = Math.min(Math.max(idx, 0), 5);
+  return 180 + clamped * 30;
+}
+
 /// Apply the rendering mode to an xterm.js `ITheme`. The original
 /// theme is not mutated — a shallow copy is returned with the
 /// background field replaced (or left alone for `'none'`).

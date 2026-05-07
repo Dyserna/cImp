@@ -1,5 +1,6 @@
 <script lang="ts">
   import { open } from '@tauri-apps/plugin-dialog';
+  import { settings as settingsStore } from './store';
   import type { TerminalBackgroundSettings } from './types';
 
   // V1.4-03: extracted from SettingsApp.svelte's terminal-background
@@ -13,6 +14,13 @@
   }: {
     config: TerminalBackgroundSettings;
   } = $props();
+
+  // V1.4-04 B.4: presets are read from the global settings store, not
+  // from the bound `config`. The bound config can itself be a per-tab
+  // override (which carries an empty `presets: []` for wire-format
+  // reasons — see `BackgroundOverride` doc note in schema.rs). The
+  // user-facing preset library is global only.
+  let presets = $derived($settingsStore.terminal.background.presets);
 
   // bgMode is *intent*; (config.image, config.color) are state. The
   // c6e3e8a pattern: derive bgMode once from the initial snapshot,
@@ -85,7 +93,56 @@
   function setColor(next: string) {
     config = { ...config, color: next };
   }
+
+  // V1.4-04 B.4: one-shot preset picker. Selecting a preset overwrites
+  // the shared subset of `config` with the preset's contents; the
+  // bound config's existing `presets` array is preserved (presets only
+  // live on the global config in practice, but the type carries the
+  // field so we keep it intact). The select is reset to `''` after
+  // each pick so the dropdown stays a verb ("Load preset…"), not a
+  // state indicator — the mode select below is the source of truth
+  // for what's currently configured.
+  function loadPreset(name: string) {
+    if (!name) return;
+    const preset = presets.find((p) => p.name === name);
+    if (!preset) return;
+    // Preserve fields that aren't part of a preset payload:
+    //   - `presets`: the global library lives on the global config; an
+    //     override carries `[]`. Either way, loading a preset shouldn't
+    //     change it.
+    //   - `preview_category_flips` (V1.4-04 C.4): global UI behavior,
+    //     not a preset property.
+    config = {
+      ...preset.config,
+      presets: config.presets,
+      preview_category_flips: config.preview_category_flips,
+    };
+    // Snap bgMode back into agreement with the loaded config. This is
+    // an explicit user action — not a settings-store snapshot — so the
+    // c6e3e8a guard against snapshot-driven re-derivation doesn't
+    // apply. Treat it like a fresh pickBgMode click.
+    bgMode = config.image ? 'image' : config.color ? 'color' : 'theme';
+  }
 </script>
+
+{#if presets.length > 0}
+  <label class="palette-row">
+    <span>Load preset</span>
+    <select
+      value=""
+      onchange={(e) => {
+        const target = e.currentTarget as HTMLSelectElement;
+        loadPreset(target.value);
+        target.value = '';
+      }}
+    >
+      <option value="">Load preset…</option>
+      {#each presets as p (p.name)}
+        <option value={p.name}>{p.name}</option>
+      {/each}
+    </select>
+  </label>
+{/if}
 
 <label class="palette-row">
   <span>Background</span>

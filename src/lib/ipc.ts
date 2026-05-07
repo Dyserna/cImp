@@ -8,13 +8,33 @@ export function createBytesChannel(): BytesChannel {
   return new Channel<string>();
 }
 
+/// V1.4-04 D.5: `pty_start` now returns the persisted-scrollback bytes
+/// (if any) from the previous session. The caller writes them to the
+/// new xterm before binding the live channel so the user sees their
+/// last shell output above a fresh prompt. Returns `null` when:
+///   - `terminal.scrollback.restore_on_launch` is `false`
+///   - no persisted file exists (cold install, or already consumed
+///     earlier in this session)
+///   - the persisted-file read failed (logged backend-side; the
+///     spawn proceeds either way)
+///
+/// Tauri serializes Rust `Vec<u8>` as `number[]`. Callers convert to
+/// `Uint8Array` + `TextDecoder` to feed `term.write`.
 export async function ptyStart(
   tab: TabId,
   channel: BytesChannel,
   rows: number,
-  cols: number
-): Promise<void> {
-  await invoke('pty_start', { tab, channel, rows, cols });
+  cols: number,
+): Promise<number[] | null> {
+  return invoke<number[] | null>('pty_start', { tab, channel, rows, cols });
+}
+
+/// V1.4-04 D.3: snapshot the current PTY scrollback ring as raw bytes.
+/// Diagnostic-only — the launch-replay path uses `pty_start`'s return
+/// value, not this command. Errors with `NotStarted` if the tab has no
+/// live PTY.
+export async function ptyGetScrollback(tab: TabId): Promise<number[]> {
+  return invoke<number[]>('pty_get_scrollback', { tab });
 }
 
 export async function ptyRestart(

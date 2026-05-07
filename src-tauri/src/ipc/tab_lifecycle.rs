@@ -281,6 +281,14 @@ pub async fn close_tab(
         });
     }
 
+    // V1.4-04 D.6: drop any persisted scrollback file for the closed
+    // tab. The orphan-prune sweep at next launch would also catch it,
+    // but cleaning up immediately keeps the disk-state consistent
+    // with the user's mental model.
+    if let Err(e) = crate::pty::scrollback::delete(&tab) {
+        warn!(?tab, error = %e, "close_tab: scrollback delete failed");
+    }
+
     // Remove the settings entry. Drop the active_tab_id pointer if it
     // referenced this tab — the frontend will set a new one on its next
     // tab-switch event.

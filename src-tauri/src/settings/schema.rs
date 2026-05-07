@@ -584,6 +584,11 @@ pub struct TerminalSettings {
     /// for the four-cell rendering matrix and the three-state
     /// override semantics.
     pub background: TerminalBackgroundSettings,
+    /// V1.4-04 D: cross-restart scrollback buffer. PTY output is
+    /// captured into a per-tab ring buffer (`ring_bytes` cap, 256 KB
+    /// default), persisted to disk on graceful exit, and replayed on
+    /// next launch.
+    pub scrollback: ScrollbackSettings,
 }
 
 /// Terminal palette setting. `name` is either a bundled theme name
@@ -641,6 +646,29 @@ pub struct TerminalBackgroundSettings {
     /// Image-mode CSS `background-position` value. Ignored when `image`
     /// is `None`.
     pub position: String,
+    /// V1.4-04 A.1 snapshot cap. Number of scrollback rows to capture
+    /// when `serializeAddon.serialize({ scrollback })` runs on a
+    /// renderer-category flip. Bounds JS-heap allocation under
+    /// long-scrollback (50k+ lines) edge cases. Existing v1.5 files
+    /// without this field deserialize to the default via serde-default
+    /// — no migration version bump.
+    pub snapshot_lines: u32,
+    /// V1.4-04 B: named presets the user has saved. The recursion is
+    /// blocked by the sister-struct `BackgroundPresetConfig` (presets
+    /// can't contain presets). Migration v1.5 → v1.6 stamps `[]`; older
+    /// files deserialize to `[]` via serde-default. When a per-tab
+    /// `BackgroundOverride::Custom(...)` round-trips, this field rides
+    /// along as `[]` — that's harmless wire-format growth and avoided
+    /// the wire-format break that switching `Custom` to wrap
+    /// `BackgroundPresetConfig` would have caused.
+    pub presets: Vec<BackgroundPreset>,
+    /// V1.4-04 C.4: when `false`, per-tab Configure dialog edits that
+    /// would flip renderer category (image ↔ no-image) are deferred to
+    /// Save. In-place changes (color / opacity / blur / size /
+    /// position / tint) preview live regardless. Default `true`. Older
+    /// files deserialize to `true` via serde-default; the v1.6 → v1.7
+    /// migration (Phase D) stamps it explicitly.
+    pub preview_category_flips: bool,
 }
 
 impl Default for TerminalBackgroundSettings {
@@ -652,6 +680,88 @@ impl Default for TerminalBackgroundSettings {
             blur: 0,
             size: BackgroundSize::Cover,
             position: "center".to_string(),
+            snapshot_lines: 2000,
+            presets: Vec::new(),
+            preview_category_flips: true,
+        }
+    }
+}
+
+/// V1.4-04 B: a saved preset. `name` is the user-facing label;
+/// `config` carries the same fields as `TerminalBackgroundSettings`
+/// minus the `presets` field itself (the sister-struct
+/// `BackgroundPresetConfig` makes the "presets don't contain presets"
+/// invariant structural rather than runtime-enforced).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct BackgroundPreset {
+    pub name: String,
+    pub config: BackgroundPresetConfig,
+}
+
+/// V1.4-04 B: the payload of a `BackgroundPreset` — same fields as
+/// `TerminalBackgroundSettings` except for the recursive `presets`
+/// field. `From`/`Into` impls bridge the two so the editor UI can hand
+/// either shape into `composeTheme` etc. The `BackgroundOverride::Custom`
+/// variant deliberately stays wrapped around `TerminalBackgroundSettings`
+/// rather than this struct — see the doc note on
+/// `TerminalBackgroundSettings.presets`.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct BackgroundPresetConfig {
+    pub image: Option<PathBuf>,
+    pub color: Option<String>,
+    pub opacity: f32,
+    pub blur: u32,
+    pub size: BackgroundSize,
+    pub position: String,
+    pub snapshot_lines: u32,
+}
+
+impl Default for BackgroundPresetConfig {
+    fn default() -> Self {
+        Self {
+            image: None,
+            color: None,
+            opacity: 0.4,
+            blur: 0,
+            size: BackgroundSize::Cover,
+            position: "center".to_string(),
+            snapshot_lines: 2000,
+        }
+    }
+}
+
+impl From<&TerminalBackgroundSettings> for BackgroundPresetConfig {
+    fn from(s: &TerminalBackgroundSettings) -> Self {
+        Self {
+            image: s.image.clone(),
+            color: s.color.clone(),
+            opacity: s.opacity,
+            blur: s.blur,
+            size: s.size,
+            position: s.position.clone(),
+            snapshot_lines: s.snapshot_lines,
+        }
+    }
+}
+
+impl From<BackgroundPresetConfig> for TerminalBackgroundSettings {
+    fn from(p: BackgroundPresetConfig) -> Self {
+        Self {
+            image: p.image,
+            color: p.color,
+            opacity: p.opacity,
+            blur: p.blur,
+            size: p.size,
+            position: p.position,
+            snapshot_lines: p.snapshot_lines,
+            presets: Vec::new(),
+            // V1.4-04 C.4: a preset doesn't carry the dialog
+            // preview-opt-out flag (it's a global UI behavior, not a
+            // background-config attribute). Lifting a preset back into
+            // a `TerminalBackgroundSettings` defaults to the same
+            // value as `Default`.
+            preview_category_flips: true,
         }
     }
 }
@@ -711,6 +821,31 @@ impl<'de> Deserialize<'de> for BackgroundOverride {
             _ => Err(D::Error::custom(
                 "background_override: expected \"disabled\" string or background config object",
             )),
+        }
+    }
+}
+
+/// V1.4-04 D: cross-restart scrollback configuration. The ring
+/// buffer is per-tab and capped at `ring_bytes`. `persist` toggles
+/// disk persistence on graceful exit (`tauri::RunEvent::ExitRequested`);
+/// `restore_on_launch` toggles the read-back at next `pty_start`.
+/// Both default `true`. Defaults match the milestone doc — 256 KB per
+/// tab is roughly 600 lines of dense ANSI, enough for "what was I
+/// doing yesterday" continuity without ballooning disk usage.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct ScrollbackSettings {
+    pub ring_bytes: usize,
+    pub persist: bool,
+    pub restore_on_launch: bool,
+}
+
+impl Default for ScrollbackSettings {
+    fn default() -> Self {
+        Self {
+            ring_bytes: 262_144,
+            persist: true,
+            restore_on_launch: true,
         }
     }
 }
@@ -850,6 +985,9 @@ mod tests {
             blur: 12,
             size: BackgroundSize::Contain,
             position: "top left".to_string(),
+            snapshot_lines: 2000,
+            presets: Vec::new(),
+            preview_category_flips: true,
         };
         let custom = Some(BackgroundOverride::Custom(cfg.clone()));
         let v = serde_json::to_value(&custom).unwrap();
@@ -889,5 +1027,69 @@ mod tests {
         assert_eq!(d.blur, 0);
         assert_eq!(d.size, BackgroundSize::Cover);
         assert_eq!(d.position, "center");
+        assert_eq!(d.snapshot_lines, 2000);
+        assert!(d.presets.is_empty());
+    }
+
+    #[test]
+    fn background_preset_config_round_trips() {
+        let p = BackgroundPresetConfig {
+            image: Some(PathBuf::from("/tmp/frost.jpg")),
+            color: Some("#0011aa".to_string()),
+            opacity: 0.55,
+            blur: 8,
+            size: BackgroundSize::Tile,
+            position: "top right".to_string(),
+            snapshot_lines: 5000,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        let parsed: BackgroundPresetConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.image, p.image);
+        assert_eq!(parsed.color, p.color);
+        assert!((parsed.opacity - p.opacity).abs() < f32::EPSILON);
+        assert_eq!(parsed.blur, p.blur);
+        assert_eq!(parsed.size, p.size);
+        assert_eq!(parsed.position, p.position);
+        assert_eq!(parsed.snapshot_lines, p.snapshot_lines);
+    }
+
+    #[test]
+    fn background_preset_config_from_settings_strips_presets() {
+        // From<&TerminalBackgroundSettings> for BackgroundPresetConfig
+        // copies the shared fields; presets has no analogue on the sister
+        // struct, so it is dropped.
+        let mut s = TerminalBackgroundSettings::default();
+        s.color = Some("#101010".to_string());
+        s.presets.push(BackgroundPreset {
+            name: "noise".to_string(),
+            config: BackgroundPresetConfig::default(),
+        });
+        let p: BackgroundPresetConfig = (&s).into();
+        assert_eq!(p.color, s.color);
+        // The round-trip back through Into<TerminalBackgroundSettings>
+        // produces a fresh `presets: []` regardless of what `s` had.
+        let s2: TerminalBackgroundSettings = p.into();
+        assert!(s2.presets.is_empty());
+    }
+
+    #[test]
+    fn background_preset_round_trips() {
+        let preset = BackgroundPreset {
+            name: "Frosted glass".to_string(),
+            config: BackgroundPresetConfig {
+                image: Some(PathBuf::from("C:\\images\\frost.jpg")),
+                color: None,
+                opacity: 0.4,
+                blur: 12,
+                size: BackgroundSize::Cover,
+                position: "center".to_string(),
+                snapshot_lines: 2000,
+            },
+        };
+        let v = serde_json::to_value(&preset).unwrap();
+        let parsed: BackgroundPreset = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.name, preset.name);
+        assert_eq!(parsed.config.image, preset.config.image);
+        assert_eq!(parsed.config.blur, preset.config.blur);
     }
 }

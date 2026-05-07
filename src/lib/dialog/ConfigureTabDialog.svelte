@@ -16,7 +16,14 @@
     type TabLifecycleError,
   } from '../ipc';
   import ShellTabFields from './ShellTabFields.svelte';
-  import { settings as settingsStore } from '../settings/store';
+  import {
+    settings as settingsStore,
+    applySettings,
+  } from '../settings/store';
+  import {
+    categoryOf,
+    effectiveBackgroundMode,
+  } from '../terminal/background';
   import type {
     BackgroundOverrideWire,
     TerminalBackgroundSettings,
@@ -35,7 +42,6 @@
   let notificationsError = $state('');
   let notificationsExited = $state('');
   let themeOverride = $state<TerminalThemeSettings | null>(null);
-  let backgroundOverride = $state<BackgroundOverrideWire | null>(null);
   let error = $state<TabLifecycleError | null>(null);
   let busy = $state(false);
 
@@ -62,13 +68,9 @@
   //   '__disabled' → backgroundOverride = 'disabled'
   //   '__custom'   → backgroundOverride = TerminalBackgroundSettings object
   type BgOverrideMode = '__inherit' | '__disabled' | '__custom';
-  let bgOverrideSelection = $derived<BgOverrideMode>(
-    backgroundOverride === null
-      ? '__inherit'
-      : backgroundOverride === 'disabled'
-        ? '__disabled'
-        : '__custom',
-  );
+  // (`bgOverrideSelection` is declared after `backgroundOverride` below,
+  // since it depends on the store-derived value that lives below
+  // `targetTab`.)
 
   function globalBgSummaryOf(bg: TerminalBackgroundSettings): string {
     if (bg.image) {
@@ -82,6 +84,35 @@
   let isOpen = $derived($dialogState.kind === 'configure-tab');
   let targetTab = $derived(
     $dialogState.kind === 'configure-tab' ? $dialogState.tab : null,
+  );
+
+  // V1.4-04 C: live preview. `backgroundOverride` is read straight
+  // from the store instead of being local state, so dialog edits flow
+  // through `applySettings` and are picked up immediately by the
+  // `unsubAppearance` subscriber in terminals.ts. Cancel-revert
+  // restores `originalBackgroundOverride` (snapshot taken on dialog
+  // open) via the same write path.
+  let backgroundOverride = $derived<BackgroundOverrideWire | null>(
+    targetTab
+      ? ($settingsStore.tabs.find((t) => t.id === targetTab)
+          ?.background_override ?? null)
+      : null,
+  );
+  let originalBackgroundOverride: BackgroundOverrideWire | null = null;
+  // V1.4-04 C.4: when `preview_category_flips` is off, image/category
+  // changes are stashed here until Save commits them. In-place changes
+  // (color/opacity/blur/size/position/tint) still preview live.
+  let pendingBackgroundOverride = $state<
+    | { kind: 'none' }
+    | { kind: 'pending'; value: BackgroundOverrideWire | null }
+  >({ kind: 'none' });
+
+  let bgOverrideSelection = $derived<BgOverrideMode>(
+    backgroundOverride === null
+      ? '__inherit'
+      : backgroundOverride === 'disabled'
+        ? '__disabled'
+        : '__custom',
   );
 
   let lastTab: string | null = null;
@@ -98,13 +129,17 @@
   async function initFields(tab: string): Promise<void> {
     error = null;
     busy = false;
+    pendingBackgroundOverride = { kind: 'none' };
     // Read theme_override from the live settings store. The IPC's
     // `get_shell_tab_config` doesn't carry it (kept narrow for M2's
     // shell-fields shape); the store is canonical and always in sync
     // because the backend broadcasts on change.
     const liveTab = get(settingsStore).tabs.find((t) => t.id === tab);
     themeOverride = liveTab?.theme_override ?? null;
-    backgroundOverride = liveTab?.background_override ?? null;
+    // V1.4-04 C: snapshot the background override so Cancel can revert
+    // any live-preview edits. `backgroundOverride` itself is now a
+    // $derived from the store and is not directly assignable.
+    originalBackgroundOverride = liveTab?.background_override ?? null;
     try {
       const cfg = await getShellTabConfig(tab);
       name = cfg.name;
@@ -152,19 +187,63 @@
     themeOverride = { name: value, custom: null };
   }
 
-  /// V1.4-03: translate the Background-row dropdown selection into a
-  /// `background_override` value. Custom mode seeds from the existing
-  /// override (if any) or the current global background.
+  /// V1.4-04 C: write a new `background_override` for the active tab
+  /// straight into the global settings store. The store change cascades
+  /// through `unsubAppearance` in `terminals.ts`, repainting the live
+  /// terminal in real time. Cancel-revert reuses this same path with
+  /// the original snapshot.
+  ///
+  /// The C.4 opt-out: when `preview_category_flips` is off and the
+  /// caller's change would flip renderer category, the change is
+  /// stashed as `pendingBackgroundOverride` for Save to commit later.
+  /// In-place changes (color/opacity/etc.) bypass the gate and preview
+  /// live regardless.
+  async function writeBackgroundOverride(
+    next: BackgroundOverrideWire | null,
+  ): Promise<void> {
+    if (!targetTab) return;
+    const live = get(settingsStore);
+    if (!live.terminal.background.preview_category_flips) {
+      const tab = live.tabs.find((t) => t.id === targetTab);
+      if (tab) {
+        const currentMode = effectiveBackgroundMode(
+          { background_override: tab.background_override },
+          live.terminal.background,
+        );
+        const nextMode = effectiveBackgroundMode(
+          { background_override: next },
+          live.terminal.background,
+        );
+        if (categoryOf(currentMode) !== categoryOf(nextMode)) {
+          pendingBackgroundOverride = { kind: 'pending', value: next };
+          return;
+        }
+      }
+    }
+    pendingBackgroundOverride = { kind: 'none' };
+    const updated = structuredClone(live);
+    const tab = updated.tabs.find((t) => t.id === targetTab);
+    if (!tab) return;
+    tab.background_override = next;
+    await applySettings(updated);
+  }
+
+  /// V1.4-03 + V1.4-04 C: translate the Background-row dropdown
+  /// selection into a `background_override` value, then write it
+  /// through to the store for live preview. Custom mode seeds from the
+  /// existing override (if any) or the current global background.
   function selectBgOverride(value: BgOverrideMode): void {
     if (value === '__inherit') {
-      backgroundOverride = null;
+      void writeBackgroundOverride(null);
       return;
     }
     if (value === '__disabled') {
-      backgroundOverride = 'disabled';
+      void writeBackgroundOverride('disabled');
       return;
     }
-    // '__custom' — already custom: preserve.
+    // '__custom' — already custom: leave the existing config in place
+    // (no-op write would still produce the same store state, but
+    // skipping avoids an unnecessary applySettings round-trip).
     if (
       backgroundOverride !== null &&
       backgroundOverride !== 'disabled' &&
@@ -173,11 +252,33 @@
       return;
     }
     const liveGlobal = get(settingsStore).terminal.background;
-    backgroundOverride = { ...liveGlobal };
+    // Strip presets when descending into an override (the override is
+    // a config, not a config-with-presets — though serde tolerates the
+    // empty array if it leaks through). The frontend type still
+    // includes the field, so we explicitly carry it as `[]`.
+    void writeBackgroundOverride({
+      ...liveGlobal,
+      presets: [],
+    });
   }
 
   function cancel(): void {
+    // V1.4-04 C.3: revert any live-preview edits before closing.
+    if (targetTab) {
+      void revertBackgroundOverride();
+    }
     closeDialog();
+  }
+
+  async function revertBackgroundOverride(): Promise<void> {
+    if (!targetTab) return;
+    pendingBackgroundOverride = { kind: 'none' };
+    const updated = structuredClone(get(settingsStore));
+    const tab = updated.tabs.find((t) => t.id === targetTab);
+    if (!tab) return;
+    if (tab.background_override === originalBackgroundOverride) return;
+    tab.background_override = originalBackgroundOverride;
+    await applySettings(updated);
   }
 
   async function save(): Promise<void> {
@@ -185,6 +286,25 @@
     busy = true;
     error = null;
     try {
+      // V1.4-04 C.4: if a pending category-flip change was stashed
+      // because preview was off, commit it before the IPC. The
+      // reconfigureShellTab call below carries the same value, but
+      // applying it via `applySettings` first ensures the live
+      // terminal repaints immediately on Save (the IPC's broadcast
+      // will then redundantly arrive with the same value — harmless).
+      const effectiveBg: BackgroundOverrideWire | null =
+        pendingBackgroundOverride.kind === 'pending'
+          ? pendingBackgroundOverride.value
+          : backgroundOverride;
+      if (pendingBackgroundOverride.kind === 'pending') {
+        const updated = structuredClone(get(settingsStore));
+        const tab = updated.tabs.find((t) => t.id === targetTab);
+        if (tab) {
+          tab.background_override = effectiveBg;
+          await applySettings(updated);
+        }
+        pendingBackgroundOverride = { kind: 'none' };
+      }
       await reconfigureShellTab({
         tab: targetTab,
         name,
@@ -195,8 +315,11 @@
         notificationsError,
         notificationsExited,
         themeOverride,
-        backgroundOverride,
+        backgroundOverride: effectiveBg,
       });
+      // Saved — commit the snapshot baseline so a later Cancel doesn't
+      // clobber the user's intent.
+      originalBackgroundOverride = effectiveBg;
       closeDialog();
     } catch (e) {
       const wire = e as { kind?: string } | string | null;
@@ -315,10 +438,20 @@
         bind:config={
           () => backgroundOverride as TerminalBackgroundSettings,
           (v) => {
-            backgroundOverride = v;
+            // V1.4-04 C: every editor change writes through to the
+            // store so the running terminal repaints live. The setter
+            // is async-fire-and-forget; the next read of
+            // `backgroundOverride` (which is $derived from the store)
+            // reflects the change once `applySettings` resolves.
+            void writeBackgroundOverride(v);
           }
         }
       />
+      {#if pendingBackgroundOverride.kind === 'pending'}
+        <small class="hint-row">
+          Image / category change pending. Save to apply.
+        </small>
+      {/if}
     {/if}
 
     <small class="footer-note">

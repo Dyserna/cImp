@@ -10,6 +10,7 @@ import {
   composeTheme,
   cssSizeFor,
   effectiveBackgroundMode,
+  recreateDebounceDelay,
   rgbaFrom,
   type RenderingMode,
   type TabWithBackgroundOverride,
@@ -23,6 +24,9 @@ const cfgNone: TerminalBackgroundSettings = {
   blur: 0,
   size: 'cover',
   position: 'center',
+  snapshot_lines: 2000,
+  presets: [],
+  preview_category_flips: true,
 };
 const cfgColorOnly: TerminalBackgroundSettings = {
   ...cfgNone,
@@ -160,6 +164,25 @@ describe('cssSizeFor', () => {
   });
   test('tile becomes auto + repeat', () => {
     expect(cssSizeFor('tile')).toEqual({ size: 'auto', repeat: 'repeat' });
+  });
+});
+
+describe('recreateDebounceDelay (V1.4-04 A.3)', () => {
+  test('idx 0 → base 180 ms', () => {
+    expect(recreateDebounceDelay(0)).toBe(180);
+  });
+  test('staggers by 30 ms per tab', () => {
+    expect(recreateDebounceDelay(1)).toBe(210);
+    expect(recreateDebounceDelay(2)).toBe(240);
+    expect(recreateDebounceDelay(5)).toBe(330);
+  });
+  test('clamps stagger at idx=5 so high-tab counts cap at 330 ms', () => {
+    expect(recreateDebounceDelay(6)).toBe(330);
+    expect(recreateDebounceDelay(20)).toBe(330);
+  });
+  test('negative / unknown indices fall back to base', () => {
+    expect(recreateDebounceDelay(-1)).toBe(180);
+    expect(recreateDebounceDelay(-100)).toBe(180);
   });
 });
 

@@ -104,8 +104,11 @@
     ) {
       return;
     }
+    // V1.4-04 B/C: strip the global presets list when descending into
+    // an override (presets live globally; the embedded list inside an
+    // override is harmless wire-format growth we'd rather avoid).
     const liveGlobal = get(settingsStore).terminal.background;
-    update('background_override', { ...liveGlobal });
+    update('background_override', { ...liveGlobal, presets: [] });
   }
 
   function updateCustomBg(next: TerminalBackgroundSettings): void {

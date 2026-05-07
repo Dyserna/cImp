@@ -90,6 +90,28 @@ pub fn migrate_if_needed(
         changed = true;
     }
 
+    // v1.5 → v1.6: V1.4-04 B adds `terminal.background.presets`. A
+    // single new array field; no per-tab stamping needed because
+    // presets live globally. Cascades naturally — the v1.4→v1.5
+    // branch above stamps `terminal.background` first, then this
+    // branch fires on the same value before flush.
+    if looks_v1_5(value) {
+        write_backup(path, "v1.5", value)?;
+        migrate_v1_5_to_v1_6(value);
+        changed = true;
+    }
+
+    // v1.6 → v1.7: V1.4-04 D adds `terminal.scrollback` (cross-restart
+    // ring buffer settings) and explicitly stamps the V1.4-04 C.4
+    // `terminal.background.preview_category_flips` flag. Detected as
+    // "has terminal.background.presets (v1.6) but lacks
+    // terminal.scrollback (v1.7)".
+    if looks_v1_6(value) {
+        write_backup(path, "v1.6", value)?;
+        migrate_v1_6_to_v1_7(value);
+        changed = true;
+    }
+
     Ok(changed)
 }
 
@@ -151,6 +173,43 @@ fn looks_v1_4(value: &Value) -> bool {
         .and_then(|t| t.get("background"))
         .is_some();
     has_terminal && !has_terminal_background
+}
+
+/// Is this a v1.5 file that lacks the v1.6
+/// `terminal.background.presets` field? V1.4-04 B's schema-bump check.
+/// `terminal.background` must be present (else we haven't run the v1.5
+/// step yet); `terminal.background.presets` must be absent. Fresh-install
+/// v1.6 files have `presets: []` populated and skip this branch.
+fn looks_v1_5(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let bg = obj.get("terminal").and_then(|t| t.get("background"));
+    match bg {
+        Some(b) => b.get("presets").is_none(),
+        None => false,
+    }
+}
+
+/// Is this a v1.6 file that lacks the v1.7 `terminal.scrollback` field?
+/// V1.4-04 D's schema-bump check. `terminal.background.presets` must
+/// be present (so we don't false-positive on earlier files mid-cascade);
+/// `terminal.scrollback` must be absent. A fresh-install v1.7 file has
+/// `terminal.scrollback` populated and skips this branch.
+fn looks_v1_6(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let has_presets = obj
+        .get("terminal")
+        .and_then(|t| t.get("background"))
+        .and_then(|bg| bg.get("presets"))
+        .is_some();
+    let has_scrollback = obj
+        .get("terminal")
+        .and_then(|t| t.get("scrollback"))
+        .is_some();
+    has_presets && !has_scrollback
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -526,6 +585,71 @@ fn migrate_v1_4_to_v1_5(value: &mut Value) {
                 obj.insert("background_override".to_string(), Value::Null);
             }
         }
+    }
+}
+
+// --- v1.5 → v1.6 ------------------------------------------------------------
+
+/// V1.4-04 B: stamp `terminal.background.presets` with an empty array.
+/// `snapshot_lines` is *not* stamped here even though it was added in
+/// V1.4-04 A — that field rides serde-default on existing v1.5 files
+/// per the milestone doc, so the on-disk shape only formally bumps
+/// when presets land. A user who upgraded through V1.4-04 A first
+/// already has `snapshot_lines` filled by serde-default; the next
+/// settings flush writes it explicitly.
+///
+/// Idempotent on second pass because the inserted `presets` key makes
+/// `looks_v1_5` return false next time.
+fn migrate_v1_5_to_v1_6(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(bg) = root
+        .get_mut("terminal")
+        .and_then(Value::as_object_mut)
+        .and_then(|t| t.get_mut("background"))
+        .and_then(Value::as_object_mut)
+    {
+        bg.insert("presets".to_string(), json!([]));
+    }
+}
+
+// --- v1.6 → v1.7 ------------------------------------------------------------
+
+/// V1.4-04 D: stamp `terminal.scrollback` defaults and explicitly write
+/// `terminal.background.preview_category_flips` (V1.4-04 C.4) so the
+/// on-disk shape is self-describing for both fields landed in V1.4-04.
+///
+/// Defaults must match `ScrollbackSettings::default()` and
+/// `TerminalBackgroundSettings::default().preview_category_flips`.
+///
+/// Idempotent on second pass because the inserted `scrollback` key
+/// makes `looks_v1_6` return false next time. Stamping
+/// `preview_category_flips` is also idempotent — `entry().or_insert`
+/// only writes when the field is absent, so a hand-edited file that
+/// already has the flag is preserved.
+fn migrate_v1_6_to_v1_7(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    let Some(terminal) = root.get_mut("terminal").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    terminal.insert(
+        "scrollback".to_string(),
+        json!({
+            "ring_bytes": 262144,
+            "persist": true,
+            "restore_on_launch": true,
+        }),
+    );
+
+    if let Some(bg) = terminal.get_mut("background").and_then(Value::as_object_mut) {
+        bg.entry("preview_category_flips")
+            .or_insert(Value::Bool(true));
     }
 }
 
@@ -985,6 +1109,160 @@ mod tests {
         )
         .unwrap();
         assert!(!looks_v1_4(&v));
+    }
+
+    #[test]
+    fn v1_5_to_v1_6_adds_empty_presets_array() {
+        // V1.4-04 B: a fresh-install v1.5 file (terminal.background
+        // present, no presets field) should be detected as v1.5 and
+        // gain `terminal.background.presets: []`.
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [{ "kind": "ai_tool", "id": "claude", "theme_override": null, "background_override": null }],
+                "layout": null,
+                "terminal": {
+                    "theme": { "name": "Default", "custom": null },
+                    "background": { "image": null, "color": null, "opacity": 0.4, "blur": 0, "size": "cover", "position": "center" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(looks_v1_5(&v));
+        migrate_v1_5_to_v1_6(&mut v);
+        let bg = v
+            .get("terminal")
+            .and_then(|t| t.get("background"))
+            .expect("terminal.background present");
+        assert!(bg.get("presets").unwrap().is_array());
+        assert_eq!(bg.get("presets").unwrap().as_array().unwrap().len(), 0);
+        assert!(!looks_v1_5(&v));
+    }
+
+    #[test]
+    fn v1_6_file_is_not_re_detected() {
+        // Fresh-install v1.6 file: presets is present.
+        let v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [{ "kind": "ai_tool", "id": "claude", "theme_override": null, "background_override": null }],
+                "layout": null,
+                "terminal": {
+                    "theme": { "name": "Default", "custom": null },
+                    "background": { "image": null, "color": null, "opacity": 0.4, "blur": 0, "size": "cover", "position": "center", "presets": [] }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(!looks_v1_5(&v));
+    }
+
+    #[test]
+    fn v1_2_cascades_through_v1_3_v1_4_v1_5_and_v1_6() {
+        // V1.4-04 B: extends `v1_2_cascades_through_v1_3_v1_4_and_v1_5`
+        // with one more step. A v1.2 file should land at v1.6 after
+        // every transform fires in order.
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "display": { "theme": "dark" },
+                "tabs": [
+                    { "kind": "ai_tool", "id": "claude", "name": "Claude" },
+                    { "kind": "shell", "id": "shell-default-1", "name": "Shell 1" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(looks_v1_2(&v));
+        migrate_v1_2_to_v1_3(&mut v);
+        assert!(looks_v1_3(&v));
+        migrate_v1_3_to_v1_4(&mut v);
+        assert!(looks_v1_4(&v));
+        migrate_v1_4_to_v1_5(&mut v);
+        assert!(looks_v1_5(&v));
+        migrate_v1_5_to_v1_6(&mut v);
+
+        let bg = v
+            .get("terminal")
+            .and_then(|t| t.get("background"))
+            .expect("terminal.background present after cascade");
+        assert!(bg.get("presets").unwrap().is_array());
+        assert!(!looks_v1_5(&v));
+    }
+
+    #[test]
+    fn v1_6_to_v1_7_adds_scrollback_and_preview_flag() {
+        // V1.4-04 D: a v1.6 file (presets present, no scrollback group)
+        // should be detected as v1.6 and gain `terminal.scrollback`
+        // defaults plus the explicit `preview_category_flips` field.
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [{ "kind": "ai_tool", "id": "claude", "theme_override": null, "background_override": null }],
+                "layout": null,
+                "terminal": {
+                    "theme": { "name": "Default", "custom": null },
+                    "background": { "image": null, "color": null, "opacity": 0.4, "blur": 0, "size": "cover", "position": "center", "presets": [] }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(looks_v1_6(&v));
+        migrate_v1_6_to_v1_7(&mut v);
+
+        let terminal = v.get("terminal").expect("terminal present");
+        let scrollback = terminal.get("scrollback").expect("scrollback added");
+        assert_eq!(scrollback.get("ring_bytes").unwrap(), 262144);
+        assert_eq!(scrollback.get("persist").unwrap(), true);
+        assert_eq!(scrollback.get("restore_on_launch").unwrap(), true);
+
+        let bg = terminal.get("background").unwrap();
+        assert_eq!(bg.get("preview_category_flips").unwrap(), true);
+
+        assert!(!looks_v1_6(&v));
+    }
+
+    #[test]
+    fn v1_7_file_is_not_re_detected() {
+        // Fresh-install v1.7 file: scrollback group present.
+        let v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [{ "kind": "ai_tool", "id": "claude", "theme_override": null, "background_override": null }],
+                "layout": null,
+                "terminal": {
+                    "theme": { "name": "Default", "custom": null },
+                    "background": { "image": null, "color": null, "opacity": 0.4, "blur": 0, "size": "cover", "position": "center", "presets": [], "preview_category_flips": true },
+                    "scrollback": { "ring_bytes": 262144, "persist": true, "restore_on_launch": true }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(!looks_v1_5(&v));
+        assert!(!looks_v1_6(&v));
+    }
+
+    #[test]
+    fn v1_6_to_v1_7_preserves_existing_preview_flag() {
+        // If a hand-edited v1.6 file already has
+        // preview_category_flips set (e.g., user set it to false),
+        // migration must not overwrite it.
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [],
+                "layout": null,
+                "terminal": {
+                    "theme": { "name": "Default", "custom": null },
+                    "background": { "image": null, "color": null, "opacity": 0.4, "blur": 0, "size": "cover", "position": "center", "presets": [], "preview_category_flips": false }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(looks_v1_6(&v));
+        migrate_v1_6_to_v1_7(&mut v);
+        let bg = v
+            .get("terminal")
+            .and_then(|t| t.get("background"))
+            .unwrap();
+        assert_eq!(bg.get("preview_category_flips").unwrap(), false);
     }
 
     #[test]

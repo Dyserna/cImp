@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -61,6 +61,20 @@ struct PtyHandle {
     /// after the child PTY exited and the cancel token fired); the
     /// caller falls back to `pty_start`.
     control_tx: mpsc::Sender<ProcessorControl>,
+    /// V1.4-04 D: per-tab cross-restart scrollback ring. The reader
+    /// task (in `pty/tasks.rs`) appends every PTY byte here; on graceful
+    /// exit the ring is written to disk; on next launch it's read back
+    /// and replayed into the new xterm. Bounded at `scrollback_cap`
+    /// bytes — surplus is dropped from the front. `StdMutex` (not the
+    /// async one) because the writer lives on the blocking pool and
+    /// every critical section is short.
+    scrollback: Arc<StdMutex<VecDeque<u8>>>,
+    /// Cap for the `scrollback` ring. Read from
+    /// `terminal.scrollback.ring_bytes` at start time; live changes to
+    /// the setting don't reshape an already-running ring (mid-buffer
+    /// expand-vs-shrink semantics aren't worth the complexity for a
+    /// rarely-changed knob — the new cap takes effect on next start).
+    scrollback_cap: usize,
 }
 
 impl PtyManager {
@@ -152,8 +166,23 @@ impl PtyManager {
         // — control messages are rare (one per renderer-flip).
         let (control_tx, control_rx) = mpsc::channel::<ProcessorControl>(4);
 
-        tasks::spawn_reader(reader, bytes_tx, cancel.clone());
         let settings = app.state::<crate::ipc::AppState>().settings.clone();
+        // V1.4-04 D: per-tab scrollback ring buffer. Reader task
+        // appends every PTY byte; we hand out clones via
+        // `scrollback_snapshot` for persistence and via the
+        // `pty_get_scrollback` Tauri command for diagnostics.
+        let scrollback_cap = settings.current().terminal.scrollback.ring_bytes;
+        let scrollback: Arc<StdMutex<VecDeque<u8>>> = Arc::new(StdMutex::new(
+            VecDeque::with_capacity(scrollback_cap.min(1 << 20)),
+        ));
+
+        tasks::spawn_reader(
+            reader,
+            bytes_tx,
+            cancel.clone(),
+            Arc::clone(&scrollback),
+            scrollback_cap,
+        );
         tasks::spawn_processor(
             tab.clone(),
             bytes_rx,
@@ -174,6 +203,8 @@ impl PtyManager {
             cancel,
             last_size: Arc::new(StdMutex::new((initial_rows.max(1), initial_cols.max(1)))),
             control_tx,
+            scrollback,
+            scrollback_cap,
         });
         info!(
             ?tab,
@@ -267,6 +298,68 @@ impl PtyManager {
             .send(ProcessorControl::ChannelChange(new_channel))
             .await
             .map_err(|_| AppError::Pty("processor task gone".into()))?;
+        Ok(())
+    }
+
+    /// V1.4-04 D: snapshot the current scrollback ring as a flat
+    /// `Vec<u8>`. Used by the graceful-exit persistence path and the
+    /// `pty_get_scrollback` Tauri command. Returns `NotStarted` if no
+    /// PTY is registered for this tab.
+    ///
+    /// The snapshot is a copy: the live ring continues to accumulate
+    /// bytes after this call returns. This means a long-running
+    /// `pty_get_scrollback` poll won't see byte-stream tearing, just
+    /// monotonically-newer prefixes.
+    pub async fn scrollback_snapshot(&self) -> AppResult<Vec<u8>> {
+        let scrollback = {
+            let guard = self.inner.lock().await;
+            let handle = guard.as_ref().ok_or(AppError::NotStarted)?;
+            Arc::clone(&handle.scrollback)
+        };
+        let ring = scrollback
+            .lock()
+            .map_err(|e| AppError::Pty(format!("scrollback poisoned: {e}")))?;
+        let (a, b) = ring.as_slices();
+        let mut out = Vec::with_capacity(a.len() + b.len());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        Ok(out)
+    }
+
+    /// V1.4-04 D: seed the scrollback ring with bytes restored from a
+    /// previous session. The replay is purely about persistence
+    /// continuity — the same bytes are also written into the new
+    /// xterm by the frontend (front-loaded in `term.write` before the
+    /// live channel binds). Truncates to the ring cap.
+    pub async fn seed_scrollback(&self, bytes: &[u8]) -> AppResult<()> {
+        let (scrollback, cap) = {
+            let guard = self.inner.lock().await;
+            let handle = guard.as_ref().ok_or(AppError::NotStarted)?;
+            (Arc::clone(&handle.scrollback), handle.scrollback_cap)
+        };
+        let mut ring = scrollback
+            .lock()
+            .map_err(|e| AppError::Pty(format!("scrollback poisoned: {e}")))?;
+        ring.extend(bytes);
+        while ring.len() > cap {
+            ring.pop_front();
+        }
+        Ok(())
+    }
+
+    /// V1.4-04 D: clear the scrollback ring. Called on user-initiated
+    /// `pty_restart` because the user explicitly asked for a clean
+    /// shell — the prior session's output is no longer relevant.
+    pub async fn clear_scrollback(&self) -> AppResult<()> {
+        let scrollback = {
+            let guard = self.inner.lock().await;
+            let handle = guard.as_ref().ok_or(AppError::NotStarted)?;
+            Arc::clone(&handle.scrollback)
+        };
+        let mut ring = scrollback
+            .lock()
+            .map_err(|e| AppError::Pty(format!("scrollback poisoned: {e}")))?;
+        ring.clear();
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -46,10 +46,21 @@ struct PtyExitPayload {
 }
 
 /// Reader task. Lives on the blocking pool because PTY reads block on most platforms.
+///
+/// V1.4-04 D: the reader also feeds the per-tab scrollback ring buffer.
+/// `scrollback` is shared with `PtyManager` so persistence and the
+/// `pty_get_scrollback` Tauri command can snapshot the same bytes. The
+/// ring is bounded at `scrollback_cap` — surplus is dropped from the
+/// front via `pop_front`. Lock contention is minimal: only this reader
+/// writes; the snapshot/persist paths are rare reads. `StdMutex` keeps
+/// every critical section tight (no awaits) and avoids the awkward
+/// blocking-pool-vs-tokio-mutex interplay.
 pub fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     tx: mpsc::Sender<Vec<u8>>,
     cancel: CancellationToken,
+    scrollback: Arc<StdMutex<VecDeque<u8>>>,
+    scrollback_cap: usize,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
@@ -74,6 +85,20 @@ pub fn spawn_reader(
                             })
                             .collect();
                         debug!(target: "pty_in", len = n, bytes = %pretty);
+                    }
+                    // V1.4-04 D: append to the cross-restart ring
+                    // before forwarding. Doing it before the
+                    // `blocking_send` means the ring captures every
+                    // byte even if the processor is back-pressured;
+                    // doing it after would risk losing bytes if the
+                    // forwarder drops mid-read.
+                    if scrollback_cap > 0 {
+                        if let Ok(mut ring) = scrollback.lock() {
+                            ring.extend(&buf[..n]);
+                            while ring.len() > scrollback_cap {
+                                ring.pop_front();
+                            }
+                        }
                     }
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         debug!("pty reader: forwarder dropped");

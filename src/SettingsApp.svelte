@@ -18,7 +18,7 @@
     ShellTabConfig,
     TabConfig,
   } from './lib/settings/types';
-  import { findTab, findTabIndex } from './lib/settings/types';
+  import { findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
   import type { AiTabId, TabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
@@ -93,6 +93,75 @@
     updater(next);
     snapshot = next;
     void applySettings(next);
+  }
+
+  // V1.4-04 B.5: inline UI for save/manage presets. Implemented as
+  // toggleable inline panels rather than modal dialogs to match the
+  // SettingsApp's existing flow (no <dialog> elements elsewhere).
+  let savingPreset = $state(false);
+  let newPresetName = $state('');
+  let savePresetError = $state<string | null>(null);
+  let managingPresets = $state(false);
+
+  function startSavePreset() {
+    savingPreset = true;
+    newPresetName = '';
+    savePresetError = null;
+  }
+
+  function cancelSavePreset() {
+    savingPreset = false;
+    newPresetName = '';
+    savePresetError = null;
+  }
+
+  function commitSavePreset() {
+    if (!snapshot) return;
+    const name = newPresetName.trim();
+    if (!name) {
+      savePresetError = 'Name required.';
+      return;
+    }
+    if (snapshot.terminal.background.presets.some((p) => p.name === name)) {
+      savePresetError = `A preset named "${name}" already exists.`;
+      return;
+    }
+    patch((s) => {
+      const cfg = toPresetConfig(s.terminal.background);
+      s.terminal.background.presets = [
+        ...s.terminal.background.presets,
+        { name, config: cfg },
+      ];
+    });
+    savingPreset = false;
+    newPresetName = '';
+    savePresetError = null;
+  }
+
+  function deletePreset(name: string) {
+    patch((s) => {
+      s.terminal.background.presets = s.terminal.background.presets.filter(
+        (p) => p.name !== name,
+      );
+    });
+  }
+
+  function renamePreset(oldName: string, nextName: string) {
+    if (!snapshot) return;
+    const trimmed = nextName.trim();
+    if (!trimmed || trimmed === oldName) return;
+    if (snapshot.terminal.background.presets.some((p) => p.name === trimmed)) {
+      // Silent reject — duplicate. The input value reverts on next
+      // store flush via the {#each} key change.
+      return;
+    }
+    patch((s) => {
+      const idx = s.terminal.background.presets.findIndex(
+        (p) => p.name === oldName,
+      );
+      if (idx < 0) return;
+      s.terminal.background.presets[idx].name = trimmed;
+    });
   }
 
   /// Replace the AI-tab entry at `id` in the snapshot. Used by the
@@ -534,6 +603,84 @@
             })
         }
       />
+
+      <div class="preset-actions">
+        <button type="button" onclick={startSavePreset}>Save as preset…</button>
+        <button
+          type="button"
+          onclick={() => (managingPresets = !managingPresets)}
+        >
+          {managingPresets ? 'Done managing' : 'Manage presets…'}
+        </button>
+      </div>
+
+      <label class="checkbox">
+        <input
+          type="checkbox"
+          checked={snapshot.terminal.background.preview_category_flips}
+          onchange={(e) =>
+            patch(
+              (s) =>
+                (s.terminal.background.preview_category_flips = (
+                  e.currentTarget as HTMLInputElement
+                ).checked),
+            )}
+        />
+        <span>Preview image / category changes in Configure Tab dialog</span>
+      </label>
+      <small class="hint">
+        When off, image-toggle and category-flip changes wait for Save in
+        the Configure Tab dialog. Color, opacity, blur, size, position,
+        and tint always preview live.
+      </small>
+
+      {#if savingPreset}
+        <div class="preset-save">
+          <input
+            type="text"
+            placeholder="Preset name"
+            bind:value={newPresetName}
+            onkeydown={(e) => {
+              if (e.key === 'Enter') commitSavePreset();
+              if (e.key === 'Escape') cancelSavePreset();
+            }}
+          />
+          <button type="button" onclick={commitSavePreset}>Save</button>
+          <button type="button" onclick={cancelSavePreset}>Cancel</button>
+          {#if savePresetError}
+            <small class="error">{savePresetError}</small>
+          {/if}
+        </div>
+        <small class="hint">
+          Presets reference image paths by absolute location — moving an
+          image file breaks any preset that uses it.
+        </small>
+      {/if}
+
+      {#if managingPresets}
+        {#if snapshot.terminal.background.presets.length === 0}
+          <small class="hint">No presets saved yet.</small>
+        {:else}
+          <ul class="preset-list">
+            {#each snapshot.terminal.background.presets as p (p.name)}
+              <li>
+                <input
+                  type="text"
+                  value={p.name}
+                  onchange={(e) =>
+                    renamePreset(
+                      p.name,
+                      (e.currentTarget as HTMLInputElement).value,
+                    )}
+                />
+                <button type="button" onclick={() => deletePreset(p.name)}>
+                  Delete
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {/if}
     </section>
 
     <section>

@@ -154,7 +154,7 @@ const entries = new Map<TabId, TerminalEntry>();
 
 function displayNameFor(t: TabId): string {
   if (t === 'claude') return 'Claude Code';
-  if (t === 'aider') return 'Aider';
+  if (t === 'claude-local') return 'Claude Code (local)';
   return 'Shell';
 }
 

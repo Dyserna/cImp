@@ -1,18 +1,25 @@
 # cctts
 
 Multi-tab AI assistant wrapper with text-to-speech and a state-driven
-animated avatar. A Tauri desktop app that hosts two CLI tabs in v2 —
-**Claude Code** and **Aider** — extracts `[[TTS]]…[[/TTS]]` markers from
-output, synthesizes them with a local Kokoro ONNX model, and drives a
-per-tab avatar overlay (Idle / Listening / Thinking / Speaking / Error)
-plus a real-time waveform.
+animated avatar. A Tauri desktop app that hosts two **Claude Code** tabs
+out of the box — one for your subscription / API account and one
+preconfigured to talk to a local LLM via a translation proxy — extracts
+`[[TTS]]…[[/TTS]]` markers from output, synthesizes them with a local
+Kokoro ONNX model, and drives a per-tab avatar overlay (Idle / Listening /
+Thinking / Speaking / Error) plus a real-time waveform.
 
 Local, offline-after-install, no audio leaves the machine.
 
-## v2: Multi-Tab Support
+## Two Claude Code tabs
 
-- Two tabs ship in v2: **Claude Code** (default) and **Aider**.
-- Switch with `Ctrl+1` (Claude Code) and `Ctrl+2` (Aider), or click the tab.
+- **Claude** — your normal Claude Code, running with whatever auth flow
+  you configured (Pro/Max subscription via OAuth, or `ANTHROPIC_API_KEY`).
+- **Claude (local)** — a second `claude` instance with
+  `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` injected at spawn time
+  so it talks to a local LLM via a translation proxy (LiteLLM / similar)
+  instead of `api.anthropic.com`. Configured in
+  *Settings → Local LLM provider*.
+- Switch with `Ctrl+1` (Claude) and `Ctrl+2` (Claude (local)), or click the tab.
 - Both subprocesses spawn at app launch in the directory cctts was started
   in. They run independently — switching tabs doesn't stop either one.
 - The compose overlay submits to whichever tab is currently active.
@@ -20,9 +27,9 @@ Local, offline-after-install, no audio leaves the machine.
 ## Shell Tabs (v1.2+)
 
 In addition to the two AI builtins, cctts hosts **Shell tabs** — plain
-configurable terminal sessions running alongside Claude and Aider, with no
-TTS, no permission detection, and a reduced notification set (`error` and
-`exited` only).
+configurable terminal sessions running alongside the Claude tabs, with
+no TTS, no permission detection, and a reduced notification set (`error`
+and `exited` only).
 
 ### Creating and managing Shell tabs
 
@@ -36,7 +43,7 @@ TTS, no permission detection, and a reduced notification set (`error` and
   subprocess and respawns it with the current configuration. Useful after
   changing the command in Configure.
 - **Close:** click the `×` on the tab, or press `Ctrl+W` while the tab is
-  active. Builtin tabs (Claude, Aider) cannot be closed.
+  active. Builtin tabs (Claude, Claude (local)) cannot be closed.
 - **Switch by position:** `Ctrl+1`..`Ctrl+9` switch to the tab at that
   ordinal position **within the focused pane** (v1.3 change — see
   *Multi-pane Layout* below). `Ctrl+9` with fewer than 9 tabs in the focused
@@ -192,18 +199,46 @@ TTS, avatar) carry over unchanged. The only behavior change is that
 `Ctrl+1`..`Ctrl+9` are now **scoped to the focused pane** rather than the
 global tab list.
 
-## Aider tab and the TTS limitation
+## Local LLM provider (the second Claude tab)
 
-Aider runs as a fully functional second tab — input, output, status,
-notifications, and the avatar all work normally. **Spoken TTS is silent
-in the aider tab** because aider does not currently expose a CLI
-mechanism (`--append-system-prompt` or equivalent) for cctts to inject
-the `[[TTS]]…[[/TTS]]` markup convention. The setting is preserved in
-the schema and the toggle is visible in *Settings → Tabs → Aider*; when
-upstream aider lands the feature, cctts will start using it.
+The **Claude (local)** tab runs the same `claude` binary as the first
+tab but with two environment variables injected at spawn time:
 
-See `docs/FUTURE-FEATURES.md` for the action plan and the upstream
-aider issue we're tracking.
+```
+ANTHROPIC_BASE_URL=<your local proxy URL>
+ANTHROPIC_AUTH_TOKEN=<token your proxy expects>
+```
+
+Configure both under *Settings → Local LLM provider*. cctts does **not**
+start the proxy itself — you run a separate translator like
+[LiteLLM](https://docs.litellm.ai/docs/proxy/quick_start) that speaks
+the Anthropic Messages API on its public side and forwards to Ollama /
+LM Studio / OpenAI / etc. on the back end.
+
+A typical local-only setup:
+
+1. Run Ollama (or LM Studio) with whichever model you want.
+2. Run LiteLLM as a proxy in front of it, mapping `claude-*` model names
+   to your local model. The LiteLLM docs cover the config shape.
+3. In cctts: *Settings → Local LLM provider* → set Proxy URL to your
+   LiteLLM URL (e.g. `http://localhost:4000`) and Auth token to whatever
+   your proxy expects (often a dummy string like `sk-dummy`).
+4. Restart the Claude (local) tab.
+
+Per-tab `env` entries always take precedence over the synthesized
+values, so you can also point a single tab at a different proxy by
+setting `ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local)
+→ Environment*.
+
+**Caveats:**
+
+- Smaller local models often don't follow tool-use protocols reliably
+  (Edit / Write / Bash). Test with the specific model you want before
+  committing.
+- Anthropic-server features (prompt caching, extended thinking, vision)
+  are unavailable on local models.
+- The auth token sits cleartext in `%APPDATA%\cctts\settings.json` —
+  fine for local dummies; don't put a real Anthropic API key there.
 
 ## System Requirements
 
@@ -216,10 +251,13 @@ aider issue we're tracking.
 - **Claude Code:** the `claude` binary must be on `PATH`. cctts spawns it
   as a subprocess and passes `--append-system-prompt` so Claude knows to
   emit the TTS markers.
-- **Aider (optional):** if `aider` is on `PATH`, the Aider tab will spawn
-  it on launch. If it isn't, the Aider tab shows a clear error with a
-  Retry button — the rest of the app, including the Claude Code tab,
-  works regardless. Install instructions: <https://aider.chat>.
+- **Local LLM proxy (optional, for the Claude (local) tab):** if the
+  Claude (local) tab's *Use local LLM provider* flag is on, you also
+  need a running translator process at the URL configured under
+  *Settings → Local LLM provider*. cctts does not start the proxy. If
+  the proxy isn't reachable, the tab will fail on first message — you
+  can disable the flag, or just stop using that tab; the subscription
+  Claude tab is unaffected.
 - **WebView2 (Windows):** preinstalled on updated Windows 10/11. Older
   systems may need the WebView2 runtime installed manually.
 
@@ -249,13 +287,16 @@ prints the expected paths to the log.
 Per-tab subprocess configuration lives under **Settings → Tabs**. Each
 tab has its own sub-section with:
 
-- **Command** (read-only): the binary cctts spawns — `claude` or `aider`.
+- **Command** (read-only): the binary cctts spawns — `claude` for both
+  AI tabs.
 - **Persistent CLI flags:** flags appended to every spawn of that tab.
+- **Use local LLM provider:** toggle that gates env synthesis from the
+  global *Local LLM provider* settings (off by default for the
+  subscription Claude tab; on by default for the Claude (local) tab).
 - **TTS markup injection:** toggle plus an editable instructions block.
-  For Claude, the instructions are passed via `--append-system-prompt` on
-  each spawn. The Reset button restores cctts's built-in runtime prompt
-  (`src-tauri/src/tts/runtime_prompt.md`). For aider, the toggle is a
-  no-op pending upstream support — see the section above.
+  Instructions are passed via `--append-system-prompt` on each spawn.
+  The Reset button restores cctts's built-in runtime prompt
+  (`src-tauri/src/tts/runtime_prompt.md`).
 - **Notifications:** text used for inactive-tab notifications (firing
   itself ships in V2-04; configuration is wired now).
 - **Restart Tab:** apply changes that require respawning the subprocess
@@ -297,7 +338,7 @@ Open with `Ctrl+,` or the cog button on the avatar.
   GitHub Dark) plus a 22-color Custom editor for foreground, background,
   cursor, selection, ANSI 8, and bright 8. Each tab can override the
   global palette via Configure Tab → Appearance — useful for color-coding
-  Claude vs. aider vs. shells. Per-tab overrides travel with the tab
+  Claude (subscription) vs. Claude (local) vs. shells. Per-tab overrides travel with the tab
   through drag-and-drop. Plus **terminal background** — a solid color or
   user-supplied image rendered beneath the terminal text. Solid color
   has no performance cost; image mode forces the slower DOM renderer
@@ -323,9 +364,11 @@ Open with `Ctrl+,` or the cog button on the avatar.
   Place the model + voicepack under `%APPDATA%\cctts\models\` as documented above.
 - **`claude` not found.** cctts looks up `claude` via `PATH`. Either install
   Claude Code so it's on `PATH` or add its install dir.
-- **`aider` not found.** Same deal: ensure `aider` is on `PATH`. If you
-  don't intend to use the aider tab, you can ignore the in-tab error —
-  the Claude tab is unaffected. Install instructions: <https://aider.chat>.
+- **Claude (local) tab errors.** Most often: the local proxy isn't running
+  or the URL in *Settings → Local LLM provider* is wrong. Confirm the
+  proxy is reachable (e.g. `curl http://localhost:4000/v1/models` or
+  similar). Until you fix the proxy you can simply use the subscription
+  Claude tab, which is unaffected.
 - **CUDA EP errors per segment (silent output).** You're on a GPU not yet
   covered by the bundled ORT 1.20 prebuilt (Blackwell / RTX 5090). Unset
   `CCTTS_GPU` to fall back to CPU. See `MAINTENANCE.md`.
@@ -337,8 +380,16 @@ Open with `Ctrl+,` or the cog button on the avatar.
 
 ## Known Limitations
 
-- The aider tab spawns aider but cannot inject the TTS markup convention
-  via CLI today, so its prose output is silent. See `docs/FUTURE-FEATURES.md`.
+- TTS markup compliance for the **Claude (local)** tab depends on the
+  underlying model. Smaller local models may not wrap content in
+  `[[TTS]]…[[/TTS]]` reliably even when the system prompt asks them to.
+  cctts will be silent for those segments — this is fallback behavior,
+  not an error.
+- Tool-use (Edit / Write / Bash / etc.) on the Claude (local) tab depends
+  on the local model supporting Anthropic-style tool calling. Test before
+  committing to a particular model.
+- cctts does not bundle or auto-spawn the local LLM proxy — you run it
+  yourself.
 - Single audio output device — no UI selector.
 - No conversation/session UI on top of the terminal.
 - No STT input.

@@ -43,10 +43,10 @@ pub enum NotificationEvent {
 /// unreachable), but the explicit gate makes the rule grep-able.
 fn allowed_for(kind: &TabKind, event: NotificationEvent) -> bool {
     match (kind, event) {
-        (TabKind::AiTool(_), NotificationEvent::Idle) => true,
-        (TabKind::AiTool(_), NotificationEvent::AwaitingPermission) => true,
-        (TabKind::AiTool(_), NotificationEvent::Error) => true,
-        (TabKind::AiTool(_), NotificationEvent::Exited) => false,
+        (TabKind::AiTool, NotificationEvent::Idle) => true,
+        (TabKind::AiTool, NotificationEvent::AwaitingPermission) => true,
+        (TabKind::AiTool, NotificationEvent::Error) => true,
+        (TabKind::AiTool, NotificationEvent::Exited) => false,
         (TabKind::Shell, NotificationEvent::Error) => true,
         (TabKind::Shell, NotificationEvent::Exited) => true,
         (TabKind::Shell, NotificationEvent::Idle) => false,
@@ -436,16 +436,16 @@ mod tests {
     #[test]
     fn dedup_preserves_first_appearing_tab_order() {
         let queue = vec![
-            q(TabId::Aider, NotificationEvent::Idle, "aider-old", 0),
+            q(TabId::ClaudeLocal, NotificationEvent::Idle, "local-old", 0),
             q(TabId::Claude, NotificationEvent::Idle, "claude-old", 5),
-            q(TabId::Aider, NotificationEvent::Error, "aider-new", 10),
+            q(TabId::ClaudeLocal, NotificationEvent::Error, "local-new", 10),
             q(TabId::Claude, NotificationEvent::Error, "claude-new", 15),
         ];
         let out = dedup_per_tab(&queue);
         assert_eq!(out.len(), 2);
-        // Aider first because it appeared first in the queue.
-        assert_eq!(out[0].tab, TabId::Aider);
-        assert_eq!(out[0].text, "aider-new");
+        // ClaudeLocal first because it appeared first in the queue.
+        assert_eq!(out[0].tab, TabId::ClaudeLocal);
+        assert_eq!(out[0].text, "local-new");
         assert_eq!(out[1].tab, TabId::Claude);
         assert_eq!(out[1].text, "claude-new");
     }
@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn allowlist_ai_tabs_get_v1_trio_only() {
-        let kind = TabKind::AiTool(crate::state::AiToolKind::ClaudeCode);
+        let kind = TabKind::AiTool;
         assert!(allowed_for(&kind, NotificationEvent::Idle));
         assert!(allowed_for(&kind, NotificationEvent::AwaitingPermission));
         assert!(allowed_for(&kind, NotificationEvent::Error));

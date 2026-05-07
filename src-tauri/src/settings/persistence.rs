@@ -1,11 +1,11 @@
 //! JSON load/save with corruption recovery + version migrations.
 //!
-//! On-disk format is a single JSON object matching `Settings` (v1.2). Older
-//! shapes are detected by their discriminator fields and routed through the
-//! `migration` module. After the optional migration step, an integrity
-//! check ensures the three reserved-id tab entries (claude, aider,
-//! shell-default-1) exist with `builtin: true` — hand-edited files that
-//! deleted them are repaired transparently.
+//! On-disk format is a single JSON object matching `Settings` (v1.8 as of
+//! V1.4-07). Older shapes are detected by their discriminator fields and
+//! routed through the `migration` module. After the optional migration
+//! step, an integrity check ensures the three reserved-id tab entries
+//! (claude, claude-local, shell-default-1) exist with `builtin: true` —
+//! hand-edited files that deleted them are repaired transparently.
 //!
 //! Either way `load` always returns a usable `Settings` — missing/corrupt
 //! files become defaults (the corrupt original is moved aside as a `.bak`).
@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
-    default_aider_tab, default_claude_tab, default_shell_1_tab, AiToolKindWire,
-    LayoutNodePersisted, Settings, TabConfig, AIDER_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID,
+    default_claude_local_tab, default_claude_tab, default_shell_1_tab, LayoutNodePersisted,
+    Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID,
 };
 use crate::shell::ShellSpec;
 
@@ -161,16 +161,17 @@ fn seeded_defaults(default_shell: &ShellSpec) -> Settings {
 /// write back to disk). Logged as a warning when an entry has to be
 /// restored — the typical cause is a hand-edited file.
 ///
-/// The order is deterministic: claude first, then aider, then
+/// The order is deterministic: claude first, then claude-local, then
 /// shell-default-1, with each restored entry inserted at its canonical
-/// position (front, after-claude, after-aider). User-created Shell tabs
-/// retain their relative ordering after the three pinned entries.
+/// position (front, after-claude, after-claude-local). User-created
+/// Shell tabs retain their relative ordering after the three pinned
+/// entries.
 pub fn integrity_check(settings: &mut Settings, default_shell: &ShellSpec) -> bool {
     let mut changed = false;
 
     // 1. Force builtin: true on the three reserved ids if they exist with
     //    builtin: false. Defends against hand-edits trying to flip the flag.
-    let reserved = [CLAUDE_TAB_ID, AIDER_TAB_ID, SHELL_DEFAULT_TAB_ID];
+    let reserved = [CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID, SHELL_DEFAULT_TAB_ID];
     for tab in settings.tabs.iter_mut() {
         if reserved.contains(&tab.id()) && !tab.builtin() {
             tab.set_builtin(true);
@@ -179,23 +180,24 @@ pub fn integrity_check(settings: &mut Settings, default_shell: &ShellSpec) -> bo
         }
     }
 
-    // 2. Coerce the AI builtins' ai_tool_kind in case a hand-edit set them
-    //    to the wrong value (e.g. swapped claude/aider). The id is the
-    //    canonical key; ai_tool_kind must follow.
+    // 2. Force `use_local_provider` to its canonical value on the two
+    //    AI builtins so a hand-edit can't, e.g., flip the subscription
+    //    Claude tab into local-LLM mode (which would silently route the
+    //    user's primary tab through their local proxy).
     for tab in settings.tabs.iter_mut() {
         if let TabConfig::AiTool(c) = tab {
             let expected = match c.id.as_str() {
-                CLAUDE_TAB_ID => Some(AiToolKindWire::ClaudeCode),
-                AIDER_TAB_ID => Some(AiToolKindWire::Aider),
+                CLAUDE_TAB_ID => Some(false),
+                CLAUDE_LOCAL_TAB_ID => Some(true),
                 _ => None,
             };
             if let Some(want) = expected {
-                if c.ai_tool_kind != want {
-                    c.ai_tool_kind = want;
+                if c.use_local_provider != want {
+                    c.use_local_provider = want;
                     changed = true;
                     tracing::warn!(
                         id = c.id,
-                        "integrity: corrected ai_tool_kind on reserved AI tab"
+                        "integrity: corrected use_local_provider on reserved AI tab"
                     );
                 }
             }
@@ -203,31 +205,32 @@ pub fn integrity_check(settings: &mut Settings, default_shell: &ShellSpec) -> bo
     }
 
     // 3. Restore missing reserved entries at canonical positions. Inserting
-    //    in the order claude(0), aider(1), shell-default-1(after aider)
-    //    works because each insert shifts later positions consistently.
+    //    in the order claude(0), claude-local(1), shell-default-1(after
+    //    claude-local) works because each insert shifts later positions
+    //    consistently.
     if !settings.tabs.iter().any(|t| t.id() == CLAUDE_TAB_ID) {
         settings.tabs.insert(0, default_claude_tab());
         changed = true;
         tracing::warn!("integrity: restored missing claude tab");
     }
 
-    if !settings.tabs.iter().any(|t| t.id() == AIDER_TAB_ID) {
+    if !settings.tabs.iter().any(|t| t.id() == CLAUDE_LOCAL_TAB_ID) {
         let pos = settings
             .tabs
             .iter()
             .position(|t| t.id() == CLAUDE_TAB_ID)
             .map(|p| p + 1)
             .unwrap_or(1);
-        settings.tabs.insert(pos, default_aider_tab());
+        settings.tabs.insert(pos, default_claude_local_tab());
         changed = true;
-        tracing::warn!("integrity: restored missing aider tab");
+        tracing::warn!("integrity: restored missing claude-local tab");
     }
 
     if !settings.tabs.iter().any(|t| t.id() == SHELL_DEFAULT_TAB_ID) {
         let pos = settings
             .tabs
             .iter()
-            .position(|t| t.id() == AIDER_TAB_ID)
+            .position(|t| t.id() == CLAUDE_LOCAL_TAB_ID)
             .map(|p| p + 1)
             .unwrap_or(2);
         settings
@@ -336,7 +339,7 @@ mod tests {
         assert!(changed);
         assert_eq!(s.tabs.len(), 3);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
-        assert_eq!(s.tabs[1].id(), AIDER_TAB_ID);
+        assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
         assert_eq!(s.tabs[2].id(), SHELL_DEFAULT_TAB_ID);
         for t in &s.tabs {
             assert!(t.builtin(), "{} should be builtin", t.id());
@@ -402,8 +405,34 @@ mod tests {
         let parsed: Settings = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed.tabs.len(), 3);
         assert_eq!(parsed.tabs[0].id(), CLAUDE_TAB_ID);
-        assert_eq!(parsed.tabs[1].id(), AIDER_TAB_ID);
+        assert_eq!(parsed.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
         assert_eq!(parsed.tabs[2].id(), SHELL_DEFAULT_TAB_ID);
+    }
+
+    #[test]
+    fn integrity_corrects_use_local_provider_on_reserved_ai_tabs() {
+        // V1.4-07: a hand-edit must not be able to silently flip the
+        // subscription Claude tab into local-LLM mode (or vice versa).
+        let mut s = Settings::default();
+        let shell = fake_default_shell();
+        integrity_check(&mut s, &shell);
+
+        // Tamper: flip claude → local, claude-local → not local.
+        if let TabConfig::AiTool(c) = &mut s.tabs[0] {
+            c.use_local_provider = true;
+        }
+        if let TabConfig::AiTool(c) = &mut s.tabs[1] {
+            c.use_local_provider = false;
+        }
+
+        let changed = integrity_check(&mut s, &shell);
+        assert!(changed);
+        if let TabConfig::AiTool(c) = &s.tabs[0] {
+            assert!(!c.use_local_provider, "claude must have use_local_provider=false");
+        }
+        if let TabConfig::AiTool(c) = &s.tabs[1] {
+            assert!(c.use_local_provider, "claude-local must have use_local_provider=true");
+        }
     }
 
     #[test]

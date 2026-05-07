@@ -5,6 +5,106 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3] — 2026-05-07
+
+### Added
+
+- **Second Claude Code tab for a local LLM.** A new `claude-local` builtin
+  AI tab runs the same `claude` binary as the subscription Claude tab but
+  with `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` injected at spawn
+  time (and optionally `ANTHROPIC_MODEL`), pointing at a local proxy that
+  translates the Anthropic Messages API to your local model. Replaces the
+  pre-V1.4-07 Aider tab in the same id slot.
+- **Local LLM provider settings group.** New `claude_local: { base_url,
+  auth_token, model_alias }` settings group exposed in *Settings → Local
+  LLM provider*. The auth-token field is password-masked with a show /
+  hide toggle. Helper text links to the LiteLLM docs and notes that cctts
+  does not start the proxy itself.
+- **Per-AI-tab `Use local LLM provider` toggle.** A checkbox on each AI
+  tab in *Settings → Tabs* gates env synthesis from the global
+  `claude_local` group. Off by default for the subscription Claude tab;
+  on by default for the new Claude (local) tab. When enabled, the
+  effective env is shown inline as helper text. Per-tab `env` entries
+  always override synthesized values, so power users can still target a
+  different provider per tab.
+- **AI-tab Configure routes to Settings → Tabs scoped to that tab.** The
+  right-click *Configure tab* entry on AI tabs (which previously only
+  worked on Shell tabs because the dialog is shell-only) now opens the
+  Settings window scrolled and expanded to the matching tab section. New
+  IPC `open_settings_window_to_tab(tab_id)` plus a `settings-deep-link`
+  event the Settings frontend listens for. Cold-open path uses a backend
+  state cell consumed via `consume_settings_deep_link`; hot-open path
+  uses the event. Shell tabs continue to use `ConfigureTabDialog.svelte`
+  unchanged.
+
+### Changed
+
+- **Per-tab theme and background overrides now reach the right-click
+  Configure flow on AI tabs.** Schema and the Settings → Tabs UI already
+  exposed `theme_override` / `background_override` on AI tabs (V1.4-01 /
+  V1.4-02 / V1.4-04); the right-click Configure entry now also routes to
+  that surface so the more discoverable path works for the Claude tabs
+  too. The runtime application path (`terminals.ts`'s `effectiveTheme`
+  / `effectiveBackgroundMode`) was already kind-agnostic — the gap was
+  purely UI routing.
+- **`AiToolKindWire` enum collapsed.** Pre-V1.4-07 the schema carried
+  `ai_tool_kind: "claude_code" | "aider"` on every AI tab; V1.4-07 drops
+  the discriminator entirely. AI tabs are simply Claude Code, with an
+  optional `use_local_provider` flag that gates env synthesis. The
+  state-side `AiToolKind` enum collapses to the same shape (`TabKind::AiTool`
+  with no inner data).
+- **Default install layout.** Fresh installs now ship with two AI tabs
+  (`claude` + `claude-local`) plus the default Shell tab. The integrity
+  check restores any of the three reserved ids if a hand-edit removes
+  them. The check also coerces `use_local_provider` to its canonical
+  value on each builtin so a hand-edit can't silently flip the
+  subscription Claude tab into local-LLM mode.
+- **`Ctrl+2` switch label** in *Settings → Shortcuts* now reads "Switch to
+  Claude (local) tab" (was "Switch to Aider tab").
+
+### Removed
+
+- **Aider tab kind.** `AiToolKindWire::Aider`, `AIDER_TAB_ID`,
+  `default_aider_tab()`, the `AiderFirstLaunchNotice.svelte` overlay,
+  the aider-specific TTS-injection no-op warning, and the aider-specific
+  install-hint in the tab-error overlay are all gone. Aider permission-
+  detection patterns (always empty in practice) are also removed.
+- **`docs/features/FEATURE-aider-parity.md`** deleted; the two
+  aider-related entries in `docs/FUTURE-FEATURES.md` (TTS injection
+  blocked on upstream support, permission-pattern enumeration) moved to
+  the historical section as superseded by the Aider removal.
+
+### Migrated
+
+- **v1.7 → v1.8** — adds the global `claude_local` group; drops the
+  `ai_tool_kind` field from every AI tab; adds `use_local_provider:
+  false` to every AI tab; rewrites the legacy aider tab in place
+  (`id` → `claude-local`, `name` → `Claude (local)`, `command` →
+  `claude`, `args` → `[]`, `use_local_provider: true`, `tts_injection`
+  re-enabled with the runtime prompt as the default instructions, and
+  the canonical "Aider …" notification strings rewritten to "Claude
+  (local) …" — user customizations to env, theme/background overrides,
+  and notification text are preserved). Layout-tree references to the
+  legacy `"aider"` id are recursively rewritten to `"claude-local"` in
+  `layout.tree`, every `layout_presets[].tree`, and
+  `session.active_tab_id`. Backup at `config.json.v1.7.bak.<ts>`.
+- A v1.2 file lands at v1.8 in one launch with six backups (v1.2, v1.3,
+  v1.4, v1.5, v1.6, v1.7).
+
+### Notes
+
+- The auth token is stored cleartext in `settings.json`. Local proxies
+  typically accept dummy tokens, so this is acceptable; OS keychain
+  integration is a future enhancement if real Anthropic API keys end up
+  in the field.
+- TTS markup compliance on the Claude (local) tab depends on the
+  underlying model. Smaller local models often don't honor the
+  `[[TTS]]…[[/TTS]]` convention reliably; cctts treats missing markup
+  as silent (the existing fallback behavior).
+- Tool-use (Edit / Write / Bash / etc.) on the Claude (local) tab
+  depends on the local model supporting Anthropic-style tool calling —
+  test before committing to a particular model.
+
 ## [1.3.2] — 2026-05-07
 
 ### Added

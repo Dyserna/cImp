@@ -7,12 +7,18 @@
 //! side table any more. `build_launch_spec` looks the tab up by id; an
 //! unknown id is a hard error (the registry shouldn't know about a tab
 //! whose entry is missing from settings).
+//!
+//! V1.4-07: AI tabs are now Claude-only (Aider was dropped). The
+//! `use_local_provider` flag on each AI tab gates env synthesis from
+//! the global `claude_local` settings group; per-tab `env` entries take
+//! precedence over synthesized values.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{AppError, AppResult};
 use crate::pty::{resolve_command, PtyLaunchSpec};
-use crate::settings::{AiToolKindWire, AiToolTabConfig, Settings, TabConfig};
+use crate::settings::{AiToolTabConfig, Settings, TabConfig};
 use crate::state::TabId;
 
 pub fn build_launch_spec(
@@ -27,7 +33,7 @@ pub fn build_launch_spec(
     })?;
 
     match entry {
-        TabConfig::AiTool(cfg) => build_ai_tool_spec(tab, cfg, launch_cwd, invocation_args),
+        TabConfig::AiTool(cfg) => build_ai_tool_spec(tab, cfg, settings, launch_cwd, invocation_args),
         TabConfig::Shell(cfg) => {
             // The detection module verified the default Shell-1 binary;
             // user-supplied paths from the New Shell Tab dialog are
@@ -55,6 +61,7 @@ pub fn build_launch_spec(
 fn build_ai_tool_spec(
     tab: TabId,
     cfg: &AiToolTabConfig,
+    settings: &Settings,
     launch_cwd: &Path,
     invocation_args: &[String],
 ) -> AppResult<PtyLaunchSpec> {
@@ -65,13 +72,14 @@ fn build_ai_tool_spec(
         .cwd
         .clone()
         .unwrap_or_else(|| launch_cwd.to_path_buf());
+    let env = compose_ai_env(cfg, settings);
     Ok(PtyLaunchSpec {
         tab,
         binary,
         pre_args,
         extra_args,
         working_dir,
-        env: cfg.env.clone(),
+        env,
     })
 }
 
@@ -79,64 +87,57 @@ fn build_pre_args(cfg: &AiToolTabConfig) -> Vec<String> {
     if !cfg.tts_injection.enabled || cfg.tts_injection.instructions.is_empty() {
         return Vec::new();
     }
-    match cfg.ai_tool_kind {
-        AiToolKindWire::ClaudeCode => vec![
-            "--append-system-prompt".to_string(),
-            cfg.tts_injection.instructions.clone(),
-        ],
-        AiToolKindWire::Aider => {
-            // Aider has no equivalent CLI mechanism; the toggle exists in the
-            // schema for forward-compat (see FUTURE-FEATURES.md) but the v2
-            // milestone calls out injection as a no-op for the aider tab.
-            tracing::info!(
-                "aider tab: TTS injection requested but aider has no CLI mechanism; skipping"
-            );
-            Vec::new()
-        }
-    }
+    vec![
+        "--append-system-prompt".to_string(),
+        cfg.tts_injection.instructions.clone(),
+    ]
 }
 
 fn build_extra_args(cfg: &AiToolTabConfig, invocation_args: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
-    // Built-in baseline flags. These come BEFORE the user's persistent
-    // args, so a user who really wants to override one (e.g. point at a
-    // different metadata file) can add their own flag and rely on aider's
-    // last-flag-wins parsing.
-    out.extend(builtin_args(cfg.ai_tool_kind));
-
     out.extend(cfg.args.iter().filter(|s| !s.is_empty()).cloned());
 
     // cctts is documented as a drop-in replacement for `claude`, so
-    // invocation args (`cctts --resume <id>`, etc.) flow only into the
-    // claude tab. The aider tab gets its persistent flags only.
-    if matches!(cfg.ai_tool_kind, AiToolKindWire::ClaudeCode) {
-        for arg in invocation_args {
-            if !arg.is_empty() {
-                out.push(arg.clone());
-            }
+    // invocation args (`cctts --resume <id>`, etc.) flow into every
+    // AI tab. (Pre-V1.4-07 they only flowed into the subscription
+    // Claude tab; with Aider gone and both AI tabs now running
+    // `claude`, both can honor the wrapper's invocation args.)
+    for arg in invocation_args {
+        if !arg.is_empty() {
+            out.push(arg.clone());
         }
     }
     out
 }
 
-/// Always-on flags per AI tool. Kept here (not in settings defaults) so the
-/// flag set takes effect even on existing user settings files where `args`
-/// is already empty — i.e. nobody has to delete their settings.json to
-/// pick up new defaults.
-fn builtin_args(kind: AiToolKindWire) -> Vec<String> {
-    match kind {
-        AiToolKindWire::ClaudeCode => Vec::new(),
-        AiToolKindWire::Aider => vec![
-            // Aider's built-in model metadata is incomplete for newer
-            // models (and lacks any project-specific tuning). Pointing it
-            // at a project-local file lets each project ship its own
-            // metadata; the path is relative to aider's cwd (= cctts
-            // launch dir), so each project's `.aider.model.metadata.json`
-            // is picked up automatically. If the file is absent, aider
-            // logs a warning and falls back to its built-in defaults.
-            "--model-metadata-file".to_string(),
-            ".aider.model.metadata.json".to_string(),
-        ],
+/// V1.4-07: compose the spawn environment for an AI tab. Per-tab
+/// `env` entries are the user's most-specific scope and take
+/// precedence over values synthesized from the global `claude_local`
+/// settings group when `use_local_provider` is true. The merge order
+/// is: synthesized → tab.env (using `entry().or_insert()` so per-tab
+/// keys never get overwritten).
+fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = HashMap::new();
+    if cfg.use_local_provider {
+        let cl = &settings.claude_local;
+        if !cl.base_url.is_empty() {
+            env.insert("ANTHROPIC_BASE_URL".to_string(), cl.base_url.clone());
+        }
+        if !cl.auth_token.is_empty() {
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), cl.auth_token.clone());
+        }
+        if !cl.model_alias.is_empty() {
+            // Claude Code primarily uses --model flag for model selection,
+            // but ANTHROPIC_MODEL is honored by some proxies; setting
+            // both is harmless. Users typically configure model mapping
+            // in their LiteLLM/proxy config rather than relying on this.
+            env.insert("ANTHROPIC_MODEL".to_string(), cl.model_alias.clone());
+        }
     }
+    // Per-tab env wins over synthesized values.
+    for (k, v) in &cfg.env {
+        env.insert(k.clone(), v.clone());
+    }
+    env
 }

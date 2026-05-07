@@ -17,19 +17,24 @@ use tracing::{debug, info, warn};
 pub type InputLengths = Arc<RwLock<HashMap<TabId, Arc<AtomicI32>>>>;
 
 /// Identifier for one of the multi-tab subprocesses cctts owns. Two
-/// reserved variants (`Claude`, `Aider`) cover the v1 builtins; `Shell(id)`
-/// carries the user-managed tab IDs introduced in v3 (M1 has a hardcoded
+/// reserved AI variants (`Claude`, `ClaudeLocal`) cover the V1.4-07
+/// builtins (subscription Claude + local-LLM Claude); `Shell(id)` carries
+/// the user-managed tab IDs introduced in v3 (M1 has a hardcoded
 /// "shell-1"; M2/M3 generalize). The runtime kind discriminator is
 /// [`TabKind`], not this — `TabId` is purely an opaque identity used as
 /// HashMap key and IPC payload.
 ///
 /// Wire format: a single string. Reserved IDs serialize as `"claude"` /
-/// `"aider"`; `Shell(s)` serializes as the inner string verbatim. Round-
-/// tripping any other string yields a `Shell` variant.
+/// `"claude-local"`; `Shell(s)` serializes as the inner string verbatim.
+/// Round-tripping any other string yields a `Shell` variant.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub enum TabId {
     Claude,
-    Aider,
+    /// V1.4-07: Claude Code talking to a local LLM via the
+    /// `claude_local` provider settings. Replaces the pre-V1.4-07 `Aider`
+    /// variant; the v1.7 → v1.8 migration rewrites the aider tab to
+    /// this id.
+    ClaudeLocal,
     Shell(String),
 }
 
@@ -37,7 +42,7 @@ impl TabId {
     pub fn as_str(&self) -> &str {
         match self {
             TabId::Claude => "claude",
-            TabId::Aider => "aider",
+            TabId::ClaudeLocal => "claude-local",
             TabId::Shell(s) => s.as_str(),
         }
     }
@@ -45,20 +50,19 @@ impl TabId {
     pub fn from_str(s: &str) -> Self {
         match s {
             "claude" => TabId::Claude,
-            "aider" => TabId::Aider,
+            "claude-local" => TabId::ClaudeLocal,
             other => TabId::Shell(other.to_string()),
         }
     }
 
     /// Pure mapping from id to runtime kind. Stable across milestones —
-    /// `Claude`/`Aider` are always AI tabs; any `Shell(_)` id is a Shell
-    /// tab. Lets call sites that don't carry `TabKind` explicitly (PTY
-    /// processor, launch-spec builder) branch without threading a separate
-    /// metadata table.
+    /// `Claude` and `ClaudeLocal` are AI tabs; any `Shell(_)` id is a
+    /// Shell tab. Lets call sites that don't carry `TabKind` explicitly
+    /// (PTY processor, launch-spec builder) branch without threading a
+    /// separate metadata table.
     pub fn kind(&self) -> TabKind {
         match self {
-            TabId::Claude => TabKind::AiTool(AiToolKind::ClaudeCode),
-            TabId::Aider => TabKind::AiTool(AiToolKind::Aider),
+            TabId::Claude | TabId::ClaudeLocal => TabKind::AiTool,
             TabId::Shell(_) => TabKind::Shell,
         }
     }
@@ -79,18 +83,13 @@ impl<'de> Deserialize<'de> for TabId {
 
 /// Discriminator for which kind of subprocess a tab runs. Gates per-kind
 /// behavior in the state machine, the processing layer, and the
-/// notification system. M1 ships two AI builtins plus one hardcoded Shell
-/// tab; M2/M3 add user-managed Shell tabs.
+/// notification system. V1.4-07 collapsed the AI inner discriminator
+/// (Claude was the only remaining variant after Aider was dropped);
+/// any future second AI tool would warrant re-introducing it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TabKind {
-    AiTool(AiToolKind),
+    AiTool,
     Shell,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AiToolKind {
-    ClaudeCode,
-    Aider,
 }
 
 impl TabKind {
@@ -297,11 +296,11 @@ pub enum StateEvent {
     TabRenamed { tab: TabId, name: String },
 }
 
-/// Wire-format projection of `TabKind` for the `TabCreated` event. We avoid
-/// serializing `TabKind` directly because the inner `AiToolKind` only
-/// matters at the backend layer (permission patterns, TTS injection); the
-/// frontend just needs to know whether a tab is a Shell or an AI tool to
-/// gate close-button rendering and similar UI affordances.
+/// Wire-format projection of `TabKind` for the `TabCreated` event. The
+/// frontend only needs to know whether a tab is a Shell or an AI tool to
+/// gate close-button rendering and similar UI affordances; matching the
+/// internal `TabKind` shape one-to-one would have leaked the (now
+/// removed) `AiToolKind` enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TabKindWire {
@@ -312,7 +311,7 @@ pub enum TabKindWire {
 impl From<&TabKind> for TabKindWire {
     fn from(k: &TabKind) -> Self {
         match k {
-            TabKind::AiTool(_) => TabKindWire::AiTool,
+            TabKind::AiTool => TabKindWire::AiTool,
             TabKind::Shell => TabKindWire::Shell,
         }
     }
@@ -420,7 +419,7 @@ async fn run(
             meta.id.clone(),
             (&meta.kind).into(),
             meta.name.clone(),
-            matches!(meta.id, TabId::Claude | TabId::Aider),
+            matches!(meta.id, TabId::Claude | TabId::ClaudeLocal),
             position,
         );
     }
@@ -461,7 +460,7 @@ async fn run(
                             meta.id.clone(),
                             (&meta.kind).into(),
                             meta.name,
-                            matches!(meta.id, TabId::Claude | TabId::Aider),
+                            matches!(meta.id, TabId::Claude | TabId::ClaudeLocal),
                             position,
                         );
                     }
@@ -1056,7 +1055,7 @@ mod tests {
     fn tab_id_serde_round_trips() {
         for id in [
             TabId::Claude,
-            TabId::Aider,
+            TabId::ClaudeLocal,
             TabId::Shell("shell-1".to_string()),
             TabId::Shell("user-bash".to_string()),
         ] {
@@ -1069,7 +1068,10 @@ mod tests {
     #[test]
     fn tab_id_wire_format_preserved() {
         assert_eq!(serde_json::to_string(&TabId::Claude).unwrap(), "\"claude\"");
-        assert_eq!(serde_json::to_string(&TabId::Aider).unwrap(), "\"aider\"");
+        assert_eq!(
+            serde_json::to_string(&TabId::ClaudeLocal).unwrap(),
+            "\"claude-local\""
+        );
         assert_eq!(
             serde_json::to_string(&TabId::Shell("shell-1".to_string())).unwrap(),
             "\"shell-1\""
@@ -1078,11 +1080,8 @@ mod tests {
 
     #[test]
     fn tab_id_kind_mapping() {
-        assert_eq!(
-            TabId::Claude.kind(),
-            TabKind::AiTool(AiToolKind::ClaudeCode)
-        );
-        assert_eq!(TabId::Aider.kind(), TabKind::AiTool(AiToolKind::Aider));
+        assert_eq!(TabId::Claude.kind(), TabKind::AiTool);
+        assert_eq!(TabId::ClaudeLocal.kind(), TabKind::AiTool);
         assert_eq!(TabId::Shell("anything".into()).kind(), TabKind::Shell);
     }
 

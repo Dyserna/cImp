@@ -112,12 +112,9 @@ export interface ShellNotificationConfig {
   exited: string;
 }
 
-export type AiToolKindWire = 'claude_code' | 'aider';
-
 export interface AiToolTabConfig {
   kind: 'ai_tool';
   id: string;
-  ai_tool_kind: AiToolKindWire;
   builtin: boolean;
   name: string;
   command: string;
@@ -134,6 +131,12 @@ export interface AiToolTabConfig {
   /// the global `terminal.background`; `"disabled"` opts out (theme bg
   /// only); a full settings object replaces the global wholesale.
   background_override: BackgroundOverrideWire | null;
+  /// V1.4-07: when true, the launch flow synthesizes
+  /// `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL`
+  /// if `claude_local.model_alias` is non-empty) from the global
+  /// `claude_local` settings group. Per-tab `env` entries override
+  /// synthesized values.
+  use_local_provider: boolean;
 }
 
 export interface ShellTabConfig {
@@ -321,8 +324,8 @@ export interface Settings {
   behavior: BehaviorSettings;
   compose: ComposeSettings;
   shortcuts: ShortcutSettings;
-  /// Ordered tab configs. Reserved ids (claude, aider, shell-default-1) are
-  /// guaranteed to be present after the backend's startup integrity check.
+  /// Ordered tab configs. Reserved ids (claude, claude-local, shell-default-1)
+  /// are guaranteed to be present after the backend's startup integrity check.
   tabs: TabConfig[];
   processing: ProcessingSettings;
   session: SessionState;
@@ -338,12 +341,29 @@ export interface Settings {
   /// Terminal-pane settings (V1.4-01+): xterm.js palette today, plus
   /// the V1.4-02 background sub-group when that ships.
   terminal: TerminalSettings;
+  /// V1.4-07: local-LLM provider config for AI tabs whose
+  /// `use_local_provider` flag is `true`. Stored cleartext on disk —
+  /// local proxies typically accept dummy tokens, so this is acceptable.
+  claude_local: ClaudeLocalSettings;
+}
+
+/// V1.4-07: local-LLM provider configuration. `base_url` and
+/// `auth_token` become `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` on
+/// any AI tab with `use_local_provider: true`. `model_alias`, when
+/// non-empty, becomes `ANTHROPIC_MODEL` (also passed through some
+/// proxies as a model-mapping key).
+export interface ClaudeLocalSettings {
+  base_url: string;
+  auth_token: string;
+  model_alias: string;
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
 /// User-created shell tabs use uuid-based ids that never collide with these.
 export const CLAUDE_TAB_ID = 'claude';
-export const AIDER_TAB_ID = 'aider';
+/// V1.4-07: replaces the pre-V1.4-07 `AIDER_TAB_ID = 'aider'`. The
+/// v1.7 → v1.8 migration rewrites the aider tab to this id in place.
+export const CLAUDE_LOCAL_TAB_ID = 'claude-local';
 export const SHELL_DEFAULT_TAB_ID = 'shell-default-1';
 
 /// Look up a tab entry by id. Returns undefined for unknown ids; callers
@@ -426,7 +446,6 @@ export function defaultSettings(): Settings {
       {
         kind: 'ai_tool',
         id: CLAUDE_TAB_ID,
-        ai_tool_kind: 'claude_code',
         builtin: true,
         name: 'Claude',
         command: 'claude',
@@ -442,26 +461,27 @@ export function defaultSettings(): Settings {
         first_launch_notice_dismissed: true,
         theme_override: null,
         background_override: null,
+        use_local_provider: false,
       },
       {
         kind: 'ai_tool',
-        id: AIDER_TAB_ID,
-        ai_tool_kind: 'aider',
+        id: CLAUDE_LOCAL_TAB_ID,
         builtin: true,
-        name: 'Aider',
-        command: 'aider',
+        name: 'Claude (local)',
+        command: 'claude',
         args: [],
         cwd: null,
         env: {},
-        tts_injection: { enabled: false, instructions: '' },
+        tts_injection: { enabled: true, instructions: '' },
         notifications: {
-          idle: 'Aider is idle',
-          awaiting_permission: 'Aider is awaiting permission',
-          error: 'Aider encountered an error',
+          idle: 'Claude (local) is idle',
+          awaiting_permission: 'Claude (local) is awaiting permission',
+          error: 'Claude (local) encountered an error',
         },
-        first_launch_notice_dismissed: false,
+        first_launch_notice_dismissed: true,
         theme_override: null,
         background_override: null,
+        use_local_provider: true,
       },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
@@ -487,6 +507,11 @@ export function defaultSettings(): Settings {
         persist: true,
         restore_on_launch: true,
       },
+    },
+    claude_local: {
+      base_url: 'http://localhost:4000',
+      auth_token: 'sk-dummy',
+      model_alias: '',
     },
   };
 }

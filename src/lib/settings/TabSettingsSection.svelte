@@ -21,8 +21,13 @@
   // Tab button. The parent owns baseline tracking and computes
   // `restartRequired`; this component just shows the indicator and routes
   // the restart click back up.
+  // V1.4-07: `tabId` is plumbed in from the parent so future per-id
+  // conditionals (e.g., a "this is the local-LLM tab — confirm proxy
+  // is up" warning) have an anchor. Currently unused after the aider
+  // TTS-injection warning was removed; underscore-prefix marks it so
+  // svelte-check doesn't complain.
   let {
-    tabId,
+    tabId: _tabId,
     displayName,
     settings = $bindable<AiToolTabConfig>(),
     defaults,
@@ -178,6 +183,35 @@
   <label class="checkbox">
     <input
       type="checkbox"
+      checked={settings.use_local_provider}
+      onchange={(e) =>
+        update(
+          'use_local_provider',
+          (e.currentTarget as HTMLInputElement).checked,
+        )}
+    />
+    <span>
+      Use local LLM provider
+      {#if restartRequired}
+        <Pill variant="orange" size="xs">restart required</Pill>
+      {/if}
+    </span>
+  </label>
+  {#if settings.use_local_provider}
+    <p class="hint hint-effective-env">
+      On launch this tab synthesizes
+      <code>ANTHROPIC_BASE_URL={$settingsStore.claude_local.base_url}</code>,
+      <code>ANTHROPIC_AUTH_TOKEN=…</code>{$settingsStore.claude_local.model_alias
+        ? `, ANTHROPIC_MODEL=${$settingsStore.claude_local.model_alias}`
+        : ''}
+      from the global <em>Local LLM provider</em> settings. Per-tab env
+      entries below override these.
+    </p>
+  {/if}
+
+  <label class="checkbox">
+    <input
+      type="checkbox"
       checked={settings.tts_injection.enabled}
       onchange={(e) =>
         updateInjection(
@@ -192,14 +226,6 @@
       {/if}
     </span>
   </label>
-
-  {#if tabId === 'aider' && settings.tts_injection.enabled}
-    <p class="warn">
-      Aider does not currently support system-prompt injection via CLI, so this
-      toggle has no effect today. The setting is preserved for forward
-      compatibility — see <code>docs/FUTURE-FEATURES.md</code>.
-    </p>
-  {/if}
 
   <label>
     <span>TTS markup instructions</span>
@@ -325,22 +351,6 @@
     font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
-  }
-  .warn {
-    margin: -6px 0 var(--space-3) 0;
-    padding: var(--space-2) 10px;
-    background: var(--surface-warning-faint);
-    border: 1px solid var(--border-warning);
-    border-radius: var(--radius-md);
-    color: var(--text-warning-bright);
-    font-size: var(--font-size-xs);
-    line-height: 1.4;
-  }
-  .warn code {
-    background: var(--surface-sunken);
-    padding: 1px var(--space-1);
-    border-radius: var(--radius-sm);
-    font-size: var(--font-size-xs);
   }
   small.hint.inline {
     margin: 0 0 0 10px;

@@ -27,12 +27,12 @@
     }
   }
 
-  // For aider we can name the upstream — there's a stable installation page
-  // and the most common failure is "not on PATH". For other tabs we keep it
-  // generic.
+  // V1.4-07: when a Claude tab fails to launch, the most common cause is
+  // that `claude` isn't on PATH yet (the user hasn't installed Claude Code
+  // CLI, or it's installed but not on this shell's PATH).
   const installHint = $derived.by(() => {
-    if (tabId !== 'aider') return null;
-    return 'Make sure aider is installed and on your PATH. Installation instructions: https://aider.chat';
+    if (tabId !== 'claude' && tabId !== 'claude-local') return null;
+    return 'Make sure Claude Code is installed and on your PATH. Installation instructions: https://docs.anthropic.com/en/docs/claude-code/setup';
   });
 </script>
 

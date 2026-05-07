@@ -14,7 +14,11 @@ use crate::shell::ShellSpec;
 /// cannot make these disappear — they are restored with defaults if missing
 /// and forced to `builtin: true` regardless of what the file claims.
 pub const CLAUDE_TAB_ID: &str = "claude";
-pub const AIDER_TAB_ID: &str = "aider";
+/// V1.4-07: second Claude tab preconfigured to use a local LLM via the
+/// `claude_local` provider settings. Replaces the v1.7-and-earlier
+/// `aider` reserved id (the v1.7 → v1.8 migration rewrites the aider
+/// tab in place to this id).
+pub const CLAUDE_LOCAL_TAB_ID: &str = "claude-local";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -56,6 +60,13 @@ pub struct Settings {
     /// the V1.4-02 background image/color group when that ships.
     /// Distinct from `ui`, which themes the cctts chrome.
     pub terminal: TerminalSettings,
+    /// V1.4-07: local-LLM provider config for AI tabs whose
+    /// `use_local_provider` flag is `true`. The launch-time env
+    /// composition reads `base_url`/`auth_token`/`model_alias` from
+    /// here and synthesizes `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
+    /// (and `ANTHROPIC_MODEL` if set) into the spawned process's env.
+    /// Per-tab `env` entries take precedence over synthesized values.
+    pub claude_local: ClaudeLocalSettings,
 }
 
 impl Settings {
@@ -185,7 +196,6 @@ impl TabConfig {
 #[serde(default)]
 pub struct AiToolTabConfig {
     pub id: String,
-    pub ai_tool_kind: AiToolKindWire,
     pub builtin: bool,
     pub name: String,
     pub command: String,
@@ -194,9 +204,10 @@ pub struct AiToolTabConfig {
     pub env: HashMap<String, String>,
     pub tts_injection: TtsInjection,
     pub notifications: AiNotificationConfig,
-    /// Mirrors v1.1's per-tab `first_launch_notice_dismissed`. Carried
-    /// through migration verbatim so the aider banner doesn't re-appear for
-    /// existing users.
+    /// Carried over from earlier schemas where aider had a one-time
+    /// first-launch banner. Aider is gone (V1.4-07) and Claude tabs
+    /// pre-dismiss this; left in place to keep the wire format stable
+    /// for users still loading older settings files.
     pub first_launch_notice_dismissed: bool,
     /// V1.4-01 per-tab terminal palette override. `None` means inherit
     /// the global `terminal.theme`; `Some(_)` replaces it with the
@@ -209,6 +220,12 @@ pub struct AiToolTabConfig {
     /// opt out (theme bg only); `Some(Custom(cfg))` replaces the global
     /// background wholesale for this tab.
     pub background_override: Option<BackgroundOverride>,
+    /// V1.4-07: when `true`, the launch-time env composition synthesizes
+    /// `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL`
+    /// if `claude_local.model_alias` is non-empty) from the global
+    /// `claude_local` settings group. Per-tab `env` entries override
+    /// synthesized values.
+    pub use_local_provider: bool,
 }
 
 impl Default for AiToolTabConfig {
@@ -217,7 +234,6 @@ impl Default for AiToolTabConfig {
         // entry mid-array. Real defaults come from the constructors below.
         Self {
             id: String::new(),
-            ai_tool_kind: AiToolKindWire::ClaudeCode,
             builtin: false,
             name: String::new(),
             command: String::new(),
@@ -229,6 +245,7 @@ impl Default for AiToolTabConfig {
             first_launch_notice_dismissed: false,
             theme_override: None,
             background_override: None,
+            use_local_provider: false,
         }
     }
 }
@@ -270,15 +287,30 @@ impl Default for ShellTabConfig {
     }
 }
 
-/// Wire-format mirror of `state::AiToolKind`. The state-side enum lives in
-/// `state::manager` for use with the runtime state machine; this serde-aware
-/// twin is the on-disk discriminator. The `From` impls below keep them in
-/// lockstep.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AiToolKindWire {
-    ClaudeCode,
-    Aider,
+/// V1.4-07: local-LLM provider configuration. When an AI tab has
+/// `use_local_provider: true`, the launch flow composes env vars from
+/// these fields onto the spawn process, allowing Claude Code to talk
+/// to a local proxy (typically LiteLLM bridging to Ollama / LM Studio /
+/// other OpenAI-compatible endpoints) instead of api.anthropic.com.
+/// Stored cleartext in settings.json — local proxies typically accept
+/// dummy tokens, so this is acceptable; OS keychain integration is a
+/// future enhancement.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct ClaudeLocalSettings {
+    pub base_url: String,
+    pub auth_token: String,
+    pub model_alias: String,
+}
+
+impl Default for ClaudeLocalSettings {
+    fn default() -> Self {
+        Self {
+            base_url: "http://localhost:4000".to_string(),
+            auth_token: "sk-dummy".to_string(),
+            model_alias: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -309,8 +341,8 @@ impl Default for ShellNotificationConfig {
 // --- Builtin defaults -------------------------------------------------------
 //
 // Used by:
-//   1. The migration step to fill in missing entries (e.g. an aider entry
-//      absent from a hand-edited v1.1 file).
+//   1. The migration step to fill in missing entries (e.g. a claude-local
+//      tab absent from an upgraded settings file).
 //   2. The integrity check at load time to restore deleted builtins.
 //   3. `Settings::default()` to seed a fresh-install file before the first
 //      save.
@@ -318,7 +350,6 @@ impl Default for ShellNotificationConfig {
 pub fn default_claude_tab() -> TabConfig {
     TabConfig::AiTool(AiToolTabConfig {
         id: CLAUDE_TAB_ID.to_string(),
-        ai_tool_kind: AiToolKindWire::ClaudeCode,
         builtin: true,
         name: "Claude".to_string(),
         command: "claude".to_string(),
@@ -334,36 +365,41 @@ pub fn default_claude_tab() -> TabConfig {
             awaiting_permission: "Claude is awaiting permission".to_string(),
             error: "Claude encountered an error".to_string(),
         },
-        // Claude has no first-launch notice; pre-dismissed so the overlay
-        // code can use a single per-tab predicate.
+        // Pre-dismissed so the overlay code can use a single per-tab
+        // predicate. Aider used to fire a first-launch banner (V1.1)
+        // but Claude tabs never did.
         first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
+        use_local_provider: false,
     })
 }
 
-pub fn default_aider_tab() -> TabConfig {
+/// V1.4-07: second Claude tab, preconfigured to talk to a local LLM
+/// via the global `claude_local` provider settings. Replaces the
+/// pre-V1.4-07 Aider builtin tab.
+pub fn default_claude_local_tab() -> TabConfig {
     TabConfig::AiTool(AiToolTabConfig {
-        id: AIDER_TAB_ID.to_string(),
-        ai_tool_kind: AiToolKindWire::Aider,
+        id: CLAUDE_LOCAL_TAB_ID.to_string(),
         builtin: true,
-        name: "Aider".to_string(),
-        command: "aider".to_string(),
+        name: "Claude (local)".to_string(),
+        command: "claude".to_string(),
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),
         tts_injection: TtsInjection {
-            enabled: false,
-            instructions: String::new(),
+            enabled: true,
+            instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
         },
         notifications: AiNotificationConfig {
-            idle: "Aider is idle".to_string(),
-            awaiting_permission: "Aider is awaiting permission".to_string(),
-            error: "Aider encountered an error".to_string(),
+            idle: "Claude (local) is idle".to_string(),
+            awaiting_permission: "Claude (local) is awaiting permission".to_string(),
+            error: "Claude (local) encountered an error".to_string(),
         },
-        first_launch_notice_dismissed: false,
+        first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
+        use_local_provider: true,
     })
 }
 

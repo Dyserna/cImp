@@ -18,6 +18,21 @@ export async function openSettingsWindow(): Promise<void> {
   await invoke('open_settings_window');
 }
 
+/// V1.4-07 A: open the Settings window scrolled to a specific tab's
+/// section. Used by the right-click "Configure tab" entry on AI tabs
+/// (shell tabs continue to use ConfigureTabDialog.svelte).
+export async function openSettingsWindowToTab(tab: TabId): Promise<void> {
+  await invoke('open_settings_window_to_tab', { tab });
+}
+
+/// V1.4-07 A: read+clear any pending deep-link target stored by
+/// `open_settings_window_to_tab`. The Settings window calls this on
+/// mount to handle the cold-open case (window not yet listening for
+/// the `settings-deep-link` event when the IPC fires).
+export async function consumeSettingsDeepLink(): Promise<string | null> {
+  return invoke('consume_settings_deep_link');
+}
+
 export async function closeSettingsWindow(): Promise<void> {
   await invoke('close_settings_window');
 }

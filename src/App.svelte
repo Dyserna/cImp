@@ -8,7 +8,6 @@
   import WaveformOverlay from './lib/WaveformOverlay.svelte';
   import ComposeOverlay from './lib/ComposeOverlay.svelte';
   import ErrorBanner from './lib/ErrorBanner.svelte';
-  import AiderFirstLaunchNotice from './lib/AiderFirstLaunchNotice.svelte';
   import NewShellTabDialog from './lib/dialog/NewShellTabDialog.svelte';
   import ConfigureTabDialog from './lib/dialog/ConfigureTabDialog.svelte';
   import SaveLayoutDialog from './lib/dialog/SaveLayoutDialog.svelte';
@@ -275,7 +274,7 @@
       // emission). Without this guard, when the two values disagree
       // — common after V4-04 migration where session.active_tab_id
       // is dropped and the backend falls back to Claude while the
-      // hydrated layout has e.g. Aider active — the two
+      // hydrated layout has e.g. Claude (local) active — the two
       // subscriptions ping-pong correcting each other across async
       // backend round-trips, flapping the active tab dozens of
       // times on launch.
@@ -333,7 +332,6 @@
     <WaveformOverlay />
     <ComposeOverlay />
     <ErrorBanner />
-    <AiderFirstLaunchNotice />
     <!--
       DnD overlays mounted here so they layer above panes but below
       modal dialogs (which render outside .terminal-area). The ghost

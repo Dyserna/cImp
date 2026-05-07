@@ -286,20 +286,6 @@ Items deferred during v1.2 design that didn't get picked up in v1.3:
 - **Cost:** Small. Append-to-ring-buffer in memory; persist last N (e.g., 100) entries to settings or a sidecar file. Settings dialog gains a "Subprocess log" tab.
 - **Trigger to act:** if a shell tab has flaky behavior and you wish you had a record.
 
-### Per-tab avatar configuration
-
-- **What:** Different avatar assets per tab (e.g., a different sprite for the aider tab vs. the Claude tab).
-- **Why:** Visual distinction reinforces "which AI am I talking to right now."
-- **Cost:** Medium. Settings schema gains per-tab avatar override; the avatar overlay component picks the right asset based on focused pane's active tab. Asset bundling decisions (ship multiple sets, or let user supply paths).
-- **Trigger to act:** if you find the single avatar visually ambiguous when switching between Claude and aider.
-
-### Per-tab TTS settings
-
-- **What:** Different voice / speed / volume per tab.
-- **Why:** Could match avatars (different voice per AI). Or use case where shell error tones want different volume than speech.
-- **Cost:** Medium. Per-tab override in settings; TTS pipeline reads target tab's voice settings before synthesis.
-- **Trigger to act:** real use feedback. Low priority.
-
 ## Auto-detect Blackwell (or any unsupported GPU) and gracefully skip CUDA opt-in
 
 - **What:** When `CCTTS_GPU=cuda` is set, probe the GPU compute capability before registering the CUDA EP. If the CC is unsupported by the bundled ORT prebuilt (currently sm_120 / Blackwell), log a clear warning and fall back to CPU instead of letting the user see per-segment `cudaErrorSymbolNotFound` errors and silent output.
@@ -313,6 +299,14 @@ Items deferred during v1.2 design that didn't get picked up in v1.3:
 ---
 
 # 3. Done / historical
+
+## ~~Per-tab avatar configuration~~ — considered, decided global-only (2026-05-07)
+
+Listed as a v1.2 deferral and slated as `MILESTONE-V1.4-05-per-tab-avatar.md`. Cancelled as a scope decision: cctts ships exactly one avatar for the entire app, customized globally. Per-tab variation was speculative ("different sprite for the aider tab"); the user explicitly does not want it. The avatar overlay stays a single global instance reading `avatar.images` directly with no per-tab override resolver.
+
+## ~~Per-tab TTS settings~~ — considered, decided global-only (2026-05-07)
+
+Listed as a v1.2 deferral and slated as `MILESTONE-V1.4-06-per-tab-tts.md`. Cancelled at the same time and for the same reason as per-tab avatar: one TTS voice / speed / volume for the whole app, customized globally. The TTS worker continues reading `settings.tts.{voice,speed,volume}` directly with no per-tab override resolver.
 
 ## ~~Espeak fallback for out-of-vocabulary words~~ — shipped (default)
 

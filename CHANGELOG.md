@@ -5,7 +5,7 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4.0] — Unreleased
+## [1.3.2] — 2026-05-07
 
 ### Added
 
@@ -34,11 +34,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instant when the OS-level reduce-motion preference is enabled.
 - **Tabular numerics** on settings value labels (Speed, Volume, Opacity,
   Glow, Line width) so the label width doesn't jitter as the slider moves.
+- **Terminal color themes (V1.4-01).** ~12 bundled xterm.js palettes (Default,
+  Dracula, Solarized Dark/Light, Nord, Tomorrow Night, Gruvbox Dark/Light,
+  One Dark, Monokai, Tokyo Night, GitHub Dark) plus a 22-color custom editor.
+  Selectable globally in *Settings → Appearance → Terminal palette*, with
+  per-tab override in *Configure Tab → Appearance*. Override travels with the
+  tab through drag-and-drop. Live theme swap via `term.options.theme = ...` —
+  no terminal recreation, no scrollback loss.
+- **Terminal background image / solid color (V1.4-02 / V1.4-03).** Image or
+  solid-color background beneath terminal text, with opacity, blur, size, and
+  position controls. Per-tab override (custom config / "use global" /
+  "disabled") in the Configure Tab dialog. Backgrounds force the xterm.js DOM
+  renderer; only tabs that opt in pay the perf cost. Scrollback survives
+  renderer flips: the outgoing xterm's state is captured via
+  `serializeAddon.serialize()` and replayed into the new instance with
+  `term.write()`.
+- **Terminal background presets (V1.4-04 B).** Save the current background
+  configuration as a named preset from *Settings → Appearance*; load presets
+  from either the global page or the per-tab Custom branch. Manage / rename /
+  delete from the Manage presets dialog.
+- **Live preview in Configure Tab (V1.4-04 C).** Background changes in the
+  Configure Tab dialog apply to the target terminal in real time while the
+  dialog is open; closing without Save reverts to the original. Optional
+  `terminal.background.preview_category_flips` toggle defers image-path swaps
+  and category flips until Save for users with many tabs.
+- **Cross-restart scrollback (V1.4-04 D).** Per-tab PTY ring buffer (256 KB
+  default) persists to `<config-dir>/scrollback/<tab-id>.bin` on graceful
+  exit, replayed via `term.write()` on next launch. Settings group
+  `terminal.scrollback` (`ring_bytes`, `persist`, `restore_on_launch`).
+  Best-effort recovery — hard kills (SIGKILL / Task Manager) lose the buffer.
 
 ### Changed
 
-- **`settings.json` shape.** New top-level `ui: { theme: string }` block,
-  defaulted to `"modern-dark"`. Existing v1.3 files load unchanged via
+- **`settings.json` shape (UI chrome).** New top-level `ui: { theme: string }`
+  block, defaulted to `"modern-dark"`. Existing v1.3 files load unchanged via
   serde defaults; the field is added on next save. No explicit migration
   required.
 - **DropZoneOverlay** — switched from a flat blue fill to a mint dashed
@@ -49,12 +78,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Status bar toggles** (mute, announcements) — pill-shaped with
   `accent-muted` bg + accent border + accent text when active, indicating
   "filter engaged."
+- **Snapshot cap and alt-screen detection (V1.4-04 A).** Renderer-flip
+  scrollback capture is bounded by `terminal.background.snapshot_lines`
+  (default 2000). When the alt-screen buffer is active (`vim`, `less`,
+  `htop`, …) snapshot capture and replay are skipped — the live shell
+  survives the rebind, but alt-screen contents are dropped (press Ctrl+L
+  in the TUI to redraw).
+- **Recreate-debounce stagger (V1.4-04 A).** Mass-recreate (e.g., a global
+  category flip with many tabs) staggers across two animation frames at
+  60 Hz instead of firing all timers in the same frame.
 
-### Migration
+### Migrated
 
-v1.3 → v1.4 is purely additive: the new `ui` field arrives with its
-default on first launch and persists on next save. No data is touched.
-Old settings files round-trip cleanly.
+- **v1.3 → v1.4** — adds `terminal.theme = { name: "Default", custom: null }`,
+  stamps `theme_override: null` on every existing tab, removes the dead
+  `display.theme` field. Backup at `config.json.v1.3.bak.<ts>`.
+- **v1.4 → v1.5** — adds `terminal.background` group (`image`, `color`,
+  `opacity`, `blur`, `size`, `position`) and stamps `background_override:
+  null` on every existing tab. Backup at `config.json.v1.4.bak.<ts>`.
+- **v1.5 → v1.6** — adds `terminal.background.presets: []`. Backup at
+  `config.json.v1.5.bak.<ts>`.
+- **v1.6 → v1.7** — adds `terminal.scrollback` group and
+  `terminal.background.preview_category_flips: true`. Backup at
+  `config.json.v1.6.bak.<ts>`.
+- A v1.3.0 file lands at v1.7 in one launch with four backups.
+- The `ui` block continues to load via serde defaults — no explicit migration
+  step is needed for the chrome theme.
+
+### Removed
+
+- **Per-tab avatar configuration** and **Per-tab TTS settings** — both were
+  planned as items 3 and 4 of `docs/features/FEATURE-per-tab-overrides.md`
+  and slated for V1.4-05 / V1.4-06. Cancelled as a scope decision: cctts
+  ships exactly one avatar and one TTS voice, customized globally only.
+  The skeleton plans were removed; the feature doc and `FUTURE-FEATURES.md`
+  were updated to reflect the decision. No code or schema changes (the
+  override fields were never added).
 
 ## [1.3.0] — 2026-05-06
 

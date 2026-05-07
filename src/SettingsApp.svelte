@@ -23,6 +23,7 @@
   import { findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
+  import { version as appVersion } from '../package.json';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
   import ThemeSwatch from './lib/settings/ThemeSwatch.svelte';
@@ -60,7 +61,8 @@
     | 'tabs'
     | 'shortcuts'
     | 'local-llm'
-    | 'advanced';
+    | 'advanced'
+    | 'about';
   let activeSection = $state<SectionId>('audio');
   const SECTIONS: { id: SectionId; label: string }[] = [
     { id: 'audio', label: 'Audio' },
@@ -72,7 +74,9 @@
     { id: 'shortcuts', label: 'Shortcuts' },
     { id: 'local-llm', label: 'Local LLM' },
     { id: 'advanced', label: 'Advanced' },
+    { id: 'about', label: 'About' },
   ];
+  const REPO_URL = 'https://github.com/Dyserna/cctts';
 
   // Sub-tab nav within the Tabs section. The two AI builtins each get
   // their own sub-tab; every Shell tab is grouped under 'shells'. Keeps
@@ -1209,6 +1213,24 @@
             </label>
           </div>
         </section>
+      {:else if activeSection === 'about'}
+        <section class="about-section">
+          <h2>About</h2>
+          <dl class="about-list">
+            <dt>Author</dt>
+            <dd>Amir Amashe</dd>
+
+            <dt>Version</dt>
+            <dd><code>{appVersion}</code></dd>
+
+            <dt>Repository</dt>
+            <dd>
+              <a href={REPO_URL} target="_blank" rel="noopener noreferrer">
+                {REPO_URL}
+              </a>
+            </dd>
+          </dl>
+        </section>
       {/if}
       </div>
     </div>
@@ -1651,6 +1673,49 @@
     padding: 1px var(--space-1);
     border-radius: var(--radius-sm);
     font-size: var(--font-size-xs);
+  }
+
+  /* About page: a small definition list keyed by Author / Version /
+     Repository. Two-column grid (label | value) so the values line up
+     even with mixed key lengths. */
+  .about-list {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    column-gap: var(--space-4);
+    row-gap: var(--space-3);
+    margin: 0;
+    padding: 0;
+  }
+  .about-list dt {
+    color: var(--text-quiet-strong);
+    font-size: var(--font-size-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    padding-top: 2px;
+  }
+  .about-list dd {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    word-break: break-all;
+  }
+  .about-list dd code {
+    background: var(--surface-deep);
+    border: 1px solid var(--border-subtle);
+    padding: 1px var(--space-2);
+    border-radius: var(--radius-sm);
+    font-family: Consolas, Menlo, monospace;
+    font-size: var(--font-size-sm);
+  }
+  .about-list dd a {
+    color: var(--accent-purple);
+    text-decoration: none;
+    transition: color var(--motion-fast) var(--easing-standard);
+  }
+  .about-list dd a:hover {
+    color: var(--accent-bright);
+    text-decoration: underline;
   }
 
   /* Narrow window: collapse sidebar to a horizontal strip on top so the

@@ -22,8 +22,8 @@ Read `docs/features/FEATURE-per-tab-overrides.md` first — that document establ
 ## What This Milestone Does NOT Do
 
 - No background image. That's V1.4-02. The `terminal` settings group is shaped to host the background config later, but only the `theme` sub-group is wired in V1.4-01.
-- No per-tab avatar override. That's V1.4-03. Schema does *not* preemptively add `avatar_override` — V1.4-03 will add it in its own migration step. The "shared override pattern" lives in design, not in a one-shot omnibus schema bump.
-- No per-tab TTS override. That's V1.4-04. Same reasoning.
+- No per-tab avatar override. That's V1.4-05. Schema does *not* preemptively add `avatar_override` — V1.4-05 will add it in its own migration step. The "shared override pattern" lives in design, not in a one-shot omnibus schema bump.
+- No per-tab TTS override. That's V1.4-06. Same reasoning.
 - No theme import (`.itermcolors`, Windows Terminal JSON). Bundled set + custom editor is enough; importer is orthogonal and listed as out-of-scope in `FEATURE-per-tab-overrides.md` Open Questions.
 - No project-local settings interaction. `FEATURE-config-scope.md` is independent; per-tab overrides land cleanly inside whichever settings file is active.
 - No cleanup of the existing `display.theme: String` field beyond removing it. It is currently dead code (the xterm.js construction in `terminals.ts:204-207` hardcodes `#000000` / `#e0e0e0` and never reads `display.theme`), so dropping it has no behavioral impact. The V5-01 schema comment that calls `display.theme` "the xterm.js terminal palette inside each tab" is aspirational — V1.4-01 is what makes it true, but under the new `terminal.theme.name` field, not `display.theme`.

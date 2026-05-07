@@ -1,8 +1,8 @@
-# Milestone V1.4-04: Per-Tab Avatar Configuration (Skeleton)
+# Milestone V1.4-05: Per-Tab Avatar Configuration (Skeleton)
 
 ## Purpose
 
-Item 3 from `FEATURE-per-tab-overrides.md`. A per-tab avatar override so different tabs can show different sprite sets (e.g., distinct visuals for Claude vs. aider). Read V1.4-01 first — V1.4-04 follows the same pattern (schema → resolver → wiring → migration → UI).
+Item 3 from `FEATURE-per-tab-overrides.md`. A per-tab avatar override so different tabs can show different sprite sets (e.g., distinct visuals for Claude vs. aider). Read V1.4-01 first — V1.4-05 follows the same pattern (schema → resolver → wiring → migration → UI).
 
 ## What This Milestone Delivers
 

@@ -138,6 +138,7 @@ fn validated_to_shell_config(
         env: input.env.clone(),
         notifications,
         theme_override: None,
+        background_override: None,
     }
 }
 

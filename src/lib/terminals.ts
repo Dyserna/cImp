@@ -29,7 +29,9 @@
 
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css';
+import './terminals.css';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { get } from 'svelte/store';
 
@@ -49,6 +51,12 @@ import {
   settings as settingsStore,
 } from './settings/store';
 import { effectiveTheme, themeFromSetting } from './themes/resolve';
+import {
+  applyHostBackgroundCss,
+  categoryOf,
+  composeTheme,
+  effectiveBackgroundMode,
+} from './terminal/background';
 import { setTerminalFocuser } from './terminalFocus';
 import { perTabClosedState } from './avatarState';
 import { clearTabError, setTabError } from './tabs/errorState';
@@ -97,11 +105,19 @@ interface TerminalEntry {
   /// time; all unsub at destroy.
   unsubFont: () => void;
   unsubClosed: (() => void) | null;
-  /// Subscribes to the full settings store and keeps the xterm theme in
-  /// sync with the global `terminal.theme` plus this tab's
-  /// `theme_override`. xterm.js supports `term.options.theme = ...` as
-  /// a live update; no recreation needed.
-  unsubTheme: () => void;
+  /// Subscribes to the full settings store and keeps both theme and
+  /// background in sync. Theme is always live (V1.4-01: `term.options
+  /// .theme = next`); background is live for color/opacity/blur/etc.
+  /// changes within the same renderer category, but a category flip
+  /// (fast ↔ image) triggers a debounced full Terminal recreate
+  /// (V1.4-02). See the V1.4-02 plan for the matrix.
+  unsubAppearance: () => void;
+  /// Renderer category currently active on this Terminal — `'fast'`
+  /// for the canvas-with-no-image path (mode 'none' or 'color') and
+  /// `'image'` for the DOM-with-image path. The settings subscriber
+  /// compares the next mode's category against this to decide between
+  /// in-place update and full recreate.
+  bgCategory: 'fast' | 'image';
   /// Mirrors the closed flag for this tab so the onData handler — which
   /// closes over its initial value — sees the latest state without
   /// rebinding xterm.
@@ -189,29 +205,43 @@ async function attemptSpawn(entry: TerminalEntry, restart: boolean): Promise<voi
 /// tab is a no-op (the snapshot path in App.svelte and the runtime
 /// `tab-created` event can both hit this for the same id during
 /// startup).
-export function createTerminal(tabId: TabId): void {
+///
+/// `options.restartPty` (V1.4-02): when true, the spawn path uses
+/// `pty_restart` instead of `pty_start`. This is the recreate-on-
+/// background-toggle flow — destroyTerminal kills the JS side
+/// (xterm + listeners) but the backend PTY survives, so a fresh
+/// `pty_start` would either error or duplicate the process.
+/// `pty_restart` shuts down the existing PTY and spawns a new one.
+export function createTerminal(
+  tabId: TabId,
+  options: { restartPty?: boolean } = {},
+): void {
   if (entries.has(tabId)) return;
 
   const offscreen = ensureOffscreen();
 
-  // Resolve the tab's effective theme — global terminal.theme plus this
-  // tab's theme_override, if any. The tab may not be in `settings.tabs`
-  // yet during the snapshot/event race at startup; in that case we fall
-  // back to the global theme alone.
+  // Resolve the tab's effective theme + background mode. The tab may
+  // not be in `settings.tabs` yet during the snapshot/event race at
+  // startup; in that case we fall back to global settings alone.
   const initialSettings = get(settingsStore);
   const initialTab = initialSettings.tabs.find((t) => t.id === tabId);
-  const initialTheme = initialTab
+  const baseTheme = initialTab
     ? effectiveTheme(initialTab, initialSettings.terminal.theme)
     : themeFromSetting(initialSettings.terminal.theme);
+  const initialMode = effectiveBackgroundMode(
+    initialTab ?? { background_override: null },
+    initialSettings.terminal.background,
+  );
+  const initialTheme = composeTheme(baseTheme, initialMode);
+  const initialCategory = categoryOf(initialMode);
 
   const host = document.createElement('div');
   host.className = 'terminal-host';
   host.dataset.tabId = tabId;
-  host.style.width = '100%';
-  host.style.height = '100%';
-  host.style.boxSizing = 'border-box';
-  host.style.padding = '4px';
+  // Brief paint between term.open(host) and the first xterm frame: use
+  // the resolved theme bg so a Dracula tab doesn't flash black.
   host.style.background = initialTheme.background ?? '#000';
+  applyHostBackgroundCss(host, initialMode);
   offscreen.appendChild(host);
 
   const display = get(displaySettings);
@@ -221,9 +251,19 @@ export function createTerminal(tabId: TabId): void {
     cursorBlink: true,
     allowProposedApi: true,
     theme: initialTheme,
+    // V1.4-02: image mode requires transparency so the CSS image
+    // beneath the cells layer is visible. Color-only and 'none' modes
+    // skip this so the canvas renderer paints opaque cells (faster).
+    ...(initialCategory === 'image' ? { allowTransparency: true } : {}),
   });
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
+  // V1.4-02: canvas renderer for the fast path (no image). Image mode
+  // stays on the in-core DOM renderer — the canvas addon is a single
+  // opaque surface and would obscure the CSS image beneath.
+  if (initialCategory !== 'image') {
+    term.loadAddon(new CanvasAddon());
+  }
   term.open(host);
 
   // Placeholder bytes channel — replaced by `bindBytesChannel` inside
@@ -240,7 +280,8 @@ export function createTerminal(tabId: TabId): void {
     unlistenRestart: null,
     unsubFont: () => {},
     unsubClosed: null,
-    unsubTheme: () => {},
+    unsubAppearance: () => {},
+    bgCategory: initialCategory,
     isClosed: false,
     restarting: false,
     resizeTimer: null,
@@ -269,26 +310,48 @@ export function createTerminal(tabId: TabId): void {
     }
   });
 
-  // Live theme subscription — recomputes the effective theme on every
-  // settings change and reassigns `term.options.theme` if it differs.
-  // xterm.js diffs colors internally; identical themes are a no-op so
-  // it's safe to subscribe to the full settings store rather than a
-  // narrow derived. Skips the initial dispatch (xterm was constructed
-  // with `initialTheme` above).
-  let firstTheme = true;
-  entry.unsubTheme = settingsStore.subscribe((s) => {
-    if (firstTheme) {
-      firstTheme = false;
+  // V1.4-02: live appearance subscription — recomputes both theme and
+  // background mode on every settings change.
+  //
+  //   - When the renderer category stays the same (fast↔fast or
+  //     image↔image), updates apply in place: theme reassignment +
+  //     CSS variable updates on the host. xterm.js diffs colors
+  //     internally so identical themes are a no-op.
+  //   - When the renderer category flips (fast↔image), the Terminal
+  //     must be recreated — the canvas addon is loaded once at
+  //     construction and `allowTransparency` is constructor-only.
+  //     `queueRecreate` debounces so live slider drags during a global
+  //     edit don't thrash, and the recreate path uses pty_restart so
+  //     the still-running PTY is rebound to the new xterm.
+  //
+  // Skips the initial dispatch (xterm was constructed with the resolved
+  // theme + mode above).
+  let firstAppearance = true;
+  entry.unsubAppearance = settingsStore.subscribe((s) => {
+    if (firstAppearance) {
+      firstAppearance = false;
       return;
     }
     const tab = s.tabs.find((t) => t.id === tabId);
-    const next = tab
+    const baseTheme = tab
       ? effectiveTheme(tab, s.terminal.theme)
       : themeFromSetting(s.terminal.theme);
-    term.options.theme = next;
-    if (next.background) {
-      host.style.background = next.background;
+    const mode = effectiveBackgroundMode(
+      tab ?? { background_override: null },
+      s.terminal.background,
+    );
+
+    if (categoryOf(mode) !== entry.bgCategory) {
+      queueRecreate(tabId);
+      return;
     }
+
+    const nextTheme = composeTheme(baseTheme, mode);
+    term.options.theme = nextTheme;
+    if (nextTheme.background) {
+      host.style.background = nextTheme.background;
+    }
+    applyHostBackgroundCss(host, mode);
   });
 
   term.onData((data) => {
@@ -366,7 +429,30 @@ export function createTerminal(tabId: TabId): void {
   });
   entry.resizeObserver.observe(host);
 
-  void attemptSpawn(entry, false);
+  void attemptSpawn(entry, options.restartPty ?? false);
+}
+
+/// V1.4-02 recreate-on-toggle debounce. A category flip
+/// (fast ↔ image) requires a full Terminal recreation because the
+/// canvas addon and `allowTransparency` are construction-time
+/// decisions. Live slider drags during a global edit can fire many
+/// settings updates per second; debouncing collapses them into a
+/// single recreate after the user pauses.
+const recreateTimers = new Map<TabId, ReturnType<typeof setTimeout>>();
+
+function queueRecreate(tabId: TabId): void {
+  const existing = recreateTimers.get(tabId);
+  if (existing) clearTimeout(existing);
+  recreateTimers.set(
+    tabId,
+    setTimeout(() => {
+      recreateTimers.delete(tabId);
+      // The previous PTY is still alive — pty_restart shuts it down
+      // and respawns. Scrollback resets, per the V1.4-02 contract.
+      destroyTerminal(tabId);
+      createTerminal(tabId, { restartPty: true });
+    }, 120),
+  );
 }
 
 /// Tear down a tab's terminal. Destroys xterm, unsubscribes every
@@ -376,13 +462,22 @@ export function destroyTerminal(tabId: TabId): void {
   if (!entry) return;
   entries.delete(tabId);
 
+  // Cancel any pending background-toggle recreate so a tab close
+  // mid-debounce doesn't resurrect the terminal a few hundred ms
+  // later.
+  const pendingRecreate = recreateTimers.get(tabId);
+  if (pendingRecreate) {
+    clearTimeout(pendingRecreate);
+    recreateTimers.delete(tabId);
+  }
+
   if (entry.resizeTimer) clearTimeout(entry.resizeTimer);
   entry.resizeObserver?.disconnect();
   entry.unlistenExit?.();
   entry.unlistenRestart?.();
   entry.unsubFont();
   entry.unsubClosed?.();
-  entry.unsubTheme();
+  entry.unsubAppearance();
   setTerminalFocuser(tabId, null);
   // xterm.dispose() can throw if internal state was already partially
   // torn down by a rapid create-then-destroy or by a host element

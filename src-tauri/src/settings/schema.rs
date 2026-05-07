@@ -204,6 +204,11 @@ pub struct AiToolTabConfig {
     /// The override travels with the tab through drag-and-drop because
     /// it lives on the tab itself, not on a pane.
     pub theme_override: Option<TerminalThemeSettings>,
+    /// V1.4-02 per-tab background override (three-state). `None` means
+    /// inherit the global `terminal.background`; `Some(Disabled)` means
+    /// opt out (theme bg only); `Some(Custom(cfg))` replaces the global
+    /// background wholesale for this tab.
+    pub background_override: Option<BackgroundOverride>,
 }
 
 impl Default for AiToolTabConfig {
@@ -223,6 +228,7 @@ impl Default for AiToolTabConfig {
             notifications: AiNotificationConfig::default(),
             first_launch_notice_dismissed: false,
             theme_override: None,
+            background_override: None,
         }
     }
 }
@@ -242,6 +248,9 @@ pub struct ShellTabConfig {
     /// the global `terminal.theme`; `Some(_)` replaces it for this tab.
     /// See `AiToolTabConfig::theme_override` for the full rationale.
     pub theme_override: Option<TerminalThemeSettings>,
+    /// V1.4-02 per-tab background override (three-state). See
+    /// `AiToolTabConfig::background_override`.
+    pub background_override: Option<BackgroundOverride>,
 }
 
 impl Default for ShellTabConfig {
@@ -256,6 +265,7 @@ impl Default for ShellTabConfig {
             env: HashMap::new(),
             notifications: ShellNotificationConfig::default(),
             theme_override: None,
+            background_override: None,
         }
     }
 }
@@ -328,6 +338,7 @@ pub fn default_claude_tab() -> TabConfig {
         // code can use a single per-tab predicate.
         first_launch_notice_dismissed: true,
         theme_override: None,
+        background_override: None,
     })
 }
 
@@ -352,6 +363,7 @@ pub fn default_aider_tab() -> TabConfig {
         },
         first_launch_notice_dismissed: false,
         theme_override: None,
+        background_override: None,
     })
 }
 
@@ -370,6 +382,7 @@ pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
         env: HashMap::new(),
         notifications: ShellNotificationConfig::default(),
         theme_override: None,
+        background_override: None,
     })
 }
 
@@ -558,13 +571,19 @@ impl Default for UiSettings {
     }
 }
 
-/// Terminal-pane settings (V1.4-01+). Currently holds the xterm.js
-/// palette config; V1.4-02 will add a `background` sub-group to this
-/// same struct for image and solid-color background support.
+/// Terminal-pane settings (V1.4-01+). Holds the xterm.js palette config
+/// (V1.4-01) and the background image / solid-color sub-group (V1.4-02).
+/// Distinct from `ui`, which themes the cctts chrome.
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct TerminalSettings {
     pub theme: TerminalThemeSettings,
+    /// V1.4-02 background configuration. Image, color, and the
+    /// opacity/blur/size/position controls that apply only when an
+    /// image is set. See `MILESTONE-V1.4-02-terminal-background.md`
+    /// for the four-cell rendering matrix and the three-state
+    /// override semantics.
+    pub background: TerminalBackgroundSettings,
 }
 
 /// Terminal palette setting. `name` is either a bundled theme name
@@ -587,6 +606,111 @@ impl Default for TerminalThemeSettings {
         Self {
             name: "Default".to_string(),
             custom: None,
+        }
+    }
+}
+
+/// V1.4-02 terminal background configuration. `image` and `color` are
+/// independent (sibling fields, not a discriminated union) — both can be
+/// `Some` simultaneously, in which case `color` becomes the dimming-overlay
+/// tint atop `image`. `opacity`, `blur`, `size`, and `position` apply only
+/// when `image` is `Some`; when only `color` is set, the resolver
+/// rewrites the theme background and the renderer stays on the canvas
+/// fast path with no transparency cost.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct TerminalBackgroundSettings {
+    /// Absolute path to the background image. `None` means "no image".
+    /// Invalid paths surface a settings error and resolve to the
+    /// no-image rendering path; the `color` field, if set, still applies.
+    pub image: Option<PathBuf>,
+    /// Hex color (e.g., `"#1a2b3c"`). When `image` is `None`, this
+    /// replaces the resolved theme's background field. When `image` is
+    /// `Some`, this drives the dimming-overlay tint (default black if
+    /// `None`).
+    pub color: Option<String>,
+    /// Image-mode dimming-overlay alpha. 0.0-1.0. Ignored when `image`
+    /// is `None`.
+    pub opacity: f32,
+    /// Image-mode CSS `backdrop-filter: blur(...)` radius in pixels.
+    /// Ignored when `image` is `None`.
+    pub blur: u32,
+    /// Image-mode CSS `background-size` strategy. Ignored when `image`
+    /// is `None`.
+    pub size: BackgroundSize,
+    /// Image-mode CSS `background-position` value. Ignored when `image`
+    /// is `None`.
+    pub position: String,
+}
+
+impl Default for TerminalBackgroundSettings {
+    fn default() -> Self {
+        Self {
+            image: None,
+            color: None,
+            opacity: 0.4,
+            blur: 0,
+            size: BackgroundSize::Cover,
+            position: "center".to_string(),
+        }
+    }
+}
+
+/// CSS `background-size` strategy. `Tile` is mapped to
+/// `background-repeat: repeat` + `background-size: auto` on the
+/// frontend; `Cover` and `Contain` map directly to their CSS values.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundSize {
+    Cover,
+    Contain,
+    Tile,
+}
+
+impl Default for BackgroundSize {
+    fn default() -> Self {
+        Self::Cover
+    }
+}
+
+/// V1.4-02 three-state per-tab override. Encodes:
+///   - `None` (the field is `null` on disk, or the override variant is
+///     `None`): inherit the global `terminal.background`.
+///   - `Some(BackgroundOverride::Disabled)` (`"disabled"` on disk):
+///     opt out of any background — render with theme bg only,
+///     ignoring both global image and global color.
+///   - `Some(BackgroundOverride::Custom(cfg))` (full object on disk):
+///     this tab's background config replaces the global one wholesale.
+///
+/// Custom (de)serialize because `serde(untagged)` can't express the
+/// literal-string `"disabled"` cleanly alongside an object variant.
+#[derive(Clone, Debug)]
+pub enum BackgroundOverride {
+    Disabled,
+    Custom(TerminalBackgroundSettings),
+}
+
+impl Serialize for BackgroundOverride {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Disabled => s.serialize_str("disabled"),
+            Self::Custom(c) => c.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BackgroundOverride {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::String(ref s) if s == "disabled" => Ok(Self::Disabled),
+            serde_json::Value::Object(_) => serde_json::from_value(v)
+                .map(Self::Custom)
+                .map_err(D::Error::custom),
+            _ => Err(D::Error::custom(
+                "background_override: expected \"disabled\" string or background config object",
+            )),
         }
     }
 }
@@ -689,5 +813,81 @@ impl Default for ProcessingSettings {
             stability_timeout_ms: 200,
             max_hold_ms: 500,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn background_override_null_round_trips_as_none() {
+        // Field-level: serializing/deserializing the Option<BackgroundOverride>
+        // with `None` produces a JSON `null`.
+        let none: Option<BackgroundOverride> = None;
+        let v = serde_json::to_value(&none).unwrap();
+        assert_eq!(v, Value::Null);
+        let parsed: Option<BackgroundOverride> = serde_json::from_value(Value::Null).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn background_override_disabled_string_round_trips() {
+        let disabled = Some(BackgroundOverride::Disabled);
+        let v = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(v, json!("disabled"));
+        let parsed: Option<BackgroundOverride> = serde_json::from_value(json!("disabled")).unwrap();
+        assert!(matches!(parsed, Some(BackgroundOverride::Disabled)));
+    }
+
+    #[test]
+    fn background_override_custom_object_round_trips() {
+        let cfg = TerminalBackgroundSettings {
+            image: Some(PathBuf::from("/tmp/bg.png")),
+            color: Some("#1a2b3c".to_string()),
+            opacity: 0.7,
+            blur: 12,
+            size: BackgroundSize::Contain,
+            position: "top left".to_string(),
+        };
+        let custom = Some(BackgroundOverride::Custom(cfg.clone()));
+        let v = serde_json::to_value(&custom).unwrap();
+        assert!(v.is_object(), "custom override should serialize as an object");
+        let parsed: Option<BackgroundOverride> = serde_json::from_value(v).unwrap();
+        match parsed {
+            Some(BackgroundOverride::Custom(out)) => {
+                assert_eq!(out.image, cfg.image);
+                assert_eq!(out.color, cfg.color);
+                assert!((out.opacity - cfg.opacity).abs() < f32::EPSILON);
+                assert_eq!(out.blur, cfg.blur);
+                assert_eq!(out.size, cfg.size);
+                assert_eq!(out.position, cfg.position);
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_override_rejects_garbage() {
+        // Numbers, arrays, and arbitrary strings all fail with the
+        // explicit error message — the only valid string is "disabled".
+        for v in [json!(42), json!([1, 2, 3]), json!("random")] {
+            let result: Result<BackgroundOverride, _> = serde_json::from_value(v);
+            assert!(result.is_err(), "expected error for invalid override input");
+        }
+    }
+
+    #[test]
+    fn background_settings_default_matches_milestone_doc() {
+        // Sanity check on the values the migration writes — opacity 0.4,
+        // blur 0, size cover, position center, no image, no color.
+        let d = TerminalBackgroundSettings::default();
+        assert!(d.image.is_none());
+        assert!(d.color.is_none());
+        assert!((d.opacity - 0.4).abs() < f32::EPSILON);
+        assert_eq!(d.blur, 0);
+        assert_eq!(d.size, BackgroundSize::Cover);
+        assert_eq!(d.position, "center");
     }
 }

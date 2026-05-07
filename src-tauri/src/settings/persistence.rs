@@ -373,6 +373,7 @@ mod tests {
             env: Default::default(),
             notifications: Default::default(),
             theme_override: None,
+            background_override: None,
         }));
         let user_pos_before = s.tabs.len() - 1;
 

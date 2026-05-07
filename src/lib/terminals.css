@@ -1,0 +1,47 @@
+/* V1.4-02 terminal host styling.
+ *
+ * Lifted from inline styles on the host element. The base layout
+ * rules (full-size, padded, box-sized) match the original V1.4-01
+ * inlining; the new rules are the .bg-image branch and the
+ * ::before image / .xterm backdrop-filter stack.
+ *
+ * Layering, when an image background is active:
+ *
+ *   .terminal-host  ← host, position: relative
+ *     ├ ::before    ← image, z-index: 0
+ *     └ .xterm      ← cells layer, z-index: 1, backdrop-filter: blur
+ *
+ * `backdrop-filter` blurs *what is behind the element it is applied
+ * to*. With .xterm at z-index 1 and ::before at z-index 0, the
+ * .xterm layer's backdrop is the image — so the image gets blurred
+ * while the cells stay sharp. xterm.js opens directly into the
+ * host, so this approach avoids any DOM restructuring.
+ */
+
+.terminal-host {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 4px;
+}
+
+.terminal-host.bg-image {
+  position: relative;
+}
+
+.terminal-host.bg-image::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: var(--bg-image);
+  background-size: var(--bg-size, cover);
+  background-repeat: var(--bg-repeat, no-repeat);
+  background-position: var(--bg-position, center);
+  z-index: 0;
+}
+
+.terminal-host.bg-image .xterm {
+  position: relative;
+  z-index: 1;
+  backdrop-filter: blur(var(--bg-blur, 0));
+}

@@ -130,6 +130,10 @@ export interface AiToolTabConfig {
   /// V1.4-01 per-tab terminal palette override. `null` inherits the
   /// global `terminal.theme`; non-null replaces it for this tab.
   theme_override: TerminalThemeSettings | null;
+  /// V1.4-02 per-tab background override (three-state). `null` inherits
+  /// the global `terminal.background`; `"disabled"` opts out (theme bg
+  /// only); a full settings object replaces the global wholesale.
+  background_override: BackgroundOverrideWire | null;
 }
 
 export interface ShellTabConfig {
@@ -145,6 +149,9 @@ export interface ShellTabConfig {
   /// V1.4-01 per-tab terminal palette override. `null` inherits the
   /// global `terminal.theme`; non-null replaces it for this tab.
   theme_override: TerminalThemeSettings | null;
+  /// V1.4-02 per-tab background override (three-state). See
+  /// `AiToolTabConfig.background_override`.
+  background_override: BackgroundOverrideWire | null;
 }
 
 export type TabConfig = AiToolTabConfig | ShellTabConfig;
@@ -180,11 +187,45 @@ export interface TerminalThemeSettings {
   custom: ThemeColorsWire | null;
 }
 
-/// V1.4-01: terminal-pane settings. Currently holds the xterm.js
-/// palette config; V1.4-02 extends with `background` for image and
-/// solid-color background support.
+/// V1.4-02: CSS `background-size` strategy. `tile` is mapped on the
+/// frontend to `background-repeat: repeat` + `background-size: auto`;
+/// `cover` and `contain` map directly to their CSS values.
+export type BackgroundSize = 'cover' | 'contain' | 'tile';
+
+/// V1.4-02 terminal background config. `image` and `color` are
+/// independent — both can be set, in which case `color` becomes the
+/// dimming-overlay tint atop the image. The opacity / blur / size /
+/// position fields apply only when `image` is set; the resolver in
+/// `src/lib/terminal/background.ts` enforces this.
+export interface TerminalBackgroundSettings {
+  image: string | null;
+  color: string | null;
+  opacity: number;
+  blur: number;
+  size: BackgroundSize;
+  position: string;
+}
+
+/// V1.4-02 three-state per-tab override on the wire. The literal
+/// `'disabled'` string opts the tab out of any background; an object
+/// is a full per-tab config; `null` (handled at the field level on the
+/// containing tab type) inherits the global setting.
+export type BackgroundOverrideWire = 'disabled' | TerminalBackgroundSettings;
+
+/// Type guard: distinguishes the `'disabled'` literal from the object
+/// branch so callers can narrow safely without struct-vs-string runtime
+/// checks scattered around the codebase.
+export function isBackgroundDisabled(
+  o: BackgroundOverrideWire | null,
+): o is 'disabled' {
+  return o === 'disabled';
+}
+
+/// V1.4-01+: terminal-pane settings. Holds the xterm.js palette config
+/// (V1.4-01) and the V1.4-02 background sub-group.
 export interface TerminalSettings {
   theme: TerminalThemeSettings;
+  background: TerminalBackgroundSettings;
 }
 
 /// Persisted layout state (V4-04). Mirrors the in-memory `LayoutState`
@@ -333,6 +374,7 @@ export function defaultSettings(): Settings {
         },
         first_launch_notice_dismissed: true,
         theme_override: null,
+        background_override: null,
       },
       {
         kind: 'ai_tool',
@@ -352,6 +394,7 @@ export function defaultSettings(): Settings {
         },
         first_launch_notice_dismissed: false,
         theme_override: null,
+        background_override: null,
       },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
@@ -359,6 +402,16 @@ export function defaultSettings(): Settings {
     layout: null,
     layout_presets: [],
     ui: { theme: 'modern-dark' },
-    terminal: { theme: { name: 'Default', custom: null } },
+    terminal: {
+      theme: { name: 'Default', custom: null },
+      background: {
+        image: null,
+        color: null,
+        opacity: 0.4,
+        blur: 0,
+        size: 'cover',
+        position: 'center',
+      },
+    },
   };
 }

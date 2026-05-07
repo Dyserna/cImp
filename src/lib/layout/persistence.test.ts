@@ -23,6 +23,7 @@ function shellTab(id: string): TabConfig {
     env: {},
     notifications: { error: '', exited: '' },
     theme_override: null,
+    background_override: null,
   };
 }
 

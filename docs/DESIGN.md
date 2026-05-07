@@ -617,6 +617,14 @@ The on-disk JSON shape, current as of v1.3:
     "theme": {
       "name": "Default",
       "custom": null
+    },
+    "background": {
+      "image": null,
+      "color": null,
+      "opacity": 0.4,
+      "blur": 0,
+      "size": "cover",
+      "position": "center"
     }
   },
   "behavior": {
@@ -662,7 +670,8 @@ The on-disk JSON shape, current as of v1.3:
         "error": "Claude encountered an error"
       },
       "first_launch_notice_dismissed": true,
-      "theme_override": null
+      "theme_override": null,
+      "background_override": null
     },
     {
       "kind": "ai_tool",
@@ -677,7 +686,8 @@ The on-disk JSON shape, current as of v1.3:
       "tts_injection": { "enabled": false, "instructions": "" },
       "notifications": { "...": "..." },
       "first_launch_notice_dismissed": false,
-      "theme_override": { "name": "Solarized Dark", "custom": null }
+      "theme_override": { "name": "Solarized Dark", "custom": null },
+      "background_override": "disabled"
     },
     {
       "kind": "shell",
@@ -692,7 +702,8 @@ The on-disk JSON shape, current as of v1.3:
         "error": "Shell encountered an error",
         "exited": "Shell exited (code {code})"
       },
-      "theme_override": null
+      "theme_override": null,
+      "background_override": null
     }
   ],
   "processing": { "stability_timeout_ms": 200, "max_hold_ms": 500 },
@@ -725,6 +736,7 @@ Notes:
 - Reserved tab ids — `claude`, `aider`, `shell-default-1` — cannot disappear. The integrity check restores them with `builtin: true` and the right `ai_tool_kind` if a hand-edited file deletes or corrupts them. User-created Shell tab ids are uuid-based and never collide.
 - `session.active_tab_id` is a legacy field. It still exists in the struct and is updated by the runtime on tab activation, but the v1.2 → v1.3 migration drops it from the file (the layout's per-pane `active_tab_id` plus `focused_pane_id` are the source of truth for active-tab state). Cleanup of the runtime write path is deferred.
 - `layout: null` on fresh installs and on the very first hydration after migration if for some reason no layout was synthesized; the frontend's `defaultLayoutForTabs` handles the null case by building a single root pane.
+- `terminal.background` (V1.4-02) has independent `image` and `color` fields plus opacity/blur/size/position controls that apply only when an image is set. The four-cell rendering matrix (image × color, each Some/None) drives a discriminated `RenderingMode` — `'none'` and `'color'` use xterm.js's canvas renderer (fast); `'image'` uses the in-core DOM renderer with `allowTransparency: true` and CSS layering on the host. Toggling between fast and image categories triggers a debounced Terminal recreate (scrollback resets); same-category changes (color tweak, slider drag) apply in place. Per-tab `background_override` is three-state: `null` inherits the global, `"disabled"` opts out (theme bg only), an object replaces the global wholesale. See `MILESTONE-V1.4-02-terminal-background.md`.
 
 ---
 

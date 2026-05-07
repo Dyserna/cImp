@@ -77,6 +77,19 @@ pub fn migrate_if_needed(
         changed = true;
     }
 
+    // v1.4 → v1.5: V1.4-02 adds the `terminal.background` sub-group and
+    // a per-tab `background_override` field. Detected as "has terminal
+    // (v1.4) but lacks terminal.background (v1.5)". Cascades naturally
+    // for files coming through earlier branches — by the time control
+    // reaches here, the v1.3→v1.4 branch has already inserted
+    // `terminal.theme`, so this branch fires once on every cold-start
+    // file from v1.0 through v1.4.
+    if looks_v1_4(value) {
+        write_backup(path, "v1.4", value)?;
+        migrate_v1_4_to_v1_5(value);
+        changed = true;
+    }
+
     Ok(changed)
 }
 
@@ -118,6 +131,26 @@ fn looks_v1_3(value: &Value) -> bool {
         return false;
     };
     obj.contains_key("layout") && !obj.contains_key("terminal")
+}
+
+/// Is this a v1.4 file that lacks the v1.5 `terminal.background` field?
+/// V1.4-02's schema-bump check. `terminal` must be present (else we
+/// haven't run the v1.4 step yet); `terminal.background` must be absent.
+/// A fresh-install v1.5 file has `terminal.background` populated and
+/// skips this branch — the `serde(default)` impl on
+/// `TerminalBackgroundSettings` would also tolerate the absence on
+/// load, but we want the on-disk file to be self-describing and the
+/// pre-migration backup to exist.
+fn looks_v1_4(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let has_terminal = obj.contains_key("terminal");
+    let has_terminal_background = obj
+        .get("terminal")
+        .and_then(|t| t.get("background"))
+        .is_some();
+    has_terminal && !has_terminal_background
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -450,6 +483,47 @@ fn migrate_v1_3_to_v1_4(value: &mut Value) {
         for tab in tabs.iter_mut() {
             if let Some(obj) = tab.as_object_mut() {
                 obj.insert("theme_override".to_string(), Value::Null);
+            }
+        }
+    }
+}
+
+// --- v1.4 → v1.5 ------------------------------------------------------------
+
+/// V1.4-02: add `terminal.background` with defaults and stamp
+/// `background_override: null` on every existing tab.
+///
+/// Defaults must match `TerminalBackgroundSettings::default()` in
+/// `schema.rs` — keep these in sync. The schema's `Default` impl is
+/// what callers see when the field is absent on disk; this migration
+/// makes the same values explicit so the on-disk file is
+/// self-describing and the v1.4 backup is honest.
+///
+/// Idempotent on second pass because the inserted
+/// `terminal.background` key makes `looks_v1_4` return false next time.
+fn migrate_v1_4_to_v1_5(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(terminal) = root.get_mut("terminal").and_then(Value::as_object_mut) {
+        terminal.insert(
+            "background".to_string(),
+            json!({
+                "image": null,
+                "color": null,
+                "opacity": 0.4,
+                "blur": 0,
+                "size": "cover",
+                "position": "center"
+            }),
+        );
+    }
+
+    if let Some(tabs) = root.get_mut("tabs").and_then(Value::as_array_mut) {
+        for tab in tabs.iter_mut() {
+            if let Some(obj) = tab.as_object_mut() {
+                obj.insert("background_override".to_string(), Value::Null);
             }
         }
     }
@@ -846,6 +920,109 @@ mod tests {
         for tab in tabs {
             assert!(tab.get("theme_override").unwrap().is_null());
         }
+    }
+
+    #[test]
+    fn v1_4_to_v1_5_adds_background_group_and_stamps_overrides() {
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [
+                    { "kind": "ai_tool", "id": "claude", "name": "Claude", "theme_override": null },
+                    { "kind": "shell", "id": "shell-default-1", "name": "Shell 1", "theme_override": null }
+                ],
+                "layout": {
+                    "tree": { "type": "pane", "id": "pane-1", "tab_ids": ["claude", "shell-default-1"], "active_tab_id": "claude" },
+                    "focused_pane_id": "pane-1"
+                },
+                "terminal": {
+                    "theme": { "name": "Default", "custom": null }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(looks_v1_4(&v));
+        migrate_v1_4_to_v1_5(&mut v);
+
+        // terminal.background populated with milestone-doc defaults.
+        let bg = v
+            .get("terminal")
+            .and_then(|t| t.get("background"))
+            .expect("terminal.background inserted");
+        assert!(bg.get("image").unwrap().is_null());
+        assert!(bg.get("color").unwrap().is_null());
+        assert_eq!(bg.get("opacity").unwrap().as_f64().unwrap(), 0.4);
+        assert_eq!(bg.get("blur").unwrap().as_u64().unwrap(), 0);
+        assert_eq!(bg.get("size").unwrap(), "cover");
+        assert_eq!(bg.get("position").unwrap(), "center");
+
+        // Every tab has background_override: null.
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        for tab in tabs {
+            let key = tab
+                .as_object()
+                .and_then(|o| o.get("background_override"))
+                .expect("background_override stamped");
+            assert!(key.is_null());
+        }
+
+        // Re-detection is false after migration.
+        assert!(!looks_v1_4(&v));
+    }
+
+    #[test]
+    fn v1_5_file_is_not_re_detected() {
+        // Fresh-install v1.5 file: `terminal.background` is present.
+        let v: Value = serde_json::from_str(
+            r#"{
+                "tabs": [{ "kind": "ai_tool", "id": "claude", "theme_override": null, "background_override": null }],
+                "layout": null,
+                "terminal": {
+                    "theme": { "name": "Default", "custom": null },
+                    "background": { "image": null, "color": null, "opacity": 0.4, "blur": 0, "size": "cover", "position": "center" }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(!looks_v1_4(&v));
+    }
+
+    #[test]
+    fn v1_2_cascades_through_v1_3_v1_4_and_v1_5() {
+        // A v1.2 file (tabs array, no layout) coming in cold should
+        // exit migration as a v1.5 file: layout populated, terminal
+        // group populated with theme + background, theme_override and
+        // background_override stamped on every tab.
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "display": { "theme": "dark" },
+                "tabs": [
+                    { "kind": "ai_tool", "id": "claude", "name": "Claude" },
+                    { "kind": "shell", "id": "shell-default-1", "name": "Shell 1" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(looks_v1_2(&v));
+        migrate_v1_2_to_v1_3(&mut v);
+        assert!(looks_v1_3(&v));
+        migrate_v1_3_to_v1_4(&mut v);
+        assert!(looks_v1_4(&v));
+        migrate_v1_4_to_v1_5(&mut v);
+
+        // Final state: layout, terminal.theme, terminal.background, both
+        // override fields on each tab.
+        assert!(v.get("layout").is_some());
+        let terminal = v.get("terminal").expect("terminal present");
+        assert!(terminal.get("theme").is_some());
+        assert!(terminal.get("background").is_some());
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        for tab in tabs {
+            assert!(tab.get("theme_override").unwrap().is_null());
+            assert!(tab.get("background_override").unwrap().is_null());
+        }
+        assert!(!looks_v1_4(&v));
     }
 
     #[test]

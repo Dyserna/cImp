@@ -26,6 +26,18 @@ export async function ptyRestart(
   await invoke('pty_restart', { tab, channel, rows, cols });
 }
 
+/// V1.4-03: re-point a still-running PTY's bytes at a fresh channel.
+/// Used by the renderer-flip recreate path so the shell session, env,
+/// cwd, and running processes survive the xterm.js destroy/create
+/// cycle. Errors when the PTY isn't registered or has already exited
+/// — the caller handles the fallback to `ptyStart`.
+export async function ptyRebindChannel(
+  tab: TabId,
+  channel: BytesChannel,
+): Promise<void> {
+  await invoke('pty_rebind_channel', { tab, channel });
+}
+
 export async function ptyWrite(tab: TabId, input: string): Promise<void> {
   await invoke('pty_write', { tab, input });
 }
@@ -147,6 +159,14 @@ export interface ReconfigureShellTabInput {
   /// global `terminal.theme`. The backend stamps it onto
   /// `tabs[].theme_override` in the same write that updates command/args.
   themeOverride: import('./settings/types').TerminalThemeSettings | null;
+  /// V1.4-03 per-tab terminal background override. Three-state:
+  ///   `null`        → inherit global `terminal.background`
+  ///   `'disabled'`  → opt this tab out, even if global has an image/color
+  ///   `{...config}` → use this config for this tab specifically
+  /// Stamped onto `tabs[].background_override` in the same write.
+  backgroundOverride:
+    | import('./settings/types').BackgroundOverrideWire
+    | null;
 }
 
 export async function reconfigureShellTab(input: ReconfigureShellTabInput): Promise<void> {

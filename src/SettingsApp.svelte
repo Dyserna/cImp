@@ -25,6 +25,7 @@
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
   import ThemeSwatch from './lib/settings/ThemeSwatch.svelte';
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
+  import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
   import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from './lib/themes';
   import type { ThemeColorsWire } from './lib/settings/types';
 
@@ -139,66 +140,6 @@
   /// view of `snapshot.tabs` so the template can render AI tabs and Shell
   /// tabs differently. Empty array when settings haven't loaded yet.
   const tabEntries = $derived<TabConfig[]>(snapshot?.tabs ?? []);
-
-  // V1.4-02 terminal background mode. Initialised once from the loaded
-  // snapshot, then driven entirely by the user's clicks. We deliberately
-  // avoid an ongoing $effect that re-derives from `(image, color)` —
-  // that would clobber a "user picked Image but hasn't chosen a file
-  // yet" intent the moment the patch flush returns and re-fires the
-  // snapshot subscription.
-  let bgMode = $state<'theme' | 'color' | 'image'>('theme');
-  let bgModeInitialised = false;
-  $effect(() => {
-    if (!snapshot || bgModeInitialised) return;
-    const bg = snapshot.terminal.background;
-    bgMode = bg.image ? 'image' : bg.color ? 'color' : 'theme';
-    bgModeInitialised = true;
-  });
-
-  function setBgMode(next: 'theme' | 'color' | 'image') {
-    bgMode = next;
-    patch((s) => {
-      const bg = s.terminal.background;
-      if (next === 'theme') {
-        bg.image = null;
-        bg.color = null;
-      } else if (next === 'color') {
-        bg.image = null;
-        if (!bg.color) bg.color = '#1a1a1a';
-      }
-      // 'image': don't write yet — user picks file next via pickBgImage.
-    });
-  }
-
-  async function pickBgImage() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [
-        {
-          name: 'Images',
-          extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'],
-        },
-      ],
-    });
-    if (typeof selected === 'string') {
-      patch((s) => {
-        s.terminal.background.image = selected;
-      });
-    }
-  }
-
-  function clearBgImage() {
-    patch((s) => {
-      s.terminal.background.image = null;
-    });
-  }
-
-  function clearBgTint() {
-    patch((s) => {
-      s.terminal.background.color = null;
-    });
-  }
 
   function aiTabAt(id: string): AiToolTabConfig | null {
     return aiTabFromSnapshot(id);
@@ -583,152 +524,16 @@
         />
       {/if}
 
-      <label class="palette-row">
-        <span>Terminal background</span>
-        <select
-          value={bgMode}
-          onchange={(e) =>
-            setBgMode(
-              (e.currentTarget as HTMLSelectElement).value as
-                | 'theme'
-                | 'color'
-                | 'image',
-            )}
-        >
-          <option value="theme">Theme default</option>
-          <option value="color">Solid color</option>
-          <option value="image">Image</option>
-        </select>
-      </label>
-      <small class="hint">
-        Solid color is rendered with no performance cost. Image switches
-        to a slower DOM renderer (2-5× slower for high-throughput output)
-        and resets the tab's scrollback when toggled.
-      </small>
-
-      {#if bgMode === 'color'}
-        <label>
-          <span>Background color</span>
-          <input
-            type="color"
-            value={snapshot.terminal.background.color ?? '#1a1a1a'}
-            onchange={(e) =>
-              patch(
-                (s) =>
-                  (s.terminal.background.color = (
-                    e.currentTarget as HTMLInputElement
-                  ).value),
-              )}
-          />
-        </label>
-        <small class="hint">Overrides the theme's background color.</small>
-      {:else if bgMode === 'image'}
-        <label>
-          <span>Image file</span>
-          <span class="bg-image-row">
-            <button type="button" onclick={pickBgImage}>Choose…</button>
-            {#if snapshot.terminal.background.image}
-              <code class="bg-image-path"
-                >{snapshot.terminal.background.image}</code
-              >
-              <button type="button" onclick={clearBgImage}>Clear</button>
-            {:else}
-              <small class="hint">No image selected.</small>
-            {/if}
-          </span>
-        </label>
-        <label>
-          <span>Opacity</span>
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.05"
-            value={snapshot.terminal.background.opacity}
-            oninput={(e) =>
-              patch(
-                (s) =>
-                  (s.terminal.background.opacity = +(
-                    e.currentTarget as HTMLInputElement
-                  ).value),
-              )}
-          />
-          <small>{snapshot.terminal.background.opacity.toFixed(2)}</small>
-        </label>
-        <label>
-          <span>Blur (px)</span>
-          <input
-            type="range"
-            min="0"
-            max="40"
-            step="1"
-            value={snapshot.terminal.background.blur}
-            oninput={(e) =>
-              patch(
-                (s) =>
-                  (s.terminal.background.blur = +(
-                    e.currentTarget as HTMLInputElement
-                  ).value),
-              )}
-          />
-          <small>{snapshot.terminal.background.blur}</small>
-        </label>
-        <label>
-          <span>Size</span>
-          <select
-            value={snapshot.terminal.background.size}
-            onchange={(e) =>
-              patch(
-                (s) =>
-                  (s.terminal.background.size = (
-                    e.currentTarget as HTMLSelectElement
-                  ).value as 'cover' | 'contain' | 'tile'),
-              )}
-          >
-            <option value="cover">cover</option>
-            <option value="contain">contain</option>
-            <option value="tile">tile</option>
-          </select>
-        </label>
-        <label>
-          <span>Position</span>
-          <input
-            type="text"
-            placeholder="center"
-            value={snapshot.terminal.background.position}
-            onchange={(e) =>
-              patch(
-                (s) =>
-                  (s.terminal.background.position = (
-                    e.currentTarget as HTMLInputElement
-                  ).value),
-              )}
-          />
-        </label>
-        <label>
-          <span>Tint color</span>
-          <span class="bg-image-row">
-            <input
-              type="color"
-              value={snapshot.terminal.background.color ?? '#000000'}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.terminal.background.color = (
-                      e.currentTarget as HTMLInputElement
-                    ).value),
-                )}
-            />
-            {#if snapshot.terminal.background.color}
-              <button type="button" onclick={clearBgTint}>Reset</button>
-            {/if}
-          </span>
-        </label>
-        <small class="hint">
-          Tints the dimming overlay drawn beneath the cells. Defaults to
-          black when unset.
-        </small>
-      {/if}
+      <h3>Terminal background</h3>
+      <BackgroundConfigEditor
+        bind:config={
+          () => snapshot!.terminal.background,
+          (v) =>
+            patch((s) => {
+              s.terminal.background = v;
+            })
+        }
+      />
     </section>
 
     <section>

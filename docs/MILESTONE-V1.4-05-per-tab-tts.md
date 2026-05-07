@@ -1,8 +1,8 @@
-# Milestone V1.4-04: Per-Tab TTS Settings (Skeleton)
+# Milestone V1.4-05: Per-Tab TTS Settings (Skeleton)
 
 ## Purpose
 
-Item 4 from `FEATURE-per-tab-overrides.md`. Per-tab voice / speed / volume override so each tab can have its own TTS identity (e.g., a distinct voice for the Claude tab vs. aider tab). Read V1.4-01 first — V1.4-04 follows the same pattern, but the *resolver* lives in Rust because TTS happens in the backend.
+Item 4 from `FEATURE-per-tab-overrides.md`. Per-tab voice / speed / volume override so each tab can have its own TTS identity (e.g., a distinct voice for the Claude tab vs. aider tab). Read V1.4-01 first — V1.4-05 follows the same pattern, but the *resolver* lives in Rust because TTS happens in the backend.
 
 ## What This Milestone Delivers
 

@@ -74,6 +74,22 @@ pub async fn pty_restart(
         .await
 }
 
+/// V1.4-03: re-point a still-running PTY's bytes at a fresh JS-side
+/// `Channel<String>` without restarting the shell. The frontend invokes
+/// this when the xterm.js Terminal is destroyed and recreated for a
+/// renderer-category flip (background image toggled on or off). The
+/// shell session, env, cwd, and any in-flight processes survive; only
+/// the IPC channel is replaced.
+#[tauri::command]
+pub async fn pty_rebind_channel(
+    state: State<'_, AppState>,
+    tab: TabId,
+    channel: Channel<String>,
+) -> AppResult<()> {
+    let registry = state.tabs.lock().await;
+    registry.rebind_channel(tab, channel).await
+}
+
 #[tauri::command]
 pub async fn pty_write(
     state: State<'_, AppState>,

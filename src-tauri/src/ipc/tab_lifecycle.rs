@@ -363,6 +363,7 @@ pub async fn reconfigure_shell_tab(
     notifications_error: String,
     notifications_exited: String,
     theme_override: Option<crate::settings::TerminalThemeSettings>,
+    background_override: Option<crate::settings::BackgroundOverride>,
 ) -> Result<(), TabLifecycleError> {
     if !matches!(tab.kind(), TabKind::Shell) {
         return Err(TabLifecycleError::WrongKind);
@@ -402,6 +403,7 @@ pub async fn reconfigure_shell_tab(
         cfg.env = validated.env.clone();
         cfg.notifications = notifications;
         cfg.theme_override = theme_override;
+        cfg.background_override = background_override;
         // builtin/id stay as they were.
         state.settings.set(snap);
     }

@@ -298,6 +298,26 @@ impl TabRegistry {
         result
     }
 
+    /// V1.4-03: rebind the PTY's output channel to a fresh
+    /// `Channel<String>` without restarting the shell. Used when the
+    /// JS-side xterm is destroyed and recreated for a renderer-category
+    /// flip (image ↔ fast). Errors propagate from `PtyManager::rebind_channel`
+    /// — `NotStarted` if the PTY never spawned, `Pty("processor task gone")`
+    /// if the child has exited and the processor task already cleaned up.
+    /// In either case the caller (frontend `attemptSpawn(entry, 'rebind')`)
+    /// falls back to a fresh `pty_start`.
+    pub async fn rebind_channel(
+        &self,
+        tab: TabId,
+        new_channel: Channel<String>,
+    ) -> AppResult<()> {
+        let manager = self
+            .managers
+            .get(&tab)
+            .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
+        manager.rebind_channel(new_channel).await
+    }
+
     pub async fn write(&self, tab: TabId, bytes: Vec<u8>) -> AppResult<()> {
         let manager = self
             .managers

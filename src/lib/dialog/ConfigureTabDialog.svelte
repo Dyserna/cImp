@@ -18,12 +18,15 @@
   import ShellTabFields from './ShellTabFields.svelte';
   import { settings as settingsStore } from '../settings/store';
   import type {
+    BackgroundOverrideWire,
+    TerminalBackgroundSettings,
     TerminalThemeSettings,
     ThemeColorsWire,
   } from '../settings/types';
   import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from '../themes';
   import ThemeSwatch from '../settings/ThemeSwatch.svelte';
   import CustomThemeEditor from '../settings/CustomThemeEditor.svelte';
+  import BackgroundConfigEditor from '../settings/BackgroundConfigEditor.svelte';
 
   let name = $state('');
   let command = $state('');
@@ -32,12 +35,19 @@
   let notificationsError = $state('');
   let notificationsExited = $state('');
   let themeOverride = $state<TerminalThemeSettings | null>(null);
+  let backgroundOverride = $state<BackgroundOverrideWire | null>(null);
   let error = $state<TabLifecycleError | null>(null);
   let busy = $state(false);
 
   // Live global theme name, used for the "Use global default (current: X)"
   // entry label. Reactive via $derived so changes elsewhere reflect.
   let globalThemeName = $derived($settingsStore.terminal.theme.name);
+
+  // V1.4-03: human-readable summary of the global background, shown in
+  // the "Use global default" Background-row option label.
+  let globalBgSummary = $derived(
+    globalBgSummaryOf($settingsStore.terminal.background),
+  );
 
   // Override-row dropdown value:
   //   '__inherit'      → themeOverride = null
@@ -46,6 +56,28 @@
   let overrideSelection = $derived(
     themeOverride === null ? '__inherit' : themeOverride.name,
   );
+
+  // V1.4-03: three-state Background override.
+  //   '__inherit'  → backgroundOverride = null
+  //   '__disabled' → backgroundOverride = 'disabled'
+  //   '__custom'   → backgroundOverride = TerminalBackgroundSettings object
+  type BgOverrideMode = '__inherit' | '__disabled' | '__custom';
+  let bgOverrideSelection = $derived<BgOverrideMode>(
+    backgroundOverride === null
+      ? '__inherit'
+      : backgroundOverride === 'disabled'
+        ? '__disabled'
+        : '__custom',
+  );
+
+  function globalBgSummaryOf(bg: TerminalBackgroundSettings): string {
+    if (bg.image) {
+      const filename = bg.image.split(/[\\/]/).pop() ?? bg.image;
+      return `image: ${filename}`;
+    }
+    if (bg.color) return `solid ${bg.color}`;
+    return 'theme background';
+  }
 
   let isOpen = $derived($dialogState.kind === 'configure-tab');
   let targetTab = $derived(
@@ -72,6 +104,7 @@
     // because the backend broadcasts on change.
     const liveTab = get(settingsStore).tabs.find((t) => t.id === tab);
     themeOverride = liveTab?.theme_override ?? null;
+    backgroundOverride = liveTab?.background_override ?? null;
     try {
       const cfg = await getShellTabConfig(tab);
       name = cfg.name;
@@ -119,6 +152,30 @@
     themeOverride = { name: value, custom: null };
   }
 
+  /// V1.4-03: translate the Background-row dropdown selection into a
+  /// `background_override` value. Custom mode seeds from the existing
+  /// override (if any) or the current global background.
+  function selectBgOverride(value: BgOverrideMode): void {
+    if (value === '__inherit') {
+      backgroundOverride = null;
+      return;
+    }
+    if (value === '__disabled') {
+      backgroundOverride = 'disabled';
+      return;
+    }
+    // '__custom' — already custom: preserve.
+    if (
+      backgroundOverride !== null &&
+      backgroundOverride !== 'disabled' &&
+      typeof backgroundOverride === 'object'
+    ) {
+      return;
+    }
+    const liveGlobal = get(settingsStore).terminal.background;
+    backgroundOverride = { ...liveGlobal };
+  }
+
   function cancel(): void {
     closeDialog();
   }
@@ -138,6 +195,7 @@
         notificationsError,
         notificationsExited,
         themeOverride,
+        backgroundOverride,
       });
       closeDialog();
     } catch (e) {
@@ -228,6 +286,41 @@
       />
     {/if}
 
+    <label class="appearance-row">
+      <span>Background</span>
+      <select
+        value={bgOverrideSelection}
+        onchange={(e) =>
+          selectBgOverride(
+            (e.currentTarget as HTMLSelectElement).value as BgOverrideMode,
+          )}
+      >
+        <option value="__inherit"
+          >Use global default (current: {globalBgSummary})</option
+        >
+        <option value="__disabled"
+          >Disabled — use theme background only</option
+        >
+        <option value="__custom">Custom for this tab</option>
+      </select>
+    </label>
+    {#if bgOverrideSelection === '__disabled'}
+      <small class="hint-row">
+        No observable effect when the global background is also "Theme
+        default."
+      </small>
+    {/if}
+    {#if bgOverrideSelection === '__custom' && backgroundOverride !== null && backgroundOverride !== 'disabled' && typeof backgroundOverride === 'object'}
+      <BackgroundConfigEditor
+        bind:config={
+          () => backgroundOverride as TerminalBackgroundSettings,
+          (v) => {
+            backgroundOverride = v;
+          }
+        }
+      />
+    {/if}
+
     <small class="footer-note">
       Changes apply on next shell restart. Palette changes apply
       immediately.
@@ -297,6 +390,13 @@
     font-size: var(--font-size-xs);
     display: block;
     margin-top: var(--space-2);
+  }
+  .hint-row {
+    color: var(--text-tertiary);
+    font-size: var(--font-size-xs);
+    display: block;
+    margin-bottom: var(--space-2);
+    margin-left: 140px;
   }
   .actions {
     display: flex;

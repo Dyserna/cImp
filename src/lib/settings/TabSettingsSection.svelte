@@ -1,13 +1,18 @@
 <script lang="ts">
   import { get } from 'svelte/store';
   import type { TabId } from '../tabs/types';
-  import type { AiToolTabConfig, ThemeColorsWire } from './types';
+  import type {
+    AiToolTabConfig,
+    TerminalBackgroundSettings,
+    ThemeColorsWire,
+  } from './types';
   import ArrayEditor from './ArrayEditor.svelte';
   import TextAreaWithReset from './TextAreaWithReset.svelte';
   import NotificationEditor from './NotificationEditor.svelte';
   import Pill from '../Pill.svelte';
   import ThemeSwatch from './ThemeSwatch.svelte';
   import CustomThemeEditor from './CustomThemeEditor.svelte';
+  import BackgroundConfigEditor from './BackgroundConfigEditor.svelte';
   import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from '../themes';
   import { settings as settingsStore } from './store';
 
@@ -57,6 +62,55 @@
   let overrideSelection = $derived(
     settings.theme_override === null ? '__inherit' : settings.theme_override.name,
   );
+
+  // V1.4-03: per-tab background override. Three states mirror the shell-
+  // tab dialog's BgOverrideMode: '__inherit' / '__disabled' / '__custom'.
+  type BgOverrideMode = '__inherit' | '__disabled' | '__custom';
+  let bgOverrideSelection = $derived<BgOverrideMode>(
+    settings.background_override === null
+      ? '__inherit'
+      : settings.background_override === 'disabled'
+        ? '__disabled'
+        : '__custom',
+  );
+
+  let globalBgSummary = $derived(
+    globalBgSummaryOf($settingsStore.terminal.background),
+  );
+
+  function globalBgSummaryOf(bg: TerminalBackgroundSettings): string {
+    if (bg.image) {
+      const filename = bg.image.split(/[\\/]/).pop() ?? bg.image;
+      return `image: ${filename}`;
+    }
+    if (bg.color) return `solid ${bg.color}`;
+    return 'theme background';
+  }
+
+  function selectBgOverride(value: BgOverrideMode): void {
+    if (value === '__inherit') {
+      update('background_override', null);
+      return;
+    }
+    if (value === '__disabled') {
+      update('background_override', 'disabled');
+      return;
+    }
+    // '__custom' — already custom: preserve.
+    if (
+      settings.background_override !== null &&
+      settings.background_override !== 'disabled' &&
+      typeof settings.background_override === 'object'
+    ) {
+      return;
+    }
+    const liveGlobal = get(settingsStore).terminal.background;
+    update('background_override', { ...liveGlobal });
+  }
+
+  function updateCustomBg(next: TerminalBackgroundSettings): void {
+    update('background_override', next);
+  }
 
   function selectThemeOverride(value: string): void {
     if (value === '__inherit') {
@@ -206,6 +260,39 @@
     Override the global terminal palette for this tab. Applied
     immediately — no restart needed.
   </small>
+
+  <label class="palette-row">
+    <span>Terminal background</span>
+    <select
+      value={bgOverrideSelection}
+      onchange={(e) =>
+        selectBgOverride(
+          (e.currentTarget as HTMLSelectElement).value as BgOverrideMode,
+        )}
+    >
+      <option value="__inherit"
+        >Use global default (current: {globalBgSummary})</option
+      >
+      <option value="__disabled"
+        >Disabled — use theme background only</option
+      >
+      <option value="__custom">Custom for this tab</option>
+    </select>
+  </label>
+  {#if bgOverrideSelection === '__disabled'}
+    <small class="hint">
+      No observable effect when the global background is also "Theme
+      default."
+    </small>
+  {/if}
+  {#if bgOverrideSelection === '__custom' && settings.background_override !== null && settings.background_override !== 'disabled' && typeof settings.background_override === 'object'}
+    <BackgroundConfigEditor
+      bind:config={
+        () => settings.background_override as TerminalBackgroundSettings,
+        (v) => updateCustomBg(v)
+      }
+    />
+  {/if}
 
   <div class="restart-row">
     <button

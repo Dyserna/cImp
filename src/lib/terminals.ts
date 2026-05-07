@@ -30,6 +30,7 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { CanvasAddon } from '@xterm/addon-canvas';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import './terminals.css';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -39,6 +40,7 @@ import {
   createBytesChannel,
   decodeBase64,
   onPtyExit,
+  ptyRebindChannel,
   ptyResize,
   ptyRestart,
   ptyStart,
@@ -96,6 +98,11 @@ interface TerminalEntry {
   host: HTMLDivElement;
   term: Terminal;
   fitAddon: FitAddon;
+  /// V1.4-03: captures xterm scrollback as a single ANSI escape stream
+  /// before a renderer-category flip destroys this Terminal. The new
+  /// xterm replays the snapshot via `term.write` so the user sees their
+  /// shell history continue across the flip.
+  serializeAddon: SerializeAddon;
   /// Live `tab-pty-exit` payload listener. Unsubscribed on destroy.
   unlistenExit: UnlistenFn | null;
   /// Live `tab-restart-requested` payload listener. Unsubscribed on
@@ -180,11 +187,28 @@ function bindBytesChannel(entry: TerminalEntry): BytesChannel {
   return channel;
 }
 
-async function attemptSpawn(entry: TerminalEntry, restart: boolean): Promise<void> {
+type SpawnMode = 'start' | 'restart' | 'rebind';
+
+async function attemptSpawn(entry: TerminalEntry, mode: SpawnMode): Promise<void> {
   const channel = bindBytesChannel(entry);
   const { rows, cols } = entry.term;
   try {
-    if (restart) {
+    if (mode === 'rebind') {
+      // V1.4-03: re-point the still-running PTY at the new xterm. The
+      // shell session, env, cwd, and processes survive. If the PTY has
+      // exited (or never started), pty_rebind_channel errors out and we
+      // fall back to a fresh pty_start so the tab is still usable —
+      // user sees scrollback reset and a brief shell respawn.
+      try {
+        await ptyRebindChannel(entry.tabId, channel);
+      } catch (rebindErr) {
+        console.warn(
+          `pty_rebind fell back to pty_start for ${entry.tabId}:`,
+          rebindErr,
+        );
+        await ptyStart(entry.tabId, channel, rows, cols);
+      }
+    } else if (mode === 'restart') {
       await ptyRestart(entry.tabId, channel, rows, cols);
     } else {
       await ptyStart(entry.tabId, channel, rows, cols);
@@ -197,7 +221,7 @@ async function attemptSpawn(entry: TerminalEntry, restart: boolean): Promise<voi
       headline: `${displayNameFor(entry.tabId)} failed to start.`,
       raw: msg,
     });
-    console.error(`pty_start failed for ${entry.tabId}:`, e);
+    console.error(`pty spawn (${mode}) failed for ${entry.tabId}:`, e);
   }
 }
 
@@ -206,15 +230,23 @@ async function attemptSpawn(entry: TerminalEntry, restart: boolean): Promise<voi
 /// `tab-created` event can both hit this for the same id during
 /// startup).
 ///
-/// `options.restartPty` (V1.4-02): when true, the spawn path uses
-/// `pty_restart` instead of `pty_start`. This is the recreate-on-
-/// background-toggle flow — destroyTerminal kills the JS side
-/// (xterm + listeners) but the backend PTY survives, so a fresh
-/// `pty_start` would either error or duplicate the process.
-/// `pty_restart` shuts down the existing PTY and spawns a new one.
+/// `options.restartPty` (V1.4-02, kept for the user-initiated Restart
+/// path): when true, the spawn path uses `pty_restart` instead of
+/// `pty_start`. Shuts down the existing PTY and spawns a new one.
+///
+/// `options.rebindPty` (V1.4-03): renderer-category flip path. The
+/// existing PTY survives — `pty_rebind_channel` re-points its bytes at
+/// the new xterm without restarting the shell. `scrollbackSnapshot`
+/// and `initialGeometry` carry the visible state from the previous
+/// xterm so the user sees their session continue across the flip.
 export function createTerminal(
   tabId: TabId,
-  options: { restartPty?: boolean } = {},
+  options: {
+    restartPty?: boolean;
+    rebindPty?: boolean;
+    scrollbackSnapshot?: string;
+    initialGeometry?: { rows: number; cols: number };
+  } = {},
 ): void {
   if (entries.has(tabId)) return;
 
@@ -255,9 +287,19 @@ export function createTerminal(
     // beneath the cells layer is visible. Color-only and 'none' modes
     // skip this so the canvas renderer paints opaque cells (faster).
     ...(initialCategory === 'image' ? { allowTransparency: true } : {}),
+    // V1.4-03: on a renderer recreate, construct at the previous
+    // terminal's geometry so the replayed scrollback's cursor positions
+    // line up with the new grid. fit-on-attach corrects any minor
+    // host-size differences after the snapshot lands.
+    ...(options.initialGeometry ?? {}),
   });
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
+  // V1.4-03: serialize addon captures scrollback as ANSI for replay
+  // across a renderer-flip recreate. Cheap to load even when no replay
+  // ever happens.
+  const serializeAddon = new SerializeAddon();
+  term.loadAddon(serializeAddon);
   // V1.4-02: canvas renderer for the fast path (no image). Image mode
   // stays on the in-core DOM renderer — the canvas addon is a single
   // opaque surface and would obscure the CSS image beneath.
@@ -265,6 +307,13 @@ export function createTerminal(
     term.loadAddon(new CanvasAddon());
   }
   term.open(host);
+
+  // V1.4-03: replay the captured scrollback before binding the PTY
+  // channel. xterm processes its write queue FIFO, so the snapshot
+  // lands before any live byte that arrives once attemptSpawn resolves.
+  if (options.scrollbackSnapshot) {
+    term.write(options.scrollbackSnapshot);
+  }
 
   // Placeholder bytes channel — replaced by `bindBytesChannel` inside
   // `attemptSpawn`. The placeholder lets us satisfy the entry's type
@@ -276,6 +325,7 @@ export function createTerminal(
     host,
     term,
     fitAddon,
+    serializeAddon,
     unlistenExit: null,
     unlistenRestart: null,
     unsubFont: () => {},
@@ -321,8 +371,10 @@ export function createTerminal(
   //     must be recreated — the canvas addon is loaded once at
   //     construction and `allowTransparency` is constructor-only.
   //     `queueRecreate` debounces so live slider drags during a global
-  //     edit don't thrash, and the recreate path uses pty_restart so
-  //     the still-running PTY is rebound to the new xterm.
+  //     edit don't thrash. V1.4-03: the recreate path captures
+  //     scrollback via the serialize addon, then uses pty_rebind
+  //     (instead of pty_restart) so the shell session, env, cwd, and
+  //     processes survive — only the JS xterm is replaced.
   //
   // Skips the initial dispatch (xterm was constructed with the resolved
   // theme + mode above).
@@ -401,10 +453,20 @@ export function createTerminal(
     if (event.payload !== tabId) return;
     if (entries.get(tabId) !== entry) return;
     if (entry.restarting) return;
+    // V1.4-03: a Restart click during a debounced recreate would
+    // otherwise produce two PTY operations — the restart now plus the
+    // recreate after the timer fires, tearing down the freshly-restarted
+    // xterm. Drop any pending recreate for this tab; the restart is the
+    // user's intent.
+    const pendingRecreate = recreateTimers.get(tabId);
+    if (pendingRecreate) {
+      clearTimeout(pendingRecreate);
+      recreateTimers.delete(tabId);
+    }
     entry.restarting = true;
     try {
       term.write(`\r\n[restarting ${tabId}…]\r\n`);
-      await attemptSpawn(entry, true);
+      await attemptSpawn(entry, 'restart');
     } finally {
       entry.restarting = false;
     }
@@ -429,7 +491,15 @@ export function createTerminal(
   });
   entry.resizeObserver.observe(host);
 
-  void attemptSpawn(entry, options.restartPty ?? false);
+  // V1.4-03: route to the right spawn mode. `rebindPty` and
+  // `restartPty` are mutually exclusive (the former is the renderer-flip
+  // recreate, the latter is the user-initiated Restart action).
+  const spawnMode: SpawnMode = options.rebindPty
+    ? 'rebind'
+    : options.restartPty
+      ? 'restart'
+      : 'start';
+  void attemptSpawn(entry, spawnMode);
 }
 
 /// V1.4-02 recreate-on-toggle debounce. A category flip
@@ -447,10 +517,49 @@ function queueRecreate(tabId: TabId): void {
     tabId,
     setTimeout(() => {
       recreateTimers.delete(tabId);
-      // The previous PTY is still alive — pty_restart shuts it down
-      // and respawns. Scrollback resets, per the V1.4-02 contract.
+      const old = entries.get(tabId);
+      if (!old) return;
+      // V1.4-03 coordination: a user-initiated Restart that fires
+      // during the debounce already cleared this timer, but if a new
+      // recreate gets queued while a restart is mid-flight, skip it —
+      // the restart already replaced the PTY's child and a recreate
+      // would tear down the freshly-restarted xterm.
+      if (old.restarting) return;
+
+      // V1.4-03: capture both the scrollback snapshot AND the geometry
+      // before destroy. The new Terminal must be constructed at the
+      // same rows/cols so the replayed cursor positions land on the
+      // right cells; xterm's default 24×80 would wrap a 60×200
+      // snapshot badly.
+      const snapshot = old.serializeAddon.serialize();
+      const { rows, cols } = old.term;
+
+      // V1.4-03: capture the old host's slot before destroy so the
+      // freshly-created host can be re-attached to the same pane.
+      // Pane.svelte's slot effect short-circuits when
+      // `mountedTab === desired` — and that's true here because the
+      // tab id is unchanged across the recreate — so it won't attach
+      // the new host on its own. Without this re-attach the new host
+      // sits in the offscreen container until the user switches tabs
+      // away and back.
+      const previousParent = old.host.parentElement;
+      const previousSlot =
+        previousParent &&
+        previousParent.classList &&
+        previousParent.classList.contains('terminal-slot')
+          ? previousParent
+          : null;
+
       destroyTerminal(tabId);
-      createTerminal(tabId, { restartPty: true });
+      createTerminal(tabId, {
+        rebindPty: true,
+        scrollbackSnapshot: snapshot,
+        initialGeometry: { rows, cols },
+      });
+
+      if (previousSlot) {
+        attachTerminal(tabId, previousSlot);
+      }
     }, 120),
   );
 }
@@ -533,12 +642,12 @@ export function detachTerminal(tabId: TabId, fromSlot?: HTMLElement): void {
 }
 
 /// Trigger a manual respawn — invoked by `TabErrorOverlay`'s Retry
-/// button. The retry flag passes through to `pty_restart`, which
-/// idempotently shuts down any stale handle before respawning.
+/// button. Uses pty_restart so any stale handle is shut down before
+/// respawning.
 export async function retryTerminal(tabId: TabId): Promise<void> {
   const entry = entries.get(tabId);
   if (!entry) return;
-  await attemptSpawn(entry, true);
+  await attemptSpawn(entry, 'restart');
 }
 
 /// Whether the registry is tracking a terminal for `tabId`. Pane

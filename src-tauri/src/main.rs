@@ -25,9 +25,9 @@ use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
-    list_tabs, list_voices, open_settings_window, pty_resize, pty_restart, pty_start, pty_write,
-    request_tab_restart, restart_shell_tab, set_active_tab, settings_get, settings_update,
-    tab_activate, tts_test,
+    list_tabs, list_voices, open_settings_window, pty_rebind_channel, pty_resize, pty_restart,
+    pty_start, pty_write, request_tab_restart, restart_shell_tab, set_active_tab, settings_get,
+    settings_update, tab_activate, tts_test,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -241,6 +241,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             pty_start,
             pty_restart,
+            pty_rebind_channel,
             pty_write,
             pty_resize,
             tts_test,

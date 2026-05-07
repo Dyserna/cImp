@@ -140,15 +140,19 @@
   /// tabs differently. Empty array when settings haven't loaded yet.
   const tabEntries = $derived<TabConfig[]>(snapshot?.tabs ?? []);
 
-  // V1.4-02 terminal background mode. Derived from the (image, color)
-  // pair on every snapshot change — but kept as a writable so clicking
-  // "Image" before a file is picked still surfaces the image controls.
-  // The mode is intent; the snapshot is the persisted reality.
+  // V1.4-02 terminal background mode. Initialised once from the loaded
+  // snapshot, then driven entirely by the user's clicks. We deliberately
+  // avoid an ongoing $effect that re-derives from `(image, color)` —
+  // that would clobber a "user picked Image but hasn't chosen a file
+  // yet" intent the moment the patch flush returns and re-fires the
+  // snapshot subscription.
   let bgMode = $state<'theme' | 'color' | 'image'>('theme');
+  let bgModeInitialised = false;
   $effect(() => {
-    if (!snapshot) return;
+    if (!snapshot || bgModeInitialised) return;
     const bg = snapshot.terminal.background;
     bgMode = bg.image ? 'image' : bg.color ? 'color' : 'theme';
+    bgModeInitialised = true;
   });
 
   function setBgMode(next: 'theme' | 'color' | 'image') {

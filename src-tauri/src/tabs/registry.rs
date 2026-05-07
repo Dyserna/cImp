@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 use crate::audio::AudioOutput;
 use crate::error::{AppError, AppResult};
 use crate::pty::PtyManager;
-use crate::settings::{SettingsHandle, AIDER_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID};
+use crate::settings::{SettingsHandle, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID};
 use crate::state::{InputLengths, StateSignal, TabId, TabKind};
 use crate::tabs::config::build_launch_spec;
 use crate::tts::{ActiveTab, TtsRequest};
@@ -58,10 +58,10 @@ pub struct TabRegistry {
 pub type TabRegistryHandle = Arc<TokioMutex<TabRegistry>>;
 
 /// True when `id` is one of the three reserved tab ids that the integrity
-/// check protects (claude, aider, shell-default-1). User-created Shell tabs
-/// use uuid-based ids that never collide with these.
+/// check protects (claude, claude-local, shell-default-1). User-created
+/// Shell tabs use uuid-based ids that never collide with these.
 fn is_builtin_id(id: &str) -> bool {
-    matches!(id, CLAUDE_TAB_ID | AIDER_TAB_ID | SHELL_DEFAULT_TAB_ID)
+    matches!(id, CLAUDE_TAB_ID | CLAUDE_LOCAL_TAB_ID | SHELL_DEFAULT_TAB_ID)
 }
 
 /// V1.4-04 D: replicate the filename-sanitization done by

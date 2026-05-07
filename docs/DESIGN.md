@@ -14,14 +14,14 @@ The audience is Claude Code working on implementation across sessions, plus any 
 
 ### What we are building
 
-A cross-platform desktop application (Windows and Linux) that wraps Claude Code, aider, and arbitrary user-configured shell sessions in a single multi-tab, multi-pane interface with text-to-speech output and an animated avatar overlay. The user retains the full interactive experience of every embedded subprocess — this is not a chat client that calls the Claude API; it is a wrapper around the actual `claude` and `aider` binaries (and any shell the user configures) running in real PTYs, with all of their tools, slash commands, file editing, and TUI behavior preserved.
+A cross-platform desktop application (Windows and Linux) that wraps Claude Code (in two configurations — subscription / API and a local-LLM variant) and arbitrary user-configured shell sessions in a single multi-tab, multi-pane interface with text-to-speech output and an animated avatar overlay. The user retains the full interactive experience of every embedded subprocess — this is not a chat client that calls the Claude API; it is a wrapper around the actual `claude` binary (and any shell the user configures) running in real PTYs, with all of their tools, slash commands, file editing, and TUI behavior preserved.
 
 Capabilities beyond the underlying tools:
 
 1. **Text-to-speech** for conversational portions of AI-tool output, using a local Kokoro TTS engine running in-process. Tools opt their conversational text into TTS by wrapping it in `[[TTS]]...[[/TTS]]` tags; technical content (code, command output) stays silent.
 2. **Animated avatar overlay** with state-driven visuals, a shared transition animation between any state change, and a live audio waveform reactive to TTS playback. Floats over the terminal as a configurable, semi-transparent overlay.
 3. **Spell-checking compose overlay** — a slide-up bottom sheet for composing longer messages, complementing the native input.
-4. **Multi-tab terminal** with Claude Code, aider, and as many user-defined Shell tabs as the user wants. Each tab runs an independent PTY; tabs persist across launches.
+4. **Multi-tab terminal** with two Claude Code tabs (subscription and local-LLM, the latter via env-var injection at spawn time) and as many user-defined Shell tabs as the user wants. Each tab runs an independent PTY; tabs persist across launches.
 5. **Multi-pane layout** — tabs can be split horizontally or vertically, dragged between panes, torn into new splits. The full layout tree persists across launches, and named layout presets can be saved and restored.
 6. **Permission-prompt detection** for Claude Code, with a per-tab `AwaitingPermission` flag and notification.
 7. **Notification system** that announces tab state changes when the user is focused elsewhere.
@@ -154,7 +154,7 @@ Two kinds, distinguished by an enum:
 
 ```rust
 pub enum TabKind {
-    AiTool(AiToolKind),   // ClaudeCode | Aider
+    AiTool,   // V1.4-07: collapsed (was AiTool(ClaudeCode | Aider))
     Shell,
 }
 ```
@@ -164,7 +164,7 @@ Kind-gated behavior:
 | Behavior                               | AiTool                                  | Shell                                                                 |
 |----------------------------------------|-----------------------------------------|-----------------------------------------------------------------------|
 | TTS markup detection / extraction      | yes                                     | bypassed entirely in processing layer                                 |
-| Permission prompt detection            | yes (Claude only; aider deferred)       | no                                                                    |
+| Permission prompt detection            | yes (both Claude tabs run the same patterns) | no                                                               |
 | Avatar states reachable                | Idle / Listening / Thinking / Speaking / Error | Idle / Error only                                              |
 | Notifications: idle                    | yes                                     | no (would fire constantly for an interactive shell)                   |
 | Notifications: awaiting_permission     | yes (Claude)                            | no                                                                    |
@@ -179,8 +179,8 @@ The `claude_still_generating` helper flag (used to disambiguate Speaking → Thi
 
 Three reserved tab IDs are always present (the integrity check at load time restores them if a hand-edited settings file deletes them):
 
-- `claude` — Claude Code, builtin AI-tool tab
-- `aider` — aider, builtin AI-tool tab
+- `claude` — Claude Code with subscription/API auth, builtin AI-tool tab
+- `claude-local` — second Claude Code tab preconfigured to talk to a local LLM via env-var injection (V1.4-07; replaces the v1.7-and-earlier `aider` reserved id)
 - `shell-default-1` — the first Shell tab, with a sensible default shell per platform
 
 Backend Tauri commands expose tab CRUD:
@@ -245,7 +245,7 @@ The processing layer scans recently-rendered regions for known Claude Code permi
 
 The patterns are exact-string matches. Brittleness against upstream changes is a known limitation; patterns live in a single well-commented module so updates are localized. The `RUST_LOG=perm_capture=debug` knob exposes detection events for re-characterization when Claude Code's UI changes.
 
-Aider permission patterns are not implemented — see `FUTURE-FEATURES.md`.
+Both AI tabs (subscription Claude and Claude (local)) run the same Claude Code permission patterns since they're the same binary.
 
 ### TTS Engine
 
@@ -567,8 +567,8 @@ The v1.2 detector triggers only when the `layout` key is *entirely absent* from 
 
 After migration and typed deserialization, an integrity pass repairs hand-edited files:
 
-- The three reserved tab ids (`claude`, `aider`, `shell-default-1`) are restored to canonical positions if missing, and forced to `builtin: true`
-- Reserved AI tabs have their `ai_tool_kind` coerced to the expected value
+- The three reserved tab ids (`claude`, `claude-local`, `shell-default-1`) are restored to canonical positions if missing, and forced to `builtin: true`
+- Reserved AI tabs have their `use_local_provider` flag coerced to the expected value (`false` for `claude`, `true` for `claude-local`) so a hand-edit can't silently flip the subscription Claude tab into local-LLM mode
 - Layout: tab refs in panes that don't exist in `settings.tabs` are dropped; an invalid `focused_pane_id` is reset to leftmost leaf
 
 The frontend's `validateAndRepairLayout` runs after this on hydration and handles deeper concerns (orphan placement, empty-pane collapse).
@@ -656,7 +656,6 @@ The on-disk JSON shape, current as of v1.3:
     {
       "kind": "ai_tool",
       "id": "claude",
-      "ai_tool_kind": "claude_code",
       "builtin": true,
       "name": "Claude",
       "command": "claude",
@@ -671,23 +670,24 @@ The on-disk JSON shape, current as of v1.3:
       },
       "first_launch_notice_dismissed": true,
       "theme_override": null,
-      "background_override": null
+      "background_override": null,
+      "use_local_provider": false
     },
     {
       "kind": "ai_tool",
-      "id": "aider",
-      "ai_tool_kind": "aider",
+      "id": "claude-local",
       "builtin": true,
-      "name": "Aider",
-      "command": "aider",
+      "name": "Claude (local)",
+      "command": "claude",
       "args": [],
       "cwd": null,
       "env": {},
-      "tts_injection": { "enabled": false, "instructions": "" },
+      "tts_injection": { "enabled": true, "instructions": "..." },
       "notifications": { "...": "..." },
-      "first_launch_notice_dismissed": false,
+      "first_launch_notice_dismissed": true,
       "theme_override": { "name": "Solarized Dark", "custom": null },
-      "background_override": "disabled"
+      "background_override": "disabled",
+      "use_local_provider": true
     },
     {
       "kind": "shell",
@@ -715,7 +715,7 @@ The on-disk JSON shape, current as of v1.3:
       "direction": "horizontal",
       "ratio": 0.5,
       "first":  { "type": "pane", "id": "pane-...", "tab_ids": ["claude"], "active_tab_id": "claude" },
-      "second": { "type": "pane", "id": "pane-...", "tab_ids": ["aider", "shell-default-1"], "active_tab_id": "aider" }
+      "second": { "type": "pane", "id": "pane-...", "tab_ids": ["claude-local", "shell-default-1"], "active_tab_id": "claude-local" }
     },
     "focused_pane_id": "pane-..."
   },
@@ -732,8 +732,9 @@ The on-disk JSON shape, current as of v1.3:
 Notes:
 
 - Every Rust struct uses `#[serde(default)]` so a settings file written by a future or past version still loads — missing fields get defaults, unknown fields are ignored.
-- `tts_injection.enabled` controls whether cctts injects system-prompt content for an AI tab. For Claude this uses `--append-system-prompt` and is on by default; for aider it's off by default because aider lacks an upstream CLI mechanism (see `FUTURE-FEATURES.md`).
-- Reserved tab ids — `claude`, `aider`, `shell-default-1` — cannot disappear. The integrity check restores them with `builtin: true` and the right `ai_tool_kind` if a hand-edited file deletes or corrupts them. User-created Shell tab ids are uuid-based and never collide.
+- `tts_injection.enabled` controls whether cctts injects system-prompt content for an AI tab via `--append-system-prompt`. On by default for both AI builtins (subscription Claude and Claude (local)); local models vary in how reliably they honor the markup convention, so the local-tab version is best-effort.
+- `use_local_provider` (V1.4-07) gates env synthesis from the global `claude_local` settings group. When `true`, the launch-time spawn merges `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL` if the alias is non-empty) into the process env, with per-tab `env` entries always winning over synthesized values.
+- Reserved tab ids — `claude`, `claude-local`, `shell-default-1` — cannot disappear. The integrity check restores them with `builtin: true` and corrects `use_local_provider` on the AI builtins if a hand-edited file flipped them. User-created Shell tab ids are uuid-based and never collide.
 - `session.active_tab_id` is a legacy field. It still exists in the struct and is updated by the runtime on tab activation, but the v1.2 → v1.3 migration drops it from the file (the layout's per-pane `active_tab_id` plus `focused_pane_id` are the source of truth for active-tab state). Cleanup of the runtime write path is deferred.
 - `layout: null` on fresh installs and on the very first hydration after migration if for some reason no layout was synthesized; the frontend's `defaultLayoutForTabs` handles the null case by building a single root pane.
 - `terminal.background` (V1.4-02) has independent `image` and `color` fields plus opacity/blur/size/position controls that apply only when an image is set. The four-cell rendering matrix (image × color, each Some/None) drives a discriminated `RenderingMode` — `'none'` and `'color'` use xterm.js's canvas renderer (fast); `'image'` uses the in-core DOM renderer with `allowTransparency: true` and CSS layering on the host. Toggling between fast and image categories triggers a debounced Terminal recreate; same-category changes (color tweak, slider drag) apply in place. Per-tab `background_override` is three-state: `null` inherits the global, `"disabled"` opts out (theme bg only), an object replaces the global wholesale. The Configure Tab dialog (shell tabs) and the per-AI-tab Settings section both surface the override row, both reusing the shared `BackgroundConfigEditor` component. See `MILESTONE-V1.4-02-terminal-background.md` and `MILESTONE-V1.4-03-terminal-background.md`.
@@ -783,11 +784,9 @@ The convention is communicated to the model via a `--append-system-prompt` instr
 
 If a complete response contains no TTS tags, the wrapper does not speak any of it. This keeps technical responses (pure code, file edits, command output) silent.
 
-### Aider TTS limitations
+### Local-LLM TTS reliability
 
-Aider does not currently provide a CLI flag for system prompt injection. The closest is `--read <file>`, which adds files as user-message context, not system prompt content; per aider's own community discussions, user-message instructions are less reliably followed than system-prompt instructions. Rather than ship a workaround that produces inconsistent results, the aider tab runs without injection. Spoken TTS is silent for aider in practice — no `[[TTS]]` tags appear in its output, so the fallback-silent behavior plays nothing.
-
-When aider adds a CLI flag for system-prompt injection, cctts will adopt it. See `FUTURE-FEATURES.md` for the action plan.
+The Claude (local) tab passes the same TTS injection instructions as the subscription Claude tab (Claude Code is identical between the two — only the auth/endpoint env differs). Whether `[[TTS]]…[[/TTS]]` markup actually appears in output depends on the model behind the local proxy. Smaller models (e.g., 7-13B class) often don't follow the markup convention reliably even when instructed; larger models (32B+ or proprietary class) tend to be more compliant. cctts treats missing markup the same way it treats any non-markup output — silently. This is fallback behavior, not an error.
 
 ---
 
@@ -942,8 +941,8 @@ The avatar overlay, waveform visualizer, and xterm.js terminal interior are expl
 - **Compose overlay / compose sheet** — the bottom-sheet textarea with browser spell-check
 - **Amplitude tap** — the mechanism by which the audio playback path exposes recent sample data for the visualizer
 - **Tab** — an independently-spawned subprocess with its own PTY, processing layer, and avatar state
-- **Tab kind** — discriminator between `AiTool` (Claude / aider; full feature set) and `Shell` (configurable shell; reduced feature set)
-- **Builtin tab** — one of the three reserved-id tabs (`claude`, `aider`, `shell-default-1`) that the integrity check guarantees to exist
+- **Tab kind** — discriminator between `AiTool` (subscription Claude / Claude (local); full feature set) and `Shell` (configurable shell; reduced feature set)
+- **Builtin tab** — one of the three reserved-id tabs (`claude`, `claude-local`, `shell-default-1`) that the integrity check guarantees to exist
 - **User tab** — a Shell tab created by the user via the `+` button or `Ctrl+T`. Can be closed, renamed, reconfigured
 - **Closed sub-state** — a Shell-tab UI state when the subprocess has exited; shows a restart message; pressing Enter respawns
 - **Tab status indicator** — visual element on the tab bar showing status (working, awaiting permission, error, done while away)

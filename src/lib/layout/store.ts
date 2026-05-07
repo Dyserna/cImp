@@ -439,8 +439,8 @@ export function setSplitRatio(splitId: SplitId, ratio: number): void {
 /// No-op when the focused pane is the root — there is nowhere for the
 /// tabs to go.
 ///
-/// Builtin tabs (Claude/aider) come along automatically because they
-/// are normal entries in `tab_ids`; the close-tab IPC's
+/// Builtin tabs (Claude / Claude (local)) come along automatically because
+/// they are normal entries in `tab_ids`; the close-tab IPC's
 /// `builtin-not-closable` guard doesn't apply here — we are moving the
 /// tab, not closing it.
 export function closeFocusedPane(): void {

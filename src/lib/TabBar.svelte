@@ -15,7 +15,9 @@
     restartShellTab,
   } from './ipc';
   import { openConfigureTabDialog, openNewShellTabDialog } from './dialog/store';
+  import { openSettingsWindowToTab } from './settings/ipc';
   import { isShellTab, type TabId } from './tabs/types';
+  import { tabMeta } from './tabs/store';
   import { requestTabIntoPane, setFocusedPane, setPaneActiveTab } from './layout/store';
   import { paneRegistry } from './layout/registry';
   import { beginDrag } from './dnd/drag';
@@ -235,7 +237,22 @@
       ? { id: t.id, builtin: t.builtin, canRestart: isShell && !closed }
       : null}
     onRename={t ? () => (renamingTab = t.id) : undefined}
-    onConfigure={t ? () => openConfigureTabDialog(t.id) : undefined}
+    onConfigure={t
+      ? () => {
+          // V1.4-07 A: AI tabs route Configure to the Settings window
+          // scrolled to that tab's section. Shell tabs keep using the
+          // shell-only ConfigureTabDialog. The dialog's `getShellTabConfig`
+          // / `reconfigureShellTab` IPC pair is shell-specific; AI tabs
+          // get their full per-tab edit surface (env, command, args,
+          // theme/background overrides, etc.) via Settings → Tabs.
+          const meta = tabMeta(t.id);
+          if (meta?.kind === 'ai-tool') {
+            void openSettingsWindowToTab(t.id);
+          } else {
+            openConfigureTabDialog(t.id);
+          }
+        }
+      : undefined}
     onRestart={t ? () => onRestartTab(t.id) : undefined}
     onClose={t ? () => onCloseTab(t.id) : undefined}
     onDismiss={dismissMenu}

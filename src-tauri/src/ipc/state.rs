@@ -31,6 +31,11 @@ pub struct AppState {
     pub input_lengths: InputLengths,
     pub settings: SettingsHandle,
     pub audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
+    /// V1.4-07 A: pending deep-link target for the Settings window.
+    /// `open_settings_window_to_tab` writes the tab id here so the
+    /// Settings window can read+clear it on mount (cold-open path)
+    /// while a `settings-deep-link` event covers the hot-open path.
+    pub pending_settings_deep_link: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]

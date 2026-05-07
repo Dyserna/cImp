@@ -26,10 +26,43 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::settings::schema::{
-    default_aider_tab, default_claude_tab, AIDER_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID,
-};
+use crate::settings::schema::{default_claude_tab, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID};
 use crate::shell::ShellSpec;
+
+/// V1.4-07: the aider tab id is gone from the live schema, but the
+/// v1 / v1.1 → v1.2 migrations still produce intermediate JSON that
+/// includes an "aider" entry — that entry is rewritten in place by
+/// the v1.7 → v1.8 step further along the cascade. We keep the
+/// literal here so the early migrations don't depend on a constant
+/// that no longer exists in the live schema.
+const LEGACY_AIDER_TAB_ID: &str = "aider";
+
+/// V1.4-07: produces a v1.2-shape aider tab JSON object. Used only by
+/// the v1 → v1.2 and v1.1 → v1.2 migration paths when the source file
+/// had no aider section to carry forward. The resulting object has the
+/// fields the v1.2 schema required at the time (notably `ai_tool_kind`,
+/// which was dropped from the live schema in v1.8); subsequent
+/// migrations transform it through to v1.8 along with everything else.
+fn legacy_aider_v1_2_entry() -> Value {
+    json!({
+        "kind": "ai_tool",
+        "id": LEGACY_AIDER_TAB_ID,
+        "ai_tool_kind": "aider",
+        "builtin": true,
+        "name": "Aider",
+        "command": "aider",
+        "args": [],
+        "cwd": null,
+        "env": {},
+        "tts_injection": { "enabled": false, "instructions": "" },
+        "notifications": {
+            "idle": "Aider is idle",
+            "awaiting_permission": "Aider is awaiting permission",
+            "error": "Aider encountered an error",
+        },
+        "first_launch_notice_dismissed": false,
+    })
+}
 
 /// Detect file shape and run the appropriate transform on `value`. Returns
 /// `Ok(true)` if the file changed shape (caller should write back to disk),
@@ -109,6 +142,21 @@ pub fn migrate_if_needed(
     if looks_v1_6(value) {
         write_backup(path, "v1.6", value)?;
         migrate_v1_6_to_v1_7(value);
+        changed = true;
+    }
+
+    // v1.7 → v1.8: V1.4-07 drops the aider tab kind, adds the global
+    // `claude_local` provider config, and adds the per-AI-tab
+    // `use_local_provider` flag. The aider tab is rewritten in place to
+    // claude-local (id, name, command, use_local_provider, tts_injection
+    // re-enabled). Layout-tree references to `"aider"` (in tab_ids,
+    // active_tab_id, layout_presets, session.active_tab_id) are
+    // rewritten to `"claude-local"` in the same pass so the integrity
+    // check sees a self-consistent file. Detected as "has
+    // terminal.scrollback (v1.7) but lacks claude_local (v1.8)".
+    if looks_v1_7(value) {
+        write_backup(path, "v1.7", value)?;
+        migrate_v1_7_to_v1_8(value);
         changed = true;
     }
 
@@ -212,6 +260,23 @@ fn looks_v1_6(value: &Value) -> bool {
     has_presets && !has_scrollback
 }
 
+/// Is this a v1.7 file that lacks the v1.8 `claude_local` field? V1.4-07's
+/// schema-bump check. `terminal.scrollback` must be present (so we don't
+/// false-positive on earlier files mid-cascade); `claude_local` must be
+/// absent. Fresh-install v1.8 files have `claude_local` populated and
+/// skip this branch.
+fn looks_v1_7(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let has_scrollback = obj
+        .get("terminal")
+        .and_then(|t| t.get("scrollback"))
+        .is_some();
+    let has_claude_local = obj.contains_key("claude_local");
+    has_scrollback && !has_claude_local
+}
+
 // --- v1.1 → v1.2 ------------------------------------------------------------
 
 fn migrate_v1_1_to_v1_2(value: &mut Value, default_shell: &ShellSpec) {
@@ -235,7 +300,7 @@ fn migrate_v1_1_to_v1_2(value: &mut Value, default_shell: &ShellSpec) {
         .get("aider")
         .filter(|v| v.is_object())
         .map(|v| transform_ai_tool_entry(v, AiToolBuiltin::Aider))
-        .unwrap_or_else(|| serde_json::to_value(default_aider_tab()).expect("encode aider default"));
+        .unwrap_or_else(legacy_aider_v1_2_entry);
     new_tabs.push(aider_entry);
 
     let shell_entry = transform_shell_1_from_interim(&shell_tmp, default_shell);
@@ -254,7 +319,7 @@ impl AiToolBuiltin {
     fn id(self) -> &'static str {
         match self {
             AiToolBuiltin::Claude => CLAUDE_TAB_ID,
-            AiToolBuiltin::Aider => AIDER_TAB_ID,
+            AiToolBuiltin::Aider => LEGACY_AIDER_TAB_ID,
         }
     }
 
@@ -429,7 +494,7 @@ fn migrate_v1_to_v1_2(value: &mut Value, default_shell: &ShellSpec) {
     });
 
     let claude_entry = transform_ai_tool_entry(&claude_v1_1, AiToolBuiltin::Claude);
-    let aider_entry = serde_json::to_value(default_aider_tab()).expect("encode aider default");
+    let aider_entry = legacy_aider_v1_2_entry();
     let shell_entry = transform_shell_1_from_interim(&Value::Null, default_shell);
 
     root.insert(
@@ -653,6 +718,182 @@ fn migrate_v1_6_to_v1_7(value: &mut Value) {
     }
 }
 
+// --- v1.7 → v1.8 ------------------------------------------------------------
+
+/// V1.4-07: drop the aider tab kind, add the global `claude_local`
+/// provider config, add the per-AI-tab `use_local_provider` flag, and
+/// rewrite any aider tab in place to claude-local.
+///
+/// Three concerns per pass:
+///
+/// 1. Stamp `claude_local` defaults at the top level of the file.
+/// 2. Walk every AI tab: drop `ai_tool_kind`, default `use_local_provider`
+///    to false, then if the tab is the legacy aider tab (id == "aider"),
+///    rewrite it (id, name, command, use_local_provider, tts_injection).
+/// 3. Rewrite layout-tree references to `"aider"` everywhere they live —
+///    `layout.tree`, every `layout_presets[].tree`, and
+///    `session.active_tab_id` — so the integrity check sees a
+///    self-consistent file.
+///
+/// Idempotent: a second pass finds `claude_local` present and
+/// `looks_v1_7` returns false. The aider id rewrite is also a no-op
+/// after the first pass since no tab carries it any more.
+fn migrate_v1_7_to_v1_8(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    // 1. Top-level claude_local defaults.
+    root.insert(
+        "claude_local".to_string(),
+        json!({
+            "base_url": "http://localhost:4000",
+            "auth_token": "sk-dummy",
+            "model_alias": "",
+        }),
+    );
+
+    // 2. Walk tabs.
+    if let Some(tabs) = root.get_mut("tabs").and_then(Value::as_array_mut) {
+        for tab in tabs.iter_mut() {
+            let Some(obj) = tab.as_object_mut() else {
+                continue;
+            };
+            let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("");
+            if kind != "ai_tool" {
+                continue;
+            }
+
+            let was_aider = obj.get("id").and_then(Value::as_str) == Some(LEGACY_AIDER_TAB_ID);
+
+            // Drop the dead AI-tool discriminator (collapsed to a single
+            // ClaudeCode kind in V1.4-07).
+            obj.remove("ai_tool_kind");
+
+            // Default the new flag (false; the rewrite below flips it
+            // for the legacy aider tab).
+            obj.entry("use_local_provider".to_string())
+                .or_insert(Value::Bool(false));
+
+            if was_aider {
+                obj.insert(
+                    "id".to_string(),
+                    Value::String("claude-local".to_string()),
+                );
+                obj.insert("name".to_string(), Value::String("Claude (local)".to_string()));
+                obj.insert("command".to_string(), Value::String("claude".to_string()));
+                obj.insert("args".to_string(), Value::Array(Vec::new()));
+                obj.insert("use_local_provider".to_string(), Value::Bool(true));
+                // Aider's default had tts_injection.enabled=false; the
+                // rewritten tab is Claude, which does honor TTS injection.
+                if let Some(tts) = obj
+                    .get_mut("tts_injection")
+                    .and_then(Value::as_object_mut)
+                {
+                    tts.insert("enabled".to_string(), Value::Bool(true));
+                    let needs_default = tts
+                        .get("instructions")
+                        .and_then(Value::as_str)
+                        .map(str::is_empty)
+                        .unwrap_or(true);
+                    if needs_default {
+                        tts.insert(
+                            "instructions".to_string(),
+                            Value::String(crate::tts::RUNTIME_SYSTEM_PROMPT.to_string()),
+                        );
+                    }
+                }
+                // Notification strings — replace any "Aider …" text with
+                // the matching "Claude (local) …" text. If the user
+                // customized the notifications, we leave their custom
+                // text alone (only rewrite the canonical Aider strings).
+                if let Some(notifs) = obj.get_mut("notifications").and_then(Value::as_object_mut) {
+                    let canonical_aider = [
+                        ("idle", "Aider is idle", "Claude (local) is idle"),
+                        (
+                            "awaiting_permission",
+                            "Aider is awaiting permission",
+                            "Claude (local) is awaiting permission",
+                        ),
+                        ("error", "Aider encountered an error", "Claude (local) encountered an error"),
+                    ];
+                    for (field, from_text, to_text) in canonical_aider {
+                        if notifs.get(field).and_then(Value::as_str) == Some(from_text) {
+                            notifs.insert(field.to_string(), Value::String(to_text.to_string()));
+                        }
+                    }
+                }
+                // first_launch_notice_dismissed: pre-dismiss so the gone
+                // banner doesn't fire. Aider users who upgraded to a
+                // schema where this carried through will already have
+                // some value; force it true (safe — the banner code is
+                // gone anyway).
+                obj.insert(
+                    "first_launch_notice_dismissed".to_string(),
+                    Value::Bool(true),
+                );
+            }
+        }
+    }
+
+    // 3. Rewrite layout-tree id references.
+    rewrite_aider_tab_ids(root);
+}
+
+/// Walk layout-tree-shaped JSON inside the settings root and rewrite
+/// any `"aider"` tab-id reference to `"claude-local"`. Covers
+/// `layout.tree`, every `layout_presets[].tree`, and
+/// `session.active_tab_id`. Used only by `migrate_v1_7_to_v1_8`.
+fn rewrite_aider_tab_ids(root: &mut Map<String, Value>) {
+    fn rewrite_node(node: &mut Value) {
+        let Some(obj) = node.as_object_mut() else {
+            return;
+        };
+        if let Some(arr) = obj.get_mut("tab_ids").and_then(Value::as_array_mut) {
+            for entry in arr.iter_mut() {
+                if entry.as_str() == Some(LEGACY_AIDER_TAB_ID) {
+                    *entry = Value::String("claude-local".to_string());
+                }
+            }
+        }
+        if obj.get("active_tab_id").and_then(Value::as_str) == Some(LEGACY_AIDER_TAB_ID) {
+            obj.insert(
+                "active_tab_id".to_string(),
+                Value::String("claude-local".to_string()),
+            );
+        }
+        if let Some(child) = obj.get_mut("first") {
+            rewrite_node(child);
+        }
+        if let Some(child) = obj.get_mut("second") {
+            rewrite_node(child);
+        }
+    }
+
+    if let Some(layout) = root.get_mut("layout") {
+        if let Some(tree) = layout.get_mut("tree") {
+            rewrite_node(tree);
+        }
+    }
+    if let Some(presets) = root.get_mut("layout_presets").and_then(Value::as_array_mut) {
+        for preset in presets.iter_mut() {
+            if let Some(obj) = preset.as_object_mut() {
+                if let Some(tree) = obj.get_mut("tree") {
+                    rewrite_node(tree);
+                }
+            }
+        }
+    }
+    if let Some(session) = root.get_mut("session").and_then(Value::as_object_mut) {
+        if session.get("active_tab_id").and_then(Value::as_str) == Some(LEGACY_AIDER_TAB_ID) {
+            session.insert(
+                "active_tab_id".to_string(),
+                Value::String("claude-local".to_string()),
+            );
+        }
+    }
+}
+
 // --- Backup helpers ---------------------------------------------------------
 
 /// Write `<path>.<from_version>.bak` next to the settings file. If that name
@@ -780,7 +1021,7 @@ mod tests {
         assert_eq!(claude.get("builtin").unwrap(), &Value::Bool(true));
 
         let aider = &tabs[1];
-        assert_eq!(aider.get("id").unwrap(), AIDER_TAB_ID);
+        assert_eq!(aider.get("id").unwrap(), LEGACY_AIDER_TAB_ID);
 
         let shell_entry = &tabs[2];
         assert_eq!(shell_entry.get("kind").unwrap(), "shell");
@@ -824,7 +1065,7 @@ mod tests {
         let tabs = v.get("tabs").unwrap().as_array().unwrap();
         assert_eq!(tabs.len(), 3);
         let aider = &tabs[1];
-        assert_eq!(aider.get("id").unwrap(), AIDER_TAB_ID);
+        assert_eq!(aider.get("id").unwrap(), LEGACY_AIDER_TAB_ID);
         assert_eq!(aider.get("command").unwrap(), "aider");
     }
 
@@ -1323,5 +1564,309 @@ mod tests {
                 .unwrap(),
             "boom"
         );
+    }
+
+    // --- v1.7 → v1.8 (V1.4-07) ---
+
+    /// Helper: a v1.7-shape settings file with a stock claude tab and a
+    /// stock aider tab plus a layout that puts both side-by-side. Used
+    /// as the starting state for several v1.7 → v1.8 tests.
+    fn v1_7_with_aider_tab() -> Value {
+        json!({
+            "tabs": [
+                {
+                    "kind": "ai_tool",
+                    "id": "claude",
+                    "ai_tool_kind": "claude_code",
+                    "builtin": true,
+                    "name": "Claude",
+                    "command": "claude",
+                    "args": [],
+                    "cwd": null,
+                    "env": {},
+                    "tts_injection": { "enabled": true, "instructions": "..." },
+                    "notifications": { "idle": "Claude is idle", "awaiting_permission": "...", "error": "..." },
+                    "first_launch_notice_dismissed": true,
+                    "theme_override": null,
+                    "background_override": null
+                },
+                {
+                    "kind": "ai_tool",
+                    "id": "aider",
+                    "ai_tool_kind": "aider",
+                    "builtin": true,
+                    "name": "Aider",
+                    "command": "aider",
+                    "args": ["--model-metadata-file", ".aider.model.metadata.json"],
+                    "cwd": null,
+                    "env": { "USER_KEY": "user-value" },
+                    "tts_injection": { "enabled": false, "instructions": "" },
+                    "notifications": {
+                        "idle": "Aider is idle",
+                        "awaiting_permission": "Aider is awaiting permission",
+                        "error": "Aider encountered an error"
+                    },
+                    "first_launch_notice_dismissed": false,
+                    "theme_override": { "name": "Solarized Dark", "custom": null },
+                    "background_override": null
+                }
+            ],
+            "layout": {
+                "tree": {
+                    "type": "split",
+                    "id": "split-1",
+                    "direction": "horizontal",
+                    "ratio": 0.5,
+                    "first": { "type": "pane", "id": "pane-1", "tab_ids": ["claude"], "active_tab_id": "claude" },
+                    "second": { "type": "pane", "id": "pane-2", "tab_ids": ["aider"], "active_tab_id": "aider" }
+                },
+                "focused_pane_id": "pane-2"
+            },
+            "layout_presets": [
+                {
+                    "name": "Both AI",
+                    "created_at": "2026-05-07T00:00:00Z",
+                    "tree": { "type": "pane", "id": "pane-x", "tab_ids": ["claude", "aider"], "active_tab_id": "aider" }
+                }
+            ],
+            "session": { "active_tab_id": "aider" },
+            "terminal": {
+                "theme": { "name": "Default", "custom": null },
+                "background": {
+                    "image": null,
+                    "color": null,
+                    "opacity": 0.4,
+                    "blur": 0,
+                    "size": "cover",
+                    "position": "center",
+                    "snapshot_lines": 2000,
+                    "presets": [],
+                    "preview_category_flips": true
+                },
+                "scrollback": { "ring_bytes": 262144, "persist": true, "restore_on_launch": true }
+            }
+        })
+    }
+
+    #[test]
+    fn looks_v1_7_detects_v1_7_files() {
+        let v = v1_7_with_aider_tab();
+        assert!(looks_v1_7(&v));
+    }
+
+    #[test]
+    fn v1_8_file_is_not_re_detected() {
+        let mut v = v1_7_with_aider_tab();
+        migrate_v1_7_to_v1_8(&mut v);
+        assert!(!looks_v1_7(&v));
+        // Idempotent on second pass.
+        migrate_v1_7_to_v1_8(&mut v);
+        assert!(!looks_v1_7(&v));
+    }
+
+    #[test]
+    fn v1_7_to_v1_8_stamps_claude_local_defaults() {
+        let mut v = v1_7_with_aider_tab();
+        migrate_v1_7_to_v1_8(&mut v);
+        let cl = v.get("claude_local").expect("claude_local present");
+        assert_eq!(cl.get("base_url").unwrap(), "http://localhost:4000");
+        assert_eq!(cl.get("auth_token").unwrap(), "sk-dummy");
+        assert_eq!(cl.get("model_alias").unwrap(), "");
+    }
+
+    #[test]
+    fn v1_7_to_v1_8_drops_ai_tool_kind_from_every_ai_tab() {
+        let mut v = v1_7_with_aider_tab();
+        migrate_v1_7_to_v1_8(&mut v);
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        for tab in tabs {
+            if tab.get("kind").and_then(Value::as_str) == Some("ai_tool") {
+                assert!(
+                    tab.get("ai_tool_kind").is_none(),
+                    "ai_tool_kind should have been dropped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v1_7_to_v1_8_stamps_use_local_provider_on_every_ai_tab() {
+        let mut v = v1_7_with_aider_tab();
+        migrate_v1_7_to_v1_8(&mut v);
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        let claude = &tabs[0];
+        let claude_local = &tabs[1];
+        assert_eq!(claude.get("use_local_provider").unwrap(), false);
+        assert_eq!(claude_local.get("use_local_provider").unwrap(), true);
+    }
+
+    #[test]
+    fn v1_7_to_v1_8_rewrites_aider_tab_in_place() {
+        let mut v = v1_7_with_aider_tab();
+        migrate_v1_7_to_v1_8(&mut v);
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        let rewritten = &tabs[1];
+        assert_eq!(rewritten.get("id").unwrap(), "claude-local");
+        assert_eq!(rewritten.get("name").unwrap(), "Claude (local)");
+        assert_eq!(rewritten.get("command").unwrap(), "claude");
+        assert!(rewritten.get("args").unwrap().as_array().unwrap().is_empty());
+        assert_eq!(rewritten.get("use_local_provider").unwrap(), true);
+        // tts_injection re-enabled with default instructions.
+        let tts = rewritten.get("tts_injection").unwrap();
+        assert_eq!(tts.get("enabled").unwrap(), true);
+        assert!(
+            tts.get("instructions").unwrap().as_str().unwrap().len() > 10,
+            "tts_injection.instructions should have been seeded with the runtime prompt"
+        );
+        // Canonical aider notifications rewritten to claude-local.
+        let n = rewritten.get("notifications").unwrap();
+        assert_eq!(n.get("idle").unwrap(), "Claude (local) is idle");
+        assert_eq!(
+            n.get("awaiting_permission").unwrap(),
+            "Claude (local) is awaiting permission"
+        );
+        assert_eq!(n.get("error").unwrap(), "Claude (local) encountered an error");
+    }
+
+    #[test]
+    fn v1_7_to_v1_8_preserves_user_env_on_rewritten_tab() {
+        // The rewrite-in-place semantics promise to preserve per-tab env
+        // (where the user typically set their local-LLM proxy URL).
+        let mut v = v1_7_with_aider_tab();
+        migrate_v1_7_to_v1_8(&mut v);
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        let rewritten = &tabs[1];
+        let env = rewritten.get("env").unwrap().as_object().unwrap();
+        assert_eq!(env.get("USER_KEY").unwrap(), "user-value");
+    }
+
+    #[test]
+    fn v1_7_to_v1_8_preserves_theme_override_on_rewritten_tab() {
+        let mut v = v1_7_with_aider_tab();
+        migrate_v1_7_to_v1_8(&mut v);
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        let rewritten = &tabs[1];
+        // theme_override was set on the aider tab in the fixture; should
+        // carry through unchanged (rewrite touches identity fields, not
+        // appearance).
+        assert_eq!(
+            rewritten
+                .get("theme_override")
+                .unwrap()
+                .get("name")
+                .unwrap(),
+            "Solarized Dark"
+        );
+    }
+
+    #[test]
+    fn v1_7_to_v1_8_rewrites_layout_tree_aider_references() {
+        let mut v = v1_7_with_aider_tab();
+        migrate_v1_7_to_v1_8(&mut v);
+
+        // layout.tree.second.tab_ids and active_tab_id rewritten.
+        let layout = v.get("layout").unwrap();
+        let second = layout.get("tree").unwrap().get("second").unwrap();
+        let tab_ids = second.get("tab_ids").unwrap().as_array().unwrap();
+        assert_eq!(tab_ids[0], "claude-local");
+        assert_eq!(second.get("active_tab_id").unwrap(), "claude-local");
+
+        // layout_presets[0].tree references rewritten.
+        let preset_tree = v
+            .get("layout_presets")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("tree")
+            .unwrap();
+        let preset_tab_ids = preset_tree.get("tab_ids").unwrap().as_array().unwrap();
+        assert_eq!(preset_tab_ids[0], "claude");
+        assert_eq!(preset_tab_ids[1], "claude-local");
+        assert_eq!(preset_tree.get("active_tab_id").unwrap(), "claude-local");
+
+        // session.active_tab_id rewritten.
+        assert_eq!(
+            v.get("session").unwrap().get("active_tab_id").unwrap(),
+            "claude-local"
+        );
+    }
+
+    #[test]
+    fn v1_7_to_v1_8_handles_missing_aider_tab() {
+        // A user who deleted their aider tab pre-migration: the rewrite
+        // step finds nothing to rewrite, but the migration still stamps
+        // claude_local and use_local_provider on the remaining tabs. The
+        // integrity check (run after migration) restores claude-local.
+        let mut v = v1_7_with_aider_tab();
+        // Drop the aider tab.
+        if let Some(arr) = v
+            .as_object_mut()
+            .and_then(|o| o.get_mut("tabs"))
+            .and_then(Value::as_array_mut)
+        {
+            arr.retain(|t| t.get("id").and_then(Value::as_str) != Some("aider"));
+        }
+        migrate_v1_7_to_v1_8(&mut v);
+        assert!(v.get("claude_local").is_some());
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        for tab in tabs {
+            if tab.get("kind").and_then(Value::as_str) == Some("ai_tool") {
+                assert!(tab.get("use_local_provider").unwrap().is_boolean());
+                assert!(tab.get("ai_tool_kind").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn v1_2_cascades_through_v1_3_v1_4_v1_5_v1_6_v1_7_and_v1_8() {
+        // Full cascade from a v1.2 file to v1.8 in one pass. Verifies
+        // every step fires once and the final shape is the v1.8 schema.
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "display": { "theme": "dark" },
+                "tabs": [
+                    { "kind": "ai_tool", "id": "claude", "ai_tool_kind": "claude_code", "name": "Claude" },
+                    { "kind": "ai_tool", "id": "aider", "ai_tool_kind": "aider", "name": "Aider" },
+                    { "kind": "shell", "id": "shell-default-1", "name": "Shell 1" }
+                ],
+                "session": { "active_tab_id": "aider" }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(looks_v1_2(&v));
+        migrate_v1_2_to_v1_3(&mut v);
+        assert!(looks_v1_3(&v));
+        migrate_v1_3_to_v1_4(&mut v);
+        assert!(looks_v1_4(&v));
+        migrate_v1_4_to_v1_5(&mut v);
+        assert!(looks_v1_5(&v));
+        migrate_v1_5_to_v1_6(&mut v);
+        assert!(looks_v1_6(&v));
+        migrate_v1_6_to_v1_7(&mut v);
+        assert!(looks_v1_7(&v));
+        migrate_v1_7_to_v1_8(&mut v);
+
+        // Post-cascade invariants.
+        assert!(!looks_v1_7(&v));
+        assert!(v.get("claude_local").is_some());
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        // aider was rewritten to claude-local.
+        assert_eq!(tabs[1].get("id").unwrap(), "claude-local");
+        assert_eq!(tabs[1].get("use_local_provider").unwrap(), true);
+        assert!(tabs[1].get("ai_tool_kind").is_none());
+        assert_eq!(tabs[0].get("use_local_provider").unwrap(), false);
+        // The v1.2 → v1.3 migration moves session.active_tab_id into
+        // the layout's per-pane active_tab_id, so by v1.8 the session
+        // field is null. The layout's active tab should reflect the
+        // rewritten id when the original active tab was aider.
+        let layout = v.get("layout").expect("layout populated by v1.2 → v1.3");
+        let tree = layout.get("tree").unwrap();
+        // The v1.2 → v1.3 migration synthesizes a single root pane
+        // with all tabs in order. After v1.7 → v1.8 the aider id has
+        // become claude-local everywhere it appeared.
+        let tab_ids = tree.get("tab_ids").unwrap().as_array().unwrap();
+        assert!(tab_ids.iter().any(|t| t.as_str() == Some("claude-local")));
+        assert!(!tab_ids.iter().any(|t| t.as_str() == Some("aider")));
     }
 }

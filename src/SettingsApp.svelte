@@ -9,9 +9,11 @@
   } from './lib/settings/store';
   import {
     aiToolTabDefaults,
+    consumeSettingsDeepLink,
     listVoices,
     requestTabRestart,
   } from './lib/settings/ipc';
+  import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
     Settings,
@@ -30,6 +32,10 @@
   import type { ThemeColorsWire } from './lib/settings/types';
 
   let voices = $state<string[]>([]);
+  // V1.4-07: Local LLM provider section. The auth-token input toggles
+  // between password and text via this flag (no keychain integration in
+  // this milestone — the token sits cleartext in settings.json).
+  let showLocalToken = $state<boolean>(false);
   // Per-tab "applied" baselines — used to compute the Restart Required
   // indicator when subprocess-affecting fields drift from the spawn-time
   // settings. Notification text and first-launch dismissal are NOT in
@@ -62,6 +68,26 @@
     };
   }
 
+  // V1.4-07 A: deep-link to a specific tab's section. Cold-open path
+  // reads the pending target from the backend on mount; hot-open path
+  // listens for `settings-deep-link` events fired while the window is
+  // already open. Both call `scrollToTabSection` with the same id.
+  let unlistenDeepLink: (() => void) | undefined;
+
+  function scrollToTabSection(tabId: string): void {
+    // Each Tabs-section <details> wrapper has id `tab-section-<tabId>`.
+    // Use a microtask to give the {#each} a chance to render after the
+    // settings snapshot lands (covers the cold-open case where this
+    // runs before the section exists in the DOM).
+    queueMicrotask(() => {
+      const el = document.getElementById(`tab-section-${tabId}`);
+      if (!el) return;
+      // Force the <details> open so the section is visible.
+      if (el instanceof HTMLDetailsElement) el.open = true;
+      el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    });
+  }
+
   onMount(async () => {
     await initSettings();
     snapshot = structuredClone(get(settings));
@@ -81,9 +107,30 @@
         })
         .catch((e) => console.warn(`ai_tool_tab_defaults(${t}) failed`, e));
     }
+
+    // V1.4-07 A: cold-open deep-link. The IPC stored a target id in
+    // backend state when the user clicked "Configure tab" on an AI
+    // tab; we read+clear it and scroll if non-null.
+    consumeSettingsDeepLink()
+      .then((target) => {
+        if (target) scrollToTabSection(target);
+      })
+      .catch((e) => console.warn('consume_settings_deep_link failed', e));
+
+    // V1.4-07 A: hot-open deep-link. Fired while this window is already
+    // open and the user clicks Configure on a different tab.
+    unlistenDeepLink = await listen<{ kind: string; tab_id: string }>(
+      'settings-deep-link',
+      (e) => {
+        if (e.payload.kind === 'tab') scrollToTabSection(e.payload.tab_id);
+      },
+    );
   });
 
-  onDestroy(() => unsub?.());
+  onDestroy(() => {
+    unsub?.();
+    unlistenDeepLink?.();
+  });
 
   /// Mutate the live snapshot via `updater`, then push to the backend.
   /// Backend's debounced save coalesces rapid calls (slider drags).
@@ -818,13 +865,92 @@
         />
       </label>
       <label>
-        <span>Switch to Aider tab</span>
+        <span>Switch to Claude (local) tab</span>
         <ShortcutCapture
           bind:value={
             () => snapshot!.shortcuts.switch_to_tab_2,
             (v) => patch((s) => (s.shortcuts.switch_to_tab_2 = v))
           }
         />
+      </label>
+    </section>
+
+    <section>
+      <h2>Local LLM provider</h2>
+      <small class="hint">
+        Settings for AI tabs that have <em>Use local LLM provider</em>
+        enabled. Run a LiteLLM (or compatible) proxy that translates the
+        Anthropic Messages API to your local model — cctts does not start
+        the proxy. See the
+        <a
+          href="https://docs.litellm.ai/docs/proxy/quick_start"
+          target="_blank"
+          rel="noopener noreferrer">LiteLLM docs</a
+        >.
+      </small>
+      <label>
+        <span>Proxy URL</span>
+        <input
+          type="text"
+          value={snapshot?.claude_local.base_url ?? ''}
+          oninput={(e) =>
+            patch(
+              (s) =>
+                (s.claude_local.base_url = (
+                  e.currentTarget as HTMLInputElement
+                ).value),
+            )}
+          placeholder="http://localhost:4000"
+        />
+        <small class="hint">
+          Becomes <code>ANTHROPIC_BASE_URL</code> on launch.
+        </small>
+      </label>
+      <label>
+        <span>Auth token</span>
+        <input
+          type={showLocalToken ? 'text' : 'password'}
+          value={snapshot?.claude_local.auth_token ?? ''}
+          oninput={(e) =>
+            patch(
+              (s) =>
+                (s.claude_local.auth_token = (
+                  e.currentTarget as HTMLInputElement
+                ).value),
+            )}
+          placeholder="sk-dummy"
+        />
+        <button
+          type="button"
+          class="secondary"
+          onclick={() => (showLocalToken = !showLocalToken)}
+        >
+          {showLocalToken ? 'Hide' : 'Show'}
+        </button>
+        <small class="hint">
+          Becomes <code>ANTHROPIC_AUTH_TOKEN</code>. Stored cleartext;
+          local proxies usually accept dummy tokens.
+        </small>
+      </label>
+      <label>
+        <span>Model alias (optional)</span>
+        <input
+          type="text"
+          value={snapshot?.claude_local.model_alias ?? ''}
+          oninput={(e) =>
+            patch(
+              (s) =>
+                (s.claude_local.model_alias = (
+                  e.currentTarget as HTMLInputElement
+                ).value),
+            )}
+          placeholder=""
+        />
+        <small class="hint">
+          When non-empty, becomes <code>ANTHROPIC_MODEL</code>. Most
+          users leave this blank and configure model mapping inside
+          their LiteLLM proxy config.
+        </small>
       </label>
     </section>
 
@@ -839,7 +965,7 @@
         {#each tabEntries as entry (entry.id)}
           {#if entry.kind === 'ai_tool'}
             {@const live = aiTabAt(entry.id)}
-            <details open>
+            <details open id="tab-section-{entry.id}">
               <summary>
                 {entry.name}
                 <span class="kind-badge ai">AI</span>
@@ -860,7 +986,7 @@
               {/if}
             </details>
           {:else}
-            <details>
+            <details id="tab-section-{entry.id}">
               <summary>
                 {entry.name}
                 <span class="kind-badge shell">Shell</span>

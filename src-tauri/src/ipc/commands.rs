@@ -7,8 +7,8 @@ use crate::error::{AppError, AppResult};
 use crate::ipc::windows::{open_or_focus_settings, SETTINGS_LABEL};
 use crate::ipc::AppState;
 use crate::settings::{
-    default_aider_tab, default_claude_tab, AiToolTabConfig, Settings, TabConfig, AIDER_TAB_ID,
-    CLAUDE_TAB_ID,
+    default_claude_local_tab, default_claude_tab, AiToolTabConfig, Settings, TabConfig,
+    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
 };
 use crate::state::{StateSignal, TabId};
 
@@ -380,7 +380,7 @@ pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Settings> {
 pub async fn ai_tool_tab_defaults(tab: TabId) -> AppResult<AiToolTabConfig> {
     let config = match tab.as_str() {
         CLAUDE_TAB_ID => default_claude_tab(),
-        AIDER_TAB_ID => default_aider_tab(),
+        CLAUDE_LOCAL_TAB_ID => default_claude_local_tab(),
         other => {
             return Err(AppError::Pty(format!(
                 "ai_tool_tab_defaults: tab {other} has no AI defaults"
@@ -440,6 +440,43 @@ pub async fn close_settings_window(app: AppHandle) -> AppResult<()> {
         let _ = w.close();
     }
     Ok(())
+}
+
+/// V1.4-07 A: open the Settings window scrolled to a specific tab's
+/// section. The right-click "Configure tab" entry on AI tabs uses this
+/// instead of the shell-only `ConfigureTabDialog.svelte`. Cold-open is
+/// handled by storing the target id in `AppState.pending_settings_deep_link`
+/// (the Settings window calls `consume_settings_deep_link` on mount);
+/// hot-open by emitting a `settings-deep-link` event the Settings window
+/// listens for. We do both so either path works without a race.
+#[tauri::command]
+pub async fn open_settings_window_to_tab(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tab: String,
+) -> AppResult<()> {
+    if let Ok(mut slot) = state.pending_settings_deep_link.lock() {
+        *slot = Some(tab.clone());
+    }
+    open_or_focus_settings(&app)?;
+    let _ = app.emit_to(
+        EventTarget::webview_window(SETTINGS_LABEL),
+        "settings-deep-link",
+        serde_json::json!({ "kind": "tab", "tab_id": tab }),
+    );
+    Ok(())
+}
+
+/// V1.4-07 A: pulled by `SettingsApp.svelte` on mount to read+clear any
+/// pending deep-link target stored by `open_settings_window_to_tab`.
+/// Returns `None` when no target is pending.
+#[tauri::command]
+pub async fn consume_settings_deep_link(state: State<'_, AppState>) -> AppResult<Option<String>> {
+    Ok(state
+        .pending_settings_deep_link
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take()))
 }
 
 /// Trigger a tab restart from another window (typically settings). The

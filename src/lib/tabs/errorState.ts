@@ -6,8 +6,8 @@ import { writable } from 'svelte/store';
 import type { TabId } from './types';
 
 export interface TabError {
-  // One-line user-facing summary, e.g. "Aider failed to start." or
-  // "Aider exited unexpectedly."
+  // One-line user-facing summary, e.g. "Claude failed to start." or
+  // "Claude exited unexpectedly."
   headline: string;
   // Raw error text from the backend or PTY exit payload.
   raw: string;

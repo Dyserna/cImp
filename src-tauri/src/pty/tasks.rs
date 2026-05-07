@@ -17,7 +17,7 @@ use crate::processing::permission::{
 use crate::processing::{ProcessingEvent, ProcessingLayer};
 use super::manager::ProcessorControl;
 use crate::settings::SettingsHandle;
-use crate::state::{AiToolKind, StateSignal, TabId, TabKind};
+use crate::state::{StateSignal, TabId, TabKind};
 use crate::tts::TtsRequest;
 
 /// Tail size scanned by the permission detector after each ingest/flush.
@@ -161,13 +161,13 @@ pub fn spawn_processor(
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // Permission detector. Aider patterns are deferred (NO_PATTERNS keeps
-        // the detector loop a no-op for that tab without special-casing in the
-        // hot path). Shell tabs go through the no-op path too, and the
-        // detector itself is never invoked for them — see `is_shell` below.
+        // Permission detector. AI tabs run the Claude Code patterns
+        // (subscription and local Claude both emit the same permission
+        // prompts since they're the same binary); Shell tabs use a no-op
+        // pattern set, and the detector itself is never invoked for them
+        // — see `is_shell` below.
         let detector_patterns = match kind {
-            TabKind::AiTool(AiToolKind::ClaudeCode) => CLAUDE_PERMISSION_PATTERNS,
-            TabKind::AiTool(AiToolKind::Aider) => NO_PATTERNS,
+            TabKind::AiTool => CLAUDE_PERMISSION_PATTERNS,
             TabKind::Shell => NO_PATTERNS,
         };
         let mut detector = PermissionDetector::new(detector_patterns);

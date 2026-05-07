@@ -25,9 +25,10 @@ use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
-    list_tabs, list_voices, open_settings_window, pty_get_scrollback, pty_rebind_channel,
-    pty_resize, pty_restart, pty_start, pty_write, request_tab_restart, restart_shell_tab,
-    set_active_tab, settings_get, settings_update, tab_activate, tts_test,
+    consume_settings_deep_link, list_tabs, list_voices, open_settings_window,
+    open_settings_window_to_tab, pty_get_scrollback, pty_rebind_channel, pty_resize, pty_restart,
+    pty_start, pty_write, request_tab_restart, restart_shell_tab, set_active_tab, settings_get,
+    settings_update, tab_activate, tts_test,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -38,12 +39,10 @@ use crate::ipc::tab_lifecycle::{
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
-    LayoutNodePersisted, LayoutPersisted, Settings, SettingsHandle, TabConfig, AIDER_TAB_ID,
-    CLAUDE_TAB_ID,
+    LayoutNodePersisted, LayoutPersisted, Settings, SettingsHandle, TabConfig,
+    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
 };
-use crate::state::{
-    spawn_state_manager, AiToolKind, StateEvent, StateSignal, TabId, TabKind, TabMeta,
-};
+use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, TtsEngine, TtsRequest};
 
@@ -89,9 +88,9 @@ fn main() {
     let (state_event_tx, _) = broadcast::channel::<StateEvent>(64);
 
     // Launch-seed tab list comes from settings now. The integrity check
-    // guarantees claude / aider / shell-default-1 are present; user-
-    // created Shell tabs that have been persisted across launches are
-    // appended in their stored order. Each entry's name reflects the
+    // guarantees claude / claude-local / shell-default-1 are present;
+    // user-created Shell tabs that have been persisted across launches
+    // are appended in their stored order. Each entry's name reflects the
     // user's last-seen edit (rename, configure dialog, settings window).
     let tab_metas: Vec<TabMeta> = build_tab_metas_from_settings(&settings_handle.current());
     let seed_tabs: Vec<TabId> = tab_metas.iter().map(|m| m.id.clone()).collect();
@@ -169,6 +168,7 @@ fn main() {
         input_lengths: input_lengths.clone(),
         settings: settings_handle.clone(),
         audio: audio_slot.clone(),
+        pending_settings_deep_link: Arc::new(Mutex::new(None)),
     };
 
     let tts_rx_for_setup = tts_rx_slot.clone();
@@ -268,6 +268,8 @@ fn main() {
             list_voices,
             list_tabs,
             open_settings_window,
+            open_settings_window_to_tab,
+            consume_settings_deep_link,
             close_settings_window,
             request_tab_restart,
             restart_shell_tab,
@@ -359,10 +361,10 @@ fn layout_focused_active_tab_id(layout: &LayoutPersisted) -> Option<String> {
 }
 
 /// Build the launch-seed `Vec<TabMeta>` from a settings snapshot. Reserved
-/// ids (claude / aider) map to their corresponding `TabId` variants;
-/// everything else is a Shell tab. The integrity check has already
-/// guaranteed claude / aider / shell-default-1 are present, so the result
-/// always has at least three entries.
+/// ids (claude / claude-local) map to their corresponding `TabId`
+/// variants; everything else is a Shell tab. The integrity check has
+/// already guaranteed claude / claude-local / shell-default-1 are
+/// present, so the result always has at least three entries.
 fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
     settings
         .tabs
@@ -371,14 +373,11 @@ fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
             let id = cfg.id();
             let tab_id = match id {
                 CLAUDE_TAB_ID => TabId::Claude,
-                AIDER_TAB_ID => TabId::Aider,
+                CLAUDE_LOCAL_TAB_ID => TabId::ClaudeLocal,
                 other => TabId::Shell(other.to_string()),
             };
             let kind = match cfg {
-                TabConfig::AiTool(c) => match c.id.as_str() {
-                    AIDER_TAB_ID => TabKind::AiTool(AiToolKind::Aider),
-                    _ => TabKind::AiTool(AiToolKind::ClaudeCode),
-                },
+                TabConfig::AiTool(_) => TabKind::AiTool,
                 TabConfig::Shell(_) => TabKind::Shell,
             };
             TabMeta {

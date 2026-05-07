@@ -144,7 +144,14 @@ jobs:
           if ($fail -eq 1) { exit 1 }
 
       - name: Install npm deps
-        run: npm ci
+        # `npm install` rather than `npm ci` because the committed lockfile
+        # was generated under newer npm (11.x) than the runner ships
+        # (10.x), and npm 10 is stricter about peer-dep resolution. `npm
+        # install` re-resolves transitive trees that npm 10 considers
+        # missing without rejecting the whole tree. Trade-off: lockfile
+        # is not strictly enforced in CI; acceptable for a single-target
+        # personal build where every release is rebuilt from scratch.
+        run: npm install --no-audit --no-fund
 
       - name: Tauri build (release)
         shell: pwsh

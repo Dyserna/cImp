@@ -32,6 +32,10 @@ Thumbs.db
 **/.claude/settings.local.json
 **/.claude/scheduled_tasks.lock
 
+# CCTTS local custom config (per-machine layout / session / avatar /
+# TTS state; the app writes these alongside the regular config).
+**/.cctts.custom.config.json
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

@@ -66,6 +66,9 @@ export interface BehaviorSettings {
   /// When true, tab announcements fire even for the currently-focused tab.
   /// Default false reproduces the historical background-only behavior.
   announce_focused_tab: boolean;
+  /// When true, text selected in any terminal is copied to the system
+  /// clipboard automatically.
+  copy_on_select: boolean;
 }
 
 export interface ComposeSettings {
@@ -359,11 +362,36 @@ export interface Settings {
   /// IPC opens / closes the corresponding AI tabs in response. Default
   /// is `cloud` (subscription Claude only) on a fresh install.
   claude_tabs_enabled: ClaudeTabsEnabled;
+  /// File-logger configuration. The backend writes daily rolling log
+  /// files into `<exe-dir>/logs/`; this field drives the live filter.
+  logging: LoggingSettings;
 }
 
 /// Which Claude tabs the user has enabled. Mirrored from the backend's
 /// `ClaudeTabsEnabled` enum (kebab-case wire format).
 export type ClaudeTabsEnabled = 'cloud' | 'local' | 'both';
+
+/// Tracing-filter level. Lowercase to match Rust's serde rename.
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
+
+/// Log file retention. Drives the startup cleanup pass that removes
+/// rolled files older than the chosen window. `never` keeps everything.
+export type LogRetention = 'daily' | 'weekly' | 'monthly' | 'never';
+
+/// Per-tab raw PTY content capture. Disabled by default. When on,
+/// every tab's PTY output is also written to
+/// `<exe-dir>/logs/content/<tab-id>.log.<YYYY-MM-DD>`.
+export interface ContentCaptureSettings {
+  enabled: boolean;
+  retention: LogRetention;
+}
+
+/// File-logger configuration. Mirrors Rust's `LoggingSettings`.
+export interface LoggingSettings {
+  level: LogLevel;
+  retention: LogRetention;
+  content_capture: ContentCaptureSettings;
+}
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
 /// `auth_token` become `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` on
@@ -436,6 +464,7 @@ export function defaultSettings(): Settings {
       announcements_enabled: true,
       follow_avatar: false,
       announce_focused_tab: false,
+      copy_on_select: true,
     },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {
@@ -536,5 +565,10 @@ export function defaultSettings(): Settings {
       model_alias: '',
     },
     claude_tabs_enabled: 'cloud',
+    logging: {
+      level: 'info',
+      retention: 'weekly',
+      content_capture: { enabled: false, retention: 'weekly' },
+    },
   };
 }

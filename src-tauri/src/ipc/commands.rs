@@ -404,6 +404,40 @@ pub async fn settings_update(
     Ok(())
 }
 
+/// Open `<exe-dir>/logs/content/` in the host file manager. Creates the
+/// folder first if it doesn't exist so the call doesn't 404 on a clean
+/// install. Windows uses `explorer.exe`; macOS `open`; Linux
+/// `xdg-open`. Errors are wrapped in `AppError::Settings` for a single
+/// IPC error type.
+#[tauri::command]
+pub async fn content_open_folder() -> AppResult<()> {
+    let dir = crate::content::dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(AppError::Settings(format!(
+            "create_dir_all {}: {e}",
+            dir.display()
+        )));
+    }
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg(&dir).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&dir).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&dir).spawn()
+    };
+    result
+        .map(|_| ())
+        .map_err(|e| AppError::Settings(format!("open folder: {e}")))
+}
+
+/// Delete every file inside `<exe-dir>/logs/content/`. Returns the
+/// count of removed files. Per-file failures are logged backend-side
+/// and do not abort the pass.
+#[tauri::command]
+pub async fn content_clear() -> AppResult<u32> {
+    Ok(crate::content::delete_all())
+}
+
 #[tauri::command]
 pub async fn list_voices() -> AppResult<Vec<String>> {
     use std::collections::BTreeSet;

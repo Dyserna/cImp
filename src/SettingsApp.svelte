@@ -22,7 +22,7 @@
     TabConfig,
   } from './lib/settings/types';
   import { findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
-  import { setClaudeTabsEnabled } from './lib/ipc';
+  import { contentClear, contentOpenFolder, setClaudeTabsEnabled } from './lib/ipc';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
@@ -532,6 +532,19 @@
             Off by default — announcements (idle, awaiting permission, error,
             exit) only fire for background tabs. Turn on to hear them for the
             tab you're currently looking at as well.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.copy_on_select}
+              onchange={(e) =>
+                patch((s) => (s.behavior.copy_on_select = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Copy on select</span>
+          </label>
+          <small class="hint">
+            When on, text selected in any terminal is copied to the system
+            clipboard automatically.
           </small>
           <label class="checkbox disabled">
             <input type="checkbox" checked={snapshot.behavior.fallback_silent} disabled />
@@ -1300,6 +1313,127 @@
             </label>
           </div>
         </section>
+
+        <section>
+          <h2>Logging</h2>
+          <small class="hint top">
+            Log files roll daily into <code>logs/</code> next to the cctts
+            executable. Changing the level applies live; the
+            <code>RUST_LOG</code> env var, when set at launch, overrides
+            this until you change it here.
+          </small>
+          <label>
+            <span>Log level</span>
+            <select
+              value={snapshot.logging.level}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.logging.level = (
+                      e.currentTarget as HTMLSelectElement
+                    ).value as Settings['logging']['level']),
+                )}
+            >
+              <option value="trace">Trace</option>
+              <option value="debug">Debug</option>
+              <option value="info">Info</option>
+              <option value="warn">Warn</option>
+              <option value="error">Error</option>
+            </select>
+          </label>
+          <label>
+            <span>Retention</span>
+            <select
+              value={snapshot.logging.retention}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.logging.retention = (
+                      e.currentTarget as HTMLSelectElement
+                    ).value as Settings['logging']['retention']),
+                )}
+            >
+              <option value="daily">Daily (keep 1 day)</option>
+              <option value="weekly">Weekly (keep 7 days)</option>
+              <option value="monthly">Monthly (keep 30 days)</option>
+              <option value="never">Never (keep everything)</option>
+            </select>
+            <small class="hint">
+              Cleanup runs at launch and whenever this setting changes.
+              Files older than the window are deleted; the active day's log
+              is always kept.
+            </small>
+          </label>
+
+          <h3>Content capture</h3>
+          <small class="hint top">
+            When on, raw PTY output for every Claude / shell tab is also
+            written to <code>logs/content/&lt;tab-id&gt;.log.&lt;date&gt;</code>,
+            rotated daily. Output includes ANSI escape codes — pipe through
+            <code>sed</code> or a viewer if you want plain text.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.logging.content_capture.enabled}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.logging.content_capture.enabled = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Capture full tab output</span>
+          </label>
+          <label>
+            <span>Retention</span>
+            <select
+              value={snapshot.logging.content_capture.retention}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.logging.content_capture.retention = (
+                      e.currentTarget as HTMLSelectElement
+                    ).value as Settings['logging']['content_capture']['retention']),
+                )}
+            >
+              <option value="daily">Daily (keep 1 day)</option>
+              <option value="weekly">Weekly (keep 7 days)</option>
+              <option value="monthly">Monthly (keep 30 days)</option>
+              <option value="never">Never (keep everything)</option>
+            </select>
+          </label>
+          <div class="content-actions">
+            <button
+              type="button"
+              onclick={() =>
+                contentOpenFolder().catch((e) =>
+                  console.error('content_open_folder failed:', e),
+                )}
+            >
+              Open folder
+            </button>
+            <button
+              type="button"
+              onclick={async () => {
+                if (
+                  !confirm(
+                    'Delete every file inside the content folder? This cannot be undone.',
+                  )
+                )
+                  return;
+                try {
+                  await contentClear();
+                } catch (e) {
+                  console.error('content_clear failed:', e);
+                }
+              }}
+            >
+              Delete all files
+            </button>
+          </div>
+        </section>
       {:else if activeSection === 'about'}
         <section class="about-section">
           <h2>About</h2>
@@ -1567,6 +1701,11 @@
     display: flex;
     gap: var(--space-2);
     margin-bottom: var(--space-3);
+  }
+  .content-actions {
+    display: flex;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
   }
   .preset-save {
     display: flex;

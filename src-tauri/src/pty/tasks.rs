@@ -220,6 +220,9 @@ pub fn spawn_processor(
                 maybe = rx.recv() => {
                     match maybe {
                         Some(bytes) => {
+                            // Per-tab raw content capture. Disabled by
+                            // default; fast-path no-op when off.
+                            crate::content::write(&tab, &bytes);
                             let events = layer.ingest(&bytes);
                             let saw_terminal_bytes = events.iter().any(|e| matches!(
                                 e,

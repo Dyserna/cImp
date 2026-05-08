@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod content;
 mod error;
 mod ipc;
+mod logging;
 mod notifications;
 mod processing;
 mod pty;
@@ -19,16 +21,15 @@ use std::sync::{Arc, Mutex, RwLock};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
-    consume_settings_deep_link, list_tabs, list_voices, open_settings_window,
-    open_settings_window_to_tab, pty_get_scrollback, pty_rebind_channel, pty_resize, pty_restart,
-    pty_start, pty_write, request_tab_restart, restart_shell_tab, set_active_tab, settings_get,
-    settings_update, tab_activate, tts_test,
+    consume_settings_deep_link, content_clear, content_open_folder, list_tabs, list_voices,
+    open_settings_window, open_settings_window_to_tab, pty_get_scrollback, pty_rebind_channel,
+    pty_resize, pty_restart, pty_start, pty_write, request_tab_restart, restart_shell_tab,
+    set_active_tab, settings_get, settings_update, tab_activate, tts_test,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -39,8 +40,8 @@ use crate::ipc::tab_lifecycle::{
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
-    LayoutNodePersisted, LayoutPersisted, Settings, SettingsHandle, TabConfig,
-    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
+    LayoutNodePersisted, LayoutPersisted, LogLevel, LogRetention, Settings, SettingsHandle,
+    TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
 };
 use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
@@ -50,10 +51,15 @@ fn main() {
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
 
-    init_tracing();
+    // Tracing comes up before settings load so the load path's own logs
+    // hit the file. The default-level guard is replaced once settings
+    // load completes (`logging::set_level` below); RUST_LOG, when set,
+    // wins over both.
+    let _log_guard = logging::init(LogLevel::default());
     info!(
         cwd = %launch_cwd.display(),
         args = ?extra_args,
+        logs_dir = %logging::logs_dir().display(),
         "cctts starting"
     );
 
@@ -69,6 +75,22 @@ fn main() {
     // fresh installs and during the v1.1 → v1.2 transform that consumes
     // the legacy `_shell_1_tmp` interim key.
     let settings_handle = settings::init(&default_shell, &launch_cwd);
+
+    // Apply the user's saved log level to the live filter. RUST_LOG, when
+    // set, was already locked in by `logging::init` and remains in effect
+    // until the user picks a new level here — at which point we reload to
+    // the chosen level and the env override is overridden. The cleanup
+    // pass deletes old rolled files per the user's retention setting.
+    // Content capture is disabled by default — `set_enabled` mirrors the
+    // saved flag, and the cleanup pass also runs against the content
+    // subdirectory.
+    {
+        let snap = settings_handle.current();
+        logging::set_level(snap.logging.level);
+        logging::run_cleanup(snap.logging.retention);
+        content::set_enabled(snap.logging.content_capture.enabled);
+        content::run_cleanup(snap.logging.content_capture.retention);
+    }
 
     // TTS / audio pipeline. Failures are non-fatal — the app launches with
     // TTS silent and a warning logged. Init is deferred to the Tauri `setup`
@@ -297,6 +319,8 @@ fn main() {
             save_layout_preset,
             delete_layout_preset,
             rename_layout_preset,
+            content_open_folder,
+            content_clear,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -400,15 +424,6 @@ fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
         .collect()
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,cctts=debug"));
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_target(true).with_thread_ids(false))
-        .init();
-}
-
 fn init_tts_pipeline(
     app: AppHandle,
     tts_rx: mpsc::Receiver<TtsRequest>,
@@ -471,10 +486,31 @@ fn init_tts_pipeline(
 fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle) {
     tauri::async_runtime::spawn(async move {
         let mut rx = settings.subscribe();
-        let _ = app.emit("settings-changed", settings.current());
+        let initial = settings.current();
+        let mut current_log_level = initial.logging.level;
+        let mut current_retention: LogRetention = initial.logging.retention;
+        let mut current_content_enabled = initial.logging.content_capture.enabled;
+        let mut current_content_retention: LogRetention = initial.logging.content_capture.retention;
+        let _ = app.emit("settings-changed", initial);
         loop {
             match rx.recv().await {
                 Ok(s) => {
+                    if s.logging.level != current_log_level {
+                        current_log_level = s.logging.level;
+                        logging::set_level(current_log_level);
+                    }
+                    if s.logging.retention != current_retention {
+                        current_retention = s.logging.retention;
+                        logging::run_cleanup(current_retention);
+                    }
+                    if s.logging.content_capture.enabled != current_content_enabled {
+                        current_content_enabled = s.logging.content_capture.enabled;
+                        content::set_enabled(current_content_enabled);
+                    }
+                    if s.logging.content_capture.retention != current_content_retention {
+                        current_content_retention = s.logging.content_capture.retention;
+                        content::run_cleanup(current_content_retention);
+                    }
                     let _ = app.emit::<Settings>("settings-changed", s);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

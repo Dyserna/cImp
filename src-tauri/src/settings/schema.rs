@@ -74,6 +74,107 @@ pub struct Settings {
     /// enforces the invariant on load. Default is `Cloud` so a brand-new
     /// install starts with the subscription Claude tab only.
     pub claude_tabs_enabled: ClaudeTabsEnabled,
+    /// File-logger configuration. The tracing subscriber writes daily
+    /// rolling files into `<exe-dir>/logs/`; the level field drives the
+    /// EnvFilter via a reload handle so changes apply live.
+    pub logging: LoggingSettings,
+}
+
+/// Logging configuration. The file path is fixed at
+/// `<exe-dir>/logs/cctts.log.<YYYY-MM-DD>`; the `level` field drives the
+/// live filter and `retention` drives the startup cleanup pass.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct LoggingSettings {
+    pub level: LogLevel,
+    pub retention: LogRetention,
+    pub content_capture: ContentCaptureSettings,
+}
+
+/// Per-tab content (PTY raw output) capture configuration. Disabled by
+/// default — when enabled, every byte read from each tab's PTY is also
+/// appended to `<exe-dir>/logs/content/<tab-id>.log.<YYYY-MM-DD>`,
+/// rotated daily by `tracing-appender`. `retention` runs the same
+/// max-age cleanup as the tracing logs but against the `content/`
+/// subdirectory.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct ContentCaptureSettings {
+    pub enabled: bool,
+    pub retention: LogRetention,
+}
+
+impl Default for ContentCaptureSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retention: LogRetention::Weekly,
+        }
+    }
+}
+
+/// Per-process tracing-filter level. Mapped to an `EnvFilter` string by
+/// `as_filter_str`; serialized as a lowercase string. The `RUST_LOG`
+/// environment variable, when set, overrides this at startup.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl Default for LogLevel {
+    fn default() -> Self {
+        Self::Info
+    }
+}
+
+impl LogLevel {
+    pub fn as_filter_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// How long to keep rolled log files before the startup cleanup pass
+/// removes them. `Never` skips cleanup entirely. Computed as a max-age
+/// against each file's mtime in `logging::run_cleanup`.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogRetention {
+    Daily,
+    Weekly,
+    Monthly,
+    Never,
+}
+
+impl Default for LogRetention {
+    fn default() -> Self {
+        Self::Weekly
+    }
+}
+
+impl LogRetention {
+    /// Max-age threshold for cleanup. `None` means "keep everything".
+    /// Approximate calendar values (1d / 7d / 30d) — exact day-boundary
+    /// alignment isn't necessary for log retention.
+    pub fn max_age(self) -> Option<std::time::Duration> {
+        const DAY: u64 = 24 * 60 * 60;
+        match self {
+            Self::Daily => Some(std::time::Duration::from_secs(DAY)),
+            Self::Weekly => Some(std::time::Duration::from_secs(7 * DAY)),
+            Self::Monthly => Some(std::time::Duration::from_secs(30 * DAY)),
+            Self::Never => None,
+        }
+    }
 }
 
 /// Which Claude tabs the user has enabled. Exactly one of these is the
@@ -635,6 +736,10 @@ pub struct BehaviorSettings {
     /// don't want to hear "awaiting permission" for the tab they're
     /// staring at.
     pub announce_focused_tab: bool,
+    /// When true, text selected in any terminal is copied to the system
+    /// clipboard automatically. Older settings files without this field
+    /// deserialize to the default via serde-default — no migration bump.
+    pub copy_on_select: bool,
 }
 
 impl Default for BehaviorSettings {
@@ -646,6 +751,7 @@ impl Default for BehaviorSettings {
             announcements_enabled: true,
             follow_avatar: false,
             announce_focused_tab: false,
+            copy_on_select: true,
         }
     }
 }

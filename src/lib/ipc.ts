@@ -214,6 +214,18 @@ export async function setClaudeTabsEnabled(
   await invoke('set_claude_tabs_enabled', { value });
 }
 
+/// Open `<exe-dir>/logs/content/` in the OS file manager. Backend
+/// creates the folder first if it doesn't exist.
+export async function contentOpenFolder(): Promise<void> {
+  await invoke('content_open_folder');
+}
+
+/// Delete every file inside `<exe-dir>/logs/content/`. Returns the
+/// count of removed files.
+export async function contentClear(): Promise<number> {
+  return invoke<number>('content_clear');
+}
+
 export interface PtyExitPayload {
   tab: TabId;
   exit: string;

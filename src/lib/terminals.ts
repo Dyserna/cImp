@@ -120,6 +120,10 @@ interface TerminalEntry {
   /// (fast ↔ image) triggers a debounced full Terminal recreate
   /// (V1.4-02). See the V1.4-02 plan for the matrix.
   unsubAppearance: () => void;
+  /// xterm.js `onSelectionChange` listener disposable. Drives the
+  /// behavior.copy_on_select feature — see the registration block in
+  /// `createTerminal`.
+  selectionListener: { dispose: () => void } | null;
   /// Renderer category currently active on this Terminal — `'fast'`
   /// for the canvas-with-no-image path (mode 'none' or 'color') and
   /// `'image'` for the DOM-with-image path. The settings subscriber
@@ -350,6 +354,7 @@ export function createTerminal(
     unsubFont: () => {},
     unsubClosed: null,
     unsubAppearance: () => {},
+    selectionListener: null,
     bgCategory: initialCategory,
     isClosed: false,
     restarting: false,
@@ -423,6 +428,23 @@ export function createTerminal(
       host.style.background = nextTheme.background;
     }
     applyHostBackgroundCss(host, mode);
+  });
+
+  // Copy-on-select: when xterm reports a selection change, push the
+  // selected text to the system clipboard. The setting is read at fire
+  // time so toggling it in the live settings store takes effect without
+  // re-binding. Empty selections (click-to-deselect, mouseup outside the
+  // grid) are skipped so we don't blow away whatever the user actually
+  // has on the clipboard. xterm fires this event many times during a
+  // drag — every fire writes the latest selection, which is fine and
+  // matches conventional terminal copy-on-select behavior.
+  entry.selectionListener = term.onSelectionChange(() => {
+    if (!get(settingsStore).behavior.copy_on_select) return;
+    const text = term.getSelection();
+    if (!text) return;
+    void navigator.clipboard.writeText(text).catch((e) =>
+      console.warn('copy-on-select clipboard write failed:', e),
+    );
   });
 
   term.onData((data) => {
@@ -626,6 +648,7 @@ export function destroyTerminal(tabId: TabId): void {
   entry.unsubFont();
   entry.unsubClosed?.();
   entry.unsubAppearance();
+  entry.selectionListener?.dispose();
   setTerminalFocuser(tabId, null);
   // xterm.dispose() can throw if internal state was already partially
   // torn down by a rapid create-then-destroy or by a host element

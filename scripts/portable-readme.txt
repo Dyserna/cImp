@@ -2,8 +2,9 @@ cctts portable (Windows x64)
 ============================
 
 This zip is a self-contained build of cctts. No installer; no registry
-entries; nothing written outside the folder you unzipped to (until you
-run cctts and it creates settings under %APPDATA%\cctts\).
+entries. The global settings file is written next to cctts.exe; per-
+launch-directory overlays go in whatever folder you start cctts from.
+Transient runtime state (scrollback) lives under %APPDATA%\cctts\.
 
 
 Quick start
@@ -76,17 +77,26 @@ in the repo for the GPU support matrix.
 Updating
 --------
 
-Download the next release zip, unzip over the top of this folder. Your
-settings live in `%APPDATA%\cctts\` and persist across updates.
+Download the next release zip and unzip over the top of this folder.
+The zip ships only the exe, DLLs, models, and docs — your existing
+settings.json (next to the exe) and any per-folder
+.cctts.custom.config.json overlays are not in the zip and stay where
+they are.
+
+For an exe-only update that preserves your existing model files, grab
+the matching `*-no-models.zip` from the same release.
 
 
 Uninstall
 ---------
 
-  1. Delete the unzipped folder.
+  1. Delete the unzipped folder. (This removes cctts.exe, the bundled
+     models, and the global settings.json that lives next to the exe.)
   2. Remove the PATH entry you added.
-  3. Optionally delete `%APPDATA%\cctts\` to drop settings, scrollback,
-     and any voicepacks you added there.
+  3. Optionally delete `%APPDATA%\cctts\` to drop scrollback and any
+     extra voicepacks you saved there.
+  4. Optionally delete `.cctts.custom.config.json` from any folder you
+     used to start cctts to drop those per-folder overlays.
 
 
 Troubleshooting

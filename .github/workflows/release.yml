@@ -45,7 +45,8 @@ jobs:
           version="${ref#v}"
           echo "tag=$ref" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "stage_dir=cctts-portable-win-x64-$ref" >> "$GITHUB_OUTPUT"
+          echo "stage_dir_full=cctts-portable-win-x64-$ref" >> "$GITHUB_OUTPUT"
+          echo "stage_dir_slim=cctts-portable-win-x64-$ref-no-models" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -166,45 +167,78 @@ jobs:
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
         run: npm run tauri build -- --no-bundle
 
-      - name: Stage portable layout
+      - name: Stage portable layouts (full + no-models)
         shell: pwsh
         run: |
-          $stage = "${{ steps.tag.outputs.stage_dir }}"
-          New-Item -ItemType Directory -Force -Path "$stage/bin" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$stage/models/voices" | Out-Null
+          $stageFull = "${{ steps.tag.outputs.stage_dir_full }}"
+          $stageSlim = "${{ steps.tag.outputs.stage_dir_slim }}"
+
+          # --- Full variant (with model + default voicepack) ---------------
+          New-Item -ItemType Directory -Force -Path "$stageFull/bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stageFull/models/voices" | Out-Null
 
           # cctts.exe + ORT runtime DLLs (the `ort` crate's download-binaries
           # feature drops these into target/release at build time).
-          Copy-Item src-tauri/target/release/cctts.exe "$stage/bin/"
+          Copy-Item src-tauri/target/release/cctts.exe "$stageFull/bin/"
           Get-ChildItem src-tauri/target/release -Filter 'onnxruntime*.dll' |
-            ForEach-Object { Copy-Item $_.FullName "$stage/bin/" }
+            ForEach-Object { Copy-Item $_.FullName "$stageFull/bin/" }
 
           # Models (downloaded above)
-          Copy-Item download/kokoro-v1.0.onnx "$stage/models/"
-          Copy-Item download/af_heart.bin "$stage/models/voices/"
+          Copy-Item download/kokoro-v1.0.onnx "$stageFull/models/"
+          Copy-Item download/af_heart.bin "$stageFull/models/voices/"
 
           # Top-level docs
-          Copy-Item LICENSE "$stage/"
-          Copy-Item NOTICE "$stage/"
-          Copy-Item scripts/portable-readme.txt "$stage/README.txt"
+          Copy-Item LICENSE "$stageFull/"
+          Copy-Item NOTICE "$stageFull/"
+          Copy-Item scripts/portable-readme.txt "$stageFull/README.txt"
 
-          Write-Host "Staged contents:"
-          Get-ChildItem -Recurse $stage | Select-Object FullName, Length |
+          # --- Slim variant (no Kokoro model, no voicepack) ----------------
+          # Same exe + DLLs as the full build. Skip `models/` entirely so a
+          # user extracting this zip over an existing install keeps their
+          # local model files untouched.
+          New-Item -ItemType Directory -Force -Path "$stageSlim/bin" | Out-Null
+
+          Copy-Item src-tauri/target/release/cctts.exe "$stageSlim/bin/"
+          Get-ChildItem src-tauri/target/release -Filter 'onnxruntime*.dll' |
+            ForEach-Object { Copy-Item $_.FullName "$stageSlim/bin/" }
+
+          Copy-Item LICENSE "$stageSlim/"
+          Copy-Item NOTICE "$stageSlim/"
+          Copy-Item scripts/portable-readme-no-models.txt "$stageSlim/README.txt"
+
+          Write-Host "Staged FULL contents:"
+          Get-ChildItem -Recurse $stageFull | Select-Object FullName, Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+          Write-Host "Staged SLIM contents:"
+          Get-ChildItem -Recurse $stageSlim | Select-Object FullName, Length |
             Format-Table -AutoSize | Out-String | Write-Host
 
-      - name: Zip
+      - name: Zip both variants
         id: zip
         shell: pwsh
         run: |
-          $stage = "${{ steps.tag.outputs.stage_dir }}"
-          $zip = "$stage.zip"
-          Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
-          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
-          $size = (Get-Item $zip).Length
-          Write-Host "zip:  $zip ($size bytes)"
-          Write-Host "sha256: $sha"
-          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $stageFull = "${{ steps.tag.outputs.stage_dir_full }}"
+          $stageSlim = "${{ steps.tag.outputs.stage_dir_slim }}"
+          $zipFull = "$stageFull.zip"
+          $zipSlim = "$stageSlim.zip"
+
+          Compress-Archive -Path $stageFull -DestinationPath $zipFull -CompressionLevel Optimal
+          Compress-Archive -Path $stageSlim -DestinationPath $zipSlim -CompressionLevel Optimal
+
+          $shaFull = (Get-FileHash -Algorithm SHA256 $zipFull).Hash.ToLower()
+          $shaSlim = (Get-FileHash -Algorithm SHA256 $zipSlim).Hash.ToLower()
+          $sizeFull = (Get-Item $zipFull).Length
+          $sizeSlim = (Get-Item $zipSlim).Length
+
+          Write-Host "full zip: $zipFull ($sizeFull bytes)"
+          Write-Host "  sha256: $shaFull"
+          Write-Host "slim zip: $zipSlim ($sizeSlim bytes)"
+          Write-Host "  sha256: $shaSlim"
+
+          "zip_full=$zipFull" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_slim=$zipSlim" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha_full=$shaFull" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha_slim=$shaSlim" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Build release notes (CHANGELOG section if present, else autogen)
         id: notes
@@ -245,7 +279,9 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "**Portable zip SHA-256:** \`${{ steps.zip.outputs.sha }}\`"
+            echo "**Portable zip SHA-256 (full, with models):** \`${{ steps.zip.outputs.sha_full }}\`"
+            echo ""
+            echo "**Portable zip SHA-256 (no-models, update zip):** \`${{ steps.zip.outputs.sha_slim }}\`"
           } >> "$out"
 
       - name: Create or update GitHub release
@@ -255,14 +291,15 @@ jobs:
         run: |
           set -e
           tag="${{ steps.tag.outputs.tag }}"
-          zip="${{ steps.zip.outputs.zip }}"
+          zip_full="${{ steps.zip.outputs.zip_full }}"
+          zip_slim="${{ steps.zip.outputs.zip_slim }}"
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag exists — refreshing notes and uploading asset"
+            echo "release $tag exists — refreshing notes and uploading both assets"
             gh release edit "$tag" --notes-file release-notes.md
-            gh release upload "$tag" "$zip" --clobber
+            gh release upload "$tag" "$zip_full" "$zip_slim" --clobber
           else
-            gh release create "$tag" "$zip" \
+            gh release create "$tag" "$zip_full" "$zip_slim" \
               --title "$tag" \
               --notes-file release-notes.md
           fi

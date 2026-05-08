@@ -110,6 +110,16 @@ struct NotificationManager {
     /// fires. Cleared by both the deadline arm and the audio idle-edge
     /// arm so the next enqueue can re-schedule cleanly.
     drain_deadline: Option<Instant>,
+    /// Tabs whose notification audio is currently in flight (from `try_drain`
+    /// to the matching `Speaking → Idle` echo). The audio playback for our
+    /// own announcement fires `TtsPlaybackStarted/Stopped` on the active
+    /// tab, which makes the state machine cycle `Idle → Speaking → Idle`.
+    /// Without this guard, that closing `Speaking → Idle` would itself look
+    /// like a fresh "tab went idle" event and queue another announcement —
+    /// which loops on every "Claude is idle" repeat. Cleared either when
+    /// the matching echo arrives (suppressed) or when any non-Speaking,
+    /// non-Idle state edge for the tab pre-empts it.
+    just_dispatched: HashSet<TabId>,
 }
 
 impl NotificationManager {
@@ -138,6 +148,7 @@ impl NotificationManager {
             last_awaiting: HashMap::new(),
             last_awaiting_question: HashMap::new(),
             drain_deadline: None,
+            just_dispatched: HashSet::new(),
         }
     }
 
@@ -186,6 +197,31 @@ impl NotificationManager {
                     .unwrap_or(AvatarState::Idle);
                 if prev == state {
                     return;
+                }
+                // Suppress the `Speaking → Idle` echo from our own
+                // notification's audio playback ending. The audio thread
+                // emits `TtsPlaybackStarted/Stopped` for the active tab on
+                // every stretch of audio, which makes the state machine
+                // cycle `Idle → Speaking → Idle` whenever an announcement
+                // plays. Without this, that closing edge fires another
+                // "Claude is idle" notification, which plays, fires another
+                // edge, and so on. `just_dispatched` is set in `try_drain`
+                // and is consumed exactly once here.
+                if prev == AvatarState::Speaking
+                    && state == AvatarState::Idle
+                    && self.just_dispatched.remove(&tab)
+                {
+                    debug!(?tab, "notifications: suppressing Idle (own playback echo)");
+                    return;
+                }
+                // Any state edge other than `Idle ↔ Speaking` for a
+                // just-dispatched tab means real activity got there before
+                // the echo (user typed, Claude restarted, error fired).
+                // Drop the marker so the next dispatch's echo can be
+                // suppressed cleanly without our flag stale-suppressing a
+                // genuine future Idle.
+                if state != AvatarState::Speaking && state != AvatarState::Idle {
+                    self.just_dispatched.remove(&tab);
                 }
                 if self.suppress_for_focus(&tab) {
                     return;
@@ -263,6 +299,7 @@ impl NotificationManager {
                 self.last_avatar.remove(&tab);
                 self.last_awaiting.remove(&tab);
                 self.last_awaiting_question.remove(&tab);
+                self.just_dispatched.remove(&tab);
                 // Drop any queued notifications targeting the closed tab —
                 // playing them after close would refer to a tab that no
                 // longer exists in the UI.
@@ -348,6 +385,7 @@ impl NotificationManager {
             "notifications: draining"
         );
         for n in surviving {
+            let tab = n.tab.clone();
             let req = TtsRequest::SynthesizeNotification {
                 tab: n.tab,
                 text: n.text,
@@ -355,6 +393,19 @@ impl NotificationManager {
             if let Err(e) = self.tts_tx.send(req).await {
                 warn!(error = %e, "notifications: tts channel closed");
                 return;
+            }
+            // Arm the echo-suppression guard. The audio thread tags its
+            // `TtsPlaybackStarted/Stopped` events with the *currently
+            // active* tab, not the notification's originating tab — so
+            // the `Idle → Speaking → Idle` cycle plays out on the active
+            // tab. In the common same-tab case the two are equal; in the
+            // cross-tab case (announcement for an inactive tab while
+            // `announce_focused_tab=true`) the active tab is the one
+            // whose echo would otherwise re-queue. Insert both so either
+            // surface gets suppressed.
+            self.just_dispatched.insert(tab);
+            if let Ok(active) = self.active.read() {
+                self.just_dispatched.insert(active.clone());
             }
         }
     }

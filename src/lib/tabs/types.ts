@@ -14,9 +14,11 @@ export function isShellTab(id: TabId): boolean {
 /// True for tabs that ship with the app and cannot be closed/removed.
 /// Mirrors the backend's `builtin: true` field on the `TabCreated` event;
 /// useful when the event payload isn't in scope (e.g., quick lookups in
-/// the title-bar or shortcut-dispatcher paths).
+/// the title-bar or shortcut-dispatcher paths). The `shell-default-1`
+/// reserved id is *not* a builtin: it's a regular closable shell that
+/// ships on fresh installs.
 export function isBuiltinTab(id: TabId): boolean {
-  return id === 'claude' || id === 'claude-local' || id === 'shell-default-1';
+  return id === 'claude' || id === 'claude-local';
 }
 
 /// Subset of TabId covering only the AI builtins. Used by call sites that

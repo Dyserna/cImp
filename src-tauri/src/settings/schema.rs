@@ -415,12 +415,12 @@ pub fn default_claude_local_tab() -> TabConfig {
 
 /// Default Shell-1 entry. Takes the resolved platform default shell so the
 /// `command` and `args` fields land on the right binary for the host. The
-/// reserved id keeps the integrity check able to identify "the original
-/// Shell 1" across launches.
+/// reserved id is just the seed value for the first shell tab on a fresh
+/// install — it's a regular closable shell, not a builtin.
 pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
     TabConfig::Shell(ShellTabConfig {
         id: SHELL_DEFAULT_TAB_ID.to_string(),
-        builtin: true,
+        builtin: false,
         name: "Shell 1".to_string(),
         command: default_shell.command.to_string_lossy().into_owned(),
         args: default_shell.args.clone(),

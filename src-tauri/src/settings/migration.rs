@@ -432,7 +432,7 @@ fn transform_shell_1_from_interim(shell_tmp: &Value, default_shell: &ShellSpec) 
         "id".to_string(),
         Value::String(SHELL_DEFAULT_TAB_ID.to_string()),
     );
-    entry.insert("builtin".to_string(), Value::Bool(true));
+    entry.insert("builtin".to_string(), Value::Bool(false));
     entry.insert("name".to_string(), Value::String(name));
     entry.insert(
         "command".to_string(),

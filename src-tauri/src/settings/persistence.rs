@@ -16,9 +16,11 @@
 //! by their discriminator fields and routed through the `migration`
 //! module after the merge so a hand-imported old file at the new path
 //! still upgrades cleanly. After migration an integrity check ensures the
-//! three reserved-id tab entries (claude, claude-local, shell-default-1)
-//! exist with `builtin: true` — hand-edited files that deleted them are
-//! repaired transparently.
+//! two AI builtins (claude, claude-local) exist with `builtin: true` —
+//! hand-edited files that deleted them are repaired transparently. The
+//! `shell-default-1` reserved id is *not* re-seeded by the integrity
+//! check: it ships on fresh installs only, and stays closed once a user
+//! closes it.
 //!
 //! `load` always returns a usable `Settings` and a snapshot of the global
 //! baseline (so the save path can compute diffs without re-reading disk).
@@ -363,14 +365,20 @@ fn diff(current: &Value, baseline: &Value) -> Option<Value> {
     }
 }
 
-/// `Settings::default()` with the three reserved-id tab entries seeded for
-/// the host platform and the portable on-disk avatar paths stamped in
-/// (when present). Used on fresh installs and as the recovery fallback
-/// when the file is unrecoverable. Equivalent to running the integrity
-/// check against an empty `tabs` array.
+/// `Settings::default()` with the three default tab entries seeded for the
+/// host platform and the portable on-disk avatar paths stamped in (when
+/// present). Used on fresh installs and as the recovery fallback when the
+/// file is unrecoverable.
+///
+/// The integrity check restores the AI builtins; we additionally seed
+/// `shell-default-1` here so a brand-new install gets one ready-to-use
+/// shell tab. The integrity check no longer re-creates that tab on its
+/// own, so closing it once is permanent (which is what we want for a
+/// closable tab).
 fn seeded_defaults(default_shell: &ShellSpec) -> Settings {
     let mut s = Settings::default();
     integrity_check(&mut s, default_shell);
+    s.tabs.push(default_shell_1_tab(default_shell));
     seed_portable_avatar_paths(&mut s);
     s
 }
@@ -423,31 +431,45 @@ fn stamp_avatar_paths_from(s: &mut Settings, dir: &Path) {
     }
 }
 
-/// Ensure the three reserved-id tab entries are present and marked as
-/// builtins. Returns true if anything was changed (caller may want to
-/// write back to disk). Logged as a warning when an entry has to be
-/// restored — the typical cause is a hand-edited file.
+/// Ensure the two AI builtin entries are present and marked as builtins.
+/// Returns true if anything was changed (caller may want to write back
+/// to disk). Logged as a warning when an entry has to be restored — the
+/// typical cause is a hand-edited file.
 ///
-/// The order is deterministic: claude first, then claude-local, then
-/// shell-default-1, with each restored entry inserted at its canonical
-/// position (front, after-claude, after-claude-local). User-created
-/// Shell tabs retain their relative ordering after the three pinned
-/// entries.
+/// The order is deterministic: claude first, then claude-local, each
+/// restored entry inserted at its canonical position (front,
+/// after-claude). User-created Shell tabs retain their relative ordering
+/// after the two pinned AI builtins. The `shell-default-1` reserved id
+/// is *not* re-seeded here: it's a closable shell that ships only on
+/// fresh installs (see `seeded_defaults`).
 pub fn integrity_check(settings: &mut Settings, default_shell: &ShellSpec) -> bool {
+    let _ = default_shell; // retained for signature stability across call sites
     let mut changed = false;
 
-    // 1. Force builtin: true on the three reserved ids if they exist with
+    // 1. Force builtin: true on the two AI builtins if they exist with
     //    builtin: false. Defends against hand-edits trying to flip the flag.
-    let reserved = [CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID, SHELL_DEFAULT_TAB_ID];
+    let ai_builtins = [CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID];
     for tab in settings.tabs.iter_mut() {
-        if reserved.contains(&tab.id()) && !tab.builtin() {
+        if ai_builtins.contains(&tab.id()) && !tab.builtin() {
             tab.set_builtin(true);
             changed = true;
-            tracing::warn!(id = tab.id(), "integrity: forced builtin: true on reserved tab");
+            tracing::warn!(id = tab.id(), "integrity: forced builtin: true on AI builtin");
         }
     }
 
-    // 2. Force `use_local_provider` to its canonical value on the two
+    // 2. Force builtin: false on `shell-default-1`: older settings files
+    //    persisted it as `builtin: true`, which would block close_tab.
+    //    Closability is now uniform across all shell tabs, so demote any
+    //    surviving entry on load.
+    for tab in settings.tabs.iter_mut() {
+        if tab.id() == SHELL_DEFAULT_TAB_ID && tab.builtin() {
+            tab.set_builtin(false);
+            changed = true;
+            tracing::warn!("integrity: demoted shell-default-1 to builtin: false");
+        }
+    }
+
+    // 3. Force `use_local_provider` to its canonical value on the two
     //    AI builtins so a hand-edit can't, e.g., flip the subscription
     //    Claude tab into local-LLM mode (which would silently route the
     //    user's primary tab through their local proxy).
@@ -471,10 +493,10 @@ pub fn integrity_check(settings: &mut Settings, default_shell: &ShellSpec) -> bo
         }
     }
 
-    // 3. Restore missing reserved entries at canonical positions. Inserting
-    //    in the order claude(0), claude-local(1), shell-default-1(after
-    //    claude-local) works because each insert shifts later positions
-    //    consistently.
+    // 4. Restore missing AI builtin entries at canonical positions.
+    //    Inserting in the order claude(0), claude-local(1) works because
+    //    each insert shifts later positions consistently. shell-default-1
+    //    is intentionally not restored — it's a regular closable shell.
     if !settings.tabs.iter().any(|t| t.id() == CLAUDE_TAB_ID) {
         settings.tabs.insert(0, default_claude_tab());
         changed = true;
@@ -493,21 +515,7 @@ pub fn integrity_check(settings: &mut Settings, default_shell: &ShellSpec) -> bo
         tracing::warn!("integrity: restored missing claude-local tab");
     }
 
-    if !settings.tabs.iter().any(|t| t.id() == SHELL_DEFAULT_TAB_ID) {
-        let pos = settings
-            .tabs
-            .iter()
-            .position(|t| t.id() == CLAUDE_LOCAL_TAB_ID)
-            .map(|p| p + 1)
-            .unwrap_or(2);
-        settings
-            .tabs
-            .insert(pos, default_shell_1_tab(default_shell));
-        changed = true;
-        tracing::warn!("integrity: restored missing default shell tab");
-    }
-
-    // 4. Backend layout sanity. The frontend owns the deep integrity
+    // 5. Backend layout sanity. The frontend owns the deep integrity
     //    walk (orphan placement, empty-pane collapse) — it has the tree
     //    helpers. The backend's job here is just to keep the file
     //    deserializable and stop a hand-edit from referring to dead tab
@@ -599,22 +607,70 @@ mod tests {
     }
 
     #[test]
-    fn integrity_seeds_three_reserved_tabs_on_empty() {
+    fn integrity_seeds_ai_builtins_on_empty() {
+        // The integrity check restores only the AI builtins; the closable
+        // shell-default-1 ships via `seeded_defaults` on fresh installs and
+        // is never re-created here (so closing it stays closed).
         let mut s = Settings::default();
         let shell = fake_default_shell();
         let changed = integrity_check(&mut s, &shell);
         assert!(changed);
-        assert_eq!(s.tabs.len(), 3);
+        assert_eq!(s.tabs.len(), 2);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
         assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
-        assert_eq!(s.tabs[2].id(), SHELL_DEFAULT_TAB_ID);
         for t in &s.tabs {
             assert!(t.builtin(), "{} should be builtin", t.id());
         }
     }
 
     #[test]
-    fn integrity_forces_builtin_true_on_reserved_ids() {
+    fn integrity_does_not_restore_shell_default_1() {
+        // Closing shell-default-1 must persist across launches: the
+        // integrity check should leave it absent.
+        let mut s = Settings::default();
+        let shell = fake_default_shell();
+        integrity_check(&mut s, &shell);
+        assert!(s
+            .tabs
+            .iter()
+            .all(|t| t.id() != SHELL_DEFAULT_TAB_ID));
+    }
+
+    #[test]
+    fn integrity_demotes_legacy_shell_default_1_to_non_builtin() {
+        // Older settings files persisted shell-default-1 with builtin: true.
+        // Loading those files must demote the entry so the close button
+        // works.
+        let mut s = Settings::default();
+        let shell = fake_default_shell();
+        integrity_check(&mut s, &shell);
+        // Insert a legacy-shaped shell-default-1 with builtin: true.
+        s.tabs.push(TabConfig::Shell(
+            crate::settings::schema::ShellTabConfig {
+                id: SHELL_DEFAULT_TAB_ID.to_string(),
+                builtin: true,
+                name: "Shell 1".to_string(),
+                command: "/bin/bash".to_string(),
+                args: vec!["-i".to_string()],
+                cwd: None,
+                env: Default::default(),
+                notifications: Default::default(),
+                theme_override: None,
+                background_override: None,
+            },
+        ));
+        let changed = integrity_check(&mut s, &shell);
+        assert!(changed);
+        let entry = s
+            .tabs
+            .iter()
+            .find(|t| t.id() == SHELL_DEFAULT_TAB_ID)
+            .expect("shell-default-1 still present");
+        assert!(!entry.builtin());
+    }
+
+    #[test]
+    fn integrity_forces_builtin_true_on_ai_builtins() {
         let mut s = Settings::default();
         let shell = fake_default_shell();
         integrity_check(&mut s, &shell);
@@ -670,10 +726,9 @@ mod tests {
         integrity_check(&mut s, &shell);
         let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed.tabs.len(), 3);
+        assert_eq!(parsed.tabs.len(), 2);
         assert_eq!(parsed.tabs[0].id(), CLAUDE_TAB_ID);
         assert_eq!(parsed.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
-        assert_eq!(parsed.tabs[2].id(), SHELL_DEFAULT_TAB_ID);
     }
 
     #[test]

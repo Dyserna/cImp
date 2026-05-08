@@ -41,7 +41,7 @@ pub enum TabLifecycleError {
     CwdNotFound { path: String },
     /// The target tab id does not exist in the registry.
     TabNotFound { tab: String },
-    /// Attempt to close a builtin (Claude / Claude-local / shell-default-1).
+    /// Attempt to close an AI builtin (Claude / Claude-local).
     BuiltinNotClosable,
     /// `reconfigure_shell_tab` was called on a non-Shell tab.
     WrongKind,
@@ -227,9 +227,10 @@ pub async fn create_shell_tab(
     Ok(tab)
 }
 
-/// Close a user-managed Shell tab. Builtins (Claude/Claude-local/shell-default-1)
-/// reject. The PTY is killed, the registry entry dropped, the settings
-/// entry removed, and `TabRemoved` is emitted.
+/// Close a Shell tab (including the default `shell-default-1`). The AI
+/// builtins (Claude / Claude-local) reject with `BuiltinNotClosable`. The
+/// PTY is killed, the registry entry dropped, the settings entry removed,
+/// and `TabRemoved` is emitted.
 #[tauri::command]
 pub async fn close_tab(
     state: State<'_, AppState>,

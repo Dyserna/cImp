@@ -88,10 +88,12 @@ fn main() {
     let (state_event_tx, _) = broadcast::channel::<StateEvent>(64);
 
     // Launch-seed tab list comes from settings now. The integrity check
-    // guarantees claude / claude-local / shell-default-1 are present;
-    // user-created Shell tabs that have been persisted across launches
-    // are appended in their stored order. Each entry's name reflects the
-    // user's last-seen edit (rename, configure dialog, settings window).
+    // guarantees the AI builtins (claude / claude-local) are present;
+    // shell-default-1 is seeded only on a fresh install (it's a closable
+    // shell, so once the user closes it, it stays closed). User-created
+    // Shell tabs that have been persisted across launches are appended in
+    // their stored order. Each entry's name reflects the user's last-seen
+    // edit (rename, configure dialog, settings window).
     let tab_metas: Vec<TabMeta> = build_tab_metas_from_settings(&settings_handle.current());
     let seed_tabs: Vec<TabId> = tab_metas.iter().map(|m| m.id.clone()).collect();
 
@@ -370,8 +372,9 @@ fn layout_focused_active_tab_id(layout: &LayoutPersisted) -> Option<String> {
 /// Build the launch-seed `Vec<TabMeta>` from a settings snapshot. Reserved
 /// ids (claude / claude-local) map to their corresponding `TabId`
 /// variants; everything else is a Shell tab. The integrity check has
-/// already guaranteed claude / claude-local / shell-default-1 are
-/// present, so the result always has at least three entries.
+/// already guaranteed claude / claude-local are present, so the result
+/// always has at least two entries (and a third — `shell-default-1` — on
+/// fresh installs unless the user has closed it).
 fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
     settings
         .tabs

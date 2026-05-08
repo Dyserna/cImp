@@ -8,7 +8,7 @@ Three connected changes shipped under one milestone:
 
 - **A. Per-tab appearance reaches the AI-tab Configure flow.** The schema and Settings → Tabs UI already expose `theme_override` and `background_override` for AI tabs (`AiToolTabConfig` carries the fields; `TabSettingsSection.svelte` renders the rows). The gap is the right-click **Configure tab** entry: today it opens `ConfigureTabDialog.svelte`, which is hardcoded shell-only (calls `getShellTabConfig` / `reconfigureShellTab`). For AI tabs, that entry will instead open Settings → Tabs scoped to the right tab, surfacing the existing per-tab Appearance section. No new dialog work, no risk of regressing the shell flow.
 - **B. Drop the Aider tab kind.** The `AiToolKindWire` enum collapses to a single ClaudeCode-only flavor (or is removed entirely — see B.1). Aider-specific code paths are deleted: the `AiderFirstLaunchNotice` component, aider permission-detection patterns, the `AIDER_TAB_ID` constant, `default_aider_tab()`, and the related lines across the 14 backend files and 10 frontend files that name aider today.
-- **C. Add a "Claude Code (local LLM)" provider option.** A new global `claude_local: { base_url, auth_token, model_alias }` settings group, plus a per-tab `use_local_provider: bool` flag on AI tabs. When the flag is true, the launch flow synthesizes `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and optionally `ANTHROPIC_MODEL`) into the spawned process's env. The default install ships two AI tabs: "Claude" (subscription, `use_local_provider: false`) and "Claude (local)" (`use_local_provider: true`).
+- **C. Add a "Claude Code (local LLM)" provider option.** A new global `claude_local: { base_url, auth_token, model_alias }` settings group, plus a per-tab `use_local_provider: bool` flag on AI tabs. When the flag is true, the launch flow synthesizes `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and optionally `ANTHROPIC_MODEL`) into the spawned process's env. The local backend speaks the Anthropic Messages API directly — LM Studio (≥0.4.1), Ollama, vLLM, and llama.cpp's `llama-server` (PR #17570, `--jinja` for tool use) all expose a native `/v1/messages` endpoint, so no translation proxy is required. Backends that are OpenAI-only need a separate translator (e.g. `anthropic-proxy-rs`) run by the user; cctts is agnostic to that. The default install ships two AI tabs: "Claude" (subscription, `use_local_provider: false`) and "Claude (local)" (`use_local_provider: true`).
 
 The phases are independently shippable and ordered A → B → C because A is the lowest-risk change (one route swap), B is mostly deletions, and C builds the new provider config on top of B's simplified schema.
 
@@ -45,22 +45,25 @@ The phases are independently shippable and ordered A → B → C because A is th
     #[derive(Clone, Serialize, Deserialize, Debug)]
     #[serde(default)]
     pub struct ClaudeLocalSettings {
-        /// Local proxy URL (e.g. http://localhost:4000). Becomes
-        /// ANTHROPIC_BASE_URL in the spawned process's env.
+        /// Anthropic-compatible endpoint URL (e.g. http://localhost:1234
+        /// for LM Studio). Becomes ANTHROPIC_BASE_URL in the spawned
+        /// process's env.
         pub base_url: String,
-        /// Auth token. Local proxies typically accept any string;
+        /// Auth token. Local backends typically accept any string;
         /// "sk-dummy" is a common placeholder. Becomes ANTHROPIC_AUTH_TOKEN.
         pub auth_token: String,
-        /// Optional model alias passed via `--model`. Empty = use Claude
-        /// Code's default model selection (LiteLLM maps `claude-*` names
-        /// to the local model based on its config).
+        /// Optional model alias. Empty = use Claude Code's default model
+        /// selection (the backend resolves `claude-*` names per its own
+        /// config).
         pub model_alias: String,
     }
 
     impl Default for ClaudeLocalSettings {
         fn default() -> Self {
             Self {
-                base_url: "http://localhost:4000".to_string(),
+                // LM Studio's default port. llama-server uses 8080,
+                // Ollama 11434, vLLM 8000 — user retargets in Settings.
+                base_url: "http://localhost:1234".to_string(),
                 auth_token: "sk-dummy".to_string(),
                 model_alias: String::new(),
             }
@@ -117,14 +120,14 @@ The phases are independently shippable and ordered A → B → C because A is th
     }
     ```
 
-    Per-tab `env` entries take precedence over synthesized ones (the user can still override per-tab if they need a different proxy on a specific tab) — flip the merge order if so.
+    Per-tab `env` entries take precedence over synthesized ones (the user can still override per-tab if they need a different backend on a specific tab) — flip the merge order if so.
 
     **Decision at impl time:** do per-tab `env` entries override synthesized values, or vice versa? Recommend tab-env wins (it's the more specific scope) and document.
 15. **Settings UI: AI section.** A new "AI" section in the Settings window (or a subsection of the existing Tabs section) exposes:
     - Base URL (text input)
     - Auth token (password-masked input with a show/hide toggle; cleartext storage in settings.json — documented)
     - Model alias (text input, optional)
-    - Help text linking to the LiteLLM docs and noting that the LiteLLM proxy must be running separately (cctts does not auto-spawn it).
+    - Help text naming the supported backends (LM Studio, Ollama, vLLM, llama-server) and noting that the backend must be running separately (cctts does not auto-spawn it).
 16. **Per-tab UI: Tabs section.** `TabSettingsSection.svelte` for AI tabs gains a "Use local LLM" checkbox bound to `use_local_provider`. When checked, the tab's effective env shows `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` synthesized — render this as read-only helper text below the existing per-tab `env` editor so the user understands what's being injected.
 17. **Restart semantics.** Toggling `use_local_provider` or editing `claude_local.*` doesn't restart running tabs. The change takes effect on next tab restart. Add a "Restart required" pill on the affected tab(s) when these fields change while a tab is running, mirroring the existing "Restart required" pattern in Settings (see V5-02's `<Pill>` primitive).
 
@@ -135,7 +138,7 @@ The phases are independently shippable and ordered A → B → C because A is th
     a. **Rewrite the aider tab in place.** The aider tab keeps its id (`"aider"`) so layout-tree references stay valid; rename to `claude-local` only via a follow-on layout fix-up — *or* preserve the id `"aider"` and live with the legacy id in `settings.json` for that one tab. **Recommend preserving the id** to keep the migration trivial and the layout tree untouched. Update `kind` (drop discriminator if B.1.a), `name = "Claude (local)"`, `command = "claude"`, `args = []`, `use_local_provider = true`. Keep the user's existing `env` (if they had a local-LLM proxy URL set there manually, it's preserved as a per-tab override on top of the new global config).
     b. Remove `ai_tool_kind` from every AI tab object (B.1.a path) — schema cleanup.
     c. Add `use_local_provider: false` to every other AI tab.
-    d. Add the new top-level `claude_local: { base_url: "http://localhost:4000", auth_token: "sk-dummy", model_alias: "" }` block.
+    d. Add the new top-level `claude_local: { base_url: "http://localhost:1234", auth_token: "sk-dummy", model_alias: "" }` block.
     e. (If chosen in step 7) Remove `first_launch_notice_dismissed` from every AI tab.
 19. Backup at `config.json.v1.7.bak.<ts>`. Migration cascade tests grow: a v1.3.0 file lands at v1.8 with five backups.
 20. Layout integrity check (`tabs/registry.rs`'s startup repair): the reserved-id list changes from `[CLAUDE_TAB_ID, AIDER_TAB_ID, SHELL_DEFAULT_TAB_ID]` to `[CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID, SHELL_DEFAULT_TAB_ID]`. If a user has manually deleted both their aider/claude-local tabs and the migration above didn't run (somehow), the integrity check restores `claude-local` from `default_claude_local_tab()`.
@@ -144,7 +147,7 @@ The phases are independently shippable and ordered A → B → C because A is th
 
 **Cross-cutting**
 
-21. README updated: replace the "Claude / aider" framing with "Claude (subscription) / Claude (local LLM)". Add a paragraph on the LiteLLM setup (link to upstream docs, note that cctts does not bundle or spawn the proxy). Note the env-var precedence (per-tab `env` > synthesized > nothing).
+21. README updated: replace the "Claude / aider" framing with "Claude (subscription) / Claude (local LLM)". Add a paragraph naming the supported backends — LM Studio, Ollama, vLLM, llama-server — and noting that all four expose a native Anthropic Messages endpoint, so no translation proxy is needed. Mention `anthropic-proxy-rs` once as the recommended translator for OpenAI-only backends. Note that cctts does not start the backend, and that env-var precedence is per-tab `env` > synthesized > nothing.
 22. `docs/DESIGN.md` updated: replace the aider tab description with the local-provider model. Document the `claude_local` settings group and `use_local_provider` per-tab flag.
 23. `CHANGELOG.md` v1.3.3 entry: Added (claude-local provider, "Claude (local)" tab, AI section in Settings, AI-tab Configure routes to Settings → Tabs, scoped settings deep-link), Removed (Aider tab kind, AiderFirstLaunchNotice, aider permission patterns, aider parity feature doc), Migrated (v1.7 → v1.8 with the rewrite-in-place semantics).
 24. `docs/FUTURE-FEATURES.md` updated: aider TTS injection and aider permission detection move from "External dependencies" to "Done / historical" with the cancellation note. `docs/features/FEATURE-aider-parity.md` deleted.
@@ -158,11 +161,11 @@ The phases are independently shippable and ordered A → B → C because A is th
 
 ## What This Milestone Does NOT Do
 
-- **Auto-spawn the LiteLLM proxy.** cctts does not bundle, install, or start a LiteLLM/Ollama process. The user runs the proxy themselves (a Shell tab is a natural place to start it). Documented in README. A future "proxy sidecar" feature is a candidate for FUTURE-FEATURES.md if real-use friction surfaces.
-- **Bundle a local model** or any provider config beyond the env vars. cctts is provider-agnostic past the env-var injection. The user picks their own model in their LiteLLM/Ollama config.
+- **Auto-spawn the local backend.** cctts does not bundle, install, or start LM Studio, Ollama, llama-server, vLLM, or any external translator. The user runs the backend themselves (a Shell tab is a natural place to start it). Documented in README. A future "backend sidecar" feature is a candidate for FUTURE-FEATURES.md if real-use friction surfaces.
+- **Bundle a local model** or any provider config beyond the env vars. cctts is provider-agnostic past the env-var injection. The user picks their own model in their backend's config (LM Studio, Ollama, llama-server, vLLM).
 - **Multiple local-provider configs.** One global `claude_local` group; tabs are local or not. If the user wants a second local provider on a third tab, they set the env vars in the per-tab `env` HashMap directly (which is the existing v1.3 mechanism — already works).
 - **Tool-use compatibility certification.** Local models vary in tool-call reliability. cctts displays whatever the model emits; broken tool use is a model issue, not a cctts bug. Documented in README under "Local LLM caveats."
-- **Credential masking beyond a UI password input.** `auth_token` is stored cleartext in `settings.json`. Local proxies typically accept dummy tokens, so this is acceptable. If a user puts a real Anthropic API key there (rather than a local proxy token), it sits cleartext. Documented; OS keychain integration is a separate feature.
+- **Credential masking beyond a UI password input.** `auth_token` is stored cleartext in `settings.json`. Local backends typically accept dummy tokens, so this is acceptable. If a user puts a real Anthropic API key there (rather than a local backend token), it sits cleartext. Documented; OS keychain integration is a separate feature.
 - **Right-click "Configure" extension to a kind-aware dialog.** The user explicitly chose the simpler route (open Settings → Tabs scoped to the tab) over extending `ConfigureTabDialog.svelte` to handle both shells and AI tabs. If discoverability turns out to bite, revisit; until then no shell-dialog regression risk.
 - **Aider import path.** Users on aider with custom config (special args, env, cwd) get *some* of it preserved by the rewrite-in-place migration: `name` and `args` are reset to claude-local defaults, but per-tab `env` is preserved. Users who heavily customized their aider tab will need to re-set Claude-relevant args in Settings → Tabs after upgrade. Documented in CHANGELOG migration notes.
 - **Renaming the "AI tool" framing in code.** `TabConfig::AiTool` and `AiToolTabConfig` keep their names — they're now Claude-only, but renaming to `ClaudeTab` is a wide-reaching mechanical refactor and not worth it inside this milestone. The naming is mildly aspirational ("AI tool" leaves room for future variants); revisit when concrete need surfaces.
@@ -304,7 +307,7 @@ Use `Grep` or the `Explore` agent to confirm no aider mentions remain. The file 
 
 #### C.1 Schema
 
-Per step 11 above. `Settings::claude_local` field, `ClaudeLocalSettings` struct, `Default` impl pointing at `http://localhost:4000` / `sk-dummy` / empty alias.
+Per step 11 above. `Settings::claude_local` field, `ClaudeLocalSettings` struct, `Default` impl pointing at `http://localhost:1234` / `sk-dummy` / empty alias.
 
 #### C.2 TS mirror
 
@@ -329,7 +332,7 @@ export interface AiToolTabConfigWire {
 }
 ```
 
-`defaultSettings()` in `src/lib/settings/store.ts` adds `claude_local: { base_url: 'http://localhost:4000', auth_token: 'sk-dummy', model_alias: '' }` and `use_local_provider: false` on the default Claude tab.
+`defaultSettings()` in `src/lib/settings/store.ts` adds `claude_local: { base_url: 'http://localhost:1234', auth_token: 'sk-dummy', model_alias: '' }` and `use_local_provider: false` on the default Claude tab.
 
 #### C.3 Spawn-time env synthesis
 
@@ -363,13 +366,17 @@ Document the precedence in a comment and in DESIGN.md.
 <section class="ai-section">
   <h3>Local LLM provider</h3>
   <p class="hint">
-    Run a LiteLLM (or compatible) proxy that translates the Anthropic
-    Messages API to your local model. cctts does not start the proxy —
-    run it separately. <a href="https://docs.litellm.ai/docs/proxy/quick_start" target="_blank" rel="noopener">LiteLLM docs</a>
+    Point this at any Anthropic-compatible endpoint:
+    <a href="https://lmstudio.ai/docs/developer/anthropic-compat" target="_blank" rel="noopener">LM Studio</a> (≥0.4.1, port 1234),
+    <a href="https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md" target="_blank" rel="noopener">llama-server</a> (port 8080, run with <code>--jinja</code> for tool use),
+    Ollama, or vLLM. cctts does not start the backend — launch it separately.
+    For OpenAI-only backends, run a translator like
+    <a href="https://github.com/m0n0x41d/anthropic-proxy-rs" target="_blank" rel="noopener">anthropic-proxy-rs</a>
+    in front of it.
   </p>
   <label>
-    Proxy URL
-    <input type="text" bind:value={baseUrl} placeholder="http://localhost:4000" />
+    Endpoint URL
+    <input type="text" bind:value={baseUrl} placeholder="http://localhost:1234" />
   </label>
   <label>
     Auth token
@@ -440,7 +447,7 @@ fn migrate_v1_7_to_v1_8(value: &mut Value) {
     root.insert(
         "claude_local".to_string(),
         json!({
-            "base_url": "http://localhost:4000",
+            "base_url": "http://localhost:1234",
             "auth_token": "sk-dummy",
             "model_alias": ""
         }),
@@ -555,7 +562,7 @@ Layout presets (`layout_presets[].tree`) — apply the same rewrite recursively.
 
 ### Phase C
 - **Unit (Rust)** — `claude_local` round-trips through serde with all field types. Default values match the spec. Spawn-env-synthesis test: feed an AI tab with `use_local_provider: true`, assert spawn env contains `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`. Per-tab `env` overrides synthesized — set `ANTHROPIC_BASE_URL` in `tab.env` and assert it wins.
-- **Manual** — Set up LiteLLM locally pointing at any local model. Set `claude_local.base_url` to its URL, `auth_token` to whatever the proxy expects. Toggle the Claude (local) tab's `use_local_provider`. Restart the tab. Send a message — confirm the local model responds (visually distinct: different name/style than Anthropic Claude). Toggle off, restart, confirm subscription Claude responds.
+- **Manual** — Run a backend locally (LM Studio is easiest: load any model and enable the server; the `/v1/messages` endpoint comes up at `http://localhost:1234`). Set `claude_local.base_url` to its URL, `auth_token` to whatever the backend expects (LM Studio accepts any non-empty string). Toggle the Claude (local) tab's `use_local_provider`. Restart the tab. Send a message — confirm the local model responds (visually distinct: different name/style than Anthropic Claude). Toggle off, restart, confirm subscription Claude responds.
 - **Manual — concurrent** — Both tabs running simultaneously: send a message to Claude (subscription tab), confirm Anthropic response. Send a message to Claude (local), confirm local-model response. No cross-contamination.
 - **Manual — restart-required** — Edit `claude_local.base_url` while the local tab is running. The "Restart required" pill appears on the local tab. Restart confirms the new URL is used; the pill clears.
 
@@ -613,11 +620,11 @@ Layout presets (`layout_presets[].tree`) — apply the same rewrite recursively.
 - **Migration cascade reaching v1.8 from very old files.** A user on v1.0 (unlikely but possible — five major migration generations old) would pass through v1 → v1.1 → v1.2 → v1.3 → v1.4 → v1.5 → v1.6 → v1.7 → v1.8 in a single launch with eight backups. Each individual migration is well-tested; the chain isn't. Add one cascade test from v1.0 to v1.8 to lock down.
 
 ### Phase C
-- **`auth_token` stored cleartext.** Local-proxy tokens are typically dummies, so this is fine. If a user mistakenly puts a real Anthropic API key (intending to bypass subscription auth that way), it's at-rest in `settings.json`. Documented; OS keychain is a separate feature. Helper text in the Settings field can warn: "Use a real key only if you understand the security implications — local proxy tokens are dummy strings."
-- **`ANTHROPIC_MODEL` env support is uncertain.** Claude Code may use the `--model` flag exclusively. Setting `ANTHROPIC_MODEL` may be a no-op. Mitigation: confirm at impl time by running `claude` with the env set and observing whether the model picks up. If it doesn't, drop the model_alias field's env injection and either (a) inject `--model alias` into `args` instead, or (b) leave model selection entirely to the LiteLLM config. Default to (b) — simplest and matches the LiteLLM-first design.
+- **`auth_token` stored cleartext.** Local-backend tokens are typically dummies, so this is fine. If a user mistakenly puts a real Anthropic API key (intending to bypass subscription auth that way), it's at-rest in `settings.json`. Documented; OS keychain is a separate feature. Helper text in the Settings field can warn: "Use a real key only if you understand the security implications — local backend tokens are dummy strings."
+- **`ANTHROPIC_MODEL` env support is uncertain.** Claude Code may use the `--model` flag exclusively. Setting `ANTHROPIC_MODEL` may be a no-op. Mitigation: confirm at impl time by running `claude` with the env set and observing whether the model picks up. If it doesn't, drop the model_alias field's env injection and either (a) inject `--model alias` into `args` instead, or (b) leave model selection entirely to the backend's config. Default to (b) — simplest, and matches how the supported backends (LM Studio, Ollama, vLLM, llama-server) expose loaded models.
 - **Per-tab env precedence ambiguity.** `entry().or_insert()` makes per-tab env win. If a user sets `ANTHROPIC_BASE_URL` per-tab and then expects the global to update, they'll be surprised. Documented as "per-tab env always wins."
-- **No proxy-up indicator.** If the user toggles `use_local_provider` but their LiteLLM proxy isn't running, Claude Code launches and fails on first message with a connection error. cctts shows the error in the avatar/status bar via the existing error path, but doesn't proactively check the proxy. Out of scope; if real-use friction surfaces, add a "ping the proxy on tab spawn" warning.
-- **Anthropic subscription cookie / session leak.** When `use_local_provider` is on, env vars override the subscription auth, but the subscription credentials may still be cached on disk in `~/.claude/`. They're not transmitted to the local proxy (the env vars override at request build time), so this is fine in practice. Documented in CHANGELOG security notes.
+- **No backend-up indicator.** If the user toggles `use_local_provider` but their backend isn't running, Claude Code launches and fails on first message with a connection error. cctts shows the error in the avatar/status bar via the existing error path, but doesn't proactively check the backend. Out of scope; if real-use friction surfaces, add a "ping the backend on tab spawn" warning.
+- **Anthropic subscription cookie / session leak.** When `use_local_provider` is on, env vars override the subscription auth, but the subscription credentials may still be cached on disk in `~/.claude/`. They're not transmitted to the local backend (the env vars override at request build time), so this is fine in practice. Documented in CHANGELOG security notes.
 
 ### Phase D
 - **The aider id rewrite is irreversible without the backup.** A user who lost their `config.json.v1.7.bak.<ts>` and wanted aider back could rebuild manually but their layout-tree positioning of "aider" is now `claude-local`. Backup path documented; this is the standard cctts migration model, no novel risk.
@@ -626,7 +633,7 @@ Layout presets (`layout_presets[].tree`) — apply the same rewrite recursively.
 
 ## Followups Tracked Elsewhere
 
-- **OS keychain integration for `auth_token`.** Add to `FUTURE-FEATURES.md` if real-use friction surfaces (e.g., users storing real Anthropic API keys in settings.json instead of using a local proxy).
-- **Auto-spawn LiteLLM proxy as a sidecar.** Candidate for `FUTURE-FEATURES.md` if "did I start the proxy" friction is real. Could ship as an opt-in `claude_local.autospawn_proxy: { command, args }` group.
+- **OS keychain integration for `auth_token`.** Add to `FUTURE-FEATURES.md` if real-use friction surfaces (e.g., users storing real Anthropic API keys in settings.json instead of pointing at a local backend).
+- **Auto-spawn the local backend as a sidecar.** Candidate for `FUTURE-FEATURES.md` if "did I start the backend" friction is real. Could ship as an opt-in `claude_local.autospawn: { command, args }` group, generic over the backend (LM Studio CLI, `llama-server`, `ollama serve`, etc.).
 - **Multiple local-provider configs.** Defer; one is enough for the headline use case. If a user has two local proxies (e.g., a fast one for simple tasks and a slow one for code), they configure per-tab `env` directly.
 - **Provider-detection UI hint.** Color-code the AI tab differently when `use_local_provider` is on (e.g., a small "🏠" indicator in the tab title or a different accent on the tab pill). Polish; defer.

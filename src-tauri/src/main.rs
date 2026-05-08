@@ -68,7 +68,7 @@ fn main() {
     // resolved default shell is needed to fill in Shell-1's command on
     // fresh installs and during the v1.1 → v1.2 transform that consumes
     // the legacy `_shell_1_tmp` interim key.
-    let settings_handle = settings::init(&default_shell);
+    let settings_handle = settings::init(&default_shell, &launch_cwd);
 
     // TTS / audio pipeline. Failures are non-fatal — the app launches with
     // TTS silent and a warning logged. Init is deferred to the Tauri `setup`

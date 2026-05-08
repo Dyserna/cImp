@@ -263,23 +263,33 @@ setting `ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local)
 
 ## Installing the Kokoro Model
 
-cctts ships without the Kokoro model files because they're large
-(hundreds of MB) and have their own license. You provide them.
+The **portable Windows zip** (downloadable from the GitHub Releases page)
+ships `kokoro-v1.0.onnx` and `af_heart.bin` next to the executable —
+unzip, add `bin/` to PATH, run, hear TTS. Nothing else to install.
 
-Place these two files under `%APPDATA%\cctts\models\`:
+For **source builds** (or if you delete the bundled files), cctts looks
+for the Kokoro model in two places, in order:
+
+1. `%APPDATA%\cctts\models\` — the user data dir, always writable.
+2. `<exe-dir>/../models/` — the portable layout's bundled location.
+
+Place these two files in either:
 
 ```
-%APPDATA%\cctts\models\kokoro-v1.0.onnx
-%APPDATA%\cctts\models\voices\af_heart.bin
+kokoro-v1.0.onnx
+voices/af_heart.bin
 ```
 
 Download from
 [onnx-community/Kokoro-82M-v1.0-ONNX](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/tree/main):
 
 - model: `onnx/model.onnx` → rename to `kokoro-v1.0.onnx`
-- voices: `voices/<name>.bin` — `af_heart.bin` is the default; any voicepack in `voices/` shows up in the settings dropdown.
+- voices: `voices/<name>.bin` — `af_heart.bin` is the default; any
+  voicepack in either `voices/` folder shows up in the settings dropdown.
+  APPDATA wins over portable on duplicate filenames so a user-installed
+  voice can override a bundled one.
 
-If the files are missing at startup the app launches with TTS silent and
+If both lookups fail at startup the app launches with TTS silent and
 prints the expected paths to the log.
 
 ## Configuring Tabs
@@ -307,18 +317,27 @@ Settings persist to `%APPDATA%\cctts\settings.json` (debounced save).
 
 ## Running
 
+**End users (Windows):** download the latest portable zip from the
+[Releases page](https://github.com/Dyserna/cctts/releases), unzip it, add
+`bin/` to your PATH, and run `cctts`. The zip ships with the Kokoro
+model and the default voice — no extra setup beyond Claude Code itself
+being on PATH.
+
+**Developers:**
+
 ```
 npm install
 npm run tauri dev
 ```
 
-For a release build:
+For a local release build:
 
 ```
 npm run tauri build
 ```
 
-See `PACKAGING.md` for distribution considerations.
+See `docs/PACKAGING.md` for the distribution shape and `docs/RELEASE.md`
+for the tag-driven release workflow.
 
 ## Settings Overview
 

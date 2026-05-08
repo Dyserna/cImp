@@ -7,6 +7,8 @@
   import AnnouncementsButton from './status/AnnouncementsButton.svelte';
   import VolumeSlider from './status/VolumeSlider.svelte';
   import LayoutsPopover from './status/LayoutsPopover.svelte';
+  import SettingsButton from './status/SettingsButton.svelte';
+  import AvatarToggleButton from './status/AvatarToggleButton.svelte';
 </script>
 
 <div class="status-bar">
@@ -14,9 +16,11 @@
     <LayoutsPopover />
   </div>
   <div class="status-bar-right">
+    <AvatarToggleButton />
     <MuteButton />
     <AnnouncementsButton />
     <VolumeSlider />
+    <SettingsButton />
   </div>
 </div>
 

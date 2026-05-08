@@ -49,23 +49,56 @@ pub fn default_model_dir() -> AppResult<PathBuf> {
         .join("models"))
 }
 
+/// Portable model dir: `<exe-dir>/../models/`. The Windows release zip ships
+/// `kokoro-v1.0.onnx` and `voices/af_heart.bin` here so a fresh unzip works
+/// without any APPDATA setup. APPDATA always wins over portable on duplicate
+/// filenames so a user-installed file overrides a bundled one.
+pub fn portable_model_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.parent()?.join("models");
+    Some(dir)
+}
+
 pub fn default_model_path() -> AppResult<PathBuf> {
-    Ok(default_model_dir()?.join(MODEL_FILE))
+    let appdata = default_model_dir()?.join(MODEL_FILE);
+    if appdata.exists() {
+        return Ok(appdata);
+    }
+    if let Some(portable) = portable_model_dir() {
+        let p = portable.join(MODEL_FILE);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    Ok(appdata)
 }
 
 pub fn default_voice_path(voice: &str) -> AppResult<PathBuf> {
-    Ok(default_model_dir()?
-        .join("voices")
-        .join(format!("{voice}.bin")))
+    let file = format!("{voice}.bin");
+    let appdata = default_model_dir()?.join("voices").join(&file);
+    if appdata.exists() {
+        return Ok(appdata);
+    }
+    if let Some(portable) = portable_model_dir() {
+        let p = portable.join("voices").join(&file);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    Ok(appdata)
 }
 
 pub fn report_missing_model_files() {
     let dir = default_model_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<config dir>".to_string());
+    let portable = portable_model_dir().map(|p| p.display().to_string());
     tracing::warn!(target: "tts", "");
     tracing::warn!(target: "tts", "TTS disabled: Kokoro model files not found.");
     tracing::warn!(target: "tts", "Place these files under: {dir}");
+    if let Some(p) = portable.as_deref() {
+        tracing::warn!(target: "tts", "  (or under: {p})");
+    }
     tracing::warn!(target: "tts", "  {MODEL_FILE}");
     tracing::warn!(target: "tts", "  voices/{DEFAULT_VOICE}.bin");
     tracing::warn!(target: "tts", "Sources:");

@@ -28,9 +28,9 @@ dist-ssr
 .DS_Store
 Thumbs.db
 
-# Claude Code local state
-.claude/settings.local.json
-.claude/scheduled_tasks.lock
+# Claude Code local state (any nesting level, not just repo root)
+**/.claude/settings.local.json
+**/.claude/scheduled_tasks.lock
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
@@ -39,3 +39,10 @@ Thumbs.db
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .aider*
+
+# Local release-staging output (workflow assembles this in CI; ignore if
+# you experiment with `npm run tauri build` followed by manual staging).
+staging/
+download/
+release-notes.md
+cctts-portable-*.zip

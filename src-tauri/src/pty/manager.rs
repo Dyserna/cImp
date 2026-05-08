@@ -459,7 +459,12 @@ mod tests {
 
         // SettingsHandle uses defaults; no `.set()` is ever called so the
         // debounced saver task stays idle and never touches disk.
-        let settings = SettingsHandle::new(crate::settings::Settings::default());
+        let defaults = crate::settings::Settings::default();
+        let settings = SettingsHandle::new(
+            defaults.clone(),
+            defaults,
+            std::env::temp_dir(),
+        );
 
         let tab = TabId::Shell("shell-test".to_string());
         spawn_processor(
@@ -516,7 +521,12 @@ mod tests {
         let (state_tx, _state_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let typed = Arc::new(StdMutex::new(HashSet::new()));
-        let settings = SettingsHandle::new(crate::settings::Settings::default());
+        let defaults = crate::settings::Settings::default();
+        let settings = SettingsHandle::new(
+            defaults.clone(),
+            defaults,
+            std::env::temp_dir(),
+        );
 
         let initial: Channel<String> = Channel::new(|_| Ok(()));
 

@@ -578,6 +578,16 @@ pub struct BehaviorSettings {
     pub auto_speak: bool,
     pub fallback_silent: bool,
     pub announcements_enabled: bool,
+    /// When true, `tts.mute` follows `avatar.visible` — hiding the avatar
+    /// auto-mutes, showing it auto-unmutes. The frontend handles the sync
+    /// (App.svelte settings subscriber); the backend just persists the flag.
+    pub follow_avatar: bool,
+    /// When true, announcements (idle / awaiting-permission / error / exit)
+    /// fire even for the tab the user is currently looking at. Default off
+    /// preserves the historical "background-only" behavior — most users
+    /// don't want to hear "awaiting permission" for the tab they're
+    /// staring at.
+    pub announce_focused_tab: bool,
 }
 
 impl Default for BehaviorSettings {
@@ -587,6 +597,8 @@ impl Default for BehaviorSettings {
             auto_speak: true,
             fallback_silent: true,
             announcements_enabled: true,
+            follow_avatar: false,
+            announce_focused_tab: false,
         }
     }
 }

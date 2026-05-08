@@ -23,7 +23,7 @@
     seedPerTabEntries,
     startAvatarStateListener,
   } from './lib/avatarState';
-  import { initSettings, settings } from './lib/settings/store';
+  import { initSettings, settings, applySettings } from './lib/settings/store';
   import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
   import { applyTabCreated, tabMeta } from './lib/tabs/store';
@@ -66,6 +66,7 @@
   let unsubActiveTabBack: (() => void) | undefined;
   let removeDebugKeys: (() => void) | undefined;
   let unsubLayoutSave: (() => void) | undefined;
+  let unsubFollowAvatar: (() => void) | undefined;
 
   onMount(() => {
     void (async () => {
@@ -278,6 +279,19 @@
       // subscriptions ping-pong correcting each other across async
       // backend round-trips, flapping the active tab dozens of
       // times on launch.
+      // "Follow avatar visibility" mode: keep tts.mute in sync with the
+      // inverse of avatar.visible. Only mutates state when the two are
+      // out of agreement, so the resulting applySettings broadcast (which
+      // re-fires this subscriber) is a no-op and there's no loop. Lives
+      // in App.svelte rather than the Settings window so the sync runs
+      // continuously regardless of whether Settings is open.
+      unsubFollowAvatar = settings.subscribe((s) => {
+        if (!s.behavior.follow_avatar) return;
+        const wantMute = !s.avatar.visible;
+        if (s.tts.mute === wantMute) return;
+        void applySettings({ ...s, tts: { ...s.tts, mute: wantMute } });
+      });
+
       let activeTabFirstEmission = true;
       unsubActiveTabBack = activeTab.subscribe((t) => {
         if (activeTabFirstEmission) {
@@ -313,6 +327,7 @@
       unsubActiveTabBack?.();
       removeDebugKeys?.();
       unsubLayoutSave?.();
+      unsubFollowAvatar?.();
     };
   });
 </script>

@@ -13,3 +13,39 @@ body {
   width: 100vw;
   height: 100vh;
 }
+
+/* Overlay-style scrollbars: track is transparent (so the underlying
+   panel background shows through), thumb is a translucent pill so the
+   scroll position is still readable. Webkit pseudos cover the Tauri
+   webview (Chromium / WebView2); the standard `scrollbar-*` properties
+   are set for completeness. The 3px transparent border + padding-box
+   clip leave a visible gap between thumb and edges, giving the look of
+   a thin pill rather than a flush block. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+*::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+  background: transparent;
+}
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  min-height: 32px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.32);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:active {
+  background-color: rgba(255, 255, 255, 0.42);
+  background-clip: padding-box;
+}

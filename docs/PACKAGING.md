@@ -1,8 +1,35 @@
 # Packaging Notes
 
-cctts is not packaged for distribution in v1. This file collects what would
-need to be addressed when distribution becomes a goal, so future-you (or
-future-Claude-Code) doesn't have to reconstruct it.
+This file collects what was decided about distribution. The actual
+release pipeline lives at `.github/workflows/release.yml` and is
+documented in `RELEASE.md`. This document is the *why*.
+
+## Current shape: portable Windows zip
+
+A tag-driven GitHub Actions job builds `cctts-portable-win-x64-vX.Y.Z.zip`
+on every `v*.*.*` push. Layout:
+
+```
+bin/
+  cctts.exe
+  onnxruntime*.dll
+models/
+  kokoro-v1.0.onnx
+  voices/af_heart.bin
+LICENSE
+NOTICE
+README.txt
+```
+
+Add `bin/` to PATH; run `cctts` from any terminal. No installer, no
+registry entries, no admin rights. Settings still write to
+`%APPDATA%\cctts\` at runtime.
+
+The Rust runtime treats `<exe-dir>/../models/` as a fallback model dir
+(see `portable_model_dir()` in `src-tauri/src/tts/mod.rs`). APPDATA wins
+on duplicate filenames so user-installed voicepacks and models override
+bundled ones. Voicepack auto-discovery (`list_voices` IPC) reads from
+both dirs and merges.
 
 ## Build
 
@@ -37,26 +64,26 @@ Per-platform targets:
 
 ## Kokoro Model Files
 
-The Kokoro ONNX model + voicepacks total a few hundred MB. v1 leaves them
-out of the binary because:
+The portable zip ships `kokoro-v1.0.onnx` + `af_heart.bin` (Apache 2.0,
+attributed in `NOTICE`). The release workflow downloads them from
+HuggingFace at build time — they are not checked into the source repo.
 
-1. They have their own license (review before redistribution).
-2. They're too large to be palatable inside an installer for a personal-use
-   tool that expects you to bring your own.
+Source builds (`npm run tauri build` locally without the workflow) still
+rely on the user dropping the model files into `%APPDATA%\cctts\models\`.
+The runtime check order is APPDATA → portable (`<exe-dir>/../models/`),
+so neither path is exclusive.
 
-Three options for distribution:
+Alternative distribution shapes considered and rejected:
 
-1. **User-provided (current).** Document the download in `README.md`. Done
-   for v1.
-2. **Bundle.** Embed the .onnx + at least the default voice in the
-   installer. Adds ~300 MB to the download. Doable; touch
-   `tauri.conf.json -> bundle.resources` and update `default_model_dir()`
-   in `src-tauri/src/tts/mod.rs` to fall back to the bundled path when the
-   `%APPDATA%` copy is absent.
-3. **Download on first run.** Tauri has no built-in downloader; would need
-   a Rust task that hits HuggingFace, verifies a SHA-256, drops the files
-   in `default_model_dir()`. Adds first-run latency + a network-failure
-   path.
+1. **User-provided only (pre-portable-zip).** Worked for source builds
+   but made the portable zip useless on first launch.
+2. **Download on first run.** Adds first-run latency + a network-failure
+   path; the Tauri runtime would need a Rust task that hits HuggingFace,
+   verifies a SHA-256, drops the files. Build-time bundling beats it on
+   reliability and offline use.
+3. **Tauri bundle resources.** `tauri.conf.json -> bundle.resources` is
+   designed for MSI/NSIS installers; the portable zip pipeline assembles
+   the layout directly so this isn't needed.
 
 ## CUDA Runtime
 
@@ -75,12 +102,18 @@ CPU-only is the default and needs no extra runtime.
 
 ## Updates
 
+Currently manual: download the next release zip, unzip over the existing
+folder. Settings persist in `%APPDATA%\cctts\` across updates.
+
 Tauri ships a built-in updater that polls a JSON manifest, downloads, and
-verifies signatures. Out of scope for v1. Would require:
+verifies signatures. Adopting it would require:
 
 - A signing key for updates (separate from code-signing cert).
 - A static URL hosting the latest manifest + binaries.
 - `tauri.conf.json -> plugins.updater` configured.
+
+The GitHub release page is sufficient for now since the zip is small
+relative to the model download.
 
 ## Settings Migration
 

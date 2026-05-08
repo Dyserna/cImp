@@ -179,8 +179,7 @@ impl NotificationManager {
                 if prev == state {
                     return;
                 }
-                let active_tab = self.active.read().expect("active tab poisoned").clone();
-                if tab == active_tab {
+                if self.suppress_for_focus(&tab) {
                     return;
                 }
                 let nev = match state {
@@ -208,8 +207,7 @@ impl NotificationManager {
                 if prev == awaiting || !awaiting {
                     return;
                 }
-                let active_tab = self.active.read().expect("active tab poisoned").clone();
-                if tab == active_tab {
+                if self.suppress_for_focus(&tab) {
                     return;
                 }
                 self.try_enqueue(tab, NotificationEvent::AwaitingPermission)
@@ -225,8 +223,7 @@ impl NotificationManager {
                 if !closed {
                     return;
                 }
-                let active_tab = self.active.read().expect("active tab poisoned").clone();
-                if tab == active_tab {
+                if self.suppress_for_focus(&tab) {
                     return;
                 }
                 self.try_enqueue_with_code(tab, NotificationEvent::Exited, exit_code)
@@ -265,6 +262,18 @@ impl NotificationManager {
         if queued && self.drain_deadline.is_none() {
             self.drain_deadline = Some(Instant::now() + DRAIN_DEBOUNCE);
         }
+    }
+
+    /// True if `tab` should be skipped because it's the currently-focused
+    /// tab and the user hasn't opted into hearing announcements for the
+    /// focused tab. Re-reads settings each call so toggling the checkbox
+    /// applies on the very next state edge without restart.
+    fn suppress_for_focus(&self, tab: &TabId) -> bool {
+        if self.settings.current().behavior.announce_focused_tab {
+            return false;
+        }
+        let active_tab = self.active.read().expect("active tab poisoned").clone();
+        *tab == active_tab
     }
 
     fn try_enqueue(&mut self, tab: TabId, event: NotificationEvent) -> bool {

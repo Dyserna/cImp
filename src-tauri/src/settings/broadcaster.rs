@@ -6,7 +6,15 @@
 //! `broadcast::Receiver<Settings>`; on `set` the new full `Settings` struct
 //! is sent to every receiver. Saves are coalesced so a slider drag doesn't
 //! hammer the disk.
+//!
+//! Persistence is layered: a global baseline lives at `<exe-dir>/settings.json`
+//! and the saver writes a diff against that baseline to the launch-dir
+//! overlay file (`.cctts.custom.config.json`). The handle keeps the global
+//! snapshot resolved at startup so `set()` can compute diffs without
+//! re-reading from disk; the launch_cwd is captured in `main` and threaded
+//! through `init`.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,12 +34,12 @@ pub struct SettingsHandle {
 }
 
 impl SettingsHandle {
-    pub fn new(initial: Settings) -> Self {
+    pub fn new(initial: Settings, global: Settings, launch_cwd: PathBuf) -> Self {
         let (tx, _) = broadcast::channel::<Settings>(BROADCAST_CAPACITY);
         let (save_tx, save_rx) = mpsc::unbounded_channel::<()>();
         let inner = Arc::new(Mutex::new(initial));
 
-        spawn_saver(inner.clone(), save_rx);
+        spawn_saver(inner.clone(), save_rx, global, launch_cwd);
 
         Self {
             inner,
@@ -65,7 +73,12 @@ impl SettingsHandle {
     }
 }
 
-fn spawn_saver(inner: Arc<Mutex<Settings>>, mut rx: mpsc::UnboundedReceiver<()>) {
+fn spawn_saver(
+    inner: Arc<Mutex<Settings>>,
+    mut rx: mpsc::UnboundedReceiver<()>,
+    global: Settings,
+    launch_cwd: PathBuf,
+) {
     tauri::async_runtime::spawn(async move {
         while rx.recv().await.is_some() {
             // Coalesce: wait the debounce window, then drain anything that
@@ -81,7 +94,7 @@ fn spawn_saver(inner: Arc<Mutex<Settings>>, mut rx: mpsc::UnboundedReceiver<()>)
                     continue;
                 }
             };
-            if let Err(e) = persistence::save(&snapshot) {
+            if let Err(e) = persistence::save(&snapshot, &launch_cwd, &global) {
                 tracing::warn!(error = %e, "settings: save failed");
             } else {
                 tracing::debug!("settings: saved");

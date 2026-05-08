@@ -17,9 +17,10 @@ use std::path::PathBuf;
 use crate::error::{AppError, AppResult};
 use crate::state::TabId;
 
-/// Resolve `<config-dir>/cctts/scrollback/`. Mirrors the layout used by
-/// `settings::persistence::config_path()` but lifts the directory part
-/// here so we don't grow that module.
+/// Resolve `<config-dir>/cctts/scrollback/`. Scrollback is transient
+/// runtime state (cleared on first replay), so it stays under the OS
+/// config dir even though settings now live next to the exe — keeping
+/// the portable folder free of per-tab binary blobs.
 fn scrollback_dir() -> AppResult<PathBuf> {
     let dir = dirs::config_dir()
         .ok_or_else(|| AppError::Settings("no config dir on this platform".into()))?;

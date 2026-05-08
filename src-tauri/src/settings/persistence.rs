@@ -1,19 +1,36 @@
 //! JSON load/save with corruption recovery + version migrations.
 //!
-//! On-disk format is a single JSON object matching `Settings` (v1.8 as of
-//! V1.4-07). Older shapes are detected by their discriminator fields and
-//! routed through the `migration` module. After the optional migration
-//! step, an integrity check ensures the three reserved-id tab entries
-//! (claude, claude-local, shell-default-1) exist with `builtin: true` —
-//! hand-edited files that deleted them are repaired transparently.
+//! Two files participate:
 //!
-//! Either way `load` always returns a usable `Settings` — missing/corrupt
-//! files become defaults (the corrupt original is moved aside as a `.bak`).
+//!   * **Global** (`<exe-dir>/settings.json`) — portable baseline. Written
+//!     once on first launch when missing; never rewritten through normal
+//!     edits afterwards. Hand-edit to change defaults.
+//!   * **Custom overlay** (`<launch_cwd>/.cctts.custom.config.json`) — per
+//!     launch-directory delta layered on top of global. Created the first
+//!     time a user customizes anything from a given working directory and
+//!     deleted automatically when the diff is empty.
+//!
+//! On-disk format for both files is the same JSON object shape (matching
+//! `Settings`). The custom file is allowed to be a *partial* object — any
+//! keys it doesn't carry fall through to global. Older shapes are detected
+//! by their discriminator fields and routed through the `migration`
+//! module after the merge so a hand-imported old file at the new path
+//! still upgrades cleanly. After migration an integrity check ensures the
+//! three reserved-id tab entries (claude, claude-local, shell-default-1)
+//! exist with `builtin: true` — hand-edited files that deleted them are
+//! repaired transparently.
+//!
+//! `load` always returns a usable `Settings` and a snapshot of the global
+//! baseline (so the save path can compute diffs without re-reading disk).
+//! Missing/corrupt files become defaults; the corrupt original is moved
+//! aside as a `.bak`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use std::collections::HashSet;
+
+use serde_json::{Map, Value};
 
 use crate::error::{AppError, AppResult};
 use crate::settings::migration;
@@ -23,73 +40,80 @@ use crate::settings::schema::{
 };
 use crate::shell::ShellSpec;
 
-const FILE_NAME: &str = "settings.json";
+const GLOBAL_FILE_NAME: &str = "settings.json";
+const CUSTOM_FILE_NAME: &str = ".cctts.custom.config.json";
 
-/// `%APPDATA%\cctts\settings.json` on Windows; the analogous config dir on
-/// other platforms.
-pub fn config_path() -> AppResult<PathBuf> {
-    let dir = dirs::config_dir()
-        .ok_or_else(|| AppError::Settings("no config dir on this platform".into()))?;
-    Ok(dir.join("cctts").join(FILE_NAME))
+/// `<exe-dir>/settings.json` — the portable baseline. Falls back to the
+/// current working directory if `current_exe()` is unavailable, which
+/// shouldn't happen on any platform we ship to but is logged loudly if
+/// it does.
+pub fn global_path() -> AppResult<PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::Settings(format!("current_exe failed: {e}")))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| AppError::Settings("exe has no parent dir".into()))?;
+    Ok(dir.join(GLOBAL_FILE_NAME))
 }
 
-/// Always returns a `Settings`. Defaults are written to disk when the file
-/// is absent or corrupt; v1 / v1.1 files are migrated and rewritten in v1.2
-/// shape with a backup of the original alongside.
-pub fn load(default_shell: &ShellSpec) -> Settings {
-    let path = match config_path() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "settings: cannot resolve config path; using defaults");
-            return seeded_defaults(default_shell);
+/// `<launch_cwd>/.cctts.custom.config.json` — the per-folder overlay.
+pub fn custom_path(launch_cwd: &Path) -> PathBuf {
+    launch_cwd.join(CUSTOM_FILE_NAME)
+}
+
+/// Bundle returned from `load`: the resolved settings plus a snapshot of
+/// just the global baseline. The saver needs the baseline so it can diff
+/// the live state against it on every write without re-reading the file.
+pub struct LoadOutcome {
+    pub settings: Settings,
+    pub global: Settings,
+}
+
+/// Always returns a `LoadOutcome`. Defaults are written to disk for the
+/// global baseline when it's absent or corrupt; the custom overlay is
+/// merely skipped if absent and quarantined if corrupt. v1 / v1.1 files
+/// found at the global path are migrated and rewritten in v1.2 shape with
+/// a backup of the original alongside.
+pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
+    let global = load_global(default_shell);
+
+    let custom_path = custom_path(launch_cwd);
+    let merged_value = match read_overlay(&custom_path) {
+        Some(overlay) => {
+            let mut base = serde_json::to_value(&global)
+                .unwrap_or_else(|_| Value::Object(Map::new()));
+            deep_merge(&mut base, overlay);
+            base
         }
+        None => match serde_json::to_value(&global) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "settings: serialize global to value failed; using global as-is");
+                return LoadOutcome {
+                    settings: global.clone(),
+                    global,
+                };
+            }
+        },
     };
 
-    if !path.exists() {
-        let s = seeded_defaults(default_shell);
-        if let Err(e) = save_to(&path, &s) {
-            tracing::warn!(error = %e, path = %path.display(), "settings: write defaults failed");
-        } else {
-            tracing::info!(path = %path.display(), "settings: wrote defaults");
-        }
-        return s;
-    }
+    let mut value = merged_value;
 
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "settings: read failed; using defaults");
-            return seeded_defaults(default_shell);
-        }
-    };
-
-    let mut value: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "settings: parse failed; quarantining file and resetting to defaults"
-            );
-            migration::quarantine_corrupt_file(&path);
-            let s = seeded_defaults(default_shell);
-            let _ = save_to(&path, &s);
-            return s;
-        }
-    };
-
-    let migrated = match migration::migrate_if_needed(&mut value, &path, default_shell) {
+    // Run migration against the merged Value. The combined shape is whatever
+    // global carried plus any keys the overlay added — usually current shape,
+    // but we keep the migration cascade in place so a hand-imported legacy
+    // file at the global path still upgrades.
+    let migrated = match migration::migrate_if_needed(&mut value, &global_path_or_fallback(), default_shell) {
         Ok(b) => b,
         Err(e) => {
-            // Backup write failed — don't proceed with the migration since
-            // we'd lose the user's original. Surface defaults in-memory so
-            // the app still launches; the file on disk is untouched.
             tracing::error!(
                 error = %e,
-                path = %path.display(),
-                "settings: migration aborted (backup failed); using defaults in-session"
+                "settings: migration aborted (backup failed); using global in-session"
             );
-            return seeded_defaults(default_shell);
+            return LoadOutcome {
+                settings: global.clone(),
+                global,
+            };
         }
     };
 
@@ -98,8 +122,69 @@ pub fn load(default_shell: &ShellSpec) -> Settings {
         Err(e) => {
             tracing::warn!(
                 error = %e,
+                "settings: typed parse failed (post-merge); using global"
+            );
+            return LoadOutcome {
+                settings: global.clone(),
+                global,
+            };
+        }
+    };
+
+    let repaired = integrity_check(&mut settings, default_shell);
+
+    if migrated || repaired {
+        // Persist the post-migration / post-repair state back to its source
+        // of truth. If a custom overlay was in play, we recompute and
+        // rewrite the diff; otherwise we rewrite global.
+        if custom_path.exists() {
+            if let Err(e) = save(&settings, launch_cwd, &global) {
+                tracing::warn!(error = %e, "settings: post-migration save (custom) failed");
+            }
+        } else if let Err(e) = save_global(&settings) {
+            tracing::warn!(error = %e, "settings: post-migration save (global) failed");
+        }
+    }
+
+    LoadOutcome { settings, global }
+}
+
+/// Read the global file. Writes seeded defaults when absent. On parse
+/// failure quarantines the file and returns defaults.
+fn load_global(default_shell: &ShellSpec) -> Settings {
+    let path = match global_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "settings: cannot resolve global path; using defaults");
+            return seeded_defaults(default_shell);
+        }
+    };
+
+    if !path.exists() {
+        let s = seeded_defaults(default_shell);
+        if let Err(e) = save_to(&path, &s) {
+            tracing::warn!(error = %e, path = %path.display(), "settings: write global defaults failed");
+        } else {
+            tracing::info!(path = %path.display(), "settings: wrote global defaults");
+        }
+        return s;
+    }
+
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "settings: read global failed; using defaults");
+            return seeded_defaults(default_shell);
+        }
+    };
+
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
                 path = %path.display(),
-                "settings: typed parse failed (post-migration); quarantining and resetting"
+                "settings: parse global failed; quarantining and resetting"
             );
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
@@ -108,32 +193,94 @@ pub fn load(default_shell: &ShellSpec) -> Settings {
         }
     };
 
-    let repaired = integrity_check(&mut settings, default_shell);
-
-    if migrated || repaired {
-        if let Err(e) = save_to(&path, &settings) {
+    // Typed deserialize directly — migration runs on the merged value in
+    // `load` so the global baseline here is whatever shape the file is.
+    // serde(default) on every field tolerates a file that's missing keys;
+    // truly old shapes get fixed up by the merge-time migration step.
+    match serde_json::from_value(value) {
+        Ok(s) => {
+            tracing::info!(path = %path.display(), "settings: global loaded");
+            s
+        }
+        Err(e) => {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
-                "settings: post-migration save failed (in-memory state retained)"
+                "settings: typed parse of global failed; quarantining and resetting"
             );
-        } else {
-            tracing::info!(
-                path = %path.display(),
-                migrated,
-                repaired,
-                "settings: file refreshed after migration/integrity"
-            );
+            migration::quarantine_corrupt_file(&path);
+            let s = seeded_defaults(default_shell);
+            let _ = save_to(&path, &s);
+            s
         }
-    } else {
-        tracing::info!(path = %path.display(), "settings: loaded");
     }
-
-    settings
 }
 
-pub fn save(settings: &Settings) -> AppResult<()> {
-    let path = config_path()?;
+/// Read and parse the custom overlay file as a generic `Value`. Returns
+/// `None` if absent. On parse failure the file is quarantined and `None`
+/// is returned — we want the app to come up cleanly even if a hand-edit
+/// broke the overlay.
+fn read_overlay(path: &Path) -> Option<Value> {
+    if !path.exists() {
+        return None;
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "settings: read overlay failed; ignoring");
+            return None;
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "settings: parse overlay failed; quarantining"
+            );
+            migration::quarantine_corrupt_file(path);
+            None
+        }
+    }
+}
+
+/// Write the diff between `settings` and `global` to the custom overlay
+/// file in `launch_cwd`. If the diff is empty, deletes any existing
+/// overlay (so a user who reverts every change ends up with a clean
+/// directory).
+pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppResult<()> {
+    let path = custom_path(launch_cwd);
+    let current = serde_json::to_value(settings)
+        .map_err(|e| AppError::Settings(format!("serialize current: {e}")))?;
+    let baseline = serde_json::to_value(global)
+        .map_err(|e| AppError::Settings(format!("serialize global: {e}")))?;
+
+    match diff(&current, &baseline) {
+        Some(delta) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(AppError::Io)?;
+            }
+            let text = serde_json::to_string_pretty(&delta)
+                .map_err(|e| AppError::Settings(format!("serialize overlay: {e}")))?;
+            fs::write(&path, text).map_err(AppError::Io)?;
+        }
+        None => {
+            if path.exists() {
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::warn!(error = %e, path = %path.display(), "settings: remove empty overlay failed");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write the full settings to the global file. Only used during initial
+/// seeding and to finalize a post-migration / post-integrity rewrite when
+/// no custom overlay is in play.
+pub fn save_global(settings: &Settings) -> AppResult<()> {
+    let path = global_path()?;
     save_to(&path, settings)
 }
 
@@ -144,6 +291,76 @@ fn save_to(path: &Path, settings: &Settings) -> AppResult<()> {
     let text = serde_json::to_string_pretty(settings)
         .map_err(|e| AppError::Settings(format!("serialize: {e}")))?;
     fs::write(path, text).map_err(AppError::Io)
+}
+
+/// Convenience: `global_path()` if it resolves, else a sentinel under the
+/// current dir. Only used as the `path` arg for `migrate_if_needed`, which
+/// uses it to write a rotation-suffixed `.bak` next to the source. If
+/// `current_exe()` failed we'd already have logged the warning during
+/// `load_global`; this just keeps the migration call signature happy.
+fn global_path_or_fallback() -> PathBuf {
+    global_path().unwrap_or_else(|_| PathBuf::from("settings.json"))
+}
+
+/// Recursively merge `overlay` into `base`. Objects are merged key-by-key;
+/// every other value (arrays, primitives, null) replaces wholesale.
+fn deep_merge(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                match base_map.get_mut(&k) {
+                    Some(existing) => deep_merge(existing, v),
+                    None => {
+                        base_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, overlay) => {
+            *slot = overlay;
+        }
+    }
+}
+
+/// Compute the minimal `current - baseline` overlay. Returns `None` when
+/// the two are equal (i.e. nothing to write). Objects are diffed
+/// key-by-key — keys whose values match the baseline are omitted, keys
+/// that differ are included with the current value, keys present in the
+/// baseline but missing from current are emitted as JSON null so the
+/// reverse merge can reconstruct the deletion. Arrays and primitives are
+/// included whole if they differ at all.
+fn diff(current: &Value, baseline: &Value) -> Option<Value> {
+    if current == baseline {
+        return None;
+    }
+    match (current, baseline) {
+        (Value::Object(c), Value::Object(b)) => {
+            let mut out = Map::new();
+            for (k, cv) in c {
+                match b.get(k) {
+                    Some(bv) => {
+                        if let Some(sub) = diff(cv, bv) {
+                            out.insert(k.clone(), sub);
+                        }
+                    }
+                    None => {
+                        out.insert(k.clone(), cv.clone());
+                    }
+                }
+            }
+            for (k, _) in b {
+                if !c.contains_key(k) {
+                    out.insert(k.clone(), Value::Null);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(Value::Object(out))
+            }
+        }
+        _ => Some(current.clone()),
+    }
 }
 
 /// `Settings::default()` with the three reserved-id tab entries seeded for
@@ -452,5 +669,133 @@ mod tests {
         let v1_3_json = r#"{"tabs":[]}"#;
         let parsed: Settings = serde_json::from_str(v1_3_json).unwrap();
         assert_eq!(parsed.ui.theme, "modern-dark");
+    }
+
+    // --- Layered config (global + custom overlay) -----------------------
+
+    #[test]
+    fn deep_merge_object_keys() {
+        let mut base = serde_json::json!({
+            "a": 1,
+            "nested": { "x": 1, "y": 2 },
+        });
+        let overlay = serde_json::json!({
+            "a": 99,
+            "nested": { "y": 22, "z": 33 },
+            "new_key": "added",
+        });
+        deep_merge(&mut base, overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({
+                "a": 99,
+                "nested": { "x": 1, "y": 22, "z": 33 },
+                "new_key": "added",
+            })
+        );
+    }
+
+    #[test]
+    fn deep_merge_arrays_replace_wholesale() {
+        let mut base = serde_json::json!({ "tabs": [1, 2, 3] });
+        let overlay = serde_json::json!({ "tabs": [9] });
+        deep_merge(&mut base, overlay);
+        assert_eq!(base, serde_json::json!({ "tabs": [9] }));
+    }
+
+    #[test]
+    fn diff_identical_returns_none() {
+        let v = serde_json::json!({ "a": 1, "b": [1, 2] });
+        assert!(diff(&v, &v).is_none());
+    }
+
+    #[test]
+    fn diff_drops_matching_keys() {
+        let current = serde_json::json!({
+            "a": 1,
+            "nested": { "x": 1, "y": 99 },
+        });
+        let baseline = serde_json::json!({
+            "a": 1,
+            "nested": { "x": 1, "y": 2 },
+        });
+        let d = diff(&current, &baseline).unwrap();
+        assert_eq!(d, serde_json::json!({ "nested": { "y": 99 } }));
+    }
+
+    #[test]
+    fn diff_emits_null_for_keys_only_in_baseline() {
+        // Models a removal in the overlay so the reverse merge can
+        // reconstruct it. (Not common in our typed Settings — every field
+        // has a default — but the diff/merge pair must round-trip
+        // generic JSON objects cleanly.)
+        let current = serde_json::json!({ "a": 1 });
+        let baseline = serde_json::json!({ "a": 1, "b": 2 });
+        let d = diff(&current, &baseline).unwrap();
+        assert_eq!(d, serde_json::json!({ "b": null }));
+    }
+
+    #[test]
+    fn diff_arrays_replace_whole() {
+        let current = serde_json::json!({ "tabs": [1, 2, 3] });
+        let baseline = serde_json::json!({ "tabs": [1, 2] });
+        let d = diff(&current, &baseline).unwrap();
+        assert_eq!(d, serde_json::json!({ "tabs": [1, 2, 3] }));
+    }
+
+    #[test]
+    fn merge_then_diff_round_trip_typed_settings() {
+        // Take default Settings as global, mutate one nested field, diff
+        // it, and verify that re-applying the diff to global recovers the
+        // mutated state.
+        let shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global, &shell);
+
+        let mut customized = global.clone();
+        customized.ui.theme = "future-light".to_string();
+
+        let g_value = serde_json::to_value(&global).unwrap();
+        let c_value = serde_json::to_value(&customized).unwrap();
+        let delta = diff(&c_value, &g_value).expect("non-empty diff");
+
+        // The delta should be tiny — just the ui.theme branch.
+        assert_eq!(delta, serde_json::json!({ "ui": { "theme": "future-light" } }));
+
+        // Reverse: apply delta to global, deserialize, confirm we get
+        // `customized` back.
+        let mut reapplied = g_value.clone();
+        deep_merge(&mut reapplied, delta);
+        let recovered: Settings = serde_json::from_value(reapplied).unwrap();
+        assert_eq!(recovered.ui.theme, "future-light");
+    }
+
+    #[test]
+    fn save_writes_overlay_when_diff_nonempty_and_removes_when_empty() {
+        let shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global, &shell);
+
+        // Use a unique subdir under the system temp root so parallel test
+        // runs don't collide. Cleaned up at the end of the test.
+        let dir = std::env::temp_dir()
+            .join(format!("cctts_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let overlay = dir.join(CUSTOM_FILE_NAME);
+
+        // Customized: should write a non-empty overlay.
+        let mut customized = global.clone();
+        customized.ui.theme = "future-light".to_string();
+        save(&customized, &dir, &global).unwrap();
+        assert!(overlay.exists());
+        let text = fs::read_to_string(&overlay).unwrap();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "ui": { "theme": "future-light" } }));
+
+        // Reverted to identical: should remove the overlay.
+        save(&global, &dir, &global).unwrap();
+        assert!(!overlay.exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -109,6 +109,9 @@ export interface TtsInjection {
 export interface AiNotificationConfig {
   idle: string;
   awaiting_permission: string;
+  /// Spoken when a `kind: question` pattern fires (AskUserQuestion-style
+  /// multi-option prompts). Empty string disables the announcement.
+  question: string;
   error: string;
 }
 
@@ -464,6 +467,7 @@ export function defaultSettings(): Settings {
         notifications: {
           idle: 'Claude is idle',
           awaiting_permission: 'Claude is awaiting permission',
+          question: 'Claude has a question',
           error: 'Claude encountered an error',
         },
         first_launch_notice_dismissed: true,
@@ -484,6 +488,7 @@ export function defaultSettings(): Settings {
         notifications: {
           idle: 'Claude (local) is idle',
           awaiting_permission: 'Claude (local) is awaiting permission',
+          question: 'Claude (local) has a question',
           error: 'Claude (local) encountered an error',
         },
         first_launch_notice_dismissed: true,

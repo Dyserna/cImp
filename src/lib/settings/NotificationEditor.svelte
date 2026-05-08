@@ -9,6 +9,7 @@
     notifications = $bindable<AiNotificationConfig>({
       idle: '',
       awaiting_permission: '',
+      question: '',
       error: '',
     }),
     defaults,
@@ -25,6 +26,10 @@
     {
       key: 'awaiting_permission',
       label: 'When tab requests permission while you’re on another tab',
+    },
+    {
+      key: 'question',
+      label: 'When tab asks a question while you’re on another tab',
     },
     { key: 'error', label: 'When tab encounters an error while you’re on another tab' },
   ];

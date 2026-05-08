@@ -102,6 +102,12 @@ fn main() {
 
     let audio_slot: Arc<RwLock<Option<Arc<AudioOutput>>>> = Arc::new(RwLock::new(None));
 
+    // Detection patterns. Lives next to settings.json on disk; auto-seeded
+    // with a sensible default permission pattern + a disabled question
+    // template on first launch. Hot-reload is intentionally not wired —
+    // patterns rarely change and a relaunch is fine.
+    let patterns = Arc::new(processing::patterns_file::load_or_seed());
+
     // Active-tab cell shared with the TTS worker (filters background-tab
     // synthesis requests) and the audio thread (tags TtsPlaybackStarted/
     // Stopped signals with the speaking tab). Synchronous so both consumers
@@ -148,6 +154,7 @@ fn main() {
         audio_slot.clone(),
         state_tx.clone(),
         input_lengths.clone(),
+        patterns.clone(),
     );
     let tabs_handle: TabRegistryHandle = Arc::new(TokioMutex::new(registry));
 

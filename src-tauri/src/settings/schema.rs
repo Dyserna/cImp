@@ -318,6 +318,14 @@ impl Default for ClaudeLocalSettings {
 pub struct AiNotificationConfig {
     pub idle: String,
     pub awaiting_permission: String,
+    /// Spoken when a `kind: question` pattern fires (AskUserQuestion-style
+    /// multi-option prompts). Empty disables the announcement. Older
+    /// settings files that pre-date this field deserialize to `""` via
+    /// `#[serde(default)]`; the integrity check at load doesn't backfill
+    /// it, so users on the two AI builtins get the configured-defaults
+    /// experience only on fresh installs. (See `default_claude_tab` and
+    /// `default_claude_local_tab`.)
+    pub question: String,
     pub error: String,
 }
 
@@ -363,6 +371,7 @@ pub fn default_claude_tab() -> TabConfig {
         notifications: AiNotificationConfig {
             idle: "Claude is idle".to_string(),
             awaiting_permission: "Claude is awaiting permission".to_string(),
+            question: "Claude has a question".to_string(),
             error: "Claude encountered an error".to_string(),
         },
         // Pre-dismissed so the overlay code can use a single per-tab
@@ -394,6 +403,7 @@ pub fn default_claude_local_tab() -> TabConfig {
         notifications: AiNotificationConfig {
             idle: "Claude (local) is idle".to_string(),
             awaiting_permission: "Claude (local) is awaiting permission".to_string(),
+            question: "Claude (local) has a question".to_string(),
             error: "Claude (local) encountered an error".to_string(),
         },
         first_launch_notice_dismissed: true,

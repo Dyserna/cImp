@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::audio::AudioOutput;
 use crate::error::{AppError, AppResult};
+use crate::processing::permission::PermissionPattern;
 use crate::pty::PtyManager;
 use crate::settings::{SettingsHandle, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID};
 use crate::state::{InputLengths, StateSignal, TabId, TabKind};
@@ -53,6 +54,12 @@ pub struct TabRegistry {
     /// TabAdded/TabRemoved; the registry only reads it (indirectly, via
     /// the IPC layer).
     input_lengths: InputLengths,
+    /// Detection patterns loaded from `<exe-dir>/patterns.json` at
+    /// startup. Cloned per-tab into the processor task on PTY start.
+    /// Wrapped in `Arc` so the per-tab clone is cheap (the inner Vec
+    /// itself is only cloned by the processor when constructing its
+    /// detector).
+    patterns: Arc<Vec<PermissionPattern>>,
 }
 
 pub type TabRegistryHandle = Arc<TokioMutex<TabRegistry>>;
@@ -80,6 +87,7 @@ fn sanitize_tab_id_for_filename(raw: &str) -> String {
 }
 
 impl TabRegistry {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         seed: Vec<crate::state::TabMeta>,
         initial_active: TabId,
@@ -87,6 +95,7 @@ impl TabRegistry {
         audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
         state_signals: mpsc::Sender<StateSignal>,
         input_lengths: InputLengths,
+        patterns: Arc<Vec<PermissionPattern>>,
     ) -> Self {
         let mut managers = HashMap::new();
         let mut names = HashMap::new();
@@ -105,6 +114,7 @@ impl TabRegistry {
             audio,
             state_signals,
             input_lengths,
+            patterns,
         }
     }
 
@@ -250,6 +260,7 @@ impl TabRegistry {
                 tts_segments,
                 user_typed_tts,
                 self.state_signals.clone(),
+                self.patterns.clone(),
             )
             .await;
         // On a successful Shell spawn, broadcast `ShellRestarted` so the
@@ -303,6 +314,7 @@ impl TabRegistry {
                 tts_segments,
                 user_typed_tts,
                 self.state_signals.clone(),
+                self.patterns.clone(),
             )
             .await;
         if result.is_ok() && matches!(tab.kind(), TabKind::Shell) {

@@ -30,6 +30,10 @@ use crate::tts::{ActiveTab, TtsRequest};
 pub enum NotificationEvent {
     Idle,
     AwaitingPermission,
+    /// AskUserQuestion-style prompt detected. Independent of the
+    /// `AwaitingPermission` event so each can have its own template and
+    /// fire even when the other is also in flight.
+    AwaitingQuestion,
     Error,
     /// Shell-only: subprocess exited while the user was on a different tab.
     /// Phase 5 of MILESTONE-V3-01.
@@ -45,12 +49,14 @@ fn allowed_for(kind: &TabKind, event: NotificationEvent) -> bool {
     match (kind, event) {
         (TabKind::AiTool, NotificationEvent::Idle) => true,
         (TabKind::AiTool, NotificationEvent::AwaitingPermission) => true,
+        (TabKind::AiTool, NotificationEvent::AwaitingQuestion) => true,
         (TabKind::AiTool, NotificationEvent::Error) => true,
         (TabKind::AiTool, NotificationEvent::Exited) => false,
         (TabKind::Shell, NotificationEvent::Error) => true,
         (TabKind::Shell, NotificationEvent::Exited) => true,
         (TabKind::Shell, NotificationEvent::Idle) => false,
         (TabKind::Shell, NotificationEvent::AwaitingPermission) => false,
+        (TabKind::Shell, NotificationEvent::AwaitingQuestion) => false,
     }
 }
 
@@ -98,6 +104,7 @@ struct NotificationManager {
     /// queueing a phantom `idle` notification before any real activity.
     last_avatar: HashMap<TabId, AvatarState>,
     last_awaiting: HashMap<TabId, bool>,
+    last_awaiting_question: HashMap<TabId, bool>,
     /// Set when something is enqueued and we haven't yet drained. The
     /// run loop selects on `sleep_until(deadline)` and drains when it
     /// fires. Cleared by both the deadline arm and the audio idle-edge
@@ -129,6 +136,7 @@ impl NotificationManager {
             queue: Vec::new(),
             last_avatar: HashMap::new(),
             last_awaiting: HashMap::new(),
+            last_awaiting_question: HashMap::new(),
             drain_deadline: None,
         }
     }
@@ -212,6 +220,19 @@ impl NotificationManager {
                 }
                 self.try_enqueue(tab, NotificationEvent::AwaitingPermission)
             }
+            StateEvent::AwaitingQuestionChanged { tab, awaiting } => {
+                let prev = self
+                    .last_awaiting_question
+                    .insert(tab.clone(), awaiting)
+                    .unwrap_or(false);
+                if prev == awaiting || !awaiting {
+                    return;
+                }
+                if self.suppress_for_focus(&tab) {
+                    return;
+                }
+                self.try_enqueue(tab, NotificationEvent::AwaitingQuestion)
+            }
             StateEvent::TabClosedStateChanged {
                 tab,
                 closed,
@@ -230,17 +251,18 @@ impl NotificationManager {
             }
             StateEvent::TabCreated { tab, .. } => {
                 // Seed per-tab caches so the first real StateChanged /
-                // AwaitingPermissionChanged event compares against an
-                // explicit baseline instead of relying on `unwrap_or`
-                // fallbacks. Idempotent — re-seeding is a no-op if the tab
-                // already had cached state.
+                // AwaitingPermissionChanged / AwaitingQuestionChanged event
+                // compares against an explicit baseline instead of relying
+                // on `unwrap_or` fallbacks. Idempotent.
                 self.last_avatar.entry(tab.clone()).or_insert(AvatarState::Idle);
-                self.last_awaiting.entry(tab).or_insert(false);
+                self.last_awaiting.entry(tab.clone()).or_insert(false);
+                self.last_awaiting_question.entry(tab).or_insert(false);
                 return;
             }
             StateEvent::TabClosed { tab } => {
                 self.last_avatar.remove(&tab);
                 self.last_awaiting.remove(&tab);
+                self.last_awaiting_question.remove(&tab);
                 // Drop any queued notifications targeting the closed tab —
                 // playing them after close would refer to a tab that no
                 // longer exists in the UI.
@@ -359,14 +381,19 @@ fn notification_text(
         (TabConfig::AiTool(c), NotificationEvent::AwaitingPermission) => {
             c.notifications.awaiting_permission.clone()
         }
+        (TabConfig::AiTool(c), NotificationEvent::AwaitingQuestion) => {
+            c.notifications.question.clone()
+        }
         (TabConfig::AiTool(c), NotificationEvent::Error) => c.notifications.error.clone(),
         // AI tabs don't fire Exited; defensive empty.
         (TabConfig::AiTool(_), NotificationEvent::Exited) => String::new(),
         (TabConfig::Shell(c), NotificationEvent::Error) => c.notifications.error.clone(),
         (TabConfig::Shell(c), NotificationEvent::Exited) => c.notifications.exited.clone(),
-        // Shell tabs don't fire Idle / AwaitingPermission; defensive empty.
+        // Shell tabs don't fire Idle / AwaitingPermission / AwaitingQuestion;
+        // defensive empty.
         (TabConfig::Shell(_), NotificationEvent::Idle)
-        | (TabConfig::Shell(_), NotificationEvent::AwaitingPermission) => String::new(),
+        | (TabConfig::Shell(_), NotificationEvent::AwaitingPermission)
+        | (TabConfig::Shell(_), NotificationEvent::AwaitingQuestion) => String::new(),
     };
 
     interpolate_code(&template, exit_code)
@@ -474,10 +501,11 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_ai_tabs_get_v1_trio_only() {
+    fn allowlist_ai_tabs_get_v1_trio_plus_question() {
         let kind = TabKind::AiTool;
         assert!(allowed_for(&kind, NotificationEvent::Idle));
         assert!(allowed_for(&kind, NotificationEvent::AwaitingPermission));
+        assert!(allowed_for(&kind, NotificationEvent::AwaitingQuestion));
         assert!(allowed_for(&kind, NotificationEvent::Error));
         assert!(!allowed_for(&kind, NotificationEvent::Exited));
     }
@@ -489,6 +517,7 @@ mod tests {
         assert!(allowed_for(&kind, NotificationEvent::Exited));
         assert!(!allowed_for(&kind, NotificationEvent::Idle));
         assert!(!allowed_for(&kind, NotificationEvent::AwaitingPermission));
+        assert!(!allowed_for(&kind, NotificationEvent::AwaitingQuestion));
     }
 
     #[test]

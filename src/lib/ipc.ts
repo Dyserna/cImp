@@ -29,14 +29,6 @@ export async function ptyStart(
   return invoke<number[] | null>('pty_start', { tab, channel, rows, cols });
 }
 
-/// V1.4-04 D.3: snapshot the current PTY scrollback ring as raw bytes.
-/// Diagnostic-only — the launch-replay path uses `pty_start`'s return
-/// value, not this command. Errors with `NotStarted` if the tab has no
-/// live PTY.
-export async function ptyGetScrollback(tab: TabId): Promise<number[]> {
-  return invoke<number[]>('pty_get_scrollback', { tab });
-}
-
 export async function ptyRestart(
   tab: TabId,
   channel: BytesChannel,
@@ -76,10 +68,6 @@ export async function composeContentChanged(nonEmpty: boolean): Promise<void> {
 
 export async function acknowledgeError(tab: TabId): Promise<void> {
   await invoke('acknowledge_error', { tab });
-}
-
-export async function tabActivate(tab: TabId): Promise<void> {
-  await invoke('tab_activate', { tab });
 }
 
 export interface TabMetaWire {

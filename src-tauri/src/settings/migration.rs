@@ -74,104 +74,111 @@ pub fn migrate_if_needed(
     path: &Path,
     default_shell: &ShellSpec,
 ) -> AppResult<bool> {
-    let mut changed = false;
+    // Detect the entry-point version once, write *one* backup (named
+    // after the entry version), then run every subsequent step without
+    // its own backup. Pre-V0.6 each step wrote its own `.bak` file, so a
+    // v1.0 file produced seven stamped backups on a single launch
+    // (`v1.0.bak`, `v1.2.bak`, `v1.3.bak`, …). One backup per cascade is
+    // both less disk noise and a more accurate label — the entry version
+    // is what the user originally had.
+    let entry = detect_entry_version(value);
+    if entry.is_none() {
+        return Ok(false);
+    }
+    write_backup(path, entry.unwrap(), value)?;
 
-    if looks_v1(value) {
-        write_backup(path, "v1.0", value)?;
-        migrate_v1_to_v1_2(value, default_shell);
-        changed = true;
-        // After v1 → v1.2 the file's `tabs` field is already the array
-        // shape; the v1.1 branch below short-circuits naturally.
-    } else if looks_v1_1(value) {
-        write_backup(path, "v1.1", value)?;
-        migrate_v1_1_to_v1_2(value, default_shell);
-        changed = true;
+    // Walk the dispatcher table once. Each step's `detect` is gated on
+    // the previous step's marker being present, so a value entering the
+    // cascade at v1.0 cleanly cascades through every subsequent step on
+    // the same pass; a value already at v1.10 short-circuits because no
+    // step's detector matches.
+    for step in MIGRATION_STEPS {
+        if (step.detect)(value) {
+            (step.transform)(value, default_shell);
+        }
     }
 
-    // v1.2 → v1.3: detected as "tabs is array" (post-v1.2-shape) plus
-    // "no `layout` field present". Either of the v1.0 / v1.1 branches
-    // above coerces tabs into an array, so this branch is the second
-    // pass for files that came in as v1.0 or v1.1 too — they get one
-    // file rewrite, not two backup files.
-    if looks_v1_2(value) {
-        write_backup(path, "v1.2", value)?;
-        migrate_v1_2_to_v1_3(value);
-        changed = true;
-    }
+    Ok(true)
+}
 
-    // v1.3 → v1.4: V1.4-01 adds the top-level `terminal` group (with a
-    // `theme` sub-group) and a per-tab `theme_override` field. Detected
-    // as "post-v1.3 (layout key present) but no `terminal` key". The
-    // dead `display.theme` field is dropped at the same time. Cascades
-    // naturally for files coming through earlier branches.
-    if looks_v1_3(value) {
-        write_backup(path, "v1.3", value)?;
-        migrate_v1_3_to_v1_4(value);
-        changed = true;
-    }
+/// Pick the lowest-version detector that matches `value`. Returns `None`
+/// when the file is already at the current schema (no migration needed).
+/// Used by `migrate_if_needed` to label the single pre-cascade backup.
+fn detect_entry_version(value: &Value) -> Option<&'static str> {
+    MIGRATION_STEPS
+        .iter()
+        .find(|step| (step.detect)(value))
+        .map(|step| step.from_version)
+}
 
-    // v1.4 → v1.5: V1.4-02 adds the `terminal.background` sub-group and
-    // a per-tab `background_override` field. Detected as "has terminal
-    // (v1.4) but lacks terminal.background (v1.5)". Cascades naturally
-    // for files coming through earlier branches — by the time control
-    // reaches here, the v1.3→v1.4 branch has already inserted
-    // `terminal.theme`, so this branch fires once on every cold-start
-    // file from v1.0 through v1.4.
-    if looks_v1_4(value) {
-        write_backup(path, "v1.4", value)?;
-        migrate_v1_4_to_v1_5(value);
-        changed = true;
-    }
+/// One step of the migration cascade: detect a particular legacy shape
+/// and transform it forward by one schema version. The cascade is
+/// declarative — adding a new schema bump is a single new entry in
+/// `MIGRATION_STEPS`. Transform signatures are uniform `(value,
+/// default_shell)`; steps that don't need the shell take it as an
+/// underscore-prefixed param.
+struct MigrationStep {
+    from_version: &'static str,
+    detect: fn(&Value) -> bool,
+    transform: fn(&mut Value, &ShellSpec),
+}
 
-    // v1.5 → v1.6: V1.4-04 B adds `terminal.background.presets`. A
-    // single new array field; no per-tab stamping needed because
-    // presets live globally. Cascades naturally — the v1.4→v1.5
-    // branch above stamps `terminal.background` first, then this
-    // branch fires on the same value before flush.
-    if looks_v1_5(value) {
-        write_backup(path, "v1.5", value)?;
-        migrate_v1_5_to_v1_6(value);
-        changed = true;
-    }
+/// The cascade. Order matters: the v1.0 → v1.2 transform produces the
+/// shape that the v1.2 → v1.3 detector needs to match, and so on. Two
+/// entry points (v1.0 and v1.1) both produce v1.2; once any one of them
+/// runs, the next pass looks for v1.2's discriminator.
+///
+/// V1.0 and V1.1 are the only steps that need the default shell (for
+/// the `_shell_1_tmp` interim key). The rest accept it via the uniform
+/// signature and ignore it.
+const MIGRATION_STEPS: &[MigrationStep] = &[
+    MigrationStep { from_version: "v1.0", detect: looks_v1, transform: migrate_v1_to_v1_2 },
+    MigrationStep { from_version: "v1.1", detect: looks_v1_1, transform: migrate_v1_1_to_v1_2 },
+    MigrationStep { from_version: "v1.2", detect: looks_v1_2, transform: migrate_v1_2_to_v1_3_step },
+    MigrationStep { from_version: "v1.3", detect: looks_v1_3, transform: migrate_v1_3_to_v1_4_step },
+    MigrationStep { from_version: "v1.4", detect: looks_v1_4, transform: migrate_v1_4_to_v1_5_step },
+    MigrationStep { from_version: "v1.5", detect: looks_v1_5, transform: migrate_v1_5_to_v1_6_step },
+    MigrationStep { from_version: "v1.6", detect: looks_v1_6, transform: migrate_v1_6_to_v1_7_step },
+    MigrationStep { from_version: "v1.7", detect: looks_v1_7, transform: migrate_v1_7_to_v1_8_step },
+    MigrationStep { from_version: "v1.8", detect: looks_v1_8, transform: migrate_v1_8_to_v1_9_step },
+    MigrationStep { from_version: "v1.9", detect: looks_v1_9, transform: migrate_v1_9_to_v1_10_step },
+    MigrationStep { from_version: "v1.10", detect: looks_v1_10, transform: migrate_v1_10_to_v1_11_step },
+];
 
-    // v1.6 → v1.7: V1.4-04 D adds `terminal.scrollback` (cross-restart
-    // ring buffer settings) and explicitly stamps the V1.4-04 C.4
-    // `terminal.background.preview_category_flips` flag. Detected as
-    // "has terminal.background.presets (v1.6) but lacks
-    // terminal.scrollback (v1.7)".
-    if looks_v1_6(value) {
-        write_backup(path, "v1.6", value)?;
-        migrate_v1_6_to_v1_7(value);
-        changed = true;
-    }
+// --- Uniform-signature wrappers -------------------------------------------
+//
+// The MIGRATION_STEPS table requires every transform to have the same
+// signature `fn(&mut Value, &ShellSpec)`. The v1.0 and v1.1 transforms
+// natively use the shell; the rest don't, and we expose a thin shim
+// here to keep the table mechanical and the underlying transforms
+// clean of unused parameters.
 
-    // v1.7 → v1.8: V1.4-07 drops the aider tab kind, adds the global
-    // `claude_local` provider config, and adds the per-AI-tab
-    // `use_local_provider` flag. The aider tab is rewritten in place to
-    // claude-local (id, name, command, use_local_provider, tts_injection
-    // re-enabled). Layout-tree references to `"aider"` (in tab_ids,
-    // active_tab_id, layout_presets, session.active_tab_id) are
-    // rewritten to `"claude-local"` in the same pass so the integrity
-    // check sees a self-consistent file. Detected as "has
-    // terminal.scrollback (v1.7) but lacks claude_local (v1.8)".
-    if looks_v1_7(value) {
-        write_backup(path, "v1.7", value)?;
-        migrate_v1_7_to_v1_8(value);
-        changed = true;
-    }
-
-    // v1.8 → v1.9: adds the `claude_tabs_enabled` setting (Cloud / Local /
-    // Both). The migration infers the initial value from the existing
-    // tabs array so users who had both Claude tabs in v1.8 keep both
-    // after the upgrade. Detection: `claude_local` is present (v1.8
-    // marker) but `claude_tabs_enabled` is absent (v1.9 marker).
-    if looks_v1_8(value) {
-        write_backup(path, "v1.8", value)?;
-        migrate_v1_8_to_v1_9(value);
-        changed = true;
-    }
-
-    Ok(changed)
+fn migrate_v1_2_to_v1_3_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_2_to_v1_3(value)
+}
+fn migrate_v1_3_to_v1_4_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_3_to_v1_4(value)
+}
+fn migrate_v1_4_to_v1_5_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_4_to_v1_5(value)
+}
+fn migrate_v1_5_to_v1_6_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_5_to_v1_6(value)
+}
+fn migrate_v1_6_to_v1_7_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_6_to_v1_7(value)
+}
+fn migrate_v1_7_to_v1_8_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_7_to_v1_8(value)
+}
+fn migrate_v1_8_to_v1_9_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_8_to_v1_9(value)
+}
+fn migrate_v1_9_to_v1_10_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_9_to_v1_10(value)
+}
+fn migrate_v1_10_to_v1_11_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_10_to_v1_11(value)
 }
 
 fn looks_v1(value: &Value) -> bool {
@@ -300,6 +307,42 @@ fn looks_v1_8(value: &Value) -> bool {
     let has_claude_local = obj.contains_key("claude_local");
     let has_setting = obj.contains_key("claude_tabs_enabled");
     has_claude_local && !has_setting
+}
+
+/// Is this a v1.9 file that lacks the v1.10 `schema_version` field? V1.10's
+/// schema-bump check. `claude_tabs_enabled` must be present (v1.9 marker,
+/// so we don't false-positive on earlier files mid-cascade);
+/// `schema_version` must be absent. Fresh-install v1.10 files have
+/// `schema_version: 10` populated and skip this branch.
+///
+/// Once every supported entry point has been migrated through v1.10 and
+/// the `schema_version` field is universal, future detectors can simplify
+/// to `value.get("schema_version") == Some(N)` instead of the
+/// presence-of-key archaeology that the earlier `looks_v1_X` predicates
+/// rely on. See `docs/features/FEATURE-secret-storage.md` for the
+/// migration-style consolidation plan.
+fn looks_v1_9(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let has_setting = obj.contains_key("claude_tabs_enabled");
+    let has_version = obj.contains_key("schema_version");
+    has_setting && !has_version
+}
+
+/// Is this a v1.10 file (schema_version == 10) whose tab notifications
+/// still use the bare-string per-slot shape? V1.11 promotes each slot
+/// to `{ enabled, text }`; the predicate gates on the explicit
+/// `schema_version` integer so a freshly-stamped v1.10 file can be
+/// distinguished from a v1.11 one (which carries `schema_version: 11`).
+/// Tolerant `Deserialize` on the slot type accepts both shapes, but the
+/// migration still rewrites in place so the on-disk file reflects the
+/// new shape immediately rather than only after the user's first save.
+fn looks_v1_10(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 10)
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -501,6 +544,24 @@ fn migrate_v1_to_v1_2(value: &mut Value, default_shell: &ShellSpec) {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // v1's `claude_code.claude_md_path` was a path to a CLAUDE.md file the
+    // wrapper auto-loaded; v1.2+ uses `--append-system-prompt` instead and
+    // doesn't carry the field forward. Log the dropped value so a user
+    // upgrading from a long-dormant install can see what they need to
+    // re-configure (the rolling log file rotates on retention so this is
+    // their one signal that the field went away).
+    if let Some(p) = root
+        .get("claude_code")
+        .and_then(|cc| cc.get("claude_md_path"))
+        .and_then(Value::as_str)
+    {
+        if !p.is_empty() {
+            tracing::warn!(
+                claude_md_path = %p,
+                "settings v1→v1.2: dropping claude_md_path; the runtime now uses --append-system-prompt"
+            );
+        }
+    }
     root.remove("claude_code");
 
     // Synthesize a v1.1-shaped "claude" tab with the carried args, then
@@ -702,6 +763,13 @@ fn migrate_v1_5_to_v1_6(value: &mut Value) {
         .and_then(Value::as_object_mut)
     {
         bg.insert("presets".to_string(), json!([]));
+        // V1.4-04 A.1's `snapshot_lines` field landed without a dedicated
+        // schema bump and silently rode `serde(default)`. Stamp it
+        // explicitly here so the on-disk file is self-describing —
+        // matching the value `TerminalBackgroundSettings::default()`
+        // produces. `entry().or_insert` preserves any hand-edited value.
+        bg.entry("snapshot_lines".to_string())
+            .or_insert(json!(2000));
     }
 }
 
@@ -960,27 +1028,98 @@ fn infer_claude_tabs_enabled(root: &Map<String, Value>) -> &'static str {
     }
 }
 
+// --- v1.9 → v1.10 -----------------------------------------------------------
+//
+// Adds the explicit `schema_version` integer field (default 10). Pre-V1.10
+// files relied on presence-of-key archaeology to detect their version; this
+// step plants the discriminator so future migrations can use a single
+// integer comparison.
+
+fn migrate_v1_9_to_v1_10(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    root.insert(
+        "schema_version".to_string(),
+        // V1.11 raised CURRENT_SCHEMA_VERSION; this step only promotes
+        // the file to v1.10, so stamp the literal 10 rather than the
+        // moving constant.
+        Value::Number(serde_json::Number::from(10u8)),
+    );
+}
+
+// --- v1.10 → v1.11 ----------------------------------------------------------
+//
+// Promotes each notification slot from a bare string to a
+// `{ enabled, text }` object. The mapping mirrors the documented
+// "leave blank to disable" convention: empty string → disabled,
+// non-empty → enabled. The schema's tolerant `Deserialize` would
+// transparently absorb the legacy shape on load, but rewriting on
+// migration means the on-disk file matches the live shape from the
+// first launch after upgrade rather than only after the user's first
+// settings save.
+
+fn migrate_v1_10_to_v1_11(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(tabs) = root.get_mut("tabs").and_then(Value::as_array_mut) {
+        for tab in tabs {
+            if let Some(notifications) = tab
+                .get_mut("notifications")
+                .and_then(Value::as_object_mut)
+            {
+                let keys: Vec<String> = notifications.keys().cloned().collect();
+                for key in keys {
+                    if let Some(slot) = notifications.get_mut(&key) {
+                        if let Value::String(text) = slot {
+                            let promoted = json!({
+                                "enabled": !text.is_empty(),
+                                "text": text,
+                            });
+                            *slot = promoted;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(
+            crate::settings::schema::CURRENT_SCHEMA_VERSION,
+        )),
+    );
+}
+
 // --- Backup helpers ---------------------------------------------------------
 
-/// Write `<path>.<from_version>.bak` next to the settings file. If that name
-/// already exists (the user somehow rolled back and re-migrated), append a
-/// unix timestamp to the suffix so the original backup survives. Failure
-/// here aborts the migration — we never proceed without a recoverable copy.
+/// Write `<full-filename>.<from_version>.bak` next to the settings file. If
+/// that name already exists (the user somehow rolled back and re-migrated),
+/// append a unix timestamp to the suffix so the original backup survives.
+/// Failure here aborts the migration — we never proceed without a
+/// recoverable copy.
+///
+/// Backup filenames are built by *appending* to the full filename rather
+/// than `with_extension`, which only knows the last dot — for the per-folder
+/// overlay file `.cctts.custom.config.json`, `with_extension` would consume
+/// `config` as the extension and produce `.cctts.custom.json.<ver>.bak`,
+/// drifting the backup name away from the source's stem.
 fn write_backup(path: &Path, from_version: &str, value: &Value) -> AppResult<()> {
-    let primary = path.with_extension(format!("json.{from_version}.bak"));
+    let primary = backup_path_for(path, &format!("{from_version}.bak"));
     let target = if primary.exists() {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        path.with_extension(format!("json.{from_version}.bak.{ts}"))
+        backup_path_for(path, &format!("{from_version}.bak.{ts}"))
     } else {
         primary
     };
 
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| AppError::Settings(format!("backup serialize: {e}")))?;
-    fs::write(&target, bytes).map_err(|e| {
+    crate::settings::write_atomic(&target, &bytes).map_err(|e| {
         AppError::Settings(format!(
             "backup write {} failed: {e}",
             target.display()
@@ -994,8 +1133,28 @@ fn write_backup(path: &Path, from_version: &str, value: &Value) -> AppResult<()>
     Ok(())
 }
 
+/// Produce `<path-with-original-filename>.<suffix>`. Unlike
+/// `Path::with_extension` this preserves the entire original filename
+/// (including any embedded dots), so a backup of `.cctts.custom.config.json`
+/// becomes `.cctts.custom.config.json.<suffix>` rather than
+/// `.cctts.custom.json.<suffix>`.
+fn backup_path_for(path: &Path, suffix: &str) -> PathBuf {
+    match path.file_name() {
+        Some(name) => {
+            let mut new_name = name.to_os_string();
+            new_name.push(".");
+            new_name.push(suffix);
+            path.with_file_name(new_name)
+        }
+        None => PathBuf::from(format!("{}.{suffix}", path.display())),
+    }
+}
+
 /// Move a corrupt settings file aside before resetting to defaults. Best-
-/// effort: a failed move just logs and returns — we still want to reset.
+/// effort: a failed rename falls back to copy+remove (cross-volume
+/// rename fails on Windows when, e.g., the launch_cwd lives on a different
+/// drive than the user temp). A total failure just logs and returns — the
+/// caller still resets to defaults.
 pub fn quarantine_corrupt_file(path: &Path) {
     if !path.exists() {
         return;
@@ -1004,18 +1163,26 @@ pub fn quarantine_corrupt_file(path: &Path) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let target: PathBuf = path.with_extension(format!("json.corrupted.{ts}.bak"));
-    if let Err(e) = fs::rename(path, &target) {
-        tracing::warn!(
-            error = %e,
-            path = %path.display(),
-            target = %target.display(),
-            "settings: could not quarantine corrupt file"
-        );
+    let target = backup_path_for(path, &format!("corrupted.{ts}.bak"));
+    let renamed = fs::rename(path, &target).is_ok();
+    let moved = if renamed {
+        true
+    } else if let Ok(_) = fs::copy(path, &target) {
+        let _ = fs::remove_file(path);
+        true
     } else {
+        false
+    };
+    if moved {
         tracing::warn!(
             quarantine = %target.display(),
             "settings: corrupt file moved aside; defaults will be written"
+        );
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            target = %target.display(),
+            "settings: could not quarantine corrupt file"
         );
     }
 }
@@ -2007,5 +2174,108 @@ mod tests {
         // Idempotent on second pass.
         migrate_v1_8_to_v1_9(&mut v);
         assert!(!looks_v1_8(&v));
+    }
+
+    // --- v1.9 → v1.10 -------------------------------------------------------
+
+    #[test]
+    fn v1_9_to_v1_10_stamps_schema_version() {
+        let mut v = v1_8_with_tabs(true, true);
+        migrate_v1_8_to_v1_9(&mut v);
+        assert!(looks_v1_9(&v));
+        migrate_v1_9_to_v1_10(&mut v);
+        // The v1.9 → v1.10 step stamps the literal version 10 (the
+        // version it produces), not the moving CURRENT_SCHEMA_VERSION.
+        // The next step in the cascade (v1.10 → v1.11) bumps to current.
+        assert_eq!(v.get("schema_version").and_then(Value::as_u64), Some(10));
+        assert!(!looks_v1_9(&v));
+    }
+
+    #[test]
+    fn v1_10_file_is_not_re_detected() {
+        // A fresh-schema file has the schema_version field already and
+        // must not re-trigger the v1.9 detector.
+        let v = json!({
+            "schema_version": crate::settings::schema::CURRENT_SCHEMA_VERSION,
+            "claude_tabs_enabled": "cloud",
+            "tabs": [],
+            "claude_local": { "base_url": "", "auth_token": "", "model_alias": "" },
+        });
+        assert!(!looks_v1_8(&v));
+        assert!(!looks_v1_9(&v));
+    }
+
+    // --- v1.10 → v1.11 ------------------------------------------------------
+
+    #[test]
+    fn v1_10_to_v1_11_promotes_string_notifications_to_objects() {
+        let mut v = json!({
+            "schema_version": 10,
+            "tabs": [
+                {
+                    "kind": "ai_tool",
+                    "id": "claude",
+                    "notifications": {
+                        "idle": "Claude is idle",
+                        "awaiting_permission": "",
+                        "question": "Claude has a question",
+                        "error": "Claude encountered an error"
+                    }
+                },
+                {
+                    "kind": "shell",
+                    "id": "shell-1",
+                    "notifications": {
+                        "error": "boom",
+                        "exited": ""
+                    }
+                }
+            ]
+        });
+        assert!(looks_v1_10(&v));
+        migrate_v1_10_to_v1_11(&mut v);
+        let tabs = v.get("tabs").unwrap().as_array().unwrap();
+        let idle = tabs[0].get("notifications").unwrap().get("idle").unwrap();
+        assert_eq!(idle.get("enabled").unwrap(), true);
+        assert_eq!(idle.get("text").unwrap(), "Claude is idle");
+        let perm = tabs[0]
+            .get("notifications")
+            .unwrap()
+            .get("awaiting_permission")
+            .unwrap();
+        assert_eq!(perm.get("enabled").unwrap(), false);
+        assert_eq!(perm.get("text").unwrap(), "");
+        let exited = tabs[1].get("notifications").unwrap().get("exited").unwrap();
+        assert_eq!(exited.get("enabled").unwrap(), false);
+        assert_eq!(
+            v.get("schema_version").and_then(Value::as_u64),
+            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64)
+        );
+        assert!(!looks_v1_10(&v));
+    }
+
+    #[test]
+    fn detect_entry_version_returns_lowest_matching_detector() {
+        // V0.6+ contract: `detect_entry_version` returns the lowest-version
+        // detector that matches, so the cascade writes one backup labelled
+        // by the user's actual on-disk version. The v1_8_with_tabs helper
+        // is intentionally minimal — it lacks v1.3+ markers, so it matches
+        // the v1.2 detector first. That's correct behavior: the cascade
+        // will fill in v1.3+ markers as it walks forward.
+        let minimal = v1_8_with_tabs(true, true);
+        assert_eq!(detect_entry_version(&minimal), Some("v1.2"));
+
+        // Empty value never matches any detector.
+        assert_eq!(detect_entry_version(&json!({})), None);
+        // A current-shape file (has `schema_version`) skips the cascade.
+        let current = json!({
+            "schema_version": crate::settings::schema::CURRENT_SCHEMA_VERSION,
+            "tabs": [],
+            "layout": null,
+            "terminal": {"background": {"presets": []}, "scrollback": {}},
+            "claude_local": {},
+            "claude_tabs_enabled": "cloud",
+        });
+        assert_eq!(detect_entry_version(&current), None);
     }
 }

@@ -21,9 +21,29 @@ pub const CLAUDE_TAB_ID: &str = "claude";
 pub const CLAUDE_LOCAL_TAB_ID: &str = "claude-local";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+/// The on-disk schema version. Bumped on every migration step. Detection
+/// of legacy files prefers this field's integer value over the older
+/// presence-of-key archaeology in the migration cascade — a future migration
+/// only needs to compare `value.schema_version < N`.
+///
+/// Files that pre-date V1.10 lack the field entirely; the cascade still
+/// uses the `looks_v1_X` predicates for those, falling through to a final
+/// step that stamps the field with the current value.
+pub const CURRENT_SCHEMA_VERSION: u8 = 11;
+
+fn current_schema_version() -> u8 {
+    CURRENT_SCHEMA_VERSION
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct Settings {
+    /// On-disk schema version. Stamped at `CURRENT_SCHEMA_VERSION`
+    /// on fresh installs and by the v1.9→v1.10 migration. Defaulted via
+    /// `current_schema_version` so legacy files (which lack the key)
+    /// deserialize at the latest version after migration runs.
+    #[serde(default = "current_schema_version")]
+    pub schema_version: u8,
     pub tts: TtsSettings,
     pub avatar: AvatarSettings,
     pub display: DisplaySettings,
@@ -78,6 +98,30 @@ pub struct Settings {
     /// rolling files into `<exe-dir>/logs/`; the level field drives the
     /// EnvFilter via a reload handle so changes apply live.
     pub logging: LoggingSettings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            tts: TtsSettings::default(),
+            avatar: AvatarSettings::default(),
+            display: DisplaySettings::default(),
+            behavior: BehaviorSettings::default(),
+            compose: ComposeSettings::default(),
+            shortcuts: ShortcutSettings::default(),
+            tabs: Vec::new(),
+            processing: ProcessingSettings::default(),
+            session: SessionState::default(),
+            layout: None,
+            layout_presets: Vec::new(),
+            ui: UiSettings::default(),
+            terminal: TerminalSettings::default(),
+            claude_local: ClaudeLocalSettings::default(),
+            claude_tabs_enabled: ClaudeTabsEnabled::default(),
+            logging: LoggingSettings::default(),
+        }
+    }
 }
 
 /// Logging configuration. The file path is fixed at
@@ -431,14 +475,34 @@ impl Default for ShellTabConfig {
 /// to a local proxy (typically LiteLLM bridging to Ollama / LM Studio /
 /// other OpenAI-compatible endpoints) instead of api.anthropic.com.
 /// Stored cleartext in settings.json — local proxies typically accept
-/// dummy tokens, so this is acceptable; OS keychain integration is a
-/// future enhancement.
-#[derive(Clone, Serialize, Deserialize, Debug)]
+/// dummy tokens. OS-keychain integration is documented as a future
+/// upgrade in `docs/FUTURE-FEATURES-keyring.md`.
+///
+/// The `Debug` impl is hand-rolled to redact `auth_token` so any
+/// accidental `?settings` / `?cfg` log line cannot leak the secret to
+/// the rolling log file. This is defense-in-depth against future code
+/// that adds such a log line; today no caller logs the struct.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClaudeLocalSettings {
     pub base_url: String,
     pub auth_token: String,
     pub model_alias: String,
+}
+
+impl std::fmt::Debug for ClaudeLocalSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = if self.auth_token.is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("ClaudeLocalSettings")
+            .field("base_url", &self.base_url)
+            .field("auth_token", &redacted)
+            .field("model_alias", &self.model_alias)
+            .finish()
+    }
 }
 
 impl Default for ClaudeLocalSettings {
@@ -451,35 +515,101 @@ impl Default for ClaudeLocalSettings {
     }
 }
 
+/// One notification slot: a per-event `{ enabled, text }` pair. The
+/// firing path requires both `enabled == true` AND a non-empty `text`
+/// to dispatch — the empty-text suppression matches the pre-v1.11
+/// convention so users who hand-edit a slot to `""` still see it
+/// disabled.
+///
+/// Custom `Deserialize` accepts either a bare string (the v1.10-and-
+/// earlier shape — empty string maps to `enabled: false`, non-empty to
+/// `enabled: true`) or the v1.11 object shape, so a legacy file loads
+/// without losing the user's text. On next save the file is rewritten
+/// in the new shape.
+#[derive(Clone, Serialize, Debug, Default)]
+pub struct NotificationSlot {
+    pub enabled: bool,
+    pub text: String,
+}
+
+impl NotificationSlot {
+    /// A configured-and-enabled slot. Constructor for the builtin tab
+    /// defaults so the call sites stay terse.
+    pub fn enabled(text: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            text: text.into(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NotificationSlot {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            // v1.10-and-earlier shape: bare string. Empty string was the
+            // documented "leave blank to disable" convention, so map it
+            // to `enabled: false`. Non-empty maps to `enabled: true` so
+            // the upgrade path preserves prior firing behavior.
+            serde_json::Value::String(s) => Ok(Self {
+                enabled: !s.is_empty(),
+                text: s,
+            }),
+            serde_json::Value::Object(_) => {
+                #[derive(Deserialize)]
+                struct Inner {
+                    #[serde(default = "default_true")]
+                    enabled: bool,
+                    #[serde(default)]
+                    text: String,
+                }
+                fn default_true() -> bool {
+                    true
+                }
+                let inner: Inner = serde_json::from_value(v).map_err(D::Error::custom)?;
+                Ok(Self {
+                    enabled: inner.enabled,
+                    text: inner.text,
+                })
+            }
+            serde_json::Value::Null => Ok(Self::default()),
+            _ => Err(D::Error::custom(
+                "notification slot: expected string or { enabled, text } object",
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct AiNotificationConfig {
-    pub idle: String,
-    pub awaiting_permission: String,
+    pub idle: NotificationSlot,
+    pub awaiting_permission: NotificationSlot,
     /// Spoken when a `kind: question` pattern fires (AskUserQuestion-style
-    /// multi-option prompts). Empty disables the announcement. Older
-    /// settings files that pre-date this field deserialize to `""` via
+    /// multi-option prompts). Older settings files that pre-date this
+    /// field deserialize to a default-disabled slot via
     /// `#[serde(default)]`; the integrity check at load doesn't backfill
     /// it, so users on the two AI builtins get the configured-defaults
     /// experience only on fresh installs. (See `default_claude_tab` and
     /// `default_claude_local_tab`.)
-    pub question: String,
-    pub error: String,
+    pub question: NotificationSlot,
+    pub error: NotificationSlot,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct ShellNotificationConfig {
-    pub error: String,
+    pub error: NotificationSlot,
     /// `{code}` placeholder is interpolated with the actual exit code in M4.
-    pub exited: String,
+    pub exited: NotificationSlot,
 }
 
 impl Default for ShellNotificationConfig {
     fn default() -> Self {
         Self {
-            error: "Shell encountered an error".to_string(),
-            exited: "Shell exited (code {code})".to_string(),
+            error: NotificationSlot::enabled("Shell encountered an error"),
+            exited: NotificationSlot::enabled("Shell exited (code {code})"),
         }
     }
 }
@@ -507,10 +637,10 @@ pub fn default_claude_tab() -> TabConfig {
             instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
         },
         notifications: AiNotificationConfig {
-            idle: "Claude is idle".to_string(),
-            awaiting_permission: "Claude is awaiting permission".to_string(),
-            question: "Claude has a question".to_string(),
-            error: "Claude encountered an error".to_string(),
+            idle: NotificationSlot::enabled("Claude is idle"),
+            awaiting_permission: NotificationSlot::enabled("Claude is awaiting permission"),
+            question: NotificationSlot::enabled("Claude has a question"),
+            error: NotificationSlot::enabled("Claude encountered an error"),
         },
         // Pre-dismissed so the overlay code can use a single per-tab
         // predicate. Aider used to fire a first-launch banner (V1.1)
@@ -539,10 +669,12 @@ pub fn default_claude_local_tab() -> TabConfig {
             instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
         },
         notifications: AiNotificationConfig {
-            idle: "Claude (local) is idle".to_string(),
-            awaiting_permission: "Claude (local) is awaiting permission".to_string(),
-            question: "Claude (local) has a question".to_string(),
-            error: "Claude (local) encountered an error".to_string(),
+            idle: NotificationSlot::enabled("Claude (local) is idle"),
+            awaiting_permission: NotificationSlot::enabled(
+                "Claude (local) is awaiting permission",
+            ),
+            question: NotificationSlot::enabled("Claude (local) has a question"),
+            error: NotificationSlot::enabled("Claude (local) encountered an error"),
         },
         first_launch_notice_dismissed: true,
         theme_override: None,
@@ -736,6 +868,13 @@ pub struct BehaviorSettings {
     /// don't want to hear "awaiting permission" for the tab they're
     /// staring at.
     pub announce_focused_tab: bool,
+    /// When true, tagged-content TTS (the `[[TTS]]…[[/TTS]]` segments
+    /// produced by AI tabs) plays even when the originating tab is not
+    /// the active one. Default off keeps the v2 behavior — only the
+    /// foreground tab's TTS plays. Independent of announcement TTS,
+    /// which is gated by `announce_focused_tab` and never dropped for
+    /// background tabs.
+    pub speak_background_tabs: bool,
     /// When true, text selected in any terminal is copied to the system
     /// clipboard automatically. Older settings files without this field
     /// deserialize to the default via serde-default — no migration bump.
@@ -751,6 +890,7 @@ impl Default for BehaviorSettings {
             announcements_enabled: true,
             follow_avatar: false,
             announce_focused_tab: false,
+            speak_background_tabs: false,
             copy_on_select: true,
         }
     }

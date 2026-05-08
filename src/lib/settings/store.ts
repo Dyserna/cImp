@@ -5,17 +5,18 @@
 // in the other (and persisted to disk by the backend's debounced saver).
 
 import { writable, derived, type Readable } from 'svelte/store';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { listen } from '@tauri-apps/api/event';
 import { settingsGet, settingsUpdate } from './ipc';
 import { defaultSettings, type Settings } from './types';
 
 export const settings = writable<Settings>(defaultSettings());
 
-let unlisten: UnlistenFn | null = null;
 let initPromise: Promise<void> | null = null;
 
 /// Initialize the store by fetching the current backend value and subscribing
 /// to live updates. Idempotent: subsequent calls return the same promise.
+/// The listener is process-scoped — there's no teardown path because the
+/// settings store survives for the lifetime of the window.
 export function initSettings(): Promise<void> {
   if (initPromise) return initPromise;
   initPromise = (async () => {
@@ -25,19 +26,11 @@ export function initSettings(): Promise<void> {
     } catch (e) {
       console.warn('settings_get failed; using defaults', e);
     }
-    unlisten = await listen<Settings>('settings-changed', (event) => {
+    await listen<Settings>('settings-changed', (event) => {
       settings.set(event.payload);
     });
   })();
   return initPromise;
-}
-
-export function teardownSettings(): void {
-  if (unlisten) {
-    unlisten();
-    unlisten = null;
-  }
-  initPromise = null;
 }
 
 /// Push a full updated Settings struct to the backend. The backend will

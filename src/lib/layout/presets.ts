@@ -19,7 +19,7 @@ import {
   leftmostLeafPaneId,
   validateAndRepairLayout,
 } from './persistence';
-import type { LayoutPersisted, LayoutPreset } from '../settings/types';
+import type { LayoutPersisted } from '../settings/types';
 
 /// Snapshot the current layout's tree (without focus — presets are
 /// "set up panes this way" and focus is the user's next-click
@@ -78,13 +78,4 @@ export async function renameLayoutPreset(
   newName: string,
 ): Promise<void> {
   await renamePresetIpc(oldName, newName);
-}
-
-/// Read-only snapshot of the current presets list, sorted by
-/// `created_at` descending (most recent first). Used by the popover
-/// to render the "Recent presets" section. Stable equality: re-call
-/// after a settings update to get the refreshed order.
-export function recentPresets(): LayoutPreset[] {
-  const presets = get(settings).layout_presets;
-  return [...presets].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }

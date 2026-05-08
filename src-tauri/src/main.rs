@@ -200,6 +200,7 @@ fn main() {
         settings: settings_handle.clone(),
         audio: audio_slot.clone(),
         pending_settings_deep_link: Arc::new(Mutex::new(None)),
+        lifecycle_serializer: Arc::new(TokioMutex::new(())),
     };
 
     let tts_rx_for_setup = tts_rx_slot.clone();

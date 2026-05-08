@@ -427,27 +427,35 @@ fn notification_text(
         return String::new();
     };
 
-    let template = match (entry, event) {
-        (TabConfig::AiTool(c), NotificationEvent::Idle) => c.notifications.idle.clone(),
+    use crate::settings::NotificationSlot;
+    // V1.11 promoted each per-event slot to a `{ enabled, text }`
+    // pair. Disabled or empty-text slots both fall through to the
+    // empty-string suppression path in the caller, so the firing
+    // contract is unchanged.
+    let slot: &NotificationSlot = match (entry, event) {
+        (TabConfig::AiTool(c), NotificationEvent::Idle) => &c.notifications.idle,
         (TabConfig::AiTool(c), NotificationEvent::AwaitingPermission) => {
-            c.notifications.awaiting_permission.clone()
+            &c.notifications.awaiting_permission
         }
         (TabConfig::AiTool(c), NotificationEvent::AwaitingQuestion) => {
-            c.notifications.question.clone()
+            &c.notifications.question
         }
-        (TabConfig::AiTool(c), NotificationEvent::Error) => c.notifications.error.clone(),
+        (TabConfig::AiTool(c), NotificationEvent::Error) => &c.notifications.error,
         // AI tabs don't fire Exited; defensive empty.
-        (TabConfig::AiTool(_), NotificationEvent::Exited) => String::new(),
-        (TabConfig::Shell(c), NotificationEvent::Error) => c.notifications.error.clone(),
-        (TabConfig::Shell(c), NotificationEvent::Exited) => c.notifications.exited.clone(),
+        (TabConfig::AiTool(_), NotificationEvent::Exited) => return String::new(),
+        (TabConfig::Shell(c), NotificationEvent::Error) => &c.notifications.error,
+        (TabConfig::Shell(c), NotificationEvent::Exited) => &c.notifications.exited,
         // Shell tabs don't fire Idle / AwaitingPermission / AwaitingQuestion;
         // defensive empty.
         (TabConfig::Shell(_), NotificationEvent::Idle)
         | (TabConfig::Shell(_), NotificationEvent::AwaitingPermission)
-        | (TabConfig::Shell(_), NotificationEvent::AwaitingQuestion) => String::new(),
+        | (TabConfig::Shell(_), NotificationEvent::AwaitingQuestion) => return String::new(),
     };
 
-    interpolate_code(&template, exit_code)
+    if !slot.enabled {
+        return String::new();
+    }
+    interpolate_code(&slot.text, exit_code)
 }
 
 /// Replace `{code}` with the exit code (or `?` when none was reported).

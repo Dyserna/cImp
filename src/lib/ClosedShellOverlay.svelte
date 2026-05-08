@@ -1,21 +1,22 @@
 <script lang="ts">
   import type { TabId } from './tabs/types';
   import { perTabClosedState } from './avatarState';
-  import { activeTab } from './tabs/state';
   import { restartShellTab } from './ipc';
   import { openConfigureTabDialog } from './dialog/store';
 
   // Shown when a Shell tab's subprocess has exited or its launch failed.
   // The card displays the exit code (or a custom message for launch
-  // failures like command-not-found) and a primary action button. The
-  // host Terminal forwards the Enter keypress to `pressedEnter`; when the
+  // failures like command-not-found) and a primary action button.
+  //
+  // Enter-key routing lives in `terminals.ts`'s onData handler: when the
   // closed state has a `closed_message`, Enter opens the Configure dialog
   // (so the user can fix the broken command) instead of attempting a
-  // restart that would fail the same way.
+  // restart that would fail the same way; otherwise Enter restarts the
+  // subprocess. Keeping that branching in terminals.ts puts it next to
+  // xterm's onData wiring and lets this overlay stay a pure renderer.
   let { tabId }: { tabId: TabId } = $props();
 
   const closedState = $derived($perTabClosedState[tabId]);
-  const isActive = $derived($activeTab === tabId);
   const launchFailed = $derived(
     !!closedState?.closed && !!closedState.closed_message,
   );
@@ -35,18 +36,6 @@
 
   function configure() {
     openConfigureTabDialog(tabId);
-  }
-
-  // The host Terminal's keydown handler invokes this when the user presses
-  // Enter while this overlay is visible. Routes to Configure for launch
-  // failures, restart otherwise.
-  export function pressedEnter() {
-    if (!closedState?.closed || !isActive) return;
-    if (launchFailed) {
-      configure();
-    } else {
-      void restart();
-    }
   }
 
   const code = $derived(closedState?.exit_code ?? null);

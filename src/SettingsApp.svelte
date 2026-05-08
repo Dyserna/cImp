@@ -116,6 +116,12 @@
   // listens for `settings-deep-link` events fired while the window is
   // already open. Both call `scrollToTabSection` with the same id.
   let unlistenDeepLink: (() => void) | undefined;
+  // Async-IIFE / async-onMount disposal guard. The deep-link listener
+  // is registered after an `await` and may not resolve before the
+  // window closes. Without this flag the late-resolving listener gets
+  // stored in `unlistenDeepLink` after onDestroy already ran, leaking
+  // the listener for the rest of the parent process's life.
+  let disposed = false;
 
   function scrollToTabSection(tabId: string): void {
     // Sidebar nav + sub-tabs both hide content, so flip both before
@@ -134,6 +140,7 @@
 
   onMount(async () => {
     await initSettings();
+    if (disposed) return;
     snapshot = structuredClone(get(settings));
     for (const t of AI_TABS) captureBaseline(t);
     unsub = settings.subscribe((s) => {
@@ -162,16 +169,25 @@
       .catch((e) => console.warn('consume_settings_deep_link failed', e));
 
     // V1.4-07 A: hot-open deep-link. Fired while this window is already
-    // open and the user clicks Configure on a different tab.
-    unlistenDeepLink = await listen<{ kind: string; tab_id: string }>(
+    // open and the user clicks Configure on a different tab. If we got
+    // disposed between the await and now, tear the listener down
+    // immediately rather than storing it where onDestroy can no longer
+    // reach it.
+    const deepLinkUnlisten = await listen<{ kind: string; tab_id: string }>(
       'settings-deep-link',
       (e) => {
         if (e.payload.kind === 'tab') scrollToTabSection(e.payload.tab_id);
       },
     );
+    if (disposed) {
+      deepLinkUnlisten();
+      return;
+    }
+    unlistenDeepLink = deepLinkUnlisten;
   });
 
   onDestroy(() => {
+    disposed = true;
     unsub?.();
     unlistenDeepLink?.();
   });
@@ -532,6 +548,20 @@
             Off by default — announcements (idle, awaiting permission, error,
             exit) only fire for background tabs. Turn on to hear them for the
             tab you're currently looking at as well.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.speak_background_tabs}
+              onchange={(e) =>
+                patch((s) => (s.behavior.speak_background_tabs = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Speak tagged TTS from background tabs</span>
+          </label>
+          <small class="hint">
+            Off by default — tagged TTS segments (the spoken bits inside
+            AI-tab output) only play for the active tab. Turn on to hear
+            them from background tabs too. Announcements are unaffected.
           </small>
           <label class="checkbox">
             <input
@@ -1101,39 +1131,76 @@
                             Configure…
                           </small>
                         </label>
-                        <label>
-                          <span>Error notification text</span>
+                        <div class="shell-notif-row">
+                          <label class="row-toggle">
+                            <input
+                              type="checkbox"
+                              checked={entry.notifications.error.enabled}
+                              onchange={(e) =>
+                                patchShellNotifications(entry.id, {
+                                  ...entry.notifications,
+                                  error: {
+                                    ...entry.notifications.error,
+                                    enabled: (e.currentTarget as HTMLInputElement)
+                                      .checked,
+                                  },
+                                })}
+                            />
+                            <span>Error notification</span>
+                          </label>
                           <input
                             type="text"
-                            value={entry.notifications.error}
+                            value={entry.notifications.error.text}
+                            disabled={!entry.notifications.error.enabled}
                             oninput={(e) =>
                               patchShellNotifications(entry.id, {
                                 ...entry.notifications,
-                                error: (e.currentTarget as HTMLInputElement).value,
+                                error: {
+                                  ...entry.notifications.error,
+                                  text: (e.currentTarget as HTMLInputElement).value,
+                                },
                               })}
                           />
                           <small class="hint">
                             Spoken when this tab errors while you're on a different
-                            tab. Leave blank to disable.
+                            tab.
                           </small>
-                        </label>
-                        <label>
-                          <span>Exited notification text</span>
+                        </div>
+                        <div class="shell-notif-row">
+                          <label class="row-toggle">
+                            <input
+                              type="checkbox"
+                              checked={entry.notifications.exited.enabled}
+                              onchange={(e) =>
+                                patchShellNotifications(entry.id, {
+                                  ...entry.notifications,
+                                  exited: {
+                                    ...entry.notifications.exited,
+                                    enabled: (e.currentTarget as HTMLInputElement)
+                                      .checked,
+                                  },
+                                })}
+                            />
+                            <span>Exited notification</span>
+                          </label>
                           <input
                             type="text"
-                            value={entry.notifications.exited}
+                            value={entry.notifications.exited.text}
+                            disabled={!entry.notifications.exited.enabled}
                             oninput={(e) =>
                               patchShellNotifications(entry.id, {
                                 ...entry.notifications,
-                                exited: (e.currentTarget as HTMLInputElement).value,
+                                exited: {
+                                  ...entry.notifications.exited,
+                                  text: (e.currentTarget as HTMLInputElement).value,
+                                },
                               })}
                           />
                           <small class="hint">
                             Spoken when this shell exits while you're on a different
                             tab. Use <code>{'{code}'}</code> to insert the exit code.
-                            Leave blank to disable.
                           </small>
-                        </label>
+                        </div>
                       </div>
                     </details>
                   {/if}
@@ -1929,6 +1996,27 @@
     padding: 1px var(--space-1);
     border-radius: var(--radius-sm);
     font-size: var(--font-size-xs);
+  }
+  /* V1.11 per-slot notification row: enabled checkbox above a text
+     input. The disabled-text style mirrors `.shell-edit input[disabled]`
+     so a toggled-off slot reads as visually quiet without the
+     readonly-Command "this is informational" feel. */
+  .shell-edit .shell-notif-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .shell-edit .row-toggle {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+  }
+  .shell-edit .row-toggle input[type="checkbox"] {
+    margin: 0;
+  }
+  .shell-edit .shell-notif-row > input[type="text"]:disabled {
+    opacity: 0.5;
   }
 
   /* About page: a small definition list keyed by Author / Version /

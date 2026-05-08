@@ -36,6 +36,7 @@ use serde_json::{Map, Value};
 
 use crate::error::{AppError, AppResult};
 use crate::settings::migration;
+use crate::settings::write_atomic;
 use crate::settings::schema::{
     default_claude_local_tab, default_claude_tab, default_shell_1_tab, LayoutNodePersisted,
     Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID,
@@ -73,53 +74,44 @@ pub struct LoadOutcome {
 
 /// Always returns a `LoadOutcome`. Defaults are written to disk for the
 /// global baseline when it's absent or corrupt; the custom overlay is
-/// merely skipped if absent and quarantined if corrupt. v1 / v1.1 files
-/// found at the global path are migrated and rewritten in v1.2 shape with
-/// a backup of the original alongside.
+/// merely skipped if absent and quarantined if corrupt.
+///
+/// Migration runs *separately* on the global value and the overlay value
+/// before they are merged, so a `.bak` file is written next to whichever
+/// source actually carried the legacy keys. Pre-V0.6 the migration ran on
+/// the merged value with the global path hardcoded as the backup target,
+/// which mis-named the backup of an overlay-only legacy shape and
+/// produced a confusing post-migration overlay diff against a still-old
+/// global baseline.
 pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
+    // 1. Load and migrate the global baseline. After this `global` is in
+    //    the current schema shape; a v1.x file on disk has been backed up
+    //    next to the global path and rewritten.
     let global = load_global(default_shell);
 
+    // 2. Load and migrate the overlay (if any). A migrated overlay's
+    //    `.bak` is written next to the overlay file — the right place
+    //    for a user looking at their per-folder config.
     let custom_path = custom_path(launch_cwd);
-    let merged_value = match read_overlay(&custom_path) {
-        Some(overlay) => {
-            let mut base = serde_json::to_value(&global)
-                .unwrap_or_else(|_| Value::Object(Map::new()));
-            deep_merge(&mut base, overlay);
-            base
-        }
-        None => match serde_json::to_value(&global) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "settings: serialize global to value failed; using global as-is");
-                return LoadOutcome {
-                    settings: global.clone(),
-                    global,
-                };
-            }
-        },
-    };
+    let overlay_value = read_overlay_migrated(&custom_path, default_shell);
 
-    let mut value = merged_value;
-
-    // Run migration against the merged Value. The combined shape is whatever
-    // global carried plus any keys the overlay added — usually current shape,
-    // but we keep the migration cascade in place so a hand-imported legacy
-    // file at the global path still upgrades.
-    let migrated = match migration::migrate_if_needed(&mut value, &global_path_or_fallback(), default_shell) {
-        Ok(b) => b,
+    // 3. Merge the (now both-current-shape) global + overlay.
+    let mut merged = match serde_json::to_value(&global) {
+        Ok(v) => v,
         Err(e) => {
-            tracing::error!(
-                error = %e,
-                "settings: migration aborted (backup failed); using global in-session"
-            );
+            tracing::warn!(error = %e, "settings: serialize global to value failed; using global as-is");
             return LoadOutcome {
                 settings: global.clone(),
                 global,
             };
         }
     };
+    let overlay_existed = overlay_value.is_some();
+    if let Some(overlay) = overlay_value {
+        deep_merge(&mut merged, overlay);
+    }
 
-    let mut settings: Settings = match serde_json::from_value(value) {
+    let mut settings: Settings = match serde_json::from_value(merged) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -133,26 +125,53 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         }
     };
 
-    let repaired = integrity_check(&mut settings, default_shell);
+    let repaired = integrity_check(&mut settings);
 
-    if migrated || repaired {
-        // Persist the post-migration / post-repair state back to its source
-        // of truth. If a custom overlay was in play, we recompute and
-        // rewrite the diff; otherwise we rewrite global.
-        if custom_path.exists() {
+    if repaired {
+        // Persist the post-repair state back to its source of truth. If a
+        // custom overlay was in play, we recompute and rewrite the diff;
+        // otherwise we rewrite global.
+        if overlay_existed {
             if let Err(e) = save(&settings, launch_cwd, &global) {
-                tracing::warn!(error = %e, "settings: post-migration save (custom) failed");
+                tracing::warn!(error = %e, "settings: post-repair save (custom) failed");
             }
         } else if let Err(e) = save_global(&settings) {
-            tracing::warn!(error = %e, "settings: post-migration save (global) failed");
+            tracing::warn!(error = %e, "settings: post-repair save (global) failed");
         }
     }
 
     LoadOutcome { settings, global }
 }
 
+/// Read the overlay file, run any pending migration on it (writing a `.bak`
+/// next to the overlay file itself), and return the migrated Value. Returns
+/// `None` when the overlay is absent or the file was quarantined for
+/// corruption. On migration-backup failure we still return the raw value —
+/// callers can choose to abort if they want stricter behavior; here we
+/// prefer "boot up with the user's settings" over "boot defaults because
+/// we couldn't snapshot a backup".
+fn read_overlay_migrated(path: &Path, default_shell: &ShellSpec) -> Option<Value> {
+    let mut value = read_overlay(path)?;
+    match migration::migrate_if_needed(&mut value, path, default_shell) {
+        Ok(true) => {
+            tracing::info!(path = %path.display(), "settings: overlay migrated in place");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "settings: overlay migration backup failed; using overlay raw",
+            );
+        }
+    }
+    Some(value)
+}
+
 /// Read the global file. Writes seeded defaults when absent. On parse
-/// failure quarantines the file and returns defaults.
+/// failure quarantines the file and returns defaults. Runs migration on
+/// the global file in place — backup goes next to the global path itself,
+/// not next to whatever path the merged result resolved to.
 fn load_global(default_shell: &ShellSpec) -> Settings {
     let path = match global_path() {
         Ok(p) => p,
@@ -180,7 +199,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
         }
     };
 
-    let value: Value = match serde_json::from_str(&text) {
+    let mut value: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -195,15 +214,22 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
         }
     };
 
-    // Typed deserialize directly — migration runs on the merged value in
-    // `load` so the global baseline here is whatever shape the file is.
-    // serde(default) on every field tolerates a file that's missing keys;
-    // truly old shapes get fixed up by the merge-time migration step.
-    match serde_json::from_value(value) {
-        Ok(s) => {
-            tracing::info!(path = %path.display(), "settings: global loaded");
-            s
+    // Migrate the global file in place. Backup is named after the global
+    // file, which is the source of truth for the global baseline shape.
+    let migrated = match migration::migrate_if_needed(&mut value, &path, default_shell) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                path = %path.display(),
+                "settings: global migration aborted (backup failed); using defaults"
+            );
+            return seeded_defaults(default_shell);
         }
+    };
+
+    let typed: Settings = match serde_json::from_value(value) {
+        Ok(s) => s,
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -213,9 +239,23 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            s
+            return s;
         }
+    };
+
+    if migrated {
+        // Persist the migrated shape back to disk so future launches don't
+        // re-migrate. Atomic write inside save_to keeps this safe under
+        // crash.
+        if let Err(e) = save_to(&path, &typed) {
+            tracing::warn!(error = %e, path = %path.display(), "settings: post-migration global save failed");
+        } else {
+            tracing::info!(path = %path.display(), "settings: global migrated and rewritten");
+        }
+    } else {
+        tracing::info!(path = %path.display(), "settings: global loaded");
     }
+    typed
 }
 
 /// Read and parse the custom overlay file as a generic `Value`. Returns
@@ -265,7 +305,7 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             }
             let text = serde_json::to_string_pretty(&delta)
                 .map_err(|e| AppError::Settings(format!("serialize overlay: {e}")))?;
-            fs::write(&path, text).map_err(AppError::Io)?;
+            write_atomic(&path, text.as_bytes())?;
         }
         None => {
             if path.exists() {
@@ -292,16 +332,7 @@ fn save_to(path: &Path, settings: &Settings) -> AppResult<()> {
     }
     let text = serde_json::to_string_pretty(settings)
         .map_err(|e| AppError::Settings(format!("serialize: {e}")))?;
-    fs::write(path, text).map_err(AppError::Io)
-}
-
-/// Convenience: `global_path()` if it resolves, else a sentinel under the
-/// current dir. Only used as the `path` arg for `migrate_if_needed`, which
-/// uses it to write a rotation-suffixed `.bak` next to the source. If
-/// `current_exe()` failed we'd already have logged the warning during
-/// `load_global`; this just keeps the migration call signature happy.
-fn global_path_or_fallback() -> PathBuf {
-    global_path().unwrap_or_else(|_| PathBuf::from("settings.json"))
+    write_atomic(path, text.as_bytes())
 }
 
 /// Recursively merge `overlay` into `base`. Objects are merged key-by-key;
@@ -377,7 +408,7 @@ fn diff(current: &Value, baseline: &Value) -> Option<Value> {
 /// closable tab).
 fn seeded_defaults(default_shell: &ShellSpec) -> Settings {
     let mut s = Settings::default();
-    integrity_check(&mut s, default_shell);
+    integrity_check(&mut s);
     s.tabs.push(default_shell_1_tab(default_shell));
     seed_portable_avatar_paths(&mut s);
     s
@@ -442,8 +473,7 @@ fn stamp_avatar_paths_from(s: &mut Settings, dir: &Path) {
 /// after the two pinned AI builtins. The `shell-default-1` reserved id
 /// is *not* re-seeded here: it's a closable shell that ships only on
 /// fresh installs (see `seeded_defaults`).
-pub fn integrity_check(settings: &mut Settings, default_shell: &ShellSpec) -> bool {
-    let _ = default_shell; // retained for signature stability across call sites
+pub fn integrity_check(settings: &mut Settings) -> bool {
     let mut changed = false;
 
     // 1. Force builtin: true on the two AI builtins if they exist with
@@ -632,7 +662,7 @@ mod tests {
         // ships via `seeded_defaults`, not the integrity check.
         let mut s = Settings::default();
         let shell = fake_default_shell();
-        let changed = integrity_check(&mut s, &shell);
+        let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs.len(), 1);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
@@ -644,7 +674,7 @@ mod tests {
         let mut s = Settings::default();
         s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
         let shell = fake_default_shell();
-        let changed = integrity_check(&mut s, &shell);
+        let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs.len(), 2);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
@@ -656,7 +686,7 @@ mod tests {
         let mut s = Settings::default();
         s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Local;
         let shell = fake_default_shell();
-        let changed = integrity_check(&mut s, &shell);
+        let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs.len(), 1);
         assert_eq!(s.tabs[0].id(), CLAUDE_LOCAL_TAB_ID);
@@ -669,11 +699,11 @@ mod tests {
         let mut s = Settings::default();
         let shell = fake_default_shell();
         s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
-        integrity_check(&mut s, &shell);
+        integrity_check(&mut s);
         assert_eq!(s.tabs.len(), 2);
 
         s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Cloud;
-        let changed = integrity_check(&mut s, &shell);
+        let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs.len(), 1);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
@@ -685,7 +715,7 @@ mod tests {
         // integrity check should leave it absent.
         let mut s = Settings::default();
         let shell = fake_default_shell();
-        integrity_check(&mut s, &shell);
+        integrity_check(&mut s);
         assert!(s
             .tabs
             .iter()
@@ -699,7 +729,7 @@ mod tests {
         // works.
         let mut s = Settings::default();
         let shell = fake_default_shell();
-        integrity_check(&mut s, &shell);
+        integrity_check(&mut s);
         // Insert a legacy-shaped shell-default-1 with builtin: true.
         s.tabs.push(TabConfig::Shell(
             crate::settings::schema::ShellTabConfig {
@@ -715,7 +745,7 @@ mod tests {
                 background_override: None,
             },
         ));
-        let changed = integrity_check(&mut s, &shell);
+        let changed = integrity_check(&mut s);
         assert!(changed);
         let entry = s
             .tabs
@@ -729,12 +759,12 @@ mod tests {
     fn integrity_forces_builtin_true_on_ai_builtins() {
         let mut s = Settings::default();
         let shell = fake_default_shell();
-        integrity_check(&mut s, &shell);
+        integrity_check(&mut s);
         // Tamper: flip claude's builtin to false.
         if let TabConfig::AiTool(c) = &mut s.tabs[0] {
             c.builtin = false;
         }
-        let changed = integrity_check(&mut s, &shell);
+        let changed = integrity_check(&mut s);
         assert!(changed);
         assert!(s.tabs[0].builtin());
     }
@@ -743,7 +773,7 @@ mod tests {
     fn integrity_preserves_user_tabs() {
         let mut s = Settings::default();
         let shell = fake_default_shell();
-        integrity_check(&mut s, &shell);
+        integrity_check(&mut s);
         // Insert a user shell tab.
         s.tabs.push(TabConfig::Shell(crate::settings::schema::ShellTabConfig {
             id: "shell-user-1".to_string(),
@@ -762,7 +792,7 @@ mod tests {
         // Delete claude — integrity should restore it without disturbing
         // the user tab's relative position.
         s.tabs.retain(|t| t.id() != CLAUDE_TAB_ID);
-        let changed = integrity_check(&mut s, &shell);
+        let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
         let user_pos_after = s
@@ -780,7 +810,7 @@ mod tests {
         let shell = fake_default_shell();
         let mut s = Settings::default();
         s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
-        integrity_check(&mut s, &shell);
+        integrity_check(&mut s);
         let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed.tabs.len(), 2);
@@ -796,7 +826,7 @@ mod tests {
         let mut s = Settings::default();
         s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
         let shell = fake_default_shell();
-        integrity_check(&mut s, &shell);
+        integrity_check(&mut s);
 
         // Tamper: flip claude → local, claude-local → not local.
         if let TabConfig::AiTool(c) = &mut s.tabs[0] {
@@ -806,7 +836,7 @@ mod tests {
             c.use_local_provider = false;
         }
 
-        let changed = integrity_check(&mut s, &shell);
+        let changed = integrity_check(&mut s);
         assert!(changed);
         if let TabConfig::AiTool(c) = &s.tabs[0] {
             assert!(!c.use_local_provider, "claude must have use_local_provider=false");
@@ -914,7 +944,7 @@ mod tests {
         // mutated state.
         let shell = fake_default_shell();
         let mut global = Settings::default();
-        integrity_check(&mut global, &shell);
+        integrity_check(&mut global);
 
         let mut customized = global.clone();
         customized.ui.theme = "future-light".to_string();
@@ -991,7 +1021,7 @@ mod tests {
     fn save_writes_overlay_when_diff_nonempty_and_removes_when_empty() {
         let shell = fake_default_shell();
         let mut global = Settings::default();
-        integrity_check(&mut global, &shell);
+        integrity_check(&mut global);
 
         // Use a unique subdir under the system temp root so parallel test
         // runs don't collide. Cleaned up at the end of the test.

@@ -77,7 +77,13 @@ struct ValidatedShellInput {
     env: HashMap<String, String>,
 }
 
-fn validate_inputs(
+/// Validate the dialog inputs. Each filesystem probe (`which::which`,
+/// `is_file`, `is_dir`) is synchronous and may stat slow paths (network
+/// drives, antivirus-scanned directories), so the whole probe runs on a
+/// blocking pool thread. The Tauri command wrapper is async; calling
+/// this from there off the runtime keeps the tokio worker thread free
+/// for other IPC work while a slow PATH walk is in flight.
+async fn validate_inputs(
     name: String,
     command: String,
     args: Vec<String>,
@@ -89,40 +95,44 @@ fn validate_inputs(
         return Err(TabLifecycleError::EmptyName);
     }
 
-    // Resolve the command. If it contains a path separator we treat it as
-    // an absolute or relative path; otherwise we resolve via PATH using
-    // `which`. The `which` crate handles symlinks correctly on both
-    // platforms.
-    let raw = command.clone();
-    let resolved = if command.contains(['/', '\\']) {
-        let path = PathBuf::from(&command);
-        if !path.is_file() {
-            return Err(TabLifecycleError::CommandNotFound { tried: raw });
-        }
-        path
-    } else {
-        which::which(&command)
-            .map_err(|_| TabLifecycleError::CommandNotFound { tried: raw.clone() })?
-    };
-
-    let cwd_path = match cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => {
-            let p = PathBuf::from(s);
-            if !p.is_dir() {
-                return Err(TabLifecycleError::CwdNotFound { path: s.to_string() });
+    let cwd_string = cwd;
+    tokio::task::spawn_blocking(move || {
+        // Resolve the command. If it contains a path separator we treat it
+        // as an absolute or relative path; otherwise we resolve via PATH
+        // using `which`.
+        let raw = command.clone();
+        let resolved = if command.contains(['/', '\\']) {
+            let path = PathBuf::from(&command);
+            if !path.is_file() {
+                return Err(TabLifecycleError::CommandNotFound { tried: raw });
             }
-            Some(p)
-        }
-        None => None,
-    };
+            path
+        } else {
+            which::which(&command)
+                .map_err(|_| TabLifecycleError::CommandNotFound { tried: raw.clone() })?
+        };
 
-    Ok(ValidatedShellInput {
-        name: trimmed_name,
-        command: resolved,
-        args,
-        cwd: cwd_path,
-        env,
+        let cwd_path = match cwd_string.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => {
+                let p = PathBuf::from(s);
+                if !p.is_dir() {
+                    return Err(TabLifecycleError::CwdNotFound { path: s.to_string() });
+                }
+                Some(p)
+            }
+            None => None,
+        };
+
+        Ok(ValidatedShellInput {
+            name: trimmed_name,
+            command: resolved,
+            args,
+            cwd: cwd_path,
+            env,
+        })
     })
+    .await
+    .map_err(|e| TabLifecycleError::internal(format!("validate_inputs join: {e}")))?
 }
 
 fn validated_to_shell_config(
@@ -148,9 +158,21 @@ fn validated_to_shell_config(
 /// Build a `ShellNotificationConfig` from the dialog's two strings. An empty
 /// string is intentional disable-this-notification (the manager treats empty
 /// as "skip"); the dialog is responsible for pre-filling the defaults so the
-/// user has to actively clear a field to disable it.
+/// user has to actively clear a field to disable it. V1.11 promoted each
+/// slot to `{ enabled, text }`; the dialog still sends bare strings, so
+/// `enabled` is derived from non-emptiness here. Users wanting the
+/// "disabled but text preserved" combination edit via Settings → Tabs.
 fn notifications_from_dialog(error: String, exited: String) -> ShellNotificationConfig {
-    ShellNotificationConfig { error, exited }
+    ShellNotificationConfig {
+        error: crate::settings::NotificationSlot {
+            enabled: !error.is_empty(),
+            text: error,
+        },
+        exited: crate::settings::NotificationSlot {
+            enabled: !exited.is_empty(),
+            text: exited,
+        },
+    }
 }
 
 /// Create a new user-managed Shell tab. Validates the inputs, registers it
@@ -168,8 +190,9 @@ pub async fn create_shell_tab(
     notifications_error: String,
     notifications_exited: String,
 ) -> Result<TabId, TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
     let args = shlex::split(&args_string).unwrap_or_default();
-    let validated = validate_inputs(name, command, args, cwd, env)?;
+    let validated = validate_inputs(name, command, args, cwd, env).await?;
     let notifications = notifications_from_dialog(notifications_error, notifications_exited);
 
     let tab = TabId::Shell(format!("shell-{}", Uuid::new_v4()));
@@ -239,6 +262,7 @@ pub async fn close_tab(
     state: State<'_, AppState>,
     tab: TabId,
 ) -> Result<(), TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
     {
         // Snapshot the entry to gate on builtin status. Settings is the
         // canonical builtin marker; the id-based heuristic is a fallback.
@@ -326,6 +350,7 @@ pub async fn rename_tab(
     tab: TabId,
     new_name: String,
 ) -> Result<(), TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
     let trimmed = new_name.trim().to_string();
     if trimmed.is_empty() {
         return Err(TabLifecycleError::EmptyName);
@@ -377,11 +402,12 @@ pub async fn reconfigure_shell_tab(
     theme_override: Option<crate::settings::TerminalThemeSettings>,
     background_override: Option<crate::settings::BackgroundOverride>,
 ) -> Result<(), TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
     if !matches!(tab.kind(), TabKind::Shell) {
         return Err(TabLifecycleError::WrongKind);
     }
     let args = shlex::split(&args_string).unwrap_or_default();
-    let validated = validate_inputs(name, command, args, cwd, env)?;
+    let validated = validate_inputs(name, command, args, cwd, env).await?;
     let notifications = notifications_from_dialog(notifications_error, notifications_exited);
 
     let name_changed: bool = {
@@ -452,8 +478,8 @@ pub fn default_shell_spec() -> DefaultShellWire {
         command: spec.command.to_string_lossy().into_owned(),
         args: spec.args.join(" "),
         git_bash_found: detect::was_default_git_bash_found(),
-        notifications_error: notif_defaults.error,
-        notifications_exited: notif_defaults.exited,
+        notifications_error: notif_defaults.error.text,
+        notifications_exited: notif_defaults.exited.text,
     }
 }
 
@@ -509,8 +535,8 @@ pub async fn get_shell_tab_config(
         args: cfg.args.join(" "),
         cwd: cfg.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
         env: cfg.env.clone(),
-        notifications_error: cfg.notifications.error.clone(),
-        notifications_exited: cfg.notifications.exited.clone(),
+        notifications_error: cfg.notifications.error.text.clone(),
+        notifications_exited: cfg.notifications.exited.text.clone(),
     })
 }
 
@@ -527,6 +553,13 @@ pub async fn set_claude_tabs_enabled(
     state: State<'_, AppState>,
     value: ClaudeTabsEnabled,
 ) -> Result<(), TabLifecycleError> {
+    // Serialize with all other lifecycle commands so concurrent
+    // close_tab / create_shell_tab / etc. can't interleave with the
+    // multi-step add-then-remove sequence below. Without this an
+    // outside close_tab between step 1 (add) and step 3 (remove) could
+    // produce a state where the discriminator says "Cloud" but neither
+    // AI tab is in tabs[].
+    let _serializer = state.lifecycle_serializer.lock().await;
     let want_cloud = value.includes_cloud();
     let want_local = value.includes_local();
 

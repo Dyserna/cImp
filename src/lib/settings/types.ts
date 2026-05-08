@@ -66,6 +66,11 @@ export interface BehaviorSettings {
   /// When true, tab announcements fire even for the currently-focused tab.
   /// Default false reproduces the historical background-only behavior.
   announce_focused_tab: boolean;
+  /// When true, tagged-content TTS plays even for tabs that aren't the
+  /// active one. Default false matches the v2 behavior — only the
+  /// foreground tab speaks. Independent of `announce_focused_tab`, which
+  /// only controls announcement TTS.
+  speak_background_tabs: boolean;
   /// When true, text selected in any terminal is copied to the system
   /// clipboard automatically.
   copy_on_select: boolean;
@@ -109,19 +114,29 @@ export interface TtsInjection {
   instructions: string;
 }
 
+/// V1.11 per-event notification slot. Both `enabled === true` AND a
+/// non-empty `text` are required for the slot to fire — the legacy
+/// "leave blank to disable" convention still works alongside the
+/// explicit checkbox. The Rust side ships a tolerant `Deserialize` so
+/// pre-v1.11 settings files (bare strings) load without losing text.
+export interface NotificationSlot {
+  enabled: boolean;
+  text: string;
+}
+
 export interface AiNotificationConfig {
-  idle: string;
-  awaiting_permission: string;
+  idle: NotificationSlot;
+  awaiting_permission: NotificationSlot;
   /// Spoken when a `kind: question` pattern fires (AskUserQuestion-style
-  /// multi-option prompts). Empty string disables the announcement.
-  question: string;
-  error: string;
+  /// multi-option prompts).
+  question: NotificationSlot;
+  error: NotificationSlot;
 }
 
 export interface ShellNotificationConfig {
-  error: string;
+  error: NotificationSlot;
   /// `{code}` placeholder is interpolated with the actual exit code in M4.
-  exited: string;
+  exited: NotificationSlot;
 }
 
 export interface AiToolTabConfig {
@@ -329,7 +344,19 @@ export interface LayoutPreset {
   tree: LayoutNode;
 }
 
+/// Latest on-disk schema version. Mirrors `CURRENT_SCHEMA_VERSION` in
+/// `src-tauri/src/settings/schema.rs`. Bumped on every backend migration
+/// step. Frontend doesn't read it for any logic — it round-trips as a
+/// bare integer through the IPC bridge.
+export const CURRENT_SCHEMA_VERSION = 11;
+
 export interface Settings {
+  /// On-disk schema version. The backend stamps `CURRENT_SCHEMA_VERSION`
+  /// on fresh installs and via the v1.9 → v1.10 migration; the frontend
+  /// receives it as a bare integer and includes it in `defaultSettings`
+  /// so a manually-constructed Settings (test fixtures, fallback paths)
+  /// matches the on-disk shape.
+  schema_version: number;
   tts: TtsSettings;
   avatar: AvatarSettings;
   display: DisplaySettings;
@@ -430,6 +457,7 @@ export function findTabIndex(settings: Settings, id: string): number {
 // re-broadcasts on init so this value is short-lived in practice.
 export function defaultSettings(): Settings {
   return {
+    schema_version: CURRENT_SCHEMA_VERSION,
     tts: { voice: 'af_heart', speed: 1.0, volume: 1.0, mute: false },
     avatar: {
       visible: true,
@@ -464,6 +492,7 @@ export function defaultSettings(): Settings {
       announcements_enabled: true,
       follow_avatar: false,
       announce_focused_tab: false,
+      speak_background_tabs: false,
       copy_on_select: true,
     },
     compose: { min_height_px: 80, max_height_px: 300 },
@@ -503,10 +532,13 @@ export function defaultSettings(): Settings {
         env: {},
         tts_injection: { enabled: true, instructions: '' },
         notifications: {
-          idle: 'Claude is idle',
-          awaiting_permission: 'Claude is awaiting permission',
-          question: 'Claude has a question',
-          error: 'Claude encountered an error',
+          idle: { enabled: true, text: 'Claude is idle' },
+          awaiting_permission: {
+            enabled: true,
+            text: 'Claude is awaiting permission',
+          },
+          question: { enabled: true, text: 'Claude has a question' },
+          error: { enabled: true, text: 'Claude encountered an error' },
         },
         first_launch_notice_dismissed: true,
         theme_override: null,
@@ -524,10 +556,16 @@ export function defaultSettings(): Settings {
         env: {},
         tts_injection: { enabled: true, instructions: '' },
         notifications: {
-          idle: 'Claude (local) is idle',
-          awaiting_permission: 'Claude (local) is awaiting permission',
-          question: 'Claude (local) has a question',
-          error: 'Claude (local) encountered an error',
+          idle: { enabled: true, text: 'Claude (local) is idle' },
+          awaiting_permission: {
+            enabled: true,
+            text: 'Claude (local) is awaiting permission',
+          },
+          question: { enabled: true, text: 'Claude (local) has a question' },
+          error: {
+            enabled: true,
+            text: 'Claude (local) encountered an error',
+          },
         },
         first_launch_notice_dismissed: true,
         theme_override: null,

@@ -358,6 +358,11 @@ struct TabState {
     /// Enter routes to the Configure dialog instead of restart. Cleared
     /// on `ShellRestarted`.
     closed_message: Option<String>,
+    /// Set true between `ClaudeOutputStarted` and `ClaudeOutputStopped`.
+    /// Lets `Speaking → TtsPlaybackStopped` fall back to Thinking instead
+    /// of Idle when Claude is still emitting output (the TTS tag was a
+    /// commentary tag, not a final answer). Always false for Shell tabs.
+    claude_output_active: bool,
 }
 
 impl TabState {
@@ -375,6 +380,7 @@ impl TabState {
             closed: false,
             closed_exit_code: None,
             closed_message: None,
+            claude_output_active: false,
         }
     }
 }
@@ -683,6 +689,12 @@ async fn run(
                             ts.last_keystroke_at = Some(Instant::now());
                         }
                     }
+                    StateSignal::ClaudeOutputStarted { .. } => {
+                        ts.claude_output_active = true;
+                    }
+                    StateSignal::ClaudeOutputStopped { .. } => {
+                        ts.claude_output_active = false;
+                    }
                     _ => {}
                 }
 
@@ -715,7 +727,13 @@ async fn run(
                 let next = if is_shell && !is_error_edge(&signal) {
                     prev_state
                 } else {
-                    transition(prev_state, &signal, ts.has_unsent_input, ts.composing)
+                    transition(
+                        prev_state,
+                        &signal,
+                        ts.has_unsent_input,
+                        ts.composing,
+                        ts.claude_output_active,
+                    )
                 };
                 if next != prev_state {
                     info!(tab = ?target_tab, from = ?prev_state, to = ?next, ?signal, "avatar state");
@@ -797,6 +815,7 @@ fn transition(
     signal: &StateSignal,
     has_unsent_input: bool,
     composing: bool,
+    claude_output_active: bool,
 ) -> AvatarState {
     use AvatarState::*;
     use StateSignal::*;
@@ -822,6 +841,11 @@ fn transition(
         (Speaking, TtsPlaybackStopped { .. }) => {
             if has_unsent_input || composing {
                 Listening
+            } else if claude_output_active {
+                // TTS tag was an interstitial comment ("about to do X");
+                // Claude is still producing output, so go back to
+                // Thinking instead of falsely announcing Idle.
+                Thinking
             } else {
                 Idle
             }
@@ -968,15 +992,19 @@ mod tests {
     }
 
     fn t(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, false, false)
+        transition(current, &signal, false, false, false)
     }
 
     fn t_with_input(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, true, false)
+        transition(current, &signal, true, false, false)
     }
 
     fn t_composing(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, false, true)
+        transition(current, &signal, false, true, false)
+    }
+
+    fn t_with_output(current: AvatarState, signal: StateSignal) -> AvatarState {
+        transition(current, &signal, false, false, true)
     }
 
     #[test]
@@ -1080,6 +1108,33 @@ mod tests {
     fn speaking_tts_stop_resumes_listening_when_composing() {
         assert_eq!(
             t_composing(Speaking, TtsPlaybackStopped { tab: tab() }),
+            Listening
+        );
+    }
+
+    #[test]
+    fn speaking_tts_stop_returns_thinking_when_claude_still_outputting() {
+        // Interstitial TTS tag ("I'll start by reading the file"): Claude
+        // is still producing output behind the speech, so the avatar
+        // should go back to Thinking, not Idle.
+        assert_eq!(
+            t_with_output(Speaking, TtsPlaybackStopped { tab: tab() }),
+            Thinking
+        );
+    }
+
+    #[test]
+    fn speaking_tts_stop_user_input_beats_claude_output() {
+        // If the user typed during speech, treat it like a normal
+        // interruption — Listening wins over Thinking.
+        assert_eq!(
+            transition(
+                Speaking,
+                &TtsPlaybackStopped { tab: tab() },
+                true,  // has_unsent_input
+                false, // composing
+                true,  // claude_output_active
+            ),
             Listening
         );
     }

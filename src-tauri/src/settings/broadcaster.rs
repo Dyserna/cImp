@@ -24,7 +24,13 @@ use crate::settings::persistence;
 use crate::settings::schema::Settings;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
-const BROADCAST_CAPACITY: usize = 16;
+/// Bumped from 16 to 64 to give slow subscribers more headroom during
+/// rapid edits (slider drags, theme picker, multi-keystroke compose
+/// changes that touch settings). Subscribers that lag past the buffer
+/// receive `RecvError::Lagged` and must call `current()` to resync —
+/// the broadcaster's contract is "every receiver always sees the latest
+/// state eventually," not "every receiver sees every intermediate state."
+const BROADCAST_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 pub struct SettingsHandle {
@@ -49,7 +55,15 @@ impl SettingsHandle {
     }
 
     pub fn current(&self) -> Settings {
-        self.inner.lock().expect("settings poisoned").clone()
+        // Recover from poisoning rather than panicking. A poisoned mutex
+        // means an earlier panic occurred while the lock was held; the
+        // inner Settings is still valid and cloning it lets the app keep
+        // running. Panicking here cascades the original failure into a
+        // second panic that unwinds the calling IPC handler.
+        match self.inner.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Settings> {
@@ -59,7 +73,14 @@ impl SettingsHandle {
     /// Replace the full settings struct, broadcast, and request a debounced save.
     pub fn set(&self, new: Settings) {
         {
-            let mut g = self.inner.lock().expect("settings poisoned");
+            // Recover from poisoning here too — same rationale as
+            // `current()`. The slot is replaced wholesale so the prior
+            // (potentially partially-mutated) state is overwritten and
+            // the poisoned flag is no longer load-bearing.
+            let mut g = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             *g = new.clone();
         }
         // A `send` failure here means "no receivers" — that's fine, just a

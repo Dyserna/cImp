@@ -33,7 +33,7 @@ import { CanvasAddon } from '@xterm/addon-canvas';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import './terminals.css';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { listen } from '@tauri-apps/api/event';
 import { get } from 'svelte/store';
 
 import {
@@ -62,6 +62,7 @@ import {
 } from './terminal/background';
 import { setTerminalFocuser } from './terminalFocus';
 import { perTabClosedState } from './avatarState';
+import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
 import { isShellTab, type TabId } from './tabs/types';
 
@@ -104,11 +105,6 @@ interface TerminalEntry {
   /// xterm replays the snapshot via `term.write` so the user sees their
   /// shell history continue across the flip.
   serializeAddon: SerializeAddon;
-  /// Live `tab-pty-exit` payload listener. Unsubscribed on destroy.
-  unlistenExit: UnlistenFn | null;
-  /// Live `tab-restart-requested` payload listener. Unsubscribed on
-  /// destroy.
-  unlistenRestart: UnlistenFn | null;
   /// Subscribers to the display + closed-state stores. Run at create
   /// time; all unsub at destroy.
   unsubFont: () => void;
@@ -155,6 +151,57 @@ interface TerminalEntry {
 }
 
 const entries = new Map<TabId, TerminalEntry>();
+
+/// V0.6+ module-scope listeners. Pre-V0.6 each `createTerminal` call
+/// registered its own `pty-exit` and `tab-restart-requested` listener
+/// that filtered by tab id inside the callback — with N tabs every
+/// backend emit ran N JS callbacks, and a quick create-then-destroy
+/// could drop a not-yet-resolved listener (`unlistenExit` would still
+/// be null when destroy ran). One listener per event, dispatched via
+/// the `entries` map by tab id, fixes both: O(1) dispatch and a single
+/// install/teardown that doesn't depend on listener resolution order.
+let moduleListenersInstalled = false;
+async function ensureModuleListeners(): Promise<void> {
+  if (moduleListenersInstalled) return;
+  moduleListenersInstalled = true;
+  try {
+    await onPtyExit((payload) => {
+      const entry = entries.get(payload.tab as TabId);
+      if (!entry) return;
+      entry.term.write(`\r\n[${entry.tabId} exited: ${payload.exit}]\r\n`);
+      if (isShellTab(entry.tabId)) return;
+      setTabError(entry.tabId, {
+        headline: `${displayNameFor(entry.tabId)} exited unexpectedly.`,
+        raw: payload.exit,
+      });
+    });
+  } catch (e) {
+    console.error('listen pty-exit failed:', e);
+  }
+  try {
+    await listen<TabId>('tab-restart-requested', async (event) => {
+      const entry = entries.get(event.payload);
+      if (!entry || entry.restarting) return;
+      // V1.4-03: a Restart click during a debounced recreate would
+      // otherwise produce two PTY operations — drop any pending recreate
+      // for this tab; the restart is the user's intent.
+      const pendingRecreate = recreateTimers.get(entry.tabId);
+      if (pendingRecreate) {
+        clearTimeout(pendingRecreate);
+        recreateTimers.delete(entry.tabId);
+      }
+      entry.restarting = true;
+      try {
+        entry.term.write(`\r\n[restarting ${entry.tabId}…]\r\n`);
+        await attemptSpawn(entry, 'restart');
+      } finally {
+        entry.restarting = false;
+      }
+    });
+  } catch (e) {
+    console.error('listen tab-restart-requested failed:', e);
+  }
+}
 
 function displayNameFor(t: TabId): string {
   if (t === 'claude') return 'Claude Code';
@@ -349,8 +396,6 @@ export function createTerminal(
     term,
     fitAddon,
     serializeAddon,
-    unlistenExit: null,
-    unlistenRestart: null,
     unsubFont: () => {},
     unsubClosed: null,
     unsubAppearance: () => {},
@@ -364,6 +409,10 @@ export function createTerminal(
     bytesChannel: placeholderChannel,
   };
   entries.set(tabId, entry);
+  // Idempotent: only the first call actually registers. Run it from
+  // here rather than at module top-level so the listeners are tied to
+  // app-bootstrap timing (after Tauri runtime is ready).
+  void ensureModuleListeners();
 
   // Live font subscription — applies font changes in place. Skips the
   // initial dispatch because xterm was constructed with the current
@@ -449,13 +498,20 @@ export function createTerminal(
 
   term.onData((data) => {
     if (entry.isClosed) {
-      // Shell-tab closed-state intercept: Enter triggers a restart, all
-      // other input is dropped on the floor (the PTY is gone, writing
-      // would error).
+      // Shell-tab closed-state intercept. Enter routes to Configure
+      // when the close was a launch failure (closed_message set —
+      // typically command-not-found), because re-running the same
+      // broken command will hit the same error. For a normal exit
+      // (no closed_message), Enter restarts the subprocess.
       if (data === '\r' || data === '\n' || data === '\r\n') {
-        void restartShellTab(tabId).catch((e) =>
-          console.error('restart_shell_tab failed:', e),
-        );
+        const closed = get(perTabClosedState)[tabId];
+        if (closed?.closed_message) {
+          openConfigureTabDialog(tabId);
+        } else {
+          void restartShellTab(tabId).catch((e) =>
+            console.error('restart_shell_tab failed:', e),
+          );
+        }
       }
       return;
     }
@@ -470,56 +526,9 @@ export function createTerminal(
 
   setTerminalFocuser(tabId, () => term.focus());
 
-  void onPtyExit((payload) => {
-    if (payload.tab !== tabId) return;
-    term.write(`\r\n[${tabId} exited: ${payload.exit}]\r\n`);
-    if (isShellTab(tabId)) return;
-    setTabError(tabId, {
-      headline: `${displayNameFor(tabId)} exited unexpectedly.`,
-      raw: payload.exit,
-    });
-  })
-    .then((unlisten) => {
-      // Tab may have been destroyed before the listener returned —
-      // detach immediately if so.
-      if (entries.get(tabId) !== entry) {
-        unlisten();
-        return;
-      }
-      entry.unlistenExit = unlisten;
-    })
-    .catch((e) => console.error('listen pty-exit failed:', e));
-
-  void listen<TabId>('tab-restart-requested', async (event) => {
-    if (event.payload !== tabId) return;
-    if (entries.get(tabId) !== entry) return;
-    if (entry.restarting) return;
-    // V1.4-03: a Restart click during a debounced recreate would
-    // otherwise produce two PTY operations — the restart now plus the
-    // recreate after the timer fires, tearing down the freshly-restarted
-    // xterm. Drop any pending recreate for this tab; the restart is the
-    // user's intent.
-    const pendingRecreate = recreateTimers.get(tabId);
-    if (pendingRecreate) {
-      clearTimeout(pendingRecreate);
-      recreateTimers.delete(tabId);
-    }
-    entry.restarting = true;
-    try {
-      term.write(`\r\n[restarting ${tabId}…]\r\n`);
-      await attemptSpawn(entry, 'restart');
-    } finally {
-      entry.restarting = false;
-    }
-  })
-    .then((unlisten) => {
-      if (entries.get(tabId) !== entry) {
-        unlisten();
-        return;
-      }
-      entry.unlistenRestart = unlisten;
-    })
-    .catch((e) => console.error('listen tab-restart-requested failed:', e));
+  // V0.6+: pty-exit and tab-restart-requested are dispatched from a
+  // single module-scope listener (`ensureModuleListeners`). No per-tab
+  // listener registration here.
 
   // Track host size; refit when visible. The visibility guard prevents
   // a tiny SIGWINCH when the host is detached (offscreen has 1px×1px).
@@ -643,8 +652,10 @@ export function destroyTerminal(tabId: TabId): void {
 
   if (entry.resizeTimer) clearTimeout(entry.resizeTimer);
   entry.resizeObserver?.disconnect();
-  entry.unlistenExit?.();
-  entry.unlistenRestart?.();
+  // pty-exit and tab-restart-requested listeners are module-scope and
+  // dispatch via `entries.get(tabId)` — removing this entry from the
+  // map (already done above via `entries.delete(tabId)`) is what
+  // detaches them from this tab.
   entry.unsubFont();
   entry.unsubClosed?.();
   entry.unsubAppearance();
@@ -671,18 +682,31 @@ export function destroyTerminal(tabId: TabId): void {
 /// `fitAddon.fit()` measures pixel dimensions — without it, a freshly
 /// portaled host can fit at the wrong size when the slot's flexbox
 /// hasn't yet propagated.
-export function attachTerminal(tabId: TabId, slot: HTMLElement): void {
+///
+/// `options.focus` (default: false) controls whether the post-attach
+/// rAF also calls `term.focus()`. The caller (typically Pane.svelte's
+/// slot effect) passes `true` only for the *focused* pane — without
+/// that gate every active-tab change in any pane would steal keyboard
+/// focus from whichever pane the user is currently typing into. When
+/// `focus` is false the host is still attached and fit; just no focus
+/// shift.
+export function attachTerminal(
+  tabId: TabId,
+  slot: HTMLElement,
+  options: { focus?: boolean } = {},
+): void {
   const entry = entries.get(tabId);
   if (!entry) return;
   if (entry.host.parentElement !== slot) {
     slot.appendChild(entry.host);
   }
   entry.attached = true;
+  const wantFocus = options.focus ?? false;
   requestAnimationFrame(() => {
     if (entries.get(tabId) !== entry) return;
     if (!entry.attached) return;
     fitAndResize(entry);
-    entry.term.focus();
+    if (wantFocus) entry.term.focus();
   });
 }
 

@@ -467,11 +467,25 @@ impl TabRegistry {
 
         let prev = self.active.clone();
 
-        // Step 1 + 2: stop audio, with a synchronous stop signal first if
-        // playback is in flight. The audio thread's own edge will later
-        // emit a redundant stop tagged with the NEW tab — harmless because
-        // the new tab is in a non-Speaking state, so the transition is a
-        // no-op there.
+        // V0.6+ ordering: flip the TTS active-tab cell FIRST. This closes a
+        // narrow race that the previous step-1-then-step-3 ordering had —
+        // a processing-layer send for the *new* tab that arrived between
+        // the synchronous stop signal and the active-tab write got
+        // filtered against the old `active` value, dropping the segment.
+        // With the write hoisted to step 1 a new-tab send in flight is
+        // correctly accepted; an old-tab send in flight is correctly
+        // dropped (it didn't match the new active and never would).
+        if let Ok(mut g) = self.tts_active.write() {
+            *g = tab.clone();
+        }
+
+        // Step 2: emit a synchronous TtsPlaybackStopped tagged with the
+        // *previous* tab if audio is in flight. The audio thread's own
+        // playing→idle edge fires a few PLAYBACK_POLL ticks later tagged
+        // with whichever tab is active at that moment — by then the new
+        // tab is non-Speaking so its transition is a no-op there. Tagging
+        // explicitly with `prev` here ensures the previous tab's avatar
+        // leaves Speaking on the synchronous path.
         if let Ok(slot) = self.audio.read() {
             if let Some(audio) = slot.as_ref() {
                 if audio.is_playing() {
@@ -483,16 +497,11 @@ impl TabRegistry {
             }
         }
 
-        // Step 3: flip TTS gate.
-        if let Ok(mut g) = self.tts_active.write() {
-            *g = tab.clone();
-        }
-
-        // Step 4: update local pointer.
+        // Step 3: update local pointer.
         self.active = tab.clone();
         info!(?prev, ?tab, "tab activated");
 
-        // Step 5: tell the state manager so it can broadcast ActiveTabChanged.
+        // Step 4: tell the state manager so it can broadcast ActiveTabChanged.
         let _ = self
             .state_signals
             .try_send(StateSignal::TabActivated { tab });

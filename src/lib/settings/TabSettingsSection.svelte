@@ -154,10 +154,24 @@
   <div class="group">
     <h4>Subprocess</h4>
     <label class="field">
-      <span>Command</span>
-      <input type="text" value={settings.command} disabled readonly />
+      <span>
+        Command
+        {#if restartRequired}
+          <Pill variant="orange" size="xs">restart required</Pill>
+        {/if}
+      </span>
+      <input
+        type="text"
+        value={settings.command}
+        oninput={(e) =>
+          update('command', (e.currentTarget as HTMLInputElement).value)}
+      />
       <small class="hint">
-        The binary spawned for this tab. Not editable in v2.
+        The binary spawned for this tab. Defaults to <code>claude</code>;
+        edit if your <code>claude</code> binary lives somewhere PATH
+        doesn't reach (e.g. an absolute path like
+        <code>C:\tools\claude.exe</code>). Restart this tab after
+        changing.
       </small>
     </label>
 
@@ -419,10 +433,6 @@
   .field select:focus {
     outline: none;
     border-color: var(--accent);
-  }
-  .field input[disabled] {
-    color: var(--text-tertiary);
-    background: var(--surface-deep);
   }
 
   .checkbox {

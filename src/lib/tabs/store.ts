@@ -8,7 +8,7 @@
 // the codebase subscribe to `tabs` and add/remove keys as the order
 // changes; they do NOT seed from `ALL_TABS` constants the way M1 did.
 
-import { derived, get, writable, type Readable, type Writable } from 'svelte/store';
+import { get, writable, type Writable } from 'svelte/store';
 import { type TabId, type TabKind, type TabMeta } from './types';
 
 export interface TabCreatedEvent {
@@ -22,11 +22,6 @@ export interface TabCreatedEvent {
 /// Live tab order. Mutated only by event handlers. Iterating this store is
 /// the canonical way to render the tab bar.
 export const tabs: Writable<TabMeta[]> = writable<TabMeta[]>([]);
-
-/// Live IDs in render order — convenient for `{#each}` blocks that key by
-/// id and for per-tab map subscriptions that only need to know which tabs
-/// exist (not what they're called).
-export const tabIds: Readable<TabId[]> = derived(tabs, ($t) => $t.map((m) => m.id));
 
 /// Synchronously look up a tab's meta. Returns `undefined` if the id isn't
 /// in the live order — e.g., a stale event or a not-yet-loaded startup.

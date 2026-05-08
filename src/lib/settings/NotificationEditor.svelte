@@ -1,16 +1,17 @@
 <script lang="ts">
-  import type { AiNotificationConfig } from './types';
+  import type { AiNotificationConfig, NotificationSlot } from './types';
 
-  // Three labeled rows (idle, awaiting permission, error) with a per-row
-  // reset. Defaults come from a prop so the same component renders for any
-  // tab. Notification firing logic itself ships in V2-04; this is just the
-  // configuration surface.
+  // Four labeled rows (idle, awaiting permission, question, error). Each
+  // row carries an enabled checkbox plus a text input with a per-row
+  // reset. V1.11 promoted each slot to `{ enabled, text }` so disabling
+  // a notification preserves the user's typed text — re-enabling
+  // restores it without retyping.
   let {
     notifications = $bindable<AiNotificationConfig>({
-      idle: '',
-      awaiting_permission: '',
-      question: '',
-      error: '',
+      idle: { enabled: false, text: '' },
+      awaiting_permission: { enabled: false, text: '' },
+      question: { enabled: false, text: '' },
+      error: { enabled: false, text: '' },
     }),
     defaults,
     onchange,
@@ -34,31 +35,57 @@
     { key: 'error', label: 'When tab encounters an error while you’re on another tab' },
   ];
 
-  function update(key: RowKey, value: string) {
-    notifications = { ...notifications, [key]: value };
+  function updateSlot(key: RowKey, slot: NotificationSlot) {
+    notifications = { ...notifications, [key]: slot };
     onchange?.();
   }
 
+  function toggleEnabled(key: RowKey, enabled: boolean) {
+    updateSlot(key, { ...notifications[key], enabled });
+  }
+
+  function updateText(key: RowKey, text: string) {
+    updateSlot(key, { ...notifications[key], text });
+  }
+
   function reset(key: RowKey) {
-    update(key, defaults[key]);
+    updateSlot(key, { ...defaults[key] });
+  }
+
+  function isAtDefault(key: RowKey): boolean {
+    const cur = notifications[key];
+    const def = defaults[key];
+    return cur.enabled === def.enabled && cur.text === def.text;
   }
 </script>
 
 <div class="notif-editor">
   {#each rows as row (row.key)}
     <div class="row">
-      <span class="label">{row.label}</span>
+      <label class="row-toggle">
+        <input
+          type="checkbox"
+          checked={notifications[row.key].enabled}
+          onchange={(e) =>
+            toggleEnabled(
+              row.key,
+              (e.currentTarget as HTMLInputElement).checked,
+            )}
+        />
+        <span class="label">{row.label}</span>
+      </label>
       <div class="controls">
         <input
           type="text"
-          value={notifications[row.key]}
+          value={notifications[row.key].text}
+          disabled={!notifications[row.key].enabled}
           oninput={(e) =>
-            update(row.key, (e.currentTarget as HTMLInputElement).value)}
+            updateText(row.key, (e.currentTarget as HTMLInputElement).value)}
         />
         <button
           type="button"
           class="reset"
-          disabled={notifications[row.key] === defaults[row.key]}
+          disabled={isAtDefault(row.key)}
           onclick={() => reset(row.key)}
         >
           Reset
@@ -79,6 +106,15 @@
     flex-direction: column;
     gap: 3px;
   }
+  .row-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+  }
+  .row-toggle input[type='checkbox'] {
+    margin: 0;
+  }
   .label {
     color: var(--text-tertiary);
     font-size: var(--font-size-xs);
@@ -88,7 +124,7 @@
     gap: 6px;
     align-items: center;
   }
-  .controls input {
+  .controls input[type='text'] {
     flex: 1;
     background: var(--surface-sunken);
     border: 1px solid var(--border-default);
@@ -98,9 +134,13 @@
     font-size: var(--font-size-sm);
     transition: border-color var(--motion-fast) var(--easing-standard);
   }
-  .controls input:focus {
+  .controls input[type='text']:focus {
     outline: none;
     border-color: var(--accent);
+  }
+  .controls input[type='text']:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   .reset {
     background: var(--surface-2);

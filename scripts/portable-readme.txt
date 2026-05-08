@@ -39,8 +39,30 @@ What is bundled
   bin\onnxruntime_providers_shared.dll
   models\kokoro-v1.0.onnx            Kokoro 82M TTS model
   models\voices\af_heart.bin         default voice
+  avatars\Idle.mp4 / Listening.mp4 / Thinking.mp4 / Speaking.mp4 / Error.mp4
+                                     bundled avatar state videos (also
+                                     embedded inside cctts.exe — see
+                                     "Custom avatars" below)
+  avatars\Transition.mp4             optional crossfade between states
   LICENSE                            Apache 2.0 (cctts source)
   NOTICE                             attributions for bundled assets
+
+
+Custom avatars
+--------------
+
+The same avatar videos are also embedded inside cctts.exe, so the app
+runs with its built-in defaults out of the box. The standalone copies
+under `avatars\` are there if you want to swap one out:
+
+  1. Drop a replacement file (mp4 / webm / mov / png / jpg) into
+     `avatars\` (or anywhere else on disk).
+  2. Open Settings -> Avatar.
+  3. For each state (Idle / Listening / Thinking / Speaking / Error /
+     Transition) point the picker at the file you want to use.
+
+Until a state is overridden it keeps using the embedded default. Clear
+an override to fall back to the bundled video.
 
 
 Adding more voicepacks

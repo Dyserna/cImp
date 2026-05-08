@@ -364,13 +364,63 @@ fn diff(current: &Value, baseline: &Value) -> Option<Value> {
 }
 
 /// `Settings::default()` with the three reserved-id tab entries seeded for
-/// the host platform. Used on fresh installs and as the recovery fallback
+/// the host platform and the portable on-disk avatar paths stamped in
+/// (when present). Used on fresh installs and as the recovery fallback
 /// when the file is unrecoverable. Equivalent to running the integrity
 /// check against an empty `tabs` array.
 fn seeded_defaults(default_shell: &ShellSpec) -> Settings {
     let mut s = Settings::default();
     integrity_check(&mut s, default_shell);
+    seed_portable_avatar_paths(&mut s);
     s
+}
+
+/// `<exe-dir>/../avatars/` — the portable avatar folder shipped in the
+/// release zip. `None` if the exe path can't be resolved (which would
+/// only happen on platforms or sandboxes where `current_exe()` fails) or
+/// the folder doesn't actually exist (dev `cargo run`, or someone built
+/// from source without staging).
+fn portable_avatars_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.parent()?.join("avatars");
+    if dir.is_dir() { Some(dir) } else { None }
+}
+
+/// On a fresh install, populate `avatar.images.*` and
+/// `avatar.transition.path` with absolute paths to the videos staged in
+/// `<exe-dir>/../avatars/` so the global settings file written on first
+/// launch points at the on-disk copies users can swap. Each state is
+/// only stamped when its file actually exists; missing files leave the
+/// embedded `/avatar/...` URL (transition) or `None` (images) defaults
+/// in place so the runtime still falls back to the bundled-in-exe copy.
+fn seed_portable_avatar_paths(s: &mut Settings) {
+    if let Some(dir) = portable_avatars_dir() {
+        stamp_avatar_paths_from(s, &dir);
+    }
+}
+
+/// Pure version of the avatar stamping step: given a directory, stamp the
+/// appropriate fields from any matching files inside it. Split out so the
+/// behavior is unit-testable without depending on the test binary's
+/// `current_exe()` location.
+fn stamp_avatar_paths_from(s: &mut Settings, dir: &Path) {
+    let stamp = |slot: &mut Option<PathBuf>, file: &str| {
+        let p = dir.join(file);
+        if p.is_file() {
+            *slot = Some(p);
+        }
+    };
+
+    stamp(&mut s.avatar.images.idle, "Idle.mp4");
+    stamp(&mut s.avatar.images.listening, "Listening.mp4");
+    stamp(&mut s.avatar.images.thinking, "Thinking.mp4");
+    stamp(&mut s.avatar.images.speaking, "Speaking.mp4");
+    stamp(&mut s.avatar.images.error, "Error.mp4");
+
+    let transition = dir.join("Transition.mp4");
+    if transition.is_file() {
+        s.avatar.transition.path = Some(transition);
+    }
 }
 
 /// Ensure the three reserved-id tab entries are present and marked as
@@ -768,6 +818,59 @@ mod tests {
         deep_merge(&mut reapplied, delta);
         let recovered: Settings = serde_json::from_value(reapplied).unwrap();
         assert_eq!(recovered.ui.theme, "future-light");
+    }
+
+    #[test]
+    fn stamp_avatar_paths_uses_files_present_in_dir() {
+        let dir = std::env::temp_dir()
+            .join(format!("cctts_avatars_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Stage two of the five state videos plus the transition; the
+        // remaining three should be left untouched (None / embedded URL).
+        for f in ["Idle.mp4", "Speaking.mp4", "Transition.mp4"] {
+            fs::write(dir.join(f), b"").unwrap();
+        }
+
+        let mut s = Settings::default();
+        // Sanity: defaults start with images None and transition pointing
+        // at the embedded `/avatar/...` URL.
+        assert!(s.avatar.images.idle.is_none());
+        assert_eq!(
+            s.avatar.transition.path.as_deref().map(|p| p.to_string_lossy().to_string()),
+            Some("/avatar/Transition.mp4".to_string())
+        );
+
+        stamp_avatar_paths_from(&mut s, &dir);
+
+        assert_eq!(s.avatar.images.idle.as_deref(), Some(dir.join("Idle.mp4").as_path()));
+        assert_eq!(s.avatar.images.speaking.as_deref(), Some(dir.join("Speaking.mp4").as_path()));
+        assert!(s.avatar.images.listening.is_none(), "missing files should not be stamped");
+        assert!(s.avatar.images.thinking.is_none());
+        assert!(s.avatar.images.error.is_none());
+        assert_eq!(s.avatar.transition.path.as_deref(), Some(dir.join("Transition.mp4").as_path()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_avatar_paths_noop_when_dir_empty() {
+        let dir = std::env::temp_dir()
+            .join(format!("cctts_avatars_empty_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut s = Settings::default();
+        let before_transition = s.avatar.transition.path.clone();
+        stamp_avatar_paths_from(&mut s, &dir);
+
+        assert!(s.avatar.images.idle.is_none());
+        assert!(s.avatar.images.listening.is_none());
+        assert!(s.avatar.images.thinking.is_none());
+        assert!(s.avatar.images.speaking.is_none());
+        assert!(s.avatar.images.error.is_none());
+        assert_eq!(s.avatar.transition.path, before_transition);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

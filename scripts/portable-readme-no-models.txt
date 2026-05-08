@@ -10,6 +10,10 @@ Compared to the full zip:
 
   bin\cctts.exe                      <- updated
   bin\onnxruntime*.dll               <- updated (matched to the new exe)
+  avatars\*.mp4 / *.png              <- updated (bundled avatar videos
+                                        for optional customization;
+                                        same files are also embedded in
+                                        cctts.exe)
   LICENSE / NOTICE / README.txt      <- updated
   models\kokoro-v1.0.onnx            <- NOT INCLUDED (preserved from your existing install)
   models\voices\af_heart.bin         <- NOT INCLUDED (preserved from your existing install)

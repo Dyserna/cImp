@@ -187,6 +187,14 @@ jobs:
           Copy-Item download/kokoro-v1.0.onnx "$stageFull/models/"
           Copy-Item download/af_heart.bin "$stageFull/models/voices/"
 
+          # Avatar videos: ship the canonical set as discoverable on-disk
+          # files for users who want to customize. The runtime still serves
+          # the same files from the embedded frontend bundle by default;
+          # users override per state via Settings -> Avatar by pointing at
+          # the matching file in this folder (or any other on disk).
+          New-Item -ItemType Directory -Force -Path "$stageFull/avatars" | Out-Null
+          Copy-Item public/avatar/* "$stageFull/avatars/"
+
           # Top-level docs
           Copy-Item LICENSE "$stageFull/"
           Copy-Item NOTICE "$stageFull/"
@@ -195,12 +203,16 @@ jobs:
           # --- Slim variant (no Kokoro model, no voicepack) ----------------
           # Same exe + DLLs as the full build. Skip `models/` entirely so a
           # user extracting this zip over an existing install keeps their
-          # local model files untouched.
+          # local model files untouched. Avatar videos are still bundled
+          # (3.8MB; cheap and keeps the layout symmetric across variants).
           New-Item -ItemType Directory -Force -Path "$stageSlim/bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stageSlim/avatars" | Out-Null
 
           Copy-Item src-tauri/target/release/cctts.exe "$stageSlim/bin/"
           Get-ChildItem src-tauri/target/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageSlim/bin/" }
+
+          Copy-Item public/avatar/* "$stageSlim/avatars/"
 
           Copy-Item LICENSE "$stageSlim/"
           Copy-Item NOTICE "$stageSlim/"

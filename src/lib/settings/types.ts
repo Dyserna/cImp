@@ -63,6 +63,9 @@ export interface BehaviorSettings {
   /// When true, the frontend keeps `tts.mute` in sync with the inverse of
   /// `avatar.visible` — hide → mute, show → unmute. Wired in App.svelte.
   follow_avatar: boolean;
+  /// When true, tab announcements fire even for the currently-focused tab.
+  /// Default false reproduces the historical background-only behavior.
+  announce_focused_tab: boolean;
 }
 
 export interface ComposeSettings {
@@ -420,6 +423,7 @@ export function defaultSettings(): Settings {
       fallback_silent: true,
       announcements_enabled: true,
       follow_avatar: false,
+      announce_focused_tab: false,
     },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {

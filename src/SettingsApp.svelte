@@ -485,6 +485,20 @@
             the Mute toggle tracks the avatar. Turn this off to control
             mute independently.
           </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.announce_focused_tab}
+              onchange={(e) =>
+                patch((s) => (s.behavior.announce_focused_tab = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Announce focused tab</span>
+          </label>
+          <small class="hint">
+            Off by default — announcements (idle, awaiting permission, error,
+            exit) only fire for background tabs. Turn on to hear them for the
+            tab you're currently looking at as well.
+          </small>
           <label class="checkbox disabled">
             <input type="checkbox" checked={snapshot.behavior.fallback_silent} disabled />
             <span>Fallback silent on TTS error (always on in v1)</span>

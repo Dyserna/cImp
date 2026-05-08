@@ -35,7 +35,7 @@ use crate::ipc::layout::{
 };
 use crate::ipc::tab_lifecycle::{
     close_tab, create_shell_tab, default_shell_spec, get_shell_tab_config, reconfigure_shell_tab,
-    rename_tab,
+    rename_tab, set_claude_tabs_enabled,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
@@ -292,6 +292,7 @@ fn main() {
             reconfigure_shell_tab,
             default_shell_spec,
             get_shell_tab_config,
+            set_claude_tabs_enabled,
             save_layout,
             save_layout_preset,
             delete_layout_preset,

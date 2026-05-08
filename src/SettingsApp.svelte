@@ -16,11 +16,13 @@
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
+    ClaudeTabsEnabled,
     Settings,
     ShellTabConfig,
     TabConfig,
   } from './lib/settings/types';
   import { findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
+  import { setClaudeTabsEnabled } from './lib/ipc';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
@@ -182,6 +184,38 @@
     updater(next);
     snapshot = next;
     void applySettings(next);
+  }
+
+  /// Apply a Claude-tabs-enabled radio change. Routes through the
+  /// dedicated IPC instead of a plain `applySettings` because the
+  /// backend has to open / close the AI builtin tabs (kill PTY, drop
+  /// scrollback) in response — `settings_update` alone wouldn't
+  /// trigger that lifecycle. Optimistically updates the local snapshot
+  /// so the radio reflects the new value before the broadcast comes
+  /// back; the broadcast overwrites with the same value harmlessly.
+  /// Switches the tabsSubSection if the user is currently viewing a
+  /// tab that's about to disappear.
+  async function setClaudeTabsEnabledFromUi(value: ClaudeTabsEnabled) {
+    if (!snapshot) return;
+    const prev = snapshot.claude_tabs_enabled;
+    if (prev === value) return;
+    if (
+      (tabsSubSection === 'claude' && value === 'local') ||
+      (tabsSubSection === 'claude-local' && value === 'cloud')
+    ) {
+      tabsSubSection = value === 'cloud' ? 'claude' : 'claude-local';
+    }
+    const next = structuredClone($state.snapshot(snapshot));
+    next.claude_tabs_enabled = value;
+    snapshot = next;
+    try {
+      await setClaudeTabsEnabled(value);
+    } catch (e) {
+      console.error('set_claude_tabs_enabled failed:', e);
+      const restored = structuredClone($state.snapshot(snapshot));
+      restored.claude_tabs_enabled = prev;
+      snapshot = restored;
+    }
   }
 
   // V1.4-04 B.5: inline UI for save/manage presets. Implemented as
@@ -912,8 +946,47 @@
         {@const claudeLive = aiTabAt('claude')}
         {@const claudeLocalLive = aiTabAt('claude-local')}
         {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
+        {@const claudeTabsValue = snapshot.claude_tabs_enabled}
         <section>
           <h2>Tabs</h2>
+          <fieldset class="claude-tabs-radio">
+            <legend>Claude tabs enabled</legend>
+            <small class="hint">
+              Pick which Claude tabs to keep. Changing this opens or closes the matching tabs (the closed tab's PTY is killed and its scrollback dropped).
+            </small>
+            <div class="radio-row">
+              <label>
+                <input
+                  type="radio"
+                  name="claude-tabs-enabled"
+                  value="cloud"
+                  checked={claudeTabsValue === 'cloud'}
+                  onchange={() => void setClaudeTabsEnabledFromUi('cloud')}
+                />
+                Claude (cloud)
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="claude-tabs-enabled"
+                  value="local"
+                  checked={claudeTabsValue === 'local'}
+                  onchange={() => void setClaudeTabsEnabledFromUi('local')}
+                />
+                Claude (local)
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="claude-tabs-enabled"
+                  value="both"
+                  checked={claudeTabsValue === 'both'}
+                  onchange={() => void setClaudeTabsEnabledFromUi('both')}
+                />
+                Both
+              </label>
+            </div>
+          </fieldset>
           <div class="sub-tabs" role="tablist" aria-label="Tabs sub-sections">
             <button
               type="button"
@@ -1532,6 +1605,36 @@
   }
   .palette-row > span:first-child {
     grid-column: 1 / -1;
+  }
+  .claude-tabs-radio {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-3) var(--space-4);
+    margin: 0 0 var(--space-4) 0;
+    background: var(--surface-1);
+  }
+  .claude-tabs-radio legend {
+    padding: 0 var(--space-2);
+    font-size: var(--font-size-sm);
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+  .claude-tabs-radio .hint {
+    display: block;
+    margin: 0 0 var(--space-3) 0;
+    color: var(--text-quiet);
+  }
+  .claude-tabs-radio .radio-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+  }
+  .claude-tabs-radio .radio-row label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--font-size-sm);
+    cursor: pointer;
   }
   .sub-tabs {
     display: flex;

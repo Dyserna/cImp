@@ -67,6 +67,43 @@ pub struct Settings {
     /// (and `ANTHROPIC_MODEL` if set) into the spawned process's env.
     /// Per-tab `env` entries take precedence over synthesized values.
     pub claude_local: ClaudeLocalSettings,
+    /// Which Claude tabs are enabled. Selecting a value that excludes a
+    /// currently-open Claude tab closes that tab (kills its PTY, drops
+    /// scrollback, removes the settings entry) and selecting a value
+    /// that includes a missing one re-creates it. The integrity check
+    /// enforces the invariant on load. Default is `Cloud` so a brand-new
+    /// install starts with the subscription Claude tab only.
+    pub claude_tabs_enabled: ClaudeTabsEnabled,
+}
+
+/// Which Claude tabs the user has enabled. Exactly one of these is the
+/// current selection; the integrity check ensures the live `tabs` array
+/// matches.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaudeTabsEnabled {
+    /// Subscription Claude tab only (`claude`).
+    Cloud,
+    /// Local-LLM Claude tab only (`claude-local`).
+    Local,
+    /// Both `claude` and `claude-local` are present.
+    Both,
+}
+
+impl Default for ClaudeTabsEnabled {
+    fn default() -> Self {
+        Self::Cloud
+    }
+}
+
+impl ClaudeTabsEnabled {
+    pub fn includes_cloud(self) -> bool {
+        matches!(self, Self::Cloud | Self::Both)
+    }
+
+    pub fn includes_local(self) -> bool {
+        matches!(self, Self::Local | Self::Both)
+    }
 }
 
 impl Settings {

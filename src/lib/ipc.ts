@@ -202,6 +202,18 @@ export async function restartShellTab(tab: TabId): Promise<void> {
   await invoke('restart_shell_tab', { tab });
 }
 
+/// Apply a new `claude_tabs_enabled` value: opens / closes the AI builtin
+/// tabs as needed. The backend kills the PTY and drops scrollback for
+/// any newly-disabled tab; newly-enabled tabs spawn fresh on the next
+/// frontend mount. Switches the active tab off any soon-to-be-removed
+/// tab onto the surviving Claude tab so the avatar/TTS gate doesn't
+/// dangle.
+export async function setClaudeTabsEnabled(
+  value: import('./settings/types').ClaudeTabsEnabled,
+): Promise<void> {
+  await invoke('set_claude_tabs_enabled', { value });
+}
+
 export interface PtyExitPayload {
   tab: TabId;
   exit: string;

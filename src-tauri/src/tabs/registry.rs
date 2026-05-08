@@ -197,24 +197,51 @@ impl TabRegistry {
         position
     }
 
-    /// Remove a tab. Builtins are silently ignored — callers (IPC) gate
-    /// with `BuiltinNotClosable` first. Returns `true` if the tab was
-    /// found and removed.
-    pub async fn remove_user_shell_tab(&mut self, tab: &TabId) -> bool {
-        if is_builtin_id(tab.as_str()) {
-            return false;
-        }
+    /// Remove a tab. Callers (IPC) are responsible for any policy gate —
+    /// `close_tab` rejects AI builtins with `BuiltinNotClosable`, but the
+    /// `set_claude_tabs_enabled` path bypasses that check because the
+    /// radio selection is the canonical way to close AI tabs. Returns
+    /// `true` if the tab was found and removed.
+    pub async fn remove_tab(&mut self, tab: &TabId) -> bool {
         let Some(idx) = self.tab_order.iter().position(|t| t == tab) else {
             return false;
         };
         self.tab_order.remove(idx);
         if let Some(manager) = self.managers.remove(tab) {
             if let Err(e) = manager.shutdown().await {
-                warn!(?tab, error = %e, "remove_user_shell_tab: shutdown failed");
+                warn!(?tab, error = %e, "remove_tab: shutdown failed");
             }
         }
         self.names.remove(tab);
         true
+    }
+
+    /// Re-insert an AI builtin tab (claude / claude-local) at its
+    /// canonical position. Used by `set_claude_tabs_enabled` when the
+    /// radio re-enables a previously-removed tab. Idempotent; returns
+    /// the resulting position. Distinct from `insert_user_shell_tab`
+    /// because AI builtins land at fixed positions (0 for claude, after
+    /// claude for claude-local) rather than the end of the list.
+    pub fn insert_ai_builtin_tab(&mut self, tab: TabId, name: String) -> usize {
+        if let Some(idx) = self.tab_order.iter().position(|t| t == &tab) {
+            self.names.insert(tab, name);
+            return idx;
+        }
+        let position = match tab.as_str() {
+            CLAUDE_TAB_ID => 0,
+            CLAUDE_LOCAL_TAB_ID => self
+                .tab_order
+                .iter()
+                .position(|t| t.as_str() == CLAUDE_TAB_ID)
+                .map(|p| p + 1)
+                .unwrap_or(0),
+            _ => self.tab_order.len(),
+        };
+        let position = position.min(self.tab_order.len());
+        self.tab_order.insert(position, tab.clone());
+        self.managers.insert(tab.clone(), PtyManager::new());
+        self.names.insert(tab, name);
+        position
     }
 
     /// Spawn the subprocess for `tab` and bind it to `output_channel`. Each

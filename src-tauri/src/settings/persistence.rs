@@ -493,26 +493,44 @@ pub fn integrity_check(settings: &mut Settings, default_shell: &ShellSpec) -> bo
         }
     }
 
-    // 4. Restore missing AI builtin entries at canonical positions.
-    //    Inserting in the order claude(0), claude-local(1) works because
-    //    each insert shifts later positions consistently. shell-default-1
-    //    is intentionally not restored — it's a regular closable shell.
-    if !settings.tabs.iter().any(|t| t.id() == CLAUDE_TAB_ID) {
+    // 4. Reconcile AI builtin entries with `claude_tabs_enabled`. The
+    //    setting is the source of truth for which Claude tabs exist:
+    //    Cloud → claude only, Local → claude-local only, Both → both.
+    //    A tab that's enabled but missing is restored at its canonical
+    //    position; a tab that's disabled but present is dropped (the
+    //    runtime's set-claude-tabs-enabled IPC is what kills the PTY
+    //    in-session, but on cold load we just normalize the settings
+    //    file). shell-default-1 is intentionally untouched here — it's
+    //    a regular closable shell.
+    let want_cloud = settings.claude_tabs_enabled.includes_cloud();
+    let want_local = settings.claude_tabs_enabled.includes_local();
+
+    let has_cloud = settings.tabs.iter().any(|t| t.id() == CLAUDE_TAB_ID);
+    if want_cloud && !has_cloud {
         settings.tabs.insert(0, default_claude_tab());
         changed = true;
         tracing::warn!("integrity: restored missing claude tab");
+    } else if !want_cloud && has_cloud {
+        settings.tabs.retain(|t| t.id() != CLAUDE_TAB_ID);
+        changed = true;
+        tracing::warn!("integrity: removed claude tab (disabled by setting)");
     }
 
-    if !settings.tabs.iter().any(|t| t.id() == CLAUDE_LOCAL_TAB_ID) {
+    let has_local = settings.tabs.iter().any(|t| t.id() == CLAUDE_LOCAL_TAB_ID);
+    if want_local && !has_local {
         let pos = settings
             .tabs
             .iter()
             .position(|t| t.id() == CLAUDE_TAB_ID)
             .map(|p| p + 1)
-            .unwrap_or(1);
+            .unwrap_or(0);
         settings.tabs.insert(pos, default_claude_local_tab());
         changed = true;
         tracing::warn!("integrity: restored missing claude-local tab");
+    } else if !want_local && has_local {
+        settings.tabs.retain(|t| t.id() != CLAUDE_LOCAL_TAB_ID);
+        changed = true;
+        tracing::warn!("integrity: removed claude-local tab (disabled by setting)");
     }
 
     // 5. Backend layout sanity. The frontend owns the deep integrity
@@ -607,20 +625,58 @@ mod tests {
     }
 
     #[test]
-    fn integrity_seeds_ai_builtins_on_empty() {
-        // The integrity check restores only the AI builtins; the closable
-        // shell-default-1 ships via `seeded_defaults` on fresh installs and
-        // is never re-created here (so closing it stays closed).
+    fn integrity_seeds_only_claude_on_empty_with_default_setting() {
+        // Default `claude_tabs_enabled = Cloud` means a fresh install
+        // gets the subscription Claude tab only; the integrity check
+        // mustn't re-seed claude-local. The closable shell-default-1
+        // ships via `seeded_defaults`, not the integrity check.
         let mut s = Settings::default();
+        let shell = fake_default_shell();
+        let changed = integrity_check(&mut s, &shell);
+        assert!(changed);
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
+        assert!(s.tabs[0].builtin());
+    }
+
+    #[test]
+    fn integrity_seeds_both_when_claude_tabs_enabled_is_both() {
+        let mut s = Settings::default();
+        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
         let shell = fake_default_shell();
         let changed = integrity_check(&mut s, &shell);
         assert!(changed);
         assert_eq!(s.tabs.len(), 2);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
         assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
-        for t in &s.tabs {
-            assert!(t.builtin(), "{} should be builtin", t.id());
-        }
+    }
+
+    #[test]
+    fn integrity_seeds_only_claude_local_when_setting_is_local() {
+        let mut s = Settings::default();
+        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Local;
+        let shell = fake_default_shell();
+        let changed = integrity_check(&mut s, &shell);
+        assert!(changed);
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(s.tabs[0].id(), CLAUDE_LOCAL_TAB_ID);
+    }
+
+    #[test]
+    fn integrity_drops_disabled_ai_tab() {
+        // Loading a file where the setting and tabs disagree (e.g. a
+        // hand-edit, or post-migration drift) reconciles to the setting.
+        let mut s = Settings::default();
+        let shell = fake_default_shell();
+        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
+        integrity_check(&mut s, &shell);
+        assert_eq!(s.tabs.len(), 2);
+
+        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Cloud;
+        let changed = integrity_check(&mut s, &shell);
+        assert!(changed);
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
     }
 
     #[test]
@@ -723,6 +779,7 @@ mod tests {
     fn v1_2_round_trip() {
         let shell = fake_default_shell();
         let mut s = Settings::default();
+        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
         integrity_check(&mut s, &shell);
         let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
@@ -735,7 +792,9 @@ mod tests {
     fn integrity_corrects_use_local_provider_on_reserved_ai_tabs() {
         // V1.4-07: a hand-edit must not be able to silently flip the
         // subscription Claude tab into local-LLM mode (or vice versa).
+        // Force `Both` so the check has both AI tabs to validate.
         let mut s = Settings::default();
+        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
         let shell = fake_default_shell();
         integrity_check(&mut s, &shell);
 

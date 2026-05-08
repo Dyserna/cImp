@@ -160,6 +160,17 @@ pub fn migrate_if_needed(
         changed = true;
     }
 
+    // v1.8 → v1.9: adds the `claude_tabs_enabled` setting (Cloud / Local /
+    // Both). The migration infers the initial value from the existing
+    // tabs array so users who had both Claude tabs in v1.8 keep both
+    // after the upgrade. Detection: `claude_local` is present (v1.8
+    // marker) but `claude_tabs_enabled` is absent (v1.9 marker).
+    if looks_v1_8(value) {
+        write_backup(path, "v1.8", value)?;
+        migrate_v1_8_to_v1_9(value);
+        changed = true;
+    }
+
     Ok(changed)
 }
 
@@ -275,6 +286,20 @@ fn looks_v1_7(value: &Value) -> bool {
         .is_some();
     let has_claude_local = obj.contains_key("claude_local");
     has_scrollback && !has_claude_local
+}
+
+/// Is this a v1.8 file that lacks the v1.9 `claude_tabs_enabled` field?
+/// `claude_local` must be present (v1.8 marker, so we don't false-positive
+/// on earlier files mid-cascade); `claude_tabs_enabled` must be absent.
+/// Fresh-install v1.9 files have `claude_tabs_enabled` populated and
+/// skip this branch.
+fn looks_v1_8(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let has_claude_local = obj.contains_key("claude_local");
+    let has_setting = obj.contains_key("claude_tabs_enabled");
+    has_claude_local && !has_setting
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -891,6 +916,47 @@ fn rewrite_aider_tab_ids(root: &mut Map<String, Value>) {
                 Value::String("claude-local".to_string()),
             );
         }
+    }
+}
+
+// --- v1.8 → v1.9 ------------------------------------------------------------
+//
+// v1.9 introduces the `claude_tabs_enabled` setting (Cloud / Local /
+// Both). The migration infers the initial value from the existing tabs
+// array so users who had both Claude tabs in v1.8 keep both after the
+// upgrade; users who had only one keep that one. Idempotent — a second
+// pass finds the field present and `looks_v1_8` returns false.
+
+fn migrate_v1_8_to_v1_9(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    let inferred = infer_claude_tabs_enabled(root);
+    root.insert(
+        "claude_tabs_enabled".to_string(),
+        Value::String(inferred.to_string()),
+    );
+}
+
+fn infer_claude_tabs_enabled(root: &Map<String, Value>) -> &'static str {
+    let mut has_claude = false;
+    let mut has_claude_local = false;
+    if let Some(tabs) = root.get("tabs").and_then(Value::as_array) {
+        for tab in tabs {
+            match tab.get("id").and_then(Value::as_str) {
+                Some("claude") => has_claude = true,
+                Some("claude-local") => has_claude_local = true,
+                _ => {}
+            }
+        }
+    }
+    match (has_claude, has_claude_local) {
+        (true, true) => "both",
+        (false, true) => "local",
+        // (true, false) and (false, false) both default to cloud — for
+        // (false, false), the integrity check will recreate the claude
+        // tab on its next pass.
+        _ => "cloud",
     }
 }
 
@@ -1868,5 +1934,78 @@ mod tests {
         let tab_ids = tree.get("tab_ids").unwrap().as_array().unwrap();
         assert!(tab_ids.iter().any(|t| t.as_str() == Some("claude-local")));
         assert!(!tab_ids.iter().any(|t| t.as_str() == Some("aider")));
+    }
+
+    fn v1_8_with_tabs(claude: bool, claude_local: bool) -> Value {
+        let mut tabs: Vec<Value> = Vec::new();
+        if claude {
+            tabs.push(json!({
+                "kind": "ai_tool",
+                "id": "claude",
+                "name": "Claude",
+                "use_local_provider": false,
+            }));
+        }
+        if claude_local {
+            tabs.push(json!({
+                "kind": "ai_tool",
+                "id": "claude-local",
+                "name": "Claude (local)",
+                "use_local_provider": true,
+            }));
+        }
+        tabs.push(json!({
+            "kind": "shell",
+            "id": "shell-default-1",
+            "name": "Shell 1",
+        }));
+        json!({
+            "tabs": tabs,
+            "claude_local": {
+                "base_url": "http://localhost:4000",
+                "auth_token": "sk-dummy",
+                "model_alias": "",
+            },
+        })
+    }
+
+    #[test]
+    fn v1_8_to_v1_9_infers_both_when_both_tabs_present() {
+        let mut v = v1_8_with_tabs(true, true);
+        assert!(looks_v1_8(&v));
+        migrate_v1_8_to_v1_9(&mut v);
+        assert_eq!(v.get("claude_tabs_enabled").unwrap(), "both");
+        assert!(!looks_v1_8(&v));
+    }
+
+    #[test]
+    fn v1_8_to_v1_9_infers_cloud_when_only_claude() {
+        let mut v = v1_8_with_tabs(true, false);
+        migrate_v1_8_to_v1_9(&mut v);
+        assert_eq!(v.get("claude_tabs_enabled").unwrap(), "cloud");
+    }
+
+    #[test]
+    fn v1_8_to_v1_9_infers_local_when_only_claude_local() {
+        let mut v = v1_8_with_tabs(false, true);
+        migrate_v1_8_to_v1_9(&mut v);
+        assert_eq!(v.get("claude_tabs_enabled").unwrap(), "local");
+    }
+
+    #[test]
+    fn v1_8_to_v1_9_defaults_cloud_when_neither_tab_present() {
+        let mut v = v1_8_with_tabs(false, false);
+        migrate_v1_8_to_v1_9(&mut v);
+        assert_eq!(v.get("claude_tabs_enabled").unwrap(), "cloud");
+    }
+
+    #[test]
+    fn v1_9_file_is_not_re_detected() {
+        let mut v = v1_8_with_tabs(true, true);
+        migrate_v1_8_to_v1_9(&mut v);
+        assert!(!looks_v1_8(&v));
+        // Idempotent on second pass.
+        migrate_v1_8_to_v1_9(&mut v);
+        assert!(!looks_v1_8(&v));
     }
 }

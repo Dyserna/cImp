@@ -354,7 +354,16 @@ export interface Settings {
   /// `use_local_provider` flag is `true`. Stored cleartext on disk —
   /// local proxies typically accept dummy tokens, so this is acceptable.
   claude_local: ClaudeLocalSettings;
+  /// Which Claude tabs are enabled. The radio in Settings → Tabs is the
+  /// canonical way to flip this; the backend's `set_claude_tabs_enabled`
+  /// IPC opens / closes the corresponding AI tabs in response. Default
+  /// is `cloud` (subscription Claude only) on a fresh install.
+  claude_tabs_enabled: ClaudeTabsEnabled;
 }
+
+/// Which Claude tabs the user has enabled. Mirrored from the backend's
+/// `ClaudeTabsEnabled` enum (kebab-case wire format).
+export type ClaudeTabsEnabled = 'cloud' | 'local' | 'both';
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
 /// `auth_token` become `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` on
@@ -526,5 +535,6 @@ export function defaultSettings(): Settings {
       auth_token: 'sk-dummy',
       model_alias: '',
     },
+    claude_tabs_enabled: 'cloud',
   };
 }

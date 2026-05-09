@@ -1386,25 +1386,27 @@
           </label>
           <label>
             <span>Auth token</span>
-            <input
-              type={showLocalToken ? 'text' : 'password'}
-              value={snapshot?.claude_local.auth_token ?? ''}
-              oninput={(e) =>
-                patch(
-                  (s) =>
-                    (s.claude_local.auth_token = (
-                      e.currentTarget as HTMLInputElement
-                    ).value),
-                )}
-              placeholder="sk-dummy"
-            />
-            <button
-              type="button"
-              class="secondary"
-              onclick={() => (showLocalToken = !showLocalToken)}
-            >
-              {showLocalToken ? 'Hide' : 'Show'}
-            </button>
+            <div class="input-with-action">
+              <input
+                type={showLocalToken ? 'text' : 'password'}
+                value={snapshot?.claude_local.auth_token ?? ''}
+                oninput={(e) =>
+                  patch(
+                    (s) =>
+                      (s.claude_local.auth_token = (
+                        e.currentTarget as HTMLInputElement
+                      ).value),
+                  )}
+                placeholder="sk-dummy"
+              />
+              <button
+                type="button"
+                class="secondary"
+                onclick={() => (showLocalToken = !showLocalToken)}
+              >
+                {showLocalToken ? 'Hide' : 'Show'}
+              </button>
+            </div>
             <small class="hint">
               Becomes <code>ANTHROPIC_AUTH_TOKEN</code>. Stored cleartext;
               local proxies usually accept dummy tokens.
@@ -1829,6 +1831,22 @@
   .row > label {
     flex: 1;
   }
+  /* Pair an input with an inline action button (Show/Hide, Browse, etc.).
+     Without this, the button wraps below a width:100% input and
+     `small.hint`'s negative top margin pulls the hint upward into the
+     wrapped button. */
+  .input-with-action {
+    display: flex;
+    gap: var(--space-2);
+    align-items: stretch;
+  }
+  .input-with-action > input {
+    flex: 1;
+    min-width: 0;
+  }
+  .input-with-action > button {
+    flex-shrink: 0;
+  }
   .file-row {
     display: flex;
     gap: var(--space-2);
@@ -1896,6 +1914,14 @@
   small.hint.top {
     margin-top: 0;
     margin-bottom: var(--space-3);
+  }
+  /* When a hint is nested *inside* a label after the input (Local LLM
+     section, shell command field, etc.) the global -8px would pull it
+     up over the input box. The negative margin only makes sense for
+     sibling hints below a label, where it tightens the gap to the
+     label above. */
+  label > small.hint {
+    margin-top: var(--space-1);
   }
   .preset-actions {
     display: flex;

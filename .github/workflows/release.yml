@@ -188,12 +188,15 @@ jobs:
           Copy-Item download/af_heart.bin "$stageFull/models/voices/"
 
           # Avatar videos: ship the canonical set as discoverable on-disk
-          # files for users who want to customize. The runtime still serves
-          # the same files from the embedded frontend bundle by default;
-          # users override per state via Settings -> Avatar by pointing at
-          # the matching file in this folder (or any other on disk).
+          # files for users who want to customize. Source of truth is the
+          # top-level `avatars/` folder — the same files the Vite plugin
+          # bundles into the embedded frontend at build time. Users
+          # override per state via Settings -> Avatar by pointing at the
+          # matching file in this folder (or any other on disk). The
+          # bundled defaults are theme-keyed under per-theme subfolders,
+          # so we copy recursively to preserve the layout.
           New-Item -ItemType Directory -Force -Path "$stageFull/avatars" | Out-Null
-          Copy-Item public/avatar/* "$stageFull/avatars/"
+          Copy-Item -Recurse avatars/* "$stageFull/avatars/"
 
           # Top-level docs
           Copy-Item LICENSE "$stageFull/"
@@ -212,7 +215,7 @@ jobs:
           Get-ChildItem src-tauri/target/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageSlim/bin/" }
 
-          Copy-Item public/avatar/* "$stageSlim/avatars/"
+          Copy-Item -Recurse avatars/* "$stageSlim/avatars/"
 
           Copy-Item LICENSE "$stageSlim/"
           Copy-Item NOTICE "$stageSlim/"

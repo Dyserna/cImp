@@ -442,23 +442,44 @@ fn seed_portable_avatar_paths(s: &mut Settings) {
 /// appropriate fields from any matching files inside it. Split out so the
 /// behavior is unit-testable without depending on the test binary's
 /// `current_exe()` location.
+///
+/// Layout-aware: prefers the active theme's subfolder
+/// (`<dir>/<ui.theme>/<file>`) so portable installs land on animations
+/// matching the chrome they ship with. Falls back to a flat
+/// `<dir>/<file>` layout for legacy zips produced before the per-theme
+/// split, so existing folders keep working.
 fn stamp_avatar_paths_from(s: &mut Settings, dir: &Path) {
-    let stamp = |slot: &mut Option<PathBuf>, file: &str| {
-        let p = dir.join(file);
-        if p.is_file() {
-            *slot = Some(p);
+    let theme_dir = dir.join(&s.ui.theme);
+
+    let pick = |file: &str| -> Option<PathBuf> {
+        let themed = theme_dir.join(file);
+        if themed.is_file() {
+            return Some(themed);
         }
+        let flat = dir.join(file);
+        if flat.is_file() {
+            return Some(flat);
+        }
+        None
     };
 
-    stamp(&mut s.avatar.images.idle, "Idle.mp4");
-    stamp(&mut s.avatar.images.listening, "Listening.mp4");
-    stamp(&mut s.avatar.images.thinking, "Thinking.mp4");
-    stamp(&mut s.avatar.images.speaking, "Speaking.mp4");
-    stamp(&mut s.avatar.images.error, "Error.mp4");
-
-    let transition = dir.join("Transition.mp4");
-    if transition.is_file() {
-        s.avatar.transition.path = Some(transition);
+    if let Some(p) = pick("Idle.mp4") {
+        s.avatar.images.idle = Some(p);
+    }
+    if let Some(p) = pick("Listening.mp4") {
+        s.avatar.images.listening = Some(p);
+    }
+    if let Some(p) = pick("Thinking.mp4") {
+        s.avatar.images.thinking = Some(p);
+    }
+    if let Some(p) = pick("Speaking.mp4") {
+        s.avatar.images.speaking = Some(p);
+    }
+    if let Some(p) = pick("Error.mp4") {
+        s.avatar.images.error = Some(p);
+    }
+    if let Some(p) = pick("Transition.mp4") {
+        s.avatar.transition.path = Some(p);
     }
 }
 
@@ -994,6 +1015,73 @@ mod tests {
         assert!(s.avatar.images.thinking.is_none());
         assert!(s.avatar.images.error.is_none());
         assert_eq!(s.avatar.transition.path.as_deref(), Some(dir.join("Transition.mp4").as_path()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_avatar_paths_prefers_theme_subfolder() {
+        let dir = std::env::temp_dir()
+            .join(format!("cctts_avatars_themed_{}", uuid::Uuid::new_v4()));
+        let modern = dir.join("modern-dark");
+        let tui = dir.join("tui");
+        fs::create_dir_all(&modern).unwrap();
+        fs::create_dir_all(&tui).unwrap();
+
+        // Stage the same files in both theme folders so we can prove the
+        // active theme drives the selection rather than alphabetical luck.
+        for f in ["Idle.mp4", "Speaking.mp4", "Transition.mp4"] {
+            fs::write(modern.join(f), b"").unwrap();
+            fs::write(tui.join(f), b"").unwrap();
+        }
+
+        let mut s = Settings::default();
+        s.ui.theme = "tui".to_string();
+        stamp_avatar_paths_from(&mut s, &dir);
+
+        assert_eq!(s.avatar.images.idle.as_deref(), Some(tui.join("Idle.mp4").as_path()));
+        assert_eq!(
+            s.avatar.images.speaking.as_deref(),
+            Some(tui.join("Speaking.mp4").as_path()),
+        );
+        assert_eq!(
+            s.avatar.transition.path.as_deref(),
+            Some(tui.join("Transition.mp4").as_path()),
+        );
+
+        // Switching themes restamps from the other folder.
+        let mut s2 = Settings::default();
+        s2.ui.theme = "modern-dark".to_string();
+        stamp_avatar_paths_from(&mut s2, &dir);
+        assert_eq!(
+            s2.avatar.images.idle.as_deref(),
+            Some(modern.join("Idle.mp4").as_path()),
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_avatar_paths_falls_back_to_flat_layout() {
+        // Legacy zips (pre per-theme split) staged the videos at the top
+        // of `avatars/`. Verify those still get picked up when the active
+        // theme's subfolder is missing.
+        let dir = std::env::temp_dir()
+            .join(format!("cctts_avatars_flat_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        for f in ["Idle.mp4", "Transition.mp4"] {
+            fs::write(dir.join(f), b"").unwrap();
+        }
+
+        let mut s = Settings::default();
+        s.ui.theme = "tui".to_string(); // tui/ subfolder does not exist
+        stamp_avatar_paths_from(&mut s, &dir);
+
+        assert_eq!(s.avatar.images.idle.as_deref(), Some(dir.join("Idle.mp4").as_path()));
+        assert_eq!(
+            s.avatar.transition.path.as_deref(),
+            Some(dir.join("Transition.mp4").as_path()),
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

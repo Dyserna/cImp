@@ -29,7 +29,7 @@ pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 11;
+pub const CURRENT_SCHEMA_VERSION: u8 = 12;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -730,7 +730,7 @@ pub struct AvatarSettings {
     pub visible: bool,
     pub size: AvatarSize,
     pub position: AvatarPosition,
-    pub margin_px: u32,
+    pub margin: AvatarMargin,
     pub opacity: f32,
     pub images: AvatarImages,
     pub transition: TransitionSettings,
@@ -743,7 +743,7 @@ impl Default for AvatarSettings {
             visible: true,
             size: AvatarSize::default(),
             position: AvatarPosition::TopRight,
-            margin_px: 16,
+            margin: AvatarMargin::default(),
             opacity: 0.8,
             images: AvatarImages::default(),
             transition: TransitionSettings::default(),
@@ -765,6 +765,23 @@ impl Default for AvatarSize {
             width_px: 240,
             height_px: 240,
         }
+    }
+}
+
+/// Per-axis offset from the screen edge defined by `AvatarPosition`. The
+/// X component pushes the avatar inward from the left/right edge; the Y
+/// component pushes it inward from the top/bottom. Replaces the pre-v1.12
+/// scalar `margin_px` field, which applied a single value to both axes.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct AvatarMargin {
+    pub x_px: u32,
+    pub y_px: u32,
+}
+
+impl Default for AvatarMargin {
+    fn default() -> Self {
+        Self { x_px: 16, y_px: 16 }
     }
 }
 

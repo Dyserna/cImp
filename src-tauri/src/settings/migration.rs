@@ -143,6 +143,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.8", detect: looks_v1_8, transform: migrate_v1_8_to_v1_9_step },
     MigrationStep { from_version: "v1.9", detect: looks_v1_9, transform: migrate_v1_9_to_v1_10_step },
     MigrationStep { from_version: "v1.10", detect: looks_v1_10, transform: migrate_v1_10_to_v1_11_step },
+    MigrationStep { from_version: "v1.11", detect: looks_v1_11, transform: migrate_v1_11_to_v1_12_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -179,6 +180,9 @@ fn migrate_v1_9_to_v1_10_step(value: &mut Value, _shell: &ShellSpec) {
 }
 fn migrate_v1_10_to_v1_11_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v1_10_to_v1_11(value)
+}
+fn migrate_v1_11_to_v1_12_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_11_to_v1_12(value)
 }
 
 fn looks_v1(value: &Value) -> bool {
@@ -343,6 +347,20 @@ fn looks_v1_10(value: &Value) -> bool {
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 10)
+}
+
+/// Is this a v1.11 file (schema_version == 11) whose `avatar.margin_px`
+/// scalar still needs to be promoted to the v1.12
+/// `avatar.margin: { x_px, y_px }` object? Tolerant `Deserialize` on
+/// `AvatarMargin` would absorb the absence on load, but we still rewrite
+/// in place so the on-disk file matches the new shape from the first
+/// post-upgrade launch and the user's legacy margin value is preserved
+/// across both axes (rather than silently dropping to the default).
+fn looks_v1_11(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 11)
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -1083,6 +1101,41 @@ fn migrate_v1_10_to_v1_11(value: &mut Value) {
                 }
             }
         }
+    }
+    root.insert(
+        "schema_version".to_string(),
+        // V1.12 raised CURRENT_SCHEMA_VERSION; this step only promotes
+        // the file to v1.11, so stamp the literal 11 rather than the
+        // moving constant. The next step (v1.11 → v1.12) bumps to current.
+        Value::Number(serde_json::Number::from(11u8)),
+    );
+}
+
+// --- v1.11 → v1.12 ----------------------------------------------------------
+//
+// Promotes `avatar.margin_px: u32` to `avatar.margin: { x_px, y_px }`
+// so the user can offset the avatar independently per axis. The legacy
+// scalar value is copied to both fields, preserving the on-screen
+// position for everyone who hadn't tweaked their margin since v1.11.
+// Defaults (16) flow in via `AvatarMargin::default()` if the legacy
+// field is absent.
+
+fn migrate_v1_11_to_v1_12(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(avatar) = root.get_mut("avatar").and_then(Value::as_object_mut) {
+        let legacy = avatar
+            .remove("margin_px")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(16);
+        avatar.insert(
+            "margin".to_string(),
+            json!({
+                "x_px": legacy,
+                "y_px": legacy,
+            }),
+        );
     }
     root.insert(
         "schema_version".to_string(),
@@ -2247,11 +2300,54 @@ mod tests {
         assert_eq!(perm.get("text").unwrap(), "");
         let exited = tabs[1].get("notifications").unwrap().get("exited").unwrap();
         assert_eq!(exited.get("enabled").unwrap(), false);
+        // The v1.10 → v1.11 step stamps the literal version 11 (the version
+        // it produces). The next step in the cascade (v1.11 → v1.12) bumps
+        // to current.
+        assert_eq!(v.get("schema_version").and_then(Value::as_u64), Some(11));
+        assert!(!looks_v1_10(&v));
+    }
+
+    // --- v1.11 → v1.12 ------------------------------------------------------
+
+    #[test]
+    fn v1_11_to_v1_12_promotes_margin_scalar_to_xy_object() {
+        let mut v = json!({
+            "schema_version": 11,
+            "avatar": {
+                "margin_px": 24,
+            }
+        });
+        assert!(looks_v1_11(&v));
+        migrate_v1_11_to_v1_12(&mut v);
+        let avatar = v.get("avatar").unwrap();
+        assert!(
+            avatar.get("margin_px").is_none(),
+            "legacy scalar should be removed",
+        );
+        let margin = avatar.get("margin").unwrap();
+        assert_eq!(margin.get("x_px").unwrap(), 24);
+        assert_eq!(margin.get("y_px").unwrap(), 24);
         assert_eq!(
             v.get("schema_version").and_then(Value::as_u64),
             Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64)
         );
-        assert!(!looks_v1_10(&v));
+        assert!(!looks_v1_11(&v));
+    }
+
+    #[test]
+    fn v1_11_to_v1_12_falls_back_to_default_when_legacy_field_missing() {
+        // A v1.11 file in which the user already had a partially-migrated
+        // avatar block (e.g. settings hand-edits) — the migration should
+        // still produce a valid `margin` object so the schema's
+        // serde-default doesn't have to silently absorb the gap.
+        let mut v = json!({
+            "schema_version": 11,
+            "avatar": {}
+        });
+        migrate_v1_11_to_v1_12(&mut v);
+        let margin = v.get("avatar").unwrap().get("margin").unwrap();
+        assert_eq!(margin.get("x_px").unwrap(), 16);
+        assert_eq!(margin.get("y_px").unwrap(), 16);
     }
 
     #[test]

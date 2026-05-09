@@ -701,17 +701,30 @@
               />
             </label>
           </div>
-          <label>
-            <span>Margin (px)</span>
-            <input
-              type="number"
-              min="0"
-              max="200"
-              value={snapshot.avatar.margin_px}
-              onchange={(e) =>
-                patch((s) => (s.avatar.margin_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
-            />
-          </label>
+          <div class="row">
+            <label>
+              <span>Margin X (px)</span>
+              <input
+                type="number"
+                min="0"
+                max="200"
+                value={snapshot.avatar.margin.x_px}
+                onchange={(e) =>
+                  patch((s) => (s.avatar.margin.x_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+            <label>
+              <span>Margin Y (px)</span>
+              <input
+                type="number"
+                min="0"
+                max="200"
+                value={snapshot.avatar.margin.y_px}
+                onchange={(e) =>
+                  patch((s) => (s.avatar.margin.y_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+          </div>
           <label>
             <span>Opacity: {Math.round(snapshot.avatar.opacity * 100)}%</span>
             <input

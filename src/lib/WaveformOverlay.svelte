@@ -38,12 +38,14 @@
   // avatar's image area regardless of resize/reposition.
   let avatarWidthPx = $state(240);
   let avatarHeightPx = $state(240);
-  let avatarMarginPx = $state(16);
+  let avatarMarginXPx = $state(16);
+  let avatarMarginYPx = $state(16);
   let avatarPositionClass = $state<string>('top-right');
   const unsubAvatar = avatarSettings.subscribe((a) => {
     avatarWidthPx = a.size.width_px;
     avatarHeightPx = a.size.height_px;
-    avatarMarginPx = a.margin_px;
+    avatarMarginXPx = a.margin.x_px;
+    avatarMarginYPx = a.margin.y_px;
     avatarPositionClass = a.position;
   });
 
@@ -51,7 +53,8 @@
     [
       `--avatar-width: ${avatarWidthPx}px`,
       `--avatar-height: ${avatarHeightPx}px`,
-      `--avatar-margin: ${avatarMarginPx}px`,
+      `--avatar-margin-x: ${avatarMarginXPx}px`,
+      `--avatar-margin-y: ${avatarMarginYPx}px`,
     ].join(';'),
   );
 
@@ -164,20 +167,20 @@
      centred over the avatar's image area. Top-* positions add the same
      32px tab-bar clearance the avatar uses. */
   .waveform-container.top-right {
-    top: calc(var(--avatar-margin) + 32px);
-    right: var(--avatar-margin);
+    top: calc(var(--avatar-margin-y) + 32px);
+    right: var(--avatar-margin-x);
   }
   .waveform-container.top-left {
-    top: calc(var(--avatar-margin) + 32px);
-    left: var(--avatar-margin);
+    top: calc(var(--avatar-margin-y) + 32px);
+    left: var(--avatar-margin-x);
   }
   .waveform-container.bottom-right {
-    bottom: var(--avatar-margin);
-    right: var(--avatar-margin);
+    bottom: var(--avatar-margin-y);
+    right: var(--avatar-margin-x);
   }
   .waveform-container.bottom-left {
-    bottom: var(--avatar-margin);
-    left: var(--avatar-margin);
+    bottom: var(--avatar-margin-y);
+    left: var(--avatar-margin-x);
   }
   .hidden {
     opacity: 0;

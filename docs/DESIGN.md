@@ -608,7 +608,7 @@ The on-disk JSON shape, current as of v1.9. The example below shows the fully-re
     "visible": true,
     "size": { "width_px": 240, "height_px": 240 },
     "position": "top-right",
-    "margin_px": 16,
+    "margin": { "x_px": 16, "y_px": 16 },
     "opacity": 0.8,
     "images": {
       "idle":      "/path/to/idle.gif",

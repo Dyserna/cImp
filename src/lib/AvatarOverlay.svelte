@@ -39,8 +39,10 @@
     [
       `--avatar-width: ${$avatarSettings.size.width_px}px`,
       `--avatar-height: ${$avatarSettings.size.height_px}px`,
-      `--avatar-margin: ${$avatarSettings.margin_px}px`,
+      `--avatar-margin-x: ${$avatarSettings.margin.x_px}px`,
+      `--avatar-margin-y: ${$avatarSettings.margin.y_px}px`,
       `--avatar-opacity: ${$avatarSettings.opacity}`,
+      `--avatar-border-color: ${$avatarSettings.waveform.color}`,
     ].join(';'),
   );
 
@@ -163,29 +165,29 @@
     z-index: 10;
   }
   /* Top-positioned variants add 32px (one per-pane tab bar height,
-     declared in TabBar.svelte) on top of the user's margin so the
+     declared in TabBar.svelte) on top of the user's Y margin so the
      avatar clears the focused pane's tab bar instead of obscuring it.
      Without this, top-right / top-left avatars sit over the tab bar
      of whichever pane occupies that corner. Bottom-* positions don't
      need clearance — panes have no bottom bar. */
   .avatar-container.top-right {
-    top: calc(var(--avatar-margin) + 32px);
-    right: var(--avatar-margin);
+    top: calc(var(--avatar-margin-y) + 32px);
+    right: var(--avatar-margin-x);
     flex-direction: row;
   }
   .avatar-container.top-left {
-    top: calc(var(--avatar-margin) + 32px);
-    left: var(--avatar-margin);
+    top: calc(var(--avatar-margin-y) + 32px);
+    left: var(--avatar-margin-x);
     flex-direction: row-reverse;
   }
   .avatar-container.bottom-right {
-    bottom: var(--avatar-margin);
-    right: var(--avatar-margin);
+    bottom: var(--avatar-margin-y);
+    right: var(--avatar-margin-x);
     flex-direction: row;
   }
   .avatar-container.bottom-left {
-    bottom: var(--avatar-margin);
-    left: var(--avatar-margin);
+    bottom: var(--avatar-margin-y);
+    left: var(--avatar-margin-x);
     flex-direction: row-reverse;
   }
 
@@ -195,6 +197,10 @@
     height: var(--avatar-height);
     opacity: var(--avatar-opacity);
     pointer-events: auto;
+    /* 1px frame in the user's waveform color; outline keeps the image's
+       layout box untouched (no inward squeeze) and renders cleanly over
+       the terminal underneath. */
+    outline: 1px solid var(--avatar-border-color);
   }
 
   .avatar-image {

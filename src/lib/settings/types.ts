@@ -11,6 +11,14 @@ export interface AvatarSize {
   height_px: number;
 }
 
+/// Per-axis offset from the screen edge specified by `AvatarPosition`.
+/// Replaces the pre-v1.12 scalar `margin_px` field; the migration copies
+/// the legacy value into both axes.
+export interface AvatarMargin {
+  x_px: number;
+  y_px: number;
+}
+
 export interface AvatarImages {
   idle: string | null;
   listening: string | null;
@@ -35,7 +43,7 @@ export interface AvatarSettings {
   visible: boolean;
   size: AvatarSize;
   position: AvatarPosition;
-  margin_px: number;
+  margin: AvatarMargin;
   opacity: number;
   images: AvatarImages;
   transition: TransitionSettings;
@@ -349,7 +357,7 @@ export interface LayoutPreset {
 /// `src-tauri/src/settings/schema.rs`. Bumped on every backend migration
 /// step. Frontend doesn't read it for any logic — it round-trips as a
 /// bare integer through the IPC bridge.
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 export interface Settings {
   /// On-disk schema version. The backend stamps `CURRENT_SCHEMA_VERSION`
@@ -464,7 +472,7 @@ export function defaultSettings(): Settings {
       visible: true,
       size: { width_px: 240, height_px: 240 },
       position: 'top-right',
-      margin_px: 16,
+      margin: { x_px: 16, y_px: 16 },
       opacity: 0.8,
       images: {
         idle: null,

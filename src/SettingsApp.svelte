@@ -21,7 +21,7 @@
     ShellTabConfig,
     TabConfig,
   } from './lib/settings/types';
-  import { findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
+  import { defaultSettings, findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
   import { contentClear, contentOpenFolder, setClaudeTabsEnabled } from './lib/ipc';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
@@ -29,6 +29,7 @@
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
   import ThemeSwatch from './lib/settings/ThemeSwatch.svelte';
+  import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
   import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from './lib/themes';
@@ -349,6 +350,73 @@
   /// tabs differently. Empty array when settings haven't loaded yet.
   const tabEntries = $derived<TabConfig[]>(snapshot?.tabs ?? []);
 
+  /// Active-tab metadata, used by the Advanced → "Apply to global"
+  /// button. The session's `active_tab_id` is the canonical
+  /// "currently focused tab" reference at the settings layer; if
+  /// nothing has set it yet (fresh install before any tab focus),
+  /// fall back to the first tab so the action remains useful.
+  const activeTabId = $derived(
+    snapshot?.session.active_tab_id ?? snapshot?.tabs[0]?.id ?? null,
+  );
+  const activeTab = $derived(
+    activeTabId && snapshot
+      ? snapshot.tabs.find((t) => t.id === activeTabId) ?? null
+      : null,
+  );
+  const activeTabHasOverrides = $derived(
+    activeTab !== null &&
+      (activeTab.theme_override !== null ||
+        (activeTab.background_override !== null &&
+          activeTab.background_override !== 'disabled')),
+  );
+
+  /// Promote the active tab's terminal palette + background overrides
+  /// to the global terminal settings, then clear overrides on every
+  /// tab so all tabs inherit the new global. The 'disabled' literal
+  /// in `background_override` is an opt-out, not a config, so it does
+  /// not get promoted.
+  /// Hard reset: replaces the live Settings struct with the canonical
+  /// defaults from `defaultSettings()`. Wipes user-created shell tabs,
+  /// saved layouts, shortcut overrides, etc. — fully destructive, so
+  /// gated on a native `confirm()` prompt.
+  function resetSettingsToDefaults() {
+    const ok = confirm(
+      'Reset every setting to its default? This wipes:\n' +
+        '  • all user-created shell tabs\n' +
+        '  • saved layouts and presets\n' +
+        '  • shortcut overrides\n' +
+        '  • theme, background, and per-tab overrides\n' +
+        '\nThis cannot be undone.',
+    );
+    if (!ok) return;
+    void applySettings(defaultSettings());
+  }
+
+  function applyActiveTabOverridesToGlobal() {
+    patch((s) => {
+      const id = s.session.active_tab_id ?? s.tabs[0]?.id;
+      if (!id) return;
+      const src = s.tabs.find((t) => t.id === id);
+      if (!src) return;
+      if (src.theme_override) {
+        s.terminal.theme = src.theme_override;
+      }
+      if (
+        src.background_override !== null &&
+        src.background_override !== 'disabled'
+      ) {
+        s.terminal.background = {
+          ...s.terminal.background,
+          ...src.background_override,
+        };
+      }
+      for (const t of s.tabs) {
+        t.theme_override = null;
+        t.background_override = null;
+      }
+    });
+  }
+
   function aiTabAt(id: string): AiToolTabConfig | null {
     return aiTabFromSnapshot(id);
   }
@@ -432,6 +500,9 @@
   }
 </script>
 
+{#if $settings.ui.theme === 'tui'}
+  <TuiTitleBar title="cctts settings" />
+{/if}
 {#if !snapshot}
   <div class="loading">Loading settings…</div>
 {:else}
@@ -767,6 +838,7 @@
                 patch((s) => (s.ui.theme = (e.currentTarget as HTMLSelectElement).value))}
             >
               <option value="modern-dark">Modern Dark</option>
+              <option value="tui">TUI</option>
             </select>
           </label>
 
@@ -1348,6 +1420,30 @@
         </section>
       {:else if activeSection === 'advanced'}
         <section>
+          <h2>Per-tab overrides</h2>
+          <small class="hint top">
+            Promote the active tab's terminal palette and background
+            overrides to the global defaults, then clear the overrides
+            on every tab so they inherit the new global. Useful after
+            dialing in one tab and wanting the rest to match.
+          </small>
+          <button
+            type="button"
+            class="promote-overrides"
+            onclick={applyActiveTabOverridesToGlobal}
+            disabled={!activeTabHasOverrides}
+          >
+            {#if activeTab && activeTabHasOverrides}
+              Apply "{activeTab.name}" overrides to global
+            {:else if activeTab}
+              No overrides on "{activeTab.name}" to promote
+            {:else}
+              No active tab
+            {/if}
+          </button>
+        </section>
+
+        <section>
           <h2>Processing</h2>
           <small class="hint top">
             Stream-stability tuning for the segmenter. Increase if speech
@@ -1500,6 +1596,22 @@
               Delete all files
             </button>
           </div>
+        </section>
+
+        <section>
+          <h2>Reset</h2>
+          <small class="hint top">
+            Replace every setting with its factory default. Wipes
+            user-created shell tabs, saved layouts, shortcut overrides,
+            and all theme / background overrides. Cannot be undone.
+          </small>
+          <button
+            type="button"
+            class="danger"
+            onclick={resetSettingsToDefaults}
+          >
+            Reset all settings to defaults
+          </button>
         </section>
       {:else if activeSection === 'about'}
         <section class="about-section">
@@ -1751,6 +1863,14 @@
   }
   button.ghost {
     background: transparent;
+  }
+  button.danger {
+    color: var(--text-danger-bright);
+    border-color: var(--border-danger);
+  }
+  button.danger:hover:not(:disabled) {
+    background: var(--surface-danger-soft);
+    border-color: var(--border-danger-strong);
   }
   small.hint {
     display: block;

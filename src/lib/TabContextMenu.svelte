@@ -52,7 +52,11 @@
     paneId: PaneId;
     /// When provided, the tab section renders. When null, only the
     /// pane section shows (right-click on the bar background).
-    tab: { id: TabId; builtin: boolean; canRestart: boolean } | null;
+    /// `kind` lets the menu show "Configure…" for builtin AI tabs
+    /// (Claude / Claude-local) where the parent routes Configure to
+    /// the Settings window. Builtin shell tabs continue to hide it
+    /// because their ConfigureTabDialog rejects builtin-shell edits.
+    tab: { id: TabId; builtin: boolean; kind: 'shell' | 'ai-tool'; canRestart: boolean } | null;
     /// Tab actions. Required when `tab` is non-null; ignored otherwise.
     /// Optional in the type to make the bar-background callsite
     /// boilerplate-free.
@@ -158,10 +162,12 @@
     <button type="button" class="entry" role="menuitem" onclick={fire(onRename)}>
       Rename
     </button>
-    {#if !tab.builtin}
+    {#if !tab.builtin || tab.kind === 'ai-tool'}
       <button type="button" class="entry" role="menuitem" onclick={fire(onConfigure)}>
         Configure…
       </button>
+    {/if}
+    {#if !tab.builtin}
       {#if tab.canRestart && onRestart}
         <button type="button" class="entry" role="menuitem" onclick={fire(onRestart)}>
           Restart shell

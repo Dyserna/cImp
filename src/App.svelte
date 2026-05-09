@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LayoutNodeRenderer from './lib/LayoutNodeRenderer.svelte';
   import StatusBar from './lib/StatusBar.svelte';
+  import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import AvatarOverlay from './lib/AvatarOverlay.svelte';
   import WaveformOverlay from './lib/WaveformOverlay.svelte';
   import ComposeOverlay from './lib/ComposeOverlay.svelte';
@@ -369,7 +370,13 @@
     overlays remain at app root, layered over the entire content area;
     they subscribe to `activeTab`-derived stores which are kept in
     sync with the focused pane's active tab.
+
+    Custom title bar mounts under TUI only — modern-dark keeps OS
+    chrome via setDecorations(true) wired in main.ts.
   -->
+  {#if $settings.ui.theme === 'tui'}
+    <TuiTitleBar title="cctts" />
+  {/if}
   <div class="terminal-area">
     <LayoutNodeRenderer node={$layout.tree} />
     <AvatarOverlay />

@@ -196,9 +196,10 @@ export interface ProcessingSettings {
 }
 
 export interface UiSettings {
-  /// Active UI chrome theme. V5-01 ships only `"modern-dark"`; the field
-  /// exists so future themes (light, high-contrast) plug in without UI
-  /// plumbing churn. Distinct from `terminal.theme`, which governs the
+  /// Active UI chrome theme. Two values currently ship: `"modern-dark"`
+  /// (slate-blue + mint, OS-native window chrome) and `"tui"` (gruvbox
+  /// + custom title bar, ratatui aesthetic). New installs default to
+  /// `"tui"`. Distinct from `terminal.theme`, which governs the
   /// xterm.js terminal palette inside each tab.
   theme: string;
 }
@@ -577,9 +578,9 @@ export function defaultSettings(): Settings {
     session: { active_tab_id: null },
     layout: null,
     layout_presets: [],
-    ui: { theme: 'modern-dark' },
+    ui: { theme: 'tui' },
     terminal: {
-      theme: { name: 'Default', custom: null },
+      theme: { name: 'Gruvbox Dark', custom: null },
       background: {
         image: null,
         color: null,

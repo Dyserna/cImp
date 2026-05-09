@@ -899,15 +899,19 @@ impl Default for BehaviorSettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UiSettings {
-    /// Active UI chrome theme. V5-01 ships only `"modern-dark"`; future
-    /// themes (light, high-contrast) plug in here as additional values.
+    /// Active UI chrome theme. Two values currently ship: `"modern-dark"`
+    /// (slate-blue + mint, OS-native window chrome) and `"tui"` (gruvbox
+    /// + custom title bar, ratatui aesthetic). New installs land on
+    /// `"tui"`. Existing settings.json files keep whatever value they
+    /// were persisted with — defaults only apply when serde fills in a
+    /// missing field.
     pub theme: String,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: "modern-dark".to_string(),
+            theme: "tui".to_string(),
         }
     }
 }
@@ -950,7 +954,7 @@ pub struct TerminalThemeSettings {
 impl Default for TerminalThemeSettings {
     fn default() -> Self {
         Self {
-            name: "Default".to_string(),
+            name: "Gruvbox Dark".to_string(),
             custom: None,
         }
     }

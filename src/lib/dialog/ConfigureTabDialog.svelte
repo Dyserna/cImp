@@ -485,7 +485,7 @@
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-lg);
     padding: 20px var(--space-5);
-    width: 480px;
+    width: 560px;
     max-width: calc(100vw - 40px);
     color: var(--text-primary);
     z-index: 101;
@@ -517,6 +517,11 @@
   }
   .appearance-row select {
     flex: 1;
+    /* Without min-width:0, the select's intrinsic content size (a long
+       option label like "Use global default (current: …)") prevents
+       it from shrinking inside the flex row, pushing the trailing
+       ThemeSwatch past the dialog's right edge. */
+    min-width: 0;
   }
   .footer-note {
     color: var(--text-tertiary);

@@ -234,7 +234,12 @@
     y={menu.y}
     paneId={pane.id}
     tab={t
-      ? { id: t.id, builtin: t.builtin, canRestart: isShell && !closed }
+      ? {
+          id: t.id,
+          builtin: t.builtin,
+          kind: isShell ? 'shell' : 'ai-tool',
+          canRestart: isShell && !closed,
+        }
       : null}
     onRename={t ? () => (renamingTab = t.id) : undefined}
     onConfigure={t

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use crate::audio::AudioOutput;
 use crate::settings::SettingsHandle;
@@ -36,6 +36,16 @@ pub struct AppState {
     /// Settings window can read+clear it on mount (cold-open path)
     /// while a `settings-deep-link` event covers the hot-open path.
     pub pending_settings_deep_link: Arc<Mutex<Option<String>>>,
+    /// Serializes tab-lifecycle commands (`create_shell_tab`,
+    /// `close_tab`, `reconfigure_shell_tab`, `set_claude_tabs_enabled`)
+    /// against each other. Without this each command would interleave
+    /// its multiple read-modify-write passes against `state.settings`
+    /// and the registry, producing inconsistent state — for example,
+    /// `set_claude_tabs_enabled` reading `had_cloud=true` and racing a
+    /// concurrent `close_tab` of the same Claude tab. The lifecycle
+    /// commands are user-initiated and rare; the serializer is cheap
+    /// and trivially correct.
+    pub lifecycle_serializer: Arc<TokioMutex<()>>,
 }
 
 #[derive(Clone)]

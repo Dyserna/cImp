@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::error::{AppError, AppResult};
+use crate::processing::permission::PermissionPattern;
 use crate::pty::tasks;
 use crate::state::{StateSignal, TabId};
 use crate::tts::TtsRequest;
@@ -84,6 +85,7 @@ impl PtyManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         app: AppHandle,
@@ -94,6 +96,7 @@ impl PtyManager {
         tts_segments: mpsc::Sender<TtsRequest>,
         user_typed_tts: Arc<StdMutex<HashSet<String>>>,
         state_signals: mpsc::Sender<StateSignal>,
+        patterns: Arc<Vec<PermissionPattern>>,
     ) -> AppResult<()> {
         let mut guard = self.inner.lock().await;
         if guard.is_some() {
@@ -193,6 +196,7 @@ impl PtyManager {
             user_typed_tts,
             state_signals.clone(),
             settings,
+            patterns,
         );
         tasks::spawn_waiter(tab.clone(), child, app, cancel.clone(), state_signals);
 
@@ -467,6 +471,7 @@ mod tests {
         );
 
         let tab = TabId::Shell("shell-test".to_string());
+        let patterns = Arc::new(Vec::new());
         spawn_processor(
             tab,
             bytes_rx,
@@ -477,6 +482,7 @@ mod tests {
             typed,
             state_tx,
             settings,
+            patterns,
         );
 
         // Bytes before the rebind. The processor's flush tick is 50ms;
@@ -531,6 +537,7 @@ mod tests {
         let initial: Channel<String> = Channel::new(|_| Ok(()));
 
         let tab = TabId::Shell("shell-test".to_string());
+        let patterns = Arc::new(Vec::new());
         spawn_processor(
             tab,
             bytes_rx,
@@ -541,6 +548,7 @@ mod tests {
             typed,
             state_tx,
             settings,
+            patterns,
         );
 
         // Three rapid rebinds. The last channel is the one whose buffer

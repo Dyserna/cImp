@@ -56,19 +56,23 @@ pub async fn pty_start(
         )
         .await?;
 
-    // V1.4-04 D.5: read-and-consume any persisted scrollback for this
-    // tab. Done after a successful start so a spawn failure doesn't
-    // burn the persisted bytes.
+    // V1.4-04 D.5: read any persisted scrollback for this tab. Done
+    // after a successful start so a spawn failure doesn't burn the
+    // bytes. V0.6+: read-then-delete is split — we only delete the
+    // on-disk file after `seed_scrollback` returns Ok, so a transient
+    // seed failure (poisoned mutex, ring contention) leaves the file
+    // in place for the next launch to retry rather than dropping the
+    // user's scrollback between read and seed.
     if !restore_on_launch {
         return Ok(None);
     }
-    let restored = crate::pty::scrollback::take(&tab);
+    let restored = crate::pty::scrollback::read(&tab);
     if let Some(bytes) = &restored {
-        // Seed the new ring with the restored bytes so a subsequent
-        // crash-restart still has them. Logging-only on error: the
-        // user-visible replay (the returned bytes) succeeds regardless.
-        if let Err(e) = registry.seed_scrollback(&tab, bytes).await {
-            tracing::warn!(?tab, error = %e, "scrollback seed failed");
+        match registry.seed_scrollback(&tab, bytes).await {
+            Ok(()) => crate::pty::scrollback::consume_after_read(&tab),
+            Err(e) => {
+                tracing::warn!(?tab, error = %e, "scrollback seed failed; on-disk copy retained for retry");
+            }
         }
     }
     Ok(restored)
@@ -162,11 +166,29 @@ pub async fn pty_write(
                     set.insert(key);
                 }
             }
+            // V0.6+ bound: drop the set when it grows past a generous cap.
+            // Each entry is a normalized `[[TTS]]…[[/TTS]]` body that the
+            // user typed or pasted; a long-lived session that pastes many
+            // such blocks would otherwise leak a few hundred MB. Clearing
+            // is a wider net than LRU eviction (a tiny window where an
+            // echo could slip through) but doesn't pull a new dep, and
+            // the worst-case symptom is one extra spoken segment.
+            const USER_TYPED_TTS_CAP: usize = 4096;
+            if set.len() > USER_TYPED_TTS_CAP {
+                set.clear();
+            }
         }
     }
 
-    // Clone the counter Arc out so we don't hold the read lock across the
-    // subsequent .await on the registry. Counters are cheap to clone.
+    // Take the registry lock once at the top so the keystroke / submit
+    // counter updates and the final write run inside the same critical
+    // section. Pre-V0.6 the counter Arc was cloned out under the read
+    // lock and used after dropping it, racing with `close_tab` which
+    // removes the counter. Holding the lock end-to-end eliminates that
+    // window: if the tab was just closed, `registry.write` errors out
+    // cleanly with `unknown tab` and no half-applied state remains.
+    let registry = state.tabs.lock().await;
+
     let len_counter = {
         let map = state
             .input_lengths
@@ -186,18 +208,17 @@ pub async fn pty_write(
             let _ = state
                 .state_signals
                 .try_send(StateSignal::UserKeystroke { tab: tab.clone() });
-            // Interrupt-on-input only fires when the typed-into tab is the
-            // one actually playing. The audio output is shared; we only
-            // need the active-tab check at the registry level (the audio
-            // belongs to whichever tab is active). Reading active is cheap.
-            if state.settings.current().behavior.interrupt_on_input {
-                let active = state.tabs.lock().await.active();
-                if tab == active {
-                    if let Ok(slot) = state.audio.read() {
-                        if let Some(audio) = slot.as_ref() {
-                            if audio.is_playing() {
-                                audio.stop_all();
-                            }
+            // Interrupt-on-input fires when the typed-into tab is the one
+            // actually playing. We hold the registry lock so `active()` is
+            // a stable read against the same critical section as the
+            // final write below.
+            if state.settings.current().behavior.interrupt_on_input
+                && tab == registry.active()
+            {
+                if let Ok(slot) = state.audio.read() {
+                    if let Some(audio) = slot.as_ref() {
+                        if audio.is_playing() {
+                            audio.stop_all();
                         }
                     }
                 }
@@ -205,7 +226,6 @@ pub async fn pty_write(
         }
     }
 
-    let registry = state.tabs.lock().await;
     registry.write(tab, input.into_bytes()).await
 }
 
@@ -402,6 +422,40 @@ pub async fn settings_update(
 ) -> AppResult<()> {
     state.settings.set(settings);
     Ok(())
+}
+
+/// Open `<exe-dir>/logs/content/` in the host file manager. Creates the
+/// folder first if it doesn't exist so the call doesn't 404 on a clean
+/// install. Windows uses `explorer.exe`; macOS `open`; Linux
+/// `xdg-open`. Errors are wrapped in `AppError::Settings` for a single
+/// IPC error type.
+#[tauri::command]
+pub async fn content_open_folder() -> AppResult<()> {
+    let dir = crate::content::dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(AppError::Settings(format!(
+            "create_dir_all {}: {e}",
+            dir.display()
+        )));
+    }
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg(&dir).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&dir).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&dir).spawn()
+    };
+    result
+        .map(|_| ())
+        .map_err(|e| AppError::Settings(format!("open folder: {e}")))
+}
+
+/// Delete every file inside `<exe-dir>/logs/content/`. Returns the
+/// count of removed files. Per-file failures are logged backend-side
+/// and do not abort the pass.
+#[tauri::command]
+pub async fn content_clear() -> AppResult<u32> {
+    Ok(crate::content::delete_all())
 }
 
 #[tauri::command]

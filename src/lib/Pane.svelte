@@ -53,6 +53,14 @@
   // unmounting pane won't pull a host back to offscreen if a sibling
   // pane has already attached it — the host's current parent is no
   // longer this slot in that case, so detach skips.
+  //
+  // The attach passes `focus: focused` so only the focused pane's
+  // active-tab change moves keyboard focus to xterm. Without this
+  // gate, an active-tab swap in any pane (context menu, drag commit,
+  // layout-store mutation) would steal focus from whichever pane the
+  // user is currently typing in. The dedicated focus-on-pane-focus
+  // effect below still fires `focusTerminalFor` when the focused
+  // pane's tab is unchanged.
   $effect(() => {
     if (!slotEl) return;
     const desired = pane.active_tab_id;
@@ -61,7 +69,7 @@
       detachTerminal(mountedTab, slotEl);
     }
     if (desired !== null && hasTerminal(desired)) {
-      attachTerminal(desired, slotEl);
+      attachTerminal(desired, slotEl, { focus: focused });
     }
     mountedTab = desired;
   });

@@ -154,7 +154,7 @@ Two kinds, distinguished by an enum:
 
 ```rust
 pub enum TabKind {
-    AiTool,   // V1.4-07: collapsed (was AiTool(ClaudeCode | Aider))
+    AiTool,
     Shell,
 }
 ```
@@ -177,19 +177,20 @@ The `claude_still_generating` helper flag (used to disambiguate Speaking → Thi
 
 ### Tab Lifecycle
 
-Three reserved tab IDs are always present (the integrity check at load time restores them if a hand-edited settings file deletes them):
+Two AI builtin tab IDs are protected by the integrity check; their presence is governed by the top-level `claude_tabs_enabled` setting (`Cloud` | `Local` | `Both`, default `Cloud`):
 
-- `claude` — Claude Code with subscription/API auth, builtin AI-tool tab
-- `claude-local` — second Claude Code tab preconfigured to talk to a local LLM via env-var injection (V1.4-07; replaces the v1.7-and-earlier `aider` reserved id)
-- `shell-default-1` — the first Shell tab, with a sensible default shell per platform
+- `claude` — Claude Code with subscription/API auth. Restored at position 0 by the integrity check when `claude_tabs_enabled.includes_cloud()` and the tab is missing; removed when the setting excludes cloud and the tab is present.
+- `claude-local` — second Claude Code tab preconfigured to talk to a local LLM via env-var injection (V1.4-07; replaces the v1.7-and-earlier `aider` reserved id). Restored / removed analogously based on `claude_tabs_enabled.includes_local()`.
+- `shell-default-1` — the first Shell tab on a fresh install, with a sensible default shell per platform. Despite the reserved-looking id, it is **not** a builtin: `default_shell_1_tab(...)` returns it with `builtin: false`, and the integrity check does not re-seed it. Once the user closes it, it stays closed. Older settings files that persisted `builtin: true` on this id are demoted to `false` on load.
 
 Backend Tauri commands expose tab CRUD:
 
 - `create_shell_tab(name, command, args, cwd, env, notifications) -> TabId` — validates inputs, spawns the PTY, registers the new TabState, persists settings, broadcasts `tab-created`
-- `close_tab(tab_id)` — rejects builtins; otherwise kills the subprocess, drops processing tasks, removes the TabState, persists, broadcasts `tab-closed`
+- `close_tab(tab_id)` — rejects AI builtins (`claude`, `claude-local`); otherwise kills the subprocess, drops processing tasks, removes the TabState, persists, broadcasts `tab-closed`. `shell-default-1` is closable like any other shell.
 - `rename_tab(tab_id, new_name)` — updates name, persists, broadcasts
 - `reconfigure_shell_tab(tab_id, ...)` — updates persisted config without respawning; the change applies on the next restart of that shell
 - `restart_shell_tab(tab_id)` — kills the running subprocess (if any) and respawns with current config
+- `open_settings_window_to_tab(tab_id)` — used by the right-click Configure entry on AI tabs (V1.4-07 Phase A). Opens the Settings window and emits a `settings-deep-link` event the Settings frontend listens for to scroll/focus the matching tab section. Shell tabs continue to use the dedicated `ConfigureTabDialog` modal.
 
 The state manager broadcasts `TabCreated`, `TabClosed`, `TabRenamed`, and `TabClosedStateChanged` events for the frontend to react to.
 
@@ -199,7 +200,7 @@ When a Shell-tab subprocess exits — `exit` typed, shell crashed, killed extern
 
 Subprocess exit on an AI tab routes to Error; AI-tab auto-restart is out of scope.
 
-If a user-created Shell tab's command no longer resolves at launch (binary uninstalled, path moved), the tab is created in the closed state with `closed_exit_code = None` and a "Shell command not found" message. The user fixes the config via right-click → Configure and restarts.
+If a user-created Shell tab's command no longer resolves at launch (binary uninstalled, path moved), the tab is created in the closed state with `closed_exit_code = None` and a "Shell command not found" message. The user fixes the config via right-click → Configure (which opens `ConfigureTabDialog` for shell tabs) and restarts.
 
 ### Processing Layer
 
@@ -323,6 +324,7 @@ When a tab's state changes meaningfully and the user is focused elsewhere, an au
 |------------------------------------|--------------------------|
 | Anything → Idle                    | `idle`                   |
 | Anything → AwaitingPermission      | `awaiting_permission`    |
+| AskUserQuestion-style prompt fires | `question`               |
 | Anything → Error                   | `error`                  |
 
 | Transition (Shell tab)             | Notification event       |
@@ -350,6 +352,8 @@ Notifications go through a dedicated queue, separate from per-tab TTS:
 - **Global "announcements enabled" toggle** in settings (default ON). When OFF, no notifications fire.
 - **Quick toggle** in the bottom status bar — same effect as the settings toggle, accessible without opening settings.
 - **Per-(tab, event) notification text** in settings. Empty string disables that specific notification while leaving others active.
+- **`behavior.announce_focused_tab`** (default OFF) — when ON, notifications fire even for the focused-pane active tab. Default OFF preserves the historical "background-only" semantics.
+- **`behavior.follow_avatar`** (default OFF) — when ON, `tts.mute` syncs to the avatar's visible/hidden state (hiding mutes, showing unmutes). The frontend handles the sync; the backend just persists the flag.
 
 ### Layout System
 
@@ -535,41 +539,54 @@ Behavior is straightforward bindings: mute toggles `tts.mute`, announcements tog
 
 ### Settings Store
 
-JSON file in the OS config directory. Lives in `src-tauri/src/settings/`.
+Two JSON files participate, both under `src-tauri/src/settings/`:
 
-- Windows: `%APPDATA%\cctts\settings.json`
-- macOS: `~/Library/Application Support/cctts/settings.json`
-- Linux: `~/.config/cctts/settings.json`
+- **Global baseline** — `<exe-dir>/settings.json`. Portable; written once on first launch when missing and rewritten only on migration / integrity repair. Hand-edit to change defaults.
+- **Per-folder custom overlay** — `<launch_cwd>/.cctts.custom.config.json`. Partial JSON object containing only the keys that differ from the global baseline. Created automatically the first time the user customizes anything from a given working directory, deleted automatically when the diff is empty. Layered on top of global at load via deep-merge.
 
-Resolved via `dirs::config_dir().join("cctts").join("settings.json")`.
+This replaces an earlier design that wrote a single file under `dirs::config_dir().join("cctts")`. The portable + overlay model lets the user (a) carry the binary as a self-contained portable directory, and (b) keep per-project customizations alongside the project rather than in OS-global config.
 
-Loaded at app launch and held in memory in `SettingsHandle` (`Arc<Mutex<Settings>>` plus a `tokio::sync::broadcast` channel and a save signal). Mutations:
+`load(default_shell, launch_cwd)`:
 
-1. `SettingsHandle::set(new)` updates in-memory state, broadcasts the new struct to every subscriber (TTS engine, audio output, processing layer, notification manager, frontend), and signals the saver
-2. The saver task waits a 500 ms debounce window then writes the whole file; bursts coalesce into one disk write
-3. Tauri command handlers for individual settings sections call `set` after their mutation
+1. Read and parse the global file (seeding defaults if absent or quarantining + reseeding if corrupt).
+2. Read the overlay if present; deep-merge it onto the global value.
+3. Run the migration cascade against the merged `serde_json::Value` so a hand-imported legacy file at the global path still upgrades.
+4. Typed-deserialize into `Settings`; on failure fall back to global-only, never panic.
+5. Run the integrity check (see below). If anything migrated or repaired, persist the post-pass state — to the overlay if one was in play, otherwise to global.
+
+Loaded result is held in memory in `SettingsHandle` (`Arc<Mutex<Settings>>` plus a `tokio::sync::broadcast` channel and a save signal). The handle also carries a snapshot of the global baseline so the saver can compute diffs without re-reading disk. Mutations:
+
+1. `SettingsHandle::set(new)` updates in-memory state, broadcasts the new struct to every subscriber (TTS engine, audio output, processing layer, notification manager, frontend), and signals the saver.
+2. The saver task waits a 500 ms debounce window, then computes `diff(current, global_baseline)` and writes the result to the overlay file. An empty diff deletes the overlay rather than writing `{}`.
+3. Tauri command handlers for individual settings sections call `set` after their mutation.
 
 Components subscribe to specific slices they care about (`tts`, `avatar`, `display`, etc.) via Svelte derived stores on the frontend and broadcast receivers on the backend.
 
 #### Migrations
 
-`src-tauri/src/settings/migration.rs` runs on the loaded `serde_json::Value` *before* typed deserialization, so older shapes can be detected and transformed without struct evolution causing errors. Each migration writes a backup of the original alongside the file (`settings.json.v1.0.bak`, `settings.json.v1.1.bak`, `settings.json.v1.2.bak`), with a unix-timestamp-suffix rotation if a backup of the same version already exists.
+`src-tauri/src/settings/migration.rs` runs on the merged `serde_json::Value` *before* typed deserialization, so older shapes can be detected and transformed without struct evolution causing errors. Each migration writes a backup of the original alongside the file (`settings.json.v1.0.bak`, `settings.json.v1.1.bak`, …, `settings.json.v1.8.bak`), with a unix-timestamp-suffix rotation if a backup of the same version already exists.
 
-Detected shapes:
+Detection runs as a cascade so a sufficiently old file passes through every step in one launch (a v1.0 file lands at v1.9 with eight backups). The full set, in order:
 
-- **v1.0** — has a top-level `claude_code` object, no `tabs`. Lifts directly to v1.2 by synthesizing a v1.1-shaped Claude tab from the carried `extra_cli_args`.
-- **v1.1** — `tabs` is an *object* with `claude` / `aider` keys. Transforms into v1.2's `tabs` *array* with reserved ids, the default Shell tab, and the integrity-checked builtins.
-- **v1.2** — `tabs` is an array but the `layout` key is absent from the top-level object. Synthesizes a single root pane containing every tab in order, picks the focused-pane active tab from `session.active_tab_id` (or the first tab), drops `session.active_tab_id` (the layout owns it now), and seeds `layout_presets: []`.
-
-The v1.2 detector triggers only when the `layout` key is *entirely absent* from the JSON object — fresh-install files written by v1.3 with `"layout": null` are skipped, so backup rotation doesn't fire on every launch of a never-multi-paned install.
+- **v1 → v1.2** — top-level `claude_code` object with no `tabs` array; lifts to v1.2 by synthesizing a Claude tab from the carried `extra_cli_args`.
+- **v1.1 → v1.2** — `tabs` is an *object* with `claude` / `aider` keys; transforms into a v1.2 `tabs` *array* with reserved ids and the default Shell tab.
+- **v1.2 → v1.3** — `tabs` is an array but the `layout` key is absent from the top-level object. Synthesizes a single root pane containing every tab in order, picks the focused-pane active tab from `session.active_tab_id` (or the first tab), and seeds `layout_presets: []`. The detector triggers only when `layout` is *entirely absent* — files with `"layout": null` are skipped so backup rotation doesn't fire on every launch.
+- **v1.3 → v1.4** — V1.4-01 adds the top-level `terminal` group (with a `theme` sub-group) and per-tab `theme_override`. Drops the dead `display.theme` field at the same time.
+- **v1.4 → v1.5** — V1.4-02 adds `terminal.background` and per-tab `background_override`.
+- **v1.5 → v1.6** — V1.4-04 B adds `terminal.background.presets`.
+- **v1.6 → v1.7** — V1.4-04 D adds `terminal.scrollback` and explicitly stamps the C.4 `terminal.background.preview_category_flips` flag.
+- **v1.7 → v1.8** — V1.4-07 drops the aider tab kind, adds the global `claude_local` provider config, and adds the per-AI-tab `use_local_provider` flag. The aider tab is rewritten in place to `claude-local` (id, name, command, `use_local_provider`, `tts_injection` re-enabled). Layout-tree references to `"aider"` (in `tab_ids`, `active_tab_id`, layout presets, `session.active_tab_id`) are rewritten to `"claude-local"` in the same pass so the integrity check sees a self-consistent file.
+- **v1.8 → v1.9** — adds the `claude_tabs_enabled` setting (`Cloud` | `Local` | `Both`). The migration infers the initial value from the existing tabs array so users who had both Claude tabs in v1.8 keep both.
 
 #### Integrity check
 
 After migration and typed deserialization, an integrity pass repairs hand-edited files:
 
-- The three reserved tab ids (`claude`, `claude-local`, `shell-default-1`) are restored to canonical positions if missing, and forced to `builtin: true`
-- Reserved AI tabs have their `use_local_provider` flag coerced to the expected value (`false` for `claude`, `true` for `claude-local`) so a hand-edit can't silently flip the subscription Claude tab into local-LLM mode
-- Layout: tab refs in panes that don't exist in `settings.tabs` are dropped; an invalid `focused_pane_id` is reset to leftmost leaf
+1. **AI builtins forced to `builtin: true`.** The two AI tabs (`claude`, `claude-local`) cannot be demoted by a hand-edit.
+2. **`shell-default-1` demoted to `builtin: false`.** Older settings files that persisted `builtin: true` on this id are corrected — closability is uniform across all shell tabs.
+3. **`use_local_provider` coerced on AI builtins.** `false` for `claude`, `true` for `claude-local`, so a hand-edit can't silently flip the subscription tab into local-LLM mode.
+4. **AI builtins reconciled with `claude_tabs_enabled`.** `Cloud` → `claude` only, `Local` → `claude-local` only, `Both` → both. Missing tabs are restored at canonical positions (`claude` at index 0; `claude-local` immediately after `claude` if present, else index 0); disabled-but-present tabs are removed from the array. `shell-default-1` is intentionally untouched here — it's a regular closable shell.
+5. **Layout sanity.** Tab refs in panes that don't exist in `settings.tabs` are dropped; an invalid `focused_pane_id` is reset to leftmost leaf.
 
 The frontend's `validateAndRepairLayout` runs after this on hydration and handles deeper concerns (orphan placement, empty-pane collapse).
 
@@ -577,7 +594,7 @@ The frontend's `validateAndRepairLayout` runs after this on hydration and handle
 
 ## Settings Schema
 
-The on-disk JSON shape, current as of v1.3:
+The on-disk JSON shape, current as of v1.9. The example below shows the fully-resolved global file; the per-folder overlay (`.cctts.custom.config.json`) is a partial subset of the same shape.
 
 ```json
 {
@@ -591,7 +608,7 @@ The on-disk JSON shape, current as of v1.3:
     "visible": true,
     "size": { "width_px": 240, "height_px": 240 },
     "position": "top-right",
-    "margin_px": 16,
+    "margin": { "x_px": 16, "y_px": 16 },
     "opacity": 0.8,
     "images": {
       "idle":      "/path/to/idle.gif",
@@ -624,14 +641,30 @@ The on-disk JSON shape, current as of v1.3:
       "opacity": 0.4,
       "blur": 0,
       "size": "cover",
-      "position": "center"
+      "position": "center",
+      "snapshot_lines": 2000,
+      "presets": [],
+      "preview_category_flips": true
+    },
+    "scrollback": {
+      "ring_bytes": 262144,
+      "persist": true,
+      "restore_on_launch": true
     }
   },
+  "claude_local": {
+    "base_url": "http://localhost:4000",
+    "auth_token": "sk-dummy",
+    "model_alias": ""
+  },
+  "claude_tabs_enabled": "cloud",
   "behavior": {
     "interrupt_on_input": true,
     "auto_speak": true,
     "fallback_silent": true,
-    "announcements_enabled": true
+    "announcements_enabled": true,
+    "follow_avatar": false,
+    "announce_focused_tab": false
   },
   "compose": { "min_height_px": 80, "max_height_px": 300 },
   "shortcuts": {
@@ -666,6 +699,7 @@ The on-disk JSON shape, current as of v1.3:
       "notifications": {
         "idle": "Claude is idle",
         "awaiting_permission": "Claude is awaiting permission",
+        "question": "Claude has a question",
         "error": "Claude encountered an error"
       },
       "first_launch_notice_dismissed": true,
@@ -734,12 +768,18 @@ Notes:
 - Every Rust struct uses `#[serde(default)]` so a settings file written by a future or past version still loads — missing fields get defaults, unknown fields are ignored.
 - `tts_injection.enabled` controls whether cctts injects system-prompt content for an AI tab via `--append-system-prompt`. On by default for both AI builtins (subscription Claude and Claude (local)); local models vary in how reliably they honor the markup convention, so the local-tab version is best-effort.
 - `use_local_provider` (V1.4-07) gates env synthesis from the global `claude_local` settings group. When `true`, the launch-time spawn merges `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL` if the alias is non-empty) into the process env, with per-tab `env` entries always winning over synthesized values.
-- Reserved tab ids — `claude`, `claude-local`, `shell-default-1` — cannot disappear. The integrity check restores them with `builtin: true` and corrects `use_local_provider` on the AI builtins if a hand-edited file flipped them. User-created Shell tab ids are uuid-based and never collide.
+- `claude_tabs_enabled` (V1.9) drives the integrity-check reconciliation of the AI builtins: `Cloud` keeps only `claude`, `Local` keeps only `claude-local`, `Both` keeps both. Default is `Cloud`. Changing the value at runtime closes / re-opens the affected tabs (kills the PTY and drops scrollback when removing; re-creates with defaults when adding).
+- AI builtins (`claude`, `claude-local`) cannot be deleted by hand-edits — the integrity check restores them at canonical positions when `claude_tabs_enabled` says they should exist, and corrects `use_local_provider` if a hand-edit flipped it. The `shell-default-1` id is *not* a builtin: it ships as the first shell tab on a fresh install but is fully closable, and the integrity check does not re-seed it. User-created Shell tab ids are uuid-based and never collide with reserved ids.
+- `behavior.follow_avatar` (default off) auto-mutes when the avatar is hidden; `behavior.announce_focused_tab` (default off) lets announcements fire even for the focused tab.
+- `notifications.question` (per AI tab) is spoken when an AskUserQuestion-style multi-option prompt fires. Empty string disables.
 - `session.active_tab_id` is a legacy field. It still exists in the struct and is updated by the runtime on tab activation, but the v1.2 → v1.3 migration drops it from the file (the layout's per-pane `active_tab_id` plus `focused_pane_id` are the source of truth for active-tab state). Cleanup of the runtime write path is deferred.
 - `layout: null` on fresh installs and on the very first hydration after migration if for some reason no layout was synthesized; the frontend's `defaultLayoutForTabs` handles the null case by building a single root pane.
-- `terminal.background` (V1.4-02) has independent `image` and `color` fields plus opacity/blur/size/position controls that apply only when an image is set. The four-cell rendering matrix (image × color, each Some/None) drives a discriminated `RenderingMode` — `'none'` and `'color'` use xterm.js's canvas renderer (fast); `'image'` uses the in-core DOM renderer with `allowTransparency: true` and CSS layering on the host. Toggling between fast and image categories triggers a debounced Terminal recreate; same-category changes (color tweak, slider drag) apply in place. Per-tab `background_override` is three-state: `null` inherits the global, `"disabled"` opts out (theme bg only), an object replaces the global wholesale. The Configure Tab dialog (shell tabs) and the per-AI-tab Settings section both surface the override row, both reusing the shared `BackgroundConfigEditor` component. See `MILESTONE-V1.4-02-terminal-background.md` and `MILESTONE-V1.4-03-terminal-background.md`.
+- `terminal.background` (V1.4-02) has independent `image` and `color` fields plus opacity/blur/size/position controls that apply only when an image is set. The four-cell rendering matrix (image × color, each Some/None) drives a discriminated `RenderingMode` — `'none'` and `'color'` use xterm.js's canvas renderer (fast); `'image'` uses the in-core DOM renderer with `allowTransparency: true` and CSS layering on the host. Toggling between fast and image categories triggers a debounced Terminal recreate; same-category changes (color tweak, slider drag) apply in place. Per-tab `background_override` is three-state: `null` inherits the global, `"disabled"` opts out (theme bg only), an object replaces the global wholesale. The Configure Tab dialog (shell tabs) and the per-AI-tab Settings section both surface the override row, both reusing the shared `BackgroundConfigEditor` component. `terminal.background.presets` (V1.4-04 B) holds named global presets the user can apply from the Background editor; `preview_category_flips` (V1.4-04 C.4) gates whether per-tab Configure dialog edits that would flip renderer category preview live or are deferred to Save. See `MILESTONE-V1.4-02-terminal-background.md` and `MILESTONE-V1.4-03-terminal-background.md`.
+- `terminal.scrollback` (V1.4-04 D) configures the per-tab cross-restart scrollback ring buffer. `ring_bytes` caps in-memory size (default 256 KB); `persist` flushes on graceful exit; `restore_on_launch` replays on next `pty_start`.
 
-- **PTY rebind protocol (V1.4-03).** xterm.js's renderer is decided at `Terminal` construction (`allowTransparency` and the canvas vs. DOM split are constructor-only), so toggling the image background requires destroying the xterm Terminal and constructing a new one. To preserve the shell session across this destroy/create cycle, cctts uses `pty_rebind_channel` — the PTY and its child stay alive; only the IPC `Channel<String>` is swapped. Implementation: a per-PTY `mpsc::Sender<ProcessorControl>` (capacity 4) lets the manager push `ChannelChange(new_channel)` to the processor task's select loop, where the existing `mpsc::Receiver::recv` cancel-safety guarantee keeps byte ordering intact. `@xterm/addon-serialize` captures a snapshot of the visible scrollback before destroy and replays it into the new xterm via `term.write` *before* `pty_rebind_channel` resolves; xterm's FIFO write queue ensures the snapshot lands ahead of any live byte arriving after the rebind. The new `Terminal` is constructed with the previous instance's `rows`/`cols` so replayed cursor positions align with the new grid. Cross-app-restart scrollback is *not* in scope (it requires a backend ring buffer; deferred).
+- **PTY rebind protocol (V1.4-03).** xterm.js's renderer is decided at `Terminal` construction (`allowTransparency` and the canvas vs. DOM split are constructor-only), so toggling the image background requires destroying the xterm Terminal and constructing a new one. To preserve the shell session across this destroy/create cycle, cctts uses `pty_rebind_channel` — the PTY and its child stay alive; only the IPC `Channel<String>` is swapped. Implementation: a per-PTY `mpsc::Sender<ProcessorControl>` (capacity 4) lets the manager push `ChannelChange(new_channel)` to the processor task's select loop, where the existing `mpsc::Receiver::recv` cancel-safety guarantee keeps byte ordering intact. `@xterm/addon-serialize` captures a snapshot of the visible scrollback before destroy and replays it into the new xterm via `term.write` *before* `pty_rebind_channel` resolves; xterm's FIFO write queue ensures the snapshot lands ahead of any live byte arriving after the rebind. The new `Terminal` is constructed with the previous instance's `rows`/`cols` so replayed cursor positions align with the new grid.
+
+- **Cross-restart scrollback (V1.4-04 D).** Every PTY's output is mirrored into a per-tab ring buffer capped at `terminal.scrollback.ring_bytes` (default 256 KB ≈ 600 lines of dense ANSI). On graceful exit (`tauri::RunEvent::ExitRequested`) each tab's buffer is flushed to disk under the app data dir, keyed by sanitized tab id; on next `pty_start` the file is read back and replayed into the new xterm before any live PTY bytes. Settings: `persist` and `restore_on_launch` (both default `true`) gate the disk write and read-back independently. Orphan files (tabs that no longer exist) are pruned at startup against the registry's known ids.
 
 ---
 
@@ -802,10 +842,16 @@ The full set is in the settings schema above. Behavior of `switch_to_tab_N` is b
 
 ## Cross-Platform Considerations
 
+Settings paths on every platform:
+
+- Global baseline: `<exe-dir>/settings.json`
+- Per-folder overlay: `<launch_cwd>/.cctts.custom.config.json`
+
+These replace the OS-config-dir paths used in earlier versions. The portable design means cctts can be packaged as a self-contained directory, and per-project tweaks live alongside the project rather than in OS-global config.
+
 ### Windows
 
 - ConPTY for terminal (handled by `portable-pty`)
-- Settings path: `%APPDATA%\cctts\settings.json`
 - WebView2 as the Tauri webview backend
 - CUDA support for `ort` requires CUDA runtime libraries on PATH; cuDNN 9.21 lives at `v9.21\bin\12.9\x64` on the dev box and isn't on PATH by default — needed for the `ort` CUDA EP
 - Default shell: Git Bash auto-detected (probes `C:\Program Files\Git\bin\bash.exe`, `C:\Program Files (x86)\Git\bin\bash.exe`, `HKLM\SOFTWARE\GitForWindows\InstallPath`, then `bash.exe` on PATH); falls back to `powershell.exe -NoLogo` with a banner warning in the New Shell Tab dialog
@@ -813,7 +859,6 @@ The full set is in the settings schema above. Behavior of `switch_to_tab_N` is b
 ### Linux
 
 - Unix PTY via `forkpty` (handled by `portable-pty`)
-- Settings path: `~/.config/cctts/settings.json`
 - WebKitGTK as the Tauri webview backend
 - CUDA support for `ort` requires CUDA runtime
 - Default shell: `$SHELL` env var, fallback `/bin/bash`, fallback `/bin/sh`. Invoked with `-i` (interactive); no `--login` to avoid running login scripts that produce output the user didn't expect
@@ -893,8 +938,6 @@ src/lib/
 - Integration tests for settings load/save round-trips and migration end-to-end
 - Manual end-to-end testing for TTS, audio, transitions, drag-drop, splits, presets, notifications, cross-platform validation
 
-Cargo test count at v1.3 ship: 89 backend tests, 69 frontend tests.
-
 ### Frontend conventions
 
 - Svelte components in single-file `.svelte` files; one component per UI element
@@ -942,8 +985,8 @@ The avatar overlay, waveform visualizer, and xterm.js terminal interior are expl
 - **Amplitude tap** — the mechanism by which the audio playback path exposes recent sample data for the visualizer
 - **Tab** — an independently-spawned subprocess with its own PTY, processing layer, and avatar state
 - **Tab kind** — discriminator between `AiTool` (subscription Claude / Claude (local); full feature set) and `Shell` (configurable shell; reduced feature set)
-- **Builtin tab** — one of the three reserved-id tabs (`claude`, `claude-local`, `shell-default-1`) that the integrity check guarantees to exist
-- **User tab** — a Shell tab created by the user via the `+` button or `Ctrl+T`. Can be closed, renamed, reconfigured
+- **Builtin tab** — `claude` and `claude-local` only. The integrity check restores them per the `claude_tabs_enabled` setting and refuses to close them at runtime. `shell-default-1` is *not* a builtin despite its reserved-looking id — it ships only on fresh installs and is closable like any user shell.
+- **User tab** — a Shell tab (whether the seeded `shell-default-1` or one created later via the `+` button or `Ctrl+T`). Can be closed, renamed, reconfigured.
 - **Closed sub-state** — a Shell-tab UI state when the subprocess has exited; shows a restart message; pressing Enter respawns
 - **Tab status indicator** — visual element on the tab bar showing status (working, awaiting permission, error, done while away)
 - **DoneWhileAway** — a UI flag set when a tab transitions to Idle while not the focused pane's active tab; cleared when the user focuses that tab
@@ -966,7 +1009,7 @@ The avatar overlay, waveform visualizer, and xterm.js terminal interior are expl
 
 ## Where to Find More
 
-- **Per-milestone implementation detail**: `MILESTONE-V[N]-[N].md` files. v1 / v2 / v3 / v4 correspond to product versions v1.0 / v1.1 / v1.2 / v1.3 respectively (the design-doc version number is independent of the product version, as documented in the milestone preambles).
+- **Per-milestone implementation detail**: `MILESTONE-V[N]-[N].md` files. The milestone series numbering is independent of the git tag — each milestone preamble documents which release it shipped under (e.g. V1.4-01..04 → `v1.3.2`, V1.4-07 → `v1.3.3`). Cumulative releases are tagged on the `v0.x.y` line (most recent: `v0.4.0`).
 - **Deferred and future work**: `FUTURE-FEATURES.md` — both external dependencies and "we could build this but chose not to" items, with triggers for when to pick them up.
 - **Maintenance and operations**: `MAINTENANCE.md` — dependency upgrade notes, model files, runtime-prompt management.
 - **Packaging**: `PACKAGING.md` — release-build and distribution notes.

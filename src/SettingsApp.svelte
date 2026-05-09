@@ -16,17 +16,20 @@
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
+    ClaudeTabsEnabled,
     Settings,
     ShellTabConfig,
     TabConfig,
   } from './lib/settings/types';
-  import { findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
+  import { defaultSettings, findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
+  import { contentClear, contentOpenFolder, setClaudeTabsEnabled } from './lib/ipc';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
   import ThemeSwatch from './lib/settings/ThemeSwatch.svelte';
+  import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
   import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from './lib/themes';
@@ -114,6 +117,12 @@
   // listens for `settings-deep-link` events fired while the window is
   // already open. Both call `scrollToTabSection` with the same id.
   let unlistenDeepLink: (() => void) | undefined;
+  // Async-IIFE / async-onMount disposal guard. The deep-link listener
+  // is registered after an `await` and may not resolve before the
+  // window closes. Without this flag the late-resolving listener gets
+  // stored in `unlistenDeepLink` after onDestroy already ran, leaking
+  // the listener for the rest of the parent process's life.
+  let disposed = false;
 
   function scrollToTabSection(tabId: string): void {
     // Sidebar nav + sub-tabs both hide content, so flip both before
@@ -132,6 +141,7 @@
 
   onMount(async () => {
     await initSettings();
+    if (disposed) return;
     snapshot = structuredClone(get(settings));
     for (const t of AI_TABS) captureBaseline(t);
     unsub = settings.subscribe((s) => {
@@ -160,16 +170,25 @@
       .catch((e) => console.warn('consume_settings_deep_link failed', e));
 
     // V1.4-07 A: hot-open deep-link. Fired while this window is already
-    // open and the user clicks Configure on a different tab.
-    unlistenDeepLink = await listen<{ kind: string; tab_id: string }>(
+    // open and the user clicks Configure on a different tab. If we got
+    // disposed between the await and now, tear the listener down
+    // immediately rather than storing it where onDestroy can no longer
+    // reach it.
+    const deepLinkUnlisten = await listen<{ kind: string; tab_id: string }>(
       'settings-deep-link',
       (e) => {
         if (e.payload.kind === 'tab') scrollToTabSection(e.payload.tab_id);
       },
     );
+    if (disposed) {
+      deepLinkUnlisten();
+      return;
+    }
+    unlistenDeepLink = deepLinkUnlisten;
   });
 
   onDestroy(() => {
+    disposed = true;
     unsub?.();
     unlistenDeepLink?.();
   });
@@ -182,6 +201,38 @@
     updater(next);
     snapshot = next;
     void applySettings(next);
+  }
+
+  /// Apply a Claude-tabs-enabled radio change. Routes through the
+  /// dedicated IPC instead of a plain `applySettings` because the
+  /// backend has to open / close the AI builtin tabs (kill PTY, drop
+  /// scrollback) in response — `settings_update` alone wouldn't
+  /// trigger that lifecycle. Optimistically updates the local snapshot
+  /// so the radio reflects the new value before the broadcast comes
+  /// back; the broadcast overwrites with the same value harmlessly.
+  /// Switches the tabsSubSection if the user is currently viewing a
+  /// tab that's about to disappear.
+  async function setClaudeTabsEnabledFromUi(value: ClaudeTabsEnabled) {
+    if (!snapshot) return;
+    const prev = snapshot.claude_tabs_enabled;
+    if (prev === value) return;
+    if (
+      (tabsSubSection === 'claude' && value === 'local') ||
+      (tabsSubSection === 'claude-local' && value === 'cloud')
+    ) {
+      tabsSubSection = value === 'cloud' ? 'claude' : 'claude-local';
+    }
+    const next = structuredClone($state.snapshot(snapshot));
+    next.claude_tabs_enabled = value;
+    snapshot = next;
+    try {
+      await setClaudeTabsEnabled(value);
+    } catch (e) {
+      console.error('set_claude_tabs_enabled failed:', e);
+      const restored = structuredClone($state.snapshot(snapshot));
+      restored.claude_tabs_enabled = prev;
+      snapshot = restored;
+    }
   }
 
   // V1.4-04 B.5: inline UI for save/manage presets. Implemented as
@@ -299,6 +350,73 @@
   /// tabs differently. Empty array when settings haven't loaded yet.
   const tabEntries = $derived<TabConfig[]>(snapshot?.tabs ?? []);
 
+  /// Active-tab metadata, used by the Advanced → "Apply to global"
+  /// button. The session's `active_tab_id` is the canonical
+  /// "currently focused tab" reference at the settings layer; if
+  /// nothing has set it yet (fresh install before any tab focus),
+  /// fall back to the first tab so the action remains useful.
+  const activeTabId = $derived(
+    snapshot?.session.active_tab_id ?? snapshot?.tabs[0]?.id ?? null,
+  );
+  const activeTab = $derived(
+    activeTabId && snapshot
+      ? snapshot.tabs.find((t) => t.id === activeTabId) ?? null
+      : null,
+  );
+  const activeTabHasOverrides = $derived(
+    activeTab !== null &&
+      (activeTab.theme_override !== null ||
+        (activeTab.background_override !== null &&
+          activeTab.background_override !== 'disabled')),
+  );
+
+  /// Promote the active tab's terminal palette + background overrides
+  /// to the global terminal settings, then clear overrides on every
+  /// tab so all tabs inherit the new global. The 'disabled' literal
+  /// in `background_override` is an opt-out, not a config, so it does
+  /// not get promoted.
+  /// Hard reset: replaces the live Settings struct with the canonical
+  /// defaults from `defaultSettings()`. Wipes user-created shell tabs,
+  /// saved layouts, shortcut overrides, etc. — fully destructive, so
+  /// gated on a native `confirm()` prompt.
+  function resetSettingsToDefaults() {
+    const ok = confirm(
+      'Reset every setting to its default? This wipes:\n' +
+        '  • all user-created shell tabs\n' +
+        '  • saved layouts and presets\n' +
+        '  • shortcut overrides\n' +
+        '  • theme, background, and per-tab overrides\n' +
+        '\nThis cannot be undone.',
+    );
+    if (!ok) return;
+    void applySettings(defaultSettings());
+  }
+
+  function applyActiveTabOverridesToGlobal() {
+    patch((s) => {
+      const id = s.session.active_tab_id ?? s.tabs[0]?.id;
+      if (!id) return;
+      const src = s.tabs.find((t) => t.id === id);
+      if (!src) return;
+      if (src.theme_override) {
+        s.terminal.theme = src.theme_override;
+      }
+      if (
+        src.background_override !== null &&
+        src.background_override !== 'disabled'
+      ) {
+        s.terminal.background = {
+          ...s.terminal.background,
+          ...src.background_override,
+        };
+      }
+      for (const t of s.tabs) {
+        t.theme_override = null;
+        t.background_override = null;
+      }
+    });
+  }
+
   function aiTabAt(id: string): AiToolTabConfig | null {
     return aiTabFromSnapshot(id);
   }
@@ -382,6 +500,9 @@
   }
 </script>
 
+{#if $settings.ui.theme === 'tui'}
+  <TuiTitleBar title="cctts settings" />
+{/if}
 {#if !snapshot}
   <div class="loading">Loading settings…</div>
 {:else}
@@ -499,6 +620,33 @@
             exit) only fire for background tabs. Turn on to hear them for the
             tab you're currently looking at as well.
           </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.speak_background_tabs}
+              onchange={(e) =>
+                patch((s) => (s.behavior.speak_background_tabs = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Speak tagged TTS from background tabs</span>
+          </label>
+          <small class="hint">
+            Off by default — tagged TTS segments (the spoken bits inside
+            AI-tab output) only play for the active tab. Turn on to hear
+            them from background tabs too. Announcements are unaffected.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.copy_on_select}
+              onchange={(e) =>
+                patch((s) => (s.behavior.copy_on_select = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Copy on select</span>
+          </label>
+          <small class="hint">
+            When on, text selected in any terminal is copied to the system
+            clipboard automatically.
+          </small>
           <label class="checkbox disabled">
             <input type="checkbox" checked={snapshot.behavior.fallback_silent} disabled />
             <span>Fallback silent on TTS error (always on in v1)</span>
@@ -553,17 +701,30 @@
               />
             </label>
           </div>
-          <label>
-            <span>Margin (px)</span>
-            <input
-              type="number"
-              min="0"
-              max="200"
-              value={snapshot.avatar.margin_px}
-              onchange={(e) =>
-                patch((s) => (s.avatar.margin_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
-            />
-          </label>
+          <div class="row">
+            <label>
+              <span>Margin X (px)</span>
+              <input
+                type="number"
+                min="0"
+                max="200"
+                value={snapshot.avatar.margin.x_px}
+                onchange={(e) =>
+                  patch((s) => (s.avatar.margin.x_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+            <label>
+              <span>Margin Y (px)</span>
+              <input
+                type="number"
+                min="0"
+                max="200"
+                value={snapshot.avatar.margin.y_px}
+                onchange={(e) =>
+                  patch((s) => (s.avatar.margin.y_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+          </div>
           <label>
             <span>Opacity: {Math.round(snapshot.avatar.opacity * 100)}%</span>
             <input
@@ -690,6 +851,7 @@
                 patch((s) => (s.ui.theme = (e.currentTarget as HTMLSelectElement).value))}
             >
               <option value="modern-dark">Modern Dark</option>
+              <option value="tui">TUI</option>
             </select>
           </label>
 
@@ -912,8 +1074,47 @@
         {@const claudeLive = aiTabAt('claude')}
         {@const claudeLocalLive = aiTabAt('claude-local')}
         {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
+        {@const claudeTabsValue = snapshot.claude_tabs_enabled}
         <section>
           <h2>Tabs</h2>
+          <fieldset class="claude-tabs-radio">
+            <legend>Claude tabs enabled</legend>
+            <small class="hint">
+              Pick which Claude tabs to keep. Changing this opens or closes the matching tabs (the closed tab's PTY is killed and its scrollback dropped).
+            </small>
+            <div class="radio-row">
+              <label>
+                <input
+                  type="radio"
+                  name="claude-tabs-enabled"
+                  value="cloud"
+                  checked={claudeTabsValue === 'cloud'}
+                  onchange={() => void setClaudeTabsEnabledFromUi('cloud')}
+                />
+                Claude (cloud)
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="claude-tabs-enabled"
+                  value="local"
+                  checked={claudeTabsValue === 'local'}
+                  onchange={() => void setClaudeTabsEnabledFromUi('local')}
+                />
+                Claude (local)
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="claude-tabs-enabled"
+                  value="both"
+                  checked={claudeTabsValue === 'both'}
+                  onchange={() => void setClaudeTabsEnabledFromUi('both')}
+                />
+                Both
+              </label>
+            </div>
+          </fieldset>
           <div class="sub-tabs" role="tablist" aria-label="Tabs sub-sections">
             <button
               type="button"
@@ -1015,39 +1216,76 @@
                             Configure…
                           </small>
                         </label>
-                        <label>
-                          <span>Error notification text</span>
+                        <div class="shell-notif-row">
+                          <label class="row-toggle">
+                            <input
+                              type="checkbox"
+                              checked={entry.notifications.error.enabled}
+                              onchange={(e) =>
+                                patchShellNotifications(entry.id, {
+                                  ...entry.notifications,
+                                  error: {
+                                    ...entry.notifications.error,
+                                    enabled: (e.currentTarget as HTMLInputElement)
+                                      .checked,
+                                  },
+                                })}
+                            />
+                            <span>Error notification</span>
+                          </label>
                           <input
                             type="text"
-                            value={entry.notifications.error}
+                            value={entry.notifications.error.text}
+                            disabled={!entry.notifications.error.enabled}
                             oninput={(e) =>
                               patchShellNotifications(entry.id, {
                                 ...entry.notifications,
-                                error: (e.currentTarget as HTMLInputElement).value,
+                                error: {
+                                  ...entry.notifications.error,
+                                  text: (e.currentTarget as HTMLInputElement).value,
+                                },
                               })}
                           />
                           <small class="hint">
                             Spoken when this tab errors while you're on a different
-                            tab. Leave blank to disable.
+                            tab.
                           </small>
-                        </label>
-                        <label>
-                          <span>Exited notification text</span>
+                        </div>
+                        <div class="shell-notif-row">
+                          <label class="row-toggle">
+                            <input
+                              type="checkbox"
+                              checked={entry.notifications.exited.enabled}
+                              onchange={(e) =>
+                                patchShellNotifications(entry.id, {
+                                  ...entry.notifications,
+                                  exited: {
+                                    ...entry.notifications.exited,
+                                    enabled: (e.currentTarget as HTMLInputElement)
+                                      .checked,
+                                  },
+                                })}
+                            />
+                            <span>Exited notification</span>
+                          </label>
                           <input
                             type="text"
-                            value={entry.notifications.exited}
+                            value={entry.notifications.exited.text}
+                            disabled={!entry.notifications.exited.enabled}
                             oninput={(e) =>
                               patchShellNotifications(entry.id, {
                                 ...entry.notifications,
-                                exited: (e.currentTarget as HTMLInputElement).value,
+                                exited: {
+                                  ...entry.notifications.exited,
+                                  text: (e.currentTarget as HTMLInputElement).value,
+                                },
                               })}
                           />
                           <small class="hint">
                             Spoken when this shell exits while you're on a different
                             tab. Use <code>{'{code}'}</code> to insert the exit code.
-                            Leave blank to disable.
                           </small>
-                        </label>
+                        </div>
                       </div>
                     </details>
                   {/if}
@@ -1148,25 +1386,27 @@
           </label>
           <label>
             <span>Auth token</span>
-            <input
-              type={showLocalToken ? 'text' : 'password'}
-              value={snapshot?.claude_local.auth_token ?? ''}
-              oninput={(e) =>
-                patch(
-                  (s) =>
-                    (s.claude_local.auth_token = (
-                      e.currentTarget as HTMLInputElement
-                    ).value),
-                )}
-              placeholder="sk-dummy"
-            />
-            <button
-              type="button"
-              class="secondary"
-              onclick={() => (showLocalToken = !showLocalToken)}
-            >
-              {showLocalToken ? 'Hide' : 'Show'}
-            </button>
+            <div class="input-with-action">
+              <input
+                type={showLocalToken ? 'text' : 'password'}
+                value={snapshot?.claude_local.auth_token ?? ''}
+                oninput={(e) =>
+                  patch(
+                    (s) =>
+                      (s.claude_local.auth_token = (
+                        e.currentTarget as HTMLInputElement
+                      ).value),
+                  )}
+                placeholder="sk-dummy"
+              />
+              <button
+                type="button"
+                class="secondary"
+                onclick={() => (showLocalToken = !showLocalToken)}
+              >
+                {showLocalToken ? 'Hide' : 'Show'}
+              </button>
+            </div>
             <small class="hint">
               Becomes <code>ANTHROPIC_AUTH_TOKEN</code>. Stored cleartext;
               local proxies usually accept dummy tokens.
@@ -1194,6 +1434,30 @@
           </label>
         </section>
       {:else if activeSection === 'advanced'}
+        <section>
+          <h2>Per-tab overrides</h2>
+          <small class="hint top">
+            Promote the active tab's terminal palette and background
+            overrides to the global defaults, then clear the overrides
+            on every tab so they inherit the new global. Useful after
+            dialing in one tab and wanting the rest to match.
+          </small>
+          <button
+            type="button"
+            class="promote-overrides"
+            onclick={applyActiveTabOverridesToGlobal}
+            disabled={!activeTabHasOverrides}
+          >
+            {#if activeTab && activeTabHasOverrides}
+              Apply "{activeTab.name}" overrides to global
+            {:else if activeTab}
+              No overrides on "{activeTab.name}" to promote
+            {:else}
+              No active tab
+            {/if}
+          </button>
+        </section>
+
         <section>
           <h2>Processing</h2>
           <small class="hint top">
@@ -1226,6 +1490,143 @@
               />
             </label>
           </div>
+        </section>
+
+        <section>
+          <h2>Logging</h2>
+          <small class="hint top">
+            Log files roll daily into <code>logs/</code> next to the cctts
+            executable. Changing the level applies live; the
+            <code>RUST_LOG</code> env var, when set at launch, overrides
+            this until you change it here.
+          </small>
+          <label>
+            <span>Log level</span>
+            <select
+              value={snapshot.logging.level}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.logging.level = (
+                      e.currentTarget as HTMLSelectElement
+                    ).value as Settings['logging']['level']),
+                )}
+            >
+              <option value="trace">Trace</option>
+              <option value="debug">Debug</option>
+              <option value="info">Info</option>
+              <option value="warn">Warn</option>
+              <option value="error">Error</option>
+            </select>
+          </label>
+          <label>
+            <span>Retention</span>
+            <select
+              value={snapshot.logging.retention}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.logging.retention = (
+                      e.currentTarget as HTMLSelectElement
+                    ).value as Settings['logging']['retention']),
+                )}
+            >
+              <option value="daily">Daily (keep 1 day)</option>
+              <option value="weekly">Weekly (keep 7 days)</option>
+              <option value="monthly">Monthly (keep 30 days)</option>
+              <option value="never">Never (keep everything)</option>
+            </select>
+            <small class="hint">
+              Cleanup runs at launch and whenever this setting changes.
+              Files older than the window are deleted; the active day's log
+              is always kept.
+            </small>
+          </label>
+
+          <h3>Content capture</h3>
+          <small class="hint top">
+            When on, raw PTY output for every Claude / shell tab is also
+            written to <code>logs/content/&lt;tab-id&gt;.log.&lt;date&gt;</code>,
+            rotated daily. Output includes ANSI escape codes — pipe through
+            <code>sed</code> or a viewer if you want plain text.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.logging.content_capture.enabled}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.logging.content_capture.enabled = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Capture full tab output</span>
+          </label>
+          <label>
+            <span>Retention</span>
+            <select
+              value={snapshot.logging.content_capture.retention}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.logging.content_capture.retention = (
+                      e.currentTarget as HTMLSelectElement
+                    ).value as Settings['logging']['content_capture']['retention']),
+                )}
+            >
+              <option value="daily">Daily (keep 1 day)</option>
+              <option value="weekly">Weekly (keep 7 days)</option>
+              <option value="monthly">Monthly (keep 30 days)</option>
+              <option value="never">Never (keep everything)</option>
+            </select>
+          </label>
+          <div class="content-actions">
+            <button
+              type="button"
+              onclick={() =>
+                contentOpenFolder().catch((e) =>
+                  console.error('content_open_folder failed:', e),
+                )}
+            >
+              Open folder
+            </button>
+            <button
+              type="button"
+              onclick={async () => {
+                if (
+                  !confirm(
+                    'Delete every file inside the content folder? This cannot be undone.',
+                  )
+                )
+                  return;
+                try {
+                  await contentClear();
+                } catch (e) {
+                  console.error('content_clear failed:', e);
+                }
+              }}
+            >
+              Delete all files
+            </button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Reset</h2>
+          <small class="hint top">
+            Replace every setting with its factory default. Wipes
+            user-created shell tabs, saved layouts, shortcut overrides,
+            and all theme / background overrides. Cannot be undone.
+          </small>
+          <button
+            type="button"
+            class="danger"
+            onclick={resetSettingsToDefaults}
+          >
+            Reset all settings to defaults
+          </button>
         </section>
       {:else if activeSection === 'about'}
         <section class="about-section">
@@ -1430,6 +1831,22 @@
   .row > label {
     flex: 1;
   }
+  /* Pair an input with an inline action button (Show/Hide, Browse, etc.).
+     Without this, the button wraps below a width:100% input and
+     `small.hint`'s negative top margin pulls the hint upward into the
+     wrapped button. */
+  .input-with-action {
+    display: flex;
+    gap: var(--space-2);
+    align-items: stretch;
+  }
+  .input-with-action > input {
+    flex: 1;
+    min-width: 0;
+  }
+  .input-with-action > button {
+    flex-shrink: 0;
+  }
   .file-row {
     display: flex;
     gap: var(--space-2);
@@ -1478,6 +1895,14 @@
   button.ghost {
     background: transparent;
   }
+  button.danger {
+    color: var(--text-danger-bright);
+    border-color: var(--border-danger);
+  }
+  button.danger:hover:not(:disabled) {
+    background: var(--surface-danger-soft);
+    border-color: var(--border-danger-strong);
+  }
   small.hint {
     display: block;
     color: var(--text-tertiary);
@@ -1490,10 +1915,23 @@
     margin-top: 0;
     margin-bottom: var(--space-3);
   }
+  /* When a hint is nested *inside* a label after the input (Local LLM
+     section, shell command field, etc.) the global -8px would pull it
+     up over the input box. The negative margin only makes sense for
+     sibling hints below a label, where it tightens the gap to the
+     label above. */
+  label > small.hint {
+    margin-top: var(--space-1);
+  }
   .preset-actions {
     display: flex;
     gap: var(--space-2);
     margin-bottom: var(--space-3);
+  }
+  .content-actions {
+    display: flex;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
   }
   .preset-save {
     display: flex;
@@ -1532,6 +1970,36 @@
   }
   .palette-row > span:first-child {
     grid-column: 1 / -1;
+  }
+  .claude-tabs-radio {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-3) var(--space-4);
+    margin: 0 0 var(--space-4) 0;
+    background: var(--surface-1);
+  }
+  .claude-tabs-radio legend {
+    padding: 0 var(--space-2);
+    font-size: var(--font-size-sm);
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+  .claude-tabs-radio .hint {
+    display: block;
+    margin: 0 0 var(--space-3) 0;
+    color: var(--text-quiet);
+  }
+  .claude-tabs-radio .radio-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+  }
+  .claude-tabs-radio .radio-row label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--font-size-sm);
+    cursor: pointer;
   }
   .sub-tabs {
     display: flex;
@@ -1687,6 +2155,27 @@
     padding: 1px var(--space-1);
     border-radius: var(--radius-sm);
     font-size: var(--font-size-xs);
+  }
+  /* V1.11 per-slot notification row: enabled checkbox above a text
+     input. The disabled-text style mirrors `.shell-edit input[disabled]`
+     so a toggled-off slot reads as visually quiet without the
+     readonly-Command "this is informational" feel. */
+  .shell-edit .shell-notif-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .shell-edit .row-toggle {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+  }
+  .shell-edit .row-toggle input[type="checkbox"] {
+    margin: 0;
+  }
+  .shell-edit .shell-notif-row > input[type="text"]:disabled {
+    opacity: 0.5;
   }
 
   /* About page: a small definition list keyed by Author / Version /

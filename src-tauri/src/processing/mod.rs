@@ -27,6 +27,7 @@
 //!   or a complete TTS tag is detected. Returns events as a `Vec` so the
 //!   layer is easy to unit-test without async machinery.
 
+pub mod patterns_file;
 pub mod permission;
 mod screen;
 mod segmenter;

@@ -195,6 +195,14 @@ pub enum StateSignal {
     /// Permission detector observed the previously-matched pattern leave the
     /// rendered tail. Clears `awaiting_permission`.
     PermissionPromptResolved { tab: TabId },
+    /// Detector saw a question-pattern match in the rendered tail (e.g.
+    /// Claude Code's AskUserQuestion multi-option prompt). Sets
+    /// `awaiting_question` on the tab; mirrors the permission path but
+    /// drives a separate notification template.
+    QuestionPromptDetected { tab: TabId },
+    /// Detector observed the previously-matched question pattern leave the
+    /// rendered tail. Clears `awaiting_question`.
+    QuestionPromptResolved { tab: TabId },
     /// A Shell tab's subprocess has been (re)spawned after a previous exit.
     /// Clears the `closed` flag and emits `TabClosedStateChanged { closed:
     /// false }`. AI tabs don't use this — they have no closed sub-state.
@@ -239,6 +247,8 @@ impl StateSignal {
             | Self::TabActivated { tab }
             | Self::PermissionPromptDetected { tab }
             | Self::PermissionPromptResolved { tab }
+            | Self::QuestionPromptDetected { tab }
+            | Self::QuestionPromptResolved { tab }
             | Self::ShellRestarted { tab }
             | Self::TabRemoved { tab }
             | Self::TabRenameRequested { tab, .. }
@@ -261,6 +271,7 @@ pub enum StateEvent {
     StateChanged { tab: TabId, state: AvatarState },
     ActiveTabChanged { tab: TabId },
     AwaitingPermissionChanged { tab: TabId, awaiting: bool },
+    AwaitingQuestionChanged { tab: TabId, awaiting: bool },
     DoneWhileAwayChanged { tab: TabId, done: bool },
     /// Shell tab's `closed` UI flag flipped. `closed: true` is fired when
     /// the subprocess exits; `closed: false` when the user restarts it.
@@ -330,6 +341,10 @@ struct TabState {
     /// or tab activation triggering Claude to emit further output. Always
     /// false for Shell tabs (the detector is a no-op for them).
     awaiting_permission: bool,
+    /// Mirrors `awaiting_permission` but for AskUserQuestion-style prompts
+    /// detected by `kind: question` patterns. Independent of the
+    /// permission flag — a tab could in principle be in both at once.
+    awaiting_question: bool,
     /// UI-derived: tab transitioned to Idle while inactive. Cleared on
     /// activation. Independent of `avatar_state` and `awaiting_permission`.
     done_while_away: bool,
@@ -343,6 +358,11 @@ struct TabState {
     /// Enter routes to the Configure dialog instead of restart. Cleared
     /// on `ShellRestarted`.
     closed_message: Option<String>,
+    /// Set true between `ClaudeOutputStarted` and `ClaudeOutputStopped`.
+    /// Lets `Speaking → TtsPlaybackStopped` fall back to Thinking instead
+    /// of Idle when Claude is still emitting output (the TTS tag was a
+    /// commentary tag, not a final answer). Always false for Shell tabs.
+    claude_output_active: bool,
 }
 
 impl TabState {
@@ -355,10 +375,12 @@ impl TabState {
             composing: false,
             last_keystroke_at: None,
             awaiting_permission: false,
+            awaiting_question: false,
             done_while_away: false,
             closed: false,
             closed_exit_code: None,
             closed_message: None,
+            claude_output_active: false,
         }
     }
 }
@@ -539,6 +561,28 @@ async fn run(
                     }
                     continue;
                 }
+                if let StateSignal::QuestionPromptDetected { tab } = &signal {
+                    let tab = tab.clone();
+                    if let Some(ts) = tabs.get_mut(&tab) {
+                        if !ts.awaiting_question {
+                            ts.awaiting_question = true;
+                            info!(?tab, "awaiting question: set");
+                            emit_awaiting_question(&app, &state_events, tab, true);
+                        }
+                    }
+                    continue;
+                }
+                if let StateSignal::QuestionPromptResolved { tab } = &signal {
+                    let tab = tab.clone();
+                    if let Some(ts) = tabs.get_mut(&tab) {
+                        if ts.awaiting_question {
+                            ts.awaiting_question = false;
+                            info!(?tab, "awaiting question: cleared (resolved)");
+                            emit_awaiting_question(&app, &state_events, tab, false);
+                        }
+                    }
+                    continue;
+                }
 
                 // Shell tabs route SubprocessExited to the closed sub-state
                 // instead of Error (per DESIGN.md § "Shell-Tab Closed
@@ -645,21 +689,32 @@ async fn run(
                             ts.last_keystroke_at = Some(Instant::now());
                         }
                     }
+                    StateSignal::ClaudeOutputStarted { .. } => {
+                        ts.claude_output_active = true;
+                    }
+                    StateSignal::ClaudeOutputStopped { .. } => {
+                        ts.claude_output_active = false;
+                    }
                     _ => {}
                 }
 
-                // Input-driven clearing of awaiting_permission. Either the
-                // user typed a yes/no into the prompt, or they're typing
-                // unrelated text on a tab that wasn't actually prompting —
-                // clearing an already-false flag below is a no-op.
-                if matches!(
+                // Input-driven clearing of awaiting_permission /
+                // awaiting_question. The user typing into the prompt is the
+                // signal that the prompt is being answered; clearing an
+                // already-false flag is a no-op.
+                let is_input = matches!(
                     signal,
                     StateSignal::UserKeystroke { .. } | StateSignal::UserSubmit { .. }
-                ) && ts.awaiting_permission
-                {
+                );
+                if is_input && ts.awaiting_permission {
                     ts.awaiting_permission = false;
                     info!(tab = ?target_tab, "awaiting permission: cleared (input)");
                     emit_awaiting_permission(&app, &state_events, target_tab.clone(), false);
+                }
+                if is_input && ts.awaiting_question {
+                    ts.awaiting_question = false;
+                    info!(tab = ?target_tab, "awaiting question: cleared (input)");
+                    emit_awaiting_question(&app, &state_events, target_tab.clone(), false);
                 }
 
                 let prev_state = ts.avatar_state;
@@ -672,7 +727,13 @@ async fn run(
                 let next = if is_shell && !is_error_edge(&signal) {
                     prev_state
                 } else {
-                    transition(prev_state, &signal, ts.has_unsent_input, ts.composing)
+                    transition(
+                        prev_state,
+                        &signal,
+                        ts.has_unsent_input,
+                        ts.composing,
+                        ts.claude_output_active,
+                    )
                 };
                 if next != prev_state {
                     info!(tab = ?target_tab, from = ?prev_state, to = ?next, ?signal, "avatar state");
@@ -754,6 +815,7 @@ fn transition(
     signal: &StateSignal,
     has_unsent_input: bool,
     composing: bool,
+    claude_output_active: bool,
 ) -> AvatarState {
     use AvatarState::*;
     use StateSignal::*;
@@ -779,6 +841,11 @@ fn transition(
         (Speaking, TtsPlaybackStopped { .. }) => {
             if has_unsent_input || composing {
                 Listening
+            } else if claude_output_active {
+                // TTS tag was an interstitial comment ("about to do X");
+                // Claude is still producing output, so go back to
+                // Thinking instead of falsely announcing Idle.
+                Thinking
             } else {
                 Idle
             }
@@ -835,6 +902,15 @@ fn emit_awaiting_permission(
     awaiting: bool,
 ) {
     dispatch(app, bcast, StateEvent::AwaitingPermissionChanged { tab, awaiting });
+}
+
+fn emit_awaiting_question(
+    app: &AppHandle,
+    bcast: &broadcast::Sender<StateEvent>,
+    tab: TabId,
+    awaiting: bool,
+) {
+    dispatch(app, bcast, StateEvent::AwaitingQuestionChanged { tab, awaiting });
 }
 
 fn emit_done_while_away(
@@ -916,15 +992,19 @@ mod tests {
     }
 
     fn t(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, false, false)
+        transition(current, &signal, false, false, false)
     }
 
     fn t_with_input(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, true, false)
+        transition(current, &signal, true, false, false)
     }
 
     fn t_composing(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, false, true)
+        transition(current, &signal, false, true, false)
+    }
+
+    fn t_with_output(current: AvatarState, signal: StateSignal) -> AvatarState {
+        transition(current, &signal, false, false, true)
     }
 
     #[test]
@@ -1033,6 +1113,33 @@ mod tests {
     }
 
     #[test]
+    fn speaking_tts_stop_returns_thinking_when_claude_still_outputting() {
+        // Interstitial TTS tag ("I'll start by reading the file"): Claude
+        // is still producing output behind the speech, so the avatar
+        // should go back to Thinking, not Idle.
+        assert_eq!(
+            t_with_output(Speaking, TtsPlaybackStopped { tab: tab() }),
+            Thinking
+        );
+    }
+
+    #[test]
+    fn speaking_tts_stop_user_input_beats_claude_output() {
+        // If the user typed during speech, treat it like a normal
+        // interruption — Listening wins over Thinking.
+        assert_eq!(
+            transition(
+                Speaking,
+                &TtsPlaybackStopped { tab: tab() },
+                true,  // has_unsent_input
+                false, // composing
+                true,  // claude_output_active
+            ),
+            Listening
+        );
+    }
+
+    #[test]
     fn error_sticks_until_acknowledged() {
         assert_eq!(t(Error, UserKeystroke { tab: tab() }), Error);
         assert_eq!(t(Error, UserSubmit { tab: tab() }), Error);
@@ -1044,10 +1151,13 @@ mod tests {
     fn permission_signals_dont_drive_avatar() {
         // Defensive: PermissionPromptDetected/Resolved short-circuit before
         // the run loop calls `transition()`, but if they ever reached it
-        // they should be no-ops in every state.
+        // they should be no-ops in every state. Same contract for the
+        // question prompt edges.
         for s in [Idle, Listening, Thinking, Speaking, Error] {
             assert_eq!(t(s, PermissionPromptDetected { tab: tab() }), s);
             assert_eq!(t(s, PermissionPromptResolved { tab: tab() }), s);
+            assert_eq!(t(s, QuestionPromptDetected { tab: tab() }), s);
+            assert_eq!(t(s, QuestionPromptResolved { tab: tab() }), s);
         }
     }
 

@@ -57,8 +57,15 @@ pub fn spawn_tts_worker(
                         // segments to discard later. Notifications skip this
                         // gate by design: they exist precisely to announce
                         // events on tabs the user isn't currently looking at.
+                        //
+                        // The user-facing `behavior.speak_background_tabs`
+                        // toggle opts out of this gate for tagged-content
+                        // TTS (announcements remain governed by their own
+                        // `announce_focused_tab` rule and never hit this
+                        // gate at all).
                         let active_tab = active.read().expect("active tab poisoned").clone();
-                        if tab != active_tab {
+                        let speak_background = settings.current().behavior.speak_background_tabs;
+                        if tab != active_tab && !speak_background {
                             debug!(?tab, ?active_tab, "tts: dropping segment for inactive tab");
                             continue;
                         }

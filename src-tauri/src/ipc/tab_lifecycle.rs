@@ -18,7 +18,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::ipc::AppState;
-use crate::settings::{ShellNotificationConfig, ShellTabConfig as ShellTabSettings, TabConfig};
+use crate::settings::{
+    default_claude_local_tab, default_claude_tab, ClaudeTabsEnabled, ShellNotificationConfig,
+    ShellTabConfig as ShellTabSettings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
+};
 use crate::shell::detect;
 use crate::state::{StateSignal, TabId, TabKind, TabMeta};
 
@@ -41,7 +44,7 @@ pub enum TabLifecycleError {
     CwdNotFound { path: String },
     /// The target tab id does not exist in the registry.
     TabNotFound { tab: String },
-    /// Attempt to close a builtin (Claude / Claude-local / shell-default-1).
+    /// Attempt to close an AI builtin (Claude / Claude-local).
     BuiltinNotClosable,
     /// `reconfigure_shell_tab` was called on a non-Shell tab.
     WrongKind,
@@ -74,7 +77,13 @@ struct ValidatedShellInput {
     env: HashMap<String, String>,
 }
 
-fn validate_inputs(
+/// Validate the dialog inputs. Each filesystem probe (`which::which`,
+/// `is_file`, `is_dir`) is synchronous and may stat slow paths (network
+/// drives, antivirus-scanned directories), so the whole probe runs on a
+/// blocking pool thread. The Tauri command wrapper is async; calling
+/// this from there off the runtime keeps the tokio worker thread free
+/// for other IPC work while a slow PATH walk is in flight.
+async fn validate_inputs(
     name: String,
     command: String,
     args: Vec<String>,
@@ -86,40 +95,44 @@ fn validate_inputs(
         return Err(TabLifecycleError::EmptyName);
     }
 
-    // Resolve the command. If it contains a path separator we treat it as
-    // an absolute or relative path; otherwise we resolve via PATH using
-    // `which`. The `which` crate handles symlinks correctly on both
-    // platforms.
-    let raw = command.clone();
-    let resolved = if command.contains(['/', '\\']) {
-        let path = PathBuf::from(&command);
-        if !path.is_file() {
-            return Err(TabLifecycleError::CommandNotFound { tried: raw });
-        }
-        path
-    } else {
-        which::which(&command)
-            .map_err(|_| TabLifecycleError::CommandNotFound { tried: raw.clone() })?
-    };
-
-    let cwd_path = match cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => {
-            let p = PathBuf::from(s);
-            if !p.is_dir() {
-                return Err(TabLifecycleError::CwdNotFound { path: s.to_string() });
+    let cwd_string = cwd;
+    tokio::task::spawn_blocking(move || {
+        // Resolve the command. If it contains a path separator we treat it
+        // as an absolute or relative path; otherwise we resolve via PATH
+        // using `which`.
+        let raw = command.clone();
+        let resolved = if command.contains(['/', '\\']) {
+            let path = PathBuf::from(&command);
+            if !path.is_file() {
+                return Err(TabLifecycleError::CommandNotFound { tried: raw });
             }
-            Some(p)
-        }
-        None => None,
-    };
+            path
+        } else {
+            which::which(&command)
+                .map_err(|_| TabLifecycleError::CommandNotFound { tried: raw.clone() })?
+        };
 
-    Ok(ValidatedShellInput {
-        name: trimmed_name,
-        command: resolved,
-        args,
-        cwd: cwd_path,
-        env,
+        let cwd_path = match cwd_string.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => {
+                let p = PathBuf::from(s);
+                if !p.is_dir() {
+                    return Err(TabLifecycleError::CwdNotFound { path: s.to_string() });
+                }
+                Some(p)
+            }
+            None => None,
+        };
+
+        Ok(ValidatedShellInput {
+            name: trimmed_name,
+            command: resolved,
+            args,
+            cwd: cwd_path,
+            env,
+        })
     })
+    .await
+    .map_err(|e| TabLifecycleError::internal(format!("validate_inputs join: {e}")))?
 }
 
 fn validated_to_shell_config(
@@ -145,9 +158,21 @@ fn validated_to_shell_config(
 /// Build a `ShellNotificationConfig` from the dialog's two strings. An empty
 /// string is intentional disable-this-notification (the manager treats empty
 /// as "skip"); the dialog is responsible for pre-filling the defaults so the
-/// user has to actively clear a field to disable it.
+/// user has to actively clear a field to disable it. V1.11 promoted each
+/// slot to `{ enabled, text }`; the dialog still sends bare strings, so
+/// `enabled` is derived from non-emptiness here. Users wanting the
+/// "disabled but text preserved" combination edit via Settings → Tabs.
 fn notifications_from_dialog(error: String, exited: String) -> ShellNotificationConfig {
-    ShellNotificationConfig { error, exited }
+    ShellNotificationConfig {
+        error: crate::settings::NotificationSlot {
+            enabled: !error.is_empty(),
+            text: error,
+        },
+        exited: crate::settings::NotificationSlot {
+            enabled: !exited.is_empty(),
+            text: exited,
+        },
+    }
 }
 
 /// Create a new user-managed Shell tab. Validates the inputs, registers it
@@ -165,8 +190,9 @@ pub async fn create_shell_tab(
     notifications_error: String,
     notifications_exited: String,
 ) -> Result<TabId, TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
     let args = shlex::split(&args_string).unwrap_or_default();
-    let validated = validate_inputs(name, command, args, cwd, env)?;
+    let validated = validate_inputs(name, command, args, cwd, env).await?;
     let notifications = notifications_from_dialog(notifications_error, notifications_exited);
 
     let tab = TabId::Shell(format!("shell-{}", Uuid::new_v4()));
@@ -227,14 +253,16 @@ pub async fn create_shell_tab(
     Ok(tab)
 }
 
-/// Close a user-managed Shell tab. Builtins (Claude/Claude-local/shell-default-1)
-/// reject. The PTY is killed, the registry entry dropped, the settings
-/// entry removed, and `TabRemoved` is emitted.
+/// Close a Shell tab (including the default `shell-default-1`). The AI
+/// builtins (Claude / Claude-local) reject with `BuiltinNotClosable`. The
+/// PTY is killed, the registry entry dropped, the settings entry removed,
+/// and `TabRemoved` is emitted.
 #[tauri::command]
 pub async fn close_tab(
     state: State<'_, AppState>,
     tab: TabId,
 ) -> Result<(), TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
     {
         // Snapshot the entry to gate on builtin status. Settings is the
         // canonical builtin marker; the id-based heuristic is a fallback.
@@ -273,7 +301,7 @@ pub async fn close_tab(
 
     let removed = {
         let mut registry = state.tabs.lock().await;
-        registry.remove_user_shell_tab(&tab).await
+        registry.remove_tab(&tab).await
     };
     if !removed {
         return Err(TabLifecycleError::TabNotFound {
@@ -322,6 +350,7 @@ pub async fn rename_tab(
     tab: TabId,
     new_name: String,
 ) -> Result<(), TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
     let trimmed = new_name.trim().to_string();
     if trimmed.is_empty() {
         return Err(TabLifecycleError::EmptyName);
@@ -373,11 +402,12 @@ pub async fn reconfigure_shell_tab(
     theme_override: Option<crate::settings::TerminalThemeSettings>,
     background_override: Option<crate::settings::BackgroundOverride>,
 ) -> Result<(), TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
     if !matches!(tab.kind(), TabKind::Shell) {
         return Err(TabLifecycleError::WrongKind);
     }
     let args = shlex::split(&args_string).unwrap_or_default();
-    let validated = validate_inputs(name, command, args, cwd, env)?;
+    let validated = validate_inputs(name, command, args, cwd, env).await?;
     let notifications = notifications_from_dialog(notifications_error, notifications_exited);
 
     let name_changed: bool = {
@@ -448,8 +478,8 @@ pub fn default_shell_spec() -> DefaultShellWire {
         command: spec.command.to_string_lossy().into_owned(),
         args: spec.args.join(" "),
         git_bash_found: detect::was_default_git_bash_found(),
-        notifications_error: notif_defaults.error,
-        notifications_exited: notif_defaults.exited,
+        notifications_error: notif_defaults.error.text,
+        notifications_exited: notif_defaults.exited.text,
     }
 }
 
@@ -505,7 +535,200 @@ pub async fn get_shell_tab_config(
         args: cfg.args.join(" "),
         cwd: cfg.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
         env: cfg.env.clone(),
-        notifications_error: cfg.notifications.error.clone(),
-        notifications_exited: cfg.notifications.exited.clone(),
+        notifications_error: cfg.notifications.error.text.clone(),
+        notifications_exited: cfg.notifications.exited.text.clone(),
     })
+}
+
+/// Apply a new `claude_tabs_enabled` value: open and close the AI builtin
+/// tabs as needed so the live tabs match the selection. Bypasses
+/// `BuiltinNotClosable` (the radio is the canonical way to close an AI
+/// tab); regular `close_tab` calls on AI builtins still reject. Order
+/// matters — we add the surviving Claude tab first (so the active-tab
+/// switch has somewhere to go), then move active off any soon-to-be-
+/// removed tab, then drop the now-disabled tabs (kill PTY, drop
+/// scrollback, remove the settings entry, emit TabRemoved).
+#[tauri::command]
+pub async fn set_claude_tabs_enabled(
+    state: State<'_, AppState>,
+    value: ClaudeTabsEnabled,
+) -> Result<(), TabLifecycleError> {
+    // Serialize with all other lifecycle commands so concurrent
+    // close_tab / create_shell_tab / etc. can't interleave with the
+    // multi-step add-then-remove sequence below. Without this an
+    // outside close_tab between step 1 (add) and step 3 (remove) could
+    // produce a state where the discriminator says "Cloud" but neither
+    // AI tab is in tabs[].
+    let _serializer = state.lifecycle_serializer.lock().await;
+    let want_cloud = value.includes_cloud();
+    let want_local = value.includes_local();
+
+    let (had_cloud, had_local, prev_value) = {
+        let snap = state.settings.current();
+        (
+            snap.tabs.iter().any(|t| t.id() == CLAUDE_TAB_ID),
+            snap.tabs.iter().any(|t| t.id() == CLAUDE_LOCAL_TAB_ID),
+            snap.claude_tabs_enabled,
+        )
+    };
+    if prev_value == value && want_cloud == had_cloud && want_local == had_local {
+        return Ok(());
+    }
+
+    // 1. Add any newly-enabled tabs first. This guarantees the active-tab
+    //    switch in step 2 always has a surviving Claude tab to land on.
+    if want_cloud && !had_cloud {
+        add_ai_builtin_tab(&state, TabId::Claude, "Claude".to_string(), default_claude_tab()).await?;
+    }
+    if want_local && !had_local {
+        add_ai_builtin_tab(
+            &state,
+            TabId::ClaudeLocal,
+            "Claude (local)".to_string(),
+            default_claude_local_tab(),
+        )
+        .await?;
+    }
+
+    // 2. If the currently-active tab is about to be removed, switch
+    //    to the surviving Claude tab first so the frontend's active
+    //    indicator (and the TTS active cell) doesn't briefly point at
+    //    a tab that no longer exists.
+    let surviving_claude: Option<TabId> = match (want_cloud, want_local) {
+        (true, _) => Some(TabId::Claude),
+        (_, true) => Some(TabId::ClaudeLocal),
+        // Defensively: this shouldn't be reachable because the radio
+        // can't yield (false, false). If it ever does, leave active as
+        // the user-set tab and let the caller deal with the empty state.
+        (false, false) => None,
+    };
+    if let Some(target) = surviving_claude.clone() {
+        let active = {
+            let registry = state.tabs.lock().await;
+            registry.active()
+        };
+        let about_to_close = (active == TabId::Claude && !want_cloud)
+            || (active == TabId::ClaudeLocal && !want_local);
+        if about_to_close {
+            let mut registry = state.tabs.lock().await;
+            if let Err(e) = registry.activate(target).await {
+                warn!(error = %e, "set_claude_tabs_enabled: pre-close activate failed");
+            }
+        }
+    }
+
+    // 3. Remove any newly-disabled tabs.
+    if !want_cloud && had_cloud {
+        remove_ai_builtin_tab(&state, TabId::Claude).await?;
+    }
+    if !want_local && had_local {
+        remove_ai_builtin_tab(&state, TabId::ClaudeLocal).await?;
+    }
+
+    // 4. Persist the new setting value alongside the post-step-1/3 tabs
+    //    array. We re-read the current snapshot here (rather than
+    //    cloning earlier) because `add_ai_builtin_tab` /
+    //    `remove_ai_builtin_tab` already pushed their own settings.set
+    //    calls — we just need to flip the discriminator on top.
+    {
+        let mut snap = state.settings.current();
+        if snap.claude_tabs_enabled != value {
+            snap.claude_tabs_enabled = value;
+            state.settings.set(snap);
+        }
+    }
+
+    info!(?value, "claude_tabs_enabled updated");
+    Ok(())
+}
+
+async fn add_ai_builtin_tab(
+    state: &State<'_, AppState>,
+    tab: TabId,
+    name: String,
+    config: TabConfig,
+) -> Result<(), TabLifecycleError> {
+    let tab_meta = TabMeta {
+        id: tab.clone(),
+        kind: TabKind::AiTool,
+        name: name.clone(),
+    };
+
+    {
+        let mut snap = state.settings.current();
+        if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == tab.as_str()) {
+            *existing = config;
+        } else {
+            // Canonical position: claude at front, claude-local right after
+            // claude. shell-default-1 / user shell tabs slide right.
+            let pos = match tab.as_str() {
+                CLAUDE_TAB_ID => 0,
+                CLAUDE_LOCAL_TAB_ID => snap
+                    .tabs
+                    .iter()
+                    .position(|t| t.id() == CLAUDE_TAB_ID)
+                    .map(|p| p + 1)
+                    .unwrap_or(0),
+                _ => snap.tabs.len(),
+            };
+            let pos = pos.min(snap.tabs.len());
+            snap.tabs.insert(pos, config);
+        }
+        state.settings.set(snap);
+    }
+
+    let position = {
+        let mut registry = state.tabs.lock().await;
+        registry.insert_ai_builtin_tab(tab.clone(), name)
+    };
+
+    if let Err(e) = state
+        .state_signals
+        .send(StateSignal::TabAdded {
+            meta: tab_meta,
+            position,
+        })
+        .await
+    {
+        warn!(error = %e, "set_claude_tabs_enabled: state-signal channel closed (add)");
+        return Err(TabLifecycleError::internal("state signal channel closed"));
+    }
+    Ok(())
+}
+
+async fn remove_ai_builtin_tab(
+    state: &State<'_, AppState>,
+    tab: TabId,
+) -> Result<(), TabLifecycleError> {
+    let removed = {
+        let mut registry = state.tabs.lock().await;
+        registry.remove_tab(&tab).await
+    };
+    if !removed {
+        return Ok(());
+    }
+
+    if let Err(e) = crate::pty::scrollback::delete(&tab) {
+        warn!(?tab, error = %e, "set_claude_tabs_enabled: scrollback delete failed");
+    }
+
+    {
+        let mut snap = state.settings.current();
+        snap.tabs.retain(|t| t.id() != tab.as_str());
+        if snap.session.active_tab_id.as_deref() == Some(tab.as_str()) {
+            snap.session.active_tab_id = None;
+        }
+        state.settings.set(snap);
+    }
+
+    if let Err(e) = state
+        .state_signals
+        .send(StateSignal::TabRemoved { tab: tab.clone() })
+        .await
+    {
+        warn!(error = %e, "set_claude_tabs_enabled: state-signal channel closed (remove)");
+        return Err(TabLifecycleError::internal("state signal channel closed"));
+    }
+    info!(?tab, "ai builtin tab removed");
+    Ok(())
 }

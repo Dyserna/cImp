@@ -29,14 +29,6 @@ export async function ptyStart(
   return invoke<number[] | null>('pty_start', { tab, channel, rows, cols });
 }
 
-/// V1.4-04 D.3: snapshot the current PTY scrollback ring as raw bytes.
-/// Diagnostic-only — the launch-replay path uses `pty_start`'s return
-/// value, not this command. Errors with `NotStarted` if the tab has no
-/// live PTY.
-export async function ptyGetScrollback(tab: TabId): Promise<number[]> {
-  return invoke<number[]>('pty_get_scrollback', { tab });
-}
-
 export async function ptyRestart(
   tab: TabId,
   channel: BytesChannel,
@@ -76,10 +68,6 @@ export async function composeContentChanged(nonEmpty: boolean): Promise<void> {
 
 export async function acknowledgeError(tab: TabId): Promise<void> {
   await invoke('acknowledge_error', { tab });
-}
-
-export async function tabActivate(tab: TabId): Promise<void> {
-  await invoke('tab_activate', { tab });
 }
 
 export interface TabMetaWire {
@@ -200,6 +188,30 @@ export async function reconfigureShellTab(input: ReconfigureShellTabInput): Prom
 /// spawned.
 export async function restartShellTab(tab: TabId): Promise<void> {
   await invoke('restart_shell_tab', { tab });
+}
+
+/// Apply a new `claude_tabs_enabled` value: opens / closes the AI builtin
+/// tabs as needed. The backend kills the PTY and drops scrollback for
+/// any newly-disabled tab; newly-enabled tabs spawn fresh on the next
+/// frontend mount. Switches the active tab off any soon-to-be-removed
+/// tab onto the surviving Claude tab so the avatar/TTS gate doesn't
+/// dangle.
+export async function setClaudeTabsEnabled(
+  value: import('./settings/types').ClaudeTabsEnabled,
+): Promise<void> {
+  await invoke('set_claude_tabs_enabled', { value });
+}
+
+/// Open `<exe-dir>/logs/content/` in the OS file manager. Backend
+/// creates the folder first if it doesn't exist.
+export async function contentOpenFolder(): Promise<void> {
+  await invoke('content_open_folder');
+}
+
+/// Delete every file inside `<exe-dir>/logs/content/`. Returns the
+/// count of removed files.
+export async function contentClear(): Promise<number> {
+  return invoke<number>('content_clear');
 }
 
 export interface PtyExitPayload {

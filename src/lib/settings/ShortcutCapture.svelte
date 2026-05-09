@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { setSuppressed } from '../shortcuts/dispatcher';
   import { formatShortcut } from '../shortcuts/parser';
 
@@ -40,6 +41,16 @@
   function clear() {
     value = null;
   }
+
+  // If the component unmounts while capturing (user navigates away from
+  // the Shortcuts section, or the Settings window closes mid-capture),
+  // stopCapture must still run so the global dispatcher gets unsuppressed
+  // and the window keydown listener is removed. Without this every
+  // shortcut in the app stays dead until the user manually re-enters
+  // capture mode and presses Escape.
+  onDestroy(() => {
+    if (capturing) stopCapture();
+  });
 </script>
 
 <div class="shortcut-row">

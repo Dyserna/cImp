@@ -9,8 +9,9 @@ use tracing::{debug, info, warn};
 
 use crate::audio::AudioOutput;
 use crate::error::{AppError, AppResult};
+use crate::processing::permission::PermissionPattern;
 use crate::pty::PtyManager;
-use crate::settings::{SettingsHandle, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID};
+use crate::settings::{SettingsHandle, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID};
 use crate::state::{InputLengths, StateSignal, TabId, TabKind};
 use crate::tabs::config::build_launch_spec;
 use crate::tts::{ActiveTab, TtsRequest};
@@ -53,15 +54,23 @@ pub struct TabRegistry {
     /// TabAdded/TabRemoved; the registry only reads it (indirectly, via
     /// the IPC layer).
     input_lengths: InputLengths,
+    /// Detection patterns loaded from `<exe-dir>/patterns.json` at
+    /// startup. Cloned per-tab into the processor task on PTY start.
+    /// Wrapped in `Arc` so the per-tab clone is cheap (the inner Vec
+    /// itself is only cloned by the processor when constructing its
+    /// detector).
+    patterns: Arc<Vec<PermissionPattern>>,
 }
 
 pub type TabRegistryHandle = Arc<TokioMutex<TabRegistry>>;
 
-/// True when `id` is one of the three reserved tab ids that the integrity
-/// check protects (claude, claude-local, shell-default-1). User-created
-/// Shell tabs use uuid-based ids that never collide with these.
+/// True when `id` is one of the AI builtins that cannot be closed. The
+/// reserved `shell-default-1` id is *not* a builtin: it ships as the
+/// default first shell tab on fresh installs but is closable just like
+/// any user-created shell. User-created Shell tabs use uuid-based ids
+/// that never collide with these.
 fn is_builtin_id(id: &str) -> bool {
-    matches!(id, CLAUDE_TAB_ID | CLAUDE_LOCAL_TAB_ID | SHELL_DEFAULT_TAB_ID)
+    matches!(id, CLAUDE_TAB_ID | CLAUDE_LOCAL_TAB_ID)
 }
 
 /// V1.4-04 D: replicate the filename-sanitization done by
@@ -80,6 +89,7 @@ fn sanitize_tab_id_for_filename(raw: &str) -> String {
 }
 
 impl TabRegistry {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         seed: Vec<crate::state::TabMeta>,
         initial_active: TabId,
@@ -87,6 +97,7 @@ impl TabRegistry {
         audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
         state_signals: mpsc::Sender<StateSignal>,
         input_lengths: InputLengths,
+        patterns: Arc<Vec<PermissionPattern>>,
     ) -> Self {
         let mut managers = HashMap::new();
         let mut names = HashMap::new();
@@ -105,6 +116,7 @@ impl TabRegistry {
             audio,
             state_signals,
             input_lengths,
+            patterns,
         }
     }
 
@@ -185,24 +197,51 @@ impl TabRegistry {
         position
     }
 
-    /// Remove a tab. Builtins are silently ignored — callers (IPC) gate
-    /// with `BuiltinNotClosable` first. Returns `true` if the tab was
-    /// found and removed.
-    pub async fn remove_user_shell_tab(&mut self, tab: &TabId) -> bool {
-        if is_builtin_id(tab.as_str()) {
-            return false;
-        }
+    /// Remove a tab. Callers (IPC) are responsible for any policy gate —
+    /// `close_tab` rejects AI builtins with `BuiltinNotClosable`, but the
+    /// `set_claude_tabs_enabled` path bypasses that check because the
+    /// radio selection is the canonical way to close AI tabs. Returns
+    /// `true` if the tab was found and removed.
+    pub async fn remove_tab(&mut self, tab: &TabId) -> bool {
         let Some(idx) = self.tab_order.iter().position(|t| t == tab) else {
             return false;
         };
         self.tab_order.remove(idx);
         if let Some(manager) = self.managers.remove(tab) {
             if let Err(e) = manager.shutdown().await {
-                warn!(?tab, error = %e, "remove_user_shell_tab: shutdown failed");
+                warn!(?tab, error = %e, "remove_tab: shutdown failed");
             }
         }
         self.names.remove(tab);
         true
+    }
+
+    /// Re-insert an AI builtin tab (claude / claude-local) at its
+    /// canonical position. Used by `set_claude_tabs_enabled` when the
+    /// radio re-enables a previously-removed tab. Idempotent; returns
+    /// the resulting position. Distinct from `insert_user_shell_tab`
+    /// because AI builtins land at fixed positions (0 for claude, after
+    /// claude for claude-local) rather than the end of the list.
+    pub fn insert_ai_builtin_tab(&mut self, tab: TabId, name: String) -> usize {
+        if let Some(idx) = self.tab_order.iter().position(|t| t == &tab) {
+            self.names.insert(tab, name);
+            return idx;
+        }
+        let position = match tab.as_str() {
+            CLAUDE_TAB_ID => 0,
+            CLAUDE_LOCAL_TAB_ID => self
+                .tab_order
+                .iter()
+                .position(|t| t.as_str() == CLAUDE_TAB_ID)
+                .map(|p| p + 1)
+                .unwrap_or(0),
+            _ => self.tab_order.len(),
+        };
+        let position = position.min(self.tab_order.len());
+        self.tab_order.insert(position, tab.clone());
+        self.managers.insert(tab.clone(), PtyManager::new());
+        self.names.insert(tab, name);
+        position
     }
 
     /// Spawn the subprocess for `tab` and bind it to `output_channel`. Each
@@ -250,6 +289,7 @@ impl TabRegistry {
                 tts_segments,
                 user_typed_tts,
                 self.state_signals.clone(),
+                self.patterns.clone(),
             )
             .await;
         // On a successful Shell spawn, broadcast `ShellRestarted` so the
@@ -303,6 +343,7 @@ impl TabRegistry {
                 tts_segments,
                 user_typed_tts,
                 self.state_signals.clone(),
+                self.patterns.clone(),
             )
             .await;
         if result.is_ok() && matches!(tab.kind(), TabKind::Shell) {
@@ -426,11 +467,25 @@ impl TabRegistry {
 
         let prev = self.active.clone();
 
-        // Step 1 + 2: stop audio, with a synchronous stop signal first if
-        // playback is in flight. The audio thread's own edge will later
-        // emit a redundant stop tagged with the NEW tab — harmless because
-        // the new tab is in a non-Speaking state, so the transition is a
-        // no-op there.
+        // V0.6+ ordering: flip the TTS active-tab cell FIRST. This closes a
+        // narrow race that the previous step-1-then-step-3 ordering had —
+        // a processing-layer send for the *new* tab that arrived between
+        // the synchronous stop signal and the active-tab write got
+        // filtered against the old `active` value, dropping the segment.
+        // With the write hoisted to step 1 a new-tab send in flight is
+        // correctly accepted; an old-tab send in flight is correctly
+        // dropped (it didn't match the new active and never would).
+        if let Ok(mut g) = self.tts_active.write() {
+            *g = tab.clone();
+        }
+
+        // Step 2: emit a synchronous TtsPlaybackStopped tagged with the
+        // *previous* tab if audio is in flight. The audio thread's own
+        // playing→idle edge fires a few PLAYBACK_POLL ticks later tagged
+        // with whichever tab is active at that moment — by then the new
+        // tab is non-Speaking so its transition is a no-op there. Tagging
+        // explicitly with `prev` here ensures the previous tab's avatar
+        // leaves Speaking on the synchronous path.
         if let Ok(slot) = self.audio.read() {
             if let Some(audio) = slot.as_ref() {
                 if audio.is_playing() {
@@ -442,16 +497,11 @@ impl TabRegistry {
             }
         }
 
-        // Step 3: flip TTS gate.
-        if let Ok(mut g) = self.tts_active.write() {
-            *g = tab.clone();
-        }
-
-        // Step 4: update local pointer.
+        // Step 3: update local pointer.
         self.active = tab.clone();
         info!(?prev, ?tab, "tab activated");
 
-        // Step 5: tell the state manager so it can broadcast ActiveTabChanged.
+        // Step 4: tell the state manager so it can broadcast ActiveTabChanged.
         let _ = self
             .state_signals
             .try_send(StateSignal::TabActivated { tab });

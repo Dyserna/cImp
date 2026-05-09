@@ -208,55 +208,32 @@ function hasPane(root: LayoutNode, id: PaneId): boolean {
   return false;
 }
 
-/// Install the debounced save subscription. Subscribes to the layout
-/// store and invokes `save_layout` 250ms after the last change.
+/// Install the eager save subscription. Subscribes to the layout store
+/// and invokes `save_layout` immediately on every mutation.
+///
+/// V0.6+ change: pre-V0.6 used a 250ms front-end debounce that left a
+/// closing-race window where a layout edit in the last 250ms before
+/// `beforeunload` was silently dropped (the IPC promise resolved after
+/// the WebView had already torn down). The backend already debounces
+/// settings persistence by 500ms, so the front-end debounce was double
+/// rate-limiting; removing it closes the race without adding disk
+/// writes — the backend still coalesces.
 ///
 /// The very first emission is swallowed: Svelte writables fire on
 /// subscribe with the current value, and we don't want to round-trip
-/// the just-hydrated layout back to the backend. Subsequent emissions
-/// are real mutations and get persisted.
+/// the just-hydrated layout back to the backend.
 ///
-/// Returns an unsubscribe function. The caller (App.svelte's onMount)
-/// invokes it on teardown to detach the subscriber and cancel any
-/// pending save.
+/// Returns an unsubscribe function.
 export function installLayoutPersistence(): Unsubscriber {
-  let timer: number | null = null;
-  let pending: LayoutPersisted | null = null;
   let firstEmission = true;
-
-  const flush = () => {
-    if (timer !== null) {
-      clearTimeout(timer);
-      timer = null;
-    }
-    if (pending === null) return;
-    const payload = pending;
-    pending = null;
-    void saveLayout(payload).catch((e) => {
-      console.error('save_layout failed', e);
-    });
-  };
-
-  // Flush on window unload — without this, a layout change in the
-  // last 250ms before quit can be lost. The Tauri close handler
-  // destroys the window, which fires beforeunload.
-  const onBeforeUnload = () => flush();
-  window.addEventListener('beforeunload', onBeforeUnload);
-
-  const unsub = layout.subscribe((state) => {
+  return layout.subscribe((state) => {
     if (firstEmission) {
       firstEmission = false;
       return;
     }
-    pending = serializeLayout(state);
-    if (timer !== null) clearTimeout(timer);
-    timer = window.setTimeout(flush, 250);
+    void saveLayout(serializeLayout(state)).catch((e) => {
+      console.error('save_layout failed', e);
+    });
   });
-
-  return () => {
-    flush();
-    unsub();
-    window.removeEventListener('beforeunload', onBeforeUnload);
-  };
 }
 

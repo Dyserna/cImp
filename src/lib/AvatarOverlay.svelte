@@ -8,12 +8,18 @@
     startAvatarStateListener,
     type AvatarState,
   } from './avatarState';
-  import { avatar as avatarSettings } from './settings/store';
+  import { avatar as avatarSettings, settings } from './settings/store';
+  import { derived } from 'svelte/store';
   import {
     resolveImageSrc,
     resolveTransitionSrc,
     isVideoSrc,
   } from './avatarConfig';
+
+  // Active UI theme drives which `/avatar/<theme>/` subfolder the bundled
+  // defaults resolve from. Subscribed separately because `avatarSettings`
+  // is scoped to the `avatar` slice and won't fire on `ui.theme` changes.
+  const uiTheme = derived(settings, (s) => s.ui.theme);
 
   /// Default crossfade duration when the user has disabled video transitions
   /// (empty path or duration_ms=0). Short enough to feel snappy, long enough
@@ -33,22 +39,25 @@
     [
       `--avatar-width: ${$avatarSettings.size.width_px}px`,
       `--avatar-height: ${$avatarSettings.size.height_px}px`,
-      `--avatar-margin: ${$avatarSettings.margin_px}px`,
+      `--avatar-margin-x: ${$avatarSettings.margin.x_px}px`,
+      `--avatar-margin-y: ${$avatarSettings.margin.y_px}px`,
       `--avatar-opacity: ${$avatarSettings.opacity}`,
+      `--avatar-border-color: ${$avatarSettings.waveform.color}`,
     ].join(';'),
   );
 
   const positionClass = $derived($avatarSettings.position);
 
-  // When the underlying avatar image setting changes (e.g. user picks a new
-  // Idle.png), re-resolve the displayed src for the *current* state.
-  // Transitions only apply on state changes, not on settings changes —
-  // settings updates are treated as instant swaps.
+  // When the underlying avatar image setting or the UI theme changes
+  // (e.g. user picks a new Idle.png, or switches modern-dark <-> tui),
+  // re-resolve the displayed src for the *current* state. Transitions
+  // only apply on state changes, not on settings changes — settings
+  // updates are treated as instant swaps.
   $effect(() => {
-    // Read the images slice so the effect re-runs on any image-setting change.
-    const _ = $avatarSettings.images;
+    const images = $avatarSettings.images;
+    const theme = $uiTheme;
     if (transitionTimer === null) {
-      const next = resolveImageSrc(_, displayedState);
+      const next = resolveImageSrc(images, displayedState, theme);
       if (next !== displayedSrc) {
         displayedSrc = next;
       }
@@ -61,7 +70,11 @@
 
   onMount(async () => {
     // Initialize displayedSrc from current settings on first paint.
-    displayedSrc = resolveImageSrc(get(avatarSettings).images, 'Idle');
+    displayedSrc = resolveImageSrc(
+      get(avatarSettings).images,
+      'Idle',
+      get(settings).ui.theme,
+    );
     unlisten = await startAvatarStateListener();
   });
 
@@ -74,10 +87,12 @@
   function handleStateChange(newState: AvatarState) {
     // Spec rule (M4): no transition on the very first render — the avatar
     // appears directly in its starting state.
+    const theme = get(settings).ui.theme;
+
     if (isFirstRender) {
       isFirstRender = false;
       displayedState = newState;
-      displayedSrc = resolveImageSrc(get(avatarSettings).images, newState);
+      displayedSrc = resolveImageSrc(get(avatarSettings).images, newState, theme);
       return;
     }
 
@@ -88,18 +103,18 @@
       transitionTimer = null;
     }
 
-    const settings = get(avatarSettings);
-    const transitionSrc = resolveTransitionSrc(settings.transition);
-    const stateImage = resolveImageSrc(settings.images, newState);
+    const a = get(avatarSettings);
+    const transitionSrc = resolveTransitionSrc(a.transition, theme);
+    const stateImage = resolveImageSrc(a.images, newState, theme);
 
-    if (transitionSrc && settings.transition.duration_ms > 0) {
+    if (transitionSrc && a.transition.duration_ms > 0) {
       // Cache-bust so animated assets restart their playback when reused.
       displayedSrc = `${transitionSrc}?t=${Date.now()}`;
       transitionTimer = setTimeout(() => {
         displayedSrc = stateImage;
         displayedState = newState;
         transitionTimer = null;
-      }, settings.transition.duration_ms);
+      }, a.transition.duration_ms);
       displayedState = newState;
     } else {
       displayedSrc = stateImage;
@@ -150,29 +165,29 @@
     z-index: 10;
   }
   /* Top-positioned variants add 32px (one per-pane tab bar height,
-     declared in TabBar.svelte) on top of the user's margin so the
+     declared in TabBar.svelte) on top of the user's Y margin so the
      avatar clears the focused pane's tab bar instead of obscuring it.
      Without this, top-right / top-left avatars sit over the tab bar
      of whichever pane occupies that corner. Bottom-* positions don't
      need clearance — panes have no bottom bar. */
   .avatar-container.top-right {
-    top: calc(var(--avatar-margin) + 32px);
-    right: var(--avatar-margin);
+    top: calc(var(--avatar-margin-y) + 32px);
+    right: var(--avatar-margin-x);
     flex-direction: row;
   }
   .avatar-container.top-left {
-    top: calc(var(--avatar-margin) + 32px);
-    left: var(--avatar-margin);
+    top: calc(var(--avatar-margin-y) + 32px);
+    left: var(--avatar-margin-x);
     flex-direction: row-reverse;
   }
   .avatar-container.bottom-right {
-    bottom: var(--avatar-margin);
-    right: var(--avatar-margin);
+    bottom: var(--avatar-margin-y);
+    right: var(--avatar-margin-x);
     flex-direction: row;
   }
   .avatar-container.bottom-left {
-    bottom: var(--avatar-margin);
-    left: var(--avatar-margin);
+    bottom: var(--avatar-margin-y);
+    left: var(--avatar-margin-x);
     flex-direction: row-reverse;
   }
 
@@ -182,6 +197,10 @@
     height: var(--avatar-height);
     opacity: var(--avatar-opacity);
     pointer-events: auto;
+    /* 1px frame in the user's waveform color; outline keeps the image's
+       layout box untouched (no inward squeeze) and renders cleanly over
+       the terminal underneath. */
+    outline: 1px solid var(--avatar-border-color);
   }
 
   .avatar-image {

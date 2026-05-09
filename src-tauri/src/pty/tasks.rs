@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::processing::permission::{
-    PermissionDetector, PermissionDetectorResult, CLAUDE_PERMISSION_PATTERNS, NO_PATTERNS,
+    PatternKind, PatternTransition, PermissionDetector, PermissionPattern,
 };
 use crate::processing::{ProcessingEvent, ProcessingLayer};
 use super::manager::ProcessorControl;
@@ -141,6 +141,7 @@ pub fn spawn_processor(
     user_typed_tts: Arc<StdMutex<HashSet<String>>>,
     state_signals: mpsc::Sender<StateSignal>,
     settings: SettingsHandle,
+    patterns: Arc<Vec<PermissionPattern>>,
 ) {
     tokio::spawn(async move {
         // V1.4-03: `channel` is `mut` so the `ProcessorControl::ChannelChange`
@@ -161,14 +162,14 @@ pub fn spawn_processor(
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // Permission detector. AI tabs run the Claude Code patterns
-        // (subscription and local Claude both emit the same permission
-        // prompts since they're the same binary); Shell tabs use a no-op
-        // pattern set, and the detector itself is never invoked for them
-        // — see `is_shell` below.
-        let detector_patterns = match kind {
-            TabKind::AiTool => CLAUDE_PERMISSION_PATTERNS,
-            TabKind::Shell => NO_PATTERNS,
+        // Detector. AI tabs use the user-editable patterns loaded from
+        // patterns.json at startup (subscription and local Claude both run
+        // the same binary, so they share the pattern set); Shell tabs get
+        // an empty pattern list, and the detector itself is never invoked
+        // for them anyway — see `is_shell` below.
+        let detector_patterns: Vec<PermissionPattern> = match kind {
+            TabKind::AiTool => (*patterns).clone(),
+            TabKind::Shell => Vec::new(),
         };
         let mut detector = PermissionDetector::new(detector_patterns);
 
@@ -219,6 +220,9 @@ pub fn spawn_processor(
                 maybe = rx.recv() => {
                     match maybe {
                         Some(bytes) => {
+                            // Per-tab raw content capture. Disabled by
+                            // default; fast-path no-op when off.
+                            crate::content::write(&tab, &bytes);
                             let events = layer.ingest(&bytes);
                             let saw_terminal_bytes = events.iter().any(|e| matches!(
                                 e,
@@ -290,8 +294,9 @@ pub fn spawn_processor(
     });
 }
 
-/// Scan the rendered tail for permission prompts and forward edge transitions
-/// to the state manager. No-op for tabs configured with empty patterns.
+/// Scan the rendered tail for known prompt patterns and forward edge
+/// transitions to the state manager. No-op for tabs configured with empty
+/// patterns (Shell tabs).
 fn run_permission_check(
     tab: &TabId,
     detector: &mut PermissionDetector,
@@ -300,23 +305,33 @@ fn run_permission_check(
 ) {
     let rendered = layer.recent_rendered(PERMISSION_SCAN_TAIL);
     // Opt-in capture for pattern characterization. Enable with
-    // RUST_LOG=perm_capture=debug to dump the exact rendered tail the detector
-    // is matching against; pick distinctive substrings from the dump and put
-    // them in CLAUDE_PERMISSION_PATTERNS.
+    // RUST_LOG=perm_capture=debug to dump the exact rendered tail the
+    // detector matches against; pick distinctive substrings from the dump
+    // and add them to <exe-dir>/patterns.json.
     if tracing::enabled!(target: "perm_capture", tracing::Level::DEBUG) {
         let escaped = rendered.replace('\n', "\\n");
         tracing::debug!(target: "perm_capture", ?tab, rendered = %escaped, "perm capture");
     }
-    match detector.check(&rendered) {
-        PermissionDetectorResult::Detected { pattern_name } => {
-            debug!(?tab, pattern = pattern_name, "permission prompt detected");
-            let _ = state_signals.try_send(StateSignal::PermissionPromptDetected { tab: tab.clone() });
-        }
-        PermissionDetectorResult::Resolved => {
-            debug!(?tab, "permission prompt resolved");
-            let _ = state_signals.try_send(StateSignal::PermissionPromptResolved { tab: tab.clone() });
-        }
-        PermissionDetectorResult::None => {}
+    for transition in detector.check(&rendered) {
+        let signal = match transition {
+            PatternTransition::Detected { kind: PatternKind::Permission, pattern_name } => {
+                debug!(?tab, pattern = pattern_name, "permission prompt detected");
+                StateSignal::PermissionPromptDetected { tab: tab.clone() }
+            }
+            PatternTransition::Resolved { kind: PatternKind::Permission, pattern_name } => {
+                debug!(?tab, pattern = pattern_name, "permission prompt resolved");
+                StateSignal::PermissionPromptResolved { tab: tab.clone() }
+            }
+            PatternTransition::Detected { kind: PatternKind::Question, pattern_name } => {
+                debug!(?tab, pattern = pattern_name, "question prompt detected");
+                StateSignal::QuestionPromptDetected { tab: tab.clone() }
+            }
+            PatternTransition::Resolved { kind: PatternKind::Question, pattern_name } => {
+                debug!(?tab, pattern = pattern_name, "question prompt resolved");
+                StateSignal::QuestionPromptResolved { tab: tab.clone() }
+            }
+        };
+        let _ = state_signals.try_send(signal);
     }
 }
 

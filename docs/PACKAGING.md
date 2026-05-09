@@ -124,9 +124,13 @@ settings, plan a migration rather than a hard schema break.
 
 ## Asset Bundling
 
-The avatar default assets (`/public/avatar/*.mp4`) are served by Vite in
-dev and bundled into `dist/avatar/` for builds. They're embedded in the
-Tauri output as part of `frontendDist`. No separate step required.
+The avatar default assets live at the top-level `avatars/<theme>/` folder.
+The `cctts-avatars` Vite plugin in `vite.config.ts` serves them at
+`/avatar/<theme>/...` in dev and copies them to `dist/avatar/<theme>/...`
+at build time, where they're embedded in the Tauri output as part of
+`frontendDist`. The release workflow also stages the same `avatars/`
+tree into the portable zip's `avatars/` folder for on-disk discoverability.
+No separate step required.
 
 Custom user-picked image/video paths are absolute disk paths; they're
 loaded via Tauri's asset protocol and need `assetProtocol.scope` to permit

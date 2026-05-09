@@ -57,25 +57,38 @@ pub fn persist_to_disk(tab: &TabId, bytes: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
-/// Read AND remove the per-tab persisted scrollback. Returns `None` if
-/// the file doesn't exist (cold-installed tab, or already consumed).
-/// Uses fs::read first so a partial-read failure leaves the file on
-/// disk for a retry; only deletes after a successful read.
-pub fn take(tab: &TabId) -> Option<Vec<u8>> {
+/// Read the per-tab persisted scrollback without deleting it. Returns
+/// `None` if the file doesn't exist (cold-installed tab, or already
+/// consumed). Pair with `consume_after_read` once the caller has
+/// successfully replayed and seeded the bytes — that way a transient
+/// `seed_scrollback` failure (poisoned mutex, ring contention) leaves
+/// the file in place for the next launch to retry, rather than
+/// dropping the user's scrollback on the floor between read and seed.
+pub fn read(tab: &TabId) -> Option<Vec<u8>> {
     let path = scrollback_file_for(tab).ok()?;
     if !path.exists() {
         return None;
     }
     match fs::read(&path) {
-        Ok(bytes) => {
-            // Deletion failure is non-fatal — we'll prune on next
-            // launch's orphan sweep if the file's owner tab is gone.
-            let _ = fs::remove_file(&path);
-            Some(bytes)
-        }
+        Ok(bytes) => Some(bytes),
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "scrollback read failed");
             None
+        }
+    }
+}
+
+/// Delete the per-tab scrollback file. No-op if the file is already gone.
+/// Called from `pty_start` after a successful `seed_scrollback`. Failure
+/// here is non-fatal — the orphan-prune sweep at next launch catches it
+/// if the tab has been removed; otherwise the next read returns the same
+/// bytes again, which is acceptable because seed is idempotent (the new
+/// ring is empty before the seed and the seed itself is a write).
+pub fn consume_after_read(tab: &TabId) {
+    let Ok(path) = scrollback_file_for(tab) else { return };
+    if let Err(e) = fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(error = %e, path = %path.display(), "scrollback delete failed");
         }
     }
 }

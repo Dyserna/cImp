@@ -30,6 +30,10 @@ use crate::tts::{ActiveTab, TtsRequest};
 pub enum NotificationEvent {
     Idle,
     AwaitingPermission,
+    /// AskUserQuestion-style prompt detected. Independent of the
+    /// `AwaitingPermission` event so each can have its own template and
+    /// fire even when the other is also in flight.
+    AwaitingQuestion,
     Error,
     /// Shell-only: subprocess exited while the user was on a different tab.
     /// Phase 5 of MILESTONE-V3-01.
@@ -45,12 +49,14 @@ fn allowed_for(kind: &TabKind, event: NotificationEvent) -> bool {
     match (kind, event) {
         (TabKind::AiTool, NotificationEvent::Idle) => true,
         (TabKind::AiTool, NotificationEvent::AwaitingPermission) => true,
+        (TabKind::AiTool, NotificationEvent::AwaitingQuestion) => true,
         (TabKind::AiTool, NotificationEvent::Error) => true,
         (TabKind::AiTool, NotificationEvent::Exited) => false,
         (TabKind::Shell, NotificationEvent::Error) => true,
         (TabKind::Shell, NotificationEvent::Exited) => true,
         (TabKind::Shell, NotificationEvent::Idle) => false,
         (TabKind::Shell, NotificationEvent::AwaitingPermission) => false,
+        (TabKind::Shell, NotificationEvent::AwaitingQuestion) => false,
     }
 }
 
@@ -98,11 +104,22 @@ struct NotificationManager {
     /// queueing a phantom `idle` notification before any real activity.
     last_avatar: HashMap<TabId, AvatarState>,
     last_awaiting: HashMap<TabId, bool>,
+    last_awaiting_question: HashMap<TabId, bool>,
     /// Set when something is enqueued and we haven't yet drained. The
     /// run loop selects on `sleep_until(deadline)` and drains when it
     /// fires. Cleared by both the deadline arm and the audio idle-edge
     /// arm so the next enqueue can re-schedule cleanly.
     drain_deadline: Option<Instant>,
+    /// Tabs whose notification audio is currently in flight (from `try_drain`
+    /// to the matching `Speaking → Idle` echo). The audio playback for our
+    /// own announcement fires `TtsPlaybackStarted/Stopped` on the active
+    /// tab, which makes the state machine cycle `Idle → Speaking → Idle`.
+    /// Without this guard, that closing `Speaking → Idle` would itself look
+    /// like a fresh "tab went idle" event and queue another announcement —
+    /// which loops on every "Claude is idle" repeat. Cleared either when
+    /// the matching echo arrives (suppressed) or when any non-Speaking,
+    /// non-Idle state edge for the tab pre-empts it.
+    just_dispatched: HashSet<TabId>,
 }
 
 impl NotificationManager {
@@ -129,7 +146,9 @@ impl NotificationManager {
             queue: Vec::new(),
             last_avatar: HashMap::new(),
             last_awaiting: HashMap::new(),
+            last_awaiting_question: HashMap::new(),
             drain_deadline: None,
+            just_dispatched: HashSet::new(),
         }
     }
 
@@ -179,6 +198,31 @@ impl NotificationManager {
                 if prev == state {
                     return;
                 }
+                // Suppress the `Speaking → Idle` echo from our own
+                // notification's audio playback ending. The audio thread
+                // emits `TtsPlaybackStarted/Stopped` for the active tab on
+                // every stretch of audio, which makes the state machine
+                // cycle `Idle → Speaking → Idle` whenever an announcement
+                // plays. Without this, that closing edge fires another
+                // "Claude is idle" notification, which plays, fires another
+                // edge, and so on. `just_dispatched` is set in `try_drain`
+                // and is consumed exactly once here.
+                if prev == AvatarState::Speaking
+                    && state == AvatarState::Idle
+                    && self.just_dispatched.remove(&tab)
+                {
+                    debug!(?tab, "notifications: suppressing Idle (own playback echo)");
+                    return;
+                }
+                // Any state edge other than `Idle ↔ Speaking` for a
+                // just-dispatched tab means real activity got there before
+                // the echo (user typed, Claude restarted, error fired).
+                // Drop the marker so the next dispatch's echo can be
+                // suppressed cleanly without our flag stale-suppressing a
+                // genuine future Idle.
+                if state != AvatarState::Speaking && state != AvatarState::Idle {
+                    self.just_dispatched.remove(&tab);
+                }
                 if self.suppress_for_focus(&tab) {
                     return;
                 }
@@ -212,6 +256,19 @@ impl NotificationManager {
                 }
                 self.try_enqueue(tab, NotificationEvent::AwaitingPermission)
             }
+            StateEvent::AwaitingQuestionChanged { tab, awaiting } => {
+                let prev = self
+                    .last_awaiting_question
+                    .insert(tab.clone(), awaiting)
+                    .unwrap_or(false);
+                if prev == awaiting || !awaiting {
+                    return;
+                }
+                if self.suppress_for_focus(&tab) {
+                    return;
+                }
+                self.try_enqueue(tab, NotificationEvent::AwaitingQuestion)
+            }
             StateEvent::TabClosedStateChanged {
                 tab,
                 closed,
@@ -230,17 +287,19 @@ impl NotificationManager {
             }
             StateEvent::TabCreated { tab, .. } => {
                 // Seed per-tab caches so the first real StateChanged /
-                // AwaitingPermissionChanged event compares against an
-                // explicit baseline instead of relying on `unwrap_or`
-                // fallbacks. Idempotent — re-seeding is a no-op if the tab
-                // already had cached state.
+                // AwaitingPermissionChanged / AwaitingQuestionChanged event
+                // compares against an explicit baseline instead of relying
+                // on `unwrap_or` fallbacks. Idempotent.
                 self.last_avatar.entry(tab.clone()).or_insert(AvatarState::Idle);
-                self.last_awaiting.entry(tab).or_insert(false);
+                self.last_awaiting.entry(tab.clone()).or_insert(false);
+                self.last_awaiting_question.entry(tab).or_insert(false);
                 return;
             }
             StateEvent::TabClosed { tab } => {
                 self.last_avatar.remove(&tab);
                 self.last_awaiting.remove(&tab);
+                self.last_awaiting_question.remove(&tab);
+                self.just_dispatched.remove(&tab);
                 // Drop any queued notifications targeting the closed tab —
                 // playing them after close would refer to a tab that no
                 // longer exists in the UI.
@@ -326,6 +385,7 @@ impl NotificationManager {
             "notifications: draining"
         );
         for n in surviving {
+            let tab = n.tab.clone();
             let req = TtsRequest::SynthesizeNotification {
                 tab: n.tab,
                 text: n.text,
@@ -333,6 +393,19 @@ impl NotificationManager {
             if let Err(e) = self.tts_tx.send(req).await {
                 warn!(error = %e, "notifications: tts channel closed");
                 return;
+            }
+            // Arm the echo-suppression guard. The audio thread tags its
+            // `TtsPlaybackStarted/Stopped` events with the *currently
+            // active* tab, not the notification's originating tab — so
+            // the `Idle → Speaking → Idle` cycle plays out on the active
+            // tab. In the common same-tab case the two are equal; in the
+            // cross-tab case (announcement for an inactive tab while
+            // `announce_focused_tab=true`) the active tab is the one
+            // whose echo would otherwise re-queue. Insert both so either
+            // surface gets suppressed.
+            self.just_dispatched.insert(tab);
+            if let Ok(active) = self.active.read() {
+                self.just_dispatched.insert(active.clone());
             }
         }
     }
@@ -354,22 +427,35 @@ fn notification_text(
         return String::new();
     };
 
-    let template = match (entry, event) {
-        (TabConfig::AiTool(c), NotificationEvent::Idle) => c.notifications.idle.clone(),
+    use crate::settings::NotificationSlot;
+    // V1.11 promoted each per-event slot to a `{ enabled, text }`
+    // pair. Disabled or empty-text slots both fall through to the
+    // empty-string suppression path in the caller, so the firing
+    // contract is unchanged.
+    let slot: &NotificationSlot = match (entry, event) {
+        (TabConfig::AiTool(c), NotificationEvent::Idle) => &c.notifications.idle,
         (TabConfig::AiTool(c), NotificationEvent::AwaitingPermission) => {
-            c.notifications.awaiting_permission.clone()
+            &c.notifications.awaiting_permission
         }
-        (TabConfig::AiTool(c), NotificationEvent::Error) => c.notifications.error.clone(),
+        (TabConfig::AiTool(c), NotificationEvent::AwaitingQuestion) => {
+            &c.notifications.question
+        }
+        (TabConfig::AiTool(c), NotificationEvent::Error) => &c.notifications.error,
         // AI tabs don't fire Exited; defensive empty.
-        (TabConfig::AiTool(_), NotificationEvent::Exited) => String::new(),
-        (TabConfig::Shell(c), NotificationEvent::Error) => c.notifications.error.clone(),
-        (TabConfig::Shell(c), NotificationEvent::Exited) => c.notifications.exited.clone(),
-        // Shell tabs don't fire Idle / AwaitingPermission; defensive empty.
+        (TabConfig::AiTool(_), NotificationEvent::Exited) => return String::new(),
+        (TabConfig::Shell(c), NotificationEvent::Error) => &c.notifications.error,
+        (TabConfig::Shell(c), NotificationEvent::Exited) => &c.notifications.exited,
+        // Shell tabs don't fire Idle / AwaitingPermission / AwaitingQuestion;
+        // defensive empty.
         (TabConfig::Shell(_), NotificationEvent::Idle)
-        | (TabConfig::Shell(_), NotificationEvent::AwaitingPermission) => String::new(),
+        | (TabConfig::Shell(_), NotificationEvent::AwaitingPermission)
+        | (TabConfig::Shell(_), NotificationEvent::AwaitingQuestion) => return String::new(),
     };
 
-    interpolate_code(&template, exit_code)
+    if !slot.enabled {
+        return String::new();
+    }
+    interpolate_code(&slot.text, exit_code)
 }
 
 /// Replace `{code}` with the exit code (or `?` when none was reported).
@@ -474,10 +560,11 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_ai_tabs_get_v1_trio_only() {
+    fn allowlist_ai_tabs_get_v1_trio_plus_question() {
         let kind = TabKind::AiTool;
         assert!(allowed_for(&kind, NotificationEvent::Idle));
         assert!(allowed_for(&kind, NotificationEvent::AwaitingPermission));
+        assert!(allowed_for(&kind, NotificationEvent::AwaitingQuestion));
         assert!(allowed_for(&kind, NotificationEvent::Error));
         assert!(!allowed_for(&kind, NotificationEvent::Exited));
     }
@@ -489,6 +576,7 @@ mod tests {
         assert!(allowed_for(&kind, NotificationEvent::Exited));
         assert!(!allowed_for(&kind, NotificationEvent::Idle));
         assert!(!allowed_for(&kind, NotificationEvent::AwaitingPermission));
+        assert!(!allowed_for(&kind, NotificationEvent::AwaitingQuestion));
     }
 
     #[test]

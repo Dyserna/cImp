@@ -11,6 +11,14 @@ export interface AvatarSize {
   height_px: number;
 }
 
+/// Per-axis offset from the screen edge specified by `AvatarPosition`.
+/// Replaces the pre-v1.12 scalar `margin_px` field; the migration copies
+/// the legacy value into both axes.
+export interface AvatarMargin {
+  x_px: number;
+  y_px: number;
+}
+
 export interface AvatarImages {
   idle: string | null;
   listening: string | null;
@@ -35,7 +43,7 @@ export interface AvatarSettings {
   visible: boolean;
   size: AvatarSize;
   position: AvatarPosition;
-  margin_px: number;
+  margin: AvatarMargin;
   opacity: number;
   images: AvatarImages;
   transition: TransitionSettings;
@@ -66,6 +74,14 @@ export interface BehaviorSettings {
   /// When true, tab announcements fire even for the currently-focused tab.
   /// Default false reproduces the historical background-only behavior.
   announce_focused_tab: boolean;
+  /// When true, tagged-content TTS plays even for tabs that aren't the
+  /// active one. Default false matches the v2 behavior — only the
+  /// foreground tab speaks. Independent of `announce_focused_tab`, which
+  /// only controls announcement TTS.
+  speak_background_tabs: boolean;
+  /// When true, text selected in any terminal is copied to the system
+  /// clipboard automatically.
+  copy_on_select: boolean;
 }
 
 export interface ComposeSettings {
@@ -106,16 +122,29 @@ export interface TtsInjection {
   instructions: string;
 }
 
+/// V1.11 per-event notification slot. Both `enabled === true` AND a
+/// non-empty `text` are required for the slot to fire — the legacy
+/// "leave blank to disable" convention still works alongside the
+/// explicit checkbox. The Rust side ships a tolerant `Deserialize` so
+/// pre-v1.11 settings files (bare strings) load without losing text.
+export interface NotificationSlot {
+  enabled: boolean;
+  text: string;
+}
+
 export interface AiNotificationConfig {
-  idle: string;
-  awaiting_permission: string;
-  error: string;
+  idle: NotificationSlot;
+  awaiting_permission: NotificationSlot;
+  /// Spoken when a `kind: question` pattern fires (AskUserQuestion-style
+  /// multi-option prompts).
+  question: NotificationSlot;
+  error: NotificationSlot;
 }
 
 export interface ShellNotificationConfig {
-  error: string;
+  error: NotificationSlot;
   /// `{code}` placeholder is interpolated with the actual exit code in M4.
-  exited: string;
+  exited: NotificationSlot;
 }
 
 export interface AiToolTabConfig {
@@ -175,9 +204,10 @@ export interface ProcessingSettings {
 }
 
 export interface UiSettings {
-  /// Active UI chrome theme. V5-01 ships only `"modern-dark"`; the field
-  /// exists so future themes (light, high-contrast) plug in without UI
-  /// plumbing churn. Distinct from `terminal.theme`, which governs the
+  /// Active UI chrome theme. Two values currently ship: `"modern-dark"`
+  /// (slate-blue + mint, OS-native window chrome) and `"tui"` (gruvbox
+  /// + custom title bar, ratatui aesthetic). New installs default to
+  /// `"tui"`. Distinct from `terminal.theme`, which governs the
   /// xterm.js terminal palette inside each tab.
   theme: string;
 }
@@ -323,7 +353,19 @@ export interface LayoutPreset {
   tree: LayoutNode;
 }
 
+/// Latest on-disk schema version. Mirrors `CURRENT_SCHEMA_VERSION` in
+/// `src-tauri/src/settings/schema.rs`. Bumped on every backend migration
+/// step. Frontend doesn't read it for any logic — it round-trips as a
+/// bare integer through the IPC bridge.
+export const CURRENT_SCHEMA_VERSION = 12;
+
 export interface Settings {
+  /// On-disk schema version. The backend stamps `CURRENT_SCHEMA_VERSION`
+  /// on fresh installs and via the v1.9 → v1.10 migration; the frontend
+  /// receives it as a bare integer and includes it in `defaultSettings`
+  /// so a manually-constructed Settings (test fixtures, fallback paths)
+  /// matches the on-disk shape.
+  schema_version: number;
   tts: TtsSettings;
   avatar: AvatarSettings;
   display: DisplaySettings;
@@ -351,6 +393,40 @@ export interface Settings {
   /// `use_local_provider` flag is `true`. Stored cleartext on disk —
   /// local proxies typically accept dummy tokens, so this is acceptable.
   claude_local: ClaudeLocalSettings;
+  /// Which Claude tabs are enabled. The radio in Settings → Tabs is the
+  /// canonical way to flip this; the backend's `set_claude_tabs_enabled`
+  /// IPC opens / closes the corresponding AI tabs in response. Default
+  /// is `cloud` (subscription Claude only) on a fresh install.
+  claude_tabs_enabled: ClaudeTabsEnabled;
+  /// File-logger configuration. The backend writes daily rolling log
+  /// files into `<exe-dir>/logs/`; this field drives the live filter.
+  logging: LoggingSettings;
+}
+
+/// Which Claude tabs the user has enabled. Mirrored from the backend's
+/// `ClaudeTabsEnabled` enum (kebab-case wire format).
+export type ClaudeTabsEnabled = 'cloud' | 'local' | 'both';
+
+/// Tracing-filter level. Lowercase to match Rust's serde rename.
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
+
+/// Log file retention. Drives the startup cleanup pass that removes
+/// rolled files older than the chosen window. `never` keeps everything.
+export type LogRetention = 'daily' | 'weekly' | 'monthly' | 'never';
+
+/// Per-tab raw PTY content capture. Disabled by default. When on,
+/// every tab's PTY output is also written to
+/// `<exe-dir>/logs/content/<tab-id>.log.<YYYY-MM-DD>`.
+export interface ContentCaptureSettings {
+  enabled: boolean;
+  retention: LogRetention;
+}
+
+/// File-logger configuration. Mirrors Rust's `LoggingSettings`.
+export interface LoggingSettings {
+  level: LogLevel;
+  retention: LogRetention;
+  content_capture: ContentCaptureSettings;
 }
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
@@ -390,12 +466,13 @@ export function findTabIndex(settings: Settings, id: string): number {
 // re-broadcasts on init so this value is short-lived in practice.
 export function defaultSettings(): Settings {
   return {
+    schema_version: CURRENT_SCHEMA_VERSION,
     tts: { voice: 'af_heart', speed: 1.0, volume: 1.0, mute: false },
     avatar: {
       visible: true,
       size: { width_px: 240, height_px: 240 },
       position: 'top-right',
-      margin_px: 16,
+      margin: { x_px: 16, y_px: 16 },
       opacity: 0.8,
       images: {
         idle: null,
@@ -424,6 +501,8 @@ export function defaultSettings(): Settings {
       announcements_enabled: true,
       follow_avatar: false,
       announce_focused_tab: false,
+      speak_background_tabs: false,
+      copy_on_select: true,
     },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {
@@ -462,9 +541,13 @@ export function defaultSettings(): Settings {
         env: {},
         tts_injection: { enabled: true, instructions: '' },
         notifications: {
-          idle: 'Claude is idle',
-          awaiting_permission: 'Claude is awaiting permission',
-          error: 'Claude encountered an error',
+          idle: { enabled: true, text: 'Claude is idle' },
+          awaiting_permission: {
+            enabled: true,
+            text: 'Claude is awaiting permission',
+          },
+          question: { enabled: true, text: 'Claude has a question' },
+          error: { enabled: true, text: 'Claude encountered an error' },
         },
         first_launch_notice_dismissed: true,
         theme_override: null,
@@ -482,9 +565,16 @@ export function defaultSettings(): Settings {
         env: {},
         tts_injection: { enabled: true, instructions: '' },
         notifications: {
-          idle: 'Claude (local) is idle',
-          awaiting_permission: 'Claude (local) is awaiting permission',
-          error: 'Claude (local) encountered an error',
+          idle: { enabled: true, text: 'Claude (local) is idle' },
+          awaiting_permission: {
+            enabled: true,
+            text: 'Claude (local) is awaiting permission',
+          },
+          question: { enabled: true, text: 'Claude (local) has a question' },
+          error: {
+            enabled: true,
+            text: 'Claude (local) encountered an error',
+          },
         },
         first_launch_notice_dismissed: true,
         theme_override: null,
@@ -496,9 +586,9 @@ export function defaultSettings(): Settings {
     session: { active_tab_id: null },
     layout: null,
     layout_presets: [],
-    ui: { theme: 'modern-dark' },
+    ui: { theme: 'tui' },
     terminal: {
-      theme: { name: 'Default', custom: null },
+      theme: { name: 'Gruvbox Dark', custom: null },
       background: {
         image: null,
         color: null,
@@ -520,6 +610,12 @@ export function defaultSettings(): Settings {
       base_url: 'http://localhost:4000',
       auth_token: 'sk-dummy',
       model_alias: '',
+    },
+    claude_tabs_enabled: 'cloud',
+    logging: {
+      level: 'info',
+      retention: 'weekly',
+      content_capture: { enabled: false, retention: 'weekly' },
     },
   };
 }

@@ -1,27 +1,36 @@
 # cctts
 
 Multi-tab AI assistant wrapper with text-to-speech and a state-driven
-animated avatar. A Tauri desktop app that hosts two **Claude Code** tabs
-out of the box — one for your subscription / API account and one
-preconfigured to talk to a local LLM via a translation proxy — extracts
-`[[TTS]]…[[/TTS]]` markers from output, synthesizes them with a local
-Kokoro ONNX model, and drives a per-tab avatar overlay (Idle / Listening /
-Thinking / Speaking / Error) plus a real-time waveform.
+animated avatar. A Tauri desktop app that hosts **Claude Code** — your
+subscription tab, a local-LLM tab, or both — extracts `[[TTS]]…[[/TTS]]`
+markers from output, synthesizes them with a local Kokoro ONNX model,
+and drives a per-tab avatar overlay (Idle / Listening / Thinking /
+Speaking / Error) plus a real-time waveform.
 
 Local, offline-after-install, no audio leaves the machine.
 
-## Two Claude Code tabs
+## Claude Code tabs
+
+cctts can host two flavors of Claude Code:
 
 - **Claude** — your normal Claude Code, running with whatever auth flow
   you configured (Pro/Max subscription via OAuth, or `ANTHROPIC_API_KEY`).
 - **Claude (local)** — a second `claude` instance with
   `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` injected at spawn time
-  so it talks to a local LLM via a translation proxy (LiteLLM / similar)
+  so it talks to a local backend (LM Studio, Ollama, vLLM, llama-server)
   instead of `api.anthropic.com`. Configured in
   *Settings → Local LLM provider*.
-- Switch with `Ctrl+1` (Claude) and `Ctrl+2` (Claude (local)), or click the tab.
-- Both subprocesses spawn at app launch in the directory cctts was started
-  in. They run independently — switching tabs doesn't stop either one.
+
+Which tabs exist is controlled by the **Claude tabs enabled** radio in
+*Settings → Tabs* (Cloud / Local / Both). Default on a fresh install is
+**Cloud** (subscription tab only). Switching the radio at runtime closes
+the affected tab (kills its PTY, drops scrollback) or re-creates it from
+the built-in defaults.
+
+- Switch between tabs with `Ctrl+1`..`Ctrl+9` (within the focused pane), or click the tab.
+- Both subprocesses, when present, spawn at app launch in the directory
+  cctts was started in. They run independently — switching tabs doesn't
+  stop either one.
 - The compose overlay submits to whichever tab is currently active.
 
 ## Shell Tabs (v1.2+)
@@ -43,7 +52,10 @@ and `exited` only).
   subprocess and respawns it with the current configuration. Useful after
   changing the command in Configure.
 - **Close:** click the `×` on the tab, or press `Ctrl+W` while the tab is
-  active. Builtin tabs (Claude, Claude (local)) cannot be closed.
+  active. The AI tabs (Claude, Claude (local)) cannot be closed via the
+  `×` — toggle them via the **Claude tabs enabled** radio in Settings
+  instead. The default first shell tab (`shell-default-1`) is closable
+  like any other shell.
 - **Switch by position:** `Ctrl+1`..`Ctrl+9` switch to the tab at that
   ordinal position **within the focused pane** (v1.3 change — see
   *Multi-pane Layout* below). `Ctrl+9` with fewer than 9 tabs in the focused
@@ -94,10 +106,14 @@ Common alternatives, paste into Configure → command + arguments:
   changes apply on next shell restart. Right-click → *Restart shell*, or
   type `exit` and press Enter on the closed-shell overlay.
 - **How do I delete a Shell tab?** Hover the tab and click `×`, or press
-  `Ctrl+W` while the tab is active. Builtin tabs can't be closed.
-- **My settings.json got corrupted.** v1.2 backs up the v1.1 file as
-  `config.json.v1.1.bak` on first migration. For other corruption,
-  delete `settings.json` and the app writes a fresh default on next launch.
+  `Ctrl+W` while the tab is active. The AI tabs (Claude, Claude (local))
+  aren't closable from the tab bar — use the *Claude tabs enabled* radio
+  in *Settings → Tabs*.
+- **My settings.json got corrupted.** Each migration writes a backup
+  alongside the source file (e.g. `settings.json.v1.7.bak.<ts>`). For
+  other corruption, delete the global `<exe-dir>/settings.json` (and the
+  per-folder `.cctts.custom.config.json` overlay if present) and the app
+  writes fresh defaults on next launch.
 
 ## Multi-pane Layout (v1.3+)
 
@@ -199,34 +215,47 @@ TTS, avatar) carry over unchanged. The only behavior change is that
 `Ctrl+1`..`Ctrl+9` are now **scoped to the focused pane** rather than the
 global tab list.
 
-## Local LLM provider (the second Claude tab)
+## Local LLM provider (the Claude (local) tab)
 
-The **Claude (local)** tab runs the same `claude` binary as the first
-tab but with two environment variables injected at spawn time:
+The **Claude (local)** tab runs the same `claude` binary as the
+subscription tab but with two environment variables injected at spawn
+time:
 
 ```
-ANTHROPIC_BASE_URL=<your local proxy URL>
-ANTHROPIC_AUTH_TOKEN=<token your proxy expects>
+ANTHROPIC_BASE_URL=<your local backend URL>
+ANTHROPIC_AUTH_TOKEN=<token your backend expects>
 ```
 
 Configure both under *Settings → Local LLM provider*. cctts does **not**
-start the proxy itself — you run a separate translator like
-[LiteLLM](https://docs.litellm.ai/docs/proxy/quick_start) that speaks
-the Anthropic Messages API on its public side and forwards to Ollama /
-LM Studio / OpenAI / etc. on the back end.
+start the backend itself — you run it separately. The supported backends
+all expose a native Anthropic Messages API (`/v1/messages`), so no
+translation proxy is needed:
 
-A typical local-only setup:
+| Backend                                                                                  | Default port | Notes                                            |
+|------------------------------------------------------------------------------------------|--------------|--------------------------------------------------|
+| [LM Studio](https://lmstudio.ai/docs/developer/anthropic-compat) (≥ 0.4.1)               | `1234`       | Easiest path: load a model, enable the server.   |
+| [llama-server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) | `8080`       | Run with `--jinja` for tool use.                 |
+| Ollama                                                                                   | `11434`      | Native Anthropic compatibility.                  |
+| vLLM                                                                                     | `8000`       | Native Anthropic compatibility.                  |
 
-1. Run Ollama (or LM Studio) with whichever model you want.
-2. Run LiteLLM as a proxy in front of it, mapping `claude-*` model names
-   to your local model. The LiteLLM docs cover the config shape.
-3. In cctts: *Settings → Local LLM provider* → set Proxy URL to your
-   LiteLLM URL (e.g. `http://localhost:4000`) and Auth token to whatever
-   your proxy expects (often a dummy string like `sk-dummy`).
+A typical setup:
+
+1. Start your backend with whichever model you want (e.g. LM Studio's
+   "Start server" toggle on a loaded model).
+2. In cctts: *Settings → Tabs → Claude tabs enabled* → switch to **Local**
+   or **Both**.
+3. *Settings → Local LLM provider* → set Endpoint URL to the backend's
+   base URL (e.g. `http://localhost:1234`) and Auth token to whatever
+   the backend expects (a dummy string like `sk-dummy` works for all
+   four).
 4. Restart the Claude (local) tab.
 
+For OpenAI-only backends (no native Anthropic endpoint) run a translator
+like [`anthropic-proxy-rs`](https://github.com/m0n0x41d/anthropic-proxy-rs)
+in front of it and point cctts at the translator.
+
 Per-tab `env` entries always take precedence over the synthesized
-values, so you can also point a single tab at a different proxy by
+values, so you can also point a single tab at a different endpoint by
 setting `ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local)
 → Environment*.
 
@@ -237,13 +266,14 @@ setting `ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local)
   committing.
 - Anthropic-server features (prompt caching, extended thinking, vision)
   are unavailable on local models.
-- The auth token sits cleartext in `%APPDATA%\cctts\settings.json` —
-  fine for local dummies; don't put a real Anthropic API key there.
+- The auth token sits cleartext in `<exe-dir>/settings.json` (or the
+  per-folder `.cctts.custom.config.json` overlay) — fine for local
+  dummies; don't put a real Anthropic API key there.
 
 ## System Requirements
 
 - **OS:** Windows 10/11 (primary). Linux is feasible but not part of the
-  validation matrix — see `docs/MILESTONE-08-polish.md`.
+  validation matrix — see `docs/completedMilestones/MILESTONE-V1-08-polish.md`.
 - **GPU:** optional. The app defaults to CPU inference (Kokoro is small
   enough for near-real-time CPU). NVIDIA CUDA 12.x can be opted into via
   `setx CCTTS_GPU cuda` and a restart — see `MAINTENANCE.md` for the
@@ -251,13 +281,13 @@ setting `ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local)
 - **Claude Code:** the `claude` binary must be on `PATH`. cctts spawns it
   as a subprocess and passes `--append-system-prompt` so Claude knows to
   emit the TTS markers.
-- **Local LLM proxy (optional, for the Claude (local) tab):** if the
-  Claude (local) tab's *Use local LLM provider* flag is on, you also
-  need a running translator process at the URL configured under
-  *Settings → Local LLM provider*. cctts does not start the proxy. If
-  the proxy isn't reachable, the tab will fail on first message — you
-  can disable the flag, or just stop using that tab; the subscription
-  Claude tab is unaffected.
+- **Local backend (optional, for the Claude (local) tab):** if the
+  Claude (local) tab's *Use local LLM provider* flag is on, you need a
+  running Anthropic-compatible backend (LM Studio, Ollama, vLLM, or
+  llama-server) at the URL configured under *Settings → Local LLM
+  provider*. cctts does not start the backend. If it isn't reachable,
+  the tab will fail on first message — disable the flag, or just stop
+  using that tab; the subscription Claude tab is unaffected.
 - **WebView2 (Windows):** preinstalled on updated Windows 10/11. Older
   systems may need the WebView2 runtime installed manually.
 
@@ -294,26 +324,37 @@ prints the expected paths to the log.
 
 ## Configuring Tabs
 
-Per-tab subprocess configuration lives under **Settings → Tabs**. Each
-tab has its own sub-section with:
+Per-tab subprocess configuration lives under **Settings → Tabs**, split
+into three sub-sections: **Claude**, **Claude (local)**, and **Shells**.
+Each tab exposes:
 
-- **Command** (read-only): the binary cctts spawns — `claude` for both
-  AI tabs.
+- **Command** (read-only on AI tabs): the binary cctts spawns — `claude`
+  for both AI tabs.
 - **Persistent CLI flags:** flags appended to every spawn of that tab.
-- **Use local LLM provider:** toggle that gates env synthesis from the
-  global *Local LLM provider* settings (off by default for the
+- **Use local LLM provider** (AI tabs): toggle that gates env synthesis
+  from the global *Local LLM provider* settings (off by default for the
   subscription Claude tab; on by default for the Claude (local) tab).
-- **TTS markup injection:** toggle plus an editable instructions block.
-  Instructions are passed via `--append-system-prompt` on each spawn.
-  The Reset button restores cctts's built-in runtime prompt
+- **TTS markup injection** (AI tabs): toggle plus an editable
+  instructions block. Instructions are passed via
+  `--append-system-prompt` on each spawn. The Reset button restores
+  cctts's built-in runtime prompt
   (`src-tauri/src/tts/runtime_prompt.md`).
-- **Notifications:** text used for inactive-tab notifications (firing
-  itself ships in V2-04; configuration is wired now).
+- **Notifications:** text spoken when the tab transitions to a notable
+  state and the user is focused elsewhere. AI tabs have four slots
+  (`idle`, `awaiting_permission`, `question`, `error`); shell tabs have
+  two (`error`, `exited`). Empty string disables that specific
+  notification while leaving the others active.
+- **Appearance:** per-tab terminal-palette and background overrides
+  (V1.4-01 / V1.4-02); each travels with the tab through drag-and-drop.
 - **Restart Tab:** apply changes that require respawning the subprocess
-  (command, CLI flags, TTS injection). Notification text changes apply
-  live — no restart needed.
+  (command, CLI flags, TTS injection, `use_local_provider`). Notification
+  text and appearance changes apply live — no restart needed.
 
-Settings persist to `%APPDATA%\cctts\settings.json` (debounced save).
+Settings are persisted to two files: a **portable global baseline** at
+`<exe-dir>/settings.json`, and a **per-folder overlay** at
+`<launch_cwd>/.cctts.custom.config.json` containing only the keys that
+differ from the baseline. Saves are debounced (500 ms) and the overlay
+file is deleted automatically when the diff is empty.
 
 ## Running
 
@@ -357,23 +398,33 @@ Open with `Ctrl+,` or the cog button on the avatar.
   GitHub Dark) plus a 22-color Custom editor for foreground, background,
   cursor, selection, ANSI 8, and bright 8. Each tab can override the
   global palette via Configure Tab → Appearance — useful for color-coding
-  Claude (subscription) vs. Claude (local) vs. shells. Per-tab overrides travel with the tab
-  through drag-and-drop. Plus **terminal background** — a solid color or
-  user-supplied image rendered beneath the terminal text. Solid color
-  has no performance cost; image mode forces the slower DOM renderer
-  (2-5× slower for high-throughput output like `tail -F`). Toggling the
-  image switches xterm.js renderers cleanly — your shell session,
-  scrollback, and running processes all survive the switch (V1.4-03).
-  Image mode adds opacity, blur, size, position, and an optional tint
-  color for the dimming overlay. **Per-tab Background row** in Configure
-  Tab gives each tab its own image/color or a "Disabled" opt-out that
-  forces plain theme background regardless of the global setting.
-- **Behavior:** interrupt TTS on input, auto-speak detected segments.
+  Claude (subscription) vs. Claude (local) vs. shells. Per-tab overrides
+  travel with the tab through drag-and-drop. Plus **terminal background**
+  — a solid color or user-supplied image rendered beneath the terminal
+  text, with named **global presets** you can save and apply across tabs.
+  Solid color has no performance cost; image mode forces the slower DOM
+  renderer (2-5× slower for high-throughput output like `tail -F`).
+  Toggling the image switches xterm.js renderers cleanly — your shell
+  session, scrollback, and running processes all survive the switch
+  (V1.4-03), and the visible scrollback also survives an app restart via
+  a per-tab on-disk ring buffer (V1.4-04 D). Image mode adds opacity,
+  blur, size, position, and an optional tint color for the dimming
+  overlay. **Per-tab Background row** in Configure Tab gives each tab
+  its own image/color or a "Disabled" opt-out that forces plain theme
+  background regardless of the global setting.
+- **Audio / Behavior:** interrupt TTS on input, auto-speak detected
+  segments, fall back to silence on responses with no TTS markup,
+  enable/disable announcements globally, **announce focused tab** (let
+  notifications fire even for the tab you're looking at; default off),
+  **follow avatar** (auto-mute when the avatar is hidden; default off).
 - **Compose:** min/max sheet height for the slide-up compose overlay.
-- **Shortcuts:** rebindable open/submit/cancel for compose, open settings,
-  switch to tab 1 / tab 2 (default `Ctrl+1` / `Ctrl+2`).
-- **Tabs:** per-tab command, CLI flags, TTS injection, and notification
-  text — see *Configuring Tabs* above.
+- **Shortcuts:** rebindable bindings for compose open/submit/cancel,
+  open settings, switch-to-tab-N (within focused pane), pane focus and
+  splits, new shell tab, close active tab, and close pane. The full
+  default set is in *Multi-pane Layout → Keyboard shortcuts* above.
+- **Tabs:** the **Claude tabs enabled** radio (Cloud / Local / Both)
+  plus per-tab command, CLI flags, TTS injection, notification text,
+  and appearance overrides — see *Configuring Tabs* above.
 - **Processing:** stability and max-hold timers for the byte-burst /
   segment-detection pipeline.
 
@@ -383,11 +434,12 @@ Open with `Ctrl+,` or the cog button on the avatar.
   Place the model + voicepack under `%APPDATA%\cctts\models\` as documented above.
 - **`claude` not found.** cctts looks up `claude` via `PATH`. Either install
   Claude Code so it's on `PATH` or add its install dir.
-- **Claude (local) tab errors.** Most often: the local proxy isn't running
-  or the URL in *Settings → Local LLM provider* is wrong. Confirm the
-  proxy is reachable (e.g. `curl http://localhost:4000/v1/models` or
-  similar). Until you fix the proxy you can simply use the subscription
-  Claude tab, which is unaffected.
+- **Claude (local) tab errors.** Most often: the local backend isn't
+  running or the URL in *Settings → Local LLM provider* is wrong.
+  Confirm the backend is reachable (e.g.
+  `curl http://localhost:1234/v1/models` for LM Studio). Until you fix
+  the backend you can simply use the subscription Claude tab, which is
+  unaffected.
 - **CUDA EP errors per segment (silent output).** You're on a GPU not yet
   covered by the bundled ORT 1.20 prebuilt (Blackwell / RTX 5090). Unset
   `CCTTS_GPU` to fall back to CPU. See `MAINTENANCE.md`.
@@ -407,8 +459,8 @@ Open with `Ctrl+,` or the cog button on the avatar.
 - Tool-use (Edit / Write / Bash / etc.) on the Claude (local) tab depends
   on the local model supporting Anthropic-style tool calling. Test before
   committing to a particular model.
-- cctts does not bundle or auto-spawn the local LLM proxy — you run it
-  yourself.
+- cctts does not bundle or auto-spawn the local backend — you run
+  LM Studio / Ollama / vLLM / llama-server yourself.
 - Single audio output device — no UI selector.
 - No conversation/session UI on top of the terminal.
 - No STT input.
@@ -416,8 +468,8 @@ Open with `Ctrl+,` or the cog button on the avatar.
 - Linux is not part of the validation matrix; behavior is best-effort.
 - Kokoro model is user-provided, not bundled.
 
-See `docs/MILESTONE-08-polish.md` "After Milestone 8" and
-`docs/FUTURE-FEATURES.md` for the post-v1 parking lot.
+See `docs/completedMilestones/MILESTONE-V1-08-polish.md` "After Milestone
+8" and `docs/FUTURE-FEATURES.md` for the post-v1 parking lot.
 
 ## License
 

@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LayoutNodeRenderer from './lib/LayoutNodeRenderer.svelte';
   import StatusBar from './lib/StatusBar.svelte';
+  import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import AvatarOverlay from './lib/AvatarOverlay.svelte';
   import WaveformOverlay from './lib/WaveformOverlay.svelte';
   import ComposeOverlay from './lib/ComposeOverlay.svelte';
@@ -68,9 +69,37 @@
   let unsubLayoutSave: (() => void) | undefined;
   let unsubFollowAvatar: (() => void) | undefined;
 
+  // Set to true by the cleanup returned from onMount. Checked at the
+  // single `await` suspension point inside the async IIFE (and once
+  // more after the post-await sync block) so an HMR / quick-reload
+  // teardown that runs before the IIFE finishes can opt out of further
+  // setup. The end-of-IIFE block runs the same cleanup the returned
+  // teardown would, so any subscriptions installed in the post-await
+  // tail get torn down immediately rather than leaking.
+  let disposed = false;
+  function runCleanup(): void {
+    unsubSettings?.();
+    unsubContent?.();
+    unsubTitle?.();
+    unsubFocusedTab?.();
+    unsubActiveTabBack?.();
+    removeDebugKeys?.();
+    unsubLayoutSave?.();
+    unsubFollowAvatar?.();
+    unsubSettings = undefined;
+    unsubContent = undefined;
+    unsubTitle = undefined;
+    unsubFocusedTab = undefined;
+    unsubActiveTabBack = undefined;
+    removeDebugKeys = undefined;
+    unsubLayoutSave = undefined;
+    unsubFollowAvatar = undefined;
+  }
+
   onMount(() => {
     void (async () => {
       await initSettings();
+      if (disposed) return;
       // Seed the tabs store from a synchronous snapshot before attaching
       // the avatar-state listener. Event-driven add/remove still updates
       // the store at runtime; the snapshot just guarantees the launch
@@ -120,6 +149,7 @@
       } catch (e) {
         console.error('list_tabs failed:', e);
       }
+      if (disposed) return;
       // Install the debounced save subscription AFTER hydration so the
       // first emission (the just-set layout from settings) is the one
       // it swallows. If we install earlier, the subscription would
@@ -318,16 +348,16 @@
       };
       window.addEventListener('keydown', onDebugKey, true);
       removeDebugKeys = () => window.removeEventListener('keydown', onDebugKey, true);
+
+      // Tail check: if teardown ran while we were inside the post-await
+      // synchronous tail above, every `unsub*` is now set but the
+      // returned cleanup has already been called once and won't fire
+      // again. Run cleanup eagerly so nothing leaks.
+      if (disposed) runCleanup();
     })();
     return () => {
-      unsubSettings?.();
-      unsubContent?.();
-      unsubTitle?.();
-      unsubFocusedTab?.();
-      unsubActiveTabBack?.();
-      removeDebugKeys?.();
-      unsubLayoutSave?.();
-      unsubFollowAvatar?.();
+      disposed = true;
+      runCleanup();
     };
   });
 </script>
@@ -340,7 +370,13 @@
     overlays remain at app root, layered over the entire content area;
     they subscribe to `activeTab`-derived stores which are kept in
     sync with the focused pane's active tab.
+
+    Custom title bar mounts under TUI only — modern-dark keeps OS
+    chrome via setDecorations(true) wired in main.ts.
   -->
+  {#if $settings.ui.theme === 'tui'}
+    <TuiTitleBar title="cctts" />
+  {/if}
   <div class="terminal-area">
     <LayoutNodeRenderer node={$layout.tree} />
     <AvatarOverlay />

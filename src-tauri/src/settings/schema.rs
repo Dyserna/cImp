@@ -29,7 +29,7 @@ pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 12;
+pub const CURRENT_SCHEMA_VERSION: u8 = 13;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -920,19 +920,22 @@ impl Default for BehaviorSettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UiSettings {
-    /// Active UI chrome theme. Two values currently ship: `"modern-dark"`
-    /// (slate-blue + mint, OS-native window chrome) and `"tui"` (gruvbox
-    /// + custom title bar, ratatui aesthetic). New installs land on
-    /// `"tui"`. Existing settings.json files keep whatever value they
-    /// were persisted with — defaults only apply when serde fills in a
-    /// missing field.
+    /// Active UI chrome theme. Three values currently ship: `"modern-dark"`
+    /// (slate-blue + mint, OS-native window chrome), `"tui-yellow"`
+    /// (gruvbox surfaces + bright yellow accent, custom title bar,
+    /// ratatui aesthetic), and `"tui-purple"` (same as tui-yellow with
+    /// a gruvbox bright-purple accent). New installs land on
+    /// `"tui-yellow"`. The pre-V1.13 `"tui"` value is rewritten to
+    /// `"tui-yellow"` by the v12 → v13 migration so existing users keep
+    /// the same look. Existing settings.json files otherwise keep
+    /// whatever value they were persisted with.
     pub theme: String,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: "tui".to_string(),
+            theme: "tui-yellow".to_string(),
         }
     }
 }

@@ -144,6 +144,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.9", detect: looks_v1_9, transform: migrate_v1_9_to_v1_10_step },
     MigrationStep { from_version: "v1.10", detect: looks_v1_10, transform: migrate_v1_10_to_v1_11_step },
     MigrationStep { from_version: "v1.11", detect: looks_v1_11, transform: migrate_v1_11_to_v1_12_step },
+    MigrationStep { from_version: "v1.12", detect: looks_v1_12, transform: migrate_v1_12_to_v1_13_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -183,6 +184,9 @@ fn migrate_v1_10_to_v1_11_step(value: &mut Value, _shell: &ShellSpec) {
 }
 fn migrate_v1_11_to_v1_12_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v1_11_to_v1_12(value)
+}
+fn migrate_v1_12_to_v1_13_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_12_to_v1_13(value)
 }
 
 fn looks_v1(value: &Value) -> bool {
@@ -361,6 +365,17 @@ fn looks_v1_11(value: &Value) -> bool {
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 11)
+}
+
+/// Is this a v1.12 file (schema_version == 12) whose `ui.theme` still
+/// uses the pre-split `"tui"` value? V1.13 splits that into
+/// `"tui-yellow"` / `"tui-purple"`; the predicate gates on the explicit
+/// `schema_version` integer so a freshly-stamped v1.12 file gets caught.
+fn looks_v1_12(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 12)
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -1136,6 +1151,33 @@ fn migrate_v1_11_to_v1_12(value: &mut Value) {
                 "y_px": legacy,
             }),
         );
+    }
+    // V1.13 raised CURRENT_SCHEMA_VERSION; this step only promotes the
+    // file to v1.12, so stamp the literal 12 rather than the moving
+    // constant. The next step (v1.12 → v1.13) bumps to current.
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(12u8)),
+    );
+}
+
+// --- v1.12 → v1.13 ----------------------------------------------------------
+//
+// Splits the single `"tui"` UI theme into two variants — `"tui-yellow"`
+// (the original gruvbox bright-yellow accent) and `"tui-purple"` (same
+// surfaces, gruvbox bright-purple accent). Existing `"tui"` strings are
+// rewritten to `"tui-yellow"` so users keep the same look they had.
+
+fn migrate_v1_12_to_v1_13(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(ui) = root.get_mut("ui").and_then(Value::as_object_mut) {
+        if let Some(Value::String(theme)) = ui.get_mut("theme") {
+            if theme == "tui" {
+                *theme = "tui-yellow".to_string();
+            }
+        }
     }
     root.insert(
         "schema_version".to_string(),
@@ -2327,9 +2369,11 @@ mod tests {
         let margin = avatar.get("margin").unwrap();
         assert_eq!(margin.get("x_px").unwrap(), 24);
         assert_eq!(margin.get("y_px").unwrap(), 24);
+        // V1.11 → V1.12 stamps the literal 12 (frozen — V1.13 added
+        // a follow-on step that bumps to current).
         assert_eq!(
             v.get("schema_version").and_then(Value::as_u64),
-            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64)
+            Some(12)
         );
         assert!(!looks_v1_11(&v));
     }
@@ -2348,6 +2392,34 @@ mod tests {
         let margin = v.get("avatar").unwrap().get("margin").unwrap();
         assert_eq!(margin.get("x_px").unwrap(), 16);
         assert_eq!(margin.get("y_px").unwrap(), 16);
+    }
+
+    #[test]
+    fn v1_12_to_v1_13_renames_tui_theme_to_tui_yellow() {
+        let mut v = json!({
+            "schema_version": 12,
+            "ui": { "theme": "tui" },
+        });
+        assert!(looks_v1_12(&v));
+        migrate_v1_12_to_v1_13(&mut v);
+        assert_eq!(v.get("ui").unwrap().get("theme").unwrap(), "tui-yellow");
+        assert_eq!(
+            v.get("schema_version").and_then(Value::as_u64),
+            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64)
+        );
+        assert!(!looks_v1_12(&v));
+    }
+
+    #[test]
+    fn v1_12_to_v1_13_leaves_other_themes_alone() {
+        // A v1.12 user already on modern-dark — only the schema_version
+        // should be bumped; the theme string stays as-is.
+        let mut v = json!({
+            "schema_version": 12,
+            "ui": { "theme": "modern-dark" },
+        });
+        migrate_v1_12_to_v1_13(&mut v);
+        assert_eq!(v.get("ui").unwrap().get("theme").unwrap(), "modern-dark");
     }
 
     #[test]

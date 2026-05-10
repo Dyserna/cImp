@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Custom TUI-styled window title bar. Mounted only when ui.theme is
-  // 'tui' (modern-dark uses OS-native window chrome via setDecorations(true)).
+  // Custom TUI-styled window title bar. Mounted whenever ui.theme is a
+  // `tui-*` variant (modern-dark uses OS-native chrome via setDecorations(true)).
   //
   // The bar is a single 22px-tall row with a drag region in the middle
   // (data-tauri-drag-region — Tauri natively turns mousedown into a

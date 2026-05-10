@@ -514,7 +514,7 @@
   }
 </script>
 
-{#if $settings.ui.theme === 'tui'}
+{#if $settings.ui.theme.startsWith('tui-')}
   <TuiTitleBar title="cctts settings" />
 {/if}
 {#if !snapshot}
@@ -873,7 +873,8 @@
                 patch((s) => (s.ui.theme = (e.currentTarget as HTMLSelectElement).value))}
             >
               <option value="modern-dark">Modern Dark</option>
-              <option value="tui">TUI</option>
+              <option value="tui-yellow">TUI - Yellow</option>
+              <option value="tui-purple">TUI - Purple</option>
             </select>
           </label>
 

@@ -21,7 +21,10 @@ const STATE_FILES: Record<AvatarState, string> = {
 /// Themes that ship a bundled avatar set under `avatars/<theme>/`.
 /// Unknown values (custom themes, typos, legacy strings) fall back to
 /// `modern-dark`, the original avatar set, so the overlay never breaks.
-const KNOWN_THEMES = new Set(['modern-dark', 'tui']);
+/// Per the theme isolation policy in `src/theme.css`, every theme owns
+/// its own avatar folder — derivative themes get a copy of the source
+/// folder, never a shared one.
+const KNOWN_THEMES = new Set(['modern-dark', 'tui-yellow', 'tui-purple']);
 const FALLBACK_THEME = 'modern-dark';
 
 function themeFolder(theme: string): string {

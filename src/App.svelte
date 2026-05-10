@@ -371,10 +371,10 @@
     they subscribe to `activeTab`-derived stores which are kept in
     sync with the focused pane's active tab.
 
-    Custom title bar mounts under TUI only — modern-dark keeps OS
-    chrome via setDecorations(true) wired in main.ts.
+    Custom title bar mounts under any TUI variant — modern-dark keeps
+    OS chrome via setDecorations(true) wired in main.ts.
   -->
-  {#if $settings.ui.theme === 'tui'}
+  {#if $settings.ui.theme.startsWith('tui-')}
     <TuiTitleBar title="cctts" />
   {/if}
   <div class="terminal-area">

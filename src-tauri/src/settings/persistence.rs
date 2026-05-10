@@ -448,6 +448,9 @@ fn seed_portable_avatar_paths(s: &mut Settings) {
 /// matching the chrome they ship with. Falls back to a flat
 /// `<dir>/<file>` layout for legacy zips produced before the per-theme
 /// split, so existing folders keep working.
+///
+/// Per the theme isolation policy (see `src/theme.css`), every theme
+/// owns its own avatar folder — there is no cross-theme mapping here.
 fn stamp_avatar_paths_from(s: &mut Settings, dir: &Path) {
     let theme_dir = dir.join(&s.ui.theme);
 
@@ -869,9 +872,9 @@ mod tests {
 
     #[test]
     fn ui_theme_round_trip_and_default() {
-        // Default file has ui.theme = "tui" (new installs land here).
+        // Default file has ui.theme = "tui-yellow" (new installs land here).
         let s = Settings::default();
-        assert_eq!(s.ui.theme, "tui");
+        assert_eq!(s.ui.theme, "tui-yellow");
 
         // Round-trip preserves a hand-edited value (here: a user who
         // switched back to modern-dark or set a future theme).
@@ -884,7 +887,7 @@ mod tests {
         // A v1.3 file without the `ui` field still parses (serde(default)).
         let v1_3_json = r#"{"tabs":[]}"#;
         let parsed: Settings = serde_json::from_str(v1_3_json).unwrap();
-        assert_eq!(parsed.ui.theme, "tui");
+        assert_eq!(parsed.ui.theme, "tui-yellow");
     }
 
     // --- Layered config (global + custom overlay) -----------------------
@@ -1024,29 +1027,29 @@ mod tests {
         let dir = std::env::temp_dir()
             .join(format!("cctts_avatars_themed_{}", uuid::Uuid::new_v4()));
         let modern = dir.join("modern-dark");
-        let tui = dir.join("tui");
+        let tui_yellow = dir.join("tui-yellow");
         fs::create_dir_all(&modern).unwrap();
-        fs::create_dir_all(&tui).unwrap();
+        fs::create_dir_all(&tui_yellow).unwrap();
 
         // Stage the same files in both theme folders so we can prove the
         // active theme drives the selection rather than alphabetical luck.
         for f in ["Idle.mp4", "Speaking.mp4", "Transition.mp4"] {
             fs::write(modern.join(f), b"").unwrap();
-            fs::write(tui.join(f), b"").unwrap();
+            fs::write(tui_yellow.join(f), b"").unwrap();
         }
 
         let mut s = Settings::default();
-        s.ui.theme = "tui".to_string();
+        s.ui.theme = "tui-yellow".to_string();
         stamp_avatar_paths_from(&mut s, &dir);
 
-        assert_eq!(s.avatar.images.idle.as_deref(), Some(tui.join("Idle.mp4").as_path()));
+        assert_eq!(s.avatar.images.idle.as_deref(), Some(tui_yellow.join("Idle.mp4").as_path()));
         assert_eq!(
             s.avatar.images.speaking.as_deref(),
-            Some(tui.join("Speaking.mp4").as_path()),
+            Some(tui_yellow.join("Speaking.mp4").as_path()),
         );
         assert_eq!(
             s.avatar.transition.path.as_deref(),
-            Some(tui.join("Transition.mp4").as_path()),
+            Some(tui_yellow.join("Transition.mp4").as_path()),
         );
 
         // Switching themes restamps from the other folder.
@@ -1074,7 +1077,7 @@ mod tests {
         }
 
         let mut s = Settings::default();
-        s.ui.theme = "tui".to_string(); // tui/ subfolder does not exist
+        s.ui.theme = "tui-yellow".to_string(); // tui-yellow/ subfolder does not exist
         stamp_avatar_paths_from(&mut s, &dir);
 
         assert_eq!(s.avatar.images.idle.as_deref(), Some(dir.join("Idle.mp4").as_path()));

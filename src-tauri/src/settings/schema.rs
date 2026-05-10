@@ -832,6 +832,10 @@ impl Default for TransitionSettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct WaveformSettings {
+    /// Hex color the waveform stroke and the avatar's outline use. Empty
+    /// string means "follow the active UI theme" — the frontend resolves
+    /// it from the `--waveform-color` CSS variable in `theme.css`. A
+    /// non-empty value is a user override that wins regardless of theme.
     pub color: String,
     pub line_width: f32,
     pub glow_intensity: f32,
@@ -841,7 +845,7 @@ pub struct WaveformSettings {
 impl Default for WaveformSettings {
     fn default() -> Self {
         Self {
-            color: "#bb55ff".to_string(),
+            color: String::new(),
             line_width: 2.0,
             glow_intensity: 0.6,
             opacity: 0.85,

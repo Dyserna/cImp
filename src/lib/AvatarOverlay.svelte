@@ -42,7 +42,8 @@
       `--avatar-margin-x: ${$avatarSettings.margin.x_px}px`,
       `--avatar-margin-y: ${$avatarSettings.margin.y_px}px`,
       `--avatar-opacity: ${$avatarSettings.opacity}`,
-      `--avatar-border-color: ${$avatarSettings.waveform.color}`,
+      // Empty user value falls through to the theme's --waveform-color.
+      `--avatar-border-color: ${$avatarSettings.waveform.color || 'var(--waveform-color)'}`,
     ].join(';'),
   );
 

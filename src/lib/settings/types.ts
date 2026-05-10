@@ -483,7 +483,7 @@ export function defaultSettings(): Settings {
       },
       transition: { path: '/avatar/Transition.mp4', duration_ms: 400 },
       waveform: {
-        color: '#bb55ff',
+        color: '',
         line_width: 2.0,
         glow_intensity: 0.6,
         opacity: 0.85,

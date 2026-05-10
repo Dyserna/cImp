@@ -46,6 +46,10 @@
   --accent-fg:       #ffffff;   /* white text reads cleanly on purple */
   --accent-muted:    rgba(187, 85, 255, 0.15);
 
+  /* Default waveform / avatar-border color used when the user hasn't
+     overridden `avatar.waveform.color` (empty string in settings). */
+  --waveform-color:  #bb55ff;
+
   /* Semantics — `--success` stays green so "done" indicators remain
      visually distinct from the now-purple accent. */
   --success:         #4caf50;
@@ -185,6 +189,9 @@
   --accent-info:     #83a598;   /* gruvbox bright blue */
   --accent-fg:       #1d2021;
   --accent-muted:    rgba(250, 189, 47, 0.15);
+
+  /* Waveform / avatar-border color follows the gruvbox yellow accent. */
+  --waveform-color:  #fabd2f;
 
   /* Semantics — Gruvbox bright variants. */
   --success:         #b8bb26;   /* bright green */

@@ -335,10 +335,17 @@
   /// TabSettingsSection's bound setter; the array shape forces the
   /// find-by-id lookup at write time.
   function patchAiTab(id: string, value: AiToolTabConfig) {
+    // The value came in via a $bindable() prop spread from the child
+    // (TabSettingsSection). The spread copies own keys but leaves nested
+    // children as $state proxy references. Snapshotting here flattens
+    // those to plain JS so structuredClone in the store subscriber and
+    // Tauri's IPC serializer don't choke. See the DataCloneError that
+    // surfaced when wiring the per-tab Terminal palette dropdown.
+    const plain = $state.snapshot(value) as AiToolTabConfig;
     patch((s) => {
       const idx = findTabIndex(s, id);
       if (idx < 0) return;
-      s.tabs[idx] = value;
+      s.tabs[idx] = plain;
     });
   }
 

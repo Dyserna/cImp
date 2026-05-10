@@ -424,7 +424,7 @@ pub async fn settings_update(
     Ok(())
 }
 
-/// Open `<exe-dir>/logs/content/` in the host file manager. Creates the
+/// Open `<portable-root>/logs/content/` in the host file manager. Creates the
 /// folder first if it doesn't exist so the call doesn't 404 on a clean
 /// install. Windows uses `explorer.exe`; macOS `open`; Linux
 /// `xdg-open`. Errors are wrapped in `AppError::Settings` for a single
@@ -450,7 +450,7 @@ pub async fn content_open_folder() -> AppResult<()> {
         .map_err(|e| AppError::Settings(format!("open folder: {e}")))
 }
 
-/// Delete every file inside `<exe-dir>/logs/content/`. Returns the
+/// Delete every file inside `<portable-root>/logs/content/`. Returns the
 /// count of removed files. Per-file failures are logged backend-side
 /// and do not abort the pass.
 #[tauri::command]
@@ -462,18 +462,8 @@ pub async fn content_clear() -> AppResult<u32> {
 pub async fn list_voices() -> AppResult<Vec<String>> {
     use std::collections::BTreeSet;
     let mut out = BTreeSet::<String>::new();
-    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(d) = crate::tts::default_model_dir() {
-        dirs.push(d.join("voices"));
-    }
-    if let Some(d) = crate::tts::portable_model_dir() {
-        dirs.push(d.join("voices"));
-    }
-    for dir in dirs {
-        let read = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+    let dir = crate::tts::model_dir()?.join("voices");
+    if let Ok(read) = std::fs::read_dir(&dir) {
         for entry in read.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("bin") {

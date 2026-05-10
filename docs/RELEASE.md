@@ -84,10 +84,10 @@ npm run tauri build -- --no-bundle
 mkdir -p staging/cctts-portable/bin staging/cctts-portable/models/voices
 cp src-tauri/target/release/cctts.exe staging/cctts-portable/bin/
 cp src-tauri/target/release/onnxruntime*.dll staging/cctts-portable/bin/
-# Drop your local %APPDATA%\cctts\models\* into staging/cctts-portable/models/
-# and run staging/cctts-portable/bin/cctts.exe — `portable_model_dir()` in
-# src-tauri/src/tts/mod.rs will pick up files via the `<exe-dir>/../models/`
-# fallback.
+# Drop kokoro-v1.0.onnx into staging/cctts-portable/models/ and the
+# voicepacks under staging/cctts-portable/models/voices/, then run
+# staging/cctts-portable/bin/cctts.exe — `model_dir()` in
+# src-tauri/src/tts/mod.rs resolves to `<exe-dir>/../models/`.
 ```
 
 ## Code signing

@@ -22,14 +22,16 @@ README.txt
 ```
 
 Add `bin/` to PATH; run `cctts` from any terminal. No installer, no
-registry entries, no admin rights. Settings still write to
-`%APPDATA%\cctts\` at runtime.
+registry entries, no admin rights. Everything cctts writes lives inside
+the unzip folder: `settings.json` and `scrollback/` next to the exe in
+`bin/`; logs under `<portable-root>/logs/` (sibling of `bin/`).
+Per-launch-directory overlays (`.cctts.custom.config.json`) go in
+whatever working directory the user starts cctts from.
 
-The Rust runtime treats `<exe-dir>/../models/` as a fallback model dir
-(see `portable_model_dir()` in `src-tauri/src/tts/mod.rs`). APPDATA wins
-on duplicate filenames so user-installed voicepacks and models override
-bundled ones. Voicepack auto-discovery (`list_voices` IPC) reads from
-both dirs and merges.
+The Rust runtime resolves the model dir as `<exe-dir>/../models/` (see
+`model_dir()` in `src-tauri/src/tts/mod.rs`) — that's the only location
+checked. Voicepack auto-discovery (`list_voices` IPC) reads the same
+dir.
 
 ## Build
 
@@ -68,10 +70,10 @@ The portable zip ships `kokoro-v1.0.onnx` + `af_heart.bin` (Apache 2.0,
 attributed in `NOTICE`). The release workflow downloads them from
 HuggingFace at build time — they are not checked into the source repo.
 
-Source builds (`npm run tauri build` locally without the workflow) still
-rely on the user dropping the model files into `%APPDATA%\cctts\models\`.
-The runtime check order is APPDATA → portable (`<exe-dir>/../models/`),
-so neither path is exclusive.
+Source builds (`npm run tauri build` locally without the workflow) need
+the model files dropped into `<exe-dir>/../models/` — for a `cargo run`
+that means `src-tauri/target/models/`, for a portable-staged build it's
+the `models/` sibling of `bin/`. There is no APPDATA fallback.
 
 Alternative distribution shapes considered and rejected:
 
@@ -103,7 +105,9 @@ CPU-only is the default and needs no extra runtime.
 ## Updates
 
 Currently manual: download the next release zip, unzip over the existing
-folder. Settings persist in `%APPDATA%\cctts\` across updates.
+folder. The `settings.json` next to the exe and any per-folder
+`.cctts.custom.config.json` overlays are not in the zip and stay where
+they are across updates.
 
 Tauri ships a built-in updater that polls a JSON manifest, downloads, and
 verifies signatures. Adopting it would require:

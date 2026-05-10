@@ -1,8 +1,10 @@
 //! File-logger init for the portable build.
 //!
-//! Writes daily-rolling files to `<exe-dir>/logs/cctts.log.<YYYY-MM-DD>` via
-//! `tracing-appender`. The filter is wrapped in a `reload::Layer` so changes
-//! to `settings.logging.level` apply live without a restart.
+//! Writes daily-rolling files to `<exe-dir>/../logs/cctts.log.<YYYY-MM-DD>` via
+//! `tracing-appender` — the `logs/` folder sits next to `bin/` and `models/`
+//! at the portable root, not inside `bin/`. The filter is wrapped in a
+//! `reload::Layer` so changes to `settings.logging.level` apply live without
+//! a restart.
 //!
 //! Order of operations from `main`:
 //!   1. `init(LogLevel::default())` → returns a `WorkerGuard` that must be
@@ -29,13 +31,13 @@ use crate::settings::{LogLevel, LogRetention};
 /// and read every time the user changes the level from settings.
 static RELOAD_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
-/// `<exe-dir>/logs/`. Falls back to `./logs/` if `current_exe()` is
-/// unavailable (sandbox / weird platform); same fallback shape as
-/// `settings::persistence::global_path`.
+/// `<exe-dir>/../logs/` — sibling of `bin/` and `models/` at the portable
+/// root. Falls back to `./logs/` if `current_exe()` is unavailable
+/// (sandbox / weird platform).
 pub fn logs_dir() -> PathBuf {
     let dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .and_then(|p| p.parent().and_then(|d| d.parent()).map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     dir.join("logs")
 }

@@ -1,6 +1,6 @@
 [package]
 name = "cctts"
-version = "0.6.0"
+version = "0.6.1"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
@@ -41,9 +41,6 @@ bytemuck = "1"
 # Audio output
 cpal = "0.15"
 rodio = "0.20"
-
-# Filesystem paths
-dirs = "5"
 
 # Windows-only: registry probe for Git Bash auto-detection in shell::detect.
 [target.'cfg(windows)'.dependencies]

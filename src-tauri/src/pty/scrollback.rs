@@ -1,7 +1,7 @@
 //! V1.4-04 D: cross-restart scrollback persistence.
 //!
 //! On graceful exit (`tauri::RunEvent::ExitRequested`) the live ring
-//! buffer in `PtyManager` is written to `<config-dir>/cctts/scrollback/<tab-id>.bin`.
+//! buffer in `PtyManager` is written to `<exe-dir>/scrollback/<tab-id>.bin`.
 //! On the next `pty_start` for that tab the file is read once, replayed
 //! into the new xterm, used to seed the new ring, then deleted (so a
 //! crash mid-run doesn't replay it twice).
@@ -17,14 +17,15 @@ use std::path::PathBuf;
 use crate::error::{AppError, AppResult};
 use crate::state::TabId;
 
-/// Resolve `<config-dir>/cctts/scrollback/`. Scrollback is transient
-/// runtime state (cleared on first replay), so it stays under the OS
-/// config dir even though settings now live next to the exe — keeping
-/// the portable folder free of per-tab binary blobs.
+/// Resolve `<exe-dir>/scrollback/`. Lives next to `settings.json` and
+/// `logs/` so the entire portable folder is self-contained.
 fn scrollback_dir() -> AppResult<PathBuf> {
-    let dir = dirs::config_dir()
-        .ok_or_else(|| AppError::Settings("no config dir on this platform".into()))?;
-    Ok(dir.join("cctts").join("scrollback"))
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::Settings(format!("current_exe failed: {e}")))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| AppError::Settings("exe has no parent dir".into()))?;
+    Ok(dir.join("scrollback"))
 }
 
 /// Per-tab scrollback file path. Tab IDs are sanitized defensively —

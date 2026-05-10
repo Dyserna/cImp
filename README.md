@@ -298,29 +298,25 @@ ships `kokoro-v1.0.onnx` and `af_heart.bin` next to the executable —
 unzip, add `bin/` to PATH, run, hear TTS. Nothing else to install.
 
 For **source builds** (or if you delete the bundled files), cctts looks
-for the Kokoro model in two places, in order:
-
-1. `%APPDATA%\cctts\models\` — the user data dir, always writable.
-2. `<exe-dir>/../models/` — the portable layout's bundled location.
-
-Place these two files in either:
+for the Kokoro model in exactly one place, relative to the executable:
 
 ```
-kokoro-v1.0.onnx
-voices/af_heart.bin
+<exe-dir>/../models/kokoro-v1.0.onnx
+<exe-dir>/../models/voices/af_heart.bin
 ```
+
+In a portable install that resolves to the `models/` folder sitting next
+to `bin/`. Drop new voicepacks into `models/voices/` and they appear in
+the settings dropdown.
 
 Download from
 [onnx-community/Kokoro-82M-v1.0-ONNX](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/tree/main):
 
 - model: `onnx/model.onnx` → rename to `kokoro-v1.0.onnx`
-- voices: `voices/<name>.bin` — `af_heart.bin` is the default; any
-  voicepack in either `voices/` folder shows up in the settings dropdown.
-  APPDATA wins over portable on duplicate filenames so a user-installed
-  voice can override a bundled one.
+- voices: `voices/<name>.bin` — `af_heart.bin` is the default.
 
-If both lookups fail at startup the app launches with TTS silent and
-prints the expected paths to the log.
+If the lookup fails at startup the app launches with TTS silent and
+prints the expected path to the log.
 
 ## Configuring Tabs
 
@@ -431,7 +427,7 @@ Open with `Ctrl+,` or the cog button on the avatar.
 ## Troubleshooting
 
 - **TTS silent.** Check the log for `TTS disabled: Kokoro model files not found.`
-  Place the model + voicepack under `%APPDATA%\cctts\models\` as documented above.
+  Place the model + voicepack under `<exe-dir>/../models/` as documented above.
 - **`claude` not found.** cctts looks up `claude` via `PATH`. Either install
   Claude Code so it's on `PATH` or add its install dir.
 - **Claude (local) tab errors.** Most often: the local backend isn't

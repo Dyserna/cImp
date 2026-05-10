@@ -2,7 +2,7 @@
 //!
 //! When enabled in settings, every byte read off each tab's master PTY
 //! is appended to a per-tab daily-rolling file at
-//! `<exe-dir>/logs/content/<tab-id>.log.<YYYY-MM-DD>`. Rotation is
+//! `<portable-root>/logs/content/<tab-id>.log.<YYYY-MM-DD>`. Rotation is
 //! handled by `tracing-appender::rolling::daily`; cleanup deletes files
 //! whose mtime is older than the retention window.
 //!
@@ -41,7 +41,7 @@ fn instance() -> &'static ContentCapture {
     })
 }
 
-/// `<exe-dir>/logs/content/`.
+/// `<portable-root>/logs/content/`.
 pub fn dir() -> PathBuf {
     crate::logging::logs_dir().join("content")
 }

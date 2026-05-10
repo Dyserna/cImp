@@ -42,63 +42,34 @@ pub enum TtsRequest {
 /// few instructions, never across an await point.
 pub type ActiveTab = Arc<RwLock<TabId>>;
 
-pub fn default_model_dir() -> AppResult<PathBuf> {
-    Ok(dirs::config_dir()
-        .ok_or_else(|| AppError::Tts("no config dir on this platform".into()))?
-        .join("cctts")
-        .join("models"))
-}
-
 /// Portable model dir: `<exe-dir>/../models/`. The Windows release zip ships
 /// `kokoro-v1.0.onnx` and `voices/af_heart.bin` here so a fresh unzip works
-/// without any APPDATA setup. APPDATA always wins over portable on duplicate
-/// filenames so a user-installed file overrides a bundled one.
-pub fn portable_model_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.parent()?.join("models");
-    Some(dir)
+/// out of the box. This is the only location the runtime looks at.
+pub fn model_dir() -> AppResult<PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::Tts(format!("current_exe failed: {e}")))?;
+    let dir = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| AppError::Tts("exe has no grandparent dir".into()))?;
+    Ok(dir.join("models"))
 }
 
 pub fn default_model_path() -> AppResult<PathBuf> {
-    let appdata = default_model_dir()?.join(MODEL_FILE);
-    if appdata.exists() {
-        return Ok(appdata);
-    }
-    if let Some(portable) = portable_model_dir() {
-        let p = portable.join(MODEL_FILE);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-    Ok(appdata)
+    Ok(model_dir()?.join(MODEL_FILE))
 }
 
 pub fn default_voice_path(voice: &str) -> AppResult<PathBuf> {
-    let file = format!("{voice}.bin");
-    let appdata = default_model_dir()?.join("voices").join(&file);
-    if appdata.exists() {
-        return Ok(appdata);
-    }
-    if let Some(portable) = portable_model_dir() {
-        let p = portable.join("voices").join(&file);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-    Ok(appdata)
+    Ok(model_dir()?.join("voices").join(format!("{voice}.bin")))
 }
 
 pub fn report_missing_model_files() {
-    let dir = default_model_dir()
+    let dir = model_dir()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "<config dir>".to_string());
-    let portable = portable_model_dir().map(|p| p.display().to_string());
+        .unwrap_or_else(|_| "<exe-dir>/../models".to_string());
     tracing::warn!(target: "tts", "");
     tracing::warn!(target: "tts", "TTS disabled: Kokoro model files not found.");
     tracing::warn!(target: "tts", "Place these files under: {dir}");
-    if let Some(p) = portable.as_deref() {
-        tracing::warn!(target: "tts", "  (or under: {p})");
-    }
     tracing::warn!(target: "tts", "  {MODEL_FILE}");
     tracing::warn!(target: "tts", "  voices/{DEFAULT_VOICE}.bin");
     tracing::warn!(target: "tts", "Sources:");

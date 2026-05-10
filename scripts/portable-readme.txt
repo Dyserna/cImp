@@ -2,9 +2,10 @@ cctts portable (Windows x64)
 ============================
 
 This zip is a self-contained build of cctts. No installer; no registry
-entries. The global settings file is written next to cctts.exe; per-
-launch-directory overlays go in whatever folder you start cctts from.
-Transient runtime state (scrollback) lives under %APPDATA%\cctts\.
+entries; nothing written outside this folder. The global settings file
+is written next to cctts.exe; per-launch-directory overlays go in
+whatever folder you start cctts from. Transient runtime state
+(scrollback) is kept under bin\scrollback\.
 
 
 Quick start
@@ -68,19 +69,14 @@ an override to fall back to the bundled video.
 Adding more voicepacks
 ----------------------
 
-cctts auto-discovers `.bin` files in two locations:
+cctts auto-discovers `.bin` files in one location:
 
-  1. Next to this README:  models\voices\
-  2. In your user config:  %APPDATA%\cctts\models\voices\
+  models\voices\   (next to this README)
 
 Drop any voicepack `.bin` from
 https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/tree/main/voices
-into either folder; it appears in Settings -> TTS -> Voice on next launch
-(or on next time the dropdown is opened, depending on the build).
-
-If the same filename exists in both locations, the %APPDATA% copy wins —
-so you can override a bundled voice by saving an edited version into
-%APPDATA%\cctts\models\voices\ without touching this folder.
+into that folder; it appears in Settings -> TTS -> Voice on next launch
+(or the next time the dropdown is opened, depending on the build).
 
 
 Optional: GPU acceleration
@@ -113,11 +109,10 @@ Uninstall
 ---------
 
   1. Delete the unzipped folder. (This removes cctts.exe, the bundled
-     models, and the global settings.json that lives next to the exe.)
+     models, the global settings.json, scrollback files, and logs —
+     everything cctts writes lives inside this folder.)
   2. Remove the PATH entry you added.
-  3. Optionally delete `%APPDATA%\cctts\` to drop scrollback and any
-     extra voicepacks you saved there.
-  4. Optionally delete `.cctts.custom.config.json` from any folder you
+  3. Optionally delete `.cctts.custom.config.json` from any folder you
      used to start cctts to drop those per-folder overlays.
 
 

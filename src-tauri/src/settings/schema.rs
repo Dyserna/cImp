@@ -95,8 +95,8 @@ pub struct Settings {
     /// install starts with the subscription Claude tab only.
     pub claude_tabs_enabled: ClaudeTabsEnabled,
     /// File-logger configuration. The tracing subscriber writes daily
-    /// rolling files into `<exe-dir>/logs/`; the level field drives the
-    /// EnvFilter via a reload handle so changes apply live.
+    /// rolling files into `<portable-root>/logs/`; the level field drives
+    /// the EnvFilter via a reload handle so changes apply live.
     pub logging: LoggingSettings,
 }
 
@@ -125,8 +125,8 @@ impl Default for Settings {
 }
 
 /// Logging configuration. The file path is fixed at
-/// `<exe-dir>/logs/cctts.log.<YYYY-MM-DD>`; the `level` field drives the
-/// live filter and `retention` drives the startup cleanup pass.
+/// `<portable-root>/logs/cctts.log.<YYYY-MM-DD>`; the `level` field drives
+/// the live filter and `retention` drives the startup cleanup pass.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct LoggingSettings {
@@ -137,7 +137,7 @@ pub struct LoggingSettings {
 
 /// Per-tab content (PTY raw output) capture configuration. Disabled by
 /// default — when enabled, every byte read from each tab's PTY is also
-/// appended to `<exe-dir>/logs/content/<tab-id>.log.<YYYY-MM-DD>`,
+/// appended to `<portable-root>/logs/content/<tab-id>.log.<YYYY-MM-DD>`,
 /// rotated daily by `tracing-appender`. `retention` runs the same
 /// max-age cleanup as the tracing logs but against the `content/`
 /// subdirectory.

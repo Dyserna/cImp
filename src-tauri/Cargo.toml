@@ -42,9 +42,6 @@ bytemuck = "1"
 cpal = "0.15"
 rodio = "0.20"
 
-# Filesystem paths
-dirs = "5"
-
 # Windows-only: registry probe for Git Bash auto-detection in shell::detect.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

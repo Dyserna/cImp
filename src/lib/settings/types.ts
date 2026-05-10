@@ -399,7 +399,7 @@ export interface Settings {
   /// is `cloud` (subscription Claude only) on a fresh install.
   claude_tabs_enabled: ClaudeTabsEnabled;
   /// File-logger configuration. The backend writes daily rolling log
-  /// files into `<exe-dir>/logs/`; this field drives the live filter.
+  /// files into `<portable-root>/logs/`; this field drives the live filter.
   logging: LoggingSettings;
 }
 
@@ -416,7 +416,7 @@ export type LogRetention = 'daily' | 'weekly' | 'monthly' | 'never';
 
 /// Per-tab raw PTY content capture. Disabled by default. When on,
 /// every tab's PTY output is also written to
-/// `<exe-dir>/logs/content/<tab-id>.log.<YYYY-MM-DD>`.
+/// `<portable-root>/logs/content/<tab-id>.log.<YYYY-MM-DD>`.
 export interface ContentCaptureSettings {
   enabled: boolean;
   retention: LogRetention;

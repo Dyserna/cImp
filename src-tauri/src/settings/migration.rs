@@ -145,6 +145,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.10", detect: looks_v1_10, transform: migrate_v1_10_to_v1_11_step },
     MigrationStep { from_version: "v1.11", detect: looks_v1_11, transform: migrate_v1_11_to_v1_12_step },
     MigrationStep { from_version: "v1.12", detect: looks_v1_12, transform: migrate_v1_12_to_v1_13_step },
+    MigrationStep { from_version: "v1.13", detect: looks_v1_13, transform: migrate_v1_13_to_v1_14_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -187,6 +188,9 @@ fn migrate_v1_11_to_v1_12_step(value: &mut Value, _shell: &ShellSpec) {
 }
 fn migrate_v1_12_to_v1_13_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v1_12_to_v1_13(value)
+}
+fn migrate_v1_13_to_v1_14_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_13_to_v1_14(value)
 }
 
 fn looks_v1(value: &Value) -> bool {
@@ -307,14 +311,18 @@ fn looks_v1_7(value: &Value) -> bool {
 /// `claude_local` must be present (v1.8 marker, so we don't false-positive
 /// on earlier files mid-cascade); `claude_tabs_enabled` must be absent.
 /// Fresh-install v1.9 files have `claude_tabs_enabled` populated and
-/// skip this branch.
+/// skip this branch. The schema_version absence guard avoids
+/// re-firing on V14+ files where `claude_tabs_enabled` was removed by
+/// the v1.13 → v1.14 migration: a real v1.8 file has no
+/// `schema_version` (v1.10 is what stamps it).
 fn looks_v1_8(value: &Value) -> bool {
     let Some(obj) = value.as_object() else {
         return false;
     };
     let has_claude_local = obj.contains_key("claude_local");
     let has_setting = obj.contains_key("claude_tabs_enabled");
-    has_claude_local && !has_setting
+    let has_version = obj.contains_key("schema_version");
+    has_claude_local && !has_setting && !has_version
 }
 
 /// Is this a v1.9 file that lacks the v1.10 `schema_version` field? V1.10's
@@ -376,6 +384,16 @@ fn looks_v1_12(value: &Value) -> bool {
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 12)
+}
+
+/// Is this a v1.13 file (schema_version == 13) that still uses the
+/// tri-state `claude_tabs_enabled` setting and lacks the V14 list-shape
+/// `enabled_ai_tabs` / `aider_local` fields?
+fn looks_v1_13(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 13)
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -1179,6 +1197,55 @@ fn migrate_v1_12_to_v1_13(value: &mut Value) {
             }
         }
     }
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(13u8)),
+    );
+}
+
+// --- v1.13 → v1.14 ----------------------------------------------------------
+//
+// V14 generalizes the v1.9 tri-state `claude_tabs_enabled` setting (Cloud /
+// Local / Both) to a list of arbitrary AI-tab ids — so the user can also
+// enable the new `aider` and `aider-local` builtins. The migration:
+//
+// 1. Translates the legacy `claude_tabs_enabled` string into the new
+//    `enabled_ai_tabs` array and removes the old key.
+// 2. Stamps default `aider_local` provider settings at the top level so
+//    the field round-trips cleanly. (Aider tabs are not auto-added to
+//    `tabs[]`; they materialize on first enable via the integrity check
+//    or the lifecycle IPC.)
+// 3. Bumps `schema_version` to 14.
+//
+// Idempotent — a second pass finds `enabled_ai_tabs` present and
+// `looks_v1_13` returns false.
+
+fn migrate_v1_13_to_v1_14(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    let enabled = match root
+        .remove("claude_tabs_enabled")
+        .as_ref()
+        .and_then(Value::as_str)
+    {
+        Some("local") => vec![Value::String("claude-local".to_string())],
+        Some("both") => vec![
+            Value::String("claude".to_string()),
+            Value::String("claude-local".to_string()),
+        ],
+        // "cloud" or anything unexpected: default to the cloud tab.
+        _ => vec![Value::String("claude".to_string())],
+    };
+    root.insert("enabled_ai_tabs".to_string(), Value::Array(enabled));
+
+    root.entry("aider_local".to_string()).or_insert(json!({
+        "base_url": "http://localhost:11434/v1",
+        "auth_token": "ollama",
+        "model": "",
+    }));
+
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(
@@ -2403,11 +2470,82 @@ mod tests {
         assert!(looks_v1_12(&v));
         migrate_v1_12_to_v1_13(&mut v);
         assert_eq!(v.get("ui").unwrap().get("theme").unwrap(), "tui-yellow");
+        // v1.12 → v1.13 stamps 13, even when CURRENT_SCHEMA_VERSION has
+        // moved further. The v1.13 → v1.14 step is what brings the file
+        // up to the current version on the cascade.
+        assert_eq!(v.get("schema_version").and_then(Value::as_u64), Some(13));
+        assert!(!looks_v1_12(&v));
+    }
+
+    #[test]
+    fn v1_13_to_v1_14_maps_cloud_to_claude_only() {
+        let mut v = json!({
+            "schema_version": 13,
+            "claude_tabs_enabled": "cloud",
+        });
+        assert!(looks_v1_13(&v));
+        migrate_v1_13_to_v1_14(&mut v);
+        assert!(v.get("claude_tabs_enabled").is_none());
+        assert_eq!(
+            v.get("enabled_ai_tabs").unwrap(),
+            &json!(["claude"]),
+        );
         assert_eq!(
             v.get("schema_version").and_then(Value::as_u64),
-            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64)
+            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64),
         );
-        assert!(!looks_v1_12(&v));
+        // aider_local defaults stamped.
+        let aider_local = v.get("aider_local").unwrap();
+        assert_eq!(aider_local.get("base_url").unwrap(), "http://localhost:11434/v1");
+        assert_eq!(aider_local.get("auth_token").unwrap(), "ollama");
+        assert_eq!(aider_local.get("model").unwrap(), "");
+        assert!(!looks_v1_13(&v));
+    }
+
+    #[test]
+    fn v1_13_to_v1_14_maps_local_to_claude_local_only() {
+        let mut v = json!({
+            "schema_version": 13,
+            "claude_tabs_enabled": "local",
+        });
+        migrate_v1_13_to_v1_14(&mut v);
+        assert_eq!(
+            v.get("enabled_ai_tabs").unwrap(),
+            &json!(["claude-local"]),
+        );
+    }
+
+    #[test]
+    fn v1_13_to_v1_14_maps_both_to_claude_pair() {
+        let mut v = json!({
+            "schema_version": 13,
+            "claude_tabs_enabled": "both",
+        });
+        migrate_v1_13_to_v1_14(&mut v);
+        assert_eq!(
+            v.get("enabled_ai_tabs").unwrap(),
+            &json!(["claude", "claude-local"]),
+        );
+    }
+
+    #[test]
+    fn v1_13_to_v1_14_preserves_user_aider_local_settings() {
+        // A user who hand-edited their settings to point at a different
+        // local proxy should not have their aider_local block clobbered
+        // by the migration. `entry().or_insert` keeps the user value.
+        let mut v = json!({
+            "schema_version": 13,
+            "claude_tabs_enabled": "cloud",
+            "aider_local": {
+                "base_url": "http://my-host:8080/v1",
+                "auth_token": "secret",
+                "model": "qwen3:14b",
+            },
+        });
+        migrate_v1_13_to_v1_14(&mut v);
+        let al = v.get("aider_local").unwrap();
+        assert_eq!(al.get("base_url").unwrap(), "http://my-host:8080/v1");
+        assert_eq!(al.get("model").unwrap(), "qwen3:14b");
     }
 
     #[test]
@@ -2442,7 +2580,8 @@ mod tests {
             "layout": null,
             "terminal": {"background": {"presets": []}, "scrollback": {}},
             "claude_local": {},
-            "claude_tabs_enabled": "cloud",
+            "aider_local": {},
+            "enabled_ai_tabs": ["claude"],
         });
         assert_eq!(detect_entry_version(&current), None);
     }

@@ -37,12 +37,12 @@ pub struct AppState {
     /// while a `settings-deep-link` event covers the hot-open path.
     pub pending_settings_deep_link: Arc<Mutex<Option<String>>>,
     /// Serializes tab-lifecycle commands (`create_shell_tab`,
-    /// `close_tab`, `reconfigure_shell_tab`, `set_claude_tabs_enabled`)
+    /// `close_tab`, `reconfigure_shell_tab`, `set_enabled_ai_tabs`)
     /// against each other. Without this each command would interleave
     /// its multiple read-modify-write passes against `state.settings`
     /// and the registry, producing inconsistent state — for example,
-    /// `set_claude_tabs_enabled` reading `had_cloud=true` and racing a
-    /// concurrent `close_tab` of the same Claude tab. The lifecycle
+    /// `set_enabled_ai_tabs` reading the current have-set and racing a
+    /// concurrent `close_tab` of the same AI tab. The lifecycle
     /// commands are user-initiated and rare; the serializer is cheap
     /// and trivially correct.
     pub lifecycle_serializer: Arc<TokioMutex<()>>,

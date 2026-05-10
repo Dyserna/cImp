@@ -319,7 +319,7 @@
   /* Text — Gruvbox fg → fg4 (cream → tan-gray). */
   --text-primary:    #ebdbb2;   /* fg / fg1, main cream */
   --text-bright:     #fbf1c7;   /* fg0 */
-  --text-on-accent:  #1d2021;   /* dark text reads on the light pink fill */
+  --text-on-accent:  #1d2021;   /* dark text reads on deep purple fill */
   --text-secondary:  #d5c4a1;   /* fg2 */
   --text-quiet:      #bdae93;   /* fg3 */
   --text-quiet-strong: #a89984; /* fg4 */
@@ -328,19 +328,19 @@
   --text-disabled:   #665c54;
   --text-disabled-deep: #504945;
 
-  /* Accent — Gruvbox bright purple. Replaces tui-yellow's
-     `#fabd2f` accent for users who prefer a cooler/rosier hue. */
-  --accent:          #d3869b;   /* gruvbox bright purple */
-  --accent-hover:    #d896a8;
-  --accent-bright:   #e3acba;
-  --accent-soft:     #8f4d68;   /* faded purple for muted CTAs */
-  --accent-soft-hover: #ad6b80;
+  /* Accent — deep purple. Replaces tui-yellow's
+     `#fabd2f` accent for users who prefer a cooler hue. */
+  --accent:          #9d4dbb;   /* deep purple */
+  --accent-hover:    #b06acf;
+  --accent-bright:   #c78be3;
+  --accent-soft:     #5e2d75;   /* dark purple for muted CTAs */
+  --accent-soft-hover: #7a3d94;
   --accent-info:     #83a598;   /* gruvbox bright blue */
   --accent-fg:       #1d2021;
-  --accent-muted:    rgba(211, 134, 155, 0.15);
+  --accent-muted:    rgba(157, 77, 187, 0.15);
 
   /* Waveform / avatar-border default — matches the purple accent. */
-  --waveform-color:  #d3869b;
+  --waveform-color:  #9d4dbb;
 
   /* Semantics — Gruvbox bright variants. Warning stays yellow on
      purpose; semantic colors do not follow the accent. */
@@ -392,7 +392,7 @@
   --text-info-quiet:        #689d6a;
   --border-info:            #689d6a;
   --border-info-soft:       #3a4a3a;
-  --accent-purple:          #d3869b;   /* bright purple */
+  --accent-purple:          #9d4dbb;   /* deep purple */
 
   /* Borders — gruvbox bg3/bg4. Warm gray to match the palette. */
   --border-faint:    #3c3836;

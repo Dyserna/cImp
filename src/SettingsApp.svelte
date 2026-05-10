@@ -16,13 +16,12 @@
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
-    ClaudeTabsEnabled,
     Settings,
     ShellTabConfig,
     TabConfig,
   } from './lib/settings/types';
   import { defaultSettings, findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
-  import { contentClear, contentOpenFolder, setClaudeTabsEnabled } from './lib/ipc';
+  import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
@@ -40,6 +39,8 @@
   // between password and text via this flag (no keychain integration in
   // this milestone — the token sits cleartext in settings.json).
   let showLocalToken = $state<boolean>(false);
+  // V14: same toggle for the Aider local LLM section.
+  let showAiderLocalToken = $state<boolean>(false);
   // Per-tab "applied" baselines — used to compute the Restart Required
   // indicator when subprocess-affecting fields drift from the spawn-time
   // settings. Notification text and first-launch dismissal are NOT in
@@ -64,6 +65,7 @@
     | 'tabs'
     | 'shortcuts'
     | 'local-llm'
+    | 'aider-local-llm'
     | 'advanced'
     | 'about';
   let activeSection = $state<SectionId>('audio');
@@ -75,20 +77,27 @@
     { id: 'display', label: 'Display' },
     { id: 'tabs', label: 'Tabs' },
     { id: 'shortcuts', label: 'Shortcuts' },
-    { id: 'local-llm', label: 'Local LLM' },
+    { id: 'local-llm', label: 'Local LLM (Claude)' },
+    { id: 'aider-local-llm', label: 'Local LLM (Aider)' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
   const REPO_URL = 'https://github.com/Dyserna/cctts';
 
-  // Sub-tab nav within the Tabs section. The two AI builtins each get
-  // their own sub-tab; every Shell tab is grouped under 'shells'. Keeps
-  // the previously-collapsible <details> wall navigable.
-  type TabsSubSection = 'claude' | 'claude-local' | 'shells';
+  // Sub-tab nav within the Tabs section. Each AI builtin gets its own
+  // sub-tab; every Shell tab is grouped under 'shells'. Keeps the
+  // previously-collapsible <details> wall navigable.
+  type TabsSubSection = AiTabId | 'shells';
   let tabsSubSection = $state<TabsSubSection>('claude');
   function subSectionForTabId(tabId: string): TabsSubSection {
-    if (tabId === 'claude') return 'claude';
-    if (tabId === 'claude-local') return 'claude-local';
+    if (
+      tabId === 'claude' ||
+      tabId === 'claude-local' ||
+      tabId === 'aider' ||
+      tabId === 'aider-local'
+    ) {
+      return tabId;
+    }
     return 'shells';
   }
 
@@ -203,34 +212,52 @@
     void applySettings(next);
   }
 
-  /// Apply a Claude-tabs-enabled radio change. Routes through the
-  /// dedicated IPC instead of a plain `applySettings` because the
-  /// backend has to open / close the AI builtin tabs (kill PTY, drop
-  /// scrollback) in response — `settings_update` alone wouldn't
-  /// trigger that lifecycle. Optimistically updates the local snapshot
-  /// so the radio reflects the new value before the broadcast comes
-  /// back; the broadcast overwrites with the same value harmlessly.
-  /// Switches the tabsSubSection if the user is currently viewing a
-  /// tab that's about to disappear.
-  async function setClaudeTabsEnabledFromUi(value: ClaudeTabsEnabled) {
+  /// Toggle one AI tab's enabled state. Routes through the dedicated
+  /// IPC instead of a plain `applySettings` because the backend has to
+  /// open / close the AI builtin tabs (kill PTY, drop scrollback) in
+  /// response — `settings_update` alone wouldn't trigger that
+  /// lifecycle. Optimistically updates the local snapshot so the
+  /// checkbox reflects the new value before the broadcast comes back;
+  /// the broadcast overwrites with the same value harmlessly.
+  ///
+  /// The "at least one AI tab must be enabled" rule is enforced two
+  /// ways: the checkbox renders `disabled` when it would be the last
+  /// remaining tick, and the IPC additionally rejects an empty array
+  /// as defense-in-depth.
+  ///
+  /// If the user disables the tab they're currently viewing, jump to
+  /// the first surviving tab in canonical order so the sub-tab body
+  /// doesn't render an empty-state hint until the broadcast settles.
+  async function toggleAiTabEnabled(id: AiTabId, enable: boolean) {
     if (!snapshot) return;
-    const prev = snapshot.claude_tabs_enabled;
-    if (prev === value) return;
-    if (
-      (tabsSubSection === 'claude' && value === 'local') ||
-      (tabsSubSection === 'claude-local' && value === 'cloud')
-    ) {
-      tabsSubSection = value === 'cloud' ? 'claude' : 'claude-local';
+    const prev = snapshot.enabled_ai_tabs;
+    const wasEnabled = prev.includes(id);
+    if (wasEnabled === enable) return;
+    let next_ids: AiTabId[];
+    if (enable) {
+      // Insert in canonical order so the persisted list mirrors the
+      // tab-bar order users see.
+      const order: AiTabId[] = ['claude', 'claude-local', 'aider', 'aider-local'];
+      next_ids = order.filter((x) => prev.includes(x) || x === id);
+    } else {
+      if (prev.length <= 1) return; // last-one lock (also guarded by the disabled attribute)
+      next_ids = prev.filter((x) => x !== id);
     }
-    const next = structuredClone($state.snapshot(snapshot));
-    next.claude_tabs_enabled = value;
-    snapshot = next;
+    if (!enable && tabsSubSection === id) {
+      // Jump to the first surviving id in canonical order.
+      const order: AiTabId[] = ['claude', 'claude-local', 'aider', 'aider-local'];
+      const survivor = order.find((x) => next_ids.includes(x));
+      if (survivor) tabsSubSection = survivor;
+    }
+    const updated = structuredClone($state.snapshot(snapshot));
+    updated.enabled_ai_tabs = next_ids;
+    snapshot = updated;
     try {
-      await setClaudeTabsEnabled(value);
+      await setEnabledAiTabs(next_ids);
     } catch (e) {
-      console.error('set_claude_tabs_enabled failed:', e);
+      console.error('set_enabled_ai_tabs failed:', e);
       const restored = structuredClone($state.snapshot(snapshot));
-      restored.claude_tabs_enabled = prev;
+      restored.enabled_ai_tabs = prev;
       snapshot = restored;
     }
   }
@@ -308,10 +335,17 @@
   /// TabSettingsSection's bound setter; the array shape forces the
   /// find-by-id lookup at write time.
   function patchAiTab(id: string, value: AiToolTabConfig) {
+    // The value came in via a $bindable() prop spread from the child
+    // (TabSettingsSection). The spread copies own keys but leaves nested
+    // children as $state proxy references. Snapshotting here flattens
+    // those to plain JS so structuredClone in the store subscriber and
+    // Tauri's IPC serializer don't choke. See the DataCloneError that
+    // surfaced when wiring the per-tab Terminal palette dropdown.
+    const plain = $state.snapshot(value) as AiToolTabConfig;
     patch((s) => {
       const idx = findTabIndex(s, id);
       if (idx < 0) return;
-      s.tabs[idx] = value;
+      s.tabs[idx] = plain;
     });
   }
 
@@ -1096,45 +1130,81 @@
       {:else if activeSection === 'tabs'}
         {@const claudeLive = aiTabAt('claude')}
         {@const claudeLocalLive = aiTabAt('claude-local')}
+        {@const aiderLive = aiTabAt('aider')}
+        {@const aiderLocalLive = aiTabAt('aider-local')}
         {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
-        {@const claudeTabsValue = snapshot.claude_tabs_enabled}
+        {@const enabledAiTabs = snapshot.enabled_ai_tabs}
+        {@const lastChecked = enabledAiTabs.length === 1 ? enabledAiTabs[0] : null}
         <section>
           <h2>Tabs</h2>
           <fieldset class="claude-tabs-radio">
-            <legend>Claude tabs enabled</legend>
+            <legend>AI tabs enabled</legend>
             <small class="hint">
-              Pick which Claude tabs to keep. Changing this opens or closes the matching tabs (the closed tab's PTY is killed and its scrollback dropped).
+              Pick which AI-tool tabs to keep. Toggling a checkbox opens
+              or closes the matching tab (the closed tab's PTY is killed
+              and its scrollback dropped). At least one tab must remain
+              checked.
             </small>
             <div class="radio-row">
               <label>
                 <input
-                  type="radio"
-                  name="claude-tabs-enabled"
-                  value="cloud"
-                  checked={claudeTabsValue === 'cloud'}
-                  onchange={() => void setClaudeTabsEnabledFromUi('cloud')}
+                  type="checkbox"
+                  name="ai-tabs-enabled"
+                  value="claude"
+                  checked={enabledAiTabs.includes('claude')}
+                  disabled={lastChecked === 'claude'}
+                  onchange={(e) =>
+                    void toggleAiTabEnabled(
+                      'claude',
+                      (e.currentTarget as HTMLInputElement).checked,
+                    )}
                 />
                 Claude (cloud)
               </label>
               <label>
                 <input
-                  type="radio"
-                  name="claude-tabs-enabled"
-                  value="local"
-                  checked={claudeTabsValue === 'local'}
-                  onchange={() => void setClaudeTabsEnabledFromUi('local')}
+                  type="checkbox"
+                  name="ai-tabs-enabled"
+                  value="claude-local"
+                  checked={enabledAiTabs.includes('claude-local')}
+                  disabled={lastChecked === 'claude-local'}
+                  onchange={(e) =>
+                    void toggleAiTabEnabled(
+                      'claude-local',
+                      (e.currentTarget as HTMLInputElement).checked,
+                    )}
                 />
                 Claude (local)
               </label>
               <label>
                 <input
-                  type="radio"
-                  name="claude-tabs-enabled"
-                  value="both"
-                  checked={claudeTabsValue === 'both'}
-                  onchange={() => void setClaudeTabsEnabledFromUi('both')}
+                  type="checkbox"
+                  name="ai-tabs-enabled"
+                  value="aider"
+                  checked={enabledAiTabs.includes('aider')}
+                  disabled={lastChecked === 'aider'}
+                  onchange={(e) =>
+                    void toggleAiTabEnabled(
+                      'aider',
+                      (e.currentTarget as HTMLInputElement).checked,
+                    )}
                 />
-                Both
+                Aider (cloud)
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  name="ai-tabs-enabled"
+                  value="aider-local"
+                  checked={enabledAiTabs.includes('aider-local')}
+                  disabled={lastChecked === 'aider-local'}
+                  onchange={(e) =>
+                    void toggleAiTabEnabled(
+                      'aider-local',
+                      (e.currentTarget as HTMLInputElement).checked,
+                    )}
+                />
+                Aider (local)
               </label>
             </div>
           </fieldset>
@@ -1156,6 +1226,24 @@
               onclick={() => (tabsSubSection = 'claude-local')}
             >
               Claude (local)
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={tabsSubSection === 'aider'}
+              aria-selected={tabsSubSection === 'aider'}
+              onclick={() => (tabsSubSection = 'aider')}
+            >
+              Aider
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={tabsSubSection === 'aider-local'}
+              aria-selected={tabsSubSection === 'aider-local'}
+              onclick={() => (tabsSubSection = 'aider-local')}
+            >
+              Aider (local)
             </button>
             <button
               type="button"
@@ -1187,7 +1275,7 @@
                   onrestart={() => restartTab('claude')}
                 />
               {:else}
-                <small class="hint top">Claude tab not configured.</small>
+                <small class="hint top">Claude tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
             </div>
           {:else if tabsSubSection === 'claude-local'}
@@ -1206,7 +1294,45 @@
                   onrestart={() => restartTab('claude-local')}
                 />
               {:else}
-                <small class="hint top">Claude (local) tab not configured.</small>
+                <small class="hint top">Claude (local) tab is disabled — tick the checkbox above to enable it.</small>
+              {/if}
+            </div>
+          {:else if tabsSubSection === 'aider'}
+            <div id="tab-section-aider">
+              {#if aiderLive}
+                <TabSettingsSection
+                  tabId={'aider'}
+                  displayName={'Aider'}
+                  bind:settings={
+                    () => aiderLive,
+                    (v) => patchAiTab('aider', v)
+                  }
+                  defaults={tabDefaults['aider'] ?? null}
+                  restartRequired={restartRequired['aider'] ?? false}
+                  onchange={() => {}}
+                  onrestart={() => restartTab('aider')}
+                />
+              {:else}
+                <small class="hint top">Aider tab is disabled — tick the checkbox above to enable it.</small>
+              {/if}
+            </div>
+          {:else if tabsSubSection === 'aider-local'}
+            <div id="tab-section-aider-local">
+              {#if aiderLocalLive}
+                <TabSettingsSection
+                  tabId={'aider-local'}
+                  displayName={'Aider (local)'}
+                  bind:settings={
+                    () => aiderLocalLive,
+                    (v) => patchAiTab('aider-local', v)
+                  }
+                  defaults={tabDefaults['aider-local'] ?? null}
+                  restartRequired={restartRequired['aider-local'] ?? false}
+                  onchange={() => {}}
+                  onrestart={() => restartTab('aider-local')}
+                />
+              {:else}
+                <small class="hint top">Aider (local) tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
             </div>
           {:else}
@@ -1377,10 +1503,10 @@
         </section>
       {:else if activeSection === 'local-llm'}
         <section>
-          <h2>Local LLM provider</h2>
+          <h2>Local LLM provider — Claude</h2>
           <small class="hint top">
-            Settings for AI tabs that have <em>Use local LLM provider</em>
-            enabled. Run a LiteLLM (or compatible) proxy that translates the
+            Settings for the Claude AI tab when <em>Use local LLM provider</em>
+            is enabled. Run a LiteLLM (or compatible) proxy that translates the
             Anthropic Messages API to your local model — cctts does not start
             the proxy. See the
             <a
@@ -1453,6 +1579,88 @@
               When non-empty, becomes <code>ANTHROPIC_MODEL</code>. Most
               users leave this blank and configure model mapping inside
               their LiteLLM proxy config.
+            </small>
+          </label>
+        </section>
+      {:else if activeSection === 'aider-local-llm'}
+        <section>
+          <h2>Local LLM provider — Aider</h2>
+          <small class="hint top">
+            Settings for the Aider (local) tab. cctts synthesizes
+            <code>OPENAI_API_BASE</code> / <code>OPENAI_API_KEY</code>
+            from the values below and (when <em>Model</em> is set) passes
+            <code>--model &lt;model&gt;</code> on the spawn argv. Point
+            this at any OpenAI-compatible endpoint (Ollama, LM Studio,
+            vLLM, LiteLLM proxy, …); cctts does not start the endpoint
+            itself.
+          </small>
+          <label>
+            <span>Endpoint URL</span>
+            <input
+              type="text"
+              value={snapshot?.aider_local.base_url ?? ''}
+              oninput={(e) =>
+                patch(
+                  (s) =>
+                    (s.aider_local.base_url = (
+                      e.currentTarget as HTMLInputElement
+                    ).value),
+                )}
+              placeholder="http://localhost:11434/v1"
+            />
+            <small class="hint">
+              Becomes <code>OPENAI_API_BASE</code> on launch. For Ollama,
+              the default <code>:11434/v1</code> path serves the
+              OpenAI-compatible API.
+            </small>
+          </label>
+          <label>
+            <span>Auth token</span>
+            <div class="input-with-action">
+              <input
+                type={showAiderLocalToken ? 'text' : 'password'}
+                value={snapshot?.aider_local.auth_token ?? ''}
+                oninput={(e) =>
+                  patch(
+                    (s) =>
+                      (s.aider_local.auth_token = (
+                        e.currentTarget as HTMLInputElement
+                      ).value),
+                  )}
+                placeholder="ollama"
+              />
+              <button
+                type="button"
+                class="secondary"
+                onclick={() => (showAiderLocalToken = !showAiderLocalToken)}
+              >
+                {showAiderLocalToken ? 'Hide' : 'Show'}
+              </button>
+            </div>
+            <small class="hint">
+              Becomes <code>OPENAI_API_KEY</code>. Stored cleartext;
+              local endpoints typically accept any non-empty value
+              (Ollama defaults to the literal string <code>ollama</code>).
+            </small>
+          </label>
+          <label>
+            <span>Model</span>
+            <input
+              type="text"
+              value={snapshot?.aider_local.model ?? ''}
+              oninput={(e) =>
+                patch(
+                  (s) =>
+                    (s.aider_local.model = (
+                      e.currentTarget as HTMLInputElement
+                    ).value),
+                )}
+              placeholder="qwen3:14b"
+            />
+            <small class="hint">
+              When non-empty, passed as <code>--model &lt;model&gt;</code>
+              on the aider spawn argv. Aider's own naming conventions
+              apply (e.g. <code>openai/qwen3:14b</code> for some endpoints).
             </small>
           </label>
         </section>

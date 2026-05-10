@@ -15,10 +15,11 @@
 //! keys it doesn't carry fall through to global. Older shapes are detected
 //! by their discriminator fields and routed through the `migration`
 //! module after the merge so a hand-imported old file at the new path
-//! still upgrades cleanly. After migration an integrity check ensures the
-//! two AI builtins (claude, claude-local) exist with `builtin: true` —
-//! hand-edited files that deleted them are repaired transparently. The
-//! `shell-default-1` reserved id is *not* re-seeded by the integrity
+//! still upgrades cleanly. After migration an integrity check reconciles
+//! the four reserved AI builtins (claude, claude-local, aider, aider-local)
+//! with `enabled_ai_tabs`: every enabled id is forced present with
+//! `builtin: true`, every reserved id absent from the list is dropped.
+//! The `shell-default-1` reserved id is *not* re-seeded by the integrity
 //! check: it ships on fresh installs only, and stays closed once a user
 //! closes it.
 //!
@@ -38,8 +39,8 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
-    default_claude_local_tab, default_claude_tab, default_shell_1_tab, LayoutNodePersisted,
-    Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID,
+    default_ai_tab, default_shell_1_tab, AiTabId, LayoutNodePersisted, Settings, TabConfig,
+    AIDER_LOCAL_TAB_ID, AIDER_TAB_ID, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, SHELL_DEFAULT_TAB_ID,
 };
 use crate::shell::ShellSpec;
 
@@ -486,25 +487,126 @@ fn stamp_avatar_paths_from(s: &mut Settings, dir: &Path) {
     }
 }
 
-/// Ensure the two AI builtin entries are present and marked as builtins.
-/// Returns true if anything was changed (caller may want to write back
-/// to disk). Logged as a warning when an entry has to be restored — the
-/// typical cause is a hand-edited file.
+/// Drop any reserved AI tab that is not in `enabled_ai_tabs`. Returns
+/// `true` if any entry was removed.
+fn drop_disabled_ai_builtins(settings: &mut Settings) -> bool {
+    let want: std::collections::HashSet<&'static str> = settings
+        .enabled_ai_tabs
+        .iter()
+        .map(|id| id.as_str())
+        .collect();
+    let before = settings.tabs.len();
+    settings.tabs.retain(|t| {
+        // Keep anything that isn't a reserved AI id, plus reserved ids
+        // that are in the want-set.
+        let id = t.id();
+        if AiTabId::from_id(id).is_some() {
+            want.contains(id)
+        } else {
+            true
+        }
+    });
+    let removed = before != settings.tabs.len();
+    if removed {
+        tracing::warn!("integrity: dropped reserved AI tab(s) not in enabled_ai_tabs");
+    }
+    removed
+}
+
+/// For each id in `enabled_ai_tabs` that's missing from `tabs`, insert
+/// the default config at the canonical position. Returns `true` if any
+/// entry was inserted.
+fn restore_enabled_ai_builtins(settings: &mut Settings) -> bool {
+    // Iterate in canonical order (claude → claude-local → aider →
+    // aider-local) so successive insertions land in the right relative
+    // slot regardless of the user's `enabled_ai_tabs` ordering.
+    let order = [
+        AiTabId::Claude,
+        AiTabId::ClaudeLocal,
+        AiTabId::Aider,
+        AiTabId::AiderLocal,
+    ];
+    let mut changed = false;
+    for &id in &order {
+        if !settings.enabled_ai_tabs.contains(&id) {
+            continue;
+        }
+        if settings.tabs.iter().any(|t| t.id() == id.as_str()) {
+            continue;
+        }
+        let pos = canonical_insert_position(&settings.tabs, id);
+        settings.tabs.insert(pos, default_ai_tab(id));
+        changed = true;
+        tracing::warn!(id = id.as_str(), "integrity: restored missing AI builtin tab");
+    }
+    changed
+}
+
+/// Position to insert a freshly-restored reserved AI tab so the AI
+/// builtins keep their canonical leading order. Walks the existing
+/// `tabs[]` and lands the new entry after the last reserved AI tab
+/// whose canonical order is < `id`'s — so reinserting `aider` after the
+/// user has `claude`, `claude-local`, and a shell tab places aider at
+/// index 2 (in front of the shell), not at the end.
+fn canonical_insert_position(tabs: &[TabConfig], id: AiTabId) -> usize {
+    let target = id.canonical_order();
+    let mut pos = 0usize;
+    for (idx, tab) in tabs.iter().enumerate() {
+        match AiTabId::from_id(tab.id()) {
+            Some(other) if other.canonical_order() < target => {
+                pos = idx + 1;
+            }
+            // First non-reserved-AI tab (or a higher-canonical-order AI
+            // tab) marks the upper bound — anything past here is a
+            // shell or a later-AI tab and we should insert before it.
+            _ => return pos,
+        }
+    }
+    pos
+}
+
+/// All four reserved AI tab ids. Used by the integrity check's "is this
+/// id one of our reserved AI builtins?" loops; a single source of truth
+/// keeps the `ai_builtins` membership check, the `use_local_provider`
+/// expectation table, and the drop-disabled-tab pass in sync.
+const AI_BUILTIN_IDS: [&str; 4] = [
+    CLAUDE_TAB_ID,
+    CLAUDE_LOCAL_TAB_ID,
+    AIDER_TAB_ID,
+    AIDER_LOCAL_TAB_ID,
+];
+
+/// Reconcile the `tabs` array with `enabled_ai_tabs`. Every enabled AI
+/// id is forced present and marked `builtin: true`; every reserved AI
+/// id absent from the list is dropped from `tabs`. Returns true if
+/// anything was changed (caller may want to write back to disk). Logged
+/// as a warning when an entry has to be restored — the typical cause is
+/// a hand-edited file.
 ///
-/// The order is deterministic: claude first, then claude-local, each
-/// restored entry inserted at its canonical position (front,
-/// after-claude). User-created Shell tabs retain their relative ordering
-/// after the two pinned AI builtins. The `shell-default-1` reserved id
-/// is *not* re-seeded here: it's a closable shell that ships only on
-/// fresh installs (see `seeded_defaults`).
+/// Restored AI tabs land at their canonical position (claude → 0,
+/// claude-local → after claude, aider → after claude-local,
+/// aider-local → after aider). User-created Shell tabs retain their
+/// relative ordering after the AI builtins. The `shell-default-1`
+/// reserved id is *not* re-seeded here: it's a closable shell that
+/// ships only on fresh installs (see `seeded_defaults`).
+///
+/// Empty `enabled_ai_tabs` (a hand-edit, or a malformed migration) is
+/// repaired by forcing it back to `[claude]` so the user always boots
+/// with at least one AI tab.
 pub fn integrity_check(settings: &mut Settings) -> bool {
     let mut changed = false;
 
-    // 1. Force builtin: true on the two AI builtins if they exist with
+    // 0. Empty enabled_ai_tabs is invalid — repair to [claude].
+    if settings.enabled_ai_tabs.is_empty() {
+        settings.enabled_ai_tabs = vec![AiTabId::Claude];
+        changed = true;
+        tracing::warn!("integrity: enabled_ai_tabs was empty; reset to [claude]");
+    }
+
+    // 1. Force builtin: true on every reserved AI id if it exists with
     //    builtin: false. Defends against hand-edits trying to flip the flag.
-    let ai_builtins = [CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID];
     for tab in settings.tabs.iter_mut() {
-        if ai_builtins.contains(&tab.id()) && !tab.builtin() {
+        if AI_BUILTIN_IDS.contains(&tab.id()) && !tab.builtin() {
             tab.set_builtin(true);
             changed = true;
             tracing::warn!(id = tab.id(), "integrity: forced builtin: true on AI builtin");
@@ -523,18 +625,15 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         }
     }
 
-    // 3. Force `use_local_provider` to its canonical value on the two
-    //    AI builtins so a hand-edit can't, e.g., flip the subscription
-    //    Claude tab into local-LLM mode (which would silently route the
-    //    user's primary tab through their local proxy).
+    // 3. Force `use_local_provider` to its canonical value on every
+    //    reserved AI tab so a hand-edit can't, e.g., flip the
+    //    subscription Claude tab into local-LLM mode (which would
+    //    silently route the user's primary tab through their local
+    //    proxy).
     for tab in settings.tabs.iter_mut() {
         if let TabConfig::AiTool(c) = tab {
-            let expected = match c.id.as_str() {
-                CLAUDE_TAB_ID => Some(false),
-                CLAUDE_LOCAL_TAB_ID => Some(true),
-                _ => None,
-            };
-            if let Some(want) = expected {
+            if let Some(reserved) = AiTabId::from_id(c.id.as_str()) {
+                let want = reserved.uses_local_provider();
                 if c.use_local_provider != want {
                     c.use_local_provider = want;
                     changed = true;
@@ -547,44 +646,18 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         }
     }
 
-    // 4. Reconcile AI builtin entries with `claude_tabs_enabled`. The
-    //    setting is the source of truth for which Claude tabs exist:
-    //    Cloud → claude only, Local → claude-local only, Both → both.
-    //    A tab that's enabled but missing is restored at its canonical
-    //    position; a tab that's disabled but present is dropped (the
-    //    runtime's set-claude-tabs-enabled IPC is what kills the PTY
-    //    in-session, but on cold load we just normalize the settings
-    //    file). shell-default-1 is intentionally untouched here — it's
-    //    a regular closable shell.
-    let want_cloud = settings.claude_tabs_enabled.includes_cloud();
-    let want_local = settings.claude_tabs_enabled.includes_local();
-
-    let has_cloud = settings.tabs.iter().any(|t| t.id() == CLAUDE_TAB_ID);
-    if want_cloud && !has_cloud {
-        settings.tabs.insert(0, default_claude_tab());
+    // 4. Reconcile AI builtin entries with `enabled_ai_tabs`. The list
+    //    is the source of truth for which AI tabs exist: every enabled
+    //    id is restored at its canonical position; every reserved id
+    //    that's not enabled is dropped (the runtime's
+    //    set-enabled-ai-tabs IPC kills the PTY in-session, but on cold
+    //    load we just normalize the settings file). shell-default-1 is
+    //    intentionally untouched here — it's a regular closable shell.
+    if drop_disabled_ai_builtins(settings) {
         changed = true;
-        tracing::warn!("integrity: restored missing claude tab");
-    } else if !want_cloud && has_cloud {
-        settings.tabs.retain(|t| t.id() != CLAUDE_TAB_ID);
-        changed = true;
-        tracing::warn!("integrity: removed claude tab (disabled by setting)");
     }
-
-    let has_local = settings.tabs.iter().any(|t| t.id() == CLAUDE_LOCAL_TAB_ID);
-    if want_local && !has_local {
-        let pos = settings
-            .tabs
-            .iter()
-            .position(|t| t.id() == CLAUDE_TAB_ID)
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        settings.tabs.insert(pos, default_claude_local_tab());
+    if restore_enabled_ai_builtins(settings) {
         changed = true;
-        tracing::warn!("integrity: restored missing claude-local tab");
-    } else if !want_local && has_local {
-        settings.tabs.retain(|t| t.id() != CLAUDE_LOCAL_TAB_ID);
-        changed = true;
-        tracing::warn!("integrity: removed claude-local tab (disabled by setting)");
     }
 
     // 5. Backend layout sanity. The frontend owns the deep integrity
@@ -680,12 +753,12 @@ mod tests {
 
     #[test]
     fn integrity_seeds_only_claude_on_empty_with_default_setting() {
-        // Default `claude_tabs_enabled = Cloud` means a fresh install
+        // Default `enabled_ai_tabs = [claude]` means a fresh install
         // gets the subscription Claude tab only; the integrity check
         // mustn't re-seed claude-local. The closable shell-default-1
         // ships via `seeded_defaults`, not the integrity check.
         let mut s = Settings::default();
-        let shell = fake_default_shell();
+        let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs.len(), 1);
@@ -694,10 +767,10 @@ mod tests {
     }
 
     #[test]
-    fn integrity_seeds_both_when_claude_tabs_enabled_is_both() {
+    fn integrity_seeds_both_when_enabled_ai_tabs_is_both_claudes() {
         let mut s = Settings::default();
-        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
-        let shell = fake_default_shell();
+        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
+        let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs.len(), 2);
@@ -706,10 +779,10 @@ mod tests {
     }
 
     #[test]
-    fn integrity_seeds_only_claude_local_when_setting_is_local() {
+    fn integrity_seeds_only_claude_local_when_setting_is_claude_local_only() {
         let mut s = Settings::default();
-        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Local;
-        let shell = fake_default_shell();
+        s.enabled_ai_tabs = vec![AiTabId::ClaudeLocal];
+        let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs.len(), 1);
@@ -717,18 +790,82 @@ mod tests {
     }
 
     #[test]
+    fn integrity_seeds_aider_pair_at_canonical_positions() {
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = vec![
+            AiTabId::Claude,
+            AiTabId::Aider,
+            AiTabId::AiderLocal,
+        ];
+        integrity_check(&mut s);
+        assert_eq!(s.tabs.len(), 3);
+        assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
+        assert_eq!(s.tabs[1].id(), AIDER_TAB_ID);
+        assert_eq!(s.tabs[2].id(), AIDER_LOCAL_TAB_ID);
+    }
+
+    #[test]
+    fn integrity_inserts_aider_between_claude_local_and_user_shell() {
+        // User has [claude, claude-local, shell-foo] and now enables
+        // aider. The new tab should land at index 2 (after claude-local,
+        // before the shell), not at the end.
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = vec![
+            AiTabId::Claude,
+            AiTabId::ClaudeLocal,
+            AiTabId::Aider,
+        ];
+        integrity_check(&mut s);
+        // Insert a user shell tab to simulate the existing layout.
+        s.tabs.push(TabConfig::Shell(crate::settings::schema::ShellTabConfig {
+            id: "shell-foo".to_string(),
+            builtin: false,
+            name: "Foo".to_string(),
+            command: "/bin/bash".to_string(),
+            args: vec!["-i".to_string()],
+            cwd: None,
+            env: Default::default(),
+            notifications: Default::default(),
+            theme_override: None,
+            background_override: None,
+        }));
+        // Drop aider, then re-add via integrity.
+        s.tabs.retain(|t| t.id() != AIDER_TAB_ID);
+        let changed = integrity_check(&mut s);
+        assert!(changed);
+        assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
+        assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
+        assert_eq!(s.tabs[2].id(), AIDER_TAB_ID);
+        assert_eq!(s.tabs[3].id(), "shell-foo");
+    }
+
+    #[test]
     fn integrity_drops_disabled_ai_tab() {
         // Loading a file where the setting and tabs disagree (e.g. a
         // hand-edit, or post-migration drift) reconciles to the setting.
         let mut s = Settings::default();
-        let shell = fake_default_shell();
-        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
+        let _shell = fake_default_shell();
+        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         integrity_check(&mut s);
         assert_eq!(s.tabs.len(), 2);
 
-        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Cloud;
+        s.enabled_ai_tabs = vec![AiTabId::Claude];
         let changed = integrity_check(&mut s);
         assert!(changed);
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
+    }
+
+    #[test]
+    fn integrity_repairs_empty_enabled_ai_tabs() {
+        // A hand-edited file with `enabled_ai_tabs: []` is invalid;
+        // integrity forces it back to [claude] so the user always boots
+        // with at least one AI tab.
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = Vec::new();
+        let changed = integrity_check(&mut s);
+        assert!(changed);
+        assert_eq!(s.enabled_ai_tabs, vec![AiTabId::Claude]);
         assert_eq!(s.tabs.len(), 1);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
     }
@@ -738,7 +875,7 @@ mod tests {
         // Closing shell-default-1 must persist across launches: the
         // integrity check should leave it absent.
         let mut s = Settings::default();
-        let shell = fake_default_shell();
+        let _shell = fake_default_shell();
         integrity_check(&mut s);
         assert!(s
             .tabs
@@ -752,7 +889,7 @@ mod tests {
         // Loading those files must demote the entry so the close button
         // works.
         let mut s = Settings::default();
-        let shell = fake_default_shell();
+        let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a legacy-shaped shell-default-1 with builtin: true.
         s.tabs.push(TabConfig::Shell(
@@ -782,7 +919,7 @@ mod tests {
     #[test]
     fn integrity_forces_builtin_true_on_ai_builtins() {
         let mut s = Settings::default();
-        let shell = fake_default_shell();
+        let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Tamper: flip claude's builtin to false.
         if let TabConfig::AiTool(c) = &mut s.tabs[0] {
@@ -796,7 +933,7 @@ mod tests {
     #[test]
     fn integrity_preserves_user_tabs() {
         let mut s = Settings::default();
-        let shell = fake_default_shell();
+        let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a user shell tab.
         s.tabs.push(TabConfig::Shell(crate::settings::schema::ShellTabConfig {
@@ -831,9 +968,9 @@ mod tests {
 
     #[test]
     fn v1_2_round_trip() {
-        let shell = fake_default_shell();
+        let _shell = fake_default_shell();
         let mut s = Settings::default();
-        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
+        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         integrity_check(&mut s);
         let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
@@ -844,12 +981,12 @@ mod tests {
 
     #[test]
     fn integrity_corrects_use_local_provider_on_reserved_ai_tabs() {
-        // V1.4-07: a hand-edit must not be able to silently flip the
+        // A hand-edit must not be able to silently flip the
         // subscription Claude tab into local-LLM mode (or vice versa).
-        // Force `Both` so the check has both AI tabs to validate.
+        // Enable both so the check has both AI tabs to validate.
         let mut s = Settings::default();
-        s.claude_tabs_enabled = crate::settings::ClaudeTabsEnabled::Both;
-        let shell = fake_default_shell();
+        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
+        let _shell = fake_default_shell();
         integrity_check(&mut s);
 
         // Tamper: flip claude → local, claude-local → not local.
@@ -867,6 +1004,32 @@ mod tests {
         }
         if let TabConfig::AiTool(c) = &s.tabs[1] {
             assert!(c.use_local_provider, "claude-local must have use_local_provider=true");
+        }
+    }
+
+    #[test]
+    fn integrity_corrects_use_local_provider_on_aider_pair() {
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = vec![AiTabId::Aider, AiTabId::AiderLocal];
+        integrity_check(&mut s);
+        // Tamper: aider → local, aider-local → not local.
+        if let TabConfig::AiTool(c) = s.tabs.iter_mut().find(|t| t.id() == AIDER_TAB_ID).unwrap() {
+            c.use_local_provider = true;
+        }
+        if let TabConfig::AiTool(c) =
+            s.tabs.iter_mut().find(|t| t.id() == AIDER_LOCAL_TAB_ID).unwrap()
+        {
+            c.use_local_provider = false;
+        }
+        let changed = integrity_check(&mut s);
+        assert!(changed);
+        if let TabConfig::AiTool(c) = s.tabs.iter().find(|t| t.id() == AIDER_TAB_ID).unwrap() {
+            assert!(!c.use_local_provider, "aider must have use_local_provider=false");
+        }
+        if let TabConfig::AiTool(c) =
+            s.tabs.iter().find(|t| t.id() == AIDER_LOCAL_TAB_ID).unwrap()
+        {
+            assert!(c.use_local_provider, "aider-local must have use_local_provider=true");
         }
     }
 
@@ -967,7 +1130,7 @@ mod tests {
         // Take default Settings as global, mutate one nested field, diff
         // it, and verify that re-applying the diff to global recovers the
         // mutated state.
-        let shell = fake_default_shell();
+        let _shell = fake_default_shell();
         let mut global = Settings::default();
         integrity_check(&mut global);
 
@@ -1111,7 +1274,7 @@ mod tests {
 
     #[test]
     fn save_writes_overlay_when_diff_nonempty_and_removes_when_empty() {
-        let shell = fake_default_shell();
+        let _shell = fake_default_shell();
         let mut global = Settings::default();
         integrity_check(&mut global);
 

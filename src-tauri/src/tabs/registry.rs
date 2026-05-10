@@ -11,7 +11,7 @@ use crate::audio::AudioOutput;
 use crate::error::{AppError, AppResult};
 use crate::processing::permission::PermissionPattern;
 use crate::pty::PtyManager;
-use crate::settings::{SettingsHandle, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID};
+use crate::settings::{AiTabId, SettingsHandle};
 use crate::state::{InputLengths, StateSignal, TabId, TabKind};
 use crate::tabs::config::build_launch_spec;
 use crate::tts::{ActiveTab, TtsRequest};
@@ -70,7 +70,7 @@ pub type TabRegistryHandle = Arc<TokioMutex<TabRegistry>>;
 /// any user-created shell. User-created Shell tabs use uuid-based ids
 /// that never collide with these.
 fn is_builtin_id(id: &str) -> bool {
-    matches!(id, CLAUDE_TAB_ID | CLAUDE_LOCAL_TAB_ID)
+    AiTabId::from_id(id).is_some()
 }
 
 /// V1.4-04 D: replicate the filename-sanitization done by
@@ -199,8 +199,8 @@ impl TabRegistry {
 
     /// Remove a tab. Callers (IPC) are responsible for any policy gate —
     /// `close_tab` rejects AI builtins with `BuiltinNotClosable`, but the
-    /// `set_claude_tabs_enabled` path bypasses that check because the
-    /// radio selection is the canonical way to close AI tabs. Returns
+    /// `set_enabled_ai_tabs` path bypasses that check because the
+    /// checkbox group is the canonical way to close AI tabs. Returns
     /// `true` if the tab was found and removed.
     pub async fn remove_tab(&mut self, tab: &TabId) -> bool {
         let Some(idx) = self.tab_order.iter().position(|t| t == tab) else {
@@ -216,26 +216,35 @@ impl TabRegistry {
         true
     }
 
-    /// Re-insert an AI builtin tab (claude / claude-local) at its
-    /// canonical position. Used by `set_claude_tabs_enabled` when the
-    /// radio re-enables a previously-removed tab. Idempotent; returns
-    /// the resulting position. Distinct from `insert_user_shell_tab`
-    /// because AI builtins land at fixed positions (0 for claude, after
-    /// claude for claude-local) rather than the end of the list.
+    /// Re-insert an AI builtin tab at its canonical position
+    /// (claude → 0, claude-local → after claude, aider → after
+    /// claude-local, aider-local → after aider). Used by
+    /// `set_enabled_ai_tabs` when the user re-enables a previously-
+    /// removed tab. Idempotent; returns the resulting position.
+    /// Distinct from `insert_user_shell_tab` because AI builtins land
+    /// at fixed positions rather than at the end of the list.
     pub fn insert_ai_builtin_tab(&mut self, tab: TabId, name: String) -> usize {
         if let Some(idx) = self.tab_order.iter().position(|t| t == &tab) {
             self.names.insert(tab, name);
             return idx;
         }
-        let position = match tab.as_str() {
-            CLAUDE_TAB_ID => 0,
-            CLAUDE_LOCAL_TAB_ID => self
-                .tab_order
-                .iter()
-                .position(|t| t.as_str() == CLAUDE_TAB_ID)
-                .map(|p| p + 1)
-                .unwrap_or(0),
-            _ => self.tab_order.len(),
+        let position = match AiTabId::from_id(tab.as_str()) {
+            Some(target) => {
+                let target_order = target.canonical_order();
+                let mut pos = 0usize;
+                for (idx, existing) in self.tab_order.iter().enumerate() {
+                    match AiTabId::from_id(existing.as_str()) {
+                        Some(other) if other.canonical_order() < target_order => {
+                            pos = idx + 1;
+                        }
+                        _ => break,
+                    }
+                }
+                pos
+            }
+            // Non-reserved id (shouldn't happen in this code path) —
+            // fall through to "append".
+            None => self.tab_order.len(),
         };
         let position = position.min(self.tab_order.len());
         self.tab_order.insert(position, tab.clone());

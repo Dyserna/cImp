@@ -52,9 +52,11 @@ pub struct PermissionPattern {
 }
 
 /// Built-in fallback patterns. Used when patterns.json is missing/corrupt
-/// at load time so detection still works against subscription-Claude on
+/// at load time so detection still works against the four AI builtins on
 /// fresh installs and after a hand-edit accident. Mirrors the layout the
-/// loader writes to disk on first launch.
+/// loader writes to disk on first launch. Pattern matching is pure
+/// substring containment against the ANSI-stripped tail; the same shape
+/// covers Claude Code chrome and Aider's prompts.
 pub fn default_patterns() -> Vec<PermissionPattern> {
     vec![
         PermissionPattern {
@@ -92,6 +94,38 @@ pub fn default_patterns() -> Vec<PermissionPattern> {
                 "<replace with a substring unique to question prompts>".to_string(),
             ],
             disabled: true,
+        },
+        // Aider's "Apply edits?" prompt. Aider prints a (Y)es/(N)o/etc.
+        // option line; the trailing `(Y)es` is the most stable marker
+        // across versions.
+        PermissionPattern {
+            name: "aider_apply_edits".to_string(),
+            kind: PatternKind::Permission,
+            all_of: vec![
+                "Apply edits?".to_string(),
+                "(Y)es".to_string(),
+            ],
+            disabled: false,
+        },
+        // Aider's "Add file to chat?" prompt. The phrasing is "Add … to
+        // the chat?" — the open-ended middle is matched by absence of a
+        // substring constraint there.
+        PermissionPattern {
+            name: "aider_add_to_chat".to_string(),
+            kind: PatternKind::Permission,
+            all_of: vec![
+                "Add ".to_string(),
+                " to the chat?".to_string(),
+            ],
+            disabled: false,
+        },
+        // Aider's "Run shell command?" confirmation. Used when the user
+        // (or the model) proposes a shell action via /run.
+        PermissionPattern {
+            name: "aider_run_shell".to_string(),
+            kind: PatternKind::Permission,
+            all_of: vec!["Run shell command?".to_string()],
+            disabled: false,
         },
     ]
 }

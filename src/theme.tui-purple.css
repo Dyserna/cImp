@@ -151,6 +151,21 @@ html[data-theme="tui-purple"] textarea:focus {
   box-shadow: none;
 }
 
+/* The closed `<select>` is transparent (above), but the open dropdown
+   popup is OS-rendered and falls back to a light background unless we
+   style `<option>` explicitly. Chromium honors these on the popup
+   surface. */
+html[data-theme="tui-purple"] select option,
+html[data-theme="tui-purple"] select optgroup {
+  background-color: var(--surface-sunken);
+  color: var(--text-primary);
+}
+html[data-theme="tui-purple"] select option:checked,
+html[data-theme="tui-purple"] select option:hover {
+  background-color: var(--accent-muted);
+  color: var(--text-primary);
+}
+
 html[data-theme="tui-purple"] input[type='checkbox'] {
   appearance: none;
   width: 1.2ch;

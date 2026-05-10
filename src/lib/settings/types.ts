@@ -359,7 +359,7 @@ export interface LayoutPreset {
 /// `src-tauri/src/settings/schema.rs`. Bumped on every backend migration
 /// step. Frontend doesn't read it for any logic — it round-trips as a
 /// bare integer through the IPC bridge.
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 14;
 
 export interface Settings {
   /// On-disk schema version. The backend stamps `CURRENT_SCHEMA_VERSION`
@@ -395,19 +395,27 @@ export interface Settings {
   /// `use_local_provider` flag is `true`. Stored cleartext on disk —
   /// local proxies typically accept dummy tokens, so this is acceptable.
   claude_local: ClaudeLocalSettings;
-  /// Which Claude tabs are enabled. The radio in Settings → Tabs is the
-  /// canonical way to flip this; the backend's `set_claude_tabs_enabled`
-  /// IPC opens / closes the corresponding AI tabs in response. Default
-  /// is `cloud` (subscription Claude only) on a fresh install.
-  claude_tabs_enabled: ClaudeTabsEnabled;
+  /// V14: local-LLM provider config for Aider tabs whose
+  /// `use_local_provider: true`. Stored cleartext on disk for the same
+  /// reasons as `claude_local` (local proxies typically accept dummy
+  /// tokens; OS-keychain integration is a future upgrade).
+  aider_local: AiderLocalSettings;
+  /// Which AI-tool tabs are enabled. The checkbox group in
+  /// Settings → Tabs is the canonical way to flip this; the backend's
+  /// `set_enabled_ai_tabs` IPC opens / closes the corresponding AI
+  /// tabs in response. The list is required to be non-empty; the UI
+  /// disables the last-checked checkbox to enforce that, and the IPC
+  /// rejects an empty value as defense-in-depth. Default is
+  /// `["claude"]` (subscription Claude only) on a fresh install.
+  enabled_ai_tabs: AiTabId[];
   /// File-logger configuration. The backend writes daily rolling log
   /// files into `<portable-root>/logs/`; this field drives the live filter.
   logging: LoggingSettings;
 }
 
-/// Which Claude tabs the user has enabled. Mirrored from the backend's
-/// `ClaudeTabsEnabled` enum (kebab-case wire format).
-export type ClaudeTabsEnabled = 'cloud' | 'local' | 'both';
+/// One of the four reserved AI-tool tab ids. Wire format mirrors the
+/// backend's `AiTabId` enum (kebab-case strings).
+export type AiTabId = 'claude' | 'claude-local' | 'aider' | 'aider-local';
 
 /// Tracing-filter level. Lowercase to match Rust's serde rename.
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
@@ -442,12 +450,28 @@ export interface ClaudeLocalSettings {
   model_alias: string;
 }
 
+/// V14: local-LLM provider configuration for Aider tabs whose
+/// `use_local_provider: true`. `base_url` becomes `OPENAI_API_BASE`
+/// and `auth_token` becomes `OPENAI_API_KEY` on launch; `model`,
+/// when non-empty, is passed as `--model <model>` on the spawn argv.
+export interface AiderLocalSettings {
+  base_url: string;
+  auth_token: string;
+  model: string;
+}
+
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
 /// User-created shell tabs use uuid-based ids that never collide with these.
 export const CLAUDE_TAB_ID = 'claude';
 /// V1.4-07: replaces the pre-V1.4-07 `AIDER_TAB_ID = 'aider'`. The
 /// v1.7 → v1.8 migration rewrites the aider tab to this id in place.
 export const CLAUDE_LOCAL_TAB_ID = 'claude-local';
+/// V14: Aider AI-tool tab using whatever provider Aider's own config
+/// selects (cloud / API keys / per-project `.aider.conf.yml`).
+export const AIDER_TAB_ID = 'aider';
+/// V14: Aider tab pointed at a local OpenAI-compatible endpoint via
+/// the `aider_local` provider settings.
+export const AIDER_LOCAL_TAB_ID = 'aider-local';
 export const SHELL_DEFAULT_TAB_ID = 'shell-default-1';
 
 /// Look up a tab entry by id. Returns undefined for unknown ids; callers
@@ -613,7 +637,12 @@ export function defaultSettings(): Settings {
       auth_token: 'sk-dummy',
       model_alias: '',
     },
-    claude_tabs_enabled: 'cloud',
+    aider_local: {
+      base_url: 'http://localhost:11434/v1',
+      auth_token: 'ollama',
+      model: '',
+    },
+    enabled_ai_tabs: ['claude'],
     logging: {
       level: 'info',
       retention: 'weekly',

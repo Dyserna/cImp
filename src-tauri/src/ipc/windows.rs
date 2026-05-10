@@ -22,7 +22,7 @@ pub fn open_or_focus_settings(app: &AppHandle) -> AppResult<()> {
         WebviewUrl::App("settings.html".into()),
     )
     .title("cctts — Settings")
-    .inner_size(720.0, 720.0)
+    .inner_size(970.0, 750.0)
     .min_inner_size(560.0, 480.0)
     .resizable(true)
     .build()

@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::ipc::AppState;
 use crate::settings::{
-    default_claude_local_tab, default_claude_tab, ClaudeTabsEnabled, ShellNotificationConfig,
-    ShellTabConfig as ShellTabSettings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
+    default_ai_tab, AiTabId, ShellNotificationConfig, ShellTabConfig as ShellTabSettings,
+    TabConfig,
 };
 use crate::shell::detect;
 use crate::state::{StateSignal, TabId, TabKind, TabMeta};
@@ -55,6 +55,10 @@ pub enum TabLifecycleError {
     /// overlay, so `create_shell_tab` returns Ok and lets that path fire.
     #[allow(dead_code)]
     SpawnFailed { message: String },
+    /// `set_enabled_ai_tabs` was called with an empty list. The UI's
+    /// last-checked-is-locked rule prevents this from the user side; the
+    /// IPC enforces it as defense-in-depth.
+    EmptyAiTabsList,
     /// Internal error (lock poisoning, channel send failure, etc.). Not
     /// expected in practice — surfaces as a toast on the frontend.
     Internal { message: String },
@@ -540,114 +544,127 @@ pub async fn get_shell_tab_config(
     })
 }
 
-/// Apply a new `claude_tabs_enabled` value: open and close the AI builtin
+/// Apply a new `enabled_ai_tabs` value: open and close the AI builtin
 /// tabs as needed so the live tabs match the selection. Bypasses
-/// `BuiltinNotClosable` (the radio is the canonical way to close an AI
-/// tab); regular `close_tab` calls on AI builtins still reject. Order
-/// matters — we add the surviving Claude tab first (so the active-tab
-/// switch has somewhere to go), then move active off any soon-to-be-
-/// removed tab, then drop the now-disabled tabs (kill PTY, drop
-/// scrollback, remove the settings entry, emit TabRemoved).
+/// `BuiltinNotClosable` (the checkbox group is the canonical way to
+/// close an AI tab); regular `close_tab` calls on AI builtins still
+/// reject. Order matters — we add the newly-enabled tab(s) first (so
+/// the active-tab switch has somewhere to go), then move active off
+/// any soon-to-be-removed tab, then drop the now-disabled tab(s) (kill
+/// PTY, drop scrollback, remove the settings entry, emit TabRemoved).
+///
+/// Empty input is rejected — the user must keep at least one AI tab
+/// enabled. The Settings UI enforces this with a last-checked lock;
+/// this server-side check is defense-in-depth.
 #[tauri::command]
-pub async fn set_claude_tabs_enabled(
+pub async fn set_enabled_ai_tabs(
     state: State<'_, AppState>,
-    value: ClaudeTabsEnabled,
+    value: Vec<AiTabId>,
 ) -> Result<(), TabLifecycleError> {
+    if value.is_empty() {
+        return Err(TabLifecycleError::EmptyAiTabsList);
+    }
+
+    // De-dup while preserving the user's intended order — useful only
+    // as defense against a malformed IPC payload, since the UI cannot
+    // produce duplicates.
+    let mut seen: std::collections::HashSet<AiTabId> =
+        std::collections::HashSet::with_capacity(value.len());
+    let want_ordered: Vec<AiTabId> = value
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect();
+    let want: std::collections::HashSet<AiTabId> = want_ordered.iter().copied().collect();
+
     // Serialize with all other lifecycle commands so concurrent
     // close_tab / create_shell_tab / etc. can't interleave with the
-    // multi-step add-then-remove sequence below. Without this an
-    // outside close_tab between step 1 (add) and step 3 (remove) could
-    // produce a state where the discriminator says "Cloud" but neither
-    // AI tab is in tabs[].
+    // multi-step add-then-remove sequence below.
     let _serializer = state.lifecycle_serializer.lock().await;
-    let want_cloud = value.includes_cloud();
-    let want_local = value.includes_local();
 
-    let (had_cloud, had_local, prev_value) = {
+    let (have, prev_value) = {
         let snap = state.settings.current();
-        (
-            snap.tabs.iter().any(|t| t.id() == CLAUDE_TAB_ID),
-            snap.tabs.iter().any(|t| t.id() == CLAUDE_LOCAL_TAB_ID),
-            snap.claude_tabs_enabled,
-        )
+        let have: std::collections::HashSet<AiTabId> = snap
+            .tabs
+            .iter()
+            .filter_map(|t| AiTabId::from_id(t.id()))
+            .collect();
+        (have, snap.enabled_ai_tabs.clone())
     };
-    if prev_value == value && want_cloud == had_cloud && want_local == had_local {
+    let prev_set: std::collections::HashSet<AiTabId> = prev_value.iter().copied().collect();
+    if prev_set == want && have == want {
         return Ok(());
     }
 
-    // 1. Add any newly-enabled tabs first. This guarantees the active-tab
-    //    switch in step 2 always has a surviving Claude tab to land on.
-    if want_cloud && !had_cloud {
-        add_ai_builtin_tab(&state, TabId::Claude, "Claude".to_string(), default_claude_tab()).await?;
-    }
-    if want_local && !had_local {
-        add_ai_builtin_tab(
-            &state,
-            TabId::ClaudeLocal,
-            "Claude (local)".to_string(),
-            default_claude_local_tab(),
-        )
-        .await?;
+    // Canonical add order: claude → claude-local → aider → aider-local
+    // so insertions land in the right relative slot.
+    let canonical = [
+        AiTabId::Claude,
+        AiTabId::ClaudeLocal,
+        AiTabId::Aider,
+        AiTabId::AiderLocal,
+    ];
+
+    // 1. Add any newly-enabled tabs.
+    for &id in &canonical {
+        if want.contains(&id) && !have.contains(&id) {
+            add_ai_builtin_tab(&state, id).await?;
+        }
     }
 
     // 2. If the currently-active tab is about to be removed, switch
-    //    to the surviving Claude tab first so the frontend's active
+    //    to a surviving AI tab first so the frontend's active
     //    indicator (and the TTS active cell) doesn't briefly point at
-    //    a tab that no longer exists.
-    let surviving_claude: Option<TabId> = match (want_cloud, want_local) {
-        (true, _) => Some(TabId::Claude),
-        (_, true) => Some(TabId::ClaudeLocal),
-        // Defensively: this shouldn't be reachable because the radio
-        // can't yield (false, false). If it ever does, leave active as
-        // the user-set tab and let the caller deal with the empty state.
-        (false, false) => None,
-    };
-    if let Some(target) = surviving_claude.clone() {
+    //    a tab that no longer exists. Pick the first id from `want` in
+    //    canonical order.
+    let surviving: Option<TabId> = canonical
+        .iter()
+        .find(|id| want.contains(id))
+        .map(|id| TabId::from_str(id.as_str()));
+    if let Some(target) = surviving.clone() {
         let active = {
             let registry = state.tabs.lock().await;
             registry.active()
         };
-        let about_to_close = (active == TabId::Claude && !want_cloud)
-            || (active == TabId::ClaudeLocal && !want_local);
-        if about_to_close {
+        let active_id_opt = AiTabId::from_id(active.as_str());
+        let about_to_close = active_id_opt
+            .map(|id| have.contains(&id) && !want.contains(&id))
+            .unwrap_or(false);
+        if about_to_close && active != target {
             let mut registry = state.tabs.lock().await;
             if let Err(e) = registry.activate(target).await {
-                warn!(error = %e, "set_claude_tabs_enabled: pre-close activate failed");
+                warn!(error = %e, "set_enabled_ai_tabs: pre-close activate failed");
             }
         }
     }
 
     // 3. Remove any newly-disabled tabs.
-    if !want_cloud && had_cloud {
-        remove_ai_builtin_tab(&state, TabId::Claude).await?;
-    }
-    if !want_local && had_local {
-        remove_ai_builtin_tab(&state, TabId::ClaudeLocal).await?;
+    for &id in &canonical {
+        if !want.contains(&id) && have.contains(&id) {
+            remove_ai_builtin_tab(&state, TabId::from_str(id.as_str())).await?;
+        }
     }
 
     // 4. Persist the new setting value alongside the post-step-1/3 tabs
-    //    array. We re-read the current snapshot here (rather than
-    //    cloning earlier) because `add_ai_builtin_tab` /
-    //    `remove_ai_builtin_tab` already pushed their own settings.set
-    //    calls — we just need to flip the discriminator on top.
+    //    array.
     {
         let mut snap = state.settings.current();
-        if snap.claude_tabs_enabled != value {
-            snap.claude_tabs_enabled = value;
+        if snap.enabled_ai_tabs != want_ordered {
+            snap.enabled_ai_tabs = want_ordered.clone();
             state.settings.set(snap);
         }
     }
 
-    info!(?value, "claude_tabs_enabled updated");
+    info!(?want_ordered, "enabled_ai_tabs updated");
     Ok(())
 }
 
 async fn add_ai_builtin_tab(
     state: &State<'_, AppState>,
-    tab: TabId,
-    name: String,
-    config: TabConfig,
+    id: AiTabId,
 ) -> Result<(), TabLifecycleError> {
+    let config = default_ai_tab(id);
+    let name = config.name().to_string();
+    let tab = TabId::from_str(id.as_str());
     let tab_meta = TabMeta {
         id: tab.clone(),
         kind: TabKind::AiTool,
@@ -659,18 +676,21 @@ async fn add_ai_builtin_tab(
         if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == tab.as_str()) {
             *existing = config;
         } else {
-            // Canonical position: claude at front, claude-local right after
-            // claude. shell-default-1 / user shell tabs slide right.
-            let pos = match tab.as_str() {
-                CLAUDE_TAB_ID => 0,
-                CLAUDE_LOCAL_TAB_ID => snap
-                    .tabs
-                    .iter()
-                    .position(|t| t.id() == CLAUDE_TAB_ID)
-                    .map(|p| p + 1)
-                    .unwrap_or(0),
-                _ => snap.tabs.len(),
-            };
+            // Canonical position: walk the existing tabs and find the
+            // last reserved-AI tab whose canonical order is below this
+            // id's. Insert immediately after it. This keeps AI tabs in
+            // the canonical leading order regardless of which subset
+            // the user has enabled.
+            let target = id.canonical_order();
+            let mut pos = 0usize;
+            for (idx, tab) in snap.tabs.iter().enumerate() {
+                match AiTabId::from_id(tab.id()) {
+                    Some(other) if other.canonical_order() < target => {
+                        pos = idx + 1;
+                    }
+                    _ => break,
+                }
+            }
             let pos = pos.min(snap.tabs.len());
             snap.tabs.insert(pos, config);
         }
@@ -690,7 +710,7 @@ async fn add_ai_builtin_tab(
         })
         .await
     {
-        warn!(error = %e, "set_claude_tabs_enabled: state-signal channel closed (add)");
+        warn!(error = %e, "set_enabled_ai_tabs: state-signal channel closed (add)");
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
     Ok(())
@@ -709,7 +729,7 @@ async fn remove_ai_builtin_tab(
     }
 
     if let Err(e) = crate::pty::scrollback::delete(&tab) {
-        warn!(?tab, error = %e, "set_claude_tabs_enabled: scrollback delete failed");
+        warn!(?tab, error = %e, "set_enabled_ai_tabs: scrollback delete failed");
     }
 
     {
@@ -726,7 +746,7 @@ async fn remove_ai_builtin_tab(
         .send(StateSignal::TabRemoved { tab: tab.clone() })
         .await
     {
-        warn!(error = %e, "set_claude_tabs_enabled: state-signal channel closed (remove)");
+        warn!(error = %e, "set_enabled_ai_tabs: state-signal channel closed (remove)");
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
     info!(?tab, "ai builtin tab removed");

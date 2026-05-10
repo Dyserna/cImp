@@ -36,12 +36,12 @@ use crate::ipc::layout::{
 };
 use crate::ipc::tab_lifecycle::{
     close_tab, create_shell_tab, default_shell_spec, get_shell_tab_config, reconfigure_shell_tab,
-    rename_tab, set_claude_tabs_enabled,
+    rename_tab, set_enabled_ai_tabs,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
     LayoutNodePersisted, LayoutPersisted, LogLevel, LogRetention, Settings, SettingsHandle,
-    TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
+    TabConfig,
 };
 use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
@@ -315,7 +315,7 @@ fn main() {
             reconfigure_shell_tab,
             default_shell_spec,
             get_shell_tab_config,
-            set_claude_tabs_enabled,
+            set_enabled_ai_tabs,
             save_layout,
             save_layout_preset,
             delete_layout_preset,
@@ -395,23 +395,18 @@ fn layout_focused_active_tab_id(layout: &LayoutPersisted) -> Option<String> {
         .and_then(|opt| opt.clone())
 }
 
-/// Build the launch-seed `Vec<TabMeta>` from a settings snapshot. Reserved
-/// ids (claude / claude-local) map to their corresponding `TabId`
-/// variants; everything else is a Shell tab. The integrity check has
-/// already guaranteed claude / claude-local are present, so the result
-/// always has at least two entries (and a third — `shell-default-1` — on
-/// fresh installs unless the user has closed it).
+/// Build the launch-seed `Vec<TabMeta>` from a settings snapshot.
+/// Reserved AI ids map to their corresponding `TabId` variants;
+/// everything else is a Shell tab. The integrity check has already
+/// guaranteed every id named in `enabled_ai_tabs` is present, so the
+/// result always has at least one AI builtin (and a `shell-default-1`
+/// on fresh installs unless the user has closed it).
 fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
     settings
         .tabs
         .iter()
         .map(|cfg| {
-            let id = cfg.id();
-            let tab_id = match id {
-                CLAUDE_TAB_ID => TabId::Claude,
-                CLAUDE_LOCAL_TAB_ID => TabId::ClaudeLocal,
-                other => TabId::Shell(other.to_string()),
-            };
+            let tab_id = TabId::from_str(cfg.id());
             let kind = match cfg {
                 TabConfig::AiTool(_) => TabKind::AiTool,
                 TabConfig::Shell(_) => TabKind::Shell,

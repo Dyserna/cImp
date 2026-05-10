@@ -12,13 +12,21 @@ use crate::shell::ShellSpec;
 
 /// Reserved IDs the integrity check protects. Hand-edited settings files
 /// cannot make these disappear — they are restored with defaults if missing
-/// and forced to `builtin: true` regardless of what the file claims.
+/// and forced to `builtin: true` regardless of what the file claims. Four
+/// reserved AI ids today: subscription/local pairs for both Claude Code
+/// and Aider.
 pub const CLAUDE_TAB_ID: &str = "claude";
 /// V1.4-07: second Claude tab preconfigured to use a local LLM via the
 /// `claude_local` provider settings. Replaces the v1.7-and-earlier
 /// `aider` reserved id (the v1.7 → v1.8 migration rewrites the aider
 /// tab in place to this id).
 pub const CLAUDE_LOCAL_TAB_ID: &str = "claude-local";
+/// Aider AI-tool tab using whatever provider Aider's own config selects
+/// (cloud/keys/etc). Reserved in V14 alongside `aider-local`.
+pub const AIDER_TAB_ID: &str = "aider";
+/// Aider AI-tool tab pointed at a local OpenAI-compatible endpoint via
+/// the global `aider_local` provider settings.
+pub const AIDER_LOCAL_TAB_ID: &str = "aider-local";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 
 /// The on-disk schema version. Bumped on every migration step. Detection
@@ -29,7 +37,7 @@ pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 13;
+pub const CURRENT_SCHEMA_VERSION: u8 = 14;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -50,11 +58,12 @@ pub struct Settings {
     pub behavior: BehaviorSettings,
     pub compose: ComposeSettings,
     pub shortcuts: ShortcutSettings,
-    /// Ordered list of tabs. The first user-created shell tab appears after
-    /// the two AI builtins (claude/aider) and the default shell tab. Order
-    /// is user-visible (tab bar) and persisted across launches. The startup
-    /// integrity check ensures the three reserved-id entries are present;
-    /// hand-edits that delete them are repaired at load time.
+    /// Ordered list of tabs. AI builtins occupy the canonical leading
+    /// slots in the order claude → claude-local → aider → aider-local
+    /// (only the ids in `enabled_ai_tabs` actually materialize); user
+    /// shell tabs follow. The startup integrity check reconciles
+    /// `tabs[]` with `enabled_ai_tabs` — hand-edits that delete an
+    /// enabled AI builtin are repaired at load time.
     pub tabs: Vec<TabConfig>,
     pub processing: ProcessingSettings,
     /// Last-active tab pointer, restored on launch. None on a fresh install
@@ -87,13 +96,23 @@ pub struct Settings {
     /// (and `ANTHROPIC_MODEL` if set) into the spawned process's env.
     /// Per-tab `env` entries take precedence over synthesized values.
     pub claude_local: ClaudeLocalSettings,
-    /// Which Claude tabs are enabled. Selecting a value that excludes a
-    /// currently-open Claude tab closes that tab (kills its PTY, drops
-    /// scrollback, removes the settings entry) and selecting a value
-    /// that includes a missing one re-creates it. The integrity check
-    /// enforces the invariant on load. Default is `Cloud` so a brand-new
-    /// install starts with the subscription Claude tab only.
-    pub claude_tabs_enabled: ClaudeTabsEnabled,
+    /// V14: local-LLM provider config for Aider tabs whose
+    /// `use_local_provider` flag is `true`. The launch-time env
+    /// composition reads `base_url`/`auth_token`/`model` from here and
+    /// synthesizes `OPENAI_API_BASE` / `OPENAI_API_KEY` (and a
+    /// `--model <model>` CLI arg when `model` is non-empty) into the
+    /// spawned aider process. Per-tab `env` entries take precedence
+    /// over synthesized values.
+    pub aider_local: AiderLocalSettings,
+    /// Which AI-tool tabs are enabled. Each id in this list corresponds
+    /// to one of the four reserved AI builtins (`claude`, `claude-local`,
+    /// `aider`, `aider-local`). Adding an id opens that tab; removing
+    /// one closes it (kills its PTY, drops scrollback, removes the
+    /// settings entry). The list is required to be non-empty — the
+    /// integrity check forces `[claude]` if it deserializes empty, and
+    /// the runtime IPC rejects an empty value. Default is `[claude]` so
+    /// a fresh install starts with the subscription Claude tab only.
+    pub enabled_ai_tabs: Vec<AiTabId>,
     /// File-logger configuration. The tracing subscriber writes daily
     /// rolling files into `<portable-root>/logs/`; the level field drives
     /// the EnvFilter via a reload handle so changes apply live.
@@ -118,7 +137,8 @@ impl Default for Settings {
             ui: UiSettings::default(),
             terminal: TerminalSettings::default(),
             claude_local: ClaudeLocalSettings::default(),
-            claude_tabs_enabled: ClaudeTabsEnabled::default(),
+            aider_local: AiderLocalSettings::default(),
+            enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
         }
     }
@@ -221,33 +241,57 @@ impl LogRetention {
     }
 }
 
-/// Which Claude tabs the user has enabled. Exactly one of these is the
-/// current selection; the integrity check ensures the live `tabs` array
-/// matches.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+/// One of the four reserved AI-tool tab ids. Wire format is the kebab-
+/// case tab-id string (`"claude"`, `"claude-local"`, `"aider"`,
+/// `"aider-local"`); the type exists so `enabled_ai_tabs` can be a
+/// strongly-typed `Vec<AiTabId>` instead of an untyped string list.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
-pub enum ClaudeTabsEnabled {
-    /// Subscription Claude tab only (`claude`).
-    Cloud,
-    /// Local-LLM Claude tab only (`claude-local`).
-    Local,
-    /// Both `claude` and `claude-local` are present.
-    Both,
+pub enum AiTabId {
+    Claude,
+    ClaudeLocal,
+    Aider,
+    AiderLocal,
 }
 
-impl Default for ClaudeTabsEnabled {
-    fn default() -> Self {
-        Self::Cloud
+impl AiTabId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => CLAUDE_TAB_ID,
+            Self::ClaudeLocal => CLAUDE_LOCAL_TAB_ID,
+            Self::Aider => AIDER_TAB_ID,
+            Self::AiderLocal => AIDER_LOCAL_TAB_ID,
+        }
     }
-}
 
-impl ClaudeTabsEnabled {
-    pub fn includes_cloud(self) -> bool {
-        matches!(self, Self::Cloud | Self::Both)
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            CLAUDE_TAB_ID => Some(Self::Claude),
+            CLAUDE_LOCAL_TAB_ID => Some(Self::ClaudeLocal),
+            AIDER_TAB_ID => Some(Self::Aider),
+            AIDER_LOCAL_TAB_ID => Some(Self::AiderLocal),
+            _ => None,
+        }
     }
 
-    pub fn includes_local(self) -> bool {
-        matches!(self, Self::Local | Self::Both)
+    /// True for the local-provider variants (`claude-local`,
+    /// `aider-local`). The integrity check uses this as the canonical
+    /// `use_local_provider` value for each reserved id.
+    pub fn uses_local_provider(self) -> bool {
+        matches!(self, Self::ClaudeLocal | Self::AiderLocal)
+    }
+
+    /// Canonical tab-bar position: claude (0) → claude-local → aider →
+    /// aider-local, with shells trailing afterwards. Used by
+    /// `add_ai_builtin_tab` and `integrity_check` so re-adding a
+    /// previously-disabled AI tab lands in the same slot every time.
+    pub fn canonical_order(self) -> usize {
+        match self {
+            Self::Claude => 0,
+            Self::ClaudeLocal => 1,
+            Self::Aider => 2,
+            Self::AiderLocal => 3,
+        }
     }
 }
 
@@ -515,6 +559,49 @@ impl Default for ClaudeLocalSettings {
     }
 }
 
+/// V14: local-LLM provider configuration for Aider tabs whose
+/// `use_local_provider: true`. The launch flow synthesizes
+/// `OPENAI_API_BASE` from `base_url`, `OPENAI_API_KEY` from
+/// `auth_token`, and (when `model` is non-empty) appends
+/// `--model <model>` to the spawn argv. Stored cleartext for the same
+/// reasons as `ClaudeLocalSettings` (local proxies typically accept
+/// dummy tokens; OS-keychain integration is a future upgrade).
+///
+/// The hand-rolled `Debug` impl redacts `auth_token` so a stray
+/// `?settings` log line cannot leak the secret to the rolling log.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiderLocalSettings {
+    pub base_url: String,
+    pub auth_token: String,
+    pub model: String,
+}
+
+impl std::fmt::Debug for AiderLocalSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = if self.auth_token.is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("AiderLocalSettings")
+            .field("base_url", &self.base_url)
+            .field("auth_token", &redacted)
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+impl Default for AiderLocalSettings {
+    fn default() -> Self {
+        Self {
+            base_url: "http://localhost:11434/v1".to_string(),
+            auth_token: "ollama".to_string(),
+            model: String::new(),
+        }
+    }
+}
+
 /// One notification slot: a per-event `{ enabled, text }` pair. The
 /// firing path requires both `enabled == true` AND a non-empty `text`
 /// to dispatch — the empty-text suppression matches the pre-v1.11
@@ -681,6 +768,75 @@ pub fn default_claude_local_tab() -> TabConfig {
         background_override: None,
         use_local_provider: true,
     })
+}
+
+/// V14: Aider AI-tool tab using whatever provider Aider's own config
+/// selects (cloud / API keys / per-project `.aider.conf.yml`). cctts
+/// does not synthesize provider env vars for this tab — the user's
+/// existing aider configuration is in charge. TTS prompt injection is
+/// disabled by default because Aider's CLI has no
+/// `--append-system-prompt` equivalent (the spawn path enforces this
+/// regardless of the toggle).
+pub fn default_aider_tab() -> TabConfig {
+    TabConfig::AiTool(AiToolTabConfig {
+        id: AIDER_TAB_ID.to_string(),
+        builtin: true,
+        name: "Aider".to_string(),
+        command: "aider".to_string(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        tts_injection: TtsInjection::default(),
+        notifications: AiNotificationConfig {
+            idle: NotificationSlot::enabled("Aider is idle"),
+            awaiting_permission: NotificationSlot::enabled("Aider is awaiting permission"),
+            question: NotificationSlot::enabled("Aider has a question"),
+            error: NotificationSlot::enabled("Aider encountered an error"),
+        },
+        first_launch_notice_dismissed: true,
+        theme_override: None,
+        background_override: None,
+        use_local_provider: false,
+    })
+}
+
+/// V14: second Aider tab preconfigured to use a local OpenAI-compatible
+/// LLM via the global `aider_local` provider settings.
+pub fn default_aider_local_tab() -> TabConfig {
+    TabConfig::AiTool(AiToolTabConfig {
+        id: AIDER_LOCAL_TAB_ID.to_string(),
+        builtin: true,
+        name: "Aider (local)".to_string(),
+        command: "aider".to_string(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        tts_injection: TtsInjection::default(),
+        notifications: AiNotificationConfig {
+            idle: NotificationSlot::enabled("Aider (local) is idle"),
+            awaiting_permission: NotificationSlot::enabled(
+                "Aider (local) is awaiting permission",
+            ),
+            question: NotificationSlot::enabled("Aider (local) has a question"),
+            error: NotificationSlot::enabled("Aider (local) encountered an error"),
+        },
+        first_launch_notice_dismissed: true,
+        theme_override: None,
+        background_override: None,
+        use_local_provider: true,
+    })
+}
+
+/// Look up the default `TabConfig` for a reserved AI tab id. Used by
+/// the integrity check and the lifecycle IPC when materializing a tab
+/// the user just enabled.
+pub fn default_ai_tab(id: AiTabId) -> TabConfig {
+    match id {
+        AiTabId::Claude => default_claude_tab(),
+        AiTabId::ClaudeLocal => default_claude_local_tab(),
+        AiTabId::Aider => default_aider_tab(),
+        AiTabId::AiderLocal => default_aider_local_tab(),
+    }
 }
 
 /// Default Shell-1 entry. Takes the resolved platform default shell so the

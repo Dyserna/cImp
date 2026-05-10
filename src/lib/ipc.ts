@@ -190,16 +190,17 @@ export async function restartShellTab(tab: TabId): Promise<void> {
   await invoke('restart_shell_tab', { tab });
 }
 
-/// Apply a new `claude_tabs_enabled` value: opens / closes the AI builtin
+/// Apply a new `enabled_ai_tabs` value: opens / closes the AI builtin
 /// tabs as needed. The backend kills the PTY and drops scrollback for
 /// any newly-disabled tab; newly-enabled tabs spawn fresh on the next
 /// frontend mount. Switches the active tab off any soon-to-be-removed
-/// tab onto the surviving Claude tab so the avatar/TTS gate doesn't
-/// dangle.
-export async function setClaudeTabsEnabled(
-  value: import('./settings/types').ClaudeTabsEnabled,
+/// tab onto a surviving AI tab so the avatar/TTS gate doesn't dangle.
+/// Empty `value` is rejected — the user must keep at least one AI tab
+/// enabled.
+export async function setEnabledAiTabs(
+  value: import('./settings/types').AiTabId[],
 ): Promise<void> {
-  await invoke('set_claude_tabs_enabled', { value });
+  await invoke('set_enabled_ai_tabs', { value });
 }
 
 /// Open `<portable-root>/logs/content/` in the OS file manager. Backend

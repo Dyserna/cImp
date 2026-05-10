@@ -1,0 +1,14 @@
+## Git LFS
+##
+## The Kokoro ONNX model is ~310 MB — over GitHub's 100 MB hard file limit
+## for regular git blobs, so it must be tracked through LFS. The voicepack
+## .bin files are ~512 KB each (small enough for regular git), but tracking
+## them via LFS too keeps the `models/` folder uniformly stored and makes
+## `git clone --no-fetch-blobs` / `lfs.fetchexclude` filtering predictable
+## for users who don't need TTS at checkout time.
+##
+## Source files for these blobs:
+##   - kokoro-v1.0.onnx — onnx-community/Kokoro-82M-v1.0-ONNX/onnx/model.onnx
+##   - models/voices/*.bin — onnx-community/Kokoro-82M-v1.0-ONNX/voices/<name>.bin
+*.onnx filter=lfs diff=lfs merge=lfs -text
+models/voices/*.bin filter=lfs diff=lfs merge=lfs -text

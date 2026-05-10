@@ -4,7 +4,27 @@
 
    V5-02 ships the modern dark theme: cool slate-blue surfaces, mint/teal
    accent, coral semantics, generous radii, soft shadows. Token NAMES are
-   stable from V5-01; only the values changed. */
+   stable from V5-01; only the values changed.
+
+   --- Theme isolation policy --------------------------------------------
+
+   Every theme is a self-contained `[data-theme="<name>"]` block that
+   declares its full token set. There are NO shared parent blocks, NO
+   `[data-theme^="..."]` prefix selectors, and NO grouped selectors
+   that span multiple themes. Same applies to per-theme structural CSS
+   (e.g. `theme.tui-yellow.css` / `theme.tui-purple.css`): each theme
+   gets its own file, never a shared one.
+
+   When adding a new theme — even when it's "just a derivative" of an
+   existing one (different accent, same surfaces) — copy the entire
+   source theme's block (and structural file, and `avatars/<name>/`
+   folder) and rename it. Tweak the few tokens that differ. The
+   duplication is the point: themes can drift from each other freely
+   without anyone discovering a load-bearing shared rule mid-tweak.
+
+   This rule supersedes any DRY instinct. Reviewers should reject
+   refactors that "lift common tokens" out of one theme into another.
+   ----------------------------------------------------------------------- */
 
 :root,
 [data-theme="modern-dark"] {
@@ -45,6 +65,10 @@
   --accent-info:     #6699cc;   /* secondary blue (compose textarea focus) */
   --accent-fg:       #ffffff;   /* white text reads cleanly on purple */
   --accent-muted:    rgba(187, 85, 255, 0.15);
+
+  /* Default waveform / avatar-border color used when the user hasn't
+     overridden `avatar.waveform.color` (empty string in settings). */
+  --waveform-color:  #bb55ff;
 
   /* Semantics — `--success` stays green so "done" indicators remain
      visually distinct from the now-purple accent. */
@@ -145,11 +169,16 @@
   --line-height-normal: 1.5;
 }
 
-/* TUI theme — Gruvbox Dark palette, matching the ratatui aesthetic in
-   the reference screenshot. Same token names as modern-dark so
-   components don't need conditional wiring; they just pick up the
-   different values. Flat 1px borders, no shadows, monospace cascade. */
-[data-theme="tui"] {
+/* tui-yellow theme — Gruvbox Dark palette + bright yellow accent.
+   Matches the ratatui reference screenshot. Same token names as
+   modern-dark so components don't need conditional wiring; flat 1px
+   borders, no shadows, monospace cascade. Pair with
+   `theme.tui-yellow.css` for the structural overrides.
+
+   Self-contained per the isolation policy at the top of this file —
+   any future edits to the gruvbox palette must be made here, not
+   factored out into a shared block. */
+[data-theme="tui-yellow"] {
   /* Surfaces — Gruvbox dark0_hard → dark2 (warm near-black to brown-
      gray). Tight contrast between layers; depth comes from borders. */
   --surface-0:       #1d2021;   /* dark0_hard, body bg */
@@ -185,6 +214,9 @@
   --accent-info:     #83a598;   /* gruvbox bright blue */
   --accent-fg:       #1d2021;
   --accent-muted:    rgba(250, 189, 47, 0.15);
+
+  /* Waveform / avatar-border default — matches the yellow accent. */
+  --waveform-color:  #fabd2f;
 
   /* Semantics — Gruvbox bright variants. */
   --success:         #b8bb26;   /* bright green */
@@ -262,6 +294,129 @@
   /* Typography — monospace cascade. font-family inherits, so setting it
      on the theme root propagates to every descendant that doesn't
      override. */
+  font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code',
+    'Source Code Pro', Consolas, 'Courier New', monospace;
+}
+
+/* tui-purple theme — Gruvbox Dark palette + bright purple accent.
+   Started as a copy of `tui-yellow` per the isolation policy at the
+   top of this file. Pair with `theme.tui-purple.css`. Same surface
+   palette as tui-yellow today; future edits to either theme stay
+   local to that theme's block — do not refactor common tokens out. */
+[data-theme="tui-purple"] {
+  /* Surfaces — Gruvbox dark0_hard → dark2 (warm near-black to brown-
+     gray). Tight contrast between layers; depth comes from borders. */
+  --surface-0:       #1d2021;   /* dark0_hard, body bg */
+  --surface-1:       #282828;   /* dark0, panes */
+  --surface-2:       #32302f;   /* dark0_soft, tab bar / dialog body */
+  --surface-3:       #3c3836;   /* dark1, hover-elevated */
+  --surface-4:       #504945;   /* dark2, deeper hover */
+
+  --surface-sunken:  #1d2021;
+  --surface-deep:    #16181a;
+  --surface-input:   #32302f;
+
+  /* Text — Gruvbox fg → fg4 (cream → tan-gray). */
+  --text-primary:    #ebdbb2;   /* fg / fg1, main cream */
+  --text-bright:     #fbf1c7;   /* fg0 */
+  --text-on-accent:  #1d2021;   /* dark text reads on the light pink fill */
+  --text-secondary:  #d5c4a1;   /* fg2 */
+  --text-quiet:      #bdae93;   /* fg3 */
+  --text-quiet-strong: #a89984; /* fg4 */
+  --text-tertiary:   #928374;   /* gray */
+  --text-faint:      #7c6f64;   /* dark3 */
+  --text-disabled:   #665c54;
+  --text-disabled-deep: #504945;
+
+  /* Accent — Gruvbox bright purple. Replaces tui-yellow's
+     `#fabd2f` accent for users who prefer a cooler/rosier hue. */
+  --accent:          #d3869b;   /* gruvbox bright purple */
+  --accent-hover:    #d896a8;
+  --accent-bright:   #e3acba;
+  --accent-soft:     #8f4d68;   /* faded purple for muted CTAs */
+  --accent-soft-hover: #ad6b80;
+  --accent-info:     #83a598;   /* gruvbox bright blue */
+  --accent-fg:       #1d2021;
+  --accent-muted:    rgba(211, 134, 155, 0.15);
+
+  /* Waveform / avatar-border default — matches the purple accent. */
+  --waveform-color:  #d3869b;
+
+  /* Semantics — Gruvbox bright variants. Warning stays yellow on
+     purpose; semantic colors do not follow the accent. */
+  --success:         #b8bb26;   /* bright green */
+  --warning:         #fabd2f;   /* bright yellow */
+  --danger:          #fb4934;   /* bright red */
+  --awaiting:        var(--warning);
+
+  /* Danger — gruvbox red, warm-tinted surfaces. */
+  --surface-danger:         #3c2828;
+  --surface-danger-strong:  #4a2828;
+  --surface-danger-hover:   #5c2c2c;
+  --surface-danger-bg:      #2a1d1d;
+  --surface-danger-deep:    #1d1515;
+  --surface-danger-soft:    #2c2020;
+  --surface-danger-faint:   #1a1414;
+  --text-danger-soft:       #fb4934;
+  --text-danger-strong:     #fe8181;
+  --text-danger-bright:     #fb4934;
+  --text-danger-quiet:      #cc241d;
+  --text-danger-faint:      #9d0006;
+  --text-danger-pale:       #fb6e6e;
+  --text-danger-pastel:     #fb8888;
+  --text-danger-extra:      #fbafaf;
+  --text-danger-mute:       #d5a5a5;
+  --border-danger-strong:   #fb4934;
+  --border-danger:          #cc241d;
+  --border-danger-soft:     #803838;
+
+  /* Warning — gruvbox yellow on warm dark. */
+  --surface-warning:        #3a2e1a;
+  --surface-warning-deep:   #2a2010;
+  --surface-warning-faint:  #1d1608;
+  --text-warning:           #fabd2f;
+  --text-warning-bright:    #fce074;
+  --border-warning:         #d79921;
+
+  /* Success — gruvbox green. */
+  --surface-success:        #283228;
+  --text-success:           #b8bb26;
+  --text-success-bright:    #d3d349;
+
+  /* Info — gruvbox aqua/blue. */
+  --surface-info:           #1d3030;
+  --surface-info-deep:      #142222;
+  --surface-info-faint:     #0d1818;
+  --text-info:              #8ec07c;   /* bright aqua */
+  --text-info-bright:       #aedfa0;
+  --text-info-quiet:        #689d6a;
+  --border-info:            #689d6a;
+  --border-info-soft:       #3a4a3a;
+  --accent-purple:          #d3869b;   /* bright purple */
+
+  /* Borders — gruvbox bg3/bg4. Warm gray to match the palette. */
+  --border-faint:    #3c3836;
+  --border-subtle:   #504945;
+  --border-default:  #665c54;
+  --border-strong:   #7c6f64;
+  --border-focus:    var(--accent);
+
+  /* Radii — fully square. Terminals don't round. */
+  --radius-sm:    0;
+  --radius-md:    0;
+  --radius-lg:    0;
+  --radius-pill:  0;
+
+  /* Elevation — none. Borders carry the depth. */
+  --shadow-sm: none;
+  --shadow-md: none;
+  --shadow-lg: none;
+
+  /* Motion — instant. CRTs don't ease. */
+  --motion-fast: 0ms;
+  --motion-base: 0ms;
+
+  /* Typography — monospace cascade. */
   font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code',
     'Source Code Pro', Consolas, 'Courier New', monospace;
 }

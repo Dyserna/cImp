@@ -350,6 +350,20 @@
   /// tabs differently. Empty array when settings haven't loaded yet.
   const tabEntries = $derived<TabConfig[]>(snapshot?.tabs ?? []);
 
+  /// Resolved theme default for the waveform color, used as the picker's
+  /// displayed value when `avatar.waveform.color` is empty (the "follow
+  /// theme" sentinel). Re-evaluates whenever `ui.theme` changes — the
+  /// `<html data-theme>` attribute has already been updated by
+  /// `settings_main.ts` so `getComputedStyle` reflects the new theme.
+  const themeWaveformColor = $derived.by(() => {
+    void snapshot?.ui.theme;
+    if (typeof window === 'undefined') return '#bb55ff';
+    const v = getComputedStyle(document.documentElement)
+      .getPropertyValue('--waveform-color')
+      .trim();
+    return v || '#bb55ff';
+  });
+
   /// Active-tab metadata, used by the Advanced → "Apply to global"
   /// button. The session's `active_tab_id` is the canonical
   /// "currently focused tab" reference at the settings layer; if
@@ -500,7 +514,7 @@
   }
 </script>
 
-{#if $settings.ui.theme === 'tui'}
+{#if $settings.ui.theme.startsWith('tui-')}
   <TuiTitleBar title="cctts settings" />
 {/if}
 {#if !snapshot}
@@ -788,15 +802,23 @@
 
         <section>
           <h2>Waveform</h2>
-          <label>
-            <span>Color</span>
+          <div class="file-row">
+            <span class="state-label">Color</span>
             <input
               type="color"
-              value={snapshot.avatar.waveform.color}
+              value={snapshot.avatar.waveform.color || themeWaveformColor}
               oninput={(e) =>
                 patch((s) => (s.avatar.waveform.color = (e.currentTarget as HTMLInputElement).value))}
             />
-          </label>
+            <button
+              class="ghost"
+              onclick={() => patch((s) => (s.avatar.waveform.color = ''))}
+              disabled={snapshot.avatar.waveform.color === ''}
+              title="Follow active UI theme"
+            >
+              Reset
+            </button>
+          </div>
           <label>
             <span>Line width: {snapshot.avatar.waveform.line_width.toFixed(1)}</span>
             <input
@@ -851,7 +873,8 @@
                 patch((s) => (s.ui.theme = (e.currentTarget as HTMLSelectElement).value))}
             >
               <option value="modern-dark">Modern Dark</option>
-              <option value="tui">TUI</option>
+              <option value="tui-yellow">TUI - Yellow</option>
+              <option value="tui-purple">TUI - Purple</option>
             </select>
           </label>
 

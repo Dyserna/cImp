@@ -22,8 +22,10 @@
   let lastSeenSeq = 0;
 
   // Mirror waveform settings into local state so the render loop reads them
-  // synchronously. Updates fire a redraw on the next animation frame.
-  let waveColor = '#bb55ff';
+  // synchronously. Updates fire a redraw on the next animation frame. An
+  // empty `waveColor` is the "follow active UI theme" sentinel — resolved
+  // per-frame from the `--waveform-color` CSS variable.
+  let waveColor = '';
   let waveLineWidth = 2;
   let waveGlow = 0.6;
   let waveOpacity = 0.85;
@@ -33,6 +35,13 @@
     waveGlow = w.glow_intensity;
     waveOpacity = w.opacity;
   });
+
+  function effectiveWaveColor(): string {
+    if (waveColor) return waveColor;
+    if (!canvasEl) return '#bb55ff';
+    const v = getComputedStyle(canvasEl).getPropertyValue('--waveform-color').trim();
+    return v || '#bb55ff';
+  }
 
   // Layout values mirror the avatar's so the waveform sits inside the
   // avatar's image area regardless of resize/reposition.
@@ -116,10 +125,11 @@
     const h = canvasEl.height / dpr;
     ctx.clearRect(0, 0, w, h);
 
+    const color = effectiveWaveColor();
     ctx.globalAlpha = waveOpacity;
-    ctx.strokeStyle = waveColor;
+    ctx.strokeStyle = color;
     ctx.lineWidth = waveLineWidth;
-    ctx.shadowColor = waveColor;
+    ctx.shadowColor = color;
     ctx.shadowBlur = 12 * waveGlow;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';

@@ -204,11 +204,13 @@ export interface ProcessingSettings {
 }
 
 export interface UiSettings {
-  /// Active UI chrome theme. Two values currently ship: `"modern-dark"`
-  /// (slate-blue + mint, OS-native window chrome) and `"tui"` (gruvbox
-  /// + custom title bar, ratatui aesthetic). New installs default to
-  /// `"tui"`. Distinct from `terminal.theme`, which governs the
-  /// xterm.js terminal palette inside each tab.
+  /// Active UI chrome theme. Three values currently ship: `"modern-dark"`
+  /// (slate-blue + mint, OS-native window chrome), `"tui-yellow"`
+  /// (gruvbox + bright yellow accent, custom title bar, ratatui aesthetic),
+  /// and `"tui-purple"` (same surfaces, gruvbox bright-purple accent).
+  /// New installs default to `"tui-yellow"`. Distinct from
+  /// `terminal.theme`, which governs the xterm.js terminal palette
+  /// inside each tab.
   theme: string;
 }
 
@@ -483,7 +485,7 @@ export function defaultSettings(): Settings {
       },
       transition: { path: '/avatar/Transition.mp4', duration_ms: 400 },
       waveform: {
-        color: '#bb55ff',
+        color: '',
         line_width: 2.0,
         glow_intensity: 0.6,
         opacity: 0.85,
@@ -586,7 +588,7 @@ export function defaultSettings(): Settings {
     session: { active_tab_id: null },
     layout: null,
     layout_presets: [],
-    ui: { theme: 'tui' },
+    ui: { theme: 'tui-yellow' },
     terminal: {
       theme: { name: 'Gruvbox Dark', custom: null },
       background: {

@@ -15,7 +15,7 @@ mod tabs;
 mod tts;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
@@ -50,6 +50,13 @@ use crate::tts::{spawn_tts_worker, ActiveTab, TtsEngine, TtsRequest};
 fn main() {
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Window title reflects the project the user launched from. If the
+    // launch cwd is anywhere inside a git working copy, the title uses
+    // the repo-root folder name; otherwise it falls back to the launch
+    // dir's own folder name. Format is "<project> - cctts". Applied to
+    // the main window in the Tauri setup hook below.
+    let window_title = format!("{} - cctts", project_label_for(&launch_cwd));
 
     // Tracing comes up before settings load so the load path's own logs
     // hit the file. The default-level guard is replaced once settings
@@ -269,6 +276,16 @@ fn main() {
             }
             spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
 
+            // Apply the project-derived window title. The hardcoded
+            // "cctts" from tauri.conf.json is what the OS sees before
+            // this fires; this overwrite happens during setup so the
+            // user only briefly sees the bare default.
+            if let Some(win) = app.get_webview_window("main") {
+                if let Err(e) = win.set_title(&window_title) {
+                    warn!(error = %e, "set_title for main window failed");
+                }
+            }
+
             // V1.4-04 D.6: orphan-prune the scrollback dir so files
             // for tabs deleted between sessions don't accumulate. We
             // ask the registry for its sanitized known IDs (matches
@@ -368,6 +385,33 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to launch tauri app");
+}
+
+/// Resolve the project label used in the OS window title. Walks up
+/// from `cwd` looking for a `.git` entry (directory or file — submodules
+/// and worktrees use a `.git` file pointing at the parent's gitdir).
+/// The first ancestor that has one wins, and its folder name becomes
+/// the label. With no `.git` anywhere along the chain, the launch
+/// directory's own folder name is used. A final fallback to "cctts"
+/// covers degenerate paths like a drive root with no file_name segment.
+fn project_label_for(cwd: &Path) -> String {
+    let mut dir = cwd;
+    loop {
+        if dir.join(".git").exists() {
+            if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+                return name.to_string();
+            }
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+    cwd.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cctts")
+        .to_string()
 }
 
 /// Find the persisted layout's focused pane and return its active tab

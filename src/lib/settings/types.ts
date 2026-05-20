@@ -82,6 +82,10 @@ export interface BehaviorSettings {
   /// When true, text selected in any terminal is copied to the system
   /// clipboard automatically.
   copy_on_select: boolean;
+  /// When true, a right-click inside any terminal pastes the system
+  /// clipboard into the focused PTY and suppresses the browser's default
+  /// context menu.
+  paste_on_right_click: boolean;
 }
 
 export interface ComposeSettings {
@@ -529,6 +533,7 @@ export function defaultSettings(): Settings {
       announce_focused_tab: false,
       speak_background_tabs: false,
       copy_on_select: true,
+      paste_on_right_click: true,
     },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {

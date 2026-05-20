@@ -496,6 +496,25 @@ export function createTerminal(
     );
   });
 
+  // Paste-on-right-click: when the setting is on, swallow the browser's
+  // default context menu and feed the clipboard through `term.paste`.
+  // paste() routes via xterm's onData below (so bracketed-paste mode is
+  // honored when the shell has enabled it) instead of writing to the
+  // PTY directly. When the setting is off we leave the event alone.
+  host.addEventListener('contextmenu', (e) => {
+    if (!get(settingsStore).behavior.paste_on_right_click) return;
+    e.preventDefault();
+    navigator.clipboard
+      .readText()
+      .then((text) => {
+        if (!text) return;
+        term.paste(text);
+      })
+      .catch((err) =>
+        console.warn('paste-on-right-click clipboard read failed:', err),
+      );
+  });
+
   term.onData((data) => {
     if (entry.isClosed) {
       // Shell-tab closed-state intercept. Enter routes to Configure

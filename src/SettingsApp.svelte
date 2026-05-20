@@ -695,6 +695,20 @@
             When on, text selected in any terminal is copied to the system
             clipboard automatically.
           </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.paste_on_right_click}
+              onchange={(e) =>
+                patch((s) => (s.behavior.paste_on_right_click = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Paste on right-click</span>
+          </label>
+          <small class="hint">
+            When on, right-clicking inside any terminal pastes the system
+            clipboard into the focused shell and suppresses the browser's
+            default context menu.
+          </small>
           <label class="checkbox disabled">
             <input type="checkbox" checked={snapshot.behavior.fallback_silent} disabled />
             <span>Fallback silent on TTS error (always on in v1)</span>

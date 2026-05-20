@@ -20,14 +20,13 @@
   import { closeTab as closeTabIpc } from './lib/ipc';
   import { showToast } from './lib/toast';
   import {
-    avatarState,
     seedPerTabEntries,
     startAvatarStateListener,
   } from './lib/avatarState';
   import { initSettings, settings, applySettings } from './lib/settings/store';
   import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
-  import { applyTabCreated, tabMeta } from './lib/tabs/store';
+  import { applyTabCreated } from './lib/tabs/store';
   import {
     applyTabCreatedToLayout,
     closeFocusedPane,
@@ -60,9 +59,12 @@
   } from './lib/composeState';
   import { composeContentChanged } from './lib/ipc';
 
+  // OS window title is set by the Rust setup hook to "<project> - cctts".
+  // Mirrored into the TUI title bar via a one-shot read in onMount.
+  let tuiTitle = $state('cctts');
+
   let unsubSettings: (() => void) | undefined;
   let unsubContent: (() => void) | undefined;
-  let unsubTitle: (() => void) | undefined;
   let unsubFocusedTab: (() => void) | undefined;
   let unsubActiveTabBack: (() => void) | undefined;
   let removeDebugKeys: (() => void) | undefined;
@@ -80,7 +82,6 @@
   function runCleanup(): void {
     unsubSettings?.();
     unsubContent?.();
-    unsubTitle?.();
     unsubFocusedTab?.();
     unsubActiveTabBack?.();
     removeDebugKeys?.();
@@ -88,7 +89,6 @@
     unsubFollowAvatar?.();
     unsubSettings = undefined;
     unsubContent = undefined;
-    unsubTitle = undefined;
     unsubFocusedTab = undefined;
     unsubActiveTabBack = undefined;
     removeDebugKeys = undefined;
@@ -236,20 +236,17 @@
           close_pane: closeFocusedPane,
         });
       });
-      // Window title reflects the active tab's avatar state. Switching
-      // tabs re-derives the avatar state, so this listener picks that up
-      // automatically. The tab name comes from the tabs store so user
-      // renames flow through immediately.
-      const win = getCurrentWindow();
-      unsubTitle = avatarState.subscribe((s) => {
-        const tab = get(activeTab);
-        const meta = tabMeta(tab);
-        const tabLabel = meta?.name ?? tab;
-        const label = s === 'Idle' ? tabLabel : `${tabLabel} — ${s}`;
-        void win.setTitle(label).catch((e) =>
-          console.warn('setTitle failed:', e),
-        );
-      });
+      // OS window title is set by the Rust setup hook to
+      // "<project> - cctts" (project = git-root or launch-dir folder
+      // name). Mirror it into the TUI in-app title bar so the chrome
+      // matches. Read once — Rust set it before the webview rendered
+      // and nothing in the frontend changes it after launch.
+      void getCurrentWindow()
+        .title()
+        .then((t) => {
+          if (t) tuiTitle = t;
+        })
+        .catch((e) => console.warn('read window title failed:', e));
 
       let lastNonEmpty = false;
       unsubContent = composeContent.subscribe((content) => {
@@ -375,7 +372,7 @@
     OS chrome via setDecorations(true) wired in main.ts.
   -->
   {#if $settings.ui.theme.startsWith('tui-')}
-    <TuiTitleBar title="cctts" />
+    <TuiTitleBar title={tuiTitle} />
   {/if}
   <div class="terminal-area">
     <LayoutNodeRenderer node={$layout.tree} />

@@ -1056,6 +1056,10 @@ pub struct BehaviorSettings {
     /// clipboard automatically. Older settings files without this field
     /// deserialize to the default via serde-default — no migration bump.
     pub copy_on_select: bool,
+    /// When true, a right-click inside any terminal pastes the system
+    /// clipboard into the focused PTY (and suppresses the browser's
+    /// default context menu). Backward-compatible via serde-default.
+    pub paste_on_right_click: bool,
 }
 
 impl Default for BehaviorSettings {
@@ -1069,6 +1073,7 @@ impl Default for BehaviorSettings {
             announce_focused_tab: false,
             speak_background_tabs: false,
             copy_on_select: true,
+            paste_on_right_click: true,
         }
     }
 }

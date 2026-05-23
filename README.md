@@ -33,6 +33,26 @@ the built-in defaults.
   stop either one.
 - The compose overlay submits to whichever tab is currently active.
 
+### Multiple tabs of the same type (v0.6.7+)
+
+Each builtin Claude tab carries a **`+` button** (revealed on hover, or
+while the tab is active). Click it to spawn **another tab of the same
+type** — `+` on **Claude** opens a second subscription Claude, `+` on
+**Claude (local)** opens a second local-LLM Claude. A duplicate:
+
+- clones the origin tab's live config (CLI flags, environment, TTS
+  injection, *Use local LLM provider*), so a Claude (local) duplicate gets
+  the same `ANTHROPIC_*` injection as the tab it came from;
+- is auto-named `Claude 2`, `Claude 3`, … — rename via double-click;
+- is **closable** — it shows a `×` and accepts `Ctrl+W`, unlike the builtin
+  it was spawned from;
+- persists across restarts, reopening with your saved layout.
+
+Each duplicate is an independent subprocess with its own PTY, scrollback,
+and avatar / TTS state, launched in the directory cctts was started in.
+Duplicates aren't listed in *Settings → Tabs* — they inherit the origin
+tab's configuration.
+
 ## Shell Tabs (v1.2+)
 
 In addition to the two AI builtins, cctts hosts **Shell tabs** — plain
@@ -42,8 +62,10 @@ and `exited` only).
 
 ### Creating and managing Shell tabs
 
-- **Create:** click the `+` button at the right end of the tab bar, or press
-  `Ctrl+T`. The New Shell Tab dialog pre-fills the platform default shell.
+- **Create:** click the `+` button at the **right end of the tab bar**
+  (distinct from the per-tab `+` on Claude tabs, which spawns AI
+  duplicates), or press `Ctrl+T`. The New Shell Tab dialog pre-fills the
+  platform default shell.
 - **Rename:** right-click a tab → *Rename*, or double-click the tab name.
 - **Configure:** right-click a Shell tab → *Configure…* to change command,
   args, working directory, or notification text. Spawn-affecting changes
@@ -52,10 +74,11 @@ and `exited` only).
   subprocess and respawns it with the current configuration. Useful after
   changing the command in Configure.
 - **Close:** click the `×` on the tab, or press `Ctrl+W` while the tab is
-  active. The AI tabs (Claude, Claude (local)) cannot be closed via the
-  `×` — toggle them via the **Claude tabs enabled** radio in Settings
-  instead. The default first shell tab (`shell-default-1`) is closable
-  like any other shell.
+  active. The **builtin** AI tabs (Claude, Claude (local)) cannot be closed
+  via the `×` — toggle them via the **Claude tabs enabled** radio in
+  Settings instead — but **spawned duplicates** (see *Multiple tabs of the
+  same type*) are closable like any shell. The default first shell tab
+  (`shell-default-1`) is closable like any other shell.
 - **Switch by position:** `Ctrl+1`..`Ctrl+9` switch to the tab at that
   ordinal position **within the focused pane** (v1.3 change — see
   *Multi-pane Layout* below). `Ctrl+9` with fewer than 9 tabs in the focused
@@ -106,9 +129,10 @@ Common alternatives, paste into Configure → command + arguments:
   changes apply on next shell restart. Right-click → *Restart shell*, or
   type `exit` and press Enter on the closed-shell overlay.
 - **How do I delete a Shell tab?** Hover the tab and click `×`, or press
-  `Ctrl+W` while the tab is active. The AI tabs (Claude, Claude (local))
-  aren't closable from the tab bar — use the *Claude tabs enabled* radio
-  in *Settings → Tabs*.
+  `Ctrl+W` while the tab is active. The *builtin* AI tabs (Claude, Claude
+  (local)) aren't closable from the tab bar — use the *Claude tabs enabled*
+  radio in *Settings → Tabs*; *spawned* AI duplicates are closable with `×`
+  like any shell.
 - **My settings.json got corrupted.** Each migration writes a backup
   alongside the source file (e.g. `settings.json.v1.7.bak.<ts>`). For
   other corruption, delete the global `<exe-dir>/settings.json` (and the
@@ -444,6 +468,10 @@ Open with `Ctrl+,` or the cog button on the avatar.
 - **Avatar doesn't move.** Confirm `Settings → Avatar → Visible` is on
   and the per-state image paths point to readable files (or are blank to use
   the bundled defaults).
+- **`Ctrl+R` / `Ctrl+Shift+R` / `F5` don't reload the app.** Intentional
+  (v0.6.6+) — a reload would tear down every tab's session and lose
+  scrollback. The keystrokes still reach the terminal, so `Ctrl+R` works
+  as your shell's reverse-history search as usual.
 
 ## Known Limitations
 

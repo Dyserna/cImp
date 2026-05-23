@@ -18,6 +18,7 @@
     doneWhileAway = false,
     onclick,
     onclose,
+    onnew,
     oncontextmenu,
     onpointerdowndrag,
     onrename,
@@ -44,6 +45,10 @@
     /// Invoked when the user confirms the close (or skips the confirm).
     /// Optional because builtin tabs render no close button.
     onclose?: () => void;
+    /// Invoked when the user clicks the `+` (spawn duplicate). Only set
+    /// for AI builtins, so the button renders exactly where `×` would on
+    /// closable tabs. The two are mutually exclusive in practice.
+    onnew?: () => void;
     /// Invoked on right-click. Receives the click event so the caller
     /// can position a menu at the cursor; preventDefault is the caller's
     /// responsibility.
@@ -124,6 +129,12 @@
       return;
     }
     confirming = true;
+  }
+
+  function onNewClick(e: MouseEvent): void {
+    // Don't let the click also activate/drag the tab.
+    e.stopPropagation();
+    onnew?.();
   }
 
   function onConfirmYes(e: MouseEvent): void {
@@ -215,6 +226,24 @@
       ></span>
     {/if}
     <span class="label">{label}</span>
+    {#if onnew}
+      <span
+        class="spawn"
+        role="button"
+        tabindex="0"
+        aria-label="New tab of this type"
+        title="New tab of this type"
+        onclick={onNewClick}
+        onkeydown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onNewClick(e as unknown as MouseEvent);
+          }
+        }}
+      >
+        +
+      </span>
+    {/if}
     {#if !builtin && onclose}
       <span
         class="close"
@@ -337,6 +366,32 @@
   .close:hover {
     background: var(--surface-danger);
     color: var(--text-danger-soft);
+  }
+  /* Spawn-duplicate (+) button. Mirrors .close's hover/active reveal so
+     the AI builtins get the same affordance footprint a closable tab
+     gets for ×; hover tint uses the accent rather than the danger color. */
+  .spawn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: var(--radius-sm);
+    color: var(--text-tertiary);
+    font-size: 16px;
+    line-height: 1;
+    margin-left: var(--space-1);
+    opacity: 0;
+    transition: opacity var(--motion-fast) var(--easing-standard);
+    cursor: pointer;
+  }
+  .tab:hover .spawn,
+  .tab.active .spawn {
+    opacity: 1;
+  }
+  .spawn:hover {
+    background: var(--surface-3);
+    color: var(--text-primary);
   }
   .confirm-label {
     color: var(--text-primary);

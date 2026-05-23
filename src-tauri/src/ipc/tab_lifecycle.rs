@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::ipc::AppState;
 use crate::settings::{
-    default_ai_tab, AiTabId, ShellNotificationConfig, ShellTabConfig as ShellTabSettings,
+    default_ai_tab, AiTabId, Settings, ShellNotificationConfig, ShellTabConfig as ShellTabSettings,
     TabConfig,
 };
 use crate::shell::detect;
@@ -230,7 +230,7 @@ pub async fn create_shell_tab(
 
     let position = {
         let mut registry = state.tabs.lock().await;
-        registry.insert_user_shell_tab(tab.clone(), validated.name.clone())
+        registry.insert_user_tab(tab.clone(), validated.name.clone())
     };
 
     if let Err(e) = state
@@ -254,6 +254,105 @@ pub async fn create_shell_tab(
 
     let _ = app; // reserved for future per-window emits
     info!(?tab, "shell tab created");
+    Ok(tab)
+}
+
+/// Pick a unique display name for a spawned duplicate by suffixing the
+/// template's name with the lowest free integer ≥ 2 (e.g. "Claude" →
+/// "Claude 2", "Claude 3"). Falls back to a uuid suffix in the
+/// (practically impossible) event the first thousand are all taken.
+fn unique_tab_name(settings: &Settings, base: &str) -> String {
+    let taken: std::collections::HashSet<&str> =
+        settings.tabs.iter().map(|t| t.name()).collect();
+    for n in 2..1000 {
+        let candidate = format!("{base} {n}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    format!("{base} {}", Uuid::new_v4())
+}
+
+/// Spawn a duplicate of an existing AI tab — the `+` affordance on a
+/// Claude/Aider builtin. The new tab clones the *template's live config*
+/// (command, env, tts-injection, use_local_provider, theme/background
+/// overrides, …) so it behaves identically to the tab it came from,
+/// including local-provider env synthesis. It gets a fresh `"ai-<uuid>"`
+/// id, `builtin: false` (so it's closable and shows the `×`), and a
+/// unique auto-incremented name. Persisting it to `settings.tabs` means
+/// it survives a restart; the integrity check leaves non-reserved AI ids
+/// untouched.
+#[tauri::command]
+pub async fn create_ai_tab(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    template: TabId,
+) -> Result<TabId, TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
+
+    // Clone the template's AI config. The `+` only appears on AI tabs, so
+    // a missing entry or a Shell template is a malformed request.
+    let mut cfg = {
+        let snap = state.settings.current();
+        let entry = snap.find_tab(template.as_str()).ok_or_else(|| {
+            TabLifecycleError::TabNotFound {
+                tab: template.as_str().to_string(),
+            }
+        })?;
+        match entry {
+            TabConfig::AiTool(ai) => ai.clone(),
+            TabConfig::Shell(_) => return Err(TabLifecycleError::WrongKind),
+        }
+    };
+
+    let tab = TabId::Ai(format!("ai-{}", Uuid::new_v4()));
+    let name = unique_tab_name(&state.settings.current(), &cfg.name);
+    cfg.id = tab.as_str().to_string();
+    cfg.builtin = false;
+    cfg.name = name.clone();
+
+    let tab_meta = TabMeta {
+        id: tab.clone(),
+        kind: TabKind::AiTool,
+        name: name.clone(),
+    };
+
+    // Persist BEFORE registering so `build_launch_spec` can find the entry
+    // once the frontend mounts the new tab and calls `pty_start` (same
+    // ordering rationale as `create_shell_tab`). Append, like a shell tab —
+    // the visible position is owned by the frontend layout.
+    {
+        let mut snap = state.settings.current();
+        snap.tabs.push(TabConfig::AiTool(cfg));
+        state.settings.set(snap);
+    }
+
+    let position = {
+        let mut registry = state.tabs.lock().await;
+        registry.insert_user_tab(tab.clone(), name.clone())
+    };
+
+    if let Err(e) = state
+        .state_signals
+        .send(StateSignal::TabAdded {
+            meta: tab_meta,
+            position,
+        })
+        .await
+    {
+        warn!(error = %e, "create_ai_tab: state-signal channel closed");
+        return Err(TabLifecycleError::internal("state signal channel closed"));
+    }
+
+    {
+        let mut registry = state.tabs.lock().await;
+        if let Err(e) = registry.activate(tab.clone()).await {
+            warn!(error = %e, "create_ai_tab: activate failed");
+        }
+    }
+
+    let _ = app; // reserved for future per-window emits
+    info!(?tab, ?template, "ai tab duplicated");
     Ok(tab)
 }
 

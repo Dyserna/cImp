@@ -32,12 +32,12 @@ const DRAG_THRESHOLD_PX = 4;
 export const dragState = writable<DragState>({ kind: 'idle' });
 
 /// CSS selector matching tab sub-controls that handle their own
-/// clicks (close ×, rename input, confirm Yes/No). Pointerdown on
+/// clicks (close ×, spawn +, rename input, confirm Yes/No). Pointerdown on
 /// any of them must NOT begin a drag — pointer capture on the parent
 /// button would otherwise redirect the synthesized click to the
 /// button itself, swallowing the sub-control's click handler. The
 /// drag should only begin when the user grabs the tab body proper.
-const NON_DRAG_TARGET_SELECTOR = 'input, .close, .confirm-btn, .rename-input';
+const NON_DRAG_TARGET_SELECTOR = 'input, .close, .spawn, .confirm-btn, .rename-input';
 
 /// Called from a tab's `onpointerdown` handler. Records the pending
 /// drag and attaches pointer-event listeners to the source element

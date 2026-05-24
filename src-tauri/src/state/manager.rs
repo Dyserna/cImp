@@ -25,8 +25,9 @@ pub type InputLengths = Arc<RwLock<HashMap<TabId, Arc<AtomicI32>>>>;
 /// and IPC payload.
 ///
 /// Wire format: a single string. Reserved IDs serialize as `"claude"` /
-/// `"claude-local"` / `"aider"` / `"aider-local"`; `Shell(s)`
-/// serializes as the inner string verbatim. Round-tripping any other
+/// `"claude-local"` / `"aider"` / `"aider-local"`; `Ai(s)` and `Shell(s)`
+/// serialize as the inner string verbatim. Round-tripping a string that
+/// starts with `"ai-"` yields an `Ai` variant; any other unrecognized
 /// string yields a `Shell` variant.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub enum TabId {
@@ -42,6 +43,13 @@ pub enum TabId {
     /// V14: Aider tab pointed at a local OpenAI-compatible endpoint via
     /// the `aider_local` provider settings.
     AiderLocal,
+    /// A user-spawned *duplicate* of one of the AI builtins (the `+` on
+    /// a Claude/Aider tab). Carries a `"ai-<uuid>"` id and is a closable,
+    /// non-builtin AI-kind tab. Its launch behavior (env synthesis,
+    /// `--append-system-prompt`, etc.) is driven entirely by its
+    /// `AiToolTabConfig` in settings — which is cloned from the template
+    /// tab at spawn time — so this variant carries no template marker.
+    Ai(String),
     Shell(String),
 }
 
@@ -52,6 +60,7 @@ impl TabId {
             TabId::ClaudeLocal => "claude-local",
             TabId::Aider => "aider",
             TabId::AiderLocal => "aider-local",
+            TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
         }
     }
@@ -62,29 +71,44 @@ impl TabId {
             "claude-local" => TabId::ClaudeLocal,
             "aider" => TabId::Aider,
             "aider-local" => TabId::AiderLocal,
+            // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
+            // `create_ai_tab`). They must round-trip back to `Ai`, not
+            // `Shell`, so they keep AI-kind behavior on relaunch. The
+            // reserved exact-matches above are checked first, and
+            // `"aider"` / `"aider-local"` don't start with `"ai-"`, so
+            // there's no collision.
+            other if other.starts_with("ai-") => TabId::Ai(other.to_string()),
             other => TabId::Shell(other.to_string()),
         }
     }
 
     /// Pure mapping from id to runtime kind. Stable across milestones —
-    /// every reserved AI variant maps to `AiTool`; any `Shell(_)` id is
-    /// a Shell tab. Lets call sites that don't carry `TabKind` explicitly
-    /// (PTY processor, launch-spec builder) branch without threading a
-    /// separate metadata table.
+    /// every reserved AI variant and every spawned `Ai(_)` duplicate maps
+    /// to `AiTool`; any `Shell(_)` id is a Shell tab. Lets call sites that
+    /// don't carry `TabKind` explicitly (PTY processor, launch-spec
+    /// builder) branch without threading a separate metadata table.
     pub fn kind(&self) -> TabKind {
         match self {
-            TabId::Claude | TabId::ClaudeLocal | TabId::Aider | TabId::AiderLocal => {
-                TabKind::AiTool
-            }
+            TabId::Claude
+            | TabId::ClaudeLocal
+            | TabId::Aider
+            | TabId::AiderLocal
+            | TabId::Ai(_) => TabKind::AiTool,
             TabId::Shell(_) => TabKind::Shell,
         }
     }
 
-    /// True if this id is one of the four reserved AI builtins. Helper
-    /// for places that today say `matches!(id, TabId::Claude | TabId::ClaudeLocal)`
-    /// and want to extend cleanly to the Aider pair.
-    pub fn is_ai_builtin(&self) -> bool {
-        matches!(self.kind(), TabKind::AiTool)
+    /// True only for the four reserved AI builtins — the non-closable
+    /// tabs that `+` spawns duplicates of. Spawned `Ai(_)` duplicates and
+    /// `Shell(_)` tabs are closable, so they return false. This is the
+    /// canonical `builtin` flag surfaced to the frontend (gates the close
+    /// `×` and the spawn `+`); keep it in sync with `tabs::registry`'s
+    /// `is_builtin_id`.
+    pub fn is_builtin(&self) -> bool {
+        matches!(
+            self,
+            TabId::Claude | TabId::ClaudeLocal | TabId::Aider | TabId::AiderLocal
+        )
     }
 }
 
@@ -461,7 +485,7 @@ async fn run(
             meta.id.clone(),
             (&meta.kind).into(),
             meta.name.clone(),
-            meta.id.is_ai_builtin(),
+            meta.id.is_builtin(),
             position,
         );
     }
@@ -502,7 +526,7 @@ async fn run(
                             meta.id.clone(),
                             (&meta.kind).into(),
                             meta.name,
-                            meta.id.is_ai_builtin(),
+                            meta.id.is_builtin(),
                             position,
                         );
                     }
@@ -1188,6 +1212,7 @@ mod tests {
             TabId::ClaudeLocal,
             TabId::Aider,
             TabId::AiderLocal,
+            TabId::Ai("ai-1234".to_string()),
             TabId::Shell("shell-1".to_string()),
             TabId::Shell("user-bash".to_string()),
         ] {
@@ -1195,6 +1220,35 @@ mod tests {
             let back: TabId = serde_json::from_str(&s).unwrap();
             assert_eq!(id, back);
         }
+    }
+
+    #[test]
+    fn spawned_ai_id_routes_to_ai_not_shell() {
+        // Spawned duplicates carry an "ai-<uuid>" id and must come back as
+        // `Ai` (AI-kind, non-builtin) on relaunch — not `Shell`. The
+        // reserved "aider"/"aider-local" ids must stay their own variants
+        // despite sharing the "ai" prefix-without-dash.
+        assert_eq!(
+            TabId::from_str("ai-abc123"),
+            TabId::Ai("ai-abc123".to_string())
+        );
+        assert_eq!(TabId::from_str("aider"), TabId::Aider);
+        assert_eq!(TabId::from_str("aider-local"), TabId::AiderLocal);
+        assert_eq!(
+            TabId::from_str("shell-xyz"),
+            TabId::Shell("shell-xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn spawned_ai_tab_is_ai_kind_but_not_builtin() {
+        let dup = TabId::Ai("ai-abc123".to_string());
+        assert_eq!(dup.kind(), TabKind::AiTool);
+        assert!(!dup.is_builtin());
+        // The reserved AI tabs are the only builtins.
+        assert!(TabId::Claude.is_builtin());
+        assert!(TabId::AiderLocal.is_builtin());
+        assert!(!TabId::Shell("shell-1".into()).is_builtin());
     }
 
     #[test]
@@ -1221,6 +1275,7 @@ mod tests {
         assert_eq!(TabId::ClaudeLocal.kind(), TabKind::AiTool);
         assert_eq!(TabId::Aider.kind(), TabKind::AiTool);
         assert_eq!(TabId::AiderLocal.kind(), TabKind::AiTool);
+        assert_eq!(TabId::Ai("ai-1".into()).kind(), TabKind::AiTool);
         assert_eq!(TabId::Shell("anything".into()).kind(), TabKind::Shell);
     }
 

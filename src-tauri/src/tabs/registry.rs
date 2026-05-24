@@ -178,14 +178,16 @@ impl TabRegistry {
         self.names.insert(tab.clone(), name.to_string());
     }
 
-    /// Append a new user-managed Shell tab to the registry. Returns the
-    /// resulting position in `tab_order`. Idempotent on duplicate ids: the
-    /// existing entry's name is overwritten and the original position is
-    /// returned.
+    /// Append a new user-managed tab (a Shell tab, or a `+`-spawned AI
+    /// duplicate) to the registry. Returns the resulting position in
+    /// `tab_order`. Idempotent on duplicate ids: the existing entry's name
+    /// is overwritten and the original position is returned. Unlike
+    /// `insert_ai_builtin_tab`, this appends at the end rather than at a
+    /// canonical slot — the frontend layout decides the visible position.
     ///
     /// V3-M3: the spawn config now lives in settings — callers persist the
-    /// `TabConfig::Shell` entry separately via `SettingsHandle::set`.
-    pub fn insert_user_shell_tab(&mut self, tab: TabId, name: String) -> usize {
+    /// `TabConfig` entry separately via `SettingsHandle::set`.
+    pub fn insert_user_tab(&mut self, tab: TabId, name: String) -> usize {
         if let Some(idx) = self.tab_order.iter().position(|t| t == &tab) {
             self.names.insert(tab, name);
             return idx;

@@ -2,6 +2,7 @@ import { mount } from 'svelte';
 import App from './App.svelte';
 import { ttsTest } from './lib/ipc';
 import { settings } from './lib/settings/store';
+import { installReloadBlocker } from './lib/shortcuts/blockReload';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import './theme.css';
 import './theme.tui-yellow.css';
@@ -15,6 +16,10 @@ import './app.css';
 // default in defaultSettings(), and existing modern-dark users have a
 // persisted setting that overrides this on the first subscribe tick.
 document.documentElement.dataset.theme = 'tui-yellow';
+
+// Disable the webview's reload accelerators (F5 / Ctrl+R / Ctrl+Shift+R) so a
+// stray keystroke can't tear every tab's PTY down and restart sessions.
+installReloadBlocker();
 
 // Follow the persisted ui.theme value: the store starts on defaults
 // ("tui-yellow"), then reflects the backend value once initSettings()

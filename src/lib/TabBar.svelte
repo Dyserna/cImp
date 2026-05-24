@@ -11,6 +11,7 @@
   } from './avatarState';
   import {
     closeTab as closeTabIpc,
+    createAiTab,
     renameTab as renameTabIpc,
     restartShellTab,
   } from './ipc';
@@ -125,6 +126,16 @@
     });
   }
 
+  /// Spawn a duplicate of an AI builtin (the `+` on a Claude/Aider tab).
+  /// Routes the new tab into this pane via the same pending-placement
+  /// cell the New Shell Tab `+` uses, so it lands next to its origin.
+  function onSpawnAiTab(template: TabId): void {
+    requestTabIntoPane(pane.id);
+    void createAiTab(template).catch((e) => {
+      console.error('create_ai_tab failed:', e);
+    });
+  }
+
   function onRestartTab(tab: TabId): void {
     void restartShellTab(tab).catch((e) => {
       console.error('restart_shell_tab failed:', e);
@@ -204,6 +215,9 @@
           }
           onclick={() => onTabClick(id)}
           onclose={meta.builtin ? undefined : () => onCloseTab(id)}
+          onnew={meta.kind === 'ai-tool' && meta.builtin
+            ? () => onSpawnAiTab(id)
+            : undefined}
           oncontextmenu={(e) => onTabContextMenu(id, meta.builtin, e)}
           onpointerdowndrag={(e) => beginDrag(id, pane.id, e)}
           onrename={(newName) => onRenameTab(id, newName)}

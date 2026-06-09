@@ -36,6 +36,10 @@ pub struct AppState {
     /// Settings window can read+clear it on mount (cold-open path)
     /// while a `settings-deep-link` event covers the hot-open path.
     pub pending_settings_deep_link: Arc<Mutex<Option<String>>>,
+    /// System-monitor sampler (CPU / memory / GPU / network) backing the
+    /// bottom-bar stats panel's `get_system_stats` command. Holds the sysinfo
+    /// + NVML handles; interior-locked so the shared `&AppState` can sample it.
+    pub sysmon: crate::sysmon::SystemStatsState,
     /// Serializes tab-lifecycle commands (`create_shell_tab`,
     /// `close_tab`, `reconfigure_shell_tab`, `set_enabled_ai_tabs`)
     /// against each other. Without this each command would interleave

@@ -287,13 +287,13 @@ html[data-theme="tui-purple"] *::-webkit-scrollbar-thumb:hover {
   background-color: var(--border-strong);
 }
 
-/* StatusBar (bottom strip) — collapse to match the TuiTitleBar height
-   so the window has symmetric chrome strips top and bottom. Drop the
-   filled background; the top border is enough separation. Tighter
-   horizontal padding (1ch instead of 12px) to align with the TUI grid. */
+/* StatusBar (bottom strip) — two lines tall to fit the stacked Claude Code
+   usage meter (current + weekly session rows). Drop the filled background;
+   the top border is enough separation. Tighter horizontal padding (1ch
+   instead of 12px) to align with the TUI grid. */
 html[data-theme="tui-purple"] .status-bar {
-  height: 22px !important;
-  flex: 0 0 22px !important;
+  height: 44px !important;
+  flex: 0 0 44px !important;
   background: transparent !important;
   border-top: 1px solid var(--border-default) !important;
   padding: 0 1ch !important;

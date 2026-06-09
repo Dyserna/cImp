@@ -69,6 +69,61 @@ export async function ttsSpeak(text: string): Promise<void> {
   await invoke('tts_speak', { text });
 }
 
+/// One Claude usage quota window. `utilization` is 0–100; `resets_at` is an
+/// ISO-8601 timestamp (with timezone) or null.
+export interface UsageWindow {
+  utilization: number;
+  resets_at: string | null;
+}
+
+/// Session (5h) + weekly (7d) usage snapshot for the bottom-bar tracker.
+export interface UsageSnapshot {
+  five_hour: UsageWindow | null;
+  seven_day: UsageWindow | null;
+}
+
+/// Outcome of a usage fetch:
+///   - `snapshot` set → success.
+///   - `rate_limited` → 429 (transient); keep showing last-good/placeholder and
+///     retry after `retry_after_secs` (or the caller's cooldown).
+///   - all empty → unavailable (not logged in / network error).
+export interface UsageResult {
+  snapshot: UsageSnapshot | null;
+  rate_limited: boolean;
+  retry_after_secs: number | null;
+}
+
+/// Fetch the current Claude Code usage. See `UsageResult` for the outcomes.
+export async function getClaudeUsage(): Promise<UsageResult> {
+  return invoke<UsageResult>('get_claude_usage');
+}
+
+/// NVIDIA GPU stats (null when no NVIDIA GPU / NVML).
+export interface GpuStats {
+  util_pct: number;
+  mem_pct: number;
+  temp_c: number;
+}
+
+/// Network throughput, bytes/sec, since the previous sample.
+export interface NetStats {
+  down_bps: number;
+  up_bps: number;
+}
+
+/// One system-monitor sample (CPU / memory / GPU / network).
+export interface SystemStatsSnapshot {
+  cpu_pct: number;
+  mem_pct: number;
+  gpu: GpuStats | null;
+  net: NetStats;
+}
+
+/// Sample the system-monitor stats for the bottom-bar panel.
+export async function getSystemStats(): Promise<SystemStatsSnapshot> {
+  return invoke<SystemStatsSnapshot>('get_system_stats');
+}
+
 export async function composeContentChanged(nonEmpty: boolean): Promise<void> {
   await invoke('compose_content_changed', { nonEmpty });
 }

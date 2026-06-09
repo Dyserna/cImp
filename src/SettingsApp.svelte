@@ -62,6 +62,7 @@
     | 'theme'
     | 'background'
     | 'display'
+    | 'bottom-bar'
     | 'tabs'
     | 'shortcuts'
     | 'local-llm'
@@ -75,6 +76,7 @@
     { id: 'theme', label: 'Theme' },
     { id: 'background', label: 'Background' },
     { id: 'display', label: 'Display' },
+    { id: 'bottom-bar', label: 'Bottom bar' },
     { id: 'tabs', label: 'Tabs' },
     { id: 'shortcuts', label: 'Shortcuts' },
     { id: 'local-llm', label: 'Local LLM (Claude)' },
@@ -1154,6 +1156,171 @@
               />
             </label>
           </div>
+        </section>
+      {:else if activeSection === 'bottom-bar'}
+        <section>
+          <h2>Claude session usage</h2>
+          <small class="hint top">
+            Shows your Claude Code session (5h) and weekly (7d) quota in the
+            bottom bar, next to Layouts. Data comes from Claude's usage
+            endpoint; the widget hides when you're not logged into Claude.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.usage.enabled}
+              onchange={(e) =>
+                patch((s) => (s.usage.enabled = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Show usage in the bottom bar</span>
+          </label>
+          <small class="hint">
+            The toggles below pick which pieces of each window are shown
+            (they apply to both the 5h and 7d readouts).
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.usage.show_bar}
+              disabled={!snapshot.usage.enabled}
+              onchange={(e) =>
+                patch((s) => (s.usage.show_bar = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Bar</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.usage.show_percentage}
+              disabled={!snapshot.usage.enabled}
+              onchange={(e) =>
+                patch((s) => (s.usage.show_percentage = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Percentage</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.usage.show_countdown}
+              disabled={!snapshot.usage.enabled}
+              onchange={(e) =>
+                patch((s) => (s.usage.show_countdown = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Countdown timer</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.usage.show_reset_clock}
+              disabled={!snapshot.usage.enabled}
+              onchange={(e) =>
+                patch((s) => (s.usage.show_reset_clock = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Reset clock (local time)</span>
+          </label>
+          <label>
+            <span>Poll interval (seconds)</span>
+            <input
+              type="number"
+              min="15"
+              max="3600"
+              step="15"
+              disabled={!snapshot.usage.enabled}
+              value={snapshot.usage.poll_interval_secs}
+              onchange={(e) =>
+                patch((s) => (s.usage.poll_interval_secs = Math.max(15, +(e.currentTarget as HTMLInputElement).value)))}
+            />
+          </label>
+          <small class="hint">
+            How often the usage figures refresh. Minimum 15s; the countdown
+            ticks every second locally between refreshes.
+          </small>
+        </section>
+
+        <section>
+          <h2>Local machine information</h2>
+          <small class="hint top">
+            Live CPU / memory / GPU / network panel in the bottom bar, right of
+            the Claude session usage meter.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.system_stats.enabled}
+              onchange={(e) =>
+                patch((s) => (s.system_stats.enabled = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Show local machine information</span>
+          </label>
+          <small class="hint">
+            The toggles below pick which components are shown.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.system_stats.show_cpu}
+              disabled={!snapshot.system_stats.enabled}
+              onchange={(e) =>
+                patch((s) => (s.system_stats.show_cpu = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>CPU usage</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.system_stats.show_memory}
+              disabled={!snapshot.system_stats.enabled}
+              onchange={(e) =>
+                patch((s) => (s.system_stats.show_memory = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Memory</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.system_stats.show_gpu}
+              disabled={!snapshot.system_stats.enabled}
+              onchange={(e) =>
+                patch((s) => (s.system_stats.show_gpu = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>GPU (usage + VRAM)</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.system_stats.show_gpu_temp}
+              disabled={!snapshot.system_stats.enabled || !snapshot.system_stats.show_gpu}
+              onchange={(e) =>
+                patch((s) => (s.system_stats.show_gpu_temp = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>GPU temperature</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.system_stats.show_network}
+              disabled={!snapshot.system_stats.enabled}
+              onchange={(e) =>
+                patch((s) => (s.system_stats.show_network = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Network</span>
+          </label>
+          <label>
+            <span>Poll interval (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              max="60"
+              disabled={!snapshot.system_stats.enabled}
+              value={snapshot.system_stats.poll_interval_secs}
+              onchange={(e) =>
+                patch((s) => (s.system_stats.poll_interval_secs = Math.max(1, +(e.currentTarget as HTMLInputElement).value)))}
+            />
+          </label>
+          <small class="hint">
+            How often CPU / GPU / network are sampled. The graphs update at this
+            rate.
+          </small>
         </section>
       {:else if activeSection === 'tabs'}
         {@const claudeLive = aiTabAt('claude')}

@@ -62,6 +62,13 @@ export async function ttsTest(text: string): Promise<void> {
   await invoke('tts_test', { text });
 }
 
+/// Read arbitrary text aloud through the TTS worker (skips the
+/// processor, routed to the active tab). Backs the Ctrl+right-click
+/// "speak selection" gesture.
+export async function ttsSpeak(text: string): Promise<void> {
+  await invoke('tts_speak', { text });
+}
+
 export async function composeContentChanged(nonEmpty: boolean): Promise<void> {
   await invoke('compose_content_changed', { nonEmpty });
 }

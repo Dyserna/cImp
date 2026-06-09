@@ -304,6 +304,26 @@ pub async fn tts_test(state: State<'_, AppState>, text: String) -> AppResult<()>
     Ok(())
 }
 
+/// Read arbitrary text aloud through the TTS worker, skipping the
+/// processor. Backs the Ctrl+right-click "speak selection" gesture
+/// (`behavior.speak_selection_on_right_click`). Routed as if it came
+/// from the active tab so the worker's background-tab filter doesn't
+/// drop it. Whitespace-only text is ignored — the frontend guards too,
+/// but a backend skip keeps an empty synthesis off the worker.
+#[tauri::command]
+pub async fn tts_speak(state: State<'_, AppState>, text: String) -> AppResult<()> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let active = state.tabs.lock().await.active();
+    state
+        .tts_segments
+        .send(crate::tts::TtsRequest::Synthesize { tab: active, text })
+        .await
+        .map_err(|e| AppError::Tts(format!("tts_speak send: {e}")))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn pty_resize(
     state: State<'_, AppState>,

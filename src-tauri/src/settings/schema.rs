@@ -1060,6 +1060,11 @@ pub struct BehaviorSettings {
     /// clipboard into the focused PTY (and suppresses the browser's
     /// default context menu). Backward-compatible via serde-default.
     pub paste_on_right_click: bool,
+    /// When true, Ctrl+right-click inside any terminal reads the current
+    /// selection aloud through TTS instead of pasting. The Ctrl modifier
+    /// always suppresses the paste branch when this is on, so the gesture
+    /// can never accidentally paste. Backward-compatible via serde-default.
+    pub speak_selection_on_right_click: bool,
 }
 
 impl Default for BehaviorSettings {
@@ -1074,6 +1079,7 @@ impl Default for BehaviorSettings {
             speak_background_tabs: false,
             copy_on_select: true,
             paste_on_right_click: true,
+            speak_selection_on_right_click: true,
         }
     }
 }

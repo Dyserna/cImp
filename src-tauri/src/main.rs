@@ -29,7 +29,7 @@ use crate::ipc::commands::{
     consume_settings_deep_link, content_clear, content_open_folder, list_tabs, list_voices,
     open_settings_window, open_settings_window_to_tab, pty_get_scrollback, pty_rebind_channel,
     pty_resize, pty_restart, pty_start, pty_write, request_tab_restart, restart_shell_tab,
-    set_active_tab, settings_get, settings_update, tab_activate, tts_test,
+    set_active_tab, settings_get, settings_update, tab_activate, tts_speak, tts_test,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -311,6 +311,7 @@ fn main() {
             pty_write,
             pty_resize,
             tts_test,
+            tts_speak,
             settings_get,
             settings_update,
             ai_tool_tab_defaults,

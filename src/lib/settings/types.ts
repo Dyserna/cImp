@@ -86,6 +86,9 @@ export interface BehaviorSettings {
   /// clipboard into the focused PTY and suppresses the browser's default
   /// context menu.
   paste_on_right_click: boolean;
+  /// When true, Ctrl+right-click inside any terminal reads the current
+  /// selection aloud through TTS instead of pasting.
+  speak_selection_on_right_click: boolean;
 }
 
 export interface ComposeSettings {
@@ -534,6 +537,7 @@ export function defaultSettings(): Settings {
       speak_background_tabs: false,
       copy_on_select: true,
       paste_on_right_click: true,
+      speak_selection_on_right_click: true,
     },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {

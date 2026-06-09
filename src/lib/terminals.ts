@@ -46,6 +46,7 @@ import {
   ptyStart,
   ptyWrite,
   restartShellTab,
+  ttsSpeak,
   type BytesChannel,
 } from './ipc';
 import {
@@ -496,13 +497,31 @@ export function createTerminal(
     );
   });
 
-  // Paste-on-right-click: when the setting is on, swallow the browser's
-  // default context menu and feed the clipboard through `term.paste`.
-  // paste() routes via xterm's onData below (so bracketed-paste mode is
-  // honored when the shell has enabled it) instead of writing to the
-  // PTY directly. When the setting is off we leave the event alone.
+  // Right-click handling. Two distinct gestures share the contextmenu
+  // event:
+  //   - Ctrl+right-click → speak the current selection aloud (TTS).
+  //   - plain right-click → paste the clipboard into the PTY.
+  // The Ctrl branch is checked FIRST and always returns, so holding Ctrl
+  // can never fall through to the paste branch — the modifier suppresses
+  // paste entirely (the user's requirement). Each gesture is
+  // independently gated by its own behavior setting; both read settings
+  // at fire time so toggles take effect without re-binding.
   host.addEventListener('contextmenu', (e) => {
-    if (!get(settingsStore).behavior.paste_on_right_click) return;
+    const behavior = get(settingsStore).behavior;
+    if (e.ctrlKey) {
+      // Speak-selection gesture. Even when the feature is off we still
+      // swallow the event for Ctrl+right-click so it never pastes — the
+      // modifier is reserved for this gesture.
+      e.preventDefault();
+      if (!behavior.speak_selection_on_right_click) return;
+      const text = term.getSelection();
+      if (!text.trim()) return;
+      void ttsSpeak(text).catch((err) =>
+        console.warn('speak-selection TTS failed:', err),
+      );
+      return;
+    }
+    if (!behavior.paste_on_right_click) return;
     e.preventDefault();
     navigator.clipboard
       .readText()

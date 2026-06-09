@@ -709,6 +709,20 @@
             clipboard into the focused shell and suppresses the browser's
             default context menu.
           </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.behavior.speak_selection_on_right_click}
+              onchange={(e) =>
+                patch((s) => (s.behavior.speak_selection_on_right_click = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Speak selection on Ctrl+right-click</span>
+          </label>
+          <small class="hint">
+            When on, Ctrl+right-clicking inside any terminal reads the
+            selected text aloud through TTS. Holding Ctrl always suppresses
+            paste, so the gesture never pastes the clipboard.
+          </small>
           <label class="checkbox disabled">
             <input type="checkbox" checked={snapshot.behavior.fallback_silent} disabled />
             <span>Fallback silent on TTS error (always on in v1)</span>

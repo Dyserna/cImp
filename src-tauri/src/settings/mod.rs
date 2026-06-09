@@ -15,6 +15,7 @@ mod persistence;
 mod schema;
 
 pub use broadcaster::SettingsHandle;
+pub use persistence::apply_portable_avatar_paths;
 pub use schema::*;
 
 use std::fs;

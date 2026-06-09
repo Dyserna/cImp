@@ -460,8 +460,12 @@ pub async fn ai_tool_tab_defaults(tab: TabId) -> AppResult<AiToolTabConfig> {
 #[tauri::command]
 pub async fn settings_update(
     state: State<'_, AppState>,
-    settings: Settings,
+    mut settings: Settings,
 ) -> AppResult<()> {
+    // Re-point bundled avatar videos at the (possibly just-changed) theme's
+    // on-disk subfolder before broadcasting, so switching theme switches the
+    // avatar. User overrides are preserved; see `apply_portable_avatar_paths`.
+    crate::settings::apply_portable_avatar_paths(&mut settings);
     state.settings.set(settings);
     Ok(())
 }

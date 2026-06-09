@@ -128,6 +128,14 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
 
     let repaired = integrity_check(&mut settings);
 
+    // Re-point bundled avatar videos at the loaded theme. Existing installs
+    // had absolute paths frozen to the seed-time theme written into their
+    // settings file; this corrects them in memory on every launch so the
+    // avatar matches `ui.theme`. Done after the merge (so the resolved
+    // theme is known) and kept out of the persisted diff — it re-derives
+    // from theme + on-disk folder each load, so there's nothing to save.
+    apply_portable_avatar_paths(&mut settings);
+
     if repaired {
         // Persist the post-repair state back to its source of truth. If a
         // custom overlay was in play, we recompute and rewrite the diff;
@@ -411,7 +419,7 @@ fn seeded_defaults(default_shell: &ShellSpec) -> Settings {
     let mut s = Settings::default();
     integrity_check(&mut s);
     s.tabs.push(default_shell_1_tab(default_shell));
-    seed_portable_avatar_paths(&mut s);
+    apply_portable_avatar_paths(&mut s);
     s
 }
 
@@ -426,32 +434,41 @@ fn portable_avatars_dir() -> Option<PathBuf> {
     if dir.is_dir() { Some(dir) } else { None }
 }
 
-/// On a fresh install, populate `avatar.images.*` and
-/// `avatar.transition.path` with absolute paths to the videos staged in
-/// `<exe-dir>/../avatars/` so the global settings file written on first
-/// launch points at the on-disk copies users can swap. Each state is
-/// only stamped when its file actually exists; missing files leave the
-/// embedded `/avatar/...` URL (transition) or `None` (images) defaults
-/// in place so the runtime still falls back to the bundled-in-exe copy.
-fn seed_portable_avatar_paths(s: &mut Settings) {
+/// Point the bundled avatar defaults at the active theme's videos under
+/// `<exe-dir>/../avatars/<theme>/` so the on-disk copies users can swap are
+/// the live source. Re-pointing follows the active theme, so callers run it
+/// on first-launch seeding, on load (to repair a settings file seeded under
+/// a different theme), and on every theme change. Genuine user overrides
+/// (paths outside the portable avatars dir) are preserved; see
+/// [`stamp_avatar_paths_from`]. No-op when the portable folder is absent
+/// (dev `cargo run` / source builds), leaving the embedded `/avatar/...`
+/// defaults in place.
+pub fn apply_portable_avatar_paths(s: &mut Settings) {
     if let Some(dir) = portable_avatars_dir() {
         stamp_avatar_paths_from(s, &dir);
     }
 }
 
-/// Pure version of the avatar stamping step: given a directory, stamp the
-/// appropriate fields from any matching files inside it. Split out so the
-/// behavior is unit-testable without depending on the test binary's
+/// Pure version of the avatar stamping step: given a directory, re-point the
+/// bundled avatar defaults at the active theme's videos inside it. Split out
+/// so the behavior is unit-testable without depending on the test binary's
 /// `current_exe()` location.
 ///
 /// Layout-aware: prefers the active theme's subfolder
-/// (`<dir>/<ui.theme>/<file>`) so portable installs land on animations
-/// matching the chrome they ship with. Falls back to a flat
-/// `<dir>/<file>` layout for legacy zips produced before the per-theme
-/// split, so existing folders keep working.
+/// (`<dir>/<ui.theme>/<file>`) so the avatar follows the chrome theme.
+/// Falls back to a flat `<dir>/<file>` layout for legacy zips produced
+/// before the per-theme split, so existing folders keep working. Per the
+/// theme isolation policy (see `src/theme.css`), every theme owns its own
+/// avatar folder — there is no cross-theme mapping here.
 ///
-/// Per the theme isolation policy (see `src/theme.css`), every theme
-/// owns its own avatar folder — there is no cross-theme mapping here.
+/// Idempotent and safe to call on every load and theme change: it only
+/// re-points fields that are *bundled defaults* — unset, a bundled
+/// `/avatar/...` URL, or a path we previously stamped inside `dir` (for any
+/// theme). An absolute path *outside* `dir` is a deliberate user override
+/// (picked from elsewhere on disk via the file dialog) and is left alone.
+/// This is what makes the avatar videos follow theme switches instead of
+/// staying frozen on whichever theme was active when the global settings
+/// file was first seeded.
 fn stamp_avatar_paths_from(s: &mut Settings, dir: &Path) {
     let theme_dir = dir.join(&s.ui.theme);
 
@@ -467,23 +484,40 @@ fn stamp_avatar_paths_from(s: &mut Settings, dir: &Path) {
         None
     };
 
-    if let Some(p) = pick("Idle.mp4") {
-        s.avatar.images.idle = Some(p);
+    // Bundled default = re-pointable. A None field, a bundled `/avatar/...`
+    // URL, or any path under `dir` (something we stamped before, possibly
+    // for a different theme) all qualify. A path outside `dir` is a real
+    // user override and is never disturbed.
+    let is_bundled = |p: &Option<PathBuf>| match p {
+        None => true,
+        Some(path) => {
+            path.starts_with(dir)
+                || path.to_str().is_some_and(|s| s.starts_with("/avatar/"))
+        }
+    };
+
+    if is_bundled(&s.avatar.images.idle) {
+        s.avatar.images.idle = pick("Idle.mp4");
     }
-    if let Some(p) = pick("Listening.mp4") {
-        s.avatar.images.listening = Some(p);
+    if is_bundled(&s.avatar.images.listening) {
+        s.avatar.images.listening = pick("Listening.mp4");
     }
-    if let Some(p) = pick("Thinking.mp4") {
-        s.avatar.images.thinking = Some(p);
+    if is_bundled(&s.avatar.images.thinking) {
+        s.avatar.images.thinking = pick("Thinking.mp4");
     }
-    if let Some(p) = pick("Speaking.mp4") {
-        s.avatar.images.speaking = Some(p);
+    if is_bundled(&s.avatar.images.speaking) {
+        s.avatar.images.speaking = pick("Speaking.mp4");
     }
-    if let Some(p) = pick("Error.mp4") {
-        s.avatar.images.error = Some(p);
+    if is_bundled(&s.avatar.images.error) {
+        s.avatar.images.error = pick("Error.mp4");
     }
-    if let Some(p) = pick("Transition.mp4") {
-        s.avatar.transition.path = Some(p);
+    // Transition keeps a non-None bundled fallback (`/avatar/Transition.mp4`,
+    // which the frontend redirects into the active theme) when the theme
+    // ships no on-disk file, so a theme switch never silently disables the
+    // crossfade by leaving it None.
+    if is_bundled(&s.avatar.transition.path) {
+        s.avatar.transition.path =
+            pick("Transition.mp4").or_else(|| Some(PathBuf::from("/avatar/Transition.mp4")));
     }
 }
 
@@ -1268,6 +1302,89 @@ mod tests {
         assert!(s.avatar.images.speaking.is_none());
         assert!(s.avatar.images.error.is_none());
         assert_eq!(s.avatar.transition.path, before_transition);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_avatar_paths_preserves_user_override_outside_dir() {
+        let dir = std::env::temp_dir()
+            .join(format!("cctts_avatars_ovr_{}", uuid::Uuid::new_v4()));
+        let theme = dir.join("tui-yellow");
+        fs::create_dir_all(&theme).unwrap();
+        fs::write(theme.join("Idle.mp4"), b"").unwrap();
+
+        // A genuine override the user picked from elsewhere on disk.
+        let custom = std::env::temp_dir()
+            .join(format!("cctts_custom_{}.mp4", uuid::Uuid::new_v4()));
+        fs::write(&custom, b"").unwrap();
+
+        let mut s = Settings::default();
+        s.ui.theme = "tui-yellow".to_string();
+        s.avatar.images.idle = Some(custom.clone());
+        stamp_avatar_paths_from(&mut s, &dir);
+
+        // The override (outside `dir`) survives; bundled fields are stamped.
+        assert_eq!(s.avatar.images.idle.as_deref(), Some(custom.as_path()));
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&custom);
+    }
+
+    #[test]
+    fn stamp_avatar_paths_repoints_on_theme_switch() {
+        let dir = std::env::temp_dir()
+            .join(format!("cctts_avatars_switch_{}", uuid::Uuid::new_v4()));
+        let yellow = dir.join("tui-yellow");
+        let purple = dir.join("tui-purple");
+        fs::create_dir_all(&yellow).unwrap();
+        fs::create_dir_all(&purple).unwrap();
+        fs::write(yellow.join("Idle.mp4"), b"").unwrap();
+        fs::write(purple.join("Idle.mp4"), b"").unwrap();
+
+        let mut s = Settings::default();
+        s.ui.theme = "tui-yellow".to_string();
+        stamp_avatar_paths_from(&mut s, &dir);
+        assert_eq!(s.avatar.images.idle.as_deref(), Some(yellow.join("Idle.mp4").as_path()));
+
+        // The previously-stamped path (inside `dir`) is re-pointed to the new
+        // theme, NOT mistaken for a user override. This is the actual bug fix.
+        s.ui.theme = "tui-purple".to_string();
+        stamp_avatar_paths_from(&mut s, &dir);
+        assert_eq!(s.avatar.images.idle.as_deref(), Some(purple.join("Idle.mp4").as_path()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_avatar_paths_resets_when_new_theme_has_no_files() {
+        let dir = std::env::temp_dir()
+            .join(format!("cctts_avatars_reset_{}", uuid::Uuid::new_v4()));
+        let yellow = dir.join("tui-yellow");
+        fs::create_dir_all(&yellow).unwrap();
+        fs::write(yellow.join("Idle.mp4"), b"").unwrap();
+        fs::write(yellow.join("Transition.mp4"), b"").unwrap();
+
+        let mut s = Settings::default();
+        s.ui.theme = "tui-yellow".to_string();
+        stamp_avatar_paths_from(&mut s, &dir);
+        assert_eq!(s.avatar.images.idle.as_deref(), Some(yellow.join("Idle.mp4").as_path()));
+        assert_eq!(
+            s.avatar.transition.path.as_deref(),
+            Some(yellow.join("Transition.mp4").as_path()),
+        );
+
+        // Switch to a theme with no on-disk folder: the image resets to None
+        // (frontend uses the embedded bundled video) and the transition
+        // reverts to the redirectable `/avatar/` URL — never a stale
+        // tui-yellow path, never a disabling None.
+        s.ui.theme = "modern-dark".to_string();
+        stamp_avatar_paths_from(&mut s, &dir);
+        assert!(s.avatar.images.idle.is_none());
+        assert_eq!(
+            s.avatar.transition.path.as_deref().map(|p| p.to_string_lossy().to_string()),
+            Some("/avatar/Transition.mp4".to_string())
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,0 +1,56 @@
+{
+  "_doc": "Edit this file to add or refine prompt-detection substrings. Each pattern's `all_of` is a list of substrings that must ALL be present in the rendered terminal tail for the pattern to match. `kind` is `permission` or `question`. Set `disabled: true` to keep an entry in the file without enabling it. Capture live chrome with RUST_LOG=perm_capture=debug. Patterns are tested in declaration order; first match per kind wins.",
+  "patterns": [
+    {
+      "name": "claude_permission",
+      "kind": "permission",
+      "all_of": [
+        "Esc to cancel · Tab to amend"
+      ],
+      "disabled": false
+    },
+    {
+      "name": "claude_permission_alt_example",
+      "kind": "permission",
+      "all_of": [
+        "<replace with a substring unique to this prompt shape>"
+      ],
+      "disabled": true
+    },
+    {
+      "name": "claude_question_template",
+      "kind": "question",
+      "all_of": [
+        "Esc to cancel · Tab to amend",
+        "<replace with a substring unique to question prompts>"
+      ],
+      "disabled": true
+    },
+    {
+      "name": "aider_apply_edits",
+      "kind": "permission",
+      "all_of": [
+        "Apply edits?",
+        "(Y)es"
+      ],
+      "disabled": false
+    },
+    {
+      "name": "aider_add_to_chat",
+      "kind": "permission",
+      "all_of": [
+        "Add ",
+        " to the chat?"
+      ],
+      "disabled": false
+    },
+    {
+      "name": "aider_run_shell",
+      "kind": "permission",
+      "all_of": [
+        "Run shell command?"
+      ],
+      "disabled": false
+    }
+  ]
+}

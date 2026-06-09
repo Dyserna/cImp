@@ -164,6 +164,15 @@ jobs:
           Get-ChildItem src-tauri/target/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageFull/bin/" }
 
+          # Prompt-detection patterns. Ships next to cctts.exe (the loader
+          # reads <exe-dir>/patterns.json) so it's present and editable on a
+          # fresh install instead of only appearing after first run. Source
+          # of truth is scripts/patterns.default.json, kept in sync with the
+          # code defaults by a unit test. Full zip only — the no-models
+          # update zip omits it so re-extracting an update never clobbers a
+          # user's hand-edited patterns.
+          Copy-Item scripts/patterns.default.json "$stageFull/bin/patterns.json"
+
           # Kokoro ONNX model and every voicepack the repo carries via
           # Git LFS. Shipping all voices means the user can switch via
           # Settings -> Audio without re-downloading anything; the

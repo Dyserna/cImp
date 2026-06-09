@@ -172,6 +172,32 @@ mod tests {
     }
 
     #[test]
+    fn shipped_default_file_matches_code_defaults() {
+        // `scripts/patterns.default.json` is copied verbatim into the full
+        // release zip as `bin/patterns.json` so the file is discoverable on
+        // a fresh install (the loader otherwise seeds it on first run). This
+        // test fails if that committed copy drifts from `default_file()` —
+        // regenerate it from the body below when the defaults change.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("patterns.default.json");
+        let text = fs::read_to_string(&path)
+            .expect("read scripts/patterns.default.json");
+        let shipped: PatternsFile =
+            serde_json::from_str(&text).expect("parse scripts/patterns.default.json");
+        // Compare semantically (re-serialize both) so on-disk whitespace
+        // isn't load-bearing — only the content has to match.
+        let shipped_norm = serde_json::to_string_pretty(&shipped).unwrap();
+        let code_norm = serde_json::to_string_pretty(&default_file()).unwrap();
+        assert_eq!(
+            shipped_norm, code_norm,
+            "scripts/patterns.default.json is out of sync with default_file(); \
+             regenerate it from the current defaults"
+        );
+    }
+
+    #[test]
     fn empty_object_yields_empty_pattern_list() {
         // A user who deletes everything ends up with no patterns —
         // detection effectively off. That's a valid choice; we don't

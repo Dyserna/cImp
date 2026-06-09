@@ -15,6 +15,8 @@ Compared to the full zip:
                                         same files are also embedded in
                                         cctts.exe)
   LICENSE / NOTICE / README.txt      <- updated
+  bin\patterns.json                  <- NOT INCLUDED (your edited prompt
+                                        patterns are preserved)
   models\kokoro-v1.0.onnx            <- NOT INCLUDED (preserved from your existing install)
   models\voices\af_heart.bin         <- NOT INCLUDED (preserved from your existing install)
 
@@ -29,9 +31,10 @@ How to use (updating an existing install)
      folder untouched.
   3. Launch cctts as usual.
 
-Your settings file (settings.json next to cctts.exe) and any per-folder
-overlay files (.cctts.custom.config.json) are not affected — they live
-outside `bin\` and the zip never touches them.
+Your settings file (settings.json next to cctts.exe), your edited
+prompt-detection patterns (bin\patterns.json), and any per-folder
+overlay files (.cctts.custom.config.json) are not affected — the zip
+never touches them.
 
 
 Don't have an existing install?

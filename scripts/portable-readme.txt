@@ -38,6 +38,8 @@ What is bundled
   bin\cctts.exe                      the app
   bin\onnxruntime.dll                CPU TTS inference (ORT 1.20)
   bin\onnxruntime_providers_shared.dll
+  bin\patterns.json                  editable prompt-detection patterns
+                                     (see "Customizing prompt detection")
   models\kokoro-v1.0.onnx            Kokoro 82M TTS model
   models\voices\af_heart.bin         default voice
   avatars\Idle.mp4 / Listening.mp4 / Thinking.mp4 / Speaking.mp4 / Error.mp4
@@ -64,6 +66,32 @@ under `avatars\` are there if you want to swap one out:
 
 Until a state is overridden it keeps using the embedded default. Clear
 an override to fall back to the bundled video.
+
+
+Customizing prompt detection
+----------------------------
+
+cctts watches the terminal for prompts it should react to — Claude Code
+tool-use approvals, AskUserQuestion-style questions, and a few Aider
+prompts. The substrings it matches live in:
+
+  bin\patterns.json
+
+Each entry lists one or more substrings under `all_of` that must ALL be
+present in the on-screen text for the pattern to match, plus a `kind`
+("permission" or "question") that decides how cctts reacts. Set
+`disabled: true` to keep an entry without using it. Edit the file and
+restart cctts to apply changes.
+
+If a Claude Code update changes the prompt wording and detection stops
+firing, capture the live text by launching with
+
+    set RUST_LOG=perm_capture=debug
+
+(the rendered prompt is then written to the log under logs\), pick a
+distinctive substring, and add it as a new pattern. If you delete or
+corrupt the file, cctts falls back to built-in defaults so detection
+keeps working.
 
 
 Adding more voicepacks
@@ -96,13 +124,20 @@ Updating
 --------
 
 Download the next release zip and unzip over the top of this folder.
-The zip ships only the exe, DLLs, models, and docs — your existing
-settings.json (next to the exe) and any per-folder
-.cctts.custom.config.json overlays are not in the zip and stay where
-they are.
+The zip ships the exe, DLLs, models, docs, and a default
+bin\patterns.json — your existing settings.json (next to the exe) and
+any per-folder .cctts.custom.config.json overlays are not in the zip and
+stay where they are.
 
-For an exe-only update that preserves your existing model files, grab
-the matching `*-no-models.zip` from the same release.
+Note: the full zip DOES contain bin\patterns.json, so unzipping it over
+the top overwrites any edits you made to that file. If you've customized
+your prompt-detection patterns, back the file up first, or use the
+no-models update zip below (which omits patterns.json and leaves your
+copy untouched).
+
+For an exe-only update that preserves your existing model files and
+patterns.json, grab the matching `*-no-models.zip` from the same
+release.
 
 
 Uninstall

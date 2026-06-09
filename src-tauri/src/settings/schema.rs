@@ -1160,11 +1160,12 @@ impl Default for SystemStatsSettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UiSettings {
-    /// Active UI chrome theme. Three values currently ship: `"modern-dark"`
+    /// Active UI chrome theme. Four values currently ship: `"modern-dark"`
     /// (slate-blue + mint, OS-native window chrome), `"tui-yellow"`
     /// (gruvbox surfaces + bright yellow accent, custom title bar,
-    /// ratatui aesthetic), and `"tui-purple"` (same as tui-yellow with
-    /// a gruvbox bright-purple accent). New installs land on
+    /// ratatui aesthetic), `"tui-purple"` (same as tui-yellow with a
+    /// gruvbox bright-purple accent), and `"tui-orange"` (same surfaces
+    /// with Claude Code's accent orange, #d77757). New installs land on
     /// `"tui-yellow"`. The pre-V1.13 `"tui"` value is rewritten to
     /// `"tui-yellow"` by the v12 → v13 migration so existing users keep
     /// the same look. Existing settings.json files otherwise keep

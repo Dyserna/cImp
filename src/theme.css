@@ -421,6 +421,132 @@
     'Source Code Pro', Consolas, 'Courier New', monospace;
 }
 
+/* tui-orange theme — Gruvbox Dark palette + Claude Code's accent orange.
+   Started as a copy of `tui-purple` per the isolation policy at the top
+   of this file. Pair with `theme.tui-orange.css`. The accent family is
+   keyed off #d77757 — the exact orange Claude Code paints its spinner
+   glyph (✻) and chrome in (ANSI 38;2;215;119;87). Same gruvbox surfaces
+   as the other tui-* themes today; future edits to either theme stay
+   local to that theme's block — do not refactor common tokens out. */
+[data-theme="tui-orange"] {
+  /* Surfaces — Gruvbox dark0_hard → dark2 (warm near-black to brown-
+     gray). Tight contrast between layers; depth comes from borders. */
+  --surface-0:       #1d2021;   /* dark0_hard, body bg */
+  --surface-1:       #282828;   /* dark0, panes */
+  --surface-2:       #32302f;   /* dark0_soft, tab bar / dialog body */
+  --surface-3:       #3c3836;   /* dark1, hover-elevated */
+  --surface-4:       #504945;   /* dark2, deeper hover */
+
+  --surface-sunken:  #1d2021;
+  --surface-deep:    #16181a;
+  --surface-input:   #32302f;
+
+  /* Text — Gruvbox fg → fg4 (cream → tan-gray). */
+  --text-primary:    #ebdbb2;   /* fg / fg1, main cream */
+  --text-bright:     #fbf1c7;   /* fg0 */
+  --text-on-accent:  #1d2021;   /* dark text reads on the orange fill */
+  --text-secondary:  #d5c4a1;   /* fg2 */
+  --text-quiet:      #bdae93;   /* fg3 */
+  --text-quiet-strong: #a89984; /* fg4 */
+  --text-tertiary:   #928374;   /* gray */
+  --text-faint:      #7c6f64;   /* dark3 */
+  --text-disabled:   #665c54;
+  --text-disabled-deep: #504945;
+
+  /* Accent — Claude Code orange. #d77757 is the terracotta the Claude
+     Code CLI uses for its active spinner and brand chrome; the brighter
+     and softer steps are tuned around it. */
+  --accent:          #d77757;   /* Claude Code orange */
+  --accent-hover:    #e08a6a;
+  --accent-bright:   #f0a98e;
+  --accent-soft:     #9c4e34;   /* faded terracotta for muted CTAs */
+  --accent-soft-hover: #c0613f;
+  --accent-info:     #83a598;   /* gruvbox bright blue */
+  --accent-fg:       #1d2021;
+  --accent-muted:    rgba(215, 119, 87, 0.15);
+
+  /* Waveform / avatar-border default — matches the orange accent. */
+  --waveform-color:  #d77757;
+
+  /* Semantics — Gruvbox bright variants. Warning stays yellow on
+     purpose; semantic colors do not follow the accent. */
+  --success:         #b8bb26;   /* bright green */
+  --warning:         #fabd2f;   /* bright yellow */
+  --danger:          #fb4934;   /* bright red */
+  --awaiting:        var(--warning);
+
+  /* Danger — gruvbox red, warm-tinted surfaces. */
+  --surface-danger:         #3c2828;
+  --surface-danger-strong:  #4a2828;
+  --surface-danger-hover:   #5c2c2c;
+  --surface-danger-bg:      #2a1d1d;
+  --surface-danger-deep:    #1d1515;
+  --surface-danger-soft:    #2c2020;
+  --surface-danger-faint:   #1a1414;
+  --text-danger-soft:       #fb4934;
+  --text-danger-strong:     #fe8181;
+  --text-danger-bright:     #fb4934;
+  --text-danger-quiet:      #cc241d;
+  --text-danger-faint:      #9d0006;
+  --text-danger-pale:       #fb6e6e;
+  --text-danger-pastel:     #fb8888;
+  --text-danger-extra:      #fbafaf;
+  --text-danger-mute:       #d5a5a5;
+  --border-danger-strong:   #fb4934;
+  --border-danger:          #cc241d;
+  --border-danger-soft:     #803838;
+
+  /* Warning — gruvbox yellow on warm dark. */
+  --surface-warning:        #3a2e1a;
+  --surface-warning-deep:   #2a2010;
+  --surface-warning-faint:  #1d1608;
+  --text-warning:           #fabd2f;
+  --text-warning-bright:    #fce074;
+  --border-warning:         #d79921;
+
+  /* Success — gruvbox green. */
+  --surface-success:        #283228;
+  --text-success:           #b8bb26;
+  --text-success-bright:    #d3d349;
+
+  /* Info — gruvbox aqua/blue. */
+  --surface-info:           #1d3030;
+  --surface-info-deep:      #142222;
+  --surface-info-faint:     #0d1818;
+  --text-info:              #8ec07c;   /* bright aqua */
+  --text-info-bright:       #aedfa0;
+  --text-info-quiet:        #689d6a;
+  --border-info:            #689d6a;
+  --border-info-soft:       #3a4a3a;
+  --accent-purple:          #d3869b;   /* gruvbox bright purple (kind-color) */
+
+  /* Borders — gruvbox bg3/bg4. Warm gray to match the palette. */
+  --border-faint:    #3c3836;
+  --border-subtle:   #504945;
+  --border-default:  #665c54;
+  --border-strong:   #7c6f64;
+  --border-focus:    var(--accent);
+
+  /* Radii — fully square. Terminals don't round. */
+  --radius-sm:    0;
+  --radius-md:    0;
+  --radius-lg:    0;
+  --radius-pill:  0;
+
+  /* Elevation — none. Borders carry the depth. */
+  --shadow-sm: none;
+  --shadow-md: none;
+  --shadow-lg: none;
+
+  /* Motion — instant. CRTs don't ease. */
+  --motion-fast: 0ms;
+  --motion-base: 0ms;
+
+  /* Typography — monospace cascade. */
+  font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code',
+    'Source Code Pro', Consolas, 'Courier New', monospace;
+}
+
 @media (prefers-reduced-motion: reduce) {
   :root {
     --motion-fast: 0ms;

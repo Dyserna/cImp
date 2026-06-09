@@ -24,7 +24,7 @@ const STATE_FILES: Record<AvatarState, string> = {
 /// Per the theme isolation policy in `src/theme.css`, every theme owns
 /// its own avatar folder — derivative themes get a copy of the source
 /// folder, never a shared one.
-const KNOWN_THEMES = new Set(['modern-dark', 'tui-yellow', 'tui-purple']);
+const KNOWN_THEMES = new Set(['modern-dark', 'tui-yellow', 'tui-purple', 'tui-orange']);
 const FALLBACK_THEME = 'modern-dark';
 
 function themeFolder(theme: string): string {

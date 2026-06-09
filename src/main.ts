@@ -7,6 +7,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import './theme.css';
 import './theme.tui-yellow.css';
 import './theme.tui-purple.css';
+import './theme.tui-orange.css';
 import './app.css';
 
 // Set the active theme synchronously before Svelte mounts so the first

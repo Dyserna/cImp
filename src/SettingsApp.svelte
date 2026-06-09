@@ -939,6 +939,7 @@
               <option value="modern-dark">Modern Dark</option>
               <option value="tui-yellow">TUI - Yellow</option>
               <option value="tui-purple">TUI - Purple</option>
+              <option value="tui-orange">TUI - Orange</option>
             </select>
           </label>
 

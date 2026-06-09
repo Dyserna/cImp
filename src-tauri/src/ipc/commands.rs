@@ -324,6 +324,25 @@ pub async fn tts_speak(state: State<'_, AppState>, text: String) -> AppResult<()
     Ok(())
 }
 
+/// Fetch the current Claude Code usage snapshot (session 5h + weekly 7d) for
+/// the bottom-bar usage tracker. Returns `None` when usage can't be obtained
+/// (not logged in, endpoint unreachable) — the frontend hides the widget in
+/// that case. Polled by the frontend on `usage.poll_interval_secs`.
+#[tauri::command]
+pub async fn get_claude_usage() -> AppResult<crate::usage::UsageResult> {
+    Ok(crate::usage::fetch_usage().await)
+}
+
+/// Sample the system-monitor stats (CPU / memory / GPU / network) for the
+/// bottom-bar panel. Polled by the frontend on `system_stats.poll_interval_secs`
+/// (default 1s); the frontend keeps its own history for the sparklines.
+#[tauri::command]
+pub async fn get_system_stats(
+    state: State<'_, AppState>,
+) -> AppResult<crate::sysmon::SystemStatsSnapshot> {
+    Ok(state.sysmon.sample())
+}
+
 #[tauri::command]
 pub async fn pty_resize(
     state: State<'_, AppState>,

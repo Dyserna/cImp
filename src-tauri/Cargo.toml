@@ -31,6 +31,16 @@ vte = "0.13"
 shlex = "1"
 uuid = { version = "1", features = ["v4"] }
 
+# Claude Code usage tracker: GETs the undocumented oauth/usage endpoint.
+# rustls-tls keeps TLS pure-Rust (no system OpenSSL) for the single-binary build.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# System-monitor panel (CPU / memory / network). Pure-Rust, no admin.
+sysinfo = { version = "0.36", default-features = false, features = ["system", "network"] }
+# NVIDIA GPU stats (utilization / memory / temperature). Loads nvml.dll at
+# runtime; absent driver → GPU section degrades to n/a.
+nvml-wrapper = "0.12"
+
 # TTS (Kokoro via ONNX Runtime). misaki-rs default features include espeak-ng
 # fallback for OOV words; the resulting binary is GPLv3 (see NOTICE).
 misaki-rs = "0.3"

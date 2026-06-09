@@ -9,11 +9,15 @@
   import LayoutsPopover from './status/LayoutsPopover.svelte';
   import SettingsButton from './status/SettingsButton.svelte';
   import AvatarToggleButton from './status/AvatarToggleButton.svelte';
+  import UsageMeter from './status/UsageMeter.svelte';
+  import SystemStats from './status/SystemStats.svelte';
 </script>
 
 <div class="status-bar">
   <div class="status-bar-left">
     <LayoutsPopover />
+    <UsageMeter />
+    <SystemStats />
   </div>
   <div class="status-bar-right">
     <AvatarToggleButton />
@@ -30,8 +34,8 @@
     flex-direction: row;
     align-items: center;
     justify-content: space-between;
-    height: 28px;
-    flex: 0 0 28px;
+    height: 44px;
+    flex: 0 0 44px;
     background: var(--surface-sunken);
     border-top: 1px solid var(--border-subtle);
     padding: 0 var(--space-3);
@@ -39,6 +43,10 @@
   }
   .status-bar-left {
     flex: 1 1 auto;
+    display: inline-flex;
+    flex-direction: row;
+    align-items: center;
+    min-width: 0;
   }
   .status-bar-right {
     display: inline-flex;

@@ -56,6 +56,10 @@ pub struct Settings {
     pub avatar: AvatarSettings,
     pub display: DisplaySettings,
     pub behavior: BehaviorSettings,
+    /// Bottom-bar Claude Code usage tracker config.
+    pub usage: UsageSettings,
+    /// Bottom-bar system-monitor panel config.
+    pub system_stats: SystemStatsSettings,
     pub compose: ComposeSettings,
     pub shortcuts: ShortcutSettings,
     /// Ordered list of tabs. AI builtins occupy the canonical leading
@@ -127,6 +131,8 @@ impl Default for Settings {
             avatar: AvatarSettings::default(),
             display: DisplaySettings::default(),
             behavior: BehaviorSettings::default(),
+            usage: UsageSettings::default(),
+            system_stats: SystemStatsSettings::default(),
             compose: ComposeSettings::default(),
             shortcuts: ShortcutSettings::default(),
             tabs: Vec::new(),
@@ -1080,6 +1086,73 @@ impl Default for BehaviorSettings {
             copy_on_select: true,
             paste_on_right_click: true,
             speak_selection_on_right_click: true,
+        }
+    }
+}
+
+/// Bottom-bar Claude Code usage tracker (session 5h + weekly 7d). The
+/// per-element flags toggle individual pieces of each window's inline
+/// readout; they apply to both windows. `enabled` gates the whole widget.
+/// Backward-compatible via serde-default — no migration bump.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct UsageSettings {
+    /// Overall on/off for the inline usage widget.
+    pub enabled: bool,
+    /// Show the proportional fill bar.
+    pub show_bar: bool,
+    /// Show the rounded utilization percentage.
+    pub show_percentage: bool,
+    /// Show the live countdown to reset.
+    pub show_countdown: bool,
+    /// Show the local reset clock time.
+    pub show_reset_clock: bool,
+    /// How often the frontend polls the usage endpoint, in seconds. The UI
+    /// clamps this to a sane minimum so the undocumented endpoint isn't
+    /// hammered.
+    pub poll_interval_secs: u32,
+}
+
+impl Default for UsageSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_bar: true,
+            show_percentage: true,
+            show_countdown: true,
+            show_reset_clock: true,
+            poll_interval_secs: 60,
+        }
+    }
+}
+
+/// Bottom-bar system-monitor panel (CPU / memory / GPU / network), shown to
+/// the right of the Claude usage meter. Backward-compatible via serde-default.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct SystemStatsSettings {
+    /// Overall on/off for the system-monitor panel.
+    pub enabled: bool,
+    /// Poll cadence in seconds (the sparklines tick locally between polls).
+    pub poll_interval_secs: u32,
+    /// Per-component visibility. `show_gpu_temp` is a sub-toggle of `show_gpu`.
+    pub show_cpu: bool,
+    pub show_memory: bool,
+    pub show_gpu: bool,
+    pub show_gpu_temp: bool,
+    pub show_network: bool,
+}
+
+impl Default for SystemStatsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_secs: 1,
+            show_cpu: true,
+            show_memory: true,
+            show_gpu: true,
+            show_gpu_temp: true,
+            show_network: true,
         }
     }
 }

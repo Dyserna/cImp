@@ -11,8 +11,10 @@ mod pty;
 mod settings;
 mod shell;
 mod state;
+mod sysmon;
 mod tabs;
 mod tts;
+mod usage;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,10 +28,12 @@ use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
-    consume_settings_deep_link, content_clear, content_open_folder, list_tabs, list_voices,
-    open_settings_window, open_settings_window_to_tab, pty_get_scrollback, pty_rebind_channel,
-    pty_resize, pty_restart, pty_start, pty_write, request_tab_restart, restart_shell_tab,
-    set_active_tab, settings_get, settings_update, tab_activate, tts_speak, tts_test,
+    consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
+    get_system_stats, list_tabs,
+    list_voices, open_settings_window, open_settings_window_to_tab, pty_get_scrollback,
+    pty_rebind_channel, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
+    restart_shell_tab, set_active_tab, settings_get, settings_update, tab_activate, tts_speak,
+    tts_test,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -207,6 +211,7 @@ fn main() {
         settings: settings_handle.clone(),
         audio: audio_slot.clone(),
         pending_settings_deep_link: Arc::new(Mutex::new(None)),
+        sysmon: crate::sysmon::SystemStatsState::new(),
         lifecycle_serializer: Arc::new(TokioMutex::new(())),
     };
 
@@ -312,6 +317,8 @@ fn main() {
             pty_resize,
             tts_test,
             tts_speak,
+            get_claude_usage,
+            get_system_stats,
             settings_get,
             settings_update,
             ai_tool_tab_defaults,

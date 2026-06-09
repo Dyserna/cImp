@@ -91,6 +91,35 @@ export interface BehaviorSettings {
   speak_selection_on_right_click: boolean;
 }
 
+export interface UsageSettings {
+  /// Overall on/off for the inline bottom-bar usage widget.
+  enabled: boolean;
+  /// Show the proportional fill bar.
+  show_bar: boolean;
+  /// Show the rounded utilization percentage.
+  show_percentage: boolean;
+  /// Show the live countdown to reset.
+  show_countdown: boolean;
+  /// Show the local reset clock time.
+  show_reset_clock: boolean;
+  /// Poll cadence for the usage endpoint, in seconds. Clamped to a sane
+  /// minimum in the UI so the undocumented endpoint isn't hammered.
+  poll_interval_secs: number;
+}
+
+export interface SystemStatsSettings {
+  /// Overall on/off for the bottom-bar system-monitor panel.
+  enabled: boolean;
+  /// Poll cadence in seconds (sparklines tick locally between polls).
+  poll_interval_secs: number;
+  /// Per-component visibility (show_gpu_temp is a sub-toggle of show_gpu).
+  show_cpu: boolean;
+  show_memory: boolean;
+  show_gpu: boolean;
+  show_gpu_temp: boolean;
+  show_network: boolean;
+}
+
 export interface ComposeSettings {
   min_height_px: number;
   max_height_px: number;
@@ -379,6 +408,8 @@ export interface Settings {
   avatar: AvatarSettings;
   display: DisplaySettings;
   behavior: BehaviorSettings;
+  usage: UsageSettings;
+  system_stats: SystemStatsSettings;
   compose: ComposeSettings;
   shortcuts: ShortcutSettings;
   /// Ordered tab configs. Reserved ids (claude, claude-local, shell-default-1)
@@ -538,6 +569,23 @@ export function defaultSettings(): Settings {
       copy_on_select: true,
       paste_on_right_click: true,
       speak_selection_on_right_click: true,
+    },
+    usage: {
+      enabled: true,
+      show_bar: true,
+      show_percentage: true,
+      show_countdown: true,
+      show_reset_clock: true,
+      poll_interval_secs: 60,
+    },
+    system_stats: {
+      enabled: true,
+      poll_interval_secs: 1,
+      show_cpu: true,
+      show_memory: true,
+      show_gpu: true,
+      show_gpu_temp: true,
+      show_network: true,
     },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {

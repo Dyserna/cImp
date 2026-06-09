@@ -31,6 +31,13 @@ pub enum PatternKind {
     /// the user to choose between options. Sets `awaiting_question` and
     /// fires the `question` notification template.
     Question,
+    /// Claude is actively generating — its "busy" chrome (the
+    /// `esc to interrupt` footer) is on screen. Drives the avatar's
+    /// Thinking↔Idle activity instead of the byte-silence timer:
+    /// `Detected` maps to `ClaudeOutputStarted`, `Resolved` to
+    /// `ClaudeOutputStopped`. Content-based so a thinking pause (no output
+    /// for >0.5s) no longer collapses the avatar to Idle mid-work.
+    Working,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,20 +87,38 @@ pub fn default_patterns() -> Vec<PermissionPattern> {
             ],
             disabled: true,
         },
-        // Question template: ships disabled because the content marker
-        // varies across Claude Code releases. Capture the live chrome with
-        // `RUST_LOG=perm_capture=debug`, fill in the marker, and flip
-        // `disabled` to false. Patterns are tested in declaration order
-        // so listing this entry BEFORE the bare permission pattern (when
-        // enabled) makes the more-specific kind win for shared chrome.
+        // Claude Code's AskUserQuestion prompt. Unlike the permission
+        // prompt it renders its own footer ("Enter to select · ↑/↓ to
+        // navigate · Esc to cancel") and always appends a free-text
+        // "Type something" choice. Neither marker appears in permission
+        // prompts or normal output, and the pair is independent of the
+        // specific question text, so it identifies the question UI for any
+        // AskUserQuestion. Both sit at the bottom of the box, so they
+        // survive the rendered-tail window even when a long question
+        // scrolls off the top. Captured 2026-06-09 against Claude Code's
+        // current chrome; re-capture with RUST_LOG=perm_capture=debug if a
+        // future release changes the footer or option wording.
         PermissionPattern {
-            name: "claude_question_template".to_string(),
+            name: "claude_question".to_string(),
             kind: PatternKind::Question,
             all_of: vec![
-                "Esc to cancel · Tab to amend".to_string(),
-                "<replace with a substring unique to question prompts>".to_string(),
+                "Enter to select".to_string(),
+                "Type something".to_string(),
             ],
-            disabled: true,
+            disabled: false,
+        },
+        // Claude's "busy" footer, shown only while a request is in flight
+        // (and never during a permission/question prompt, where Claude is
+        // waiting on the user). Drives the avatar's Thinking state: present
+        // = working, absent = done. Lowercase "esc" distinguishes it from
+        // the permission prompt's "Esc to cancel". If a future Claude Code
+        // release reworks this footer, re-capture with
+        // RUST_LOG=perm_capture=debug and update the marker here.
+        PermissionPattern {
+            name: "claude_working".to_string(),
+            kind: PatternKind::Working,
+            all_of: vec!["esc to interrupt".to_string()],
+            disabled: false,
         },
         // Aider's "Apply edits?" prompt. Aider prints a (Y)es/(N)o/etc.
         // option line; the trailing `(Y)es` is the most stable marker
@@ -189,7 +214,11 @@ impl PermissionDetector {
         }
 
         let mut out = Vec::new();
-        for kind in [PatternKind::Permission, PatternKind::Question] {
+        for kind in [
+            PatternKind::Permission,
+            PatternKind::Question,
+            PatternKind::Working,
+        ] {
             let prev = self.last_detected.get(&kind).cloned();
             let now = hits.get(&kind).map(|p| p.name.clone());
             match (prev, now) {
@@ -416,5 +445,86 @@ mod tests {
         // substring pattern always-true.
         let mut d = PermissionDetector::new(vec![perm("partial", &["", "real"])]);
         assert!(d.check("real").is_empty());
+    }
+
+    // Rendered-tail fixtures captured from Claude Code via
+    // RUST_LOG=perm_capture=debug on 2026-06-09. Trimmed to the bottom of
+    // each prompt (what the detector's tail window actually sees) and with
+    // the ANSI already stripped, as the detector receives it.
+    const PERMISSION_TAIL: &str = "   New-Item -ItemType File -Path \"delete.me\"\n\n \
+        Do you want to proceed?\n > 1. Yes\n  2. Yes, and don't ask again\n   3. No\n\n \
+        Esc to cancel · Tab to amend · ctrl+e to explain\n";
+    const QUESTION_TAIL: &str = "Which primary color do you prefer?\n\n> 1. Red\n     \
+        A warm, high-energy primary color.\n  2. Green\n  3. Blue\n  4. Type something.\n  \
+        5. Chat about this\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n";
+
+    #[test]
+    fn shipped_defaults_detect_question_not_permission() {
+        // The AskUserQuestion box must fire the Question kind only — its
+        // footer shares "Esc to cancel" with the permission prompt but lacks
+        // "Tab to amend", so the permission pattern must not also trip.
+        let mut d = PermissionDetector::new(default_patterns());
+        let out = d.check(QUESTION_TAIL);
+        assert_eq!(out.len(), 1, "expected exactly one transition: {out:?}");
+        assert!(matches!(
+            &out[0],
+            PatternTransition::Detected { kind: PatternKind::Question, pattern_name }
+                if pattern_name == "claude_question"
+        ));
+    }
+
+    #[test]
+    fn shipped_defaults_detect_permission_not_question() {
+        // The permission prompt must fire Permission only — it contains
+        // neither "Enter to select" nor "Type something".
+        let mut d = PermissionDetector::new(default_patterns());
+        let out = d.check(PERMISSION_TAIL);
+        assert_eq!(out.len(), 1, "expected exactly one transition: {out:?}");
+        assert!(matches!(
+            &out[0],
+            PatternTransition::Detected { kind: PatternKind::Permission, pattern_name }
+                if pattern_name == "claude_permission"
+        ));
+    }
+
+    // Working-state footer while Claude is generating. Note lowercase "esc",
+    // distinct from the permission prompt's "Esc to cancel".
+    const WORKING_TAIL: &str = "✢ Pouncing… (4s · ↓ 176 tokens · thinking)\n\n\
+        ────────────────────\n> \n────────────────────\n  esc to interrupt\n";
+
+    #[test]
+    fn shipped_defaults_detect_working_marker() {
+        let mut d = PermissionDetector::new(default_patterns());
+        let out = d.check(WORKING_TAIL);
+        assert_eq!(out.len(), 1, "expected exactly one transition: {out:?}");
+        assert!(matches!(
+            &out[0],
+            PatternTransition::Detected { kind: PatternKind::Working, pattern_name }
+                if pattern_name == "claude_working"
+        ));
+        // Footer gone (back to an idle prompt) → Working resolves, which is
+        // what releases the avatar to Idle.
+        let out2 = d.check("> \n  ? for shortcuts\n");
+        assert_eq!(out2.len(), 1, "expected exactly one transition: {out2:?}");
+        assert!(matches!(
+            &out2[0],
+            PatternTransition::Resolved { kind: PatternKind::Working, .. }
+        ));
+    }
+
+    #[test]
+    fn working_marker_absent_from_permission_and_question() {
+        // The Working marker must not trip on the other two prompt UIs —
+        // when Claude is waiting on the user it is not "working".
+        let mut d = PermissionDetector::new(default_patterns());
+        assert!(!matches!(
+            d.check(PERMISSION_TAIL).first(),
+            Some(PatternTransition::Detected { kind: PatternKind::Working, .. })
+        ));
+        let mut d2 = PermissionDetector::new(default_patterns());
+        assert!(!matches!(
+            d2.check(QUESTION_TAIL).first(),
+            Some(PatternTransition::Detected { kind: PatternKind::Working, .. })
+        ));
     }
 }

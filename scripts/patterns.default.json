@@ -18,13 +18,21 @@
       "disabled": true
     },
     {
-      "name": "claude_question_template",
+      "name": "claude_question",
       "kind": "question",
       "all_of": [
-        "Esc to cancel · Tab to amend",
-        "<replace with a substring unique to question prompts>"
+        "Enter to select",
+        "Type something"
       ],
-      "disabled": true
+      "disabled": false
+    },
+    {
+      "name": "claude_working",
+      "kind": "working",
+      "all_of": [
+        "esc to interrupt"
+      ],
+      "disabled": false
     },
     {
       "name": "aider_apply_edits",

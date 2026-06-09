@@ -906,6 +906,10 @@ fn transition(
 
         (Idle, UserKeystroke { .. }) => Listening,
         (Idle, TtsPlaybackStarted { .. }) => Speaking,
+        // Claude began producing output without a fresh submit (resumed
+        // session, slash command, hook-driven turn). The marker-driven
+        // ClaudeOutputStarted is reliable enough to surface Thinking.
+        (Idle, ClaudeOutputStarted { .. }) => Thinking,
         (Idle, _) => Idle,
     }
 }
@@ -1084,6 +1088,13 @@ mod tests {
     #[test]
     fn thinking_claude_done_returns_idle() {
         assert_eq!(t(Thinking, ClaudeOutputStopped { tab: tab() }), Idle);
+    }
+
+    #[test]
+    fn idle_claude_output_starts_thinking() {
+        // Marker-driven ClaudeOutputStarted surfaces Thinking even without a
+        // fresh UserSubmit (resumed session, slash command, hook turn).
+        assert_eq!(t(Idle, ClaudeOutputStarted { tab: tab() }), Thinking);
     }
 
     #[test]

@@ -134,9 +134,10 @@ mod tests {
         // there as a multi-pattern declaration example.
         assert_eq!(parsed.patterns[1].kind, PatternKind::Permission);
         assert!(parsed.patterns[1].disabled);
-        // Third is the disabled question template.
+        // Third is the active AskUserQuestion pattern.
         assert_eq!(parsed.patterns[2].kind, PatternKind::Question);
-        assert!(parsed.patterns[2].disabled);
+        assert_eq!(parsed.patterns[2].name, "claude_question");
+        assert!(!parsed.patterns[2].disabled);
     }
 
     #[test]

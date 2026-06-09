@@ -29,15 +29,31 @@ const PERMISSION_SCAN_TAIL: usize = 1000;
 /// 200ms stability and 500ms max-hold thresholds fire promptly.
 const FLUSH_TICK: Duration = Duration::from_millis(50);
 
-/// Output-burst duration before we consider the child to be actually
-/// generating. Real responses sustain bytes for seconds; per-keystroke
-/// TUI input-box redraws are tens of ms. Anything shorter is treated as
-/// churn and ignored.
+/// Claude-activity (avatar Thinking) detection is primarily content-based:
+/// the `claude_working` pattern matches Claude's on-screen busy footer
+/// (`esc to interrupt`), which is present for exactly as long as a request
+/// is in flight. While that marker shows we hold `output_active` regardless
+/// of the byte stream, so a thinking pause (Claude routinely emits nothing
+/// for >0.5s mid-response) no longer collapses the avatar to Idle. The two
+/// timers below are backstops only.
+///
+/// Byte-burst duration before the timer alone considers the child to be
+/// generating — the fallback path for the rare response that never paints
+/// the marker. Real responses sustain bytes for seconds; per-keystroke TUI
+/// redraws are tens of ms, so anything shorter is churn.
 const CLAUDE_BURST_MIN: Duration = Duration::from_millis(1000);
 
-/// Quiet interval that closes a burst. After this much silence we fire
-/// ClaudeOutputStopped (if Started was fired) and reset the burst tracker.
+/// Quiet interval that closes a burst once the marker is gone. Only fires
+/// `ClaudeOutputStopped` when `claude_working` is NOT currently matched —
+/// the marker, not this timer, decides Idle while Claude is working.
 const CLAUDE_QUIET: Duration = Duration::from_millis(500);
+
+/// Safety valve: if the working marker is somehow still matched but the
+/// byte stream has been completely silent this long, treat it as stale
+/// (e.g. ghost footer text left in the cell grid) and release Idle. The
+/// live spinner repaints its elapsed-second counter ~once/sec, so a true
+/// in-flight request keeps bytes flowing well under this window.
+const CLAUDE_WORKING_STALE: Duration = Duration::from_secs(6);
 
 #[derive(serde::Serialize, Clone)]
 struct PtyExitPayload {
@@ -124,8 +140,8 @@ pub fn spawn_reader(
 /// route it to the correct per-tab `TabState`.
 ///
 /// Per-kind gating (Phase 3 of MILESTONE-V3-01):
-/// - AI tabs: full pipeline — permission detection, claude-output burst
-///   tracker, TTS dispatch.
+/// - AI tabs: full pipeline — permission/question/working detection,
+///   claude-output activity tracking, TTS dispatch.
 /// - Shell tabs: bypass all three. The vte parser still runs (xterm.js needs
 ///   correctly-rendered bytes) but no TTS request is ever sent, no permission
 ///   pattern is scanned, and `ClaudeOutputStarted/Stopped` never fires for
@@ -176,6 +192,10 @@ pub fn spawn_processor(
         let mut output_active = false;
         let mut burst_start: Option<tokio::time::Instant> = None;
         let mut last_byte_time: Option<tokio::time::Instant> = None;
+        // True while the `claude_working` marker ("esc to interrupt") is on
+        // screen. Authoritative for the avatar's Thinking state; the byte
+        // timers above are only a fallback. Updated by run_permission_check.
+        let mut working_active = false;
 
         loop {
             tokio::select! {
@@ -237,7 +257,13 @@ pub fn spawn_processor(
                                     burst_start = Some(now);
                                 }
                                 last_byte_time = Some(now);
-                                run_permission_check(&tab, &mut detector, &layer, &state_signals);
+                                run_permission_check(
+                                    &tab,
+                                    &mut detector,
+                                    &layer,
+                                    &state_signals,
+                                    &mut working_active,
+                                );
                             }
                         }
                         None => {
@@ -261,27 +287,51 @@ pub fn spawn_processor(
                             burst_start = Some(now);
                         }
                         last_byte_time = Some(now);
-                        run_permission_check(&tab, &mut detector, &layer, &state_signals);
+                        run_permission_check(
+                            &tab,
+                            &mut detector,
+                            &layer,
+                            &state_signals,
+                            &mut working_active,
+                        );
                     }
 
-                    if !is_shell && !output_active {
-                        if let Some(start) = burst_start {
-                            if start.elapsed() >= CLAUDE_BURST_MIN {
+                    // Avatar activity (Thinking↔Idle). Content-first: the
+                    // `claude_working` marker is authoritative while it's on
+                    // screen; the byte timers are fallbacks.
+                    if !is_shell {
+                        if !output_active {
+                            // Enter "working" on the marker, or — for a
+                            // response that never paints it — a sustained
+                            // byte burst.
+                            let burst_ready = burst_start
+                                .map_or(false, |s| s.elapsed() >= CLAUDE_BURST_MIN);
+                            if working_active || burst_ready {
                                 output_active = true;
                                 let _ = state_signals
                                     .try_send(StateSignal::ClaudeOutputStarted { tab: tab.clone() });
                             }
-                        }
-                    }
-
-                    if !is_shell {
-                        if let Some(t) = last_byte_time {
-                            if t.elapsed() >= CLAUDE_QUIET {
-                                if output_active {
-                                    output_active = false;
-                                    let _ = state_signals
-                                        .try_send(StateSignal::ClaudeOutputStopped { tab: tab.clone() });
+                        } else {
+                            // Leave "working" only once the marker is gone and
+                            // the stream has settled — a thinking pause with
+                            // the marker still up must NOT release Idle. The
+                            // stale guard frees a marker left ghosting in the
+                            // grid with no underlying byte activity.
+                            let quiet = last_byte_time
+                                .map_or(false, |t| t.elapsed() >= CLAUDE_QUIET);
+                            let stale = last_byte_time
+                                .map_or(false, |t| t.elapsed() >= CLAUDE_WORKING_STALE);
+                            if (!working_active && quiet) || stale {
+                                if stale && working_active {
+                                    // Looked stuck — drop the detector's
+                                    // latched Working state so a genuine
+                                    // resumption can re-trigger it.
+                                    detector.force_clear(PatternKind::Working);
+                                    working_active = false;
                                 }
+                                output_active = false;
+                                let _ = state_signals
+                                    .try_send(StateSignal::ClaudeOutputStopped { tab: tab.clone() });
                                 burst_start = None;
                                 last_byte_time = None;
                             }
@@ -302,6 +352,7 @@ fn run_permission_check(
     detector: &mut PermissionDetector,
     layer: &ProcessingLayer,
     state_signals: &mpsc::Sender<StateSignal>,
+    working_active: &mut bool,
 ) {
     let rendered = layer.recent_rendered(PERMISSION_SCAN_TAIL);
     // Opt-in capture for pattern characterization. Enable with
@@ -313,25 +364,39 @@ fn run_permission_check(
         tracing::debug!(target: "perm_capture", ?tab, rendered = %escaped, "perm capture");
     }
     for transition in detector.check(&rendered) {
-        let signal = match transition {
+        match transition {
             PatternTransition::Detected { kind: PatternKind::Permission, pattern_name } => {
                 debug!(?tab, pattern = pattern_name, "permission prompt detected");
-                StateSignal::PermissionPromptDetected { tab: tab.clone() }
+                let _ = state_signals
+                    .try_send(StateSignal::PermissionPromptDetected { tab: tab.clone() });
             }
             PatternTransition::Resolved { kind: PatternKind::Permission, pattern_name } => {
                 debug!(?tab, pattern = pattern_name, "permission prompt resolved");
-                StateSignal::PermissionPromptResolved { tab: tab.clone() }
+                let _ = state_signals
+                    .try_send(StateSignal::PermissionPromptResolved { tab: tab.clone() });
             }
             PatternTransition::Detected { kind: PatternKind::Question, pattern_name } => {
                 debug!(?tab, pattern = pattern_name, "question prompt detected");
-                StateSignal::QuestionPromptDetected { tab: tab.clone() }
+                let _ = state_signals
+                    .try_send(StateSignal::QuestionPromptDetected { tab: tab.clone() });
             }
             PatternTransition::Resolved { kind: PatternKind::Question, pattern_name } => {
                 debug!(?tab, pattern = pattern_name, "question prompt resolved");
-                StateSignal::QuestionPromptResolved { tab: tab.clone() }
+                let _ = state_signals
+                    .try_send(StateSignal::QuestionPromptResolved { tab: tab.clone() });
             }
-        };
-        let _ = state_signals.try_send(signal);
+            // Working transitions don't emit directly — they update the
+            // marker level the activity block reads to drive ClaudeOutput
+            // Started/Stopped (content-first, byte timers as fallback).
+            PatternTransition::Detected { kind: PatternKind::Working, pattern_name } => {
+                debug!(?tab, pattern = pattern_name, "claude working detected");
+                *working_active = true;
+            }
+            PatternTransition::Resolved { kind: PatternKind::Working, pattern_name } => {
+                debug!(?tab, pattern = pattern_name, "claude working resolved");
+                *working_active = false;
+            }
+        }
     }
 }
 

@@ -270,8 +270,12 @@ jobs:
 
           if grep -q "^## \[$version\]" CHANGELOG.md; then
             echo "found CHANGELOG section for $version"
-            awk -v ver="$version" '
-              $0 ~ "^## \\[" ver "\\]" { found=1; print; next }
+            # Match the heading as a literal prefix rather than a regex:
+            # the previous `$0 ~ "^## \\[" ver "\\]"` form had gawk treat
+            # `\[`/`\]` as character classes (not literal brackets), so the
+            # section was never matched and the notes came out empty.
+            awk -v hdr="## [$version]" '
+              index($0, hdr) == 1 { found=1; print; next }
               found && /^## / { exit }
               found { print }
             ' CHANGELOG.md > "$out"

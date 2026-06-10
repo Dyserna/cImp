@@ -98,17 +98,20 @@ impl TabId {
         }
     }
 
-    /// True only for the four reserved AI builtins — the non-closable
-    /// tabs that `+` spawns duplicates of. Spawned `Ai(_)` duplicates and
+    /// True for the reserved non-closable builtins: the four AI builtins
+    /// (which `+` spawns duplicates of), plus the `shell-broot` utility tab
+    /// (V15), which is gated by the Settings → Tabs enable toggle rather
+    /// than the close `×`. Spawned `Ai(_)` duplicates and ordinary
     /// `Shell(_)` tabs are closable, so they return false. This is the
     /// canonical `builtin` flag surfaced to the frontend (gates the close
-    /// `×` and the spawn `+`); keep it in sync with `tabs::registry`'s
-    /// `is_builtin_id`.
+    /// `×`; the spawn `+` is additionally gated on AI-tool kind); keep it
+    /// in sync with `tabs::registry`'s `is_builtin_id`.
     pub fn is_builtin(&self) -> bool {
-        matches!(
-            self,
-            TabId::Claude | TabId::ClaudeLocal | TabId::Aider | TabId::AiderLocal
-        )
+        match self {
+            TabId::Claude | TabId::ClaudeLocal | TabId::Aider | TabId::AiderLocal => true,
+            TabId::Shell(s) => s == crate::settings::SHELL_BROOT_TAB_ID,
+            TabId::Ai(_) => false,
+        }
     }
 }
 
@@ -1256,9 +1259,10 @@ mod tests {
         let dup = TabId::Ai("ai-abc123".to_string());
         assert_eq!(dup.kind(), TabKind::AiTool);
         assert!(!dup.is_builtin());
-        // The reserved AI tabs are the only builtins.
+        // The reserved AI tabs and the shell-broot utility tab are builtins.
         assert!(TabId::Claude.is_builtin());
         assert!(TabId::AiderLocal.is_builtin());
+        assert!(TabId::Shell("shell-broot".into()).is_builtin());
         assert!(!TabId::Shell("shell-1".into()).is_builtin());
     }
 

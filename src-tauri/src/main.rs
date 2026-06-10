@@ -40,7 +40,7 @@ use crate::ipc::layout::{
 };
 use crate::ipc::tab_lifecycle::{
     close_tab, create_ai_tab, create_shell_tab, default_shell_spec, get_shell_tab_config,
-    reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
+    reconfigure_shell_tab, rename_tab, set_broot_enabled, set_enabled_ai_tabs,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
@@ -342,6 +342,7 @@ fn main() {
             default_shell_spec,
             get_shell_tab_config,
             set_enabled_ai_tabs,
+            set_broot_enabled,
             save_layout,
             save_layout_preset,
             delete_layout_preset,

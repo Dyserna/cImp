@@ -1,6 +1,6 @@
 [package]
 name = "cctts"
-version = "0.8.0"
+version = "0.9.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"

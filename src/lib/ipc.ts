@@ -274,6 +274,17 @@ export async function setEnabledAiTabs(
   await invoke('set_enabled_ai_tabs', { value });
 }
 
+/// Enable or disable the reserved `broot` tab (V15). Enabling
+/// materializes the tab (settings entry + PTY on next mount) and
+/// activates it; disabling kills its PTY, drops its scrollback, and
+/// removes its settings entry. Idempotent on the backend — a no-op when
+/// the tab is already in the requested state. The broot tab is a
+/// non-closable builtin while present, so this toggle is the only way to
+/// remove it.
+export async function setBrootEnabled(enabled: boolean): Promise<void> {
+  await invoke('set_broot_enabled', { enabled });
+}
+
 /// Open `<portable-root>/logs/content/` in the OS file manager. Backend
 /// creates the folder first if it doesn't exist.
 export async function contentOpenFolder(): Promise<void> {

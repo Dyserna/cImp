@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::ipc::AppState;
 use crate::settings::{
-    default_ai_tab, AiTabId, Settings, ShellNotificationConfig, ShellTabConfig as ShellTabSettings,
-    TabConfig,
+    default_ai_tab, default_broot_tab, AiTabId, Settings, ShellNotificationConfig,
+    ShellTabConfig as ShellTabSettings, TabConfig, SHELL_BROOT_TAB_ID,
 };
 use crate::shell::detect;
 use crate::state::{StateSignal, TabId, TabKind, TabMeta};
@@ -754,6 +754,131 @@ pub async fn set_enabled_ai_tabs(
     }
 
     info!(?want_ordered, "enabled_ai_tabs updated");
+    Ok(())
+}
+
+/// Enable or disable the reserved `broot` tab (V15). Mirrors the
+/// AI-tab enable mechanism (`set_enabled_ai_tabs`) but for a single
+/// reserved Shell tab whose presence in `tabs[]` *is* its enabled state
+/// — there is no separate boolean setting. Enabling materializes the tab
+/// (settings entry + registry + `TabAdded`) and activates it; disabling
+/// switches away from it if active, kills its PTY, drops its scrollback,
+/// and removes its settings entry. Idempotent: a no-op when the tab is
+/// already in the requested state.
+///
+/// The broot tab is `builtin: true` while present, so the tab bar hides
+/// its close `×` and `close_tab` rejects it — this command is the only
+/// way to remove it, which is why disabling here must clear it fully.
+#[tauri::command]
+pub async fn set_broot_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
+    let tab = TabId::Shell(SHELL_BROOT_TAB_ID.to_string());
+
+    let present = {
+        let registry = state.tabs.lock().await;
+        registry.has_tab(&tab)
+    };
+    if present == enabled {
+        return Ok(());
+    }
+
+    if enabled {
+        // Materialize the broot tab. Persist BEFORE registering so
+        // `build_launch_spec` finds the entry once the frontend mounts the
+        // tab and calls `pty_start` (same ordering as `create_shell_tab`).
+        let config = default_broot_tab();
+        let name = config.name().to_string();
+        {
+            let mut snap = state.settings.current();
+            if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == tab.as_str()) {
+                *existing = config;
+            } else {
+                snap.tabs.push(config);
+            }
+            state.settings.set(snap);
+        }
+
+        let position = {
+            let mut registry = state.tabs.lock().await;
+            registry.insert_user_tab(tab.clone(), name.clone())
+        };
+
+        if let Err(e) = state
+            .state_signals
+            .send(StateSignal::TabAdded {
+                meta: TabMeta {
+                    id: tab.clone(),
+                    kind: TabKind::Shell,
+                    name,
+                },
+                position,
+            })
+            .await
+        {
+            warn!(error = %e, "set_broot_enabled: state-signal channel closed (add)");
+            return Err(TabLifecycleError::internal("state signal channel closed"));
+        }
+
+        {
+            let mut registry = state.tabs.lock().await;
+            if let Err(e) = registry.activate(tab.clone()).await {
+                warn!(error = %e, "set_broot_enabled: activate failed");
+            }
+        }
+        info!("broot tab enabled");
+    } else {
+        // Disable: switch active off broot first (mirrors close_tab), then
+        // tear down PTY, scrollback, and the settings entry.
+        let prev_tab = {
+            let registry = state.tabs.lock().await;
+            registry.previous_tab(&tab)
+        };
+        {
+            let mut registry = state.tabs.lock().await;
+            if registry.active() == tab {
+                if let Some(target) = prev_tab {
+                    if let Err(e) = registry.activate(target).await {
+                        warn!(error = %e, "set_broot_enabled: activate previous failed");
+                    }
+                }
+            }
+        }
+
+        let removed = {
+            let mut registry = state.tabs.lock().await;
+            registry.remove_tab(&tab).await
+        };
+        if !removed {
+            return Ok(());
+        }
+
+        if let Err(e) = crate::pty::scrollback::delete(&tab) {
+            warn!(?tab, error = %e, "set_broot_enabled: scrollback delete failed");
+        }
+
+        {
+            let mut snap = state.settings.current();
+            snap.tabs.retain(|t| t.id() != tab.as_str());
+            if snap.session.active_tab_id.as_deref() == Some(tab.as_str()) {
+                snap.session.active_tab_id = None;
+            }
+            state.settings.set(snap);
+        }
+
+        if let Err(e) = state
+            .state_signals
+            .send(StateSignal::TabRemoved { tab: tab.clone() })
+            .await
+        {
+            warn!(error = %e, "set_broot_enabled: state-signal channel closed (remove)");
+            return Err(TabLifecycleError::internal("state signal channel closed"));
+        }
+        info!("broot tab disabled");
+    }
+
     Ok(())
 }
 

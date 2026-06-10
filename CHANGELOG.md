@@ -5,6 +5,26 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-06-10
+
+### Added
+
+- **Default `broot` tab.** Fresh installs now ship a `broot` tab alongside
+  the default shell. It launches `broot -g` (the broot file browser with
+  git info shown in the tree) with no `cwd`, so it opens in the directory
+  cctts was started in. `broot` is resolved via `PATH` at spawn time; if it
+  isn't installed the tab shows the standard "command not found" overlay
+  until you install it. Existing installs get the tab injected by the
+  v14 → v15 settings migration (schema bumped to 15); the frontend's layout
+  repair places it in the focused pane on first launch after upgrade.
+- **broot enable/disable in Settings → Tabs.** A new *Utility tabs* group
+  exposes a `broot (git)` checkbox. While enabled the broot tab is a
+  builtin — it has no close `×` and can't be closed from the tab bar or
+  context menu; untick the checkbox to remove it (kills its PTY and drops
+  its scrollback). Re-ticking re-creates it. Backed by the new
+  `set_broot_enabled` IPC, mirroring how the AI tabs are gated by
+  `enabled_ai_tabs`.
+
 ## [1.3.3] — 2026-05-07
 
 ### Added

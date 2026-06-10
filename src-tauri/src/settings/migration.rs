@@ -146,6 +146,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.11", detect: looks_v1_11, transform: migrate_v1_11_to_v1_12_step },
     MigrationStep { from_version: "v1.12", detect: looks_v1_12, transform: migrate_v1_12_to_v1_13_step },
     MigrationStep { from_version: "v1.13", detect: looks_v1_13, transform: migrate_v1_13_to_v1_14_step },
+    MigrationStep { from_version: "v1.14", detect: looks_v1_14, transform: migrate_v1_14_to_v1_15_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -191,6 +192,9 @@ fn migrate_v1_12_to_v1_13_step(value: &mut Value, _shell: &ShellSpec) {
 }
 fn migrate_v1_13_to_v1_14_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v1_13_to_v1_14(value)
+}
+fn migrate_v1_14_to_v1_15_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_14_to_v1_15(value)
 }
 
 fn looks_v1(value: &Value) -> bool {
@@ -394,6 +398,16 @@ fn looks_v1_13(value: &Value) -> bool {
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 13)
+}
+
+/// Is this a v1.14 file (schema_version == 14) that lacks the V15 default
+/// `broot` tab? Gated purely on the version integer; the transform's own
+/// presence check makes re-injection idempotent.
+fn looks_v1_14(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 14)
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -1248,6 +1262,58 @@ fn migrate_v1_13_to_v1_14(value: &mut Value) {
         "auth_token": "ollama",
         "model": "",
     }));
+
+    // Stamp a *literal* 14 (not CURRENT_SCHEMA_VERSION): later steps in the
+    // cascade gate on `schema_version == N`, so each step must stamp its own
+    // concrete version. The final v14 → v15 step bumps to the current value.
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(14u8)),
+    );
+}
+
+// --- v1.14 → v1.15 ----------------------------------------------------------
+//
+// V15 ships a default `broot` tab (`broot -g`, launch-dir cwd). The
+// migration injects the Shell-tab entry into existing files so upgraders
+// get it too, then bumps `schema_version` to 15. The new tab id is left
+// out of any persisted `layout` tree on purpose — the frontend's
+// `validateAndRepairLayout` places tabs present in `tabs[]` but absent
+// from the tree as "orphans" into the focused pane on next launch, so
+// the tab shows up without this migration having to touch the layout.
+//
+// Idempotent: skips injection if a `shell-broot` entry already exists
+// (e.g. a fresh-install file that was seeded with it, or a second pass),
+// and `looks_v1_14` returns false once `schema_version` is 15.
+
+fn migrate_v1_14_to_v1_15(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
+        let already_present = tabs.iter().any(|t| {
+            t.get("id").and_then(Value::as_str)
+                == Some(crate::settings::schema::SHELL_BROOT_TAB_ID)
+        });
+        if !already_present {
+            tabs.push(json!({
+                "kind": "shell",
+                "id": crate::settings::schema::SHELL_BROOT_TAB_ID,
+                // Reserved non-closable builtin (see SHELL_BROOT_TAB_ID).
+                "builtin": true,
+                "name": "broot",
+                "command": "broot",
+                "args": ["-g"],
+                "cwd": null,
+                "env": {},
+                "notifications": {
+                    "error": "Shell encountered an error",
+                    "exited": "Shell exited (code {code})",
+                },
+            }));
+        }
+    }
 
     root.insert(
         "schema_version".to_string(),
@@ -2493,9 +2559,11 @@ mod tests {
             v.get("enabled_ai_tabs").unwrap(),
             &json!(["claude"]),
         );
+        // This step stamps a literal 14 (the final v14 → v15 step bumps to
+        // CURRENT_SCHEMA_VERSION); see the comment in migrate_v1_13_to_v1_14.
         assert_eq!(
             v.get("schema_version").and_then(Value::as_u64),
-            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64),
+            Some(14),
         );
         // aider_local defaults stamped.
         let aider_local = v.get("aider_local").unwrap();
@@ -2561,6 +2629,61 @@ mod tests {
         });
         migrate_v1_12_to_v1_13(&mut v);
         assert_eq!(v.get("ui").unwrap().get("theme").unwrap(), "modern-dark");
+    }
+
+    #[test]
+    fn v1_14_to_v1_15_injects_broot_tab() {
+        let mut v = json!({
+            "schema_version": 14,
+            "tabs": [
+                { "kind": "ai_tool", "id": "claude" },
+                { "kind": "shell", "id": "shell-default-1" },
+            ],
+        });
+        assert!(looks_v1_14(&v));
+        migrate_v1_14_to_v1_15(&mut v);
+
+        let tabs = v.get("tabs").and_then(Value::as_array).unwrap();
+        let broot = tabs
+            .iter()
+            .find(|t| t.get("id").and_then(Value::as_str) == Some("shell-broot"))
+            .expect("broot tab injected");
+        assert_eq!(broot.get("kind").unwrap(), "shell");
+        assert_eq!(broot.get("command").unwrap(), "broot");
+        assert_eq!(broot.get("args").unwrap(), &json!(["-g"]));
+        assert_eq!(broot.get("cwd").unwrap(), &Value::Null);
+        assert_eq!(broot.get("builtin").unwrap(), &Value::Bool(true));
+        // Existing tabs preserved, broot appended at the end.
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs[2].get("id").unwrap(), "shell-broot");
+
+        assert_eq!(
+            v.get("schema_version").and_then(Value::as_u64),
+            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64),
+        );
+        assert!(!looks_v1_14(&v));
+    }
+
+    #[test]
+    fn v1_14_to_v1_15_is_idempotent_on_existing_broot() {
+        // A file that already has a shell-broot tab (fresh-install seed, or
+        // a re-run) must not get a duplicate.
+        let mut v = json!({
+            "schema_version": 14,
+            "tabs": [
+                { "kind": "shell", "id": "shell-broot", "command": "broot", "args": ["-g"] },
+            ],
+        });
+        migrate_v1_14_to_v1_15(&mut v);
+        let count = v
+            .get("tabs")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter(|t| t.get("id").and_then(Value::as_str) == Some("shell-broot"))
+            .count();
+        assert_eq!(count, 1, "no duplicate broot tab");
+        assert!(!looks_v1_14(&v));
     }
 
     #[test]

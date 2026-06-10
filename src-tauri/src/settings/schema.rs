@@ -28,6 +28,16 @@ pub const AIDER_TAB_ID: &str = "aider";
 /// the global `aider_local` provider settings.
 pub const AIDER_LOCAL_TAB_ID: &str = "aider-local";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
+/// V15: a reserved Shell tab that launches `broot -g` (the broot file
+/// browser with git info shown) in the cctts launch directory. Unlike
+/// `shell-default-1`, it is a non-closable builtin while present: the tab
+/// bar hides its close `×` and `close_tab` rejects it. It is added/removed
+/// only through the Settings → Tabs enable toggle (`set_broot_enabled`),
+/// the same way the AI builtins are gated by `enabled_ai_tabs`. Seeded on
+/// fresh installs (`seeded_defaults`) and injected into existing files by
+/// the v14 → v15 migration; the integrity check forces its `builtin` flag
+/// but does not re-create it once disabled (so disabling sticks).
+pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 
 /// The on-disk schema version. Bumped on every migration step. Detection
 /// of legacy files prefers this field's integer value over the older
@@ -37,7 +47,7 @@ pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 14;
+pub const CURRENT_SCHEMA_VERSION: u8 = 15;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -856,6 +866,33 @@ pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
         name: "Shell 1".to_string(),
         command: default_shell.command.to_string_lossy().into_owned(),
         args: default_shell.args.clone(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
+}
+
+/// V15: default broot tab. A Shell tab that launches `broot -g` — the
+/// broot file browser with git info shown in the tree — with `cwd: None`
+/// so it inherits the cctts launch directory (the folder cctts was
+/// started in). `broot` is resolved via PATH at spawn time; if it isn't
+/// installed the tab shows the standard "command not found" closed
+/// overlay until the user installs it. Closable like `shell-default-1`;
+/// the integrity check does not re-seed it.
+pub fn default_broot_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: SHELL_BROOT_TAB_ID.to_string(),
+        // Reserved, non-closable when present: the tab bar hides the close
+        // `×` for builtin tabs and `close_tab` rejects them. The broot tab
+        // is added/removed only via the Settings → Tabs enable toggle
+        // (`set_broot_enabled`), mirroring how the AI builtins are gated by
+        // `enabled_ai_tabs`.
+        builtin: true,
+        name: "broot".to_string(),
+        command: "broot".to_string(),
+        args: vec!["-g".to_string()],
         cwd: None,
         env: HashMap::new(),
         notifications: ShellNotificationConfig::default(),

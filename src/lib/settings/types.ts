@@ -33,19 +33,36 @@ export interface TransitionSettings {
 }
 
 export interface WaveformSettings {
+  /// Render the audio waveform over the avatar. Default true.
+  visible: boolean;
   color: string;
   line_width: number;
   glow_intensity: number;
   opacity: number;
 }
 
+/// Avatar render mode. `media` plays the per-state image/video files in
+/// `AvatarImages`; `sprite` ignores them and runs the manifest-driven
+/// frame-animation renderer over the sprite set named in `SpriteSettings`.
+export type AvatarKind = 'media' | 'sprite';
+
+/// Sprite-renderer config. `set` is a folder name under the bundled
+/// `sprites/` tree (resolved to `/sprites/<set>/manifest.json` at runtime).
+export interface SpriteSettings {
+  set: string;
+}
+
 export interface AvatarSettings {
   visible: boolean;
+  kind: AvatarKind;
   size: AvatarSize;
   position: AvatarPosition;
   margin: AvatarMargin;
   opacity: number;
+  /// Draw the 1px frame around the avatar box. Default off.
+  show_border: boolean;
   images: AvatarImages;
+  sprite: SpriteSettings;
   transition: TransitionSettings;
   waveform: WaveformSettings;
 }
@@ -240,13 +257,14 @@ export interface ProcessingSettings {
 }
 
 export interface UiSettings {
-  /// Active UI chrome theme. Three values currently ship: `"modern-dark"`
+  /// Active UI chrome theme. Four values currently ship: `"modern-dark"`
   /// (slate-blue + mint, OS-native window chrome), `"tui-yellow"`
   /// (gruvbox + bright yellow accent, custom title bar, ratatui aesthetic),
-  /// and `"tui-purple"` (same surfaces, gruvbox bright-purple accent).
-  /// New installs default to `"tui-yellow"`. Distinct from
-  /// `terminal.theme`, which governs the xterm.js terminal palette
-  /// inside each tab.
+  /// `"tui-purple"` (same surfaces, gruvbox bright-purple accent), and
+  /// `"tui-orange"` (same surfaces, Claude Code accent orange). New installs
+  /// default to `"tui-orange"`, which also defaults the avatar to the
+  /// animated `claudeSprites` mascot. Distinct from `terminal.theme`, which
+  /// governs the xterm.js terminal palette inside each tab.
   theme: string;
 }
 
@@ -534,10 +552,12 @@ export function defaultSettings(): Settings {
     tts: { voice: 'af_heart', speed: 1.0, volume: 1.0, mute: false },
     avatar: {
       visible: true,
-      size: { width_px: 240, height_px: 240 },
+      kind: 'sprite',
+      size: { width_px: 140, height_px: 140 },
       position: 'top-right',
-      margin: { x_px: 16, y_px: 16 },
-      opacity: 0.8,
+      margin: { x_px: 21, y_px: 0 },
+      opacity: 1.0,
+      show_border: false,
       images: {
         idle: null,
         listening: null,
@@ -545,8 +565,10 @@ export function defaultSettings(): Settings {
         speaking: null,
         error: null,
       },
+      sprite: { set: 'claudeSprites' },
       transition: { path: '/avatar/Transition.mp4', duration_ms: 400 },
       waveform: {
+        visible: true,
         color: '',
         line_width: 2.0,
         glow_intensity: 0.6,
@@ -669,9 +691,11 @@ export function defaultSettings(): Settings {
     session: { active_tab_id: null },
     layout: null,
     layout_presets: [],
-    ui: { theme: 'tui-yellow' },
+    ui: { theme: 'tui-orange' },
+    // Default terminal palette is paired with the default UI theme
+    // (tui-orange → Tomorrow Night); see THEME_DEFAULT_PALETTE in SettingsApp.
     terminal: {
-      theme: { name: 'Gruvbox Dark', custom: null },
+      theme: { name: 'Tomorrow Night', custom: null },
       background: {
         image: null,
         color: null,

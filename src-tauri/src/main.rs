@@ -388,6 +388,14 @@ fn main() {
                     }
                     registry.shutdown_all().await;
                     drop(registry);
+                    // Closing the main window also closes the settings window
+                    // if it's open — otherwise it would keep the process alive
+                    // with no main window. Destroy it before the main window.
+                    if let Some(settings) =
+                        app.get_webview_window(crate::ipc::windows::SETTINGS_LABEL)
+                    {
+                        let _ = settings.destroy();
+                    }
                     let _ = window.destroy();
                 });
             }

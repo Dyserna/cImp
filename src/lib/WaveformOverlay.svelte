@@ -29,7 +29,11 @@
   let waveLineWidth = 2;
   let waveGlow = 0.6;
   let waveOpacity = 0.85;
+  // Independent show/hide for the waveform (Settings → Waveform → Visible).
+  // Reactive so the container's `hidden` class updates live on toggle.
+  let waveVisible = $state(true);
   const unsubWave = waveformSettings.subscribe((w) => {
+    waveVisible = w.visible;
     waveColor = w.color;
     waveLineWidth = w.line_width;
     waveGlow = w.glow_intensity;
@@ -157,7 +161,7 @@
 <div
   class="waveform-container {avatarPositionClass}"
   style={positionStyles}
-  class:hidden={!avatarOn}
+  class:hidden={!avatarOn || !waveVisible}
 >
   <div class="waveform-band">
     <canvas bind:this={canvasEl} class="waveform-canvas"></canvas>

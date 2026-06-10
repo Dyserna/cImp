@@ -1,0 +1,988 @@
+{
+  "source": "https://github.com/HermannBjorgvin/Clawdmeter (firmware/src/splash_animations.h)",
+  "art_credit": "https://claudepix.vercel.app",
+  "tile": 20,
+  "animations": {
+    "idle breathe": {
+      "slug": "idle_breathe",
+      "category": "Idle",
+      "frames": [
+        {
+          "file": "idle_breathe/00.png",
+          "hold_ms": 500
+        },
+        {
+          "file": "idle_breathe/01.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_breathe/02.png",
+          "hold_ms": 280
+        },
+        {
+          "file": "idle_breathe/03.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "idle_breathe/04.png",
+          "hold_ms": 360
+        },
+        {
+          "file": "idle_breathe/05.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_breathe/06.png",
+          "hold_ms": 320
+        },
+        {
+          "file": "idle_breathe/07.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "idle_breathe/08.png",
+          "hold_ms": 700
+        },
+        {
+          "file": "idle_breathe/09.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_breathe/10.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "idle_breathe/11.png",
+          "hold_ms": 500
+        },
+        {
+          "file": "idle_breathe/12.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_breathe/13.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "idle_breathe/14.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "idle_breathe/15.png",
+          "hold_ms": 340
+        }
+      ]
+    },
+    "idle blink": {
+      "slug": "idle_blink",
+      "category": "Idle",
+      "frames": [
+        {
+          "file": "idle_blink/00.png",
+          "hold_ms": 2400
+        },
+        {
+          "file": "idle_blink/01.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "idle_blink/02.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "idle_blink/03.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "idle_blink/04.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "idle_blink/05.png",
+          "hold_ms": 220
+        },
+        {
+          "file": "idle_blink/06.png",
+          "hold_ms": 1600
+        },
+        {
+          "file": "idle_blink/07.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "idle_blink/08.png",
+          "hold_ms": 90
+        },
+        {
+          "file": "idle_blink/09.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "idle_blink/10.png",
+          "hold_ms": 70
+        },
+        {
+          "file": "idle_blink/11.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "idle_blink/12.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "idle_blink/13.png",
+          "hold_ms": 70
+        },
+        {
+          "file": "idle_blink/14.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_blink/15.png",
+          "hold_ms": 900
+        }
+      ]
+    },
+    "idle look around": {
+      "slug": "idle_look_around",
+      "category": "Idle",
+      "frames": [
+        {
+          "file": "idle_look_around/00.png",
+          "hold_ms": 800
+        },
+        {
+          "file": "idle_look_around/01.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_look_around/02.png",
+          "hold_ms": 500
+        },
+        {
+          "file": "idle_look_around/03.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "idle_look_around/04.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_look_around/05.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "idle_look_around/06.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "idle_look_around/07.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_look_around/08.png",
+          "hold_ms": 500
+        },
+        {
+          "file": "idle_look_around/09.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "idle_look_around/10.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_look_around/11.png",
+          "hold_ms": 500
+        },
+        {
+          "file": "idle_look_around/12.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_look_around/13.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "idle_look_around/14.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "idle_look_around/15.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "idle_look_around/16.png",
+          "hold_ms": 700
+        }
+      ]
+    },
+    "expression wink": {
+      "slug": "expression_wink",
+      "category": "Expressions",
+      "frames": [
+        {
+          "file": "expression_wink/00.png",
+          "hold_ms": 1200
+        },
+        {
+          "file": "expression_wink/01.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "expression_wink/02.png",
+          "hold_ms": 120
+        },
+        {
+          "file": "expression_wink/03.png",
+          "hold_ms": 150
+        },
+        {
+          "file": "expression_wink/04.png",
+          "hold_ms": 120
+        },
+        {
+          "file": "expression_wink/05.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "expression_wink/06.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "expression_wink/07.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "expression_wink/08.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "expression_wink/09.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "expression_wink/10.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "expression_wink/11.png",
+          "hold_ms": 800
+        }
+      ]
+    },
+    "expression surprise": {
+      "slug": "expression_surprise",
+      "category": "Expressions",
+      "frames": [
+        {
+          "file": "expression_surprise/00.png",
+          "hold_ms": 900
+        },
+        {
+          "file": "expression_surprise/01.png",
+          "hold_ms": 120
+        },
+        {
+          "file": "expression_surprise/02.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "expression_surprise/03.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "expression_surprise/04.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "expression_surprise/05.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "expression_surprise/06.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "expression_surprise/07.png",
+          "hold_ms": 500
+        },
+        {
+          "file": "expression_surprise/08.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "expression_surprise/09.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "expression_surprise/10.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_surprise/11.png",
+          "hold_ms": 600
+        }
+      ]
+    },
+    "expression sleep": {
+      "slug": "expression_sleep",
+      "category": "Expressions",
+      "frames": [
+        {
+          "file": "expression_sleep/00.png",
+          "hold_ms": 600
+        },
+        {
+          "file": "expression_sleep/01.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "expression_sleep/02.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/03.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/04.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/05.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/06.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/07.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/08.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/09.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/10.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/11.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/12.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/13.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "expression_sleep/14.png",
+          "hold_ms": 700
+        },
+        {
+          "file": "expression_sleep/15.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "expression_sleep/16.png",
+          "hold_ms": 500
+        },
+        {
+          "file": "expression_sleep/17.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/18.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/19.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/20.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/21.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/22.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "expression_sleep/23.png",
+          "hold_ms": 400
+        }
+      ]
+    },
+    "dance bounce": {
+      "slug": "dance_bounce",
+      "category": "Dance",
+      "frames": [
+        {
+          "file": "dance_bounce/00.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_bounce/01.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce/02.png",
+          "hold_ms": 140
+        },
+        {
+          "file": "dance_bounce/03.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_bounce/04.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "dance_bounce/05.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce/06.png",
+          "hold_ms": 120
+        },
+        {
+          "file": "dance_bounce/07.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce/08.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_bounce/09.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce/10.png",
+          "hold_ms": 160
+        },
+        {
+          "file": "dance_bounce/11.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce/12.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "dance_bounce/13.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce/14.png",
+          "hold_ms": 120
+        },
+        {
+          "file": "dance_bounce/15.png",
+          "hold_ms": 100
+        }
+      ]
+    },
+    "dance sway": {
+      "slug": "dance_sway",
+      "category": "Dance",
+      "frames": [
+        {
+          "file": "dance_sway/00.png",
+          "hold_ms": 240
+        },
+        {
+          "file": "dance_sway/01.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "dance_sway/02.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway/03.png",
+          "hold_ms": 240
+        },
+        {
+          "file": "dance_sway/04.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway/05.png",
+          "hold_ms": 160
+        },
+        {
+          "file": "dance_sway/06.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "dance_sway/07.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway/08.png",
+          "hold_ms": 240
+        },
+        {
+          "file": "dance_sway/09.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway/10.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway/11.png",
+          "hold_ms": 180
+        }
+      ]
+    },
+    "work coding": {
+      "slug": "work_coding",
+      "category": "Work",
+      "frames": [
+        {
+          "file": "work_coding/00.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/01.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/02.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/03.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/04.png",
+          "hold_ms": 140
+        },
+        {
+          "file": "work_coding/05.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/06.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/07.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/08.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/09.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/10.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/11.png",
+          "hold_ms": 90
+        },
+        {
+          "file": "work_coding/12.png",
+          "hold_ms": 90
+        },
+        {
+          "file": "work_coding/13.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "work_coding/14.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "work_coding/15.png",
+          "hold_ms": 280
+        },
+        {
+          "file": "work_coding/16.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "work_coding/17.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "work_coding/18.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/19.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/20.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/21.png",
+          "hold_ms": 180
+        },
+        {
+          "file": "work_coding/22.png",
+          "hold_ms": 180
+        }
+      ]
+    },
+    "work think": {
+      "slug": "work_think",
+      "category": "Work",
+      "frames": [
+        {
+          "file": "work_think/00.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "work_think/01.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "work_think/02.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "work_think/03.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "work_think/04.png",
+          "hold_ms": 350
+        },
+        {
+          "file": "work_think/05.png",
+          "hold_ms": 350
+        },
+        {
+          "file": "work_think/06.png",
+          "hold_ms": 350
+        },
+        {
+          "file": "work_think/07.png",
+          "hold_ms": 350
+        },
+        {
+          "file": "work_think/08.png",
+          "hold_ms": 350
+        },
+        {
+          "file": "work_think/09.png",
+          "hold_ms": 350
+        },
+        {
+          "file": "work_think/10.png",
+          "hold_ms": 600
+        },
+        {
+          "file": "work_think/11.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "work_think/12.png",
+          "hold_ms": 400
+        },
+        {
+          "file": "work_think/13.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "work_think/14.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "work_think/15.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "work_think/16.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "work_think/17.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "work_think/18.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "work_think/19.png",
+          "hold_ms": 120
+        },
+        {
+          "file": "work_think/20.png",
+          "hold_ms": 150
+        },
+        {
+          "file": "work_think/21.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "work_think/22.png",
+          "hold_ms": 300
+        },
+        {
+          "file": "work_think/23.png",
+          "hold_ms": 400
+        }
+      ]
+    },
+    "dance bounce dj": {
+      "slug": "dance_bounce_dj",
+      "category": "Dance",
+      "frames": [
+        {
+          "file": "dance_bounce_dj/00.png",
+          "hold_ms": 90
+        },
+        {
+          "file": "dance_bounce_dj/01.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce_dj/02.png",
+          "hold_ms": 140
+        },
+        {
+          "file": "dance_bounce_dj/03.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce_dj/04.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "dance_bounce_dj/05.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce_dj/06.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce_dj/07.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_bounce_dj/08.png",
+          "hold_ms": 90
+        },
+        {
+          "file": "dance_bounce_dj/09.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce_dj/10.png",
+          "hold_ms": 160
+        },
+        {
+          "file": "dance_bounce_dj/11.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce_dj/12.png",
+          "hold_ms": 60
+        },
+        {
+          "file": "dance_bounce_dj/13.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce_dj/14.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_bounce_dj/15.png",
+          "hold_ms": 100
+        }
+      ]
+    },
+    "dance sway dj": {
+      "slug": "dance_sway_dj",
+      "category": "Dance",
+      "frames": [
+        {
+          "file": "dance_sway_dj/00.png",
+          "hold_ms": 220
+        },
+        {
+          "file": "dance_sway_dj/01.png",
+          "hold_ms": 160
+        },
+        {
+          "file": "dance_sway_dj/02.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway_dj/03.png",
+          "hold_ms": 220
+        },
+        {
+          "file": "dance_sway_dj/04.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway_dj/05.png",
+          "hold_ms": 160
+        },
+        {
+          "file": "dance_sway_dj/06.png",
+          "hold_ms": 160
+        },
+        {
+          "file": "dance_sway_dj/07.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway_dj/08.png",
+          "hold_ms": 220
+        },
+        {
+          "file": "dance_sway_dj/09.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway_dj/10.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_sway_dj/11.png",
+          "hold_ms": 180
+        }
+      ]
+    },
+    "dance djmix": {
+      "slug": "dance_djmix",
+      "category": "Dance",
+      "frames": [
+        {
+          "file": "dance_djmix/00.png",
+          "hold_ms": 200
+        },
+        {
+          "file": "dance_djmix/01.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_djmix/02.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_djmix/03.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_djmix/04.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_djmix/05.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_djmix/06.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_djmix/07.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_djmix/08.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_djmix/09.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_djmix/10.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_djmix/11.png",
+          "hold_ms": 160
+        },
+        {
+          "file": "dance_djmix/12.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_djmix/13.png",
+          "hold_ms": 80
+        },
+        {
+          "file": "dance_djmix/14.png",
+          "hold_ms": 100
+        },
+        {
+          "file": "dance_djmix/15.png",
+          "hold_ms": 100
+        }
+      ]
+    }
+  },
+  "groups": [
+    {
+      "id": 0,
+      "name": "idle",
+      "animations": [
+        "expression sleep",
+        "idle breathe",
+        "idle blink",
+        "expression wink"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "normal",
+      "animations": [
+        "idle look around",
+        "work think",
+        "work coding"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "active",
+      "animations": [
+        "dance sway",
+        "expression surprise",
+        "dance bounce"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "heavy",
+      "animations": [
+        "dance bounce dj",
+        "dance sway dj",
+        "dance djmix"
+      ]
+    }
+  ]
+}

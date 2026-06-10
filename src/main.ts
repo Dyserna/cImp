@@ -2,6 +2,7 @@ import { mount } from 'svelte';
 import App from './App.svelte';
 import { ttsTest } from './lib/ipc';
 import { settings } from './lib/settings/store';
+import { themeFromSetting } from './lib/themes/resolve';
 import { installReloadBlocker } from './lib/shortcuts/blockReload';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import './theme.css';
@@ -13,10 +14,10 @@ import './app.css';
 // Set the active theme synchronously before Svelte mounts so the first
 // paint already reflects token values — avoids FOUC. The static
 // `data-theme` attribute on <html> (set in index.html) is a defense-in-
-// depth fallback. Both default to "tui-yellow" — matches the new-install
-// default in defaultSettings(), and existing modern-dark users have a
-// persisted setting that overrides this on the first subscribe tick.
-document.documentElement.dataset.theme = 'tui-yellow';
+// depth fallback. Both default to "tui-orange" — matches the new-install
+// default in defaultSettings(), and existing users have a persisted
+// setting that overrides this on the first subscribe tick.
+document.documentElement.dataset.theme = 'tui-orange';
 
 // Disable the webview's reload accelerators (F5 / Ctrl+R / Ctrl+Shift+R) so a
 // stray keystroke can't tear every tab's PTY down and restart sessions.
@@ -31,12 +32,25 @@ installReloadBlocker();
 // bar; every `tui-*` variant hides it (`setDecorations(false)`) and
 // renders the custom `TuiTitleBar` Svelte component instead. The two
 // stay in sync via this single subscription.
+// Publish the active GLOBAL terminal palette as CSS custom properties so the
+// chrome (tab/bar backgrounds via --surface-*, body text via --text-primary)
+// integrates with the terminal colors. Theme CSS references these with the
+// per-theme value as a fallback, so an unset var leaves the original look.
+// Per-tab palette overrides intentionally do NOT drive the chrome — there's
+// one tab bar / status bar shared across tabs, so it follows the global pick.
+function applyTerminalPaletteVars(theme: ReturnType<typeof themeFromSetting>) {
+  const root = document.documentElement.style;
+  if (theme.background) root.setProperty('--term-bg', theme.background);
+  if (theme.foreground) root.setProperty('--term-fg', theme.foreground);
+}
+
 let lastDecorations: boolean | null = null;
 settings.subscribe((s) => {
-  const next = s.ui?.theme || 'tui-yellow';
+  const next = s.ui?.theme || 'tui-orange';
   if (document.documentElement.dataset.theme !== next) {
     document.documentElement.dataset.theme = next;
   }
+  if (s.terminal?.theme) applyTerminalPaletteVars(themeFromSetting(s.terminal.theme));
   const wantDecorations = !next.startsWith('tui-');
   if (wantDecorations !== lastDecorations) {
     lastDecorations = wantDecorations;

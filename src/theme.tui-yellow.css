@@ -67,7 +67,7 @@ html[data-theme="tui-yellow"] section > h3:first-of-type {
   margin: 0;
   padding: 0 0.5ch;
   background: var(--surface-0);
-  color: var(--text-warning);
+  color: var(--accent);
   font-size: var(--font-size-md);
   font-weight: 400;
   line-height: 1;
@@ -82,7 +82,7 @@ html[data-theme="tui-yellow"] section h3 {
   border-top: none;
   padding-top: 0;
   margin-top: var(--space-4);
-  color: var(--text-warning);
+  color: var(--accent);
   font-weight: 400;
 }
 html[data-theme="tui-yellow"] section h3::before {
@@ -115,7 +115,7 @@ html[data-theme="tui-yellow"] dialog > .title {
   margin: 0;
   padding: 0 0.5ch;
   background: var(--surface-0);
-  color: var(--text-warning);
+  color: var(--accent);
   font-size: var(--font-size-md);
   font-weight: 400;
   line-height: 1;
@@ -337,7 +337,7 @@ html[data-theme="tui-yellow"] .status-button:focus-visible {
    reading as too high. */
 html[data-theme="tui-yellow"] .glyph {
   font-variant-emoji: text;
-  filter: grayscale(1) brightness(1.1) sepia(0.4);
+  filter: grayscale(1) brightness(1.1);
   transform: translateY(1px);
 }
 

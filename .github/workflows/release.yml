@@ -191,6 +191,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stageFull/avatars" | Out-Null
           Copy-Item -Recurse avatars/* "$stageFull/avatars/"
 
+          # Sprite avatar sets: the manifest-driven pixel-art mascot variant.
+          # Mirrors the `avatars/` staging — source of truth is the top-level
+          # `sprites/<set>/` tree the `cctts-sprites` Vite plugin embeds into
+          # the frontend. Staged on-disk too for discoverability / adding sets.
+          New-Item -ItemType Directory -Force -Path "$stageFull/sprites" | Out-Null
+          Copy-Item -Recurse sprites/* "$stageFull/sprites/"
+
           # Top-level docs
           Copy-Item LICENSE "$stageFull/"
           Copy-Item NOTICE "$stageFull/"
@@ -203,12 +210,14 @@ jobs:
           # (3.8MB; cheap and keeps the layout symmetric across variants).
           New-Item -ItemType Directory -Force -Path "$stageSlim/bin" | Out-Null
           New-Item -ItemType Directory -Force -Path "$stageSlim/avatars" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stageSlim/sprites" | Out-Null
 
           Copy-Item src-tauri/target/release/cctts.exe "$stageSlim/bin/"
           Get-ChildItem src-tauri/target/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageSlim/bin/" }
 
           Copy-Item -Recurse avatars/* "$stageSlim/avatars/"
+          Copy-Item -Recurse sprites/* "$stageSlim/sprites/"
 
           Copy-Item LICENSE "$stageSlim/"
           Copy-Item NOTICE "$stageSlim/"

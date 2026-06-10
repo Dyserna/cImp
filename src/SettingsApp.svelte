@@ -34,6 +34,17 @@
   import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from './lib/themes';
   import type { ThemeColorsWire } from './lib/settings/types';
 
+  /// Terminal palette paired with each UI chrome theme. Selecting a UI theme
+  /// re-points the terminal palette to its pairing (a manual palette pick
+  /// afterward sticks until the next theme switch). Unlisted themes leave the
+  /// palette untouched.
+  const THEME_DEFAULT_PALETTE: Record<string, string> = {
+    'modern-dark': 'Default',
+    'tui-yellow': 'Gruvbox Dark',
+    'tui-purple': 'Gruvbox Dark',
+    'tui-orange': 'Tomorrow Night',
+  };
+
   let voices = $state<string[]>([]);
   // V1.4-07: Local LLM provider section. The auth-token input toggles
   // between password and text via this flag (no keychain integration in
@@ -743,6 +754,35 @@
             <span>Visible</span>
           </label>
           <label>
+            <span>Type</span>
+            <select
+              value={snapshot.avatar.kind}
+              onchange={(e) =>
+                patch((s) => (s.avatar.kind = (e.currentTarget as HTMLSelectElement).value as Settings['avatar']['kind']))}
+            >
+              <option value="media">Picture / Video</option>
+              <option value="sprite">Animated sprites</option>
+            </select>
+          </label>
+          {#if snapshot.avatar.kind === 'sprite'}
+            <label>
+              <span>Sprite set</span>
+              <select
+                value={snapshot.avatar.sprite.set}
+                onchange={(e) =>
+                  patch((s) => (s.avatar.sprite.set = (e.currentTarget as HTMLSelectElement).value))}
+              >
+                <option value="claudeSprites">Claude (pixel art)</option>
+              </select>
+            </label>
+            <small class="hint">
+              Frame-animated pixel-art mascot. Each state (Idle, Listening,
+              Thinking, Speaking, Error) maps to a set of animations from the
+              set's <code>manifest.json</code>; the per-state image/video and
+              transition options below are ignored in this mode.
+            </small>
+          {/if}
+          <label>
             <span>Position</span>
             <select
               value={snapshot.avatar.position}
@@ -815,7 +855,17 @@
                 patch((s) => (s.avatar.opacity = +(e.currentTarget as HTMLInputElement).value))}
             />
           </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.avatar.show_border}
+              onchange={(e) =>
+                patch((s) => (s.avatar.show_border = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Show border</span>
+          </label>
 
+          {#if snapshot.avatar.kind !== 'sprite'}
           <h3>Per-state images</h3>
           {#each ['idle', 'listening', 'thinking', 'speaking', 'error'] as const as state}
             <div class="file-row">
@@ -862,10 +912,20 @@
                 patch((s) => (s.avatar.transition.duration_ms = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
             />
           </label>
+          {/if}
         </section>
 
         <section>
           <h2>Waveform</h2>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.avatar.waveform.visible}
+              onchange={(e) =>
+                patch((s) => (s.avatar.waveform.visible = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Show waveform</span>
+          </label>
           <div class="file-row">
             <span class="state-label">Color</span>
             <input
@@ -933,8 +993,20 @@
             <span>Theme</span>
             <select
               value={snapshot.ui.theme}
-              onchange={(e) =>
-                patch((s) => (s.ui.theme = (e.currentTarget as HTMLSelectElement).value))}
+              onchange={(e) => {
+                const theme = (e.currentTarget as HTMLSelectElement).value;
+                patch((s) => {
+                  s.ui.theme = theme;
+                  // Pair the terminal palette to the chosen theme. Skipped for
+                  // a user "Custom" palette so a hand-tuned palette isn't lost
+                  // on a theme switch.
+                  const paired = THEME_DEFAULT_PALETTE[theme];
+                  if (paired && s.terminal.theme.name !== 'Custom') {
+                    s.terminal.theme.name = paired;
+                    s.terminal.theme.custom = null;
+                  }
+                });
+              }}
             >
               <option value="modern-dark">Modern Dark</option>
               <option value="tui-yellow">TUI - Yellow</option>

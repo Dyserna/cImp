@@ -1069,9 +1069,9 @@ mod tests {
 
     #[test]
     fn ui_theme_round_trip_and_default() {
-        // Default file has ui.theme = "tui-yellow" (new installs land here).
+        // Default file has ui.theme = "tui-orange" (new installs land here).
         let s = Settings::default();
-        assert_eq!(s.ui.theme, "tui-yellow");
+        assert_eq!(s.ui.theme, "tui-orange");
 
         // Round-trip preserves a hand-edited value (here: a user who
         // switched back to modern-dark or set a future theme).
@@ -1084,7 +1084,7 @@ mod tests {
         // A v1.3 file without the `ui` field still parses (serde(default)).
         let v1_3_json = r#"{"tabs":[]}"#;
         let parsed: Settings = serde_json::from_str(v1_3_json).unwrap();
-        assert_eq!(parsed.ui.theme, "tui-yellow");
+        assert_eq!(parsed.ui.theme, "tui-orange");
     }
 
     // --- Layered config (global + custom overlay) -----------------------

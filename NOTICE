@@ -31,3 +31,18 @@ Kokoro-82M-v1.0-ONNX:
   Files bundled: onnx/model.onnx (renamed kokoro-v1.0.onnx),
                  voices/af_heart.bin
   License: Apache License 2.0 — same text as cctts's own LICENSE file.
+
+------------------------------------------------------------------------
+
+The "Animated sprites" avatar variant ships a bundled pixel-art mascot
+set (`sprites/claudeSprites/`) — frame sequences plus a `manifest.json`
+describing per-frame timing. These assets originate from the Clawdmeter
+project and depict the Clawd mascot.
+
+Clawdmeter / Clawd sprites:
+  Project: https://github.com/HermannBjorgvin/Clawdmeter
+  Pixel art: https://claudepix.vercel.app
+  Project code license: MIT
+  The Clawd mascot character is property of Anthropic PBC. The sprite
+  artwork is bundled here as-is for cctts's animated-avatar variant with
+  attribution to the sources above.

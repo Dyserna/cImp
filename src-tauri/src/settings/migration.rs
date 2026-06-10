@@ -725,8 +725,11 @@ fn migrate_v1_3_to_v1_4(value: &mut Value) {
         display.remove("theme");
     }
 
-    // Insert default `terminal.theme` group. Matches the Default impl
-    // on `TerminalThemeSettings` in schema.rs — keep these in sync.
+    // Insert the `terminal.theme` group pinned to the "Default" palette.
+    // This is deliberately NOT the `TerminalThemeSettings::default()` value
+    // (which seeds *fresh* installs and has since changed): an upgrading v1.3
+    // user must keep their pre-V1.4-01 appearance, which the "Default" palette
+    // preserves. Do not "sync" this to the Default impl.
     root.insert(
         "terminal".to_string(),
         json!({

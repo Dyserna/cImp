@@ -90,3 +90,60 @@ export function isVideoSrc(src: string): boolean {
   const path = src.split('?')[0].toLowerCase();
   return path.endsWith('.mp4') || path.endsWith('.webm') || path.endsWith('.mov');
 }
+
+// --- Sprite avatar variant -------------------------------------------------
+//
+// Sprite sets live under the top-level `sprites/<set>/` folder, served to the
+// WebView at `/sprites/<set>/...` by the `cctts-sprites` Vite plugin (dev) and
+// embedded under `dist/sprites/` for builds — exactly mirroring how `avatars/`
+// maps to `/avatar/`. Each set holds a `manifest.json` (Clawdmeter format:
+// `{ tile, animations: { "<name>": { slug, category, frames: [{file, hold_ms}] } } }`)
+// plus one frame subfolder per animation.
+
+/// Sprite sets that ship bundled under `sprites/`. Unknown values fall back to
+/// `claudeSprites` so a stale/typo'd setting never leaves the overlay blank.
+/// Add new bundled sets here (and drop the folder under `sprites/`).
+const KNOWN_SPRITE_SETS = new Set(['claudeSprites']);
+const FALLBACK_SPRITE_SET = 'claudeSprites';
+
+export function spriteSetName(set: string): string {
+  return KNOWN_SPRITE_SETS.has(set) ? set : FALLBACK_SPRITE_SET;
+}
+
+/// Base URL for a bundled sprite set's assets. Frame files from the manifest
+/// are appended to this (`<base>/<frame.file>`).
+export function spriteBaseUrl(set: string): string {
+  return `/sprites/${spriteSetName(set)}`;
+}
+
+export function spriteManifestUrl(set: string): string {
+  return `${spriteBaseUrl(set)}/manifest.json`;
+}
+
+/// Maps each avatar state to a preference-ordered list of animation names.
+/// The player filters these to the names actually present in the chosen set's
+/// manifest, then rotates among the survivors (falling back to *all* available
+/// animations if a state matches none, so any conformant manifest animates).
+///
+/// Per the design decision, the four Dance animations are folded into the Idle
+/// rotation alongside the Idle/Expression animations — so an idle avatar drifts
+/// between breathing, blinking, looking around, and the occasional dance rather
+/// than only the calm idles.
+export const SPRITE_STATE_ANIMS: Record<AvatarState, string[]> = {
+  Idle: [
+    'idle breathe',
+    'idle blink',
+    'idle look around',
+    'expression wink',
+    'expression sleep',
+    'dance bounce',
+    'dance sway',
+    'dance bounce dj',
+    'dance sway dj',
+    'dance djmix',
+  ],
+  Listening: ['idle look around', 'idle blink'],
+  Thinking: ['work think'],
+  Speaking: ['work coding'],
+  Error: ['expression surprise'],
+};

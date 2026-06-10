@@ -890,26 +890,80 @@ impl Default for TtsSettings {
 #[serde(default)]
 pub struct AvatarSettings {
     pub visible: bool,
+    /// Which renderer drives the avatar. `Media` (default) shows the
+    /// per-state image/video files in `images`; `Sprite` ignores `images`
+    /// and instead plays a manifest-driven frame animation from the sprite
+    /// set named in `sprite`. The two are mutually exclusive render paths in
+    /// the frontend — see `AvatarOverlay.svelte`.
+    pub kind: AvatarKind,
     pub size: AvatarSize,
     pub position: AvatarPosition,
     pub margin: AvatarMargin,
     pub opacity: f32,
+    /// Draw the 1px frame (in the waveform color) around the avatar box.
+    /// Defaults off — the sprite mascot reads better borderless. Applies to
+    /// both render kinds; toggled by the "Show border" checkbox in Settings.
+    pub show_border: bool,
     pub images: AvatarImages,
+    /// Sprite-renderer configuration. Only consulted when `kind == Sprite`.
+    pub sprite: SpriteSettings,
     pub transition: TransitionSettings,
     pub waveform: WaveformSettings,
 }
 
 impl Default for AvatarSettings {
     fn default() -> Self {
+        // Size/margin/opacity are set as literals here (rather than via the
+        // field structs' own `Default`) so the v1.11→v1.12 margin migration —
+        // which relies on `AvatarMargin::default()` staying 16/16 for legacy
+        // files — is unaffected while fresh installs get the tuned sprite look.
         Self {
             visible: true,
-            size: AvatarSize::default(),
+            kind: AvatarKind::default(),
+            size: AvatarSize {
+                width_px: 140,
+                height_px: 140,
+            },
             position: AvatarPosition::TopRight,
-            margin: AvatarMargin::default(),
-            opacity: 0.8,
+            margin: AvatarMargin { x_px: 21, y_px: 0 },
+            opacity: 1.0,
+            show_border: false,
             images: AvatarImages::default(),
+            sprite: SpriteSettings::default(),
             transition: TransitionSettings::default(),
             waveform: WaveformSettings::default(),
+        }
+    }
+}
+
+/// Avatar render mode. `Media` is the original image/video-per-state
+/// renderer; `Sprite` is the pixel-art frame-animation renderer driven by a
+/// `manifest.json` under `<root>/sprites/<set>/`.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AvatarKind {
+    Media,
+    /// Default render mode: the animated pixel-art mascot, paired with the
+    /// default `tui-orange` theme. The bundled set is `claudeSprites`.
+    #[default]
+    Sprite,
+}
+
+/// Sprite-renderer settings. `set` names a folder under the bundled
+/// `<root>/sprites/` tree (served to the WebView at `/sprites/<set>/`) that
+/// contains a `manifest.json` plus its frame subfolders. Kept as a plain
+/// name (not a path) so new sets can be dropped in alongside `claudeSprites`
+/// without a schema change; the frontend maps the name to a URL.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct SpriteSettings {
+    pub set: String,
+}
+
+impl Default for SpriteSettings {
+    fn default() -> Self {
+        Self {
+            set: "claudeSprites".to_string(),
         }
     }
 }
@@ -998,6 +1052,10 @@ pub struct WaveformSettings {
     /// string means "follow the active UI theme" — the frontend resolves
     /// it from the `--waveform-color` CSS variable in `theme.css`. A
     /// non-empty value is a user override that wins regardless of theme.
+    /// Render the audio waveform over the avatar. When false the waveform
+    /// canvas is hidden entirely (the avatar itself is unaffected). Toggled
+    /// by the "Show waveform" checkbox in Settings → Waveform.
+    pub visible: bool,
     pub color: String,
     pub line_width: f32,
     pub glow_intensity: f32,
@@ -1007,6 +1065,7 @@ pub struct WaveformSettings {
 impl Default for WaveformSettings {
     fn default() -> Self {
         Self {
+            visible: true,
             color: String::new(),
             line_width: 2.0,
             glow_intensity: 0.6,
@@ -1166,17 +1225,19 @@ pub struct UiSettings {
     /// ratatui aesthetic), `"tui-purple"` (same as tui-yellow with a
     /// gruvbox bright-purple accent), and `"tui-orange"` (same surfaces
     /// with Claude Code's accent orange, #d77757). New installs land on
-    /// `"tui-yellow"`. The pre-V1.13 `"tui"` value is rewritten to
-    /// `"tui-yellow"` by the v12 → v13 migration so existing users keep
-    /// the same look. Existing settings.json files otherwise keep
-    /// whatever value they were persisted with.
+    /// `"tui-orange"`, which also defaults the avatar to the animated
+    /// `claudeSprites` mascot (see [`AvatarKind`] / [`SpriteSettings`]).
+    /// The pre-V1.13 `"tui"` value is rewritten to `"tui-yellow"` by the
+    /// v12 → v13 migration so existing users keep the same look. Existing
+    /// settings.json files otherwise keep whatever value they were
+    /// persisted with.
     pub theme: String,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: "tui-yellow".to_string(),
+            theme: "tui-orange".to_string(),
         }
     }
 }
@@ -1219,7 +1280,9 @@ pub struct TerminalThemeSettings {
 impl Default for TerminalThemeSettings {
     fn default() -> Self {
         Self {
-            name: "Gruvbox Dark".to_string(),
+            // Paired with the default `tui-orange` UI theme. The frontend's
+            // theme picker re-pairs this when the user switches UI theme.
+            name: "Tomorrow Night".to_string(),
             custom: None,
         }
     }

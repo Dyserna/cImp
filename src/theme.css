@@ -31,28 +31,37 @@
   /* Surfaces — cool slate-blue, layered from darkest to lightest. Tight
      contrast between layers; depth comes from accent + shadow, not from
      extreme bg differences. */
-  --surface-0:       #14161c;   /* body / app background */
-  --surface-1:       #1c1f27;   /* panes, base elevated */
-  --surface-2:       #252934;   /* tab bar, dialog body, popover body */
+  /* Chrome backgrounds follow the terminal palette (--term-bg) so the tab
+     bar, status bar, and panes integrate with the terminal; the literal is
+     the fallback when no palette var is set. */
+  --surface-0:       var(--term-bg, #14161c);   /* body / app background */
+  --surface-1:       var(--term-bg, #1c1f27);   /* panes, base elevated */
+  --surface-2:       var(--term-bg, #252934);   /* tab bar, dialog body, popover body */
   --surface-3:       #303644;   /* hover-elevated, active-tab fill */
   --surface-4:       #3a4051;   /* deeper hover, alt-input bg in dialogs */
 
-  /* Sunken — for content inset into a panel/dialog */
-  --surface-sunken:  #181b22;   /* input bg in dialogs/settings */
-  --surface-deep:    #131519;   /* details summary, deeply-recessed bg */
-  --surface-input:   #2d3240;   /* alt input bg (capture / hover-on-input) */
+  /* Sunken — for content inset into a panel/dialog. Also follow the
+     terminal palette so the settings sidebar / inputs / dropdowns match. */
+  --surface-sunken:  var(--term-bg, #181b22);   /* input bg in dialogs/settings */
+  --surface-deep:    var(--term-bg, #131519);   /* sidebar, details summary, recessed bg */
+  --surface-input:   var(--term-bg, #2d3240);   /* alt input bg (capture / hover-on-input) */
 
   /* Text — gradations preserved from V5-01 names; values retuned. */
-  --text-primary:    #f1f3f5;
-  --text-bright:     #ffffff;
+  /* General body text follows the terminal palette foreground (--term-fg);
+     accent / quiet / secondary stay theme-defined (tab + status-bar text). */
+  --text-primary:    var(--term-fg, #f1f3f5);
+  --text-bright:     var(--term-fg, #ffffff);
   --text-on-accent:  #0d1117;   /* dark text on mint fills (high contrast) */
-  --text-secondary:  #b6bdc7;
-  --text-quiet:      #a0a8b3;
-  --text-quiet-strong: #8e95a0;
-  --text-tertiary:   #6f7682;
-  --text-faint:      #5d6470;
-  --text-disabled:   #4d5460;
-  --text-disabled-deep: #404652;
+  /* Neutral text ramp derived from the terminal palette: term-fg blended
+     toward term-bg for the dimmer steps, so all chrome/body text stays
+     in-palette instead of carrying the theme's warm tint. */
+  --text-secondary:  color-mix(in srgb, var(--term-fg, #b6bdc7) 88%, var(--term-bg, #14161c));
+  --text-quiet:      color-mix(in srgb, var(--term-fg, #a0a8b3) 72%, var(--term-bg, #14161c));
+  --text-quiet-strong: color-mix(in srgb, var(--term-fg, #8e95a0) 80%, var(--term-bg, #14161c));
+  --text-tertiary:   color-mix(in srgb, var(--term-fg, #6f7682) 58%, var(--term-bg, #14161c));
+  --text-faint:      color-mix(in srgb, var(--term-fg, #5d6470) 46%, var(--term-bg, #14161c));
+  --text-disabled:   color-mix(in srgb, var(--term-fg, #4d5460) 38%, var(--term-bg, #14161c));
+  --text-disabled-deep: color-mix(in srgb, var(--term-fg, #404652) 30%, var(--term-bg, #14161c));
 
   /* Accent — purple, matching the default avatar / waveform color. The
      two-tier active-state pattern reserves accent fill for filters /
@@ -181,27 +190,30 @@
 [data-theme="tui-yellow"] {
   /* Surfaces — Gruvbox dark0_hard → dark2 (warm near-black to brown-
      gray). Tight contrast between layers; depth comes from borders. */
-  --surface-0:       #1d2021;   /* dark0_hard, body bg */
-  --surface-1:       #282828;   /* dark0, panes */
-  --surface-2:       #32302f;   /* dark0_soft, tab bar / dialog body */
+  --surface-0:       var(--term-bg, #1d2021);   /* dark0_hard, body bg — follows terminal palette */
+  --surface-1:       var(--term-bg, #282828);   /* dark0, panes — follows terminal palette */
+  --surface-2:       var(--term-bg, #32302f);   /* dark0_soft, tab bar / dialog body — follows terminal palette */
   --surface-3:       #3c3836;   /* dark1, hover-elevated */
   --surface-4:       #504945;   /* dark2, deeper hover */
 
-  --surface-sunken:  #1d2021;
-  --surface-deep:    #16181a;
-  --surface-input:   #32302f;
+  --surface-sunken:  var(--term-bg, #1d2021);
+  --surface-deep:    var(--term-bg, #16181a);
+  --surface-input:   var(--term-bg, #32302f);
 
   /* Text — Gruvbox fg → fg4 (cream → tan-gray). */
-  --text-primary:    #ebdbb2;   /* fg / fg1, main cream */
-  --text-bright:     #fbf1c7;   /* fg0 */
+  --text-primary:    var(--term-fg, #ebdbb2);   /* main text — follows terminal palette fg */
+  --text-bright:     var(--term-fg, #fbf1c7);   /* brightest text — follows terminal fg */
   --text-on-accent:  #1d2021;   /* dark text on yellow fills */
-  --text-secondary:  #d5c4a1;   /* fg2 */
-  --text-quiet:      #bdae93;   /* fg3 */
-  --text-quiet-strong: #a89984; /* fg4 */
-  --text-tertiary:   #928374;   /* gray */
-  --text-faint:      #7c6f64;   /* dark3 */
-  --text-disabled:   #665c54;
-  --text-disabled-deep: #504945;
+  /* Neutral text ramp from the terminal palette (term-fg → term-bg blend).
+     Keeps the whole chrome/body text in-palette; accent + semantics stay
+     theme-defined. */
+  --text-secondary:  color-mix(in srgb, var(--term-fg, #d5c4a1) 88%, var(--term-bg, #1d2021));
+  --text-quiet:      color-mix(in srgb, var(--term-fg, #bdae93) 72%, var(--term-bg, #1d2021));
+  --text-quiet-strong: color-mix(in srgb, var(--term-fg, #a89984) 80%, var(--term-bg, #1d2021));
+  --text-tertiary:   color-mix(in srgb, var(--term-fg, #928374) 58%, var(--term-bg, #1d2021));
+  --text-faint:      color-mix(in srgb, var(--term-fg, #7c6f64) 46%, var(--term-bg, #1d2021));
+  --text-disabled:   color-mix(in srgb, var(--term-fg, #665c54) 38%, var(--term-bg, #1d2021));
+  --text-disabled-deep: color-mix(in srgb, var(--term-fg, #504945) 30%, var(--term-bg, #1d2021));
 
   /* Accent — Gruvbox bright yellow. Titles, active selections, and
      focus indicators in ratatui apps almost always use this color;
@@ -306,27 +318,30 @@
 [data-theme="tui-purple"] {
   /* Surfaces — Gruvbox dark0_hard → dark2 (warm near-black to brown-
      gray). Tight contrast between layers; depth comes from borders. */
-  --surface-0:       #1d2021;   /* dark0_hard, body bg */
-  --surface-1:       #282828;   /* dark0, panes */
-  --surface-2:       #32302f;   /* dark0_soft, tab bar / dialog body */
+  --surface-0:       var(--term-bg, #1d2021);   /* dark0_hard, body bg — follows terminal palette */
+  --surface-1:       var(--term-bg, #282828);   /* dark0, panes — follows terminal palette */
+  --surface-2:       var(--term-bg, #32302f);   /* dark0_soft, tab bar / dialog body — follows terminal palette */
   --surface-3:       #3c3836;   /* dark1, hover-elevated */
   --surface-4:       #504945;   /* dark2, deeper hover */
 
-  --surface-sunken:  #1d2021;
-  --surface-deep:    #16181a;
-  --surface-input:   #32302f;
+  --surface-sunken:  var(--term-bg, #1d2021);
+  --surface-deep:    var(--term-bg, #16181a);
+  --surface-input:   var(--term-bg, #32302f);
 
   /* Text — Gruvbox fg → fg4 (cream → tan-gray). */
-  --text-primary:    #ebdbb2;   /* fg / fg1, main cream */
-  --text-bright:     #fbf1c7;   /* fg0 */
+  --text-primary:    var(--term-fg, #ebdbb2);   /* main text — follows terminal palette fg */
+  --text-bright:     var(--term-fg, #fbf1c7);   /* brightest text — follows terminal fg */
   --text-on-accent:  #1d2021;   /* dark text reads on deep purple fill */
-  --text-secondary:  #d5c4a1;   /* fg2 */
-  --text-quiet:      #bdae93;   /* fg3 */
-  --text-quiet-strong: #a89984; /* fg4 */
-  --text-tertiary:   #928374;   /* gray */
-  --text-faint:      #7c6f64;   /* dark3 */
-  --text-disabled:   #665c54;
-  --text-disabled-deep: #504945;
+  /* Neutral text ramp from the terminal palette (term-fg → term-bg blend).
+     Keeps the whole chrome/body text in-palette; accent + semantics stay
+     theme-defined. */
+  --text-secondary:  color-mix(in srgb, var(--term-fg, #d5c4a1) 88%, var(--term-bg, #1d2021));
+  --text-quiet:      color-mix(in srgb, var(--term-fg, #bdae93) 72%, var(--term-bg, #1d2021));
+  --text-quiet-strong: color-mix(in srgb, var(--term-fg, #a89984) 80%, var(--term-bg, #1d2021));
+  --text-tertiary:   color-mix(in srgb, var(--term-fg, #928374) 58%, var(--term-bg, #1d2021));
+  --text-faint:      color-mix(in srgb, var(--term-fg, #7c6f64) 46%, var(--term-bg, #1d2021));
+  --text-disabled:   color-mix(in srgb, var(--term-fg, #665c54) 38%, var(--term-bg, #1d2021));
+  --text-disabled-deep: color-mix(in srgb, var(--term-fg, #504945) 30%, var(--term-bg, #1d2021));
 
   /* Accent — deep purple. Replaces tui-yellow's
      `#fabd2f` accent for users who prefer a cooler hue. */
@@ -431,27 +446,30 @@
 [data-theme="tui-orange"] {
   /* Surfaces — Gruvbox dark0_hard → dark2 (warm near-black to brown-
      gray). Tight contrast between layers; depth comes from borders. */
-  --surface-0:       #1d2021;   /* dark0_hard, body bg */
-  --surface-1:       #282828;   /* dark0, panes */
-  --surface-2:       #32302f;   /* dark0_soft, tab bar / dialog body */
+  --surface-0:       var(--term-bg, #1d2021);   /* dark0_hard, body bg — follows terminal palette */
+  --surface-1:       var(--term-bg, #282828);   /* dark0, panes — follows terminal palette */
+  --surface-2:       var(--term-bg, #32302f);   /* dark0_soft, tab bar / dialog body — follows terminal palette */
   --surface-3:       #3c3836;   /* dark1, hover-elevated */
   --surface-4:       #504945;   /* dark2, deeper hover */
 
-  --surface-sunken:  #1d2021;
-  --surface-deep:    #16181a;
-  --surface-input:   #32302f;
+  --surface-sunken:  var(--term-bg, #1d2021);
+  --surface-deep:    var(--term-bg, #16181a);
+  --surface-input:   var(--term-bg, #32302f);
 
   /* Text — Gruvbox fg → fg4 (cream → tan-gray). */
-  --text-primary:    #ebdbb2;   /* fg / fg1, main cream */
-  --text-bright:     #fbf1c7;   /* fg0 */
+  --text-primary:    var(--term-fg, #ebdbb2);   /* main text — follows terminal palette fg */
+  --text-bright:     var(--term-fg, #fbf1c7);   /* brightest text — follows terminal fg */
   --text-on-accent:  #1d2021;   /* dark text reads on the orange fill */
-  --text-secondary:  #d5c4a1;   /* fg2 */
-  --text-quiet:      #bdae93;   /* fg3 */
-  --text-quiet-strong: #a89984; /* fg4 */
-  --text-tertiary:   #928374;   /* gray */
-  --text-faint:      #7c6f64;   /* dark3 */
-  --text-disabled:   #665c54;
-  --text-disabled-deep: #504945;
+  /* Neutral text ramp from the terminal palette (term-fg → term-bg blend).
+     Keeps the whole chrome/body text in-palette; accent + semantics stay
+     theme-defined. */
+  --text-secondary:  color-mix(in srgb, var(--term-fg, #d5c4a1) 88%, var(--term-bg, #1d2021));
+  --text-quiet:      color-mix(in srgb, var(--term-fg, #bdae93) 72%, var(--term-bg, #1d2021));
+  --text-quiet-strong: color-mix(in srgb, var(--term-fg, #a89984) 80%, var(--term-bg, #1d2021));
+  --text-tertiary:   color-mix(in srgb, var(--term-fg, #928374) 58%, var(--term-bg, #1d2021));
+  --text-faint:      color-mix(in srgb, var(--term-fg, #7c6f64) 46%, var(--term-bg, #1d2021));
+  --text-disabled:   color-mix(in srgb, var(--term-fg, #665c54) 38%, var(--term-bg, #1d2021));
+  --text-disabled-deep: color-mix(in srgb, var(--term-fg, #504945) 30%, var(--term-bg, #1d2021));
 
   /* Accent — Claude Code orange. #d77757 is the terracotta the Claude
      Code CLI uses for its active spinner and brand chrome; the brighter

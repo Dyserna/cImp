@@ -136,6 +136,21 @@ at build time, where they're embedded in the Tauri output as part of
 tree into the portable zip's `avatars/` folder for on-disk discoverability.
 No separate step required.
 
+The **sprite** avatar variant works the same way: sets live at the
+top-level `sprites/<set>/` folder (each a `manifest.json` + frame
+subfolders), served at `/sprites/<set>/...` in dev by the `cctts-sprites`
+Vite plugin and copied to `dist/sprites/<set>/...` at build. Because the
+frontend loads them from the embedded `/sprites/...` URLs, sprite avatars
+function without any on-disk portable folder or Rust path-stamping — the
+release workflow still stages `sprites/` into the zip for discoverability
+and for dropping in new sets. Adding a new bundled set is two steps: drop
+the folder under `sprites/`, and add its name to `KNOWN_SPRITE_SETS` in
+`src/lib/avatarConfig.ts`.
+
+The bundled `claudeSprites` set is pixel-art Clawd mascot animation,
+sourced from the Clawdmeter project (see the credits in `README.md` and
+`NOTICE`).
+
 Custom user-picked image/video paths are absolute disk paths; they're
 loaded via Tauri's asset protocol and need `assetProtocol.scope` to permit
 the path. `tauri.conf.json` currently sets `scope: ["**"]` — broad, fine

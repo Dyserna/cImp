@@ -406,13 +406,21 @@ Open with `Ctrl+,` or the cog button on the avatar.
 
 - **TTS:** voice picker (auto-discovered from `voices/`), speed, volume,
   mute.
-- **Avatar:** visibility, position, size, opacity, per-state image / video
-  overrides, transition video + duration. Empty transition path or
-  `duration = 0` falls back to a 150 ms crossfade.
+- **Avatar:** a **Type** picker — *Picture / Video* (the default) or
+  *Animated sprites* — plus visibility, position, size, opacity. In
+  Picture / Video mode: per-state image / video overrides and a transition
+  video + duration (empty transition path or `duration = 0` falls back to a
+  150 ms crossfade). In Animated sprites mode: a **Sprite set** picker that
+  drives a manifest-based pixel-art mascot whose frames are timed per-frame
+  and rotate per state; the image/video and transition options don't apply.
+  See *Animated sprite avatars* below.
 - **Waveform:** color, line width, glow, opacity.
 - **Display:** terminal font family + size, toggle to render TTS markup
   verbatim in the terminal (debug aid).
-- **Appearance:** UI chrome theme (Modern Dark) and **terminal palette** —
+- **Appearance:** UI chrome theme — Modern Dark plus the TUI variants
+  (Yellow, Purple, Orange); new installs default to **TUI Orange**, which
+  also defaults the avatar to the animated `claudeSprites` mascot — and the
+  **terminal palette** —
   12 bundled palettes (Default, Dracula, Solarized Dark/Light, Nord,
   Tomorrow Night, Gruvbox Dark/Light, One Dark, Monokai, Tokyo Night,
   GitHub Dark) plus a 22-color Custom editor for foreground, background,
@@ -448,6 +456,31 @@ Open with `Ctrl+,` or the cog button on the avatar.
 - **Processing:** stability and max-hold timers for the byte-burst /
   segment-detection pipeline.
 
+## Animated sprite avatars
+
+cctts can render a **frame-animated pixel-art mascot** instead of the
+image/video avatar. It is the **default** on new installs (paired with the
+default TUI Orange theme); switch between it and the image/video avatar in
+*Settings → Avatar → Type*.
+
+How it works:
+
+- A **sprite set** is a folder under `sprites/<set>/` containing a
+  `manifest.json` plus one subfolder of PNG frames per animation. The
+  manifest lists each animation's frames with a per-frame `hold_ms`, so
+  timing is expressive rather than a fixed frame rate.
+- The five avatar states map to animation rotation lists: **Idle** drifts
+  between breathing, blinking, looking around and the occasional **dance**;
+  **Listening** looks around; **Thinking** and **Speaking** show the work
+  animations; **Error** shows a surprise. The mapping lives in
+  `src/lib/avatarConfig.ts` (`SPRITE_STATE_ANIMS`).
+- Frames are drawn on a canvas with nearest-neighbor scaling, so the small
+  source art (20×20) stays crisp pixel art at any avatar size.
+
+The bundled `claudeSprites` set is sourced from the **Clawdmeter** project
+(see *Credits* below). To add another set, drop a `sprites/<name>/` folder
+in and add `<name>` to `KNOWN_SPRITE_SETS` in `src/lib/avatarConfig.ts`.
+
 ## Troubleshooting
 
 - **TTS silent.** Check the log for `TTS disabled: Kokoro model files not found.`
@@ -467,7 +500,8 @@ Open with `Ctrl+,` or the cog button on the avatar.
   Disable it if you'd rather keep playback rolling.
 - **Avatar doesn't move.** Confirm `Settings → Avatar → Visible` is on
   and the per-state image paths point to readable files (or are blank to use
-  the bundled defaults).
+  the bundled defaults). In *Animated sprites* mode, confirm the chosen
+  sprite set exists under `sprites/<set>/` with a valid `manifest.json`.
 - **`Ctrl+R` / `Ctrl+Shift+R` / `F5` don't reload the app.** Intentional
   (v0.6.6+) — a reload would tear down every tab's session and lose
   scrollback. The keystrokes still reach the terminal, so `Ctrl+R` works
@@ -494,6 +528,16 @@ Open with `Ctrl+,` or the cog button on the avatar.
 
 See `docs/completedMilestones/MILESTONE-V1-08-polish.md` "After Milestone
 8" and `docs/FUTURE-FEATURES.md` for the post-v1 parking lot.
+
+## Credits
+
+- **Animated sprite avatar (`claudeSprites`)** — pixel-art Clawd mascot
+  animations from the [Clawdmeter](https://github.com/HermannBjorgvin/Clawdmeter)
+  project (MIT-licensed code; pixel art from
+  [claudepix](https://claudepix.vercel.app)). The Clawd character is property
+  of Anthropic PBC. Full attribution in `NOTICE`.
+- **TTS** — Kokoro-82M ONNX model and `af_heart` voicepack (Apache-2.0);
+  espeak-ng phonemizer via misaki-rs (GPLv3+). See `NOTICE`.
 
 ## License
 

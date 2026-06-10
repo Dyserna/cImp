@@ -6,7 +6,7 @@ import { existsSync, statSync, createReadStream, cpSync, rmSync } from 'fs';
 const host = process.env.TAURI_DEV_HOST;
 
 const AVATARS_SRC = resolve(__dirname, 'avatars');
-const AVATARS_URL_PREFIX = '/avatar';
+const SPRITES_SRC = resolve(__dirname, 'sprites');
 const MIME: Record<string, string> = {
   '.mp4': 'video/mp4',
   '.webm': 'video/webm',
@@ -16,23 +16,37 @@ const MIME: Record<string, string> = {
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
   '.gif': 'image/gif',
+  '.json': 'application/json',
 };
 
-/// Bridge between the on-disk source folder (`<root>/avatars/...`) and the
-/// runtime URL prefix (`/avatar/...`) the WebView fetches. Keeping the
-/// source folder at the project root makes it obvious what ships with the
-/// build; keeping the URL prefix means existing settings.json files with
-/// `/avatar/Transition.mp4` continue to resolve without a migration.
-function avatarsPlugin(): Plugin {
+/// Bridge between an on-disk source folder (`<root>/<srcDir>/...`) and the
+/// runtime URL prefix the WebView fetches. Keeping source folders at the
+/// project root makes it obvious what ships with the build; the dev
+/// middleware serves them directly while `closeBundle` copies them into
+/// `dist/<outDir>/...` so the packaged frontend embeds them too.
+///
+/// Used for two trees:
+///   - `avatars/`  → `/avatar/...`  (per-state image/video avatar assets)
+///   - `sprites/`  → `/sprites/...` (manifest-driven frame-animation sets)
+///
+/// Keeping the `/avatar` URL prefix (singular) means existing settings.json
+/// files with `/avatar/Transition.mp4` continue to resolve without a
+/// migration.
+function staticFolderPlugin(opts: {
+  name: string;
+  src: string;
+  urlPrefix: string;
+  outDir: string;
+}): Plugin {
   return {
-    name: 'cctts-avatars',
+    name: opts.name,
     configureServer(server) {
-      server.middlewares.use(AVATARS_URL_PREFIX, (req, res, next) => {
+      server.middlewares.use(opts.urlPrefix, (req, res, next) => {
         if (!req.url) return next();
         const rel = decodeURIComponent(req.url.split('?')[0]).replace(/^\/+/, '');
-        const file = resolve(AVATARS_SRC, rel);
-        // Prevent escaping the avatars dir via `..` segments.
-        if (file !== AVATARS_SRC && !file.startsWith(AVATARS_SRC + sep)) {
+        const file = resolve(opts.src, rel);
+        // Prevent escaping the source dir via `..` segments.
+        if (file !== opts.src && !file.startsWith(opts.src + sep)) {
           return next();
         }
         if (!existsSync(file) || !statSync(file).isFile()) return next();
@@ -45,9 +59,9 @@ function avatarsPlugin(): Plugin {
       });
     },
     closeBundle() {
-      const out = resolve(__dirname, 'dist', 'avatar');
+      const out = resolve(__dirname, 'dist', opts.outDir);
       rmSync(out, { recursive: true, force: true });
-      cpSync(AVATARS_SRC, out, { recursive: true });
+      if (existsSync(opts.src)) cpSync(opts.src, out, { recursive: true });
     },
   };
 }
@@ -57,7 +71,21 @@ export default defineConfig(async () => ({
   // and are routed/copied by `avatarsPlugin`. Disabling Vite's default
   // public dir avoids confusion about which folder ships at build time.
   publicDir: false,
-  plugins: [svelte(), avatarsPlugin()],
+  plugins: [
+    svelte(),
+    staticFolderPlugin({
+      name: 'cctts-avatars',
+      src: AVATARS_SRC,
+      urlPrefix: '/avatar',
+      outDir: 'avatar',
+    }),
+    staticFolderPlugin({
+      name: 'cctts-sprites',
+      src: SPRITES_SRC,
+      urlPrefix: '/sprites',
+      outDir: 'sprites',
+    }),
+  ],
   clearScreen: false,
   server: {
     port: 1420,

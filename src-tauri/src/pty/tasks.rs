@@ -305,7 +305,7 @@ pub fn spawn_processor(
                             // response that never paints it — a sustained
                             // byte burst.
                             let burst_ready = burst_start
-                                .map_or(false, |s| s.elapsed() >= CLAUDE_BURST_MIN);
+                                .is_some_and(|s| s.elapsed() >= CLAUDE_BURST_MIN);
                             if working_active || burst_ready {
                                 output_active = true;
                                 let _ = state_signals
@@ -318,9 +318,9 @@ pub fn spawn_processor(
                             // stale guard frees a marker left ghosting in the
                             // grid with no underlying byte activity.
                             let quiet = last_byte_time
-                                .map_or(false, |t| t.elapsed() >= CLAUDE_QUIET);
+                                .is_some_and(|t| t.elapsed() >= CLAUDE_QUIET);
                             let stale = last_byte_time
-                                .map_or(false, |t| t.elapsed() >= CLAUDE_WORKING_STALE);
+                                .is_some_and(|t| t.elapsed() >= CLAUDE_WORKING_STALE);
                             if (!working_active && quiet) || stale {
                                 if stale && working_active {
                                     // Looked stuck — drop the detector's
@@ -443,9 +443,6 @@ async fn dispatch_events(
                 if tts_segments.send(req).await.is_err() {
                     debug!("pty processor: TTS segment channel closed (worker not running)");
                 }
-            }
-            ProcessingEvent::Stalled => {
-                warn!(?tab, "pty processor: stalled");
             }
         }
     }

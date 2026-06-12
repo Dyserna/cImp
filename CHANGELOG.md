@@ -5,6 +5,19 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] — 2026-06-12
+
+### Changed
+
+- **Internal cleanup — no user-facing behavior change.** Removed dead code
+  across the Rust backend (unused functions, methods, enum variants, and the
+  unused cell-attribute/row-timestamp bookkeeping in the terminal screen
+  model) now that all milestones are complete, and cleared the remaining
+  `#[allow(dead_code)]` suppressions. Applied mechanical clippy cleanups and
+  de-duplicated a few frontend helpers (`AiTabId`, terminal-palette
+  application, error-to-string formatting). Terminal colors are unaffected —
+  they have always been rendered by xterm.js from the raw byte stream.
+
 ## [0.9.1] — 2026-06-12
 
 ### Fixed

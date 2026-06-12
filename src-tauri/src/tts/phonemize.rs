@@ -26,8 +26,9 @@ pub struct PhonemeTokens {
     /// Unpadded token count. Index into the voicepack with this — Kokoro's
     /// style embeddings vary by utterance length.
     pub raw_count: usize,
-    /// The raw IPA string for diagnostics.
-    #[allow(dead_code)]
+    /// The raw IPA string for diagnostics. Read by the espeak OOV-fallback
+    /// test to assert real G2P (not letter-spelling); unused in normal builds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub phonemes: String,
 }
 

@@ -196,20 +196,15 @@ impl Default for ContentCaptureSettings {
 /// Per-process tracing-filter level. Mapped to an `EnvFilter` string by
 /// `as_filter_str`; serialized as a lowercase string. The `RUST_LOG`
 /// environment variable, when set, overrides this at startup.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Trace,
     Debug,
+    #[default]
     Info,
     Warn,
     Error,
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Info
-    }
 }
 
 impl LogLevel {
@@ -227,19 +222,14 @@ impl LogLevel {
 /// How long to keep rolled log files before the startup cleanup pass
 /// removes them. `Never` skips cleanup entirely. Computed as a max-age
 /// against each file's mtime in `logging::run_cleanup`.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogRetention {
     Daily,
+    #[default]
     Weekly,
     Monthly,
     Never,
-}
-
-impl Default for LogRetention {
-    fn default() -> Self {
-        Self::Weekly
-    }
 }
 
 impl LogRetention {
@@ -434,7 +424,7 @@ impl TabConfig {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct AiToolTabConfig {
     pub id: String,
@@ -470,29 +460,7 @@ pub struct AiToolTabConfig {
     pub use_local_provider: bool,
 }
 
-impl Default for AiToolTabConfig {
-    fn default() -> Self {
-        // Neutral default — only used when serde encounters a malformed
-        // entry mid-array. Real defaults come from the constructors below.
-        Self {
-            id: String::new(),
-            builtin: false,
-            name: String::new(),
-            command: String::new(),
-            args: Vec::new(),
-            cwd: None,
-            env: HashMap::new(),
-            tts_injection: TtsInjection::default(),
-            notifications: AiNotificationConfig::default(),
-            first_launch_notice_dismissed: false,
-            theme_override: None,
-            background_override: None,
-            use_local_provider: false,
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct ShellTabConfig {
     pub id: String,
@@ -512,22 +480,6 @@ pub struct ShellTabConfig {
     pub background_override: Option<BackgroundOverride>,
 }
 
-impl Default for ShellTabConfig {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            builtin: false,
-            name: String::new(),
-            command: String::new(),
-            args: Vec::new(),
-            cwd: None,
-            env: HashMap::new(),
-            notifications: ShellNotificationConfig::default(),
-            theme_override: None,
-            background_override: None,
-        }
-    }
-}
 
 /// V1.4-07: local-LLM provider configuration. When an AI tab has
 /// `use_local_provider: true`, the launch flow composes env vars from
@@ -1088,19 +1040,14 @@ impl Default for AvatarMargin {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AvatarPosition {
+    #[default]
     TopRight,
     TopLeft,
     BottomRight,
     BottomLeft,
-}
-
-impl Default for AvatarPosition {
-    fn default() -> Self {
-        Self::TopRight
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -1581,18 +1528,13 @@ impl From<BackgroundPresetConfig> for TerminalBackgroundSettings {
 /// CSS `background-size` strategy. `Tile` is mapped to
 /// `background-repeat: repeat` + `background-size: auto` on the
 /// frontend; `Cover` and `Contain` map directly to their CSS values.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BackgroundSize {
+    #[default]
     Cover,
     Contain,
     Tile,
-}
-
-impl Default for BackgroundSize {
-    fn default() -> Self {
-        Self::Cover
-    }
 }
 
 /// V1.4-02 three-state per-tab override. Encodes:

@@ -2,7 +2,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
-#[allow(dead_code)] // variants reserved for upcoming milestones
 pub enum AppError {
     #[error("PTY operation failed: {0}")]
     Pty(String),

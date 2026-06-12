@@ -112,6 +112,7 @@ fn read_access_token() -> Option<String> {
 ///   - the default (all-`None`/false) "unavailable" state on no-token / network
 ///     error / other non-2xx / parse failure — the caller hides the widget if
 ///     it never had data.
+///
 /// Failures are logged for diagnostics but never surfaced as errors.
 pub async fn fetch_usage() -> UsageResult {
     let token = match read_access_token() {

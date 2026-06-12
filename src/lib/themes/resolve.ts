@@ -50,3 +50,14 @@ export function effectiveTheme(
 ): ThemeColors {
   return themeFromSetting(tab.theme_override ?? global);
 }
+
+/// Publish the active GLOBAL terminal palette as `--term-bg` / `--term-fg`
+/// CSS custom properties on <html> so the app chrome (tab/bar backgrounds,
+/// body text) integrates with the terminal colors. Theme CSS references
+/// these with the per-theme value as a fallback, so an unset var leaves the
+/// original look. Shared by both window entry points (main + settings).
+export function applyTerminalPaletteVars(theme: ThemeColors): void {
+  const root = document.documentElement.style;
+  if (theme.background) root.setProperty('--term-bg', theme.background);
+  if (theme.foreground) root.setProperty('--term-fg', theme.foreground);
+}

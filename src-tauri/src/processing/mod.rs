@@ -58,9 +58,6 @@ pub enum ProcessingEvent {
     TerminalBytes(Vec<u8>),
     /// A single sentence extracted from a `[[TTS]]...[[/TTS]]` block.
     TtsSegment(String),
-    /// Diagnostic: the layer has held content for an unusually long time.
-    #[allow(dead_code)]
-    Stalled,
 }
 
 pub struct ProcessingLayer {
@@ -115,13 +112,11 @@ impl ProcessingLayer {
         if self.oldest_pending_at.is_none() {
             self.oldest_pending_at = Some(now);
         }
-        self.screen.set_now(now);
         self.screen.feed(&mut self.parser, bytes);
         self.collect_events(/*allow_close_emit=*/ true, /*force=*/ false)
     }
 
     pub(crate) fn flush_pending_at(&mut self, now: Instant) -> Vec<ProcessingEvent> {
-        self.screen.set_now(now);
         let force = self
             .oldest_pending_at
             .map(|t| now.saturating_duration_since(t) >= self.max_hold)

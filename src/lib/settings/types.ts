@@ -3,6 +3,7 @@
 // JSON, never as `undefined`.
 
 import type { LayoutNode } from '../layout/types';
+import type { AiTabId } from '../tabs/types';
 
 export type AvatarPosition = 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left';
 
@@ -512,8 +513,10 @@ export interface Settings {
 }
 
 /// One of the four reserved AI-tool tab ids. Wire format mirrors the
-/// backend's `AiTabId` enum (kebab-case strings).
-export type AiTabId = 'claude' | 'claude-local' | 'aider' | 'aider-local';
+/// backend's `AiTabId` enum (kebab-case strings). Canonical definition
+/// lives in `../tabs/types` (alongside `AI_TABS` and the type guards);
+/// re-exported here so settings consumers keep a single source of truth.
+export type { AiTabId };
 
 /// Tracing-filter level. Lowercase to match Rust's serde rename.
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';

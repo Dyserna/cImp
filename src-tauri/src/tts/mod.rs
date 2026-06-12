@@ -4,8 +4,6 @@ mod voice;
 mod worker;
 
 pub use engine::TtsEngine;
-#[allow(unused_imports)]
-pub use engine::{SynthesisRequest, SynthesisResponse, SAMPLE_RATE};
 pub use worker::spawn_tts_worker;
 
 use std::path::PathBuf;

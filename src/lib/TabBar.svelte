@@ -185,6 +185,7 @@
 <div
   class="tab-bar"
   role="tablist"
+  tabindex="-1"
   bind:this={barEl}
   oncontextmenu={onBarContextMenu}
 >

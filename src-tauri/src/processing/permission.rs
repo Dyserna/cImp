@@ -156,10 +156,8 @@ pub fn default_patterns() -> Vec<PermissionPattern> {
 }
 
 /// Empty pattern list for tabs that don't run detection (Shell tabs).
-/// Kept as a named helper for callers that prefer the intent over a bare
-/// `Vec::new()`. Test code uses it; production code constructs via
-/// `Vec::new()` inline.
-#[allow(dead_code)]
+/// Test-only helper; production code constructs via `Vec::new()` inline.
+#[cfg(test)]
 pub fn no_patterns() -> Vec<PermissionPattern> {
     Vec::new()
 }
@@ -253,10 +251,9 @@ impl PermissionDetector {
     }
 
     /// Force-clear recorded state for one kind without emitting. Used by
-    /// the state manager when input-driven clearing has already updated
+    /// the PTY processor when input-driven clearing has already updated
     /// `awaiting_*`, so the detector doesn't re-emit a redundant Resolved
     /// on the next tick if the prompt text is still on screen.
-    #[allow(dead_code)]
     pub fn force_clear(&mut self, kind: PatternKind) {
         self.last_detected.remove(&kind);
     }

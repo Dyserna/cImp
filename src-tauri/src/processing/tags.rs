@@ -77,11 +77,7 @@ impl TagScanner {
         let mut local_open = false;
         let mut last_consumed: usize = 0;
 
-        loop {
-            let rel_open = match find_bytes(&scan[i..], OPEN) {
-                Some(p) => p,
-                None => break,
-            };
+        while let Some(rel_open) = find_bytes(&scan[i..], OPEN) {
             let abs_open = i + rel_open;
             let content_start = abs_open + OPEN.len();
 
@@ -227,18 +223,14 @@ fn strip_ansi(bytes: &[u8]) -> String {
                                 .ok()
                                 .and_then(|s| s.parse::<usize>().ok())
                                 .unwrap_or(1)
-                                .max(1)
-                                .min(64);
-                            for _ in 0..n_skip {
-                                out.push(b' ');
-                            }
+                                .clamp(1, 64);
+                            out.resize(out.len() + n_skip, b' ');
                         }
-                        b'A' | b'B' | b'D' | b'E' | b'F' | b'G' | b'H' | b'd' | b'f' | b'`' => {
+                        b'A' | b'B' | b'D' | b'E' | b'F' | b'G' | b'H' | b'd' | b'f' | b'`'
                             // Other cursor-move sequences → break the line.
-                            if !out.last().map(|&c| c == b'\n').unwrap_or(true) {
+                            if !out.last().map(|&c| c == b'\n').unwrap_or(true) => {
                                 out.push(b'\n');
                             }
-                        }
                         _ => { /* SGR, erase, etc. — discard */ }
                     }
                     i += 1;

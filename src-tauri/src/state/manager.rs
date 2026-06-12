@@ -139,12 +139,6 @@ pub enum TabKind {
     Shell,
 }
 
-impl TabKind {
-    pub fn is_shell(&self) -> bool {
-        matches!(self, TabKind::Shell)
-    }
-}
-
 /// Static metadata describing one tab at registration time. Plumbed into the
 /// state manager and notification manager so per-kind behavior is decided
 /// without round-tripping through settings on every signal.
@@ -211,7 +205,6 @@ pub enum AvatarState {
 /// small string clone per signal touch — is paid only on cross-thread sends
 /// and the per-signal route step in the run loop, never in tight loops.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // some variants reserved for later milestones
 pub enum StateSignal {
     UserKeystroke { tab: TabId },
     UserSubmit { tab: TabId },
@@ -318,7 +311,6 @@ impl StateSignal {
 /// the internal signal vocabulary.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-#[allow(dead_code)] // some variants are consumed only by the frontend
 // Variant names are the IPC wire format (kebab-case after serde); renaming
 // to satisfy the lint would break the frontend contract.
 #[allow(clippy::enum_variant_names)]
@@ -390,7 +382,6 @@ impl From<&TabKind> for TabKindWire {
 #[derive(Clone, Debug)]
 struct TabState {
     kind: TabKind,
-    #[allow(dead_code)] // Phase 1 only stores it; Phase 6 surfaces it in events.
     name: String,
     avatar_state: AvatarState,
     has_unsent_input: bool,

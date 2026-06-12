@@ -57,15 +57,6 @@ impl RingBuffer {
         out
     }
 
-    #[allow(dead_code)] // M5 visualizer hook
-    pub fn rms(&self, window: usize) -> f32 {
-        let recent = self.recent(window);
-        if recent.is_empty() {
-            return 0.0;
-        }
-        let sum_sq: f32 = recent.iter().map(|s| s * s).sum();
-        (sum_sq / recent.len() as f32).sqrt()
-    }
 }
 
 #[derive(Clone)]
@@ -85,11 +76,6 @@ impl AmplitudeTap {
             .unwrap_or_default()
     }
 
-    #[allow(dead_code)] // alternate visualizer mode hook
-    pub fn current_amplitude_rms(&self) -> f32 {
-        // 1024 samples ≈ 42 ms at 24 kHz — a typical visualizer frame window.
-        self.inner.read().map(|b| b.rms(1024)).unwrap_or(0.0)
-    }
 }
 
 #[cfg(test)]
@@ -117,16 +103,4 @@ mod tests {
         assert_eq!(r.recent(2), vec![4.0, 5.0]);
     }
 
-    #[test]
-    fn ring_rms() {
-        let mut r = RingBuffer::new(8);
-        for _ in 0..4 {
-            r.push(1.0);
-        }
-        for _ in 0..4 {
-            r.push(-1.0);
-        }
-        // All samples are ±1.0 → RMS = 1.0
-        assert!((r.rms(8) - 1.0).abs() < 1e-6);
-    }
 }

@@ -8,6 +8,7 @@
   import { closeDialog, dialogState } from './store';
   import { createShellTab, defaultShellSpec, type TabLifecycleError } from '../ipc';
   import { tabs } from '../tabs/store';
+  import { errorMessage } from '../errors';
   import ShellTabFields from './ShellTabFields.svelte';
 
   let name = $state('');
@@ -92,7 +93,7 @@
       } else {
         error = {
           kind: 'internal',
-          message: typeof e === 'string' ? e : JSON.stringify(e),
+          message: errorMessage(e),
         };
       }
     } finally {

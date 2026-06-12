@@ -2,7 +2,7 @@ import { mount } from 'svelte';
 import App from './App.svelte';
 import { ttsTest } from './lib/ipc';
 import { settings } from './lib/settings/store';
-import { themeFromSetting } from './lib/themes/resolve';
+import { themeFromSetting, applyTerminalPaletteVars } from './lib/themes/resolve';
 import { installReloadBlocker } from './lib/shortcuts/blockReload';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
@@ -33,18 +33,6 @@ installReloadBlocker();
 // bar; every `tui-*` variant hides it (`setDecorations(false)`) and
 // renders the custom `TuiTitleBar` Svelte component instead. The two
 // stay in sync via this single subscription.
-// Publish the active GLOBAL terminal palette as CSS custom properties so the
-// chrome (tab/bar backgrounds via --surface-*, body text via --text-primary)
-// integrates with the terminal colors. Theme CSS references these with the
-// per-theme value as a fallback, so an unset var leaves the original look.
-// Per-tab palette overrides intentionally do NOT drive the chrome — there's
-// one tab bar / status bar shared across tabs, so it follows the global pick.
-function applyTerminalPaletteVars(theme: ReturnType<typeof themeFromSetting>) {
-  const root = document.documentElement.style;
-  if (theme.background) root.setProperty('--term-bg', theme.background);
-  if (theme.foreground) root.setProperty('--term-fg', theme.foreground);
-}
-
 // The main window is created hidden (`visible: false` in tauri.conf.json) to
 // avoid a blank WebView flashing on screen while the bundle loads and Svelte
 // mounts. We reveal it exactly once, after the first decorations toggle has

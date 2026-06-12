@@ -14,7 +14,6 @@
     getClaudeUsage,
     type UsageResult,
     type UsageSnapshot,
-    type UsageWindow,
   } from '../ipc';
 
   // Floor on the poll cadence so a hand-edited tiny interval can't hammer the
@@ -149,90 +148,131 @@
   // (e.g. not logged into Claude).
   const visible = $derived(!!snapshot || rateLimited);
 
-  // Number of grid columns each window row emits (label + whichever elements
-  // are enabled). Both rows emit the same set, so the grid's columns size to
-  // the widest cell and the two rows line up — bars included — regardless of
-  // label length.
-  const colCount = $derived(
-    1 +
-      (usage.show_bar ? 1 : 0) +
-      (usage.show_percentage ? 1 : 0) +
-      (usage.show_countdown ? 1 : 0) +
-      (usage.show_reset_clock ? 1 : 0),
-  );
+  // The two quota windows in display order. `w` is null while we have no
+  // data yet (rate-limited at startup) — cells render "—" placeholders so
+  // the layout stays stable and fills in once a fetch succeeds. Name and
+  // duration are split so each column ((5h)/(7d) included) aligns across
+  // both rows.
+  const windowsList = $derived([
+    {
+      name: 'current session',
+      dur: '(5h)',
+      full: 'Rolling 5-hour session quota',
+      w: snapshot?.five_hour ?? null,
+    },
+    {
+      name: 'weekly session',
+      dur: '(7d)',
+      full: 'Rolling 7-day weekly quota',
+      w: snapshot?.seven_day ?? null,
+    },
+  ]);
 </script>
-
-{#snippet windowView(label: string, full: string, w: UsageWindow | null)}
-  <!-- `w` is null while we have no data yet (e.g. rate-limited at startup):
-       render the same cells with "—" placeholders so the layout is stable and
-       fills in once a fetch succeeds. -->
-  <span class="uw">
-    <span class="uw-label" title={full}>{label}</span>
-    {#if usage.show_bar}
-      <span class="bar">
-        <span
-          class="fill"
-          style="width: {w ? Math.min(100, Math.max(0, w.utilization)) : 0}%"
-        ></span>
-      </span>
-    {/if}
-    {#if usage.show_percentage}
-      <span class="pct">{w ? pct(w.utilization) + '%' : '—'}</span>
-    {/if}
-    {#if usage.show_countdown}
-      <span class="cd">{w?.resets_at ? 'resets in: ' + fmtCountdown(w.resets_at, now) : '—'}</span>
-    {/if}
-    {#if usage.show_reset_clock}
-      <span class="clk"
-        >{w?.resets_at
-          ? (usage.show_countdown ? 'at ' : 'resets at ') + fmtResetClock(w.resets_at, now)
-          : ''}</span
-      >
-    {/if}
-  </span>
-{/snippet}
 
 {#if usage.enabled && visible}
   <div
     class="usage-meter"
     title={rateLimited && !snapshot ? 'Claude Code usage — rate limited, retrying…' : 'Claude Code usage'}
   >
-    <div class="windows" style="grid-template-columns: repeat({colCount}, max-content);">
-      {@render windowView('current session (5h)', 'Rolling 5-hour session quota', snapshot?.five_hour ?? null)}
-      {@render windowView('weekly session (7d)', 'Rolling 7-day weekly quota', snapshot?.seven_day ?? null)}
+    <!-- label column: name + duration in their own tracks so (5h)/(7d)
+         line up across the two rows. -->
+    <div class="ug label">
+      {#each windowsList as r}
+        <span class="name" title={r.full}>{r.name}</span>
+        <span class="dur">{r.dur}</span>
+      {/each}
     </div>
+    {#if usage.show_bar}
+      <div class="ug">
+        {#each windowsList as r}
+          <span class="bar">
+            <span
+              class="fill"
+              style="width: {r.w ? Math.min(100, Math.max(0, r.w.utilization)) : 0}%"
+            ></span>
+          </span>
+        {/each}
+      </div>
+    {/if}
+    {#if usage.show_percentage}
+      <div class="ug">
+        {#each windowsList as r}
+          <span class="pct">{r.w ? pct(r.w.utilization) + '%' : '—'}</span>
+        {/each}
+      </div>
+    {/if}
+    {#if usage.show_percentage && (usage.show_countdown || usage.show_reset_clock)}
+      <span class="vdiv" aria-hidden="true"></span>
+    {/if}
+    {#if usage.show_countdown}
+      <div class="ug">
+        {#each windowsList as r}
+          <span class="cd">{r.w?.resets_at ? 'resets in: ' + fmtCountdown(r.w.resets_at, now) : '—'}</span>
+        {/each}
+      </div>
+    {/if}
+    {#if usage.show_countdown && usage.show_reset_clock}
+      <span class="vdiv" aria-hidden="true"></span>
+    {/if}
+    {#if usage.show_reset_clock}
+      <div class="ug">
+        {#each windowsList as r}
+          <span class="clk"
+            >{r.w?.resets_at
+              ? (usage.show_countdown ? '@ ' : 'resets @ ') + fmtResetClock(r.w.resets_at, now)
+              : ''}</span
+          >
+        {/each}
+      </div>
+    {/if}
   </div>
 {/if}
 
 <style>
+  /* A flex row of stacked columns (label, bar, %, countdown, clock) with
+     short dividers between groups. Each column is a 2-row grid: the 5h
+     window over the 7d window, so the two rows line up per column. */
   .usage-meter {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-3);
+    gap: var(--space-2);
     font-size: 11px;
     line-height: 1;
     color: var(--text-secondary);
     white-space: nowrap;
     user-select: none;
   }
-  /* The two windows stack as two grid rows sharing one set of columns, so
-     every column (label, bar, %, reset text) lines up across both rows
-     regardless of label length. Column count is set inline from `colCount`. */
-  .windows {
+  .ug {
     display: grid;
     grid-auto-flow: row;
+    /* Uniform row height across every column so the two rows line up
+       panel-wide (the bar column has no text of its own to set its row
+       height) and each bar centers in an identical box — otherwise the
+       short bar rows center independently and land on fractional pixels,
+       making the bottom bar look thinner and off-centre. Kept close to the
+       11px text height so the two lines sit as tight as the system-stats
+       panel rather than spaced apart. */
+    grid-auto-rows: 1.1em;
     align-items: center;
     justify-items: start;
-    column-gap: var(--space-2);
     row-gap: var(--space-1);
   }
-  /* `display: contents` dissolves the per-window wrapper so each window's
-     cells become direct grid items of `.windows` and participate in the
-     shared column tracks. */
-  .uw {
-    display: contents;
+  /* Label column splits name + duration into two tracks so the (5h)/(7d)
+     suffixes line up across the two rows regardless of name length. */
+  .ug.label {
+    grid-template-columns: max-content max-content;
+    column-gap: 4px;
   }
-  .uw-label {
+  /* Short vertical divider between groups; deliberately shorter than the
+     panel height so the columns still read as one component. */
+  .vdiv {
+    flex: 0 0 auto;
+    width: 1px;
+    height: 1.8em;
+    background: var(--border-subtle);
+  }
+  .name,
+  .dur {
     font-weight: 600;
     color: var(--accent);
   }
@@ -257,17 +297,14 @@
   .pct {
     font-variant-numeric: tabular-nums;
     color: var(--text-primary);
-    justify-self: end;
     /* Reserve room for "100%" so a digit change doesn't widen the column
        and shift the panel. */
     min-width: 4ch;
     text-align: right;
   }
-  /* Extra breathing room so the "when it resets" group (countdown + clock)
-     reads as separate from the "how full" group (label + bar + %). */
   .cd {
     font-variant-numeric: tabular-nums;
-    margin-left: var(--space-1);
+    color: var(--text-primary);
   }
   .clk {
     color: var(--text-secondary);

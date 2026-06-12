@@ -45,6 +45,21 @@ function applyTerminalPaletteVars(theme: ReturnType<typeof themeFromSetting>) {
   if (theme.foreground) root.setProperty('--term-fg', theme.foreground);
 }
 
+// The main window is created hidden (`visible: false` in tauri.conf.json) to
+// avoid a blank WebView flashing on screen while the bundle loads and Svelte
+// mounts. We reveal it exactly once, after the first decorations toggle has
+// been applied below — so the user never sees the empty window nor a title-bar
+// jump as the TUI themes drop the OS chrome.
+let hasShownWindow = false;
+function showMainWindowOnce() {
+  if (hasShownWindow) return;
+  hasShownWindow = true;
+  void getCurrentWindow().show().catch(() => {});
+}
+// Safety net: if the decorations IPC round-trip never resolves, reveal anyway
+// so a backend hiccup can't leave the user staring at nothing.
+setTimeout(showMainWindowOnce, 3000);
+
 let lastDecorations: boolean | null = null;
 settings.subscribe((s) => {
   const next = s.ui?.theme || 'tui-orange';
@@ -61,8 +76,14 @@ settings.subscribe((s) => {
     void getCurrentWindow()
       .setDecorations(wantDecorations)
       .finally(() => {
-        void invoke('set_window_square_corners', { square: !wantDecorations }).catch(() => {});
+        void invoke('set_window_square_corners', { square: !wantDecorations })
+          .catch(() => {})
+          // First decorations pass is done — the window is now in its final
+          // chrome state, so it's safe to reveal it.
+          .finally(() => showMainWindowOnce());
       });
+  } else {
+    showMainWindowOnce();
   }
 });
 

@@ -33,8 +33,8 @@ use crate::ipc::commands::{
     get_system_stats, list_tabs,
     list_voices, open_settings_window, open_settings_window_to_tab, pty_get_scrollback,
     pty_rebind_channel, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
-    restart_shell_tab, set_active_tab, settings_get, settings_update, tab_activate, tts_speak,
-    tts_set_paused, tts_speak_selection, tts_stop, tts_test,
+    restart_shell_tab, set_active_tab, set_window_square_corners, settings_get, settings_update,
+    tab_activate, tts_speak, tts_set_paused, tts_speak_selection, tts_stop, tts_test,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -360,6 +360,7 @@ fn main() {
             get_shell_tab_config,
             set_enabled_ai_tabs,
             set_broot_enabled,
+            set_window_square_corners,
             save_layout,
             save_layout_preset,
             delete_layout_preset,

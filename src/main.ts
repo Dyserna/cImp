@@ -5,6 +5,7 @@ import { settings } from './lib/settings/store';
 import { themeFromSetting } from './lib/themes/resolve';
 import { installReloadBlocker } from './lib/shortcuts/blockReload';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
 import './theme.css';
 import './theme.tui-yellow.css';
 import './theme.tui-purple.css';
@@ -54,7 +55,14 @@ settings.subscribe((s) => {
   const wantDecorations = !next.startsWith('tui-');
   if (wantDecorations !== lastDecorations) {
     lastDecorations = wantDecorations;
-    void getCurrentWindow().setDecorations(wantDecorations);
+    // Square the window corners for the TUI themes (borderless), restore
+    // the OS default rounding for modern-dark. Applied after the
+    // decorations toggle since changing decorations can reset DWM attrs.
+    void getCurrentWindow()
+      .setDecorations(wantDecorations)
+      .finally(() => {
+        void invoke('set_window_square_corners', { square: !wantDecorations }).catch(() => {});
+      });
   }
 });
 

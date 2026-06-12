@@ -586,6 +586,65 @@ pub async fn close_settings_window(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
+/// Square off (or restore) the main window's corners. Windows 11 rounds
+/// borderless windows via DWM regardless of CSS; the `tui-*` themes drop
+/// the native decorations and want hard corners to match the ratatui
+/// look, so the frontend calls this with `square = true` when a TUI theme
+/// is active and `false` (default OS rounding) otherwise. No-op on
+/// non-Windows platforms.
+#[tauri::command]
+pub fn set_window_square_corners(app: AppHandle, square: bool) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        let window = app
+            .get_webview_window("main")
+            .ok_or_else(|| AppError::Ipc("main window not found".into()))?;
+        let hwnd = window
+            .hwnd()
+            .map_err(|e| AppError::Ipc(format!("hwnd: {e}")))?;
+
+        // DWMWA_WINDOW_CORNER_PREFERENCE = 33; DWMWCP_DEFAULT = 0,
+        // DWMWCP_DONOTROUND = 1. Declared inline so we don't pull in the
+        // whole `windows` crate for a single attribute call.
+        const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+        const DWMWCP_DEFAULT: u32 = 0;
+        const DWMWCP_DONOTROUND: u32 = 1;
+        #[link(name = "dwmapi")]
+        extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: isize,
+                attr: u32,
+                pv: *const core::ffi::c_void,
+                cb: u32,
+            ) -> i32;
+        }
+        let pref: u32 = if square {
+            DWMWCP_DONOTROUND
+        } else {
+            DWMWCP_DEFAULT
+        };
+        let hr = unsafe {
+            DwmSetWindowAttribute(
+                hwnd.0 as isize,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &pref as *const u32 as *const core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if hr < 0 {
+            return Err(AppError::Ipc(format!(
+                "DwmSetWindowAttribute failed: 0x{hr:08x}"
+            )));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, square);
+    }
+    Ok(())
+}
+
 /// V1.4-07 A: open the Settings window scrolled to a specific tab's
 /// section. The right-click "Configure tab" entry on AI tabs uses this
 /// instead of the shell-only `ConfigureTabDialog.svelte`. Cold-open is

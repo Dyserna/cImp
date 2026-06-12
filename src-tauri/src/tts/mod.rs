@@ -9,6 +9,7 @@ pub use engine::{SynthesisRequest, SynthesisResponse, SAMPLE_RATE};
 pub use worker::spawn_tts_worker;
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use crate::error::{AppError, AppResult};
@@ -30,11 +31,45 @@ pub const RUNTIME_SYSTEM_PROMPT: &str = include_str!("runtime_prompt.md");
 /// are *for* inactive tabs by definition (V2-04). The notification manager
 /// is the only producer; regular processing-layer segments stay on the
 /// `Synthesize` path.
+///
+/// `SpeakSelection` backs the Ctrl+right-click read-along gesture: a
+/// pre-segmented list of sentence chunks synthesized and played in order,
+/// each tagged with a `(session, index)` mark so the audio thread can emit
+/// progress as it plays through them. `session` matches the value the
+/// command stored in the shared [`SpeakSession`] cell — the worker re-checks
+/// it before every chunk so an Esc/`tts_stop` (which zeroes the cell) or a
+/// superseding read aborts the loop without playing the rest.
 #[derive(Debug)]
 pub enum TtsRequest {
-    Synthesize { tab: TabId, text: String },
+    Synthesize {
+        tab: TabId,
+        text: String,
+        /// `true` for AI-tag content from the processing layer — these are
+        /// dropped while [`AiTtsSuppressed`] is set (Esc stops the rest of the
+        /// current burst until new output). `false` for command-initiated
+        /// speech (`tts_test`, `tts_speak`), which is never suppressed.
+        suppressible: bool,
+    },
     SynthesizeNotification { tab: TabId, text: String },
+    SpeakSelection {
+        tab: TabId,
+        session: u64,
+        chunks: Vec<String>,
+    },
 }
+
+/// Shared "current selection-read session" id. `tts_speak_selection` stores
+/// its session id here; `tts_stop` (and the Esc gesture behind it) zeroes it.
+/// The TTS worker reads it before each chunk to decide whether to keep going.
+/// 0 means "no active selection read".
+pub type SpeakSession = Arc<AtomicU64>;
+
+/// Shared "suppress AI-tag TTS" flag. Set by `tts_stop` (Esc) so the rest of
+/// the current Claude output burst's `[[TTS]]` segments are dropped instead of
+/// played; cleared by the state manager on the next `ClaudeOutputStarted` (new
+/// output). Only gates `TtsRequest::Synthesize { suppressible: true }` —
+/// notifications and selection reads are never affected.
+pub type AiTtsSuppressed = Arc<std::sync::atomic::AtomicBool>;
 
 /// Shared active-tab cell, read on every TTS request (worker) and on every
 /// audio playback edge (audio thread). Synchronous because the audio thread

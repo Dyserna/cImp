@@ -8,7 +8,7 @@ use crate::audio::AudioOutput;
 use crate::settings::SettingsHandle;
 use crate::state::{InputLengths, StateSignal};
 use crate::tabs::TabRegistryHandle;
-use crate::tts::TtsRequest;
+use crate::tts::{AiTtsSuppressed, SpeakSession, TtsRequest};
 
 pub struct AppState {
     /// All tabs and the active-tab pointer live here. Methods on the
@@ -18,6 +18,16 @@ pub struct AppState {
     /// Channel into the TTS worker. Each per-tab processing layer clones the
     /// sender; the worker filters by active tab on the receive side.
     pub tts_segments: mpsc::Sender<TtsRequest>,
+    /// Shared "current selection-read session" id (0 = none).
+    /// `tts_speak_selection` bumps it; `tts_stop` zeroes it. The TTS worker
+    /// reads it between chunks so an Esc-driven stop or a superseding read
+    /// abandons the remaining chunks of an in-flight read. See
+    /// [`crate::tts::SpeakSession`].
+    pub speak_session: SpeakSession,
+    /// Set by `tts_stop` (Esc) to drop the rest of the current AI-output
+    /// burst's tagged TTS; cleared by the state manager on the next
+    /// `ClaudeOutputStarted`. See [`crate::tts::AiTtsSuppressed`].
+    pub ai_tts_suppressed: AiTtsSuppressed,
     /// Tag contents the user typed/pasted. Shared across tabs because the
     /// processing layer's filter is content-based (not timing- or tab-
     /// scoped). Keeping a single set is correct: a `[[TTS]]` the user typed

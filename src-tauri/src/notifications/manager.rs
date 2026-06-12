@@ -308,7 +308,8 @@ impl NotificationManager {
             }
             StateEvent::ActiveTabChanged { .. }
             | StateEvent::DoneWhileAwayChanged { .. }
-            | StateEvent::TabRenamed { .. } => {
+            | StateEvent::TabRenamed { .. }
+            | StateEvent::TtsSelectionProgress { .. } => {
                 return;
             }
         };

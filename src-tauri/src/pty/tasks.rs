@@ -439,7 +439,7 @@ async fn dispatch_events(
                     continue;
                 }
                 debug!(target: "tts_stub", ?tab, text = %text, "extracted TTS segment");
-                let req = TtsRequest::Synthesize { tab: tab.clone(), text };
+                let req = TtsRequest::Synthesize { tab: tab.clone(), text, suppressible: true };
                 if tts_segments.send(req).await.is_err() {
                     debug!("pty processor: TTS segment channel closed (worker not running)");
                 }

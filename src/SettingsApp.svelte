@@ -656,15 +656,10 @@
 
         <section>
           <h2>Behavior</h2>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.behavior.interrupt_on_input}
-              onchange={(e) =>
-                patch((s) => (s.behavior.interrupt_on_input = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Interrupt TTS when typing</span>
-          </label>
+          <small class="hint">
+            TTS is only stopped by Esc (or by switching tabs) — typing never
+            interrupts speech.
+          </small>
           <label class="checkbox">
             <input
               type="checkbox"
@@ -756,6 +751,70 @@
             When on, Ctrl+right-clicking inside any terminal reads the
             selected text aloud through TTS. Holding Ctrl always suppresses
             paste, so the gesture never pastes the clipboard.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.tts.selection_highlight.enabled}
+              onchange={(e) =>
+                patch((s) => (s.tts.selection_highlight.enabled = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Highlight selection while reading</span>
+          </label>
+          <small class="hint">
+            While the selection is read aloud, it is recolored and the
+            highlight recedes sentence-by-sentence as each is spoken. The
+            sentence being read uses a distinct accent color; finished text
+            returns to its original colors. Press Esc to cancel and restore.
+          </small>
+          <small class="hint">
+            Uncheck "Custom" on any channel to leave it as the terminal's own
+            palette color (e.g. tint only the background, keeping the original
+            text color).
+          </small>
+          <div class="color-grid" class:disabled={!snapshot.tts.selection_highlight.enabled}>
+            {#each [
+              { key: 'unread_fg', custom: 'unread_fg_custom', label: 'Unread text' },
+              { key: 'unread_bg', custom: 'unread_bg_custom', label: 'Unread background' },
+              { key: 'reading_fg', custom: 'reading_fg_custom', label: 'Reading text' },
+              { key: 'reading_bg', custom: 'reading_bg_custom', label: 'Reading background' },
+            ] as ch (ch.key)}
+              <div class="color-cell">
+                <span class="color-cell-label">{ch.label}</span>
+                <label class="checkbox compact">
+                  <input
+                    type="checkbox"
+                    checked={(snapshot.tts.selection_highlight as unknown as Record<string, boolean>)[ch.custom]}
+                    disabled={!snapshot.tts.selection_highlight.enabled}
+                    onchange={(e) =>
+                      patch((s) => ((s.tts.selection_highlight as unknown as Record<string, boolean>)[ch.custom] = (e.currentTarget as HTMLInputElement).checked))}
+                  />
+                  <span>Custom</span>
+                </label>
+                <input
+                  type="color"
+                  value={(snapshot.tts.selection_highlight as unknown as Record<string, string>)[ch.key]}
+                  disabled={!snapshot.tts.selection_highlight.enabled ||
+                    !(snapshot.tts.selection_highlight as unknown as Record<string, boolean>)[ch.custom]}
+                  onchange={(e) =>
+                    patch((s) => ((s.tts.selection_highlight as unknown as Record<string, string>)[ch.key] = (e.currentTarget as HTMLInputElement).value))}
+                />
+              </div>
+            {/each}
+          </div>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.tts.show_selection_controls}
+              onchange={(e) =>
+                patch((s) => (s.tts.show_selection_controls = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Show selection-TTS controls in the status bar</span>
+          </label>
+          <small class="hint">
+            Adds play / pause / restart / stop buttons to the bottom bar for
+            reading the current terminal selection aloud (play has the same
+            effect as Ctrl+right-click).
           </small>
           <label class="checkbox disabled">
             <input type="checkbox" checked={snapshot.behavior.fallback_silent} disabled />
@@ -2370,6 +2429,30 @@
     border: 1px solid var(--border-default);
     background: var(--surface-2);
     border-radius: var(--radius-md);
+  }
+  /* Selection-highlight color pickers: two columns, each a label + a
+     "Custom" toggle + the swatch. */
+  .color-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--space-2) var(--space-3);
+    margin: var(--space-2) 0;
+  }
+  .color-cell {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: 0.85em;
+  }
+  .color-cell-label {
+    font-weight: 500;
+  }
+  .checkbox.compact {
+    font-size: 0.9em;
+    gap: var(--space-1);
+  }
+  .color-grid.disabled {
+    opacity: 0.5;
   }
   .row {
     display: flex;

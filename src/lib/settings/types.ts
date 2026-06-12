@@ -72,6 +72,29 @@ export interface TtsSettings {
   speed: number;
   volume: number;
   mute: boolean;
+  /// Read-along highlight shown while a Ctrl+right-click selection is spoken.
+  selection_highlight: SelectionHighlightSettings;
+  /// Show the play/pause/restart/stop selection-TTS transport in the bottom bar.
+  show_selection_controls: boolean;
+}
+
+/// Colors for the Ctrl+right-click read-along highlight. xterm decorations
+/// only accept `#RRGGBB` hex, so all four colors must be 6-digit hex strings.
+export interface SelectionHighlightSettings {
+  /// When false the selection is still spoken (chunked) but not highlighted.
+  enabled: boolean;
+  /// Not-yet-read sentences. Each `*_custom` flag chooses between the custom
+  /// color (true) and the terminal's own palette color (false) for that
+  /// channel.
+  unread_fg: string;
+  unread_fg_custom: boolean;
+  unread_bg: string;
+  unread_bg_custom: boolean;
+  /// The sentence currently being spoken.
+  reading_fg: string;
+  reading_fg_custom: boolean;
+  reading_bg: string;
+  reading_bg_custom: boolean;
 }
 
 export interface DisplaySettings {
@@ -81,7 +104,6 @@ export interface DisplaySettings {
 }
 
 export interface BehaviorSettings {
-  interrupt_on_input: boolean;
   auto_speak: boolean;
   fallback_silent: boolean;
   announcements_enabled: boolean;
@@ -549,7 +571,24 @@ export function findTabIndex(settings: Settings, id: string): number {
 export function defaultSettings(): Settings {
   return {
     schema_version: CURRENT_SCHEMA_VERSION,
-    tts: { voice: 'af_heart', speed: 1.0, volume: 1.0, mute: false },
+    tts: {
+      voice: 'af_heart',
+      speed: 1.0,
+      volume: 1.0,
+      mute: false,
+      selection_highlight: {
+        enabled: true,
+        unread_fg: '#000000',
+        unread_fg_custom: true,
+        unread_bg: '#ff5555',
+        unread_bg_custom: true,
+        reading_fg: '#000000',
+        reading_fg_custom: true,
+        reading_bg: '#f1fa8c',
+        reading_bg_custom: true,
+      },
+      show_selection_controls: true,
+    },
     avatar: {
       visible: true,
       kind: 'sprite',
@@ -581,7 +620,6 @@ export function defaultSettings(): Settings {
       show_tts_markup: false,
     },
     behavior: {
-      interrupt_on_input: true,
       auto_speak: true,
       fallback_silent: true,
       announcements_enabled: true,

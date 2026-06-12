@@ -7,16 +7,17 @@
 //! The worker also subscribes to [`SettingsHandle`] updates so a voice or
 //! speed change applies to the very next synthesis (no engine restart).
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::audio::AudioOutput;
+use crate::audio::{AudioOutput, ChunkMark};
 use crate::settings::{Settings, SettingsHandle};
 use crate::state::StateSignal;
 use crate::tts::engine::{SynthesisRequest, TtsEngine};
-use crate::tts::{ActiveTab, TtsRequest};
+use crate::tts::{ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
 
 pub fn spawn_tts_worker(
     mut engine: TtsEngine,
@@ -25,6 +26,8 @@ pub fn spawn_tts_worker(
     state_signals: mpsc::Sender<StateSignal>,
     settings: SettingsHandle,
     active: ActiveTab,
+    speak_session: SpeakSession,
+    ai_tts_suppressed: AiTtsSuppressed,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut next_id: u64 = 0;
@@ -44,10 +47,88 @@ pub fn spawn_tts_worker(
                 seg = rx.recv() => {
                     let Some(req) = seg else { break };
 
-                    let (tab, text, is_notification) = match req {
-                        TtsRequest::Synthesize { tab, text } => (tab, text, false),
-                        TtsRequest::SynthesizeNotification { tab, text } => (tab, text, true),
+                    // Ctrl+right-click read-along: a pre-segmented selection
+                    // synthesized chunk-by-chunk and enqueued in order, each
+                    // tagged so the audio thread can drive the highlight.
+                    // Re-checks the shared session id around every (possibly
+                    // long) synthesis so an Esc/`tts_stop` — which zeroes the
+                    // cell — or a superseding read abandons the rest without
+                    // playing it.
+                    if let TtsRequest::SpeakSelection { tab, session, chunks } = req {
+                        let count = chunks.len() as u32;
+                        let mut enqueued_any = false;
+                        let mut cancelled = false;
+                        for (i, text) in chunks.into_iter().enumerate() {
+                            if speak_session.load(Ordering::SeqCst) != session {
+                                debug!(session, "selection read cancelled before chunk {i}");
+                                cancelled = true;
+                                break;
+                            }
+                            next_id += 1;
+                            let synth_req = SynthesisRequest { text, request_id: next_id };
+                            match engine.synthesize(synth_req) {
+                                Ok(resp) => {
+                                    // A cancel may have arrived during synthesis;
+                                    // skip the enqueue so no extra audio plays
+                                    // after Esc.
+                                    if speak_session.load(Ordering::SeqCst) != session {
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    if !resp.samples.is_empty() {
+                                        audio.enqueue_marked(
+                                            resp.samples,
+                                            resp.sample_rate,
+                                            ChunkMark { session, index: i as u32 },
+                                        );
+                                        enqueued_any = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, chunk = i, "selection chunk synthesis failed");
+                                }
+                            }
+                        }
+                        if cancelled {
+                            // Esc / supersede already cleared the frontend session
+                            // and the sink; nothing more to do.
+                        } else if enqueued_any {
+                            // All chunks are queued. Tell the audio thread so it
+                            // can emit the "done" sentinel once they've actually
+                            // drained — NOT merely when the queue momentarily
+                            // empties between chunks (which on a cold first read,
+                            // where synthesis lags playback, would otherwise end
+                            // the read after the first sentence).
+                            audio.selection_finished(session, count);
+                        } else {
+                            // Nothing enqueued (all chunks empty/failed): the audio
+                            // thread will never see this session, so emit the done
+                            // sentinel directly so the frontend highlight clears.
+                            let _ = state_signals.try_send(StateSignal::TtsSelectionProgress {
+                                tab,
+                                session,
+                                index: count,
+                            });
+                        }
+                        continue;
+                    }
+
+                    let (tab, text, is_notification, suppressible) = match req {
+                        TtsRequest::Synthesize { tab, text, suppressible } => {
+                            (tab, text, false, suppressible)
+                        }
+                        TtsRequest::SynthesizeNotification { tab, text } => (tab, text, true, false),
+                        TtsRequest::SpeakSelection { .. } => unreachable!("handled above"),
                     };
+
+                    // Esc-driven suppression: drop the rest of the current AI
+                    // output burst's tagged segments until new output clears the
+                    // flag. Only applies to suppressible (AI-tag) segments —
+                    // notifications and command-initiated speech are never gated.
+                    if suppressible && ai_tts_suppressed.load(Ordering::SeqCst) {
+                        debug!(?tab, "tts: dropping AI segment (suppressed until new output)");
+                        continue;
+                    }
 
                     if !is_notification {
                         // Background-tab gate: if the request's tab is no longer
@@ -76,6 +157,16 @@ pub fn spawn_tts_worker(
                     let started = std::time::Instant::now();
                     match engine.synthesize(synth_req) {
                         Ok(resp) => {
+                            // Re-check suppression AFTER synthesis: an Esc may
+                            // have arrived during the (few-hundred-ms) synth of
+                            // this segment, which the pre-synthesis check above
+                            // couldn't see. Without this, the segment that was
+                            // mid-synthesis when Esc fired would still play —
+                            // e.g. the second sentence of a multi-sentence tag.
+                            if suppressible && ai_tts_suppressed.load(Ordering::SeqCst) {
+                                debug!(?tab, "tts: dropping AI segment synthesized during suppress");
+                                continue;
+                            }
                             let elapsed_ms = started.elapsed().as_millis();
                             debug!(
                                 request_id = resp.request_id,

@@ -7,7 +7,6 @@ use tauri::AppHandle;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tracing::{debug, info, warn};
 
-use crate::audio::AudioOutput;
 use crate::error::{AppError, AppResult};
 use crate::processing::permission::PermissionPattern;
 use crate::pty::PtyManager;
@@ -48,7 +47,6 @@ pub struct TabRegistry {
     /// Shared with the TTS worker so it can filter by active tab on every
     /// request. Updated under write-lock from `activate`.
     tts_active: ActiveTab,
-    audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
     state_signals: mpsc::Sender<StateSignal>,
     /// Shared input-length counter map. Mutated by the state manager on
     /// TabAdded/TabRemoved; the registry only reads it (indirectly, via
@@ -96,7 +94,6 @@ impl TabRegistry {
         seed: Vec<crate::state::TabMeta>,
         initial_active: TabId,
         tts_active: ActiveTab,
-        audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
         state_signals: mpsc::Sender<StateSignal>,
         input_lengths: InputLengths,
         patterns: Arc<Vec<PermissionPattern>>,
@@ -115,7 +112,6 @@ impl TabRegistry {
             names,
             active: initial_active,
             tts_active,
-            audio,
             state_signals,
             input_lengths,
             patterns,
@@ -455,21 +451,20 @@ impl TabRegistry {
         manager.resize(rows, cols).await
     }
 
-    /// Switch the active tab. Order matters:
-    ///   1. If the prev tab was speaking, *synchronously* emit a stop
-    ///      signal tagged with the prev tab so the state machine drops it
-    ///      out of Speaking. We can't rely on the audio thread to do this:
-    ///      `stop_all` is fire-and-forget over an mpsc, the audio thread
-    ///      processes it later, and by the time it emits its own stop
-    ///      signal the active-tab cell has already flipped — so its signal
-    ///      gets tagged with the NEW tab and Claude stays pinned in
-    ///      Speaking forever.
-    ///   2. Stop in-flight audio (rodio sink clear) so the prev tab's TTS
-    ///      doesn't bleed into the next view.
-    ///   3. Flip the TTS active-tab cell so any in-flight processing-layer
-    ///      sends for the prev tab get filtered out at the worker.
-    ///   4. Update our own `active` field.
-    ///   5. Broadcast TabActivated to the state manager.
+    /// Switch the active tab.
+    ///
+    /// Switching tabs does NOT stop in-flight TTS — by design, speech is only
+    /// interrupted by Esc (`tts_stop`). Audio already enqueued plays to
+    /// completion regardless of which tab is in front; the audio thread
+    /// remembers which tab started the current stretch of speech and tags its
+    /// playing→idle edge with that tab (see `playback.rs`), so the speaking
+    /// tab's avatar leaves Speaking when the audio actually finishes — not
+    /// when the user happens to switch away.
+    ///
+    /// We still flip the TTS active-tab cell here so that *future*
+    /// processing-layer sends for the previous tab are filtered out at the
+    /// worker (the "active tab speaks" rule applies to newly-produced
+    /// segments, not to audio that is already playing).
     pub async fn activate(&mut self, tab: TabId) -> AppResult<()> {
         if !self.managers.contains_key(&tab) {
             return Err(AppError::Pty(format!("unknown tab {tab:?}")));
@@ -480,41 +475,18 @@ impl TabRegistry {
 
         let prev = self.active.clone();
 
-        // V0.6+ ordering: flip the TTS active-tab cell FIRST. This closes a
-        // narrow race that the previous step-1-then-step-3 ordering had —
-        // a processing-layer send for the *new* tab that arrived between
-        // the synchronous stop signal and the active-tab write got
-        // filtered against the old `active` value, dropping the segment.
-        // With the write hoisted to step 1 a new-tab send in flight is
-        // correctly accepted; an old-tab send in flight is correctly
-        // dropped (it didn't match the new active and never would).
+        // Flip the TTS active-tab cell. A new-tab processing-layer send in
+        // flight is correctly accepted; an old-tab send in flight is correctly
+        // dropped (it doesn't match the new active). Audio already in the sink
+        // is unaffected and keeps playing.
         if let Ok(mut g) = self.tts_active.write() {
             *g = tab.clone();
         }
 
-        // Step 2: emit a synchronous TtsPlaybackStopped tagged with the
-        // *previous* tab if audio is in flight. The audio thread's own
-        // playing→idle edge fires a few PLAYBACK_POLL ticks later tagged
-        // with whichever tab is active at that moment — by then the new
-        // tab is non-Speaking so its transition is a no-op there. Tagging
-        // explicitly with `prev` here ensures the previous tab's avatar
-        // leaves Speaking on the synchronous path.
-        if let Ok(slot) = self.audio.read() {
-            if let Some(audio) = slot.as_ref() {
-                if audio.is_playing() {
-                    let _ = self
-                        .state_signals
-                        .try_send(StateSignal::TtsPlaybackStopped { tab: prev.clone() });
-                }
-                audio.stop_all();
-            }
-        }
-
-        // Step 3: update local pointer.
         self.active = tab.clone();
         info!(?prev, ?tab, "tab activated");
 
-        // Step 4: tell the state manager so it can broadcast ActiveTabChanged.
+        // Tell the state manager so it can broadcast ActiveTabChanged.
         let _ = self
             .state_signals
             .try_send(StateSignal::TabActivated { tab });

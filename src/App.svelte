@@ -44,6 +44,7 @@
     validateAndRepairLayout,
   } from './lib/layout/persistence';
   import { createTerminal } from './lib/terminals';
+  import { stopAllTts, isSelectionTtsActive } from './lib/selectionTts';
   import { listTabs } from './lib/ipc';
   import {
     configureShortcuts,
@@ -234,6 +235,12 @@
             void splitFocusedPaneWithNewShell('vertical');
           },
           close_pane: closeFocusedPane,
+          stop_tts: {
+            handler: () => {
+              void stopAllTts();
+            },
+            active: () => isSelectionTtsActive(),
+          },
         });
       });
       // OS window title is set by the Rust setup hook to

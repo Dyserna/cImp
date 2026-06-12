@@ -11,6 +11,8 @@
   import AvatarToggleButton from './status/AvatarToggleButton.svelte';
   import UsageMeter from './status/UsageMeter.svelte';
   import SystemStats from './status/SystemStats.svelte';
+  import SelectionTtsControls from './status/SelectionTtsControls.svelte';
+  import { settings } from './settings/store';
 </script>
 
 <div class="status-bar">
@@ -20,6 +22,9 @@
     <SystemStats />
   </div>
   <div class="status-bar-right">
+    {#if $settings.tts.show_selection_controls}
+      <SelectionTtsControls />
+    {/if}
     <AvatarToggleButton />
     <MuteButton />
     <AnnouncementsButton />

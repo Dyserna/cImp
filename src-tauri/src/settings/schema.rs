@@ -910,6 +910,12 @@ pub struct TtsSettings {
     pub speed: f32,
     pub volume: f32,
     pub mute: bool,
+    /// Read-along highlight shown while a Ctrl+right-click selection is being
+    /// spoken. Optional/back-compat via `#[serde(default)]`.
+    pub selection_highlight: SelectionHighlightSettings,
+    /// Show the play / pause / restart / stop transport for selection TTS in
+    /// the bottom status bar.
+    pub show_selection_controls: bool,
 }
 
 impl Default for TtsSettings {
@@ -919,6 +925,50 @@ impl Default for TtsSettings {
             speed: 1.0,
             volume: 1.0,
             mute: false,
+            selection_highlight: SelectionHighlightSettings::default(),
+            show_selection_controls: true,
+        }
+    }
+}
+
+/// Colors for the Ctrl+right-click read-along highlight. The whole selection
+/// is painted with the `unread_*` colors when a read starts; the sentence
+/// currently being spoken uses the `reading_*` accent; each sentence reverts
+/// to its original terminal colors as it finishes. xterm decorations only
+/// accept `#RRGGBB` hex, so these must be 6-digit hex strings.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct SelectionHighlightSettings {
+    /// Master toggle. When false, the gesture still speaks the selection
+    /// (chunked, so large/multi-line selections work) but paints no highlight.
+    pub enabled: bool,
+    /// Foreground/background for not-yet-read sentences. Each `*_custom`
+    /// flag chooses between the custom color below (true) and leaving that
+    /// channel as the terminal's own palette color (false) — so the user can
+    /// tint just the background, just the text, both, or neither.
+    pub unread_fg: String,
+    pub unread_fg_custom: bool,
+    pub unread_bg: String,
+    pub unread_bg_custom: bool,
+    /// Foreground/background for the sentence currently being spoken.
+    pub reading_fg: String,
+    pub reading_fg_custom: bool,
+    pub reading_bg: String,
+    pub reading_bg_custom: bool,
+}
+
+impl Default for SelectionHighlightSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            unread_fg: "#000000".to_string(),
+            unread_fg_custom: true,
+            unread_bg: "#ff5555".to_string(),
+            unread_bg_custom: true,
+            reading_fg: "#000000".to_string(),
+            reading_fg_custom: true,
+            reading_bg: "#f1fa8c".to_string(),
+            reading_bg_custom: true,
         }
     }
 }
@@ -1133,7 +1183,6 @@ impl Default for DisplaySettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct BehaviorSettings {
-    pub interrupt_on_input: bool,
     pub auto_speak: bool,
     pub fallback_silent: bool,
     pub announcements_enabled: bool,
@@ -1172,7 +1221,6 @@ pub struct BehaviorSettings {
 impl Default for BehaviorSettings {
     fn default() -> Self {
         Self {
-            interrupt_on_input: true,
             auto_speak: true,
             fallback_silent: true,
             announcements_enabled: true,

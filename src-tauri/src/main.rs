@@ -18,6 +18,7 @@ mod usage;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
@@ -33,7 +34,7 @@ use crate::ipc::commands::{
     list_voices, open_settings_window, open_settings_window_to_tab, pty_get_scrollback,
     pty_rebind_channel, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
     restart_shell_tab, set_active_tab, settings_get, settings_update, tab_activate, tts_speak,
-    tts_test,
+    tts_set_paused, tts_speak_selection, tts_stop, tts_test,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -49,7 +50,7 @@ use crate::settings::{
 };
 use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
-use crate::tts::{spawn_tts_worker, ActiveTab, TtsEngine, TtsRequest};
+use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsEngine, TtsRequest};
 
 fn main() {
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -180,13 +181,18 @@ fn main() {
         });
     drop(snap);
     let tts_active: ActiveTab = Arc::new(RwLock::new(initial_active.clone()));
+    // Shared selection-read session id (0 = none). Shared between the
+    // `tts_speak_selection`/`tts_stop` commands and the TTS worker.
+    let speak_session: SpeakSession = Arc::new(AtomicU64::new(0));
+    // Shared "suppress AI-tag TTS" flag. Set by Esc (`tts_stop`), cleared by
+    // the state manager on the next `ClaudeOutputStarted`.
+    let ai_tts_suppressed: AiTtsSuppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Tab registry — one PtyManager per tab, lazy-spawn at frontend mount.
     let registry = TabRegistry::new(
         tab_metas.clone(),
         initial_active.clone(),
         tts_active.clone(),
-        audio_slot.clone(),
         state_tx.clone(),
         input_lengths.clone(),
         patterns.clone(),
@@ -205,6 +211,8 @@ fn main() {
             extra_args,
         },
         tts_segments: tts_tx,
+        speak_session: speak_session.clone(),
+        ai_tts_suppressed: ai_tts_suppressed.clone(),
         user_typed_tts: Arc::new(Mutex::new(HashSet::new())),
         state_signals: state_tx.clone(),
         input_lengths: input_lengths.clone(),
@@ -225,6 +233,9 @@ fn main() {
     let settings_for_notifications = settings_handle.clone();
     let tts_active_for_setup = tts_active.clone();
     let tts_active_for_notifications = tts_active.clone();
+    let speak_session_for_setup = speak_session.clone();
+    let ai_tts_suppressed_for_tts = ai_tts_suppressed.clone();
+    let ai_tts_suppressed_for_state = ai_tts_suppressed.clone();
     let initial_active_for_state = initial_active.clone();
     let initial_active_for_tts = initial_active.clone();
     let initial_active_for_notifications = initial_active.clone();
@@ -244,6 +255,7 @@ fn main() {
                     input_lengths_for_setup.clone(),
                     tab_metas.clone(),
                     initial_active_for_state,
+                    ai_tts_suppressed_for_state.clone(),
                 );
             }
             if let Some(rx) = tts_rx_for_setup
@@ -259,6 +271,8 @@ fn main() {
                     audio_slot.clone(),
                     tts_active_for_setup.clone(),
                     initial_active_for_tts,
+                    speak_session_for_setup.clone(),
+                    ai_tts_suppressed_for_tts.clone(),
                 );
                 // Notification manager piggybacks on the audio output we
                 // just built. If audio init failed above, audio_slot is
@@ -317,6 +331,9 @@ fn main() {
             pty_resize,
             tts_test,
             tts_speak,
+            tts_speak_selection,
+            tts_stop,
+            tts_set_paused,
             get_claude_usage,
             get_system_stats,
             settings_get,
@@ -490,6 +507,8 @@ fn init_tts_pipeline(
     audio_slot: Arc<RwLock<Option<Arc<AudioOutput>>>>,
     active: ActiveTab,
     initial_active: TabId,
+    speak_session: SpeakSession,
+    ai_tts_suppressed: AiTtsSuppressed,
 ) {
     let audio = match AudioOutput::new(state_signals.clone(), settings.clone(), active.clone()) {
         Ok(a) => Arc::new(a),
@@ -527,7 +546,16 @@ fn init_tts_pipeline(
 
     match TtsEngine::new(&model_path, &voice_path) {
         Ok(engine) => {
-            spawn_tts_worker(engine, audio, tts_rx, state_signals, settings, active);
+            spawn_tts_worker(
+                engine,
+                audio,
+                tts_rx,
+                state_signals,
+                settings,
+                active,
+                speak_session,
+                ai_tts_suppressed,
+            );
         }
         Err(AppError::ModelNotFound(_)) => {
             tts::report_missing_model_files();

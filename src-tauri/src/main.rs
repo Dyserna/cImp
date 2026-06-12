@@ -162,7 +162,7 @@ fn main() {
     let layout_active_id: Option<String> = snap
         .layout
         .as_ref()
-        .and_then(|l| layout_focused_active_tab_id(l));
+        .and_then(layout_focused_active_tab_id);
     let session_active_id: Option<&str> = snap.session.active_tab_id.as_deref();
     let resolved_id: Option<String> = layout_active_id.or_else(|| session_active_id.map(String::from));
     let initial_active = resolved_id
@@ -194,7 +194,6 @@ fn main() {
         initial_active.clone(),
         tts_active.clone(),
         state_tx.clone(),
-        input_lengths.clone(),
         patterns.clone(),
     );
     let tabs_handle: TabRegistryHandle = Arc::new(TokioMutex::new(registry));

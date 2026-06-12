@@ -1398,7 +1398,7 @@ pub fn quarantine_corrupt_file(path: &Path) {
     let renamed = fs::rename(path, &target).is_ok();
     let moved = if renamed {
         true
-    } else if let Ok(_) = fs::copy(path, &target) {
+    } else if fs::copy(path, &target).is_ok() {
         let _ = fs::remove_file(path);
         true
     } else {

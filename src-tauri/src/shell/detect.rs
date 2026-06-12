@@ -30,7 +30,9 @@
 //! trailing slash if the registry value contains one, so no explicit
 //! sanitization is required.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::path::Path;
 
 use tracing::info;
 #[cfg(unix)]
@@ -50,7 +52,7 @@ pub fn default_shell_resolution() -> (ShellSpec, ShellSource) {
     }
     #[cfg(windows)]
     {
-        return resolve_windows();
+        resolve_windows()
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -210,12 +212,6 @@ fn is_executable(path: &Path) -> bool {
         return false;
     }
     meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-#[allow(dead_code)] // unix-only helper; the windows path uses path.is_file() directly
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
 }
 
 #[cfg(test)]

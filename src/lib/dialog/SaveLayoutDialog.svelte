@@ -7,6 +7,7 @@
   import { closeDialog, dialogState } from './store';
   import { settings } from '../settings/store';
   import { saveCurrentLayoutAsPreset } from '../layout/presets';
+  import { errorMessage } from '../errors';
 
   let isOpen = $derived($dialogState.kind === 'save-layout');
   let name = $state('');
@@ -53,7 +54,7 @@
       await saveCurrentLayoutAsPreset(name.trim());
       closeDialog();
     } catch (e) {
-      error = typeof e === 'string' ? e : JSON.stringify(e);
+      error = errorMessage(e);
     } finally {
       busy = false;
     }

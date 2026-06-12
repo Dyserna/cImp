@@ -59,13 +59,6 @@ pub fn set_enabled(enabled: bool) {
     }
 }
 
-/// True iff capture is currently on. Used by the IPC layer's
-/// `content_clear` to surface "nothing to clear" cleanly.
-#[allow(dead_code)]
-pub fn is_enabled() -> bool {
-    instance().enabled.load(Ordering::Relaxed)
-}
-
 /// Write a chunk of raw PTY bytes to the per-tab daily file. No-op when
 /// capture is disabled (fast path: one atomic load). Per-write errors
 /// are logged at warn-level and swallowed — capture should never wedge

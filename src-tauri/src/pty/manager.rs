@@ -1,6 +1,5 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -398,11 +397,6 @@ impl Default for PtyManager {
 /// Resolve a command name (e.g. "claude", "aider") via PATH.
 pub fn resolve_command(name: &str) -> AppResult<std::path::PathBuf> {
     which::which(name).map_err(|_| AppError::CommandNotFound(name.to_string()))
-}
-
-#[allow(dead_code)] // kept for parity with v1; current callers go via `resolve_command`
-pub fn working_dir_from(path: &Path) -> std::path::PathBuf {
-    path.to_path_buf()
 }
 
 #[cfg(test)]

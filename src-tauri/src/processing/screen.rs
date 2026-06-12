@@ -15,37 +15,18 @@
 //!    bytes — xterm renders the same cursor-moves-and-overwrites the original
 //!    PTY would, so visual fidelity is preserved.
 
-use std::time::Instant;
-
 use vte::{Params, Perform};
 
 use crate::processing::tags::{build_rendered, TagScanner};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CellAttrs {
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub fg: Option<u32>,
-    pub bg: Option<u32>,
-}
-
 #[derive(Debug, Clone)]
 pub struct Cell {
     pub ch: char,
-    /// Reserved: SGR attributes captured at print time. Not yet inspected by
-    /// the tag scanner (which works on plain text), but kept on the cell so
-    /// future re-rendering or styled-aware features can use it without a
-    /// data-structure change.
-    #[allow(dead_code)]
-    pub attrs: CellAttrs,
 }
 
 #[derive(Debug, Default)]
 pub struct Row {
     pub cells: Vec<Option<Cell>>,
-    #[allow(dead_code)] // future stability gating
-    pub last_modified: Option<Instant>,
 }
 
 impl Row {
@@ -55,35 +36,31 @@ impl Row {
         }
     }
 
-    fn put(&mut self, col: usize, cell: Cell, now: Instant) {
+    fn put(&mut self, col: usize, cell: Cell) {
         self.ensure_col(col);
         self.cells[col] = Some(cell);
-        self.last_modified = Some(now);
     }
 
-    fn erase_from(&mut self, from_col: usize, now: Instant) {
+    fn erase_from(&mut self, from_col: usize) {
         if from_col < self.cells.len() {
             for col in from_col..self.cells.len() {
                 self.cells[col] = None;
             }
-            self.last_modified = Some(now);
         }
     }
 
-    fn erase_to(&mut self, to_col_inclusive: usize, now: Instant) {
+    fn erase_to(&mut self, to_col_inclusive: usize) {
         let stop = to_col_inclusive.min(self.cells.len().saturating_sub(1));
         if !self.cells.is_empty() {
             for col in 0..=stop {
                 self.cells[col] = None;
             }
-            self.last_modified = Some(now);
         }
     }
 
-    fn erase_all(&mut self, now: Instant) {
+    fn erase_all(&mut self) {
         if !self.cells.is_empty() {
             self.cells.clear();
-            self.last_modified = Some(now);
         }
     }
 
@@ -112,7 +89,6 @@ pub struct Screen {
     rows: Vec<Row>,
     cursor_row: usize,
     cursor_col: usize,
-    current_attrs: CellAttrs,
     saved_cursor: Option<(usize, usize)>,
 
     /// Raw byte buffer, mirrored from every byte fed to the parser.
@@ -121,9 +97,6 @@ pub struct Screen {
     /// Number of leading raw bytes already emitted as `TerminalBytes`.
     /// On flush, only bytes after this offset are eligible.
     raw_emitted_offset: usize,
-
-    /// "Now" passed by the owning layer. Updated before each ingest/flush.
-    now: Instant,
 }
 
 impl Screen {
@@ -132,16 +105,10 @@ impl Screen {
             rows: vec![Row::default()],
             cursor_row: 0,
             cursor_col: 0,
-            current_attrs: CellAttrs::default(),
             saved_cursor: None,
             raw_buffer: Vec::new(),
             raw_emitted_offset: 0,
-            now: Instant::now(),
         }
-    }
-
-    pub fn set_now(&mut self, now: Instant) {
-        self.now = now;
     }
 
     pub fn rows(&self) -> &[Row] {
@@ -165,12 +132,6 @@ impl Screen {
         }
         parts.reverse();
         parts.join("\n")
-    }
-
-    #[allow(dead_code)]
-    #[allow(dead_code)]
-    pub fn cursor(&self) -> (usize, usize) {
-        (self.cursor_row, self.cursor_col)
     }
 
     pub fn has_pending(&self) -> bool {
@@ -205,34 +166,6 @@ impl Screen {
         self.ensure_row(row);
         self.cursor_row = row;
         self.cursor_col = col;
-    }
-
-    fn handle_sgr(&mut self, params: &Params) {
-        if params.is_empty() {
-            self.current_attrs = CellAttrs::default();
-            return;
-        }
-        for p in params.iter() {
-            let code = p.first().copied().unwrap_or(0);
-            match code {
-                0 => self.current_attrs = CellAttrs::default(),
-                1 => self.current_attrs.bold = true,
-                3 => self.current_attrs.italic = true,
-                4 => self.current_attrs.underline = true,
-                22 => self.current_attrs.bold = false,
-                23 => self.current_attrs.italic = false,
-                24 => self.current_attrs.underline = false,
-                30..=37 => self.current_attrs.fg = Some(u32::from(code) - 30),
-                38 => { /* extended color; we don't decode subparams in M2 */ }
-                39 => self.current_attrs.fg = None,
-                40..=47 => self.current_attrs.bg = Some(u32::from(code) - 40),
-                48 => {}
-                49 => self.current_attrs.bg = None,
-                90..=97 => self.current_attrs.fg = Some(u32::from(code) - 90 + 8),
-                100..=107 => self.current_attrs.bg = Some(u32::from(code) - 100 + 8),
-                _ => {}
-            }
-        }
     }
 
     /// Try to drain `raw_buffer` to a `Vec<u8>` of bytes safe to forward to
@@ -336,13 +269,10 @@ fn strip_marker_bytes(slice: &[u8]) -> Vec<u8> {
 impl Perform for Screen {
     fn print(&mut self, c: char) {
         self.ensure_row(self.cursor_row);
-        let cell = Cell {
-            ch: c,
-            attrs: self.current_attrs,
-        };
+        let cell = Cell { ch: c };
         let row = self.cursor_row;
         let col = self.cursor_col;
-        self.rows[row].put(col, cell, self.now);
+        self.rows[row].put(col, cell);
         self.cursor_col = col + 1;
     }
 
@@ -357,12 +287,11 @@ impl Perform for Screen {
             b'\r' => {
                 self.cursor_col = 0;
             }
-            0x08 => {
+            0x08
                 // BS: cursor back one column, no erase.
-                if self.cursor_col > 0 {
+                if self.cursor_col > 0 => {
                     self.cursor_col -= 1;
                 }
-            }
             0x07 => {
                 // BEL: ignore (terminals beep, we don't track).
             }
@@ -432,9 +361,9 @@ impl Perform for Screen {
                 let col = self.cursor_col;
                 self.ensure_row(row);
                 match mode {
-                    0 => self.rows[row].erase_from(col, self.now),
-                    1 => self.rows[row].erase_to(col, self.now),
-                    2 => self.rows[row].erase_all(self.now),
+                    0 => self.rows[row].erase_from(col),
+                    1 => self.rows[row].erase_to(col),
+                    2 => self.rows[row].erase_all(),
                     _ => {}
                 }
             }
@@ -445,26 +374,26 @@ impl Perform for Screen {
                 self.ensure_row(row);
                 match mode {
                     0 => {
-                        self.rows[row].erase_from(col, self.now);
+                        self.rows[row].erase_from(col);
                         for r in (row + 1)..self.rows.len() {
-                            self.rows[r].erase_all(self.now);
+                            self.rows[r].erase_all();
                         }
                     }
                     1 => {
-                        self.rows[row].erase_to(col, self.now);
+                        self.rows[row].erase_to(col);
                         for r in 0..row {
-                            self.rows[r].erase_all(self.now);
+                            self.rows[r].erase_all();
                         }
                     }
                     2 | 3 => {
                         for r in 0..self.rows.len() {
-                            self.rows[r].erase_all(self.now);
+                            self.rows[r].erase_all();
                         }
                     }
                     _ => {}
                 }
             }
-            'm' => self.handle_sgr(params),
+            'm' => { /* SGR styling discarded — the cell model is text-only. */ }
             's' => self.saved_cursor = Some((self.cursor_row, self.cursor_col)),
             'u' => {
                 if let Some((r, c)) = self.saved_cursor {

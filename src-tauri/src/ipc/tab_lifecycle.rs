@@ -48,13 +48,6 @@ pub enum TabLifecycleError {
     BuiltinNotClosable,
     /// `reconfigure_shell_tab` was called on a non-Shell tab.
     WrongKind,
-    /// Subprocess spawn failed after validation. Surfaced verbatim so the
-    /// dialog can show the OS-level reason (PTY open failed, kernel said
-    /// no, etc.). Reserved for future use — the frontend's Terminal
-    /// component currently surfaces spawn failures via its own error
-    /// overlay, so `create_shell_tab` returns Ok and lets that path fire.
-    #[allow(dead_code)]
-    SpawnFailed { message: String },
     /// `set_enabled_ai_tabs` was called with an empty list. The UI's
     /// last-checked-is-locked rule prevents this from the user side; the
     /// IPC enforces it as defense-in-depth.

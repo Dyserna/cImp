@@ -34,6 +34,7 @@
   import ThemeSwatch from '../settings/ThemeSwatch.svelte';
   import CustomThemeEditor from '../settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from '../settings/BackgroundConfigEditor.svelte';
+  import { errorMessage } from '../errors';
 
   let name = $state('');
   let command = $state('');
@@ -328,7 +329,7 @@
       } else {
         error = {
           kind: 'internal',
-          message: typeof e === 'string' ? e : JSON.stringify(e),
+          message: errorMessage(e),
         };
       }
     } finally {

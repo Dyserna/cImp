@@ -48,10 +48,6 @@ pub struct TabRegistry {
     /// request. Updated under write-lock from `activate`.
     tts_active: ActiveTab,
     state_signals: mpsc::Sender<StateSignal>,
-    /// Shared input-length counter map. Mutated by the state manager on
-    /// TabAdded/TabRemoved; the registry only reads it (indirectly, via
-    /// the IPC layer).
-    input_lengths: InputLengths,
     /// Detection patterns loaded from `<exe-dir>/patterns.json` at
     /// startup. Cloned per-tab into the processor task on PTY start.
     /// Wrapped in `Arc` so the per-tab clone is cheap (the inner Vec
@@ -95,7 +91,6 @@ impl TabRegistry {
         initial_active: TabId,
         tts_active: ActiveTab,
         state_signals: mpsc::Sender<StateSignal>,
-        input_lengths: InputLengths,
         patterns: Arc<Vec<PermissionPattern>>,
     ) -> Self {
         let mut managers = HashMap::new();
@@ -113,7 +108,6 @@ impl TabRegistry {
             active: initial_active,
             tts_active,
             state_signals,
-            input_lengths,
             patterns,
         }
     }
@@ -135,12 +129,6 @@ impl TabRegistry {
                 builtin: is_builtin_id(id.as_str()),
             })
             .collect()
-    }
-
-    /// Snapshot of the live tab order. Used by IPC commands that need to
-    /// echo the order back to the frontend (e.g. `list_tabs`).
-    pub fn tab_order(&self) -> Vec<TabId> {
-        self.tab_order.clone()
     }
 
     pub fn active(&self) -> TabId {

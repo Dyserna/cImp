@@ -27,10 +27,14 @@ pub struct ShellSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellSource {
     /// Linux: `$SHELL` env var resolved to an existing binary.
+    /// Constructed only under `#[cfg(unix)]`; allow on other targets.
+    #[cfg_attr(not(unix), allow(dead_code))]
     EnvShell,
     /// Linux: `/bin/bash` fallback.
+    #[cfg_attr(not(unix), allow(dead_code))]
     BashFallback,
     /// Linux: `/bin/sh` fallback (last resort — bash absent too).
+    #[cfg_attr(not(unix), allow(dead_code))]
     ShFallback,
     /// Windows: Git Bash found under Program Files at a standard location.
     GitBashProgramFiles,

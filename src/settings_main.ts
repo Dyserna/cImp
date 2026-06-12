@@ -1,7 +1,7 @@
 import { mount } from 'svelte';
 import SettingsApp from './SettingsApp.svelte';
 import { settings } from './lib/settings/store';
-import { themeFromSetting } from './lib/themes/resolve';
+import { themeFromSetting, applyTerminalPaletteVars } from './lib/themes/resolve';
 import { installReloadBlocker } from './lib/shortcuts/blockReload';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import './theme.css';
@@ -14,14 +14,6 @@ document.documentElement.dataset.theme = 'tui-orange';
 
 // Match the main window: no user-triggered reload in the settings window either.
 installReloadBlocker();
-
-// Mirror main.ts: publish the global terminal palette as --term-bg/--term-fg
-// so the settings window chrome integrates with the terminal colors too.
-function applyTerminalPaletteVars(theme: ReturnType<typeof themeFromSetting>) {
-  const root = document.documentElement.style;
-  if (theme.background) root.setProperty('--term-bg', theme.background);
-  if (theme.foreground) root.setProperty('--term-fg', theme.foreground);
-}
 
 let lastDecorations: boolean | null = null;
 settings.subscribe((s) => {

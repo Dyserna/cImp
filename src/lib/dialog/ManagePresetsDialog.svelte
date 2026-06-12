@@ -13,6 +13,7 @@
     restoreLayoutPreset,
   } from '../layout/presets';
   import type { LayoutPreset } from '../settings/types';
+  import { errorMessage } from '../errors';
 
   let isOpen = $derived($dialogState.kind === 'manage-presets');
 
@@ -70,7 +71,7 @@
       await renameLayoutPreset(oldName, newName);
       cancelEdit();
     } catch (e) {
-      editError = typeof e === 'string' ? e : JSON.stringify(e);
+      editError = errorMessage(e);
     }
   }
 

@@ -179,10 +179,6 @@ impl AudioOutput {
         let _ = self.cmd_tx.send(AudioCommand::SelectionFinished { session, count });
     }
 
-    #[allow(dead_code)] // Direct setter; settings broadcast is the usual path.
-    pub fn set_volume(&self, volume: f32) {
-        let _ = self.cmd_tx.send(AudioCommand::SetVolume(volume));
-    }
 }
 
 /// Read the active-tab cell synchronously. Falls back to Claude on a

@@ -63,8 +63,6 @@ fn allowed_for(kind: &TabKind, event: NotificationEvent) -> bool {
 #[derive(Clone, Debug)]
 struct Queued {
     tab: TabId,
-    #[allow(dead_code)] // retained for tracing/future use; logged on enqueue
-    event: NotificationEvent,
     text: String,
     timestamp: Instant,
 }
@@ -362,7 +360,6 @@ impl NotificationManager {
         debug!(?tab, ?event, "notifications: queued");
         self.queue.push(Queued {
             tab,
-            event,
             text,
             timestamp: Instant::now(),
         });
@@ -506,10 +503,9 @@ fn dedup_per_tab(queue: &[Queued]) -> Vec<Queued> {
 mod tests {
     use super::*;
 
-    fn q(tab: TabId, event: NotificationEvent, text: &str, t_ms: u64) -> Queued {
+    fn q(tab: TabId, _event: NotificationEvent, text: &str, t_ms: u64) -> Queued {
         Queued {
             tab,
-            event,
             text: text.to_string(),
             // Tests only compare via `>` on Instant, so we anchor everything
             // to a single base and offset by ms.

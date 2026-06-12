@@ -5,6 +5,17 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-06-12
+
+### Fixed
+
+- **No more blank window on startup.** The main window is now created hidden
+  and revealed only once the UI has mounted and the window chrome has settled,
+  so the empty WebView that used to flash for a couple of seconds on launch —
+  along with the brief title-bar jump as the TUI themes drop the OS
+  decorations — is no longer visible. A short safety-net timeout reveals the
+  window regardless if the chrome setup stalls.
+
 ## [0.9.0] — 2026-06-10
 
 ### Added

@@ -6,21 +6,15 @@
   import MuteButton from './status/MuteButton.svelte';
   import AnnouncementsButton from './status/AnnouncementsButton.svelte';
   import VolumeSlider from './status/VolumeSlider.svelte';
-  import LayoutsPopover from './status/LayoutsPopover.svelte';
   import SettingsButton from './status/SettingsButton.svelte';
   import AvatarToggleButton from './status/AvatarToggleButton.svelte';
-  import UsageMeter from './status/UsageMeter.svelte';
-  import SystemStats from './status/SystemStats.svelte';
+  import StatusBarArrangement from './status/StatusBarArrangement.svelte';
   import SelectionTtsControls from './status/SelectionTtsControls.svelte';
   import { settings } from './settings/store';
 </script>
 
 <div class="status-bar">
-  <div class="status-bar-left">
-    <LayoutsPopover />
-    <UsageMeter />
-    <SystemStats />
-  </div>
+  <StatusBarArrangement />
   <div class="status-bar-right">
     {#if $settings.tts.show_selection_controls}
       <SelectionTtsControls />
@@ -45,13 +39,6 @@
     border-top: 1px solid var(--border-subtle);
     padding: 0 var(--space-3);
     box-sizing: border-box;
-  }
-  .status-bar-left {
-    flex: 1 1 auto;
-    display: inline-flex;
-    flex-direction: row;
-    align-items: center;
-    min-width: 0;
   }
   .status-bar-right {
     display: inline-flex;

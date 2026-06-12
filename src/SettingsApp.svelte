@@ -1475,6 +1475,35 @@
             rate.
           </small>
         </section>
+
+        <section>
+          <h2>Status bar arrangement</h2>
+          <small class="hint top">
+            Drag the session and local-machine panels in the bottom bar to
+            reorder them, or drag one sideways to leave a gap (e.g. push the
+            local-machine panel to the right). Reordering clears any gaps.
+          </small>
+          <button
+            type="button"
+            class="reset-arrangement"
+            onclick={() =>
+              patch(
+                (s) =>
+                  (s.ui.status_bar = {
+                    items: [
+                      { component: 'usage', gap: 0 },
+                      { component: 'system_stats', gap: 0 },
+                    ],
+                  }),
+              )}
+          >
+            Reset to default arrangement
+          </button>
+          <small class="hint">
+            Restores the default order (session, then local machine) and removes
+            any spacers you added.
+          </small>
+        </section>
       {:else if activeSection === 'tabs'}
         {@const claudeLive = aiTabAt('claude')}
         {@const claudeLocalLive = aiTabAt('claude-local')}

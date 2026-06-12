@@ -288,6 +288,26 @@ export interface UiSettings {
   /// animated `claudeSprites` mascot. Distinct from `terminal.theme`, which
   /// governs the xterm.js terminal palette inside each tab.
   theme: string;
+  /// Arrangement of the bottom status bar's movable left cluster.
+  status_bar: StatusBarLayout;
+}
+
+/// A display panel in the status bar's movable left cluster.
+export type StatusBarComponent = 'usage' | 'system_stats';
+
+/// One slot in the movable cluster: a component plus the leading gap (px)
+/// before it. The gap is drag-adjustable ("stays where you drop it") and
+/// resets to 0 for all slots when the component order changes.
+export interface StatusBarSlot {
+  component: StatusBarComponent;
+  gap: number;
+}
+
+/// Persisted left-to-right arrangement of the status bar's movable
+/// cluster. Normalized on read so `usage` and `system_stats` each appear
+/// exactly once.
+export interface StatusBarLayout {
+  items: StatusBarSlot[];
 }
 
 /// On-wire shape of a custom palette block. Mirrors the Rust
@@ -729,7 +749,15 @@ export function defaultSettings(): Settings {
     session: { active_tab_id: null },
     layout: null,
     layout_presets: [],
-    ui: { theme: 'tui-orange' },
+    ui: {
+      theme: 'tui-orange',
+      status_bar: {
+        items: [
+          { component: 'usage', gap: 0 },
+          { component: 'system_stats', gap: 0 },
+        ],
+      },
+    },
     // Default terminal palette is paired with the default UI theme
     // (tui-orange → Tomorrow Night); see THEME_DEFAULT_PALETTE in SettingsApp.
     terminal: {

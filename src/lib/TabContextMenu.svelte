@@ -31,6 +31,9 @@
   import { splitFocusedPaneWithNewShell } from './layout/actions';
   import { eachPane } from './layout/tree';
   import { tabs } from './tabs/store';
+  import { settings } from './settings/store';
+  import { openManagePresetsDialog, openSaveLayoutDialog } from './dialog/store';
+  import { restoreLayoutPreset } from './layout/presets';
   import type { PaneId } from './layout/types';
   import type { TabId } from './tabs/types';
 
@@ -69,6 +72,15 @@
 
   let menuEl: HTMLDivElement | undefined = $state();
   let submenuOpen = $state(false);
+  let layoutsOpen = $state(false);
+
+  // Top 5 layout presets, most-recent first. ISO 8601 `created_at`
+  // strings sort lexicographically, so localeCompare orders them by date.
+  const recentPresets = $derived(
+    [...$settings.layout_presets]
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, 5),
+  );
 
   // Other panes for the Move-all-tabs-to submenu, with friendly labels
   // derived from each pane's active tab. Snapshotted at mount; the
@@ -135,6 +147,15 @@
   }
   function onMoveAllTo(targetId: PaneId): void {
     moveAllTabsToPane(paneId, targetId);
+  }
+  function onSaveLayout(): void {
+    openSaveLayoutDialog();
+  }
+  function onManagePresets(): void {
+    openManagePresetsDialog();
+  }
+  function onRestorePreset(name: string): void {
+    void restoreLayoutPreset(name);
   }
 
   onMount(() => {
@@ -239,6 +260,55 @@
       {/if}
     </div>
   {/if}
+  <div class="separator"></div>
+  <div class="entry submenu-host" role="menuitem">
+    <button
+      type="button"
+      class="submenu-trigger"
+      onmouseenter={() => (layoutsOpen = true)}
+      onfocus={() => (layoutsOpen = true)}
+    >
+      Layouts
+      <span class="submenu-arrow">▶</span>
+    </button>
+    {#if layoutsOpen}
+      <!-- svelte-ignore a11y_interactive_supports_focus -->
+      <div class="submenu" role="menu" onmouseleave={() => (layoutsOpen = false)}>
+        <button
+          type="button"
+          class="entry"
+          role="menuitem"
+          onclick={fire(onSaveLayout)}
+        >
+          Save current layout as…
+        </button>
+        <div class="separator"></div>
+        {#if recentPresets.length === 0}
+          <div class="submenu-empty">No saved layouts yet</div>
+        {:else}
+          {#each recentPresets as preset (preset.name)}
+            <button
+              type="button"
+              class="entry"
+              role="menuitem"
+              onclick={fire(() => onRestorePreset(preset.name))}
+            >
+              {preset.name}
+            </button>
+          {/each}
+        {/if}
+        <div class="separator"></div>
+        <button
+          type="button"
+          class="entry"
+          role="menuitem"
+          onclick={fire(onManagePresets)}
+        >
+          Manage presets…
+        </button>
+      </div>
+    {/if}
+  </div>
 </div>
 
 <style>
@@ -328,5 +398,11 @@
     min-width: 200px;
     max-height: 320px;
     overflow-y: auto;
+  }
+  .submenu-empty {
+    color: var(--text-tertiary);
+    font-size: var(--font-size-sm);
+    font-style: italic;
+    padding: 6px var(--space-3);
   }
 </style>

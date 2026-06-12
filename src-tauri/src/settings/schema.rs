@@ -1317,12 +1317,66 @@ pub struct UiSettings {
     /// settings.json files otherwise keep whatever value they were
     /// persisted with.
     pub theme: String,
+    /// Arrangement of the bottom status bar's movable left cluster. See
+    /// [`StatusBarLayout`]. Added after the `theme` field; old files
+    /// lacking the key deserialize to the default `[usage, system_stats]`
+    /// via the struct-level `#[serde(default)]`.
+    pub status_bar: StatusBarLayout,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
             theme: "tui-orange".to_string(),
+            status_bar: StatusBarLayout::default(),
+        }
+    }
+}
+
+/// A display panel in the status bar's movable left cluster: `usage` =
+/// Claude session meter, `system_stats` = CPU/GPU/network panel.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusBarComponent {
+    Usage,
+    SystemStats,
+}
+
+/// One slot in the movable cluster: a component plus the leading gap (in
+/// px) before it. The gap is grown/shrunk by dragging the panel left or
+/// right — it "stays where you drop it" — and is reset to 0 for every
+/// slot whenever the component order changes.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct StatusBarSlot {
+    pub component: StatusBarComponent,
+    #[serde(default)]
+    pub gap: u32,
+}
+
+/// Persisted left-to-right arrangement of the status bar's movable
+/// cluster. The frontend normalizes on read so `usage` and
+/// `system_stats` each appear exactly once regardless of what's on disk.
+/// Reordered and spaced by dragging the panels in the bar; reset from
+/// Settings → Bottom bar.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusBarLayout {
+    pub items: Vec<StatusBarSlot>,
+}
+
+impl Default for StatusBarLayout {
+    fn default() -> Self {
+        Self {
+            items: vec![
+                StatusBarSlot {
+                    component: StatusBarComponent::Usage,
+                    gap: 0,
+                },
+                StatusBarSlot {
+                    component: StatusBarComponent::SystemStats,
+                    gap: 0,
+                },
+            ],
         }
     }
 }

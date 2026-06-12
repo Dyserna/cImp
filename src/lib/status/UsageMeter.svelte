@@ -209,7 +209,6 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-3);
-    margin-left: var(--space-3);
     font-size: 11px;
     line-height: 1;
     color: var(--text-secondary);
@@ -259,6 +258,10 @@
     font-variant-numeric: tabular-nums;
     color: var(--text-primary);
     justify-self: end;
+    /* Reserve room for "100%" so a digit change doesn't widen the column
+       and shift the panel. */
+    min-width: 4ch;
+    text-align: right;
   }
   /* Extra breathing room so the "when it resets" group (countdown + clock)
      reads as separate from the "how full" group (label + bar + %). */

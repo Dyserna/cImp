@@ -28,6 +28,12 @@
   const pollMs = $derived(Math.max(1, stats.poll_interval_secs) * 1000);
   const netMax = $derived(netHist.length ? Math.max(...netHist, 1) : 1);
 
+  // Each visible "column" is a stacked pair: CPU/RAM, GPU/VRAM, NET
+  // graph/speed. Dividers are drawn only between two visible columns.
+  const showCpuRam = $derived(stats.show_cpu || stats.show_memory);
+  const showGpuVram = $derived(stats.show_gpu);
+  const showNet = $derived(stats.show_network);
+
   function pushHist(arr: number[], v: number): void {
     arr.push(v);
     if (arr.length > CAP) arr.shift();
@@ -133,90 +139,149 @@
 {/snippet}
 
 {#if enabled && snapshot}
-  <!-- Two lines as one 8-column grid so both rows align into columns:
-       usage(label+%) · graph · temp · mem(label+%) · bar · net-label · net-graph · net-speed.
-       Each component is gated by its settings toggle; hidden ones emit empty
-       cells (above) to preserve the column alignment. The top (CPU/MEM) line
-       leaves the trailing 3 network columns empty — network is bottom-line only. -->
+  <!-- Three stacked "columns", each a 2-row mini-grid that self-aligns its
+       own top/bottom lines. Top line = usage %/graphs; bottom line =
+       capacity/throughput:
+         CPU% / graph     GPU% / graph (+temp)     NET label / graph
+         RAM% / bar       VRAM% / bar              speed (under the label)
+       Short dividers sit between visible columns; the full-height frame
+       around the whole panel is drawn by the status-bar slot. -->
   <div class="sysmon" title="System monitor">
-    <span class="line">
-      {#if stats.show_cpu}
-        <span class="metric"><span class="lbl">CPU</span> <span class="val">{pct(snapshot.cpu_pct)}%</span></span>
-        {@render spark(cpuHist, 100)}
-      {:else}
-        {@render empty(2)}
-      {/if}
-      <!-- CPU has no temperature; this column is always blank on the top line
-           (it aligns under the GPU-temp column below). -->
-      {@render empty(1)}
-      {#if stats.show_memory}
-        <span class="metric"><span class="lbl">MEM</span> <span class="val">{pct(snapshot.mem_pct)}%</span></span>
-        {@render bar(snapshot.mem_pct)}
-      {:else}
-        {@render empty(2)}
-      {/if}
-      {@render empty(3)}
-    </span>
-    <span class="line">
-      {#if stats.show_gpu}
+    {#if showCpuRam}
+      <!-- [label][value][graph]; label/value share columns so CPU%↔RAM%
+           line up, and the bar stretches to end where the graph ends. -->
+      <div class="group ab">
+        {#if stats.show_cpu}
+          <span class="lbl">CPU</span>
+          <span class="val">{pct(snapshot.cpu_pct)}%</span>
+          {@render spark(cpuHist, 100)}
+        {:else}
+          {@render empty(3)}
+        {/if}
+        {#if stats.show_memory}
+          <span class="lbl">RAM</span>
+          <span class="val">{pct(snapshot.mem_pct)}%</span>
+          {@render bar(snapshot.mem_pct)}
+        {:else}
+          {@render empty(3)}
+        {/if}
+      </div>
+    {/if}
+
+    {#if showCpuRam && showGpuVram}
+      <span class="vdiv" aria-hidden="true"></span>
+    {/if}
+
+    {#if showGpuVram}
+      <!-- [label][value][graph][temp]; GPU%↔VRAM% share the value column,
+           and the VRAM bar spans the graph+temp columns so it ends where
+           the temperature ends. -->
+      <div class="group gpu">
         {#if snapshot.gpu}
-          <span class="metric"><span class="lbl">GPU</span> <span class="val">{pct(snapshot.gpu.util_pct)}%</span></span>
+          <span class="lbl">GPU</span>
+          <span class="val">{pct(snapshot.gpu.util_pct)}%</span>
           {@render spark(gpuHist, 100)}
           {#if stats.show_gpu_temp}
             <span class="temp">{Math.round(snapshot.gpu.temp_c)}°C</span>
           {:else}
             {@render empty(1)}
           {/if}
-          <span class="metric"><span class="lbl">VRAM</span> <span class="val">{pct(snapshot.gpu.mem_pct)}%</span></span>
+          <span class="lbl">VRAM</span>
+          <span class="val">{pct(snapshot.gpu.mem_pct)}%</span>
           {@render bar(snapshot.gpu.mem_pct)}
         {:else}
-          <span class="metric na">GPU n/a</span>
+          <span class="lbl na">GPU</span>
+          <span class="val na">n/a</span>
+          {@render empty(2)}
           {@render empty(4)}
         {/if}
-      {:else}
-        {@render empty(5)}
-      {/if}
-      {#if stats.show_network}
-        <span class="metric"><span class="lbl">NET</span></span>
-        {@render spark(netHist, netMax)}
-        <span class="net">↓{fmtBps(snapshot.net.down_bps)} ↑{fmtBps(snapshot.net.up_bps)}</span>
-      {:else}
-        {@render empty(3)}
-      {/if}
-    </span>
+      </div>
+    {/if}
+
+    {#if (showCpuRam || showGpuVram) && showNet}
+      <span class="vdiv" aria-hidden="true"></span>
+    {/if}
+
+    {#if showNet}
+      <div class="group net">
+        <span class="net-top">
+          <span class="lbl">NET</span>
+          {@render spark(netHist, netMax)}
+        </span>
+        <span class="net">
+          <span class="net-dl">↓{fmtBps(snapshot.net.down_bps)}</span>
+          <span class="net-ul">↑{fmtBps(snapshot.net.up_bps)}</span>
+        </span>
+      </div>
+    {/if}
   </div>
 {/if}
 
 <style>
-  /* Left border doubles as the divider from the usage meter; only present
-     when the panel renders. */
-  /* Both lines share one grid so columns line up across rows (GPU under CPU,
-     VRAM under MEM, graphs/temps/bars aligned). 8 fixed columns. */
+  /* A flex row of stacked "columns" (CPU/RAM, GPU/VRAM, NET) separated by
+     short dividers. Each column self-aligns its own two lines. */
   .sysmon {
-    display: grid;
-    grid-template-columns: repeat(8, max-content);
+    display: inline-flex;
+    flex-direction: row;
     align-items: center;
-    justify-items: start;
-    column-gap: var(--space-2);
-    row-gap: var(--space-1);
-    margin-left: var(--space-3);
-    padding-left: var(--space-3);
-    border-left: 1px solid var(--border-subtle);
+    gap: var(--space-2);
     font-size: 11px;
     line-height: 1;
     color: var(--text-secondary);
     white-space: nowrap;
     user-select: none;
   }
-  /* Dissolve the per-line wrapper so each line's cells become grid items
-     participating in the shared column tracks. */
-  .line {
-    display: contents;
+  /* One column = a 2-row mini-grid: top line (usage) over bottom line
+     (capacity). Label and value sit in their own tracks so the two rows'
+     percentages line up; the graph/bar share the last track(s). */
+  .group {
+    display: grid;
+    align-items: center;
+    justify-items: start;
+    column-gap: var(--space-2);
+    row-gap: var(--space-1);
   }
-  .metric {
+  /* CPU/RAM: [label][value][graph] */
+  .group.ab {
+    grid-template-columns: max-content max-content max-content;
+  }
+  /* GPU/VRAM: [label][value][graph][temp] */
+  .group.gpu {
+    grid-template-columns: max-content max-content max-content max-content;
+  }
+  /* VRAM bar spans the graph + temp tracks so it ends under the temp. */
+  .group.gpu .bar {
+    grid-column: span 2;
+  }
+  /* NET column stacks "NET + graph" over the speed, with the speed
+     left-aligned so it sits directly under the NET label. */
+  .group.net {
     display: inline-flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    row-gap: var(--space-1);
+  }
+  .net-top {
+    display: flex;
     align-items: center;
     gap: 4px;
+  }
+  /* The NET graph stretches to fill the column width (set by the speed
+     below), so the top line ends where the speed ends. */
+  .group.net .spark {
+    flex: 1 1 0;
+    min-width: 0;
+    width: auto;
+  }
+  /* Short vertical divider between two visible columns. Deliberately
+     shorter than the panel height so the columns still read as one
+     component (the full-height frame is the status-bar slot border). */
+  .vdiv {
+    flex: 0 0 auto;
+    width: 1px;
+    height: 1.8em;
+    background: var(--border-subtle);
   }
   .lbl {
     font-weight: 600;
@@ -226,6 +291,34 @@
   .temp,
   .net {
     color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  /* Reserve room for the widest reading ("100%", "100°C") and right-align,
+     so a single↔double↔triple digit change doesn't reflow the grid and
+     shift the panel. */
+  .val {
+    display: inline-block;
+    min-width: 4ch;
+    text-align: right;
+  }
+  .temp {
+    display: inline-block;
+    min-width: 5ch;
+    text-align: right;
+  }
+  /* Down and up each get a fixed slot so a change in the download width
+     can't shove the upload sideways, and the two together give the column
+     a stable width (which also fixes the graph length above). Sized to the
+     common high range; left-aligned so the arrows stay put. */
+  .net {
+    display: inline-flex;
+    gap: var(--space-2);
+  }
+  .net-dl,
+  .net-ul {
+    display: inline-block;
+    min-width: 10.5ch;
+    text-align: left;
     font-variant-numeric: tabular-nums;
   }
   .na {
@@ -241,10 +334,16 @@
     stroke: var(--accent);
     stroke-width: 1;
   }
+  /* Stretch to fill its grid track(s): in CPU/RAM that's the graph column
+     (so the bar ends exactly where the graph above it ends); in GPU it
+     spans graph+temp (so it ends where the temperature ends). min-width
+     keeps it from collapsing if the graph above is toggled off. */
   .bar {
     position: relative;
-    display: inline-block;
-    width: 36px;
+    display: block;
+    width: auto;
+    justify-self: stretch;
+    min-width: 36px;
     height: 6px;
     background: var(--surface-3);
     border-radius: var(--radius-pill);

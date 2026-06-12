@@ -209,21 +209,10 @@ pub async fn pty_write(
             let _ = state
                 .state_signals
                 .try_send(StateSignal::UserKeystroke { tab: tab.clone() });
-            // Interrupt-on-input fires when the typed-into tab is the one
-            // actually playing. We hold the registry lock so `active()` is
-            // a stable read against the same critical section as the
-            // final write below.
-            if state.settings.current().behavior.interrupt_on_input
-                && tab == registry.active()
-            {
-                if let Ok(slot) = state.audio.read() {
-                    if let Some(audio) = slot.as_ref() {
-                        if audio.is_playing() {
-                            audio.stop_all();
-                        }
-                    }
-                }
-            }
+            // Note: typing does NOT interrupt TTS. By design, in-flight
+            // speech is only stopped by Esc (`tts_stop`) or by switching
+            // tabs (so the previous tab's audio doesn't bleed into the new
+            // view). Keystrokes still drive avatar state via UserKeystroke.
         }
     }
 
@@ -298,7 +287,7 @@ pub async fn tts_test(state: State<'_, AppState>, text: String) -> AppResult<()>
     let active = state.tabs.lock().await.active();
     state
         .tts_segments
-        .send(crate::tts::TtsRequest::Synthesize { tab: active, text })
+        .send(crate::tts::TtsRequest::Synthesize { tab: active, text, suppressible: false })
         .await
         .map_err(|e| AppError::Tts(format!("tts_test send: {e}")))?;
     Ok(())
@@ -318,9 +307,69 @@ pub async fn tts_speak(state: State<'_, AppState>, text: String) -> AppResult<()
     let active = state.tabs.lock().await.active();
     state
         .tts_segments
-        .send(crate::tts::TtsRequest::Synthesize { tab: active, text })
+        .send(crate::tts::TtsRequest::Synthesize { tab: active, text, suppressible: false })
         .await
         .map_err(|e| AppError::Tts(format!("tts_speak send: {e}")))?;
+    Ok(())
+}
+
+/// Read a terminal selection aloud as a read-along: `chunks` are the
+/// sentence segments (pre-split on the frontend so the spoken text exactly
+/// matches the highlighted text), synthesized and played in order. `session`
+/// is a frontend-assigned monotonic id stored in the shared cell so the
+/// worker can be told to abandon the read — `tts_stop` (Esc) zeroes the
+/// cell, and a newer call overwrites it. The audio thread emits
+/// `tts-selection-progress` events as it advances through the chunks so the
+/// frontend can recede the highlight. Backs `behavior.speak_selection_on_right_click`.
+#[tauri::command]
+pub async fn tts_speak_selection(
+    state: State<'_, AppState>,
+    session: u64,
+    chunks: Vec<String>,
+) -> AppResult<()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    // Mark this as the active read before sending so the worker (which reads
+    // the cell between chunks) keeps going for exactly this session.
+    state.speak_session.store(session, Ordering::SeqCst);
+    let active = state.tabs.lock().await.active();
+    state
+        .tts_segments
+        .send(crate::tts::TtsRequest::SpeakSelection { tab: active, session, chunks })
+        .await
+        .map_err(|e| AppError::Tts(format!("tts_speak_selection send: {e}")))?;
+    Ok(())
+}
+
+/// Stop all TTS playback immediately and cancel any in-flight selection read.
+/// Backs the Esc gesture: clears the audio sink (so queued chunks never play)
+/// and zeroes the shared session cell (so the worker abandons the remaining
+/// chunks it hasn't enqueued yet). The frontend clears its highlight on the
+/// same Esc.
+#[tauri::command]
+pub async fn tts_stop(state: State<'_, AppState>) -> AppResult<()> {
+    state.speak_session.store(0, Ordering::SeqCst);
+    // Suppress the rest of the current AI-output burst's tagged segments
+    // (those still queued or yet to arrive) until the next `ClaudeOutputStarted`
+    // clears the flag. Notifications and selection reads are unaffected — they
+    // ride other request variants the worker doesn't gate on this flag.
+    state.ai_tts_suppressed.store(true, Ordering::SeqCst);
+    if let Some(audio) = state.audio.read().ok().and_then(|g| g.as_ref().cloned()) {
+        audio.stop_all();
+    }
+    Ok(())
+}
+
+/// Pause or resume TTS playback without discarding queued audio. Backs the
+/// bottom-bar selection-TTS pause/resume transport. The in-flight read's
+/// session is left untouched (so resume continues exactly where it paused);
+/// only the audio sink is paused.
+#[tauri::command]
+pub async fn tts_set_paused(state: State<'_, AppState>, paused: bool) -> AppResult<()> {
+    if let Some(audio) = state.audio.read().ok().and_then(|g| g.as_ref().cloned()) {
+        audio.set_paused(paused);
+    }
     Ok(())
 }
 
@@ -533,6 +582,65 @@ pub async fn close_settings_window(app: AppHandle) -> AppResult<()> {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = w.close();
+    }
+    Ok(())
+}
+
+/// Square off (or restore) the main window's corners. Windows 11 rounds
+/// borderless windows via DWM regardless of CSS; the `tui-*` themes drop
+/// the native decorations and want hard corners to match the ratatui
+/// look, so the frontend calls this with `square = true` when a TUI theme
+/// is active and `false` (default OS rounding) otherwise. No-op on
+/// non-Windows platforms.
+#[tauri::command]
+pub fn set_window_square_corners(app: AppHandle, square: bool) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        let window = app
+            .get_webview_window("main")
+            .ok_or_else(|| AppError::Ipc("main window not found".into()))?;
+        let hwnd = window
+            .hwnd()
+            .map_err(|e| AppError::Ipc(format!("hwnd: {e}")))?;
+
+        // DWMWA_WINDOW_CORNER_PREFERENCE = 33; DWMWCP_DEFAULT = 0,
+        // DWMWCP_DONOTROUND = 1. Declared inline so we don't pull in the
+        // whole `windows` crate for a single attribute call.
+        const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+        const DWMWCP_DEFAULT: u32 = 0;
+        const DWMWCP_DONOTROUND: u32 = 1;
+        #[link(name = "dwmapi")]
+        extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: isize,
+                attr: u32,
+                pv: *const core::ffi::c_void,
+                cb: u32,
+            ) -> i32;
+        }
+        let pref: u32 = if square {
+            DWMWCP_DONOTROUND
+        } else {
+            DWMWCP_DEFAULT
+        };
+        let hr = unsafe {
+            DwmSetWindowAttribute(
+                hwnd.0 as isize,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &pref as *const u32 as *const core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if hr < 0 {
+            return Err(AppError::Ipc(format!(
+                "DwmSetWindowAttribute failed: 0x{hr:08x}"
+            )));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, square);
     }
     Ok(())
 }

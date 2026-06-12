@@ -7,6 +7,7 @@
 //! commands off a `std::sync::mpsc` channel. The public type is just the
 //! command sender plus a shared amplitude ring.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, RwLock};
@@ -27,11 +28,37 @@ use crate::tts::ActiveTab;
 /// avatar transition and cheap.
 const PLAYBACK_POLL: Duration = Duration::from_millis(50);
 
+/// Identifies one sentence chunk of a Ctrl+right-click selection read. The
+/// audio thread carries one per enqueued selection source so it can emit a
+/// playback "begin" edge as that chunk reaches the front of the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkMark {
+    pub session: u64,
+    pub index: u32,
+}
+
 #[derive(Debug)]
 enum AudioCommand {
-    Enqueue { samples: Vec<f32>, sample_rate: u32 },
+    Enqueue {
+        samples: Vec<f32>,
+        sample_rate: u32,
+        /// `Some` for selection-read chunks (drives progress events), `None`
+        /// for ordinary AI-output / notification audio.
+        mark: Option<ChunkMark>,
+    },
     StopAll,
     SetVolume(f32),
+    /// Pause (`true`) or resume (`false`) the sink without discarding queued
+    /// audio. Backs the selection-TTS pause/resume transport. While paused the
+    /// sink keeps its sources, so `sink.len()`/`empty()` are unchanged and no
+    /// playback or selection-progress edges fire until resumed.
+    SetPaused(bool),
+    /// The worker has enqueued every chunk of selection-read `session`
+    /// (`count` total). The audio thread emits the `index == count` "done"
+    /// sentinel only once this has arrived AND the session's audio has drained
+    /// — so a momentary gap between chunks (synthesis lagging playback on a
+    /// cold read) is not mistaken for end-of-read.
+    SelectionFinished { session: u64, count: u32 },
 }
 
 pub struct AudioOutput {
@@ -93,10 +120,24 @@ impl AudioOutput {
     }
 
     pub fn enqueue(&self, samples: Vec<f32>, sample_rate: u32) {
+        self.enqueue_inner(samples, sample_rate, None);
+    }
+
+    /// Enqueue a selection-read chunk tagged with its [`ChunkMark`]. The audio
+    /// thread emits a `TtsSelectionProgress` edge as this chunk reaches the
+    /// front of the queue and again when it (and the whole read) drains.
+    pub fn enqueue_marked(&self, samples: Vec<f32>, sample_rate: u32, mark: ChunkMark) {
+        self.enqueue_inner(samples, sample_rate, Some(mark));
+    }
+
+    fn enqueue_inner(&self, samples: Vec<f32>, sample_rate: u32, mark: Option<ChunkMark>) {
         if samples.is_empty() {
             return;
         }
-        if let Err(e) = self.cmd_tx.send(AudioCommand::Enqueue { samples, sample_rate }) {
+        if let Err(e) = self
+            .cmd_tx
+            .send(AudioCommand::Enqueue { samples, sample_rate, mark })
+        {
             warn!(error = %e, "audio command channel closed; dropping samples");
         }
     }
@@ -124,6 +165,18 @@ impl AudioOutput {
 
     pub fn stop_all(&self) {
         let _ = self.cmd_tx.send(AudioCommand::StopAll);
+    }
+
+    /// Pause or resume playback without discarding queued audio.
+    pub fn set_paused(&self, paused: bool) {
+        let _ = self.cmd_tx.send(AudioCommand::SetPaused(paused));
+    }
+
+    /// Signal that every chunk of a selection read has been enqueued. Lets the
+    /// audio thread emit the read's "done" sentinel only after the audio truly
+    /// drains (not on a between-chunk gap).
+    pub fn selection_finished(&self, session: u64, count: u32) {
+        let _ = self.cmd_tx.send(AudioCommand::SelectionFinished { session, count });
     }
 
     #[allow(dead_code)] // Direct setter; settings broadcast is the usual path.
@@ -210,6 +263,24 @@ fn run_audio_thread(
     // once per stretch of audio. We poll via recv_timeout so playback edges
     // can be detected even when no command arrives.
     let mut speaking = false;
+    // The tab that started the current stretch of speech. Captured on the
+    // idle→speaking edge and reused on the speaking→idle edge so a tab switch
+    // mid-speech doesn't misattribute the stop (audio is no longer stopped on
+    // tab switch — only Esc stops it).
+    let mut speaking_tab: Option<TabId> = None;
+    // Selection-read progress: a per-source mark queue that mirrors the
+    // rodio sink's FIFO. `None` entries stand in for ordinary AI/notification
+    // audio so the deque length always equals `sink.len()` — that invariant
+    // is what lets us map a `sink.len()` drop to "the front source finished".
+    let mut marks: VecDeque<Option<ChunkMark>> = VecDeque::new();
+    let mut prev_len: usize = 0;
+    // The selection chunk we last told the frontend is "now playing", so we
+    // emit a begin edge only when the front actually changes.
+    let mut last_front: Option<ChunkMark> = None;
+    // Set when the worker has enqueued every chunk of a read. The "done"
+    // sentinel fires only once this is set AND that session's marks have all
+    // drained — never on a mere between-chunk gap.
+    let mut pending_done: Option<(u64, u32)> = None;
     loop {
         let cmd = match cmd_rx.recv_timeout(PLAYBACK_POLL) {
             Ok(c) => Some(c),
@@ -219,21 +290,90 @@ fn run_audio_thread(
 
         if let Some(cmd) = cmd {
             match cmd {
-                AudioCommand::Enqueue { samples, sample_rate } => {
+                AudioCommand::Enqueue { samples, sample_rate, mark } => {
                     let source = TappedSource::new(samples, sample_rate, amplitude.clone());
                     sink.append(source);
+                    marks.push_back(mark);
                 }
                 AudioCommand::StopAll => {
-                    // rodio's `clear()` ALSO pauses the sink. Without an
-                    // explicit `play()` after, the next `append()` lands in a
-                    // paused queue — synthesized samples sit there forever
-                    // and the user hears nothing. v2's tab-switch path makes
-                    // this trivially reproducible (switch tab during/after
-                    // TTS, switch back, ask for more TTS → silent).
+                    // Reached only via Esc (`tts_stop`) now — tab switches no
+                    // longer stop audio. rodio's `clear()` ALSO pauses the
+                    // sink. Without an explicit `play()` after, the next
+                    // `append()` lands in a paused queue — synthesized samples
+                    // sit there forever and the user hears nothing (Esc during
+                    // TTS, then a new read → silent).
                     sink.clear();
                     sink.play();
+                    // Drop the mark queue too: a stop cancels any in-flight
+                    // selection read, and the frontend clears its highlight on
+                    // the same Esc that triggered the stop.
+                    marks.clear();
+                    last_front = None;
+                    pending_done = None;
                 }
                 AudioCommand::SetVolume(v) => sink.set_volume(v),
+                AudioCommand::SetPaused(paused) => {
+                    if paused {
+                        sink.pause();
+                    } else {
+                        sink.play();
+                    }
+                }
+                AudioCommand::SelectionFinished { session, count } => {
+                    pending_done = Some((session, count));
+                }
+            }
+        }
+
+        // Selection-read progress. Compare the sink's queue length to the
+        // previous tick: any drop means that many front sources drained. We
+        // pop the matching marks but do NOT treat a drop as end-of-read —
+        // end-of-read is decided below by `pending_done` + an empty session.
+        let len = sink.len();
+        if len < prev_len {
+            for _ in 0..(prev_len - len) {
+                marks.pop_front();
+            }
+        }
+        prev_len = len;
+
+        // Tell the frontend which selection chunk is now at the front of the
+        // queue (i.e. playing). Only on an actual change of front. A gap with
+        // no front (audio drained between chunks) leaves `last_front` as-is, so
+        // the highlight holds on the last sentence until the next one begins
+        // rather than flickering off.
+        let front = marks.front().copied().flatten();
+        if let Some(f) = front {
+            if last_front != Some(f) {
+                last_front = Some(f);
+                let tab = current_active(&active);
+                let _ = state_signals.try_send(StateSignal::TtsSelectionProgress {
+                    tab,
+                    session: f.session,
+                    index: f.index,
+                });
+            }
+        }
+
+        // End-of-read: once the worker has signalled it enqueued everything
+        // (`pending_done`) and none of that session's chunks remain in the
+        // queue, emit the `index == count` sentinel so the frontend clears the
+        // highlight. This is robust to between-chunk gaps on a cold read.
+        if let Some((session, count)) = pending_done {
+            let session_remaining = marks
+                .iter()
+                .any(|m| matches!(m, Some(mk) if mk.session == session));
+            if !session_remaining {
+                let tab = current_active(&active);
+                let _ = state_signals.try_send(StateSignal::TtsSelectionProgress {
+                    tab,
+                    session,
+                    index: count,
+                });
+                pending_done = None;
+                if last_front.map(|f| f.session) == Some(session) {
+                    last_front = None;
+                }
             }
         }
 
@@ -241,12 +381,18 @@ fn run_audio_thread(
         if now_speaking && !speaking {
             speaking = true;
             playing.store(true, Ordering::Relaxed);
+            // Remember which tab owns this stretch of speech so the matching
+            // stop edge is tagged with the SAME tab. Switching tabs mid-speech
+            // no longer stops audio (only Esc does), so reading `current_active`
+            // at the stop edge could tag the wrong tab and leave the speaking
+            // tab's avatar pinned in Speaking.
             let tab = current_active(&active);
+            speaking_tab = Some(tab.clone());
             let _ = state_signals.try_send(StateSignal::TtsPlaybackStarted { tab });
         } else if !now_speaking && speaking {
             speaking = false;
             playing.store(false, Ordering::Relaxed);
-            let tab = current_active(&active);
+            let tab = speaking_tab.take().unwrap_or_else(|| current_active(&active));
             let _ = state_signals.try_send(StateSignal::TtsPlaybackStopped { tab });
             // Wake any task waiting on the next idle edge. `playing` is
             // already false above, so a `try_drain` running on this notify

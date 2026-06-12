@@ -46,9 +46,9 @@ import {
   ptyStart,
   ptyWrite,
   restartShellTab,
-  ttsSpeak,
   type BytesChannel,
 } from './ipc';
+import { beginSelectionTts } from './selectionTts';
 import {
   display as displaySettings,
   settings as settingsStore,
@@ -511,12 +511,15 @@ export function createTerminal(
     if (e.ctrlKey) {
       // Speak-selection gesture. Even when the feature is off we still
       // swallow the event for Ctrl+right-click so it never pastes — the
-      // modifier is reserved for this gesture.
+      // modifier is reserved for this gesture. The selection is chunked into
+      // sentences (so large/multi-line selections aren't truncated) and, when
+      // enabled, painted with a receding read-along highlight; see
+      // `selectionTts.ts`.
       e.preventDefault();
       if (!behavior.speak_selection_on_right_click) return;
-      const text = term.getSelection();
-      if (!text.trim()) return;
-      void ttsSpeak(text).catch((err) =>
+      if (!term.getSelection().trim()) return;
+      const highlight = get(settingsStore).tts.selection_highlight;
+      void beginSelectionTts(term, highlight).catch((err) =>
         console.warn('speak-selection TTS failed:', err),
       );
       return;
@@ -789,4 +792,18 @@ export function focusTerminalFor(tabId: TabId): void {
   const entry = entries.get(tabId);
   if (!entry) return;
   entry.term.focus();
+}
+
+/// The terminal that currently holds a non-empty selection, if any. Backs the
+/// bottom-bar "play" transport (selection lives in whichever pane the user
+/// last selected in, independent of which tab is "active"). xterm keeps its
+/// selection model across focus changes, so clicking the toolbar button does
+/// not clear it. Returns the first match in registry order — in practice only
+/// one terminal has a selection at a time.
+export function terminalWithSelection(): Terminal | undefined {
+  for (const entry of entries.values()) {
+    const sel = entry.term.getSelection();
+    if (sel && sel.trim()) return entry.term;
+  }
+  return undefined;
 }

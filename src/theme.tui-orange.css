@@ -34,10 +34,9 @@ html[data-theme="tui-orange"] main {
    TuiTitleBar (mounted inside #app). Shrink its height to leave room
    for the 22px title bar, and frame the same three sides.
 
-   Selector pinned to `#app > .root` because `.root` is also used by
-   LayoutsPopover for its inline-block trigger wrapper — without the
-   `#app >` qualifier the height rule applied there too and grew the
-   StatusBar's Layouts dropdown into an 800px-tall column. */
+   Selector pinned to `#app > .root` so the height rule targets only the
+   top-level container, not any nested `.root` wrappers elsewhere in the
+   chrome (which would otherwise inherit the 100vh-minus-titlebar height). */
 html[data-theme="tui-orange"] #app > .root {
   height: calc(100vh - 22px);
   border-left: 1px solid var(--border-default);
@@ -346,25 +345,6 @@ html[data-theme="tui-orange"] .glyph {
    only it carries the word "announcement". */
 html[data-theme="tui-orange"] [title*="announcement" i] .glyph {
   transform: translateY(2px);
-}
-
-/* LayoutsPopover trigger — match the flat status-button look. */
-html[data-theme="tui-orange"] .status-bar .trigger {
-  background: transparent !important;
-  border: 1px solid transparent !important;
-  border-radius: 0 !important;
-  color: var(--text-quiet) !important;
-  height: 22px !important;
-  padding: 0 1ch !important;
-}
-html[data-theme="tui-orange"] .status-bar .trigger:hover {
-  background: transparent !important;
-  color: var(--accent) !important;
-}
-html[data-theme="tui-orange"] .status-bar .trigger[aria-expanded='true'] {
-  background: transparent !important;
-  border-color: var(--accent) !important;
-  color: var(--accent) !important;
 }
 
 /* VolumeSlider: keep the slider but flatten any chrome around it. */

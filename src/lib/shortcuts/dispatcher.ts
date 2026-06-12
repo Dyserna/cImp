@@ -31,7 +31,14 @@ export type ShortcutAction =
   | 'focus_pane_down'
   | 'split_pane_horizontal'
   | 'split_pane_vertical'
-  | 'close_pane';
+  | 'close_pane'
+  /// Esc stops all in-flight TTS (the only thing that interrupts speech —
+  /// typing never does). Bound directly to the Escape key, not a configurable
+  /// shortcut. When a Ctrl+right-click selection read is active the key is
+  /// consumed (it cancels the read and clears its highlight); otherwise the
+  /// stop runs as a side effect and Esc still flows to the terminal/PTY so
+  /// Claude's own Escape handling keeps working.
+  | 'stop_tts';
 
 /// A shortcut binding can be a bare function (always fires when matched) or
 /// an object with an `active` predicate. When `active()` returns false the
@@ -99,6 +106,28 @@ export function setSuppressed(value: boolean): void {
 
 function onKeyDown(event: KeyboardEvent): void {
   if (suppressed) return;
+
+  // Escape is handled outside the configurable-shortcut table: it stops all
+  // in-flight TTS (`stop_tts`). When a selection read is active (the handler's
+  // `active()` guard) we consume the key so it cancels the read and clears its
+  // highlight. Otherwise we still run the stop, but do NOT preventDefault —
+  // Escape continues to xterm/PTY so Claude's own Escape handling works.
+  if (event.key === 'Escape') {
+    const binding = handlers.stop_tts;
+    if (binding) {
+      const fn = typeof binding === 'function' ? binding : binding.handler;
+      const active = typeof binding === 'function' ? null : binding.active;
+      if (active && active()) {
+        event.preventDefault();
+        event.stopPropagation();
+        fn();
+        return;
+      }
+      // No selection read: stop other TTS as a side effect, let Esc pass through.
+      fn();
+    }
+  }
+
   for (const name of Object.keys(predicates) as ShortcutAction[]) {
     const pred = predicates[name];
     if (!pred || !matches(event, pred)) continue;

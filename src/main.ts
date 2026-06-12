@@ -5,6 +5,7 @@ import { settings } from './lib/settings/store';
 import { themeFromSetting } from './lib/themes/resolve';
 import { installReloadBlocker } from './lib/shortcuts/blockReload';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
 import './theme.css';
 import './theme.tui-yellow.css';
 import './theme.tui-purple.css';
@@ -44,6 +45,21 @@ function applyTerminalPaletteVars(theme: ReturnType<typeof themeFromSetting>) {
   if (theme.foreground) root.setProperty('--term-fg', theme.foreground);
 }
 
+// The main window is created hidden (`visible: false` in tauri.conf.json) to
+// avoid a blank WebView flashing on screen while the bundle loads and Svelte
+// mounts. We reveal it exactly once, after the first decorations toggle has
+// been applied below — so the user never sees the empty window nor a title-bar
+// jump as the TUI themes drop the OS chrome.
+let hasShownWindow = false;
+function showMainWindowOnce() {
+  if (hasShownWindow) return;
+  hasShownWindow = true;
+  void getCurrentWindow().show().catch(() => {});
+}
+// Safety net: if the decorations IPC round-trip never resolves, reveal anyway
+// so a backend hiccup can't leave the user staring at nothing.
+setTimeout(showMainWindowOnce, 3000);
+
 let lastDecorations: boolean | null = null;
 settings.subscribe((s) => {
   const next = s.ui?.theme || 'tui-orange';
@@ -54,7 +70,20 @@ settings.subscribe((s) => {
   const wantDecorations = !next.startsWith('tui-');
   if (wantDecorations !== lastDecorations) {
     lastDecorations = wantDecorations;
-    void getCurrentWindow().setDecorations(wantDecorations);
+    // Square the window corners for the TUI themes (borderless), restore
+    // the OS default rounding for modern-dark. Applied after the
+    // decorations toggle since changing decorations can reset DWM attrs.
+    void getCurrentWindow()
+      .setDecorations(wantDecorations)
+      .finally(() => {
+        void invoke('set_window_square_corners', { square: !wantDecorations })
+          .catch(() => {})
+          // First decorations pass is done — the window is now in its final
+          // chrome state, so it's safe to reveal it.
+          .finally(() => showMainWindowOnce());
+      });
+  } else {
+    showMainWindowOnce();
   }
 });
 

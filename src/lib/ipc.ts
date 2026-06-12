@@ -69,6 +69,29 @@ export async function ttsSpeak(text: string): Promise<void> {
   await invoke('tts_speak', { text });
 }
 
+/// Read a terminal selection aloud as a read-along. `chunks` are the
+/// pre-split sentence segments (so the spoken text matches the highlight
+/// exactly); `session` is a frontend-assigned monotonic id used to correlate
+/// `tts-selection-progress` events and to let `ttsStop` cancel this read.
+export async function ttsSpeakSelection(
+  session: number,
+  chunks: string[],
+): Promise<void> {
+  await invoke('tts_speak_selection', { session, chunks });
+}
+
+/// Stop all TTS playback and cancel any in-flight selection read. Backs the
+/// Esc gesture that also clears the read-along highlight.
+export async function ttsStop(): Promise<void> {
+  await invoke('tts_stop');
+}
+
+/// Pause (`true`) or resume (`false`) TTS playback without discarding queued
+/// audio. Backs the bottom-bar selection-TTS pause/resume transport.
+export async function ttsSetPaused(paused: boolean): Promise<void> {
+  await invoke('tts_set_paused', { paused });
+}
+
 /// One Claude usage quota window. `utilization` is 0–100; `resets_at` is an
 /// ISO-8601 timestamp (with timezone) or null.
 export interface UsageWindow {

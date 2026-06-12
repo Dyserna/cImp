@@ -219,6 +219,13 @@ pub enum StateSignal {
     ClaudeOutputStopped { tab: TabId },
     TtsPlaybackStarted { tab: TabId },
     TtsPlaybackStopped { tab: TabId },
+    /// A selection-read (Ctrl+right-click) crossed a sentence boundary in
+    /// playback. `index` is the chunk now starting to play; `index ==
+    /// chunk_count` is the end-of-session sentinel. Pure pass-through — the
+    /// state machine does not mutate any `TabState`, it just re-emits this as
+    /// `StateEvent::TtsSelectionProgress` so the frontend can advance the
+    /// read-along highlight. `session` lets the frontend ignore stale reads.
+    TtsSelectionProgress { tab: TabId, session: u64, index: u32 },
     /// Subprocess for `tab` exited with the given exit code (`None` if the
     /// child wait returned an error, or if we synthesize the signal from a
     /// spawn-time failure where there is no process to exit). Phase 4 routes
@@ -286,6 +293,7 @@ impl StateSignal {
             | Self::ClaudeOutputStopped { tab }
             | Self::TtsPlaybackStarted { tab }
             | Self::TtsPlaybackStopped { tab }
+            | Self::TtsSelectionProgress { tab, .. }
             | Self::SubprocessExited { tab, .. }
             | Self::AudioError { tab }
             | Self::TtsError { tab }
@@ -317,6 +325,10 @@ impl StateSignal {
 pub enum StateEvent {
     StateChanged { tab: TabId, state: AvatarState },
     ActiveTabChanged { tab: TabId },
+    /// Read-along progress for a Ctrl+right-click selection read. `index` is
+    /// the sentence chunk now beginning playback; `index == chunk_count`
+    /// signals the whole selection finished. Wire tag: `tts-selection-progress`.
+    TtsSelectionProgress { tab: TabId, session: u64, index: u32 },
     AwaitingPermissionChanged { tab: TabId, awaiting: bool },
     AwaitingQuestionChanged { tab: TabId, awaiting: bool },
     DoneWhileAwayChanged { tab: TabId, done: bool },
@@ -448,9 +460,19 @@ pub fn spawn_state_manager(
     input_lengths: InputLengths,
     tab_metas: Vec<TabMeta>,
     initial_active: TabId,
+    ai_tts_suppressed: crate::tts::AiTtsSuppressed,
 ) {
     tauri::async_runtime::spawn(async move {
-        run(app, rx, state_events, input_lengths, tab_metas, initial_active).await;
+        run(
+            app,
+            rx,
+            state_events,
+            input_lengths,
+            tab_metas,
+            initial_active,
+            ai_tts_suppressed,
+        )
+        .await;
     });
 }
 
@@ -461,6 +483,7 @@ async fn run(
     input_lengths: InputLengths,
     tab_metas: Vec<TabMeta>,
     initial_active: TabId,
+    ai_tts_suppressed: crate::tts::AiTtsSuppressed,
 ) {
     // Preserve tab_metas order so the startup TabCreated emit positions
     // match the registry's tab order (registry uses the same launch_seed).
@@ -579,6 +602,30 @@ async fn run(
                             }
                         }
                     }
+                    continue;
+                }
+
+                // New Claude output clears the Esc-driven AI-TTS suppression:
+                // the user stopped the *previous* burst's tagged speech, but a
+                // fresh burst should speak again. Done as a peek (no `continue`)
+                // so the signal still drives the avatar transition below.
+                if let StateSignal::ClaudeOutputStarted { .. } = &signal {
+                    ai_tts_suppressed.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+
+                // Selection-read progress is a pure pass-through to the
+                // frontend — it carries no avatar-state meaning, so we relay
+                // it as an event and skip the per-tab transition routing.
+                if let StateSignal::TtsSelectionProgress { tab, session, index } = &signal {
+                    dispatch(
+                        &app,
+                        &state_events,
+                        StateEvent::TtsSelectionProgress {
+                            tab: tab.clone(),
+                            session: *session,
+                            index: *index,
+                        },
+                    );
                     continue;
                 }
 

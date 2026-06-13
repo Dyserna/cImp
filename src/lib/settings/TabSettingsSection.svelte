@@ -13,7 +13,8 @@
   import ThemeSwatch from './ThemeSwatch.svelte';
   import CustomThemeEditor from './CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './BackgroundConfigEditor.svelte';
-  import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from '../themes';
+  import { resolveBundledTheme, defaultPalette } from '../themes';
+  import { paletteRegistry } from '../themes/registry';
   import { settings as settingsStore } from './store';
 
   // Renders the per-AI-tab settings form: command (read-only), CLI args,
@@ -135,7 +136,7 @@
           : settings.theme_override.name;
       const seed =
         previousName === 'Custom'
-          ? BUNDLED_THEMES.Default
+          ? defaultPalette()
           : resolveBundledTheme(previousName);
       update('theme_override', {
         name: 'Custom',
@@ -305,8 +306,8 @@
           selectThemeOverride((e.currentTarget as HTMLSelectElement).value)}
       >
         <option value="__inherit">Use global default (current: {globalThemeName})</option>
-        {#each BUNDLED_THEME_NAMES as paletteName}
-          <option value={paletteName}>{paletteName}</option>
+        {#each $paletteRegistry as p}
+          <option value={p.name}>{p.name}</option>
         {/each}
         <option value="Custom">Custom…</option>
       </select>

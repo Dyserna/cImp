@@ -1,3 +1,130 @@
+/* tui-yellow theme — Gruvbox Dark palette + bright yellow accent.
+   Matches the ratatui reference screenshot. Self-contained per the theme
+   isolation policy (see src/theme.css): the token block below plus the
+   structural overrides that follow are this theme's complete definition. */
+[data-theme="tui-yellow"] {
+  /* Surfaces — Gruvbox dark0_hard → dark2 (warm near-black to brown-
+     gray). Tight contrast between layers; depth comes from borders. */
+  --surface-0:       var(--term-bg, #1d2021);   /* dark0_hard, body bg — follows terminal palette */
+  --surface-1:       var(--term-bg, #282828);   /* dark0, panes — follows terminal palette */
+  --surface-2:       var(--term-bg, #32302f);   /* dark0_soft, tab bar / dialog body — follows terminal palette */
+  --surface-3:       #3c3836;   /* dark1, hover-elevated */
+  --surface-4:       #504945;   /* dark2, deeper hover */
+
+  --surface-sunken:  var(--term-bg, #1d2021);
+  --surface-deep:    var(--term-bg, #16181a);
+  --surface-input:   var(--term-bg, #32302f);
+
+  /* Text — Gruvbox fg → fg4 (cream → tan-gray). */
+  --text-primary:    var(--term-fg, #ebdbb2);   /* main text — follows terminal palette fg */
+  --text-bright:     var(--term-fg, #fbf1c7);   /* brightest text — follows terminal fg */
+  --text-on-accent:  #1d2021;   /* dark text on yellow fills */
+  /* Neutral text ramp from the terminal palette (term-fg → term-bg blend).
+     Keeps the whole chrome/body text in-palette; accent + semantics stay
+     theme-defined. */
+  --text-secondary:  color-mix(in srgb, var(--term-fg, #d5c4a1) 88%, var(--term-bg, #1d2021));
+  --text-quiet:      color-mix(in srgb, var(--term-fg, #bdae93) 72%, var(--term-bg, #1d2021));
+  --text-quiet-strong: color-mix(in srgb, var(--term-fg, #a89984) 80%, var(--term-bg, #1d2021));
+  --text-tertiary:   color-mix(in srgb, var(--term-fg, #928374) 58%, var(--term-bg, #1d2021));
+  --text-faint:      color-mix(in srgb, var(--term-fg, #7c6f64) 46%, var(--term-bg, #1d2021));
+  --text-disabled:   color-mix(in srgb, var(--term-fg, #665c54) 38%, var(--term-bg, #1d2021));
+  --text-disabled-deep: color-mix(in srgb, var(--term-fg, #504945) 30%, var(--term-bg, #1d2021));
+
+  /* Accent — Gruvbox bright yellow. Titles, active selections, and
+     focus indicators in ratatui apps almost always use this color;
+     it's what makes the screenshot read as "ratatui". */
+  --accent:          #fabd2f;   /* bright yellow */
+  --accent-hover:    #fac32f;
+  --accent-bright:   #fce074;
+  --accent-soft:     #b57614;   /* faded yellow for muted CTAs */
+  --accent-soft-hover: #d79921;
+  --accent-info:     #83a598;   /* gruvbox bright blue */
+  --accent-fg:       #1d2021;
+  --accent-muted:    rgba(250, 189, 47, 0.15);
+
+  /* Waveform / avatar-border default — matches the yellow accent. */
+  --waveform-color:  #fabd2f;
+
+  /* Semantics — Gruvbox bright variants. */
+  --success:         #b8bb26;   /* bright green */
+  --warning:         #fabd2f;   /* bright yellow */
+  --danger:          #fb4934;   /* bright red */
+  --awaiting:        var(--warning);
+
+  /* Danger — gruvbox red, warm-tinted surfaces. */
+  --surface-danger:         #3c2828;
+  --surface-danger-strong:  #4a2828;
+  --surface-danger-hover:   #5c2c2c;
+  --surface-danger-bg:      #2a1d1d;
+  --surface-danger-deep:    #1d1515;
+  --surface-danger-soft:    #2c2020;
+  --surface-danger-faint:   #1a1414;
+  --text-danger-soft:       #fb4934;
+  --text-danger-strong:     #fe8181;
+  --text-danger-bright:     #fb4934;
+  --text-danger-quiet:      #cc241d;
+  --text-danger-faint:      #9d0006;
+  --text-danger-pale:       #fb6e6e;
+  --text-danger-pastel:     #fb8888;
+  --text-danger-extra:      #fbafaf;
+  --text-danger-mute:       #d5a5a5;
+  --border-danger-strong:   #fb4934;
+  --border-danger:          #cc241d;
+  --border-danger-soft:     #803838;
+
+  /* Warning — gruvbox yellow on warm dark. */
+  --surface-warning:        #3a2e1a;
+  --surface-warning-deep:   #2a2010;
+  --surface-warning-faint:  #1d1608;
+  --text-warning:           #fabd2f;
+  --text-warning-bright:    #fce074;
+  --border-warning:         #d79921;
+
+  /* Success — gruvbox green. */
+  --surface-success:        #283228;
+  --text-success:           #b8bb26;
+  --text-success-bright:    #d3d349;
+
+  /* Info — gruvbox aqua/blue. */
+  --surface-info:           #1d3030;
+  --surface-info-deep:      #142222;
+  --surface-info-faint:     #0d1818;
+  --text-info:              #8ec07c;   /* bright aqua */
+  --text-info-bright:       #aedfa0;
+  --text-info-quiet:        #689d6a;
+  --border-info:            #689d6a;
+  --border-info-soft:       #3a4a3a;
+  --accent-purple:          #d3869b;   /* bright purple */
+
+  /* Borders — gruvbox bg3/bg4. Warm gray to match the palette. */
+  --border-faint:    #3c3836;
+  --border-subtle:   #504945;
+  --border-default:  #665c54;
+  --border-strong:   #7c6f64;
+  --border-focus:    var(--accent);
+
+  /* Radii — fully square. Terminals don't round. */
+  --radius-sm:    0;
+  --radius-md:    0;
+  --radius-lg:    0;
+  --radius-pill:  0;
+
+  /* Elevation — none. Borders carry the depth. */
+  --shadow-sm: none;
+  --shadow-md: none;
+  --shadow-lg: none;
+
+  /* Motion — instant. CRTs don't ease. */
+  --motion-fast: 0ms;
+  --motion-base: 0ms;
+
+  /* Typography — monospace cascade. font-family inherits, so setting it
+     on the theme root propagates to every descendant that doesn't
+     override. */
+  font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code',
+    'Source Code Pro', Consolas, 'Courier New', monospace;
+}
+
 /* Structural overrides for `tui-yellow`. Where modern-dark relies on
    filled surfaces, shadows, and rounded corners, the TUI look uses 1px
    box borders, transparent fills, square corners, and titles embedded

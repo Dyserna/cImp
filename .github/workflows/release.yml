@@ -173,6 +173,17 @@ jobs:
           # user's hand-edited patterns.
           Copy-Item scripts/patterns.default.json "$stageFull/bin/patterns.json"
 
+          # UI themes + terminal palettes. Ship next to cctts.exe (the loader
+          # reads <exe-dir>/themes/ and <exe-dir>/palettes/) so the full theme
+          # set is present and editable on a fresh install — nothing is embedded
+          # in the binary or seeded at runtime. Source of truth is the repo-root
+          # themes/ and palettes/ folders (the same ones build.rs copies next to
+          # the dev exe). Copied recursively to preserve the per-theme subfolders.
+          New-Item -ItemType Directory -Force -Path "$stageFull/bin/themes" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stageFull/bin/palettes" | Out-Null
+          Copy-Item -Recurse themes/* "$stageFull/bin/themes/"
+          Copy-Item -Recurse palettes/* "$stageFull/bin/palettes/"
+
           # Kokoro ONNX model and every voicepack the repo carries via
           # Git LFS. Shipping all voices means the user can switch via
           # Settings -> Audio without re-downloading anything; the
@@ -218,6 +229,15 @@ jobs:
 
           Copy-Item -Recurse avatars/* "$stageSlim/avatars/"
           Copy-Item -Recurse sprites/* "$stageSlim/sprites/"
+
+          # UI themes + terminal palettes (see the full-variant note). Bundled
+          # in the slim zip too so the app is themed after a no-models update;
+          # like avatars/sprites these are default assets, not hand-edited
+          # config, so re-extracting refreshing them is fine.
+          New-Item -ItemType Directory -Force -Path "$stageSlim/bin/themes" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stageSlim/bin/palettes" | Out-Null
+          Copy-Item -Recurse themes/* "$stageSlim/bin/themes/"
+          Copy-Item -Recurse palettes/* "$stageSlim/bin/palettes/"
 
           Copy-Item LICENSE "$stageSlim/"
           Copy-Item NOTICE "$stageSlim/"

@@ -40,6 +40,11 @@ What is bundled
   bin\onnxruntime_providers_shared.dll
   bin\patterns.json                  editable prompt-detection patterns
                                      (see "Customizing prompt detection")
+  bin\themes\<id>\                   UI chrome themes (theme.json + theme.css);
+                                     edit a theme or drop in a new folder,
+                                     then restart to pick it up
+  bin\palettes\<name>.json           terminal color palettes (one file each);
+                                     edit or add files, then restart
   models\kokoro-v1.0.onnx            Kokoro 82M TTS model
   models\voices\af_heart.bin         default voice
   avatars\Idle.mp4 / Listening.mp4 / Thinking.mp4 / Speaking.mp4 / Error.mp4

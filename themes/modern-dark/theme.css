@@ -1,39 +1,14 @@
-/* V5 design tokens. The single source of truth for cctts UI chrome colors,
-   spacing, radii, motion, and typography. Components reference `var(--*)`
-   so changing values here updates everything.
+/* modern-dark theme — cool slate-blue surfaces, purple accent, coral
+   semantics, generous radii, soft shadows. Uses the OS-native window
+   chrome (decorations: true in theme.json).
 
-   The `:root` block below is the BASE / FALLBACK token set — the same cool
-   slate-blue values the `modern-dark` theme uses — applied before any theme
-   CSS is present. The actual themes are no longer defined in this file:
-   each one lives in its own folder (`theme.json` + `theme.css`) shipped in
-   the portable release at `<exe-dir>/themes/<id>/` (source of truth is the
-   repo-root `themes/` folder; `build.rs` copies it next to the dev exe).
-   Nothing is embedded or seeded at runtime — the backend reads + verifies
-   them from disk and the frontend injects each theme's CSS into <head>. The
-   active theme is selected by the `data-theme` attribute on <html>, exactly
-   as before — the per-theme `[data-theme="<id>"]` block (which redeclares the
-   full token set) wins over these defaults.
-
-   --- Theme isolation policy --------------------------------------------
-
-   Every theme is a self-contained `[data-theme="<name>"]` block (now an
-   external `themes/<id>/theme.css`) that declares its full token set —
-   plus, for the TUI themes, its structural overrides in the same file.
-   There are NO shared parent blocks, NO `[data-theme^="..."]` prefix
-   selectors, and NO grouped selectors that span multiple themes.
-
-   When adding a new theme — even when it's "just a derivative" of an
-   existing one (different accent, same surfaces) — copy the entire source
-   theme's folder (`theme.json` + `theme.css`, and `avatars/<name>/`) and
-   rename it. Tweak the few tokens that differ. The duplication is the
-   point: themes can drift from each other freely without anyone
-   discovering a load-bearing shared rule mid-tweak.
-
-   This rule supersedes any DRY instinct. Reviewers should reject refactors
-   that "lift common tokens" out of one theme into another.
-   ----------------------------------------------------------------------- */
-
-:root {
+   Self-contained per the theme isolation policy (see src/theme.css). These
+   are the same values the base `:root` block declares as the universal
+   default; modern-dark re-declares them under its own selector so the
+   theme stays a complete, free-standing definition. modern-dark has no
+   separate structural-override file — the default component CSS (filled
+   surfaces, shadows, rounded corners) is its structural look. */
+[data-theme="modern-dark"] {
   /* Surfaces — cool slate-blue, layered from darkest to lightest. Tight
      contrast between layers; depth comes from accent + shadow, not from
      extreme bg differences. */
@@ -182,17 +157,4 @@
   --font-weight-semibold: 600;
   --line-height-tight: 1.3;
   --line-height-normal: 1.5;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  :root {
-    --motion-fast: 0ms;
-    --motion-base: 0ms;
-  }
-}
-
-/* Utility: tabular numerics for numeric displays (volume %, counts). */
-.tnum {
-  font-variant-numeric: tabular-nums;
-  font-feature-settings: "tnum";
 }

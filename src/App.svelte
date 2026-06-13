@@ -24,6 +24,7 @@
     startAvatarStateListener,
   } from './lib/avatarState';
   import { initSettings, settings, applySettings } from './lib/settings/store';
+  import { themeRegistry } from './lib/themes/registry';
   import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
   import { applyTabCreated } from './lib/tabs/store';
@@ -63,6 +64,15 @@
   // OS window title is set by the Rust setup hook to "<project> - cctts".
   // Mirrored into the TUI title bar via a one-shot read in onMount.
   let tuiTitle = $state('cctts');
+
+  // Whether to render the custom TuiTitleBar: driven by the active theme's
+  // `decorations` metadata (false = OS chrome hidden, we draw our own bar).
+  // Derived from the registry store so it re-evaluates when the registry
+  // finishes loading, not just when the theme id changes. Unknown / not-yet-
+  // loaded themes default to the custom bar (matches the tui-orange fallback).
+  let useCustomTitleBar = $derived(
+    !($themeRegistry.find((t) => t.id === $settings.ui.theme)?.decorations ?? false),
+  );
 
   let unsubSettings: (() => void) | undefined;
   let unsubContent: (() => void) | undefined;
@@ -375,10 +385,11 @@
     they subscribe to `activeTab`-derived stores which are kept in
     sync with the focused pane's active tab.
 
-    Custom title bar mounts under any TUI variant — modern-dark keeps
-    OS chrome via setDecorations(true) wired in main.ts.
+    Custom title bar mounts for any theme whose metadata sets
+    `decorations: false`; native-chrome themes (e.g. modern-dark) keep the
+    OS title bar via setDecorations(true) wired in main.ts.
   -->
-  {#if $settings.ui.theme.startsWith('tui-')}
+  {#if useCustomTitleBar}
     <TuiTitleBar title={tuiTitle} />
   {/if}
   <div class="terminal-area">

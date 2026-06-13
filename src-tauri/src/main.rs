@@ -12,6 +12,7 @@ mod settings;
 mod shell;
 mod state;
 mod sysmon;
+mod theming;
 mod tabs;
 mod tts;
 mod usage;
@@ -366,6 +367,8 @@ fn main() {
             rename_layout_preset,
             content_open_folder,
             content_clear,
+            theming::themes_list,
+            theming::palettes_list,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

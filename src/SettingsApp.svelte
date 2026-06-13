@@ -31,19 +31,24 @@
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
-  import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from './lib/themes';
+  import { resolveBundledTheme, defaultPalette } from './lib/themes';
+  import { themeRegistry, paletteRegistry } from './lib/themes/registry';
   import type { ThemeColorsWire } from './lib/settings/types';
 
-  /// Terminal palette paired with each UI chrome theme. Selecting a UI theme
-  /// re-points the terminal palette to its pairing (a manual palette pick
-  /// afterward sticks until the next theme switch). Unlisted themes leave the
-  /// palette untouched.
-  const THEME_DEFAULT_PALETTE: Record<string, string> = {
-    'modern-dark': 'Default',
-    'tui-yellow': 'Gruvbox Dark',
-    'tui-purple': 'Gruvbox Dark',
-    'tui-orange': 'Tomorrow Night',
-  };
+  // Whether the active theme uses the OS-native chrome — drives the custom
+  // settings-window title bar. Derived from the registry so it follows the
+  // theme's `decorations` metadata (and updates once the registry loads).
+  let useCustomTitleBar = $derived(
+    !($themeRegistry.find((t) => t.id === $settings.ui.theme)?.decorations ?? false),
+  );
+
+  /// Terminal palette paired with a UI chrome theme: each theme's metadata
+  /// carries its default palette. Selecting a UI theme re-points the terminal
+  /// palette to its pairing (a manual palette pick afterward sticks until the
+  /// next theme switch). An unknown theme leaves the palette untouched.
+  function pairedPalette(themeId: string): string | undefined {
+    return $themeRegistry.find((t) => t.id === themeId)?.palette;
+  }
 
   let voices = $state<string[]>([]);
   // V1.4-07: Local LLM provider section. The auth-token input toggles
@@ -582,7 +587,7 @@
   }
 </script>
 
-{#if $settings.ui.theme.startsWith('tui-')}
+{#if useCustomTitleBar}
   <TuiTitleBar title="cctts settings" />
 {/if}
 {#if !snapshot}
@@ -1080,7 +1085,7 @@
                   // Pair the terminal palette to the chosen theme. Skipped for
                   // a user "Custom" palette so a hand-tuned palette isn't lost
                   // on a theme switch.
-                  const paired = THEME_DEFAULT_PALETTE[theme];
+                  const paired = pairedPalette(theme);
                   if (paired && s.terminal.theme.name !== 'Custom') {
                     s.terminal.theme.name = paired;
                     s.terminal.theme.custom = null;
@@ -1088,10 +1093,9 @@
                 });
               }}
             >
-              <option value="modern-dark">Modern Dark</option>
-              <option value="tui-yellow">TUI - Yellow</option>
-              <option value="tui-purple">TUI - Purple</option>
-              <option value="tui-orange">TUI - Orange</option>
+              {#each $themeRegistry as t}
+                <option value={t.id}>{t.name}</option>
+              {/each}
             </select>
           </label>
 
@@ -1116,7 +1120,7 @@
                     if (!s.terminal.theme.custom) {
                       const seed =
                         previousName === 'Custom'
-                          ? BUNDLED_THEMES.Default
+                          ? defaultPalette()
                           : resolveBundledTheme(previousName);
                       s.terminal.theme.custom = { ...seed } as ThemeColorsWire;
                     }
@@ -1126,8 +1130,8 @@
                 });
               }}
             >
-              {#each BUNDLED_THEME_NAMES as name}
-                <option value={name}>{name}</option>
+              {#each $paletteRegistry as p}
+                <option value={p.name}>{p.name}</option>
               {/each}
               <option value="Custom">Custom…</option>
             </select>

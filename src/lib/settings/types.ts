@@ -762,7 +762,8 @@ export function defaultSettings(): Settings {
       },
     },
     // Default terminal palette is paired with the default UI theme
-    // (tui-orange → Tomorrow Night); see THEME_DEFAULT_PALETTE in SettingsApp.
+    // (tui-orange → Tomorrow Night); the pairing comes from each theme's
+    // `palette` metadata (theme.json), applied by SettingsApp on theme switch.
     terminal: {
       theme: { name: 'Tomorrow Night', custom: null },
       background: {

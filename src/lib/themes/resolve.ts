@@ -15,7 +15,7 @@
 // instead of leaving xterm.js with a half-undefined theme. The user's
 // custom hex values win for any keys they set.
 
-import { BUNDLED_THEMES, resolveBundledTheme, type ThemeColors } from './index';
+import { defaultPalette, resolveBundledTheme, type ThemeColors } from './index';
 import type { TerminalThemeSettings } from '../settings/types';
 
 // Re-exported under the historical name so the test file (and any
@@ -35,7 +35,7 @@ export interface TabWithThemeOverride {
 /// back to Default rather than throwing.
 export function themeFromSetting(t: TerminalThemeSettingsLike): ThemeColors {
   if (t.name === 'Custom' && t.custom) {
-    return { ...BUNDLED_THEMES.Default, ...(t.custom as Partial<ThemeColors>) };
+    return { ...defaultPalette(), ...(t.custom as Partial<ThemeColors>) };
   }
   return resolveBundledTheme(t.name);
 }

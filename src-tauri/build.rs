@@ -2,7 +2,42 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     copy_espeak_data();
+    copy_theming_assets();
     tauri_build::build()
+}
+
+/// Copy the repo-root `themes/` and `palettes/` folders next to the built
+/// binary (`target/{profile}/themes` etc.), the same place the portable
+/// release stages them (`<exe-dir>/themes`). The app reads themes/palettes
+/// purely from disk — nothing is embedded in the binary and nothing is seeded
+/// at runtime — so this build-time copy is what makes dev / local builds find
+/// them without hand-staging a portable layout. The release zip gets its copy
+/// from `.github/workflows/release.yml` instead.
+fn copy_theming_assets() {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    // OUT_DIR = target/{profile}/build/cctts-{hash}/out → up 3 = target/{profile}.
+    let profile_dir = out_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .expect("OUT_DIR has unexpected shape");
+    // CARGO_MANIFEST_DIR = .../src-tauri; the repo root is one level up.
+    let manifest =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest.parent().expect("manifest has no parent");
+
+    for folder in ["themes", "palettes"] {
+        let src = repo_root.join(folder);
+        println!("cargo:rerun-if-changed={}", src.display());
+        if !src.is_dir() {
+            continue;
+        }
+        let dst = profile_dir.join(folder);
+        // Remove any stale copy first so a file deleted from the source doesn't
+        // linger next to the exe and keep getting served.
+        let _ = std::fs::remove_dir_all(&dst);
+        copy_dir_all(&src, &dst).expect("failed to copy theming assets next to exe");
+    }
 }
 
 /// Copy espeak-ng-data/ (built by espeak-rs-sys's cmake step) next to the

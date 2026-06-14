@@ -1,4 +1,4 @@
-mod amplitude;
+pub(crate) mod amplitude;
 mod playback;
 mod streaming;
 

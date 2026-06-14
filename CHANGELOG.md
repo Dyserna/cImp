@@ -5,6 +5,31 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Offline speech-to-text (dictation).** Press the new microphone button in
+  the bottom bar, or hold the push-to-talk shortcut (default `Ctrl+Shift`), to
+  dictate by voice. A fully offline, bundled Whisper model (whisper.cpp)
+  transcribes your speech into the compose overlay for review before you send
+  it — no cloud, no API key, nothing leaves your machine. Enable it under
+  Settings → Speech-to-text, where you can pick the model, input device,
+  language, translate-to-English, and the record-button mode (toggle vs hold).
+  Drop additional `ggml-*.bin` models into the `models/` folder to switch
+  between them. Local builds use GPU acceleration by default (CUDA, with
+  automatic CPU fallback); the released portable binary is CPU-only so it runs
+  on any machine. See `docs/MAINTENANCE.md` for the GPU build toolchain.
+
+### Changed
+
+- **Three default shortcuts moved off `Ctrl+Shift`** so they don't collide
+  with the new push-to-talk chord: Open compose `Ctrl+Shift+E` → `Alt+Enter`,
+  Split pane (vertical) `Ctrl+Shift+\` → `Alt+\`, Close pane `Ctrl+Shift+W` →
+  `Ctrl+Alt+W`. These are new-install defaults only — existing settings keep
+  your current bindings; re-bind them under Settings → Shortcuts if you want
+  the new defaults.
+
 ## [0.9.2] — 2026-06-12
 
 ### Changed

@@ -146,7 +146,14 @@ jobs:
         env:
           # bindgen / clang-sys for misaki-rs -> espeak-ng-sys
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
-        run: npm run tauri build -- --no-bundle
+        # `--no-default-features` (a tauri-build flag, forwarded to cargo) drops
+        # the default `stt-cuda` feature so the released binary is CPU-only and
+        # portable: the runner has no CUDA toolkit, and a CUDA-compiled binary
+        # would import cublas64_*.dll and fail to launch on machines without the
+        # CUDA runtime. STT GPU is a local-build default (on dev machines with
+        # CUDA 13.2); the portable zip stays CPU. (The forced CUDA_PATH/CUDACXX
+        # in .cargo/config.toml are unused here since CUDA isn't compiled.)
+        run: npm run tauri build -- --no-bundle --no-default-features
 
       - name: Stage portable layouts (full + no-models)
         shell: pwsh
@@ -190,6 +197,17 @@ jobs:
           # voicepacks are ~512 KB each so the cost is small.
           Copy-Item models/kokoro-v1.0.onnx "$stageFull/models/"
           Copy-Item models/voices/*.bin "$stageFull/models/voices/"
+
+          # V6-01: bundled offline STT (Whisper) model, also via Git LFS.
+          # Full zip only — the slim/no-models zip is untouched so a no-models
+          # update never clobbers a user's local ggml-*.bin. Guarded so a
+          # release can ship before the LFS blob is committed (STT just
+          # degrades to "model not found" until the user drops one in).
+          if (Test-Path models/ggml-small.bin) {
+            Copy-Item models/ggml-small.bin "$stageFull/models/"
+          } else {
+            Write-Host "::warning::models/ggml-small.bin not present; full zip ships without the STT model"
+          }
 
           # Avatar videos: ship the canonical set as discoverable on-disk
           # files for users who want to customize. Source of truth is the

@@ -87,6 +87,27 @@ Alternative distribution shapes considered and rejected:
    designed for MSI/NSIS installers; the portable zip pipeline assembles
    the layout directly so this isn't needed.
 
+## Whisper Model Files (V6-01 speech-to-text)
+
+The **full** portable zip also ships a ggml Whisper model — default
+`ggml-small.bin` (~466 MB, MIT, attributed in `NOTICE`) — into the same
+`<exe-dir>/../models/` directory as the Kokoro assets. Unlike Kokoro it is
+**committed via Git LFS** (alongside the Kokoro model + voicepacks) and
+verified against `models/CHECKSUMS.txt` by the workflow's existing
+"Verify committed assets" step; no build-time download.
+
+The **slim / no-models** zip does **not** include it, so re-extracting a
+no-models update never clobbers a user's local `ggml-*.bin`. The full zip
+therefore grew by ~466 MB on top of Kokoro's ~310 MB — acceptable because
+size-sensitive users take the slim zip and drop in whatever model they want.
+
+Users can add other models by dropping `ggml-*.bin` files into `models/`;
+they appear in Settings → Speech-to-text → Model. A missing configured
+model degrades gracefully to an in-UI "model not found" state (the app
+still launches; the record button surfaces an error on first use). The
+release-staging copy is guarded by `Test-Path` so a release can ship
+before the LFS blob is committed.
+
 ## CUDA Runtime
 
 `ort = 2.0.0-rc.11` (which wraps ORT 1.20.x) dynamically links the CUDA
@@ -101,6 +122,26 @@ and `cudnn64_9.dll` directly — distribution would need to either:
   check the current EULA before shipping.
 
 CPU-only is the default and needs no extra runtime.
+
+STT GPU is **separate** from the above and works differently. whisper.cpp's
+CUDA backend is a *compile-time* cctts feature (`stt-cuda`), compiled from
+source by `nvcc` — not a prebuilt download like `ort`. It is **on by default**
+so local dev builds use the GPU, but:
+
+- **The released portable zips are CPU-only.** `release.yml` builds with
+  `--no-default-features` because (a) the CI runner has no CUDA toolkit and
+  (b) a CUDA-compiled `cctts.exe` imports `cublas64_13.dll` and would fail to
+  launch on any machine without the CUDA 13.2 runtime. Keeping the release CPU
+  preserves the portable zip's "unzip and run anywhere" contract.
+- **A local GPU build needs CUDA 13.2 specifically.** `nvcc` gates on the MSVC
+  host-compiler version; this box's VS 2026 (MSVC 14.50) is rejected by CUDA
+  12.x but accepted by 13.2. `.cargo/config.toml` forces `CUDA_PATH` to v13.2
+  for the build. To *run* that build, CUDA 13.2's `bin` must be on PATH
+  (`cublas64_13.dll`). See MAINTENANCE.md for the full toolchain note.
+- **Runtime:** the GPU build uses the GPU by default and falls back to CPU
+  automatically if GPU init fails; `CCTTS_GPU=cpu` forces CPU. (This is the
+  opposite default from TTS/`ort`, which is opt-in via `CCTTS_GPU=cuda` — the
+  two GPU paths are independent.)
 
 ## Updates
 

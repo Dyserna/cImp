@@ -30,6 +30,9 @@ pub enum AppError {
     #[error("TTS error: {0}")]
     Tts(String),
 
+    #[error("STT error: {0}")]
+    Stt(String),
+
     #[error("model file not found: {0}")]
     ModelNotFound(String),
 

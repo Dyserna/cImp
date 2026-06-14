@@ -60,6 +60,13 @@
     submitCompose,
   } from './lib/composeState';
   import { composeContentChanged } from './lib/ipc';
+  import {
+    initStt,
+    startRecording,
+    stopRecording,
+    cancelRecording,
+  } from './lib/stt';
+  import { configurePushToTalk } from './lib/shortcuts/pushToTalk';
 
   // OS window title is set by the Rust setup hook to "<project> - cctts".
   // Mirrored into the TUI title bar via a one-shot read in onMount.
@@ -175,6 +182,10 @@
         console.error('startAvatarStateListener failed:', e),
       );
       installDispatcher();
+      // V6-01: register the STT event listeners (state + transcript →
+      // compose overlay). Idempotent; safe even when STT is disabled —
+      // the backend simply never emits until the user records.
+      initStt();
       // Position-bound tab-switch handler: 1-indexed lookup against the
       // *focused pane's* tab list (V4-03 reinterpretation of v1.2's
       // global Ctrl+N). No-op when the focused pane has fewer than N
@@ -251,6 +262,14 @@
             },
             active: () => isSelectionTtsActive(),
           },
+        });
+        // V6-01: push-to-talk is a hold gesture, configured separately from
+        // the fire-once shortcut table. Re-runs on every settings change so a
+        // re-bound chord or an enable/disable toggle takes effect live.
+        configurePushToTalk(s.stt.enabled, s.shortcuts.push_to_talk, {
+          start: () => void startRecording(),
+          stop: () => void stopRecording(),
+          cancel: () => void cancelRecording(),
         });
       });
       // OS window title is set by the Rust setup hook to

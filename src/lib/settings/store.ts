@@ -51,6 +51,7 @@ export async function applySettings(updated: Settings): Promise<void> {
 /// the granularity they actually need (avoiding unnecessary re-renders when
 /// an unrelated section changes).
 export const tts: Readable<Settings['tts']> = derived(settings, (s) => s.tts);
+export const stt: Readable<Settings['stt']> = derived(settings, (s) => s.stt);
 export const avatar: Readable<Settings['avatar']> = derived(settings, (s) => s.avatar);
 export const waveform: Readable<Settings['avatar']['waveform']> = derived(
   settings,

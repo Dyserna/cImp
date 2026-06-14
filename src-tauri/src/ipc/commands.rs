@@ -373,6 +373,48 @@ pub async fn tts_set_paused(state: State<'_, AppState>, paused: bool) -> AppResu
     Ok(())
 }
 
+// --- Speech-to-text (V6-01) -------------------------------------------------
+//
+// The handle just posts commands to the capture thread; recording/transcribe
+// state transitions and the resulting transcript arrive on the frontend via
+// the `stt-state` / `stt-transcription` events, not these return values.
+
+/// Open the input device and begin capturing. No-op if already recording.
+#[tauri::command]
+pub async fn stt_start_recording(state: State<'_, AppState>) -> AppResult<()> {
+    state.stt.start();
+    Ok(())
+}
+
+/// Stop capturing and hand the recording to the transcription worker. The
+/// transcript arrives later via the `stt-transcription` event.
+#[tauri::command]
+pub async fn stt_stop_recording(state: State<'_, AppState>) -> AppResult<()> {
+    state.stt.stop();
+    Ok(())
+}
+
+/// Stop capturing and discard the buffer (no transcription).
+#[tauri::command]
+pub async fn stt_cancel(state: State<'_, AppState>) -> AppResult<()> {
+    state.stt.cancel();
+    Ok(())
+}
+
+/// List the `ggml-*.bin` Whisper models present under `models/` for the
+/// settings dropdown.
+#[tauri::command]
+pub async fn stt_list_models() -> AppResult<Vec<String>> {
+    crate::stt::list_models()
+}
+
+/// List cpal input device names for the settings device picker. The frontend
+/// prepends a "System default" entry (which maps to an empty `input_device`).
+#[tauri::command]
+pub async fn stt_list_input_devices() -> AppResult<Vec<String>> {
+    crate::stt::list_input_devices()
+}
+
 /// Fetch the current Claude Code usage snapshot (session 5h + weekly 7d) for
 /// the bottom-bar usage tracker. Returns `None` when usage can't be obtained
 /// (not logged in, endpoint unreachable) — the frontend hides the widget in

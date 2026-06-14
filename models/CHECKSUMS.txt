@@ -12,8 +12,13 @@
 # Source: https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX
 # Model file (kokoro-v1.0.onnx): renamed from onnx/model.onnx in the repo.
 # Voicepacks (voices/*.bin): one per voice from voices/ in the repo.
+#
+# V6-01 speech-to-text (Whisper). The full zip bundles the default ggml model
+# `ggml-small.bin` (Git LFS, MIT). Downloaded from
+# https://huggingface.co/ggerganov/whisper.cpp on 2026-06-14.
 
 8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb  kokoro-v1.0.onnx
+1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b  ggml-small.bin
 c4a6b876047fd7fb472edf4ebd63cfac7c3b958a7cae7c106e8f038ca6308c45  voices/af_alloy.bin
 4a004c33430762e2461eedb2013fad808ef4ab3121f5300f554476caf58d8361  voices/af_aoede.bin
 f69d836209b78eb8c66e75e3cda491e26ea838a3674257e9d4e5703cbaf55c8b  voices/af_bella.bin

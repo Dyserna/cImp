@@ -209,14 +209,21 @@ in the bottom-left of the status bar.
 | New shell tab in focused pane   | `Ctrl+T`             |
 | Close active tab in focused pane| `Ctrl+W`             |
 | Split focused pane horizontally | `Ctrl+\`             |
-| Split focused pane vertically   | `Ctrl+Shift+\`       |
-| Close focused pane              | `Ctrl+Shift+W`       |
+| Split focused pane vertically   | `Alt+\`              |
+| Close focused pane              | `Ctrl+Alt+W`         |
 | Focus pane left / right / up / down | `Ctrl+Alt+Arrow` |
-| Open compose                    | `Ctrl+Shift+E`       |
+| Open compose                    | `Alt+Enter`          |
 | Submit compose                  | `Ctrl+Enter`         |
 | Open settings                   | `Ctrl+,`             |
+| Push-to-talk (dictate)          | `Ctrl+Shift` (hold)  |
 
 All shortcuts are rebindable in *Settings → Shortcuts*.
+
+> **v6 note:** Open compose, Split-vertical, and Close-pane moved off
+> `Ctrl+Shift+…` (they were `Ctrl+Shift+E` / `Ctrl+Shift+\` / `Ctrl+Shift+W`)
+> so they no longer collide with the bare-`Ctrl+Shift` push-to-talk chord.
+> These are new-install defaults — upgrading keeps your existing bindings; the
+> table above reflects fresh installs.
 
 ### Known shortcut conflicts
 
@@ -341,6 +348,49 @@ Download from
 
 If the lookup fails at startup the app launches with TTS silent and
 prints the expected path to the log.
+
+## Speech-to-text (dictation)
+
+cctts can transcribe your voice into the compose overlay, fully offline. It
+is **off by default** — enable it under *Settings → Speech-to-text*.
+
+**Usage**
+
+- **Record button** — a microphone button appears in the bottom bar when STT
+  is enabled. In *toggle* mode (default) click to start, click again to stop.
+  In *hold* mode press and hold while you speak.
+- **Push-to-talk** — hold `Ctrl+Shift` (rebindable) to record, release to
+  transcribe. A quick tap or a `Ctrl+Shift+<key>` chord won't start a
+  recording, so it coexists with terminal copy/paste and OS shortcuts.
+- The transcript appends into the compose overlay (opening it if needed) so
+  you can edit before sending with `Ctrl+Enter`. Silence or a too-short clip
+  shows a brief "Didn't catch that" toast instead.
+
+**Models**
+
+The **full** portable zip ships the default `ggml-small.bin` (multilingual,
+~466 MB) next to the executable. Like Kokoro, the model is resolved at:
+
+```
+<exe-dir>/../models/ggml-small.bin
+```
+
+Drop additional `ggml-*.bin` files into `models/` and pick them in
+*Settings → Speech-to-text → Model*. The **slim / no-models** zip omits the
+model — download one from
+[ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)
+(e.g. `ggml-base.bin`, `ggml-small.bin`, `ggml-medium.bin`) and drop it in.
+A missing model launches normally; the record button reports "model not
+found" on first use and logs the expected path.
+
+**GPU.** The released portable zips run STT on CPU (a short utterance on
+`small` takes ~1–3 s) — the shipped binary is CPU-only so it runs on any
+machine. Local builds compile with GPU support **on by default** (`stt-cuda`
+feature) and use the GPU automatically, falling back to CPU if GPU init fails
+(`CCTTS_GPU=cpu` forces CPU). Building/running the GPU variant requires the
+CUDA 13.2 toolkit (12.x is incompatible with VS 2026's compiler) and CUDA
+13.2's `bin` on PATH; see `docs/MAINTENANCE.md`. For a portable CPU binary,
+build with `--no-default-features`.
 
 ## Configuring Tabs
 

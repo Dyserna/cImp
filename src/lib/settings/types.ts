@@ -79,6 +79,26 @@ export interface TtsSettings {
   show_selection_controls: boolean;
 }
 
+/// Bottom-bar record button behavior: click-to-toggle vs press-and-hold.
+export type SttButtonMode = 'toggle' | 'hold';
+
+/// V6-01 offline speech-to-text (dictation) config. Mirrors the Rust
+/// `SttSettings`.
+export interface SttSettings {
+  /// Master enable for the whole STT feature (record button + PTT).
+  enabled: boolean;
+  /// GGML model filename under `models/` (e.g. "ggml-small.bin").
+  model_file: string;
+  /// Whisper language hint. "auto" = detect; "en", "he", … force a language.
+  language: string;
+  /// cpal input device name; empty = system default input device.
+  input_device: string;
+  /// Bottom-bar record button behavior.
+  button_mode: SttButtonMode;
+  /// Translate non-English speech to English instead of transcribing verbatim.
+  translate_to_english: boolean;
+}
+
 /// Colors for the Ctrl+right-click read-along highlight. xterm decorations
 /// only accept `#RRGGBB` hex, so all four colors must be 6-digit hex strings.
 export interface SelectionHighlightSettings {
@@ -191,6 +211,8 @@ export interface ShortcutSettings {
   split_pane_horizontal: string | null;
   split_pane_vertical: string | null;
   close_pane: string | null;
+  /// V6-01 push-to-talk (hold) dictation trigger. Default bare `Ctrl+Shift`.
+  push_to_talk: string | null;
 }
 
 export interface TtsInjection {
@@ -466,6 +488,8 @@ export interface Settings {
   /// matches the on-disk shape.
   schema_version: number;
   tts: TtsSettings;
+  /// V6-01 offline speech-to-text. Additive; old files default it disabled.
+  stt: SttSettings;
   avatar: AvatarSettings;
   display: DisplaySettings;
   behavior: BehaviorSettings;
@@ -612,6 +636,14 @@ export function defaultSettings(): Settings {
       },
       show_selection_controls: true,
     },
+    stt: {
+      enabled: false,
+      model_file: 'ggml-small.bin',
+      language: 'auto',
+      input_device: '',
+      button_mode: 'toggle',
+      translate_to_english: false,
+    },
     avatar: {
       visible: true,
       kind: 'sprite',
@@ -672,7 +704,7 @@ export function defaultSettings(): Settings {
     },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {
-      open_compose: 'Ctrl+Shift+E',
+      open_compose: 'Alt+Enter',
       submit_compose: 'Ctrl+Enter',
       cancel_compose: 'Escape',
       open_settings: 'Ctrl+,',
@@ -692,8 +724,9 @@ export function defaultSettings(): Settings {
       focus_pane_up: 'Ctrl+Alt+Up',
       focus_pane_down: 'Ctrl+Alt+Down',
       split_pane_horizontal: 'Ctrl+\\',
-      split_pane_vertical: 'Ctrl+Shift+\\',
-      close_pane: 'Ctrl+Shift+W',
+      split_pane_vertical: 'Alt+\\',
+      close_pane: 'Ctrl+Alt+W',
+      push_to_talk: 'Ctrl+Shift',
     },
     tabs: [
       {

@@ -4,6 +4,7 @@
   // reserved for future text. Live-updates from the settings store, so
   // changes elsewhere (settings window) reflect here and vice versa.
   import MuteButton from './status/MuteButton.svelte';
+  import RecordButton from './status/RecordButton.svelte';
   import AnnouncementsButton from './status/AnnouncementsButton.svelte';
   import VolumeSlider from './status/VolumeSlider.svelte';
   import SettingsButton from './status/SettingsButton.svelte';
@@ -20,6 +21,9 @@
       <SelectionTtsControls />
     {/if}
     <AvatarToggleButton />
+    {#if $settings.stt.enabled}
+      <RecordButton />
+    {/if}
     <MuteButton />
     <AnnouncementsButton />
     <VolumeSlider />

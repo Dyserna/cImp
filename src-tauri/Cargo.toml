@@ -10,6 +10,15 @@ rust-version = "1.77"
 name = "cctts"
 path = "src/main.rs"
 
+[features]
+# GPU-accelerated STT: compiles whisper.cpp's CUDA backend. ON BY DEFAULT so
+# local builds use the GPU (with automatic CPU fallback at runtime — see
+# stt/engine.rs). Needs the CUDA toolkit at build time (CUDA 13.2 here; see
+# .cargo/config.toml) and CUDA 13.2's bin on PATH to run. Portable / CI builds
+# that must run without CUDA use `--no-default-features` for a CPU-only binary.
+default = ["stt-cuda"]
+stt-cuda = ["whisper-rs/cuda"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -51,6 +60,15 @@ bytemuck = "1"
 # Audio output
 cpal = "0.15"
 rodio = "0.20"
+
+# STT (Whisper via whisper.cpp bindings). Statically links one C library;
+# needs a C/C++ toolchain + CMake at build time (see MAINTENANCE.md). CUDA is
+# a compile-time feature (`stt-cuda`) wired to the same CCTTS_GPU=cuda runtime
+# opt-in as ort — see [features] below. Default build is CPU-only so it works
+# on any machine without the CUDA toolkit.
+whisper-rs = "0.16"
+# Native-rate -> 16 kHz mono resampling of captured mic audio for Whisper.
+rubato = "0.16"
 
 # Windows-only: registry probe for Git Bash auto-detection in shell::detect.
 [target.'cfg(windows)'.dependencies]

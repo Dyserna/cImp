@@ -2,3 +2,21 @@
 # bindgen needs libclang.dll to generate FFI bindings for espeak-rs-sys
 # (pulled in by misaki-rs's default features). Required for every build.
 LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+
+# V6-01 STT GPU: whisper.cpp's CUDA backend (default feature `stt-cuda`) is
+# compiled by nvcc, whose host_config.h gates the MSVC version. This box's
+# VS 2026 (MSVC 14.50, _MSC_VER 1950) is REJECTED by CUDA 12.x but ACCEPTED by
+# CUDA 13.2 (which allows _MSC_VER < 1960). So the GPU build must use CUDA 13.2.
+# These two pin the include path (CUDA_PATH) and the compiler (CUDACXX) to 13.2,
+# overriding the machine's default CUDA_PATH (12.9) via `force = true`.
+# Build-time only — neither affects runtime.
+#
+# IMPORTANT — these are NOT sufficient on their own. With the Visual Studio
+# CMake generator, MSBuild's CUDA integration injects an include path based on
+# the *first CUDA bin on PATH*; if that's 12.x, its host_config.h is pulled in
+# and rejects VS 2026 even though nvcc is 13.2. So CUDA **13.2's bin must be the
+# first CUDA directory on PATH** (ahead of any 12.x). That same PATH entry also
+# supplies cublas64_13.dll, a load-time dependency needed to RUN the GPU build.
+# See docs/MAINTENANCE.md.
+CUDA_PATH = { value = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2", force = true }
+CUDACXX = { value = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2\\bin\\nvcc.exe", force = true }

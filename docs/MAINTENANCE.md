@@ -26,6 +26,65 @@ Living list of dependencies and runtime concerns to revisit periodically. Each i
 
 - **When to act:** any time `ort` bumps. After bumping: re-test `CCTTS_GPU=cuda` on the 5090 (expect Blackwell to work in 1.21+); re-test DirectML by re-adding `directml` to ort features and registering it; if DML works for Kokoro again, consider making it the default GPU path on Windows since it's vendor-agnostic.
 
+### `whisper-rs` / whisper.cpp — STT build toolchain (V6-01)
+
+- **Current pin:** `whisper-rs = "0.16"` (→ `whisper-rs-sys 0.15.0`) + `rubato = "0.16"`.
+- **Build needs a C/C++ toolchain + CMake.** `whisper-rs-sys` compiles
+  whisper.cpp from source via the `cc` + `cmake` crates and generates FFI
+  bindings with `bindgen` (libclang). On this Windows dev box that means:
+  MSVC (`cl.exe`, auto-found by `cc`), **CMake on PATH** (VS bundles 4.2.3 +
+  Ninja), and `libclang` at `C:\Program Files\LLVM\bin` — already pinned via
+  `src-tauri/.cargo/config.toml`'s `LIBCLANG_PATH` (shared with misaki/espeak).
+  No new CI tools: `windows-latest` already has VS + CMake + LLVM and the
+  workflow exports `LIBCLANG_PATH`.
+- **Known pitfall (bindgen on MSVC):** `whisper-rs-sys` bindgen can emit glibc
+  types and fail with a `usize` overflow when it sees MinGW/MSYS headers.
+  **Build from PowerShell or the VS x64 Native Tools prompt, never Git Bash**
+  (Git Bash's PATH carries `/mingw64/bin`). Validated 2026-06-14: clean build
+  from PowerShell, no #599 recurrence. If it bites on a bump: pin a
+  known-good version, set `BINDGEN_EXTRA_CLANG_ARGS` to force the MSVC target,
+  or commit Windows-target pre-generated bindings.
+- **GPU is a compile-time feature, ON BY DEFAULT (`stt-cuda`).** whisper.cpp's
+  CUDA backend is compiled by `nvcc`. Local dev builds get GPU; releases/CI
+  pass `--no-default-features` for a portable CPU binary (see below). Runtime
+  uses GPU by default with automatic CPU fallback (`stt/engine.rs`);
+  `CCTTS_GPU=cpu` forces CPU. Unlike `ort` there is no prebuilt-download path —
+  STT GPU and TTS GPU are independent.
+- **CUDA version vs MSVC host-compiler gate (the key constraint here).** `nvcc`
+  rejects host compilers newer than it supports (`crt/host_config.h`). This box
+  has **only** MSVC 14.50 (VS 2026, `_MSC_VER` 1950) and no VS 2022 toolset.
+  CUDA 12.x rejects 1950 (`_MSC_VER >= 1950`); **CUDA 13.2 accepts it**
+  (`_MSC_VER < 1960`). So the GPU build **must** use CUDA 13.2, not 12.x.
+- **`.cargo/config.toml` pins CUDA_PATH + CUDACXX to v13.2** (`force = true`,
+  build-time only) — the machine's default `CUDA_PATH` is 12.9. But that alone
+  is **not sufficient**: with the VS CMake generator, MSBuild's CUDA
+  integration injects an include path from the **first CUDA `bin` on PATH**, so
+  a 12.x there pulls in its rejecting `host_config.h` even when nvcc is 13.2.
+- **CUDA 13.2's `bin` MUST be the first CUDA directory on PATH** (ahead of any
+  12.x). This one PATH entry fixes the build's include injection AND supplies
+  `cublas64_13.dll` — a **load-time** dependency of the GPU binary (cudart is
+  static-linked). Without it the process won't even launch, and that loader
+  failure happens before any Rust runs, so the runtime CPU-fallback can't catch
+  it. Validated 2026-06-14: with 13.2 ahead of 12.2 on PATH, a bare
+  `cargo build` produces a clean GPU binary, auto-detecting `sm_120a` (the RTX
+  5090's Blackwell arch — the same arch `ort`/Kokoro's prebuilt CUDA can't
+  target, so STT GPU works on Blackwell where TTS GPU doesn't). With 12.x first,
+  the build fails with ~250 `host_config.h` "unsupported Microsoft Visual
+  Studio version" errors.
+- **Releases stay CPU-only.** `release.yml` builds with `--no-default-features`:
+  GitHub `windows-latest` has no CUDA toolkit, and a CUDA binary isn't portable
+  (the `cublas64_13.dll` dependency). The full/slim zips therefore ship a
+  CPU-only `cctts.exe`; GPU STT is a local-build feature.
+- **What to check on CUDA bumps:** when a CUDA release adds VS 2026 (`_MSC_VER`
+  1950+) support, 12.x could work again; if VS bumps past 1959, re-point
+  `CUDA_PATH` at a newer CUDA. To verify the gate: grep the chosen CUDA's
+  `include/crt/host_config.h` for the `_MSC_VER` bounds.
+- **What to check on bumps:** the `whisper-rs` API has shifted across releases
+  (e.g. segment text moved to `WhisperState::get_segment(i).to_str_lossy()` in
+  0.16). Re-verify `FullParams` / `WhisperContextParameters` / `WhisperState`
+  against `src/stt/engine.rs` when bumping. Watch
+  <https://github.com/tazz4843/whisper-rs/releases>.
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

@@ -63,6 +63,10 @@ pub struct Settings {
     #[serde(default = "current_schema_version")]
     pub schema_version: u8,
     pub tts: TtsSettings,
+    /// V6-01 offline speech-to-text (dictation) config. Additive
+    /// `#[serde(default)]` field — old settings files round-trip with
+    /// the feature disabled by default.
+    pub stt: SttSettings,
     pub avatar: AvatarSettings,
     pub display: DisplaySettings,
     pub behavior: BehaviorSettings,
@@ -138,6 +142,7 @@ impl Default for Settings {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             tts: TtsSettings::default(),
+            stt: SttSettings::default(),
             avatar: AvatarSettings::default(),
             display: DisplaySettings::default(),
             behavior: BehaviorSettings::default(),
@@ -879,6 +884,48 @@ impl Default for TtsSettings {
             mute: false,
             selection_highlight: SelectionHighlightSettings::default(),
             show_selection_controls: true,
+        }
+    }
+}
+
+/// V6-01 offline speech-to-text (dictation). Captures microphone audio and
+/// transcribes it with a bundled Whisper model (whisper.cpp), dropping the
+/// transcript into the compose overlay. Disabled by default — the feature
+/// is opt-in and needs a `ggml-*.bin` model present under `models/`.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct SttSettings {
+    /// Master enable for the whole STT feature (record button + PTT).
+    pub enabled: bool,
+    /// GGML model filename under `models/` (e.g. "ggml-small.bin").
+    pub model_file: String,
+    /// Whisper language hint. "auto" = detect; "en", "he", … force a language.
+    pub language: String,
+    /// cpal input device name; empty = system default input device.
+    pub input_device: String,
+    /// Bottom-bar record button behavior (click-to-toggle vs press-and-hold).
+    pub button_mode: SttButtonMode,
+    /// Translate non-English speech to English instead of transcribing
+    /// verbatim (Whisper's translate task).
+    pub translate_to_english: bool,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SttButtonMode {
+    Toggle,
+    Hold,
+}
+
+impl Default for SttSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_file: "ggml-small.bin".to_string(),
+            language: "auto".to_string(),
+            input_device: String::new(),
+            button_mode: SttButtonMode::Toggle,
+            translate_to_english: false,
         }
     }
 }
@@ -1651,12 +1698,23 @@ pub struct ShortcutSettings {
     pub split_pane_horizontal: Option<String>,
     pub split_pane_vertical: Option<String>,
     pub close_pane: Option<String>,
+    /// V6-01 push-to-talk (hold) dictation trigger. Default bare
+    /// `Ctrl+Shift` (modifiers-only) — held to record, released to
+    /// transcribe. The dispatcher's arm/debounce + abort-on-other-key
+    /// state machine keeps this from firing on ordinary `Ctrl+Shift+<key>`
+    /// chords. Optional so older settings files round-trip; the default
+    /// supplies the binding when the key is absent.
+    pub push_to_talk: Option<String>,
 }
 
 impl Default for ShortcutSettings {
     fn default() -> Self {
         Self {
-            open_compose: Some("Ctrl+Shift+E".to_string()),
+            // V6-01: open_compose, split_pane_vertical, and close_pane were
+            // moved off `Ctrl+Shift+…` so the bare-`Ctrl+Shift` push-to-talk
+            // chord doesn't visibly arm/abort when these fire. New installs
+            // get these defaults; existing settings files keep their bindings.
+            open_compose: Some("Alt+Enter".to_string()),
             submit_compose: Some("Ctrl+Enter".to_string()),
             cancel_compose: Some("Escape".to_string()),
             open_settings: Some("Ctrl+,".to_string()),
@@ -1676,8 +1734,9 @@ impl Default for ShortcutSettings {
             focus_pane_up: Some("Ctrl+Alt+Up".to_string()),
             focus_pane_down: Some("Ctrl+Alt+Down".to_string()),
             split_pane_horizontal: Some("Ctrl+\\".to_string()),
-            split_pane_vertical: Some("Ctrl+Shift+\\".to_string()),
-            close_pane: Some("Ctrl+Shift+W".to_string()),
+            split_pane_vertical: Some("Alt+\\".to_string()),
+            close_pane: Some("Ctrl+Alt+W".to_string()),
+            push_to_talk: Some("Ctrl+Shift".to_string()),
         }
     }
 }
@@ -1728,6 +1787,31 @@ mod tests {
         assert_eq!(v, json!("disabled"));
         let parsed: Option<BackgroundOverride> = serde_json::from_value(json!("disabled")).unwrap();
         assert!(matches!(parsed, Some(BackgroundOverride::Disabled)));
+    }
+
+    #[test]
+    fn stt_settings_default_round_trips() {
+        let s = SttSettings::default();
+        let v = serde_json::to_value(&s).unwrap();
+        let back: SttSettings = serde_json::from_value(v).unwrap();
+        assert!(!back.enabled);
+        assert_eq!(back.model_file, "ggml-small.bin");
+        assert_eq!(back.language, "auto");
+        assert!(back.input_device.is_empty());
+        assert_eq!(back.button_mode, SttButtonMode::Toggle);
+        assert!(!back.translate_to_english);
+    }
+
+    #[test]
+    fn settings_without_stt_block_loads_defaults() {
+        // An old settings file lacking the `stt` field deserializes with the
+        // additive `#[serde(default)]` SttSettings — no migration needed.
+        let json = json!({ "schema_version": CURRENT_SCHEMA_VERSION });
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert!(!s.stt.enabled);
+        assert_eq!(s.stt.model_file, "ggml-small.bin");
+        // The push_to_talk shortcut default is present too.
+        assert_eq!(s.shortcuts.push_to_talk.as_deref(), Some("Ctrl+Shift"));
     }
 
     #[test]

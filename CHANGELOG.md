@@ -5,7 +5,7 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] — 2026-06-15
 
 ### Added
 
@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ctrl+Alt+W`. These are new-install defaults only — existing settings keep
   your current bindings; re-bind them under Settings → Shortcuts if you want
   the new defaults.
+- **Compose overlay: `Enter` now sends**, and `Alt+Enter` (or `Shift+Enter`)
+  inserts a newline — a one-handed flow that pairs well with dictation. The
+  default `submit_compose` shortcut changed `Ctrl+Enter` → `Enter`; the compose
+  box handles these keys directly, so the behavior applies without re-binding.
+  Also fixed a flicker where the terminal area briefly shifted down when the
+  compose sheet opened.
 
 ## [0.9.2] — 2026-06-12
 

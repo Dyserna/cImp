@@ -11,7 +11,9 @@ mod pty;
 mod settings;
 mod shell;
 mod state;
+mod stt;
 mod sysmon;
+mod theming;
 mod tabs;
 mod tts;
 mod usage;
@@ -34,6 +36,7 @@ use crate::ipc::commands::{
     list_voices, open_settings_window, open_settings_window_to_tab, pty_get_scrollback,
     pty_rebind_channel, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
     restart_shell_tab, set_active_tab, set_window_square_corners, settings_get, settings_update,
+    stt_cancel, stt_list_input_devices, stt_list_models, stt_start_recording, stt_stop_recording,
     tab_activate, tts_speak, tts_set_paused, tts_speak_selection, tts_stop, tts_test,
 };
 use crate::ipc::layout::{
@@ -49,6 +52,7 @@ use crate::settings::{
     TabConfig,
 };
 use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
+use crate::stt::SttHandle;
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsEngine, TtsRequest};
 
@@ -188,6 +192,12 @@ fn main() {
     // the state manager on the next `ClaudeOutputStarted`.
     let ai_tts_suppressed: AiTtsSuppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // V6-01 STT handle. The capture + transcription threads are spawned in
+    // the Tauri `setup` hook (they need an AppHandle to emit events); the
+    // runtime half is stashed here until then, mirroring the tts_rx slot.
+    let (stt_handle, stt_runtime) = SttHandle::new();
+    let stt_runtime_slot = Arc::new(Mutex::new(Some(stt_runtime)));
+
     // Tab registry — one PtyManager per tab, lazy-spawn at frontend mount.
     let registry = TabRegistry::new(
         tab_metas.clone(),
@@ -204,6 +214,7 @@ fn main() {
     let tts_tx_for_notifications = tts_tx.clone();
 
     let state = AppState {
+        stt: stt_handle,
         tabs: tabs_handle.clone(),
         launch: LaunchContext {
             cwd: launch_cwd,
@@ -238,6 +249,8 @@ fn main() {
     let initial_active_for_state = initial_active.clone();
     let initial_active_for_tts = initial_active.clone();
     let initial_active_for_notifications = initial_active.clone();
+    let stt_runtime_for_setup = stt_runtime_slot.clone();
+    let settings_for_stt = settings_handle.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
@@ -292,6 +305,18 @@ fn main() {
                     );
                 }
             }
+            // V6-01 STT: spawn the capture + transcription threads. The
+            // engine is constructed lazily on the first recording, so a
+            // missing model never blocks launch — it surfaces as an `error`
+            // state on the first record attempt instead.
+            if let Some(rt) = stt_runtime_for_setup
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+            {
+                stt::spawn(app.handle().clone(), settings_for_stt.clone(), rt);
+            }
+
             spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
 
             // Apply the project-derived window title. The hardcoded
@@ -333,6 +358,11 @@ fn main() {
             tts_speak_selection,
             tts_stop,
             tts_set_paused,
+            stt_start_recording,
+            stt_stop_recording,
+            stt_cancel,
+            stt_list_models,
+            stt_list_input_devices,
             get_claude_usage,
             get_system_stats,
             settings_get,
@@ -366,6 +396,8 @@ fn main() {
             rename_layout_preset,
             content_open_folder,
             content_clear,
+            theming::themes_list,
+            theming::palettes_list,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

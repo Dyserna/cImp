@@ -87,6 +87,27 @@ Alternative distribution shapes considered and rejected:
    designed for MSI/NSIS installers; the portable zip pipeline assembles
    the layout directly so this isn't needed.
 
+## Whisper Model Files (V6-01 speech-to-text)
+
+The **full** portable zip also ships a ggml Whisper model — default
+`ggml-small.bin` (~466 MB, MIT, attributed in `NOTICE`) — into the same
+`<exe-dir>/../models/` directory as the Kokoro assets. Unlike Kokoro it is
+**committed via Git LFS** (alongside the Kokoro model + voicepacks) and
+verified against `models/CHECKSUMS.txt` by the workflow's existing
+"Verify committed assets" step; no build-time download.
+
+The **slim / no-models** zip does **not** include it, so re-extracting a
+no-models update never clobbers a user's local `ggml-*.bin`. The full zip
+therefore grew by ~466 MB on top of Kokoro's ~310 MB — acceptable because
+size-sensitive users take the slim zip and drop in whatever model they want.
+
+Users can add other models by dropping `ggml-*.bin` files into `models/`;
+they appear in Settings → Speech-to-text → Model. A missing configured
+model degrades gracefully to an in-UI "model not found" state (the app
+still launches; the record button surfaces an error on first use). The
+release-staging copy is guarded by `Test-Path` so a release can ship
+before the LFS blob is committed.
+
 ## CUDA Runtime
 
 `ort = 2.0.0-rc.11` (which wraps ORT 1.20.x) dynamically links the CUDA
@@ -101,6 +122,27 @@ and `cudnn64_9.dll` directly — distribution would need to either:
   check the current EULA before shipping.
 
 CPU-only is the default and needs no extra runtime.
+
+## STT GPU — portable Vulkan (the released zip)
+
+STT GPU works **unlike** the TTS/CUDA story above, and is the reason the
+portable zip can offer GPU without sacrificing portability. The release is
+built with whisper.cpp's **Vulkan** backend (`--features stt-vulkan`):
+
+- **The released `cctts.exe` is portable AND GPU-capable.** Its only
+  GPU-related runtime dependency is `vulkan-1.dll` — a Windows system component
+  present on every Win10+ machine. So one binary: uses any vendor's GPU
+  (NVIDIA/AMD/Intel) when present, falls back to CPU automatically when not
+  (`stt/engine.rs` tries GPU then CPU; `CCTTS_GPU=cpu` forces CPU). **Nothing
+  GPU-specific is bundled** — no CUDA DLLs, no redistributables.
+- **The default feature set is CPU-only**, so routine local builds stay light;
+  the GPU build is explicit (`--features stt-vulkan`). CI builds the release
+  that way — see `release.yml`'s MSVC-dev-env + Vulkan-SDK steps and
+  MAINTENANCE.md for the build requirements (Vulkan SDK, Ninja generator, MSVC
+  dev env; deep local repos also need a short `CARGO_TARGET_DIR` for MAX_PATH).
+- **Optional `stt-cuda`** exists for local NVIDIA max-perf but is never shipped:
+  a CUDA binary imports `cublas64_*.dll`, isn't portable, and needs the CUDA
+  13.2 toolchain to build (see MAINTENANCE.md). Vulkan is the portable default.
 
 ## Updates
 

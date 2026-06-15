@@ -26,3 +26,20 @@ export function startAmplitudeListener(): void {
     latestSamples.seq++;
   });
 }
+
+let micStarted = false;
+
+/// V6-01: feed mic capture amplitude into the SAME visualizer buffer while
+/// recording, so the existing avatar waveform reflects the user's voice
+/// (reusing the component rather than building a second one). The backend
+/// only emits `mic-amplitude` while recording, and TTS playback (the
+/// `audio-amplitude` source) is silent then, so the two never fight over the
+/// buffer. Process-lifetime singleton, like `startAmplitudeListener`.
+export function startMicAmplitudeListener(): void {
+  if (micStarted) return;
+  micStarted = true;
+  void listen<number[]>('mic-amplitude', (event) => {
+    latestSamples.current = new Float32Array(event.payload);
+    latestSamples.seq++;
+  });
+}

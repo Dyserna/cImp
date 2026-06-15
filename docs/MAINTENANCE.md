@@ -26,6 +26,79 @@ Living list of dependencies and runtime concerns to revisit periodically. Each i
 
 - **When to act:** any time `ort` bumps. After bumping: re-test `CCTTS_GPU=cuda` on the 5090 (expect Blackwell to work in 1.21+); re-test DirectML by re-adding `directml` to ort features and registering it; if DML works for Kokoro again, consider making it the default GPU path on Windows since it's vendor-agnostic.
 
+### `whisper-rs` / whisper.cpp — STT build toolchain (V6-01)
+
+- **Current pin:** `whisper-rs = "0.16"` (→ `whisper-rs-sys 0.15.0`) + `rubato = "0.16"`.
+- **Build needs a C/C++ toolchain + CMake.** `whisper-rs-sys` compiles
+  whisper.cpp from source via the `cc` + `cmake` crates and generates FFI
+  bindings with `bindgen` (libclang). On this Windows dev box that means:
+  MSVC (`cl.exe`, auto-found by `cc`), **CMake on PATH** (VS bundles 4.2.3 +
+  Ninja), and `libclang` at `C:\Program Files\LLVM\bin` — already pinned via
+  `src-tauri/.cargo/config.toml`'s `LIBCLANG_PATH` (shared with misaki/espeak).
+  No new CI tools: `windows-latest` already has VS + CMake + LLVM and the
+  workflow exports `LIBCLANG_PATH`.
+- **Known pitfall (bindgen on MSVC):** `whisper-rs-sys` bindgen can emit glibc
+  types and fail with a `usize` overflow when it sees MinGW/MSYS headers.
+  **Build from PowerShell or the VS x64 Native Tools prompt, never Git Bash**
+  (Git Bash's PATH carries `/mingw64/bin`). Validated 2026-06-14: clean build
+  from PowerShell, no #599 recurrence. If it bites on a bump: pin a
+  known-good version, set `BINDGEN_EXTRA_CLANG_ARGS` to force the MSVC target,
+  or commit Windows-target pre-generated bindings.
+- **GPU backends are compile-time features; the DEFAULT feature set is empty
+  (CPU).** So routine `cargo build`/`cargo test` and rust-analyzer work from a
+  plain shell with no GPU SDK / dev-env / generator requirements. GPU is opt-in:
+  - **`stt-vulkan` (the release backend, recommended).** whisper.cpp's Vulkan
+    backend. Produces a **portable** binary — the only GPU runtime dep is the
+    system `vulkan-1.dll` (on every Win10+) — runs on any vendor's GPU and
+    falls back to CPU when none is present. `release.yml` builds the zip with
+    this, so end users get auto GPU/CPU with nothing bundled.
+  - **`stt-cuda` (optional, NVIDIA-only).** ~20-40% faster than Vulkan but not
+    portable (imports `cublas64_*.dll`) and build-heavy — see the CUDA note
+    below. For local NVIDIA max-perf only; not shipped.
+  - Runtime (`stt/engine.rs`): when a GPU backend is compiled, STT uses the GPU
+    by default and **falls back to CPU automatically** if GPU init fails or no
+    GPU is present (this is what makes the Vulkan binary universal).
+    `CCTTS_GPU=cpu` forces CPU.
+
+- **Building `--features stt-vulkan` (the saga — three Windows gotchas):**
+  1. **Vulkan SDK** (LunarG) provides `glslc` + headers + `vulkan-1.lib`.
+     `VULKAN_SDK` is pinned in `.cargo/config.toml` (the installer also sets it
+     machine-wide). Pinned version: `C:\VulkanSDK\1.4.350.0` — bump on upgrade.
+  2. **MSVC dev environment + Ninja generator.** ggml-vulkan builds its shader
+     generator as a nested CMake *ExternalProject*. The VS CMake generator does
+     NOT propagate the compiler into that sub-build (`No CMAKE_C_COMPILER`), so
+     force `CMAKE_GENERATOR=Ninja` and build with `cl.exe` on PATH (a VS x64
+     Native Tools prompt, or `vcvars64.bat` sourced). `CL=/FS` serializes PDB
+     writes. NOTE these are env-only and intentionally NOT in `.cargo/config.toml`
+     (that would force every CPU build through Ninja+dev-env too).
+  3. **MAX_PATH on a deep repo.** The nested shader-gen path is ~264 chars from
+     this repo's deep location and `cl` fails (`C1041`) even with
+     `LongPathsEnabled=1`. Local fix: build with a short `CARGO_TARGET_DIR`
+     (e.g. `C:\ct`). CI is unaffected — the runner path (`D:\a\cctts\cctts`) is
+     short enough. Validated 2026-06-14: with all three, a local Vulkan build
+     produces a clean binary importing **only** `vulkan-1.dll` (no CUDA DLLs).
+- **CI (`release.yml`):** a `Setup MSVC dev environment` step (`ilammy/msvc-dev-cmd`)
+  + an `Install Vulkan SDK` step (LunarG silent installer, sets `VULKAN_SDK` /
+  PATH), then the build sets `CMAKE_GENERATOR=Ninja` + `CL=/FS` and runs
+  `--features stt-vulkan`. If CI ever hits the MAX_PATH wall, add a short
+  `CARGO_TARGET_DIR` and update the staging-copy paths.
+
+- **Optional CUDA path (`--features stt-cuda`) — kept for local NVIDIA only:**
+  `nvcc` gates the MSVC host version in `crt/host_config.h`. This box has only
+  MSVC 14.50 (VS 2026, `_MSC_VER` 1950); CUDA 12.x rejects `>=1950`, **CUDA 13.2
+  accepts** (`<1960`). So a CUDA build must use 13.2, and **CUDA 13.2's `bin`
+  must be the first CUDA dir on PATH** (the VS-generator MSBuild CUDA
+  integration injects an include path from the first CUDA bin; a 12.x there
+  pulls its rejecting header even when nvcc is 13.2). That PATH entry also
+  supplies the load-time `cublas64_13.dll`. Auto-detects `sm_120a` (the 5090's
+  Blackwell arch — works where `ort`/Kokoro's prebuilt CUDA can't). This is why
+  `stt-cuda` is NOT the default or shipped: too much setup, not portable.
+- **What to check on bumps:** the `whisper-rs` API has shifted across releases
+  (e.g. segment text moved to `WhisperState::get_segment(i).to_str_lossy()` in
+  0.16). Re-verify `FullParams` / `WhisperContextParameters` / `WhisperState`
+  against `src/stt/engine.rs` when bumping. Watch
+  <https://github.com/tazz4843/whisper-rs/releases>.
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

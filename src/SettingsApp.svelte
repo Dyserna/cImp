@@ -22,6 +22,7 @@
   } from './lib/settings/types';
   import { defaultSettings, findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
   import { contentClear, contentOpenFolder, setBrootEnabled, setEnabledAiTabs } from './lib/ipc';
+  import { listSttModels, listInputDevices } from './lib/stt';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
@@ -31,21 +32,48 @@
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
-  import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from './lib/themes';
+  import { resolveBundledTheme, defaultPalette } from './lib/themes';
+  import { themeRegistry, paletteRegistry } from './lib/themes/registry';
   import type { ThemeColorsWire } from './lib/settings/types';
 
-  /// Terminal palette paired with each UI chrome theme. Selecting a UI theme
-  /// re-points the terminal palette to its pairing (a manual palette pick
-  /// afterward sticks until the next theme switch). Unlisted themes leave the
-  /// palette untouched.
-  const THEME_DEFAULT_PALETTE: Record<string, string> = {
-    'modern-dark': 'Default',
-    'tui-yellow': 'Gruvbox Dark',
-    'tui-purple': 'Gruvbox Dark',
-    'tui-orange': 'Tomorrow Night',
-  };
+  // Whether the active theme uses the OS-native chrome — drives the custom
+  // settings-window title bar. Derived from the registry so it follows the
+  // theme's `decorations` metadata (and updates once the registry loads).
+  let useCustomTitleBar = $derived(
+    !($themeRegistry.find((t) => t.id === $settings.ui.theme)?.decorations ?? false),
+  );
+
+  /// Terminal palette paired with a UI chrome theme: each theme's metadata
+  /// carries its default palette. Selecting a UI theme re-points the terminal
+  /// palette to its pairing (a manual palette pick afterward sticks until the
+  /// next theme switch). An unknown theme leaves the palette untouched.
+  function pairedPalette(themeId: string): string | undefined {
+    return $themeRegistry.find((t) => t.id === themeId)?.palette;
+  }
 
   let voices = $state<string[]>([]);
+  // V6-01: available STT models (ggml-*.bin under models/) and cpal input
+  // device names, populated on mount for the STT section dropdowns.
+  let sttModels = $state<string[]>([]);
+  let inputDevices = $state<string[]>([]);
+  // Common Whisper language hints offered in the dropdown ("auto" detects).
+  const STT_LANGUAGES: { code: string; label: string }[] = [
+    { code: 'auto', label: 'Auto-detect' },
+    { code: 'en', label: 'English' },
+    { code: 'es', label: 'Spanish' },
+    { code: 'fr', label: 'French' },
+    { code: 'de', label: 'German' },
+    { code: 'it', label: 'Italian' },
+    { code: 'pt', label: 'Portuguese' },
+    { code: 'nl', label: 'Dutch' },
+    { code: 'ru', label: 'Russian' },
+    { code: 'zh', label: 'Chinese' },
+    { code: 'ja', label: 'Japanese' },
+    { code: 'ko', label: 'Korean' },
+    { code: 'ar', label: 'Arabic' },
+    { code: 'he', label: 'Hebrew' },
+    { code: 'hi', label: 'Hindi' },
+  ];
   // V1.4-07: Local LLM provider section. The auth-token input toggles
   // between password and text via this flag (no keychain integration in
   // this milestone — the token sits cleartext in settings.json).
@@ -69,6 +97,7 @@
   // (TTS sat at the top of the original single-scroll layout).
   type SectionId =
     | 'audio'
+    | 'stt'
     | 'avatar'
     | 'theme'
     | 'background'
@@ -83,6 +112,7 @@
   let activeSection = $state<SectionId>('audio');
   const SECTIONS: { id: SectionId; label: string }[] = [
     { id: 'audio', label: 'Audio' },
+    { id: 'stt', label: 'Speech-to-text' },
     { id: 'avatar', label: 'Avatar' },
     { id: 'theme', label: 'Theme' },
     { id: 'background', label: 'Background' },
@@ -178,6 +208,12 @@
         voices = v.length > 0 ? v : [snapshot?.tts.voice ?? 'af_heart'];
       })
       .catch((e) => console.warn('list_voices failed', e));
+    listSttModels()
+      .then((m) => (sttModels = m))
+      .catch((e) => console.warn('stt_list_models failed', e));
+    listInputDevices()
+      .then((d) => (inputDevices = d))
+      .catch((e) => console.warn('stt_list_input_devices failed', e));
     for (const t of AI_TABS) {
       aiToolTabDefaults(t)
         .then((d) => {
@@ -582,7 +618,7 @@
   }
 </script>
 
-{#if $settings.ui.theme.startsWith('tui-')}
+{#if useCustomTitleBar}
   <TuiTitleBar title="cctts settings" />
 {/if}
 {#if !snapshot}
@@ -821,6 +857,129 @@
             <span>Fallback silent on TTS error (always on in v1)</span>
           </label>
         </section>
+      {:else if activeSection === 'stt'}
+        <section>
+          <h2>Speech-to-text</h2>
+          <small class="hint">
+            Dictate by voice instead of typing. A fully offline Whisper model
+            transcribes your speech into the compose overlay for review before
+            you send it. Nothing leaves your machine.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.stt.enabled}
+              onchange={(e) =>
+                patch((s) => (s.stt.enabled = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Enable speech-to-text</span>
+          </label>
+          <small class="hint">
+            Shows a microphone button in the bottom bar and enables the
+            push-to-talk shortcut. Requires a model in the <code>models/</code> folder.
+          </small>
+
+          <label>
+            <span>Model</span>
+            <select
+              value={snapshot.stt.model_file}
+              onchange={(e) => patch((s) => (s.stt.model_file = (e.currentTarget as HTMLSelectElement).value))}
+            >
+              {#if !sttModels.includes(snapshot.stt.model_file)}
+                <option value={snapshot.stt.model_file}>{snapshot.stt.model_file} (missing)</option>
+              {/if}
+              {#each sttModels as m}
+                <option value={m}>{m}</option>
+              {/each}
+            </select>
+          </label>
+          {#if !sttModels.includes(snapshot.stt.model_file)}
+            <small class="hint warn">
+              Model <code>{snapshot.stt.model_file}</code> isn't in the
+              <code>models/</code> folder. Download a ggml Whisper model (e.g.
+              <code>ggml-small.bin</code>) from
+              huggingface.co/ggerganov/whisper.cpp and drop it there.
+            </small>
+          {:else}
+            <small class="hint">
+              Drop additional <code>ggml-*.bin</code> files into the
+              <code>models/</code> folder to add models. Changing the model
+              reloads the engine on your next recording.
+            </small>
+          {/if}
+
+          <label>
+            <span>Input device</span>
+            <select
+              value={snapshot.stt.input_device}
+              onchange={(e) => patch((s) => (s.stt.input_device = (e.currentTarget as HTMLSelectElement).value))}
+            >
+              <option value="">System default</option>
+              {#if snapshot.stt.input_device && !inputDevices.includes(snapshot.stt.input_device)}
+                <option value={snapshot.stt.input_device}>{snapshot.stt.input_device} (not found)</option>
+              {/if}
+              {#each inputDevices as d}
+                <option value={d}>{d}</option>
+              {/each}
+            </select>
+          </label>
+
+          <label>
+            <span>Language</span>
+            <select
+              value={snapshot.stt.language}
+              onchange={(e) => patch((s) => (s.stt.language = (e.currentTarget as HTMLSelectElement).value))}
+            >
+              {#if !STT_LANGUAGES.some((l) => l.code === snapshot!.stt.language)}
+                <option value={snapshot.stt.language}>{snapshot.stt.language}</option>
+              {/if}
+              {#each STT_LANGUAGES as l}
+                <option value={l.code}>{l.label}</option>
+              {/each}
+            </select>
+          </label>
+
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.stt.translate_to_english}
+              onchange={(e) =>
+                patch((s) => (s.stt.translate_to_english = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Translate to English</span>
+          </label>
+          <small class="hint">
+            Transcribe non-English speech as English instead of verbatim.
+          </small>
+
+          <label>
+            <span>Record button mode</span>
+            <select
+              value={snapshot.stt.button_mode}
+              onchange={(e) =>
+                patch((s) => (s.stt.button_mode = (e.currentTarget as HTMLSelectElement).value as 'toggle' | 'hold'))}
+            >
+              <option value="toggle">Toggle (click to start / stop)</option>
+              <option value="hold">Hold (press and hold to record)</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Push-to-talk</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.push_to_talk,
+                (v) => patch((s) => (s.shortcuts.push_to_talk = v))
+              }
+            />
+          </label>
+          <small class="hint">
+            Hold the chord to record, release to transcribe. The default is
+            bare <code>Ctrl+Shift</code> — a quick tap or a
+            <code>Ctrl+Shift+&lt;key&gt;</code> chord won't trigger a recording.
+          </small>
+        </section>
+
       {:else if activeSection === 'avatar'}
         <section>
           <h2>Avatar</h2>
@@ -1080,7 +1239,7 @@
                   // Pair the terminal palette to the chosen theme. Skipped for
                   // a user "Custom" palette so a hand-tuned palette isn't lost
                   // on a theme switch.
-                  const paired = THEME_DEFAULT_PALETTE[theme];
+                  const paired = pairedPalette(theme);
                   if (paired && s.terminal.theme.name !== 'Custom') {
                     s.terminal.theme.name = paired;
                     s.terminal.theme.custom = null;
@@ -1088,10 +1247,9 @@
                 });
               }}
             >
-              <option value="modern-dark">Modern Dark</option>
-              <option value="tui-yellow">TUI - Yellow</option>
-              <option value="tui-purple">TUI - Purple</option>
-              <option value="tui-orange">TUI - Orange</option>
+              {#each $themeRegistry as t}
+                <option value={t.id}>{t.name}</option>
+              {/each}
             </select>
           </label>
 
@@ -1116,7 +1274,7 @@
                     if (!s.terminal.theme.custom) {
                       const seed =
                         previousName === 'Custom'
-                          ? BUNDLED_THEMES.Default
+                          ? defaultPalette()
                           : resolveBundledTheme(previousName);
                       s.terminal.theme.custom = { ...seed } as ThemeColorsWire;
                     }
@@ -1126,8 +1284,8 @@
                 });
               }}
             >
-              {#each BUNDLED_THEME_NAMES as name}
-                <option value={name}>{name}</option>
+              {#each $paletteRegistry as p}
+                <option value={p.name}>{p.name}</option>
               {/each}
               <option value="Custom">Custom…</option>
             </select>
@@ -2573,6 +2731,10 @@
   small.hint.top {
     margin-top: 0;
     margin-bottom: var(--space-3);
+  }
+  /* V6-01: missing-model / device-not-found warning hint. */
+  small.hint.warn {
+    color: var(--accent, #d77757);
   }
   /* When a hint is nested *inside* a label after the input (Local LLM
      section, shell command field, etc.) the global -8px would pull it

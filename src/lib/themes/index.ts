@@ -1,39 +1,23 @@
-// Bundled terminal-palette registry for V1.4-01.
+// Terminal-palette registry.
 //
-// Each entry is a complete xterm.js `ITheme` object — all 22 color slots
-// populated — so that picking any bundled name fully determines what the
-// terminal renders. The resolver in `./resolve.ts` either returns one of
-// these entries directly, or merges a user-supplied "Custom" override on
-// top of `BUNDLED_THEMES.Default`.
+// Palettes are no longer hardcoded here. They live as one JSON file per
+// palette under `<exe-dir>/palettes/`, are verified by the Rust backend, and
+// fetched once at startup via the `palettes_list` IPC (see ./registry.ts),
+// which calls `setPalettes` to populate the module-level map below.
 //
-// The "Default" palette intentionally preserves today's appearance. Its
-// foreground/background pair (#e0e0e0 / #000000) matches the values
-// `terminals.ts` hardcoded prior to V1.4-01; its 16 ANSI slots use the
-// VS Code Dark+ defaults, which are close enough to xterm.js's internal
-// fill-ins that a user upgrading from v1.3 sees no perceptible change.
+// Two palettes are compiled into this bundle as a fallback (`FALLBACK_PALETTES`)
+// so the resolver returns a complete xterm.js `ITheme` *synchronously* — before
+// the backend registry has loaded, and after any IPC failure. They mirror the
+// Rust-side `FALLBACK_PALETTE_NAMES`: `Default` (the merge base for "Custom"
+// palettes; its fg/bg preserves the pre-V1.4 hardcoded look) and
+// `Tomorrow Night` (the default terminal palette, paired with tui-orange).
 
 import type { ITheme } from '@xterm/xterm';
 
 export type ThemeColors = ITheme;
 
-export const BUNDLED_THEME_NAMES = [
-  'Default',
-  'Dracula',
-  'Solarized Dark',
-  'Solarized Light',
-  'Nord',
-  'Tomorrow Night',
-  'Gruvbox Dark',
-  'Gruvbox Light',
-  'One Dark',
-  'Monokai',
-  'Tokyo Night',
-  'GitHub Dark',
-] as const;
-
-export type BundledThemeName = (typeof BUNDLED_THEME_NAMES)[number];
-
-export const BUNDLED_THEMES: Record<BundledThemeName, ThemeColors> = {
+/// Palettes compiled into the frontend bundle as the always-present fallback.
+export const FALLBACK_PALETTES: Record<string, ThemeColors> = {
   Default: {
     foreground: '#e0e0e0',
     background: '#000000',
@@ -57,102 +41,6 @@ export const BUNDLED_THEMES: Record<BundledThemeName, ThemeColors> = {
     brightMagenta: '#d670d6',
     brightCyan: '#29b8db',
     brightWhite: '#ffffff',
-  },
-  Dracula: {
-    foreground: '#f8f8f2',
-    background: '#282a36',
-    cursor: '#f8f8f2',
-    cursorAccent: '#282a36',
-    selectionBackground: '#44475a',
-    selectionForeground: '#f8f8f2',
-    black: '#21222c',
-    red: '#ff5555',
-    green: '#50fa7b',
-    yellow: '#f1fa8c',
-    blue: '#bd93f9',
-    magenta: '#ff79c6',
-    cyan: '#8be9fd',
-    white: '#f8f8f2',
-    brightBlack: '#6272a4',
-    brightRed: '#ff6e6e',
-    brightGreen: '#69ff94',
-    brightYellow: '#ffffa5',
-    brightBlue: '#d6acff',
-    brightMagenta: '#ff92df',
-    brightCyan: '#a4ffff',
-    brightWhite: '#ffffff',
-  },
-  'Solarized Dark': {
-    foreground: '#839496',
-    background: '#002b36',
-    cursor: '#839496',
-    cursorAccent: '#002b36',
-    selectionBackground: '#073642',
-    selectionForeground: '#93a1a1',
-    black: '#073642',
-    red: '#dc322f',
-    green: '#859900',
-    yellow: '#b58900',
-    blue: '#268bd2',
-    magenta: '#d33682',
-    cyan: '#2aa198',
-    white: '#eee8d5',
-    brightBlack: '#002b36',
-    brightRed: '#cb4b16',
-    brightGreen: '#586e75',
-    brightYellow: '#657b83',
-    brightBlue: '#839496',
-    brightMagenta: '#6c71c4',
-    brightCyan: '#93a1a1',
-    brightWhite: '#fdf6e3',
-  },
-  'Solarized Light': {
-    foreground: '#657b83',
-    background: '#fdf6e3',
-    cursor: '#657b83',
-    cursorAccent: '#fdf6e3',
-    selectionBackground: '#eee8d5',
-    selectionForeground: '#586e75',
-    black: '#073642',
-    red: '#dc322f',
-    green: '#859900',
-    yellow: '#b58900',
-    blue: '#268bd2',
-    magenta: '#d33682',
-    cyan: '#2aa198',
-    white: '#eee8d5',
-    brightBlack: '#002b36',
-    brightRed: '#cb4b16',
-    brightGreen: '#586e75',
-    brightYellow: '#657b83',
-    brightBlue: '#839496',
-    brightMagenta: '#6c71c4',
-    brightCyan: '#93a1a1',
-    brightWhite: '#fdf6e3',
-  },
-  Nord: {
-    foreground: '#d8dee9',
-    background: '#2e3440',
-    cursor: '#d8dee9',
-    cursorAccent: '#2e3440',
-    selectionBackground: '#434c5e',
-    selectionForeground: '#eceff4',
-    black: '#3b4252',
-    red: '#bf616a',
-    green: '#a3be8c',
-    yellow: '#ebcb8b',
-    blue: '#81a1c1',
-    magenta: '#b48ead',
-    cyan: '#88c0d0',
-    white: '#e5e9f0',
-    brightBlack: '#4c566a',
-    brightRed: '#bf616a',
-    brightGreen: '#a3be8c',
-    brightYellow: '#ebcb8b',
-    brightBlue: '#81a1c1',
-    brightMagenta: '#b48ead',
-    brightCyan: '#8fbcbb',
-    brightWhite: '#eceff4',
   },
   'Tomorrow Night': {
     foreground: '#c5c8c6',
@@ -178,162 +66,45 @@ export const BUNDLED_THEMES: Record<BundledThemeName, ThemeColors> = {
     brightCyan: '#8abeb7',
     brightWhite: '#ffffff',
   },
-  'Gruvbox Dark': {
-    foreground: '#ebdbb2',
-    background: '#282828',
-    cursor: '#ebdbb2',
-    cursorAccent: '#282828',
-    selectionBackground: '#504945',
-    selectionForeground: '#ebdbb2',
-    black: '#282828',
-    red: '#cc241d',
-    green: '#98971a',
-    yellow: '#d79921',
-    blue: '#458588',
-    magenta: '#b16286',
-    cyan: '#689d6a',
-    white: '#a89984',
-    brightBlack: '#928374',
-    brightRed: '#fb4934',
-    brightGreen: '#b8bb26',
-    brightYellow: '#fabd2f',
-    brightBlue: '#83a598',
-    brightMagenta: '#d3869b',
-    brightCyan: '#8ec07c',
-    brightWhite: '#ebdbb2',
-  },
-  'Gruvbox Light': {
-    foreground: '#3c3836',
-    background: '#fbf1c7',
-    cursor: '#3c3836',
-    cursorAccent: '#fbf1c7',
-    selectionBackground: '#d5c4a1',
-    selectionForeground: '#3c3836',
-    black: '#fbf1c7',
-    red: '#cc241d',
-    green: '#98971a',
-    yellow: '#d79921',
-    blue: '#458588',
-    magenta: '#b16286',
-    cyan: '#689d6a',
-    white: '#7c6f64',
-    brightBlack: '#928374',
-    brightRed: '#9d0006',
-    brightGreen: '#79740e',
-    brightYellow: '#b57614',
-    brightBlue: '#076678',
-    brightMagenta: '#8f3f71',
-    brightCyan: '#427b58',
-    brightWhite: '#3c3836',
-  },
-  'One Dark': {
-    foreground: '#abb2bf',
-    background: '#282c34',
-    cursor: '#abb2bf',
-    cursorAccent: '#282c34',
-    selectionBackground: '#3e4451',
-    selectionForeground: '#abb2bf',
-    black: '#282c34',
-    red: '#e06c75',
-    green: '#98c379',
-    yellow: '#e5c07b',
-    blue: '#61afef',
-    magenta: '#c678dd',
-    cyan: '#56b6c2',
-    white: '#abb2bf',
-    brightBlack: '#5c6370',
-    brightRed: '#e06c75',
-    brightGreen: '#98c379',
-    brightYellow: '#e5c07b',
-    brightBlue: '#61afef',
-    brightMagenta: '#c678dd',
-    brightCyan: '#56b6c2',
-    brightWhite: '#ffffff',
-  },
-  Monokai: {
-    foreground: '#f8f8f2',
-    background: '#272822',
-    cursor: '#f8f8f2',
-    cursorAccent: '#272822',
-    selectionBackground: '#49483e',
-    selectionForeground: '#f8f8f2',
-    black: '#272822',
-    red: '#f92672',
-    green: '#a6e22e',
-    yellow: '#f4bf75',
-    blue: '#66d9ef',
-    magenta: '#ae81ff',
-    cyan: '#a1efe4',
-    white: '#f8f8f2',
-    brightBlack: '#75715e',
-    brightRed: '#f92672',
-    brightGreen: '#a6e22e',
-    brightYellow: '#f4bf75',
-    brightBlue: '#66d9ef',
-    brightMagenta: '#ae81ff',
-    brightCyan: '#a1efe4',
-    brightWhite: '#f9f8f5',
-  },
-  'Tokyo Night': {
-    foreground: '#a9b1d6',
-    background: '#1a1b26',
-    cursor: '#c0caf5',
-    cursorAccent: '#1a1b26',
-    selectionBackground: '#33467c',
-    selectionForeground: '#c0caf5',
-    black: '#15161e',
-    red: '#f7768e',
-    green: '#9ece6a',
-    yellow: '#e0af68',
-    blue: '#7aa2f7',
-    magenta: '#bb9af7',
-    cyan: '#7dcfff',
-    white: '#a9b1d6',
-    brightBlack: '#414868',
-    brightRed: '#f7768e',
-    brightGreen: '#9ece6a',
-    brightYellow: '#e0af68',
-    brightBlue: '#7aa2f7',
-    brightMagenta: '#bb9af7',
-    brightCyan: '#7dcfff',
-    brightWhite: '#c0caf5',
-  },
-  'GitHub Dark': {
-    foreground: '#c9d1d9',
-    background: '#0d1117',
-    cursor: '#c9d1d9',
-    cursorAccent: '#0d1117',
-    selectionBackground: '#264f78',
-    selectionForeground: '#c9d1d9',
-    black: '#484f58',
-    red: '#ff7b72',
-    green: '#3fb950',
-    yellow: '#d29922',
-    blue: '#58a6ff',
-    magenta: '#bc8cff',
-    cyan: '#39c5cf',
-    white: '#b1bac4',
-    brightBlack: '#6e7681',
-    brightRed: '#ffa198',
-    brightGreen: '#56d364',
-    brightYellow: '#e3b341',
-    brightBlue: '#79c0ff',
-    brightMagenta: '#d2a8ff',
-    brightCyan: '#56d4dd',
-    brightWhite: '#f0f6fc',
-  },
 };
 
-/// Look up a bundled theme by name. Falls back to Default for an
-/// unrecognised name — protects against settings.json containing a
-/// theme name from a future or removed bundle entry.
-export function resolveBundledTheme(name: string): ThemeColors {
-  return (BUNDLED_THEMES as Record<string, ThemeColors>)[name] ?? BUNDLED_THEMES.Default;
+// Live palette map. Seeded with the fallback and replaced wholesale once the
+// backend `palettes_list` resolves. Read synchronously by `resolveBundledTheme`
+// (the resolver runs on the terminal hot path and can't await an IPC).
+let paletteMap: Record<string, ThemeColors> = { ...FALLBACK_PALETTES };
+// Display order for the Settings dropdown — the backend's order (sorted by
+// name), or the fallback keys before it has loaded.
+let paletteOrder: string[] = Object.keys(FALLBACK_PALETTES);
+
+/// Replace the live palette map from the backend registry. Fallback palettes
+/// are always retained underneath so `Default` (the Custom merge base) and
+/// `Tomorrow Night` survive even if the disk folder somehow omits them.
+export function setPalettes(palettes: { name: string; colors: ThemeColors }[]): void {
+  const map: Record<string, ThemeColors> = { ...FALLBACK_PALETTES };
+  for (const p of palettes) map[p.name] = p.colors;
+  paletteMap = map;
+  paletteOrder = palettes.length ? palettes.map((p) => p.name) : Object.keys(FALLBACK_PALETTES);
 }
 
-/// The 22 keys every bundled theme is required to populate. Used by the
-/// completeness test in `themes.test.ts` to catch typos when adding a new
-/// bundled palette.
+/// Names of the currently-available palettes, in display order. Used by the
+/// Settings palette dropdown.
+export function paletteNames(): string[] {
+  return paletteOrder;
+}
+
+/// Look up a palette by name. Falls back to `Default` for an unrecognised name
+/// — protects against a settings.json palette name from a deleted/renamed file.
+export function resolveBundledTheme(name: string): ThemeColors {
+  return paletteMap[name] ?? paletteMap.Default ?? FALLBACK_PALETTES.Default;
+}
+
+/// The `Default` palette — the merge base a "Custom" palette layers over.
+export function defaultPalette(): ThemeColors {
+  return paletteMap.Default ?? FALLBACK_PALETTES.Default;
+}
+
+/// The 22 keys every palette is required to populate. Mirrors the Rust-side
+/// `REQUIRED_PALETTE_KEYS`; used by `CustomThemeEditor` and the frontend tests.
 export const REQUIRED_THEME_KEYS: readonly (keyof ThemeColors)[] = [
   'foreground',
   'background',

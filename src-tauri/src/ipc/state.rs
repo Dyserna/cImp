@@ -11,6 +11,10 @@ use crate::tabs::TabRegistryHandle;
 use crate::tts::{AiTtsSuppressed, SpeakSession, TtsRequest};
 
 pub struct AppState {
+    /// V6-01 speech-to-text handle: posts start/stop/cancel to the capture
+    /// thread. Recording state and transcripts flow back to the frontend via
+    /// the `stt-state` / `stt-transcription` events, not through this handle.
+    pub stt: crate::stt::SttHandle,
     /// All tabs and the active-tab pointer live here. Methods on the
     /// registry are async; the lock is dropped before each await point.
     pub tabs: TabRegistryHandle,

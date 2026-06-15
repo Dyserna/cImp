@@ -26,6 +26,7 @@ Capabilities beyond the underlying tools:
 6. **Permission-prompt detection** for Claude Code, with a per-tab `AwaitingPermission` flag and notification.
 7. **Notification system** that announces tab state changes when the user is focused elsewhere.
 8. **Bottom status bar** with mute / announcements / volume controls and a Layouts menu.
+9. **Offline speech-to-text (dictation)** — the inverse of the TTS path: a `cpal` microphone capture feeds a bundled, fully offline Whisper model (whisper.cpp via `whisper-rs`) and the transcript lands in the compose overlay for review. Triggered by a bottom-bar record button (toggle or hold) or a push-to-talk shortcut. No cloud, no API key.
 
 ### What we are NOT building
 
@@ -51,7 +52,9 @@ A single technical user running on their main desktop (Windows, RTX 5090) with o
 - **`tokio`** — async runtime
 - **`ort`** (ONNX Runtime) — Kokoro TTS inference, with CUDA execution provider when available
 - **`misaki-rs`** — phonemization (default features include espeak-ng fallback for OOV)
-- **`cpal`** + **`rodio`** — audio output and queue management
+- **`cpal`** + **`rodio`** — audio output and queue management; `cpal` input streams also back speech-to-text capture
+- **`whisper-rs`** (whisper.cpp) — offline speech-to-text inference, with an optional `stt-cuda` compile feature for the CUDA backend
+- **`rubato`** — resampling captured mic audio to Whisper's 16 kHz mono
 - **`serde` / `serde_json`** — settings persistence and IPC payloads
 - **`uuid`** — pane / split / tab id generation
 - **`tracing`** — structured logging

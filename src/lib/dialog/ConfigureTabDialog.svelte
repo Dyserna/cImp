@@ -30,7 +30,8 @@
     TerminalThemeSettings,
     ThemeColorsWire,
   } from '../settings/types';
-  import { BUNDLED_THEME_NAMES, BUNDLED_THEMES, resolveBundledTheme } from '../themes';
+  import { resolveBundledTheme, defaultPalette } from '../themes';
+  import { paletteRegistry } from '../themes/registry';
   import ThemeSwatch from '../settings/ThemeSwatch.svelte';
   import CustomThemeEditor from '../settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from '../settings/BackgroundConfigEditor.svelte';
@@ -177,7 +178,7 @@
         themeOverride === null ? liveGlobal.name : themeOverride.name;
       const seed =
         previousName === 'Custom'
-          ? BUNDLED_THEMES.Default
+          ? defaultPalette()
           : resolveBundledTheme(previousName);
       themeOverride = {
         name: 'Custom',
@@ -390,8 +391,8 @@
           selectOverride((e.currentTarget as HTMLSelectElement).value)}
       >
         <option value="__inherit">Use global default (current: {globalThemeName})</option>
-        {#each BUNDLED_THEME_NAMES as paletteName}
-          <option value={paletteName}>{paletteName}</option>
+        {#each $paletteRegistry as p}
+          <option value={p.name}>{p.name}</option>
         {/each}
         <option value="Custom">Custom…</option>
       </select>

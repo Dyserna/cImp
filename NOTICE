@@ -34,6 +34,31 @@ Kokoro-82M-v1.0-ONNX:
 
 ------------------------------------------------------------------------
 
+The compiled binary statically links whisper.cpp (via the whisper-rs
+bindings) for offline speech-to-text. whisper.cpp is licensed under the
+MIT License — a permissive license compatible with the Apache 2.0 (and,
+where combined, GPLv3+) terms above.
+
+whisper.cpp:
+  Copyright (c) 2023-2024 Georgi Gerganov and contributors
+  Source: https://github.com/ggerganov/whisper.cpp
+  License: MIT — https://opensource.org/licenses/MIT
+
+------------------------------------------------------------------------
+
+The portable Windows zip (full variant only) bundles a ggml Whisper
+speech-to-text model (default `ggml-small.bin`). Like the Kokoro model,
+it is tracked via Git LFS rather than committed to source, and its
+license is independent of the cctts source license above.
+
+Whisper (ggml models):
+  Source: https://huggingface.co/ggerganov/whisper.cpp
+  Files bundled: ggml-small.bin (default; the user may add other ggml-*.bin)
+  Original model: OpenAI Whisper — https://github.com/openai/whisper
+  License: MIT — https://opensource.org/licenses/MIT
+
+------------------------------------------------------------------------
+
 The "Animated sprites" avatar variant ships a bundled pixel-art mascot
 set (`sprites/claudeSprites/`) — frame sequences plus a `manifest.json`
 describing per-frame timing. These assets originate from the Clawdmeter

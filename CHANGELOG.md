@@ -5,6 +5,39 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-06-15
+
+### Added
+
+- **Offline speech-to-text (dictation).** Press the new microphone button in
+  the bottom bar, or hold the push-to-talk shortcut (default `Ctrl+Shift`), to
+  dictate by voice. A fully offline, bundled Whisper model (whisper.cpp)
+  transcribes your speech into the compose overlay for review before you send
+  it — no cloud, no API key, nothing leaves your machine. Enable it under
+  Settings → Speech-to-text, where you can pick the model, input device,
+  language, translate-to-English, and the record-button mode (toggle vs hold).
+  Drop additional `ggml-*.bin` models into the `models/` folder to switch
+  between them. The released portable binary is **GPU-accelerated via Vulkan**:
+  it automatically uses any GPU (NVIDIA/AMD/Intel) and falls back to CPU when
+  none is present — no install, the only requirement is Windows' built-in
+  `vulkan-1.dll`. (`CCTTS_GPU=cpu` forces CPU.) Source builds default to CPU;
+  build `--features stt-vulkan` for the GPU variant. See `docs/MAINTENANCE.md`.
+
+### Changed
+
+- **Three default shortcuts moved off `Ctrl+Shift`** so they don't collide
+  with the new push-to-talk chord: Open compose `Ctrl+Shift+E` → `Alt+Enter`,
+  Split pane (vertical) `Ctrl+Shift+\` → `Alt+\`, Close pane `Ctrl+Shift+W` →
+  `Ctrl+Alt+W`. These are new-install defaults only — existing settings keep
+  your current bindings; re-bind them under Settings → Shortcuts if you want
+  the new defaults.
+- **Compose overlay: `Enter` now sends**, and `Alt+Enter` (or `Shift+Enter`)
+  inserts a newline — a one-handed flow that pairs well with dictation. The
+  default `submit_compose` shortcut changed `Ctrl+Enter` → `Enter`; the compose
+  box handles these keys directly, so the behavior applies without re-binding.
+  Also fixed a flicker where the terminal area briefly shifted down when the
+  compose sheet opened.
+
 ## [0.9.2] — 2026-06-12
 
 ### Changed

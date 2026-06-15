@@ -5,7 +5,8 @@
   // foreground, red, green, blue — enough variety to differentiate the
   // bundled themes at a glance.
 
-  import { resolveBundledTheme, BUNDLED_THEMES } from '../themes';
+  import { resolveBundledTheme, defaultPalette } from '../themes';
+  import { paletteRegistry } from '../themes/registry';
   import type { ThemeColorsWire } from './types';
 
   interface Props {
@@ -18,9 +19,13 @@
   const swatchKeys = ['background', 'foreground', 'red', 'green', 'blue'] as const;
 
   let colors = $derived.by(() => {
+    // Touch the registry store so the swatch re-resolves once the backend
+    // palettes load (resolveBundledTheme reads ./index's synchronous map,
+    // which is populated from the same fetch).
+    void $paletteRegistry;
     if (name === 'Custom' && custom) {
       // Merge over Default so missing keys still preview something.
-      return { ...BUNDLED_THEMES.Default, ...custom } as Record<string, string>;
+      return { ...defaultPalette(), ...custom } as Record<string, string>;
     }
     return resolveBundledTheme(name) as unknown as Record<string, string>;
   });

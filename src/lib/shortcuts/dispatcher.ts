@@ -7,6 +7,7 @@
 // disturbing the listener.
 
 import { parseShortcut, matches, type ShortcutPredicate } from './parser';
+import { installPushToTalk } from './pushToTalk';
 import type { ShortcutSettings } from '../settings/types';
 
 export type ShortcutAction =
@@ -94,6 +95,10 @@ export function installDispatcher(): void {
   if (installed) return;
   installed = true;
   window.addEventListener('keydown', onKeyDown, true);
+  // V6-01: the push-to-talk hold gesture (keydown + keyup state machine)
+  // installs its own capture-phase listeners; it's configured separately via
+  // `configurePushToTalk` because it can't be modeled as a fire-once chord.
+  installPushToTalk();
 }
 
 /// Temporarily silence the dispatcher. Used by the shortcut-capture UI so
@@ -102,6 +107,12 @@ export function installDispatcher(): void {
 /// with a matching `setSuppressed(false)`.
 export function setSuppressed(value: boolean): void {
   suppressed = value;
+}
+
+/// Read the suppression flag. Used by the push-to-talk controller so the
+/// shortcut-capture UI silences PTT too while the user is binding a key.
+export function getSuppressed(): boolean {
+  return suppressed;
 }
 
 function onKeyDown(event: KeyboardEvent): void {

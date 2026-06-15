@@ -2,3 +2,15 @@
 # bindgen needs libclang.dll to generate FFI bindings for espeak-rs-sys
 # (pulled in by misaki-rs's default features). Required for every build.
 LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+
+# V6-01 STT GPU: the default `stt-vulkan` feature compiles whisper.cpp's
+# Vulkan backend. whisper.cpp's CMake `find_package(Vulkan)` locates glslc
+# (shader compiler), the headers, and vulkan-1.lib via VULKAN_SDK. The SDK
+# installer sets this env var, but pin it here so builds don't depend on the
+# shell environment (mirrors LIBCLANG_PATH above). Update the version on an
+# SDK upgrade.
+VULKAN_SDK = "C:\\VulkanSDK\\1.4.350.0"
+
+# The optional `stt-cuda` feature (NVIDIA-only) additionally needs CUDA 13.2
+# with 13.2's bin first on PATH — see docs/MAINTENANCE.md. It is NOT wired
+# here so the default Vulkan/CPU builds stay clean of CUDA env.

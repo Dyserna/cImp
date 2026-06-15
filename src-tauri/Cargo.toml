@@ -1,6 +1,6 @@
 [package]
 name = "cctts"
-version = "0.9.2"
+version = "0.10.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
@@ -9,6 +9,27 @@ rust-version = "1.77"
 [[bin]]
 name = "cctts"
 path = "src/main.rs"
+
+[features]
+# Default is CPU-only so routine builds, `cargo test`, and rust-analyzer work
+# from a plain shell with no GPU SDK / dev-env / generator requirements.
+default = []
+
+# GPU-accelerated STT via whisper.cpp's VULKAN backend. Produces a fully
+# PORTABLE binary — the only GPU runtime dependency is the system vulkan-1.dll
+# (present on all Win10+) — runs on any vendor's GPU (NVIDIA/AMD/Intel), and
+# falls back to CPU automatically when no GPU is present (see stt/engine.rs).
+# This is what the RELEASE ships, so the portable zip gets auto GPU/CPU with no
+# bundled DLLs. Building it needs the Vulkan SDK + the MSVC dev environment +
+# the Ninja generator (ggml's nested shader-generator sub-build); see
+# docs/MAINTENANCE.md and the release.yml build step.
+stt-vulkan = ["whisper-rs/vulkan"]
+
+# Optional NVIDIA-only fast path (~20-40% faster than Vulkan for whisper).
+# NOT portable (imports cublas64_*.dll) and needs the CUDA toolkit at build
+# time — on this box CUDA 13.2 specifically, with 13.2's bin first on PATH (see
+# docs/MAINTENANCE.md). Build with `--features stt-cuda`.
+stt-cuda = ["whisper-rs/cuda"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -51,6 +72,15 @@ bytemuck = "1"
 # Audio output
 cpal = "0.15"
 rodio = "0.20"
+
+# STT (Whisper via whisper.cpp bindings). Statically links one C library;
+# needs a C/C++ toolchain + CMake at build time (see MAINTENANCE.md). CUDA is
+# a compile-time feature (`stt-cuda`) wired to the same CCTTS_GPU=cuda runtime
+# opt-in as ort — see [features] below. Default build is CPU-only so it works
+# on any machine without the CUDA toolkit.
+whisper-rs = "0.16"
+# Native-rate -> 16 kHz mono resampling of captured mic audio for Whisper.
+rubato = "0.16"
 
 # Windows-only: registry probe for Git Bash auto-detection in shell::detect.
 [target.'cfg(windows)'.dependencies]

@@ -24,6 +24,7 @@
     startAvatarStateListener,
   } from './lib/avatarState';
   import { initSettings, settings, applySettings } from './lib/settings/store';
+  import { themeRegistry } from './lib/themes/registry';
   import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
   import { applyTabCreated } from './lib/tabs/store';
@@ -59,10 +60,26 @@
     submitCompose,
   } from './lib/composeState';
   import { composeContentChanged } from './lib/ipc';
+  import {
+    initStt,
+    startRecording,
+    stopRecording,
+    cancelRecording,
+  } from './lib/stt';
+  import { configurePushToTalk } from './lib/shortcuts/pushToTalk';
 
   // OS window title is set by the Rust setup hook to "<project> - cctts".
   // Mirrored into the TUI title bar via a one-shot read in onMount.
   let tuiTitle = $state('cctts');
+
+  // Whether to render the custom TuiTitleBar: driven by the active theme's
+  // `decorations` metadata (false = OS chrome hidden, we draw our own bar).
+  // Derived from the registry store so it re-evaluates when the registry
+  // finishes loading, not just when the theme id changes. Unknown / not-yet-
+  // loaded themes default to the custom bar (matches the tui-orange fallback).
+  let useCustomTitleBar = $derived(
+    !($themeRegistry.find((t) => t.id === $settings.ui.theme)?.decorations ?? false),
+  );
 
   let unsubSettings: (() => void) | undefined;
   let unsubContent: (() => void) | undefined;
@@ -165,6 +182,10 @@
         console.error('startAvatarStateListener failed:', e),
       );
       installDispatcher();
+      // V6-01: register the STT event listeners (state + transcript →
+      // compose overlay). Idempotent; safe even when STT is disabled —
+      // the backend simply never emits until the user records.
+      initStt();
       // Position-bound tab-switch handler: 1-indexed lookup against the
       // *focused pane's* tab list (V4-03 reinterpretation of v1.2's
       // global Ctrl+N). No-op when the focused pane has fewer than N
@@ -199,7 +220,15 @@
       };
       unsubSettings = settings.subscribe((s) => {
         configureShortcuts(s.shortcuts, {
-          open_compose: openCompose,
+          open_compose: {
+            // Default is Alt+Enter — which, while the compose sheet is open,
+            // doubles as the "insert newline" key (handled in the textarea).
+            // Guard so the dispatcher only consumes Alt+Enter to OPEN compose
+            // when it's closed; when it's open the keystroke falls through to
+            // the textarea's newline handler.
+            handler: openCompose,
+            active: () => !get(composeOpen),
+          },
           submit_compose: {
             handler: () => {
               void submitCompose();
@@ -241,6 +270,14 @@
             },
             active: () => isSelectionTtsActive(),
           },
+        });
+        // V6-01: push-to-talk is a hold gesture, configured separately from
+        // the fire-once shortcut table. Re-runs on every settings change so a
+        // re-bound chord or an enable/disable toggle takes effect live.
+        configurePushToTalk(s.stt.enabled, s.shortcuts.push_to_talk, {
+          start: () => void startRecording(),
+          stop: () => void stopRecording(),
+          cancel: () => void cancelRecording(),
         });
       });
       // OS window title is set by the Rust setup hook to
@@ -375,10 +412,11 @@
     they subscribe to `activeTab`-derived stores which are kept in
     sync with the focused pane's active tab.
 
-    Custom title bar mounts under any TUI variant — modern-dark keeps
-    OS chrome via setDecorations(true) wired in main.ts.
+    Custom title bar mounts for any theme whose metadata sets
+    `decorations: false`; native-chrome themes (e.g. modern-dark) keep the
+    OS title bar via setDecorations(true) wired in main.ts.
   -->
-  {#if $settings.ui.theme.startsWith('tui-')}
+  {#if useCustomTitleBar}
     <TuiTitleBar title={tuiTitle} />
   {/if}
   <div class="terminal-area">

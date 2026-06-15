@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { latestSamples, startAmplitudeListener } from './audioStream';
+  import { latestSamples, startAmplitudeListener, startMicAmplitudeListener } from './audioStream';
   import { avatarVisible } from './avatarState';
   import { avatar as avatarSettings, waveform as waveformSettings } from './settings/store';
 
@@ -76,6 +76,8 @@
     resizeCanvas();
     window.addEventListener('resize', resizeCanvas);
     startAmplitudeListener();
+    // V6-01: mic capture amplitude feeds the same waveform while recording.
+    startMicAmplitudeListener();
     animationId = requestAnimationFrame(render);
   });
 

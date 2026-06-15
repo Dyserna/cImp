@@ -220,7 +220,15 @@
       };
       unsubSettings = settings.subscribe((s) => {
         configureShortcuts(s.shortcuts, {
-          open_compose: openCompose,
+          open_compose: {
+            // Default is Alt+Enter — which, while the compose sheet is open,
+            // doubles as the "insert newline" key (handled in the textarea).
+            // Guard so the dispatcher only consumes Alt+Enter to OPEN compose
+            // when it's closed; when it's open the keystroke falls through to
+            // the textarea's newline handler.
+            handler: openCompose,
+            active: () => !get(composeOpen),
+          },
           submit_compose: {
             handler: () => {
               void submitCompose();

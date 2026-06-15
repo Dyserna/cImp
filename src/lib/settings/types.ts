@@ -705,7 +705,7 @@ export function defaultSettings(): Settings {
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {
       open_compose: 'Alt+Enter',
-      submit_compose: 'Ctrl+Enter',
+      submit_compose: 'Enter',
       cancel_compose: 'Escape',
       open_settings: 'Ctrl+,',
       switch_to_tab_1: 'Ctrl+1',

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import { composeOpen, composeContent, composeFocused } from './composeState';
+  import { composeOpen, composeContent, composeFocused, submitCompose } from './composeState';
   import { compose as composeSettings } from './settings/store';
 
   let textareaEl: HTMLTextAreaElement | undefined = $state();
@@ -27,7 +27,12 @@
   $effect(() => {
     if ($composeOpen) {
       void tick().then(() => {
-        textareaEl?.focus();
+        // `preventScroll`: the sheet is mid slide-up (translated partly below
+        // the viewport) when we focus, and a plain focus() makes the browser
+        // scroll the page to reveal the textarea — which visibly shoves the
+        // whole terminal area down for a frame. Focusing without scrolling
+        // keeps everything still.
+        textareaEl?.focus({ preventScroll: true });
         adjustHeight();
       });
     }
@@ -44,24 +49,45 @@
     adjustHeight();
   }
 
-  // Tab key inserts a literal tab character at the caret instead of
-  // shifting focus out of the sheet. Multi-line code paste workflows expect
-  // it. Shift+Tab is left alone (default focus-cycle behavior preserved).
-  function handleKeydown(e: KeyboardEvent): void {
-    if (e.key !== 'Tab' || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) {
-      return;
-    }
-    e.preventDefault();
+  // Insert text at the caret and mirror it into the bound store so
+  // submitCompose sees it. Shared by the Tab and Alt+Enter handlers.
+  function insertAtCaret(text: string): void {
     const ta = textareaEl;
     if (!ta) return;
     const start = ta.selectionStart;
     const end = ta.selectionEnd;
-    const value = ta.value;
-    ta.value = value.slice(0, start) + '\t' + value.slice(end);
-    ta.selectionStart = ta.selectionEnd = start + 1;
-    // Mirror the change into the bound store so submitCompose sees it.
+    ta.value = ta.value.slice(0, start) + text + ta.value.slice(end);
+    ta.selectionStart = ta.selectionEnd = start + text.length;
     composeContent.set(ta.value);
     adjustHeight();
+  }
+
+  // Compose key handling, tuned for one-handed dictation/typing:
+  //   Enter            → submit (send to the active tab)
+  //   Alt+Enter        → newline (the universal "soft return")
+  //   Shift+Enter      → newline (textarea default; left untouched)
+  //   Ctrl/Cmd+Enter   → left for the configurable `submit_compose` shortcut
+  //   Tab              → literal tab at the caret (not focus-cycle)
+  // Plain Enter is also bound as the default `submit_compose` shortcut, which
+  // the dispatcher handles first; this is the fallback for users whose submit
+  // key isn't Enter.
+  function handleKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Enter') {
+      if (e.ctrlKey || e.metaKey) return;
+      if (e.altKey) {
+        e.preventDefault();
+        insertAtCaret('\n');
+        return;
+      }
+      if (e.shiftKey) return; // textarea inserts the newline itself
+      e.preventDefault();
+      void submitCompose();
+      return;
+    }
+    if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      insertAtCaret('\t');
+    }
   }
 
   function handleFocus(): void {

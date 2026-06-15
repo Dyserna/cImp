@@ -1715,7 +1715,9 @@ impl Default for ShortcutSettings {
             // chord doesn't visibly arm/abort when these fire. New installs
             // get these defaults; existing settings files keep their bindings.
             open_compose: Some("Alt+Enter".to_string()),
-            submit_compose: Some("Ctrl+Enter".to_string()),
+            // V6-01: Enter submits (one-handed send for dictation); Alt+Enter
+            // (and Shift+Enter) insert a newline — see ComposeOverlay.svelte.
+            submit_compose: Some("Enter".to_string()),
             cancel_compose: Some("Escape".to_string()),
             open_settings: Some("Ctrl+,".to_string()),
             switch_to_tab_1: Some("Ctrl+1".to_string()),

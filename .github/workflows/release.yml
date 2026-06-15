@@ -200,6 +200,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path src-tauri\target | Out-Null
           subst B: /D 2>$null
           subst B: (Resolve-Path src-tauri\target).Path
+          # Force a fresh whisper-rs-sys (CMake/ggml) build. A cached build
+          # state from a prior run was produced under a different (pre-subst)
+          # target path, leaving ninja convinced the objects are current while
+          # the files are absent (LNK1181 "cannot open ggml.c.obj"). Cleaning it
+          # makes it reconfigure + compile cleanly under the B: paths.
+          cargo clean --manifest-path src-tauri/Cargo.toml -p whisper-rs-sys
           npm run tauri build -- --no-bundle --features stt-vulkan
 
       - name: Stage portable layouts (full + no-models)

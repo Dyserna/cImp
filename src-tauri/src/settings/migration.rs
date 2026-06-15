@@ -1333,8 +1333,8 @@ fn migrate_v1_14_to_v1_15(value: &mut Value) {
 ///
 /// Backup filenames are built by *appending* to the full filename rather
 /// than `with_extension`, which only knows the last dot — for the per-folder
-/// overlay file `.cctts.custom.config.json`, `with_extension` would consume
-/// `config` as the extension and produce `.cctts.custom.json.<ver>.bak`,
+/// overlay file `.ccimp.custom.config.json`, `with_extension` would consume
+/// `config` as the extension and produce `.ccimp.custom.json.<ver>.bak`,
 /// drifting the backup name away from the source's stem.
 fn write_backup(path: &Path, from_version: &str, value: &Value) -> AppResult<()> {
     let primary = backup_path_for(path, &format!("{from_version}.bak"));
@@ -1366,9 +1366,9 @@ fn write_backup(path: &Path, from_version: &str, value: &Value) -> AppResult<()>
 
 /// Produce `<path-with-original-filename>.<suffix>`. Unlike
 /// `Path::with_extension` this preserves the entire original filename
-/// (including any embedded dots), so a backup of `.cctts.custom.config.json`
-/// becomes `.cctts.custom.config.json.<suffix>` rather than
-/// `.cctts.custom.json.<suffix>`.
+/// (including any embedded dots), so a backup of `.ccimp.custom.config.json`
+/// becomes `.ccimp.custom.config.json.<suffix>` rather than
+/// `.ccimp.custom.json.<suffix>`.
 fn backup_path_for(path: &Path, suffix: &str) -> PathBuf {
     match path.file_name() {
         Some(name) => {

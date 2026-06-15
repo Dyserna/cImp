@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "cctts",
+  "productName": "ccImp",
+  "mainBinaryName": "ccimp",
   "version": "0.11.0",
-  "identifier": "com.cctts.app",
+  "identifier": "com.ccimp.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -13,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "cctts",
+        "title": "ccImp",
         "width": 1200,
         "height": 800,
         "minWidth": 600,

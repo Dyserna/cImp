@@ -50,8 +50,8 @@ jobs:
           version="${ref#v}"
           echo "tag=$ref" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "stage_dir_full=cctts-portable-win-x64-$ref" >> "$GITHUB_OUTPUT"
-          echo "stage_dir_slim=cctts-portable-win-x64-$ref-no-models" >> "$GITHUB_OUTPUT"
+          echo "stage_dir_full=ccimp-portable-win-x64-$ref" >> "$GITHUB_OUTPUT"
+          echo "stage_dir_slim=ccimp-portable-win-x64-$ref-no-models" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -223,12 +223,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stageFull/bin" | Out-Null
           New-Item -ItemType Directory -Force -Path "$stageFull/models/voices" | Out-Null
 
-          # cctts.exe + ORT runtime DLLs (the `ort` crate's download-binaries
+          # ccimp.exe + ORT runtime DLLs (the `ort` crate's download-binaries
           # feature drops these into target/release at build time). With the
           # tts-webgpu prebuilt the core ONNX Runtime is static-linked into
-          # cctts.exe, so this glob usually matches nothing today — kept for
+          # ccimp.exe, so this glob usually matches nothing today — kept for
           # forward-compat in case ort ships a dynamic onnxruntime.dll again.
-          Copy-Item $env:CARGO_TARGET_DIR/release/cctts.exe "$stageFull/bin/"
+          Copy-Item $env:CARGO_TARGET_DIR/release/ccimp.exe "$stageFull/bin/"
           Get-ChildItem $env:CARGO_TARGET_DIR/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageFull/bin/" }
 
@@ -243,7 +243,7 @@ jobs:
             else { Write-Host "::error::WebGPU runtime DLL missing from build output: $d"; exit 1 }
           }
 
-          # Prompt-detection patterns. Ships next to cctts.exe (the loader
+          # Prompt-detection patterns. Ships next to ccimp.exe (the loader
           # reads <exe-dir>/patterns.json) so it's present and editable on a
           # fresh install instead of only appearing after first run. Source
           # of truth is scripts/patterns.default.json, kept in sync with the
@@ -252,7 +252,7 @@ jobs:
           # user's hand-edited patterns.
           Copy-Item scripts/patterns.default.json "$stageFull/bin/patterns.json"
 
-          # UI themes + terminal palettes. Ship next to cctts.exe (the loader
+          # UI themes + terminal palettes. Ship next to ccimp.exe (the loader
           # reads <exe-dir>/themes/ and <exe-dir>/palettes/) so the full theme
           # set is present and editable on a fresh install — nothing is embedded
           # in the binary or seeded at runtime. Source of truth is the repo-root
@@ -294,7 +294,7 @@ jobs:
 
           # Sprite avatar sets: the manifest-driven pixel-art mascot variant.
           # Mirrors the `avatars/` staging — source of truth is the top-level
-          # `sprites/<set>/` tree the `cctts-sprites` Vite plugin embeds into
+          # `sprites/<set>/` tree the `ccimp-sprites` Vite plugin embeds into
           # the frontend. Staged on-disk too for discoverability / adding sets.
           New-Item -ItemType Directory -Force -Path "$stageFull/sprites" | Out-Null
           Copy-Item -Recurse sprites/* "$stageFull/sprites/"
@@ -313,7 +313,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stageSlim/avatars" | Out-Null
           New-Item -ItemType Directory -Force -Path "$stageSlim/sprites" | Out-Null
 
-          Copy-Item $env:CARGO_TARGET_DIR/release/cctts.exe "$stageSlim/bin/"
+          Copy-Item $env:CARGO_TARGET_DIR/release/ccimp.exe "$stageSlim/bin/"
           Get-ChildItem $env:CARGO_TARGET_DIR/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageSlim/bin/" }
 

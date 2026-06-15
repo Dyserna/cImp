@@ -63,9 +63,9 @@ fn main() {
     // Window title reflects the project the user launched from. If the
     // launch cwd is anywhere inside a git working copy, the title uses
     // the repo-root folder name; otherwise it falls back to the launch
-    // dir's own folder name. Format is "<project> - cctts". Applied to
+    // dir's own folder name. Format is "<project> - ccImp". Applied to
     // the main window in the Tauri setup hook below.
-    let window_title = format!("{} - cctts", project_label_for(&launch_cwd));
+    let window_title = format!("{} - ccImp", project_label_for(&launch_cwd));
 
     // Tracing comes up before settings load so the load path's own logs
     // hit the file. The default-level guard is replaced once settings
@@ -76,7 +76,7 @@ fn main() {
         cwd = %launch_cwd.display(),
         args = ?extra_args,
         logs_dir = %logging::logs_dir().display(),
-        "cctts starting"
+        "ccimp starting"
     );
 
     // Probe the platform default shell once and cache it for every Shell
@@ -320,7 +320,7 @@ fn main() {
             spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
 
             // Apply the project-derived window title. The hardcoded
-            // "cctts" from tauri.conf.json is what the OS sees before
+            // "ccImp" from tauri.conf.json is what the OS sees before
             // this fires; this overwrite happens during setup so the
             // user only briefly sees the bare default.
             if let Some(win) = app.get_webview_window("main") {
@@ -459,7 +459,7 @@ fn main() {
 /// and worktrees use a `.git` file pointing at the parent's gitdir).
 /// The first ancestor that has one wins, and its folder name becomes
 /// the label. With no `.git` anywhere along the chain, the launch
-/// directory's own folder name is used. A final fallback to "cctts"
+/// directory's own folder name is used. A final fallback to "ccImp"
 /// covers degenerate paths like a drive root with no file_name segment.
 fn project_label_for(cwd: &Path) -> String {
     let mut dir = cwd;
@@ -477,7 +477,7 @@ fn project_label_for(cwd: &Path) -> String {
     }
     cwd.file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("cctts")
+        .unwrap_or("ccImp")
         .to_string()
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Sync the cctts version across the three places that need to agree:
+// Sync the ccimp version across the three places that need to agree:
 //   - package.json                  (drives the Settings → About display)
 //   - src-tauri/Cargo.toml          (Rust crate version)
 //   - src-tauri/tauri.conf.json     (Tauri runtime version)
@@ -73,10 +73,10 @@ const prevConf = conf.version;
 conf.version = target;
 writeFileSync(confPath, JSON.stringify(conf, null, 2) + '\n');
 
-// Refresh Cargo.lock so cctts's own entry matches. `cargo update -p cctts`
+// Refresh Cargo.lock so ccimp's own entry matches. `cargo update -p ccimp`
 // only touches our package, leaving every other dep at its current pin.
 try {
-  execFileSync('cargo', ['update', '-p', 'cctts'], {
+  execFileSync('cargo', ['update', '-p', 'ccimp'], {
     cwd: join(repo, 'src-tauri'),
     stdio: 'inherit',
   });

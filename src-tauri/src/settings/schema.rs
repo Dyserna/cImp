@@ -29,7 +29,7 @@ pub const AIDER_TAB_ID: &str = "aider";
 pub const AIDER_LOCAL_TAB_ID: &str = "aider-local";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// V15: a reserved Shell tab that launches `broot -g` (the broot file
-/// browser with git info shown) in the cctts launch directory. Unlike
+/// browser with git info shown) in the ccimp launch directory. Unlike
 /// `shell-default-1`, it is a non-closable builtin while present: the tab
 /// bar hides its close `×` and `close_tab` rejects it. It is added/removed
 /// only through the Settings → Tabs enable toggle (`set_broot_enabled`),
@@ -99,13 +99,13 @@ pub struct Settings {
     /// replaces the live tree wholesale; the preset itself is unchanged.
     pub layout_presets: Vec<LayoutPreset>,
     /// UI chrome theme settings (V5). The `theme` field selects the
-    /// design-token block applied to the cctts chrome (tab bar, status
+    /// design-token block applied to the ccimp chrome (tab bar, status
     /// bar, dialogs, settings). Distinct from `terminal.theme`, which
     /// governs the xterm.js terminal palette inside each tab.
     pub ui: UiSettings,
     /// Terminal-pane settings (V1.4-01+): xterm.js theme today, plus
     /// the V1.4-02 background image/color group when that ships.
-    /// Distinct from `ui`, which themes the cctts chrome.
+    /// Distinct from `ui`, which themes the ccimp chrome.
     pub terminal: TerminalSettings,
     /// V1.4-07: local-LLM provider config for AI tabs whose
     /// `use_local_provider` flag is `true`. The launch-time env
@@ -166,7 +166,7 @@ impl Default for Settings {
 }
 
 /// Logging configuration. The file path is fixed at
-/// `<portable-root>/logs/cctts.log.<YYYY-MM-DD>`; the `level` field drives
+/// `<portable-root>/logs/ccimp.log.<YYYY-MM-DD>`; the `level` field drives
 /// the live filter and `retention` drives the startup cleanup pass.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
@@ -744,7 +744,7 @@ pub fn default_claude_local_tab() -> TabConfig {
 }
 
 /// V14: Aider AI-tool tab using whatever provider Aider's own config
-/// selects (cloud / API keys / per-project `.aider.conf.yml`). cctts
+/// selects (cloud / API keys / per-project `.aider.conf.yml`). ccimp
 /// does not synthesize provider env vars for this tab — the user's
 /// existing aider configuration is in charge. TTS prompt injection is
 /// disabled by default because Aider's CLI has no
@@ -833,7 +833,7 @@ pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
 
 /// V15: default broot tab. A Shell tab that launches `broot -g` — the
 /// broot file browser with git info shown in the tree — with `cwd: None`
-/// so it inherits the cctts launch directory (the folder cctts was
+/// so it inherits the ccimp launch directory (the folder ccimp was
 /// started in). `broot` is resolved via PATH at spawn time; if it isn't
 /// installed the tab shows the standard "command not found" closed
 /// overlay until the user installs it. Closable like `shell-default-1`;
@@ -1377,7 +1377,7 @@ impl Default for StatusBarLayout {
 
 /// Terminal-pane settings (V1.4-01+). Holds the xterm.js palette config
 /// (V1.4-01) and the background image / solid-color sub-group (V1.4-02).
-/// Distinct from `ui`, which themes the cctts chrome.
+/// Distinct from `ui`, which themes the ccimp chrome.
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct TerminalSettings {

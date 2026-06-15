@@ -68,9 +68,9 @@
   } from './lib/stt';
   import { configurePushToTalk } from './lib/shortcuts/pushToTalk';
 
-  // OS window title is set by the Rust setup hook to "<project> - cctts".
+  // OS window title is set by the Rust setup hook to "<project> - ccImp".
   // Mirrored into the TUI title bar via a one-shot read in onMount.
-  let tuiTitle = $state('cctts');
+  let tuiTitle = $state('ccImp');
 
   // Whether to render the custom TuiTitleBar: driven by the active theme's
   // `decorations` metadata (false = OS chrome hidden, we draw our own bar).
@@ -281,7 +281,7 @@
         });
       });
       // OS window title is set by the Rust setup hook to
-      // "<project> - cctts" (project = git-root or launch-dir folder
+      // "<project> - ccImp" (project = git-root or launch-dir folder
       // name). Mirror it into the TUI in-app title bar so the chrome
       // matches. Read once — Rust set it before the webview rendered
       // and nothing in the frontend changes it after launch.

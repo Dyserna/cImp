@@ -125,7 +125,7 @@
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
-  const REPO_URL = 'https://github.com/Dyserna/cctts';
+  const REPO_URL = 'https://github.com/Dyserna/ccImp';
   // V15: reserved id of the broot utility tab. Mirrors
   // `SHELL_BROOT_TAB_ID` in the Rust schema. Its presence in
   // `snapshot.tabs` is its enabled state (it has no separate setting).
@@ -619,7 +619,7 @@
 </script>
 
 {#if useCustomTitleBar}
-  <TuiTitleBar title="cctts settings" />
+  <TuiTitleBar title="ccImp settings" />
 {/if}
 {#if !snapshot}
   <div class="loading">Loading settings…</div>
@@ -1225,7 +1225,7 @@
 
           <h3>UI theme</h3>
           <small class="hint top">
-            Governs the cctts chrome — tab bar, status bar, dialogs.
+            Governs the ccImp chrome — tab bar, status bar, dialogs.
             Distinct from the terminal palette below.
           </small>
           <label>
@@ -1750,7 +1750,7 @@
             <legend>Utility tabs</legend>
             <small class="hint">
               The broot tab runs <code>broot -g</code> (the broot file
-              browser with git info) in the directory cctts was started in.
+              browser with git info) in the directory ccImp was started in.
               While enabled it's a builtin tab — it can't be closed from the
               tab bar; untick here to remove it.
             </small>
@@ -2069,7 +2069,7 @@
           <small class="hint top">
             Settings for the Claude AI tab when <em>Use local LLM provider</em>
             is enabled. Run a LiteLLM (or compatible) proxy that translates the
-            Anthropic Messages API to your local model — cctts does not start
+            Anthropic Messages API to your local model — ccImp does not start
             the proxy. See the
             <a
               href="https://docs.litellm.ai/docs/proxy/quick_start"
@@ -2148,12 +2148,12 @@
         <section>
           <h2>Local LLM provider — Aider</h2>
           <small class="hint top">
-            Settings for the Aider (local) tab. cctts synthesizes
+            Settings for the Aider (local) tab. ccImp synthesizes
             <code>OPENAI_API_BASE</code> / <code>OPENAI_API_KEY</code>
             from the values below and (when <em>Model</em> is set) passes
             <code>--model &lt;model&gt;</code> on the spawn argv. Point
             this at any OpenAI-compatible endpoint (Ollama, LM Studio,
-            vLLM, LiteLLM proxy, …); cctts does not start the endpoint
+            vLLM, LiteLLM proxy, …); ccImp does not start the endpoint
             itself.
           </small>
           <label>
@@ -2288,7 +2288,7 @@
         <section>
           <h2>Logging</h2>
           <small class="hint top">
-            Log files roll daily into <code>logs/</code> next to the cctts
+            Log files roll daily into <code>logs/</code> next to the ccImp
             executable. Changing the level applies live; the
             <code>RUST_LOG</code> env var, when set at launch, overrides
             this until you change it here.

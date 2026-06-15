@@ -1,6 +1,6 @@
 // Bundled default avatar assets + helpers for resolving user-overridden
 // paths into URLs the WebView can load. Source files live at the
-// top-level `avatars/<theme>/` folder; the `cctts-avatars` Vite plugin
+// top-level `avatars/<theme>/` folder; the `ccimp-avatars` Vite plugin
 // (see `vite.config.ts`) serves them at `/avatar/<theme>/...` in dev and
 // copies them into `dist/avatar/<theme>/...` for builds. User-picked
 // paths from the file dialog are absolute disk paths and need
@@ -94,7 +94,7 @@ export function isVideoSrc(src: string): boolean {
 // --- Sprite avatar variant -------------------------------------------------
 //
 // Sprite sets live under the top-level `sprites/<set>/` folder, served to the
-// WebView at `/sprites/<set>/...` by the `cctts-sprites` Vite plugin (dev) and
+// WebView at `/sprites/<set>/...` by the `ccimp-sprites` Vite plugin (dev) and
 // embedded under `dist/sprites/` for builds — exactly mirroring how `avatars/`
 // maps to `/avatar/`. Each set holds a `manifest.json` (Clawdmeter format:
 // `{ tile, animations: { "<name>": { slug, category, frames: [{file, hold_ms}] } } }`)

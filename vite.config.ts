@@ -74,13 +74,13 @@ export default defineConfig(async () => ({
   plugins: [
     svelte(),
     staticFolderPlugin({
-      name: 'cctts-avatars',
+      name: 'ccimp-avatars',
       src: AVATARS_SRC,
       urlPrefix: '/avatar',
       outDir: 'avatar',
     }),
     staticFolderPlugin({
-      name: 'cctts-sprites',
+      name: 'ccimp-sprites',
       src: SPRITES_SRC,
       urlPrefix: '/sprites',
       outDir: 'sprites',

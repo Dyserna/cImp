@@ -6,7 +6,7 @@
 //! slider drag doesn't write the file on every frame.
 //!
 //! Storage is layered: the global baseline lives at `<exe-dir>/settings.json`
-//! and a per-launch-directory overlay (`.cctts.custom.config.json`) records
+//! and a per-launch-directory overlay (`.ccimp.custom.config.json`) records
 //! only the fields that differ from global. See `persistence` for details.
 
 mod broadcaster;
@@ -80,7 +80,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
 /// to fill in the platform-specific Shell-1 entry on fresh installs and
 /// when migration consumes the legacy `_shell_1_tmp` interim key.
 ///
-/// `launch_cwd` is the directory cctts was started in. The custom overlay,
+/// `launch_cwd` is the directory ccimp was started in. The custom overlay,
 /// if any, is read from and written to that directory.
 pub fn init(default_shell: &ShellSpec, launch_cwd: &Path) -> SettingsHandle {
     let outcome = persistence::load(default_shell, launch_cwd);

@@ -32,13 +32,13 @@ Thumbs.db
 **/.claude/settings.local.json
 **/.claude/scheduled_tasks.lock
 
-# CCTTS local custom config (per-machine layout / session / avatar /
+# CCIMP local custom config (per-machine layout / session / avatar /
 # TTS state; the app writes these alongside the regular config).
-**/.cctts.custom.config.json
+**/.ccimp.custom.config.json
 # Schema-migration backups: when the backend bumps schema_version, the
 # previous file is renamed with a `.vN.M.bak` suffix (sometimes with a
 # trailing timestamp, e.g. `.bak.1778262818`).
-**/.cctts.custom.config.json.*.bak*
+**/.ccimp.custom.config.json.*.bak*
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
@@ -53,7 +53,7 @@ Thumbs.db
 staging/
 download/
 release-notes.md
-cctts-portable-*.zip
+ccimp-portable-*.zip
 
 # Local build/run logs (transient, e.g. tauri-dev.log, release-build.log)
 /*.log

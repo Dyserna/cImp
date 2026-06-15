@@ -114,6 +114,14 @@ impl SttHandle {
 /// Called once from the Tauri `setup` hook with the runtime half of
 /// [`SttHandle::new`].
 pub fn spawn(app: AppHandle, settings: SettingsHandle, runtime: SttRuntime) {
+    // Route whisper.cpp / ggml's C-side logging away from raw stdout/stderr.
+    // They `fprintf(stderr, …)` model-load / backend diagnostics; in a windowed
+    // build there is no valid stderr, so the MSVC debug CRT's file-descriptor
+    // assertion (`_osfile(fh) & FOPEN`) fires and aborts the process
+    // (STATUS_STACK_BUFFER_OVERRUN). This silences that path (logs are dropped
+    // unless whisper-rs's tracing backend is enabled). Idempotent; first wins.
+    whisper_rs::install_logging_hooks();
+
     let (jobs_tx, jobs_rx) = mpsc::channel::<Vec<f32>>();
     worker::spawn_stt_worker(app.clone(), settings.clone(), jobs_rx, runtime.state.clone());
     spawn_mic_streamer(app.clone(), runtime.recording.clone(), runtime.mic.clone());

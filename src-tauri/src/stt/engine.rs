@@ -138,6 +138,55 @@ impl SttEngine {
                 }
             }
         }
-        Ok(text.trim().to_string())
+        let text = text.trim().to_string();
+        // whisper emits non-speech as a single fully-bracketed token —
+        // "[BLANK_AUDIO]", "[ Silence ]", "(music)" — when it hears no speech
+        // (e.g. a silent clip from the wrong/muted input device). Drop those so
+        // the literal marker never lands in the compose box; the empty result
+        // surfaces as a "didn't catch that" toast instead.
+        if is_non_speech(&text) {
+            return Ok(String::new());
+        }
+        Ok(text)
+    }
+}
+
+/// True when `text` is a single fully-bracketed/parenthesized group with no
+/// other content — whisper's convention for non-speech segments. Guarded so a
+/// real sentence containing a bracketed aside isn't dropped.
+fn is_non_speech(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let bracketed = (t.starts_with('[') && t.ends_with(']'))
+        || (t.starts_with('(') && t.ends_with(')'));
+    if !bracketed {
+        return false;
+    }
+    let inner = &t[1..t.len() - 1];
+    !inner.contains(['[', '(', ']', ')'])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_non_speech;
+
+    #[test]
+    fn non_speech_markers_are_dropped() {
+        for m in ["[BLANK_AUDIO]", "[ Silence ]", "(music)", "[Inaudible]", "  ", ""] {
+            assert!(is_non_speech(m), "{m:?} should be non-speech");
+        }
+    }
+
+    #[test]
+    fn real_speech_is_kept() {
+        for s in [
+            "hello world",
+            "run the tests [for the parser] now",
+            "what is (x)?",
+        ] {
+            assert!(!is_non_speech(s), "{s:?} should be kept");
+        }
     }
 }

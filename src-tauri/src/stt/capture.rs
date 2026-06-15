@@ -84,6 +84,8 @@ pub(crate) fn spawn_capture_thread(
                         set_state(&app, &state, SttState::Transcribing);
                         match resample_to_16k(samples, rate) {
                             Ok(ready) => {
+                                let (peak, rms) = peak_rms(&ready);
+                                info!(target: "stt", frames_16k = ready.len(), peak, rms, "resampled for whisper");
                                 if jobs_tx.send(ready).is_err() {
                                     warn!(target: "stt", "transcription worker gone; dropping recording");
                                     set_state(&app, &state, SttState::Idle);
@@ -221,8 +223,34 @@ fn finish(cap: ActiveCapture) -> (Vec<f32>, u32) {
         .lock()
         .map(|mut b| std::mem::take(&mut *b))
         .unwrap_or_default();
-    debug!(target: "stt", frames = samples.len(), rate, "capture finished");
+    let (peak, rms) = peak_rms(&samples);
+    // INFO so it lands in the default-level log: a near-zero peak/rms means the
+    // device delivered silence (wrong device, muted, or denied mic permission)
+    // rather than a capture/resample bug downstream.
+    info!(
+        target: "stt",
+        frames = samples.len(),
+        rate,
+        secs = samples.len() as f32 / rate.max(1) as f32,
+        peak,
+        rms,
+        "capture finished"
+    );
     (samples, rate)
+}
+
+/// Peak (max |sample|) and RMS of a buffer, for diagnosing silent captures.
+fn peak_rms(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut peak = 0.0f32;
+    let mut sumsq = 0.0f64;
+    for &s in samples {
+        peak = peak.max(s.abs());
+        sumsq += (s as f64) * (s as f64);
+    }
+    (peak, (sumsq / samples.len() as f64).sqrt() as f32)
 }
 
 /// Resample mono f32 from `in_rate` to 16 kHz using rubato's FFT resampler.

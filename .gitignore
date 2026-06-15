@@ -54,3 +54,6 @@ staging/
 download/
 release-notes.md
 cctts-portable-*.zip
+
+# Local build/run logs (transient, e.g. tauri-dev.log, release-build.log)
+/*.log

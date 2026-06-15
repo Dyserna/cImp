@@ -123,25 +123,26 @@ and `cudnn64_9.dll` directly — distribution would need to either:
 
 CPU-only is the default and needs no extra runtime.
 
-STT GPU is **separate** from the above and works differently. whisper.cpp's
-CUDA backend is a *compile-time* cctts feature (`stt-cuda`), compiled from
-source by `nvcc` — not a prebuilt download like `ort`. It is **on by default**
-so local dev builds use the GPU, but:
+## STT GPU — portable Vulkan (the released zip)
 
-- **The released portable zips are CPU-only.** `release.yml` builds with
-  `--no-default-features` because (a) the CI runner has no CUDA toolkit and
-  (b) a CUDA-compiled `cctts.exe` imports `cublas64_13.dll` and would fail to
-  launch on any machine without the CUDA 13.2 runtime. Keeping the release CPU
-  preserves the portable zip's "unzip and run anywhere" contract.
-- **A local GPU build needs CUDA 13.2 specifically.** `nvcc` gates on the MSVC
-  host-compiler version; this box's VS 2026 (MSVC 14.50) is rejected by CUDA
-  12.x but accepted by 13.2. `.cargo/config.toml` forces `CUDA_PATH` to v13.2
-  for the build. To *run* that build, CUDA 13.2's `bin` must be on PATH
-  (`cublas64_13.dll`). See MAINTENANCE.md for the full toolchain note.
-- **Runtime:** the GPU build uses the GPU by default and falls back to CPU
-  automatically if GPU init fails; `CCTTS_GPU=cpu` forces CPU. (This is the
-  opposite default from TTS/`ort`, which is opt-in via `CCTTS_GPU=cuda` — the
-  two GPU paths are independent.)
+STT GPU works **unlike** the TTS/CUDA story above, and is the reason the
+portable zip can offer GPU without sacrificing portability. The release is
+built with whisper.cpp's **Vulkan** backend (`--features stt-vulkan`):
+
+- **The released `cctts.exe` is portable AND GPU-capable.** Its only
+  GPU-related runtime dependency is `vulkan-1.dll` — a Windows system component
+  present on every Win10+ machine. So one binary: uses any vendor's GPU
+  (NVIDIA/AMD/Intel) when present, falls back to CPU automatically when not
+  (`stt/engine.rs` tries GPU then CPU; `CCTTS_GPU=cpu` forces CPU). **Nothing
+  GPU-specific is bundled** — no CUDA DLLs, no redistributables.
+- **The default feature set is CPU-only**, so routine local builds stay light;
+  the GPU build is explicit (`--features stt-vulkan`). CI builds the release
+  that way — see `release.yml`'s MSVC-dev-env + Vulkan-SDK steps and
+  MAINTENANCE.md for the build requirements (Vulkan SDK, Ninja generator, MSVC
+  dev env; deep local repos also need a short `CARGO_TARGET_DIR` for MAX_PATH).
+- **Optional `stt-cuda`** exists for local NVIDIA max-perf but is never shipped:
+  a CUDA binary imports `cublas64_*.dll`, isn't portable, and needs the CUDA
+  13.2 toolchain to build (see MAINTENANCE.md). Vulkan is the portable default.
 
 ## Updates
 

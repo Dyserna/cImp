@@ -17,9 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Settings → Speech-to-text, where you can pick the model, input device,
   language, translate-to-English, and the record-button mode (toggle vs hold).
   Drop additional `ggml-*.bin` models into the `models/` folder to switch
-  between them. Local builds use GPU acceleration by default (CUDA, with
-  automatic CPU fallback); the released portable binary is CPU-only so it runs
-  on any machine. See `docs/MAINTENANCE.md` for the GPU build toolchain.
+  between them. The released portable binary is **GPU-accelerated via Vulkan**:
+  it automatically uses any GPU (NVIDIA/AMD/Intel) and falls back to CPU when
+  none is present — no install, the only requirement is Windows' built-in
+  `vulkan-1.dll`. (`CCTTS_GPU=cpu` forces CPU.) Source builds default to CPU;
+  build `--features stt-vulkan` for the GPU variant. See `docs/MAINTENANCE.md`.
 
 ### Changed
 

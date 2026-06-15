@@ -94,6 +94,36 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # V6-01 STT GPU: the released binary is built with the `stt-vulkan`
+      # feature (whisper.cpp's Vulkan backend) so the portable zip auto-uses
+      # any GPU and falls back to CPU — the only GPU runtime dep is the system
+      # vulkan-1.dll. Building it needs the MSVC dev environment (ggml's nested
+      # shader-generator sub-build resolves cl.exe from PATH) and the Vulkan SDK
+      # (glslc + headers + vulkan-1.lib).
+      - name: Setup MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        env:
+          VULKAN_VERSION: '1.4.350.0'
+        run: |
+          $url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/VulkanSDK-$env:VULKAN_VERSION-Installer.exe"
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          Write-Host "Downloading Vulkan SDK $env:VULKAN_VERSION"
+          curl.exe -L --fail -o $installer $url
+          # LunarG uses the Qt installer framework; this installs the core SDK
+          # (glslc / headers / vulkan-1.lib) unattended.
+          & $installer --accept-licenses --default-answer --confirm-command install | Out-Null
+          $sdk = "C:\VulkanSDK\$env:VULKAN_VERSION"
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) { Write-Host "::error::Vulkan SDK install failed"; exit 1 }
+          # Expose to subsequent steps (the build needs VULKAN_SDK; Bin on PATH
+          # provides glslc for the shader generator).
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
       - name: Verify committed Kokoro assets against models/CHECKSUMS.txt
         # The model + voicepacks are tracked via Git LFS in `models/` and
         # checked out by the previous step (lfs: true). This step is a
@@ -146,14 +176,18 @@ jobs:
         env:
           # bindgen / clang-sys for misaki-rs -> espeak-ng-sys
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
-        # `--no-default-features` (a tauri-build flag, forwarded to cargo) drops
-        # the default `stt-cuda` feature so the released binary is CPU-only and
-        # portable: the runner has no CUDA toolkit, and a CUDA-compiled binary
-        # would import cublas64_*.dll and fail to launch on machines without the
-        # CUDA runtime. STT GPU is a local-build default (on dev machines with
-        # CUDA 13.2); the portable zip stays CPU. (The forced CUDA_PATH/CUDACXX
-        # in .cargo/config.toml are unused here since CUDA isn't compiled.)
-        run: npm run tauri build -- --no-bundle --no-default-features
+          # ggml-vulkan builds its shader generator as a nested CMake
+          # ExternalProject. The Visual Studio generator doesn't propagate the
+          # compiler to that sub-build, so force Ninja (cl is on PATH via the
+          # MSVC dev-env step). CL=/FS serializes PDB writes under parallelism.
+          CMAKE_GENERATOR: Ninja
+          CL: /FS
+        # `--features stt-vulkan` builds the portable Vulkan GPU binary: it runs
+        # on any GPU vendor and falls back to CPU when none is present (only
+        # runtime dep is the system vulkan-1.dll — nothing bundled). Default is
+        # CPU-only, so this flag is what ships GPU in the zip. (VULKAN_SDK is set
+        # by the Install Vulkan SDK step.)
+        run: npm run tauri build -- --no-bundle --features stt-vulkan
 
       - name: Stage portable layouts (full + no-models)
         shell: pwsh

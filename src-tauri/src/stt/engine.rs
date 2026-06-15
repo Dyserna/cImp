@@ -5,12 +5,13 @@
 //! reused across calls and only rebuilt when the user picks a different model.
 //!
 //! GPU handling differs from `tts/engine.rs` (which is opt-in via
-//! `CCTTS_GPU=cuda`). whisper.cpp's CUDA backend is a *compile-time* feature
-//! (`stt-cuda`, on by default); when it's compiled in, STT uses the GPU
-//! **by default** and falls back to CPU automatically if GPU init fails, so a
-//! driver/device problem never disables dictation. `CCTTS_GPU=cpu` forces CPU.
-//! When the binary is built CPU-only (`--no-default-features`), there is no GPU
-//! backend and STT always runs on CPU.
+//! `CCTTS_GPU=cuda`). whisper.cpp's GPU backend is a *compile-time* feature —
+//! `stt-vulkan` (default, portable, any GPU vendor) or the optional
+//! `stt-cuda` (NVIDIA-only). When a GPU backend is compiled in, STT uses the
+//! GPU **by default** and falls back to CPU automatically if GPU init fails or
+//! no GPU is present — so the same Vulkan binary runs on any machine, GPU or
+//! not. `CCTTS_GPU=cpu` forces CPU. Built `--no-default-features`, there is no
+//! GPU backend and STT always runs on CPU.
 
 use std::path::Path;
 
@@ -21,6 +22,16 @@ use crate::error::{AppError, AppResult};
 /// Whisper's required input sample rate. Capture resamples to this before
 /// handing samples to [`SttEngine::transcribe`].
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
+
+/// Human-readable label for the compiled GPU backend, logged when the engine
+/// comes up on the GPU. Vulkan is the default; CUDA is the optional opt-in.
+const GPU_BACKEND: &str = if cfg!(feature = "stt-vulkan") {
+    "GPU (Vulkan)"
+} else if cfg!(feature = "stt-cuda") {
+    "GPU (CUDA)"
+} else {
+    "GPU"
+};
 
 pub struct SttEngine {
     ctx: WhisperContext,
@@ -38,16 +49,19 @@ impl SttEngine {
             return Err(AppError::ModelNotFound(model_path.display().to_string()));
         }
 
-        // GPU is the default whenever the CUDA backend is compiled in
-        // (feature `stt-cuda`). `CCTTS_GPU=cpu` forces CPU. On a GPU init
-        // failure we retry on CPU automatically.
+        // GPU is the default whenever a GPU backend is compiled in (default
+        // `stt-vulkan`, or the optional `stt-cuda`). `CCTTS_GPU=cpu` forces
+        // CPU. On a GPU init failure — including no GPU present on the machine
+        // — we retry on CPU automatically, which is what makes the Vulkan build
+        // portable: the binary launches everywhere and silently uses the CPU
+        // when there's no usable GPU.
         let force_cpu = std::env::var("CCTTS_GPU").as_deref() == Ok("cpu");
-        let gpu_compiled = cfg!(feature = "stt-cuda");
+        let gpu_compiled = cfg!(any(feature = "stt-vulkan", feature = "stt-cuda"));
 
         if gpu_compiled && !force_cpu {
             match Self::load_ctx(model_path, true) {
                 Ok(ctx) => {
-                    tracing::info!(target: "stt", model = %model_file, backend = "GPU (CUDA)", "STT engine ready");
+                    tracing::info!(target: "stt", model = %model_file, backend = GPU_BACKEND, "STT engine ready");
                     return Ok(Self { ctx, model_file });
                 }
                 Err(e) => {

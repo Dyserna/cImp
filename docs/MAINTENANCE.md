@@ -44,41 +44,55 @@ Living list of dependencies and runtime concerns to revisit periodically. Each i
   from PowerShell, no #599 recurrence. If it bites on a bump: pin a
   known-good version, set `BINDGEN_EXTRA_CLANG_ARGS` to force the MSVC target,
   or commit Windows-target pre-generated bindings.
-- **GPU is a compile-time feature, ON BY DEFAULT (`stt-cuda`).** whisper.cpp's
-  CUDA backend is compiled by `nvcc`. Local dev builds get GPU; releases/CI
-  pass `--no-default-features` for a portable CPU binary (see below). Runtime
-  uses GPU by default with automatic CPU fallback (`stt/engine.rs`);
-  `CCTTS_GPU=cpu` forces CPU. Unlike `ort` there is no prebuilt-download path —
-  STT GPU and TTS GPU are independent.
-- **CUDA version vs MSVC host-compiler gate (the key constraint here).** `nvcc`
-  rejects host compilers newer than it supports (`crt/host_config.h`). This box
-  has **only** MSVC 14.50 (VS 2026, `_MSC_VER` 1950) and no VS 2022 toolset.
-  CUDA 12.x rejects 1950 (`_MSC_VER >= 1950`); **CUDA 13.2 accepts it**
-  (`_MSC_VER < 1960`). So the GPU build **must** use CUDA 13.2, not 12.x.
-- **`.cargo/config.toml` pins CUDA_PATH + CUDACXX to v13.2** (`force = true`,
-  build-time only) — the machine's default `CUDA_PATH` is 12.9. But that alone
-  is **not sufficient**: with the VS CMake generator, MSBuild's CUDA
-  integration injects an include path from the **first CUDA `bin` on PATH**, so
-  a 12.x there pulls in its rejecting `host_config.h` even when nvcc is 13.2.
-- **CUDA 13.2's `bin` MUST be the first CUDA directory on PATH** (ahead of any
-  12.x). This one PATH entry fixes the build's include injection AND supplies
-  `cublas64_13.dll` — a **load-time** dependency of the GPU binary (cudart is
-  static-linked). Without it the process won't even launch, and that loader
-  failure happens before any Rust runs, so the runtime CPU-fallback can't catch
-  it. Validated 2026-06-14: with 13.2 ahead of 12.2 on PATH, a bare
-  `cargo build` produces a clean GPU binary, auto-detecting `sm_120a` (the RTX
-  5090's Blackwell arch — the same arch `ort`/Kokoro's prebuilt CUDA can't
-  target, so STT GPU works on Blackwell where TTS GPU doesn't). With 12.x first,
-  the build fails with ~250 `host_config.h` "unsupported Microsoft Visual
-  Studio version" errors.
-- **Releases stay CPU-only.** `release.yml` builds with `--no-default-features`:
-  GitHub `windows-latest` has no CUDA toolkit, and a CUDA binary isn't portable
-  (the `cublas64_13.dll` dependency). The full/slim zips therefore ship a
-  CPU-only `cctts.exe`; GPU STT is a local-build feature.
-- **What to check on CUDA bumps:** when a CUDA release adds VS 2026 (`_MSC_VER`
-  1950+) support, 12.x could work again; if VS bumps past 1959, re-point
-  `CUDA_PATH` at a newer CUDA. To verify the gate: grep the chosen CUDA's
-  `include/crt/host_config.h` for the `_MSC_VER` bounds.
+- **GPU backends are compile-time features; the DEFAULT feature set is empty
+  (CPU).** So routine `cargo build`/`cargo test` and rust-analyzer work from a
+  plain shell with no GPU SDK / dev-env / generator requirements. GPU is opt-in:
+  - **`stt-vulkan` (the release backend, recommended).** whisper.cpp's Vulkan
+    backend. Produces a **portable** binary — the only GPU runtime dep is the
+    system `vulkan-1.dll` (on every Win10+) — runs on any vendor's GPU and
+    falls back to CPU when none is present. `release.yml` builds the zip with
+    this, so end users get auto GPU/CPU with nothing bundled.
+  - **`stt-cuda` (optional, NVIDIA-only).** ~20-40% faster than Vulkan but not
+    portable (imports `cublas64_*.dll`) and build-heavy — see the CUDA note
+    below. For local NVIDIA max-perf only; not shipped.
+  - Runtime (`stt/engine.rs`): when a GPU backend is compiled, STT uses the GPU
+    by default and **falls back to CPU automatically** if GPU init fails or no
+    GPU is present (this is what makes the Vulkan binary universal).
+    `CCTTS_GPU=cpu` forces CPU.
+
+- **Building `--features stt-vulkan` (the saga — three Windows gotchas):**
+  1. **Vulkan SDK** (LunarG) provides `glslc` + headers + `vulkan-1.lib`.
+     `VULKAN_SDK` is pinned in `.cargo/config.toml` (the installer also sets it
+     machine-wide). Pinned version: `C:\VulkanSDK\1.4.350.0` — bump on upgrade.
+  2. **MSVC dev environment + Ninja generator.** ggml-vulkan builds its shader
+     generator as a nested CMake *ExternalProject*. The VS CMake generator does
+     NOT propagate the compiler into that sub-build (`No CMAKE_C_COMPILER`), so
+     force `CMAKE_GENERATOR=Ninja` and build with `cl.exe` on PATH (a VS x64
+     Native Tools prompt, or `vcvars64.bat` sourced). `CL=/FS` serializes PDB
+     writes. NOTE these are env-only and intentionally NOT in `.cargo/config.toml`
+     (that would force every CPU build through Ninja+dev-env too).
+  3. **MAX_PATH on a deep repo.** The nested shader-gen path is ~264 chars from
+     this repo's deep location and `cl` fails (`C1041`) even with
+     `LongPathsEnabled=1`. Local fix: build with a short `CARGO_TARGET_DIR`
+     (e.g. `C:\ct`). CI is unaffected — the runner path (`D:\a\cctts\cctts`) is
+     short enough. Validated 2026-06-14: with all three, a local Vulkan build
+     produces a clean binary importing **only** `vulkan-1.dll` (no CUDA DLLs).
+- **CI (`release.yml`):** a `Setup MSVC dev environment` step (`ilammy/msvc-dev-cmd`)
+  + an `Install Vulkan SDK` step (LunarG silent installer, sets `VULKAN_SDK` /
+  PATH), then the build sets `CMAKE_GENERATOR=Ninja` + `CL=/FS` and runs
+  `--features stt-vulkan`. If CI ever hits the MAX_PATH wall, add a short
+  `CARGO_TARGET_DIR` and update the staging-copy paths.
+
+- **Optional CUDA path (`--features stt-cuda`) — kept for local NVIDIA only:**
+  `nvcc` gates the MSVC host version in `crt/host_config.h`. This box has only
+  MSVC 14.50 (VS 2026, `_MSC_VER` 1950); CUDA 12.x rejects `>=1950`, **CUDA 13.2
+  accepts** (`<1960`). So a CUDA build must use 13.2, and **CUDA 13.2's `bin`
+  must be the first CUDA dir on PATH** (the VS-generator MSBuild CUDA
+  integration injects an include path from the first CUDA bin; a 12.x there
+  pulls its rejecting header even when nvcc is 13.2). That PATH entry also
+  supplies the load-time `cublas64_13.dll`. Auto-detects `sm_120a` (the 5090's
+  Blackwell arch — works where `ort`/Kokoro's prebuilt CUDA can't). This is why
+  `stt-cuda` is NOT the default or shipped: too much setup, not portable.
 - **What to check on bumps:** the `whisper-rs` API has shifted across releases
   (e.g. segment text moved to `WhisperState::get_segment(i).to_str_lossy()` in
   0.16). Re-verify `FullParams` / `WhisperContextParameters` / `WhisperState`

@@ -383,14 +383,18 @@ model — download one from
 A missing model launches normally; the record button reports "model not
 found" on first use and logs the expected path.
 
-**GPU.** The released portable zips run STT on CPU (a short utterance on
-`small` takes ~1–3 s) — the shipped binary is CPU-only so it runs on any
-machine. Local builds compile with GPU support **on by default** (`stt-cuda`
-feature) and use the GPU automatically, falling back to CPU if GPU init fails
-(`CCTTS_GPU=cpu` forces CPU). Building/running the GPU variant requires the
-CUDA 13.2 toolkit (12.x is incompatible with VS 2026's compiler) and CUDA
-13.2's `bin` on PATH; see `docs/MAINTENANCE.md`. For a portable CPU binary,
-build with `--no-default-features`.
+**GPU.** The released portable zip is **GPU-accelerated and portable at the
+same time**: it's built with whisper.cpp's Vulkan backend, so it automatically
+uses any GPU (NVIDIA, AMD, or Intel) and falls back to CPU on machines without
+one — the only requirement is `vulkan-1.dll`, which ships with Windows. Nothing
+to install. (`CCTTS_GPU=cpu` forces CPU; a short utterance on `small` is
+~1–3 s on CPU, well under a second on a GPU.)
+
+Building from source, the **default is CPU-only** (no GPU SDK needed). To build
+the GPU variant locally, compile `--features stt-vulkan` from a VS x64 Native
+Tools prompt with the Vulkan SDK installed — see `docs/MAINTENANCE.md`. An
+optional NVIDIA-only `stt-cuda` feature exists for maximum speed but isn't
+portable and isn't shipped.
 
 ## Configuring Tabs
 

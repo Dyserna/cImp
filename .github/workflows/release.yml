@@ -193,6 +193,12 @@ jobs:
           # MSVC dev-env step). CL=/FS serializes PDB writes under parallelism.
           CMAKE_GENERATOR: Ninja
           CL: /FS
+          # whisper.cpp's CMake auto-detects the ccache the runner ships and
+          # wraps the compiler with it. On the hosted runner those wrapped
+          # invocations return phantom cache *hits* — "success" without writing
+          # the .obj — so the ggml-base.lib link can't open ggml.c.obj (LNK1181).
+          # Disable ccache so every object is compiled and written fresh.
+          CCACHE_DISABLE: '1'
         # `--features stt-vulkan` builds the portable Vulkan GPU binary: it runs
         # on any GPU vendor and falls back to CPU when none is present (only
         # runtime dep is the system vulkan-1.dll — nothing bundled). Default is

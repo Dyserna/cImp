@@ -12,7 +12,10 @@ on every `v*.*.*` push. Layout:
 ```
 bin/
   cctts.exe
-  onnxruntime*.dll
+  onnxruntime*.dll      # usually none — ORT core is static-linked in the webgpu build
+  webgpu_dawn.dll       # WebGPU EP (Dawn) runtime — GPU TTS
+  dxcompiler.dll        #   "   (DirectX shader compiler Dawn uses for D3D12)
+  dxil.dll              #   "
 models/
   kokoro-v1.0.onnx
   voices/af_heart.bin
@@ -108,20 +111,39 @@ still launches; the record button surfaces an error on first use). The
 release-staging copy is guarded by `Test-Path` so a release can ship
 before the LFS blob is committed.
 
-## CUDA Runtime
+## TTS GPU — portable WebGPU (the released zip)
 
-`ort = 2.0.0-rc.11` (which wraps ORT 1.20.x) dynamically links the CUDA
-runtime when `CCTTS_GPU=cuda` is set. The bundled providers DLL references
-`cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`,
-and `cudnn64_9.dll` directly — distribution would need to either:
+The release builds Kokoro TTS with ONNX Runtime's **WebGPU** execution provider
+(`--features tts-webgpu`), the TTS analog of the STT Vulkan story below: one
+portable binary that uses any vendor's GPU and falls back to CPU.
 
-- Document a CUDA 12.x + cuDNN 9 install requirement (current README
-  approach), or
-- Bundle the CUDA redistributables. Bigger download but works out of the
-  box. NVIDIA's CUDA redist license allows redistribution of the runtime;
-  check the current EULA before shipping.
+- **Portable AND GPU-capable.** The WebGPU EP is Dawn-backed (D3D12 on Windows,
+  Vulkan on Linux, Metal on macOS). The only bundled runtime deps are three Dawn
+  dylibs staged into `bin/`: `webgpu_dawn.dll`, `dxcompiler.dll`, `dxil.dll`. No
+  CUDA DLLs, no redistributables, no SDK. `ort`'s `download-binaries` static-links
+  core ONNX Runtime into `cctts.exe`, so there is usually no `onnxruntime.dll`.
+- **GPU by default with CPU fallback** (`tts/engine.rs` registers WebGPU then
+  falls back; `CCTTS_GPU=cpu` forces CPU) — same model as STT. Validated ~5×
+  faster than CPU and correct on Kokoro, including the `ConvTranspose` that broke
+  the DirectML EP. See `docs/features/FEATURE-tts-webgpu.md`.
+- **No extra build toolchain.** Unlike `stt-vulkan`, the WebGPU EP is a prebuilt
+  — no Vulkan SDK / Ninja / MSVC-generator needed for the TTS half.
+- The release staging step **fails the build** if any of the three Dawn dylibs is
+  missing from the build output, so a GPU-less zip never ships silently.
 
-CPU-only is the default and needs no extra runtime.
+## CUDA Runtime (optional `tts-cuda` only — not shipped)
+
+GPU TTS via CUDA is now an **optional, non-default compile-time feature**
+(`--features tts-cuda`), mutually exclusive with `tts-webgpu` (`ort` has no
+prebuilt combining both). It is **not shipped** — the release uses `tts-webgpu`,
+which already covers NVIDIA. Kept only for local NVIDIA experiments. A `tts-cuda`
+binary dynamically links the CUDA runtime: `ort = 2.0.0-rc.11` (ORT 1.20.x)'s
+providers DLL references `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`,
+`cufft64_11.dll`, and `cudnn64_9.dll`, so such a build would need a CUDA 12.x +
+cuDNN 9 install (and is broken on Blackwell — see MAINTENANCE.md). This is exactly
+why WebGPU is the shipped path instead.
+
+CPU-only is the default feature set and needs no extra runtime.
 
 ## STT GPU — portable Vulkan (the released zip)
 

@@ -246,9 +246,32 @@ These build on the V6-01 offline speech-to-text milestone (`docs/MILESTONE-V6-01
 - **Trigger to act:** if anyone besides the dev box reports the "registered but no audio" symptom on Blackwell, OR when `ort` upgrades to a version that adds new GPU support and we want the probe to handle the next-gen-GPU regression class generally.
 - **Related:** `MAINTENANCE.md` "ort / ONNX Runtime" entry tracks the underlying ORT 1.20 + Blackwell mismatch.
 
+## Unify TTS and STT on one inference runtime (ORT + WebGPU) — DECIDED: not now
+
+- **Decision (2026-06-15):** **No-go for the foreseeable future. STT stays on `whisper-rs`/whisper.cpp + ggml-Vulkan.** It was just shipped (V6-01), it's fast and accurate, and because ggml's Vulkan backend is already cross-platform, **Linux is not blocked** by leaving STT where it is. Revisit only if a real issue forces it — provisionally re-evaluate in a couple of months once TTS-on-WebGPU has proven the native EP is solid on real hardware.
+- **What it would be:** the only viable convergence point is **ONNX Runtime + WebGPU**, not ggml. Kokoro has no mature ggml port (so TTS can't move to STT's stack), but Whisper exports cleanly to ONNX — including an all-in-one encoder+decoder+beam-search graph — and Whisper-on-WebGPU is heavily proven via Transformers.js / onnxruntime-web. So unifying means **STT migrates onto `ort`**, dropping whisper.cpp, after TTS adopts WebGPU.
+- **Why it's tempting:** one inference runtime and one GPU backend for both subsystems; and — the strongest pull — it **deletes the entire `stt-vulkan` build saga** (Vulkan SDK + forced Ninja generator + MAX_PATH wall + compiling whisper.cpp from source; see `MAINTENANCE.md`). The ORT WebGPU prebuilt erases all of that.
+- **Why we're not doing it:** whisper.cpp is batteries-included and `stt/engine.rs` leans on all of it — mel preprocessing, the encoder→decoder loop, greedy/beam decoding, language auto-detect, segment assembly. ONNX Whisper gives a graph, not a pipeline: you'd either drive the all-in-one beam-search export (whose `BeamSearch` is a contrib op that historically runs on **CPU**, so it's not a cleanly all-GPU path) or re-own the decode loop in Rust. That's real new surface area traded for runtime symmetry, against a working, proven STT path. The native (non-browser) WebGPU EP running the merged model fully on GPU is also less proven than the browser path. Net: not worth regressing a good STT path purely for "same tech."
+- **Note:** operationally the two **already converge on Vulkan under Linux** once TTS adopts WebGPU (Dawn for TTS, ggml for STT) — the portability/packaging story is unified even with different runtimes. Sharing the literal same runtime crate is mostly internal-tidiness, not a user-facing win.
+- **Trigger to act:** if the whisper.cpp Vulkan build toolchain becomes a recurring CI/maintenance burden (the saga keeps biting on bumps), OR a concrete STT issue on the current stack forces a rethink — and only after TTS-on-WebGPU has demonstrated the native EP is reliable enough to bet STT on. Sequence is fixed: TTS to WebGPU first, STT migration as a gated follow-on, never the reverse.
+
 ---
 
 # 3. Done / historical
+
+## ~~Portable GPU TTS via the ONNX Runtime WebGPU EP~~ — shipped (replaces the CUDA-only TTS opt-in)
+
+Kokoro TTS now runs on ONNX Runtime's native **WebGPU EP** (Dawn-backed → D3D12 on
+Windows, Vulkan on Linux, Metal on macOS) via the `tts-webgpu` Cargo feature,
+which the release builds (`--features stt-vulkan,tts-webgpu`). Portable and
+vendor-agnostic with automatic CPU fallback, mirroring `stt-vulkan`. Validated
+2026-06-15 on Blackwell (RTX 5090): correct output, genuinely on-GPU, ~5× faster
+than CPU, and it runs the `ConvTranspose` that broke DirectML. The old runtime
+`CCTTS_GPU=cuda` opt-in is gone; CUDA survives only as the optional, non-default,
+mutually-exclusive `tts-cuda` build (NVIDIA-only, not shipped). Implementation and
+the Phase 0 validation results: `docs/features/FEATURE-tts-webgpu.md`; dependency
+notes in `MAINTENANCE.md`; packaging (Dawn dylibs) in `PACKAGING.md`. The separate
+"unify STT onto the same runtime" question remains explicitly deferred — see § 2.
 
 ## ~~Aider TTS markup injection~~ — superseded by Aider removal (V1.4-07 / v1.3.3)
 

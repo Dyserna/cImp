@@ -1,6 +1,6 @@
 [package]
 name = "cctts"
-version = "0.10.0"
+version = "0.11.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
@@ -30,6 +30,24 @@ stt-vulkan = ["whisper-rs/vulkan"]
 # time — on this box CUDA 13.2 specifically, with 13.2's bin first on PATH (see
 # docs/MAINTENANCE.md). Build with `--features stt-cuda`.
 stt-cuda = ["whisper-rs/cuda"]
+
+# GPU-accelerated TTS (Kokoro) via ONNX Runtime's WebGPU execution provider
+# (Dawn-backed: D3D12 on Windows, Vulkan on Linux, Metal on macOS). Like
+# `stt-vulkan` this is PORTABLE and vendor-agnostic — runs on any NVIDIA/AMD/
+# Intel GPU and falls back to CPU when none is usable (see tts/engine.rs). The
+# only added runtime deps are the bundled Dawn dylibs (webgpu_dawn.dll +
+# dxcompiler.dll + dxil.dll on Windows). Validated ~5x faster than CPU and
+# correct on Kokoro incl. the ConvTranspose that broke DirectML — see
+# docs/features/FEATURE-tts-webgpu.md. This is what the RELEASE ships for TTS.
+# Unlike `stt-vulkan` it needs NO Vulkan SDK / Ninja at build time (prebuilt).
+tts-webgpu = ["ort/webgpu"]
+
+# Optional NVIDIA-only TTS GPU path. Works on Pascal..Ada but is broken on
+# Blackwell (sm_120) with ORT 1.20's prebuilt, and is NOT portable (imports
+# CUDA DLLs). MUTUALLY EXCLUSIVE with `tts-webgpu`: `ort` has no prebuilt that
+# combines `cuda`+`webgpu`, so enabling both downloads a CPU-only ORT and
+# silently disables the GPU. Pick exactly one. Build with `--features tts-cuda`.
+tts-cuda = ["ort/cuda"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -65,7 +83,10 @@ nvml-wrapper = "0.12"
 # TTS (Kokoro via ONNX Runtime). misaki-rs default features include espeak-ng
 # fallback for OOV words; the resulting binary is GPLv3 (see NOTICE).
 misaki-rs = "0.3"
-ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "cuda"] }
+# SPIKE (Phase 0, tts-webgpu): swapped `cuda` -> `webgpu`. cuda+webgpu can't
+# share a prebuilt (falls back to CPU-only), so the spike drops cuda to test the
+# WebGPU EP for real. Revert to `cuda` if the spike fails.
+ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "webgpu"] }
 ndarray = "0.16"
 bytemuck = "1"
 

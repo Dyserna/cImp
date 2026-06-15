@@ -4,11 +4,16 @@ Living list of dependencies and runtime concerns to revisit periodically. Each i
 
 ## Dependencies to track
 
-### `ort` / ONNX Runtime — GPU EPs are unusable for Kokoro on this dev box
+### `ort` / ONNX Runtime — GPU TTS via the WebGPU EP (shipped); CUDA broken on Blackwell
 
-- **Current pin:** `ort = "=2.0.0-rc.11"` (`src-tauri/Cargo.toml`), which wraps **ORT 1.20.x** prebuilt against **CUDA 12.x + cuDNN 9**. Hard-linked to CUDA major 12: the bundled `onnxruntime_providers_cuda.dll` references `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`, and `cudnn64_9.dll` directly. CUDA 13.x will not load at all with this version.
+- **Current pin:** `ort = "=2.0.0-rc.11"` (`src-tauri/Cargo.toml`), `features = ["download-binaries"]` + a per-build GPU feature (below). Wraps **ORT 1.20.x**. The optional `cuda` prebuilt is hard-linked to CUDA major 12 (`onnxruntime_providers_cuda.dll` references `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`, `cudnn64_9.dll`); CUDA 13.x won't load with this version.
 
-- **Default runtime is CPU.** Kokoro is small enough to run near real-time on CPU. GPU EPs are opt-in via `CCTTS_GPU=cuda` env var. DirectML support was removed from the build (the `directml` ort feature is **not** enabled in `Cargo.toml`).
+- **IMPLEMENTED — `tts-webgpu` is the shipped GPU TTS backend.** Kokoro runs on ONNX Runtime's native **WebGPU EP** (Dawn-backed → D3D12 on Windows, Vulkan on Linux, Metal on macOS). Validated on the dev box (RTX 5090 / Blackwell) 2026-06-15: correct output matching the CPU reference, genuinely on-GPU (ORT node-placement logs show WebGPU shader programs for every op, incl. the `ConvTranspose2D` that broke DirectML), **~5× faster than CPU** at steady state. Wired in `tts/engine.rs` as GPU-by-default with automatic CPU fallback, `CCTTS_GPU=cpu` forces CPU — mirrors `stt/engine.rs`. Runtime deps: three Dawn dylibs (`webgpu_dawn.dll`, `dxcompiler.dll`, `dxil.dll`) staged into the zip by `release.yml`; `download-binaries` static-links core ONNX Runtime into `cctts.exe` (no `onnxruntime.dll`). Full write-up: `docs/features/FEATURE-tts-webgpu.md`.
+
+- **GPU backend is a compile-time feature; default is CPU.** Kokoro is near-real-time on CPU, so the default feature set has **no** GPU EP (routine `cargo build`/test/rust-analyzer pull the CPU-only ORT prebuilt, no GPU SDK). GPU is opt-in at build time, exactly mirroring STT:
+  - **`tts-webgpu` (shipped, portable, any vendor)** — `["ort/webgpu"]`. The release builds `--features stt-vulkan,tts-webgpu`.
+  - **`tts-cuda` (optional, NVIDIA-only, not shipped)** — `["ort/cuda"]`. **Mutually exclusive with `tts-webgpu`**: `ort` has no `cuda`+`webgpu` prebuilt, so enabling both silently downloads a CPU-only ORT. Broken on Blackwell (below).
+  - DirectML was evaluated and rejected (Windows-only D3D12, and ORT 1.20's DML EP rejects Kokoro's `ConvTranspose`); the `directml` feature is not enabled.
 
 - **Failure matrix** (investigated 2026-05-02 on RTX 5090, driver 596.21, CUDA toolkits 12.2 & 12.9, cuDNN 9.21):
 
@@ -18,13 +23,15 @@ Living list of dependencies and runtime concerns to revisit periodically. Each i
   | DirectML | `ConvTranspose` E_INVALIDARG (0x80070057) on `/encoder/F0.1/pool/ConvTranspose` | ORT 1.20's DML EP rejects Kokoro's F0-decoder ConvTranspose parameters. No useful config knob; not GPU-specific (DML is broken for this model on any DX12 GPU). |
   | CPU | works | — |
 
-- **CUDA opt-in is left available** because the same `cuda` ort feature is expected to work on Pascal/Volta/Turing/Ampere/Ada NVIDIA cards (anything with a cubin shipped in ORT 1.20). Users on those cards can `setx CCTTS_GPU cuda` and restart. On Blackwell, expect per-segment `cudaErrorSymbolNotFound` errors and silent output — see FEATURES.md for the auto-detection enhancement.
+- **Why the failure matrix no longer bites us:** `tts-webgpu` sidesteps both broken EPs — it runs on Blackwell where the CUDA prebuilt can't, and it runs the `ConvTranspose` that DirectML rejects. The matrix above is retained as the rationale for *why* WebGPU is the shipped path. The optional `tts-cuda` build still inherits the CUDA row's Blackwell breakage (per-segment `cudaErrorSymbolNotFound`, silent output) — it's expected to work only on Pascal..Ada, which is why it's neither default nor shipped. See `FEATURE-gpu-robustness.md` for the (still-relevant) CC pre-flight idea for `tts-cuda` users.
 
 - **What to check for on `ort` updates:**
-  - A newer `ort` release wrapping ORT 1.21+ — likely fixes both EPs at once: 1.21 adds Blackwell sm_120 cubins to the CUDA prebuilt, and updates DML's ConvTranspose validator. Watch <https://github.com/pykeio/ort/releases> and <https://crates.io/crates/ort>.
+  - The WebGPU EP is flagged **experimental** upstream. On an `ort` bump, re-run the `tts-webgpu` smoke test (`cargo test --features tts-webgpu --bin cctts -- --ignored --nocapture synthesizes`) to confirm Kokoro still produces correct audio and stays on-GPU. Watch <https://github.com/pykeio/ort/releases> and <https://crates.io/crates/ort>.
+  - A newer `ort` wrapping ORT 1.21+ may fix the CUDA EP for Blackwell (1.21 adds sm_120 cubins) — relevant only for the optional `tts-cuda` build.
+  - Watch whether the Dawn dylib set (`webgpu_dawn.dll`/`dxcompiler.dll`/`dxil.dll`) changes — if so, update the staging list in `release.yml` (both zip variants) and the layout in `PACKAGING.md`.
   - Upstream ORT release notes: <https://github.com/microsoft/onnxruntime/releases>.
 
-- **When to act:** any time `ort` bumps. After bumping: re-test `CCTTS_GPU=cuda` on the 5090 (expect Blackwell to work in 1.21+); re-test DirectML by re-adding `directml` to ort features and registering it; if DML works for Kokoro again, consider making it the default GPU path on Windows since it's vendor-agnostic.
+- **Open follow-ups (not blocking):** validate `tts-webgpu` on a non-NVIDIA GPU (AMD/Intel) when one is available; the cold-start one-time Dawn shader-compile cost (~1.3 s on first synth, paid once by the long-lived engine); and surfacing the active TTS backend in the UI (currently log-only, matching STT — see `FEATURE-tts-webgpu.md` Phase 4). Cross-platform/Linux rationale and the "STT stays on whisper.cpp — do NOT unify runtimes yet" decision live in `FUTURE-FEATURES.md`.
 
 ### `whisper-rs` / whisper.cpp — STT build toolchain (V6-01)
 

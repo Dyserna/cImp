@@ -199,13 +199,19 @@ jobs:
           # the .obj — so the ggml-base.lib link can't open ggml.c.obj (LNK1181).
           # Disable ccache so every object is compiled and written fresh.
           CCACHE_DISABLE: '1'
-        # `--features stt-vulkan` builds the portable Vulkan GPU binary: it runs
-        # on any GPU vendor and falls back to CPU when none is present (only
-        # runtime dep is the system vulkan-1.dll — nothing bundled). Default is
-        # CPU-only, so this flag is what ships GPU in the zip. (VULKAN_SDK is set
-        # by the Install Vulkan SDK step. CARGO_TARGET_DIR=C:\b is job-level.)
+        # Portable GPU build for BOTH subsystems:
+        #  - `stt-vulkan` — whisper.cpp's Vulkan backend (only runtime dep is the
+        #    system vulkan-1.dll; needs the Vulkan SDK + MSVC dev-env at build).
+        #  - `tts-webgpu` — Kokoro on ONNX Runtime's WebGPU EP (Dawn-backed). A
+        #    PREBUILT, so it needs NO Vulkan SDK / Ninja; its runtime deps are the
+        #    bundled Dawn dylibs staged below. ~5x faster than CPU and works where
+        #    CUDA can't (incl. Blackwell) — see docs/features/FEATURE-tts-webgpu.md.
+        # Both run on any GPU vendor and fall back to CPU when none is present.
+        # Default is CPU-only, so these flags are what ship GPU in the zip.
+        # (VULKAN_SDK is set by the Install Vulkan SDK step. CARGO_TARGET_DIR=C:\b
+        # is job-level.) NOTE: tts-webgpu and tts-cuda are mutually exclusive.
         run: |
-          npm run tauri build -- --no-bundle --features stt-vulkan
+          npm run tauri build -- --no-bundle --features stt-vulkan,tts-webgpu
 
       - name: Stage portable layouts (full + no-models)
         shell: pwsh
@@ -218,10 +224,24 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stageFull/models/voices" | Out-Null
 
           # cctts.exe + ORT runtime DLLs (the `ort` crate's download-binaries
-          # feature drops these into target/release at build time).
+          # feature drops these into target/release at build time). With the
+          # tts-webgpu prebuilt the core ONNX Runtime is static-linked into
+          # cctts.exe, so this glob usually matches nothing today — kept for
+          # forward-compat in case ort ships a dynamic onnxruntime.dll again.
           Copy-Item $env:CARGO_TARGET_DIR/release/cctts.exe "$stageFull/bin/"
           Get-ChildItem $env:CARGO_TARGET_DIR/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageFull/bin/" }
+
+          # WebGPU EP (tts-webgpu) runtime: the Dawn backend + the DirectX shader
+          # compiler it uses for D3D12. copy-dylibs drops these next to the exe.
+          # All three are REQUIRED for GPU TTS — without them the WebGPU EP fails
+          # to init and TTS silently falls back to CPU. Fail the build if missing
+          # so a broken GPU zip never ships.
+          foreach ($d in @('webgpu_dawn.dll','dxcompiler.dll','dxil.dll')) {
+            $src = "$env:CARGO_TARGET_DIR/release/$d"
+            if (Test-Path $src) { Copy-Item $src "$stageFull/bin/" }
+            else { Write-Host "::error::WebGPU runtime DLL missing from build output: $d"; exit 1 }
+          }
 
           # Prompt-detection patterns. Ships next to cctts.exe (the loader
           # reads <exe-dir>/patterns.json) so it's present and editable on a
@@ -296,6 +316,14 @@ jobs:
           Copy-Item $env:CARGO_TARGET_DIR/release/cctts.exe "$stageSlim/bin/"
           Get-ChildItem $env:CARGO_TARGET_DIR/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageSlim/bin/" }
+
+          # WebGPU EP (tts-webgpu) runtime DLLs — same set as the full variant
+          # (see that block's note). Required for GPU TTS; fail if missing.
+          foreach ($d in @('webgpu_dawn.dll','dxcompiler.dll','dxil.dll')) {
+            $src = "$env:CARGO_TARGET_DIR/release/$d"
+            if (Test-Path $src) { Copy-Item $src "$stageSlim/bin/" }
+            else { Write-Host "::error::WebGPU runtime DLL missing from build output: $d"; exit 1 }
+          }
 
           Copy-Item -Recurse avatars/* "$stageSlim/avatars/"
           Copy-Item -Recurse sprites/* "$stageSlim/sprites/"

@@ -218,6 +218,24 @@ Items deferred during v1.2 design that didn't get picked up in v1.3:
 - **Cost:** Small. Append-to-ring-buffer in memory; persist last N (e.g., 100) entries to settings or a sidecar file. Settings dialog gains a "Subprocess log" tab.
 - **Trigger to act:** if a shell tab has flaky behavior and you wish you had a record.
 
+## V6 (speech) follow-ups
+
+These build on the V6-01 offline speech-to-text milestone (`docs/MILESTONE-V6-01-speech-to-text.md` — record button + push-to-talk dictation into the compose overlay, whisper.cpp, portable Vulkan GPU). They escalate that pipeline rather than start fresh.
+
+### No-hands mode (always-on voice control)
+
+> **Design status: broad sketch.** The specifics below — the wake phrase, the command vocabulary, which overlay actions are voiceable — are an *illustration of the idea*, not a spec. They will almost certainly change if/when this is built. Recorded now so the direction and its real costs are captured while V6-01 is fresh.
+
+- **What:** A fully hands-free mode. Speech-to-text is armed continuously instead of held on a key. A **wake phrase** (sketch: "ok, claude") opens the compose overlay and starts capturing dictation; a small set of **spoken commands** drive the overlay instead of the keyboard — e.g. "accept composition" / "send it" acts like pressing Enter (submit), "cancel" closes the overlay, "new line" inserts a break, "scratch that" clears. The user dictates a message and sends it to Claude without touching the keyboard at all. This is the natural escalation of V6-01 from *press-to-talk* to *just-talk*.
+- **Why:** True hands-free operation. Two real drivers: **accessibility** (RSI, motor impairment, anyone for whom the keyboard is the barrier) and **ergonomics/ambient use** (dictating while pacing, reading something else, or away from the keys). V6-01 already shipped the hard half — offline transcription, the capture thread, the compose overlay, the `sttState` indicator, and the push-to-talk state machine. No-hands mode is the controller that sits on top of all of it. Since cctts is *already* a voice-forward app (it speaks Claude's replies via TTS), closing the loop so the user can also *speak* to Claude is the coherent end state.
+- **Cost:** Substantial — and it's not one feature, it's several distinct hard problems, only the last of which V6-01 already solved:
+  - **Low-power always-on capture.** whisper.cpp is a *batch* transcriber, not a streaming/always-listening engine. Running it continuously over the live mic is exactly the constant GPU/CPU burn (and fan noise) we just worked to avoid. Need a cheap front gate: **voice-activity detection** (Silero VAD / WebRTC VAD) so whisper only wakes on speech, and ideally a dedicated **wake-word model** (openWakeWord, Porcupine) so the heavy transcriber runs *only after* the wake phrase fires. That's a new dependency category (VAD / wake-word), separate from whisper, and the gating logic is the bulk of the work. **This is the prerequisite** — without it the feature reintroduces the always-hot-GPU problem.
+  - **Self-trigger / echo.** The avatar speaks Claude's replies through the same machine's speakers. An always-hot mic will hear that TTS and can self-trigger the wake word (Claude literally saying "ok" wakes itself) or capture its own voice as dictation. Needs either acoustic echo cancellation or — simpler — gating STT while TTS is playing. The feedback loop is a genuine hazard, not an edge case.
+  - **Command-vs-dictation disambiguation.** Once capturing, the system must distinguish "text the user wants typed" from "a command to execute." If "cancel" is both a command *and* a word someone might dictate, you have a problem. Options, all with trade-offs: a reserved command grammar matched post-transcription; a command prefix ("claude, send"); a separate command mode toggled by phrase. This ambiguity is the core UX problem and the main reason the example commands "will probably change."
+  - **Listening-state machine + trust UI.** A clear model — asleep → wake-detected → dictating → command → action — with an always-visible indicator of whether the mic is hot. An always-listening microphone is a materially different privacy posture than push-to-talk: it needs an obvious on/off and a prominent live indicator (extend the existing status-bar record button / `sttState` store), and must stay **fully offline** like the rest of V6-01. This is as much a trust feature as a technical one.
+  - **Action mapping (the cheap part).** The spoken commands map onto surface that already exists — `submit_compose` / `cancel_compose` in the shortcut dispatcher, and the compose overlay's own edit operations. So once a command is *recognized*, firing it is nearly free. The expense is entirely in the recognition + gating layers above.
+- **Trigger to act:** a concrete accessibility need (a user who genuinely can't drive the keyboard) is the strongest. Otherwise: once V6-01 dictation sees enough real use that reaching for push-to-talk becomes the friction. **Gated on first solving low-power always-on capture** (VAD/wake-word) — don't start here until that prerequisite is in hand, or the feature undoes the GPU/fan work from V6-01.
+
 ## Auto-detect Blackwell (or any unsupported GPU) and gracefully skip CUDA opt-in
 
 - **What:** When `CCTTS_GPU=cuda` is set, probe the GPU compute capability before registering the CUDA EP. If the CC is unsupported by the bundled ORT prebuilt (currently sm_120 / Blackwell), log a clear warning and fall back to CPU instead of letting the user see per-segment `cudaErrorSymbolNotFound` errors and silent output.
@@ -228,9 +246,32 @@ Items deferred during v1.2 design that didn't get picked up in v1.3:
 - **Trigger to act:** if anyone besides the dev box reports the "registered but no audio" symptom on Blackwell, OR when `ort` upgrades to a version that adds new GPU support and we want the probe to handle the next-gen-GPU regression class generally.
 - **Related:** `MAINTENANCE.md` "ort / ONNX Runtime" entry tracks the underlying ORT 1.20 + Blackwell mismatch.
 
+## Unify TTS and STT on one inference runtime (ORT + WebGPU) — DECIDED: not now
+
+- **Decision (2026-06-15):** **No-go for the foreseeable future. STT stays on `whisper-rs`/whisper.cpp + ggml-Vulkan.** It was just shipped (V6-01), it's fast and accurate, and because ggml's Vulkan backend is already cross-platform, **Linux is not blocked** by leaving STT where it is. Revisit only if a real issue forces it — provisionally re-evaluate in a couple of months once TTS-on-WebGPU has proven the native EP is solid on real hardware.
+- **What it would be:** the only viable convergence point is **ONNX Runtime + WebGPU**, not ggml. Kokoro has no mature ggml port (so TTS can't move to STT's stack), but Whisper exports cleanly to ONNX — including an all-in-one encoder+decoder+beam-search graph — and Whisper-on-WebGPU is heavily proven via Transformers.js / onnxruntime-web. So unifying means **STT migrates onto `ort`**, dropping whisper.cpp, after TTS adopts WebGPU.
+- **Why it's tempting:** one inference runtime and one GPU backend for both subsystems; and — the strongest pull — it **deletes the entire `stt-vulkan` build saga** (Vulkan SDK + forced Ninja generator + MAX_PATH wall + compiling whisper.cpp from source; see `MAINTENANCE.md`). The ORT WebGPU prebuilt erases all of that.
+- **Why we're not doing it:** whisper.cpp is batteries-included and `stt/engine.rs` leans on all of it — mel preprocessing, the encoder→decoder loop, greedy/beam decoding, language auto-detect, segment assembly. ONNX Whisper gives a graph, not a pipeline: you'd either drive the all-in-one beam-search export (whose `BeamSearch` is a contrib op that historically runs on **CPU**, so it's not a cleanly all-GPU path) or re-own the decode loop in Rust. That's real new surface area traded for runtime symmetry, against a working, proven STT path. The native (non-browser) WebGPU EP running the merged model fully on GPU is also less proven than the browser path. Net: not worth regressing a good STT path purely for "same tech."
+- **Note:** operationally the two **already converge on Vulkan under Linux** once TTS adopts WebGPU (Dawn for TTS, ggml for STT) — the portability/packaging story is unified even with different runtimes. Sharing the literal same runtime crate is mostly internal-tidiness, not a user-facing win.
+- **Trigger to act:** if the whisper.cpp Vulkan build toolchain becomes a recurring CI/maintenance burden (the saga keeps biting on bumps), OR a concrete STT issue on the current stack forces a rethink — and only after TTS-on-WebGPU has demonstrated the native EP is reliable enough to bet STT on. Sequence is fixed: TTS to WebGPU first, STT migration as a gated follow-on, never the reverse.
+
 ---
 
 # 3. Done / historical
+
+## ~~Portable GPU TTS via the ONNX Runtime WebGPU EP~~ — shipped (replaces the CUDA-only TTS opt-in)
+
+Kokoro TTS now runs on ONNX Runtime's native **WebGPU EP** (Dawn-backed → D3D12 on
+Windows, Vulkan on Linux, Metal on macOS) via the `tts-webgpu` Cargo feature,
+which the release builds (`--features stt-vulkan,tts-webgpu`). Portable and
+vendor-agnostic with automatic CPU fallback, mirroring `stt-vulkan`. Validated
+2026-06-15 on Blackwell (RTX 5090): correct output, genuinely on-GPU, ~5× faster
+than CPU, and it runs the `ConvTranspose` that broke DirectML. The old runtime
+`CCTTS_GPU=cuda` opt-in is gone; CUDA survives only as the optional, non-default,
+mutually-exclusive `tts-cuda` build (NVIDIA-only, not shipped). Implementation and
+the Phase 0 validation results: `docs/features/FEATURE-tts-webgpu.md`; dependency
+notes in `MAINTENANCE.md`; packaging (Dawn dylibs) in `PACKAGING.md`. The separate
+"unify STT onto the same runtime" question remains explicitly deferred — see § 2.
 
 ## ~~Aider TTS markup injection~~ — superseded by Aider removal (V1.4-07 / v1.3.3)
 

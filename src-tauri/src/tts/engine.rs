@@ -5,15 +5,44 @@
 
 use std::path::Path;
 
-use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider};
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::execution_providers::{CPUExecutionProvider, ExecutionProvider};
+use ort::session::{builder::GraphOptimizationLevel, builder::SessionBuilder, Session};
 use ort::value::Tensor;
+#[cfg(feature = "tts-webgpu")]
+use ort::execution_providers::WebGPUExecutionProvider;
+#[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
+use ort::execution_providers::CUDAExecutionProvider;
 
 use crate::error::{AppError, AppResult};
 use crate::tts::phonemize::Phonemizer;
 use crate::tts::voice::VoicePack;
 
 pub const SAMPLE_RATE: u32 = 24_000;
+
+/// Label for the compiled GPU backend, used when a GPU EP registers. The
+/// backend is a compile-time choice (mutually-exclusive `tts-webgpu` /
+/// `tts-cuda` Cargo features); only one of these consts exists per build.
+#[cfg(feature = "tts-webgpu")]
+const GPU_BACKEND: &str = "GPU (WebGPU)";
+#[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
+const GPU_BACKEND: &str = "GPU (CUDA)";
+
+/// Register the compiled GPU execution provider. Exactly one EP is selected at
+/// compile time; `tts-webgpu` wins if both features are (mis)configured on.
+#[cfg(any(feature = "tts-webgpu", feature = "tts-cuda"))]
+fn register_gpu_ep(builder: &mut SessionBuilder) -> AppResult<()> {
+    let result = {
+        #[cfg(feature = "tts-webgpu")]
+        {
+            WebGPUExecutionProvider::default().register(builder)
+        }
+        #[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
+        {
+            CUDAExecutionProvider::default().register(builder)
+        }
+    };
+    result.map_err(|e| AppError::Tts(format!("GPU EP register: {e}")))
+}
 
 /// Engine-level synthesis request. Distinct from the worker-channel
 /// [`crate::tts::TtsRequest`] (which carries a `TabId` for active-tab
@@ -49,35 +78,7 @@ impl TtsEngine {
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| AppError::Tts(format!("opt level: {e}")))?;
 
-        // CPU is the default; opt in to CUDA via `CCTTS_GPU=cuda`. The CUDA
-        // path works on Pascal/Volta/Turing/Ampere/Ada NVIDIA cards but is
-        // broken on Blackwell (sm_120) with ORT 1.20's prebuilt — see
-        // MAINTENANCE.md. Re-test both EPs when `ort` bumps to ORT 1.21+.
-        let bound_ep = match std::env::var("CCTTS_GPU").ok().as_deref() {
-            Some("cuda") => match CUDAExecutionProvider::default().register(&mut builder) {
-                Ok(()) => "GPU (CUDA)",
-                Err(e) => {
-                    tracing::warn!(error = %e, "CUDA EP unavailable; falling back to CPU");
-                    CPUExecutionProvider::default()
-                        .register(&mut builder)
-                        .map_err(|e| AppError::Tts(format!("CPU EP register: {e}")))?;
-                    "CPU"
-                }
-            },
-            Some(other) if !other.is_empty() => {
-                tracing::warn!(value = %other, "unknown CCTTS_GPU value; using CPU");
-                CPUExecutionProvider::default()
-                    .register(&mut builder)
-                    .map_err(|e| AppError::Tts(format!("CPU EP register: {e}")))?;
-                "CPU"
-            }
-            _ => {
-                CPUExecutionProvider::default()
-                    .register(&mut builder)
-                    .map_err(|e| AppError::Tts(format!("CPU EP register: {e}")))?;
-                "CPU"
-            }
-        };
+        let bound_ep = Self::register_execution_provider(&mut builder)?;
 
         let session = builder
             .commit_from_file(model_path)
@@ -95,6 +96,43 @@ impl TtsEngine {
             phonemizer,
             speed: 1.0,
         })
+    }
+
+    /// Register the execution provider and return its label. When a GPU backend
+    /// is compiled in (`tts-webgpu` / `tts-cuda`), the GPU is the default and we
+    /// fall back to CPU automatically if its registration fails (no usable GPU,
+    /// driver issue, …) — so the same binary runs everywhere, mirroring
+    /// `stt/engine.rs`. `CCTTS_GPU=cpu` forces CPU. Built with no GPU feature,
+    /// this is always CPU.
+    ///
+    /// NB: a successful GPU registration means the EP is *active*, not that
+    /// every op runs on the GPU — the WebGPU EP can place unsupported ops on CPU.
+    #[cfg(any(feature = "tts-webgpu", feature = "tts-cuda"))]
+    fn register_execution_provider(builder: &mut SessionBuilder) -> AppResult<&'static str> {
+        if std::env::var("CCTTS_GPU").as_deref() == Ok("cpu") {
+            Self::register_cpu(builder)?;
+            return Ok("CPU (forced)");
+        }
+        match register_gpu_ep(builder) {
+            Ok(()) => Ok(GPU_BACKEND),
+            Err(e) => {
+                tracing::warn!(error = %e, "TTS GPU EP unavailable; falling back to CPU");
+                Self::register_cpu(builder)?;
+                Ok("CPU (GPU fallback)")
+            }
+        }
+    }
+
+    #[cfg(not(any(feature = "tts-webgpu", feature = "tts-cuda")))]
+    fn register_execution_provider(builder: &mut SessionBuilder) -> AppResult<&'static str> {
+        Self::register_cpu(builder)?;
+        Ok("CPU")
+    }
+
+    fn register_cpu(builder: &mut SessionBuilder) -> AppResult<()> {
+        CPUExecutionProvider::default()
+            .register(builder)
+            .map_err(|e| AppError::Tts(format!("CPU EP register: {e}")))
     }
 
     /// Reload the voicepack from disk. Used by the worker on a settings
@@ -153,5 +191,70 @@ impl TtsEngine {
             samples: samples.to_vec(),
             sample_rate: SAMPLE_RATE,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end synthesis smoke test on whatever EP is compiled in (CPU by
+    /// default; `GPU (WebGPU)` under `--features tts-webgpu`). Asserts the model
+    /// loads and produces real (non-silent) audio — the failure mode for an
+    /// unsupported-op silent fallback or a broken ConvTranspose is silence/
+    /// garbage. Ignored by default: needs the model files under `<repo>/models`
+    /// and, on a GPU build, pulls the GPU.
+    ///
+    /// Run:        `cargo test --bin cctts [--features tts-webgpu] -- --ignored --nocapture synthesizes`
+    /// CPU baseline: prefix with `CCTTS_GPU=cpu`.
+    #[test]
+    #[ignore]
+    fn synthesizes() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
+            )
+            .with_test_writer()
+            .try_init();
+
+        // <repo>/models — CARGO_MANIFEST_DIR is src-tauri.
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri has a parent");
+        let model = repo.join("models").join(crate::tts::MODEL_FILE);
+        let voice = repo
+            .join("models")
+            .join("voices")
+            .join(format!("{}.bin", crate::tts::DEFAULT_VOICE));
+        assert!(model.exists(), "model missing at {}", model.display());
+        assert!(voice.exists(), "voice missing at {}", voice.display());
+
+        // The bound EP is logged by `TtsEngine::new` ("TTS engine ready
+        // bound=…"); the tracing subscriber above surfaces it under --nocapture.
+        let mut engine = TtsEngine::new(&model, &voice).expect("engine init");
+
+        let text = "Hello world. This is a text to speech test.";
+        // First synth pays one-time shader compilation on GPU backends; the
+        // long-lived engine warms once, so this also exercises that path.
+        let t = std::time::Instant::now();
+        let resp = engine
+            .synthesize(SynthesisRequest { text: text.into(), request_id: 1 })
+            .expect("synthesis");
+        let synth_ms = t.elapsed().as_millis();
+
+        let n = resp.samples.len();
+        let peak = resp.samples.iter().fold(0f32, |m, &s| m.max(s.abs()));
+        let rms = if n > 0 {
+            (resp.samples.iter().map(|s| s * s).sum::<f32>() / n as f32).sqrt()
+        } else {
+            0.0
+        };
+        let dur_s = n as f32 / resp.sample_rate as f32;
+        eprintln!("=== samples: {n} ({dur_s:.2}s audio) | first synth {synth_ms} ms | peak {peak:.4} | rms {rms:.4} ===");
+
+        assert!(n > 0, "no samples produced");
+        assert!(peak > 0.05, "output peak too low ({peak}) — likely silence");
+        assert!(rms > 0.005, "output rms too low ({rms}) — likely silence");
     }
 }

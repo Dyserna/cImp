@@ -8,9 +8,9 @@ See `FUTURE-FEATURES.md` for per-item rationale and trigger-to-act conditions; t
 
 > **Scope note (2026-05-07):** this feature group originally listed four items; per-tab avatar configuration and per-tab TTS settings were cancelled as a deliberate scope decision (avatar and TTS stay global-only). The shared override pattern below applies to the remaining two items: terminal color themes and terminal background image.
 
-## Scope clarification: this is NOT the cctts UI chrome theme
+## Scope clarification: this is NOT the ccImp UI chrome theme
 
-`FEATURE-ui-modernization.md` covers **the cctts chrome** — tab bar, status bar, dialogs, settings window, overlays. That's a global look-and-feel for the application shell, applied via CSS design tokens and a `data-theme` attribute on `<html>`.
+`FEATURE-ui-modernization.md` covers **the ccImp chrome** — tab bar, status bar, dialogs, settings window, overlays. That's a global look-and-feel for the application shell, applied via CSS design tokens and a `data-theme` attribute on `<html>`.
 
 **This feature** is **per-tab visual identity** — the xterm.js terminal palette and the background image behind the terminal text. The two layers are independent and ship independently. The word "theme" appears in both but operates on different surfaces. A user can have:
 
@@ -114,7 +114,7 @@ Per-tab: `tab.background_override: BackgroundConfig | "disabled" | null`.
 
 **Wiring**: in `terminals.createForTab`, branch on `effectiveBackground(tab)`. If non-null, set `allowTransparency: true`, set theme `background` to `rgba(0,0,0,opacity)` (or honor active theme bg with adjusted alpha), apply `backgroundImage`/`backgroundSize`/`backgroundPosition` to the host `<div>`, wrap cells in a `backdrop-filter: blur(...)` container if `blur > 0`. If null, default canvas-renderer construction.
 
-**Image storage**: reference user's chosen file by absolute path. If file becomes invalid, show a clear Settings error and treat as null for rendering. Do not copy into cctts data dir at pick time — that adds disk and clutters state. (Note: when Configuration Scope ships, project-local settings will resolve relative paths against the project root — see that feature doc.)
+**Image storage**: reference user's chosen file by absolute path. If file becomes invalid, show a clear Settings error and treat as null for rendering. Do not copy into ccImp data dir at pick time — that adds disk and clutters state. (Note: when Configuration Scope ships, project-local settings will resolve relative paths against the project root — see that feature doc.)
 
 **Animated/video backgrounds**: out of scope. Static images only.
 

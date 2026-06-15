@@ -1,7 +1,7 @@
-cctts
+ccImp
 Copyright 2026 Amir Amashe
 
-The source code of cctts is licensed under the Apache License, Version
+The source code of ccImp is licensed under the Apache License, Version
 2.0 — see LICENSE for the full text.
 
 ------------------------------------------------------------------------
@@ -9,7 +9,7 @@ The source code of cctts is licensed under the Apache License, Version
 The compiled binary statically links espeak-ng (via misaki-rs), which
 is licensed under the GNU General Public License version 3 or later
 (GPLv3+). Per GPLv3 §5, the combined binary distribution is governed
-by the GPLv3+; the source code of cctts itself remains under the
+by the GPLv3+; the source code of ccImp itself remains under the
 Apache License 2.0 above.
 
 espeak-ng:
@@ -20,17 +20,17 @@ espeak-ng:
 
 ------------------------------------------------------------------------
 
-The portable Windows zip distribution of cctts bundles the Kokoro 82M
+The portable Windows zip distribution of ccImp bundles the Kokoro 82M
 ONNX model and the af_heart voicepack. These files are not included in
 the source repository and are downloaded at build time from the
 onnx-community mirror on HuggingFace; their license is independent of
-the cctts source license above.
+the ccImp source license above.
 
 Kokoro-82M-v1.0-ONNX:
   Source: https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX
   Files bundled: onnx/model.onnx (renamed kokoro-v1.0.onnx),
                  voices/af_heart.bin
-  License: Apache License 2.0 — same text as cctts's own LICENSE file.
+  License: Apache License 2.0 — same text as ccImp's own LICENSE file.
 
 ------------------------------------------------------------------------
 
@@ -49,7 +49,7 @@ whisper.cpp:
 The portable Windows zip (full variant only) bundles a ggml Whisper
 speech-to-text model (default `ggml-small.bin`). Like the Kokoro model,
 it is tracked via Git LFS rather than committed to source, and its
-license is independent of the cctts source license above.
+license is independent of the ccImp source license above.
 
 Whisper (ggml models):
   Source: https://huggingface.co/ggerganov/whisper.cpp
@@ -69,5 +69,5 @@ Clawdmeter / Clawd sprites:
   Pixel art: https://claudepix.vercel.app
   Project code license: MIT
   The Clawd mascot character is property of Anthropic PBC. The sprite
-  artwork is bundled here as-is for cctts's animated-avatar variant with
+  artwork is bundled here as-is for ccImp's animated-avatar variant with
   attribution to the sources above.

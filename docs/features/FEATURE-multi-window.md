@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Allow a tab (or a pane's worth of tabs) to be torn out of the main window into a new top-level cctts window. Standard browser-style tab-tearing pattern. The headline use case is multi-monitor: arrange Claude on monitor 1, aider + shells on monitor 2, with each window holding its own multi-pane layout tree.
+Allow a tab (or a pane's worth of tabs) to be torn out of the main window into a new top-level ccImp window. Standard browser-style tab-tearing pattern. The headline use case is multi-monitor: arrange Claude on monitor 1, aider + shells on monitor 2, with each window holding its own multi-pane layout tree.
 
 This is the only item in `FUTURE-FEATURES.md` that fundamentally challenges v1.3's *single-window assumption*. Every other deferred item composes with the existing architecture; this one forces revisiting several architectural decisions that were intentional in v1.3. The complexity warrants its own feature doc and almost certainly a multi-milestone rollout.
 
@@ -135,7 +135,7 @@ Document this in the milestone: presets are full-snapshot, not per-window.
 - **Per-window vs. global keyboard shortcuts**: most v1.3 shortcuts are pane/layout actions and naturally scope to the focused window. A few (mute, volume) are app-global. Audit the shortcut list at implementation time.
 - **How does the avatar overlay behave in a non-focused window?** Recommend: render the same state machine but suppress audio-driven waveform animation (since audio target is the focused window). Keep the visual presence so a torn-out tab still feels "owned."
 - **Tab uniqueness across windows in tab id space**: tab ids are already globally unique strings (V2 era). No change.
-- **Tauri 2.x WebviewWindow ergonomics**: Tauri 2.x is what cctts is on today. Verify at implementation time that `WebviewWindow::new` works the way assumed above; test that webview-to-webview communication via the broadcaster pattern actually works (it should — events go via the Tauri core).
+- **Tauri 2.x WebviewWindow ergonomics**: Tauri 2.x is what ccImp is on today. Verify at implementation time that `WebviewWindow::new` works the way assumed above; test that webview-to-webview communication via the broadcaster pattern actually works (it should — events go via the Tauri core).
 - **Compose overlay submitting cross-window**: with the pane-aware compose overlay (from Layout & Pane Operations group), the target dropdown could in principle span all windows' tabs. Recommend: per-window scoping. Cross-window targeting is too magical and the user's intent is rarely to do it. Defer if asked.
 
 ## Milestone recommendation

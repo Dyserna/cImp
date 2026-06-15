@@ -1,4 +1,4 @@
-# cctts
+# ccImp
 
 Multi-tab AI assistant wrapper with text-to-speech and a state-driven
 animated avatar. A Tauri desktop app that hosts **Claude Code** — your
@@ -11,7 +11,7 @@ Local, offline-after-install, no audio leaves the machine.
 
 ## Claude Code tabs
 
-cctts can host two flavors of Claude Code:
+ccImp can host two flavors of Claude Code:
 
 - **Claude** — your normal Claude Code, running with whatever auth flow
   you configured (Pro/Max subscription via OAuth, or `ANTHROPIC_API_KEY`).
@@ -29,7 +29,7 @@ the built-in defaults.
 
 - Switch between tabs with `Ctrl+1`..`Ctrl+9` (within the focused pane), or click the tab.
 - Both subprocesses, when present, spawn at app launch in the directory
-  cctts was started in. They run independently — switching tabs doesn't
+  ccImp was started in. They run independently — switching tabs doesn't
   stop either one.
 - The compose overlay submits to whichever tab is currently active.
 
@@ -49,13 +49,13 @@ type** — `+` on **Claude** opens a second subscription Claude, `+` on
 - persists across restarts, reopening with your saved layout.
 
 Each duplicate is an independent subprocess with its own PTY, scrollback,
-and avatar / TTS state, launched in the directory cctts was started in.
+and avatar / TTS state, launched in the directory ccImp was started in.
 Duplicates aren't listed in *Settings → Tabs* — they inherit the origin
 tab's configuration.
 
 ## Shell Tabs (v1.2+)
 
-In addition to the two AI builtins, cctts hosts **Shell tabs** — plain
+In addition to the two AI builtins, ccImp hosts **Shell tabs** — plain
 configurable terminal sessions running alongside the Claude tabs, with
 no TTS, no permission detection, and a reduced notification set (`error`
 and `exited` only).
@@ -136,7 +136,7 @@ Common alternatives, paste into Configure → command + arguments:
 - **My settings.json got corrupted.** Each migration writes a backup
   alongside the source file (e.g. `settings.json.v1.7.bak.<ts>`). For
   other corruption, delete the global `<exe-dir>/settings.json` (and the
-  per-folder `.cctts.custom.config.json` overlay if present) and the app
+  per-folder `.ccimp.custom.config.json` overlay if present) and the app
   writes fresh defaults on next launch.
 
 ## Multi-pane Layout (v1.3+)
@@ -257,7 +257,7 @@ ANTHROPIC_BASE_URL=<your local backend URL>
 ANTHROPIC_AUTH_TOKEN=<token your backend expects>
 ```
 
-Configure both under *Settings → Local LLM provider*. cctts does **not**
+Configure both under *Settings → Local LLM provider*. ccImp does **not**
 start the backend itself — you run it separately. The supported backends
 all expose a native Anthropic Messages API (`/v1/messages`), so no
 translation proxy is needed:
@@ -273,7 +273,7 @@ A typical setup:
 
 1. Start your backend with whichever model you want (e.g. LM Studio's
    "Start server" toggle on a loaded model).
-2. In cctts: *Settings → Tabs → Claude tabs enabled* → switch to **Local**
+2. In ccImp: *Settings → Tabs → Claude tabs enabled* → switch to **Local**
    or **Both**.
 3. *Settings → Local LLM provider* → set Endpoint URL to the backend's
    base URL (e.g. `http://localhost:1234`) and Auth token to whatever
@@ -283,7 +283,7 @@ A typical setup:
 
 For OpenAI-only backends (no native Anthropic endpoint) run a translator
 like [`anthropic-proxy-rs`](https://github.com/m0n0x41d/anthropic-proxy-rs)
-in front of it and point cctts at the translator.
+in front of it and point ccImp at the translator.
 
 Per-tab `env` entries always take precedence over the synthesized
 values, so you can also point a single tab at a different endpoint by
@@ -298,7 +298,7 @@ setting `ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local)
 - Anthropic-server features (prompt caching, extended thinking, vision)
   are unavailable on local models.
 - The auth token sits cleartext in `<exe-dir>/settings.json` (or the
-  per-folder `.cctts.custom.config.json` overlay) — fine for local
+  per-folder `.ccimp.custom.config.json` overlay) — fine for local
   dummies; don't put a real Anthropic API key there.
 
 ## System Requirements
@@ -307,16 +307,16 @@ setting `ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local)
   validation matrix — see `docs/completedMilestones/MILESTONE-V1-08-polish.md`.
 - **GPU:** optional. The app defaults to CPU inference (Kokoro is small
   enough for near-real-time CPU). NVIDIA CUDA 12.x can be opted into via
-  `setx CCTTS_GPU cuda` and a restart — see `MAINTENANCE.md` for the
+  `setx CCIMP_GPU cuda` and a restart — see `MAINTENANCE.md` for the
   current GPU support matrix and Blackwell caveat.
-- **Claude Code:** the `claude` binary must be on `PATH`. cctts spawns it
+- **Claude Code:** the `claude` binary must be on `PATH`. ccImp spawns it
   as a subprocess and passes `--append-system-prompt` so Claude knows to
   emit the TTS markers.
 - **Local backend (optional, for the Claude (local) tab):** if the
   Claude (local) tab's *Use local LLM provider* flag is on, you need a
   running Anthropic-compatible backend (LM Studio, Ollama, vLLM, or
   llama-server) at the URL configured under *Settings → Local LLM
-  provider*. cctts does not start the backend. If it isn't reachable,
+  provider*. ccImp does not start the backend. If it isn't reachable,
   the tab will fail on first message — disable the flag, or just stop
   using that tab; the subscription Claude tab is unaffected.
 - **WebView2 (Windows):** preinstalled on updated Windows 10/11. Older
@@ -328,7 +328,7 @@ The **portable Windows zip** (downloadable from the GitHub Releases page)
 ships `kokoro-v1.0.onnx` and `af_heart.bin` next to the executable —
 unzip, add `bin/` to PATH, run, hear TTS. Nothing else to install.
 
-For **source builds** (or if you delete the bundled files), cctts looks
+For **source builds** (or if you delete the bundled files), ccImp looks
 for the Kokoro model in exactly one place, relative to the executable:
 
 ```
@@ -351,7 +351,7 @@ prints the expected path to the log.
 
 ## Speech-to-text (dictation)
 
-cctts can transcribe your voice into the compose overlay, fully offline. It
+ccImp can transcribe your voice into the compose overlay, fully offline. It
 is **off by default** — enable it under *Settings → Speech-to-text*.
 
 **Usage**
@@ -387,7 +387,7 @@ found" on first use and logs the expected path.
 same time**: it's built with whisper.cpp's Vulkan backend, so it automatically
 uses any GPU (NVIDIA, AMD, or Intel) and falls back to CPU on machines without
 one — the only requirement is `vulkan-1.dll`, which ships with Windows. Nothing
-to install. (`CCTTS_GPU=cpu` forces CPU; a short utterance on `small` is
+to install. (`CCIMP_GPU=cpu` forces CPU; a short utterance on `small` is
 ~1–3 s on CPU, well under a second on a GPU.)
 
 Building from source, the **default is CPU-only** (no GPU SDK needed). To build
@@ -402,7 +402,7 @@ Per-tab subprocess configuration lives under **Settings → Tabs**, split
 into three sub-sections: **Claude**, **Claude (local)**, and **Shells**.
 Each tab exposes:
 
-- **Command** (read-only on AI tabs): the binary cctts spawns — `claude`
+- **Command** (read-only on AI tabs): the binary ccImp spawns — `claude`
   for both AI tabs.
 - **Persistent CLI flags:** flags appended to every spawn of that tab.
 - **Use local LLM provider** (AI tabs): toggle that gates env synthesis
@@ -411,7 +411,7 @@ Each tab exposes:
 - **TTS markup injection** (AI tabs): toggle plus an editable
   instructions block. Instructions are passed via
   `--append-system-prompt` on each spawn. The Reset button restores
-  cctts's built-in runtime prompt
+  ccImp's built-in runtime prompt
   (`src-tauri/src/tts/runtime_prompt.md`).
 - **Notifications:** text spoken when the tab transitions to a notable
   state and the user is focused elsewhere. AI tabs have four slots
@@ -426,15 +426,15 @@ Each tab exposes:
 
 Settings are persisted to two files: a **portable global baseline** at
 `<exe-dir>/settings.json`, and a **per-folder overlay** at
-`<launch_cwd>/.cctts.custom.config.json` containing only the keys that
+`<launch_cwd>/.ccimp.custom.config.json` containing only the keys that
 differ from the baseline. Saves are debounced (500 ms) and the overlay
 file is deleted automatically when the diff is empty.
 
 ## Running
 
 **End users (Windows):** download the latest portable zip from the
-[Releases page](https://github.com/Dyserna/cctts/releases), unzip it, add
-`bin/` to your PATH, and run `cctts`. The zip ships with the Kokoro
+[Releases page](https://github.com/Dyserna/ccImp/releases), unzip it, add
+`bin/` to your PATH, and run `ccimp`. The zip ships with the Kokoro
 model and the default voice — no extra setup beyond Claude Code itself
 being on PATH.
 
@@ -512,7 +512,7 @@ Open with `Ctrl+,` or the cog button on the avatar.
 
 ## Animated sprite avatars
 
-cctts can render a **frame-animated pixel-art mascot** instead of the
+ccImp can render a **frame-animated pixel-art mascot** instead of the
 image/video avatar. It is the **default** on new installs (paired with the
 default TUI Orange theme); switch between it and the image/video avatar in
 *Settings → Avatar → Type*.
@@ -539,7 +539,7 @@ in and add `<name>` to `KNOWN_SPRITE_SETS` in `src/lib/avatarConfig.ts`.
 
 - **TTS silent.** Check the log for `TTS disabled: Kokoro model files not found.`
   Place the model + voicepack under `<exe-dir>/../models/` as documented above.
-- **`claude` not found.** cctts looks up `claude` via `PATH`. Either install
+- **`claude` not found.** ccImp looks up `claude` via `PATH`. Either install
   Claude Code so it's on `PATH` or add its install dir.
 - **Claude (local) tab errors.** Most often: the local backend isn't
   running or the URL in *Settings → Local LLM provider* is wrong.
@@ -549,7 +549,7 @@ in and add `<name>` to `KNOWN_SPRITE_SETS` in `src/lib/avatarConfig.ts`.
   unaffected.
 - **CUDA EP errors per segment (silent output).** You're on a GPU not yet
   covered by the bundled ORT 1.20 prebuilt (Blackwell / RTX 5090). Unset
-  `CCTTS_GPU` to fall back to CPU. See `MAINTENANCE.md`.
+  `CCIMP_GPU` to fall back to CPU. See `MAINTENANCE.md`.
 - **Audio interrupted by typing.** That's `Behavior → Interrupt TTS when typing`.
   Disable it if you'd rather keep playback rolling.
 - **Avatar doesn't move.** Confirm `Settings → Avatar → Visible` is on
@@ -566,12 +566,12 @@ in and add `<name>` to `KNOWN_SPRITE_SETS` in `src/lib/avatarConfig.ts`.
 - TTS markup compliance for the **Claude (local)** tab depends on the
   underlying model. Smaller local models may not wrap content in
   `[[TTS]]…[[/TTS]]` reliably even when the system prompt asks them to.
-  cctts will be silent for those segments — this is fallback behavior,
+  ccImp will be silent for those segments — this is fallback behavior,
   not an error.
 - Tool-use (Edit / Write / Bash / etc.) on the Claude (local) tab depends
   on the local model supporting Anthropic-style tool calling. Test before
   committing to a particular model.
-- cctts does not bundle or auto-spawn the local backend — you run
+- ccImp does not bundle or auto-spawn the local backend — you run
   LM Studio / Ollama / vLLM / llama-server yourself.
 - Single audio output device — no UI selector.
 - No conversation/session UI on top of the terminal.

@@ -23,6 +23,15 @@ jobs:
       # setup-node/etc.); has no bearing on the Node version we install
       # for the build.
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      # ggml-vulkan's nested shader-generator ExternalProject creates very deep
+      # build paths; under the default target dir (deep under the workspace)
+      # they blow past Windows' MAX_PATH (260) and cl/link fail. Build into a
+      # real, short, STABLE drive-root dir so the paths stay short. Real (not a
+      # `subst` virtual drive — those race the parallel ninja build and leave
+      # ggml.c.obj unopenable at link, LNK1181) and stable across runs so the
+      # rust-cache restores cleanly. Mirrors the working local build. Job-level
+      # so the staging step reads the exe from the same path.
+      CARGO_TARGET_DIR: 'C:\b'
 
     steps:
       - name: Resolve tag
@@ -184,28 +193,12 @@ jobs:
           # MSVC dev-env step). CL=/FS serializes PDB writes under parallelism.
           CMAKE_GENERATOR: Ninja
           CL: /FS
-          # ggml-vulkan's nested shader-generator ExternalProject creates very
-          # deep build paths; under the default target dir they exceed Windows'
-          # MAX_PATH (260) and cl/link fail (compiler-ABI test fails / LNK1181
-          # "cannot open input file"). Build via a `subst`'d short drive so the
-          # paths stay short. B: still maps to src-tauri/target, so the build
-          # output physically lands there and the staging step is unchanged.
-          CARGO_TARGET_DIR: 'B:\'
         # `--features stt-vulkan` builds the portable Vulkan GPU binary: it runs
         # on any GPU vendor and falls back to CPU when none is present (only
         # runtime dep is the system vulkan-1.dll — nothing bundled). Default is
         # CPU-only, so this flag is what ships GPU in the zip. (VULKAN_SDK is set
-        # by the Install Vulkan SDK step.)
+        # by the Install Vulkan SDK step. CARGO_TARGET_DIR=C:\b is job-level.)
         run: |
-          New-Item -ItemType Directory -Force -Path src-tauri\target | Out-Null
-          subst B: /D 2>$null
-          subst B: (Resolve-Path src-tauri\target).Path
-          # Force a fresh whisper-rs-sys (CMake/ggml) build. A cached build
-          # state from a prior run was produced under a different (pre-subst)
-          # target path, leaving ninja convinced the objects are current while
-          # the files are absent (LNK1181 "cannot open ggml.c.obj"). Cleaning it
-          # makes it reconfigure + compile cleanly under the B: paths.
-          cargo clean --manifest-path src-tauri/Cargo.toml -p whisper-rs-sys
           npm run tauri build -- --no-bundle --features stt-vulkan
 
       - name: Stage portable layouts (full + no-models)
@@ -220,8 +213,8 @@ jobs:
 
           # cctts.exe + ORT runtime DLLs (the `ort` crate's download-binaries
           # feature drops these into target/release at build time).
-          Copy-Item src-tauri/target/release/cctts.exe "$stageFull/bin/"
-          Get-ChildItem src-tauri/target/release -Filter 'onnxruntime*.dll' |
+          Copy-Item $env:CARGO_TARGET_DIR/release/cctts.exe "$stageFull/bin/"
+          Get-ChildItem $env:CARGO_TARGET_DIR/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageFull/bin/" }
 
           # Prompt-detection patterns. Ships next to cctts.exe (the loader
@@ -294,8 +287,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stageSlim/avatars" | Out-Null
           New-Item -ItemType Directory -Force -Path "$stageSlim/sprites" | Out-Null
 
-          Copy-Item src-tauri/target/release/cctts.exe "$stageSlim/bin/"
-          Get-ChildItem src-tauri/target/release -Filter 'onnxruntime*.dll' |
+          Copy-Item $env:CARGO_TARGET_DIR/release/cctts.exe "$stageSlim/bin/"
+          Get-ChildItem $env:CARGO_TARGET_DIR/release -Filter 'onnxruntime*.dll' |
             ForEach-Object { Copy-Item $_.FullName "$stageSlim/bin/" }
 
           Copy-Item -Recurse avatars/* "$stageSlim/avatars/"

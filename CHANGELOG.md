@@ -5,6 +5,27 @@ All notable changes to cctts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-06-15
+
+### Added
+
+- **GPU-accelerated text-to-speech via WebGPU.** Kokoro TTS now runs on ONNX
+  Runtime's WebGPU execution provider (Dawn-backed), making GPU TTS **portable
+  and vendor-agnostic** — it uses any GPU (NVIDIA/AMD/Intel) and falls back to
+  CPU automatically, exactly like the Vulkan STT path. Measured ~5× faster than
+  CPU, and it works on GPUs where the old CUDA path couldn't (including Blackwell
+  / RTX 50-series). Nothing CUDA-specific is bundled — just three small Dawn
+  dylibs. (`CCTTS_GPU=cpu` forces CPU.) Source builds default to CPU; build
+  `--features tts-webgpu` for the GPU variant. See `docs/features/FEATURE-tts-webgpu.md`.
+
+### Changed
+
+- **TTS GPU is now a compile-time feature, not the `CCTTS_GPU=cuda` runtime
+  opt-in.** The released binary ships `tts-webgpu`; the old NVIDIA-only CUDA path
+  survives only as the optional, non-default `tts-cuda` build (mutually exclusive
+  with `tts-webgpu`, and not shipped). `CCTTS_GPU=cpu` forces CPU for both TTS
+  and STT.
+
 ## [0.10.0] — 2026-06-15
 
 ### Added

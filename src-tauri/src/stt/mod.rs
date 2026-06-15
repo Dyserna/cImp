@@ -114,14 +114,12 @@ impl SttHandle {
 /// Called once from the Tauri `setup` hook with the runtime half of
 /// [`SttHandle::new`].
 pub fn spawn(app: AppHandle, settings: SettingsHandle, runtime: SttRuntime) {
-    // Route whisper.cpp / ggml's C-side logging away from raw stdout/stderr.
-    // They `fprintf(stderr, …)` model-load / backend diagnostics; in a windowed
-    // build there is no valid stderr, so the MSVC debug CRT's file-descriptor
-    // assertion (`_osfile(fh) & FOPEN`) fires and aborts the process
-    // (STATUS_STACK_BUFFER_OVERRUN). This silences that path (logs are dropped
-    // unless whisper-rs's tracing backend is enabled). Idempotent; first wins.
-    whisper_rs::install_logging_hooks();
-
+    // NOTE: the whisper/ggml logging-hook install lives on the worker thread
+    // (worker.rs), NOT here. This `spawn` runs on the Tauri `setup` hook, which
+    // is synchronous and must return quickly — with the Vulkan backend compiled
+    // in, touching whisper/ggml symbols here triggers GPU backend init
+    // (device enumeration) and stalls setup, so the main window never gets
+    // shown or titled. Keep this function to channel/thread wiring only.
     let (jobs_tx, jobs_rx) = mpsc::channel::<Vec<f32>>();
     worker::spawn_stt_worker(app.clone(), settings.clone(), jobs_rx, runtime.state.clone());
     spawn_mic_streamer(app.clone(), runtime.recording.clone(), runtime.mic.clone());

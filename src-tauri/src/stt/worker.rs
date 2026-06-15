@@ -31,6 +31,14 @@ pub(crate) fn spawn_stt_worker(
     std::thread::Builder::new()
         .name("cctts-stt-worker".into())
         .spawn(move || {
+            // NOTE: the whisper/ggml logging hooks are installed lazily in
+            // `load_engine` (right before the first engine creation), NOT here.
+            // Touching any ggml symbol with the Vulkan backend compiled in
+            // initializes the GPU backend (loads the Vulkan driver, enumerates
+            // devices); doing that at startup — even on this worker thread —
+            // races the main thread's WebView2/window init and the app's main
+            // window never appears. Deferring it to the first recording keeps
+            // startup clean: this thread just blocks on `recv` until then.
             let mut engine: Option<SttEngine> = None;
             while let Ok(samples) = jobs_rx.recv() {
                 let cfg = settings.current().stt;
@@ -90,6 +98,10 @@ pub(crate) fn spawn_stt_worker(
 }
 
 fn load_engine(model_file: &str) -> crate::error::AppResult<SttEngine> {
+    // Route whisper/ggml C-side logging through Rust (off raw stdout/stderr).
+    // Installed here, on the first engine load (a recording), so the GPU
+    // backend init it triggers never runs during app startup. Idempotent.
+    whisper_rs::install_logging_hooks();
     let path = crate::stt::default_model_path(model_file)?;
     SttEngine::new(&path, model_file.to_string())
 }

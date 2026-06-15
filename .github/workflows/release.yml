@@ -110,7 +110,9 @@ jobs:
         env:
           VULKAN_VERSION: '1.4.350.0'
         run: |
-          $url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/VulkanSDK-$env:VULKAN_VERSION-Installer.exe"
+          # LunarG's Windows installer filename is vulkansdk-windows-X64-<ver>.exe
+          # (NOT VulkanSDK-<ver>-Installer.exe). Verified 2026-06-15.
+          $url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
           $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
           Write-Host "Downloading Vulkan SDK $env:VULKAN_VERSION"
           curl.exe -L --fail -o $installer $url

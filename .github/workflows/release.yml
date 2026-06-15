@@ -184,12 +184,23 @@ jobs:
           # MSVC dev-env step). CL=/FS serializes PDB writes under parallelism.
           CMAKE_GENERATOR: Ninja
           CL: /FS
+          # ggml-vulkan's nested shader-generator ExternalProject creates very
+          # deep build paths; under the default target dir they exceed Windows'
+          # MAX_PATH (260) and cl/link fail (compiler-ABI test fails / LNK1181
+          # "cannot open input file"). Build via a `subst`'d short drive so the
+          # paths stay short. B: still maps to src-tauri/target, so the build
+          # output physically lands there and the staging step is unchanged.
+          CARGO_TARGET_DIR: 'B:\'
         # `--features stt-vulkan` builds the portable Vulkan GPU binary: it runs
         # on any GPU vendor and falls back to CPU when none is present (only
         # runtime dep is the system vulkan-1.dll — nothing bundled). Default is
         # CPU-only, so this flag is what ships GPU in the zip. (VULKAN_SDK is set
         # by the Install Vulkan SDK step.)
-        run: npm run tauri build -- --no-bundle --features stt-vulkan
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri\target | Out-Null
+          subst B: /D 2>$null
+          subst B: (Resolve-Path src-tauri\target).Path
+          npm run tauri build -- --no-bundle --features stt-vulkan
 
       - name: Stage portable layouts (full + no-models)
         shell: pwsh

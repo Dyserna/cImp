@@ -523,17 +523,24 @@ How it works:
   `manifest.json` plus one subfolder of PNG frames per animation. The
   manifest lists each animation's frames with a per-frame `hold_ms`, so
   timing is expressive rather than a fixed frame rate.
-- The five avatar states map to animation rotation lists: **Idle** drifts
-  between breathing, blinking, looking around and the occasional **dance**;
-  **Listening** looks around; **Thinking** and **Speaking** show the work
-  animations; **Error** shows a surprise. The mapping lives in
-  `src/lib/avatarConfig.ts` (`SPRITE_STATE_ANIMS`).
+- Per-state behaviour is **manifest-driven**: the manifest's `groups` array
+  maps each of the five avatar states to an animation rotation list (the
+  player rotates a list with more than one entry). In the bundled sets
+  **Idle** drifts between breathing, blinking, looking around and the
+  occasional **dance**; **Listening** looks around; **Thinking** and
+  **Speaking** show the work animations; **Error** shows a surprise. A state
+  with no group falls back to the set's `Idle` group. (This behaviour used
+  to be hardcoded in `SPRITE_STATE_ANIMS`; it now lives entirely in each
+  set's manifest, so a sprite set fully defines its own behaviour.)
 - Frames are drawn on a canvas with nearest-neighbor scaling, so the small
   source art (20×20) stays crisp pixel art at any avatar size.
 
 The bundled `claudeSprites` set is sourced from the **Clawdmeter** project
-(see *Credits* below). To add another set, drop a `sprites/<name>/` folder
-in and add `<name>` to `KNOWN_SPRITE_SETS` in `src/lib/avatarConfig.ts`.
+(see *Credits* below); an `impSprites` set scaffolds the project's own imp
+mascot. To add another set, drop a `sprites/<name>/` folder in (with a
+`manifest.json` defining its `groups`) and register `<name>` in
+`KNOWN_SPRITE_SETS` in `src/lib/avatarConfig.ts` — no other app-code changes
+are needed, since the per-state behaviour comes from the manifest.
 
 ## Troubleshooting
 

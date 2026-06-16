@@ -181,6 +181,11 @@ pub async fn pty_write(
         }
     }
 
+    // Accumulate the user's plain typed line and, on Enter, register its
+    // sentences too. Unlike the `[[TTS]]`-marker path above, this is what
+    // suppresses the *unmarked* question echo in "speak all output" mode.
+    note_typed_input(&state.user_input_buf, &state.user_typed_tts, &tab, &input);
+
     // Take the registry lock once at the top so the keystroke / submit
     // counter updates and the final write run inside the same critical
     // section. Pre-V0.6 the counter Arc was cloned out under the read
@@ -255,6 +260,81 @@ fn is_automatic_terminal_response(input: &str) -> bool {
     bytes[2..bytes.len() - 1]
         .iter()
         .all(|&b| b.is_ascii_digit() || b == b';' || b == b'?')
+}
+
+/// Accumulate the user's typed input per tab and, on Enter, fold its
+/// sentences into the shared echo-suppression set so "speak all output"
+/// mode doesn't read the question back when the TUI echoes it. Mirrors the
+/// line editing `apply_input_delta` already understands (backspace, kill-line,
+/// kill-word). ESC-led writes (arrow keys, function keys, bracketed paste) are
+/// skipped wholesale, exactly like the length counter — so a pasted question
+/// isn't captured, which is an accepted gap.
+fn note_typed_input(
+    buf_map: &std::sync::Mutex<std::collections::HashMap<TabId, String>>,
+    user_typed: &std::sync::Mutex<std::collections::HashSet<String>>,
+    tab: &TabId,
+    input: &str,
+) {
+    if input.starts_with('\x1b') {
+        return;
+    }
+    let Ok(mut map) = buf_map.lock() else {
+        return;
+    };
+    let buf = map.entry(tab.clone()).or_default();
+    for c in input.chars() {
+        match c {
+            '\r' | '\n' => {
+                register_echo_sentences(user_typed, buf);
+                buf.clear();
+            }
+            // Backspace / DEL.
+            '\x08' | '\x7f' => {
+                buf.pop();
+            }
+            // Ctrl-U (kill line) / Ctrl-C (abandon).
+            '\x15' | '\x03' => buf.clear(),
+            // Ctrl-W (kill previous word).
+            '\x17' => {
+                while buf.ends_with(' ') {
+                    buf.pop();
+                }
+                while !buf.is_empty() && !buf.ends_with(' ') {
+                    buf.pop();
+                }
+            }
+            c if c.is_control() => {}
+            c => buf.push(c),
+        }
+    }
+    // Bound a line that's never submitted (e.g. user keeps typing, hits Esc).
+    if buf.len() > 8192 {
+        buf.clear();
+    }
+}
+
+/// Register each sentence of `text` (whitespace-normalized) in the echo
+/// set. Empty input is a no-op. Caps the set like the marker path does.
+fn register_echo_sentences(
+    user_typed: &std::sync::Mutex<std::collections::HashSet<String>>,
+    text: &str,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let Ok(mut set) = user_typed.lock() else {
+        return;
+    };
+    for sentence in crate::processing::segment_sentences(text) {
+        let key = crate::processing::normalize_for_dedup(&sentence);
+        if !key.is_empty() {
+            set.insert(key);
+        }
+    }
+    const USER_TYPED_TTS_CAP: usize = 4096;
+    if set.len() > USER_TYPED_TTS_CAP {
+        set.clear();
+    }
 }
 
 fn extract_tts_contents(input: &str) -> Vec<String> {

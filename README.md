@@ -413,14 +413,21 @@ you can see at a glance which tabs have it on.
   finishes. Unterminated chrome (the spinner / "esc to interrupt" status
   line, box-drawing, the input prompt) is held and dropped rather than
   spoken, so the synthesizer stays focused on prose.
+- **Your own input isn't read back.** Text you type (or submit from the
+  compose overlay) is registered as you go, so when the TUI echoes your
+  prompt it's recognized and skipped — even behind the `> ` prompt prefix.
+  (Pasted input via bracketed paste is the one gap; it isn't captured.)
 - **`Esc` still stops playback until new output** — the same interrupt that
   works for marked segments. Speaking resumes on the tab's next output burst.
 
 This mode is cleanest for plain, line-oriented output — e.g. a **Claude
 (local)** tab whose model doesn't emit `[[TTS]]` markers, or any model you
-just want fully read aloud. On the full-screen Claude TUI some status-line
-chrome can still slip through despite the filtering; that's an inherent
-trade-off of reading raw terminal output rather than marked segments.
+just want fully read aloud. **It reads everything Claude prints** — including
+"thinking"/reasoning shown above the answer — because raw terminal output has
+no reliable marker that separates the answer from thinking or status chrome.
+If you want **only Claude's answer** spoken (no question, no thinking), that's
+exactly what the default `[[TTS]]` marker mode does — leave "TTS all output"
+**off** on the subscription Claude tab and let Claude mark its answer.
 
 ## Configuring Tabs
 

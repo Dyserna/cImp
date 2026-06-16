@@ -222,10 +222,15 @@ impl TagScanner {
             if key.is_empty() || self.spoken.contains(&key) {
                 continue;
             }
+            // The TUI echoes the user's question behind a prompt prefix
+            // ("> ", box borders → spaces), so also match against the key with
+            // leading non-alphanumerics stripped. The registered keys are the
+            // raw typed sentences, with no such prefix.
+            let echo_key = key.trim_start_matches(|c: char| !c.is_alphanumeric());
             let user_echo = self
                 .user_typed
                 .lock()
-                .map(|u| u.contains(&key))
+                .map(|u| u.contains(&key) || u.contains(echo_key))
                 .unwrap_or(false);
             if !user_echo {
                 out.push(key.clone());
@@ -450,6 +455,27 @@ mod tests {
         assert!(s.scan_all(&raw, false).is_empty());
         // ...but a forced (max-hold) flush emits whatever is pending.
         assert_eq!(s.scan_all(&raw, true), vec!["No trailing newline here"]);
+    }
+
+    #[test]
+    fn scan_all_suppresses_echoed_user_question_behind_prompt_prefix() {
+        // Mirror what `note_typed_input` registers: the raw typed sentence,
+        // normalized, with no prompt prefix.
+        let typed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        typed
+            .lock()
+            .unwrap()
+            .insert("what is the capital of France?".to_string());
+        let mut s = TagScanner::with_user_typed_filter(typed);
+
+        // The TUI echoes it behind a "> " prompt prefix; still suppressed.
+        let raw = b"> what is the capital of France?\n".to_vec();
+        assert!(s.scan_all(&raw, false).is_empty());
+
+        // A genuine Claude sentence still comes through.
+        let mut raw2 = raw.clone();
+        raw2.extend_from_slice(b"The capital of France is Paris.\n");
+        assert_eq!(s.scan_all(&raw2, false), vec!["The capital of France is Paris."]);
     }
 
     #[test]

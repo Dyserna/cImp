@@ -19,8 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Esc` still stops playback until the next output burst. The toggle is
   per-tab, applies live (no restart), skips the existing backlog, and
   persists in the per-folder overlay (`.ccimp.custom.config.json`). Cleanest
-  for plain/line-oriented output (e.g. a local-LLM tab with no markers);
-  some status-line chrome can still slip through on the full Claude TUI.
+  for plain/line-oriented output (e.g. a local-LLM tab with no markers). The
+  user's own typed/submitted input is registered and skipped when the TUI
+  echoes it (even behind the `> ` prompt prefix), so the question isn't read
+  back. Note: it speaks everything Claude prints, including reasoning/thinking
+  shown above the answer — for answer-only speech, use the default `[[TTS]]`
+  marker mode instead.
 
 ## [0.11.0] — 2026-06-15
 

@@ -33,6 +33,7 @@ mod screen;
 mod segmenter;
 mod tags;
 
+pub use segmenter::segment_sentences;
 pub use tags::normalize_for_dedup;
 
 #[cfg(test)]
@@ -43,7 +44,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::processing::screen::Screen;
-use crate::processing::segmenter::segment_sentences;
 use crate::processing::tags::TagScanner;
 
 /// Default max-hold for an open `[[TTS]]` tag — used until the layer is

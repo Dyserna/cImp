@@ -118,6 +118,16 @@ struct NotificationManager {
     /// the matching echo arrives (suppressed) or when any non-Speaking,
     /// non-Idle state edge for the tab pre-empts it.
     just_dispatched: HashSet<TabId>,
+    /// Tabs the user has actually interacted with this session — observed by
+    /// the tab entering `Listening`, which is only reachable via a user
+    /// keystroke or compose input. The spoken `Idle` notification is gated on
+    /// membership here: until a tab is armed, any settle into Idle is just
+    /// startup chrome (Claude's welcome banner cycles a freshly-spawned tab
+    /// `Idle → Thinking → Idle` as it prints) and must stay silent. This is
+    /// the user-input analogue of the `last_avatar` "no idle before any real
+    /// activity" guard, which only rejects the re-emitted *initial* Idle and
+    /// not this real banner-driven transition.
+    interacted: HashSet<TabId>,
 }
 
 impl NotificationManager {
@@ -147,6 +157,7 @@ impl NotificationManager {
             last_awaiting_question: HashMap::new(),
             drain_deadline: None,
             just_dispatched: HashSet::new(),
+            interacted: HashSet::new(),
         }
     }
 
@@ -189,6 +200,14 @@ impl NotificationManager {
     fn on_state_event(&mut self, event: StateEvent) {
         let queued = match event {
             StateEvent::StateChanged { tab, state } => {
+                // Entering `Listening` is the first observable proof the user
+                // has interacted with this tab (it's reachable only via a
+                // keystroke or compose input). Arm the tab so a later settle
+                // into Idle is allowed to notify; until then, Idle edges are
+                // startup-banner chrome and stay silent.
+                if state == AvatarState::Listening {
+                    self.interacted.insert(tab.clone());
+                }
                 let prev = self
                     .last_avatar
                     .insert(tab.clone(), state)
@@ -226,6 +245,15 @@ impl NotificationManager {
                 }
                 let nev = match state {
                     AvatarState::Idle if prev != AvatarState::Idle => {
+                        // Pre-interaction settle (e.g. the startup welcome
+                        // banner cycling Idle → Thinking → Idle as it prints):
+                        // the user has never driven this tab to Listening, so
+                        // this is not a "Claude finished your task" event.
+                        // Stay silent until the tab has been interacted with.
+                        if !self.interacted.contains(&tab) {
+                            debug!(?tab, "notifications: suppressing Idle (no user interaction yet)");
+                            return;
+                        }
                         // Suppress Idle when this tab currently has a
                         // pending permission prompt — the avatar state
                         // machine drops to Idle when Claude stops printing
@@ -298,6 +326,7 @@ impl NotificationManager {
                 self.last_awaiting.remove(&tab);
                 self.last_awaiting_question.remove(&tab);
                 self.just_dispatched.remove(&tab);
+                self.interacted.remove(&tab);
                 // Drop any queued notifications targeting the closed tab —
                 // playing them after close would refer to a tab that no
                 // longer exists in the UI.

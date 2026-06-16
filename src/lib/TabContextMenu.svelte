@@ -42,8 +42,10 @@
     y,
     paneId,
     tab,
+    ttsAllOutput,
     onRename,
     onConfigure,
+    onToggleTtsAllOutput,
     onRestart,
     onClose,
     onDismiss,
@@ -60,11 +62,15 @@
     /// the Settings window. Builtin shell tabs continue to hide it
     /// because their ConfigureTabDialog rejects builtin-shell edits.
     tab: { id: TabId; builtin: boolean; kind: 'shell' | 'ai-tool'; canRestart: boolean } | null;
+    /// Current "speak all output" state for an AI tab — drives the check
+    /// mark on the toggle entry. Ignored for shell tabs.
+    ttsAllOutput?: boolean;
     /// Tab actions. Required when `tab` is non-null; ignored otherwise.
     /// Optional in the type to make the bar-background callsite
     /// boilerplate-free.
     onRename?: () => void;
     onConfigure?: () => void;
+    onToggleTtsAllOutput?: () => void;
     onRestart?: () => void;
     onClose?: () => void;
     onDismiss: () => void;
@@ -186,6 +192,18 @@
     {#if !tab.builtin || tab.kind === 'ai-tool'}
       <button type="button" class="entry" role="menuitem" onclick={fire(onConfigure)}>
         Configure…
+      </button>
+    {/if}
+    {#if tab.kind === 'ai-tool'}
+      <button
+        type="button"
+        class="entry check"
+        role="menuitemcheckbox"
+        aria-checked={ttsAllOutput ?? false}
+        onclick={fire(onToggleTtsAllOutput)}
+      >
+        <span class="check-mark">{ttsAllOutput ? '✓' : ''}</span>
+        TTS all output
       </button>
     {/if}
     {#if !tab.builtin}
@@ -346,6 +364,18 @@
   .entry.danger:hover {
     background: var(--surface-danger-soft);
     color: var(--text-danger-soft);
+  }
+  .entry.check {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .check-mark {
+    display: inline-block;
+    width: 12px;
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-size: var(--font-size-sm);
   }
   .entry.disabled,
   .entry[disabled] {

@@ -5,6 +5,23 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-tab "TTS all output" mode.** Right-click a Claude tab → **TTS all
+  output** to make that tab speak **all** new terminal output and ignore the
+  `[[TTS]]…[[/TTS]]` markers, instead of speaking only the marked segments. A
+  speaker icon on the tab shows which tabs have it on. Output is
+  ANSI-stripped, sentence-segmented, and deduped; an in-progress trailing
+  sentence is held until it completes, and unterminated TUI chrome (spinner /
+  status line / box-drawing / input prompt) is dropped rather than spoken.
+  `Esc` still stops playback until the next output burst. The toggle is
+  per-tab, applies live (no restart), skips the existing backlog, and
+  persists in the per-folder overlay (`.ccimp.custom.config.json`). Cleanest
+  for plain/line-oriented output (e.g. a local-LLM tab with no markers);
+  some status-line chrome can still slip through on the full Claude TUI.
+
 ## [0.11.0] — 2026-06-15
 
 ### Added

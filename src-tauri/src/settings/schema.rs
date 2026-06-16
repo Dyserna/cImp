@@ -317,6 +317,13 @@ impl Settings {
     pub fn find_tab_mut(&mut self, id: &str) -> Option<&mut TabConfig> {
         self.tabs.iter_mut().find(|t| t.id() == id)
     }
+
+    /// Whether the given tab is in "speak all output" mode — true only for
+    /// an AI tab with `tts_all_output` set. Read live by the per-tab
+    /// processor on each settings broadcast. Unknown / shell tabs are false.
+    pub fn tab_speak_all_output(&self, id: &str) -> bool {
+        matches!(self.find_tab(id), Some(TabConfig::AiTool(c)) if c.tts_all_output)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -463,6 +470,13 @@ pub struct AiToolTabConfig {
     /// `claude_local` settings group. Per-tab `env` entries override
     /// synthesized values.
     pub use_local_provider: bool,
+    /// When `true`, the processing layer speaks ALL new terminal output
+    /// for this tab (sentence-segmented, deduped) and ignores
+    /// `[[TTS]]…[[/TTS]]` markers entirely, rather than speaking only the
+    /// marked segments. Toggled from the tab's right-click menu; persists
+    /// in the per-folder overlay like any other per-tab field. Read live by
+    /// the per-tab processor via the settings broadcast — no tab restart.
+    pub tts_all_output: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -709,6 +723,7 @@ pub fn default_claude_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: false,
+        tts_all_output: false,
     })
 }
 
@@ -740,6 +755,7 @@ pub fn default_claude_local_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: true,
+        tts_all_output: false,
     })
 }
 
@@ -770,6 +786,7 @@ pub fn default_aider_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: false,
+        tts_all_output: false,
     })
 }
 
@@ -797,6 +814,7 @@ pub fn default_aider_local_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: true,
+        tts_all_output: false,
     })
 }
 

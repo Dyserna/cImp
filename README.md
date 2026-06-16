@@ -396,6 +396,32 @@ Tools prompt with the Vulkan SDK installed — see `docs/MAINTENANCE.md`. An
 optional NVIDIA-only `stt-cuda` feature exists for maximum speed but isn't
 portable and isn't shipped.
 
+## Speak all output (per-tab)
+
+By default ccImp only speaks the text Claude wraps in `[[TTS]]…[[/TTS]]`
+markers. **Right-click any Claude tab → "TTS all output"** to flip that tab
+into a mode where it speaks **all** new terminal output and **ignores the
+`[[TTS]]` markers** entirely. A small **speaker icon** appears on the tab so
+you can see at a glance which tabs have it on.
+
+- The toggle is **per tab** and **persists in the per-folder overlay**
+  (`.ccimp.custom.config.json`) like any other per-tab setting. It applies
+  live — no tab restart — and only affects output produced *after* you turn
+  it on (the existing backlog isn't replayed).
+- Output is **sentence-segmented and deduped**: ANSI is stripped, complete
+  sentences are spoken, and an in-progress trailing sentence is held until it
+  finishes. Unterminated chrome (the spinner / "esc to interrupt" status
+  line, box-drawing, the input prompt) is held and dropped rather than
+  spoken, so the synthesizer stays focused on prose.
+- **`Esc` still stops playback until new output** — the same interrupt that
+  works for marked segments. Speaking resumes on the tab's next output burst.
+
+This mode is cleanest for plain, line-oriented output — e.g. a **Claude
+(local)** tab whose model doesn't emit `[[TTS]]` markers, or any model you
+just want fully read aloud. On the full-screen Claude TUI some status-line
+chrome can still slip through despite the filtering; that's an inherent
+trade-off of reading raw terminal output rather than marked segments.
+
 ## Configuring Tabs
 
 Per-tab subprocess configuration lives under **Settings → Tabs**, split

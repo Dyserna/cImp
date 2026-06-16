@@ -68,6 +68,11 @@ pub struct ProcessingLayer {
     oldest_pending_at: Option<Instant>,
     /// Tunable max-hold; reconfigured live from settings.
     max_hold: Duration,
+    /// Per-tab "speak all output" mode. When set, the layer speaks every new
+    /// sentence of terminal output and ignores `[[TTS]]…[[/TTS]]` markers
+    /// (see [`TagScanner::scan_all`]) instead of extracting only marked
+    /// segments. Reconfigured live from settings, like `max_hold`.
+    speak_all: bool,
 }
 
 impl ProcessingLayer {
@@ -82,11 +87,23 @@ impl ProcessingLayer {
             scanner: TagScanner::with_user_typed_filter(user_typed),
             oldest_pending_at: None,
             max_hold: DEFAULT_MAX_HOLD,
+            speak_all: false,
         }
     }
 
     pub fn set_max_hold(&mut self, max_hold: Duration) {
         self.max_hold = max_hold;
+    }
+
+    /// Toggle "speak all output" mode for this tab (see the `speak_all`
+    /// field). Cheap and idempotent; safe to call on every settings change.
+    /// On the off→on edge it skips the current backlog so only output produced
+    /// after the toggle is spoken.
+    pub fn set_speak_all(&mut self, speak_all: bool) {
+        if speak_all && !self.speak_all {
+            self.scanner.begin_speak_all(self.screen.raw_view().len());
+        }
+        self.speak_all = speak_all;
     }
 
     /// Rendered tail of the screen, capped to roughly `max_chars`. Permission
@@ -128,17 +145,26 @@ impl ProcessingLayer {
         let mut events = Vec::new();
 
         if allow_close_emit {
-            // Scan the raw byte stream for newly-closed tags. We use raw
-            // bytes (not the cell-rendered view) so cursor-skip cells with
-            // stale spinner content can't run adjacent words together.
-            let new_tts: Vec<String> = self
-                .scanner
-                .scan_for_new_tags(self.screen.raw_view())
-                .into_iter()
-                .collect();
-            for content in new_tts {
-                for sentence in segment_sentences(&content) {
+            if self.speak_all {
+                // Speak-all mode: ignore `[[TTS]]` markers and speak every new
+                // sentence of output. `scan_all` already returns deduped,
+                // sentence-segmented text, so push each straight through.
+                for sentence in self.scanner.scan_all(self.screen.raw_view(), force) {
                     events.push(ProcessingEvent::TtsSegment(sentence));
+                }
+            } else {
+                // Scan the raw byte stream for newly-closed tags. We use raw
+                // bytes (not the cell-rendered view) so cursor-skip cells with
+                // stale spinner content can't run adjacent words together.
+                let new_tts: Vec<String> = self
+                    .scanner
+                    .scan_for_new_tags(self.screen.raw_view())
+                    .into_iter()
+                    .collect();
+                for content in new_tts {
+                    for sentence in segment_sentences(&content) {
+                        events.push(ProcessingEvent::TtsSegment(sentence));
+                    }
                 }
             }
         }

@@ -5,7 +5,7 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.0] — 2026-06-16
 
 ### Added
 
@@ -25,6 +25,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back. Note: it speaks everything Claude prints, including reasoning/thinking
   shown above the answer — for answer-only speech, use the default `[[TTS]]`
   marker mode instead.
+- **Manifest-driven animated sprite avatars.** The per-state animation
+  mapping moved out of hardcoded app code into each sprite set's
+  `manifest.json` `groups` (state → animation rotation list), so a new sprite
+  set fully defines its own behaviour without code changes. Ships an
+  `impSprites` set scaffolding the project's own imp mascot alongside the
+  bundled `claudeSprites`.
+
+### Changed
+
+- **Renamed `cctts` → `ccImp`.** The app, binary (`ccimp.exe`), crate, npm
+  package, window titles, log prefix (`ccimp.log`), per-folder overlay
+  (`.ccimp.custom.config.json`), and GPU env var (`CCTTS_GPU` → `CCIMP_GPU`)
+  all move to the new name — renaming the project after its mascot rather
+  than a single feature. Still fully portable (writes only next to the exe).
+  Re-set any `.cctts.*` overlay or `CCTTS_GPU` usage under the new names.
+- **Stronger TTS injection prompt for full-answer coverage.** The default
+  runtime prompt now makes "wrap your whole answer, not a summary" the
+  headline rule, so Claude marks its entire prose answer for speech instead
+  of just a sentence or two. Existing tabs adopt it via *Settings → Tabs →
+  TTS markup injection → Reset*, then *Restart Tab*; fresh installs get it by
+  default.
+
+### Fixed
+
+- **No spurious "idle" announcement on startup.** A freshly-spawned Claude
+  tab no longer speaks its idle notification when the welcome banner settles;
+  the idle announcement now fires only after the tab has had real user
+  interaction.
 
 ## [0.11.0] — 2026-06-15
 

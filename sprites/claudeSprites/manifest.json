@@ -948,40 +948,43 @@
   },
   "groups": [
     {
-      "id": 0,
-      "name": "idle",
+      "state": "Idle",
       "animations": [
-        "expression sleep",
         "idle breathe",
         "idle blink",
-        "expression wink"
+        "idle look around",
+        "expression wink",
+        "expression sleep",
+        "dance bounce",
+        "dance sway",
+        "dance bounce dj",
+        "dance sway dj",
+        "dance djmix"
       ]
     },
     {
-      "id": 1,
-      "name": "normal",
+      "state": "Listening",
       "animations": [
         "idle look around",
-        "work think",
+        "idle blink"
+      ]
+    },
+    {
+      "state": "Thinking",
+      "animations": [
+        "work think"
+      ]
+    },
+    {
+      "state": "Speaking",
+      "animations": [
         "work coding"
       ]
     },
     {
-      "id": 2,
-      "name": "active",
+      "state": "Error",
       "animations": [
-        "dance sway",
-        "expression surprise",
-        "dance bounce"
-      ]
-    },
-    {
-      "id": 3,
-      "name": "heavy",
-      "animations": [
-        "dance bounce dj",
-        "dance sway dj",
-        "dance djmix"
+        "expression surprise"
       ]
     }
   ]

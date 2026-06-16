@@ -131,6 +131,15 @@ cloned from Clawd so timing matches) and one folder per animation with a `.gitke
 Drop `NN.png` frames into each folder to bring the imp to life; then flip the
 default in `avatarConfig.ts` / `defaultSettings()`.
 
+**Behaviour is manifest-driven** (refactored out of the old hardcoded
+`SPRITE_STATE_ANIMS`): each manifest's `groups` array maps avatar **state →
+animation list** (`{ "state": "Idle", "animations": [...] }`, one per the 5
+states `Idle/Listening/Thinking/Speaking/Error`), and the player rotates a list
+when it has >1 entry. `SpritePlayer.groupFor(state)` reads it; a state with no
+group falls back to the set's `Idle` group. So a new set fully defines its own
+behaviour in its manifest — the imp can mirror Clawd (same groups, already
+cloned) or diverge per state without touching app code.
+
 ## Open decisions
 
 - **Bundle identifier:** `com.ccimp.app` vs `com.dyserna.ccimp`. Cosmetic on a

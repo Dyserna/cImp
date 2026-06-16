@@ -26,9 +26,18 @@ interface ManifestAnim {
   frames: ManifestFrame[];
 }
 
+/// Maps one avatar state to the animations that play for it. When more than
+/// one is listed the player rotates between them (see ROTATE_INTERVAL_MS).
+/// `state` matches the app's AvatarState values ("Idle", "Speaking", …).
+interface SpriteGroup {
+  state: string;
+  animations: string[];
+}
+
 interface Manifest {
   tile?: number;
   animations: Record<string, ManifestAnim>;
+  groups?: SpriteGroup[];
 }
 
 interface Crop {
@@ -58,6 +67,11 @@ export class SpritePlayer {
   private base = '';
   private tile = 20;
   private anims: Record<string, ManifestAnim> = {};
+  /// State -> animation-name list, parsed from the manifest's `groups`. This is
+  /// where per-set behaviour lives now (replacing the old hardcoded
+  /// SPRITE_STATE_ANIMS); the caller resolves which list to play per state and
+  /// picks a fallback when a set defines no group for a state.
+  private groups: Record<string, string[]> = {};
   private cache = new Map<string, LoadedAnim>();
 
   private activeKey = '';
@@ -97,6 +111,12 @@ export class SpritePlayer {
     this.base = baseUrl.replace(/\/+$/, '');
     this.tile = manifest.tile && manifest.tile > 0 ? manifest.tile : 20;
     this.anims = manifest.animations ?? {};
+    this.groups = {};
+    for (const g of manifest.groups ?? []) {
+      if (g && typeof g.state === 'string' && Array.isArray(g.animations)) {
+        this.groups[g.state] = g.animations;
+      }
+    }
     this.cache.clear();
     this.activeKey = '';
     this.activeList = [];
@@ -109,6 +129,13 @@ export class SpritePlayer {
   /// Names present in the loaded manifest, in declaration order.
   animNames(): string[] {
     return Object.keys(this.anims);
+  }
+
+  /// Animation-name list the manifest's `groups` assigns to avatar `state`, or
+  /// `[]` if the set defines no group for it. Returned raw — `setAnims` filters
+  /// to names actually present. The caller decides the fallback for `[]`.
+  groupFor(state: string): string[] {
+    return this.groups[state] ?? [];
   }
 
   /// Switch the active rotation list. `key` is a caller-supplied identity for

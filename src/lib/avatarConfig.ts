@@ -120,30 +120,7 @@ export function spriteManifestUrl(set: string): string {
   return `${spriteBaseUrl(set)}/manifest.json`;
 }
 
-/// Maps each avatar state to a preference-ordered list of animation names.
-/// The player filters these to the names actually present in the chosen set's
-/// manifest, then rotates among the survivors (falling back to *all* available
-/// animations if a state matches none, so any conformant manifest animates).
-///
-/// Per the design decision, the four Dance animations are folded into the Idle
-/// rotation alongside the Idle/Expression animations — so an idle avatar drifts
-/// between breathing, blinking, looking around, and the occasional dance rather
-/// than only the calm idles.
-export const SPRITE_STATE_ANIMS: Record<AvatarState, string[]> = {
-  Idle: [
-    'idle breathe',
-    'idle blink',
-    'idle look around',
-    'expression wink',
-    'expression sleep',
-    'dance bounce',
-    'dance sway',
-    'dance bounce dj',
-    'dance sway dj',
-    'dance djmix',
-  ],
-  Listening: ['idle look around', 'idle blink'],
-  Thinking: ['work think'],
-  Speaking: ['work coding'],
-  Error: ['expression surprise'],
-};
+// Per-state animation behaviour now lives in each set's `manifest.json`
+// `groups` (state -> animation list, rotated when >1) and is resolved by
+// SpritePlayer.groupFor() in AvatarOverlay — no longer hardcoded here, so a new
+// sprite set fully defines its own behaviour without touching app code.

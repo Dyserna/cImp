@@ -946,5 +946,47 @@
         }
       ]
     }
-  }
+  },
+  "groups": [
+    {
+      "state": "Idle",
+      "animations": [
+        "idle breathe",
+        "idle blink",
+        "idle look around",
+        "expression wink",
+        "expression sleep",
+        "dance bounce",
+        "dance sway",
+        "dance bounce dj",
+        "dance sway dj",
+        "dance djmix"
+      ]
+    },
+    {
+      "state": "Listening",
+      "animations": [
+        "idle look around",
+        "idle blink"
+      ]
+    },
+    {
+      "state": "Thinking",
+      "animations": [
+        "work think"
+      ]
+    },
+    {
+      "state": "Speaking",
+      "animations": [
+        "work coding"
+      ]
+    },
+    {
+      "state": "Error",
+      "animations": [
+        "expression surprise"
+      ]
+    }
+  ]
 }

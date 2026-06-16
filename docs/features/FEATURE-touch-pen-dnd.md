@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Migrate the v1.3 drag-and-drop implementation from `mouse*` events to `pointer*` events, so a single code path supports mouse, touch, and pen input. Enables tab dragging and splitter resize on touchscreen laptops, tablets running cctts, and accessibility devices that emulate pointer events.
+Migrate the v1.3 drag-and-drop implementation from `mouse*` events to `pointer*` events, so a single code path supports mouse, touch, and pen input. Enables tab dragging and splitter resize on touchscreen laptops, tablets running ccImp, and accessibility devices that emulate pointer events.
 
 See `FUTURE-FEATURES.md` § "Touch / pen drag-and-drop" for the rationale; this doc captures the implementation strategy.
 
@@ -86,7 +86,7 @@ Document any quirks in the source file's top comment, same convention as V4-05.
 
 **No milestone doc needed.** Single PR. Mostly mechanical translation + CSS additions + cross-platform validation. Comparable in size to a typical V1.x polish task.
 
-**Trigger to act**: per `FUTURE-FEATURES.md`, "if you ever run cctts on a touchscreen device, or accessibility need." Don't pre-emptively pick this up — touch isn't part of the primary user's daily driver setup, and the current mouse-only implementation works fine for the primary use case.
+**Trigger to act**: per `FUTURE-FEATURES.md`, "if you ever run ccImp on a touchscreen device, or accessibility need." Don't pre-emptively pick this up — touch isn't part of the primary user's daily driver setup, and the current mouse-only implementation works fine for the primary use case.
 
 ## Files most likely touched
 

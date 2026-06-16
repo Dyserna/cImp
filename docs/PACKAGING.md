@@ -6,12 +6,12 @@ documented in `RELEASE.md`. This document is the *why*.
 
 ## Current shape: portable Windows zip
 
-A tag-driven GitHub Actions job builds `cctts-portable-win-x64-vX.Y.Z.zip`
+A tag-driven GitHub Actions job builds `ccimp-portable-win-x64-vX.Y.Z.zip`
 on every `v*.*.*` push. Layout:
 
 ```
 bin/
-  cctts.exe
+  ccimp.exe
   onnxruntime*.dll      # usually none — ORT core is static-linked in the webgpu build
   webgpu_dawn.dll       # WebGPU EP (Dawn) runtime — GPU TTS
   dxcompiler.dll        #   "   (DirectX shader compiler Dawn uses for D3D12)
@@ -24,12 +24,12 @@ NOTICE
 README.txt
 ```
 
-Add `bin/` to PATH; run `cctts` from any terminal. No installer, no
-registry entries, no admin rights. Everything cctts writes lives inside
+Add `bin/` to PATH; run `ccimp` from any terminal. No installer, no
+registry entries, no admin rights. Everything ccImp writes lives inside
 the unzip folder: `settings.json` and `scrollback/` next to the exe in
 `bin/`; logs under `<portable-root>/logs/` (sibling of `bin/`).
-Per-launch-directory overlays (`.cctts.custom.config.json`) go in
-whatever working directory the user starts cctts from.
+Per-launch-directory overlays (`.ccimp.custom.config.json`) go in
+whatever working directory the user starts ccImp from.
 
 The Rust runtime resolves the model dir as `<exe-dir>/../models/` (see
 `model_dir()` in `src-tauri/src/tts/mod.rs`) — that's the only location
@@ -121,9 +121,9 @@ portable binary that uses any vendor's GPU and falls back to CPU.
   Vulkan on Linux, Metal on macOS). The only bundled runtime deps are three Dawn
   dylibs staged into `bin/`: `webgpu_dawn.dll`, `dxcompiler.dll`, `dxil.dll`. No
   CUDA DLLs, no redistributables, no SDK. `ort`'s `download-binaries` static-links
-  core ONNX Runtime into `cctts.exe`, so there is usually no `onnxruntime.dll`.
+  core ONNX Runtime into `ccimp.exe`, so there is usually no `onnxruntime.dll`.
 - **GPU by default with CPU fallback** (`tts/engine.rs` registers WebGPU then
-  falls back; `CCTTS_GPU=cpu` forces CPU) — same model as STT. Validated ~5×
+  falls back; `CCIMP_GPU=cpu` forces CPU) — same model as STT. Validated ~5×
   faster than CPU and correct on Kokoro, including the `ConvTranspose` that broke
   the DirectML EP. See `docs/features/FEATURE-tts-webgpu.md`.
 - **No extra build toolchain.** Unlike `stt-vulkan`, the WebGPU EP is a prebuilt
@@ -151,11 +151,11 @@ STT GPU works **unlike** the TTS/CUDA story above, and is the reason the
 portable zip can offer GPU without sacrificing portability. The release is
 built with whisper.cpp's **Vulkan** backend (`--features stt-vulkan`):
 
-- **The released `cctts.exe` is portable AND GPU-capable.** Its only
+- **The released `ccimp.exe` is portable AND GPU-capable.** Its only
   GPU-related runtime dependency is `vulkan-1.dll` — a Windows system component
   present on every Win10+ machine. So one binary: uses any vendor's GPU
   (NVIDIA/AMD/Intel) when present, falls back to CPU automatically when not
-  (`stt/engine.rs` tries GPU then CPU; `CCTTS_GPU=cpu` forces CPU). **Nothing
+  (`stt/engine.rs` tries GPU then CPU; `CCIMP_GPU=cpu` forces CPU). **Nothing
   GPU-specific is bundled** — no CUDA DLLs, no redistributables.
 - **The default feature set is CPU-only**, so routine local builds stay light;
   the GPU build is explicit (`--features stt-vulkan`). CI builds the release
@@ -170,7 +170,7 @@ built with whisper.cpp's **Vulkan** backend (`--features stt-vulkan`):
 
 Currently manual: download the next release zip, unzip over the existing
 folder. The `settings.json` next to the exe and any per-folder
-`.cctts.custom.config.json` overlays are not in the zip and stay where
+`.ccimp.custom.config.json` overlays are not in the zip and stay where
 they are across updates.
 
 Tauri ships a built-in updater that polls a JSON manifest, downloads, and
@@ -193,7 +193,7 @@ settings, plan a migration rather than a hard schema break.
 ## Asset Bundling
 
 The avatar default assets live at the top-level `avatars/<theme>/` folder.
-The `cctts-avatars` Vite plugin in `vite.config.ts` serves them at
+The `ccImp-avatars` Vite plugin in `vite.config.ts` serves them at
 `/avatar/<theme>/...` in dev and copies them to `dist/avatar/<theme>/...`
 at build time, where they're embedded in the Tauri output as part of
 `frontendDist`. The release workflow also stages the same `avatars/`
@@ -202,7 +202,7 @@ No separate step required.
 
 The **sprite** avatar variant works the same way: sets live at the
 top-level `sprites/<set>/` folder (each a `manifest.json` + frame
-subfolders), served at `/sprites/<set>/...` in dev by the `cctts-sprites`
+subfolders), served at `/sprites/<set>/...` in dev by the `ccImp-sprites`
 Vite plugin and copied to `dist/sprites/<set>/...` at build. Because the
 frontend loads them from the embedded `/sprites/...` URLs, sprite avatars
 function without any on-disk portable folder or Rust path-stamping — the

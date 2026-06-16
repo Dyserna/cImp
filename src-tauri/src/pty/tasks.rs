@@ -171,9 +171,11 @@ pub fn spawn_processor(
         let is_shell = matches!(kind, TabKind::Shell);
 
         let mut layer = ProcessingLayer::with_user_typed_filter(user_typed_tts);
-        layer.set_max_hold(Duration::from_millis(
-            settings.current().processing.max_hold_ms as u64,
-        ));
+        {
+            let s = settings.current();
+            layer.set_max_hold(Duration::from_millis(s.processing.max_hold_ms as u64));
+            layer.set_speak_all(s.tab_speak_all_output(tab.as_str()));
+        }
         let mut settings_rx = settings.subscribe();
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -209,6 +211,9 @@ pub fn spawn_processor(
                             layer.set_max_hold(Duration::from_millis(
                                 s.processing.max_hold_ms as u64,
                             ));
+                            // Pick up a live toggle of "speak all output" for
+                            // this tab — no PTY restart needed.
+                            layer.set_speak_all(s.tab_speak_all_output(tab.as_str()));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {

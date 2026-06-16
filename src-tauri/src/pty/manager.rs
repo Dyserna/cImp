@@ -24,7 +24,7 @@ pub struct PtyLaunchSpec {
     /// Arguments inserted before `extra_args`. Used for `--append-system-
     /// prompt <content>` on the Claude tab.
     pub pre_args: Vec<String>,
-    /// User-supplied flags + cctts invocation args.
+    /// User-supplied flags + ccimp invocation args.
     pub extra_args: Vec<String>,
     pub working_dir: std::path::PathBuf,
     /// Environment additions/overrides applied on top of the inherited

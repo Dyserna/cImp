@@ -141,8 +141,8 @@ fn build_extra_args(
 
     out.extend(cfg.args.iter().filter(|s| !s.is_empty()).cloned());
 
-    // cctts is documented as a drop-in replacement for `claude`, so
-    // invocation args (`cctts --resume <id>`, etc.) flow into every
+    // ccimp is documented as a drop-in replacement for `claude`, so
+    // invocation args (`ccimp --resume <id>`, etc.) flow into every
     // Claude tab. Aider ignores unknown flags less gracefully than
     // Claude, so we only forward invocation args to Claude tabs.
     if command_is(&cfg.command, "claude") {

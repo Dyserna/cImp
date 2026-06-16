@@ -5,7 +5,7 @@
 //!   * **Global** (`<exe-dir>/settings.json`) — portable baseline. Written
 //!     once on first launch when missing; never rewritten through normal
 //!     edits afterwards. Hand-edit to change defaults.
-//!   * **Custom overlay** (`<launch_cwd>/.cctts.custom.config.json`) — per
+//!   * **Custom overlay** (`<launch_cwd>/.ccimp.custom.config.json`) — per
 //!     launch-directory delta layered on top of global. Created the first
 //!     time a user customizes anything from a given working directory and
 //!     deleted automatically when the diff is empty.
@@ -47,7 +47,7 @@ use crate::settings::schema::{
 use crate::shell::ShellSpec;
 
 const GLOBAL_FILE_NAME: &str = "settings.json";
-const CUSTOM_FILE_NAME: &str = ".cctts.custom.config.json";
+const CUSTOM_FILE_NAME: &str = ".ccimp.custom.config.json";
 
 /// `<exe-dir>/settings.json` — the portable baseline. Falls back to the
 /// current working directory if `current_exe()` is unavailable, which
@@ -62,7 +62,7 @@ pub fn global_path() -> AppResult<PathBuf> {
     Ok(dir.join(GLOBAL_FILE_NAME))
 }
 
-/// `<launch_cwd>/.cctts.custom.config.json` — the per-folder overlay.
+/// `<launch_cwd>/.ccimp.custom.config.json` — the per-folder overlay.
 pub fn custom_path(launch_cwd: &Path) -> PathBuf {
     launch_cwd.join(CUSTOM_FILE_NAME)
 }
@@ -1209,7 +1209,7 @@ mod tests {
     #[test]
     fn stamp_avatar_paths_uses_files_present_in_dir() {
         let dir = std::env::temp_dir()
-            .join(format!("cctts_avatars_{}", uuid::Uuid::new_v4()));
+            .join(format!("ccimp_avatars_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
 
         // Stage two of the five state videos plus the transition; the
@@ -1242,7 +1242,7 @@ mod tests {
     #[test]
     fn stamp_avatar_paths_prefers_theme_subfolder() {
         let dir = std::env::temp_dir()
-            .join(format!("cctts_avatars_themed_{}", uuid::Uuid::new_v4()));
+            .join(format!("ccimp_avatars_themed_{}", uuid::Uuid::new_v4()));
         let modern = dir.join("modern-dark");
         let tui_yellow = dir.join("tui-yellow");
         fs::create_dir_all(&modern).unwrap();
@@ -1287,7 +1287,7 @@ mod tests {
         // of `avatars/`. Verify those still get picked up when the active
         // theme's subfolder is missing.
         let dir = std::env::temp_dir()
-            .join(format!("cctts_avatars_flat_{}", uuid::Uuid::new_v4()));
+            .join(format!("ccimp_avatars_flat_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         for f in ["Idle.mp4", "Transition.mp4"] {
             fs::write(dir.join(f), b"").unwrap();
@@ -1309,7 +1309,7 @@ mod tests {
     #[test]
     fn stamp_avatar_paths_noop_when_dir_empty() {
         let dir = std::env::temp_dir()
-            .join(format!("cctts_avatars_empty_{}", uuid::Uuid::new_v4()));
+            .join(format!("ccimp_avatars_empty_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
 
         let mut s = Settings::default();
@@ -1329,14 +1329,14 @@ mod tests {
     #[test]
     fn stamp_avatar_paths_preserves_user_override_outside_dir() {
         let dir = std::env::temp_dir()
-            .join(format!("cctts_avatars_ovr_{}", uuid::Uuid::new_v4()));
+            .join(format!("ccimp_avatars_ovr_{}", uuid::Uuid::new_v4()));
         let theme = dir.join("tui-yellow");
         fs::create_dir_all(&theme).unwrap();
         fs::write(theme.join("Idle.mp4"), b"").unwrap();
 
         // A genuine override the user picked from elsewhere on disk.
         let custom = std::env::temp_dir()
-            .join(format!("cctts_custom_{}.mp4", uuid::Uuid::new_v4()));
+            .join(format!("ccimp_custom_{}.mp4", uuid::Uuid::new_v4()));
         fs::write(&custom, b"").unwrap();
 
         let mut s = Settings::default();
@@ -1354,7 +1354,7 @@ mod tests {
     #[test]
     fn stamp_avatar_paths_repoints_on_theme_switch() {
         let dir = std::env::temp_dir()
-            .join(format!("cctts_avatars_switch_{}", uuid::Uuid::new_v4()));
+            .join(format!("ccimp_avatars_switch_{}", uuid::Uuid::new_v4()));
         let yellow = dir.join("tui-yellow");
         let purple = dir.join("tui-purple");
         fs::create_dir_all(&yellow).unwrap();
@@ -1379,7 +1379,7 @@ mod tests {
     #[test]
     fn stamp_avatar_paths_resets_when_new_theme_has_no_files() {
         let dir = std::env::temp_dir()
-            .join(format!("cctts_avatars_reset_{}", uuid::Uuid::new_v4()));
+            .join(format!("ccimp_avatars_reset_{}", uuid::Uuid::new_v4()));
         let yellow = dir.join("tui-yellow");
         fs::create_dir_all(&yellow).unwrap();
         fs::write(yellow.join("Idle.mp4"), b"").unwrap();
@@ -1418,7 +1418,7 @@ mod tests {
         // Use a unique subdir under the system temp root so parallel test
         // runs don't collide. Cleaned up at the end of the test.
         let dir = std::env::temp_dir()
-            .join(format!("cctts_test_{}", uuid::Uuid::new_v4()));
+            .join(format!("ccimp_test_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let overlay = dir.join(CUSTOM_FILE_NAME);
 

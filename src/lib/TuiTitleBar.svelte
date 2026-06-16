@@ -12,7 +12,7 @@
   import { onMount } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
 
-  let { title = 'cctts' }: { title?: string } = $props();
+  let { title = 'ccImp' }: { title?: string } = $props();
 
   let isMaximized = $state(false);
 

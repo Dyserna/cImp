@@ -14,9 +14,16 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::processing::screen::Screen;
+use crate::processing::segmenter::segment_sentences;
 
 const OPEN: &[u8] = b"[[TTS]]";
 const CLOSE: &[u8] = b"[[/TTS]]";
+
+/// Drop the accumulated speak-all buffer once it grows past this without a
+/// sentence terminator. Unterminated runs this long are almost always TUI
+/// chrome (spinner / status lines that never end in `.?!`); dropping avoids
+/// dumping a wall of garbage to the synthesizer.
+const MAX_ALL_BUF: usize = 2048;
 
 pub struct TagScanner {
     /// Whitespace-normalized tag contents already emitted as TTS segments.
@@ -41,6 +48,10 @@ pub struct TagScanner {
     /// window required. Normalization mirrors `spoken`'s, since echoed
     /// content can also be reflowed by terminal width changes.
     user_typed: Arc<Mutex<HashSet<String>>>,
+    /// Speak-all mode only: stripped-but-not-yet-emitted text. Holds the
+    /// in-progress trailing sentence between scans so a sentence split across
+    /// output bursts is spoken whole. Empty in normal (tag) mode.
+    all_buf: String,
 }
 
 impl TagScanner {
@@ -54,6 +65,7 @@ impl TagScanner {
             open_tag: false,
             scan_offset: 0,
             user_typed,
+            all_buf: String::new(),
         }
     }
 
@@ -134,6 +146,126 @@ impl TagScanner {
         }
         self.open_tag = false;
     }
+
+    /// Enter speak-all mode: skip whatever is already on screen so only
+    /// output produced *after* the toggle is spoken (never the backlog). The
+    /// tag scanner's `scan_offset` only advances past closed `[[TTS]]` pairs,
+    /// so with markers absent it can still be at 0 — jump it to the current
+    /// end explicitly. Idempotent-safe; the caller gates it on the off→on edge.
+    pub fn begin_speak_all(&mut self, raw_len: usize) {
+        self.scan_offset = raw_len;
+        self.all_buf.clear();
+    }
+
+    /// Speak-all mode: treat the entire unconsumed raw stream as speakable
+    /// content (no `[[TTS]]` markers). New bytes are consumed up to the last
+    /// newline (a boundary that never splits an ANSI escape), ANSI-stripped,
+    /// and accumulated; any literal `[[TTS]]` / `[[/TTS]]` markers are dropped
+    /// (we ignore the tags entirely in this mode). Complete sentences are then
+    /// emitted (deduped against `spoken` and the user-typed set); the trailing
+    /// in-progress sentence is held in `all_buf` for the next call so it isn't
+    /// split mid-stream. `force` (max-hold) flushes the held remainder too.
+    ///
+    /// Sentence-only by design: unterminated trailing text — spinner/status
+    /// chrome, box-drawing, the input prompt — is held and ultimately dropped
+    /// (via `MAX_ALL_BUF`) rather than spoken, which keeps full-screen TUI
+    /// noise out of the synthesizer.
+    pub fn scan_all(&mut self, raw: &[u8], force: bool) -> Vec<String> {
+        if self.scan_offset > raw.len() {
+            self.scan_offset = raw.len();
+        }
+        let scan = &raw[self.scan_offset..];
+        let consume_to = if force {
+            scan.len()
+        } else {
+            match scan.iter().rposition(|&b| b == b'\n') {
+                Some(i) => i + 1,
+                None => 0,
+            }
+        };
+        if consume_to > 0 {
+            let mut stripped = strip_ansi(&scan[..consume_to]);
+            if stripped.contains("[[") {
+                stripped = stripped.replace("[[TTS]]", " ").replace("[[/TTS]]", " ");
+            }
+            self.all_buf.push_str(&stripped);
+            self.scan_offset += consume_to;
+        }
+
+        // Split off the run of complete sentences; keep the remainder
+        // (untrimmed, so spacing across the cut is preserved) for next time.
+        let split = if force {
+            self.all_buf.len()
+        } else {
+            last_sentence_split(&self.all_buf)
+        };
+        if split == 0 {
+            // No complete sentence yet. Drop a runaway buffer (chrome that
+            // never terminates) so it can't accumulate or later dump.
+            if self.all_buf.len() > MAX_ALL_BUF {
+                self.all_buf.clear();
+            }
+            return Vec::new();
+        }
+        let complete = self.all_buf[..split].to_string();
+        self.all_buf.drain(..split);
+        if self.all_buf.len() > MAX_ALL_BUF {
+            self.all_buf.clear();
+        }
+
+        let mut out = Vec::new();
+        for sentence in segment_sentences(&complete) {
+            // The normalized form (whitespace runs, incl. mid-sentence line
+            // wraps, collapsed to single spaces) is both the dedup key and the
+            // spoken text, so wrapped output reads as one clean utterance.
+            let key = normalize_for_dedup(&sentence);
+            if key.is_empty() || self.spoken.contains(&key) {
+                continue;
+            }
+            // The TUI echoes the user's question behind a prompt prefix
+            // ("> ", box borders → spaces), so also match against the key with
+            // leading non-alphanumerics stripped. The registered keys are the
+            // raw typed sentences, with no such prefix.
+            let echo_key = key.trim_start_matches(|c: char| !c.is_alphanumeric());
+            let user_echo = self
+                .user_typed
+                .lock()
+                .map(|u| u.contains(&key) || u.contains(echo_key))
+                .unwrap_or(false);
+            if !user_echo {
+                out.push(key.clone());
+            }
+            self.spoken.insert(key);
+        }
+        out
+    }
+}
+
+/// Byte index in `s` just past the end of the last complete sentence — i.e.
+/// after the final `.?!` that is followed by whitespace or end-of-string,
+/// including any trailing whitespace. Returns 0 when there is no complete
+/// sentence. Deliberately simpler than the full [`segment_sentences`] rules
+/// (it doesn't special-case abbreviations); it only decides *how much* to
+/// flush — the flushed slice still goes through `segment_sentences`, which
+/// applies the decimal/abbreviation/ellipsis logic to the actual segments.
+fn last_sentence_split(s: &str) -> usize {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut split = 0;
+    let mut i = 0;
+    while i < n {
+        if matches!(b[i], b'.' | b'?' | b'!') && (i + 1 >= n || b[i + 1].is_ascii_whitespace()) {
+            let mut j = i + 1;
+            while j < n && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            split = j;
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    split
 }
 
 impl Default for TagScanner {
@@ -265,4 +397,96 @@ fn strip_ansi(bytes: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed the scanner the way `ProcessingLayer` does: `raw` is the full
+    /// append-only buffer, so each call passes the growing slice.
+    #[test]
+    fn scan_all_speaks_complete_sentences_and_holds_the_tail() {
+        let mut s = TagScanner::new();
+        let mut raw: Vec<u8> = Vec::new();
+
+        raw.extend_from_slice(b"Hello world. How are you\n");
+        assert_eq!(s.scan_all(&raw, false), vec!["Hello world."]);
+
+        // The trailing "How are you" is held until it terminates.
+        raw.extend_from_slice(b" doing today? Fine\n");
+        assert_eq!(s.scan_all(&raw, false), vec!["How are you doing today?"]);
+    }
+
+    #[test]
+    fn scan_all_dedupes_repeats() {
+        let mut s = TagScanner::new();
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(b"Same line.\n");
+        assert_eq!(s.scan_all(&raw, false), vec!["Same line."]);
+        // Identical content again is suppressed.
+        raw.extend_from_slice(b"Same line.\n");
+        assert!(s.scan_all(&raw, false).is_empty());
+    }
+
+    #[test]
+    fn scan_all_strips_tts_markers() {
+        let mut s = TagScanner::new();
+        let raw = b"[[TTS]]Spoken content here.[[/TTS]]\n".to_vec();
+        let out = s.scan_all(&raw, false);
+        assert_eq!(out, vec!["Spoken content here."]);
+        // Make sure the literal marker text never leaks into speech.
+        assert!(out.iter().all(|t| !t.contains("TTS")));
+    }
+
+    #[test]
+    fn scan_all_holds_unterminated_chrome() {
+        let mut s = TagScanner::new();
+        let raw = b"| > type a message |\n".to_vec();
+        // No sentence terminator -> nothing spoken (held / eventually dropped).
+        assert!(s.scan_all(&raw, false).is_empty());
+    }
+
+    #[test]
+    fn scan_all_force_flushes_unterminated_remainder() {
+        let mut s = TagScanner::new();
+        // Without a trailing newline nothing is consumed in normal mode...
+        let raw = b"No trailing newline here".to_vec();
+        assert!(s.scan_all(&raw, false).is_empty());
+        // ...but a forced (max-hold) flush emits whatever is pending.
+        assert_eq!(s.scan_all(&raw, true), vec!["No trailing newline here"]);
+    }
+
+    #[test]
+    fn scan_all_suppresses_echoed_user_question_behind_prompt_prefix() {
+        // Mirror what `note_typed_input` registers: the raw typed sentence,
+        // normalized, with no prompt prefix.
+        let typed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        typed
+            .lock()
+            .unwrap()
+            .insert("what is the capital of France?".to_string());
+        let mut s = TagScanner::with_user_typed_filter(typed);
+
+        // The TUI echoes it behind a "> " prompt prefix; still suppressed.
+        let raw = b"> what is the capital of France?\n".to_vec();
+        assert!(s.scan_all(&raw, false).is_empty());
+
+        // A genuine Claude sentence still comes through.
+        let mut raw2 = raw.clone();
+        raw2.extend_from_slice(b"The capital of France is Paris.\n");
+        assert_eq!(s.scan_all(&raw2, false), vec!["The capital of France is Paris."]);
+    }
+
+    #[test]
+    fn begin_speak_all_skips_backlog() {
+        let mut s = TagScanner::new();
+        let raw = b"Old backlog line.\n".to_vec();
+        s.begin_speak_all(raw.len());
+        // Everything already present is skipped; only new output speaks.
+        assert!(s.scan_all(&raw, false).is_empty());
+        let mut raw2 = raw.clone();
+        raw2.extend_from_slice(b"Fresh line.\n");
+        assert_eq!(s.scan_all(&raw2, false), vec!["Fresh line."]);
+    }
 }

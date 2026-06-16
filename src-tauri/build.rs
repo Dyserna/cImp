@@ -15,7 +15,7 @@ fn main() {
 /// from `.github/workflows/release.yml` instead.
 fn copy_theming_assets() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
-    // OUT_DIR = target/{profile}/build/cctts-{hash}/out → up 3 = target/{profile}.
+    // OUT_DIR = target/{profile}/build/ccimp-{hash}/out → up 3 = target/{profile}.
     let profile_dir = out_dir
         .parent()
         .and_then(|p| p.parent())
@@ -46,7 +46,7 @@ fn copy_theming_assets() {
 /// work without setting any env var at runtime.
 fn copy_espeak_data() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
-    // OUT_DIR = target/{profile}/build/cctts-{hash}/out
+    // OUT_DIR = target/{profile}/build/ccimp-{hash}/out
     // build_root = target/{profile}/build
     // profile_dir = target/{profile}
     let build_root = out_dir

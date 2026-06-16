@@ -1,10 +1,10 @@
-# Design Document: cctts
+# Design Document: ccImp
 
 ## Purpose of This Document
 
-This document captures the current architecture and design decisions of cctts. It is the authoritative reference for implementation. When a milestone specification is unclear or a design choice is not covered, this document is the fallback.
+This document captures the current architecture and design decisions of ccImp. It is the authoritative reference for implementation. When a milestone specification is unclear or a design choice is not covered, this document is the fallback.
 
-Where granular history matters (which decision changed when, what a particular milestone introduced), see the per-milestone `MILESTONE-V[N]-[N].md` files. Where deferred work is tracked, see `FUTURE-FEATURES.md`. This doc describes how cctts is, not how it evolved.
+Where granular history matters (which decision changed when, what a particular milestone introduced), see the per-milestone `MILESTONE-V[N]-[N].md` files. Where deferred work is tracked, see `FUTURE-FEATURES.md`. This doc describes how ccImp is, not how it evolved.
 
 The audience is Claude Code working on implementation across sessions, plus any human reviewer.
 
@@ -132,7 +132,7 @@ The shape: PTY bytes per tab flow through a per-tab processing layer that fans t
 
 ### PTY Manager and Tab Registry
 
-The Rust backend owns one PTY per tab. The `TabRegistry` (`src-tauri/src/tabs/`) holds the live set of tabs and per-tab PTY managers; it eagerly spawns every persisted tab's subprocess at app launch, so the user never sees a startup delay when switching tabs. Each subprocess is spawned with the configured command, args, working directory (defaulting to cctts's launch directory), and environment.
+The Rust backend owns one PTY per tab. The `TabRegistry` (`src-tauri/src/tabs/`) holds the live set of tabs and per-tab PTY managers; it eagerly spawns every persisted tab's subprocess at app launch, so the user never sees a startup delay when switching tabs. Each subprocess is spawned with the configured command, args, working directory (defaulting to ccImp's launch directory), and environment.
 
 Per-tab responsibilities:
 
@@ -143,7 +143,7 @@ Per-tab responsibilities:
 - Handle PTY resize when the terminal area changes size
 - Detect subprocess exit and route to the state manager (Error for AI-tool tabs, Closed sub-state for Shell tabs — see below)
 
-The wrapper acts as a drop-in replacement for `claude` for the Claude tab specifically: any CLI arguments passed to `cctts` are captured at startup (`std::env::args().skip(1)`) and forwarded to the spawned `claude`. CLI args from settings (per-tab `args`) are applied first, then invocation args from the cctts command line, so persistent flags and one-shot flags compose.
+The wrapper acts as a drop-in replacement for `claude` for the Claude tab specifically: any CLI arguments passed to `ccimp` are captured at startup (`std::env::args().skip(1)`) and forwarded to the spawned `claude`. CLI args from settings (per-tab `args`) are applied first, then invocation args from the ccImp command line, so persistent flags and one-shot flags compose.
 
 Implementation:
 
@@ -545,9 +545,9 @@ Behavior is straightforward bindings: mute toggles `tts.mute`, announcements tog
 Two JSON files participate, both under `src-tauri/src/settings/`:
 
 - **Global baseline** — `<exe-dir>/settings.json`. Portable; written once on first launch when missing and rewritten only on migration / integrity repair. Hand-edit to change defaults.
-- **Per-folder custom overlay** — `<launch_cwd>/.cctts.custom.config.json`. Partial JSON object containing only the keys that differ from the global baseline. Created automatically the first time the user customizes anything from a given working directory, deleted automatically when the diff is empty. Layered on top of global at load via deep-merge.
+- **Per-folder custom overlay** — `<launch_cwd>/.ccimp.custom.config.json`. Partial JSON object containing only the keys that differ from the global baseline. Created automatically the first time the user customizes anything from a given working directory, deleted automatically when the diff is empty. Layered on top of global at load via deep-merge.
 
-This replaces an earlier design that wrote a single file under `dirs::config_dir().join("cctts")`. The portable + overlay model lets the user (a) carry the binary as a self-contained portable directory, and (b) keep per-project customizations alongside the project rather than in OS-global config.
+This replaces an earlier design that wrote a single file under `dirs::config_dir().join("ccImp")`. The portable + overlay model lets the user (a) carry the binary as a self-contained portable directory, and (b) keep per-project customizations alongside the project rather than in OS-global config.
 
 `load(default_shell, launch_cwd)`:
 
@@ -597,7 +597,7 @@ The frontend's `validateAndRepairLayout` runs after this on hydration and handle
 
 ## Settings Schema
 
-The on-disk JSON shape, current as of v1.9. The example below shows the fully-resolved global file; the per-folder overlay (`.cctts.custom.config.json`) is a partial subset of the same shape.
+The on-disk JSON shape, current as of v1.9. The example below shows the fully-resolved global file; the per-folder overlay (`.ccimp.custom.config.json`) is a partial subset of the same shape.
 
 ```json
 {
@@ -769,7 +769,7 @@ The on-disk JSON shape, current as of v1.9. The example below shows the fully-re
 Notes:
 
 - Every Rust struct uses `#[serde(default)]` so a settings file written by a future or past version still loads — missing fields get defaults, unknown fields are ignored.
-- `tts_injection.enabled` controls whether cctts injects system-prompt content for an AI tab via `--append-system-prompt`. On by default for both AI builtins (subscription Claude and Claude (local)); local models vary in how reliably they honor the markup convention, so the local-tab version is best-effort.
+- `tts_injection.enabled` controls whether ccImp injects system-prompt content for an AI tab via `--append-system-prompt`. On by default for both AI builtins (subscription Claude and Claude (local)); local models vary in how reliably they honor the markup convention, so the local-tab version is best-effort.
 - `use_local_provider` (V1.4-07) gates env synthesis from the global `claude_local` settings group. When `true`, the launch-time spawn merges `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL` if the alias is non-empty) into the process env, with per-tab `env` entries always winning over synthesized values.
 - `claude_tabs_enabled` (V1.9) drives the integrity-check reconciliation of the AI builtins: `Cloud` keeps only `claude`, `Local` keeps only `claude-local`, `Both` keeps both. Default is `Cloud`. Changing the value at runtime closes / re-opens the affected tabs (kills the PTY and drops scrollback when removing; re-creates with defaults when adding).
 - AI builtins (`claude`, `claude-local`) cannot be deleted by hand-edits — the integrity check restores them at canonical positions when `claude_tabs_enabled` says they should exist, and corrects `use_local_provider` if a hand-edit flipped it. The `shell-default-1` id is *not* a builtin: it ships as the first shell tab on a fresh install but is fully closable, and the integrity check does not re-seed it. User-created Shell tab ids are uuid-based and never collide with reserved ids.
@@ -780,7 +780,7 @@ Notes:
 - `terminal.background` (V1.4-02) has independent `image` and `color` fields plus opacity/blur/size/position controls that apply only when an image is set. The four-cell rendering matrix (image × color, each Some/None) drives a discriminated `RenderingMode` — `'none'` and `'color'` use xterm.js's canvas renderer (fast); `'image'` uses the in-core DOM renderer with `allowTransparency: true` and CSS layering on the host. Toggling between fast and image categories triggers a debounced Terminal recreate; same-category changes (color tweak, slider drag) apply in place. Per-tab `background_override` is three-state: `null` inherits the global, `"disabled"` opts out (theme bg only), an object replaces the global wholesale. The Configure Tab dialog (shell tabs) and the per-AI-tab Settings section both surface the override row, both reusing the shared `BackgroundConfigEditor` component. `terminal.background.presets` (V1.4-04 B) holds named global presets the user can apply from the Background editor; `preview_category_flips` (V1.4-04 C.4) gates whether per-tab Configure dialog edits that would flip renderer category preview live or are deferred to Save. See `MILESTONE-V1.4-02-terminal-background.md` and `MILESTONE-V1.4-03-terminal-background.md`.
 - `terminal.scrollback` (V1.4-04 D) configures the per-tab cross-restart scrollback ring buffer. `ring_bytes` caps in-memory size (default 256 KB); `persist` flushes on graceful exit; `restore_on_launch` replays on next `pty_start`.
 
-- **PTY rebind protocol (V1.4-03).** xterm.js's renderer is decided at `Terminal` construction (`allowTransparency` and the canvas vs. DOM split are constructor-only), so toggling the image background requires destroying the xterm Terminal and constructing a new one. To preserve the shell session across this destroy/create cycle, cctts uses `pty_rebind_channel` — the PTY and its child stay alive; only the IPC `Channel<String>` is swapped. Implementation: a per-PTY `mpsc::Sender<ProcessorControl>` (capacity 4) lets the manager push `ChannelChange(new_channel)` to the processor task's select loop, where the existing `mpsc::Receiver::recv` cancel-safety guarantee keeps byte ordering intact. `@xterm/addon-serialize` captures a snapshot of the visible scrollback before destroy and replays it into the new xterm via `term.write` *before* `pty_rebind_channel` resolves; xterm's FIFO write queue ensures the snapshot lands ahead of any live byte arriving after the rebind. The new `Terminal` is constructed with the previous instance's `rows`/`cols` so replayed cursor positions align with the new grid.
+- **PTY rebind protocol (V1.4-03).** xterm.js's renderer is decided at `Terminal` construction (`allowTransparency` and the canvas vs. DOM split are constructor-only), so toggling the image background requires destroying the xterm Terminal and constructing a new one. To preserve the shell session across this destroy/create cycle, ccImp uses `pty_rebind_channel` — the PTY and its child stay alive; only the IPC `Channel<String>` is swapped. Implementation: a per-PTY `mpsc::Sender<ProcessorControl>` (capacity 4) lets the manager push `ChannelChange(new_channel)` to the processor task's select loop, where the existing `mpsc::Receiver::recv` cancel-safety guarantee keeps byte ordering intact. `@xterm/addon-serialize` captures a snapshot of the visible scrollback before destroy and replays it into the new xterm via `term.write` *before* `pty_rebind_channel` resolves; xterm's FIFO write queue ensures the snapshot lands ahead of any live byte arriving after the rebind. The new `Terminal` is constructed with the previous instance's `rows`/`cols` so replayed cursor positions align with the new grid.
 
 - **Cross-restart scrollback (V1.4-04 D).** Every PTY's output is mirrored into a per-tab ring buffer capped at `terminal.scrollback.ring_bytes` (default 256 KB ≈ 600 lines of dense ANSI). On graceful exit (`tauri::RunEvent::ExitRequested`) each tab's buffer is flushed to disk under the app data dir, keyed by sanitized tab id; on next `pty_start` the file is read back and replayed into the new xterm before any live PTY bytes. Settings: `persist` and `restore_on_launch` (both default `true`) gate the disk write and read-back independently. Orphan files (tabs that no longer exist) are pruned at startup against the registry's known ids.
 
@@ -829,7 +829,7 @@ If a complete response contains no TTS tags, the wrapper does not speak any of i
 
 ### Local-LLM TTS reliability
 
-The Claude (local) tab passes the same TTS injection instructions as the subscription Claude tab (Claude Code is identical between the two — only the auth/endpoint env differs). Whether `[[TTS]]…[[/TTS]]` markup actually appears in output depends on the model behind the local proxy. Smaller models (e.g., 7-13B class) often don't follow the markup convention reliably even when instructed; larger models (32B+ or proprietary class) tend to be more compliant. cctts treats missing markup the same way it treats any non-markup output — silently. This is fallback behavior, not an error.
+The Claude (local) tab passes the same TTS injection instructions as the subscription Claude tab (Claude Code is identical between the two — only the auth/endpoint env differs). Whether `[[TTS]]…[[/TTS]]` markup actually appears in output depends on the model behind the local proxy. Smaller models (e.g., 7-13B class) often don't follow the markup convention reliably even when instructed; larger models (32B+ or proprietary class) tend to be more compliant. ccImp treats missing markup the same way it treats any non-markup output — silently. This is fallback behavior, not an error.
 
 ---
 
@@ -848,9 +848,9 @@ The full set is in the settings schema above. Behavior of `switch_to_tab_N` is b
 Settings paths on every platform:
 
 - Global baseline: `<exe-dir>/settings.json`
-- Per-folder overlay: `<launch_cwd>/.cctts.custom.config.json`
+- Per-folder overlay: `<launch_cwd>/.ccimp.custom.config.json`
 
-These replace the OS-config-dir paths used in earlier versions. The portable design means cctts can be packaged as a self-contained directory, and per-project tweaks live alongside the project rather than in OS-global config.
+These replace the OS-config-dir paths used in earlier versions. The portable design means ccImp can be packaged as a self-contained directory, and per-project tweaks live alongside the project rather than in OS-global config.
 
 ### Windows
 

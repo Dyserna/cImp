@@ -103,12 +103,12 @@ export function initThemeRegistry(): Promise<void> {
 function injectThemeCss(themes: ThemeEntry[]): void {
   for (const t of themes) {
     if (!t.css) continue;
-    const elementId = `cctts-theme-${t.id}`;
+    const elementId = `ccimp-theme-${t.id}`;
     let el = document.getElementById(elementId) as HTMLStyleElement | null;
     if (!el) {
       el = document.createElement('style');
       el.id = elementId;
-      el.dataset.ccttsTheme = t.id;
+      el.dataset.ccimpTheme = t.id;
       document.head.appendChild(el);
     }
     el.textContent = t.css;

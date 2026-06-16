@@ -1,13 +1,13 @@
 [package]
-name = "cctts"
-version = "0.11.0"
+name = "ccimp"
+version = "0.12.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
 rust-version = "1.77"
 
 [[bin]]
-name = "cctts"
+name = "ccimp"
 path = "src/main.rs"
 
 [features]
@@ -96,7 +96,7 @@ rodio = "0.20"
 
 # STT (Whisper via whisper.cpp bindings). Statically links one C library;
 # needs a C/C++ toolchain + CMake at build time (see MAINTENANCE.md). CUDA is
-# a compile-time feature (`stt-cuda`) wired to the same CCTTS_GPU=cuda runtime
+# a compile-time feature (`stt-cuda`) wired to the same CCIMP_GPU=cuda runtime
 # opt-in as ort — see [features] below. Default build is CPU-only so it works
 # on any machine without the CUDA toolkit.
 whisper-rs = "0.16"

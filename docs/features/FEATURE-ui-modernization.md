@@ -2,15 +2,15 @@
 
 ## Purpose
 
-Introduce a centralized design-token system, ship a single "Modern Dark" theme using those tokens, and refresh the visual language across the cctts chrome — tab bar, status bar, dialogs, overlays, settings window — with larger rounded corners, refined spacing, subtle elevation, and polished hover/focus states.
+Introduce a centralized design-token system, ship a single "Modern Dark" theme using those tokens, and refresh the visual language across the ccImp chrome — tab bar, status bar, dialogs, overlays, settings window — with larger rounded corners, refined spacing, subtle elevation, and polished hover/focus states.
 
-Today, styling is scoped to each Svelte component, hex colors are duplicated across 31+ files, border radii are tiny (3px) and inconsistent, and there's no shared system for elevation, motion, or spacing. The cctts UI looks dated next to modern desktop apps — flat panels with sharp corners and a single accent. This feature pulls the visual language up to par.
+Today, styling is scoped to each Svelte component, hex colors are duplicated across 31+ files, border radii are tiny (3px) and inconsistent, and there's no shared system for elevation, motion, or spacing. The ccImp UI looks dated next to modern desktop apps — flat panels with sharp corners and a single accent. This feature pulls the visual language up to par.
 
 ## Scope clarification: this is NOT the per-tab terminal theme feature
 
 `FEATURE-per-tab-overrides.md` § "Terminal color themes" covers **xterm.js terminal palettes** — the colors *inside* a terminal pane (foreground, background, ANSI 16, cursor, selection). That's per-tab, palette-driven, lives in xterm.js's `ITheme` shape.
 
-**This feature** is the **cctts UI chrome** — the tab bar, status bar, dialogs, settings window, overlays, dropdowns, buttons, menus. The two are independent and ship independently. They share the word "theme" but operate on different surfaces. A user can have:
+**This feature** is the **ccImp UI chrome** — the tab bar, status bar, dialogs, settings window, overlays, dropdowns, buttons, menus. The two are independent and ship independently. They share the word "theme" but operate on different surfaces. A user can have:
 
 - A Modern Dark UI chrome (this feature) **and**
 - A Solarized Light terminal palette in their Claude tab (the per-tab feature)
@@ -133,7 +133,7 @@ For v1, the picker has one option and is essentially a placeholder. Keep it — 
 
 ### Optional: a "Classic" toggle for nostalgia / regression escape hatch
 
-If shipping the new theme as a default risks user surprise, expose "Classic" as a second option that mimics today's hex-coded look. **Recommend skipping** — the user explicitly asked for the modernization. Old screenshots in docs are bigger problem than user surprise. If skipped, the cctts visual language is the modern dark from the day this lands.
+If shipping the new theme as a default risks user surprise, expose "Classic" as a second option that mimics today's hex-coded look. **Recommend skipping** — the user explicitly asked for the modernization. Old screenshots in docs are bigger problem than user surprise. If skipped, the ccImp visual language is the modern dark from the day this lands.
 
 ### Settings window has its own webview / root
 
@@ -212,11 +212,11 @@ After the mechanical refactor renders correctly, a polish pass tunes:
 
 ## Open questions
 
-- **Accent color**: blue (default desktop convention), purple (common in modern AI-assistant aesthetics — Claude's brand colors lean orange/peach but the cctts UI doesn't have to match), teal, soft green. Decide at implementation time. Reasonable to expose accent as a token the user can tune in settings later — defer that to a follow-on if asked.
+- **Accent color**: blue (default desktop convention), purple (common in modern AI-assistant aesthetics — Claude's brand colors lean orange/peach but the ccImp UI doesn't have to match), teal, soft green. Decide at implementation time. Reasonable to expose accent as a token the user can tune in settings later — defer that to a follow-on if asked.
 - **Custom font**: today the project uses `-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif` (system stack). Modern apps often ship a UI font (Inter, system-ui, IBM Plex Sans). System stack is fine and avoids licensing/bundling — recommend keeping it. If a custom font is wanted, bundle it as a self-hosted woff2 in `public/fonts/`. Defer until specifically asked.
 - **High-contrast or accessibility variant**: the modernization may slightly *reduce* contrast vs. today's stark black/white. Verify text/background pairs hit WCAG AA at minimum, AAA for primary text. Define a `data-theme="modern-dark-high-contrast"` block as a follow-on if accessibility need arises.
 - **Animation reduce-motion respect**: prefer-reduced-motion media query suppresses transitions. Add to the token surface from day one — cheap.
-- **xterm.js terminal background contrast**: terminals run with their own theme (per-tab). The cctts chrome around them shouldn't fight visually with the most common terminal palettes (Default, Solarized Dark, Dracula). Surface-1 and surface-2 should contrast clearly with typical terminal backgrounds. Verify visually with a few popular terminal palettes installed.
+- **xterm.js terminal background contrast**: terminals run with their own theme (per-tab). The ccImp chrome around them shouldn't fight visually with the most common terminal palettes (Default, Solarized Dark, Dracula). Surface-1 and surface-2 should contrast clearly with typical terminal backgrounds. Verify visually with a few popular terminal palettes installed.
 - **Dialog "header" pattern**: should the dialogs gain a structured header (icon + title + close), or stay header-light? Recommend header-light — current dialogs are simple and don't need over-structuring.
 
 ## Milestone recommendation

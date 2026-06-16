@@ -1,32 +1,32 @@
-cctts portable (Windows x64)
+ccImp portable (Windows x64)
 ============================
 
-This zip is a self-contained build of cctts. No installer; no registry
+This zip is a self-contained build of ccImp. No installer; no registry
 entries; nothing written outside this folder. The global settings file
-is written next to cctts.exe; per-launch-directory overlays go in
-whatever folder you start cctts from. Transient runtime state
+is written next to ccimp.exe; per-launch-directory overlays go in
+whatever folder you start ccImp from. Transient runtime state
 (scrollback) is kept under bin\scrollback\.
 
 
 Quick start
 -----------
 
-  1. Unzip somewhere stable (e.g. C:\Tools\cctts\).
+  1. Unzip somewhere stable (e.g. C:\Tools\ccImp\).
   2. Add the `bin\` subfolder to your PATH:
        - Press Win, type "environment variables", open the editor.
        - Edit the User PATH variable, add: <unzip-folder>\bin
        - Open a fresh terminal so the new PATH is loaded.
-  3. Run `cctts` from any terminal, or double-click `bin\cctts.exe`.
+  3. Run `ccimp` from any terminal, or double-click `bin\ccimp.exe`.
 
 
 Prerequisites
 -------------
 
-  * Claude Code: cctts spawns the `claude` binary as a subprocess. Install
+  * Claude Code: ccImp spawns the `claude` binary as a subprocess. Install
     Claude Code separately and make sure `claude` is on your PATH. From a
     new terminal, `claude --version` should print a version.
 
-  * WebView2 runtime: preinstalled on updated Windows 10/11. If cctts
+  * WebView2 runtime: preinstalled on updated Windows 10/11. If ccImp
     fails to launch with a missing-WebView2 error, install the Evergreen
     Bootstrapper from
     https://developer.microsoft.com/en-us/microsoft-edge/webview2/.
@@ -35,7 +35,7 @@ Prerequisites
 What is bundled
 ---------------
 
-  bin\cctts.exe                      the app
+  bin\ccimp.exe                      the app
   bin\onnxruntime.dll                CPU TTS inference (ORT 1.20)
   bin\onnxruntime_providers_shared.dll
   bin\patterns.json                  editable prompt-detection patterns
@@ -49,17 +49,17 @@ What is bundled
   models\voices\af_heart.bin         default voice
   avatars\Idle.mp4 / Listening.mp4 / Thinking.mp4 / Speaking.mp4 / Error.mp4
                                      bundled avatar state videos (also
-                                     embedded inside cctts.exe — see
+                                     embedded inside ccimp.exe — see
                                      "Custom avatars" below)
   avatars\Transition.mp4             optional crossfade between states
-  LICENSE                            Apache 2.0 (cctts source)
+  LICENSE                            Apache 2.0 (ccImp source)
   NOTICE                             attributions for bundled assets
 
 
 Custom avatars
 --------------
 
-The same avatar videos are also embedded inside cctts.exe, so the app
+The same avatar videos are also embedded inside ccimp.exe, so the app
 runs with its built-in defaults out of the box. The standalone copies
 under `avatars\` are there if you want to swap one out:
 
@@ -76,7 +76,7 @@ an override to fall back to the bundled video.
 Customizing prompt detection
 ----------------------------
 
-cctts watches the terminal for prompts it should react to — Claude Code
+ccImp watches the terminal for prompts it should react to — Claude Code
 tool-use approvals, AskUserQuestion-style questions, and a few Aider
 prompts. The substrings it matches live in:
 
@@ -84,9 +84,9 @@ prompts. The substrings it matches live in:
 
 Each entry lists one or more substrings under `all_of` that must ALL be
 present in the on-screen text for the pattern to match, plus a `kind`
-("permission" or "question") that decides how cctts reacts. Set
+("permission" or "question") that decides how ccImp reacts. Set
 `disabled: true` to keep an entry without using it. Edit the file and
-restart cctts to apply changes.
+restart ccImp to apply changes.
 
 If a Claude Code update changes the prompt wording and detection stops
 firing, capture the live text by launching with
@@ -95,14 +95,14 @@ firing, capture the live text by launching with
 
 (the rendered prompt is then written to the log under logs\), pick a
 distinctive substring, and add it as a new pattern. If you delete or
-corrupt the file, cctts falls back to built-in defaults so detection
+corrupt the file, ccImp falls back to built-in defaults so detection
 keeps working.
 
 
 Adding more voicepacks
 ----------------------
 
-cctts auto-discovers `.bin` files in one location:
+ccImp auto-discovers `.bin` files in one location:
 
   models\voices\   (next to this README)
 
@@ -118,9 +118,9 @@ Optional: GPU acceleration
 CPU is the default and works near-real-time for Kokoro. Opt into NVIDIA
 CUDA with:
 
-    setx CCTTS_GPU cuda
+    setx CCIMP_GPU cuda
 
-then restart cctts. Requires CUDA 12.x runtime + cuDNN 9 installed
+then restart ccImp. Requires CUDA 12.x runtime + cuDNN 9 installed
 separately. Known broken on Blackwell (RTX 5090); see docs/MAINTENANCE.md
 in the repo for the GPU support matrix.
 
@@ -131,7 +131,7 @@ Updating
 Download the next release zip and unzip over the top of this folder.
 The zip ships the exe, DLLs, models, docs, and a default
 bin\patterns.json — your existing settings.json (next to the exe) and
-any per-folder .cctts.custom.config.json overlays are not in the zip and
+any per-folder .ccimp.custom.config.json overlays are not in the zip and
 stay where they are.
 
 Note: the full zip DOES contain bin\patterns.json, so unzipping it over
@@ -148,12 +148,12 @@ release.
 Uninstall
 ---------
 
-  1. Delete the unzipped folder. (This removes cctts.exe, the bundled
+  1. Delete the unzipped folder. (This removes ccimp.exe, the bundled
      models, the global settings.json, scrollback files, and logs —
-     everything cctts writes lives inside this folder.)
+     everything ccImp writes lives inside this folder.)
   2. Remove the PATH entry you added.
-  3. Optionally delete `.cctts.custom.config.json` from any folder you
-     used to start cctts to drop those per-folder overlays.
+  3. Optionally delete `.ccimp.custom.config.json` from any folder you
+     used to start ccImp to drop those per-folder overlays.
 
 
 Troubleshooting
@@ -170,4 +170,4 @@ Troubleshooting
     Code release.
 
 Source code, issue tracker, full documentation:
-  https://github.com/Dyserna/cctts
+  https://github.com/Dyserna/ccImp

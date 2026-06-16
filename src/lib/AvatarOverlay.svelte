@@ -16,7 +16,6 @@
     isVideoSrc,
     spriteManifestUrl,
     spriteBaseUrl,
-    SPRITE_STATE_ANIMS,
   } from './avatarConfig';
   import { SpritePlayer } from './spritePlayer';
 
@@ -50,7 +49,13 @@
   const spriteSet = $derived($avatarSettings.sprite.set);
 
   function applySpriteState(state: AvatarState): void {
-    player?.setAnims(state, SPRITE_STATE_ANIMS[state] ?? []);
+    if (!player) return;
+    // Behaviour is manifest-driven: each set's `groups` maps state -> animation
+    // list (rotated when >1). If a set defines no group for this state, fall
+    // back to its Idle group so any conformant set still animates; setAnims
+    // further falls back to all animations if even that is empty.
+    const list = player.groupFor(state);
+    player.setAnims(state, list.length ? list : player.groupFor('Idle'));
   }
 
   // Player lifecycle + manifest (re)load. Re-runs when the render kind, the

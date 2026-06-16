@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use crate::audio::AudioOutput;
 use crate::settings::SettingsHandle;
-use crate::state::{InputLengths, StateSignal};
+use crate::state::{InputLengths, StateSignal, TabId};
 use crate::tabs::TabRegistryHandle;
 use crate::tts::{AiTtsSuppressed, SpeakSession, TtsRequest};
 
@@ -37,6 +37,11 @@ pub struct AppState {
     /// scoped). Keeping a single set is correct: a `[[TTS]]` the user typed
     /// in either tab shouldn't be re-spoken if it echoes back.
     pub user_typed_tts: Arc<Mutex<HashSet<String>>>,
+    /// Per-tab accumulator of the user's in-progress typed line. On Enter its
+    /// sentences are folded into `user_typed_tts` so "speak all output" mode
+    /// doesn't read the question back when the TUI echoes it. Keyed per tab
+    /// because line editing (backspace / kill) is per input box.
+    pub user_input_buf: Arc<Mutex<HashMap<TabId, String>>>,
     pub state_signals: mpsc::Sender<StateSignal>,
     /// Per-tab unsent-input length counters. Each tab's counter is read by
     /// the state manager on every tick to decide whether to drop that tab's

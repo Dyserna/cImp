@@ -1,19 +1,19 @@
-cctts portable (Windows x64) — no-models update zip
+ccImp portable (Windows x64) — no-models update zip
 =====================================================
 
-This zip is the same self-contained build of cctts as the full portable
+This zip is the same self-contained build of ccImp as the full portable
 zip, with one difference: it does NOT contain the Kokoro TTS model file
 or the default voicepack. Use this zip when you already have a working
-cctts install and just want to update the executable.
+ccImp install and just want to update the executable.
 
 Compared to the full zip:
 
-  bin\cctts.exe                      <- updated
+  bin\ccimp.exe                      <- updated
   bin\onnxruntime*.dll               <- updated (matched to the new exe)
   avatars\*.mp4 / *.png              <- updated (bundled avatar videos
                                         for optional customization;
                                         same files are also embedded in
-                                        cctts.exe)
+                                        ccimp.exe)
   LICENSE / NOTICE / README.txt      <- updated
   bin\patterns.json                  <- NOT INCLUDED (your edited prompt
                                         patterns are preserved)
@@ -24,16 +24,16 @@ Compared to the full zip:
 How to use (updating an existing install)
 ------------------------------------------
 
-  1. Close any running cctts windows.
-  2. Unzip OVER your existing cctts folder (the one that contains the
+  1. Close any running ccImp windows.
+  2. Unzip OVER your existing ccImp folder (the one that contains the
      `bin\` and `models\` directories from a previous full release).
      Windows will overwrite the exe + DLLs and leave your `models\`
      folder untouched.
-  3. Launch cctts as usual.
+  3. Launch ccImp as usual.
 
-Your settings file (settings.json next to cctts.exe), your edited
+Your settings file (settings.json next to ccimp.exe), your edited
 prompt-detection patterns (bin\patterns.json), and any per-folder
-overlay files (.cctts.custom.config.json) are not affected — the zip
+overlay files (.ccimp.custom.config.json) are not affected — the zip
 never touches them.
 
 
@@ -42,7 +42,7 @@ Don't have an existing install?
 
 You probably want the full zip instead:
 
-  cctts-portable-win-x64-<version>.zip
+  ccimp-portable-win-x64-<version>.zip
 
 …which bundles the model + default voice. If you'd rather keep this
 no-models zip and supply the model files yourself, drop them at:
@@ -64,4 +64,4 @@ discovery, GPU acceleration, uninstall, and troubleshooting — see the
 full README that ships with the standard portable zip, or the project
 docs:
 
-  https://github.com/Dyserna/cctts
+  https://github.com/Dyserna/ccImp

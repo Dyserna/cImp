@@ -49,7 +49,7 @@ pub(crate) fn spawn_capture_thread(
     mic: Arc<RwLock<RingBuffer>>,
 ) {
     std::thread::Builder::new()
-        .name("cctts-stt-capture".into())
+        .name("ccimp-stt-capture".into())
         .spawn(move || {
             let mut active: Option<ActiveCapture> = None;
             while let Ok(cmd) = cmd_rx.recv() {

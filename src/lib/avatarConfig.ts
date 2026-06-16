@@ -1,6 +1,6 @@
 // Bundled default avatar assets + helpers for resolving user-overridden
 // paths into URLs the WebView can load. Source files live at the
-// top-level `avatars/<theme>/` folder; the `cctts-avatars` Vite plugin
+// top-level `avatars/<theme>/` folder; the `ccimp-avatars` Vite plugin
 // (see `vite.config.ts`) serves them at `/avatar/<theme>/...` in dev and
 // copies them into `dist/avatar/<theme>/...` for builds. User-picked
 // paths from the file dialog are absolute disk paths and need
@@ -94,7 +94,7 @@ export function isVideoSrc(src: string): boolean {
 // --- Sprite avatar variant -------------------------------------------------
 //
 // Sprite sets live under the top-level `sprites/<set>/` folder, served to the
-// WebView at `/sprites/<set>/...` by the `cctts-sprites` Vite plugin (dev) and
+// WebView at `/sprites/<set>/...` by the `ccimp-sprites` Vite plugin (dev) and
 // embedded under `dist/sprites/` for builds — exactly mirroring how `avatars/`
 // maps to `/avatar/`. Each set holds a `manifest.json` (Clawdmeter format:
 // `{ tile, animations: { "<name>": { slug, category, frames: [{file, hold_ms}] } } }`)
@@ -120,30 +120,7 @@ export function spriteManifestUrl(set: string): string {
   return `${spriteBaseUrl(set)}/manifest.json`;
 }
 
-/// Maps each avatar state to a preference-ordered list of animation names.
-/// The player filters these to the names actually present in the chosen set's
-/// manifest, then rotates among the survivors (falling back to *all* available
-/// animations if a state matches none, so any conformant manifest animates).
-///
-/// Per the design decision, the four Dance animations are folded into the Idle
-/// rotation alongside the Idle/Expression animations — so an idle avatar drifts
-/// between breathing, blinking, looking around, and the occasional dance rather
-/// than only the calm idles.
-export const SPRITE_STATE_ANIMS: Record<AvatarState, string[]> = {
-  Idle: [
-    'idle breathe',
-    'idle blink',
-    'idle look around',
-    'expression wink',
-    'expression sleep',
-    'dance bounce',
-    'dance sway',
-    'dance bounce dj',
-    'dance sway dj',
-    'dance djmix',
-  ],
-  Listening: ['idle look around', 'idle blink'],
-  Thinking: ['work think'],
-  Speaking: ['work coding'],
-  Error: ['expression surprise'],
-};
+// Per-state animation behaviour now lives in each set's `manifest.json`
+// `groups` (state -> animation list, rotated when >1) and is resolved by
+// SpritePlayer.groupFor() in AvatarOverlay — no longer hardcoded here, so a new
+// sprite set fully defines its own behaviour without touching app code.

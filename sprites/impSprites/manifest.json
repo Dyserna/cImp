@@ -1,8 +1,8 @@
 {
   "source": "ccImp original mascot (red imp counterpart to Clawd)",
   "art_credit": "TBD — ccImp imp sprite set",
-  "note": "First imp art pass: 6 animations drawn so far (idle blink, dance bounce, work think1, work think2, burning tokens, expression surprise) — enough to cover all five avatar states via the groups below. work coding is also drawn but not yet wired to a state. Remaining cloned animations (look-around, wink, sleep, sway, dj variants) are not listed until their frames exist, because a frame folder with no PNGs would 404.",
-  "tile": 20,
+  "note": "First imp art pass: 6 animations drawn so far (idle blink, dance bounce, work think1, work think2, burning tokens, expression surprise) — enough to cover all five avatar states via the groups below. work coding is also drawn but not yet wired to a state. Remaining cloned animations (look-around, wink, sleep, sway, dj variants) are not listed until their frames exist, because a frame folder with no PNGs would 404. Frames are 320×320 (work_think1 was downscaled from 1024 to match); `tile` MUST equal the frame pixel size — the player computes its alpha-bbox crop in tile space and reuses those coords as the source rect on the full-res image.",
+  "tile": 320,
   "animations": {
     "idle blink": {
       "slug": "idle_blink",

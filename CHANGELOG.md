@@ -5,6 +5,25 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] — 2026-06-17
+
+### Fixed
+
+- **Imp avatar rendered as garbage.** The `impSprites` manifest declared
+  `tile: 20` while its frames are 320×320. The sprite player computes its
+  alpha-bbox crop in tile space and reuses those coordinates as the source
+  rectangle on the full-resolution frame, so it sampled a ~20px patch from
+  each frame's top-left corner and blew it up — every imp animation broke. The
+  `work_think1` (Speaking) frames were also 1024×1024, inconsistent with the
+  rest. Fixed by downscaling `work_think1` to 320×320 so the set is uniform and
+  setting the manifest `tile` to 320 to match the real frame size.
+
+### Changed
+
+- **`tui-red` and `tui-orange` now use the `GitHub Dark` terminal palette**
+  (was `Imp Red` and `Tomorrow Night`). Existing settings.json files keep
+  whatever palette they were persisted with.
+
 ## [0.13.0] — 2026-06-17
 
 ### Added

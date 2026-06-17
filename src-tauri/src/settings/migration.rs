@@ -380,9 +380,9 @@ fn looks_v1_11(value: &Value) -> bool {
 }
 
 /// Is this a v1.12 file (schema_version == 12) whose `ui.theme` still
-/// uses the pre-split `"tui"` value? V1.13 splits that into
-/// `"tui-yellow"` / `"tui-purple"`; the predicate gates on the explicit
-/// `schema_version` integer so a freshly-stamped v1.12 file gets caught.
+/// uses the pre-split `"tui"` value? V1.13 rewrites that value (now to
+/// `"tui-orange"`); the predicate gates on the explicit `schema_version`
+/// integer so a freshly-stamped v1.12 file gets caught.
 fn looks_v1_12(value: &Value) -> bool {
     value
         .get("schema_version")
@@ -1198,10 +1198,11 @@ fn migrate_v1_11_to_v1_12(value: &mut Value) {
 
 // --- v1.12 → v1.13 ----------------------------------------------------------
 //
-// Splits the single `"tui"` UI theme into two variants — `"tui-yellow"`
-// (the original gruvbox bright-yellow accent) and `"tui-purple"` (same
-// surfaces, gruvbox bright-purple accent). Existing `"tui"` strings are
-// rewritten to `"tui-yellow"` so users keep the same look they had.
+// Splits the single `"tui"` UI theme into accent variants. The original
+// `"tui-yellow"` / `"tui-purple"` variants this migration introduced have
+// since been removed; existing `"tui"` strings are now rewritten to
+// `"tui-orange"`, the surviving Gruvbox-surfaced theme, so those users keep
+// the closest look to the old gruvbox `"tui"`.
 
 fn migrate_v1_12_to_v1_13(value: &mut Value) {
     let Some(root) = value.as_object_mut() else {
@@ -1210,7 +1211,7 @@ fn migrate_v1_12_to_v1_13(value: &mut Value) {
     if let Some(ui) = root.get_mut("ui").and_then(Value::as_object_mut) {
         if let Some(Value::String(theme)) = ui.get_mut("theme") {
             if theme == "tui" {
-                *theme = "tui-yellow".to_string();
+                *theme = "tui-orange".to_string();
             }
         }
     }
@@ -2531,14 +2532,14 @@ mod tests {
     }
 
     #[test]
-    fn v1_12_to_v1_13_renames_tui_theme_to_tui_yellow() {
+    fn v1_12_to_v1_13_renames_tui_theme_to_tui_orange() {
         let mut v = json!({
             "schema_version": 12,
             "ui": { "theme": "tui" },
         });
         assert!(looks_v1_12(&v));
         migrate_v1_12_to_v1_13(&mut v);
-        assert_eq!(v.get("ui").unwrap().get("theme").unwrap(), "tui-yellow");
+        assert_eq!(v.get("ui").unwrap().get("theme").unwrap(), "tui-orange");
         // v1.12 → v1.13 stamps 13, even when CURRENT_SCHEMA_VERSION has
         // moved further. The v1.13 → v1.14 step is what brings the file
         // up to the current version on the cascade.

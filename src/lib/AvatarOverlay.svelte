@@ -117,7 +117,7 @@
   const positionClass = $derived($avatarSettings.position);
 
   // When the underlying avatar image setting or the UI theme changes
-  // (e.g. user picks a new Idle.png, or switches modern-dark <-> tui),
+  // (e.g. user picks a new Idle.png, or switches tui-red <-> tui-orange),
   // re-resolve the displayed src for the *current* state. Transitions
   // only apply on state changes, not on settings changes — settings
   // updates are treated as instant swaps.

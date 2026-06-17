@@ -1048,7 +1048,7 @@ impl Default for AvatarSettings {
 pub enum AvatarKind {
     Media,
     /// Default render mode: the animated pixel-art mascot, paired with the
-    /// default `tui-orange` theme. The bundled set is `claudeSprites`.
+    /// default `tui-red` theme. The default set is `impSprites` (the imp).
     #[default]
     Sprite,
 }
@@ -1056,8 +1056,9 @@ pub enum AvatarKind {
 /// Sprite-renderer settings. `set` names a folder under the bundled
 /// `<root>/sprites/` tree (served to the WebView at `/sprites/<set>/`) that
 /// contains a `manifest.json` plus its frame subfolders. Kept as a plain
-/// name (not a path) so new sets can be dropped in alongside `claudeSprites`
-/// without a schema change; the frontend maps the name to a URL.
+/// name (not a path) so new sets can be dropped in alongside `impSprites`
+/// (default) and `claudeSprites` without a schema change; the frontend maps
+/// the name to a URL.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct SpriteSettings {
@@ -1067,7 +1068,7 @@ pub struct SpriteSettings {
 impl Default for SpriteSettings {
     fn default() -> Self {
         Self {
-            set: "claudeSprites".to_string(),
+            set: "impSprites".to_string(),
         }
     }
 }
@@ -1316,16 +1317,15 @@ impl Default for SystemStatsSettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UiSettings {
-    /// Active UI chrome theme. Four values currently ship: `"modern-dark"`
-    /// (slate-blue + mint, OS-native window chrome), `"tui-yellow"`
-    /// (gruvbox surfaces + bright yellow accent, custom title bar,
-    /// ratatui aesthetic), `"tui-purple"` (same as tui-yellow with a
-    /// gruvbox bright-purple accent), and `"tui-orange"` (same surfaces
-    /// with Claude Code's accent orange, #d77757). New installs land on
-    /// `"tui-orange"`, which also defaults the avatar to the animated
-    /// `claudeSprites` mascot (see [`AvatarKind`] / [`SpriteSettings`]).
-    /// The pre-V1.13 `"tui"` value is rewritten to `"tui-yellow"` by the
-    /// v12 → v13 migration so existing users keep the same look. Existing
+    /// Active UI chrome theme. Three values currently ship, all ratatui-style
+    /// (custom title bar, square borders): `"tui-red"` (the Imp Red palette +
+    /// the imp's scarlet accent, #e23c3c), `"tui-orange"` (Gruvbox surfaces +
+    /// Claude Code's accent orange, #d77757), and `"tui-green"` (the Aider
+    /// Green palette + Aider's terminal green accent, #2eb82e). New installs
+    /// land on `"tui-red"`, which also defaults the avatar to the animated
+    /// `impSprites` mascot (see [`AvatarKind`] / [`SpriteSettings`]).
+    /// The pre-V1.13 `"tui"` value is rewritten to `"tui-orange"` by the
+    /// v12 → v13 migration so existing users keep a Gruvbox look. Existing
     /// settings.json files otherwise keep whatever value they were
     /// persisted with.
     pub theme: String,
@@ -1339,7 +1339,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: "tui-orange".to_string(),
+            theme: "tui-red".to_string(),
             status_bar: StatusBarLayout::default(),
         }
     }
@@ -1431,9 +1431,9 @@ pub struct TerminalThemeSettings {
 impl Default for TerminalThemeSettings {
     fn default() -> Self {
         Self {
-            // Paired with the default `tui-orange` UI theme. The frontend's
+            // Paired with the default `tui-red` UI theme. The frontend's
             // theme picker re-pairs this when the user switches UI theme.
-            name: "Tomorrow Night".to_string(),
+            name: "Imp Red".to_string(),
             custom: None,
         }
     }

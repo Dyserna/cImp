@@ -307,14 +307,14 @@ export interface ProcessingSettings {
 }
 
 export interface UiSettings {
-  /// Active UI chrome theme. Four values currently ship: `"modern-dark"`
-  /// (slate-blue + mint, OS-native window chrome), `"tui-yellow"`
-  /// (gruvbox + bright yellow accent, custom title bar, ratatui aesthetic),
-  /// `"tui-purple"` (same surfaces, gruvbox bright-purple accent), and
-  /// `"tui-orange"` (same surfaces, Claude Code accent orange). New installs
-  /// default to `"tui-orange"`, which also defaults the avatar to the
-  /// animated `claudeSprites` mascot. Distinct from `terminal.theme`, which
-  /// governs the xterm.js terminal palette inside each tab.
+  /// Active UI chrome theme. Three values currently ship, all ratatui-style
+  /// (custom title bar, square borders): `"tui-red"` (Imp Red palette + the
+  /// imp's scarlet accent), `"tui-orange"` (Gruvbox surfaces + Claude Code's
+  /// accent orange), and `"tui-green"` (Aider Green palette + Aider's terminal
+  /// green accent). New installs default to `"tui-red"`, which also defaults
+  /// the avatar to the animated `impSprites` mascot. Distinct from
+  /// `terminal.theme`, which governs the xterm.js terminal palette inside
+  /// each tab.
   theme: string;
   /// Arrangement of the bottom status bar's movable left cluster.
   status_bar: StatusBarLayout;
@@ -664,7 +664,7 @@ export function defaultSettings(): Settings {
         speaking: null,
         error: null,
       },
-      sprite: { set: 'claudeSprites' },
+      sprite: { set: 'impSprites' },
       transition: { path: '/avatar/Transition.mp4', duration_ms: 400 },
       waveform: {
         visible: true,
@@ -793,7 +793,7 @@ export function defaultSettings(): Settings {
     layout: null,
     layout_presets: [],
     ui: {
-      theme: 'tui-orange',
+      theme: 'tui-red',
       status_bar: {
         items: [
           { component: 'usage', gap: 0 },
@@ -802,10 +802,10 @@ export function defaultSettings(): Settings {
       },
     },
     // Default terminal palette is paired with the default UI theme
-    // (tui-orange → Tomorrow Night); the pairing comes from each theme's
+    // (tui-red → Imp Red); the pairing comes from each theme's
     // `palette` metadata (theme.json), applied by SettingsApp on theme switch.
     terminal: {
-      theme: { name: 'Tomorrow Night', custom: null },
+      theme: { name: 'Imp Red', custom: null },
       background: {
         image: null,
         color: null,

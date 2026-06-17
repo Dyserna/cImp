@@ -2,9 +2,10 @@
    spacing, radii, motion, and typography. Components reference `var(--*)`
    so changing values here updates everything.
 
-   The `:root` block below is the BASE / FALLBACK token set — the same cool
-   slate-blue values the `modern-dark` theme uses — applied before any theme
-   CSS is present. The actual themes are no longer defined in this file:
+   The `:root` block below is the BASE / FALLBACK token set — a neutral cool
+   slate-blue palette (the legacy `modern-dark` look) applied before any theme
+   CSS is present. It is never normally seen: the default `tui-red` theme is
+   set on <html> synchronously at boot. The actual themes are not defined here:
    each one lives in its own folder (`theme.json` + `theme.css`) shipped in
    the portable release at `<exe-dir>/themes/<id>/` (source of truth is the
    repo-root `themes/` folder; `build.rs` copies it next to the dev exe).

@@ -1,0 +1,27 @@
+{
+  "name": "Aider Green",
+  "colors": {
+    "foreground": "#c8e6c8",
+    "background": "#0c130c",
+    "cursor": "#2eb82e",
+    "cursorAccent": "#0c130c",
+    "selectionBackground": "#1e3a1e",
+    "selectionForeground": "#e8f5e8",
+    "black": "#0c130c",
+    "red": "#e05a5a",
+    "green": "#2eb82e",
+    "yellow": "#d6b84a",
+    "blue": "#5a9bd0",
+    "magenta": "#b07ec0",
+    "cyan": "#4db8a8",
+    "white": "#c8e6c8",
+    "brightBlack": "#5a6e5a",
+    "brightRed": "#f07070",
+    "brightGreen": "#4ade4a",
+    "brightYellow": "#ecd06a",
+    "brightBlue": "#80b8e0",
+    "brightMagenta": "#cf9cdb",
+    "brightCyan": "#70d0c0",
+    "brightWhite": "#f0fbf0"
+  }
+}

@@ -76,7 +76,7 @@
   // `decorations` metadata (false = OS chrome hidden, we draw our own bar).
   // Derived from the registry store so it re-evaluates when the registry
   // finishes loading, not just when the theme id changes. Unknown / not-yet-
-  // loaded themes default to the custom bar (matches the tui-orange fallback).
+  // loaded themes default to the custom bar (matches the tui-red fallback).
   let useCustomTitleBar = $derived(
     !($themeRegistry.find((t) => t.id === $settings.ui.theme)?.decorations ?? false),
   );
@@ -413,8 +413,9 @@
     sync with the focused pane's active tab.
 
     Custom title bar mounts for any theme whose metadata sets
-    `decorations: false`; native-chrome themes (e.g. modern-dark) keep the
-    OS title bar via setDecorations(true) wired in main.ts.
+    `decorations: false` (both shipped themes are TUI, so it always mounts);
+    a future native-chrome theme (`decorations: true`) would keep the OS
+    title bar via setDecorations(true) wired in main.ts.
   -->
   {#if useCustomTitleBar}
     <TuiTitleBar title={tuiTitle} />

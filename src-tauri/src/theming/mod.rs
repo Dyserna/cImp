@@ -18,8 +18,8 @@
 //! before it joins the registry, and anything that fails verification is
 //! skipped with a `tracing::warn!` (it never appears in Settings).
 //!
-//! As a last-resort fallback, the default theme (`tui-orange`) and default
-//! palette (`Tomorrow Night`) are compiled into the binary via `include_str!`
+//! As a last-resort fallback, the default theme (`tui-red`) and default
+//! palette (`Imp Red`) are compiled into the binary via `include_str!`
 //! — so even if both folders are missing/empty or every file on disk is
 //! malformed, those two are always present and the app stays usable. A valid
 //! on-disk copy of the same id/name overrides its embedded namesake, so the
@@ -189,38 +189,38 @@ fn build_palette(json: &str) -> Result<PaletteWire, String> {
 
 // ---- embedded fallback ---------------------------------------------------
 //
-// Only the two defaults are embedded — `tui-orange` (the default UI theme) and
-// `Tomorrow Night` (the default terminal palette). Compiled in from the same
+// Only the two defaults are embedded — `tui-red` (the default UI theme) and
+// `Imp Red` (the default terminal palette). Compiled in from the same
 // repo-root source files that ship in the release, so the embed can never
 // drift from the on-disk copy.
 
-const EMBEDDED_THEME_ID: &str = "tui-orange";
+const EMBEDDED_THEME_ID: &str = "tui-red";
 const EMBEDDED_THEME_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-orange/theme.json"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-red/theme.json"));
 const EMBEDDED_THEME_CSS: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-orange/theme.css"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-red/theme.css"));
 
 const EMBEDDED_PALETTE_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../palettes/Tomorrow Night.json"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../palettes/Imp Red.json"));
 
-/// The compiled-in `tui-orange` theme. `None` only if the embedded source
+/// The compiled-in `tui-red` theme. `None` only if the embedded source
 /// somehow fails verification, which a unit test guards against.
 fn embedded_theme() -> Option<ThemeWire> {
     match build_theme(EMBEDDED_THEME_ID, EMBEDDED_THEME_JSON, EMBEDDED_THEME_CSS) {
         Ok(t) => Some(t),
         Err(e) => {
-            tracing::error!(error = %e, "theming: embedded tui-orange failed verification");
+            tracing::error!(error = %e, "theming: embedded tui-red failed verification");
             None
         }
     }
 }
 
-/// The compiled-in `Tomorrow Night` palette. See [`embedded_theme`].
+/// The compiled-in `Imp Red` palette. See [`embedded_theme`].
 fn embedded_palette() -> Option<PaletteWire> {
     match build_palette(EMBEDDED_PALETTE_JSON) {
         Ok(p) => Some(p),
         Err(e) => {
-            tracing::error!(error = %e, "theming: embedded Tomorrow Night failed verification");
+            tracing::error!(error = %e, "theming: embedded Imp Red failed verification");
             None
         }
     }
@@ -229,7 +229,7 @@ fn embedded_palette() -> Option<PaletteWire> {
 // ---- load ----------------------------------------------------------------
 
 /// Discover + verify every theme under `<exe-dir>/themes`, with the embedded
-/// `tui-orange` as a base so the list is never empty. A valid on-disk theme
+/// `tui-red` as a base so the list is never empty. A valid on-disk theme
 /// with the same id overrides the embedded copy. Sorted by id.
 fn load_themes() -> Vec<ThemeWire> {
     let mut map: BTreeMap<String, ThemeWire> = BTreeMap::new();
@@ -269,7 +269,7 @@ fn load_themes() -> Vec<ThemeWire> {
 }
 
 /// Discover + verify every palette under `<exe-dir>/palettes`, with the
-/// embedded `Tomorrow Night` as a base so the list is never empty. A valid
+/// embedded `Imp Red` as a base so the list is never empty. A valid
 /// on-disk palette with the same name overrides the embedded copy. Sorted by
 /// name.
 fn load_palettes() -> Vec<PaletteWire> {
@@ -356,7 +356,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("shipped theme {id} invalid: {e}"));
             count += 1;
         }
-        assert_eq!(count, 4, "expected 4 shipped themes");
+        assert_eq!(count, 3, "expected 3 shipped themes");
     }
 
     #[test]
@@ -373,7 +373,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("shipped palette {:?} invalid: {e}", path));
             count += 1;
         }
-        assert_eq!(count, 12, "expected 12 shipped palettes");
+        assert_eq!(count, 14, "expected 14 shipped palettes");
     }
 
     #[test]
@@ -384,11 +384,11 @@ mod tests {
         // The embedded defaults must still be present.
         assert!(
             load_themes().iter().any(|t| t.id == EMBEDDED_THEME_ID),
-            "load_themes must include the embedded tui-orange fallback"
+            "load_themes must include the embedded tui-red fallback"
         );
         assert!(
-            load_palettes().iter().any(|p| p.name == "Tomorrow Night"),
-            "load_palettes must include the embedded Tomorrow Night fallback"
+            load_palettes().iter().any(|p| p.name == "Imp Red"),
+            "load_palettes must include the embedded Imp Red fallback"
         );
     }
 
@@ -396,26 +396,26 @@ mod tests {
     fn embedded_fallbacks_verify() {
         // The compiled-in last-resort fallbacks must always be valid and be the
         // two documented defaults.
-        let theme = embedded_theme().expect("embedded tui-orange verifies");
+        let theme = embedded_theme().expect("embedded tui-red verifies");
         assert_eq!(theme.id, EMBEDDED_THEME_ID);
         assert!(!theme.decorations);
-        assert_eq!(theme.palette, "Tomorrow Night");
+        assert_eq!(theme.palette, "Imp Red");
 
-        let palette = embedded_palette().expect("embedded Tomorrow Night verifies");
-        assert_eq!(palette.name, "Tomorrow Night");
+        let palette = embedded_palette().expect("embedded Imp Red verifies");
+        assert_eq!(palette.name, "Imp Red");
         assert_eq!(palette.colors.len(), REQUIRED_PALETTE_KEYS.len());
     }
 
     #[test]
-    fn tui_orange_is_the_default_theme() {
+    fn tui_red_is_the_default_theme() {
         // The default UI theme must exist on disk, hide the OS chrome, and pair
-        // with the Tomorrow Night palette (matches UiSettings::default()).
-        let dir = repo_themes().join("tui-orange");
-        let json = std::fs::read_to_string(dir.join("theme.json")).expect("tui-orange theme.json");
-        let css = std::fs::read_to_string(dir.join("theme.css")).expect("tui-orange theme.css");
-        let t = build_theme("tui-orange", &json, &css).expect("tui-orange valid");
+        // with the Imp Red palette (matches UiSettings::default()).
+        let dir = repo_themes().join("tui-red");
+        let json = std::fs::read_to_string(dir.join("theme.json")).expect("tui-red theme.json");
+        let css = std::fs::read_to_string(dir.join("theme.css")).expect("tui-red theme.css");
+        let t = build_theme("tui-red", &json, &css).expect("tui-red valid");
         assert!(!t.decorations);
-        assert_eq!(t.palette, "Tomorrow Night");
+        assert_eq!(t.palette, "Imp Red");
     }
 
     #[test]

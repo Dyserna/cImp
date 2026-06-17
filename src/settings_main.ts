@@ -8,12 +8,12 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import './theme.css';
 import './app.css';
 
-document.documentElement.dataset.theme = 'tui-orange';
+document.documentElement.dataset.theme = 'tui-red';
 
 // Match the main window: no user-triggered reload in the settings window either.
 installReloadBlocker();
 
-let currentThemeId = 'tui-orange';
+let currentThemeId = 'tui-red';
 let lastDecorations: boolean | null = null;
 
 function applyChrome() {
@@ -29,7 +29,7 @@ function applyChrome() {
 void initThemeRegistry().finally(applyChrome);
 
 settings.subscribe((s) => {
-  currentThemeId = s.ui?.theme || 'tui-orange';
+  currentThemeId = s.ui?.theme || 'tui-red';
   if (document.documentElement.dataset.theme !== currentThemeId) {
     document.documentElement.dataset.theme = currentThemeId;
   }

@@ -20,12 +20,12 @@ const STATE_FILES: Record<AvatarState, string> = {
 
 /// Themes that ship a bundled avatar set under `avatars/<theme>/`.
 /// Unknown values (custom themes, typos, legacy strings) fall back to
-/// `modern-dark`, the original avatar set, so the overlay never breaks.
+/// `tui-red`, the default avatar set, so the overlay never breaks.
 /// Per the theme isolation policy in `src/theme.css`, every theme owns
 /// its own avatar folder — derivative themes get a copy of the source
 /// folder, never a shared one.
-const KNOWN_THEMES = new Set(['modern-dark', 'tui-yellow', 'tui-purple', 'tui-orange']);
-const FALLBACK_THEME = 'modern-dark';
+const KNOWN_THEMES = new Set(['tui-orange', 'tui-red', 'tui-green']);
+const FALLBACK_THEME = 'tui-red';
 
 function themeFolder(theme: string): string {
   return KNOWN_THEMES.has(theme) ? theme : FALLBACK_THEME;
@@ -101,10 +101,11 @@ export function isVideoSrc(src: string): boolean {
 // plus one frame subfolder per animation.
 
 /// Sprite sets that ship bundled under `sprites/`. Unknown values fall back to
-/// `claudeSprites` so a stale/typo'd setting never leaves the overlay blank.
-/// Add new bundled sets here (and drop the folder under `sprites/`).
-const KNOWN_SPRITE_SETS = new Set(['claudeSprites']);
-const FALLBACK_SPRITE_SET = 'claudeSprites';
+/// `impSprites` (the ccImp default mascot) so a stale/typo'd setting never
+/// leaves the overlay blank. Add new bundled sets here (and drop the folder
+/// under `sprites/`). `claudeSprites` (Clawd) stays selectable.
+const KNOWN_SPRITE_SETS = new Set(['impSprites', 'claudeSprites']);
+const FALLBACK_SPRITE_SET = 'impSprites';
 
 export function spriteSetName(set: string): string {
   return KNOWN_SPRITE_SETS.has(set) ? set : FALLBACK_SPRITE_SET;

@@ -1011,6 +1011,7 @@
                 onchange={(e) =>
                   patch((s) => (s.avatar.sprite.set = (e.currentTarget as HTMLSelectElement).value))}
               >
+                <option value="impSprites">ccImp (pixel art)</option>
                 <option value="claudeSprites">Claude (pixel art)</option>
               </select>
             </label>

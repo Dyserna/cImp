@@ -126,15 +126,15 @@
     'Source Code Pro', Consolas, 'Courier New', monospace;
 }
 
-/* Structural overrides for `tui-orange`. Where modern-dark relies on
-   filled surfaces, shadows, and rounded corners, the TUI look uses 1px
+/* Structural overrides for `tui-orange`. Where the base `:root` look relies
+   on filled surfaces, shadows, and rounded corners, the TUI look uses 1px
    box borders, transparent fills, square corners, and titles embedded
    in the top border of each pane (the ratatui aesthetic).
 
    This file is self-contained on purpose: see the "Theme isolation
-   policy" comment at the top of `theme.css`. Even though `tui-yellow`
-   and `tui-purple` have identical structural rules today, each theme
-   gets its own copy — the duplication is the point.
+   policy" comment at the top of `theme.css`. Even though `tui-red` has
+   identical structural rules today, each theme gets its own copy — the
+   duplication is the point.
 
    Specificity note: most existing per-component rules are Svelte
    scoped (`.s-HASH section { … }`, specificity 0,1,1). To win source-

@@ -35,6 +35,8 @@ Thumbs.db
 # CCIMP local custom config (per-machine layout / session / avatar /
 # TTS state; the app writes these alongside the regular config).
 **/.ccimp.custom.config.json
+# Stale pre-rebrand local custom config (old `cctts` name); never commit.
+**/.cctts.custom.config.json
 # Schema-migration backups: when the backend bumps schema_version, the
 # previous file is renamed with a `.vN.M.bak` suffix (sometimes with a
 # trailing timestamp, e.g. `.bak.1778262818`).

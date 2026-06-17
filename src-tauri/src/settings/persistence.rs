@@ -1089,22 +1089,22 @@ mod tests {
 
     #[test]
     fn ui_theme_round_trip_and_default() {
-        // Default file has ui.theme = "tui-orange" (new installs land here).
+        // Default file has ui.theme = "tui-red" (new installs land here).
         let s = Settings::default();
-        assert_eq!(s.ui.theme, "tui-orange");
+        assert_eq!(s.ui.theme, "tui-red");
 
         // Round-trip preserves a hand-edited value (here: a user who
-        // switched back to modern-dark or set a future theme).
+        // switched to tui-orange or set a future theme).
         let mut s = Settings::default();
-        s.ui.theme = "modern-dark".to_string();
+        s.ui.theme = "tui-orange".to_string();
         let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed.ui.theme, "modern-dark");
+        assert_eq!(parsed.ui.theme, "tui-orange");
 
         // A v1.3 file without the `ui` field still parses (serde(default)).
         let v1_3_json = r#"{"tabs":[]}"#;
         let parsed: Settings = serde_json::from_str(v1_3_json).unwrap();
-        assert_eq!(parsed.ui.theme, "tui-orange");
+        assert_eq!(parsed.ui.theme, "tui-red");
     }
 
     // --- Layered config (global + custom overlay) -----------------------

@@ -5,6 +5,40 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-06-17
+
+### Added
+
+- **ccImp imp mascot is now the default avatar.** The `impSprites` set ships
+  its first art pass — six pixel-art animations (idle blink, dance bounce, two
+  think loops, a burning-tokens loop, and a surprise expression) that cover all
+  five avatar states via the manifest's `groups`. New installs default to the
+  imp; Clawd (`claudeSprites`) stays selectable in Settings → Avatar.
+- **`tui-red` theme — the new ccImp default.** A ratatui-style theme keyed off
+  the imp's scarlet accent (`#e23c3c`), paired with a new `Imp Red` terminal
+  palette. New installs land here.
+- **`tui-green` theme ("TUI - Aider").** A selectable theme keyed off Aider's
+  terminal green (`#2eb82e`, brightened from Aider's `#14b014` logo green),
+  paired with a new `Aider Green` terminal palette — one TUI theme per tool the
+  app fronts.
+
+### Changed
+
+- **Default UI theme is now `tui-red`** (was `tui-orange`) and the default
+  terminal palette is `Imp Red` (was `Tomorrow Night`). Both prior defaults
+  remain selectable. Existing settings.json files keep whatever theme/palette
+  they were persisted with.
+
+### Removed
+
+- **Dropped the `modern-dark`, `tui-yellow`, and `tui-purple` themes.** The
+  theme set is now `tui-red` (imp / default), `tui-orange` (Claude Code), and
+  `tui-green` (Aider). The pre-V1.13 legacy `"tui"` theme value now migrates to
+  `tui-orange` (the surviving Gruvbox theme) instead of the removed
+  `tui-yellow`. With no remaining native-chrome theme, the custom TUI title bar
+  always mounts; the OS-chrome path stays as forward-compat for any future
+  `decorations: true` theme.
+
 ## [0.12.0] — 2026-06-16
 
 ### Added

@@ -21,7 +21,7 @@
     TabConfig,
   } from './lib/settings/types';
   import { defaultSettings, findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
-  import { contentClear, contentOpenFolder, setBrootEnabled, setEnabledAiTabs } from './lib/ipc';
+  import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
   import { listSttModels, listInputDevices } from './lib/stt';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
@@ -126,10 +126,6 @@
     { id: 'about', label: 'About' },
   ];
   const REPO_URL = 'https://github.com/Dyserna/ccImp';
-  // V15: reserved id of the broot utility tab. Mirrors
-  // `SHELL_BROOT_TAB_ID` in the Rust schema. Its presence in
-  // `snapshot.tabs` is its enabled state (it has no separate setting).
-  const BROOT_TAB_ID = 'shell-broot';
 
   // Sub-tab nav within the Tabs section. Each AI builtin gets its own
   // sub-tab; every Shell tab is grouped under 'shells'. Keeps the
@@ -312,23 +308,6 @@
       const restored = structuredClone($state.snapshot(snapshot));
       restored.enabled_ai_tabs = prev;
       snapshot = restored;
-    }
-  }
-
-  /// Enable / disable the reserved broot tab. Like `toggleAiTabEnabled`,
-  /// routes through a dedicated IPC because the backend has to open or
-  /// close the tab (kill PTY, drop scrollback) in response. The checkbox
-  /// state derives from `snapshot.tabs` presence; the backend's settings
-  /// broadcast refreshes `snapshot` after the toggle, so no optimistic
-  /// mutation is needed here.
-  async function toggleBrootEnabled(enable: boolean) {
-    if (!snapshot) return;
-    const present = snapshot.tabs.some((t) => t.id === BROOT_TAB_ID);
-    if (present === enable) return;
-    try {
-      await setBrootEnabled(enable);
-    } catch (e) {
-      console.error('set_broot_enabled failed:', e);
     }
   }
 
@@ -1668,10 +1647,7 @@
         {@const claudeLocalLive = aiTabAt('claude-local')}
         {@const aiderLive = aiTabAt('aider')}
         {@const aiderLocalLive = aiTabAt('aider-local')}
-        {@const shellEntries = tabEntries.filter(
-          (e) => e.kind === 'shell' && e.id !== BROOT_TAB_ID,
-        )}
-        {@const brootEnabled = tabEntries.some((e) => e.id === BROOT_TAB_ID)}
+        {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
         {@const enabledAiTabs = snapshot.enabled_ai_tabs}
         {@const lastChecked = enabledAiTabs.length === 1 ? enabledAiTabs[0] : null}
         <section>
@@ -1744,30 +1720,6 @@
                     )}
                 />
                 Aider (local)
-              </label>
-            </div>
-          </fieldset>
-          <fieldset class="claude-tabs-radio">
-            <legend>Utility tabs</legend>
-            <small class="hint">
-              The broot tab runs <code>broot -g</code> (the broot file
-              browser with git info) in the directory ccImp was started in.
-              While enabled it's a builtin tab — it can't be closed from the
-              tab bar; untick here to remove it.
-            </small>
-            <div class="radio-row">
-              <label>
-                <input
-                  type="checkbox"
-                  name="util-tabs-enabled"
-                  value="broot"
-                  checked={brootEnabled}
-                  onchange={(e) =>
-                    void toggleBrootEnabled(
-                      (e.currentTarget as HTMLInputElement).checked,
-                    )}
-                />
-                broot (git)
               </label>
             </div>
           </fieldset>

@@ -147,6 +147,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.12", detect: looks_v1_12, transform: migrate_v1_12_to_v1_13_step },
     MigrationStep { from_version: "v1.13", detect: looks_v1_13, transform: migrate_v1_13_to_v1_14_step },
     MigrationStep { from_version: "v1.14", detect: looks_v1_14, transform: migrate_v1_14_to_v1_15_step },
+    MigrationStep { from_version: "v1.15", detect: looks_v1_15, transform: migrate_v1_15_to_v1_16_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -195,6 +196,9 @@ fn migrate_v1_13_to_v1_14_step(value: &mut Value, _shell: &ShellSpec) {
 }
 fn migrate_v1_14_to_v1_15_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v1_14_to_v1_15(value)
+}
+fn migrate_v1_15_to_v1_16_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_15_to_v1_16(value)
 }
 
 fn looks_v1(value: &Value) -> bool {
@@ -408,6 +412,16 @@ fn looks_v1_14(value: &Value) -> bool {
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 14)
+}
+
+/// Is this a v1.15 file (schema_version == 15) that may still carry the
+/// retired auto-seeded `broot` tab? Gated purely on the version integer; the
+/// transform's own `retain` makes broot removal idempotent.
+fn looks_v1_15(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 15)
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -1314,6 +1328,42 @@ fn migrate_v1_14_to_v1_15(value: &mut Value) {
                 },
             }));
         }
+    }
+
+    // Stamp a *literal* 15 (not CURRENT_SCHEMA_VERSION): the v15 → v16 step
+    // gates on `schema_version == 15`, so this step must leave that concrete
+    // value. (The broot tab injected just above is removed again by v15 → v16
+    // — broot is no longer a persistent builtin — but the intermediate v15
+    // shape is preserved so the cascade stays mechanical.)
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(15u8)),
+    );
+}
+
+// --- v1.15 → v1.16 ----------------------------------------------------------
+//
+// V16 retires the auto-seeded `broot` builtin tab. broot is now launched on
+// demand (like rustnet) from the bottom-bar tool buttons into ordinary
+// closable Shell tabs, so the persistent `shell-broot` entry is dropped from
+// existing files. The frontend's `validateAndRepairLayout` prunes the now-
+// orphaned id from any persisted layout tree on next launch, so this
+// migration only has to touch `tabs[]`.
+//
+// Idempotent: a file with no `shell-broot` entry is left unchanged (beyond
+// the version stamp), and `looks_v1_15` returns false once `schema_version`
+// is 16.
+
+fn migrate_v1_15_to_v1_16(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
+        tabs.retain(|t| {
+            t.get("id").and_then(Value::as_str)
+                != Some(crate::settings::schema::SHELL_BROOT_TAB_ID)
+        });
     }
 
     root.insert(
@@ -2658,11 +2708,56 @@ mod tests {
         assert_eq!(tabs.len(), 3);
         assert_eq!(tabs[2].get("id").unwrap(), "shell-broot");
 
+        // Stamps a literal 15 (this is no longer the terminal step; v15 → v16
+        // follows and removes the broot tab again).
+        assert_eq!(v.get("schema_version").and_then(Value::as_u64), Some(15));
+        assert!(!looks_v1_14(&v));
+        assert!(looks_v1_15(&v));
+    }
+
+    #[test]
+    fn v1_15_to_v1_16_removes_broot_tab() {
+        // V16 retires the auto-seeded broot builtin: the cascade drops the
+        // `shell-broot` entry, leaving the user's other tabs untouched.
+        let mut v = json!({
+            "schema_version": 15,
+            "tabs": [
+                { "kind": "ai_tool", "id": "claude" },
+                { "kind": "shell", "id": "shell-default-1" },
+                { "kind": "shell", "id": "shell-broot", "command": "broot", "args": ["-g"] },
+            ],
+        });
+        assert!(looks_v1_15(&v));
+        migrate_v1_15_to_v1_16(&mut v);
+
+        let tabs = v.get("tabs").and_then(Value::as_array).unwrap();
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs
+            .iter()
+            .all(|t| t.get("id").and_then(Value::as_str) != Some("shell-broot")));
+        assert_eq!(tabs[0].get("id").unwrap(), "claude");
+        assert_eq!(tabs[1].get("id").unwrap(), "shell-default-1");
+
         assert_eq!(
             v.get("schema_version").and_then(Value::as_u64),
             Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64),
         );
-        assert!(!looks_v1_14(&v));
+        assert!(!looks_v1_15(&v));
+    }
+
+    #[test]
+    fn v1_15_to_v1_16_is_idempotent_without_broot() {
+        // A file that never had (or already lost) a broot tab is unchanged
+        // beyond the version stamp.
+        let mut v = json!({
+            "schema_version": 15,
+            "tabs": [ { "kind": "shell", "id": "shell-default-1" } ],
+        });
+        migrate_v1_15_to_v1_16(&mut v);
+        let tabs = v.get("tabs").and_then(Value::as_array).unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].get("id").unwrap(), "shell-default-1");
+        assert!(!looks_v1_15(&v));
     }
 
     #[test]

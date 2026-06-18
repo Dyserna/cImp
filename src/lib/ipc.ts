@@ -297,15 +297,17 @@ export async function setEnabledAiTabs(
   await invoke('set_enabled_ai_tabs', { value });
 }
 
-/// Enable or disable the reserved `broot` tab (V15). Enabling
-/// materializes the tab (settings entry + PTY on next mount) and
-/// activates it; disabling kills its PTY, drops its scrollback, and
-/// removes its settings entry. Idempotent on the backend — a no-op when
-/// the tab is already in the requested state. The broot tab is a
-/// non-closable builtin while present, so this toggle is the only way to
-/// remove it.
-export async function setBrootEnabled(enabled: boolean): Promise<void> {
-  await invoke('set_broot_enabled', { enabled });
+/// A built-in tool launchable from the bottom-bar quick-launch buttons (V16).
+export type ToolKind = 'rustnet' | 'broot';
+
+/// Launch a built-in tool (rustnet / broot) into a fresh closable Shell tab
+/// (V16). The backend spawns a new uuid-id Shell tab running the tool's fixed
+/// command, lands it in the focused pane, and activates it — each call opens
+/// another tab, so the user can run as many as they like and close them
+/// individually. A missing tool still opens the tab and shows the standard
+/// "command not found" overlay. Returns the new tab id.
+export async function openToolTab(tool: ToolKind): Promise<TabId> {
+  return invoke<TabId>('open_tool_tab', { tool });
 }
 
 /// Open `<portable-root>/logs/content/` in the OS file manager. Backend

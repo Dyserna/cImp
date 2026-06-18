@@ -59,14 +59,12 @@ pub struct TabRegistry {
 pub type TabRegistryHandle = Arc<TokioMutex<TabRegistry>>;
 
 /// True when `id` is a reserved builtin that cannot be closed: the four
-/// AI builtins, plus the `shell-broot` utility tab (V15) which is gated by
-/// the Settings → Tabs enable toggle rather than the close `×`. The
-/// reserved `shell-default-1` id is *not* a builtin: it ships as the
-/// default first shell tab on fresh installs but is closable just like
-/// any user-created shell. User-created Shell tabs use uuid-based ids
-/// that never collide with these.
+/// AI builtins. No Shell id is a builtin — the reserved `shell-default-1`
+/// ships as the default first shell tab on fresh installs but is closable,
+/// and the on-demand `rustnet` / `broot` tool tabs use uuid-based ids. Keep
+/// in sync with `TabId::is_builtin` in `state::manager`.
 fn is_builtin_id(id: &str) -> bool {
-    AiTabId::from_id(id).is_some() || id == crate::settings::SHELL_BROOT_TAB_ID
+    AiTabId::from_id(id).is_some()
 }
 
 /// V1.4-04 D: replicate the filename-sanitization done by

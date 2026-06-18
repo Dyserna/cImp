@@ -28,15 +28,11 @@ pub const AIDER_TAB_ID: &str = "aider";
 /// the global `aider_local` provider settings.
 pub const AIDER_LOCAL_TAB_ID: &str = "aider-local";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
-/// V15: a reserved Shell tab that launches `broot -g` (the broot file
-/// browser with git info shown) in the ccimp launch directory. Unlike
-/// `shell-default-1`, it is a non-closable builtin while present: the tab
-/// bar hides its close `×` and `close_tab` rejects it. It is added/removed
-/// only through the Settings → Tabs enable toggle (`set_broot_enabled`),
-/// the same way the AI builtins are gated by `enabled_ai_tabs`. Seeded on
-/// fresh installs (`seeded_defaults`) and injected into existing files by
-/// the v14 → v15 migration; the integrity check forces its `builtin` flag
-/// but does not re-create it once disabled (so disabling sticks).
+/// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
+/// longer a persistent builtin — it (like rustnet) launches on demand from
+/// the bottom-bar tool buttons into ordinary closable Shell tabs (uuid ids).
+/// This constant survives only so the v15 → v16 migration can find and drop
+/// the old auto-seeded `shell-broot` entry from existing settings files.
 pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 
 /// The on-disk schema version. Bumped on every migration step. Detection
@@ -47,7 +43,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 15;
+pub const CURRENT_SCHEMA_VERSION: u8 = 16;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -849,33 +845,6 @@ pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
     })
 }
 
-/// V15: default broot tab. A Shell tab that launches `broot -g` — the
-/// broot file browser with git info shown in the tree — with `cwd: None`
-/// so it inherits the ccimp launch directory (the folder ccimp was
-/// started in). `broot` is resolved via PATH at spawn time; if it isn't
-/// installed the tab shows the standard "command not found" closed
-/// overlay until the user installs it. Closable like `shell-default-1`;
-/// the integrity check does not re-seed it.
-pub fn default_broot_tab() -> TabConfig {
-    TabConfig::Shell(ShellTabConfig {
-        id: SHELL_BROOT_TAB_ID.to_string(),
-        // Reserved, non-closable when present: the tab bar hides the close
-        // `×` for builtin tabs and `close_tab` rejects them. The broot tab
-        // is added/removed only via the Settings → Tabs enable toggle
-        // (`set_broot_enabled`), mirroring how the AI builtins are gated by
-        // `enabled_ai_tabs`.
-        builtin: true,
-        name: "broot".to_string(),
-        command: "broot".to_string(),
-        args: vec!["-g".to_string()],
-        cwd: None,
-        env: HashMap::new(),
-        notifications: ShellNotificationConfig::default(),
-        theme_override: None,
-        background_override: None,
-    })
-}
-
 // --- Other settings sub-structs (unchanged from v2) -------------------------
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -908,8 +877,8 @@ impl Default for TtsSettings {
 
 /// V6-01 offline speech-to-text (dictation). Captures microphone audio and
 /// transcribes it with a bundled Whisper model (whisper.cpp), dropping the
-/// transcript into the compose overlay. Disabled by default — the feature
-/// is opt-in and needs a `ggml-*.bin` model present under `models/`.
+/// transcript into the compose overlay. Enabled by default; the feature still
+/// needs a `ggml-*.bin` model present under `models/` to actually transcribe.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct SttSettings {
@@ -938,7 +907,7 @@ pub enum SttButtonMode {
 impl Default for SttSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             model_file: "ggml-small.bin".to_string(),
             language: "auto".to_string(),
             input_device: String::new(),
@@ -1322,8 +1291,9 @@ pub struct UiSettings {
     /// the imp's scarlet accent, #e23c3c), `"tui-orange"` (Gruvbox surfaces +
     /// Claude Code's accent orange, #d77757), and `"tui-green"` (the Aider
     /// Green palette + Aider's terminal green accent, #2eb82e). New installs
-    /// land on `"tui-red"`, which also defaults the avatar to the animated
-    /// `impSprites` mascot (see [`AvatarKind`] / [`SpriteSettings`]).
+    /// land on `"tui-orange"` so the chrome accent matches Claude Code's
+    /// orange. The avatar still defaults to the animated `impSprites` mascot
+    /// independently (see [`AvatarKind`] / [`SpriteSettings`]).
     /// The pre-V1.13 `"tui"` value is rewritten to `"tui-orange"` by the
     /// v12 → v13 migration so existing users keep a Gruvbox look. Existing
     /// settings.json files otherwise keep whatever value they were
@@ -1339,7 +1309,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: "tui-red".to_string(),
+            theme: "tui-orange".to_string(),
             status_bar: StatusBarLayout::default(),
         }
     }
@@ -1431,9 +1401,10 @@ pub struct TerminalThemeSettings {
 impl Default for TerminalThemeSettings {
     fn default() -> Self {
         Self {
-            // Paired with the default `tui-red` UI theme. The frontend's
-            // theme picker re-pairs this when the user switches UI theme.
-            name: "Imp Red".to_string(),
+            // Paired with the default `tui-orange` UI theme (whose theme.json
+            // points at the GitHub Dark palette). The frontend's theme picker
+            // re-pairs this when the user switches UI theme.
+            name: "GitHub Dark".to_string(),
             custom: None,
         }
     }
@@ -1814,7 +1785,7 @@ mod tests {
         let s = SttSettings::default();
         let v = serde_json::to_value(&s).unwrap();
         let back: SttSettings = serde_json::from_value(v).unwrap();
-        assert!(!back.enabled);
+        assert!(back.enabled);
         assert_eq!(back.model_file, "ggml-small.bin");
         assert_eq!(back.language, "auto");
         assert!(back.input_device.is_empty());
@@ -1828,7 +1799,7 @@ mod tests {
         // additive `#[serde(default)]` SttSettings — no migration needed.
         let json = json!({ "schema_version": CURRENT_SCHEMA_VERSION });
         let s: Settings = serde_json::from_value(json).unwrap();
-        assert!(!s.stt.enabled);
+        assert!(s.stt.enabled);
         assert_eq!(s.stt.model_file, "ggml-small.bin");
         // The push_to_talk shortcut default is present too.
         assert_eq!(s.shortcuts.push_to_talk.as_deref(), Some("Ctrl+Shift"));

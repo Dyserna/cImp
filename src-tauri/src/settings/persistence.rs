@@ -39,9 +39,9 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
-    default_ai_tab, default_broot_tab, default_shell_1_tab, AiTabId, LayoutNodePersisted, Settings,
+    default_ai_tab, default_shell_1_tab, AiTabId, LayoutNodePersisted, Settings,
     TabConfig,
-    AIDER_LOCAL_TAB_ID, AIDER_TAB_ID, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, SHELL_BROOT_TAB_ID,
+    AIDER_LOCAL_TAB_ID, AIDER_TAB_ID, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
     SHELL_DEFAULT_TAB_ID,
 };
 use crate::shell::ShellSpec;
@@ -421,10 +421,8 @@ fn seeded_defaults(default_shell: &ShellSpec) -> Settings {
     let mut s = Settings::default();
     integrity_check(&mut s);
     s.tabs.push(default_shell_1_tab(default_shell));
-    // V15: ship a broot tab (`broot -g`, launch-dir cwd) alongside the
-    // default shell. Like shell-default-1 it's a closable shell the
-    // integrity check won't re-seed, so closing it sticks.
-    s.tabs.push(default_broot_tab());
+    // V16: broot is no longer auto-seeded. It (and rustnet) launch on demand
+    // from the bottom-bar tool buttons into ordinary closable Shell tabs.
     apply_portable_avatar_paths(&mut s);
     s
 }
@@ -662,20 +660,6 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
             tab.set_builtin(false);
             changed = true;
             tracing::warn!("integrity: demoted shell-default-1 to builtin: false");
-        }
-    }
-
-    // 2b. Force builtin: true on the reserved `shell-broot` tab if it
-    //     exists with builtin: false (e.g. a file written by the first
-    //     v14 → v15 migration before broot became a builtin, or a
-    //     hand-edit). It is *not* re-seeded when absent — disabling it via
-    //     the Settings toggle removes the entry and that removal must
-    //     stick, exactly like shell-default-1.
-    for tab in settings.tabs.iter_mut() {
-        if tab.id() == SHELL_BROOT_TAB_ID && !tab.builtin() {
-            tab.set_builtin(true);
-            changed = true;
-            tracing::warn!("integrity: forced builtin: true on shell-broot");
         }
     }
 
@@ -1089,22 +1073,22 @@ mod tests {
 
     #[test]
     fn ui_theme_round_trip_and_default() {
-        // Default file has ui.theme = "tui-red" (new installs land here).
+        // Default file has ui.theme = "tui-orange" (new installs land here).
         let s = Settings::default();
-        assert_eq!(s.ui.theme, "tui-red");
+        assert_eq!(s.ui.theme, "tui-orange");
 
         // Round-trip preserves a hand-edited value (here: a user who
-        // switched to tui-orange or set a future theme).
+        // switched to tui-red or set a future theme).
         let mut s = Settings::default();
-        s.ui.theme = "tui-orange".to_string();
+        s.ui.theme = "tui-red".to_string();
         let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed.ui.theme, "tui-orange");
+        assert_eq!(parsed.ui.theme, "tui-red");
 
         // A v1.3 file without the `ui` field still parses (serde(default)).
         let v1_3_json = r#"{"tabs":[]}"#;
         let parsed: Settings = serde_json::from_str(v1_3_json).unwrap();
-        assert_eq!(parsed.ui.theme, "tui-red");
+        assert_eq!(parsed.ui.theme, "tui-orange");
     }
 
     // --- Layered config (global + custom overlay) -----------------------

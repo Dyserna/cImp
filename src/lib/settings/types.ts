@@ -311,8 +311,9 @@ export interface UiSettings {
   /// (custom title bar, square borders): `"tui-red"` (Imp Red palette + the
   /// imp's scarlet accent), `"tui-orange"` (Gruvbox surfaces + Claude Code's
   /// accent orange), and `"tui-green"` (Aider Green palette + Aider's terminal
-  /// green accent). New installs default to `"tui-red"`, which also defaults
-  /// the avatar to the animated `impSprites` mascot. Distinct from
+  /// green accent). New installs default to `"tui-orange"` so the chrome
+  /// accent matches Claude Code's orange; the avatar still defaults to the
+  /// animated `impSprites` mascot independently. Distinct from
   /// `terminal.theme`, which governs the xterm.js terminal palette inside
   /// each tab.
   theme: string;
@@ -642,7 +643,7 @@ export function defaultSettings(): Settings {
       show_selection_controls: true,
     },
     stt: {
-      enabled: false,
+      enabled: true,
       model_file: 'ggml-small.bin',
       language: 'auto',
       input_device: '',
@@ -793,7 +794,7 @@ export function defaultSettings(): Settings {
     layout: null,
     layout_presets: [],
     ui: {
-      theme: 'tui-red',
+      theme: 'tui-orange',
       status_bar: {
         items: [
           { component: 'usage', gap: 0 },
@@ -802,10 +803,10 @@ export function defaultSettings(): Settings {
       },
     },
     // Default terminal palette is paired with the default UI theme
-    // (tui-red → Imp Red); the pairing comes from each theme's
+    // (tui-orange → GitHub Dark); the pairing comes from each theme's
     // `palette` metadata (theme.json), applied by SettingsApp on theme switch.
     terminal: {
-      theme: { name: 'Imp Red', custom: null },
+      theme: { name: 'GitHub Dark', custom: null },
       background: {
         image: null,
         color: null,

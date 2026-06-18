@@ -13,13 +13,13 @@ import './app.css';
 // Set the active theme synchronously before Svelte mounts so the first
 // paint already reflects token values — avoids FOUC. The static
 // `data-theme` attribute on <html> (set in index.html) is a defense-in-
-// depth fallback. Both default to "tui-red" — matches the new-install
+// depth fallback. Both default to "tui-orange" — matches the new-install
 // default in defaultSettings(), and existing users have a persisted
 // setting that overrides this on the first subscribe tick. The per-theme
 // CSS itself is no longer bundled here: it's fetched from the backend and
 // injected at runtime by initThemeRegistry() below, leaving only the base
 // `:root` design tokens in theme.css.
-document.documentElement.dataset.theme = 'tui-red';
+document.documentElement.dataset.theme = 'tui-orange';
 
 // Disable the webview's reload accelerators (F5 / Ctrl+R / Ctrl+Shift+R) so a
 // stray keystroke can't tear every tab's PTY down and restart sessions.
@@ -45,7 +45,7 @@ setTimeout(showMainWindowOnce, 3000);
 // (re)applied both when the settings theme changes and when the theme registry
 // finishes loading — the latter so a non-default persisted theme's real
 // metadata wins over the tui-red fallback used before the fetch resolves.
-let currentThemeId = 'tui-red';
+let currentThemeId = 'tui-orange';
 let lastDecorations: boolean | null = null;
 
 function applyChrome() {
@@ -74,12 +74,12 @@ function applyChrome() {
 void initThemeRegistry().finally(applyChrome);
 
 // Follow the persisted ui.theme value: the store starts on defaults
-// ("tui-red"), then reflects the backend value once initSettings() runs
+// ("tui-orange"), then reflects the backend value once initSettings() runs
 // from inside App.svelte. The subscription survives for the lifetime of the
 // window. data-theme + the terminal palette vars apply immediately (FOUC
 // avoidance); the decorations toggle is delegated to applyChrome().
 settings.subscribe((s) => {
-  currentThemeId = s.ui?.theme || 'tui-red';
+  currentThemeId = s.ui?.theme || 'tui-orange';
   if (document.documentElement.dataset.theme !== currentThemeId) {
     document.documentElement.dataset.theme = currentThemeId;
   }

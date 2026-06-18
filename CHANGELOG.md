@@ -5,6 +5,37 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Tool launch buttons in the bottom bar.** Two quick-launch buttons —
+  `rustnet` (🌐) and `broot` (🌳) — each open a fresh tab running that tool
+  (`rustnet`, `broot -g`). Every press opens another tab, and each is an
+  ordinary closable Shell tab with a close `×`, so these situational tools can
+  be spun up and torn down freely. The command is resolved via `PATH` at spawn
+  time; a missing tool still opens the tab and shows the standard
+  "command not found" overlay. Backed by the new `open_tool_tab` IPC.
+
+### Changed
+
+- **Default UI theme is now `tui-orange`** (was `tui-red`) so the chrome accent
+  matches Claude Code's orange; the paired default terminal palette is
+  `GitHub Dark`. The avatar still defaults to the `impSprites` imp. Existing
+  settings keep their persisted theme.
+- **Speech-to-text is enabled by default.** The bottom-bar record button now
+  shows out of the box (a Whisper `ggml-*.bin` model under `models/` is still
+  required to transcribe).
+
+### Removed
+
+- **Persistent `broot` builtin tab.** broot is no longer auto-started on fresh
+  installs, and the Settings → Tabs "Utility tabs" toggle (and its
+  `set_broot_enabled` IPC) is gone — broot now launches on demand from the
+  bottom-bar button like rustnet. The settings schema bumps to v16; the
+  v15 → v16 migration drops the old auto-seeded `shell-broot` tab from existing
+  files (any closable broot tabs you open from the button are unaffected).
+
 ## [0.13.1] — 2026-06-17
 
 ### Fixed

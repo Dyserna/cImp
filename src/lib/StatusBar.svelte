@@ -11,6 +11,7 @@
   import AvatarToggleButton from './status/AvatarToggleButton.svelte';
   import StatusBarArrangement from './status/StatusBarArrangement.svelte';
   import SelectionTtsControls from './status/SelectionTtsControls.svelte';
+  import ToolLaunchButton from './status/ToolLaunchButton.svelte';
   import { settings } from './settings/store';
 </script>
 
@@ -24,6 +25,8 @@
     {#if $settings.stt.enabled}
       <RecordButton />
     {/if}
+    <ToolLaunchButton tool="rustnet" glyph="🌐" label="New rustnet tab" />
+    <ToolLaunchButton tool="broot" glyph="🌳" label="New broot tab" />
     <MuteButton />
     <AnnouncementsButton />
     <VolumeSlider />

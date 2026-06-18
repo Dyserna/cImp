@@ -18,7 +18,7 @@
 //! before it joins the registry, and anything that fails verification is
 //! skipped with a `tracing::warn!` (it never appears in Settings).
 //!
-//! As a last-resort fallback, the default theme (`tui-red`) and default
+//! As a last-resort fallback, the embedded theme (`tui-red`) and embedded
 //! palette (`Imp Red`) are compiled into the binary via `include_str!`
 //! — so even if both folders are missing/empty or every file on disk is
 //! malformed, those two are always present and the app stays usable. A valid
@@ -189,10 +189,11 @@ fn build_palette(json: &str) -> Result<PaletteWire, String> {
 
 // ---- embedded fallback ---------------------------------------------------
 //
-// Only the two defaults are embedded — `tui-red` (the default UI theme) and
-// `Imp Red` (the default terminal palette). Compiled in from the same
-// repo-root source files that ship in the release, so the embed can never
-// drift from the on-disk copy.
+// Only two themes/palettes are embedded as last-resort fallbacks — `tui-red`
+// and `Imp Red`. Compiled in from the same repo-root source files that ship in
+// the release, so the embed can never drift from the on-disk copy. (The
+// default UI theme is `tui-orange` and the default terminal palette is
+// `GitHub Dark`; both live on disk and are not embedded.)
 
 const EMBEDDED_THEME_ID: &str = "tui-red";
 const EMBEDDED_THEME_JSON: &str =
@@ -399,7 +400,7 @@ mod tests {
         let theme = embedded_theme().expect("embedded tui-red verifies");
         assert_eq!(theme.id, EMBEDDED_THEME_ID);
         assert!(!theme.decorations);
-        assert_eq!(theme.palette, "Imp Red");
+        assert_eq!(theme.palette, "GitHub Dark");
 
         let palette = embedded_palette().expect("embedded Imp Red verifies");
         assert_eq!(palette.name, "Imp Red");
@@ -407,15 +408,16 @@ mod tests {
     }
 
     #[test]
-    fn tui_red_is_the_default_theme() {
-        // The default UI theme must exist on disk, hide the OS chrome, and pair
-        // with the Imp Red palette (matches UiSettings::default()).
+    fn embedded_tui_red_theme_pairs_with_github_dark() {
+        // The embedded `tui-red` fallback theme must exist on disk, hide the OS
+        // chrome, and pair with the GitHub Dark palette. (The default UI theme
+        // is now `tui-orange`; `tui-red` remains the compiled-in fallback.)
         let dir = repo_themes().join("tui-red");
         let json = std::fs::read_to_string(dir.join("theme.json")).expect("tui-red theme.json");
         let css = std::fs::read_to_string(dir.join("theme.css")).expect("tui-red theme.css");
         let t = build_theme("tui-red", &json, &css).expect("tui-red valid");
         assert!(!t.decorations);
-        assert_eq!(t.palette, "Imp Red");
+        assert_eq!(t.palette, "GitHub Dark");
     }
 
     #[test]

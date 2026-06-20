@@ -70,6 +70,12 @@ pub struct Settings {
     pub usage: UsageSettings,
     /// Bottom-bar system-monitor panel config.
     pub system_stats: SystemStatsSettings,
+    /// Claude Code context-window status line bar. Global (like the avatar
+    /// and TTS voice) — applies to every ccImp-launched Claude tab rather
+    /// than per-tab. Drives a `--settings` overlay injected at launch (see
+    /// `tabs::config`) that points Claude Code's `statusLine` at our own
+    /// `ccimp --statusline` renderer.
+    pub statusline: StatuslineSettings,
     pub compose: ComposeSettings,
     pub shortcuts: ShortcutSettings,
     /// Ordered list of tabs. AI builtins occupy the canonical leading
@@ -144,6 +150,7 @@ impl Default for Settings {
             behavior: BehaviorSettings::default(),
             usage: UsageSettings::default(),
             system_stats: SystemStatsSettings::default(),
+            statusline: StatuslineSettings::default(),
             compose: ComposeSettings::default(),
             shortcuts: ShortcutSettings::default(),
             tabs: Vec::new(),
@@ -1280,6 +1287,30 @@ impl Default for SystemStatsSettings {
             show_gpu_temp: true,
             show_network: true,
         }
+    }
+}
+
+/// Context-window status line config. When `enabled`, the AI launch path
+/// injects a session-scoped `--settings` overlay into ccImp-launched
+/// Claude Code tabs that points `statusLine.command` at `ccimp
+/// --statusline` — our own renderer for a themed context-usage bar
+/// (`Opus  ▓▓▓▓▓░░░░░ 50% (100k/200k)`). The overlay *merges* with the
+/// user's own Claude Code settings (CLI flags outrank settings files and
+/// only `statusLine` is set), so the user's global `~/.claude` config is
+/// left untouched and the bar appears only inside ccImp.
+///
+/// Additive `#[serde(default)]` field — settings files written before this
+/// landed round-trip with the bar enabled. Enabled by default, mirroring
+/// the TTS/STT defaults; toggle off in Settings → Bottom bar.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct StatuslineSettings {
+    pub enabled: bool,
+}
+
+impl Default for StatuslineSettings {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

@@ -5,6 +5,19 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] — 2026-06-20
+
+### Added
+
+- **Context-window bar in Claude's status line.** ccImp now injects a status
+  line into the Claude Code tabs it launches, showing live context usage —
+  e.g. `Opus  ▓▓▓▓▓░░░░░ 50% (100k/200k)` — themed to your terminal palette.
+  It renders from the new hidden `ccimp --statusline` subcommand (no external
+  script, no Node/Python/PowerShell dependency) and is wired up via a
+  session-scoped `--settings` overlay, so it appears only inside ccImp and
+  never touches your global `~/.claude` configuration. Enabled by default;
+  toggle it in Settings → Bottom bar → Claude context bar.
+
 ## [0.14.0] — 2026-06-18
 
 ### Added

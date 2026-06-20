@@ -1642,6 +1642,29 @@
             any spacers you added.
           </small>
         </section>
+
+        <section>
+          <h2>Claude context bar</h2>
+          <small class="hint top">
+            Adds a context-window usage bar to Claude Code's own status line
+            inside each Claude tab — e.g. <code>Opus ▓▓▓▓▓░░░░░ 50% (100k/200k)</code>,
+            themed to your terminal palette. ccImp wires this up only for the
+            Claude tabs it launches; your global Claude Code configuration is
+            left untouched.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.statusline.enabled}
+              onchange={(e) =>
+                patch((s) => (s.statusline.enabled = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Show the context bar in Claude's status line</span>
+          </label>
+          <small class="hint">
+            Takes effect on the next Claude tab launch (restart the tab to apply).
+          </small>
+        </section>
       {:else if activeSection === 'tabs'}
         {@const claudeLive = aiTabAt('claude')}
         {@const claudeLocalLive = aiTabAt('claude-local')}

@@ -11,6 +11,7 @@ mod pty;
 mod settings;
 mod shell;
 mod state;
+mod statusline;
 mod stt;
 mod sysmon;
 mod theming;
@@ -57,6 +58,17 @@ use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsEngine, TtsRequest};
 
 fn main() {
+    // Status-line subcommand: Claude Code invokes `ccimp --statusline`,
+    // pipes the session JSON to our stdin, and reads the rendered context
+    // bar from our stdout. Handle it before any Tauri/audio/settings init
+    // so it's instant and never spins up the GUI. Works under the release
+    // `windows` subsystem too — inherited stdio pipes stay usable; only
+    // console allocation is suppressed.
+    if std::env::args().skip(1).any(|a| a == "--statusline") {
+        statusline::run();
+        return;
+    }
+
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
 

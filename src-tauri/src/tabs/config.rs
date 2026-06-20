@@ -72,7 +72,7 @@ fn build_ai_tool_spec(
     invocation_args: &[String],
 ) -> AppResult<PtyLaunchSpec> {
     let binary = resolve_command(&cfg.command)?;
-    let pre_args = build_pre_args(cfg);
+    let pre_args = build_pre_args(cfg, settings);
     let extra_args = build_extra_args(cfg, settings, invocation_args);
     let working_dir = cfg
         .cwd
@@ -104,20 +104,38 @@ fn command_is(command: &str, name: &str) -> bool {
 }
 
 /// Pre-args injected ahead of the tab's own `args` and the wrapper's
-/// invocation args. Currently only Claude Code understands
-/// `--append-system-prompt`; Aider tabs return empty pre-args
-/// regardless of the per-tab toggle.
-fn build_pre_args(cfg: &AiToolTabConfig) -> Vec<String> {
+/// invocation args. Claude-only — both injections target Claude Code's
+/// CLI and Aider understands neither, so Aider tabs get empty pre-args:
+///
+///   * `--append-system-prompt <instructions>` — TTS markup convention,
+///     gated on the per-tab `tts_injection` toggle.
+///   * `--settings <json>` — a session-scoped overlay pointing Claude
+///     Code's `statusLine` at our `ccimp --statusline` renderer, gated on
+///     the global `statusline.enabled`. The overlay merges with the
+///     user's own Claude settings (only `statusLine` is set), so it
+///     scopes the context bar to ccImp without touching `~/.claude`.
+fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     if !command_is(&cfg.command, "claude") {
         return Vec::new();
     }
-    if !cfg.tts_injection.enabled || cfg.tts_injection.instructions.is_empty() {
-        return Vec::new();
+    let mut args = Vec::new();
+
+    if cfg.tts_injection.enabled && !cfg.tts_injection.instructions.is_empty() {
+        args.push("--append-system-prompt".to_string());
+        args.push(cfg.tts_injection.instructions.clone());
     }
-    vec![
-        "--append-system-prompt".to_string(),
-        cfg.tts_injection.instructions.clone(),
-    ]
+
+    if settings.statusline.enabled {
+        if let Some(command) = crate::statusline::launch_command() {
+            let overlay = serde_json::json!({
+                "statusLine": { "type": "command", "command": command }
+            });
+            args.push("--settings".to_string());
+            args.push(overlay.to_string());
+        }
+    }
+
+    args
 }
 
 fn build_extra_args(
@@ -205,4 +223,81 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
         env.insert(k.clone(), v.clone());
     }
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{default_aider_tab, default_claude_tab};
+
+    fn claude_cfg() -> AiToolTabConfig {
+        match default_claude_tab() {
+            TabConfig::AiTool(c) => c,
+            _ => unreachable!("default_claude_tab is an AI tool tab"),
+        }
+    }
+
+    fn aider_cfg() -> AiToolTabConfig {
+        match default_aider_tab() {
+            TabConfig::AiTool(c) => c,
+            _ => unreachable!("default_aider_tab is an AI tool tab"),
+        }
+    }
+
+    /// The value following the first `--settings` flag in `args`, parsed
+    /// as JSON. `None` if no `--settings` flag is present.
+    fn settings_overlay(args: &[String]) -> Option<serde_json::Value> {
+        let i = args.iter().position(|a| a == "--settings")?;
+        let raw = args.get(i + 1)?;
+        Some(serde_json::from_str(raw).expect("--settings value is valid JSON"))
+    }
+
+    #[test]
+    fn injects_statusline_overlay_for_claude_when_enabled() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+
+        let overlay = settings_overlay(&args).expect("statusLine overlay present");
+        assert_eq!(overlay["statusLine"]["type"], "command");
+        let cmd = overlay["statusLine"]["command"]
+            .as_str()
+            .expect("command is a string");
+        // Points back at this binary's hidden subcommand, forward-slashed.
+        assert!(cmd.ends_with(" --statusline"), "got: {cmd}");
+        assert!(!cmd.contains('\\'), "path must be forward-slashed: {cmd}");
+    }
+
+    #[test]
+    fn no_statusline_overlay_when_disabled() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        assert!(settings_overlay(&args).is_none());
+    }
+
+    #[test]
+    fn statusline_overlay_is_claude_only() {
+        // Aider understands neither --append-system-prompt nor --settings,
+        // so its pre-args stay empty even with the global toggle on.
+        let mut settings = Settings::default();
+        settings.statusline.enabled = true;
+        let args = build_pre_args(&aider_cfg(), &settings);
+        assert!(args.is_empty(), "aider must get no pre-args, got: {args:?}");
+    }
+
+    #[test]
+    fn tts_and_statusline_coexist() {
+        // A default Claude tab has TTS injection enabled; with the status
+        // line also on, both pre-arg pairs are present.
+        let mut settings = Settings::default();
+        settings.statusline.enabled = true;
+        let mut cfg = claude_cfg();
+        cfg.tts_injection.enabled = true;
+        cfg.tts_injection.instructions = "wrap prose".to_string();
+        let args = build_pre_args(&cfg, &settings);
+
+        assert!(args.iter().any(|a| a == "--append-system-prompt"));
+        assert!(args.iter().any(|a| a == "--settings"));
+    }
 }

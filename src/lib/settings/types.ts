@@ -180,6 +180,17 @@ export interface SystemStatsSettings {
   show_network: boolean;
 }
 
+/// Context-window status line for ccImp-launched Claude Code tabs.
+/// When enabled, the backend injects a session-scoped `--settings`
+/// overlay pointing Claude Code's `statusLine` at `ccimp --statusline`,
+/// which renders a themed context-usage bar. Global (not per-tab) and
+/// scoped to ccImp sessions only — the user's ~/.claude config is
+/// untouched. Mirrors `StatuslineSettings` in the backend schema.
+export interface StatuslineSettings {
+  /// Overall on/off for the context bar.
+  enabled: boolean;
+}
+
 export interface ComposeSettings {
   min_height_px: number;
   max_height_px: number;
@@ -501,6 +512,8 @@ export interface Settings {
   behavior: BehaviorSettings;
   usage: UsageSettings;
   system_stats: SystemStatsSettings;
+  /// Claude Code context-window status line bar (global, ccImp-scoped).
+  statusline: StatuslineSettings;
   compose: ComposeSettings;
   shortcuts: ShortcutSettings;
   /// Ordered tab configs. Reserved ids (claude, claude-local, shell-default-1)
@@ -708,6 +721,7 @@ export function defaultSettings(): Settings {
       show_gpu_temp: true,
       show_network: true,
     },
+    statusline: { enabled: true },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {
       open_compose: 'Alt+Enter',

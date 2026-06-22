@@ -542,6 +542,10 @@ export interface Settings {
   /// reasons as `claude_local` (local proxies typically accept dummy
   /// tokens; OS-keychain integration is a future upgrade).
   aider_local: AiderLocalSettings;
+  /// V8-01: local task-offload config. ccImp runs a user-supplied
+  /// `llama-server` and exposes an `offload_task` MCP tool into
+  /// ccImp-launched Claude tabs. Off by default.
+  offload: OffloadSettings;
   /// Which AI-tool tabs are enabled. The checkbox group in
   /// Settings → Tabs is the canonical way to flip this; the backend's
   /// `set_enabled_ai_tabs` IPC opens / closes the corresponding AI
@@ -602,6 +606,46 @@ export interface AiderLocalSettings {
   base_url: string;
   auth_token: string;
   model: string;
+}
+
+/// V8-01: native baseline offload tool toggles (mirror of Rust
+/// `OffloadToolToggles`).
+export interface OffloadToolToggles {
+  read_file: boolean;
+  code_search: boolean;
+  run_command: boolean;
+}
+
+/// V8-01: one user-installed MCP tool server (mirror of Rust
+/// `McpServerConfig`). Either stdio (`command` + `args` + `env`) or
+/// HTTP (`url`). `env` values may carry secrets — redacted in the Rust
+/// `Debug` impl, but stored cleartext on disk.
+export interface McpServerConfig {
+  name: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  url: string;
+  enabled: boolean;
+}
+
+/// V8-01: local task-offload config (mirror of Rust `OffloadSettings`).
+/// `server_command` is the single source of truth for the llama-server
+/// model/quant/GPU-layers/context/host-port; `n_ctx`/`-np` are
+/// discovered at runtime and never stored here.
+export interface OffloadSettings {
+  enabled: boolean;
+  autostart: boolean;
+  inject_guidance: boolean;
+  server_command: string;
+  tools: OffloadToolToggles;
+  allowed_roots: string[];
+  command_allowlist: string[];
+  mcp_servers: McpServerConfig[];
+  budget_high_water_pct: number;
+  per_tool_result_token_cap: number;
+  max_steps: number;
+  offload_timeout_secs: number;
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
@@ -847,6 +891,24 @@ export function defaultSettings(): Settings {
       base_url: 'http://localhost:11434/v1',
       auth_token: 'ollama',
       model: '',
+    },
+    offload: {
+      enabled: false,
+      autostart: false,
+      inject_guidance: true,
+      server_command: '',
+      tools: {
+        read_file: true,
+        code_search: true,
+        run_command: true,
+      },
+      allowed_roots: [],
+      command_allowlist: [],
+      mcp_servers: [],
+      budget_high_water_pct: 80,
+      per_tool_result_token_cap: 8000,
+      max_steps: 16,
+      offload_timeout_secs: 300,
     },
     enabled_ai_tabs: ['claude'],
     logging: {

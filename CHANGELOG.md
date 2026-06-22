@@ -5,6 +5,27 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Local task offload (V8-01).** ccImp can now hand token-heavy subtasks —
+  broad codebase searches, large-file/log summarization, web research — from the
+  main Claude (Opus) session to a local LLM, so the cloud session's context grows
+  by a paragraph instead of a megabyte. You point ccImp at a `llama-server`
+  command (e.g. Qwen3.6-35B-A3B) in **Settings → Offload**; it injects an
+  `offload_task` MCP tool into the Claude tabs it launches (session-scoped via
+  `--mcp-config`, never touching `~/.claude`), and the local model does the
+  searching/reading/summarizing while only the synthesized result returns to
+  Opus. The agent loop, the MCP server toward Claude (the hidden
+  `ccimp --offload-mcp` subcommand), and the native tools (`read_file`,
+  `code_search`, allowlisted `run_command`) all live in the single ccImp binary —
+  no Node/Python sidecar. ccImp discovers the server's context window and slot
+  count, budgets each task against the per-slot window, and bounds it by step
+  count and a wall-clock timeout. Off by default; the model is user-supplied
+  (not bundled). File access is confined to configurable `allowed_roots` and
+  `run_command` is deny-by-default (allowlist only).
+
 ## [0.15.0] — 2026-06-20
 
 ### Added

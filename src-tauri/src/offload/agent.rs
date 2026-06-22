@@ -1,0 +1,343 @@
+//! V8-01 offload agent loop — the OpenAI-compatible conversation the
+//! local model drives against `llama-server`.
+//!
+//! Posts `messages` + the aggregated `tools` with `tool_choice: "auto"`,
+//! routes each model `tool_call` to its executor (native tools today;
+//! MCP-server tools layer in via [`ToolRouter`] in Phase C), token-caps
+//! every tool result, and loops until a final assistant message or a cap
+//! is hit. `<think>` blocks are stripped from the returned text.
+//!
+//! Bounded by three caps — `max_steps`, a wall-clock `deadline` (which
+//! the caller sets from `offload_timeout_secs`), and the per-slot token
+//! budget. On any cap the loop forces a final-synthesis turn ("answer
+//! from what you have now") rather than truncating mid-thought.
+
+use std::time::Instant;
+
+use async_trait::async_trait;
+use tracing::{debug, warn};
+
+use crate::error::{AppError, AppResult};
+
+use super::openai::{
+    strip_think, ChatMessage, ChatRequest, ChatResponse, ToolDef,
+};
+use super::tools::{self, ToolCtx};
+
+/// Per-call thinking policy. Opus sets this per `offload_task` from the
+/// task's shape; `Auto` lets the loop think only on the turns that
+/// matter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThinkingMode {
+    /// Think only on the planning (first) and final-synthesis turns;
+    /// suppress on routine tool-ingestion turns.
+    Auto,
+    /// Never think (cheapest; for deterministic extract/list/lookup).
+    Off,
+    /// Always think (for genuine analysis).
+    On,
+}
+
+impl ThinkingMode {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "off" => ThinkingMode::Off,
+            "on" => ThinkingMode::On,
+            _ => ThinkingMode::Auto,
+        }
+    }
+}
+
+/// Routes a model `tool_call` to its owner. The native baseline
+/// implements this directly; Phase C's MCP host wraps it to also reach
+/// the user's tool servers. Lets the loop stay agnostic to where a tool
+/// lives.
+#[async_trait]
+pub trait ToolRouter: Send + Sync {
+    /// The full tool surface advertised to the model this call.
+    fn tool_defs(&self) -> Vec<ToolDef>;
+    /// Execute `name(args)`; errors become a `role: tool` error message
+    /// (the loop continues — a tool failure is not fatal).
+    async fn call(&self, name: &str, args: serde_json::Value) -> Result<String, String>;
+}
+
+/// Native-only router: the `read_file`/`code_search`/`run_command`
+/// baseline. Phase C adds an MCP-aware router that delegates here for
+/// native names and to tool servers otherwise.
+pub struct NativeRouter {
+    pub defs: Vec<ToolDef>,
+    pub ctx: ToolCtx,
+}
+
+#[async_trait]
+impl ToolRouter for NativeRouter {
+    fn tool_defs(&self) -> Vec<ToolDef> {
+        self.defs.clone()
+    }
+    async fn call(&self, name: &str, args: serde_json::Value) -> Result<String, String> {
+        tools::dispatch(name, args, &self.ctx).await
+    }
+}
+
+/// Static loop configuration derived from `OffloadSettings` + the
+/// discovered per-slot budget.
+pub struct AgentConfig {
+    /// HTTP origin of the server, e.g. `http://127.0.0.1:8080`.
+    pub base_url: String,
+    /// Optional model alias (llama-server ignores it, but some proxies
+    /// require it).
+    pub model: Option<String>,
+    pub max_steps: u32,
+    /// Per-slot working token budget `(n_ctx/np) * high_water`; the loop
+    /// compacts when usage crosses it. `None` if undiscovered (no
+    /// compaction, rely on `max_steps`/deadline).
+    pub budget_tokens: Option<u32>,
+    /// Per-tool-result cap in tokens (approximated as bytes/4).
+    pub per_tool_result_token_cap: u32,
+}
+
+/// The task to run.
+pub struct OffloadTask {
+    pub instructions: String,
+    pub context: Option<String>,
+    pub thinking: ThinkingMode,
+}
+
+const SYSTEM_PROMPT: &str = "You are a local offload worker. You are given a self-contained subtask \
+by a more capable orchestrator. Use the available tools to gather what you need, then return a \
+single concise, complete answer — the orchestrator sees ONLY your final message, not your \
+intermediate tool calls or reasoning. Be specific and include concrete references (file paths, \
+line numbers, names) when relevant. Do not ask clarifying questions; make reasonable assumptions \
+and state them.";
+
+/// Cap a tool result to `cap_tokens`, appending a truncation marker so
+/// the model knows it was cut and narrows/paginates.
+fn cap_result(result: String, cap_tokens: u32) -> String {
+    let cap_bytes = (cap_tokens as usize).saturating_mul(4);
+    if result.len() <= cap_bytes {
+        return result;
+    }
+    let mut cut = cap_bytes.min(result.len());
+    while cut > 0 && !result.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = result[..cut].to_string();
+    out.push_str("\n[result truncated — refine your query or page through it]");
+    out
+}
+
+/// Whether to think on a given turn under the policy.
+fn think_on_turn(mode: ThinkingMode, is_planning: bool, is_final: bool) -> bool {
+    match mode {
+        ThinkingMode::On => true,
+        ThinkingMode::Off => false,
+        ThinkingMode::Auto => is_planning || is_final,
+    }
+}
+
+/// Run the agent loop and return the synthesized final answer (with
+/// `<think>` stripped). `deadline` bounds the loop wall-clock; on expiry
+/// (or `max_steps`/budget) it forces a final-synthesis turn.
+pub async fn run(
+    client: &reqwest::Client,
+    cfg: &AgentConfig,
+    router: &dyn ToolRouter,
+    task: OffloadTask,
+    deadline: Instant,
+) -> AppResult<String> {
+    let url = format!("{}/v1/chat/completions", cfg.base_url);
+    let tools = router.tool_defs();
+
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    messages.push(ChatMessage::system(SYSTEM_PROMPT));
+    let user = match &task.context {
+        Some(c) if !c.is_empty() => format!("{}\n\n# Context\n{}", task.instructions, c),
+        _ => task.instructions.clone(),
+    };
+    messages.push(ChatMessage::user(user));
+
+    for step in 0..cfg.max_steps {
+        if Instant::now() >= deadline {
+            debug!("offload: deadline reached at step {step}; forcing final synthesis");
+            return force_final(client, &url, cfg, messages, task.thinking).await;
+        }
+        let is_planning = step == 0;
+        let enable_thinking = think_on_turn(task.thinking, is_planning, false);
+
+        let resp = post_chat(client, &url, cfg, &messages, &tools, enable_thinking, true).await?;
+        let usage = resp.usage;
+        let choice = resp
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Offload("server returned no choices".into()))?;
+        let msg = choice.message;
+
+        // Final answer: no tool calls.
+        if msg.tool_calls.is_empty() {
+            let content = msg.content.unwrap_or_default();
+            return Ok(strip_think(&content));
+        }
+
+        // Append the assistant turn (carrying the tool_calls), then each
+        // tool result.
+        let tool_calls = msg.tool_calls.clone();
+        messages.push(msg);
+        for call in &tool_calls {
+            let args: serde_json::Value = if call.function.arguments.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&call.function.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({ "_raw": call.function.arguments }))
+            };
+            let result = match router.call(&call.function.name, args).await {
+                Ok(r) => r,
+                Err(e) => format!("ERROR: {e}"),
+            };
+            let capped = cap_result(result, cfg.per_tool_result_token_cap);
+            messages.push(ChatMessage::tool(&call.id, capped));
+        }
+
+        // Budget policing: compact when real usage crosses the
+        // high-water mark.
+        if let (Some(budget), Some(usage)) = (cfg.budget_tokens, usage) {
+            if usage.prompt_tokens >= budget {
+                warn!(
+                    used = usage.prompt_tokens,
+                    budget, "offload: budget high-water crossed; compacting"
+                );
+                compact(&mut messages);
+            }
+        }
+    }
+
+    // Ran out of steps — force a final answer.
+    debug!("offload: max_steps reached; forcing final synthesis");
+    force_final(client, &url, cfg, messages, task.thinking).await
+}
+
+/// One chat-completions POST. `with_tools` lets the forced-final turn
+/// suppress further tool calls.
+async fn post_chat(
+    client: &reqwest::Client,
+    url: &str,
+    cfg: &AgentConfig,
+    messages: &[ChatMessage],
+    tools: &[ToolDef],
+    enable_thinking: bool,
+    with_tools: bool,
+) -> AppResult<ChatResponse> {
+    let req = ChatRequest {
+        messages: messages.to_vec(),
+        tools: if with_tools { tools.to_vec() } else { Vec::new() },
+        tool_choice: if with_tools { Some("auto".into()) } else { Some("none".into()) },
+        model: cfg.model.clone(),
+        temperature: Some(0.2),
+        chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": enable_thinking })),
+    };
+    let resp = client
+        .post(url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| AppError::Offload(format!("chat request failed: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Offload(format!(
+            "server returned {status}: {}",
+            body.chars().take(500).collect::<String>()
+        )));
+    }
+    resp.json::<ChatResponse>()
+        .await
+        .map_err(|e| AppError::Offload(format!("chat response parse failed: {e}")))
+}
+
+/// Force a final answer from the conversation so far (tools suppressed).
+async fn force_final(
+    client: &reqwest::Client,
+    url: &str,
+    cfg: &AgentConfig,
+    mut messages: Vec<ChatMessage>,
+    thinking: ThinkingMode,
+) -> AppResult<String> {
+    messages.push(ChatMessage::user(
+        "You are out of budget. Stop using tools and answer now, as completely as you can, \
+         from what you already have. If your information is partial, say so explicitly.",
+    ));
+    let enable_thinking = think_on_turn(thinking, false, true);
+    let resp = post_chat(client, url, cfg, &messages, &[], enable_thinking, false).await?;
+    let content = resp
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message.content)
+        .unwrap_or_default();
+    let stripped = strip_think(&content);
+    if stripped.is_empty() {
+        Ok("(offload produced no answer within its budget)".into())
+    } else {
+        Ok(stripped)
+    }
+}
+
+/// Mini auto-compact: drop the oldest tool/assistant turns (keeping the
+/// system + original user message and the most recent turns) and leave a
+/// note so the model knows context was evicted.
+fn compact(messages: &mut Vec<ChatMessage>) {
+    const KEEP_RECENT: usize = 6;
+    if messages.len() <= 2 + KEEP_RECENT {
+        return;
+    }
+    let head: Vec<ChatMessage> = messages.iter().take(2).cloned().collect(); // system + user
+    let tail_start = messages.len() - KEEP_RECENT;
+    let tail: Vec<ChatMessage> = messages.iter().skip(tail_start).cloned().collect();
+    let mut rebuilt = head;
+    rebuilt.push(ChatMessage::user(
+        "[earlier tool results were summarized away to stay within the context budget — \
+         re-fetch anything you still need]",
+    ));
+    rebuilt.extend(tail);
+    *messages = rebuilt;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_policy_auto() {
+        assert!(think_on_turn(ThinkingMode::Auto, true, false)); // planning
+        assert!(think_on_turn(ThinkingMode::Auto, false, true)); // final
+        assert!(!think_on_turn(ThinkingMode::Auto, false, false)); // ingestion
+    }
+
+    #[test]
+    fn thinking_policy_overrides() {
+        assert!(think_on_turn(ThinkingMode::On, false, false));
+        assert!(!think_on_turn(ThinkingMode::Off, true, true));
+    }
+
+    #[test]
+    fn cap_result_marks_truncation() {
+        let big = "x".repeat(10_000);
+        let capped = cap_result(big, 100); // 100 tokens ≈ 400 bytes
+        assert!(capped.len() < 1000);
+        assert!(capped.contains("truncated"));
+    }
+
+    #[test]
+    fn cap_result_passes_short() {
+        let small = "hello".to_string();
+        assert_eq!(cap_result(small.clone(), 100), small);
+    }
+
+    #[test]
+    fn parse_thinking_mode() {
+        assert_eq!(ThinkingMode::parse("off"), ThinkingMode::Off);
+        assert_eq!(ThinkingMode::parse("on"), ThinkingMode::On);
+        assert_eq!(ThinkingMode::parse("auto"), ThinkingMode::Auto);
+        assert_eq!(ThinkingMode::parse("garbage"), ThinkingMode::Auto);
+    }
+}

@@ -124,6 +124,12 @@ pub struct Settings {
     /// spawned aider process. Per-tab `env` entries take precedence
     /// over synthesized values.
     pub aider_local: AiderLocalSettings,
+    /// V8-01: local task-offload config. ccImp runs a user-supplied
+    /// `llama-server` and exposes an `offload_task` MCP tool into
+    /// ccImp-launched Claude tabs so Opus can delegate token-heavy
+    /// subtasks to the local model. Off by default. Additive — old
+    /// settings files load with the feature disabled.
+    pub offload: OffloadSettings,
     /// Which AI-tool tabs are enabled. Each id in this list corresponds
     /// to one of the four reserved AI builtins (`claude`, `claude-local`,
     /// `aider`, `aider-local`). Adding an id opens that tab; removing
@@ -162,6 +168,7 @@ impl Default for Settings {
             terminal: TerminalSettings::default(),
             claude_local: ClaudeLocalSettings::default(),
             aider_local: AiderLocalSettings::default(),
+            offload: OffloadSettings::default(),
             enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
         }
@@ -588,6 +595,194 @@ impl Default for AiderLocalSettings {
             base_url: "http://localhost:11434/v1".to_string(),
             auth_token: "ollama".to_string(),
             model: String::new(),
+        }
+    }
+}
+
+/// V8-01: local task-offload configuration. ccImp runs a user-supplied
+/// `llama-server` (the single source of truth is `server_command`) and
+/// exposes an `offload_task` MCP tool into ccImp-launched Claude tabs so
+/// the main Opus session can delegate token-heavy subtasks (deep search,
+/// large-file/log summarization, web research) to the local model and
+/// receive only the synthesized result. Off by default (`enabled` and
+/// `autostart` both false): the feature spawns a multi-GB server and is
+/// useless without a configured command, so it is opt-in.
+///
+/// Additive `#[serde(default)]` block — old settings files round-trip
+/// with the feature disabled. No schema-version bump.
+///
+/// The `Debug` impl is hand-rolled to redact any secrets carried in the
+/// configured MCP servers' `env` maps, mirroring `ClaudeLocalSettings`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OffloadSettings {
+    /// Master switch. Off = no server, no `--mcp-config` injection into
+    /// Claude tabs, `offload_task` not exposed, no Offload Server tab.
+    pub enabled: bool,
+    /// When `enabled`, spawn `llama-server` at app launch and keep it
+    /// warm. When off, the server starts lazily on the first
+    /// `offload_task` (or via a manual Start) so a ~20 GB load never
+    /// blocks launch.
+    pub autostart: bool,
+    /// Inject the system-prompt addendum that tells Opus *when* to
+    /// offload. Default true — without the nudge Opus won't reach for
+    /// the tool. Routed through the same `--append-system-prompt`
+    /// mechanism as the TTS markup convention.
+    pub inject_guidance: bool,
+    /// The single source-of-truth `llama-server` command, e.g.
+    /// `llama-server --model …\Qwen3.6-35B-A3B-Q4.gguf --port 8080
+    /// --jinja -ngl 99 --ctx-size 150000 --flash-attn`. ccImp
+    /// `shlex`-parses it to spawn, parses host/port + `-np` to know
+    /// where to connect and how many slots exist, and validates
+    /// `--jinja` is present (tool-calling needs it). ccImp never
+    /// silently mutates the command. Empty on a fresh install.
+    pub server_command: String,
+    /// Native baseline tool on/off toggles (`read_file`, `code_search`,
+    /// `run_command`).
+    pub tools: OffloadToolToggles,
+    /// Roots the native `code_search`/`read_file` tools and the
+    /// `filesystem` MCP server are confined to. Empty default → the loop
+    /// resolves it to the launch project root at call time.
+    pub allowed_roots: Vec<PathBuf>,
+    /// Commands the native `run_command` tool may execute. Deny by
+    /// default (empty list = nothing runnable). Matched against the
+    /// command's program name.
+    pub command_allowlist: Vec<String>,
+    /// User-installed MCP tool servers aggregated by ccImp's MCP host
+    /// and exposed to the local model as OpenAI tools. Mirrors Claude's
+    /// own `mcpServers` config shape so users can paste familiar config.
+    pub mcp_servers: Vec<McpServerConfig>,
+    /// Fraction (0–100) of the per-slot window the loop works against,
+    /// reserving the rest for reasoning + the final answer (~80%).
+    pub budget_high_water_pct: u8,
+    /// Hard cap on every tool result (native *and* MCP) in tokens; the
+    /// loop appends a truncation marker past this so the model knows it
+    /// was cut and paginates instead of assuming full coverage (~8k).
+    pub per_tool_result_token_cap: u32,
+    /// Maximum agent-loop iterations before a forced final-synthesis
+    /// turn.
+    pub max_steps: u32,
+    /// Per-task wall-clock bound (seconds), *including* queue-wait for a
+    /// concurrency slot. On expiry the loop is cancelled and a clear
+    /// timeout result is returned to Claude rather than hanging the tool
+    /// call.
+    pub offload_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for OffloadSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OffloadSettings")
+            .field("enabled", &self.enabled)
+            .field("autostart", &self.autostart)
+            .field("inject_guidance", &self.inject_guidance)
+            .field("server_command", &self.server_command)
+            .field("tools", &self.tools)
+            .field("allowed_roots", &self.allowed_roots)
+            .field("command_allowlist", &self.command_allowlist)
+            // McpServerConfig has its own redacted Debug.
+            .field("mcp_servers", &self.mcp_servers)
+            .field("budget_high_water_pct", &self.budget_high_water_pct)
+            .field("per_tool_result_token_cap", &self.per_tool_result_token_cap)
+            .field("max_steps", &self.max_steps)
+            .field("offload_timeout_secs", &self.offload_timeout_secs)
+            .finish()
+    }
+}
+
+impl Default for OffloadSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            autostart: false,
+            inject_guidance: true,
+            server_command: String::new(),
+            tools: OffloadToolToggles::default(),
+            allowed_roots: Vec::new(),
+            command_allowlist: Vec::new(),
+            mcp_servers: Vec::new(),
+            budget_high_water_pct: 80,
+            per_tool_result_token_cap: 8000,
+            max_steps: 16,
+            offload_timeout_secs: 300,
+        }
+    }
+}
+
+/// On/off toggles for the native baseline offload tools (built into
+/// ccImp, zero external deps). All default on so offload works with no
+/// MCP servers installed.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct OffloadToolToggles {
+    /// Bounded line/byte reads within an `allowed_root`.
+    pub read_file: bool,
+    /// `grep`/`glob` across an `allowed_root`; matching paths + snippets.
+    pub code_search: bool,
+    /// Allowlisted, read-only command execution. Default true, but inert
+    /// until `command_allowlist` is populated (deny-by-default).
+    pub run_command: bool,
+}
+
+impl Default for OffloadToolToggles {
+    fn default() -> Self {
+        Self {
+            read_file: true,
+            code_search: true,
+            run_command: true,
+        }
+    }
+}
+
+/// One user-installed MCP tool server, aggregated by ccImp's MCP host.
+/// Mirrors Claude Code's own `mcpServers` entry shape: either a stdio
+/// server (`command` + `args` + `env`) or an HTTP server (`url`). Only
+/// read-class tools from each server are exposed this milestone.
+///
+/// The hand-rolled `Debug` redacts `env` values, which may carry API
+/// keys, so a stray `?settings` log line cannot leak them.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Display + namespacing prefix (e.g. `ddg`, `git`). Tools are
+    /// exposed to the model as `<name>__<tool>`.
+    pub name: String,
+    /// Stdio transport: the server executable. Empty when `url` is set.
+    pub command: String,
+    /// Args for the stdio `command`.
+    pub args: Vec<String>,
+    /// Extra env for the stdio `command` (may carry secrets — redacted
+    /// in `Debug`).
+    pub env: HashMap<String, String>,
+    /// HTTP transport: the server base URL. Empty when `command` is set.
+    pub url: String,
+    /// Per-server enable toggle.
+    pub enabled: bool,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_keys: Vec<&String> = self.env.keys().collect();
+        f.debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            // Redact values; show only which keys are present.
+            .field("env_keys", &env_keys)
+            .field("url", &self.url)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: String::new(),
+            enabled: true,
         }
     }
 }

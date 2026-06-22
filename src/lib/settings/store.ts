@@ -65,6 +65,7 @@ export const shortcuts: Readable<Settings['shortcuts']> = derived(
   (s) => s.shortcuts,
 );
 export const tabs: Readable<Settings['tabs']> = derived(settings, (s) => s.tabs);
+export const offload: Readable<Settings['offload']> = derived(settings, (s) => s.offload);
 export const processing: Readable<Settings['processing']> = derived(
   settings,
   (s) => s.processing,

@@ -179,6 +179,31 @@ fn read_overlay_migrated(path: &Path, default_shell: &ShellSpec) -> Option<Value
     Some(value)
 }
 
+/// V8-01: read-only settings load for a lightweight subprocess (the
+/// `ccimp --offload-mcp` child). Reads the global baseline + per-folder
+/// overlay and deserializes, with **no** side effects — no writes, no
+/// migration, no quarantine, no integrity repair. The offload block is
+/// additive (`#[serde(default)]`), so a current-schema file parses with
+/// `offload` defaulted when absent; anything unreadable falls back to
+/// `Settings::default()` (offload disabled). The child only consumes a
+/// handful of `offload` fields, so the lighter path avoids dragging the
+/// shell-probe + disk-write machinery into a per-Claude-session spawn.
+pub fn load_readonly(launch_cwd: &Path) -> Settings {
+    let global = global_path()
+        .ok()
+        .filter(|p| p.exists())
+        .and_then(|p| fs::read_to_string(&p).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    let mut merged = match global {
+        Some(v) => v,
+        None => return Settings::default(),
+    };
+    if let Some(overlay) = read_overlay(&custom_path(launch_cwd)) {
+        deep_merge(&mut merged, overlay);
+    }
+    serde_json::from_value(merged).unwrap_or_default()
+}
+
 /// Read the global file. Writes seeded defaults when absent. On parse
 /// failure quarantines the file and returns defaults. Runs migration on
 /// the global file in place — backup goes next to the global path itself,

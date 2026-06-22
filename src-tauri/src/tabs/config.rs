@@ -120,9 +120,23 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     }
     let mut args = Vec::new();
 
+    // Compose a single `--append-system-prompt` from every addendum we
+    // inject (TTS markup convention + the V8-01 offload guidance nudge),
+    // joined with a blank line. Merging into one flag avoids relying on
+    // Claude Code concatenating repeated `--append-system-prompt` flags.
+    let mut addendum = String::new();
     if cfg.tts_injection.enabled && !cfg.tts_injection.instructions.is_empty() {
+        addendum.push_str(&cfg.tts_injection.instructions);
+    }
+    if settings.offload.enabled && settings.offload.inject_guidance {
+        if !addendum.is_empty() {
+            addendum.push_str("\n\n");
+        }
+        addendum.push_str(OFFLOAD_GUIDANCE);
+    }
+    if !addendum.is_empty() {
         args.push("--append-system-prompt".to_string());
-        args.push(cfg.tts_injection.instructions.clone());
+        args.push(addendum);
     }
 
     if settings.statusline.enabled {
@@ -135,8 +149,38 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         }
     }
 
+    // V8-01: point Claude at our own `ccimp --offload-mcp` MCP server so
+    // the `offload_task` tool is available in this session. Session-scoped
+    // (a `--mcp-config` overlay), never written to `~/.claude`. Claude
+    // spawns the `command` as argv (no shell), so the raw exe path is
+    // correct — no shell-quoting needed (unlike the statusLine command).
+    if settings.offload.enabled {
+        if let Ok(exe) = std::env::current_exe() {
+            let mcp = serde_json::json!({
+                "mcpServers": {
+                    "ccimp-offload": {
+                        "command": exe.to_string_lossy(),
+                        "args": ["--offload-mcp"]
+                    }
+                }
+            });
+            args.push("--mcp-config".to_string());
+            args.push(mcp.to_string());
+        }
+    }
+
     args
 }
+
+/// V8-01: the system-prompt addendum telling Opus *when* to reach for
+/// `offload_task`. Without this nudge the model rarely offloads. Gated by
+/// `offload.inject_guidance`.
+const OFFLOAD_GUIDANCE: &str = "You have an `offload_task` tool (from the ccimp-offload MCP server) \
+backed by a local model. For token-heavy subtasks — broad codebase searches, summarizing large \
+files or logs, or web research — prefer calling `offload_task` with a self-contained instruction \
+instead of doing the work yourself: it returns only a synthesized result, conserving your context \
+window. Keep work that needs your full reasoning or the conversation's context here. Set the \
+`thinking` arg to 'off' for simple lookups/extraction, 'on' for analysis, or leave it 'auto'.";
 
 fn build_extra_args(
     cfg: &AiToolTabConfig,
@@ -299,5 +343,52 @@ mod tests {
 
         assert!(args.iter().any(|a| a == "--append-system-prompt"));
         assert!(args.iter().any(|a| a == "--settings"));
+    }
+
+    #[test]
+    fn injects_offload_mcp_config_for_claude_when_enabled() {
+        let mut settings = Settings::default();
+        settings.offload.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+
+        let i = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config present");
+        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        assert_eq!(cfg["mcpServers"]["ccimp-offload"]["args"][0], "--offload-mcp");
+    }
+
+    #[test]
+    fn offload_guidance_merges_with_tts_addendum() {
+        let mut settings = Settings::default();
+        settings.offload.enabled = true;
+        settings.offload.inject_guidance = true;
+        let mut cfg = claude_cfg();
+        cfg.tts_injection.enabled = true;
+        cfg.tts_injection.instructions = "wrap prose".to_string();
+        let args = build_pre_args(&cfg, &settings);
+
+        // Exactly one --append-system-prompt, carrying both addenda.
+        let count = args.iter().filter(|a| *a == "--append-system-prompt").count();
+        assert_eq!(count, 1, "addenda must merge into one flag");
+        let i = args.iter().position(|a| a == "--append-system-prompt").unwrap();
+        assert!(args[i + 1].contains("wrap prose"));
+        assert!(args[i + 1].contains("offload_task"));
+    }
+
+    #[test]
+    fn no_offload_injection_when_disabled() {
+        let settings = Settings::default(); // offload off by default
+        let args = build_pre_args(&claude_cfg(), &settings);
+        assert!(!args.iter().any(|a| a == "--mcp-config"));
+    }
+
+    #[test]
+    fn offload_injection_is_claude_only() {
+        let mut settings = Settings::default();
+        settings.offload.enabled = true;
+        let args = build_pre_args(&aider_cfg(), &settings);
+        assert!(args.is_empty(), "aider must get no pre-args, got: {args:?}");
     }
 }

@@ -23,6 +23,15 @@
   import { defaultSettings, findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
   import { listSttModels, listInputDevices } from './lib/stt';
+  import {
+    initOffloadStatus,
+    offloadState,
+    offloadServerStart,
+    offloadServerStop,
+    offloadServerRestart,
+    offloadTest,
+    describeOffloadState,
+  } from './lib/offload';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
@@ -80,6 +89,32 @@
   let showLocalToken = $state<boolean>(false);
   // V14: same toggle for the Aider local LLM section.
   let showAiderLocalToken = $state<boolean>(false);
+  // V8-01 offload: test-box input/result and a busy guard for the
+  // Start/Stop/Reset/Test buttons.
+  let offloadTestInput = $state<string>('');
+  let offloadTestResult = $state<string>('');
+  let offloadBusy = $state<boolean>(false);
+  async function runOffloadAction(action: () => Promise<void>): Promise<void> {
+    offloadBusy = true;
+    try {
+      await action();
+    } catch (e) {
+      offloadTestResult = `Error: ${e}`;
+    } finally {
+      offloadBusy = false;
+    }
+  }
+  async function runOffloadTest(): Promise<void> {
+    offloadBusy = true;
+    offloadTestResult = 'Running…';
+    try {
+      offloadTestResult = await offloadTest(offloadTestInput);
+    } catch (e) {
+      offloadTestResult = `Error: ${e}`;
+    } finally {
+      offloadBusy = false;
+    }
+  }
   // Per-tab "applied" baselines — used to compute the Restart Required
   // indicator when subprocess-affecting fields drift from the spawn-time
   // settings. Notification text and first-launch dismissal are NOT in
@@ -107,6 +142,7 @@
     | 'shortcuts'
     | 'local-llm'
     | 'aider-local-llm'
+    | 'offload'
     | 'advanced'
     | 'about';
   let activeSection = $state<SectionId>('audio');
@@ -122,6 +158,7 @@
     { id: 'shortcuts', label: 'Shortcuts' },
     { id: 'local-llm', label: 'Local LLM (Claude)' },
     { id: 'aider-local-llm', label: 'Local LLM (Aider)' },
+    { id: 'offload', label: 'Offload' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
@@ -194,6 +231,7 @@
   onMount(async () => {
     await initSettings();
     if (disposed) return;
+    void initOffloadStatus();
     snapshot = structuredClone(get(settings));
     for (const t of AI_TABS) captureBaseline(t);
     unsub = settings.subscribe((s) => {
@@ -2202,6 +2240,243 @@
             </small>
           </label>
         </section>
+      {:else if activeSection === 'offload'}
+        <section>
+          <h2>Local task offload</h2>
+          <small class="hint top">
+            Run a local <code>llama-server</code> and expose an
+            <code>offload_task</code> tool into ccImp-launched Claude tabs.
+            The main session can hand token-heavy subtasks (broad codebase
+            searches, large-file/log summarization, web research) to the
+            local model and get back only the synthesized result —
+            conserving its context window. Everything stays local. Off by
+            default; the model is user-supplied (not bundled).
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.enabled}
+              onchange={(e) =>
+                patch((s) => (s.offload.enabled = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Enable offload</span>
+          </label>
+          <small class="hint">
+            When on, ccImp injects the <code>offload_task</code> tool into
+            Claude tabs (re-launch a tab to pick it up).
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.autostart}
+              onchange={(e) =>
+                patch((s) => (s.offload.autostart = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Start the server on launch</span>
+          </label>
+          <small class="hint">
+            Off = the server starts lazily on the first offload (a multi-GB
+            model load never blocks launch).
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.inject_guidance}
+              onchange={(e) =>
+                patch((s) => (s.offload.inject_guidance = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Inject offload guidance into the system prompt</span>
+          </label>
+
+          <label>
+            <span>Server command</span>
+            <input
+              type="text"
+              value={snapshot.offload.server_command}
+              oninput={(e) =>
+                patch((s) => (s.offload.server_command = (e.currentTarget as HTMLInputElement).value))}
+              placeholder="llama-server --model C:\models\Qwen3.6-35B-A3B-Q4.gguf --port 8080 --jinja -ngl 99 --ctx-size 150000 --flash-attn"
+            />
+            <small class="hint">
+              The single source of truth for the model, GPU layers, context,
+              and host/port. ccImp parses host/port and <code>-np</code> and
+              warns if <code>--jinja</code> is missing (tool-calling needs
+              it). The context window is discovered from the server, never
+              set here.
+            </small>
+          </label>
+
+          <div class="offload-status">
+            <span class="offload-status-label">Server:</span>
+            <span>{describeOffloadState($offloadState)}</span>
+          </div>
+          <div class="button-row">
+            <button
+              type="button"
+              disabled={offloadBusy}
+              onclick={() => runOffloadAction(offloadServerStart)}
+            >
+              Start
+            </button>
+            <button
+              type="button"
+              class="secondary"
+              disabled={offloadBusy}
+              onclick={() => runOffloadAction(offloadServerStop)}
+            >
+              Stop
+            </button>
+            <button
+              type="button"
+              class="secondary"
+              disabled={offloadBusy}
+              onclick={() => runOffloadAction(offloadServerRestart)}
+            >
+              Reset
+            </button>
+          </div>
+
+          <label>
+            <span>Test offload</span>
+            <input
+              type="text"
+              bind:value={offloadTestInput}
+              placeholder="Leave empty for a canned reachability check, or type a task…"
+            />
+            <div class="button-row">
+              <button type="button" disabled={offloadBusy} onclick={runOffloadTest}>
+                Run test
+              </button>
+            </div>
+            {#if offloadTestResult}
+              <pre class="offload-test-result">{offloadTestResult}</pre>
+            {/if}
+          </label>
+
+          <h3>Limits</h3>
+          <label>
+            <span>Working-budget high-water (%)</span>
+            <input
+              type="number"
+              min="10"
+              max="100"
+              value={snapshot.offload.budget_high_water_pct}
+              oninput={(e) =>
+                patch((s) => (s.offload.budget_high_water_pct = +(e.currentTarget as HTMLInputElement).value))}
+            />
+            <small class="hint">
+              Fraction of the per-slot window the loop works against,
+              reserving the rest for reasoning + the answer (~80%).
+            </small>
+          </label>
+          <label>
+            <span>Per-tool-result token cap</span>
+            <input
+              type="number"
+              min="256"
+              value={snapshot.offload.per_tool_result_token_cap}
+              oninput={(e) =>
+                patch((s) => (s.offload.per_tool_result_token_cap = +(e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+          <label>
+            <span>Max steps</span>
+            <input
+              type="number"
+              min="1"
+              value={snapshot.offload.max_steps}
+              oninput={(e) =>
+                patch((s) => (s.offload.max_steps = +(e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+          <label>
+            <span>Per-task timeout (seconds)</span>
+            <input
+              type="number"
+              min="30"
+              value={snapshot.offload.offload_timeout_secs}
+              oninput={(e) =>
+                patch((s) => (s.offload.offload_timeout_secs = +(e.currentTarget as HTMLInputElement).value))}
+            />
+            <small class="hint">Bounds each offload, including the wait for a free slot.</small>
+          </label>
+
+          <h3>Native tools</h3>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.read_file}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.read_file = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>read_file — bounded file reads</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.code_search}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.code_search = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>code_search — literal search across the roots</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.run_command}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.run_command = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>run_command — allowlisted, read-only commands</span>
+          </label>
+
+          <label>
+            <span>Allowed roots (one per line)</span>
+            <textarea
+              rows="3"
+              value={snapshot.offload.allowed_roots.join('\n')}
+              oninput={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.allowed_roots = (e.currentTarget as HTMLTextAreaElement).value
+                      .split('\n')
+                      .map((r) => r.trim())
+                      .filter((r) => r.length > 0)),
+                )}
+              placeholder="Leave empty to confine to the launch project root"
+            ></textarea>
+            <small class="hint">
+              <code>code_search</code>/<code>read_file</code>/<code>run_command</code>
+              are confined to these. Empty = the launch project root.
+            </small>
+          </label>
+          <label>
+            <span>Command allowlist (comma-separated)</span>
+            <input
+              type="text"
+              value={snapshot.offload.command_allowlist.join(', ')}
+              oninput={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.command_allowlist = (e.currentTarget as HTMLInputElement).value
+                      .split(',')
+                      .map((c) => c.trim())
+                      .filter((c) => c.length > 0)),
+                )}
+              placeholder="git, cargo"
+            />
+            <small class="hint">
+              <code>run_command</code> runs nothing unless its program is
+              listed here (deny by default).
+            </small>
+          </label>
+          <small class="hint">
+            MCP tool servers (web search, fetch, docs, git) are aggregated
+            once the MCP host lands; configure them in
+            <code>settings.json</code> under <code>offload.mcp_servers</code>
+            for now.
+          </small>
+        </section>
       {:else if activeSection === 'advanced'}
         <section>
           <h2>Per-tab overrides</h2>
@@ -2427,6 +2702,35 @@
     color: var(--text-primary);
     font-family: system-ui, -apple-system, sans-serif;
     font-size: var(--font-size-md);
+  }
+  /* V8-01 offload controls */
+  .button-row {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .offload-status {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+    margin: 0.6rem 0 0.2rem;
+  }
+  .offload-status-label {
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+  .offload-test-result {
+    margin-top: 0.5rem;
+    max-height: 16rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    padding: 0.5rem;
+    font-size: var(--font-size-sm);
   }
   /* Two-column layout: fixed sidebar on the left, scrollable content on
      the right. The settings page lives inside #app, which app.css pins to

@@ -641,6 +641,63 @@ pub async fn settings_update(
     Ok(())
 }
 
+// ── V8-01 local task offload ────────────────────────────────────────────
+// The supervisor is managed as its own state (it needs the AppHandle for
+// `offload-state` events, available only in the setup hook). These thin
+// commands drive its lifecycle from the Settings UI.
+
+/// Current offload server status (state + discovered `n_ctx`/slots/in-flight).
+#[tauri::command]
+pub async fn offload_status(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+) -> AppResult<crate::offload::OffloadState> {
+    Ok(supervisor.status().await)
+}
+
+/// Start the offload `llama-server` (idempotent).
+#[tauri::command]
+pub async fn offload_server_start(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+) -> AppResult<()> {
+    supervisor.inner().start().await
+}
+
+/// Stop the offload `llama-server` (idempotent).
+#[tauri::command]
+pub async fn offload_server_stop(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+) -> AppResult<()> {
+    supervisor.stop().await;
+    Ok(())
+}
+
+/// Reset: kill + respawn with the current `server_command` (re-health,
+/// re-read `n_ctx`/`np`).
+#[tauri::command]
+pub async fn offload_server_restart(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+) -> AppResult<()> {
+    supervisor.inner().restart().await
+}
+
+/// Run a canned offload task against the local server and return its
+/// answer (the Settings "Test offload" button).
+#[tauri::command]
+pub async fn offload_test(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+    instructions: String,
+) -> AppResult<String> {
+    let task = if instructions.trim().is_empty() {
+        "Briefly confirm you are reachable and list the tools available to you.".to_string()
+    } else {
+        instructions
+    };
+    supervisor
+        .inner()
+        .run_task(task, crate::offload::agent::ThinkingMode::Auto)
+        .await
+}
+
 /// Open `<portable-root>/logs/content/` in the host file manager. Creates the
 /// folder first if it doesn't exist so the call doesn't 404 on a clean
 /// install. Windows uses `explorer.exe`; macOS `open`; Linux

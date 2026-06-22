@@ -6,6 +6,7 @@ mod error;
 mod ipc;
 mod logging;
 mod notifications;
+mod offload;
 mod processing;
 mod pty;
 mod settings;
@@ -34,7 +35,8 @@ use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
     get_system_stats, list_tabs,
-    list_voices, open_settings_window, open_settings_window_to_tab, pty_get_scrollback,
+    list_voices, offload_server_restart, offload_server_start, offload_server_stop, offload_status,
+    offload_test, open_settings_window, open_settings_window_to_tab, pty_get_scrollback,
     pty_rebind_channel, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
     restart_shell_tab, set_active_tab, set_window_square_corners, settings_get, settings_update,
     stt_cancel, stt_list_input_devices, stt_list_models, stt_start_recording, stt_stop_recording,
@@ -66,6 +68,17 @@ fn main() {
     // console allocation is suppressed.
     if std::env::args().skip(1).any(|a| a == "--statusline") {
         statusline::run();
+        return;
+    }
+
+    // V8-01 offload MCP server: Claude Code invokes `ccimp --offload-mcp`
+    // (injected via `--mcp-config`) and speaks newline-delimited JSON-RPC
+    // over stdio. Handle it before any Tauri/audio/settings init so it
+    // stays GUI-free and fast to spawn per Claude session — same contract
+    // as `--statusline`. It connects to the app-owned llama-server over
+    // HTTP and never loads its own model.
+    if std::env::args().skip(1).any(|a| a == "--offload-mcp") {
+        offload::mcp::run();
         return;
     }
 
@@ -264,6 +277,7 @@ fn main() {
     let initial_active_for_notifications = initial_active.clone();
     let stt_runtime_for_setup = stt_runtime_slot.clone();
     let settings_for_stt = settings_handle.clone();
+    let settings_for_offload = settings_handle.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
@@ -328,6 +342,29 @@ fn main() {
                 .and_then(|mut g| g.take())
             {
                 stt::spawn(app.handle().clone(), settings_for_stt.clone(), rt);
+            }
+
+            // V8-01 offload: construct the supervisor (needs the
+            // AppHandle for `offload-state` events) and manage it as its
+            // own state. With `enabled` + `autostart`, kick off a
+            // non-blocking start; otherwise it stays Stopped/Disabled and
+            // the user starts it from Settings (or it's lazy on first
+            // offload). Fail-soft: a bad command surfaces as an Error
+            // status, never blocks launch.
+            {
+                let supervisor = crate::offload::OffloadSupervisor::new(
+                    app.handle().clone(),
+                    settings_for_offload.clone(),
+                );
+                app.manage(supervisor.clone());
+                let snap = settings_for_offload.current().offload;
+                if snap.enabled && snap.autostart {
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = supervisor.start().await {
+                            warn!(error = %e, "offload: autostart failed");
+                        }
+                    });
+                }
             }
 
             spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
@@ -409,6 +446,11 @@ fn main() {
             rename_layout_preset,
             content_open_folder,
             content_clear,
+            offload_status,
+            offload_server_start,
+            offload_server_stop,
+            offload_server_restart,
+            offload_test,
             theming::themes_list,
             theming::palettes_list,
         ])
@@ -451,6 +493,12 @@ fn main() {
                     }
                     registry.shutdown_all().await;
                     drop(registry);
+                    // V8-01: kill the offload `llama-server` child on
+                    // graceful exit so it doesn't outlive the app. (The
+                    // child is also `kill_on_drop`; this is the clean path.)
+                    app.state::<std::sync::Arc<crate::offload::OffloadSupervisor>>()
+                        .stop()
+                        .await;
                     // Closing the main window also closes the settings window
                     // if it's open — otherwise it would keep the process alive
                     // with no main window. Destroy it before the main window.

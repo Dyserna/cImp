@@ -38,6 +38,17 @@ pub enum AppError {
 
     #[error("settings error: {0}")]
     Settings(String),
+
+    /// V8-01: the offload `llama-server` is not running / not yet healthy
+    /// when an operation needed it. Surfaced to Claude as a clear "enable
+    /// or start offload in ccImp" message rather than a hang.
+    #[error("offload server not ready: {0}")]
+    OffloadNotReady(String),
+
+    /// V8-01: a generic offload failure (command parse, agent loop, MCP
+    /// host, budget). Carries human-readable context for the IPC layer.
+    #[error("offload error: {0}")]
+    Offload(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

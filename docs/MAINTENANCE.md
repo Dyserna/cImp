@@ -106,6 +106,132 @@ Living list of dependencies and runtime concerns to revisit periodically. Each i
   against `src/stt/engine.rs` when bumping. Watch
   <https://github.com/tazz4843/whisper-rs/releases>.
 
+## Offload backends (V8-01 / V8-02)
+
+The offload pool lives under `offload.backends` in `settings.json`. A V8-01
+single-server config (`offload.server_command` + `offload.autostart`) migrates
+to one Local backend automatically (v1.16 → v1.17); the legacy scalar fields
+still work as a fallback when `backends` is empty.
+
+Example pool — a big local model, a small LAN box, and an optional cloud API:
+
+```jsonc
+"offload": {
+  "enabled": true,
+  "backends": [
+    {
+      "name": "main",
+      "enabled": true,
+      "tier": "quality",
+      "tool_scope": { "mode": "all" },
+      "kind": {
+        "type": "local",
+        "server_command": "llama-server --model C:\\models\\Qwen3.6-35B-A3B-Q4.gguf --port 8080 --jinja -ngl 99 --ctx-size 150000 --flash-attn",
+        "autostart": true
+      }
+    },
+    {
+      "name": "lan-3070",
+      "enabled": true,
+      "tier": "fast",
+      "tool_scope": { "mode": "all" },          // trusted LAN → all tools
+      "kind": {
+        "type": "remote",
+        "base_url": "http://192.168.1.50:8080",  // a llama-server on the LAN box
+        "auth_token": "",
+        "is_cloud": false,
+        "cloud_consent": false
+      }
+    },
+    {
+      "name": "cloud",
+      "enabled": false,                          // off until you opt in
+      "tier": "quality",
+      "declared_context": 128000,                // cloud APIs rarely expose /props
+      "declared_model": "some-cloud-model",
+      "tool_scope": { "mode": "allexcept", "tools": ["read_file","code_search","run_command","filesystem","git"] },
+      "kind": {
+        "type": "remote",
+        "base_url": "https://api.example.com/v1",
+        "auth_token": "sk-...",                  // redacted in Debug logs
+        "is_cloud": true,
+        "cloud_consent": true                    // REQUIRED for a cloud backend to be usable
+      }
+    }
+  ]
+}
+```
+
+Notes when maintaining this:
+
+- **Routing** is `offload/router.rs::select` — a pure function over `BackendView`
+  snapshots (readiness → tool-need → context budget → tier/availability). The
+  unit tests there encode the expected behavior; update them when changing the
+  selection order.
+- **Remote capabilities**: a remote `llama-server` exposes `n_ctx` via `/props`;
+  cloud APIs usually don't, so they rely on `declared_context`. The probe treats
+  any HTTP response from a cloud `/health` as "reachable" (cloud endpoints often
+  lack `/health`); a LAN llama-server must answer `/health` 2xx.
+- **Cloud privacy** rests on two independent checks: the router never routes a
+  local-data task to a cloud backend (`required_tools ⊄ allowed`), and the agent
+  loop's `NativeRouter` filters the `tools` array by scope *and* refuses a
+  disallowed call. Keep both — they're tested in `router.rs` and `agent.rs`.
+- **Warm pool vs. fallback child (V8-03)**: when the app is running it owns the
+  loop + pool + router + global gate + MCP host (`offload/service.rs`), and the
+  `ccimp --offload-mcp` child is a thin proxy to it. Only the app sees all
+  in-flight offloads, so cross-backend spill/fail-over works there. The child
+  still carries the **self-contained fallback** (the V8-02 path) for when the app
+  is down — keep it first-class (headless `claude -p` / cron paths depend on it),
+  and keep the shared `router`/`agent` code shared so the two paths can't drift.
+
+## Offload warm pool, loopback endpoint & MCP host (V8-03)
+
+When the app is up, the offload service (`offload/service.rs::OffloadService`,
+held in `AppState`) is the single owner of the warm pool, the global concurrency
+gate, and the MCP host. The per-session `ccimp --offload-mcp` child forwards to it
+over a small authenticated loopback HTTP endpoint.
+
+**Loopback endpoint + discovery file (`offload/loopback.rs`).**
+
+- Binds `127.0.0.1:0` (ephemeral port) and requires a **per-launch bearer token**.
+  Routes: `POST /run`, `GET /describe`, `GET /events` (SSE). Purpose-built for
+  offload — not a general local API.
+- Advertises `{port, token, pid}` in a discovery file at
+  **`<exe-dir>/.ccimp-offload.json`** (the portable root, next to `settings.json`
+  — *never* `~/.claude`), written when `offload.enabled` and **removed on graceful
+  exit**. The token rotates every launch; on Unix the file is `chmod 600`
+  (best-effort; Windows ACL tightening is a TODO).
+- **Security model / residual risk:** loopback-only bind + token auth keep another
+  local process from driving offloads or reading task text *in flight*. A
+  malicious local process that can read the discovery file could still do both —
+  the same trust assumption as any localhost dev server. Mitigations: ephemeral
+  token, loopback bind, file perms. Don't log the token; don't widen the bind off
+  loopback.
+- The child probes the endpoint per request and **falls back** to the
+  self-contained path on any transport failure (stale discovery file from a
+  hard-killed app, app mid-restart, app not running).
+
+**MCP host (`offload/mcp_host.rs`).** Warm client pool over `offload.mcp_servers`
+(same shape as Claude's `mcpServers`). Per server: `initialize`+`tools/list`,
+namespacing `<server>__<tool>`, a **read-class filter** (leading-verb heuristic on
+the first two name segments — see `is_read_class`/`WRITE_VERBS`, unit-tested), and
+`filesystem` confinement (the configured `allowed_roots` are appended as the
+server's allowed dirs). stdio is fully warm (a reader task demuxes JSON-RPC by id);
+HTTP `url` servers are best-effort single-POST. A crashed/hung server is isolated
+(its tools drop from the capability set) and surfaces in *Settings → Offload → MCP
+tool servers*. Example config is in `README.md`.
+
+**Live capabilities / `tools/list_changed`.** `OffloadService` exposes a change
+channel fed by (a) MCP-host connect/drop pulses and (b) a periodic health watch
+that compares the ready-backend set. The loopback `/events` stream relays each as
+a `change` event; the child (which holds the stdio pipe to Claude) emits
+`notifications/tools/list_changed`. `describe()` always renders from live health.
+
+**Global concurrency.** `offload.global_concurrency` (optional) caps total
+offloads in flight; `null` auto-sizes from the summed per-backend slot counts,
+clamped to 32. The gate is created at app launch — changing the cap needs a
+relaunch.
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

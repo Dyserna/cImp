@@ -439,6 +439,97 @@ follow-up.
 access is confined to the configured roots. The model and `llama-server` are
 yours; ccImp only spawns the command you give it and connects over localhost.
 
+### A pool of backends + routing (V8-02)
+
+Beyond the single local server, you can configure a **pool of backends** and let
+ccImp route each `offload_task` to the right one. The motivating setup: your main
+PC running the big model, plus a second LAN machine with a small GPU running a
+small/fast model for trivial offloads — so the big backend stays free for heavy
+work. A cloud OpenAI-compatible endpoint can join the pool too.
+
+In *Settings → Offload → **Backend pool*** add backends:
+
+- **Local** — ccImp owns the process (a `llama-server` command, as above), with
+  per-backend Start/Stop/Reset and autostart.
+- **Remote (LAN or cloud)** — a **Base URL** (+ optional auth token) ccImp only
+  health-checks and connects to; it can't start/stop it. A remote `llama-server`
+  exposes its context window via `/props`; for endpoints that don't (many cloud
+  APIs), set a **Declared context**.
+
+Each backend has a **tier** (`fast`/`quality`) and a **tool scope**. The router
+picks **one** backend per task by, in order: (1) **tool need** — a task that
+must read local files is never sent to a backend that lacks file tools;
+(2) **required context** — a 100k-token ingest can't go to a small-window box;
+(3) **tier/complexity** — trivial single-pass work → the fast backend, real
+reasoning → the large one; (4) **availability** — spill to another eligible
+backend when the preferred one is busy, fail over when it's down. Claude can bias
+the choice with a `tier: "auto" | "fast" | "quality"` argument on `offload_task`;
+with one enabled backend the router is a no-op. The `offload_task` description
+reports the pool to Opus so it knows a fast tier exists and which backends can
+read local files.
+
+**Per-backend tool scoping is the privacy boundary.** Local and trusted-LAN
+backends get all tools by default. A **cloud** backend defaults to **web/docs
+only** — `read_file`, `code_search`, `run_command`, `filesystem`, and `git` are
+denied so local file contents and command output never leave your machine, at
+*both* the routing layer (a local-data task is not routed to cloud) and the tool
+layer (those tools aren't placed in the cloud model's `tools` array). A cloud
+backend is **unusable until you grant explicit consent** (a checkbox, because the
+task text itself is sent to a third party) and is badged distinctly from LAN
+backends. The LAN case keeps data on your own network.
+
+> **Cloud = data leaves your machine.** Offloading to a cloud backend sends the
+> task instructions (and any `context` Opus passes, plus any tool results if you
+> widen its scope) to that provider. It still protects Opus's context window, but
+> breaks the local/offline property. Use a LAN backend to keep everything on your
+> network.
+
+### MCP tool servers + warm pool (V8-03)
+
+Beyond the built-in native tools (`read_file`, `code_search`, `run_command`), an
+offload worker can use your own **MCP tool servers** — web search, fetch, docs,
+git, filesystem. ccImp is the **MCP host**: it keeps warm connections to each
+server so an offload reaches real tools without paying an `npx`/`uvx` cold-start
+per call, and it surfaces per-server health in *Settings → Offload → MCP tool
+servers*.
+
+Configure them in `settings.json` under `offload.mcp_servers` (the same shape as
+Claude's own `mcpServers`):
+
+```jsonc
+"offload": {
+  "mcp_servers": [
+    { "name": "ddg",        "command": "uvx", "args": ["duckduckgo-mcp-server"], "enabled": true },
+    { "name": "fetch",      "command": "uvx", "args": ["mcp-server-fetch"],      "enabled": true },
+    { "name": "git",        "command": "uvx", "args": ["mcp-server-git"],        "enabled": true },
+    { "name": "filesystem", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"], "enabled": true }
+  ]
+}
+```
+
+Tools are exposed to the worker namespaced as `<name>__<tool>` (e.g. `ddg__search`,
+`git__log`). Two safety rules hold automatically:
+
+- **Read-class only.** Write/destructive tools (`filesystem` write, `git` commit,
+  anything whose verb mutates) are filtered out — an offload can search/read/query
+  but never modify.
+- **`filesystem` is confined.** A server named `filesystem` is restricted to your
+  configured `allowed_roots` (ccImp appends them as the server's allowed
+  directories), so it can't read outside them.
+
+Each server is still **scoped per backend** by the same tool-scope rules above —
+a cloud backend never sees a local-data MCP server (`git`, `filesystem`).
+
+**How the warm pool runs.** When the ccImp app is running it owns the loop, the
+backend pool, the global concurrency gate, and the MCP host; the hidden
+`ccimp --offload-mcp` server in each Claude tab is a thin proxy to it over a
+**token-authenticated loopback endpoint** (`127.0.0.1`, ephemeral port). If the
+app isn't running (e.g. a headless `claude -p` run), the child falls back to a
+self-contained path so offload still works — just without the warm tool pool,
+global concurrency, or live health. Changes to a server's config take effect when
+the app next warms the pool; toggling **Enable offload** itself takes effect on
+the next app launch.
+
 ## Speak all output (per-tab)
 
 By default ccImp only speaks the text Claude wraps in `[[TTS]]…[[/TTS]]`

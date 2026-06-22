@@ -629,10 +629,45 @@ export interface McpServerConfig {
   enabled: boolean;
 }
 
-/// V8-01: local task-offload config (mirror of Rust `OffloadSettings`).
-/// `server_command` is the single source of truth for the llama-server
-/// model/quant/GPU-layers/context/host-port; `n_ctx`/`-np` are
-/// discovered at runtime and never stored here.
+/// V8-02: which capability tier a backend serves (mirror of Rust
+/// `BackendTier`).
+export type BackendTier = 'fast' | 'quality';
+
+/// V8-02: a backend's allow-list over the global tool pool (mirror of Rust
+/// `ToolScope`). `all` = every tool; `only` = just the named ones;
+/// `allexcept` = everything but the named ones (the cloud default denies
+/// the local-data set).
+export type ToolScope =
+  | { mode: 'all' }
+  | { mode: 'only'; tools: string[] }
+  | { mode: 'allexcept'; tools: string[] };
+
+/// V8-02: native + MCP tool names treated as local-data (denied to cloud
+/// backends by default). Mirrors Rust `LOCAL_DATA_TOOLS`.
+export const LOCAL_DATA_TOOLS = ['read_file', 'code_search', 'run_command', 'filesystem', 'git'];
+
+/// V8-02: kind-specific config for one backend (mirror of Rust
+/// `OffloadBackendKind`). Local = ccImp owns the process; Remote = a
+/// health-checked URL (LAN or cloud).
+export type OffloadBackendKind =
+  | { type: 'local'; server_command: string; autostart: boolean }
+  | { type: 'remote'; base_url: string; auth_token: string; is_cloud: boolean; cloud_consent: boolean };
+
+/// V8-02: one backend in the offload pool (mirror of Rust `OffloadBackend`).
+export interface OffloadBackend {
+  name: string;
+  enabled: boolean;
+  kind: OffloadBackendKind;
+  declared_context: number | null;
+  declared_model: string;
+  tier: BackendTier;
+  tool_scope: ToolScope;
+}
+
+/// V8-01/V8-02: local task-offload config (mirror of Rust `OffloadSettings`).
+/// `server_command`/`autostart` are the legacy single-local fields; V8-02
+/// uses `backends` (the pool). When `backends` is empty the legacy fields
+/// synthesize one Local backend at runtime.
 export interface OffloadSettings {
   enabled: boolean;
   autostart: boolean;
@@ -642,10 +677,14 @@ export interface OffloadSettings {
   allowed_roots: string[];
   command_allowlist: string[];
   mcp_servers: McpServerConfig[];
+  backends: OffloadBackend[];
   budget_high_water_pct: number;
   per_tool_result_token_cap: number;
   max_steps: number;
   offload_timeout_secs: number;
+  /// V8-03: global cap on offloads in flight across the whole app. `null`
+  /// lets the service auto-size it from the summed per-backend slot counts.
+  global_concurrency: number | null;
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
@@ -905,10 +944,12 @@ export function defaultSettings(): Settings {
       allowed_roots: [],
       command_allowlist: [],
       mcp_servers: [],
+      backends: [],
       budget_high_water_pct: 80,
       per_tool_result_token_cap: 8000,
       max_steps: 16,
       offload_timeout_secs: 300,
+      global_concurrency: null,
     },
     enabled_ai_tabs: ['claude'],
     logging: {

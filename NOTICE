@@ -71,3 +71,23 @@ Clawdmeter / Clawd sprites:
   The Clawd mascot character is property of Anthropic PBC. The sprite
   artwork is bundled here as-is for ccImp's animated-avatar variant with
   attribution to the sources above.
+
+------------------------------------------------------------------------
+
+Data-egress notice — cloud offload backends (V8-02).
+
+ccImp's task-offload feature is local and offline by default: the model,
+the agent loop, and the tools all run on your machine. The optional
+offload "backend pool" can additionally include a *cloud*
+OpenAI-compatible endpoint. When — and only when — you add a backend
+marked "cloud" and grant the explicit data-egress consent toggle, and the
+router selects that backend for a task, ccImp sends that task's
+instructions (and any context the calling session passes, plus any tool
+results if you widen the backend's tool scope beyond the web/docs-only
+default) to that third-party endpoint over the network. By default a cloud
+backend is denied the local-data tools (read_file, code_search,
+run_command, filesystem, git) and a task that needs them is never routed
+to it. LAN/remote backends on your own network keep data on your network.
+No cloud egress occurs unless you configure and consent to a cloud
+backend. The third-party endpoint's data handling is governed by that
+provider, independent of the ccImp licenses above.

@@ -43,7 +43,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 16;
+pub const CURRENT_SCHEMA_VERSION: u8 = 17;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -652,6 +652,15 @@ pub struct OffloadSettings {
     /// and exposed to the local model as OpenAI tools. Mirrors Claude's
     /// own `mcpServers` config shape so users can paste familiar config.
     pub mcp_servers: Vec<McpServerConfig>,
+    /// V8-02: the offload backend pool. One entry per backend (Local
+    /// `llama-server`, Remote-LAN, or Remote-cloud), each with its own
+    /// capabilities, tier, and tool scope. The router picks one per
+    /// `offload_task`. Empty on a fresh install / pre-V8-02 file — the
+    /// v1.16→v1.17 migration (and [`Self::effective_backends`] at
+    /// runtime) synthesizes one Local entry from the legacy
+    /// `server_command`/`autostart` fields so single-local setups keep
+    /// working unchanged.
+    pub backends: Vec<OffloadBackend>,
     /// Fraction (0–100) of the per-slot window the loop works against,
     /// reserving the rest for reasoning + the final answer (~80%).
     pub budget_high_water_pct: u8,
@@ -667,6 +676,15 @@ pub struct OffloadSettings {
     /// timeout result is returned to Claude rather than hanging the tool
     /// call.
     pub offload_timeout_secs: u64,
+    /// V8-03: global cap on offloads in flight across the whole app (all
+    /// Claude tabs, all backends). `None` (default) lets the
+    /// [`OffloadService`] size it from config — the summed per-backend slot
+    /// counts, clamped to a sane ceiling. A queue forms past this so a busy
+    /// pool stays coherent and the router's spill/fail-over runs on honest
+    /// `in_flight`.
+    ///
+    /// [`OffloadService`]: crate::offload::OffloadService
+    pub global_concurrency: Option<u32>,
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -681,10 +699,13 @@ impl std::fmt::Debug for OffloadSettings {
             .field("command_allowlist", &self.command_allowlist)
             // McpServerConfig has its own redacted Debug.
             .field("mcp_servers", &self.mcp_servers)
+            // OffloadBackend redacts the Remote `auth_token`.
+            .field("backends", &self.backends)
             .field("budget_high_water_pct", &self.budget_high_water_pct)
             .field("per_tool_result_token_cap", &self.per_tool_result_token_cap)
             .field("max_steps", &self.max_steps)
             .field("offload_timeout_secs", &self.offload_timeout_secs)
+            .field("global_concurrency", &self.global_concurrency)
             .finish()
     }
 }
@@ -700,10 +721,12 @@ impl Default for OffloadSettings {
             allowed_roots: Vec::new(),
             command_allowlist: Vec::new(),
             mcp_servers: Vec::new(),
+            backends: Vec::new(),
             budget_high_water_pct: 80,
             per_tool_result_token_cap: 8000,
             max_steps: 16,
             offload_timeout_secs: 300,
+            global_concurrency: None,
         }
     }
 }
@@ -784,6 +807,255 @@ impl Default for McpServerConfig {
             url: String::new(),
             enabled: true,
         }
+    }
+}
+
+/// V8-02: native + MCP-server tool names treated as **local-data** tools —
+/// they read the user's files / run commands / query the local repo, so
+/// their output must never leave the machine. The router refuses to send a
+/// task needing any of these to a cloud backend, and a cloud backend's
+/// default [`ToolScope`] denies them. (MCP servers are matched by their
+/// configured `name`; native tools by their fixed name.)
+pub const LOCAL_DATA_TOOLS: &[&str] = &[
+    "read_file",
+    "code_search",
+    "run_command",
+    "filesystem",
+    "git",
+];
+
+/// V8-02: web/docs tool names a cloud backend is allowed by default — they
+/// reach out to the public internet, not the user's machine.
+pub const WEB_DOCS_TOOLS: &[&str] = &["duckduckgo", "fetch", "context7"];
+
+/// V8-02: which capability tier a backend serves. The router prefers a
+/// `Fast` backend for trivial single-pass work and a `Quality` backend for
+/// real reasoning; Claude's `tier` hint on `offload_task` biases the choice.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendTier {
+    /// Small/fast backend (e.g. an 8 GB LAN box): trivial, single-pass,
+    /// small-context offloads only.
+    Fast,
+    /// Large/capable backend (the main model): real reasoning, big context,
+    /// multi-tool loops. The default when unspecified.
+    #[default]
+    Quality,
+}
+
+/// V8-02: a backend's allow-list over the global tool pool (native tools +
+/// configured MCP-server names). Only allowed tools are placed in the
+/// `tools` array sent to that backend's model — the privacy boundary for
+/// cloud backends.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum ToolScope {
+    /// Every tool in the pool (Local + trusted LAN default).
+    All,
+    /// Only the named tools.
+    Only { tools: Vec<String> },
+    /// Every tool except the named ones (cloud default = `AllExcept` the
+    /// local-data set).
+    AllExcept { tools: Vec<String> },
+}
+
+impl Default for ToolScope {
+    fn default() -> Self {
+        ToolScope::All
+    }
+}
+
+impl ToolScope {
+    /// Whether `tool` (a native tool name or an MCP-server name) is allowed
+    /// under this scope. Matching is exact; MCP tools namespaced as
+    /// `<server>__<tool>` are tested by their server prefix via
+    /// [`Self::allows_namespaced`].
+    pub fn allows(&self, tool: &str) -> bool {
+        match self {
+            ToolScope::All => true,
+            ToolScope::Only { tools } => tools.iter().any(|t| t == tool),
+            ToolScope::AllExcept { tools } => !tools.iter().any(|t| t == tool),
+        }
+    }
+
+    /// Whether a (possibly namespaced) tool id is allowed. An MCP tool is
+    /// exposed to the model as `<server>__<tool>`; scopes are written in
+    /// terms of native tool names and MCP *server* names, so we test the
+    /// server prefix for namespaced ids and the whole id otherwise.
+    pub fn allows_namespaced(&self, tool_id: &str) -> bool {
+        let key = tool_id.split("__").next().unwrap_or(tool_id);
+        self.allows(key)
+    }
+
+    /// The default scope for a backend of the given kind: Local and trusted
+    /// LAN get everything; a cloud backend gets web/docs only (the
+    /// local-data set denied) until the user explicitly opts in. The
+    /// Settings UI applies this when a backend's cloud flag is toggled; the
+    /// router/tests exercise it as the canonical default.
+    #[allow(dead_code)]
+    pub fn default_for(kind_is_cloud: bool) -> Self {
+        if kind_is_cloud {
+            ToolScope::AllExcept {
+                tools: LOCAL_DATA_TOOLS.iter().map(|s| s.to_string()).collect(),
+            }
+        } else {
+            ToolScope::All
+        }
+    }
+}
+
+/// V8-02: kind-specific configuration for one offload backend.
+///
+/// `Local` mirrors V8-01's single-server config (the command ccImp owns +
+/// spawns as a read-only tab). `Remote` is a `base_url` ccImp only
+/// health-checks and connects to — no process, no tab. The hand-rolled
+/// `Debug` on [`OffloadBackend`] redacts the Remote `auth_token`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum OffloadBackendKind {
+    /// ccImp owns the process: the V8-01 `server_command` + `autostart` +
+    /// read-only Offload Server tab + Start/Stop/Reset.
+    Local {
+        /// The single source-of-truth `llama-server` command (shlex-parsed
+        /// to spawn; host/port/`-np`/`--jinja` parsed from it).
+        server_command: String,
+        /// Spawn at app launch and keep warm (else lazy on first offload).
+        autostart: bool,
+    },
+    /// ccImp holds a `base_url` (+ optional auth) and health-checks it; it
+    /// cannot start/stop the process. A LAN box or a cloud API.
+    Remote {
+        /// HTTP origin of the OpenAI-compatible endpoint, e.g.
+        /// `http://192.168.1.50:8080` or `https://api.example.com/v1`.
+        base_url: String,
+        /// Optional bearer token (cloud APIs). Redacted in `Debug`.
+        auth_token: String,
+        /// Marks a backend whose data leaves the user's machine/network.
+        /// Gates the consent toggle, the distinct UI badge, and the
+        /// default web/docs-only tool scope.
+        is_cloud: bool,
+        /// Explicit acknowledgement that offloading here sends task text
+        /// (and any local-data tool results, if scoped in) to a third
+        /// party. A cloud backend is unusable until this is `true`.
+        cloud_consent: bool,
+    },
+}
+
+/// V8-02: one backend in the offload pool.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OffloadBackend {
+    /// Display + routing-log name (e.g. `main`, `lan-3070`, `cloud`).
+    pub name: String,
+    /// Per-backend enable toggle. Disabled backends are invisible to the
+    /// router and the capability union.
+    pub enabled: bool,
+    /// Local (owned process) vs. Remote (health-checked URL).
+    pub kind: OffloadBackendKind,
+    /// Context window to assume when `/props` is unavailable (many cloud
+    /// APIs don't expose it). Ignored for endpoints that report `n_ctx`.
+    pub declared_context: Option<u32>,
+    /// Model label to show when `/props` is unavailable (cosmetic).
+    pub declared_model: String,
+    /// Which tier this backend serves (router bias).
+    pub tier: BackendTier,
+    /// This backend's allow-list over the global tool pool.
+    pub tool_scope: ToolScope,
+}
+
+impl std::fmt::Debug for OffloadBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the Remote auth_token so a stray `?settings` log can't leak it.
+        let kind_dbg: String = match &self.kind {
+            OffloadBackendKind::Local {
+                server_command,
+                autostart,
+            } => format!("Local {{ server_command: {server_command:?}, autostart: {autostart} }}"),
+            OffloadBackendKind::Remote {
+                base_url,
+                auth_token,
+                is_cloud,
+                cloud_consent,
+            } => format!(
+                "Remote {{ base_url: {base_url:?}, auth_token: {}, is_cloud: {is_cloud}, cloud_consent: {cloud_consent} }}",
+                if auth_token.is_empty() { "<none>" } else { "<redacted>" }
+            ),
+        };
+        f.debug_struct("OffloadBackend")
+            .field("name", &self.name)
+            .field("enabled", &self.enabled)
+            .field("kind", &format_args!("{kind_dbg}"))
+            .field("declared_context", &self.declared_context)
+            .field("declared_model", &self.declared_model)
+            .field("tier", &self.tier)
+            .field("tool_scope", &self.tool_scope)
+            .finish()
+    }
+}
+
+impl Default for OffloadBackendKind {
+    fn default() -> Self {
+        OffloadBackendKind::Local {
+            server_command: String::new(),
+            autostart: false,
+        }
+    }
+}
+
+impl Default for OffloadBackend {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            kind: OffloadBackendKind::default(),
+            declared_context: None,
+            declared_model: String::new(),
+            tier: BackendTier::Quality,
+            tool_scope: ToolScope::All,
+        }
+    }
+}
+
+impl OffloadBackend {
+    /// A cloud backend that hasn't been consented to is not usable: the
+    /// router skips it and the UI flags it. Non-cloud backends are always
+    /// "consented".
+    pub fn cloud_blocked(&self) -> bool {
+        matches!(
+            self.kind,
+            OffloadBackendKind::Remote {
+                is_cloud: true,
+                cloud_consent: false,
+                ..
+            }
+        )
+    }
+}
+
+impl OffloadSettings {
+    /// The effective backend pool. Returns the configured [`backends`]
+    /// when non-empty; otherwise synthesizes a single Local backend from
+    /// the legacy `server_command`/`autostart` fields so a V8-01 config
+    /// (or one whose migration hasn't run) keeps working as one
+    /// quality-tier, all-tools local backend.
+    ///
+    /// [`backends`]: Self::backends
+    pub fn effective_backends(&self) -> Vec<OffloadBackend> {
+        if !self.backends.is_empty() {
+            return self.backends.clone();
+        }
+        vec![OffloadBackend {
+            name: "local".to_string(),
+            enabled: true,
+            kind: OffloadBackendKind::Local {
+                server_command: self.server_command.clone(),
+                autostart: self.autostart,
+            },
+            declared_context: None,
+            declared_model: String::new(),
+            tier: BackendTier::Quality,
+            tool_scope: ToolScope::All,
+        }]
     }
 }
 

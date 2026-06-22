@@ -26,14 +26,22 @@
 //! routing without re-architecting the loop.
 
 pub mod agent;
+pub mod loopback;
 pub mod mcp;
+pub mod mcp_host;
 pub mod openai;
+pub mod remote;
+pub mod router;
 pub mod server;
+pub mod service;
 pub mod supervisor;
 pub mod tools;
 
-pub use server::LlamaServer;
+pub use remote::RemoteBackend;
+pub use service::OffloadService;
 pub use supervisor::{OffloadState, OffloadSupervisor};
+
+use crate::settings::{BackendTier, ToolScope};
 
 /// Minimal seam over an offload model endpoint. V8-01 has one impl
 /// ([`LlamaServer`], a local `llama-server`); V8-02 adds Remote/cloud
@@ -44,18 +52,31 @@ pub use supervisor::{OffloadState, OffloadSupervisor};
 /// Lifecycle (spawn/restart) is intentionally *not* on the trait — only
 /// a Local backend owns a process, so it stays inherent to
 /// [`LlamaServer`]. This matches V8-02's planned trait surface.
+///
+/// `name`/`tier` round out the seam for the warm-pool target design (the
+/// router currently reads these from config via [`router::BackendView`]),
+/// so they're allowed to be unused today.
+#[allow(dead_code)]
 pub trait Backend: Send + Sync {
+    /// Stable display/routing name (`main`, `lan-3070`, `cloud`).
+    fn name(&self) -> &str;
     /// HTTP origin to reach the server, e.g. `http://127.0.0.1:8080`
     /// (callers append `/health`, `/props`, `/v1/chat/completions`).
     fn base_url(&self) -> String;
     /// Whether the last health check observed a ready server.
     fn is_ready(&self) -> bool;
     /// The authoritative context window discovered from `/props`
-    /// (`n_ctx`), or `None` before the first successful probe.
+    /// (`n_ctx`), or the configured `declared_context` for endpoints that
+    /// don't expose `/props`, or `None` before the first successful probe.
     fn n_ctx(&self) -> Option<u32>;
     /// Parallel slots (`-np`/`--parallel`). The window divides across
     /// these, so each in-flight request gets `n_ctx / slots` tokens.
     fn slots(&self) -> u32;
     /// Offload loops currently holding a slot.
     fn in_flight(&self) -> u32;
+    /// Which capability tier this backend serves (router bias).
+    fn tier(&self) -> BackendTier;
+    /// This backend's allow-list over the global tool pool — the surface
+    /// of tools that may be placed in the `tools` array sent to its model.
+    fn tool_scope(&self) -> &ToolScope;
 }

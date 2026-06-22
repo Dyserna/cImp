@@ -21,6 +21,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use crate::error::{AppError, AppResult};
+use crate::settings::{BackendTier, ToolScope};
 
 use super::Backend;
 
@@ -140,6 +141,12 @@ impl ServerCommand {
 
 /// The single Local backend: a supervised `llama-server`.
 pub struct LlamaServer {
+    /// Display/routing name (`local` for the V8-01 default).
+    name: String,
+    /// Which tier this backend serves (router bias).
+    tier: BackendTier,
+    /// Allow-list over the global tool pool.
+    tool_scope: ToolScope,
     cmd: ServerCommand,
     ready: AtomicBool,
     /// Discovered `n_ctx` from `/props`; `0` means not-yet-known.
@@ -153,14 +160,28 @@ pub struct LlamaServer {
 }
 
 impl LlamaServer {
-    /// Build a supervisor for the given `server_command`. Parses the
-    /// command (host/port/`-np`/`--jinja`) and warns if `--jinja` is
-    /// absent. Does not contact the server — call [`Self::poll_until_ready`]
-    /// after the tab's PTY has been spawned.
+    /// Build a supervisor for the given `server_command` with V8-01
+    /// defaults (`local` name, quality tier, all tools). A convenience over
+    /// [`Self::with_config`] used by tests and any single-local caller.
+    #[allow(dead_code)]
     pub fn new(command: &str) -> AppResult<Self> {
+        Self::with_config("local", command, BackendTier::Quality, ToolScope::All)
+    }
+
+    /// Build a Local backend with an explicit name/tier/tool-scope (one
+    /// pool entry). Parses the command (host/port/`-np`/`--jinja`) and
+    /// warns if `--jinja` is absent. Does not contact the server — call
+    /// [`Self::poll_until_ready`] after the tab's PTY has been spawned.
+    pub fn with_config(
+        name: &str,
+        command: &str,
+        tier: BackendTier,
+        tool_scope: ToolScope,
+    ) -> AppResult<Self> {
         let cmd = ServerCommand::parse(command)?;
         if !cmd.has_jinja {
             warn!(
+                backend = name,
                 "offload: server_command is missing `--jinja`; llama-server tool-calling \
                  will not work without it"
             );
@@ -171,6 +192,9 @@ impl LlamaServer {
             .map_err(|e| AppError::Offload(format!("failed to build HTTP client: {e}")))?;
         let parallel = cmd.parallel.max(1) as usize;
         Ok(Self {
+            name: name.to_string(),
+            tier,
+            tool_scope,
             cmd,
             ready: AtomicBool::new(false),
             n_ctx: AtomicU32::new(0),
@@ -292,6 +316,9 @@ impl LlamaServer {
 }
 
 impl Backend for LlamaServer {
+    fn name(&self) -> &str {
+        &self.name
+    }
     fn base_url(&self) -> String {
         self.cmd.base_url()
     }
@@ -311,6 +338,12 @@ impl Backend for LlamaServer {
         self.cmd
             .parallel
             .saturating_sub(self.gate.available_permits() as u32)
+    }
+    fn tier(&self) -> BackendTier {
+        self.tier
+    }
+    fn tool_scope(&self) -> &ToolScope {
+        &self.tool_scope
     }
 }
 

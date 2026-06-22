@@ -19,6 +19,8 @@ use tracing::{debug, warn};
 
 use crate::error::{AppError, AppResult};
 
+use crate::settings::ToolScope;
+
 use super::openai::{
     strip_think, ChatMessage, ChatRequest, ChatResponse, ToolDef,
 };
@@ -62,20 +64,102 @@ pub trait ToolRouter: Send + Sync {
 }
 
 /// Native-only router: the `read_file`/`code_search`/`run_command`
-/// baseline. Phase C adds an MCP-aware router that delegates here for
-/// native names and to tool servers otherwise.
+/// baseline, **scoped to the chosen backend's allow-list** (V8-02). Only
+/// tools the backend's [`ToolScope`] permits are advertised to the model,
+/// and a disallowed call is refused even if the model asks for it — the
+/// defense-in-depth half of the cloud-privacy guarantee (the router half
+/// is in [`super::router`]).
 pub struct NativeRouter {
     pub defs: Vec<ToolDef>,
     pub ctx: ToolCtx,
+    /// The chosen backend's tool scope. `All` for local/LAN; a cloud
+    /// backend's scope denies the local-data tools.
+    pub scope: ToolScope,
+}
+
+impl NativeRouter {
+    /// Build a native router whose advertised tools are filtered through
+    /// `scope`. (Construct the `defs` from `tools::enabled_defs` first.)
+    pub fn new(defs: Vec<ToolDef>, ctx: ToolCtx, scope: ToolScope) -> Self {
+        Self { defs, ctx, scope }
+    }
 }
 
 #[async_trait]
 impl ToolRouter for NativeRouter {
     fn tool_defs(&self) -> Vec<ToolDef> {
+        self.defs
+            .iter()
+            .filter(|d| self.scope.allows_namespaced(&d.function.name))
+            .cloned()
+            .collect()
+    }
+    async fn call(&self, name: &str, args: serde_json::Value) -> Result<String, String> {
+        // Refuse a disallowed tool even if the model requests it (e.g. a
+        // cloud backend that hallucinates a `read_file` call) — the local
+        // file is never read for an out-of-scope backend.
+        if !self.scope.allows_namespaced(name) {
+            return Err(format!(
+                "tool `{name}` is not available on this backend (denied by its tool scope)"
+            ));
+        }
+        tools::dispatch(name, args, &self.ctx).await
+    }
+}
+
+/// V8-03 host-aware router: the native baseline **plus** the warm MCP host's
+/// namespaced tools, all filtered through the chosen backend's [`ToolScope`].
+/// The merged tool surface is computed once at construction (the warm pool is
+/// reconciled before the call, so the set is stable for the loop's duration);
+/// `call` dispatches native names locally and namespaced `<server>__<tool>`
+/// ids to the owning MCP server. The scope is re-checked on every call as the
+/// defense-in-depth half of the cloud-privacy guarantee.
+pub struct HostRouter {
+    /// Merged native + MCP tool defs, already scope-filtered.
+    defs: Vec<ToolDef>,
+    ctx: ToolCtx,
+    host: std::sync::Arc<super::mcp_host::McpHost>,
+    scope: ToolScope,
+}
+
+impl HostRouter {
+    /// Build the merged, scope-filtered router. `native_defs` are the enabled
+    /// native tool defs; `mcp_defs` are the host's namespaced read-class
+    /// tools (`McpHost::tool_defs().await`).
+    pub fn new(
+        native_defs: Vec<ToolDef>,
+        mcp_defs: Vec<ToolDef>,
+        ctx: ToolCtx,
+        host: std::sync::Arc<super::mcp_host::McpHost>,
+        scope: ToolScope,
+    ) -> Self {
+        let defs: Vec<ToolDef> = native_defs
+            .into_iter()
+            .chain(mcp_defs)
+            .filter(|d| scope.allows_namespaced(&d.function.name))
+            .collect();
+        Self { defs, ctx, host, scope }
+    }
+}
+
+#[async_trait]
+impl ToolRouter for HostRouter {
+    fn tool_defs(&self) -> Vec<ToolDef> {
         self.defs.clone()
     }
     async fn call(&self, name: &str, args: serde_json::Value) -> Result<String, String> {
-        tools::dispatch(name, args, &self.ctx).await
+        if !self.scope.allows_namespaced(name) {
+            return Err(format!(
+                "tool `{name}` is not available on this backend (denied by its tool scope)"
+            ));
+        }
+        // Namespaced ids (`<server>__<tool>`) belong to an MCP server; bare
+        // names are the native baseline.
+        if name.contains("__") {
+            self.host.call(name, args).await
+        } else {
+            tools::dispatch(name, args, &self.ctx).await
+        }
     }
 }
 
@@ -94,6 +178,9 @@ pub struct AgentConfig {
     pub budget_tokens: Option<u32>,
     /// Per-tool-result cap in tokens (approximated as bytes/4).
     pub per_tool_result_token_cap: u32,
+    /// Optional bearer token for the backend (cloud APIs). `None` for a
+    /// local/LAN llama-server.
+    pub auth_token: Option<String>,
 }
 
 /// The task to run.
@@ -235,9 +322,11 @@ async fn post_chat(
         temperature: Some(0.2),
         chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": enable_thinking })),
     };
-    let resp = client
-        .post(url)
-        .json(&req)
+    let mut builder = client.post(url).json(&req);
+    if let Some(token) = cfg.auth_token.as_deref().filter(|t| !t.is_empty()) {
+        builder = builder.bearer_auth(token);
+    }
+    let resp = builder
         .send()
         .await
         .map_err(|e| AppError::Offload(format!("chat request failed: {e}")))?;

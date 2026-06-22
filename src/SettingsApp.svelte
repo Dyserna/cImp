@@ -31,7 +31,22 @@
     offloadServerRestart,
     offloadTest,
     describeOffloadState,
+    offloadStatuses,
+    offloadBackendStart,
+    offloadBackendStop,
+    offloadBackendRestart,
+    describeBackendStatus,
+    offloadServiceStatus,
+    describeMcpServerHealth,
+    type BackendStatus,
+    type ServiceStatus,
   } from './lib/offload';
+  import type {
+    OffloadBackend,
+    ToolScope,
+    BackendTier,
+  } from './lib/settings/types';
+  import { LOCAL_DATA_TOOLS } from './lib/settings/types';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
@@ -114,6 +129,128 @@
     } finally {
       offloadBusy = false;
     }
+  }
+
+  // V8-02 backend pool: live per-backend status rows + a refresh loop while
+  // the Offload section is open.
+  let backendStatuses = $state<BackendStatus[]>([]);
+  // V8-03 warm pool: honest global in-flight + per-MCP-server health.
+  let serviceStatus = $state<ServiceStatus | null>(null);
+  let backendStatusTimer: ReturnType<typeof setInterval> | null = null;
+  async function refreshBackendStatuses(): Promise<void> {
+    try {
+      backendStatuses = await offloadStatuses();
+    } catch (e) {
+      console.warn('offload_statuses failed', e);
+    }
+    serviceStatus = await offloadServiceStatus();
+  }
+  function startBackendStatusPolling(): void {
+    if (backendStatusTimer) return;
+    void refreshBackendStatuses();
+    backendStatusTimer = setInterval(refreshBackendStatuses, 4000);
+  }
+  function statusFor(name: string): BackendStatus | undefined {
+    return backendStatuses.find((s) => s.name === name);
+  }
+
+  // Backend-pool mutations (all go through `patch` so they persist + mark dirty).
+  function uniqueBackendName(base: string): string {
+    const names = new Set((snapshot?.offload.backends ?? []).map((b) => b.name));
+    if (!names.has(base)) return base;
+    let i = 2;
+    while (names.has(`${base}-${i}`)) i++;
+    return `${base}-${i}`;
+  }
+  function addLocalBackend(): void {
+    patch((s) => {
+      s.offload.backends = [
+        ...s.offload.backends,
+        {
+          name: uniqueBackendName('local'),
+          enabled: true,
+          kind: { type: 'local', server_command: '', autostart: false },
+          declared_context: null,
+          declared_model: '',
+          tier: 'quality',
+          tool_scope: { mode: 'all' },
+        },
+      ];
+    });
+  }
+  function addRemoteBackend(): void {
+    patch((s) => {
+      s.offload.backends = [
+        ...s.offload.backends,
+        {
+          name: uniqueBackendName('remote'),
+          enabled: true,
+          kind: { type: 'remote', base_url: '', auth_token: '', is_cloud: false, cloud_consent: false },
+          declared_context: null,
+          declared_model: '',
+          tier: 'fast',
+          tool_scope: { mode: 'all' },
+        },
+      ];
+    });
+  }
+  // Adopt the legacy single `server_command` into the pool as one Local backend.
+  function adoptLegacyServer(): void {
+    patch((s) => {
+      s.offload.backends = [
+        {
+          name: 'local',
+          enabled: true,
+          kind: { type: 'local', server_command: s.offload.server_command, autostart: s.offload.autostart },
+          declared_context: null,
+          declared_model: '',
+          tier: 'quality',
+          tool_scope: { mode: 'all' },
+        },
+      ];
+    });
+  }
+  function removeBackend(i: number): void {
+    patch((s) => {
+      s.offload.backends = s.offload.backends.filter((_, idx) => idx !== i);
+    });
+  }
+  function updateBackend(i: number, fn: (b: OffloadBackend) => void): void {
+    patch((s) => {
+      fn(s.offload.backends[i]);
+    });
+  }
+  // Toggling a backend's cloud flag flips its default tool scope to the safe
+  // web/docs-only set (deny the local-data tools) so a cloud backend never
+  // ships local file/exec tools unless the user explicitly widens it.
+  function setBackendCloud(i: number, isCloud: boolean): void {
+    updateBackend(i, (b) => {
+      if (b.kind.type !== 'remote') return;
+      b.kind.is_cloud = isCloud;
+      if (isCloud) {
+        b.tool_scope = { mode: 'allexcept', tools: [...LOCAL_DATA_TOOLS] };
+      } else {
+        b.kind.cloud_consent = false;
+        b.tool_scope = { mode: 'all' };
+      }
+    });
+  }
+  // Tool-scope picker: 'all' | 'web' (web/docs only) | custom (allexcept local-data).
+  function scopeMode(scope: ToolScope): 'all' | 'web' | 'custom' {
+    if (scope.mode === 'all') return 'all';
+    if (
+      scope.mode === 'allexcept' &&
+      LOCAL_DATA_TOOLS.every((t) => scope.tools.includes(t)) &&
+      scope.tools.length === LOCAL_DATA_TOOLS.length
+    ) {
+      return 'web';
+    }
+    return 'custom';
+  }
+  function setScopeMode(i: number, mode: 'all' | 'web'): void {
+    updateBackend(i, (b) => {
+      b.tool_scope = mode === 'all' ? { mode: 'all' } : { mode: 'allexcept', tools: [...LOCAL_DATA_TOOLS] };
+    });
   }
   // Per-tab "applied" baselines — used to compute the Restart Required
   // indicator when subprocess-affecting fields drift from the spawn-time
@@ -232,6 +369,7 @@
     await initSettings();
     if (disposed) return;
     void initOffloadStatus();
+    startBackendStatusPolling();
     snapshot = structuredClone(get(settings));
     for (const t of AI_TABS) captureBaseline(t);
     unsub = settings.subscribe((s) => {
@@ -287,6 +425,7 @@
     disposed = true;
     unsub?.();
     unlistenDeepLink?.();
+    if (backendStatusTimer) clearInterval(backendStatusTimer);
   });
 
   /// Mutate the live snapshot via `updater`, then push to the backend.
@@ -2353,6 +2492,191 @@
             {/if}
           </label>
 
+          <h3>Backend pool</h3>
+          <small class="hint top">
+            V8-02: route each offload to the right backend. Add a LAN box or a
+            cloud API alongside the local server; the router picks one per task
+            by tool need, required context, tier, and availability. The single
+            <code>Server command</code> above is used as one local backend when
+            the pool below is empty.
+          </small>
+
+          {#if snapshot.offload.backends.length === 0}
+            <div class="button-row">
+              <button type="button" onclick={adoptLegacyServer} disabled={!snapshot.offload.server_command.trim()}>
+                Adopt the server command above as a Local backend
+              </button>
+            </div>
+          {/if}
+
+          {#each snapshot.offload.backends as backend, i (i)}
+            <div class="backend-card">
+              <div class="backend-head">
+                <input
+                  class="backend-name"
+                  type="text"
+                  value={backend.name}
+                  oninput={(e) => updateBackend(i, (b) => (b.name = (e.currentTarget as HTMLInputElement).value))}
+                  placeholder="name"
+                />
+                <select
+                  value={backend.tier}
+                  onchange={(e) => updateBackend(i, (b) => (b.tier = (e.currentTarget as HTMLSelectElement).value as BackendTier))}
+                >
+                  <option value="quality">quality</option>
+                  <option value="fast">fast</option>
+                </select>
+                <label class="checkbox inline">
+                  <input
+                    type="checkbox"
+                    checked={backend.enabled}
+                    onchange={(e) => updateBackend(i, (b) => (b.enabled = (e.currentTarget as HTMLInputElement).checked))}
+                  />
+                  <span>enabled</span>
+                </label>
+                <button type="button" class="secondary danger" onclick={() => removeBackend(i)}>Remove</button>
+              </div>
+
+              {#if statusFor(backend.name)}
+                {@const st = statusFor(backend.name)!}
+                <div class="offload-status">
+                  <span class="offload-status-label">{st.kind}:</span>
+                  <span>{describeBackendStatus(st)} · {st.tool_scope}</span>
+                  {#if st.cloud_blocked}<span class="badge warn">consent required</span>{/if}
+                </div>
+              {/if}
+
+              {#if backend.kind.type === 'local'}
+                <label>
+                  <span>Server command</span>
+                  <input
+                    type="text"
+                    value={backend.kind.server_command}
+                    oninput={(e) =>
+                      updateBackend(i, (b) => {
+                        if (b.kind.type === 'local') b.kind.server_command = (e.currentTarget as HTMLInputElement).value;
+                      })}
+                    placeholder="llama-server --model … --port 8080 --jinja -ngl 99 --ctx-size 150000"
+                  />
+                </label>
+                <label class="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={backend.kind.autostart}
+                    onchange={(e) =>
+                      updateBackend(i, (b) => {
+                        if (b.kind.type === 'local') b.kind.autostart = (e.currentTarget as HTMLInputElement).checked;
+                      })}
+                  />
+                  <span>Start on launch</span>
+                </label>
+                <div class="button-row">
+                  <button type="button" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStart(backend.name))}>Start</button>
+                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStop(backend.name))}>Stop</button>
+                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendRestart(backend.name))}>Reset</button>
+                </div>
+              {:else if backend.kind.type === 'remote'}
+                <label>
+                  <span>Base URL</span>
+                  <input
+                    type="text"
+                    value={backend.kind.base_url}
+                    oninput={(e) =>
+                      updateBackend(i, (b) => {
+                        if (b.kind.type === 'remote') b.kind.base_url = (e.currentTarget as HTMLInputElement).value;
+                      })}
+                    placeholder="http://192.168.1.50:8080  or  https://api.example.com/v1"
+                  />
+                </label>
+                <label>
+                  <span>Auth token (optional)</span>
+                  <input
+                    type="password"
+                    value={backend.kind.auth_token}
+                    oninput={(e) =>
+                      updateBackend(i, (b) => {
+                        if (b.kind.type === 'remote') b.kind.auth_token = (e.currentTarget as HTMLInputElement).value;
+                      })}
+                    placeholder="Bearer token for cloud APIs"
+                  />
+                </label>
+                <label class="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={backend.kind.is_cloud}
+                    onchange={(e) => setBackendCloud(i, (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>Cloud backend (data leaves this machine)</span>
+                </label>
+                {#if backend.kind.is_cloud}
+                  <label class="checkbox cloud-consent">
+                    <input
+                      type="checkbox"
+                      checked={backend.kind.cloud_consent}
+                      onchange={(e) =>
+                        updateBackend(i, (b) => {
+                          if (b.kind.type === 'remote') b.kind.cloud_consent = (e.currentTarget as HTMLInputElement).checked;
+                        })}
+                    />
+                    <span>
+                      I understand: offloading to this backend sends the task text
+                      (and any tool results scoped in) to a third party. Unusable
+                      until checked.
+                    </span>
+                  </label>
+                {/if}
+                <label>
+                  <span>Declared context (tokens, when /props is absent)</span>
+                  <input
+                    type="number"
+                    min="0"
+                    value={backend.declared_context ?? ''}
+                    oninput={(e) =>
+                      updateBackend(i, (b) => {
+                        const v = (e.currentTarget as HTMLInputElement).value;
+                        b.declared_context = v === '' ? null : +v;
+                      })}
+                    placeholder="e.g. 16000"
+                  />
+                </label>
+              {/if}
+
+              <label>
+                <span>Tool scope</span>
+                <select
+                  value={scopeMode(backend.tool_scope)}
+                  onchange={(e) => setScopeMode(i, (e.currentTarget as HTMLSelectElement).value as 'all' | 'web')}
+                  disabled={scopeMode(backend.tool_scope) === 'custom'}
+                >
+                  <option value="all">All tools</option>
+                  <option value="web">Web/docs only (deny local files, code, commands, git)</option>
+                  {#if scopeMode(backend.tool_scope) === 'custom'}
+                    <option value="custom">Custom (edit in settings.json)</option>
+                  {/if}
+                </select>
+                <small class="hint">
+                  Cloud backends default to web/docs only so local file contents
+                  never leave the machine. Widen a cloud backend only with intent.
+                </small>
+              </label>
+            </div>
+          {/each}
+
+          <div class="button-row">
+            <button type="button" onclick={addLocalBackend}>+ Local backend</button>
+            <button type="button" onclick={addRemoteBackend}>+ Remote backend</button>
+          </div>
+
+          {#if serviceStatus}
+            <div class="offload-status warm-pool">
+              <span class="offload-status-label">Warm pool:</span>
+              <span>
+                {serviceStatus.global_in_flight} / {serviceStatus.global_cap} offloads in flight
+                (global, across all Claude tabs)
+              </span>
+            </div>
+          {/if}
+
           <h3>Limits</h3>
           <label>
             <span>Working-budget high-water (%)</span>
@@ -2470,12 +2794,35 @@
               listed here (deny by default).
             </small>
           </label>
-          <small class="hint">
-            MCP tool servers (web search, fetch, docs, git) are aggregated
-            once the MCP host lands; configure them in
-            <code>settings.json</code> under <code>offload.mcp_servers</code>
-            for now.
+          <h3>MCP tool servers</h3>
+          <small class="hint top">
+            ccImp's warm MCP host aggregates the read-class tools from these
+            servers (web search, fetch, docs, git, filesystem) and keeps the
+            connections warm across offloads. Write/destructive tools are
+            filtered out; <code>filesystem</code> is confined to the allowed
+            roots. Configure servers in <code>settings.json</code> under
+            <code>offload.mcp_servers</code> (same shape as Claude's
+            <code>mcpServers</code>).
           </small>
+          {#if serviceStatus && serviceStatus.mcp_servers.length > 0}
+            <ul class="mcp-health">
+              {#each serviceStatus.mcp_servers as srv (srv.name)}
+                <li class:healthy={srv.healthy} class:down={!srv.healthy}>
+                  <span class="mcp-dot" aria-hidden="true"></span>
+                  <span class="mcp-name">{srv.name}</span>
+                  <span class="mcp-detail">{describeMcpServerHealth(srv)}</span>
+                </li>
+              {/each}
+            </ul>
+          {:else if snapshot.offload.mcp_servers.length > 0}
+            <small class="hint">
+              {snapshot.offload.mcp_servers.length} server(s) configured —
+              health appears here once the app's warm pool is running (enable
+              offload and reopen this panel).
+            </small>
+          {:else}
+            <small class="hint">No MCP tool servers configured yet.</small>
+          {/if}
         </section>
       {:else if activeSection === 'advanced'}
         <section>
@@ -2720,6 +3067,45 @@
     font-weight: 600;
     color: var(--text-secondary);
   }
+  /* V8-03 warm-pool readout + per-MCP-server health */
+  .warm-pool {
+    color: var(--text-secondary);
+  }
+  .mcp-health {
+    list-style: none;
+    margin: 0.4rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .mcp-health li {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    font-size: var(--font-size-sm);
+  }
+  .mcp-dot {
+    flex: 0 0 auto;
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    background: var(--text-secondary);
+    align-self: center;
+  }
+  .mcp-health li.healthy .mcp-dot {
+    background: var(--success, #3fb950);
+  }
+  .mcp-health li.down .mcp-dot {
+    background: var(--danger, #d08770);
+  }
+  .mcp-name {
+    font-weight: 600;
+    min-width: 6rem;
+  }
+  .mcp-detail {
+    color: var(--text-secondary);
+  }
   .offload-test-result {
     margin-top: 0.5rem;
     max-height: 16rem;
@@ -2731,6 +3117,46 @@
     border-radius: 4px;
     padding: 0.5rem;
     font-size: var(--font-size-sm);
+  }
+  /* V8-02 backend pool editor */
+  .backend-card {
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    margin: 0.6rem 0;
+    background: var(--surface-sunken);
+  }
+  .backend-head {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 0.3rem;
+  }
+  .backend-name {
+    flex: 1 1 8rem;
+    min-width: 6rem;
+    font-weight: 600;
+  }
+  .checkbox.inline {
+    margin: 0;
+  }
+  .cloud-consent {
+    border-left: 3px solid var(--accent, #d08770);
+    padding-left: 0.5rem;
+  }
+  button.danger {
+    color: #d06b6b;
+  }
+  .badge {
+    font-size: var(--font-size-sm);
+    padding: 0.05rem 0.4rem;
+    border-radius: 999px;
+    border: 1px solid var(--border-subtle);
+  }
+  .badge.warn {
+    color: #d08770;
+    border-color: #d08770;
   }
   /* Two-column layout: fixed sidebar on the left, scrollable content on
      the right. The settings page lives inside #app, which app.css pins to

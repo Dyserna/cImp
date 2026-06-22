@@ -148,6 +148,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.13", detect: looks_v1_13, transform: migrate_v1_13_to_v1_14_step },
     MigrationStep { from_version: "v1.14", detect: looks_v1_14, transform: migrate_v1_14_to_v1_15_step },
     MigrationStep { from_version: "v1.15", detect: looks_v1_15, transform: migrate_v1_15_to_v1_16_step },
+    MigrationStep { from_version: "v1.16", detect: looks_v1_16, transform: migrate_v1_16_to_v1_17_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -199,6 +200,9 @@ fn migrate_v1_14_to_v1_15_step(value: &mut Value, _shell: &ShellSpec) {
 }
 fn migrate_v1_15_to_v1_16_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v1_15_to_v1_16(value)
+}
+fn migrate_v1_16_to_v1_17_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_16_to_v1_17(value)
 }
 
 fn looks_v1(value: &Value) -> bool {
@@ -422,6 +426,17 @@ fn looks_v1_15(value: &Value) -> bool {
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 15)
+}
+
+/// Is this a v1.16 file (schema_version == 16) that pre-dates the V8-02
+/// offload backend pool? Gated purely on the version integer; the
+/// transform's own check (skip if `offload.backends` already populated)
+/// makes the migration idempotent.
+fn looks_v1_16(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 16)
 }
 
 // --- v1.1 → v1.2 ------------------------------------------------------------
@@ -1364,6 +1379,70 @@ fn migrate_v1_15_to_v1_16(value: &mut Value) {
             t.get("id").and_then(Value::as_str)
                 != Some(crate::settings::schema::SHELL_BROOT_TAB_ID)
         });
+    }
+
+    // Stamp a *literal* 16 (not CURRENT_SCHEMA_VERSION): the v16 → v17 step
+    // gates on `schema_version == 16`, so this step must leave that concrete
+    // value for the next detector to match.
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(16u8)),
+    );
+}
+
+// --- v1.16 → v1.17 ----------------------------------------------------------
+//
+// V8-02 generalizes the single local `llama-server` into a backend pool. The
+// migration folds the V8-01 single-local config (`offload.server_command` +
+// `offload.autostart`) into one `Local` entry in the new `offload.backends`
+// array, so an upgrader's existing command keeps working as one
+// quality-tier, all-tools local backend. The legacy scalar fields are left
+// in place (still deserialized, and the runtime `effective_backends()`
+// fallback also reads them) — this migration only *adds* the array so the
+// on-disk file is self-describing and the user can edit the pool in Settings.
+//
+// Idempotent: skips synthesis if `offload.backends` is already a non-empty
+// array (a fresh-install or re-migrated file), and `looks_v1_16` returns
+// false once `schema_version` is 17.
+
+fn migrate_v1_16_to_v1_17(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Object(offload)) = root.get_mut("offload") {
+        let already = matches!(
+            offload.get("backends"),
+            Some(Value::Array(a)) if !a.is_empty()
+        );
+        if !already {
+            let server_command = offload
+                .get("server_command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let autostart = offload
+                .get("autostart")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // Only synthesize a backend when there's an actual command to
+            // carry forward; an empty/unconfigured offload block migrates to
+            // an empty pool (the feature is still off by default).
+            let backends = if server_command.trim().is_empty() {
+                Value::Array(Vec::new())
+            } else {
+                json!([{
+                    "name": "local",
+                    "enabled": true,
+                    "kind": { "type": "local", "server_command": server_command, "autostart": autostart },
+                    "declared_context": null,
+                    "declared_model": "",
+                    "tier": "quality",
+                    "tool_scope": { "mode": "all" }
+                }])
+            };
+            offload.insert("backends".to_string(), backends);
+        }
     }
 
     root.insert(
@@ -2738,10 +2817,9 @@ mod tests {
         assert_eq!(tabs[0].get("id").unwrap(), "claude");
         assert_eq!(tabs[1].get("id").unwrap(), "shell-default-1");
 
-        assert_eq!(
-            v.get("schema_version").and_then(Value::as_u64),
-            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64),
-        );
+        // This step stamps a *literal* 16 so the v16 → v17 step (V8-02
+        // backends) can match next in the cascade.
+        assert_eq!(v.get("schema_version").and_then(Value::as_u64), Some(16));
         assert!(!looks_v1_15(&v));
     }
 
@@ -2780,6 +2858,77 @@ mod tests {
             .count();
         assert_eq!(count, 1, "no duplicate broot tab");
         assert!(!looks_v1_14(&v));
+    }
+
+    #[test]
+    fn v1_16_to_v1_17_folds_server_command_into_one_local_backend() {
+        // A V8-01 single-local config migrates into one Local backend that
+        // preserves the user's command + autostart.
+        let mut v = json!({
+            "schema_version": 16,
+            "offload": {
+                "enabled": true,
+                "autostart": true,
+                "server_command": "llama-server --model q4.gguf --jinja -np 2",
+            },
+        });
+        migrate_v1_16_to_v1_17(&mut v);
+        let backends = v
+            .pointer("/offload/backends")
+            .and_then(Value::as_array)
+            .expect("backends array");
+        assert_eq!(backends.len(), 1);
+        let b = &backends[0];
+        assert_eq!(b.get("name").unwrap(), "local");
+        assert_eq!(b.get("tier").unwrap(), "quality");
+        assert_eq!(b.pointer("/kind/type").unwrap(), "local");
+        assert_eq!(
+            b.pointer("/kind/server_command").unwrap(),
+            "llama-server --model q4.gguf --jinja -np 2"
+        );
+        assert_eq!(b.pointer("/kind/autostart").unwrap(), &json!(true));
+        assert_eq!(b.pointer("/tool_scope/mode").unwrap(), "all");
+        assert_eq!(
+            v.get("schema_version").and_then(Value::as_u64),
+            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64)
+        );
+        assert!(!looks_v1_16(&v));
+    }
+
+    #[test]
+    fn v1_16_to_v1_17_empty_command_yields_empty_pool() {
+        // An unconfigured offload block (feature off) migrates to an empty
+        // pool, not a bogus backend with a blank command.
+        let mut v = json!({
+            "schema_version": 16,
+            "offload": { "enabled": false, "server_command": "" },
+        });
+        migrate_v1_16_to_v1_17(&mut v);
+        let backends = v
+            .pointer("/offload/backends")
+            .and_then(Value::as_array)
+            .expect("backends array");
+        assert!(backends.is_empty());
+    }
+
+    #[test]
+    fn v1_16_to_v1_17_is_idempotent_when_backends_present() {
+        // A file that already has a populated pool is not clobbered.
+        let mut v = json!({
+            "schema_version": 16,
+            "offload": {
+                "server_command": "llama-server --jinja",
+                "backends": [ { "name": "main", "kind": { "type": "local" } } ],
+            },
+        });
+        migrate_v1_16_to_v1_17(&mut v);
+        let backends = v
+            .pointer("/offload/backends")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].get("name").unwrap(), "main");
+        assert!(!looks_v1_16(&v));
     }
 
     #[test]

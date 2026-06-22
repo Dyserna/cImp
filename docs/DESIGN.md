@@ -593,6 +593,50 @@ After migration and typed deserialization, an integrity pass repairs hand-edited
 
 The frontend's `validateAndRepairLayout` runs after this on hydration and handles deeper concerns (orphan placement, empty-pane collapse).
 
+### Offload: local task delegation (V8-01) + backend pool (V8-02) + warm pool & MCP host (V8-03)
+
+Offload lets the main cloud Claude (Opus) session hand a self-contained, token-heavy subtask to a **subordinate local/remote model** and receive only the synthesized result — Opus stays in charge, but the intermediate search/read/summarize tokens never enter its window. It is exposed to Claude as a single `offload_task` MCP tool, injected session-scoped into ccImp-launched Claude tabs via `--mcp-config` (never writing `~/.claude`).
+
+ccImp bridges two MCP roles: toward Claude it is an MCP **server** (the hidden `ccimp --offload-mcp` subcommand); toward any user tool servers it is an MCP **host/client**. The `llama-server` itself never speaks MCP — ccImp runs the agent loop (`offload/agent.rs`), translating between the model's OpenAI-style `tool_calls` and each tool's executor.
+
+**Where the loop lives (V8-03).** The agent loop, the backend pool, the router, and the MCP host all run in the **long-lived ccImp app** (`offload/service.rs::OffloadService`), not in the per-session child. Only the app sees every in-flight offload across all Claude tabs, so it owns a **global concurrency gate** and feeds the router honest `in_flight` (which is why V8-02's spill/fail-over finally works), keeps **warm** MCP-host connections across calls, and renders the capability description from **live** health. The `--offload-mcp` child shrinks to a **proxy with a self-contained fallback**: when the app is up it forwards to an authenticated loopback endpoint; when the app is down (headless cron, mid-restart) it runs the V8-02 path itself (native-only, no warm host). Both paths share the pure router and the agent loop, so they can't drift.
+
+```
+  Claude tab (Opus) ──offload_task──▶ ccimp --offload-mcp  (thin proxy per session)
+                                         │  POST /run · GET /describe · GET /events
+                                         │  (127.0.0.1, ephemeral port + bearer token,
+                                         │   discovery file next to the exe)
+                                         ▼
+                          ccImp app · OffloadService
+                            ├─ global concurrency gate (all tabs)
+                            ├─ router::select(task, LIVE in_flight) ─▶ ONE backend
+                            ├─ MCP host (warm): ddg/fetch/context7/git/filesystem
+                            │     namespaced, read-class only, fs confined
+                            └─ agent loop, scoped to the chosen backend
+        ┌──────────────── backend pool ────────────────┐
+        │  Local  (ccImp owns the llama-server process) │
+        │  Remote LAN  (health-checked URL, no process) │
+        │  Remote Cloud (URL + auth + consent)          │
+        └───────────────────────────────────────────────┘
+                                         │
+                              ONE synthesized string ─▶ Opus
+
+  app down ▶ the child runs the same router + loop itself (native tools only)
+```
+
+Key types (all behind the `Backend` seam so the pool is additive over V8-01's single local server):
+
+- **`offload/service.rs::OffloadService`** — app-owned home of the loop + pool + router + global gate + MCP host. Resolves the pool from **live** state (the supervisor's running `LlamaServer` handles for honest `in_flight`/`n_ctx`, plus cached warm `RemoteBackend` handles), routes, and runs the loop with a host-aware scoped router. Exposes `run`/`describe`/`status` and a change channel for `/events`.
+- **`offload/loopback.rs::Loopback`** — the authenticated localhost endpoint (`POST /run`, `GET /describe`, `GET /events`) bound to `127.0.0.1:0`, gated by a per-launch bearer token advertised in a `{port, token, pid}` discovery file under the portable root (removed on exit). Loopback-only + token auth is the security boundary; the residual local-trust assumption is documented in `MAINTENANCE.md`.
+- **`offload/mcp_host.rs::McpHost`** — the warm MCP **client** pool: per server it runs `initialize`+`tools/list`, **namespaces** tools (`ddg__search`), drops write/destructive tools (**read-class only**), confines a `filesystem` server to the allowed roots, multiplexes stdio JSON-RPC by id, tracks per-server health, and pulses a change event when a server connects/drops. Tools merge into the chat `tools` array (then filtered by the backend's `ToolScope`).
+- **`offload/server.rs::LlamaServer`** — the Local backend: ccImp owns the process (Start/Stop/Reset, autostart), parses the command for host/port/`-np`/`--jinja`, and discovers `n_ctx` from `/props`.
+- **`offload/remote.rs::RemoteBackend`** — a Remote backend (LAN or cloud): a `base_url` (+ optional auth) ccImp only health-checks and connects to; `n_ctx` from `/props` or a configured `declared_context`. No process, no tab.
+- **`offload/router.rs::select`** — the per-task router: a pure function over `BackendView` snapshots that filters by **tool need** (the privacy hard filter — a local-data task never reaches a cloud backend), then **required context**, then **tier/complexity** and Claude's `tier` hint, then **availability** (spill on busy, fail over on down). One enabled backend → no-op.
+- **Per-backend `ToolScope`** — the allow-list over the global tool pool. Local/LAN default to all tools; **cloud defaults to web/docs only**, denying `read_file`/`code_search`/`run_command`/`filesystem`/`git`. Enforced twice: the router won't route a local-data task to cloud, and the agent loop filters the `tools` array *and* refuses a disallowed call.
+- **`offload/supervisor.rs::OffloadSupervisor`** — app-owned lifecycle for the Local backends (keyed by name) plus health-probe of Remote backends for the Settings status rows.
+
+Cloud backends are gated behind an explicit data-egress consent toggle and badged distinctly from LAN backends; offloading to cloud sends the task text (and any scoped-in tool results) to a third party, documented in `NOTICE`. Context-budget policing, dynamic thinking, and the read-only-tools posture are unchanged from V8-01. The MCP host extends the read-only posture to the user's tool servers: write/destructive tools are filtered out even when a server offers them, so an offload can search/read/query but never mutate.
+
 ---
 
 ## Settings Schema

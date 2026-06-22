@@ -35,8 +35,11 @@ use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
     get_system_stats, list_tabs,
-    list_voices, offload_server_restart, offload_server_start, offload_server_stop, offload_status,
-    offload_test, open_settings_window, open_settings_window_to_tab, pty_get_scrollback,
+    list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
+    offload_server_restart, offload_server_start, offload_server_stop, offload_service_status,
+    offload_status,
+    offload_statuses, offload_test, open_settings_window, open_settings_window_to_tab,
+    pty_get_scrollback,
     pty_rebind_channel, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
     restart_shell_tab, set_active_tab, set_window_square_corners, settings_get, settings_update,
     stt_cancel, stt_list_input_devices, stt_list_models, stt_start_recording, stt_stop_recording,
@@ -357,11 +360,40 @@ fn main() {
                     settings_for_offload.clone(),
                 );
                 app.manage(supervisor.clone());
+
+                // V8-03: the app-side offload service — owns the warm pool,
+                // the global concurrency gate, the router, and the MCP host.
+                // Managed unconditionally so the IPC + loopback can reach it;
+                // the heavy machinery (warm host, loopback endpoint, health
+                // watch) only spins up when offload is enabled.
+                let service = crate::offload::OffloadService::new(
+                    settings_for_offload.clone(),
+                    supervisor.clone(),
+                );
+                app.manage(service.clone());
+
                 let snap = settings_for_offload.current().offload;
-                if snap.enabled && snap.autostart {
+                if snap.enabled {
+                    // V8-02: autostart every Local backend that opted in.
+                    let sup = supervisor.clone();
                     tauri::async_runtime::spawn(async move {
-                        if let Err(e) = supervisor.start().await {
-                            warn!(error = %e, "offload: autostart failed");
+                        sup.autostart_all().await;
+                    });
+                    // V8-03: warm the MCP host, start the loopback endpoint
+                    // (writes the discovery file), and watch backend health
+                    // so `/events` → `tools/list_changed` tracks up/down.
+                    let svc = service.clone();
+                    let app_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        svc.warm_host().await;
+                        svc.spawn_health_watch();
+                        match crate::offload::loopback::Loopback::start(svc.clone()).await {
+                            Ok(lb) => {
+                                app_handle.manage(lb);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "offload: loopback endpoint failed to start")
+                            }
                         }
                     });
                 }
@@ -447,10 +479,15 @@ fn main() {
             content_open_folder,
             content_clear,
             offload_status,
+            offload_statuses,
             offload_server_start,
             offload_server_stop,
             offload_server_restart,
+            offload_backend_start,
+            offload_backend_stop,
+            offload_backend_restart,
             offload_test,
+            offload_service_status,
             theming::themes_list,
             theming::palettes_list,
         ])
@@ -493,11 +530,21 @@ fn main() {
                     }
                     registry.shutdown_all().await;
                     drop(registry);
-                    // V8-01: kill the offload `llama-server` child on
-                    // graceful exit so it doesn't outlive the app. (The
+                    // V8-01/V8-02: kill every local offload `llama-server`
+                    // child on graceful exit so none outlive the app. (Each
                     // child is also `kill_on_drop`; this is the clean path.)
                     app.state::<std::sync::Arc<crate::offload::OffloadSupervisor>>()
-                        .stop()
+                        .stop_all()
+                        .await;
+                    // V8-03: remove the loopback discovery file and reap the
+                    // warm MCP-host server children.
+                    if let Some(lb) =
+                        app.try_state::<std::sync::Arc<crate::offload::loopback::Loopback>>()
+                    {
+                        lb.stop();
+                    }
+                    app.state::<std::sync::Arc<crate::offload::OffloadService>>()
+                        .shutdown()
                         .await;
                     // Closing the main window also closes the settings window
                     // if it's open — otherwise it would keep the process alive

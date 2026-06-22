@@ -1,30 +1,42 @@
-//! V8-01 MCP server toward Claude — the `ccimp --offload-mcp` subcommand.
+//! MCP server toward Claude — the `ccimp --offload-mcp` subcommand.
 //!
 //! A minimal, hand-rolled stdio JSON-RPC 2.0 MCP server (newline-delimited
 //! messages on stdin/stdout). Implements `initialize` (declaring
 //! `tools.listChanged`), `tools/list`, and `tools/call`, exposing one tool:
-//! `offload_task(instructions, context?, thinking?) -> string`.
+//! `offload_task(instructions, context?, thinking?, tier?) -> string`.
 //!
-//! On a call it loads the same layered `settings.json` the app uses
-//! (read-only), connects to the **app-owned** `llama-server` over HTTP
-//! (it never spawns its own model), runs the agent loop, and returns the
-//! synthesized result. Dispatched in `main()` before Tauri init, exactly
-//! like `--statusline`, so it stays GUI-free and fast to spawn.
+//! **V8-03: proxy + fallback.** The child is now a thin bridge. When the app
+//! is running it discovers the app's [loopback endpoint](super::loopback)
+//! (via the `{port, token, pid}` discovery file next to the exe) and
+//! forwards everything — `tools/call` → `POST /run`, the tool *description* ←
+//! `GET /describe` — so the heavy lifting runs on the app's warm pool +
+//! global gate + MCP host. A background task subscribes to `GET /events` and
+//! relays `notifications/tools/list_changed` to Claude over the same stdio
+//! pipe. When the app is **unreachable** (not running, headless cron,
+//! mid-restart) the child degrades to the self-contained V8-02 path below
+//! (read settings → probe → route → native-tools loop), so offload still
+//! works without the app — just without the warm pool, global concurrency,
+//! or live MCP host. Both paths share the pure router and the agent loop.
 //!
-//! MVP scope: native tools only (`read_file`/`code_search`/`run_command`)
-//! and config-derived capability reporting. The MCP **host** (aggregating
-//! the user's tool servers) and the warm-pool/health-accurate variant are
-//! Phase C / the target design.
+//! Dispatched in `main()` before Tauri init, exactly like `--statusline`,
+//! so it stays GUI-free and fast to spawn.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex as TokioMutex;
+
+use super::loopback::read_discovery;
 
 use crate::offload::agent::{self, AgentConfig, NativeRouter, OffloadTask, ThinkingMode};
+use crate::offload::router::{self, BackendView, RouteError, TierHint};
 use crate::offload::server::ServerCommand;
 use crate::offload::tools::{self, ToolCtx};
-use crate::settings::OffloadSettings;
+use crate::settings::{
+    BackendTier, OffloadBackend, OffloadBackendKind, OffloadSettings, ToolScope,
+};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "ccimp-offload";
@@ -44,9 +56,20 @@ pub fn run() {
 }
 
 async fn serve() {
+    // stdout is shared between the request loop and the `/events` relay task
+    // (which pushes `tools/list_changed` notifications), so guard it.
+    let stdout = Arc::new(TokioMutex::new(tokio::io::stdout()));
+
+    // Relay app-side capability changes to Claude as `tools/list_changed`,
+    // whenever the app's loopback endpoint is reachable. Best-effort and
+    // self-healing — it reconnects when the app comes/goes.
+    {
+        let stdout = stdout.clone();
+        tokio::spawn(async move { events_relay(stdout).await });
+    }
+
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
-    let mut stdout = tokio::io::stdout();
 
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim();
@@ -77,10 +100,11 @@ async fn serve() {
         };
         let mut bytes = frame.to_string();
         bytes.push('\n');
-        if stdout.write_all(bytes.as_bytes()).await.is_err() {
+        let mut out = stdout.lock().await;
+        if out.write_all(bytes.as_bytes()).await.is_err() {
             break;
         }
-        let _ = stdout.flush().await;
+        let _ = out.flush().await;
     }
 }
 
@@ -94,10 +118,23 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": [offload_task_tool()] })),
+        "tools/list" => Ok(json!({ "tools": [offload_task_tool_live().await] })),
         "tools/call" => handle_tools_call(params).await,
         _ => Err((-32601, format!("method not found: {method}"))),
     }
+}
+
+/// The `offload_task` descriptor with a **live** description: the app's
+/// `GET /describe` (health-accurate) when reachable, else the config-derived
+/// fallback renderer.
+async fn offload_task_tool_live() -> Value {
+    let description = match proxy_describe().await {
+        Some(d) if !d.trim().is_empty() => d,
+        _ => offload_task_description(&current_offload_settings()),
+    };
+    let mut tool = offload_task_tool();
+    tool["description"] = Value::String(description);
+    tool
 }
 
 /// The `offload_task` tool descriptor, with its `description` rendered
@@ -122,6 +159,11 @@ fn offload_task_tool() -> Value {
                     "type": "string",
                     "enum": ["auto", "off", "on"],
                     "description": "Reasoning effort. 'off' for cheap deterministic work (extract/list/lookup), 'on' for genuine analysis, 'auto' (default) to let the worker decide per step."
+                },
+                "tier": {
+                    "type": "string",
+                    "enum": ["auto", "fast", "quality"],
+                    "description": "Backend bias when multiple offload backends are configured. 'fast' routes trivial single-pass work (summarize/extract/classify) to the small/fast backend; 'quality' forces the large/capable one for real reasoning or big context; 'auto' (default) lets the router decide by task size. Local-file tasks always run on a backend with file access (never a cloud backend)."
                 }
             },
             "required": ["instructions"]
@@ -129,29 +171,108 @@ fn offload_task_tool() -> Value {
     })
 }
 
-/// Render the capability line from the enabled native tools (MVP:
-/// config-derived; Phase C adds healthy MCP servers).
+/// Render the capability description as a **union across enabled backends**
+/// (V8-02). Each backend contributes a coarse label — its name, kind, tier,
+/// context window, and a tool-scope summary — so Opus knows a fast tier
+/// exists, which backends can read local files, and how to bias with
+/// `tier`. Falls back to the native-tool list for a single-local pool.
+///
+/// Config-derived (the per-call child can't see live app-side health);
+/// health-accurate re-rendering is the warm-pool followup noted in V8-01.
 fn offload_task_description(settings: &OffloadSettings) -> String {
-    let mut caps: Vec<&str> = Vec::new();
-    if settings.tools.code_search {
-        caps.push("code search");
+    let backends: Vec<OffloadBackend> = settings
+        .effective_backends()
+        .into_iter()
+        .filter(|b| b.enabled)
+        .collect();
+
+    if backends.is_empty() {
+        return "Delegate a token-heavy subtask to a local model to conserve this session's \
+                context. (No offload backend is configured/enabled — set one up in ccImp \
+                Settings → Offload.)"
+            .to_string();
     }
-    if settings.tools.read_file {
-        caps.push("file read");
-    }
-    if settings.tools.run_command && !settings.command_allowlist.is_empty() {
-        caps.push("allowlisted commands");
-    }
-    let avail = if caps.is_empty() {
-        "no tools currently enabled".to_string()
+
+    let parts: Vec<String> = backends.iter().map(|b| backend_label(b, settings)).collect();
+    let any_local_file = backends
+        .iter()
+        .any(|b| !b.cloud_blocked() && b.tool_scope.allows("read_file"));
+    let routing_note = if backends.len() > 1 {
+        let local_hint = if any_local_file {
+            " Local-file tasks run on a backend with file access (never a cloud backend)."
+        } else {
+            ""
+        };
+        format!(" Pass `tier` (fast|quality) to bias the choice.{local_hint}")
     } else {
-        caps.join(", ")
+        String::new()
     };
+
     format!(
-        "Delegate a token-heavy subtask (broad codebase search, large-file/log summarization) to a \
-         local model to conserve this session's context. Pass a self-contained instruction; you get \
-         back only the synthesized result. Available now: {avail}."
+        "Delegate a token-heavy subtask (broad codebase search, large-file/log summarization, web \
+         research) to a local/remote model to conserve this session's context. Pass a \
+         self-contained instruction; you get back only the synthesized result. Backends: {}.{}",
+        parts.join("; "),
+        routing_note
     )
+}
+
+/// One backend's coarse capability label for the union description.
+fn backend_label(b: &OffloadBackend, settings: &OffloadSettings) -> String {
+    let tier = match b.tier {
+        BackendTier::Fast => "fast",
+        BackendTier::Quality => "quality",
+    };
+    let kind = match &b.kind {
+        OffloadBackendKind::Local { .. } => "local",
+        OffloadBackendKind::Remote { is_cloud: true, .. } => "cloud",
+        OffloadBackendKind::Remote { .. } => "LAN",
+    };
+    let ctx = match b.declared_context {
+        Some(n) => format!("~{}k ctx", (n / 1000).max(1)),
+        None => "ctx discovered".to_string(),
+    };
+    let tools = tool_scope_summary(&b.tool_scope, settings);
+    let consent = if b.cloud_blocked() {
+        " — NEEDS CONSENT (disabled until granted)"
+    } else {
+        ""
+    };
+    format!("{} ({kind}, {tier}, {ctx}, {tools}{consent})", b.name)
+}
+
+/// Coarse, human-readable summary of a backend's tool scope.
+fn tool_scope_summary(scope: &ToolScope, settings: &OffloadSettings) -> String {
+    // Names the model could plausibly use: native toggles + MCP server names.
+    let mut pool: Vec<String> = Vec::new();
+    if settings.tools.read_file {
+        pool.push("read_file".into());
+    }
+    if settings.tools.code_search {
+        pool.push("code_search".into());
+    }
+    if settings.tools.run_command {
+        pool.push("run_command".into());
+    }
+    for s in &settings.mcp_servers {
+        if s.enabled && !s.name.is_empty() {
+            pool.push(s.name.clone());
+        }
+    }
+    let allowed: Vec<&String> = pool.iter().filter(|t| scope.allows(t)).collect();
+    match scope {
+        ToolScope::All => "all tools".to_string(),
+        _ if allowed.is_empty() => "no tools".to_string(),
+        _ => {
+            // Compact: if only web/docs survive, say so.
+            let local_blocked = !scope.allows("read_file") && !scope.allows("code_search");
+            if local_blocked {
+                "web/docs only".to_string()
+            } else {
+                format!("{} tools", allowed.len())
+            }
+        }
+    }
 }
 
 async fn handle_tools_call(params: Value) -> Result<Value, (i64, String)> {
@@ -172,9 +293,31 @@ async fn handle_tools_call(params: Value) -> Result<Value, (i64, String)> {
         .get("context")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let thinking = ThinkingMode::parse(args.get("thinking").and_then(|v| v.as_str()).unwrap_or("auto"));
+    let thinking_str = args
+        .get("thinking")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto")
+        .to_string();
+    let tier_str = args
+        .get("tier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto")
+        .to_string();
+    let thinking = ThinkingMode::parse(&thinking_str);
+    let tier = TierHint::parse(&tier_str);
 
-    match run_offload(instructions, context, thinking).await {
+    // Prefer the app's warm pool when reachable; degrade to the
+    // self-contained path otherwise. `proxy_run` returns `None` only when
+    // the app is unreachable (transport failure / no discovery file) — a
+    // task-level error from the app comes back as `Some(Err(..))` and is
+    // surfaced as a tool result, not retried locally.
+    let outcome = match proxy_run(&instructions, context.as_deref(), &thinking_str, &tier_str).await
+    {
+        Some(r) => r,
+        None => run_offload(instructions, context, thinking, tier).await,
+    };
+
+    match outcome {
         Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
         // A "not ready/busy" condition is returned as a tool result (not a
         // protocol error) so Opus can read it and retry/adapt.
@@ -186,11 +329,255 @@ fn tool_error(message: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": message }], "isError": true })
 }
 
-/// Connect to the app-owned server and run one offload task.
+// ── Proxy toward the app's loopback endpoint ────────────────────────────
+//
+// When the app is up, the child forwards to it (warm pool + global gate +
+// MCP host). All three helpers fail soft to `None`/fallback when the app is
+// unreachable, so offload still works headless.
+
+/// Base URL of the app's loopback endpoint from the discovery file.
+fn proxy_base() -> Option<(String, String)> {
+    let d = read_discovery()?;
+    Some((format!("http://127.0.0.1:{}", d.port), d.token))
+}
+
+/// Fetch the live capability description from `GET /describe`. `None` when
+/// the app is unreachable (the caller renders the config-derived fallback).
+async fn proxy_describe() -> Option<String> {
+    let (base, token) = proxy_base()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(format!("{base}/describe"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.text().await.ok()
+}
+
+/// Forward an `offload_task` to `POST /run`. Returns:
+/// - `None` → app unreachable; the caller runs the self-contained fallback.
+/// - `Some(Ok(text))` → the synthesized answer from the warm pool.
+/// - `Some(Err(msg))` → a task-level error the app already resolved (busy /
+///   no backend / timeout) — surfaced to Claude as-is, not retried locally.
+async fn proxy_run(
+    instructions: &str,
+    context: Option<&str>,
+    thinking: &str,
+    tier: &str,
+) -> Option<Result<String, String>> {
+    let (base, token) = proxy_base()?;
+    let settings = current_offload_settings();
+    // Allow generous headroom over the app's own task timeout so the proxy
+    // doesn't cut a run the app is still finishing.
+    let timeout = Duration::from_secs(settings.offload_timeout_secs.max(30) + 30);
+    let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
+
+    let body = json!({
+        "instructions": instructions,
+        "context": context,
+        "thinking": thinking,
+        "tier": tier,
+    });
+    let resp = client
+        .post(format!("{base}/run"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .ok()?; // transport failure → fallback
+    let v: Value = resp.json().await.ok()?;
+    let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+    if ok {
+        let text = v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Some(Ok(text))
+    } else {
+        let err = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("offload failed")
+            .to_string();
+        Some(Err(err))
+    }
+}
+
+/// Long-lived task: while the app's loopback endpoint is reachable, hold a
+/// `GET /events` SSE connection and relay each `change` event to Claude as a
+/// `notifications/tools/list_changed`. Reconnects when the app comes/goes.
+async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
+    loop {
+        if let Some((base, token)) = proxy_base() {
+            // No client timeout — this is a streaming connection.
+            if let Ok(client) = reqwest::Client::builder().build() {
+                if let Ok(mut resp) = client
+                    .get(format!("{base}/events"))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                {
+                    // Read the SSE byte stream chunk by chunk; emit a
+                    // notification each time a `change` event arrives.
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        if chunk.windows(SSE_CHANGE.len()).any(|w| w == SSE_CHANGE) {
+                            emit_list_changed(&stdout).await;
+                        }
+                    }
+                }
+            }
+        }
+        // App down or stream ended — back off and retry.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The SSE marker the app emits for a capability change.
+const SSE_CHANGE: &[u8] = b"event: change";
+
+/// Write a `tools/list_changed` notification on the shared stdout pipe.
+async fn emit_list_changed(stdout: &Arc<TokioMutex<tokio::io::Stdout>>) {
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed"
+    })
+    .to_string();
+    let mut out = stdout.lock().await;
+    let _ = out.write_all(frame.as_bytes()).await;
+    let _ = out.write_all(b"\n").await;
+    let _ = out.flush().await;
+}
+
+/// A backend resolved from config to a connectable endpoint, before the
+/// health probe. Local backends contribute their parsed command's URL +
+/// slot count; remote backends their configured URL/auth/declared values.
+struct ResolvedBackend {
+    name: String,
+    base_url: String,
+    auth_token: Option<String>,
+    cloud_blocked: bool,
+    is_cloud: bool,
+    tier: BackendTier,
+    tool_scope: ToolScope,
+    slots: u32,
+    declared_context: Option<u32>,
+}
+
+impl ResolvedBackend {
+    /// Resolve one configured backend. Returns `None` for a backend that
+    /// can't even be addressed (e.g. a Local entry with an unparseable or
+    /// empty command, or a Remote with no URL) — it's simply absent from
+    /// the pool rather than fatal.
+    fn from_config(b: &OffloadBackend) -> Option<Self> {
+        match &b.kind {
+            OffloadBackendKind::Local { server_command, .. } => {
+                if server_command.trim().is_empty() {
+                    return None;
+                }
+                let cmd = ServerCommand::parse(server_command).ok()?;
+                Some(Self {
+                    name: b.name.clone(),
+                    base_url: cmd.base_url(),
+                    auth_token: None,
+                    cloud_blocked: false,
+                    is_cloud: false,
+                    tier: b.tier,
+                    tool_scope: b.tool_scope.clone(),
+                    slots: cmd.parallel.max(1),
+                    declared_context: b.declared_context,
+                })
+            }
+            OffloadBackendKind::Remote {
+                base_url,
+                auth_token,
+                is_cloud,
+                ..
+            } => {
+                if base_url.trim().is_empty() {
+                    return None;
+                }
+                Some(Self {
+                    name: b.name.clone(),
+                    base_url: base_url.trim_end_matches('/').to_string(),
+                    auth_token: if auth_token.is_empty() {
+                        None
+                    } else {
+                        Some(auth_token.clone())
+                    },
+                    cloud_blocked: b.cloud_blocked(),
+                    is_cloud: *is_cloud,
+                    tier: b.tier,
+                    tool_scope: b.tool_scope.clone(),
+                    // A remote endpoint doesn't report `-np`; assume one
+                    // slot (the user sizes real parallelism on the box).
+                    slots: 1,
+                    declared_context: b.declared_context,
+                })
+            }
+        }
+    }
+}
+
+/// Health-probe one resolved backend: `(ready, discovered_or_declared_n_ctx)`.
+/// For a cloud endpoint (often no `/health`), any HTTP response counts as
+/// reachable; a LAN llama-server must answer `/health` 2xx.
+async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u32>) {
+    let health = client
+        .get(format!("{}/health", b.base_url))
+        .timeout(Duration::from_secs(5));
+    let health = match &b.auth_token {
+        Some(t) => health.bearer_auth(t),
+        None => health,
+    };
+    let ready = match health.send().await {
+        Ok(r) => b.is_cloud || r.status().is_success(),
+        Err(_) => false,
+    };
+    if !ready {
+        return (false, b.declared_context);
+    }
+    // Best-effort /props for the authoritative window; fall back to declared.
+    let props = client
+        .get(format!("{}/props", b.base_url))
+        .timeout(Duration::from_secs(5));
+    let props = match &b.auth_token {
+        Some(t) => props.bearer_auth(t),
+        None => props,
+    };
+    let n_ctx = match props.send().await {
+        Ok(r) if r.status().is_success() => r
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| {
+                v.get("default_generation_settings")
+                    .and_then(|g| g.get("n_ctx"))
+                    .and_then(|x| x.as_u64())
+                    .or_else(|| v.get("n_ctx").and_then(|x| x.as_u64()))
+            })
+            .map(|n| n as u32)
+            .or(b.declared_context),
+        _ => b.declared_context,
+    };
+    (ready, n_ctx)
+}
+
+/// Resolve, probe, and route the configured backend pool, then run the
+/// agent loop against the chosen backend. On a connection-class failure it
+/// asks the router for one fail-over backend and retries once.
 async fn run_offload(
     instructions: String,
     context: Option<String>,
     thinking: ThinkingMode,
+    tier: TierHint,
 ) -> Result<String, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let settings = current_offload_settings();
@@ -198,84 +585,175 @@ async fn run_offload(
     if !settings.enabled {
         return Err("offload is disabled — enable it in ccImp settings".into());
     }
-    if settings.server_command.trim().is_empty() {
-        return Err("offload server_command is not configured in ccImp settings".into());
+
+    // Resolve the enabled pool.
+    let resolved: Vec<ResolvedBackend> = settings
+        .effective_backends()
+        .iter()
+        .filter(|b| b.enabled)
+        .filter_map(ResolvedBackend::from_config)
+        .collect();
+    if resolved.is_empty() {
+        return Err(
+            "no offload backend is configured — add one in ccImp Settings → Offload".into(),
+        );
     }
-    let cmd = ServerCommand::parse(&settings.server_command).map_err(|e| e.to_string())?;
-    let base_url = cmd.base_url();
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(settings.offload_timeout_secs.max(30)))
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
-    // Health gate: the app owns the process; if it isn't up, fail soft.
-    let health = client
-        .get(format!("{base_url}/health"))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await;
-    if health.map(|r| !r.status().is_success()).unwrap_or(true) {
-        return Err(
-            "offload server is not running — start it in ccImp (Settings → Offload), or enable autostart"
-                .into(),
-        );
+    // Probe all backends concurrently (a down cloud backend mustn't stall
+    // the others). The per-call child can't see app-side slot usage, so
+    // `in_flight` is reported as 0 — cross-process spill needs the warm
+    // pool (V8-01 open decision); tier/context/tool routing is unaffected.
+    let mut handles = Vec::with_capacity(resolved.len());
+    for (i, b) in resolved.iter().enumerate() {
+        let client = client.clone();
+        let url = b.base_url.clone();
+        let auth = b.auth_token.clone();
+        let is_cloud = b.is_cloud;
+        let declared = b.declared_context;
+        handles.push(tauri::async_runtime::spawn(async move {
+            let rb = ResolvedBackend {
+                name: String::new(),
+                base_url: url,
+                auth_token: auth,
+                cloud_blocked: false,
+                is_cloud,
+                tier: BackendTier::Quality,
+                tool_scope: ToolScope::All,
+                slots: 1,
+                declared_context: declared,
+            };
+            (i, probe(&client, &rb).await)
+        }));
+    }
+    let mut probed: Vec<(bool, Option<u32>)> = vec![(false, None); resolved.len()];
+    for h in handles {
+        if let Ok((i, res)) = h.await {
+            probed[i] = res;
+        }
     }
 
-    // Discover the per-slot budget from /props.
-    let budget_tokens = discover_budget(&client, &base_url, &cmd, settings.budget_high_water_pct).await;
+    // Build router views.
+    let views: Vec<BackendView> = resolved
+        .iter()
+        .enumerate()
+        .map(|(i, b)| BackendView {
+            name: b.name.clone(),
+            ready: probed[i].0,
+            cloud_blocked: b.cloud_blocked,
+            n_ctx: probed[i].1,
+            slots: b.slots,
+            in_flight: 0,
+            tier: b.tier,
+            tool_scope: b.tool_scope.clone(),
+            budget_high_water_pct: settings.budget_high_water_pct,
+        })
+        .collect();
 
+    let req = router::analyze_task(&instructions, context.as_deref(), tier);
+
+    // First selection.
+    let chosen = router::select(&views, &req).map_err(|e: RouteError| e.to_string())?;
+    tracing::info!(
+        target: "offload",
+        task_chars = instructions.len(),
+        est_ctx = req.estimated_context,
+        tier = ?req.tier_hint,
+        backend = %views[chosen].name,
+        "offload: routed task → backend `{}`",
+        views[chosen].name
+    );
+
+    let result = run_on_backend(
+        &client, &settings, &cwd, &resolved[chosen], &views[chosen], &instructions,
+        context.clone(), thinking,
+    )
+    .await;
+
+    // Single re-route on a connection-class failure: drop the failed
+    // backend and re-select among the rest (fail-over).
+    match result {
+        Ok(text) => Ok(text),
+        Err(e) if is_connection_error(&e) && views.len() > 1 => {
+            let mut alt_views = views.clone();
+            alt_views[chosen].ready = false; // exclude the failed backend
+            match router::select(&alt_views, &req) {
+                Ok(next) if next != chosen => {
+                    tracing::warn!(
+                        failed = %resolved[chosen].name,
+                        reroute = %resolved[next].name,
+                        "offload: re-routing after connection failure"
+                    );
+                    run_on_backend(
+                        &client, &settings, &cwd, &resolved[next], &views[next],
+                        &instructions, context, thinking,
+                    )
+                    .await
+                }
+                _ => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Run the agent loop against one chosen backend with its tool scope, auth,
+/// and per-slot budget.
+#[allow(clippy::too_many_arguments)]
+async fn run_on_backend(
+    client: &reqwest::Client,
+    settings: &OffloadSettings,
+    cwd: &std::path::Path,
+    backend: &ResolvedBackend,
+    view: &BackendView,
+    instructions: &str,
+    context: Option<String>,
+    thinking: ThinkingMode,
+) -> Result<String, String> {
     let ctx = ToolCtx::new(
         settings.allowed_roots.clone(),
         settings.command_allowlist.clone(),
-        &cwd,
+        cwd,
     );
-    let router = NativeRouter {
-        defs: tools::enabled_defs(&settings.tools),
+    let router = NativeRouter::new(
+        tools::enabled_defs(&settings.tools),
         ctx,
-    };
+        backend.tool_scope.clone(),
+    );
     let cfg = AgentConfig {
-        base_url,
+        base_url: backend.base_url.clone(),
         model: None,
         max_steps: settings.max_steps.max(1),
-        budget_tokens,
+        budget_tokens: view.per_slot_budget(),
         per_tool_result_token_cap: settings.per_tool_result_token_cap.max(256),
+        auth_token: backend.auth_token.clone(),
     };
     let task = OffloadTask {
-        instructions,
+        instructions: instructions.to_string(),
         context,
         thinking,
     };
     let deadline = Instant::now() + Duration::from_secs(settings.offload_timeout_secs.max(30));
-    agent::run(&client, &cfg, &router, task, deadline)
+    agent::run(client, &cfg, &router, task, deadline)
         .await
         .map_err(|e| e.to_string())
 }
 
-/// GET /props and compute `(n_ctx / np) * high_water`. Returns `None`
-/// when the endpoint doesn't report `n_ctx` (the loop then relies on
-/// `max_steps`/deadline).
-async fn discover_budget(
-    client: &reqwest::Client,
-    base_url: &str,
-    cmd: &ServerCommand,
-    high_water_pct: u8,
-) -> Option<u32> {
-    let v: Value = client
-        .get(format!("{base_url}/props"))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    let n_ctx = v
-        .get("default_generation_settings")
-        .and_then(|g| g.get("n_ctx"))
-        .and_then(|x| x.as_u64())
-        .or_else(|| v.get("n_ctx").and_then(|x| x.as_u64()))? as u32;
-    let per_slot = n_ctx / cmd.parallel.max(1);
-    Some(per_slot.saturating_mul(high_water_pct.min(100) as u32) / 100)
+/// Whether an agent-loop error looks like a transport/connection failure
+/// (so a fail-over re-route is worth trying) rather than a model/logic
+/// error (which would just repeat on another backend).
+fn is_connection_error(e: &str) -> bool {
+    let e = e.to_lowercase();
+    e.contains("chat request failed")
+        || e.contains("connection")
+        || e.contains("timed out")
+        || e.contains("timeout")
+        || e.contains("refused")
+        || e.contains("/props request failed")
 }
 
 /// Load just the offload block from the layered settings, read-only.

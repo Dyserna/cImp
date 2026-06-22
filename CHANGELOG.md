@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Warm offload pool + MCP host (V8-03).** The offload machinery moves out of the
+  per-call `ccimp --offload-mcp` child and into the long-lived ccImp app, which now
+  owns the agent loop, the backend pool, the router, and — finally — the **MCP
+  host**: warm, long-lived connections to your configured tool servers
+  (`duckduckgo`, `fetch`, `context7`, `git`, `filesystem`) so an offload reaches
+  real tools without paying an `npx`/`uvx` cold-start per call. Tools are
+  namespaced (`ddg__search`), filtered to **read-class only** (write/destructive
+  tools are dropped), and `filesystem` is confined to the allowed roots; per-server
+  health shows in **Settings → Offload**. The app enforces a single **global
+  concurrency gate** across every Claude tab, so the capability description and the
+  router's spill/fail-over now run on **honest, health-accurate** state. The child
+  shrinks to a thin proxy: when the app is up it forwards over an authenticated
+  loopback endpoint (ephemeral port + per-launch token, advertised in a discovery
+  file next to the exe — never `~/.claude`) and relays `tools/list_changed` when a
+  backend or tool server goes up/down; when the app is **down** (headless cron,
+  mid-restart) it falls back to the self-contained path, so offload still works
+  without the app.
+- **Offload backend pool + capability-aware routing (V8-02).** The single local
+  offload server generalizes into a **pool of backends** — a local `llama-server`,
+  a LAN machine, and/or a cloud OpenAI-compatible endpoint — and ccImp routes each
+  `offload_task` to the right one. The router picks a backend by required tools,
+  required context, tier (`fast`/`quality`), and live availability (spilling when
+  one is busy, failing over when one is down); Claude can bias it with a new
+  `tier` argument, and the tool description reports the whole pool so Opus knows a
+  fast tier exists. **Remote backends** are configured by URL (+ optional auth)
+  and health-checked — no local process, no tab. **Per-backend tool scoping** is
+  the privacy boundary: a **cloud** backend defaults to web/docs only (local
+  file/search/command/git tools denied at both the routing and tool-array layers)
+  and is unusable until you grant explicit data-egress consent; LAN backends keep
+  data on your network. Manage it all in **Settings → Offload → Backend pool**.
+  Additive settings migration: an existing single `server_command` becomes one
+  Local backend in the pool.
 - **Local task offload (V8-01).** ccImp can now hand token-heavy subtasks —
   broad codebase searches, large-file/log summarization, web research — from the
   main Claude (Opus) session to a local LLM, so the cloud session's context grows
@@ -25,6 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count and a wall-clock timeout. Off by default; the model is user-supplied
   (not bundled). File access is confined to configurable `allowed_roots` and
   `run_command` is deny-by-default (allowlist only).
+
+### Fixed
+
+- **Cross-backend offload spill now works (V8-03).** Because each per-call
+  `--offload-mcp` child was blind to every other in-flight offload, it always
+  reported `in_flight == 0`, so V8-02's spill-on-busy and fail-over never fired in
+  production — the router saw every backend as free. The long-lived app-side
+  service sees all in-flight offloads across every Claude tab and feeds the router
+  honest counts, so a busy backend now spills to a free one (and a full pool queues
+  coherently behind the global gate) as designed.
 
 ## [0.15.0] — 2026-06-20
 

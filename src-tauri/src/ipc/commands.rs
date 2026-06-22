@@ -646,12 +646,51 @@ pub async fn settings_update(
 // `offload-state` events, available only in the setup hook). These thin
 // commands drive its lifecycle from the Settings UI.
 
-/// Current offload server status (state + discovered `n_ctx`/slots/in-flight).
+/// Current offload server status (state + discovered `n_ctx`/slots/in-flight)
+/// for the **primary** local backend (legacy single-status readout).
 #[tauri::command]
 pub async fn offload_status(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
 ) -> AppResult<crate::offload::OffloadState> {
     Ok(supervisor.status().await)
+}
+
+/// V8-02: per-backend status for every enabled backend in the pool (Local
+/// process+health and Remote health-probe). Drives the Settings backends
+/// editor's status rows.
+#[tauri::command]
+pub async fn offload_statuses(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+) -> AppResult<Vec<crate::offload::supervisor::BackendStatus>> {
+    Ok(supervisor.statuses().await)
+}
+
+/// V8-02: start one named Local backend (idempotent).
+#[tauri::command]
+pub async fn offload_backend_start(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+    name: String,
+) -> AppResult<()> {
+    supervisor.inner().start_backend(&name).await
+}
+
+/// V8-02: stop one named Local backend (idempotent).
+#[tauri::command]
+pub async fn offload_backend_stop(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+    name: String,
+) -> AppResult<()> {
+    supervisor.stop_backend(&name).await;
+    Ok(())
+}
+
+/// V8-02: restart (Reset) one named Local backend.
+#[tauri::command]
+pub async fn offload_backend_restart(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+    name: String,
+) -> AppResult<()> {
+    supervisor.inner().restart_backend(&name).await
 }
 
 /// Start the offload `llama-server` (idempotent).
@@ -696,6 +735,16 @@ pub async fn offload_test(
         .inner()
         .run_task(task, crate::offload::agent::ThinkingMode::Auto)
         .await
+}
+
+/// V8-03: aggregate offload-service status — the honest global in-flight
+/// count (now that the long-lived app sees every offload) and per-MCP-server
+/// health rows. Drives the Settings warm-pool readout.
+#[tauri::command]
+pub async fn offload_service_status(
+    service: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
+) -> AppResult<crate::offload::service::ServiceStatus> {
+    Ok(service.status().await)
 }
 
 /// Open `<portable-root>/logs/content/` in the host file manager. Creates the

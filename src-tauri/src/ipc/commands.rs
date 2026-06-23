@@ -154,6 +154,12 @@ pub async fn pty_write(
     tab: TabId,
     input: String,
 ) -> AppResult<()> {
+    // V8-03: the Offload Server tab is read-only — it has no PTY of its own
+    // (its content is the live llama-server output stream), so swallow any
+    // write. Defense-in-depth behind the frontend's read-only guard.
+    if matches!(tab, TabId::OffloadServer) {
+        return Ok(());
+    }
     // Pre-register any TTS markers in the user's input so they don't fire
     // when echoed back by the TUI. Content-based; no per-tab scoping needed.
     // The set stores whitespace-normalized content so a width-driven echo

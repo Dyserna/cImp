@@ -359,6 +359,12 @@ pub async fn close_tab(
     tab: TabId,
 ) -> Result<(), TabLifecycleError> {
     let _serializer = state.lifecycle_serializer.lock().await;
+    // V8-03: the Offload Server tab is never closable (removed only by
+    // disabling offload). Guard explicitly so a hand-edit that clears its
+    // `builtin` flag still can't close it.
+    if matches!(tab, TabId::OffloadServer) {
+        return Err(TabLifecycleError::BuiltinNotClosable);
+    }
     {
         // Snapshot the entry to gate on builtin status. Settings is the
         // canonical builtin marker; the id-based heuristic is a fallback.

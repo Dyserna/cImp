@@ -28,6 +28,12 @@ pub const AIDER_TAB_ID: &str = "aider";
 /// the global `aider_local` provider settings.
 pub const AIDER_LOCAL_TAB_ID: &str = "aider-local";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
+/// V8-03: the read-only, non-closable Offload Server tab. Materialized only
+/// while `offload.enabled` (integrity check), it shows the local
+/// `llama-server`'s live output (model-load progress + logs). Internally a
+/// Shell-kind tab with `builtin: true` (so it can't be closed) and a reserved
+/// id the frontend keys off to render read-only, log-fed content with no PTY.
+pub const OFFLOAD_SERVER_TAB_ID: &str = "offload-server";
 /// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
 /// longer a persistent builtin — it (like rustnet) launches on demand from
 /// the bottom-bar tool buttons into ordinary closable Shell tabs (uuid ids).
@@ -1298,6 +1304,28 @@ pub fn default_ai_tab(id: AiTabId) -> TabConfig {
         AiTabId::Aider => default_aider_tab(),
         AiTabId::AiderLocal => default_aider_local_tab(),
     }
+}
+
+/// V8-03: the read-only Offload Server tab config. A Shell-kind tab with the
+/// reserved id and `builtin: true` so the close `×` is suppressed and
+/// `close_tab` refuses it. `command`/`args` carry the parsed `llama-server`
+/// program for display only — the tab spawns no PTY (the frontend renders its
+/// content from the live `offload-server-output` stream), so they are never
+/// executed here. Materialized/removed by the integrity check per
+/// `offload.enabled`.
+pub fn default_offload_server_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: OFFLOAD_SERVER_TAB_ID.to_string(),
+        builtin: true,
+        name: "Offload Server".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
 }
 
 /// Default Shell-1 entry. Takes the resolved platform default shell so the

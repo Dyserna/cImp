@@ -39,10 +39,10 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
-    default_ai_tab, default_shell_1_tab, AiTabId, LayoutNodePersisted, Settings,
-    TabConfig,
+    default_ai_tab, default_offload_server_tab, default_shell_1_tab, AiTabId,
+    LayoutNodePersisted, Settings, TabConfig,
     AIDER_LOCAL_TAB_ID, AIDER_TAB_ID, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
-    SHELL_DEFAULT_TAB_ID,
+    OFFLOAD_SERVER_TAB_ID, SHELL_DEFAULT_TAB_ID,
 };
 use crate::shell::ShellSpec;
 
@@ -628,6 +628,55 @@ fn canonical_insert_position(tabs: &[TabConfig], id: AiTabId) -> usize {
     pos
 }
 
+/// V8-03: keep the read-only Offload Server tab present iff `offload.enabled`.
+/// Inserts it right after the leading AI builtins (before user shell tabs) when
+/// enabling, removes it when disabling, and re-forces `builtin: true` on a
+/// surviving entry so a hand-edit can't make it closable. Returns `true` if the
+/// tabs array changed.
+fn reconcile_offload_server_tab(settings: &mut Settings) -> bool {
+    let present = settings
+        .tabs
+        .iter()
+        .position(|t| t.id() == OFFLOAD_SERVER_TAB_ID);
+    if settings.offload.enabled {
+        match present {
+            Some(i) => {
+                if !settings.tabs[i].builtin() {
+                    settings.tabs[i].set_builtin(true);
+                    return true;
+                }
+                false
+            }
+            None => {
+                let pos = offload_insert_position(&settings.tabs);
+                settings.tabs.insert(pos, default_offload_server_tab());
+                tracing::info!("integrity: materialized Offload Server tab (offload enabled)");
+                true
+            }
+        }
+    } else if let Some(i) = present {
+        settings.tabs.remove(i);
+        tracing::info!("integrity: removed Offload Server tab (offload disabled)");
+        true
+    } else {
+        false
+    }
+}
+
+/// Insert position for the Offload Server tab: right after the contiguous
+/// leading AI builtins, ahead of any user shell tabs.
+fn offload_insert_position(tabs: &[TabConfig]) -> usize {
+    let mut pos = 0usize;
+    for (idx, tab) in tabs.iter().enumerate() {
+        if AiTabId::from_id(tab.id()).is_some() {
+            pos = idx + 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
 /// All four reserved AI tab ids. Used by the integrity check's "is this
 /// id one of our reserved AI builtins?" loops; a single source of truth
 /// keeps the `ai_builtins` membership check, the `use_local_provider`
@@ -720,6 +769,16 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         changed = true;
     }
     if restore_enabled_ai_builtins(settings) {
+        changed = true;
+    }
+
+    // 4b. V8-03: materialize the read-only Offload Server tab while offload is
+    //     enabled, and remove it otherwise. Runs before the layout sanity pass
+    //     so a freshly-materialized tab is a valid layout id (and the
+    //     frontend's orphan placement drops it into a pane); a removed one is
+    //     pruned from the layout by step 5. Toggling `offload.enabled` takes
+    //     effect on the next launch (like backend autostart / the loopback).
+    if reconcile_offload_server_tab(settings) {
         changed = true;
     }
 
@@ -865,6 +924,40 @@ mod tests {
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
         assert_eq!(s.tabs[1].id(), AIDER_TAB_ID);
         assert_eq!(s.tabs[2].id(), AIDER_LOCAL_TAB_ID);
+    }
+
+    #[test]
+    fn integrity_no_offload_tab_when_disabled() {
+        let mut s = Settings::default(); // offload disabled by default
+        integrity_check(&mut s);
+        assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
+    }
+
+    #[test]
+    fn integrity_materializes_offload_tab_after_ai_builtins() {
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
+        s.offload.enabled = true;
+        integrity_check(&mut s);
+        // Lands right after the two AI builtins, before any shell tab.
+        assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
+        assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
+        assert_eq!(s.tabs[2].id(), OFFLOAD_SERVER_TAB_ID);
+        // Non-closable: builtin flag forced on.
+        assert!(s.tabs[2].builtin());
+    }
+
+    #[test]
+    fn integrity_removes_offload_tab_when_disabled() {
+        let mut s = Settings::default();
+        s.offload.enabled = true;
+        integrity_check(&mut s);
+        assert!(s.tabs.iter().any(|t| t.id() == OFFLOAD_SERVER_TAB_ID));
+        // Disable and re-run: the tab is pruned.
+        s.offload.enabled = false;
+        let changed = integrity_check(&mut s);
+        assert!(changed);
+        assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
     }
 
     #[test]

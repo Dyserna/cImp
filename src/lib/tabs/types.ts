@@ -12,13 +12,26 @@ export type TabId =
   | 'aider-local'
   | (string & {});
 
-/// Type guard for shell tabs — every non-AI-builtin ID is a shell.
+/// V8-03: the reserved id of the read-only Offload Server tab. Internally a
+/// Shell-kind tab, but the frontend keys off this id to render read-only,
+/// log-fed content (no PTY) and suppress shell-tab affordances.
+export const OFFLOAD_SERVER_TAB_ID = 'offload-server';
+
+/// True for the read-only Offload Server tab.
+export function isOffloadTab(id: TabId): boolean {
+  return id === OFFLOAD_SERVER_TAB_ID;
+}
+
+/// Type guard for shell tabs — every non-AI-builtin ID is a shell, EXCEPT the
+/// Offload Server tab, which is read-only and log-fed (it must not get the
+/// shell closed-overlay / restart / keystroke behaviors).
 export function isShellTab(id: TabId): boolean {
   return (
     id !== 'claude' &&
     id !== 'claude-local' &&
     id !== 'aider' &&
-    id !== 'aider-local'
+    id !== 'aider-local' &&
+    id !== OFFLOAD_SERVER_TAB_ID
   );
 }
 

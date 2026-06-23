@@ -51,6 +51,11 @@ pub enum TabId {
     /// tab at spawn time — so this variant carries no template marker.
     Ai(String),
     Shell(String),
+    /// V8-03: the read-only, non-closable Offload Server tab. Shell-kind
+    /// (see [`Self::kind`]) but a distinct, reserved identity so it never
+    /// collides with a user shell and the close guard can refuse it. Renders
+    /// the local `llama-server`'s live output; spawns no PTY of its own.
+    OffloadServer,
 }
 
 impl TabId {
@@ -60,6 +65,7 @@ impl TabId {
             TabId::ClaudeLocal => "claude-local",
             TabId::Aider => "aider",
             TabId::AiderLocal => "aider-local",
+            TabId::OffloadServer => "offload-server",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
         }
@@ -71,6 +77,7 @@ impl TabId {
             "claude-local" => TabId::ClaudeLocal,
             "aider" => TabId::Aider,
             "aider-local" => TabId::AiderLocal,
+            "offload-server" => TabId::OffloadServer,
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
             // `Shell`, so they keep AI-kind behavior on relaunch. The
@@ -94,7 +101,11 @@ impl TabId {
             | TabId::Aider
             | TabId::AiderLocal
             | TabId::Ai(_) => TabKind::AiTool,
-            TabId::Shell(_) => TabKind::Shell,
+            // The Offload Server tab reuses Shell-kind for processing/state
+            // purposes (it never runs a PTY, so this is inert), keeping it off
+            // the per-kind match explosion. Its read-only behavior is keyed
+            // off the reserved id, not the kind.
+            TabId::Shell(_) | TabId::OffloadServer => TabKind::Shell,
         }
     }
 
@@ -107,7 +118,13 @@ impl TabId {
     /// AI-tool kind); keep it in sync with `tabs::registry`'s `is_builtin_id`.
     pub fn is_builtin(&self) -> bool {
         match self {
-            TabId::Claude | TabId::ClaudeLocal | TabId::Aider | TabId::AiderLocal => true,
+            TabId::Claude
+            | TabId::ClaudeLocal
+            | TabId::Aider
+            | TabId::AiderLocal
+            // Non-closable: the Offload Server tab is removed only by
+            // disabling offload, never by the close `×`.
+            | TabId::OffloadServer => true,
             TabId::Shell(_) | TabId::Ai(_) => false,
         }
     }

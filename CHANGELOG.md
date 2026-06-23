@@ -9,13 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Offload server output panel + clearer errors (V8-03).** Settings → Offload now
-  has a read-only **Server output** panel that streams the local `llama-server`'s
-  model-load progress and logs live (cleared on each restart), so you can watch the
-  model load without digging through log files. A Local backend now also requires a
-  genuine llama.cpp server: if something else is serving the port (e.g. an LM Studio
-  instance), it shows a clear **error** with guidance instead of a false "ready"
-  with an unknown context window.
+- **Offload Server tab + clearer errors (V8-03).** When offload is enabled there's
+  now a read-only, non-closable **Offload Server** tab that streams the local
+  `llama-server`'s model-load progress and logs live — keep it open beside your
+  other tabs to watch the model load and processing, instead of being stuck in
+  Settings. (The same output is also available as a panel in Settings → Offload.)
+  A Local backend now also requires a genuine llama.cpp server: if something else is
+  serving the port (e.g. an LM Studio instance), it shows a clear **error** with
+  guidance instead of a false "ready" with an unknown context window. The tab
+  appears/disappears on the next launch after toggling **Enable offload**.
 - **Warm offload pool + MCP host (V8-03).** The offload machinery moves out of the
   per-call `ccimp --offload-mcp` child and into the long-lived ccImp app, which now
   owns the agent loop, the backend pool, the router, and — finally — the **MCP

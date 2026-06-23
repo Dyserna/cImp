@@ -4,7 +4,7 @@
 
 import { writable, type Writable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 /// Mirror of Rust `OffloadState` (serde tag = "state").
 export type OffloadState =
@@ -141,6 +141,26 @@ export async function offloadServiceStatus(): Promise<ServiceStatus | null> {
     console.warn('offload_service_status failed', e);
     return null;
   }
+}
+
+/// V8-03: a captured `llama-server` output line (mirror of Rust `ServerLogLine`).
+export interface ServerLogLine {
+  backend: string;
+  line: string;
+}
+
+/// Buffered server output (model-load progress + logs) for a backend, or the
+/// primary backend when `name` is omitted. The read-only log panel's initial
+/// fill; subscribe to `onOffloadServerOutput` for live lines.
+export async function offloadServerLog(name?: string): Promise<string[]> {
+  return invoke('offload_server_log', { name: name ?? null });
+}
+
+/// Subscribe to live `llama-server` output lines. Returns an unlisten fn.
+export function onOffloadServerOutput(
+  cb: (line: ServerLogLine) => void,
+): Promise<UnlistenFn> {
+  return listen<ServerLogLine>('offload-server-output', (e) => cb(e.payload));
 }
 
 /// One-line summary of an MCP-server health row for the Settings list.

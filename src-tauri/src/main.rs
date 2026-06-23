@@ -36,7 +36,8 @@ use crate::ipc::commands::{
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
     get_system_stats, list_tabs,
     list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
-    offload_server_restart, offload_server_start, offload_server_stop, offload_service_status,
+    offload_server_log, offload_server_restart, offload_server_start, offload_server_stop,
+    offload_service_status,
     offload_status,
     offload_statuses, offload_test, open_settings_window, open_settings_window_to_tab,
     pty_get_scrollback,
@@ -488,6 +489,7 @@ fn main() {
             offload_backend_restart,
             offload_test,
             offload_service_status,
+            offload_server_log,
             theming::themes_list,
             theming::palettes_list,
         ])

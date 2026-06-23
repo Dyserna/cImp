@@ -747,6 +747,17 @@ pub async fn offload_service_status(
     Ok(service.status().await)
 }
 
+/// V8-03: buffered `llama-server` output for a backend (primary when `name`
+/// is omitted) — the read-only Settings log panel's initial fill. Live lines
+/// arrive separately via the `offload-server-output` event.
+#[tauri::command]
+pub async fn offload_server_log(
+    supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
+    name: Option<String>,
+) -> AppResult<Vec<String>> {
+    Ok(supervisor.server_logs(name))
+}
+
 /// Open `<portable-root>/logs/content/` in the host file manager. Creates the
 /// folder first if it doesn't exist so the call doesn't 404 on a clean
 /// install. Windows uses `explorer.exe`; macOS `open`; Linux

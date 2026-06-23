@@ -21,8 +21,8 @@
 //! log). Rendering each as a read-only "Offload Server" tab is still the
 //! tracked follow-up.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -31,6 +31,19 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tracing::{debug, info, warn};
+
+/// Cap on the per-backend captured-output ring buffer (model-load progress +
+/// server logs), enough to cover a load + a good window of runtime, bounded so
+/// a long-lived server can't grow it without limit.
+const MAX_LOG_LINES: usize = 800;
+
+/// One captured `llama-server` output line, emitted live on
+/// `offload-server-output` for the read-only Settings log panel.
+#[derive(Clone, Serialize)]
+struct ServerLogLine {
+    backend: String,
+    line: String,
+}
 
 use crate::error::{AppError, AppResult};
 use crate::settings::{
@@ -102,6 +115,11 @@ pub struct OffloadSupervisor {
     state: RwLock<OffloadState>,
     settings: SettingsHandle,
     app: AppHandle,
+    /// Per-backend captured stdout/stderr ring buffer (keyed by backend
+    /// name), powering the read-only Settings log panel. Cleared on each
+    /// (re)start so the panel shows the fresh model-load output. `Arc` so the
+    /// per-stream drain tasks can append concurrently.
+    logs: Arc<StdMutex<HashMap<String, VecDeque<String>>>>,
 }
 
 /// The enabled Local backends in the configured pool, in order.
@@ -136,7 +154,25 @@ impl OffloadSupervisor {
             state: RwLock::new(initial),
             settings,
             app,
+            logs: Arc::new(StdMutex::new(HashMap::new())),
         })
+    }
+
+    /// Buffered captured output for one backend (or the primary backend when
+    /// `name` is `None`), oldest line first. Drives the read-only Settings
+    /// log panel's initial fill; live lines arrive via `offload-server-output`.
+    pub fn server_logs(&self, name: Option<String>) -> Vec<String> {
+        let key = name.or_else(|| self.primary_name());
+        match key {
+            Some(k) => self
+                .logs
+                .lock()
+                .unwrap()
+                .get(&k)
+                .map(|d| d.iter().cloned().collect())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
     /// The live [`LlamaServer`] handle for a running local backend, or
@@ -320,7 +356,9 @@ impl OffloadSupervisor {
             return Err(AppError::Offload("server_command is empty".into()));
         }
         let cmd = ServerCommand::parse(&command)?;
-        let child = spawn_child(&cmd)?;
+        // Fresh capture buffer per (re)start so the panel shows this load.
+        self.logs.lock().unwrap().remove(name);
+        let child = spawn_child(&cmd, &self.app, name, self.logs.clone())?;
         let server = Arc::new(LlamaServer::with_config(
             &backend.name,
             &command,
@@ -552,9 +590,16 @@ async fn probe_remote(
 }
 
 /// Spawn the `llama-server` child, resolving the program via PATH and
-/// piping its output to the tracing log so load progress is captured.
-/// `kill_on_drop` guarantees no orphan if the supervisor is dropped.
-fn spawn_child(cmd: &ServerCommand) -> AppResult<Child> {
+/// draining its output to both the tracing log and the per-backend capture
+/// ring buffer (which feeds the read-only Settings log panel via the
+/// `offload-server-output` event). `kill_on_drop` guarantees no orphan if
+/// the supervisor is dropped.
+fn spawn_child(
+    cmd: &ServerCommand,
+    app: &AppHandle,
+    backend: &str,
+    logs: Arc<StdMutex<HashMap<String, VecDeque<String>>>>,
+) -> AppResult<Child> {
     let binary = crate::pty::resolve_command(&cmd.program)?;
     let mut command = tokio::process::Command::new(&binary);
     command
@@ -567,23 +612,57 @@ fn spawn_child(cmd: &ServerCommand) -> AppResult<Child> {
         .spawn()
         .map_err(|e| AppError::Spawn(format!("llama-server: {e}")))?;
 
-    // Drain stdout/stderr into the log so they don't fill the OS pipe
-    // buffer and stall the server.
+    // Drain stdout/stderr into the log + capture buffer so they don't fill
+    // the OS pipe buffer and stall the server, and so the panel can show them.
     if let Some(out) = child.stdout.take() {
-        tauri::async_runtime::spawn(log_stream(out, "stdout"));
+        tauri::async_runtime::spawn(log_stream(
+            out,
+            "stdout",
+            app.clone(),
+            backend.to_string(),
+            logs.clone(),
+        ));
     }
     if let Some(err) = child.stderr.take() {
-        tauri::async_runtime::spawn(log_stream(err, "stderr"));
+        tauri::async_runtime::spawn(log_stream(
+            err,
+            "stderr",
+            app.clone(),
+            backend.to_string(),
+            logs,
+        ));
     }
     Ok(child)
 }
 
-async fn log_stream<R>(reader: R, label: &'static str)
-where
+async fn log_stream<R>(
+    reader: R,
+    label: &'static str,
+    app: AppHandle,
+    backend: String,
+    logs: Arc<StdMutex<HashMap<String, VecDeque<String>>>>,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         debug!(target: "offload_server", stream = label, "{line}");
+        // Append to the capped ring buffer for this backend.
+        {
+            let mut guard = logs.lock().unwrap();
+            let buf = guard.entry(backend.clone()).or_default();
+            buf.push_back(line.clone());
+            while buf.len() > MAX_LOG_LINES {
+                buf.pop_front();
+            }
+        }
+        // Push live to the read-only panel (best-effort).
+        let _ = app.emit(
+            "offload-server-output",
+            ServerLogLine {
+                backend: backend.clone(),
+                line,
+            },
+        );
     }
 }

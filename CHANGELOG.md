@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Offload server output panel + clearer errors (V8-03).** Settings → Offload now
+  has a read-only **Server output** panel that streams the local `llama-server`'s
+  model-load progress and logs live (cleared on each restart), so you can watch the
+  model load without digging through log files. A Local backend now also requires a
+  genuine llama.cpp server: if something else is serving the port (e.g. an LM Studio
+  instance), it shows a clear **error** with guidance instead of a false "ready"
+  with an unknown context window.
 - **Warm offload pool + MCP host (V8-03).** The offload machinery moves out of the
   per-call `ccimp --offload-mcp` child and into the long-lived ccImp app, which now
   owns the agent loop, the backend pool, the router, and — finally — the **MCP
@@ -60,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Offload per-slot budget (V8-03).** llama.cpp's `/props` reports the *per-slot*
+  context window (the total `--ctx-size` already divided by `-np`), but ccImp
+  divided by the slot count a second time — so every offload got roughly half its
+  real working window. Fixed; offloads now budget against the full per-slot window.
 - **Cross-backend offload spill now works (V8-03).** Because each per-call
   `--offload-mcp` child was blind to every other in-flight offload, it always
   reported `in_flight == 0`, so V8-02's spill-on-busy and fail-over never fired in

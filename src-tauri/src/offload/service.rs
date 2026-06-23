@@ -222,8 +222,9 @@ impl OffloadService {
             }
         };
 
-        // Resolve + probe the pool from live state.
-        let pool = self.resolve_pool(&snap).await;
+        // Resolve + probe the pool from live state. This is the one path that
+        // may lazy-start a cold Local backend (start-on-first-offload).
+        let pool = self.resolve_pool(&snap, true).await;
         if pool.is_empty() {
             return Err(AppError::OffloadNotReady(
                 "no offload backend is configured — add one in ccImp Settings → Offload".into(),
@@ -338,7 +339,13 @@ impl OffloadService {
     /// Resolve the enabled backend pool from live state: live local handles
     /// from the supervisor (real `in_flight`/`n_ctx`), warm remote handles
     /// from the cache (health-refreshed). Probes concurrently.
-    async fn resolve_pool(&self, snap: &OffloadSettings) -> Vec<PoolEntry> {
+    ///
+    /// `lazy_start` gates the "warm a not-yet-running Local backend" spawn — it
+    /// is `true` only for an actual offload [`run`](Self::run) (the documented
+    /// "start on first offload" behavior when autostart is off), and `false`
+    /// for [`describe`](Self::describe) and the health watcher, which must
+    /// never load a multi-GB model just to report capabilities or poll health.
+    async fn resolve_pool(&self, snap: &OffloadSettings, lazy_start: bool) -> Vec<PoolEntry> {
         let backends: Vec<OffloadBackend> = snap
             .effective_backends()
             .into_iter()
@@ -349,7 +356,7 @@ impl OffloadService {
         for b in &backends {
             match &b.kind {
                 OffloadBackendKind::Local { server_command, .. } => {
-                    if let Some(e) = self.resolve_local(b, server_command).await {
+                    if let Some(e) = self.resolve_local(b, server_command, lazy_start).await {
                         entries.push(e);
                     }
                 }
@@ -379,6 +386,7 @@ impl OffloadService {
         &self,
         b: &OffloadBackend,
         server_command: &str,
+        lazy_start: bool,
     ) -> Option<PoolEntry> {
         if server_command.trim().is_empty() {
             return None;
@@ -407,15 +415,21 @@ impl OffloadService {
             });
         }
 
-        // Not running: warm it for next time, and try a transient handle for
-        // a server the user may have launched themselves.
-        let supervisor = self.supervisor.clone();
-        let name = b.name.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = supervisor.start_backend(&name).await {
-                debug!(backend = %name, error = %e, "offload: lazy start failed");
-            }
-        });
+        // Not running. On an actual offload, warm it for next time (the
+        // "start on first offload" behavior); NEVER from describe()/health
+        // polling, so listing capabilities or a background probe can't load a
+        // multi-GB model the user didn't ask to start.
+        if lazy_start {
+            let supervisor = self.supervisor.clone();
+            let name = b.name.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = supervisor.start_backend(&name).await {
+                    debug!(backend = %name, error = %e, "offload: lazy start failed");
+                }
+            });
+        }
+        // Try a transient handle for a server the user may have launched
+        // themselves (or one already warming from a prior offload).
 
         let transient = Arc::new(
             LlamaServer::with_config(&b.name, server_command, b.tier, b.tool_scope.clone()).ok()?,
@@ -528,7 +542,8 @@ impl OffloadService {
                 .to_string();
         }
 
-        let pool = self.resolve_pool(&snap).await;
+        // describe() must never load a model — capability reporting only.
+        let pool = self.resolve_pool(&snap, false).await;
         let ready_names: Vec<&str> = pool
             .iter()
             .filter(|p| p.ready)
@@ -586,7 +601,8 @@ impl OffloadService {
                     last.clear();
                     continue;
                 }
-                let pool = this.resolve_pool(&snap).await;
+                // Health polling only — must not lazy-start a cold backend.
+                let pool = this.resolve_pool(&snap, false).await;
                 let mut ready: Vec<String> =
                     pool.iter().filter(|p| p.ready).map(|p| p.name.clone()).collect();
                 ready.sort();

@@ -24,13 +24,7 @@
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
   import { listSttModels, listInputDevices } from './lib/stt';
   import {
-    initOffloadStatus,
-    offloadState,
-    offloadServerStart,
-    offloadServerStop,
-    offloadServerRestart,
     offloadTest,
-    describeOffloadState,
     offloadStatuses,
     offloadBackendStart,
     offloadBackendStop,
@@ -38,8 +32,6 @@
     describeBackendStatus,
     offloadServiceStatus,
     describeMcpServerHealth,
-    offloadServerLog,
-    onOffloadServerOutput,
     type BackendStatus,
     type ServiceStatus,
   } from './lib/offload';
@@ -153,29 +145,6 @@
     backendStatusTimer = setInterval(refreshBackendStatuses, 4000);
   }
 
-  // V8-03: read-only llama-server output panel (model-load progress + logs).
-  let showServerLog = $state(false);
-  let serverLog = $state<string[]>([]);
-  let serverLogEl = $state<HTMLElement | null>(null);
-  let serverLogUnlisten: (() => void) | null = null;
-  async function refreshServerLog(): Promise<void> {
-    try {
-      serverLog = await offloadServerLog();
-    } catch (e) {
-      console.warn('offload_server_log failed', e);
-    }
-  }
-  function toggleServerLog(): void {
-    showServerLog = !showServerLog;
-    if (showServerLog) void refreshServerLog();
-  }
-  // Keep the panel pinned to the newest line as output streams in.
-  $effect(() => {
-    serverLog;
-    if (showServerLog && serverLogEl) {
-      serverLogEl.scrollTop = serverLogEl.scrollHeight;
-    }
-  });
   function statusFor(name: string): BackendStatus | undefined {
     return backendStatuses.find((s) => s.name === name);
   }
@@ -394,13 +363,7 @@
   onMount(async () => {
     await initSettings();
     if (disposed) return;
-    void initOffloadStatus();
     startBackendStatusPolling();
-    // Stream live llama-server output for the read-only log panel (cap the
-    // retained tail to match the backend ring buffer).
-    serverLogUnlisten = await onOffloadServerOutput((l) => {
-      serverLog = [...serverLog, l.line].slice(-800);
-    });
     snapshot = structuredClone(get(settings));
     for (const t of AI_TABS) captureBaseline(t);
     unsub = settings.subscribe((s) => {
@@ -456,7 +419,6 @@
     disposed = true;
     unsub?.();
     unlistenDeepLink?.();
-    serverLogUnlisten?.();
     if (backendStatusTimer) clearInterval(backendStatusTimer);
   });
 
@@ -2434,20 +2396,8 @@
           </label>
           <small class="hint">
             When on, ccImp injects the <code>offload_task</code> tool into
-            Claude tabs (re-launch a tab to pick it up).
-          </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.autostart}
-              onchange={(e) =>
-                patch((s) => (s.offload.autostart = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Start the server on launch</span>
-          </label>
-          <small class="hint">
-            Off = the server starts lazily on the first offload (a multi-GB
-            model load never blocks launch).
+            Claude tabs (re-launch a tab to pick it up). Configure your
+            local/remote models in the <strong>Backend pool</strong> below.
           </small>
           <label class="checkbox">
             <input
@@ -2458,54 +2408,6 @@
             />
             <span>Inject offload guidance into the system prompt</span>
           </label>
-
-          <label>
-            <span>Server command</span>
-            <input
-              type="text"
-              value={snapshot.offload.server_command}
-              oninput={(e) =>
-                patch((s) => (s.offload.server_command = (e.currentTarget as HTMLInputElement).value))}
-              placeholder="llama-server --model C:\models\Qwen3.6-35B-A3B-Q4.gguf --port 8080 --jinja -ngl 99 --ctx-size 150000 --flash-attn"
-            />
-            <small class="hint">
-              The single source of truth for the model, GPU layers, context,
-              and host/port. ccImp parses host/port and <code>-np</code> and
-              warns if <code>--jinja</code> is missing (tool-calling needs
-              it). The context window is discovered from the server, never
-              set here.
-            </small>
-          </label>
-
-          <div class="offload-status">
-            <span class="offload-status-label">Server:</span>
-            <span>{describeOffloadState($offloadState)}</span>
-          </div>
-          <div class="button-row">
-            <button
-              type="button"
-              disabled={offloadBusy}
-              onclick={() => runOffloadAction(offloadServerStart)}
-            >
-              Start
-            </button>
-            <button
-              type="button"
-              class="secondary"
-              disabled={offloadBusy}
-              onclick={() => runOffloadAction(offloadServerStop)}
-            >
-              Stop
-            </button>
-            <button
-              type="button"
-              class="secondary"
-              disabled={offloadBusy}
-              onclick={() => runOffloadAction(offloadServerRestart)}
-            >
-              Reset
-            </button>
-          </div>
 
           <label>
             <span>Test offload</span>
@@ -2523,30 +2425,11 @@
               <pre class="offload-test-result">{offloadTestResult}</pre>
             {/if}
           </label>
-
-          <div class="server-log">
-            <button type="button" class="server-log-toggle" onclick={toggleServerLog}>
-              <span class="caret" class:open={showServerLog}>▸</span>
-              Server output {serverLog.length ? `(${serverLog.length} lines)` : ''}
-            </button>
-            {#if showServerLog}
-              <small class="hint">
-                Read-only `llama-server` output (model-load progress + logs) for
-                the primary local backend. Streams live; cleared on each
-                (re)start.
-              </small>
-              <div class="server-log-view" bind:this={serverLogEl}>
-                {#if serverLog.length === 0}
-                  <span class="server-log-empty"
-                    >No output captured yet — Start the local backend (or it
-                    isn't a managed Local server).</span
-                  >
-                {:else}
-                  {#each serverLog as line, i (i)}<div class="server-log-line">{line}</div>{/each}
-                {/if}
-              </div>
-            {/if}
-          </div>
+          <small class="hint">
+            Watch the local model load + server logs live in the read-only
+            <strong>Offload Server</strong> tab (appears when offload is
+            enabled).
+          </small>
 
           <h3>Backend pool</h3>
           <small class="hint top">
@@ -3130,49 +3013,6 @@
   .status-error {
     color: var(--danger, #d08770);
     font-weight: 600;
-  }
-  /* V8-03 read-only server-output log panel */
-  .server-log {
-    margin: 0.6rem 0 0.2rem;
-  }
-  .server-log-toggle {
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    padding: 0.2rem 0;
-    font: inherit;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-  }
-  .server-log-toggle .caret {
-    display: inline-block;
-    transition: transform 0.12s ease;
-  }
-  .server-log-toggle .caret.open {
-    transform: rotate(90deg);
-  }
-  .server-log-view {
-    margin-top: 0.4rem;
-    max-height: 18rem;
-    overflow: auto;
-    background: var(--surface-sunken, #0d1117);
-    border: 1px solid var(--border-subtle);
-    border-radius: 4px;
-    padding: 0.5rem;
-    font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: var(--font-size-sm);
-    line-height: 1.35;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .server-log-line {
-    white-space: pre-wrap;
-  }
-  .server-log-empty {
-    color: var(--text-secondary);
-    font-style: italic;
   }
   .mcp-health {
     list-style: none;

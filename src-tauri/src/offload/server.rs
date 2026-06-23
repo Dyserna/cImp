@@ -14,7 +14,7 @@
 //! its health over HTTP.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -157,6 +157,27 @@ pub struct LlamaServer {
     gate: Arc<Semaphore>,
     /// Short-timeout client for `/health` + `/props` probes.
     client: reqwest::Client,
+    /// Last readiness failure reason (e.g. a non-llama.cpp server squatting
+    /// on the port), surfaced to the Settings status row. `None` when ready
+    /// or never probed.
+    last_error: StdMutex<Option<String>>,
+}
+
+/// Outcome of a `/health` probe — distinguishes a real llama.cpp server from
+/// a non-llama server (LM Studio, vLLM, …) that merely answers HTTP on the
+/// same port. llama.cpp's `/health` always carries a `status` field
+/// (`ok`/`loading model`/`error`); a generic OpenAI server does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HealthProbe {
+    /// llama.cpp reported `{"status":"ok"}` — ready to serve.
+    Ready,
+    /// A real llama.cpp, not yet ready (loading the model / transient error).
+    Loading,
+    /// Reachable + 2xx but NOT llama.cpp (no `status` field) — another app
+    /// owns this port. A hard error, not worth waiting on.
+    NotLlama,
+    /// Unreachable / transport error / non-2xx without a llama status.
+    Down,
 }
 
 impl LlamaServer {
@@ -200,7 +221,38 @@ impl LlamaServer {
             n_ctx: AtomicU32::new(0),
             gate: Arc::new(Semaphore::new(parallel)),
             client,
+            last_error: StdMutex::new(None),
         })
+    }
+
+    /// The last readiness failure reason (e.g. a non-llama.cpp server on the
+    /// port), or `None` when ready / never failed.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().unwrap().clone()
+    }
+
+    /// Probe `/health` and classify the responder (real llama.cpp vs. an
+    /// impostor on the port vs. down).
+    async fn probe_health(&self) -> HealthProbe {
+        let url = format!("{}/health", self.cmd.base_url());
+        let resp = match self.client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => return HealthProbe::Down,
+        };
+        let is_2xx = resp.status().is_success();
+        let body = resp.text().await.unwrap_or_default();
+        let llama_status = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
+        match llama_status.as_deref() {
+            Some("ok") => HealthProbe::Ready,
+            // A real llama.cpp that isn't ready yet (`loading model`, `error`).
+            Some(_) => HealthProbe::Loading,
+            // 2xx but no llama.cpp `status` field → a different server owns
+            // the port; non-2xx without one → just down.
+            None if is_2xx => HealthProbe::NotLlama,
+            None => HealthProbe::Down,
+        }
     }
 
     /// The shared HTTP client (reused for the agent loop's chat calls).
@@ -208,55 +260,88 @@ impl LlamaServer {
         &self.client
     }
 
-    /// Per-request working token budget: `(n_ctx / slots) *
-    /// high_water_pct/100`, reserving headroom for reasoning + the final
-    /// answer. `None` until `n_ctx` is discovered.
+    /// Per-request working token budget: `n_ctx * high_water_pct/100`,
+    /// reserving headroom for reasoning + the final answer. `None` until
+    /// `n_ctx` is discovered.
     ///
-    /// NOTE (validate during impl, milestone risk c): assumes `/props`
-    /// reports the *total* `n_ctx` and divides by `slots`. If a future
-    /// llama.cpp reports per-slot `n_ctx`, drop the division here.
+    /// llama.cpp's `/props` `default_generation_settings.n_ctx` is the
+    /// **per-slot** context (the total `--ctx-size` already divided by
+    /// `-np`), confirmed empirically (`--ctx-size 150000 -np 2` → `/props`
+    /// n_ctx = 75008). So the discovered value *is* each slot's window — do
+    /// **not** divide by `parallel` again (the V8-01 risk-c note resolved).
     pub fn per_slot_budget(&self, high_water_pct: u8) -> Option<u32> {
         let n = self.n_ctx()?;
-        let per_slot = n / self.cmd.parallel.max(1);
-        Some(per_slot.saturating_mul(high_water_pct.min(100) as u32) / 100)
+        Some(n.saturating_mul(high_water_pct.min(100) as u32) / 100)
     }
 
-    /// One `GET /health` probe. `true` iff the server answered 200.
+    /// One `GET /health` probe. `true` iff a **real llama.cpp** server
+    /// answered `{"status":"ok"}` — a non-llama server (LM Studio, …) that
+    /// returns 200 for everything does *not* count as ready.
     pub async fn health_check(&self) -> bool {
-        let url = format!("{}/health", self.cmd.base_url());
-        match self.client.get(&url).send().await {
-            Ok(resp) => {
-                let ok = resp.status().is_success();
-                self.ready.store(ok, Ordering::Relaxed);
-                ok
+        match self.probe_health().await {
+            HealthProbe::Ready => {
+                self.ready.store(true, Ordering::Relaxed);
+                *self.last_error.lock().unwrap() = None;
+                true
             }
-            Err(_) => {
+            HealthProbe::NotLlama => {
+                self.ready.store(false, Ordering::Relaxed);
+                *self.last_error.lock().unwrap() = Some(self.not_llama_message());
+                false
+            }
+            HealthProbe::Loading | HealthProbe::Down => {
                 self.ready.store(false, Ordering::Relaxed);
                 false
             }
         }
     }
 
-    /// Poll `/health` until ready or `timeout` elapses, then read
-    /// `/props` once to cache `n_ctx`. Returns an error (not a hang) if
-    /// the server never reaches ready.
+    /// The error shown when something other than llama.cpp owns the port.
+    fn not_llama_message(&self) -> String {
+        format!(
+            "{} answered /health but is NOT a llama.cpp server. Another app is serving this port \
+             (e.g. LM Studio / Ollama / vLLM). Free the port or point this Local backend at a real \
+             llama-server — or add that server as a Remote backend instead.",
+            self.cmd.base_url()
+        )
+    }
+
+    /// Poll `/health` until a real llama.cpp server is ready or `timeout`
+    /// elapses, then read `/props` once to cache `n_ctx`. Fails **fast** with
+    /// a clear message when a non-llama server owns the port (no point
+    /// waiting), and on timeout otherwise — never hangs.
     pub async fn poll_until_ready(&self, timeout: Duration) -> AppResult<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.health_check().await {
-                if let Err(e) = self.refresh_props().await {
-                    warn!(error = %e, "offload: server healthy but /props read failed");
+            match self.probe_health().await {
+                HealthProbe::Ready => {
+                    self.ready.store(true, Ordering::Relaxed);
+                    *self.last_error.lock().unwrap() = None;
+                    if let Err(e) = self.refresh_props().await {
+                        warn!(error = %e, "offload: server healthy but /props read failed");
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                HealthProbe::NotLlama => {
+                    self.ready.store(false, Ordering::Relaxed);
+                    let msg = self.not_llama_message();
+                    *self.last_error.lock().unwrap() = Some(msg.clone());
+                    return Err(AppError::Offload(msg));
+                }
+                HealthProbe::Loading | HealthProbe::Down => {
+                    self.ready.store(false, Ordering::Relaxed);
+                    if Instant::now() >= deadline {
+                        let msg = format!(
+                            "llama-server at {} did not become healthy within {}s",
+                            self.cmd.base_url(),
+                            timeout.as_secs()
+                        );
+                        *self.last_error.lock().unwrap() = Some(msg.clone());
+                        return Err(AppError::OffloadNotReady(msg));
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
-            if Instant::now() >= deadline {
-                return Err(AppError::OffloadNotReady(format!(
-                    "llama-server at {} did not become healthy within {}s",
-                    self.cmd.base_url(),
-                    timeout.as_secs()
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -312,6 +397,7 @@ impl LlamaServer {
     pub fn mark_stopped(&self) {
         self.ready.store(false, Ordering::Relaxed);
         self.n_ctx.store(0, Ordering::Relaxed);
+        *self.last_error.lock().unwrap() = None;
     }
 }
 
@@ -409,10 +495,11 @@ mod tests {
     }
 
     #[test]
-    fn per_slot_budget_divides_by_parallel() {
+    fn per_slot_budget_uses_props_value_directly() {
         let s = LlamaServer::new("llama-server --jinja -np 4").unwrap();
-        s.n_ctx.store(160_000, Ordering::Relaxed);
-        // 160000 / 4 = 40000, * 80% = 32000
+        // /props reports the PER-SLOT n_ctx already, so don't divide again:
+        // 40000 * 80% = 32000.
+        s.n_ctx.store(40_000, Ordering::Relaxed);
         assert_eq!(s.per_slot_budget(80), Some(32_000));
     }
 }

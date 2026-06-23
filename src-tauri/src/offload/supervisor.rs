@@ -82,6 +82,9 @@ pub struct BackendStatus {
     pub in_flight: u32,
     /// Short tool-scope summary (`"all tools"`, `"web/docs only"`, …).
     pub tool_scope: String,
+    /// A human-readable failure reason when `state == "error"` (e.g. a
+    /// non-llama.cpp server squatting on the port). `None` otherwise.
+    pub error: Option<String>,
 }
 
 /// A live local server: the child handle plus the HTTP view.
@@ -201,16 +204,23 @@ impl OffloadSupervisor {
         let scope = scope_summary(&b.tool_scope, snap);
         match &b.kind {
             OffloadBackendKind::Local { .. } => {
-                let (state, n_ctx, slots, in_flight) = match running.get(&b.name) {
+                let (state, n_ctx, slots, in_flight, error) = match running.get(&b.name) {
                     Some(r) if r.server.is_ready() => (
                         "ready",
                         r.server.n_ctx(),
                         r.server.slots(),
                         r.server.in_flight(),
+                        None,
                     ),
-                    Some(_) => ("starting", None, 0, 0),
-                    None if !b.enabled => ("disabled", None, 0, 0),
-                    None => ("stopped", None, 0, 0),
+                    // Spawned but not ready: surface a recorded failure (e.g.
+                    // a non-llama.cpp server on the port) as an error rather
+                    // than a perpetual "starting".
+                    Some(r) => match r.server.last_error() {
+                        Some(msg) => ("error", None, 0, 0, Some(msg)),
+                        None => ("starting", None, 0, 0, None),
+                    },
+                    None if !b.enabled => ("disabled", None, 0, 0, None),
+                    None => ("stopped", None, 0, 0, None),
                 };
                 BackendStatus {
                     name: b.name.clone(),
@@ -223,6 +233,7 @@ impl OffloadSupervisor {
                     slots,
                     in_flight,
                     tool_scope: scope,
+                    error,
                 }
             }
             OffloadBackendKind::Remote {
@@ -263,6 +274,7 @@ impl OffloadSupervisor {
                     slots: 1,
                     in_flight: 0,
                     tool_scope: scope,
+                    error: None,
                 }
             }
         }

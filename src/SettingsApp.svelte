@@ -2541,7 +2541,7 @@
                 {@const st = statusFor(backend.name)!}
                 <div class="offload-status">
                   <span class="offload-status-label">{st.kind}:</span>
-                  <span>{describeBackendStatus(st)} · {st.tool_scope}</span>
+                  <span class:status-error={st.state === 'error'}>{describeBackendStatus(st)} · {st.tool_scope}</span>
                   {#if st.cloud_blocked}<span class="badge warn">consent required</span>{/if}
                 </div>
               {/if}
@@ -3070,6 +3070,10 @@
   /* V8-03 warm-pool readout + per-MCP-server health */
   .warm-pool {
     color: var(--text-secondary);
+  }
+  .status-error {
+    color: var(--danger, #d08770);
+    font-weight: 600;
   }
   .mcp-health {
     list-style: none;

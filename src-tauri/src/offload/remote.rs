@@ -192,11 +192,13 @@ impl RemoteBackend {
         &self.client
     }
 
-    /// Per-request working token budget: `(n_ctx / slots) * high_water/100`.
+    /// Per-request working token budget: `n_ctx * high_water/100`. A remote
+    /// `llama-server`'s `/props` n_ctx is already per-slot (and `declared_context`
+    /// is a single endpoint's usable window), so — like the Local backend — we
+    /// don't divide by `slots` again.
     pub fn per_slot_budget(&self, high_water_pct: u8) -> Option<u32> {
         let n = self.n_ctx()?;
-        let per_slot = n / self.slots.max(1);
-        Some(per_slot.saturating_mul(high_water_pct.min(100) as u32) / 100)
+        Some(n.saturating_mul(high_water_pct.min(100) as u32) / 100)
     }
 
     /// Acquire one slot, waiting up to `timeout`.
@@ -291,11 +293,12 @@ mod tests {
     }
 
     #[test]
-    fn per_slot_budget_divides_by_declared_slots() {
+    fn per_slot_budget_uses_n_ctx_directly() {
         let b = RemoteBackend::new(
             "lan", "http://x", "", false, BackendTier::Fast, ToolScope::All, Some(16_000), 1,
         )
         .unwrap();
+        // n_ctx is per-slot already → 16000 * 80% = 12800.
         assert_eq!(b.per_slot_budget(80), Some(12_800));
     }
 }

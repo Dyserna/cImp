@@ -55,12 +55,12 @@ pub struct BackendView {
 }
 
 impl BackendView {
-    /// Per-slot working budget `(n_ctx / slots) * high_water/100`, or
-    /// `None` when `n_ctx` is unknown.
+    /// Per-slot working budget `n_ctx * high_water/100`, or `None` when
+    /// `n_ctx` is unknown. The probed `n_ctx` is already per-slot (llama.cpp
+    /// `/props` reports `total / -np`), so it isn't divided by `slots` again.
     pub fn per_slot_budget(&self) -> Option<u32> {
         let n = self.n_ctx?;
-        let per_slot = n / self.slots.max(1);
-        Some(per_slot.saturating_mul(self.budget_high_water_pct.min(100) as u32) / 100)
+        Some(n.saturating_mul(self.budget_high_water_pct.min(100) as u32) / 100)
     }
 
     /// A slot is free right now (spill target).

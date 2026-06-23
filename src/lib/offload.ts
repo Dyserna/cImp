@@ -61,6 +61,9 @@ export interface BackendStatus {
   slots: number;
   in_flight: number;
   tool_scope: string;
+  /// Failure reason when `state === 'error'` (e.g. a non-llama.cpp server on
+  /// the configured port). `null` otherwise.
+  error: string | null;
 }
 
 /// Per-backend status for the whole pool (Local process+health and Remote
@@ -98,7 +101,7 @@ export function describeBackendStatus(s: BackendStatus): string {
     case 'disabled':
       return 'Disabled';
     case 'error':
-      return 'Error';
+      return s.error ? `Error — ${s.error}` : 'Error';
     default:
       return s.state;
   }

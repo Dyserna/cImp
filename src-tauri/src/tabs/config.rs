@@ -237,6 +237,27 @@ fn build_extra_args(
 ///   synthesized env — the user's existing configuration is in charge.
 fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
+
+    // Force Claude Code's classic inline renderer by opting out of the
+    // alternate-screen "fullscreen" TUI (introduced ~v2.1.89). That mode
+    // repaints the whole screen and enables mouse tracking, both of which
+    // break ccImp's core assumption of a linear, append-only output stream:
+    //   - the `[[TTS]]` marker stripper (processing/screen.rs) can't locate
+    //     markers in full-screen repaints, so the literal tags leak into the
+    //     terminal and show up on selection;
+    //   - mouse tracking routes drags/right-clicks to Claude Code, producing
+    //     double paste / double copy-on-select and killing local selection
+    //     (so Ctrl+right-click speak-selection has nothing to read).
+    // Disabling the alternate screen (not just the mouse) is what restores
+    // all four behaviors at once. Set before the per-tab `env` merge below so
+    // a user can still override it per tab.
+    if command_is(&cfg.command, "claude") {
+        env.insert(
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
+            "1".to_string(),
+        );
+    }
+
     if cfg.use_local_provider {
         if command_is(&cfg.command, "claude") {
             let cl = &settings.claude_local;
@@ -390,5 +411,42 @@ mod tests {
         settings.offload.enabled = true;
         let args = build_pre_args(&aider_cfg(), &settings);
         assert!(args.is_empty(), "aider must get no pre-args, got: {args:?}");
+    }
+
+    #[test]
+    fn disables_claude_fullscreen_renderer() {
+        let settings = Settings::default();
+        let env = compose_ai_env(&claude_cfg(), &settings);
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN").map(String::as_str),
+            Some("1"),
+            "every Claude tab must opt out of the fullscreen renderer",
+        );
+    }
+
+    #[test]
+    fn fullscreen_optout_is_claude_only() {
+        let settings = Settings::default();
+        let env = compose_ai_env(&aider_cfg(), &settings);
+        assert!(
+            !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            "Aider doesn't understand the Claude fullscreen flag",
+        );
+    }
+
+    #[test]
+    fn per_tab_env_overrides_fullscreen_optout() {
+        let settings = Settings::default();
+        let mut cfg = claude_cfg();
+        cfg.env.insert(
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
+            "0".to_string(),
+        );
+        let env = compose_ai_env(&cfg, &settings);
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN").map(String::as_str),
+            Some("0"),
+            "an explicit per-tab value must win over the synthesized default",
+        );
     }
 }

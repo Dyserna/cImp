@@ -5,7 +5,7 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.16.0] — 2026-06-24
 
 ### Added
 
@@ -84,6 +84,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service sees all in-flight offloads across every Claude tab and feeds the router
   honest counts, so a busy backend now spills to a free one (and a full pool queues
   coherently behind the global gate) as designed.
+- **Claude Code fullscreen renderer disabled.** Recent Claude Code versions default
+  to an alternate-screen "fullscreen" TUI that repaints the whole screen and enables
+  mouse tracking — both break ccImp's core assumption of a linear, append-only output
+  stream. The result was leaked literal `[[TTS]]` markers (visible on select), double
+  paste and double copy-on-select, and a dead Ctrl+right-click speak-selection. ccImp
+  now forces the classic inline renderer by setting
+  `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` for every Claude tab (overridable via per-tab
+  env), restoring all four behaviors.
 
 ## [0.15.0] — 2026-06-20
 

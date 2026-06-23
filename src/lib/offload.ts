@@ -187,6 +187,7 @@ export interface ServerMetrics {
   slots: SlotMetric[];
   kv_cache_pct: number | null;
   predicted_tps: number | null;
+  prompt_tps: number | null;
   requests_deferred: number | null;
   aggregate_tps: number;
   global_in_flight: number;

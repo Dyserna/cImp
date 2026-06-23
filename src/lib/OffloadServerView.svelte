@@ -96,9 +96,16 @@
         </div>
 
         <div class="stat">
-          <span class="label">Throughput</span>
+          <span class="label">Generation</span>
           <span class="value strong">{fmtTps(throughput)}</span>
         </div>
+
+        {#if metrics.prompt_tps != null}
+          <div class="stat">
+            <span class="label">Prefill</span>
+            <span class="value">{fmtTps(metrics.prompt_tps)}</span>
+          </div>
+        {/if}
 
         {#if metrics.kv_cache_pct != null}
           <div class="stat">
@@ -106,15 +113,21 @@
             <div class="bar"><div class="fill ctx" style="width:{clampPct(metrics.kv_cache_pct)}%"></div></div>
             <span class="value">{Math.round(metrics.kv_cache_pct)}%</span>
           </div>
-        {:else}
+        {:else if !metrics.metrics_available}
           <div class="stat">
             <span class="label">Context</span>
-            <span class="value muted" title="Add --metrics to your server command for the true context-fill %">
-              add <code>--metrics</code> for %
+            <span class="value muted" title="Add --metrics to your server command for queue depth, throughput, and context %">
+              add <code>--metrics</code>
             </span>
           </div>
         {/if}
       </div>
+      {#if metrics.metrics_available && metrics.kv_cache_pct == null}
+        <div class="note">
+          Context-fill % isn't exposed by this llama.cpp build — the per-slot
+          bars below show generated tokens vs the slot window.
+        </div>
+      {/if}
     </div>
 
     <div class="slots">
@@ -124,7 +137,7 @@
           <span class="slot-state">
             {#if slot.processing}<span class="dot on pulse"></span> generating{:else}<span class="dot idle"></span> idle{/if}
           </span>
-          <span class="slot-tok">{slot.n_decoded.toLocaleString()} tok</span>
+          <span class="slot-tok">{slot.n_decoded.toLocaleString()} / {slot.n_ctx.toLocaleString()}</span>
           <span class="slot-tps">{slot.processing ? fmtTps(slot.tps) : ''}</span>
           <div class="bar slim">
             {#if slot.n_ctx > 0}
@@ -251,7 +264,7 @@
   }
   .slot {
     display: grid;
-    grid-template-columns: 4rem 8rem 6rem 6rem 1fr;
+    grid-template-columns: 3.5rem 7.5rem 9rem 5.5rem 1fr;
     align-items: center;
     gap: 0.5rem;
     padding: 0.3rem 0.5rem;
@@ -337,6 +350,12 @@
   .muted {
     color: var(--text-secondary, #8b949e);
     font-weight: 400;
+  }
+  .note {
+    margin-top: 0.5rem;
+    font-size: 0.85em;
+    color: var(--text-tertiary, #6e7681);
+    font-style: italic;
   }
   .rawlog {
     margin-top: 0.6rem;

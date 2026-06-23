@@ -64,11 +64,15 @@ pub struct ServerMetrics {
     /// from `/slots`).
     pub busy_slots: u32,
     pub slots: Vec<SlotMetric>,
-    /// True context fill 0–100 (`/metrics` `kv_cache_usage_ratio`); `None`
-    /// without `--metrics`.
+    /// True context fill 0–100 (`/metrics` `kv_cache_usage_ratio`). `None`
+    /// when `/metrics` is off *or* the server build doesn't expose that gauge
+    /// (many don't) — distinguish via `metrics_available`.
     pub kv_cache_pct: Option<f32>,
     /// Server-computed generation throughput (`/metrics`); `None` without it.
     pub predicted_tps: Option<f32>,
+    /// Server-computed prompt/prefill throughput (`/metrics`
+    /// `prompt_tokens_seconds`); `None` without it.
+    pub prompt_tps: Option<f32>,
     /// Server-side queued requests (`/metrics` `requests_deferred`); `None`
     /// without `--metrics`.
     pub requests_deferred: Option<u32>,
@@ -95,6 +99,7 @@ impl ServerMetrics {
             slots: Vec::new(),
             kv_cache_pct: None,
             predicted_tps: None,
+            prompt_tps: None,
             requests_deferred: None,
             aggregate_tps: 0.0,
             global_in_flight,
@@ -193,18 +198,18 @@ impl MetricsPoller {
         // /metrics — richer, only with --metrics.
         let metrics_text = self.get_text(base_url, "/metrics").await;
         let metrics_available = metrics_text.is_some();
-        let (kv_cache_pct, predicted_tps, requests_deferred, m_processing) =
-            parse_metrics(metrics_text.as_deref());
+        let parsed = parse_metrics(metrics_text.as_deref());
 
         ServerMetrics {
             running: true,
             total_slots,
             n_ctx_per_slot: n_ctx,
-            busy_slots: m_processing.unwrap_or(busy),
+            busy_slots: parsed.requests_processing.unwrap_or(busy),
             slots,
-            kv_cache_pct,
-            predicted_tps,
-            requests_deferred,
+            kv_cache_pct: parsed.kv_cache_pct,
+            predicted_tps: parsed.predicted_tps,
+            prompt_tps: parsed.prompt_tps,
+            requests_deferred: parsed.requests_deferred,
             aggregate_tps,
             global_in_flight,
             global_cap,
@@ -316,16 +321,24 @@ fn slot_decoded(s: &Value) -> u32 {
         .unwrap_or(0) as u32
 }
 
-/// Parse the Prometheus `/metrics` text for the four gauges we surface.
-/// Returns `(kv_cache_pct, predicted_tps, requests_deferred, requests_processing)`.
-fn parse_metrics(text: Option<&str>) -> (Option<f32>, Option<f32>, Option<u32>, Option<u32>) {
+/// The gauges we surface from `/metrics`. All optional — `--metrics` may be
+/// off, and not every llama.cpp build exposes every gauge (notably
+/// `kv_cache_usage_ratio` is absent in several builds).
+#[derive(Default)]
+struct ParsedMetrics {
+    kv_cache_pct: Option<f32>,
+    predicted_tps: Option<f32>,
+    prompt_tps: Option<f32>,
+    requests_deferred: Option<u32>,
+    requests_processing: Option<u32>,
+}
+
+/// Parse the Prometheus `/metrics` text for the gauges we surface.
+fn parse_metrics(text: Option<&str>) -> ParsedMetrics {
+    let mut out = ParsedMetrics::default();
     let Some(text) = text else {
-        return (None, None, None, None);
+        return out;
     };
-    let mut kv = None;
-    let mut tps = None;
-    let mut deferred = None;
-    let mut processing = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -339,14 +352,15 @@ fn parse_metrics(text: Option<&str>) -> (Option<f32>, Option<f32>, Option<u32>, 
             continue;
         };
         match key {
-            "llamacpp:kv_cache_usage_ratio" => kv = Some((val * 100.0) as f32),
-            "llamacpp:predicted_tokens_seconds" => tps = Some(val as f32),
-            "llamacpp:requests_deferred" => deferred = Some(val.max(0.0) as u32),
-            "llamacpp:requests_processing" => processing = Some(val.max(0.0) as u32),
+            "llamacpp:kv_cache_usage_ratio" => out.kv_cache_pct = Some((val * 100.0) as f32),
+            "llamacpp:predicted_tokens_seconds" => out.predicted_tps = Some(val as f32),
+            "llamacpp:prompt_tokens_seconds" => out.prompt_tps = Some(val as f32),
+            "llamacpp:requests_deferred" => out.requests_deferred = Some(val.max(0.0) as u32),
+            "llamacpp:requests_processing" => out.requests_processing = Some(val.max(0.0) as u32),
             _ => {}
         }
     }
-    (kv, tps, deferred, processing)
+    out
 }
 
 /// Current wall-clock as epoch millis (formatted on the frontend).
@@ -379,19 +393,27 @@ mod tests {
                     llamacpp:predicted_tokens_seconds 82.5\n\
                     llamacpp:requests_processing 1\n\
                     llamacpp:requests_deferred 3\n";
-        let (kv, tps, deferred, processing) = parse_metrics(Some(text));
-        assert_eq!(kv, Some(31.0));
-        assert_eq!(tps, Some(82.5));
-        assert_eq!(deferred, Some(3));
-        assert_eq!(processing, Some(1));
+        let m = parse_metrics(Some(text));
+        assert_eq!(m.kv_cache_pct, Some(31.0));
+        assert_eq!(m.predicted_tps, Some(82.5));
+        assert_eq!(m.requests_deferred, Some(3));
+        assert_eq!(m.requests_processing, Some(1));
     }
 
     #[test]
     fn parse_metrics_handles_labels_and_absence() {
-        assert_eq!(parse_metrics(None), (None, None, None, None));
-        let labelled = "llamacpp:requests_processing{model=\"x\"} 2\n";
-        let (_, _, _, p) = parse_metrics(Some(labelled));
-        assert_eq!(p, Some(2));
+        let none = parse_metrics(None);
+        assert!(none.kv_cache_pct.is_none() && none.requests_processing.is_none());
+        // A build without kv_cache_usage_ratio (e.g. the user's) still yields
+        // the other gauges; kv stays None.
+        let real = "llamacpp:predicted_tokens_seconds 156.6\n\
+                    llamacpp:prompt_tokens_seconds 5188.2\n\
+                    llamacpp:requests_processing{model=\"x\"} 2\n";
+        let m = parse_metrics(Some(real));
+        assert_eq!(m.requests_processing, Some(2));
+        assert_eq!(m.predicted_tps, Some(156.6));
+        assert_eq!(m.prompt_tps, Some(5188.2));
+        assert!(m.kv_cache_pct.is_none());
     }
 
     #[test]

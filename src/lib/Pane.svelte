@@ -23,7 +23,8 @@
   import TabBar from './TabBar.svelte';
   import TabErrorOverlay from './TabErrorOverlay.svelte';
   import ClosedShellOverlay from './ClosedShellOverlay.svelte';
-  import { isShellTab, type TabId } from './tabs/types';
+  import OffloadServerView from './OffloadServerView.svelte';
+  import { isShellTab, isOffloadTab, type TabId } from './tabs/types';
   import { tabs } from './tabs/store';
   import type { LayoutNode, PaneNode } from './layout/types';
 
@@ -154,9 +155,13 @@
   <div class="pane-content">
     <div class="terminal-slot" bind:this={slotEl}></div>
     {#if pane.active_tab_id !== null}
-      <TabErrorOverlay tabId={pane.active_tab_id} onretry={handleRetry} />
-      {#if isShellTab(pane.active_tab_id)}
-        <ClosedShellOverlay tabId={pane.active_tab_id} />
+      {#if isOffloadTab(pane.active_tab_id)}
+        <OffloadServerView />
+      {:else}
+        <TabErrorOverlay tabId={pane.active_tab_id} onretry={handleRetry} />
+        {#if isShellTab(pane.active_tab_id)}
+          <ClosedShellOverlay tabId={pane.active_tab_id} />
+        {/if}
       {/if}
     {/if}
   </div>

@@ -163,6 +163,55 @@ export function onOffloadServerOutput(
   return listen<ServerLogLine>('offload-server-output', (e) => cb(e.payload));
 }
 
+/// V8-03: Offload Server dashboard snapshot (mirror of Rust `ServerMetrics`).
+export interface SlotMetric {
+  id: number;
+  processing: boolean;
+  n_decoded: number;
+  n_ctx: number;
+  tps: number | null;
+}
+export interface RequestRecord {
+  slot: number;
+  start_ms: number;
+  end_ms: number;
+  duration_s: number;
+  tokens: number;
+  avg_tps: number;
+}
+export interface ServerMetrics {
+  running: boolean;
+  total_slots: number;
+  n_ctx_per_slot: number | null;
+  busy_slots: number;
+  slots: SlotMetric[];
+  kv_cache_pct: number | null;
+  predicted_tps: number | null;
+  requests_deferred: number | null;
+  aggregate_tps: number;
+  global_in_flight: number;
+  global_cap: number;
+  metrics_available: boolean;
+  history: RequestRecord[];
+}
+
+/// Latest dashboard snapshot (initial fill). `null` before the first poll.
+export async function offloadServerMetrics(): Promise<ServerMetrics | null> {
+  try {
+    return await invoke<ServerMetrics | null>('offload_server_metrics');
+  } catch (e) {
+    console.warn('offload_server_metrics failed', e);
+    return null;
+  }
+}
+
+/// Subscribe to live dashboard snapshots. Returns an unlisten fn.
+export function onOffloadServerMetrics(
+  cb: (m: ServerMetrics) => void,
+): Promise<UnlistenFn> {
+  return listen<ServerMetrics>('offload-server-metrics', (e) => cb(e.payload));
+}
+
 /// One-line summary of an MCP-server health row for the Settings list.
 export function describeMcpServerHealth(s: McpServerHealth): string {
   if (s.healthy) {

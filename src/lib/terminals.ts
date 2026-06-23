@@ -66,7 +66,6 @@ import { perTabClosedState } from './avatarState';
 import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
 import { isShellTab, isOffloadTab, type TabId } from './tabs/types';
-import { offloadServerLog, onOffloadServerOutput } from './offload';
 
 const OFFSCREEN_ID = 'terminal-offscreen';
 
@@ -150,9 +149,6 @@ interface TerminalEntry {
   /// to a fresh Channel because the Tauri bridge can only target one
   /// receiver per channel.
   bytesChannel: BytesChannel;
-  /// V8-03: unsubscribe for the Offload Server tab's live log feed
-  /// (`offload-server-output`). Null for every PTY-backed tab.
-  unsubServerLog: (() => void) | null;
 }
 
 const entries = new Map<TabId, TerminalEntry>();
@@ -173,9 +169,6 @@ async function ensureModuleListeners(): Promise<void> {
     await onPtyExit((payload) => {
       const entry = entries.get(payload.tab as TabId);
       if (!entry) return;
-      // The Offload Server tab has no PTY, so a pty-exit can't be for it;
-      // guard anyway so it never gets the error overlay.
-      if (isOffloadTab(entry.tabId)) return;
       entry.term.write(`\r\n[${entry.tabId} exited: ${payload.exit}]\r\n`);
       if (isShellTab(entry.tabId)) return;
       setTabError(entry.tabId, {
@@ -232,9 +225,6 @@ function hostIsFittable(entry: TerminalEntry): boolean {
 function fitAndResize(entry: TerminalEntry): void {
   if (!hostIsFittable(entry)) return;
   entry.fitAddon.fit();
-  // V8-03: the Offload Server tab has no PTY — fit the xterm grid to the
-  // pane, but there's no child to send a SIGWINCH to.
-  if (isOffloadTab(entry.tabId)) return;
   const { rows, cols } = entry.term;
   ptyResize(entry.tabId, rows, cols).catch((e) =>
     console.error('pty_resize failed:', e),
@@ -330,6 +320,9 @@ export function createTerminal(
   } = {},
 ): void {
   if (entries.has(tabId)) return;
+  // V8-03: the Offload Server tab renders a Svelte dashboard
+  // (OffloadServerView) instead of an xterm — no terminal entry for it.
+  if (isOffloadTab(tabId)) return;
 
   const offscreen = ensureOffscreen();
 
@@ -364,9 +357,6 @@ export function createTerminal(
     cursorBlink: true,
     allowProposedApi: true,
     theme: initialTheme,
-    // V8-03: the Offload Server tab is a read-only viewer (no PTY) — disable
-    // stdin and the cursor so it reads as an output log, not an input shell.
-    ...(isOffloadTab(tabId) ? { disableStdin: true, cursorBlink: false } : {}),
     // V1.4-02: image mode requires transparency so the CSS image
     // beneath the cells layer is visible. Color-only and 'none' modes
     // skip this so the canvas renderer paints opaque cells (faster).
@@ -421,7 +411,6 @@ export function createTerminal(
     resizeObserver: null,
     attached: false,
     bytesChannel: placeholderChannel,
-    unsubServerLog: null,
   };
   entries.set(tabId, entry);
   // Idempotent: only the first call actually registers. Run it from
@@ -552,8 +541,6 @@ export function createTerminal(
   });
 
   term.onData((data) => {
-    // V8-03: the Offload Server tab is read-only — never forward input.
-    if (isOffloadTab(tabId)) return;
     if (entry.isClosed) {
       // Shell-tab closed-state intercept. Enter routes to Configure
       // when the close was a launch failure (closed_message set —
@@ -601,47 +588,12 @@ export function createTerminal(
   // V1.4-03: route to the right spawn mode. `rebindPty` and
   // `restartPty` are mutually exclusive (the former is the renderer-flip
   // recreate, the latter is the user-initiated Restart action).
-  // V8-03: the Offload Server tab has no PTY — it renders the live
-  // llama-server output stream instead of spawning a child.
-  if (isOffloadTab(tabId)) {
-    void startServerLogFeed(entry);
-    return;
-  }
-
   const spawnMode: SpawnMode = options.rebindPty
     ? 'rebind'
     : options.restartPty
       ? 'restart'
       : 'start';
   void attemptSpawn(entry, spawnMode);
-}
-
-/// V8-03: fill the Offload Server tab's xterm with the buffered llama-server
-/// output, then tail it live via `offload-server-output`. Read-only — no PTY,
-/// no input. The buffer fetch covers output produced before the tab opened
-/// (e.g. a model load that finished while the user was elsewhere).
-async function startServerLogFeed(entry: TerminalEntry): Promise<void> {
-  const { term } = entry;
-  term.write('\x1b[90m── Offload Server — live llama-server output ──\x1b[0m\r\n');
-  try {
-    const lines = await offloadServerLog();
-    if (lines.length === 0) {
-      term.write(
-        '\x1b[90m(no output yet — Start the local backend in Settings → Offload)\x1b[0m\r\n',
-      );
-    } else {
-      for (const l of lines) term.write(l + '\r\n');
-    }
-  } catch (e) {
-    console.warn('offload_server_log fetch failed:', e);
-  }
-  try {
-    entry.unsubServerLog = await onOffloadServerOutput((l) => {
-      entry.term.write(l.line + '\r\n');
-    });
-  } catch (e) {
-    console.warn('offload-server-output subscribe failed:', e);
-  }
 }
 
 /// V1.4-02 recreate-on-toggle debounce. A category flip
@@ -751,7 +703,6 @@ export function destroyTerminal(tabId: TabId): void {
   entry.unsubFont();
   entry.unsubClosed?.();
   entry.unsubAppearance();
-  entry.unsubServerLog?.();
   entry.selectionListener?.dispose();
   setTerminalFocuser(tabId, null);
   // xterm.dispose() can throw if internal state was already partially

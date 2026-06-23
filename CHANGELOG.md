@@ -9,11 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Offload Server tab + clearer errors (V8-03).** When offload is enabled there's
-  now a read-only, non-closable **Offload Server** tab that streams the local
-  `llama-server`'s model-load progress and logs live — keep it open beside your
-  other tabs to watch the model load and processing, instead of being stuck in
-  Settings. (The same output is also available as a panel in Settings → Offload.)
+- **Offload Server dashboard tab + clearer errors (V8-03).** When offload is enabled
+  there's now a read-only, non-closable **Offload Server** tab with a live
+  **dashboard** of the local `llama-server`: slots busy/total, queue depth,
+  throughput (tokens/sec), context-fill %, a per-slot row with live token counts +
+  tokens/sec + progress bars, and a request **history** (start/end, duration,
+  tokens, avg speed) — plus the raw server log tucked into a collapsible section.
+  It polls the server's `/slots` and `/metrics` endpoints rather than scraping log
+  text; add `--metrics` to your server command for the true context-fill %, the
+  server-side queue depth, and server-computed throughput.
   A Local backend now also requires a genuine llama.cpp server: if something else is
   serving the port (e.g. an LM Studio instance), it shows a clear **error** with
   guidance instead of a false "ready" with an unknown context window. The tab

@@ -23,9 +23,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use tauri::{AppHandle, Emitter};
 use tokio::sync::{broadcast, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
@@ -36,6 +37,7 @@ use crate::settings::{
 
 use super::agent::{self, AgentConfig, HostRouter, OffloadTask, ThinkingMode};
 use super::mcp_host::{McpHost, McpServerHealth};
+use super::metrics::{MetricsPoller, ServerMetrics};
 use super::remote::RemoteBackend;
 use super::router::{self, BackendView, RouteError, TierHint};
 use super::server::{LlamaServer, ServerCommand};
@@ -103,13 +105,22 @@ pub struct OffloadService {
     client: reqwest::Client,
     /// Capability-change pulses relayed to the loopback `/events` stream.
     change_tx: broadcast::Sender<()>,
+    /// For emitting the `offload-server-metrics` dashboard event.
+    app: AppHandle,
+    /// Latest dashboard snapshot (initial fill for the IPC; the poller pushes
+    /// live ones via the event).
+    latest_metrics: StdMutex<Option<ServerMetrics>>,
 }
 
 impl OffloadService {
     /// Construct the service. Sizes the global gate from config (or the
     /// explicit `global_concurrency` override) and wires the MCP host's
     /// change channel into the service's own.
-    pub fn new(settings: SettingsHandle, supervisor: Arc<OffloadSupervisor>) -> Arc<Self> {
+    pub fn new(
+        app: AppHandle,
+        settings: SettingsHandle,
+        supervisor: Arc<OffloadSupervisor>,
+    ) -> Arc<Self> {
         let snap = settings.current().offload;
         let global_cap = compute_global_cap(&snap);
         let client = reqwest::Client::builder()
@@ -128,6 +139,8 @@ impl OffloadService {
             remote_pool: TokioMutex::new(HashMap::new()),
             client,
             change_tx,
+            app,
+            latest_metrics: StdMutex::new(None),
         });
 
         // Relay MCP-host change pulses into the service change channel so a
@@ -584,6 +597,60 @@ impl OffloadService {
     /// Tear down the warm pool (app exit / disable).
     pub async fn shutdown(&self) {
         self.host.shutdown().await;
+    }
+
+    /// The latest dashboard snapshot (initial fill for the Offload Server
+    /// tab; live updates arrive via the `offload-server-metrics` event).
+    pub fn server_metrics(&self) -> Option<ServerMetrics> {
+        self.latest_metrics.lock().unwrap().clone()
+    }
+
+    /// The running `LlamaServer` handle for the primary (first enabled) Local
+    /// backend, if it's up — the dashboard's poll target.
+    async fn primary_local_server(&self, snap: &OffloadSettings) -> Option<Arc<LlamaServer>> {
+        let name = snap
+            .effective_backends()
+            .into_iter()
+            .find(|b| b.enabled && matches!(b.kind, OffloadBackendKind::Local { .. }))
+            .map(|b| b.name)?;
+        self.supervisor.running_server(&name).await
+    }
+
+    /// Spawn the Offload Server dashboard poller: every ~600ms, poll the
+    /// primary local backend's `/slots` (+ `/metrics`), fold into a snapshot,
+    /// cache it, and emit `offload-server-metrics`. Emits an "offline"
+    /// snapshot when no local backend is running.
+    pub fn spawn_metrics_poller(self: &Arc<Self>) {
+        let this = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut poller = MetricsPoller::new();
+            loop {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let snap = this.settings.current().offload;
+                let in_flight = this.global_in_flight();
+                let cap = this.global_cap;
+                let metrics = if snap.enabled {
+                    match this.primary_local_server(&snap).await {
+                        Some(server) if server.is_ready() => {
+                            poller
+                                .poll(
+                                    &server.base_url(),
+                                    server.slots(),
+                                    server.n_ctx(),
+                                    in_flight,
+                                    cap,
+                                )
+                                .await
+                        }
+                        _ => ServerMetrics::offline(in_flight, cap),
+                    }
+                } else {
+                    ServerMetrics::offline(in_flight, cap)
+                };
+                *this.latest_metrics.lock().unwrap() = Some(metrics.clone());
+                let _ = this.app.emit("offload-server-metrics", &metrics);
+            }
+        });
     }
 
     /// Spawn a lightweight health watcher: periodically re-resolves the pool

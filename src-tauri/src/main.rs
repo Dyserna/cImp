@@ -36,7 +36,8 @@ use crate::ipc::commands::{
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
     get_system_stats, list_tabs,
     list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
-    offload_server_log, offload_server_restart, offload_server_start, offload_server_stop,
+    offload_server_log, offload_server_metrics, offload_server_restart, offload_server_start,
+    offload_server_stop,
     offload_service_status,
     offload_status,
     offload_statuses, offload_test, open_settings_window, open_settings_window_to_tab,
@@ -368,6 +369,7 @@ fn main() {
                 // the heavy machinery (warm host, loopback endpoint, health
                 // watch) only spins up when offload is enabled.
                 let service = crate::offload::OffloadService::new(
+                    app.handle().clone(),
                     settings_for_offload.clone(),
                     supervisor.clone(),
                 );
@@ -388,6 +390,8 @@ fn main() {
                     tauri::async_runtime::spawn(async move {
                         svc.warm_host().await;
                         svc.spawn_health_watch();
+                        // V8-03: Offload Server dashboard metrics poller.
+                        svc.spawn_metrics_poller();
                         match crate::offload::loopback::Loopback::start(svc.clone()).await {
                             Ok(lb) => {
                                 app_handle.manage(lb);
@@ -490,6 +494,7 @@ fn main() {
             offload_test,
             offload_service_status,
             offload_server_log,
+            offload_server_metrics,
             theming::themes_list,
             theming::palettes_list,
         ])

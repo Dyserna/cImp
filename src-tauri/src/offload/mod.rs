@@ -29,6 +29,7 @@ pub mod agent;
 pub mod loopback;
 pub mod mcp;
 pub mod mcp_host;
+pub mod metrics;
 pub mod openai;
 pub mod remote;
 pub mod router;

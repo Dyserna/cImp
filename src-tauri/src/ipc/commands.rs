@@ -764,6 +764,17 @@ pub async fn offload_server_log(
     Ok(supervisor.server_logs(name))
 }
 
+/// V8-03: latest Offload Server dashboard snapshot (slots, throughput, queue,
+/// context, request history) — the initial fill for the dashboard. Live
+/// updates arrive via the `offload-server-metrics` event. `None` before the
+/// first poll.
+#[tauri::command]
+pub async fn offload_server_metrics(
+    service: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
+) -> AppResult<Option<crate::offload::metrics::ServerMetrics>> {
+    Ok(service.server_metrics())
+}
+
 /// Open `<portable-root>/logs/content/` in the host file manager. Creates the
 /// folder first if it doesn't exist so the call doesn't 404 on a clean
 /// install. Windows uses `explorer.exe`; macOS `open`; Linux

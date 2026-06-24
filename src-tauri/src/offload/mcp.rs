@@ -526,10 +526,12 @@ impl ResolvedBackend {
     }
 }
 
-/// Health-probe one resolved backend: `(ready, discovered_or_declared_n_ctx)`.
-/// For a cloud endpoint (often no `/health`), any HTTP response counts as
-/// reachable; a LAN llama-server must answer `/health` 2xx.
-async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u32>) {
+/// Health-probe one resolved backend: `(ready, n_ctx, slots)`. `n_ctx` is the
+/// discovered-or-declared window; `slots` is the `/props` `total_slots` when
+/// the endpoint reports it (a llama-server does), else the backend's declared
+/// count. For a cloud endpoint (often no `/health`), any HTTP response counts
+/// as reachable; a LAN llama-server must answer `/health` 2xx.
+async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u32>, u32) {
     let health = client
         .get(format!("{}/health", b.base_url))
         .timeout(Duration::from_secs(5));
@@ -542,9 +544,10 @@ async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u
         Err(_) => false,
     };
     if !ready {
-        return (false, b.declared_context);
+        return (false, b.declared_context, b.slots);
     }
-    // Best-effort /props for the authoritative window; fall back to declared.
+    // Best-effort /props for the authoritative window + slot count; fall back
+    // to declared values.
     let props = client
         .get(format!("{}/props", b.base_url))
         .timeout(Duration::from_secs(5));
@@ -552,22 +555,26 @@ async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u
         Some(t) => props.bearer_auth(t),
         None => props,
     };
-    let n_ctx = match props.send().await {
-        Ok(r) if r.status().is_success() => r
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|v| {
-                v.get("default_generation_settings")
-                    .and_then(|g| g.get("n_ctx"))
-                    .and_then(|x| x.as_u64())
-                    .or_else(|| v.get("n_ctx").and_then(|x| x.as_u64()))
-            })
-            .map(|n| n as u32)
-            .or(b.declared_context),
-        _ => b.declared_context,
+    let body: Option<Value> = match props.send().await {
+        Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
+        _ => None,
     };
-    (ready, n_ctx)
+    let n_ctx = body
+        .as_ref()
+        .and_then(|v| {
+            v.get("default_generation_settings")
+                .and_then(|g| g.get("n_ctx"))
+                .and_then(|x| x.as_u64())
+                .or_else(|| v.get("n_ctx").and_then(|x| x.as_u64()))
+        })
+        .map(|n| n as u32)
+        .or(b.declared_context);
+    let slots = body
+        .as_ref()
+        .and_then(|v| v.get("total_slots").and_then(|x| x.as_u64()))
+        .map(|n| (n as u32).max(1))
+        .unwrap_or(b.slots);
+    (ready, n_ctx, slots)
 }
 
 /// Resolve, probe, and route the configured backend pool, then run the
@@ -615,6 +622,7 @@ async fn run_offload(
         let auth = b.auth_token.clone();
         let is_cloud = b.is_cloud;
         let declared = b.declared_context;
+        let slots = b.slots;
         handles.push(tauri::async_runtime::spawn(async move {
             let rb = ResolvedBackend {
                 name: String::new(),
@@ -624,13 +632,13 @@ async fn run_offload(
                 is_cloud,
                 tier: BackendTier::Quality,
                 tool_scope: ToolScope::All,
-                slots: 1,
+                slots,
                 declared_context: declared,
             };
             (i, probe(&client, &rb).await)
         }));
     }
-    let mut probed: Vec<(bool, Option<u32>)> = vec![(false, None); resolved.len()];
+    let mut probed: Vec<(bool, Option<u32>, u32)> = vec![(false, None, 1); resolved.len()];
     for h in handles {
         if let Ok((i, res)) = h.await {
             probed[i] = res;
@@ -646,7 +654,7 @@ async fn run_offload(
             ready: probed[i].0,
             cloud_blocked: b.cloud_blocked,
             n_ctx: probed[i].1,
-            slots: b.slots,
+            slots: probed[i].2,
             in_flight: 0,
             tier: b.tier,
             tool_scope: b.tool_scope.clone(),

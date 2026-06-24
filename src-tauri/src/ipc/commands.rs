@@ -764,14 +764,14 @@ pub async fn offload_server_log(
     Ok(supervisor.server_logs(name))
 }
 
-/// V8-03: latest Offload Server dashboard snapshot (slots, throughput, queue,
-/// context, request history) — the initial fill for the dashboard. Live
-/// updates arrive via the `offload-server-metrics` event. `None` before the
-/// first poll.
+/// V8-03: latest Offload Server dashboard snapshot — one row per enabled
+/// backend (Local + Remote), each with slots, throughput, queue, context, and
+/// request history. The initial fill for the dashboard; live updates arrive
+/// via the `offload-server-metrics` event. Empty before the first poll.
 #[tauri::command]
 pub async fn offload_server_metrics(
     service: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
-) -> AppResult<Option<crate::offload::metrics::ServerMetrics>> {
+) -> AppResult<Vec<crate::offload::metrics::BackendDashboard>> {
     Ok(service.server_metrics())
 }
 

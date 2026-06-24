@@ -285,8 +285,8 @@ impl OffloadSupervisor {
                 };
                 // Probe health via the RemoteBackend impl (best-effort)
                 // unless blocked by consent.
-                let (state, n_ctx) = if cloud_blocked {
-                    ("blocked", b.declared_context)
+                let (state, n_ctx, slots) = if cloud_blocked {
+                    ("blocked", b.declared_context, 1)
                 } else {
                     probe_remote(
                         &b.name,
@@ -307,7 +307,7 @@ impl OffloadSupervisor {
                     cloud_blocked,
                     state: state.into(),
                     n_ctx,
-                    slots: 1,
+                    slots,
                     in_flight: 0,
                     tool_scope: scope,
                     error: None,
@@ -564,7 +564,9 @@ fn scope_summary(scope: &ToolScope, snap: &crate::settings::OffloadSettings) -> 
 
 /// Best-effort health probe of a remote endpoint for the status display,
 /// via the [`RemoteBackend`](super::RemoteBackend) `Backend` impl:
-/// `(state, n_ctx)` where state is `"ready"` or `"unreachable"`.
+/// `(state, n_ctx, slots)` where state is `"ready"` or `"unreachable"`.
+/// `slots` is the `/props` `total_slots` when the endpoint reports it
+/// (a llama-server does), else the assumed single slot.
 #[allow(clippy::too_many_arguments)]
 async fn probe_remote(
     name: &str,
@@ -574,18 +576,18 @@ async fn probe_remote(
     tier: BackendTier,
     tool_scope: ToolScope,
     declared: Option<u32>,
-) -> (&'static str, Option<u32>) {
+) -> (&'static str, Option<u32>, u32) {
     let backend = match super::RemoteBackend::new(
         name, base_url, auth_token, is_cloud, tier, tool_scope, declared, 1,
     ) {
         Ok(b) => b,
-        Err(_) => return ("error", declared),
+        Err(_) => return ("error", declared, 1),
     };
     if backend.health_check().await {
         let _ = backend.refresh_props().await; // best-effort
-        ("ready", backend.n_ctx())
+        ("ready", backend.n_ctx(), backend.slots())
     } else {
-        ("unreachable", declared)
+        ("unreachable", declared, 1)
     }
 }
 

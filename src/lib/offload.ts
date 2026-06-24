@@ -196,21 +196,33 @@ export interface ServerMetrics {
   history: RequestRecord[];
 }
 
-/// Latest dashboard snapshot (initial fill). `null` before the first poll.
-export async function offloadServerMetrics(): Promise<ServerMetrics | null> {
+/// One backend's dashboard card (mirror of Rust `BackendDashboard`). `kind`
+/// drives the Local-vs-Remote grouping; `state` is the coarse lifecycle that
+/// decides whether the live dashboard or a status line renders.
+export interface BackendDashboard {
+  name: string;
+  kind: 'local' | 'lan' | 'cloud';
+  state: 'ready' | 'stopped' | 'starting' | 'unreachable' | 'blocked' | 'disabled';
+  metrics: ServerMetrics;
+}
+
+/// Latest dashboard snapshot — one row per enabled backend. Empty before the
+/// first poll (or when offload is disabled).
+export async function offloadServerMetrics(): Promise<BackendDashboard[]> {
   try {
-    return await invoke<ServerMetrics | null>('offload_server_metrics');
+    return await invoke<BackendDashboard[]>('offload_server_metrics');
   } catch (e) {
     console.warn('offload_server_metrics failed', e);
-    return null;
+    return [];
   }
 }
 
-/// Subscribe to live dashboard snapshots. Returns an unlisten fn.
+/// Subscribe to live dashboard snapshots (one row per backend). Returns an
+/// unlisten fn.
 export function onOffloadServerMetrics(
-  cb: (m: ServerMetrics) => void,
+  cb: (rows: BackendDashboard[]) => void,
 ): Promise<UnlistenFn> {
-  return listen<ServerMetrics>('offload-server-metrics', (e) => cb(e.payload));
+  return listen<BackendDashboard[]>('offload-server-metrics', (e) => cb(e.payload));
 }
 
 /// One-line summary of an MCP-server health row for the Settings list.

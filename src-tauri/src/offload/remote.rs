@@ -41,12 +41,18 @@ pub struct RemoteBackend {
     tool_scope: ToolScope,
     /// Context window to assume when `/props` is unavailable.
     declared_context: Option<u32>,
-    /// Declared parallel capacity (the remote doesn't report `-np`).
-    slots: u32,
+    /// Fallback parallel capacity, used until `/props` reveals the real
+    /// `total_slots` (a remote doesn't report `-np` on the command line, but
+    /// a llama-server *does* expose `total_slots` on `/props`).
+    declared_slots: u32,
     ready: AtomicBool,
     /// Discovered `n_ctx` from `/props`; `0` means not-yet-known (the
     /// accessor then falls back to `declared_context`).
     n_ctx: AtomicU32,
+    /// Discovered `total_slots` from `/props`; `0` means not-yet-known (the
+    /// accessor then falls back to `declared_slots`). The gate grows to
+    /// match as bigger values are discovered.
+    slots: AtomicU32,
     gate: Arc<Semaphore>,
     client: reqwest::Client,
 }
@@ -73,7 +79,7 @@ impl RemoteBackend {
         declared_context: Option<u32>,
         slots: u32,
     ) -> AppResult<Self> {
-        let slots = slots.max(1);
+        let declared_slots = slots.max(1);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -86,10 +92,11 @@ impl RemoteBackend {
             tier,
             tool_scope,
             declared_context,
-            slots,
+            declared_slots,
             ready: AtomicBool::new(false),
             n_ctx: AtomicU32::new(0),
-            gate: Arc::new(Semaphore::new(slots as usize)),
+            slots: AtomicU32::new(0),
+            gate: Arc::new(Semaphore::new(declared_slots as usize)),
             client,
         })
     }
@@ -184,7 +191,26 @@ impl RemoteBackend {
             self.n_ctx.store(n as u32, Ordering::Relaxed);
             debug!(backend = %self.name, n_ctx = n, "offload: discovered remote context window");
         }
+        // A llama-server reports its real parallel capacity (`-np`) here, so
+        // the status line and the concurrency gate reflect the box instead
+        // of the assumed single slot. Cloud APIs omit it → keep declared.
+        if let Some(t) = v.get("total_slots").and_then(|x| x.as_u64()) {
+            self.note_total_slots(t as u32);
+        }
         Ok(())
+    }
+
+    /// Record a discovered `total_slots`, growing the concurrency gate to
+    /// match. Only ever grows: a running server's `-np` is fixed, and
+    /// shrinking a live semaphore safely is fiddly. Idempotent.
+    fn note_total_slots(&self, t: u32) {
+        let t = t.max(1);
+        let prev = self.slots.swap(t, Ordering::Relaxed);
+        let effective_prev = if prev == 0 { self.declared_slots } else { prev };
+        if t > effective_prev {
+            self.gate.add_permits((t - effective_prev) as usize);
+        }
+        debug!(backend = %self.name, total_slots = t, "offload: discovered remote slot count");
     }
 
     /// The shared HTTP client (reused for the agent loop's chat calls).
@@ -208,7 +234,7 @@ impl RemoteBackend {
             Ok(Err(_)) => Err(AppError::Offload("offload concurrency gate closed".into())),
             Err(_) => Err(AppError::OffloadNotReady(format!(
                 "all {} slot(s) on remote backend `{}` busy — timed out after {}s",
-                self.slots,
+                self.slots(),
                 self.name,
                 timeout.as_secs()
             ))),
@@ -237,10 +263,13 @@ impl Backend for RemoteBackend {
         }
     }
     fn slots(&self) -> u32 {
-        self.slots
+        match self.slots.load(Ordering::Relaxed) {
+            0 => self.declared_slots,
+            n => n,
+        }
     }
     fn in_flight(&self) -> u32 {
-        self.slots
+        self.slots()
             .saturating_sub(self.gate.available_permits() as u32)
     }
     fn tier(&self) -> BackendTier {
@@ -290,6 +319,28 @@ mod tests {
         .unwrap();
         assert_eq!(b.base_url(), "http://192.168.1.5:8080");
         assert!(b.auth_token().is_none());
+    }
+
+    #[test]
+    fn total_slots_discovery_grows_slots_and_gate() {
+        let b = RemoteBackend::new(
+            "lan", "http://x", "", false, BackendTier::Fast, ToolScope::All, Some(60_000), 1,
+        )
+        .unwrap();
+        // Before /props: the assumed single slot.
+        assert_eq!(b.slots(), 1);
+        assert_eq!(b.in_flight(), 0);
+        // llama-server reports `-np 2` via `/props.total_slots`.
+        b.note_total_slots(2);
+        assert_eq!(b.slots(), 2);
+        assert_eq!(b.gate.available_permits(), 2);
+        // Idempotent: a repeat probe doesn't keep growing the gate.
+        b.note_total_slots(2);
+        assert_eq!(b.slots(), 2);
+        assert_eq!(b.gate.available_permits(), 2);
+        // A zero/garbage value floors at one and never shrinks below it.
+        b.note_total_slots(0);
+        assert_eq!(b.slots(), 1);
     }
 
     #[test]

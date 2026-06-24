@@ -88,6 +88,22 @@ pub struct ServerMetrics {
     pub history: Vec<RequestRecord>,
 }
 
+/// One backend's dashboard card for the Offload Server tab. Wraps the live
+/// [`ServerMetrics`] with the backend's identity and a coarse lifecycle
+/// `state` so the frontend can group rows (Local vs Remote) and render an
+/// accurate header even when the backend isn't being polled (stopped, cloud,
+/// unreachable).
+#[derive(Clone, Debug, Serialize)]
+pub struct BackendDashboard {
+    pub name: String,
+    /// `"local"` | `"lan"` | `"cloud"` — drives grouping + the kind badge.
+    pub kind: String,
+    /// `"ready"` | `"stopped"` | `"starting"` | `"unreachable"` | `"blocked"`
+    /// | `"disabled"`. Mirrors the Settings status vocabulary.
+    pub state: String,
+    pub metrics: ServerMetrics,
+}
+
 impl ServerMetrics {
     /// A "server not running" snapshot (offload disabled / backend stopped).
     pub fn offline(global_in_flight: u32, global_cap: u32) -> Self {
@@ -106,6 +122,23 @@ impl ServerMetrics {
             global_cap,
             metrics_available: false,
             history: Vec::new(),
+        }
+    }
+
+    /// A reachable-but-not-polled snapshot for a backend whose `/slots` we
+    /// don't poll (a cloud endpoint). `running` stays false — there's no live
+    /// per-slot dashboard — but it carries the context/slot headline so the
+    /// card header reads like a Settings status line.
+    pub fn status_only(
+        total_slots: u32,
+        n_ctx: Option<u32>,
+        global_in_flight: u32,
+        global_cap: u32,
+    ) -> Self {
+        Self {
+            total_slots,
+            n_ctx_per_slot: n_ctx,
+            ..Self::offline(global_in_flight, global_cap)
         }
     }
 }
@@ -143,10 +176,12 @@ impl MetricsPoller {
     /// Poll the server once and fold the result into a snapshot. `base_url`
     /// is the server origin (no trailing slash); `total_slots`/`n_ctx` come
     /// from the live backend handle; the global gate figures come from the
-    /// service.
+    /// service. `auth` is the bearer token for a remote endpoint that needs
+    /// one (LAN llama-server usually doesn't; cloud APIs do).
     pub async fn poll(
         &mut self,
         base_url: &str,
+        auth: Option<&str>,
         total_slots: u32,
         n_ctx: Option<u32>,
         global_in_flight: u32,
@@ -156,7 +191,7 @@ impl MetricsPoller {
         let now_inst = Instant::now();
 
         // /slots — the always-available per-slot source.
-        let slots_json = self.get_json(base_url, "/slots").await;
+        let slots_json = self.get_json(base_url, "/slots", auth).await;
         let mut slots: Vec<SlotMetric> = Vec::new();
         let mut aggregate_tps = 0.0f32;
         let mut busy = 0u32;
@@ -196,7 +231,7 @@ impl MetricsPoller {
         slots.sort_by_key(|s| s.id);
 
         // /metrics — richer, only with --metrics.
-        let metrics_text = self.get_text(base_url, "/metrics").await;
+        let metrics_text = self.get_text(base_url, "/metrics", auth).await;
         let metrics_available = metrics_text.is_some();
         let parsed = parse_metrics(metrics_text.as_deref());
 
@@ -283,26 +318,26 @@ impl MetricsPoller {
         tps
     }
 
-    async fn get_json(&self, base_url: &str, path: &str) -> Option<Value> {
-        let resp = self
-            .client
-            .get(format!("{base_url}{path}"))
-            .send()
-            .await
-            .ok()?;
+    async fn get_json(&self, base_url: &str, path: &str, auth: Option<&str>) -> Option<Value> {
+        let req = self.client.get(format!("{base_url}{path}"));
+        let req = match auth {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        };
+        let resp = req.send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
         resp.json::<Value>().await.ok()
     }
 
-    async fn get_text(&self, base_url: &str, path: &str) -> Option<String> {
-        let resp = self
-            .client
-            .get(format!("{base_url}{path}"))
-            .send()
-            .await
-            .ok()?;
+    async fn get_text(&self, base_url: &str, path: &str, auth: Option<&str>) -> Option<String> {
+        let req = self.client.get(format!("{base_url}{path}"));
+        let req = match auth {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        };
+        let resp = req.send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }

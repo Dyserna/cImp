@@ -37,7 +37,7 @@ use crate::settings::{
 
 use super::agent::{self, AgentConfig, HostRouter, OffloadTask, ThinkingMode};
 use super::mcp_host::{McpHost, McpServerHealth};
-use super::metrics::{MetricsPoller, ServerMetrics};
+use super::metrics::{BackendDashboard, MetricsPoller, ServerMetrics};
 use super::remote::RemoteBackend;
 use super::router::{self, BackendView, RouteError, TierHint};
 use super::server::{LlamaServer, ServerCommand};
@@ -107,9 +107,10 @@ pub struct OffloadService {
     change_tx: broadcast::Sender<()>,
     /// For emitting the `offload-server-metrics` dashboard event.
     app: AppHandle,
-    /// Latest dashboard snapshot (initial fill for the IPC; the poller pushes
-    /// live ones via the event).
-    latest_metrics: StdMutex<Option<ServerMetrics>>,
+    /// Latest per-backend dashboard snapshot (initial fill for the IPC; the
+    /// poller pushes live ones via the event). One row per enabled backend,
+    /// Local first then Remote.
+    latest_metrics: StdMutex<Vec<BackendDashboard>>,
 }
 
 impl OffloadService {
@@ -140,7 +141,7 @@ impl OffloadService {
             client,
             change_tx,
             app,
-            latest_metrics: StdMutex::new(None),
+            latest_metrics: StdMutex::new(Vec::new()),
         });
 
         // Relay MCP-host change pulses into the service change channel so a
@@ -479,6 +480,9 @@ impl OffloadService {
             return None;
         }
         let cloud_blocked = b.cloud_blocked();
+        // Fallback slot count until `refresh_props` below discovers the
+        // endpoint's real `total_slots` (a llama-server reports it; cloud
+        // APIs don't, and keep this single slot).
         let slots_decl = 1u32;
 
         // Reuse a cached handle when the URL/auth/cloud signature matches; a
@@ -599,56 +603,136 @@ impl OffloadService {
         self.host.shutdown().await;
     }
 
-    /// The latest dashboard snapshot (initial fill for the Offload Server
-    /// tab; live updates arrive via the `offload-server-metrics` event).
-    pub fn server_metrics(&self) -> Option<ServerMetrics> {
+    /// The latest per-backend dashboard snapshot (initial fill for the Offload
+    /// Server tab; live updates arrive via the `offload-server-metrics`
+    /// event). One row per enabled backend, Local first then Remote.
+    pub fn server_metrics(&self) -> Vec<BackendDashboard> {
         self.latest_metrics.lock().unwrap().clone()
     }
 
-    /// The running `LlamaServer` handle for the primary (first enabled) Local
-    /// backend, if it's up — the dashboard's poll target.
-    async fn primary_local_server(&self, snap: &OffloadSettings) -> Option<Arc<LlamaServer>> {
-        let name = snap
-            .effective_backends()
-            .into_iter()
-            .find(|b| b.enabled && matches!(b.kind, OffloadBackendKind::Local { .. }))
-            .map(|b| b.name)?;
-        self.supervisor.running_server(&name).await
+    /// Build one dashboard row for a backend. Local owned servers and
+    /// reachable LAN `llama-server`s get a live `/slots`+`/metrics` poll
+    /// (history accumulates in the per-name [`MetricsPoller`]); cloud and
+    /// unreachable backends get a status-only row carrying just their
+    /// context/slot headline.
+    async fn backend_dashboard(
+        &self,
+        b: &OffloadBackend,
+        pollers: &mut HashMap<String, MetricsPoller>,
+        in_flight: u32,
+        cap: u32,
+    ) -> BackendDashboard {
+        match &b.kind {
+            OffloadBackendKind::Local { .. } => {
+                let (state, metrics) = match self.supervisor.running_server(&b.name).await {
+                    Some(server) if server.is_ready() => {
+                        let poller = pollers
+                            .entry(b.name.clone())
+                            .or_insert_with(MetricsPoller::new);
+                        let m = poller
+                            .poll(
+                                &server.base_url(),
+                                None,
+                                server.slots(),
+                                server.n_ctx(),
+                                in_flight,
+                                cap,
+                            )
+                            .await;
+                        ("ready", m)
+                    }
+                    Some(_) => ("starting", ServerMetrics::offline(in_flight, cap)),
+                    None => ("stopped", ServerMetrics::offline(in_flight, cap)),
+                };
+                BackendDashboard {
+                    name: b.name.clone(),
+                    kind: "local".into(),
+                    state: state.into(),
+                    metrics,
+                }
+            }
+            OffloadBackendKind::Remote {
+                base_url,
+                auth_token,
+                is_cloud,
+                ..
+            } => {
+                let kind = if *is_cloud { "cloud" } else { "lan" };
+                if b.cloud_blocked() {
+                    return BackendDashboard {
+                        name: b.name.clone(),
+                        kind: kind.into(),
+                        state: "blocked".into(),
+                        metrics: ServerMetrics::offline(in_flight, cap),
+                    };
+                }
+                let entry = self
+                    .resolve_remote(b, base_url, auth_token, *is_cloud)
+                    .await;
+                let (state, metrics) = match entry {
+                    Some(e) if e.ready && !*is_cloud => {
+                        // A LAN llama-server — poll it live, just like Local.
+                        let auth = e.auth_token.clone();
+                        let poller = pollers
+                            .entry(b.name.clone())
+                            .or_insert_with(MetricsPoller::new);
+                        let m = poller
+                            .poll(&e.base_url, auth.as_deref(), e.slots, e.n_ctx, in_flight, cap)
+                            .await;
+                        ("ready", m)
+                    }
+                    // A reachable cloud endpoint (no `/slots`): status-only
+                    // headline carrying its context/slot count.
+                    Some(e) if e.ready => (
+                        "ready",
+                        ServerMetrics::status_only(e.slots, e.n_ctx, in_flight, cap),
+                    ),
+                    _ => ("unreachable", ServerMetrics::offline(in_flight, cap)),
+                };
+                BackendDashboard {
+                    name: b.name.clone(),
+                    kind: kind.into(),
+                    state: state.into(),
+                    metrics,
+                }
+            }
+        }
     }
 
-    /// Spawn the Offload Server dashboard poller: every ~600ms, poll the
-    /// primary local backend's `/slots` (+ `/metrics`), fold into a snapshot,
-    /// cache it, and emit `offload-server-metrics`. Emits an "offline"
-    /// snapshot when no local backend is running.
+    /// Spawn the Offload Server dashboard poller: every ~600ms, build one
+    /// dashboard row per enabled backend — Local owned servers and reachable
+    /// LAN `llama-server`s are polled live (`/slots` + `/metrics`); cloud and
+    /// down backends carry a status-only row — then cache the set and emit
+    /// `offload-server-metrics`. A per-backend [`MetricsPoller`] (keyed by
+    /// name) accumulates each one's tokens/sec + history independently.
     pub fn spawn_metrics_poller(self: &Arc<Self>) {
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
-            let mut poller = MetricsPoller::new();
+            let mut pollers: HashMap<String, MetricsPoller> = HashMap::new();
             loop {
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 let snap = this.settings.current().offload;
                 let in_flight = this.global_in_flight();
                 let cap = this.global_cap;
-                let metrics = if snap.enabled {
-                    match this.primary_local_server(&snap).await {
-                        Some(server) if server.is_ready() => {
-                            poller
-                                .poll(
-                                    &server.base_url(),
-                                    server.slots(),
-                                    server.n_ctx(),
-                                    in_flight,
-                                    cap,
-                                )
-                                .await
-                        }
-                        _ => ServerMetrics::offline(in_flight, cap),
+
+                let mut rows: Vec<BackendDashboard> = Vec::new();
+                if snap.enabled {
+                    for b in snap.effective_backends().into_iter().filter(|b| b.enabled) {
+                        let row = this
+                            .backend_dashboard(&b, &mut pollers, in_flight, cap)
+                            .await;
+                        rows.push(row);
                     }
-                } else {
-                    ServerMetrics::offline(in_flight, cap)
-                };
-                *this.latest_metrics.lock().unwrap() = Some(metrics.clone());
-                let _ = this.app.emit("offload-server-metrics", &metrics);
+                }
+
+                // Drop pollers for backends that vanished from the config so
+                // their history doesn't leak across a rename/removal.
+                let live: std::collections::HashSet<&str> =
+                    rows.iter().map(|r| r.name.as_str()).collect();
+                pollers.retain(|k, _| live.contains(k.as_str()));
+
+                *this.latest_metrics.lock().unwrap() = rows.clone();
+                let _ = this.app.emit("offload-server-metrics", &rows);
             }
         });
     }

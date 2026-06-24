@@ -396,17 +396,17 @@ Tools prompt with the Vulkan SDK installed — see `docs/MAINTENANCE.md`. An
 optional NVIDIA-only `stt-cuda` feature exists for maximum speed but isn't
 portable and isn't shipped.
 
-## Local task offload (V8-01)
+## Local task offload
 
 Offloading lets the main Claude (Opus) session hand a self-contained, token-heavy
 subtask — a broad codebase search, summarizing a large file or log, web research —
 to a **local model**, and get back only the synthesized result. The local model
 does the searching/reading/summarizing; Opus's context grows by a paragraph
-instead of a megabyte. Everything stays local.
+instead of a megabyte. Everything stays local (unless you opt a cloud backend in).
 
 This is **not** the *Claude (local)* tab — that swaps the whole session's brain to
 a local model. Offload keeps Opus in charge and delegates a bounded subtask to a
-subordinate local worker, exposed as an `offload_task` MCP tool.
+subordinate worker, exposed as an `offload_task` MCP tool.
 
 **Setup** (*Settings → Offload*):
 
@@ -424,22 +424,24 @@ subordinate local worker, exposed as an `offload_task` MCP tool.
    host/port; ccImp parses the host/port and `-np` and discovers the context
    window from the running server.
 3. Optionally enable **Start the server on launch** (otherwise click **Start**, or
-   it starts on the first offload). Use **Test offload** to confirm it works.
+   it starts on the first offload). Use **Test offload** to confirm it works. The
+   **Offload Server** tab shows the live server log and a per-backend dashboard
+   (slots busy/total, queue depth, throughput, context-fill, request history).
 4. **Re-launch a Claude tab** so it picks up the injected `offload_task` tool. With
    *Inject offload guidance* on, ccImp also nudges Opus on when to offload.
 
-**Tools the local worker can use** are native and read-only: `read_file` (bounded
-reads), `code_search` (literal search), and `run_command` (allowlisted, deny by
-default). File access is confined to **Allowed roots** (the launch project root by
-default). The richer MCP tool servers (web search, fetch, docs, git) are a
-follow-up.
+**Tools the worker can use.** Built-in native tools are read-only: `read_file`
+(bounded reads), `code_search` (literal search), and `run_command` (allowlisted,
+deny by default). File access is confined to **Allowed roots** (the launch project
+root by default). On top of those you can attach your own **MCP tool servers** (web
+search, fetch, docs, git, filesystem — see below).
 
-**Safety:** offload is read-only this milestone — no write/edit tools.
-`run_command` runs nothing unless its program is on your allowlist, and all file
-access is confined to the configured roots. The model and `llama-server` are
+**Safety:** offload never writes or edits. `run_command` runs nothing unless its
+program is on your allowlist, write/destructive MCP tools are filtered out, and all
+file access is confined to the configured roots. The model and `llama-server` are
 yours; ccImp only spawns the command you give it and connects over localhost.
 
-### A pool of backends + routing (V8-02)
+### A pool of backends + routing
 
 Beyond the single local server, you can configure a **pool of backends** and let
 ccImp route each `offload_task` to the right one. The motivating setup: your main
@@ -484,7 +486,7 @@ backends. The LAN case keeps data on your own network.
 > breaks the local/offline property. Use a LAN backend to keep everything on your
 > network.
 
-### MCP tool servers + warm pool (V8-03)
+### MCP tool servers + warm pool
 
 Beyond the built-in native tools (`read_file`, `code_search`, `run_command`), an
 offload worker can use your own **MCP tool servers** — web search, fetch, docs,

@@ -5,6 +5,26 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] — 2026-06-24
+
+### Added
+
+- **Per-backend Offload Server dashboard, grouped Local / Remote.** The Offload
+  Server tab now shows one live card per enabled backend instead of only the
+  local server, split into **Local** and **Remote** sections. A reachable LAN
+  `llama-server` gets the full dashboard — slots busy/total, queue depth,
+  throughput, context-fill %, per-slot rows, and request history — just like a
+  Local backend; cloud and unreachable backends show a compact status row. The
+  raw server log stays available for Local backends (ccImp owns their process).
+
+### Fixed
+
+- **Remote backend slot count.** A remote `llama-server`'s real parallel
+  capacity (`-np`) is now discovered from `/props` `total_slots` instead of
+  assuming a single slot. The Settings status line and the dashboard show the
+  true slot count, and the concurrency gate grows to match so offloads are no
+  longer serialized to a multi-slot box.
+
 ## [0.16.0] — 2026-06-24
 
 ### Added

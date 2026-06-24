@@ -5,6 +5,16 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] — 2026-06-24
+
+### Fixed
+
+- **No more empty console windows on Windows.** Windows allocates a console
+  window whenever the GUI process spawns a console executable. The
+  `llama-server`, MCP server, and `run_command` spawns now pass
+  `CREATE_NO_WINDOW` so they run hidden — their output is already captured over
+  piped stdout/stderr and surfaced in the Offload Server tab.
+
 ## [0.16.1] — 2026-06-24
 
 ### Added

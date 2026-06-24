@@ -610,6 +610,12 @@ fn spawn_child(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Windows allocates a fresh console window whenever a GUI process spawns a
+    // console executable like `llama-server.exe`. We capture its output over
+    // piped stdout/stderr anyway, so suppress the empty conhost window with
+    // CREATE_NO_WINDOW (0x0800_0000).
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
     let mut child = command
         .spawn()
         .map_err(|e| AppError::Spawn(format!("llama-server: {e}")))?;

@@ -74,6 +74,9 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Don't flash a console window for each spawned command on Windows.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
 
     let child = cmd
         .spawn()

@@ -491,6 +491,10 @@ async fn connect_stdio(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Suppress the empty console window Windows allocates for each spawned
+    // MCP server (CREATE_NO_WINDOW); output is captured over piped fds.
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
     let mut child = command
         .spawn()
         .map_err(|e| format!("spawn `{}`: {e}", cfg.command))?;

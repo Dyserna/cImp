@@ -11,6 +11,27 @@ export const latestSamples: { current: Float32Array; seq: number } = {
   seq: 0,
 };
 
+// Consumers (the waveform visualizer) register here to be woken the instant a
+// fresh amplitude packet arrives. This lets the visualizer stop its
+// requestAnimationFrame loop while silent and restart only when audio resumes,
+// instead of repainting the canvas ~60×/s forever — a flat-line repaint that
+// otherwise keeps the WebView's GPU compositor busy at idle. Plain callback set
+// rather than a store, for the same 60 Hz-avoidance reason as `latestSamples`.
+const sampleListeners = new Set<() => void>();
+
+/// Register a callback fired after every fresh amplitude packet (TTS or mic).
+/// Returns an unsubscribe; call it on component teardown.
+export function onSamples(cb: () => void): () => void {
+  sampleListeners.add(cb);
+  return () => {
+    sampleListeners.delete(cb);
+  };
+}
+
+function notifySamples(): void {
+  for (const cb of sampleListeners) cb();
+}
+
 let started = false;
 
 /// Attach the backend amplitude listener exactly once for the lifetime of
@@ -24,6 +45,7 @@ export function startAmplitudeListener(): void {
   void listen<number[]>('audio-amplitude', (event) => {
     latestSamples.current = new Float32Array(event.payload);
     latestSamples.seq++;
+    notifySamples();
   });
 }
 
@@ -41,5 +63,6 @@ export function startMicAmplitudeListener(): void {
   void listen<number[]>('mic-amplitude', (event) => {
     latestSamples.current = new Float32Array(event.payload);
     latestSamples.seq++;
+    notifySamples();
   });
 }

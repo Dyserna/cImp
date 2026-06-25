@@ -5,6 +5,45 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.2] — 2026-06-25
+
+### Added
+
+- **Command security policies (Settings → Offload → Tools).** The offload
+  `run_command` tool's hardening is now a set of visible, editable per-program
+  **security policies** instead of a hidden, git-only special case. Each policy
+  names a program and the argument flags / subcommands it refuses plus the
+  environment variables it forces at spawn; the previous git hardening ships as
+  the seeded default. The Offload settings are reorganized into **Pool** and
+  **Tools** sub-tabs, and the allowlist now shows, per program, whether a policy
+  is hardening it. Existing config files inherit the default git policy
+  automatically.
+
+### Fixed
+
+- **`run_command` argument-policy bypass (security).** A value-consuming global
+  flag (e.g. git `--namespace x config …`) could shift the "first non-flag
+  token" off the real subcommand, slipping a denied subcommand like `git config`
+  past the guard and re-enabling arbitrary code execution via repo-local config.
+  The default git policy now denies every value-taking global, restoring the
+  guard's soundness; custom policies document the same requirement.
+- **Custom terminal palette corrupted the bundled Default.** Resolving a Custom
+  theme assigned colors onto the shared `defaultPalette()` object in place,
+  corrupting the Default for the rest of the session. It now clones before
+  overlaying.
+- **Read-only offload tool filter — camelCase gap.** A camelCase mutating tool
+  name like `configSet` evaded the write-verb filter that `config_set` would
+  hit; all filter tiers now split camelCase sub-words.
+- **Loopback auth token** is now compared in constant time (timing side-channel).
+- **Offload concurrency-cap reconcile** no longer spawns a task per trigger that
+  piles up behind the resize lock during a slow shrink; a single runner absorbs
+  concurrent triggers and converges to the latest config.
+- **Settings migration** no longer re-migrates (and regenerates a backup) every
+  launch if a cascade leaves a file under-migrated; the pre-migration backup
+  can't be overwritten on name-probe exhaustion.
+- **Offload backend handles** are pruned when a backend is renamed, removed, or
+  disabled (was a slow per-edit leak).
+
 ## [0.17.1] — 2026-06-25
 
 A sweep of 37 confirmed correctness issues surfaced by a multi-agent bug hunt

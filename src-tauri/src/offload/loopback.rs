@@ -285,15 +285,31 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Whether the request carries the expected bearer token.
+/// Whether the request carries the expected bearer token. Uses a constant-time
+/// comparison so a local attacker can't recover the per-launch token byte by
+/// byte from 401-response timing (best-effort; the length check leaks only the
+/// fixed token length).
 fn authorized(req: &Request, token: &str) -> bool {
     match &req.auth {
         Some(h) => h
             .strip_prefix("Bearer ")
-            .map(|t| t == token)
+            .map(|t| ct_eq(t.as_bytes(), token.as_bytes()))
             .unwrap_or(false),
         None => false,
     }
+}
+
+/// Constant-time byte-slice equality: compares all bytes of equal-length inputs
+/// without short-circuiting on the first mismatch.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Handle one connection: route by method+path after checking auth.

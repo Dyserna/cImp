@@ -114,8 +114,13 @@ fn dangerous_args(command: &str, args: &[String], policies: &[CommandPolicy]) ->
             ));
         }
     }
-    // Denied subcommand = the first non-flag token (value-taking globals are
-    // already refused as denied flags, so nothing legitimately precedes it).
+    // Denied subcommand = the first non-flag token. SECURITY: this is only
+    // sound if every value-CONSUMING global flag is in `denied_flags` and so
+    // refused by the loop above — otherwise a non-denied value-taking flag
+    // (e.g. `git --namespace x config`) shifts the first non-flag token onto
+    // the flag's value, hiding the real subcommand. The default `git` policy
+    // enumerates all of git's value-taking globals for exactly this reason; a
+    // custom policy with `denied_subcommands` MUST do the same for its program.
     if !policy.denied_subcommands.is_empty() {
         if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
             if policy
@@ -333,6 +338,21 @@ mod tests {
         assert!(dangerous_args("git", &argv(&["--work-tree", "/"]), &policies).is_some());
         // Denied subcommand as the first non-flag token.
         assert!(dangerous_args("git", &argv(&["config", "core.pager", "x"]), &policies).is_some());
+    }
+
+    #[test]
+    fn value_taking_global_cannot_shift_the_subcommand_check() {
+        // Regression: a value-consuming global flag must not push the
+        // first-non-flag-token off the real `config` subcommand. Every
+        // value-taking git global is denied, so these are refused at the flag
+        // loop before the (positional) subcommand check even runs.
+        let policies = crate::settings::default_command_policies();
+        assert!(dangerous_args("git", &argv(&["--namespace", "x", "config", "--local", "alias.p", "!sh"]), &policies).is_some());
+        assert!(dangerous_args("git", &argv(&["--super-prefix", "p/", "config", "core.pager", "!sh"]), &policies).is_some());
+        assert!(dangerous_args("git", &argv(&["--attr-source", "HEAD", "config", "x", "y"]), &policies).is_some());
+        // A legitimate read probe whose ARGUMENT is "config" still runs.
+        assert!(dangerous_args("git", &argv(&["grep", "config"]), &policies).is_none());
+        assert!(dangerous_args("git", &argv(&["log", "--grep", "config"]), &policies).is_none());
     }
 
     #[test]

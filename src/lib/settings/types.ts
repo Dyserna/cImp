@@ -977,6 +977,9 @@ export function defaultSettings(): Settings {
             '--work-tree',
             '--upload-pack',
             '--receive-pack',
+            '--namespace',
+            '--super-prefix',
+            '--attr-source',
           ],
           denied_subcommands: ['config'],
           env: [

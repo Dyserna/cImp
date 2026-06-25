@@ -172,20 +172,27 @@ fn is_read_class(name: &str) -> bool {
         return false;
     }
 
-    // Unambiguous mutation verbs disqualify as the leading verb of any segment.
+    // Unambiguous mutation verbs disqualify anywhere. Checked across every
+    // camelCase sub-word (like the HARD tier), not just each segment's leading
+    // verb — otherwise a camelCase mutator such as `configSet` / `userDataSet`
+    // evades the `set` check that the underscore form `config_set` would hit.
     let hits_anyseg = segments
         .iter()
-        .any(|seg| ANYSEG_WRITE_VERBS.contains(&token_verb(seg).as_str()));
+        .flat_map(|seg| segment_words(seg))
+        .any(|w| ANYSEG_WRITE_VERBS.contains(&w.as_str()));
     if hits_anyseg {
         return false;
     }
 
     // Noun-ish write verbs only disqualify in the first two (category) segments,
-    // so a noun-verb later in the name (`get_latest_commit`) isn't over-dropped.
-    segments
+    // so a noun-verb later in the name (`get_latest_commit`) isn't over-dropped
+    // — but across the camelCase sub-words of those segments, so `commitChanges`
+    // / `pushTags` are still caught.
+    !segments
         .iter()
         .take(2)
-        .all(|seg| !WRITE_VERBS.contains(&token_verb(seg).as_str()))
+        .flat_map(|seg| segment_words(seg))
+        .any(|w| WRITE_VERBS.contains(&w.as_str()))
 }
 
 /// One namespaced, read-class tool offered by a server: the [`ToolDef`]
@@ -916,6 +923,17 @@ mod tests {
         // though it isn't destructive enough to be a HARD verb.
         for bad in ["repo_data_set_value", "config_apply_patch", "db_record_update", "file_meta_rename"] {
             assert!(!is_read_class(bad), "{bad} should be filtered");
+        }
+        // camelCase mutators must drop too: the ANYSEG/WRITE tiers split
+        // camelCase sub-words (not just the leading lowercase run), so these
+        // can't evade the way `configSet` once did.
+        for bad in ["configSet", "userDataSet", "applyPatch", "recordUpdate", "metaRename"] {
+            assert!(!is_read_class(bad), "{bad} should be filtered");
+        }
+        // ...without over-dropping a camelCase read whose noun merely contains a
+        // verb-like plural ("sets" != "set").
+        for ok in ["listAllSets", "getResultSets"] {
+            assert!(is_read_class(ok), "{ok} should be read-class");
         }
     }
 

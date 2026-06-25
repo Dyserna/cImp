@@ -862,6 +862,15 @@ pub fn default_command_policies() -> Vec<CommandPolicy> {
             s("--work-tree"),
             s("--upload-pack"),
             s("--receive-pack"),
+            // The remaining value-consuming git globals. They aren't dangerous
+            // themselves, but `dangerous_args` finds the subcommand as the first
+            // non-flag token — so a non-denied value-taking global would shift
+            // that token onto its own value and let `git --namespace x config …`
+            // slip the `config` check. Denying every value-taking global keeps
+            // that assumption sound (a read probe never needs these).
+            s("--namespace"),
+            s("--super-prefix"),
+            s("--attr-source"),
         ],
         denied_subcommands: vec![s("config")],
         env: vec![

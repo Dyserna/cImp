@@ -27,6 +27,12 @@ use crate::processing::tags::{build_rendered, TagScanner};
 /// dropping old rows is invisible to them.
 const MAX_ROWS: usize = 5_000;
 
+/// Hard ceiling on columns per row. Real terminals are a few hundred columns
+/// wide; this is far beyond any genuine width but small enough that a hostile
+/// `\x1b[<huge>C` (cursor-forward) followed by a printable char can't make a
+/// row's cell `Vec` balloon to billions of entries and OOM the process.
+const MAX_COLS: usize = 2_000;
+
 #[derive(Debug, Clone)]
 pub struct Cell {
     pub ch: char,
@@ -39,12 +45,17 @@ pub struct Row {
 
 impl Row {
     fn ensure_col(&mut self, col: usize) {
-        while self.cells.len() <= col {
+        let target = col.min(MAX_COLS - 1);
+        while self.cells.len() <= target {
             self.cells.push(None);
         }
     }
 
     fn put(&mut self, col: usize, cell: Cell) {
+        // Backstop against unbounded column growth: clamp the index so the
+        // cells `Vec` can never exceed MAX_COLS regardless of how far the
+        // cursor was advanced.
+        let col = col.min(MAX_COLS - 1);
         self.ensure_col(col);
         self.cells[col] = Some(cell);
     }
@@ -216,7 +227,7 @@ impl Screen {
 
     fn move_cursor(&mut self, row: usize, col: usize) {
         self.cursor_row = self.ensure_row(row);
-        self.cursor_col = col;
+        self.cursor_col = col.min(MAX_COLS);
     }
 
     /// Try to drain `raw_buffer` to a `Vec<u8>` of bytes safe to forward to
@@ -324,7 +335,7 @@ impl Perform for Screen {
         let row = self.cursor_row;
         let col = self.cursor_col;
         self.rows[row].put(col, cell);
-        self.cursor_col = col + 1;
+        self.cursor_col = (col + 1).min(MAX_COLS);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -350,7 +361,7 @@ impl Perform for Screen {
             }
             b'\t' => {
                 // HT: advance to next tab stop (every 8 cols).
-                self.cursor_col = (self.cursor_col / 8 + 1) * 8;
+                self.cursor_col = ((self.cursor_col / 8 + 1) * 8).min(MAX_COLS);
             }
             _ => {}
         }
@@ -379,7 +390,7 @@ impl Perform for Screen {
             }
             'C' | 'a' => {
                 let n = p(0, 1) as usize;
-                self.cursor_col += n;
+                self.cursor_col = self.cursor_col.saturating_add(n).min(MAX_COLS);
             }
             'D' => {
                 let n = p(0, 1) as usize;

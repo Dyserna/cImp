@@ -123,6 +123,15 @@ export function installPushToTalk(): void {
   installed = true;
   window.addEventListener('keydown', onKeyDown, true);
   window.addEventListener('keyup', onKeyUp, true);
+  window.addEventListener('blur', onBlur);
+}
+
+/// The window lost focus mid-hold (e.g. Alt+Tab). The keyup that would
+/// normally stop/cancel never arrives, so without this PTT stays stuck in
+/// 'recording'/'armed' forever. Discard any in-flight recording and reset.
+function onBlur(): void {
+  if (state === 'recording') cbs?.cancel();
+  if (state !== 'idle') reset();
 }
 
 function modifiersSatisfied(e: KeyboardEvent): boolean {

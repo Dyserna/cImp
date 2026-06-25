@@ -379,11 +379,18 @@ async fn proxy_run(
     let timeout = Duration::from_secs(settings.offload_timeout_secs.max(30) + 30);
     let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
 
+    // Forward this child's working directory (the session's project root) so
+    // the app scopes native tools to the repo Claude is in, not the app's own
+    // launch dir, when no explicit `allowed_roots` is configured.
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
     let body = json!({
         "instructions": instructions,
         "context": context,
         "thinking": thinking,
         "tier": tier,
+        "cwd": cwd,
     });
     let resp = client
         .post(format!("{base}/run"))

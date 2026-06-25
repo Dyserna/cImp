@@ -216,6 +216,12 @@ impl OffloadService {
         context: Option<String>,
         thinking: ThinkingMode,
         tier: TierHint,
+        // The working directory of the *calling session* (the repo Claude Code
+        // is running in), forwarded by the MCP child over the loopback. Used as
+        // the native-tool root when no explicit `allowed_roots` is configured,
+        // so an offload from a session in repo A reads repo A — not the app's
+        // own launch directory. `None` falls back to the app's cwd.
+        session_cwd: Option<PathBuf>,
     ) -> AppResult<String> {
         let snap = self.settings.current().offload;
         if !snap.enabled {
@@ -284,7 +290,7 @@ impl OffloadService {
         );
 
         let result = self
-            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, overall_deadline)
+            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), overall_deadline)
             .await;
 
         // One fail-over on a connection-class failure: drop the failed
@@ -301,7 +307,7 @@ impl OffloadService {
                             reroute = %pool[next].name,
                             "offload: re-routing after connection failure (app service)"
                         );
-                        self.run_on(&pool[next], &views[next], &snap, &instructions, context, thinking, overall_deadline)
+                        self.run_on(&pool[next], &views[next], &snap, &instructions, context, thinking, session_cwd, overall_deadline)
                             .await
                     }
                     _ => Err(e),
@@ -322,17 +328,23 @@ impl OffloadService {
         instructions: &str,
         context: Option<String>,
         thinking: ThinkingMode,
+        session_cwd: Option<PathBuf>,
         deadline: Instant,
     ) -> AppResult<String> {
         let slot_timeout = deadline.saturating_duration_since(Instant::now());
         let _slot = entry.handle.acquire_slot(slot_timeout).await?;
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let ctx = ToolCtx::new(
-            effective_roots(snap),
-            snap.command_allowlist.clone(),
-            &cwd,
-        );
+        // Prefer the calling session's cwd (forwarded over the loopback) so
+        // tool resolution and the empty-`allowed_roots` fallback target the
+        // repo Claude is actually in, not the app's launch dir.
+        let cwd = session_cwd
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let roots = if snap.allowed_roots.is_empty() {
+            vec![cwd.clone()]
+        } else {
+            snap.allowed_roots.clone()
+        };
+        let ctx = ToolCtx::new(roots, snap.command_allowlist.clone(), &cwd);
         let native_defs = tools::enabled_defs(&snap.tools);
         let mcp_defs = self.host.tool_defs().await;
         let router = HostRouter::new(

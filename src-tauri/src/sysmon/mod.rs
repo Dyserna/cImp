@@ -113,7 +113,11 @@ impl SystemStatsState {
 
             // `received()`/`transmitted()` are bytes since the previous
             // refresh; divide by elapsed wall time for a stable bytes/sec.
-            guard.networks.refresh(false);
+            // `refresh(true)` re-scans the interface list each tick so
+            // interfaces that appear mid-session (VPN up, USB tethering) are
+            // counted and ones that vanish stop contributing a stale delta —
+            // `refresh(false)` only updates already-known interfaces.
+            guard.networks.refresh(true);
             let elapsed = guard.last_net.elapsed().as_secs_f64().max(0.001);
             guard.last_net = Instant::now();
             let (mut down, mut up) = (0u64, 0u64);

@@ -137,8 +137,12 @@ async function launch(
       const marker = terminal.registerMarker(row - base);
       if (!marker) continue;
       marker.onDispose(() => {
-        // A row scrolled out of the buffer: drop the visual highlight.
-        if (activeSession === session) clearDecorations();
+        // A row scrolled out of the buffer: end the highlight entirely.
+        // Must be endSession() (not just clearDecorations) so `painting`/
+        // `chunkCount` are reset — otherwise a later progress event would call
+        // paintState() against the now-empty chunkSpans/chunkState arrays and
+        // throw. Audio keeps playing; only the visual is dropped.
+        if (activeSession === session) endSession();
       });
       rowMarkers.set(row, marker);
     }
@@ -267,6 +271,9 @@ function paintState(reading: number): void {
 }
 
 function applyChunk(i: number, kind: ChunkState): void {
+  // Defensive: if the session's arrays were cleared out from under us, do
+  // nothing rather than iterate an undefined slot.
+  if (!chunkDecorations[i] || !chunkSpans[i]) return;
   // Dispose this chunk's current decorations first (decoration colors are
   // immutable, so a recolor is a dispose+recreate).
   for (const d of chunkDecorations[i]) d.dispose();

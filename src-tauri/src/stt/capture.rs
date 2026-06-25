@@ -219,7 +219,16 @@ where
                     scratch.push(sum * inv);
                 }
                 if let Ok(mut buf) = accumulator.lock() {
-                    buf.extend_from_slice(&scratch);
+                    // Hard cap (~10 min at 48 kHz) so a session left recording
+                    // can't grow the accumulator unbounded (~11 MB/min). Past
+                    // the cap we drop further audio rather than risk OOM; a very
+                    // long dictation is truncated at the ceiling.
+                    const MAX_ACCUM_SAMPLES: usize = 28_800_000;
+                    let remaining = MAX_ACCUM_SAMPLES.saturating_sub(buf.len());
+                    if remaining > 0 {
+                        let take = scratch.len().min(remaining);
+                        buf.extend_from_slice(&scratch[..take]);
+                    }
                 }
                 if let Ok(mut ring) = mic.write() {
                     for &m in &scratch {

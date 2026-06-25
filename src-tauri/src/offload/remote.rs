@@ -205,19 +205,33 @@ impl RemoteBackend {
     /// shrinking a live semaphore safely is fiddly. Idempotent.
     fn note_total_slots(&self, t: u32) {
         let t = t.max(1);
-        let prev = self.slots.load(Ordering::Relaxed);
-        let effective_prev = if prev == 0 { self.declared_slots } else { prev };
-        if t > effective_prev {
-            // Grow the gate and the reported slot count together. We only ever
-            // grow: a live `tokio::Semaphore` can't be safely shrunk, so if a
-            // re-fetched `/props` reports *fewer* slots (server restarted with
-            // a smaller `-np`) we must leave BOTH the gate and `self.slots`
-            // unchanged. Swapping `slots` down while the gate keeps the larger
-            // permit count would make `slots()`/`in_flight()` disagree with the
-            // real concurrency the gate allows, and the router would
-            // mis-schedule the backend.
-            self.gate.add_permits((t - effective_prev) as usize);
-            self.slots.store(t, Ordering::Relaxed);
+        // CAS loop so concurrent callers (the metrics poller and a live `run()`
+        // both refresh `/props` on the same shared `Arc`) can't each add the
+        // same delta and over-grow the gate. Only the thread that successfully
+        // swaps `slots` prev->t adds the matching permits; losers retry against
+        // the fresh value and find nothing left to grow.
+        //
+        // We only ever grow: a live `tokio::Semaphore` can't be safely shrunk,
+        // so if a re-fetched `/props` reports *fewer* slots (server restarted
+        // with a smaller `-np`) we leave BOTH the gate and `self.slots`
+        // unchanged. Swapping `slots` down while the gate keeps the larger
+        // permit count would make `slots()`/`in_flight()` disagree with the
+        // real concurrency the gate allows, and the router would mis-schedule.
+        loop {
+            let prev = self.slots.load(Ordering::Relaxed);
+            let effective_prev = if prev == 0 { self.declared_slots } else { prev };
+            if t <= effective_prev {
+                break;
+            }
+            if self
+                .slots
+                .compare_exchange(prev, t, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.gate.add_permits((t - effective_prev) as usize);
+                break;
+            }
+            // Lost the race; another thread bumped `slots`. Retry.
         }
         debug!(backend = %self.name, total_slots = t, "offload: discovered remote slot count");
     }

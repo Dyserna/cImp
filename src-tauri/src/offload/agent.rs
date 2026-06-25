@@ -269,6 +269,7 @@ pub async fn run(
         // Append the assistant turn (carrying the tool_calls), then each
         // tool result.
         let tool_calls = msg.tool_calls.clone();
+        let pre_len = messages.len();
         messages.push(msg);
         for call in &tool_calls {
             let args: serde_json::Value = if call.function.arguments.trim().is_empty() {
@@ -285,15 +286,27 @@ pub async fn run(
             messages.push(ChatMessage::tool(&call.id, capped));
         }
 
-        // Budget policing: compact when real usage crosses the
-        // high-water mark.
-        if let (Some(budget), Some(usage)) = (cfg.budget_tokens, usage) {
-            if usage.prompt_tokens >= budget {
+        // Budget policing. `usage.prompt_tokens` measures the prompt we *sent
+        // this step* — i.e. BEFORE the tool results appended just above. We add
+        // a local estimate of those freshly appended results so a single
+        // tool-heavy step that would overflow the backend's per-slot context
+        // gets compacted NOW, rather than one round later after the server has
+        // already rejected the oversized request with a hard 400/500.
+        if let Some(budget) = cfg.budget_tokens {
+            let sent = match usage {
+                Some(u) => u.prompt_tokens as usize,
+                None => estimate_tokens(&messages[..pre_len]),
+            };
+            let appended = estimate_tokens(&messages[pre_len..]);
+            let projected = sent.saturating_add(appended);
+            if projected >= budget as usize {
                 warn!(
-                    used = usage.prompt_tokens,
-                    budget, "offload: budget high-water crossed; compacting"
+                    sent,
+                    appended,
+                    budget,
+                    "offload: projected prompt over budget; compacting"
                 );
-                compact(&mut messages);
+                compact(&mut messages, budget);
             }
         }
     }
@@ -371,33 +384,69 @@ async fn force_final(
     }
 }
 
+/// Rough local token estimate (~4 chars/token) for a slice of chat messages,
+/// used to project prompt size *before* a POST so compaction can fire ahead of
+/// a server-side context overflow. Deliberately cheap and slightly
+/// conservative: counts message content plus tool-call name/argument JSON, with
+/// a small per-message framing overhead.
+fn estimate_tokens(messages: &[ChatMessage]) -> usize {
+    let mut chars = 0usize;
+    for m in messages {
+        chars += 4; // role + message framing overhead
+        if let Some(c) = &m.content {
+            chars += c.len();
+        }
+        for tc in &m.tool_calls {
+            chars += tc.function.name.len() + tc.function.arguments.len() + 8;
+        }
+        if let Some(id) = &m.tool_call_id {
+            chars += id.len();
+        }
+    }
+    chars / 4
+}
+
 /// Mini auto-compact: drop the oldest tool/assistant turns (keeping the
 /// system + original user message and the most recent turns) and leave a
 /// note so the model knows context was evicted.
-fn compact(messages: &mut Vec<ChatMessage>) {
+///
+/// Budget-aware: it keeps shrinking the retained tail until the rebuilt
+/// conversation is estimated under `budget`, so a single oversized recent turn
+/// can't leave the result still over budget — which would otherwise make
+/// compaction a no-op that re-fires (and re-sends a near-identical oversized
+/// prompt) every step until `max_steps`.
+fn compact(messages: &mut Vec<ChatMessage>, budget: u32) {
     const KEEP_RECENT: usize = 6;
+    const NOTE: &str = "[earlier tool results were summarized away to stay within the context \
+                        budget — re-fetch anything you still need]";
     if messages.len() <= 2 + KEEP_RECENT {
         return;
     }
     let head: Vec<ChatMessage> = messages.iter().take(2).cloned().collect(); // system + user
+    let budget = budget as usize;
     let mut tail_start = messages.len() - KEEP_RECENT;
-    // The tail must not begin with a `tool` message: its owning assistant turn
-    // (which carries the matching `tool_calls` id) would have been evicted, and
-    // OpenAI-compatible servers reject a `tool` message that doesn't follow the
-    // assistant that requested it. Advance past any leading orphan tool
-    // messages to the next real turn boundary (keeping slightly fewer messages
-    // is fine; sending an invalid sequence is not).
-    while tail_start < messages.len() && messages[tail_start].role == "tool" {
+    loop {
+        // The tail must not begin with a `tool` message: its owning assistant
+        // turn (which carries the matching `tool_calls` id) would have been
+        // evicted, and OpenAI-compatible servers reject a `tool` message that
+        // doesn't follow the assistant that requested it. Advance past any
+        // leading orphan tool messages to the next real turn boundary.
+        while tail_start < messages.len() && messages[tail_start].role == "tool" {
+            tail_start += 1;
+        }
+        let mut rebuilt = head.clone();
+        rebuilt.push(ChatMessage::user(NOTE));
+        rebuilt.extend(messages.iter().skip(tail_start).cloned());
+
+        // Done when under budget, or when we can't drop more without losing the
+        // single most-recent message (always keep at least one real turn).
+        if estimate_tokens(&rebuilt) < budget || tail_start >= messages.len().saturating_sub(1) {
+            *messages = rebuilt;
+            return;
+        }
+        // Still over budget: drop the next-oldest kept turn and retry.
         tail_start += 1;
     }
-    let tail: Vec<ChatMessage> = messages.iter().skip(tail_start).cloned().collect();
-    let mut rebuilt = head;
-    rebuilt.push(ChatMessage::user(
-        "[earlier tool results were summarized away to stay within the context budget — \
-         re-fetch anything you still need]",
-    ));
-    rebuilt.extend(tail);
-    *messages = rebuilt;
 }
 
 #[cfg(test)]
@@ -453,7 +502,8 @@ mod tests {
             ChatMessage::tool("c4", "r4"),     // 8
             assistant(),                       // 9
         ];
-        compact(&mut messages);
+        // Large budget: one pass, exercising only the orphan-tool skip.
+        compact(&mut messages, u32::MAX);
         // First message after the system+user+note head must not be a tool.
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");

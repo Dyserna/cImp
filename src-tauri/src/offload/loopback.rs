@@ -169,6 +169,10 @@ struct RunBody {
     thinking: Option<String>,
     #[serde(default)]
     tier: Option<String>,
+    /// The calling session's working directory (the repo Claude Code runs in),
+    /// used as the native-tool root when no explicit `allowed_roots` is set.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// A `POST /run` response.
@@ -336,7 +340,10 @@ async fn handle_run(
     let thinking = ThinkingMode::parse(body.thinking.as_deref().unwrap_or("auto"));
     let tier = TierHint::parse(body.tier.as_deref().unwrap_or("auto"));
 
-    let result = service.run(body.instructions, body.context, thinking, tier).await;
+    let session_cwd = body.cwd.map(std::path::PathBuf::from);
+    let result = service
+        .run(body.instructions, body.context, thinking, tier, session_cwd)
+        .await;
     let r = match result {
         Ok(text) => RunResult {
             ok: true,

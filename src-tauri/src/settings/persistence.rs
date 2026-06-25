@@ -87,7 +87,7 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // 1. Load and migrate the global baseline. After this `global` is in
     //    the current schema shape; a v1.x file on disk has been backed up
     //    next to the global path and rewritten.
-    let global = load_global(default_shell);
+    let mut global = load_global(default_shell);
 
     // 2. Load the overlay (if any). We deliberately DON'T run the legacy
     //    migration cascade on it: the overlay is a *partial* diff (see
@@ -142,6 +142,14 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // theme is known) and kept out of the persisted diff — it re-derives
     // from theme + on-disk folder each load, so there's nothing to save.
     apply_portable_avatar_paths(&mut settings);
+    // Stamp the baseline identically. The avatar paths are re-derived from
+    // `ui.theme` + the on-disk folder each load, so they must be present on
+    // BOTH sides of every diff to cancel out. Without this, after the user
+    // changes `ui.theme` the stamped (new-theme) paths in `settings` differ
+    // from the on-disk `global` (frozen at the seed-time theme) and the diff
+    // writes machine-specific absolute avatar paths into the portable
+    // per-folder overlay, pinning the avatar to the save-time theme.
+    apply_portable_avatar_paths(&mut global);
 
     if repaired {
         // Persist the post-repair state back to its source of truth. If a

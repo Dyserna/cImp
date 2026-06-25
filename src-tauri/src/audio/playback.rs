@@ -441,14 +441,22 @@ fn run_audio_thread(
 }
 
 /// Source that streams f32 mono samples to rodio while mirroring each one
-/// into the amplitude ring buffer. Brief lock per sample; if it ever becomes
-/// a contention point, swap for a lock-free ring.
+/// into the amplitude ring buffer. The ring write is *batched*: taking the
+/// `RwLock::write()` once per sample inside rodio's real-time mixer callback
+/// (24 kHz) lets the waveform reader momentarily stall the audio driver and
+/// cause xruns. We accumulate samples locally and flush every `BATCH` of them
+/// (≈5 ms at 24 kHz) under a single lock acquisition instead.
 struct TappedSource {
     samples: std::vec::IntoIter<f32>,
     sample_rate: u32,
     remaining: usize,
     amplitude: Arc<RwLock<RingBuffer>>,
+    batch: Vec<f32>,
 }
+
+/// Samples buffered before one batched lock acquisition flushes them to the
+/// amplitude ring. ~5 ms of audio at 24 kHz.
+const AMPLITUDE_BATCH: usize = 128;
 
 impl TappedSource {
     fn new(samples: Vec<f32>, sample_rate: u32, amplitude: Arc<RwLock<RingBuffer>>) -> Self {
@@ -458,7 +466,22 @@ impl TappedSource {
             sample_rate,
             remaining,
             amplitude,
+            batch: Vec::with_capacity(AMPLITUDE_BATCH),
         }
+    }
+
+    /// Push the locally-buffered samples into the amplitude ring under one
+    /// lock, then clear the buffer. No-op when the buffer is empty.
+    fn flush_amplitude(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        if let Ok(mut ring) = self.amplitude.write() {
+            for &s in &self.batch {
+                ring.push(s);
+            }
+        }
+        self.batch.clear();
     }
 }
 
@@ -466,10 +489,18 @@ impl Iterator for TappedSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<f32> {
-        let s = self.samples.next()?;
+        let s = match self.samples.next() {
+            Some(s) => s,
+            None => {
+                // End of stream: flush any partial batch so the tail isn't lost.
+                self.flush_amplitude();
+                return None;
+            }
+        };
         self.remaining = self.remaining.saturating_sub(1);
-        if let Ok(mut ring) = self.amplitude.write() {
-            ring.push(s);
+        self.batch.push(s);
+        if self.batch.len() >= AMPLITUDE_BATCH {
+            self.flush_amplitude();
         }
         Some(s)
     }

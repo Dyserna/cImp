@@ -27,6 +27,7 @@
 //!     returns a non-200 and we return `None` so the UI hides the widget.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,23 @@ use tracing::{debug, warn};
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reusable HTTP client for the usage poll. Built once and shared so we don't
+/// spin up a fresh connection pool / TLS config on every poll tick (the widget
+/// polls on an interval for the whole session). The bearer token is supplied
+/// per-request, so the client itself is stateless and safe to reuse.
+fn usage_client() -> &'static reqwest::Client {
+    static USAGE_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    USAGE_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "usage: failed to build HTTP client; using default");
+                reqwest::Client::new()
+            })
+    })
+}
 
 /// One quota window: how much of the limit is used and when it resets.
 /// `utilization` is 0–100; `resets_at` is an ISO-8601 timestamp (with tz) or
@@ -134,13 +152,7 @@ pub async fn fetch_usage() -> UsageResult {
         }
     };
 
-    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "usage: failed to build HTTP client");
-            return UsageResult::default();
-        }
-    };
+    let client = usage_client();
 
     let resp = match client
         .get(USAGE_URL)

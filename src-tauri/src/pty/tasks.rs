@@ -462,7 +462,36 @@ pub fn spawn_waiter(
     state_signals: mpsc::Sender<StateSignal>,
 ) {
     tokio::task::spawn_blocking(move || {
-        let exit = child.wait();
+        use std::time::{Duration, Instant};
+        const POLL: Duration = Duration::from_millis(100);
+        // Once cancellation is observed (shutdown/restart is killing the child)
+        // keep polling only briefly: if the kill works the child reports its
+        // status and we emit a clean pty-exit; if it never dies we must NOT
+        // park this blocking-pool thread forever — that leaks a thread per
+        // restart and eventually exhausts tokio's blocking pool, wedging all
+        // spawn_blocking work (PTY writes/resizes). Give up after the grace.
+        const KILL_GRACE: Duration = Duration::from_secs(5);
+        let mut give_up_at: Option<Instant> = None;
+
+        let exit = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            }
+            if cancel.is_cancelled() {
+                let deadline = *give_up_at.get_or_insert_with(|| Instant::now() + KILL_GRACE);
+                if Instant::now() >= deadline {
+                    warn!(
+                        ?tab,
+                        "pty child did not exit after kill; abandoning waiter (process may be orphaned)"
+                    );
+                    debug!(?tab, "pty waiter task exiting (abandoned)");
+                    return;
+                }
+            }
+            std::thread::sleep(POLL);
+        };
         cancel.cancel();
         let (exit_str, code) = match &exit {
             // `portable_pty::ExitStatus::exit_code()` is u32; the bit pattern

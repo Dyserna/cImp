@@ -80,40 +80,80 @@ fn leading_verb(name: &str) -> String {
     token_verb(seg)
 }
 
-/// Unambiguously destructive verbs that never legitimately appear *anywhere*
-/// in a read-only tool's name — unlike noun-ish verbs (`commit`, `set`,
-/// `merge`, `add`, `copy`) which show up in plenty of read tools such as
-/// `get_latest_commit` or `list_set_members`. These are checked across every
-/// segment so a write verb buried past the second segment
-/// (`search_and_replace`, `find_and_delete`) can't slip through.
+/// Unambiguously destructive or code-executing verbs that never legitimately
+/// appear *anywhere* in a read-only tool's name — unlike noun-ish verbs
+/// (`commit`, `set`, `merge`, `add`, `copy`) which show up in plenty of read
+/// tools such as `get_latest_commit` or `list_set_members`. These are checked
+/// across every segment (and every camelCase sub-word) so a dangerous verb
+/// buried past the second segment (`search_and_replace`, `find_and_delete`,
+/// `git_force_push`) or hidden behind a leading lowercase run (`shellExec`)
+/// can't slip through.
+///
+/// The execution verbs (`exec`/`run`/`spawn`/`shell`/`eval`/`bash`/`sh`) are
+/// the highest-value entries: a tool like `command_run` or `shell_command_exec`
+/// hands the local offload worker arbitrary code execution. We deliberately
+/// err toward dropping a read tool that merely *contains* one of these words
+/// (e.g. a CI `getRunStatus`) over ever exposing an executor — a dropped read
+/// tool is harmless; an exposed executor is not.
 const HARD_WRITE_VERBS: &[&str] = &[
     "write", "delete", "remove", "rm", "unlink", "destroy", "truncate",
     "drop", "purge", "replace", "overwrite", "rename", "uninstall", "kill",
-    "wipe",
+    "wipe", "exec", "execute", "eval", "run", "spawn", "shell", "bash", "sh",
 ];
 
+/// Split one name segment into lowercased word tokens, breaking on camelCase
+/// boundaries so `gitPush` → `["git", "push"]` and `shellExec` →
+/// `["shell", "exec"]`. Without this, [`token_verb`] only sees the leading
+/// lowercase run and a dangerous verb after the first capital hides.
+fn segment_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut prev_was_lower_or_digit = false;
+    for c in segment.chars() {
+        if c.is_ascii_uppercase() && prev_was_lower_or_digit && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        cur.push(c.to_ascii_lowercase());
+        prev_was_lower_or_digit = c.is_ascii_lowercase() || c.is_ascii_digit();
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
 /// Whether a tool name is read-class (safe to expose). The offload worker is
-/// read-only; mutating tools are dropped. Two-tier check:
+/// read-only; mutating tools are dropped. This is best-effort *defense in
+/// depth* — the real safety boundary for the native tools is server-side
+/// filesystem confinement; for third-party MCP servers it bounds what we
+/// advertise to the local model but a hostile/oddly-named server can still
+/// name a write tool to look like a read. Two-tier check:
 ///
-/// 1. No segment anywhere may be a hard-destructive verb ([`HARD_WRITE_VERBS`])
-///    — catches a write verb past the second segment.
+/// 1. No camelCase sub-word of any segment may be a hard-destructive or
+///    execution verb ([`HARD_WRITE_VERBS`]) — catches a dangerous verb past
+///    the second segment (`git_force_push`) or behind a capital (`shellExec`).
 /// 2. Neither of the first two segments may lead with a (possibly noun-ish)
 ///    write verb — catches category-prefixed names (`git_commit`, `git_push`)
 ///    without dropping reads like `get_latest_commit` where the noun-verb sits
 ///    later.
 fn is_read_class(name: &str) -> bool {
-    let verbs: Vec<String> = name
-        .split(['_', '-', '.', ' ', ':'])
+    let segments: Vec<&str> = name
+        .split(['_', '-', '.', ' ', ':', '/'])
         .filter(|s| !s.is_empty())
-        .map(token_verb)
         .collect();
-    if verbs.iter().any(|v| HARD_WRITE_VERBS.contains(&v.as_str())) {
+
+    let hits_hard_verb = segments
+        .iter()
+        .flat_map(|seg| segment_words(seg))
+        .any(|w| HARD_WRITE_VERBS.contains(&w.as_str()));
+    if hits_hard_verb {
         return false;
     }
-    verbs
+
+    segments
         .iter()
         .take(2)
-        .all(|v| !WRITE_VERBS.contains(&v.as_str()))
+        .all(|seg| !WRITE_VERBS.contains(&token_verb(seg).as_str()))
 }
 
 /// One namespaced, read-class tool offered by a server: the [`ToolDef`]
@@ -289,7 +329,20 @@ impl McpServer {
         match result {
             Ok(v) => Ok(render_tool_result(&v)),
             Err(e) => {
-                self.set_unhealthy(format!("call failed: {e}"));
+                // A single failed call must NOT permanently disable the whole
+                // server — that drops *all* its tools (`tool_defs` returns
+                // empty once unhealthy) for the app's lifetime, even though a
+                // 45s per-call timeout or a JSON-RPC tool-level error leaves a
+                // perfectly live stdio process running. Only flip unhealthy
+                // when the connection is genuinely dead (reader saw EOF/fatal,
+                // so `alive` is false). HTTP calls are independent and
+                // reconnect on demand, so a transient failure there leaves
+                // health untouched and the next call can succeed.
+                if let Some(Conn::Stdio(c)) = &self.conn {
+                    if !c.alive.load(Ordering::Relaxed) {
+                        self.set_unhealthy(format!("connection lost: {e}"));
+                    }
+                }
                 Err(e)
             }
         }

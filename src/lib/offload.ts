@@ -17,20 +17,36 @@ export type OffloadState =
 export const offloadState: Writable<OffloadState> = writable({ state: 'disabled' });
 
 let initialized = false;
+let initInFlight: Promise<void> | null = null;
 
 /// Fetch the current status and subscribe to live `offload-state` events.
 /// Idempotent; safe to call on Settings mount.
 export async function initOffloadStatus(): Promise<void> {
   if (initialized) return;
-  initialized = true;
+  // Dedupe concurrent callers (Settings mount + app mount) so we don't
+  // subscribe twice while the first attempt is still in flight.
+  if (initInFlight) return initInFlight;
+  initInFlight = (async () => {
+    // A failed status fetch is non-fatal — we still want the live listener.
+    try {
+      offloadState.set(await offloadStatus());
+    } catch (e) {
+      console.warn('offload_status failed', e);
+    }
+    await listen<OffloadState>('offload-state', (event) => {
+      offloadState.set(event.payload);
+    });
+    // Mark initialized only after the subscription is established; if `listen`
+    // throws, the flag stays false and the next call retries.
+    initialized = true;
+  })();
   try {
-    offloadState.set(await offloadStatus());
+    await initInFlight;
   } catch (e) {
-    console.warn('offload_status failed', e);
+    console.warn('offload-state subscribe failed; will retry', e);
+  } finally {
+    initInFlight = null;
   }
-  await listen<OffloadState>('offload-state', (event) => {
-    offloadState.set(event.payload);
-  });
 }
 
 export async function offloadStatus(): Promise<OffloadState> {

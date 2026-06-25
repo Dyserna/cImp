@@ -714,6 +714,15 @@ pub struct OffloadSettings {
     /// default (empty list = nothing runnable). Matched against the
     /// command's program name.
     pub command_allowlist: Vec<String>,
+    /// Per-program command security policies layered on top of the
+    /// allowlist by `run_command`: which argument flags and subcommands to
+    /// refuse, and which environment variables to force at spawn (to
+    /// neutralize config-driven hooks). Seeded with a default `git` policy
+    /// (refuse config-injection / root-escape flags + the `config`
+    /// subcommand, neutralize pager/ssh via env). Fully visible and editable
+    /// in Settings → Offload → Tools. A program with no matching policy gets
+    /// only the allowlist + bare-name/PATH guard.
+    pub command_policies: Vec<CommandPolicy>,
     /// User-installed MCP tool servers aggregated by ccImp's MCP host
     /// and exposed to the local model as OpenAI tools. Mirrors Claude's
     /// own `mcpServers` config shape so users can paste familiar config.
@@ -763,6 +772,7 @@ impl std::fmt::Debug for OffloadSettings {
             .field("tools", &self.tools)
             .field("allowed_roots", &self.allowed_roots)
             .field("command_allowlist", &self.command_allowlist)
+            .field("command_policies", &self.command_policies)
             // McpServerConfig has its own redacted Debug.
             .field("mcp_servers", &self.mcp_servers)
             // OffloadBackend redacts the Remote `auth_token`.
@@ -786,6 +796,7 @@ impl Default for OffloadSettings {
             tools: OffloadToolToggles::default(),
             allowed_roots: Vec::new(),
             command_allowlist: Vec::new(),
+            command_policies: default_command_policies(),
             mcp_servers: Vec::new(),
             backends: Vec::new(),
             budget_high_water_pct: 80,
@@ -795,6 +806,73 @@ impl Default for OffloadSettings {
             global_concurrency: None,
         }
     }
+}
+
+/// One environment variable forced at spawn by a [`CommandPolicy`] (e.g.
+/// `GIT_PAGER=cat`). An ordered list of these — rather than a map — keeps the
+/// settings diff deterministic and maps cleanly to the UI's key/value rows.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct CommandEnvVar {
+    pub key: String,
+    pub value: String,
+}
+
+/// A per-program command security policy applied by the native `run_command`
+/// tool on top of the allowlist. Generalizes what used to be a hardcoded `git`
+/// guard so any allowlisted program can be hardened, and so the rules are
+/// visible/editable in Settings rather than buried in code.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct CommandPolicy {
+    /// Program this policy hardens, matched against the allowlisted command by
+    /// file-stem, case-insensitively (so `git` covers `git` and `git.exe`).
+    pub program: String,
+    /// Argument tokens to refuse. An argument matches when it equals the entry
+    /// OR starts with `<entry>=` — covering `-c`, `--config-env`, `--git-dir`,
+    /// … in both `--flag value` and `--flag=value` forms.
+    pub denied_flags: Vec<String>,
+    /// Subcommands (the first non-flag argument) to refuse, e.g. `config`.
+    pub denied_subcommands: Vec<String>,
+    /// Environment variables forced at spawn to neutralize config-driven hooks
+    /// (e.g. `GIT_PAGER=cat`, empty `GIT_SSH_COMMAND`).
+    pub env: Vec<CommandEnvVar>,
+}
+
+/// The seeded default policies. The `git` policy reproduces exactly the
+/// hardening that `run_command` previously applied in code, so behavior is
+/// unchanged on a fresh install — it's just visible and editable now. Because
+/// [`OffloadSettings`] is `#[serde(default)]`, existing config files missing
+/// the `command_policies` key inherit this automatically (no migration).
+pub fn default_command_policies() -> Vec<CommandPolicy> {
+    fn env(key: &str, value: &str) -> CommandEnvVar {
+        CommandEnvVar { key: key.to_string(), value: value.to_string() }
+    }
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+    vec![CommandPolicy {
+        program: s("git"),
+        denied_flags: vec![
+            s("-c"),
+            s("-C"),
+            s("--config-env"),
+            s("--exec-path"),
+            s("--git-dir"),
+            s("--work-tree"),
+            s("--upload-pack"),
+            s("--receive-pack"),
+        ],
+        denied_subcommands: vec![s("config")],
+        env: vec![
+            env("GIT_PAGER", "cat"),
+            env("PAGER", "cat"),
+            env("GIT_SSH_COMMAND", ""),
+            env("GIT_TERMINAL_PROMPT", "0"),
+            env("GIT_CONFIG_NOSYSTEM", "1"),
+            env("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ],
+    }]
 }
 
 /// On/off toggles for the native baseline offload tools (built into

@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::offload::openai::ToolDef;
-use crate::settings::OffloadToolToggles;
+use crate::settings::{CommandPolicy, OffloadToolToggles};
 
 pub mod code_search;
 pub mod read_file;
@@ -31,6 +31,9 @@ pub struct ToolCtx {
     /// Programs `run_command` may execute (matched by program name).
     /// Empty = nothing runnable (deny by default).
     pub command_allowlist: Vec<String>,
+    /// Per-program security policies `run_command` enforces on top of the
+    /// allowlist (denied flags/subcommands + spawn env). See [`CommandPolicy`].
+    pub command_policies: Vec<CommandPolicy>,
 }
 
 impl ToolCtx {
@@ -39,6 +42,7 @@ impl ToolCtx {
     pub fn new(
         mut allowed_roots: Vec<PathBuf>,
         command_allowlist: Vec<String>,
+        command_policies: Vec<CommandPolicy>,
         launch_root: &Path,
     ) -> Self {
         if allowed_roots.is_empty() {
@@ -47,6 +51,7 @@ impl ToolCtx {
         Self {
             allowed_roots,
             command_allowlist,
+            command_policies,
         }
     }
 

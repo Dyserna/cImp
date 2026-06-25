@@ -400,7 +400,12 @@ impl OffloadService {
         } else {
             snap.allowed_roots.clone()
         };
-        let ctx = ToolCtx::new(roots, snap.command_allowlist.clone(), &cwd);
+        let ctx = ToolCtx::new(
+            roots,
+            snap.command_allowlist.clone(),
+            snap.command_policies.clone(),
+            &cwd,
+        );
         let native_defs = tools::enabled_defs(&snap.tools);
         let mcp_defs = self.host.tool_defs().await;
         let router = HostRouter::new(

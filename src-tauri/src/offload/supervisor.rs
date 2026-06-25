@@ -527,6 +527,7 @@ impl OffloadSupervisor {
         let ctx = super::tools::ToolCtx::new(
             snap.allowed_roots.clone(),
             snap.command_allowlist.clone(),
+            snap.command_policies.clone(),
             &cwd,
         );
         let router = super::agent::NativeRouter::new(

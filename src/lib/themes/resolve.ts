@@ -41,7 +41,9 @@ export function themeFromSetting(t: TerminalThemeSettingsLike): ThemeColors {
     // arbitrary/misspelled keys — and, worse, a non-color string on a real key
     // — straight into the xterm.js ITheme. Anything invalid falls back to the
     // default channel.
-    const base = defaultPalette();
+    // Clone — `defaultPalette()` returns the shared bundled Default object, so
+    // mutating it in place would corrupt every later resolve.
+    const base = { ...defaultPalette() };
     const custom = t.custom as Record<string, unknown>;
     for (const key of Object.keys(base) as (keyof ThemeColors)[]) {
       const v = custom[key as string];

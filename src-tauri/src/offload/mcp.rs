@@ -755,6 +755,7 @@ async fn run_on_backend(
     let ctx = ToolCtx::new(
         settings.allowed_roots.clone(),
         settings.command_allowlist.clone(),
+        settings.command_policies.clone(),
         cwd,
     );
     let router = NativeRouter::new(

@@ -668,6 +668,25 @@ export interface OffloadBackend {
 /// `server_command`/`autostart` are the legacy single-local fields; V8-02
 /// uses `backends` (the pool). When `backends` is empty the legacy fields
 /// synthesize one Local backend at runtime.
+/// One environment variable a command policy forces at spawn (mirror of Rust
+/// `CommandEnvVar`). An ordered list of these, not a map, to match the backend.
+export interface CommandEnvVar {
+  key: string;
+  value: string;
+}
+
+/// A per-program command security policy applied by `run_command` on top of the
+/// allowlist (mirror of Rust `CommandPolicy`). `program` matches the allowlisted
+/// command by file-stem (case-insensitive). A `denied_flags` entry refuses an
+/// argument that equals it or starts with `<entry>=`; `denied_subcommands`
+/// refuses the first non-flag token; `env` vars are forced at spawn.
+export interface CommandPolicy {
+  program: string;
+  denied_flags: string[];
+  denied_subcommands: string[];
+  env: CommandEnvVar[];
+}
+
 export interface OffloadSettings {
   enabled: boolean;
   autostart: boolean;
@@ -676,6 +695,9 @@ export interface OffloadSettings {
   tools: OffloadToolToggles;
   allowed_roots: string[];
   command_allowlist: string[];
+  /// Per-program security policies layered on top of the allowlist. Seeded
+  /// with a default `git` policy (see `defaultSettings`).
+  command_policies: CommandPolicy[];
   mcp_servers: McpServerConfig[];
   backends: OffloadBackend[];
   budget_high_water_pct: number;
@@ -943,6 +965,33 @@ export function defaultSettings(): Settings {
       },
       allowed_roots: [],
       command_allowlist: [],
+      command_policies: [
+        {
+          program: 'git',
+          denied_flags: [
+            '-c',
+            '-C',
+            '--config-env',
+            '--exec-path',
+            '--git-dir',
+            '--work-tree',
+            '--upload-pack',
+            '--receive-pack',
+            '--namespace',
+            '--super-prefix',
+            '--attr-source',
+          ],
+          denied_subcommands: ['config'],
+          env: [
+            { key: 'GIT_PAGER', value: 'cat' },
+            { key: 'PAGER', value: 'cat' },
+            { key: 'GIT_SSH_COMMAND', value: '' },
+            { key: 'GIT_TERMINAL_PROMPT', value: '0' },
+            { key: 'GIT_CONFIG_NOSYSTEM', value: '1' },
+            { key: 'GIT_CONFIG_GLOBAL', value: '/dev/null' },
+          ],
+        },
+      ],
       mcp_servers: [],
       backends: [],
       budget_high_water_pct: 80,

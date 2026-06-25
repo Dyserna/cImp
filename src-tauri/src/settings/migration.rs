@@ -100,15 +100,25 @@ pub fn migrate_if_needed(
 
     // Fixpoint guard. A correct cascade leaves the value stamped at the current
     // schema. If a future detector-ordering mistake leaves it under-migrated,
-    // this surfaces loudly instead of silently writing back a stale file that
-    // re-migrates (and regenerates a backup) on every launch.
+    // surface it loudly AND force-stamp to current so the file isn't re-detected
+    // and re-migrated (regenerating a backup) on every launch — the exact
+    // unbounded-`.bak`-growth failure mode the schema_version was added to
+    // prevent. The caller's typed parse still validates the shape and
+    // quarantines if it is actually broken; the error log flags the bug for
+    // repair. (Just logging here, as before, left `Ok(true)` writing the
+    // stale-versioned file straight back into the re-migrate loop.)
+    let current = crate::settings::schema::CURRENT_SCHEMA_VERSION;
     let final_version = value.get("schema_version").and_then(|v| v.as_u64());
-    if final_version != Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64) {
+    if final_version != Some(current as u64) {
         tracing::error!(
             ?final_version,
-            expected = crate::settings::schema::CURRENT_SCHEMA_VERSION,
-            "settings migration: cascade did not reach the current schema version"
+            expected = current,
+            "settings migration: cascade did not reach the current schema version; \
+             force-stamping to stop a re-migrate loop"
         );
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("schema_version".into(), serde_json::json!(current));
+        }
     }
 
     Ok(true)
@@ -1523,6 +1533,19 @@ fn write_backup(path: &Path, from_version: &str, value: &Value) -> AppResult<()>
     } else {
         primary
     };
+
+    // If the probe exhausted without finding a free name, `target` still exists
+    // — refuse rather than let `write_atomic`'s rename clobber an existing
+    // backup, preserving the "never lose the original" guarantee. (Pathological:
+    // requires ~10k identical-nanosecond collisions; aborts migration loudly,
+    // matching the backup-write-failure contract.)
+    if target.exists() {
+        return Err(AppError::Settings(format!(
+            "could not find a free backup name for {}; refusing to overwrite an \
+             existing backup",
+            target.display()
+        )));
+    }
 
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| AppError::Settings(format!("backup serialize: {e}")))?;

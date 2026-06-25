@@ -39,6 +39,7 @@
     OffloadBackend,
     ToolScope,
     BackendTier,
+    CommandPolicy,
   } from './lib/settings/types';
   import { LOCAL_DATA_TOOLS } from './lib/settings/types';
   import type { AiTabId } from './lib/tabs/types';
@@ -215,6 +216,43 @@
       fn(s.offload.backends[i]);
     });
   }
+  // ── Command security policies (Tools tab) ──────────────────────────────
+  // All mutations route through `patch` so they persist + mark dirty, mirroring
+  // the backend-pool helpers above.
+  function addCommandPolicy(): void {
+    patch((s) => {
+      s.offload.command_policies = [
+        ...s.offload.command_policies,
+        { program: '', denied_flags: [], denied_subcommands: [], env: [] },
+      ];
+    });
+  }
+  function removeCommandPolicy(i: number): void {
+    patch((s) => {
+      s.offload.command_policies = s.offload.command_policies.filter((_, idx) => idx !== i);
+    });
+  }
+  function updatePolicy(i: number, fn: (p: CommandPolicy) => void): void {
+    patch((s) => {
+      fn(s.offload.command_policies[i]);
+    });
+  }
+  // Comma-separated <-> string[] for the flag/subcommand inputs (mirrors the
+  // allowlist input). Empty entries are dropped.
+  function csvToList(value: string): string[] {
+    return value
+      .split(',')
+      .map((c) => c.trim())
+      .filter((c) => c.length > 0);
+  }
+  // Whether an allowlisted program currently has a hardening policy — drives
+  // the transparency line next to the allowlist.
+  function policyForProgram(program: string): CommandPolicy | undefined {
+    const stem = program.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, '').toLowerCase() ?? program;
+    return snapshot.offload.command_policies.find(
+      (p) => p.program.toLowerCase() === stem,
+    );
+  }
   // Toggling a backend's cloud flag flips its default tool scope to the safe
   // web/docs-only set (deny the local-data tools) so a cloud backend never
   // ships local file/exec tools unless the user explicitly widens it.
@@ -301,6 +339,11 @@
   // previously-collapsible <details> wall navigable.
   type TabsSubSection = AiTabId | 'shells';
   let tabsSubSection = $state<TabsSubSection>('claude');
+  // Sub-tab nav within the Offload section: the backend pool + limits live
+  // under 'pool'; native tools, allowlist, command policies, and MCP servers
+  // under 'tools'.
+  type OffloadSubSection = 'pool' | 'tools';
+  let offloadSubSection = $state<OffloadSubSection>('pool');
   function subSectionForTabId(tabId: string): TabsSubSection {
     if (
       tabId === 'claude' ||
@@ -2431,6 +2474,28 @@
             enabled).
           </small>
 
+          <div class="sub-tabs" role="tablist" aria-label="Offload sub-sections">
+            <button
+              type="button"
+              role="tab"
+              class:active={offloadSubSection === 'pool'}
+              aria-selected={offloadSubSection === 'pool'}
+              onclick={() => (offloadSubSection = 'pool')}
+            >
+              Pool
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={offloadSubSection === 'tools'}
+              aria-selected={offloadSubSection === 'tools'}
+              onclick={() => (offloadSubSection = 'tools')}
+            >
+              Tools
+            </button>
+          </div>
+
+          {#if offloadSubSection === 'pool'}
           <h3>Backend pool</h3>
           <small class="hint top">
             V8-02: route each offload to the right backend. Add a LAN box or a
@@ -2690,7 +2755,7 @@
             />
             <small class="hint">Bounds each offload, including the wait for a free slot.</small>
           </label>
-
+          {:else}
           <h3>Native tools</h3>
           <label class="checkbox">
             <input
@@ -2760,6 +2825,115 @@
               listed here (deny by default).
             </small>
           </label>
+
+          {#if snapshot.offload.command_allowlist.length > 0}
+            <ul class="policy-status">
+              {#each snapshot.offload.command_allowlist as prog (prog)}
+                {@const pol = policyForProgram(prog)}
+                <li>
+                  <code>{prog}</code>
+                  {#if pol}
+                    <span class="hardened">✓ hardened by policy</span>
+                  {:else}
+                    <span class="unguarded">— no extra guards (allowlist + bare-name only)</span>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+
+          <h3>Command security policies</h3>
+          <small class="hint top">
+            Per-program hardening layered on top of the allowlist:
+            <code>run_command</code> refuses the listed flags/subcommands and
+            forces the listed environment variables at spawn. <code>program</code>
+            matches an allowlisted command by name (file-stem, case-insensitive).
+            The default <code>git</code> policy blocks the config-injection and
+            root-escape vectors and neutralizes the pager/ssh hooks. You can edit
+            or remove any policy — weakening one can reopen an
+            arbitrary-code-execution path, so change with care.
+          </small>
+          {#each snapshot.offload.command_policies as policy, i (i)}
+            <fieldset class="policy-card">
+              <div class="policy-head">
+                <label class="policy-program">
+                  <span>Program</span>
+                  <input
+                    type="text"
+                    value={policy.program}
+                    oninput={(e) =>
+                      updatePolicy(i, (p) => (p.program = (e.currentTarget as HTMLInputElement).value.trim()))}
+                    placeholder="git"
+                  />
+                </label>
+                <button type="button" class="secondary danger" onclick={() => removeCommandPolicy(i)}>
+                  Remove
+                </button>
+              </div>
+              <label>
+                <span>Denied flags (comma-separated)</span>
+                <input
+                  type="text"
+                  value={policy.denied_flags.join(', ')}
+                  oninput={(e) =>
+                    updatePolicy(i, (p) => (p.denied_flags = csvToList((e.currentTarget as HTMLInputElement).value)))}
+                  placeholder="-c, --git-dir, --work-tree"
+                />
+              </label>
+              <label>
+                <span>Denied subcommands (comma-separated)</span>
+                <input
+                  type="text"
+                  value={policy.denied_subcommands.join(', ')}
+                  oninput={(e) =>
+                    updatePolicy(i, (p) => (p.denied_subcommands = csvToList((e.currentTarget as HTMLInputElement).value)))}
+                  placeholder="config"
+                />
+              </label>
+              <div class="policy-env">
+                <span class="policy-env-label">Spawn environment (forced)</span>
+                {#each policy.env as ev, j (j)}
+                  <div class="env-row">
+                    <input
+                      type="text"
+                      value={ev.key}
+                      oninput={(e) =>
+                        updatePolicy(i, (p) => (p.env[j].key = (e.currentTarget as HTMLInputElement).value))}
+                      placeholder="GIT_PAGER"
+                    />
+                    <input
+                      type="text"
+                      value={ev.value}
+                      oninput={(e) =>
+                        updatePolicy(i, (p) => (p.env[j].value = (e.currentTarget as HTMLInputElement).value))}
+                      placeholder="cat"
+                    />
+                    <button
+                      type="button"
+                      class="secondary"
+                      aria-label="Remove environment variable"
+                      onclick={() => updatePolicy(i, (p) => (p.env = p.env.filter((_, idx) => idx !== j)))}
+                    >
+                      ×
+                    </button>
+                  </div>
+                {/each}
+                <div class="button-row">
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => updatePolicy(i, (p) => (p.env = [...p.env, { key: '', value: '' }]))}
+                  >
+                    Add env var
+                  </button>
+                </div>
+              </div>
+            </fieldset>
+          {/each}
+          <div class="button-row">
+            <button type="button" onclick={addCommandPolicy}>Add command policy</button>
+          </div>
+
           <h3>MCP tool servers</h3>
           <small class="hint top">
             ccImp's warm MCP host aggregates the read-class tools from these
@@ -2788,6 +2962,7 @@
             </small>
           {:else}
             <small class="hint">No MCP tool servers configured yet.</small>
+          {/if}
           {/if}
         </section>
       {:else if activeSection === 'advanced'}
@@ -3087,6 +3262,58 @@
     border-radius: 4px;
     padding: 0.5rem;
     font-size: var(--font-size-sm);
+  }
+  /* Command security policies (Tools sub-tab) */
+  .policy-status {
+    list-style: none;
+    margin: 0.25rem 0 0.75rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: var(--font-size-sm);
+  }
+  .policy-status li {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+  }
+  .policy-status .hardened {
+    color: var(--accent, #6abf69);
+  }
+  .policy-status .unguarded {
+    color: var(--text-subtle, #999);
+  }
+  .policy-card {
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.75rem;
+    margin-bottom: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .policy-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .policy-program {
+    flex: 1;
+  }
+  .policy-env-label {
+    display: block;
+    font-size: var(--font-size-sm);
+    margin-bottom: 0.25rem;
+  }
+  .env-row {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 0.4rem;
+  }
+  .env-row input {
+    flex: 1;
   }
   /* V8-02 backend pool editor */
   .backend-card {

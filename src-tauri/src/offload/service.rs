@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -126,6 +126,11 @@ pub struct OffloadService {
     /// can't interleave and leave the gate sized inconsistently with
     /// `global_cap` (see `reconcile_global_cap`).
     cap_reconcile_lock: TokioMutex<()>,
+    /// Set when a cap reconcile is wanted. Lets a single in-flight reconcile
+    /// task absorb concurrent triggers (instead of one task piling up per
+    /// trigger behind the lock during a slow shrink drain) and still converge
+    /// to the latest config.
+    reconcile_pending: AtomicBool,
 }
 
 impl OffloadService {
@@ -159,6 +164,7 @@ impl OffloadService {
             app,
             latest_metrics: StdMutex::new(Vec::new()),
             cap_reconcile_lock: TokioMutex::new(()),
+            reconcile_pending: AtomicBool::new(false),
         });
 
         // Relay MCP-host change pulses into the service change channel so a
@@ -200,43 +206,60 @@ impl OffloadService {
     /// stays frozen at the startup value until restart. Grows by adding
     /// permits; shrinks by acquiring+forgetting the excess as it frees.
     fn reconcile_global_cap(self: &Arc<Self>, snap: &OffloadSettings) {
-        let target = compute_global_cap(snap);
         // Cheap no-op guard so the common "nothing changed" call doesn't spawn
-        // a task. The authoritative re-check happens under the lock below.
-        if target == self.global_cap.load(Ordering::Relaxed) {
+        // a task.
+        if compute_global_cap(snap) == self.global_cap.load(Ordering::Relaxed) {
             return;
         }
+        // Flag the work and ensure exactly ONE reconcile task runs. A concurrent
+        // caller that finds the lock held just leaves `reconcile_pending` set;
+        // the running task re-checks it and loops. Without this, the health
+        // watch (every 12s) would spawn a fresh task on each tick during a slow
+        // shrink drain (up to offload_timeout_secs), piling up behind the lock
+        // and re-draining redundantly.
+        self.reconcile_pending.store(true, Ordering::Relaxed);
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
-            // Serialize the whole resize (including the async shrink drain) so
-            // a concurrent grow and shrink can't interleave and forget permits
-            // the other just added.
-            let _guard = this.cap_reconcile_lock.lock().await;
-            let current = this.global_cap.load(Ordering::Relaxed);
-            if target == current {
-                return;
-            }
-            if target > current {
-                this.global_gate.add_permits((target - current) as usize);
-                // Publish the new cap only after the permits actually exist,
-                // so `global_in_flight` (= cap - available) never transiently
-                // over-reports against a not-yet-grown pool.
-                this.global_cap.store(target, Ordering::Relaxed);
-            } else {
-                // Reclaim the excess permits as in-flight tasks release them.
-                let remove = (current - target) as usize;
-                for _ in 0..remove {
-                    match this.global_gate.clone().acquire_owned().await {
-                        Ok(p) => p.forget(),
-                        Err(_) => break, // semaphore closed
+            // try_lock, not lock: if a reconcile is already running it will see
+            // `reconcile_pending` and converge, so we don't queue another.
+            let _guard = match this.cap_reconcile_lock.try_lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            loop {
+                // Claim the pending work before reading the target, so a change
+                // that lands after this point re-sets the flag and loops us.
+                this.reconcile_pending.store(false, Ordering::Relaxed);
+                // Recompute from LIVE settings each pass — a config change during
+                // a long drain is then honored without waiting for the next tick.
+                let target = compute_global_cap(&this.settings.current().offload);
+                let current = this.global_cap.load(Ordering::Relaxed);
+                if target > current {
+                    this.global_gate.add_permits((target - current) as usize);
+                    // Publish only after the permits exist (avoid transient
+                    // over-report of global_in_flight = cap - available).
+                    this.global_cap.store(target, Ordering::Relaxed);
+                    tracing::debug!(from = current, to = target, "offload: resized global gate");
+                } else if target < current {
+                    // Reclaim the excess permits as in-flight tasks release them.
+                    let remove = (current - target) as usize;
+                    for _ in 0..remove {
+                        match this.global_gate.clone().acquire_owned().await {
+                            Ok(p) => p.forget(),
+                            Err(_) => break, // semaphore closed
+                        }
                     }
+                    // Publish the smaller cap only after the drain completes —
+                    // storing it up front (against the still-large permit count)
+                    // saturates global_in_flight to 0 and masks real load.
+                    this.global_cap.store(target, Ordering::Relaxed);
+                    tracing::debug!(from = current, to = target, "offload: resized global gate");
                 }
-                // Publish the smaller cap only after the drain completes —
-                // storing it up front (against the still-large permit count)
-                // saturates `global_in_flight` to 0 and masks real load.
-                this.global_cap.store(target, Ordering::Relaxed);
+                // Exit only when nothing new arrived while we worked.
+                if !this.reconcile_pending.load(Ordering::Relaxed) {
+                    break;
+                }
             }
-            tracing::debug!(from = current, to = target, "offload: resized global gate");
         });
     }
 
@@ -400,7 +423,12 @@ impl OffloadService {
         } else {
             snap.allowed_roots.clone()
         };
-        let ctx = ToolCtx::new(roots, snap.command_allowlist.clone(), &cwd);
+        let ctx = ToolCtx::new(
+            roots,
+            snap.command_allowlist.clone(),
+            snap.command_policies.clone(),
+            &cwd,
+        );
         let native_defs = tools::enabled_defs(&snap.tools);
         let mcp_defs = self.host.tool_defs().await;
         let router = HostRouter::new(
@@ -465,6 +493,16 @@ impl OffloadService {
                 }
             }
         }
+
+        // Prune cached handles for backends that no longer exist (renamed,
+        // removed, or disabled) so the pools don't grow unbounded across config
+        // edits — mirroring the metrics poller's `retain`. Each lock is taken
+        // and dropped separately, so there's no nesting/ordering hazard.
+        let live: std::collections::HashSet<&str> =
+            backends.iter().map(|b| b.name.as_str()).collect();
+        self.local_pool.lock().await.retain(|k, _| live.contains(k.as_str()));
+        self.remote_pool.lock().await.retain(|k, _| live.contains(k.as_str()));
+
         entries
     }
 

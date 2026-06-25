@@ -11,6 +11,7 @@ use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::offload::openai::ToolDef;
+use crate::settings::CommandPolicy;
 
 use super::ToolCtx;
 
@@ -68,65 +69,71 @@ fn is_bare_command(command: &str) -> bool {
     !command.is_empty() && !command.contains(['/', '\\', ':'])
 }
 
-/// Whether the allowlisted program is `git` (by file stem, case-insensitive),
-/// so the spawn path can apply git-specific hook neutralization.
-fn stem_is_git(command: &str) -> bool {
+/// The lowercased file-stem of a program name (`git.exe` → `git`), used to
+/// match a [`CommandPolicy`] to the program being run.
+fn command_stem(command: &str) -> String {
     std::path::Path::new(command)
         .file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| s.eq_ignore_ascii_case("git"))
-        .unwrap_or(false)
+        .unwrap_or(command)
+        .to_ascii_lowercase()
 }
 
-/// Reject argument patterns that turn an allowlisted, "read-only" program
-/// into arbitrary code execution or let it escape the allowed root. Scoped by
-/// program stem so each rule only applies where the flag is actually dangerous
-/// (avoids false positives like `rg -c` = --count). Returns `Some(reason)` to
-/// refuse, `None` to allow.
-fn dangerous_args(command: &str, args: &[String]) -> Option<String> {
-    let stem = std::path::Path::new(command)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command)
-        .to_ascii_lowercase();
-    if stem == "git" {
-        // `-c k=v` / `--config-env` inject config (alias.*=!sh, core.pager,
-        // core.sshCommand, …) → arbitrary command execution.
-        // `-C <path>` / `--exec-path` / `--git-dir` / `--work-tree` change the
-        // working/exec/repo directory → escape the allowed root.
-        // `--upload-pack` / `--receive-pack` run an arbitrary helper binary.
-        for a in args {
-            let blocked = a == "-c"
-                || a == "-C"
-                || a.starts_with("--config-env")
-                || a.starts_with("--exec-path")
-                || a.starts_with("--git-dir")
-                || a.starts_with("--work-tree")
-                || a.starts_with("--upload-pack")
-                || a.starts_with("--receive-pack");
-            if blocked {
-                return Some(format!(
-                    "`git {a}` is refused: it can execute arbitrary commands or escape \
-                     the project root. run_command is for read-only probes only."
-                ));
-            }
+/// The security policy (if any) that applies to `command`, matched by stem
+/// case-insensitively.
+fn policy_for<'a>(command: &str, policies: &'a [CommandPolicy]) -> Option<&'a CommandPolicy> {
+    let stem = command_stem(command);
+    policies.iter().find(|p| p.program.eq_ignore_ascii_case(&stem))
+}
+
+/// Whether `arg` is refused by `denied`: it matches when it equals an entry OR
+/// starts with `<entry>=` (covers both `--flag value` and `--flag=value`, and
+/// short flags like `-c`).
+fn flag_denied(arg: &str, denied: &[String]) -> bool {
+    denied
+        .iter()
+        .any(|d| arg == d || arg.starts_with(&format!("{d}=")))
+}
+
+/// Reject argument patterns, per the program's [`CommandPolicy`], that would
+/// turn an allowlisted "read-only" program into arbitrary code execution or let
+/// it escape the allowed root (e.g. `git config`, `git -c`, `git --git-dir`).
+/// Policy-driven so the rules are visible/editable in Settings rather than
+/// hardcoded, and applicable to any program — not just git. Returns
+/// `Some(reason)` to refuse, `None` to allow.
+fn dangerous_args(command: &str, args: &[String], policies: &[CommandPolicy]) -> Option<String> {
+    let policy = policy_for(command, policies)?;
+    // Denied flags anywhere in argv.
+    for a in args {
+        if flag_denied(a, &policy.denied_flags) {
+            return Some(format!(
+                "`{} {a}` is refused by the `{}` command policy: it can execute \
+                 arbitrary commands or escape the project root. run_command is for \
+                 read-only probes only.",
+                policy.program, policy.program
+            ));
         }
-        // Refuse persisted-state subcommands. `git config` writes
-        // core.pager/core.sshCommand/alias.*=!cmd into .git/config, after
-        // which a later allowlisted `git log`/`git diff` in the same root
-        // executes that hook — a two-call arbitrary-code-execution escape that
-        // each individual invocation's flag check can't see. The dangerous
-        // subcommand is the first non-flag token (the value-taking globals
-        // `-c`/`-C` are already refused above, so nothing legitimately
-        // precedes it).
+    }
+    // Denied subcommand = the first non-flag token. SECURITY: this is only
+    // sound if every value-CONSUMING global flag is in `denied_flags` and so
+    // refused by the loop above — otherwise a non-denied value-taking flag
+    // (e.g. `git --namespace x config`) shifts the first non-flag token onto
+    // the flag's value, hiding the real subcommand. The default `git` policy
+    // enumerates all of git's value-taking globals for exactly this reason; a
+    // custom policy with `denied_subcommands` MUST do the same for its program.
+    if !policy.denied_subcommands.is_empty() {
         if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
-            if sub.eq_ignore_ascii_case("config") {
-                return Some(
-                    "`git config` is refused: writing repo config (core.pager, \
-                     core.sshCommand, alias.*) lets a later git command execute \
-                     arbitrary code. run_command is for read-only probes only."
-                        .to_string(),
-                );
+            if policy
+                .denied_subcommands
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(sub))
+            {
+                return Some(format!(
+                    "`{} {sub}` is refused by the `{}` command policy: this \
+                     subcommand can persist state that lets a later command execute \
+                     arbitrary code. run_command is for read-only probes only.",
+                    policy.program, policy.program
+                ));
             }
         }
     }
@@ -152,13 +159,14 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
             ctx.command_allowlist.join(", ")
         ));
     }
-    // Best-effort arg hardening. The allowlist is the real boundary (operators
-    // must only allowlist genuinely read-only programs), but some allowlisted
-    // tools expose global flags that turn them into arbitrary code execution
-    // or let them escape the allowed root. We can't denylist generically
-    // without false positives (e.g. `rg -c` = --count), so we guard the
-    // known-dangerous flags of the tools we explicitly document as examples.
-    if let Some(reason) = dangerous_args(&args.command, &args.args) {
+    // Per-program security policy. The allowlist is the real boundary
+    // (operators must only allowlist genuinely read-only programs), but some
+    // allowlisted tools expose global flags/subcommands that turn them into
+    // arbitrary code execution or let them escape the allowed root. The
+    // applicable `CommandPolicy` (visible/editable in Settings) names the
+    // denied flags/subcommands; a program with no policy gets only the
+    // allowlist + bare-name guard.
+    if let Some(reason) = dangerous_args(&args.command, &args.args, &ctx.command_policies) {
         return Err(reason);
     }
     // Resolve through PATH so we spawn the operator's `git`, never a binary
@@ -180,19 +188,15 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         // (below) drops `child` while the process keeps running detached,
         // leaking one orphan per hung command.
         .kill_on_drop(true);
-    // Defense in depth for git: even if a hostile repo already has a
-    // config-driven hook (core.pager / core.sshCommand / GIT_* env), neutralize
-    // the common execution paths for these read-only probes. GIT_PAGER=cat
-    // overrides core.pager; an empty GIT_SSH_COMMAND disarms a config-injected
-    // ssh helper; NOSYSTEM/GLOBAL/PROMPT keep the probe from honoring ambient
-    // config or hanging on a credential prompt.
-    if stem_is_git(&args.command) {
-        cmd.env("GIT_PAGER", "cat")
-            .env("PAGER", "cat")
-            .env("GIT_SSH_COMMAND", "")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    // Defense in depth: apply the program's policy env at spawn. For git these
+    // neutralize config-driven hooks even if a hostile repo already set them
+    // (GIT_PAGER=cat overrides core.pager; an empty GIT_SSH_COMMAND disarms a
+    // config-injected ssh helper; NOSYSTEM/GLOBAL/PROMPT keep the probe from
+    // honoring ambient config or hanging on a credential prompt).
+    if let Some(policy) = policy_for(&args.command, &ctx.command_policies) {
+        for ev in &policy.env {
+            cmd.env(&ev.key, &ev.value);
+        }
     }
     // Don't flash a console window for each spawned command on Windows.
     #[cfg(windows)]
@@ -318,5 +322,68 @@ mod tests {
         assert!(!is_bare_command("C:\\evil\\git.exe"));
         assert!(!is_bare_command("C:git"));
         assert!(!is_bare_command(""));
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_git_policy_blocks_exec_vectors() {
+        let policies = crate::settings::default_command_policies();
+        // Denied flags (exact and `=`-form), via stem match incl. `git.exe`.
+        assert!(dangerous_args("git", &argv(&["-c", "core.pager=!sh"]), &policies).is_some());
+        assert!(dangerous_args("git.exe", &argv(&["-C", "/etc"]), &policies).is_some());
+        assert!(dangerous_args("git", &argv(&["--git-dir=/other/.git", "log"]), &policies).is_some());
+        assert!(dangerous_args("git", &argv(&["--work-tree", "/"]), &policies).is_some());
+        // Denied subcommand as the first non-flag token.
+        assert!(dangerous_args("git", &argv(&["config", "core.pager", "x"]), &policies).is_some());
+    }
+
+    #[test]
+    fn value_taking_global_cannot_shift_the_subcommand_check() {
+        // Regression: a value-consuming global flag must not push the
+        // first-non-flag-token off the real `config` subcommand. Every
+        // value-taking git global is denied, so these are refused at the flag
+        // loop before the (positional) subcommand check even runs.
+        let policies = crate::settings::default_command_policies();
+        assert!(dangerous_args("git", &argv(&["--namespace", "x", "config", "--local", "alias.p", "!sh"]), &policies).is_some());
+        assert!(dangerous_args("git", &argv(&["--super-prefix", "p/", "config", "core.pager", "!sh"]), &policies).is_some());
+        assert!(dangerous_args("git", &argv(&["--attr-source", "HEAD", "config", "x", "y"]), &policies).is_some());
+        // A legitimate read probe whose ARGUMENT is "config" still runs.
+        assert!(dangerous_args("git", &argv(&["grep", "config"]), &policies).is_none());
+        assert!(dangerous_args("git", &argv(&["log", "--grep", "config"]), &policies).is_none());
+    }
+
+    #[test]
+    fn default_git_policy_allows_read_probes() {
+        let policies = crate::settings::default_command_policies();
+        assert!(dangerous_args("git", &argv(&["log", "--oneline", "-n", "5"]), &policies).is_none());
+        assert!(dangerous_args("git", &argv(&["diff", "--stat"]), &policies).is_none());
+        assert!(dangerous_args("git", &argv(&["status"]), &policies).is_none());
+        // `config` only as a later pathspec, not the subcommand, is fine.
+        assert!(dangerous_args("git", &argv(&["log", "--", "config"]), &policies).is_none());
+    }
+
+    #[test]
+    fn custom_policy_enforced_for_non_git_program() {
+        let policies = vec![CommandPolicy {
+            program: "cargo".to_string(),
+            denied_flags: vec!["--config".to_string()],
+            denied_subcommands: vec!["publish".to_string()],
+            env: vec![],
+        }];
+        assert!(dangerous_args("cargo", &argv(&["--config", "x=y", "build"]), &policies).is_some());
+        assert!(dangerous_args("cargo", &argv(&["publish"]), &policies).is_some());
+        assert!(dangerous_args("cargo", &argv(&["build", "--release"]), &policies).is_none());
+    }
+
+    #[test]
+    fn program_without_policy_passes_through() {
+        let policies = crate::settings::default_command_policies(); // only git
+        // No policy for `rg`/`cargo` → arg hardening is a no-op (allowlist +
+        // bare-name remain the guard).
+        assert!(dangerous_args("rg", &argv(&["-c", "pattern"]), &policies).is_none());
+        assert!(dangerous_args("cargo", &argv(&["--config", "x"]), &policies).is_none());
     }
 }

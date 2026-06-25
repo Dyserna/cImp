@@ -45,6 +45,19 @@ pub(crate) fn trim_ring(ring: &mut VecDeque<u8>, cap: usize) {
     }
 }
 
+/// Seed `ring` with `restored` bytes from a previous session, preserving
+/// chronological order. `restored` is older than anything the live reader
+/// may have already appended since the PTY started, so it is spliced in
+/// front of the current contents (`[restored, live...]`) — never extended
+/// onto the back, which would invert the order and let `trim_ring` evict
+/// the fresh live output. Trims to `cap` afterward.
+pub(crate) fn seed_front(ring: &mut VecDeque<u8>, restored: &[u8], cap: usize) {
+    let live: Vec<u8> = ring.drain(..).collect();
+    ring.extend(restored.iter().copied());
+    ring.extend(live);
+    trim_ring(ring, cap);
+}
+
 /// Resolve `<exe-dir>/scrollback/`. Lives next to `settings.json` and
 /// `logs/` so the entire portable folder is self-contained.
 fn scrollback_dir() -> AppResult<PathBuf> {
@@ -111,8 +124,10 @@ pub fn read(tab: &TabId) -> Option<Vec<u8>> {
 /// Called from `pty_start` after a successful `seed_scrollback`. Failure
 /// here is non-fatal — the orphan-prune sweep at next launch catches it
 /// if the tab has been removed; otherwise the next read returns the same
-/// bytes again, which is acceptable because seed is idempotent (the new
-/// ring is empty before the seed and the seed itself is a write).
+/// bytes again. Re-seeding is tolerable: `seed_scrollback` splices the
+/// restored bytes ahead of any live output and trims to the cap, so a
+/// duplicate seed at most re-prepends the same history (bounded by the
+/// ring cap) rather than corrupting order.
 pub fn consume_after_read(tab: &TabId) {
     let Ok(path) = scrollback_file_for(tab) else { return };
     if let Err(e) = fs::remove_file(&path) {
@@ -192,6 +207,38 @@ mod tests {
         let bytes: Vec<u8> = ring.iter().copied().collect();
         assert_eq!(bytes, vec![0x42]);
         assert!(std::str::from_utf8(&bytes).is_ok());
+    }
+
+    #[test]
+    fn seed_front_prepends_restored_before_live() {
+        // Reader already appended this session's first output ("live")
+        // before the seed ran; restored history must end up in front.
+        let mut ring: VecDeque<u8> = VecDeque::new();
+        ring.extend(b"live");
+        seed_front(&mut ring, b"old", 100);
+        let bytes: Vec<u8> = ring.iter().copied().collect();
+        assert_eq!(bytes, b"oldlive");
+    }
+
+    #[test]
+    fn seed_front_into_empty_ring() {
+        let mut ring: VecDeque<u8> = VecDeque::new();
+        seed_front(&mut ring, b"old", 100);
+        let bytes: Vec<u8> = ring.iter().copied().collect();
+        assert_eq!(bytes, b"old");
+    }
+
+    #[test]
+    fn seed_front_over_cap_evicts_oldest_restored_not_live() {
+        // When restored+live exceeds the cap, the oldest bytes (front =
+        // restored history) roll off first; the fresh live tail survives.
+        let mut ring: VecDeque<u8> = VecDeque::new();
+        ring.extend(b"LIVE");
+        seed_front(&mut ring, b"oldhistory", 6);
+        let bytes: Vec<u8> = ring.iter().copied().collect();
+        // "oldhistory" (10) + "LIVE" (4) = 14 bytes trimmed to 6: the 8
+        // oldest (restored) roll off the front, live output survives.
+        assert_eq!(bytes, b"ryLIVE");
     }
 
     #[test]

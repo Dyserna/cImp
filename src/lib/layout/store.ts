@@ -113,12 +113,27 @@ export type PendingTabPlacement =
       placeOn: 'first' | 'second';
     };
 
-export const pendingTabPlacement: Writable<PendingTabPlacement | null> = writable(null);
+/// FIFO queue of pending placements. A queue — not a single cell — so two
+/// guided creations in flight at once don't clobber each other: pressing a
+/// split shortcut twice in quick succession (key-repeat / fast double-press)
+/// before the first `tab-created` arrives used to overwrite the first request,
+/// sending its shell to the focused pane instead of its split. Each
+/// `tab-created` consumes the oldest placement, and a single backend emits
+/// those events in creation order, so guided creations route correctly in
+/// order.
+///
+/// Residual limitation: an UNGUIDED creation (e.g. a programmatic / tool-tab
+/// open that doesn't enqueue a placement) whose `tab-created` interleaves
+/// between a guided request and that request's own event can still consume the
+/// wrong placement. Fully closing that needs id-level correlation, which the
+/// create-then-emit ordering (the event often arrives before the create IPC
+/// resolves) doesn't reliably allow.
+const placementQueue: PendingTabPlacement[] = [];
 
 /// Note that the next created tab should be placed into `paneId`. Used
 /// by the per-pane `+` button.
 export function requestTabIntoPane(paneId: PaneId): void {
-  pendingTabPlacement.set({ kind: 'pane', paneId });
+  placementQueue.push({ kind: 'pane', paneId });
 }
 
 /// Note that the next created tab should land in a fresh pane created
@@ -129,7 +144,14 @@ export function requestTabIntoSplit(
   direction: SplitDirection,
   placeOn: 'first' | 'second',
 ): void {
-  pendingTabPlacement.set({ kind: 'split', sourcePaneId, direction, placeOn });
+  placementQueue.push({ kind: 'split', sourcePaneId, direction, placeOn });
+}
+
+/// Drop the most recently enqueued placement. Called when the create IPC a
+/// request was paired with fails — no `tab-created` will arrive to consume it,
+/// so leaving it queued would mis-route the next real tab.
+export function cancelLastPlacement(): void {
+  placementQueue.pop();
 }
 
 /// Place a newly-created tab into the layout. Routing rules:
@@ -146,13 +168,12 @@ export function requestTabIntoSplit(
 ///
 /// In all cases the new tab becomes the target pane's active tab,
 /// matching v1.2's "switch to the new tab on creation" behavior scoped
-/// to a pane. The placement cell is consumed (cleared) on every call,
-/// regardless of which branch fires, so a subsequent unguided
-/// `tab-created` event can't accidentally use stale routing.
+/// to a pane. The oldest queued placement is consumed (shifted off) on
+/// every call, regardless of which branch fires, so a subsequent
+/// `tab-created` event can't accidentally reuse stale routing.
 export function applyTabCreatedToLayout(tabId: TabId): void {
   layout.update((state) => {
-    const placement = get(pendingTabPlacement);
-    pendingTabPlacement.set(null);
+    const placement = placementQueue.shift() ?? null;
 
     if (placement && placement.kind === 'split') {
       const source = findPaneInTree(state.tree, placement.sourcePaneId);

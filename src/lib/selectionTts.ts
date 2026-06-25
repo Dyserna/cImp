@@ -130,25 +130,35 @@ async function launch(
     // recreated against a line that tracks scrolling/trimming. If any marker
     // is trimmed out of the buffer the geometry is no longer valid, so we end
     // the highlight (audio keeps playing — only the visual is dropped).
-    const base = terminal.buffer.active.baseY + terminal.buffer.active.cursorY;
-    const rows = new Set<number>();
-    for (const sp of spans) for (const s of sp) rows.add(s.row);
-    for (const row of rows) {
-      const marker = terminal.registerMarker(row - base);
-      if (!marker) continue;
-      marker.onDispose(() => {
-        // A row scrolled out of the buffer: end the highlight entirely.
-        // Must be endSession() (not just clearDecorations) so `painting`/
-        // `chunkCount` are reset — otherwise a later progress event would call
-        // paintState() against the now-empty chunkSpans/chunkState arrays and
-        // throw. Audio keeps playing; only the visual is dropped.
-        if (activeSession === session) endSession();
-      });
-      rowMarkers.set(row, marker);
+    //
+    // Wrapped in try/catch: the terminal may have been disposed between
+    // caching the read and this replay (tab closed), in which case
+    // `buffer.active` / `registerMarker` throw. Degrade gracefully to
+    // audio-only rather than letting the throw escape uncaught.
+    try {
+      const base = terminal.buffer.active.baseY + terminal.buffer.active.cursorY;
+      const rows = new Set<number>();
+      for (const sp of spans) for (const s of sp) rows.add(s.row);
+      for (const row of rows) {
+        const marker = terminal.registerMarker(row - base);
+        if (!marker) continue;
+        marker.onDispose(() => {
+          // A row scrolled out of the buffer: end the highlight entirely.
+          // Must be endSession() (not just clearDecorations) so `painting`/
+          // `chunkCount` are reset — otherwise a later progress event would
+          // call paintState() against the now-empty chunkSpans/chunkState
+          // arrays and throw. Audio keeps playing; only the visual is dropped.
+          if (activeSession === session) endSession();
+        });
+        rowMarkers.set(row, marker);
+      }
+      // Initial state: whole selection painted "unread"; no sentence is
+      // "reading" until its playback-start event arrives.
+      paintState(-1);
+    } catch (err) {
+      console.warn('selection highlight setup failed (terminal disposed?):', err);
+      painting = false;
     }
-    // Initial state: whole selection painted "unread"; no sentence is
-    // "reading" until its playback-start event arrives.
-    paintState(-1);
   }
 
   await ensureListener();
@@ -200,11 +210,27 @@ export async function resumeSelectionTts(): Promise<void> {
   }
 }
 
+/// xterm throws on most property access after `dispose()`. Probe a benign
+/// getter so a replay can detect a cached terminal whose tab was closed.
+function isTerminalAlive(t: Terminal): boolean {
+  try {
+    // Touch internal buffer state; a disposed terminal throws here.
+    void t.buffer.active.baseY;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /// Restart the last read from its first sentence. Falls back to reading the
-/// current selection (or toasting) when there is no cached read.
+/// current selection (or toasting) when there is no cached read — or when the
+/// cached read's terminal has since been disposed (its tab was closed), which
+/// would otherwise throw inside `launch` (registerMarker / buffer access) with
+/// no catch on this transport path.
 export async function restartSelectionTts(): Promise<void> {
   const cached = lastRead;
-  if (!cached) {
+  if (!cached || !isTerminalAlive(cached.term)) {
+    lastRead = null;
     playSelectionTts();
     return;
   }

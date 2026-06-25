@@ -100,13 +100,17 @@ impl SystemStatsState {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
             guard.sys.refresh_cpu_usage();
-            let cpu_pct = guard.sys.global_cpu_usage();
+            // Clamp to [0,100]: `global_cpu_usage` can momentarily exceed 100
+            // (sum-of-cores rounding) and the first sample right after the
+            // priming refresh can report a spurious value, both of which would
+            // otherwise spike the frontend sparkline.
+            let cpu_pct = guard.sys.global_cpu_usage().clamp(0.0, 100.0);
 
             guard.sys.refresh_memory();
             let total = guard.sys.total_memory();
             let used = guard.sys.used_memory();
             let mem_pct = if total > 0 {
-                (used as f32 / total as f32) * 100.0
+                ((used as f32 / total as f32) * 100.0).clamp(0.0, 100.0)
             } else {
                 0.0
             };
@@ -150,12 +154,12 @@ impl SystemStatsState {
         let mem = dev.memory_info().ok()?;
         let temp = dev.temperature(TemperatureSensor::Gpu).ok()?;
         let mem_pct = if mem.total > 0 {
-            (mem.used as f32 / mem.total as f32) * 100.0
+            ((mem.used as f32 / mem.total as f32) * 100.0).clamp(0.0, 100.0)
         } else {
             0.0
         };
         Some(GpuStats {
-            util_pct: util.gpu as f32,
+            util_pct: (util.gpu as f32).clamp(0.0, 100.0),
             mem_pct,
             temp_c: temp as f32,
         })

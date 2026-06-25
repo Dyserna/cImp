@@ -752,6 +752,33 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         }
     }
 
+    // 3b. Backfill the `question` notification slot on reserved AI builtins.
+    //     The slot was added after the per-slot notification migration, which
+    //     only promoted keys already on disk — so every tab that upgraded got
+    //     a default-disabled, empty `question` and never the configured
+    //     "<tool> has a question" default that fresh installs receive. Seed it
+    //     ONLY when the slot is in its pure-default state (disabled AND empty
+    //     text): that's the upgrader signature. A user who set custom text, or
+    //     who deliberately disabled a populated slot, has non-empty text and is
+    //     left untouched.
+    for tab in settings.tabs.iter_mut() {
+        if let TabConfig::AiTool(c) = tab {
+            if let Some(reserved) = AiTabId::from_id(c.id.as_str()) {
+                let q = &c.notifications.question;
+                if !q.enabled && q.text.is_empty() {
+                    if let TabConfig::AiTool(d) = default_ai_tab(reserved) {
+                        c.notifications.question = d.notifications.question;
+                        changed = true;
+                        tracing::info!(
+                            id = c.id,
+                            "integrity: backfilled default question notification on AI builtin"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // 4. Reconcile AI builtin entries with `enabled_ai_tabs`. The list
     //    is the source of truth for which AI tabs exist: every enabled
     //    id is restored at its canonical position; every reserved id
@@ -903,6 +930,60 @@ mod tests {
         assert!(changed);
         assert_eq!(s.tabs.len(), 1);
         assert_eq!(s.tabs[0].id(), CLAUDE_LOCAL_TAB_ID);
+    }
+
+    #[test]
+    fn integrity_backfills_default_question_slot_on_upgraded_ai_tab() {
+        use crate::settings::schema::{NotificationSlot, TabConfig};
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = vec![AiTabId::Claude];
+        integrity_check(&mut s); // seed the claude tab
+
+        // Simulate a file that upgraded before the `question` slot existed:
+        // the slot deserialized to the pure default (disabled, empty text).
+        if let Some(TabConfig::AiTool(c)) =
+            s.tabs.iter_mut().find(|t| t.id() == CLAUDE_TAB_ID)
+        {
+            c.notifications.question = NotificationSlot::default();
+            assert!(!c.notifications.question.enabled);
+            assert!(c.notifications.question.text.is_empty());
+        }
+
+        let changed = integrity_check(&mut s);
+        assert!(changed, "backfill should report a change");
+        let q = match s.tabs.iter().find(|t| t.id() == CLAUDE_TAB_ID).unwrap() {
+            TabConfig::AiTool(c) => c.notifications.question.clone(),
+            _ => panic!("expected AI tab"),
+        };
+        assert!(q.enabled);
+        assert_eq!(q.text, "Claude has a question");
+    }
+
+    #[test]
+    fn integrity_does_not_clobber_user_customized_question_slot() {
+        use crate::settings::schema::{NotificationSlot, TabConfig};
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = vec![AiTabId::Claude];
+        integrity_check(&mut s);
+
+        // User deliberately disabled the slot but kept (non-empty) text.
+        if let Some(TabConfig::AiTool(c)) =
+            s.tabs.iter_mut().find(|t| t.id() == CLAUDE_TAB_ID)
+        {
+            c.notifications.question = NotificationSlot {
+                enabled: false,
+                text: "My custom question text".to_string(),
+            };
+        }
+
+        integrity_check(&mut s);
+        let q = match s.tabs.iter().find(|t| t.id() == CLAUDE_TAB_ID).unwrap() {
+            TabConfig::AiTool(c) => c.notifications.question.clone(),
+            _ => panic!(),
+        };
+        // Untouched: non-empty text is not the upgrader signature.
+        assert!(!q.enabled);
+        assert_eq!(q.text, "My custom question text");
     }
 
     #[test]

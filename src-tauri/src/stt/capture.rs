@@ -317,11 +317,31 @@ fn resample_to_16k(input: Vec<f32>, in_rate: u32) -> AppResult<Vec<f32>> {
         out.extend_from_slice(&produced[0]);
         pos += need;
     }
-    // Feed the remainder (zero-padded internally) so trailing audio isn't lost.
+    // Feed the remainder (zero-padded internally). This is also the ONLY
+    // path taken for a sub-chunk recording (`input.len() < CHUNK`), where the
+    // main loop breaks immediately with `pos == 0` — e.g. a brief press-to-talk
+    // on a 44.1/48 kHz mic produces well under 1024 native samples.
     if pos < input.len() {
         let produced = resampler
             .process_partial(Some(&[&input[pos..]]), None)
             .map_err(|e| AppError::Stt(format!("resample tail: {e}")))?;
+        out.extend_from_slice(&produced[0]);
+    }
+
+    // Drain the resampler's internal delay line. `FftFixedIn` buffers up to
+    // one chunk of latency, so for a short clip (and for the tail of any clip)
+    // some output is still held inside after the input is consumed. A single
+    // `process_partial` doesn't recover it; flush with empty calls until we've
+    // produced the expected frame count or the resampler stops emitting.
+    // Without this, short dictations were silently truncated or dropped (the
+    // worker's ~150 ms minimum-sample guard would then reject a real clip).
+    while out.len() < expected {
+        let produced = resampler
+            .process_partial::<&[f32]>(None, None)
+            .map_err(|e| AppError::Stt(format!("resample flush: {e}")))?;
+        if produced[0].is_empty() {
+            break;
+        }
         out.extend_from_slice(&produced[0]);
     }
 
@@ -388,5 +408,29 @@ mod tests {
         let input = vec![0.1, -0.2, 0.3];
         let out = resample_to_16k(input.clone(), 16_000).unwrap();
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn resample_short_subchunk_input_is_not_dropped() {
+        // Fewer than one FFT chunk (1024) of native samples — a very short
+        // press-to-talk on a 48 kHz mic. Regression: this used to fall solely
+        // to a single `process_partial` that returned far fewer than the
+        // expected frames, mangling/dropping the clip. The drain loop must now
+        // recover ~proportional output.
+        let in_rate = 48_000u32;
+        let n = 480usize; // 10 ms at 48 kHz, < CHUNK
+        let input: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / in_rate as f32).sin())
+            .collect();
+        let expected = n * 16_000 / 48_000; // 160
+        let out = resample_to_16k(input, in_rate).expect("resample ok");
+        // Should be close to the proportional length, not near-zero. Allow a
+        // generous lower bound (resampler latency can shave a little).
+        assert!(
+            out.len() >= expected * 3 / 4,
+            "short clip resampled to {} frames, expected ~{}",
+            out.len(),
+            expected
+        );
     }
 }

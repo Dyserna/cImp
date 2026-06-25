@@ -12,7 +12,7 @@
 //! budget. On any cap the loop forces a final-synthesis turn ("answer
 //! from what you have now") rather than truncating mid-thought.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
@@ -222,6 +222,15 @@ fn think_on_turn(mode: ThinkingMode, is_planning: bool, is_final: bool) -> bool 
     }
 }
 
+/// Wall-clock budget granted to the forced-final synthesis turn, which runs
+/// *after* the main `deadline` has (often) already passed. Bounding it keeps
+/// the total run from reaching ~2× `offload_timeout_secs` (one full in-loop
+/// request that finishes at the deadline, then an unbounded force-final) and
+/// staying within the loopback proxy's `+30s` headroom (see `mcp.rs`), past
+/// which the proxy abandons the streamed offload and re-runs it on the local
+/// self-contained path — a wasteful double execution.
+const FINAL_SYNTHESIS_GRACE: Duration = Duration::from_secs(25);
+
 /// Run the agent loop and return the synthesized final answer (with
 /// `<think>` stripped). `deadline` bounds the loop wall-clock; on expiry
 /// (or `max_steps`/budget) it forces a final-synthesis turn.
@@ -244,14 +253,21 @@ pub async fn run(
     messages.push(ChatMessage::user(user));
 
     for step in 0..cfg.max_steps {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             debug!("offload: deadline reached at step {step}; forcing final synthesis");
             return force_final(client, &url, cfg, messages, task.thinking).await;
         }
         let is_planning = step == 0;
         let enable_thinking = think_on_turn(task.thinking, is_planning, false);
 
-        let resp = post_chat(client, &url, cfg, &messages, &tools, enable_thinking, true).await?;
+        // Bound this request by the *remaining* deadline, not the client's
+        // global `offload_timeout_secs`. Otherwise a step that starts just
+        // before the deadline could still block for the full timeout, then
+        // `force_final` would block for another — letting one offload run for
+        // ~2× its budget and overrun the proxy headroom.
+        let resp =
+            post_chat(client, &url, cfg, &messages, &tools, enable_thinking, true, remaining).await?;
         let usage = resp.usage;
         let choice = resp
             .choices
@@ -326,6 +342,7 @@ async fn post_chat(
     tools: &[ToolDef],
     enable_thinking: bool,
     with_tools: bool,
+    req_timeout: Duration,
 ) -> AppResult<ChatResponse> {
     let req = ChatRequest {
         messages: messages.to_vec(),
@@ -335,7 +352,10 @@ async fn post_chat(
         temperature: Some(0.2),
         chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": enable_thinking })),
     };
-    let mut builder = client.post(url).json(&req);
+    // Per-request timeout override: bounds this single POST (connect through
+    // body read) to the caller's remaining budget, regardless of the client's
+    // global `offload_timeout_secs` default.
+    let mut builder = client.post(url).timeout(req_timeout).json(&req);
     if let Some(token) = cfg.auth_token.as_deref().filter(|t| !t.is_empty()) {
         builder = builder.bearer_auth(token);
     }
@@ -369,7 +389,20 @@ async fn force_final(
          from what you already have. If your information is partial, say so explicitly.",
     ));
     let enable_thinking = think_on_turn(thinking, false, true);
-    let resp = post_chat(client, url, cfg, &messages, &[], enable_thinking, false).await?;
+    // The forced-final turn runs after the main deadline; cap it to a fixed
+    // grace so the whole offload can't reach ~2× its timeout (see
+    // FINAL_SYNTHESIS_GRACE).
+    let resp = post_chat(
+        client,
+        url,
+        cfg,
+        &messages,
+        &[],
+        enable_thinking,
+        false,
+        FINAL_SYNTHESIS_GRACE,
+    )
+    .await?;
     let content = resp
         .choices
         .into_iter()

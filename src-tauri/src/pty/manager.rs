@@ -147,14 +147,26 @@ impl PtyManager {
         // Drop the slave end in the parent; the child inherits its own reference.
         drop(pair.slave);
 
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| AppError::Pty(format!("try_clone_reader: {e}")))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| AppError::Pty(format!("take_writer: {e}")))?;
+        // The child is already running. If we bail past this point without
+        // killing it AND signaling exit, we leak the process and leave the
+        // state machine in its prior state (no Error overlay) — the same
+        // hazard the openpty/spawn error paths above guard. Mirror that here.
+        let reader = match pair.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = child.clone_killer().kill();
+                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
+                return Err(AppError::Pty(format!("try_clone_reader: {e}")));
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = child.clone_killer().kill();
+                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
+                return Err(AppError::Pty(format!("take_writer: {e}")));
+            }
+        };
 
         let master: Arc<StdMutex<Box<dyn MasterPty + Send>>> = Arc::new(StdMutex::new(pair.master));
         let writer: Arc<StdMutex<Box<dyn Write + Send>>> = Arc::new(StdMutex::new(writer));
@@ -334,6 +346,16 @@ impl PtyManager {
     /// continuity — the same bytes are also written into the new
     /// xterm by the frontend (front-loaded in `term.write` before the
     /// live channel binds). Truncates to the ring cap.
+    ///
+    /// Ordering note: `seed_scrollback` runs *after* `start` has already
+    /// spawned the reader (see `pty_start`), so by the time we take the
+    /// ring lock the live reader may have appended this session's first
+    /// output. The restored bytes are older than anything live, so they
+    /// must be prepended to the *front* of the ring rather than extended
+    /// onto the back — otherwise the order inverts to `[live, restored]`
+    /// and `trim_ring` (which evicts from the front) drops the fresh live
+    /// output instead of old history. Both ends are serialized by this
+    /// same `StdMutex`, so the splice can't race the reader.
     pub async fn seed_scrollback(&self, bytes: &[u8]) -> AppResult<()> {
         let (scrollback, cap) = {
             let guard = self.inner.lock().await;
@@ -343,8 +365,8 @@ impl PtyManager {
         let mut ring = scrollback
             .lock()
             .map_err(|e| AppError::Pty(format!("scrollback poisoned: {e}")))?;
-        ring.extend(bytes);
-        crate::pty::scrollback::trim_ring(&mut ring, cap);
+        // Splice restored-then-live so chronological order is preserved.
+        crate::pty::scrollback::seed_front(&mut ring, bytes, cap);
         Ok(())
     }
 

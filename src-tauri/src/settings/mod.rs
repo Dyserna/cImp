@@ -35,10 +35,18 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(AppError::Io)?;
     }
+    // Each write gets a UNIQUE temp name. Two writers can legitimately
+    // target the same file concurrently — e.g. the 500 ms debounced saver
+    // and `load()`'s repair-save both touch the per-folder overlay — and a
+    // shared `<name>.tmp` lets them truncate each other's temp mid-write or
+    // race on the rename (NotFound on the loser; sharing-violation on
+    // Windows where the destination/temp may still be open). A per-write
+    // suffix makes each writer's temp private; the rename is still the
+    // atomic commit point and last-writer-wins on the final file.
     let tmp = match path.file_name() {
         Some(name) => {
             let mut tmp_name = name.to_os_string();
-            tmp_name.push(".tmp");
+            tmp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
             path.with_file_name(tmp_name)
         }
         None => return Err(AppError::Settings(format!("path has no file name: {}", path.display()))),

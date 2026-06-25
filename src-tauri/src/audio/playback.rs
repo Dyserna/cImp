@@ -312,6 +312,15 @@ fn run_audio_thread(
                     marks.clear();
                     last_front = None;
                     pending_done = None;
+                    // Reset the amplitude ring too. It still holds up to 1 s
+                    // of the just-stopped utterance; without this the avatar /
+                    // visualizer reads those stale samples at the start of the
+                    // next utterance (the streamer gates on `is_playing()`,
+                    // which flips true before the new source's first batch
+                    // reaches the ring) and briefly lip-syncs to old audio.
+                    if let Ok(mut ring) = amplitude.write() {
+                        ring.clear();
+                    }
                     // The sink was just emptied; rebase the drain tracker so the
                     // next tick doesn't see a phantom drop (`len < prev_len`) and
                     // pop marks belonging to a freshly-enqueued selection.

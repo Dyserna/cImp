@@ -220,14 +220,20 @@ fn looks_v1_1(value: &Value) -> bool {
 /// re-migration so the user doesn't accumulate `.v1.2.bak.<ts>` files
 /// on every launch.
 fn looks_v1_2(value: &Value) -> bool {
-    let tabs_is_array = value
-        .get("tabs")
-        .map(|v| v.is_array())
-        .unwrap_or(false);
-    let layout_field_absent = !value
-        .as_object()
-        .map(|o| o.contains_key("layout"))
-        .unwrap_or(false);
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    // `schema_version` is first stamped at the v1.9 → v1.10 step, so a
+    // genuine pre-v1.10 file never carries it. Guarding on its absence
+    // stops this presence-archaeology predicate from false-positiving on a
+    // modern (v1.10+) file that merely lacks the `layout` key — which would
+    // otherwise drag it back through the entire cascade and write a fresh
+    // `.v1.2.bak.<ts>` on every launch (unbounded backup growth).
+    if obj.contains_key("schema_version") {
+        return false;
+    }
+    let tabs_is_array = obj.get("tabs").map(|v| v.is_array()).unwrap_or(false);
+    let layout_field_absent = !obj.contains_key("layout");
     tabs_is_array && layout_field_absent
 }
 
@@ -242,6 +248,9 @@ fn looks_v1_3(value: &Value) -> bool {
     let Some(obj) = value.as_object() else {
         return false;
     };
+    if obj.contains_key("schema_version") {
+        return false;
+    }
     obj.contains_key("layout") && !obj.contains_key("terminal")
 }
 
@@ -257,6 +266,9 @@ fn looks_v1_4(value: &Value) -> bool {
     let Some(obj) = value.as_object() else {
         return false;
     };
+    if obj.contains_key("schema_version") {
+        return false;
+    }
     let has_terminal = obj.contains_key("terminal");
     let has_terminal_background = obj
         .get("terminal")
@@ -274,6 +286,9 @@ fn looks_v1_5(value: &Value) -> bool {
     let Some(obj) = value.as_object() else {
         return false;
     };
+    if obj.contains_key("schema_version") {
+        return false;
+    }
     let bg = obj.get("terminal").and_then(|t| t.get("background"));
     match bg {
         Some(b) => b.get("presets").is_none(),
@@ -290,6 +305,9 @@ fn looks_v1_6(value: &Value) -> bool {
     let Some(obj) = value.as_object() else {
         return false;
     };
+    if obj.contains_key("schema_version") {
+        return false;
+    }
     let has_presets = obj
         .get("terminal")
         .and_then(|t| t.get("background"))
@@ -311,6 +329,9 @@ fn looks_v1_7(value: &Value) -> bool {
     let Some(obj) = value.as_object() else {
         return false;
     };
+    if obj.contains_key("schema_version") {
+        return false;
+    }
     let has_scrollback = obj
         .get("terminal")
         .and_then(|t| t.get("scrollback"))
@@ -1637,6 +1658,46 @@ mod tests {
         .unwrap();
         assert!(!looks_v1(&v));
         assert!(!looks_v1_1(&v));
+    }
+
+    #[test]
+    fn modern_file_missing_layout_is_not_misdetected_as_v1_2() {
+        // Regression: a current-schema file (schema_version present) that
+        // happens to lack the `layout` key must NOT trip the pre-v1.10
+        // archaeology detectors, which would otherwise drag it back through
+        // the whole cascade and write a fresh `.v1.2.bak` on every launch.
+        let v: Value = serde_json::from_str(
+            r#"{
+                "schema_version": 17,
+                "tabs": [
+                    { "kind": "ai_tool", "id": "claude", "name": "Claude" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(!looks_v1_2(&v), "schema_version-bearing file matched looks_v1_2");
+        assert!(!looks_v1_3(&v));
+        assert!(!looks_v1_4(&v));
+        assert!(!looks_v1_5(&v));
+        assert!(!looks_v1_6(&v));
+        assert!(!looks_v1_7(&v));
+        assert!(
+            detect_entry_version(&v).is_none(),
+            "modern file should need no migration"
+        );
+    }
+
+    #[test]
+    fn genuine_v1_2_file_still_detected_without_schema_version() {
+        // The guard must not break real pre-v1.10 files: a v1.2-shape file
+        // (tabs array, no layout, no schema_version) must still enter the
+        // cascade at v1.2.
+        let v: Value = serde_json::from_str(
+            r#"{ "tabs": [ { "kind": "ai_tool", "id": "claude" } ] }"#,
+        )
+        .unwrap();
+        assert!(looks_v1_2(&v));
+        assert_eq!(detect_entry_version(&v), Some("v1.2"));
     }
 
     #[test]

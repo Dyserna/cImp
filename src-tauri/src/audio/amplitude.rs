@@ -42,6 +42,16 @@ impl RingBuffer {
         }
     }
 
+    /// Reset the ring to empty so [`recent`](Self::recent) returns nothing
+    /// until fresh samples are pushed. Called on a playback stop so the
+    /// visualizer / avatar lip-sync doesn't momentarily replay the tail of
+    /// the previous utterance at the start of the next read. No need to zero
+    /// the backing storage — `recent` is bounded by `head`/`filled`.
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.filled = false;
+    }
+
     pub fn recent(&self, count: usize) -> Vec<f32> {
         let cap = self.samples.len();
         let available = if self.filled { cap } else { self.head };
@@ -90,6 +100,20 @@ mod tests {
         }
         assert_eq!(r.recent(5), vec![0.0, 1.0, 2.0]);
         assert_eq!(r.recent(2), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn ring_clear_empties_recent_and_resets() {
+        let mut r = RingBuffer::new(4);
+        for i in 0..6 {
+            r.push(i as f32);
+        }
+        assert_eq!(r.recent(4).len(), 4);
+        r.clear();
+        assert!(r.recent(4).is_empty(), "cleared ring should report nothing");
+        // New samples start a fresh fill.
+        r.push(9.0);
+        assert_eq!(r.recent(4), vec![9.0]);
     }
 
     #[test]

@@ -260,7 +260,7 @@ fn main() {
         settings: settings_handle.clone(),
         audio: audio_slot.clone(),
         pending_settings_deep_link: Arc::new(Mutex::new(None)),
-        sysmon: crate::sysmon::SystemStatsState::new(),
+        sysmon: Arc::new(crate::sysmon::SystemStatsState::new()),
         lifecycle_serializer: Arc::new(TokioMutex::new(())),
     };
 

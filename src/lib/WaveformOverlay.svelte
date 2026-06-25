@@ -1,6 +1,11 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { latestSamples, startAmplitudeListener, startMicAmplitudeListener } from './audioStream';
+  import {
+    latestSamples,
+    onSamples,
+    startAmplitudeListener,
+    startMicAmplitudeListener,
+  } from './audioStream';
   import { avatarVisible } from './avatarState';
   import { avatar as avatarSettings, waveform as waveformSettings } from './settings/store';
 
@@ -11,6 +16,21 @@
 
   const BUFFER_SIZE = 1024;
   const scrollBuffer = new Float32Array(BUFFER_SIZE);
+
+  // Samples consumed per frame, and the number of all-zero frames after which
+  // the scroll buffer is guaranteed fully flat — at which point there is
+  // nothing left to animate. BUFFER_SIZE / SAMPLES_PER_FRAME frames push the
+  // last real sample off the end; +1 guarantees the final flat frame is drawn.
+  const SAMPLES_PER_FRAME = 16;
+  const SETTLE_FRAMES = BUFFER_SIZE / SAMPLES_PER_FRAME + 1;
+
+  // Idle-out state. While audio is flowing the render loop runs at display
+  // rate; once the buffer drains to a flat line and no fresh packets arrive
+  // for SETTLE_FRAMES, the loop stops entirely so the WebView compositor goes
+  // quiet (idle GPU drops to ~0). `wake()` — fired by the amplitude listener
+  // via onSamples — restarts it the instant audio resumes.
+  let running = false;
+  let idleFrames = 0;
 
   // Mirror the visibility store into a plain local so the render loop can
   // read it synchronously without per-frame `get(store)` calls. The
@@ -38,6 +58,8 @@
     waveLineWidth = w.line_width;
     waveGlow = w.glow_intensity;
     waveOpacity = w.opacity;
+    // Reflect an appearance tweak immediately even while the loop is parked.
+    requestStaticRedraw();
   });
 
   function effectiveWaveColor(): string {
@@ -71,6 +93,8 @@
     ].join(';'),
   );
 
+  let unsubSamples: (() => void) | null = null;
+
   onMount(() => {
     ctx = canvasEl.getContext('2d');
     resizeCanvas();
@@ -78,11 +102,16 @@
     startAmplitudeListener();
     // V6-01: mic capture amplitude feeds the same waveform while recording.
     startMicAmplitudeListener();
-    animationId = requestAnimationFrame(render);
+    // Restart the render loop the instant a fresh packet lands. While silent
+    // no packets arrive, so the loop settles to flat and stops on its own.
+    unsubSamples = onSamples(wake);
+    wake();
   });
 
   onDestroy(() => {
     cancelAnimationFrame(animationId);
+    running = false;
+    unsubSamples?.();
     window.removeEventListener('resize', resizeCanvas);
     unsubVisible();
     unsubWave();
@@ -96,18 +125,37 @@
     canvasEl.width = Math.max(1, Math.floor(rect.width * dpr));
     canvasEl.height = Math.max(1, Math.floor(rect.height * dpr));
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // Resizing wipes the backing store; repaint now in case we're idle and the
+    // loop is parked (otherwise the canvas would stay blank until next audio).
+    requestStaticRedraw();
+  }
+
+  /// Start (or no-op if already running) the display-rate render loop.
+  function wake() {
+    if (running) return;
+    running = true;
+    idleFrames = 0;
+    animationId = requestAnimationFrame(render);
+  }
+
+  /// Paint a single frame without starting the loop — used to reflect a
+  /// settings/size change while the loop is parked. When the loop is live the
+  /// next frame already repaints, so this is a no-op then.
+  function requestStaticRedraw() {
+    if (running || !ctx) return;
+    drawWaveform();
   }
 
   function render() {
     if (ctx) {
-      const samplesPerFrame = 16;
       const fresh = latestSamples.seq !== lastSeenSeq;
       lastSeenSeq = latestSamples.seq;
 
       if (fresh && latestSamples.current.length > 0) {
+        idleFrames = 0;
         const newSamples = latestSamples.current;
-        const step = Math.max(1, Math.floor(newSamples.length / samplesPerFrame));
-        for (let i = 0; i < samplesPerFrame; i++) {
+        const step = Math.max(1, Math.floor(newSamples.length / SAMPLES_PER_FRAME));
+        for (let i = 0; i < SAMPLES_PER_FRAME; i++) {
           const idx = i * step;
           if (idx < newSamples.length) {
             scrollBuffer.copyWithin(0, 1);
@@ -115,12 +163,21 @@
           }
         }
       } else {
-        for (let i = 0; i < samplesPerFrame; i++) {
+        idleFrames++;
+        for (let i = 0; i < SAMPLES_PER_FRAME; i++) {
           scrollBuffer.copyWithin(0, 1);
           scrollBuffer[scrollBuffer.length - 1] = 0;
         }
       }
       drawWaveform();
+    }
+
+    // Once the buffer has fully drained to zero and no fresh packets are
+    // arriving, park the loop. Nothing repaints the canvas until `wake()`
+    // fires, so the WebView compositor idles and GPU usage drops to ~0.
+    if (idleFrames >= SETTLE_FRAMES) {
+      running = false;
+      return;
     }
     animationId = requestAnimationFrame(render);
   }

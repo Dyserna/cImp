@@ -249,7 +249,7 @@
   // the transparency line next to the allowlist.
   function policyForProgram(program: string): CommandPolicy | undefined {
     const stem = program.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, '').toLowerCase() ?? program;
-    return snapshot.offload.command_policies.find(
+    return snapshot?.offload.command_policies.find(
       (p) => p.program.toLowerCase() === stem,
     );
   }

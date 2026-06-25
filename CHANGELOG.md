@@ -5,6 +5,28 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.3] — 2026-06-26
+
+### Changed
+
+- **Waveform visualizer no longer burns GPU while idle.** The avatar waveform
+  rescheduled its `requestAnimationFrame` render loop unconditionally,
+  repainting the canvas (with a `shadowBlur` glow) at display rate even in
+  silence. In the WebView2/Chromium compositor that held the GPU at ~10–15%
+  while ccImp was otherwise idle — unrelated to the loaded TTS/STT/LLM weights,
+  which only compute on an in-flight request. The loop now parks itself once
+  the buffer drains to a flat line (~1s after audio stops) and restarts the
+  instant TTS or microphone audio resumes.
+
+### Fixed
+
+- **Settings window null-safety.** The offload command-policy lookup
+  dereferenced the settings snapshot without the null guard its sibling
+  helpers use, risking a crash if invoked before settings finished loading.
+  It now returns nothing until settings are loaded.
+- Two pre-existing `svelte-check` type errors are resolved (the Custom-palette
+  resolver write and the snapshot guard above); `npm run check` is green.
+
 ## [0.17.2] — 2026-06-25
 
 ### Added

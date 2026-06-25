@@ -170,16 +170,14 @@ pub fn run_cleanup(retention: LogRetention) {
         if age <= max_age {
             continue;
         }
-        // Drop the cached writer for this tab if its current file is
-        // about to be deleted (Windows). The writer will lazily
-        // recreate on next write.
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if let Some(prefix) = name.split(".log.").next() {
-                if let Ok(mut writers) = instance().writers.lock() {
-                    writers.remove(prefix);
-                }
-            }
-        }
+        // NOTE: we deliberately do NOT drop any cached writer here. Only files
+        // aged past `max_age` reach this point, and tracing-appender holds open
+        // only TODAY's file — never one of these old dated files. The previous
+        // code computed the writer key from the old file's name prefix (e.g.
+        // `claude.log.2026-05-08` → `claude`) and evicted `writers["claude"]`,
+        // which is the appender for *today's* file — needlessly forcing a
+        // reopen (and risking buffered-state loss) on the active writer every
+        // time one of that tab's historical files aged out.
         match std::fs::remove_file(&path) {
             Ok(()) => removed += 1,
             Err(e) => {

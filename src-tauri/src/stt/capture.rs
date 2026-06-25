@@ -79,6 +79,13 @@ pub(crate) fn spawn_capture_thread(
                         };
                         recording.store(false, Ordering::SeqCst);
                         let (samples, rate) = finish(cap);
+                        // Clear the mic amplitude ring now that the stream is
+                        // torn down, so the previous recording's trailing ~1s
+                        // doesn't bleed into the next recording's waveform
+                        // (mirrors the playback stop path in audio/amplitude).
+                        if let Ok(mut ring) = mic.write() {
+                            ring.clear();
+                        }
                         // Hand off to the worker, which emits the transcript
                         // (and the idle/error state) once inference completes.
                         set_state(&app, &state, SttState::Transcribing);
@@ -100,6 +107,11 @@ pub(crate) fn spawn_capture_thread(
                     CaptureCmd::Cancel => {
                         if active.take().is_some() {
                             recording.store(false, Ordering::SeqCst);
+                            // Drop the stale tail so the next recording starts
+                            // from a clean waveform (see Stop).
+                            if let Ok(mut ring) = mic.write() {
+                                ring.clear();
+                            }
                             info!(target: "stt", "recording cancelled");
                         }
                         set_state(&app, &state, SttState::Idle);

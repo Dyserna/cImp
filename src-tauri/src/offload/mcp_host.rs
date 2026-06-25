@@ -54,6 +54,11 @@ const WRITE_VERBS: &[&str] = &[
     "kill", "exec", "execute", "run", "spawn", "install", "uninstall", "publish",
     "send", "add", "copy", "cp", "save", "store", "upload", "mutate", "destroy",
     "clear", "purge", "apply", "checkout", "clone", "stage", "restore", "revert",
+    // Common mutating verbs that previously slipped through as "read-class"
+    // because they led with no listed verb (e.g. `task_cancel`, `job_abort`,
+    // `branch_force`, `repo_sync`). Kept first-two-only because each can also
+    // read-ishly appear later in a name.
+    "cancel", "abort", "force", "sync",
 ];
 
 /// Unambiguously-mutating leading verbs that essentially never appear as a noun
@@ -67,6 +72,10 @@ const ANYSEG_WRITE_VERBS: &[&str] = &[
     "create", "mkdir", "update", "edit", "insert", "modify", "patch", "apply",
     "append", "rename", "reset", "install", "uninstall", "publish", "upload",
     "mutate", "set", "put",
+    // Unambiguous mutators that never legitimately name a read tool — caught
+    // in any segment so `cache_evict`, `state_flush`, `db_upsert`, `git_amend`,
+    // `config_persist` can't pass as read-class.
+    "evict", "flush", "upsert", "amend", "persist",
 ];
 
 /// The leading verb of one name segment: the leading lowercase run so

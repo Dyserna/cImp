@@ -14,7 +14,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::processing::screen::Screen;
-use crate::processing::segmenter::segment_sentences;
+use crate::processing::segmenter::{last_boundary, segment_sentences};
 
 const OPEN: &[u8] = b"[[TTS]]";
 const CLOSE: &[u8] = b"[[/TTS]]";
@@ -67,6 +67,13 @@ impl BoundedDedup {
 /// chrome (spinner / status lines that never end in `.?!`); dropping avoids
 /// dumping a wall of garbage to the synthesizer.
 const MAX_ALL_BUF: usize = 2048;
+
+/// Hard ceiling for an unterminated buffer that DOES contain sentence
+/// punctuation (and so might be a genuinely long sentence still streaming, not
+/// chrome). Past this we retain the tail at a char boundary rather than
+/// dropping everything — bounds memory without silently discarding the head of
+/// a long real sentence the way a blanket clear at `MAX_ALL_BUF` did.
+const HARD_ALL_BUF_CAP: usize = 16 * 1024;
 
 pub struct TagScanner {
     /// Whitespace-normalized tag contents already emitted as TTS segments.
@@ -273,21 +280,20 @@ impl TagScanner {
         let split = if force {
             self.all_buf.len()
         } else {
-            last_sentence_split(&self.all_buf)
+            // Apply the same abbreviation/decimal/ellipsis suppression as
+            // `segment_sentences` so the flush boundary never cuts at a period
+            // that segmentation would treat as non-terminal (e.g. "Dr.").
+            last_boundary(&self.all_buf)
         };
         if split == 0 {
-            // No complete sentence yet. Drop a runaway buffer (chrome that
-            // never terminates) so it can't accumulate or later dump.
-            if self.all_buf.len() > MAX_ALL_BUF {
-                self.all_buf.clear();
-            }
+            // No complete sentence yet. Trim a runaway buffer so it can't
+            // accumulate or later dump.
+            self.trim_runaway_buf();
             return Vec::new();
         }
         let complete = self.all_buf[..split].to_string();
         self.all_buf.drain(..split);
-        if self.all_buf.len() > MAX_ALL_BUF {
-            self.all_buf.clear();
-        }
+        self.trim_runaway_buf();
 
         let mut out = Vec::new();
         for sentence in segment_sentences(&complete) {
@@ -315,33 +321,35 @@ impl TagScanner {
         }
         out
     }
-}
 
-/// Byte index in `s` just past the end of the last complete sentence — i.e.
-/// after the final `.?!` that is followed by whitespace or end-of-string,
-/// including any trailing whitespace. Returns 0 when there is no complete
-/// sentence. Deliberately simpler than the full [`segment_sentences`] rules
-/// (it doesn't special-case abbreviations); it only decides *how much* to
-/// flush — the flushed slice still goes through `segment_sentences`, which
-/// applies the decimal/abbreviation/ellipsis logic to the actual segments.
-fn last_sentence_split(s: &str) -> usize {
-    let b = s.as_bytes();
-    let n = b.len();
-    let mut split = 0;
-    let mut i = 0;
-    while i < n {
-        if matches!(b[i], b'.' | b'?' | b'!') && (i + 1 >= n || b[i + 1].is_ascii_whitespace()) {
-            let mut j = i + 1;
-            while j < n && b[j].is_ascii_whitespace() {
-                j += 1;
+    /// Bound the in-progress `all_buf` so it can't grow without limit.
+    ///
+    /// A buffer with NO sentence-terminal punctuation (`.?!`) is almost always
+    /// never-ending TUI chrome (a spinner / status line); drop it once it
+    /// passes the soft cap. A buffer that DOES contain such punctuation may be
+    /// a genuinely long sentence still streaming, so keep it — but cap memory
+    /// at `HARD_ALL_BUF_CAP`, retaining the *tail* at a char boundary. This
+    /// avoids the old behavior where a blanket clear at `MAX_ALL_BUF` silently
+    /// discarded the head of a long real sentence (only its tail got spoken).
+    fn trim_runaway_buf(&mut self) {
+        let has_terminator = self
+            .all_buf
+            .bytes()
+            .any(|b| matches!(b, b'.' | b'?' | b'!'));
+        if !has_terminator {
+            if self.all_buf.len() > MAX_ALL_BUF {
+                self.all_buf.clear();
             }
-            split = j;
-            i = j;
-        } else {
-            i += 1;
+            return;
+        }
+        if self.all_buf.len() > HARD_ALL_BUF_CAP {
+            let mut cut = self.all_buf.len() - HARD_ALL_BUF_CAP;
+            while cut < self.all_buf.len() && !self.all_buf.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.all_buf.drain(..cut);
         }
     }
-    split
 }
 
 impl Default for TagScanner {

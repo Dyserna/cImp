@@ -70,6 +70,11 @@ pub struct AudioOutput {
     /// streamer can skip IPC when the sink is empty without blocking on
     /// the audio thread itself.
     playing: Arc<AtomicBool>,
+    /// True while the sink is paused (selection-TTS pause). A paused sink keeps
+    /// its sources so `playing` stays true, but no new samples arrive — the
+    /// amplitude streamer checks this so the avatar doesn't keep lip-syncing to
+    /// the frozen tail of the buffer.
+    paused: Arc<AtomicBool>,
     /// Fired by the audio thread on every speaking → idle edge. The
     /// notification manager (V2-04) waits on this so it can drain queued
     /// announcements right when current TTS finishes.
@@ -85,11 +90,13 @@ impl AudioOutput {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let amplitude = Arc::new(RwLock::new(RingBuffer::new(RING_CAPACITY)));
         let playing = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let idle_notify = Arc::new(Notify::new());
 
         let (init_tx, init_rx) = mpsc::sync_channel::<AppResult<()>>(1);
         let amp_for_thread = amplitude.clone();
         let playing_for_thread = playing.clone();
+        let paused_for_thread = paused.clone();
         let idle_notify_for_thread = idle_notify.clone();
         let initial_volume = effective_volume(&settings.current().tts);
 
@@ -100,6 +107,7 @@ impl AudioOutput {
                     cmd_rx,
                     amp_for_thread,
                     playing_for_thread,
+                    paused_for_thread,
                     idle_notify_for_thread,
                     init_tx,
                     state_signals,
@@ -112,7 +120,7 @@ impl AudioOutput {
         match init_rx.recv() {
             Ok(Ok(())) => {
                 spawn_volume_subscriber(cmd_tx.clone(), settings);
-                Ok(Self { cmd_tx, amplitude, playing, idle_notify })
+                Ok(Self { cmd_tx, amplitude, playing, paused, idle_notify })
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(AppError::Audio("audio thread died during init".into())),
@@ -158,6 +166,13 @@ impl AudioOutput {
     /// state machine sees.
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::Relaxed)
+    }
+
+    /// True while playback is paused (sources retained but not advancing). The
+    /// amplitude streamer skips emitting while paused so the avatar doesn't
+    /// animate to the frozen tail of the buffer.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
     /// Wake-up primitive fired on every speaking → idle edge. Subscribers
@@ -231,10 +246,12 @@ fn spawn_volume_subscriber(cmd_tx: mpsc::Sender<AudioCommand>, settings: Setting
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_audio_thread(
     cmd_rx: Receiver<AudioCommand>,
     amplitude: Arc<RwLock<RingBuffer>>,
     playing: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     idle_notify: Arc<Notify>,
     init_tx: SyncSender<AppResult<()>>,
     state_signals: tokio_mpsc::Sender<StateSignal>,
@@ -296,12 +313,19 @@ fn run_audio_thread(
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
+        // How many sources we appended to the sink this tick. The drain check
+        // below must account for these: a chunk can finish in the SAME tick an
+        // Enqueue lands, leaving `sink.len()` unchanged so a naive `len <
+        // prev_len` test pops nothing and leaves a stale finished mark at the
+        // front (the deque then stays permanently offset by one).
+        let mut appended_this_tick = 0usize;
         if let Some(cmd) = cmd {
             match cmd {
                 AudioCommand::Enqueue { samples, sample_rate, mark } => {
                     let source = TappedSource::new(samples, sample_rate, amplitude.clone());
                     sink.append(source);
                     marks.push_back(mark);
+                    appended_this_tick += 1;
                 }
                 AudioCommand::StopAll => {
                     // Reached only via Esc (`tts_stop`) now — tab switches no
@@ -312,6 +336,9 @@ fn run_audio_thread(
                     // TTS, then a new read → silent).
                     sink.clear();
                     sink.play();
+                    // `clear()` + `play()` resumes the sink, so clear any
+                    // lingering paused state.
+                    paused.store(false, Ordering::Relaxed);
                     // Drop the mark queue too: a stop cancels any in-flight
                     // selection read, and the frontend clears its highlight on
                     // the same Esc that triggered the stop.
@@ -333,12 +360,15 @@ fn run_audio_thread(
                     prev_len = 0;
                 }
                 AudioCommand::SetVolume(v) => sink.set_volume(v),
-                AudioCommand::SetPaused(paused) => {
-                    if paused {
+                AudioCommand::SetPaused(want_paused) => {
+                    if want_paused {
                         sink.pause();
                     } else {
                         sink.play();
                     }
+                    // Mirror the pause state so the amplitude streamer can stop
+                    // emitting the frozen buffer tail while paused.
+                    paused.store(want_paused, Ordering::Relaxed);
                 }
                 AudioCommand::SelectionFinished { session, count } => {
                     pending_done = Some((session, count));
@@ -351,10 +381,13 @@ fn run_audio_thread(
         // pop the matching marks but do NOT treat a drop as end-of-read —
         // end-of-read is decided below by `pending_done` + an empty session.
         let len = sink.len();
-        if len < prev_len {
-            for _ in 0..(prev_len - len) {
-                marks.pop_front();
-            }
+        // Drained = (what we had + what we just appended) - what remains. Using
+        // `prev_len + appended_this_tick` (instead of `prev_len < len`) means a
+        // same-tick drain+enqueue can't mask a finished chunk: the front mark
+        // is still popped, keeping `marks.len() == sink.len()`.
+        let drained = (prev_len + appended_this_tick).saturating_sub(len);
+        for _ in 0..drained {
+            marks.pop_front();
         }
         prev_len = len;
 
@@ -366,13 +399,21 @@ fn run_audio_thread(
         let front = marks.front().copied().flatten();
         if let Some(f) = front {
             if last_front != Some(f) {
-                last_front = Some(f);
                 let tab = current_active(&active);
-                let _ = state_signals.try_send(StateSignal::TtsSelectionProgress {
+                // Advance `last_front` only once the begin edge is actually
+                // delivered (or the channel is closed). On `Full`, leave it so
+                // the edge re-emits next tick — otherwise the frontend never
+                // highlights this chunk even though its audio plays.
+                match state_signals.try_send(StateSignal::TtsSelectionProgress {
                     tab,
                     session: f.session,
                     index: f.index,
-                });
+                }) {
+                    Ok(()) | Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                        last_front = Some(f);
+                    }
+                    Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
+                }
             }
         }
 
@@ -386,14 +427,22 @@ fn run_audio_thread(
                 .any(|m| matches!(m, Some(mk) if mk.session == session));
             if !session_remaining {
                 let tab = current_active(&active);
-                let _ = state_signals.try_send(StateSignal::TtsSelectionProgress {
+                // Clear `pending_done` only once the done sentinel is actually
+                // delivered (or the channel is closed). On `Full`, keep it and
+                // retry next tick — dropping it would leave the frontend
+                // selection highlight stuck on the last sentence forever.
+                match state_signals.try_send(StateSignal::TtsSelectionProgress {
                     tab,
                     session,
                     index: count,
-                });
-                pending_done = None;
-                if last_front.map(|f| f.session) == Some(session) {
-                    last_front = None;
+                }) {
+                    Ok(()) | Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                        pending_done = None;
+                        if last_front.map(|f| f.session) == Some(session) {
+                            last_front = None;
+                        }
+                    }
+                    Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
                 }
             }
         }

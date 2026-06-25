@@ -266,7 +266,13 @@ async function attemptSpawn(entry: TerminalEntry, mode: SpawnMode): Promise<void
         // fresher session content (out of chronological order).
         // The bytes are gone after this call (consumed server-side);
         // that's acceptable for the rare fallback case.
-        await ptyStart(entry.tabId, channel, rows, cols);
+        //
+        // Re-read the geometry here rather than reusing the pre-await `rows`/
+        // `cols`: on a renderer-flip recreate the new Terminal is built at the
+        // old geometry and only fit on attach, so the snapshot above can be the
+        // pre-fit size. Spawning at the live size avoids a full-screen TUI
+        // briefly drawing at the wrong column count before SIGWINCH catches up.
+        await ptyStart(entry.tabId, channel, entry.term.rows, entry.term.cols);
       }
     } else if (mode === 'restart') {
       await ptyRestart(entry.tabId, channel, rows, cols);

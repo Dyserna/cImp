@@ -478,11 +478,50 @@ fn compact(messages: &mut Vec<ChatMessage>, budget: u32) {
         // Done when under budget, or when we can't drop more without losing the
         // single most-recent message (always keep at least one real turn).
         if estimate_tokens(&rebuilt) < budget || tail_start >= messages.len().saturating_sub(1) {
+            // Last resort: even the minimal tail (head + note + most-recent
+            // turn) is over budget — a huge original user `context` or a
+            // near-cap-sized final tool result. Hard-truncate message contents
+            // so the prompt fits, instead of dropping out of the loop still
+            // over budget and re-firing compact (a no-op) every step until the
+            // server rejects the oversized prompt with a 400/500.
+            if estimate_tokens(&rebuilt) >= budget {
+                truncate_to_budget(&mut rebuilt, budget);
+            }
             *messages = rebuilt;
             return;
         }
         // Still over budget: drop the next-oldest kept turn and retry.
         tail_start += 1;
+    }
+}
+
+/// Hard-truncate message contents until the estimate fits `budget`. Repeatedly
+/// halves the longest content (preserving its head, which carries the most
+/// relevant framing) and appends a marker. The iteration cap is a safety net —
+/// halving converges well within it.
+fn truncate_to_budget(messages: &mut [ChatMessage], budget: usize) {
+    const TRUNC_MARK: &str = "\n…[truncated to fit context budget]…";
+    for _ in 0..64 {
+        if estimate_tokens(messages) < budget {
+            return;
+        }
+        let longest = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| m.content.as_ref().map(|c| (i, c.chars().count())))
+            .max_by_key(|&(_, n)| n);
+        let Some((idx, n_chars)) = longest else {
+            return; // nothing left with content to cut
+        };
+        if n_chars <= TRUNC_MARK.chars().count() {
+            return; // can't shrink meaningfully without losing everything
+        }
+        if let Some(c) = messages[idx].content.as_mut() {
+            // char-boundary safe: take a prefix by chars, not bytes.
+            let mut cut: String = c.chars().take(n_chars / 2).collect();
+            cut.push_str(TRUNC_MARK);
+            *c = cut;
+        }
     }
 }
 

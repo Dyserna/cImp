@@ -68,6 +68,16 @@ fn is_bare_command(command: &str) -> bool {
     !command.is_empty() && !command.contains(['/', '\\', ':'])
 }
 
+/// Whether the allowlisted program is `git` (by file stem, case-insensitive),
+/// so the spawn path can apply git-specific hook neutralization.
+fn stem_is_git(command: &str) -> bool {
+    std::path::Path::new(command)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("git"))
+        .unwrap_or(false)
+}
+
 /// Reject argument patterns that turn an allowlisted, "read-only" program
 /// into arbitrary code execution or let it escape the allowed root. Scoped by
 /// program stem so each rule only applies where the flag is actually dangerous
@@ -82,14 +92,16 @@ fn dangerous_args(command: &str, args: &[String]) -> Option<String> {
     if stem == "git" {
         // `-c k=v` / `--config-env` inject config (alias.*=!sh, core.pager,
         // core.sshCommand, …) → arbitrary command execution.
-        // `-C <path>` / `--exec-path` change the working/exec directory →
-        // escape the allowed root.
+        // `-C <path>` / `--exec-path` / `--git-dir` / `--work-tree` change the
+        // working/exec/repo directory → escape the allowed root.
         // `--upload-pack` / `--receive-pack` run an arbitrary helper binary.
         for a in args {
             let blocked = a == "-c"
                 || a == "-C"
                 || a.starts_with("--config-env")
                 || a.starts_with("--exec-path")
+                || a.starts_with("--git-dir")
+                || a.starts_with("--work-tree")
                 || a.starts_with("--upload-pack")
                 || a.starts_with("--receive-pack");
             if blocked {
@@ -97,6 +109,24 @@ fn dangerous_args(command: &str, args: &[String]) -> Option<String> {
                     "`git {a}` is refused: it can execute arbitrary commands or escape \
                      the project root. run_command is for read-only probes only."
                 ));
+            }
+        }
+        // Refuse persisted-state subcommands. `git config` writes
+        // core.pager/core.sshCommand/alias.*=!cmd into .git/config, after
+        // which a later allowlisted `git log`/`git diff` in the same root
+        // executes that hook — a two-call arbitrary-code-execution escape that
+        // each individual invocation's flag check can't see. The dangerous
+        // subcommand is the first non-flag token (the value-taking globals
+        // `-c`/`-C` are already refused above, so nothing legitimately
+        // precedes it).
+        if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
+            if sub.eq_ignore_ascii_case("config") {
+                return Some(
+                    "`git config` is refused: writing repo config (core.pager, \
+                     core.sshCommand, alias.*) lets a later git command execute \
+                     arbitrary code. run_command is for read-only probes only."
+                        .to_string(),
+                );
             }
         }
     }
@@ -150,6 +180,20 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         // (below) drops `child` while the process keeps running detached,
         // leaking one orphan per hung command.
         .kill_on_drop(true);
+    // Defense in depth for git: even if a hostile repo already has a
+    // config-driven hook (core.pager / core.sshCommand / GIT_* env), neutralize
+    // the common execution paths for these read-only probes. GIT_PAGER=cat
+    // overrides core.pager; an empty GIT_SSH_COMMAND disarms a config-injected
+    // ssh helper; NOSYSTEM/GLOBAL/PROMPT keep the probe from honoring ambient
+    // config or hanging on a credential prompt.
+    if stem_is_git(&args.command) {
+        cmd.env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .env("GIT_SSH_COMMAND", "")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    }
     // Don't flash a console window for each spawned command on Windows.
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);

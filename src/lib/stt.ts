@@ -48,9 +48,12 @@ export function initStt(): void {
       return;
     }
     if (!get(composeOpen)) openCompose();
-    const cur = get(composeContent);
-    // Append with a single space so a second dictation doesn't clobber the
-    // first (or any text the user already typed).
-    composeContent.set(cur ? `${cur} ${text}` : text);
+    // Trim the existing buffer before deciding the separator: the live compose
+    // buffer is user-editable and may end in a newline/space (or be
+    // whitespace-only), so a naive `cur` check produced double spaces or glued
+    // the dictation onto the previous line. A trailing single space keeps a
+    // second dictation from clobbering the first.
+    const base = get(composeContent).trimEnd();
+    composeContent.set(base ? `${base} ${text}` : text);
   });
 }

@@ -83,7 +83,18 @@
         failures = 0;
         const ra = result.retry_after_secs ?? 0;
         delay = ra > 0 ? Math.max(pollMs, ra * 1000) : RATE_LIMIT_COOLDOWN_MS;
+      } else if (result) {
+        // Structured 'unavailable / not logged in' (snapshot null, not rate
+        // limited). This is a stable steady state, not a transient transport
+        // error — poll at the normal fixed cadence so the widget appears within
+        // one interval after the user logs in, rather than ramping the failure
+        // backoff up to MAX_BACKOFF_MS (~5 min).
+        rateLimited = false;
+        failures = 0;
+        delay = pollMs;
       } else {
+        // result === null: a thrown transport / IPC error. Back off
+        // exponentially.
         rateLimited = false;
         failures += 1;
         delay = Math.min(pollMs * 2 ** Math.min(failures, 5), MAX_BACKOFF_MS);

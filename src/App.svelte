@@ -22,6 +22,7 @@
   import {
     seedPerTabEntries,
     startAvatarStateListener,
+    perTabAvatarState,
   } from './lib/avatarState';
   import { initSettings, settings, applySettings } from './lib/settings/store';
   import { themeRegistry } from './lib/themes/registry';
@@ -266,7 +267,16 @@
           close_pane: closeFocusedPane,
           stop_tts: {
             handler: () => {
-              void stopAllTts();
+              // Only issue the stop when something is plausibly playing — a
+              // selection read, or any tab whose avatar is Speaking. Avoids an
+              // IPC round-trip on every Escape pressed in the terminal when no
+              // TTS is in flight.
+              const anySpeaking = Object.values(get(perTabAvatarState)).some(
+                (s) => s === 'Speaking',
+              );
+              if (isSelectionTtsActive() || anySpeaking) {
+                void stopAllTts();
+              }
             },
             active: () => isSelectionTtsActive(),
           },

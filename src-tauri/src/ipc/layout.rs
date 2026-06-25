@@ -29,9 +29,11 @@ pub async fn save_layout(
     state: State<'_, AppState>,
     layout: LayoutPersisted,
 ) -> AppResult<()> {
-    let mut snap = state.settings.current();
-    snap.layout = Some(layout);
-    state.settings.set(snap);
+    // Atomic mutate so a concurrent tab create/close or settings_update can't
+    // clobber the layout with a stale whole-struct snapshot (lost-update).
+    state.settings.mutate(move |snap| {
+        snap.layout = Some(layout);
+    });
     Ok(())
 }
 
@@ -51,17 +53,17 @@ pub async fn save_layout_preset(
             "save_layout_preset: name is empty".into(),
         ));
     }
-    let mut snap = state.settings.current();
-    if let Some(existing) = snap.layout_presets.iter_mut().find(|p| p.name == trimmed) {
-        existing.tree = tree;
-    } else {
-        snap.layout_presets.push(LayoutPreset {
-            name: trimmed,
-            created_at: now_iso8601(),
-            tree,
-        });
-    }
-    state.settings.set(snap);
+    state.settings.mutate(move |snap| {
+        if let Some(existing) = snap.layout_presets.iter_mut().find(|p| p.name == trimmed) {
+            existing.tree = tree;
+        } else {
+            snap.layout_presets.push(LayoutPreset {
+                name: trimmed,
+                created_at: now_iso8601(),
+                tree,
+            });
+        }
+    });
     Ok(())
 }
 
@@ -73,11 +75,12 @@ pub async fn delete_layout_preset(
     state: State<'_, AppState>,
     name: String,
 ) -> AppResult<()> {
-    let mut snap = state.settings.current();
-    let before = snap.layout_presets.len();
-    snap.layout_presets.retain(|p| p.name != name);
-    if snap.layout_presets.len() != before {
-        state.settings.set(snap);
+    // Skip the broadcast/save when the name doesn't exist; the real delete is
+    // an atomic mutate so it can't clobber a concurrent settings write.
+    if state.settings.current().layout_presets.iter().any(|p| p.name == name) {
+        state.settings.mutate(move |snap| {
+            snap.layout_presets.retain(|p| p.name != name);
+        });
     }
     Ok(())
 }
@@ -101,19 +104,28 @@ pub async fn rename_layout_preset(
     if new_trimmed == old_name {
         return Ok(());
     }
-    let mut snap = state.settings.current();
+    let snap = state.settings.current();
     if snap.layout_presets.iter().any(|p| p.name == new_trimmed) {
         return Err(AppError::Settings(format!(
             "rename_layout_preset: a preset named '{new_trimmed}' already exists"
         )));
     }
-    let Some(target) = snap.layout_presets.iter_mut().find(|p| p.name == old_name) else {
+    if !snap.layout_presets.iter().any(|p| p.name == old_name) {
         return Err(AppError::Settings(format!(
             "rename_layout_preset: no preset named '{old_name}'"
         )));
-    };
-    target.name = new_trimmed;
-    state.settings.set(snap);
+    }
+    drop(snap);
+    // Perform the rename atomically, re-checking under the held lock so a
+    // concurrent rename/delete can't be clobbered or produce a duplicate name.
+    state.settings.mutate(move |snap| {
+        if snap.layout_presets.iter().any(|p| p.name == new_trimmed) {
+            return;
+        }
+        if let Some(target) = snap.layout_presets.iter_mut().find(|p| p.name == old_name) {
+            target.name = new_trimmed;
+        }
+    });
     Ok(())
 }
 

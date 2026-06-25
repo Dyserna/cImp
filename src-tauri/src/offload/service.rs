@@ -122,6 +122,10 @@ pub struct OffloadService {
     /// poller pushes live ones via the event). One row per enabled backend,
     /// Local first then Remote.
     latest_metrics: StdMutex<Vec<BackendDashboard>>,
+    /// Serializes global-cap reconciliation so a concurrent grow + shrink
+    /// can't interleave and leave the gate sized inconsistently with
+    /// `global_cap` (see `reconcile_global_cap`).
+    cap_reconcile_lock: TokioMutex<()>,
 }
 
 impl OffloadService {
@@ -154,6 +158,7 @@ impl OffloadService {
             change_tx,
             app,
             latest_metrics: StdMutex::new(Vec::new()),
+            cap_reconcile_lock: TokioMutex::new(()),
         });
 
         // Relay MCP-host change pulses into the service change channel so a
@@ -196,27 +201,43 @@ impl OffloadService {
     /// permits; shrinks by acquiring+forgetting the excess as it frees.
     fn reconcile_global_cap(self: &Arc<Self>, snap: &OffloadSettings) {
         let target = compute_global_cap(snap);
-        let current = self.global_cap.load(Ordering::Relaxed);
-        if target == current {
+        // Cheap no-op guard so the common "nothing changed" call doesn't spawn
+        // a task. The authoritative re-check happens under the lock below.
+        if target == self.global_cap.load(Ordering::Relaxed) {
             return;
         }
-        self.global_cap.store(target, Ordering::Relaxed);
-        if target > current {
-            self.global_gate.add_permits((target - current) as usize);
-        } else {
-            // Reclaim the excess permits as in-flight tasks release them.
-            let remove = (current - target) as usize;
-            let gate = self.global_gate.clone();
-            tauri::async_runtime::spawn(async move {
+        let this = self.clone();
+        tauri::async_runtime::spawn(async move {
+            // Serialize the whole resize (including the async shrink drain) so
+            // a concurrent grow and shrink can't interleave and forget permits
+            // the other just added.
+            let _guard = this.cap_reconcile_lock.lock().await;
+            let current = this.global_cap.load(Ordering::Relaxed);
+            if target == current {
+                return;
+            }
+            if target > current {
+                this.global_gate.add_permits((target - current) as usize);
+                // Publish the new cap only after the permits actually exist,
+                // so `global_in_flight` (= cap - available) never transiently
+                // over-reports against a not-yet-grown pool.
+                this.global_cap.store(target, Ordering::Relaxed);
+            } else {
+                // Reclaim the excess permits as in-flight tasks release them.
+                let remove = (current - target) as usize;
                 for _ in 0..remove {
-                    match gate.clone().acquire_owned().await {
+                    match this.global_gate.clone().acquire_owned().await {
                         Ok(p) => p.forget(),
                         Err(_) => break, // semaphore closed
                     }
                 }
-            });
-        }
-        tracing::debug!(from = current, to = target, "offload: resized global gate");
+                // Publish the smaller cap only after the drain completes —
+                // storing it up front (against the still-large permit count)
+                // saturates `global_in_flight` to 0 and masks real load.
+                this.global_cap.store(target, Ordering::Relaxed);
+            }
+            tracing::debug!(from = current, to = target, "offload: resized global gate");
+        });
     }
 
     /// Bring the warm MCP host in line with current config. Cheap when the
@@ -555,13 +576,20 @@ impl OffloadService {
         let slots_decl = 1u32;
 
         // Reuse a cached handle when the URL/auth/cloud signature matches; a
-        // fresh handle would reset `in_flight`.
-        let sig = format!("{base_url}|{}|{is_cloud}", auth_token.is_empty());
+        // fresh handle would reset `in_flight`. The signature fingerprints the
+        // actual token *value*, not just its presence — otherwise rotating a
+        // bearer token from one non-empty value to another (a common cloud key
+        // rotation) would match the cached signature and keep reusing the
+        // handle built with the stale token (its reqwest client + health/props
+        // probe would authenticate with the old credential).
+        let sig = format!("{base_url}|{}|{is_cloud}", token_fp(auth_token));
         let handle = {
             let mut pool = self.remote_pool.lock().await;
             let reuse = pool.get(&b.name).filter(|h| h.base_url() == base_url.trim_end_matches('/'));
             match reuse {
-                Some(h) if remote_sig(h, is_cloud) == sig => h.clone(),
+                // Don't reuse a handle flagged for rebuild (the remote came
+                // back with fewer slots than its gate is sized for).
+                Some(h) if remote_sig(h, is_cloud) == sig && !h.needs_rebuild() => h.clone(),
                 _ => {
                     let h = Arc::new(
                         RemoteBackend::new(
@@ -840,7 +868,17 @@ impl OffloadService {
 
 /// Stable signature of a cached remote handle for reuse comparison.
 fn remote_sig(h: &RemoteBackend, is_cloud: bool) -> String {
-    format!("{}|{}|{is_cloud}", h.base_url(), h.auth_token().is_none())
+    format!("{}|{}|{is_cloud}", h.base_url(), token_fp(h.auth_token().unwrap_or("")))
+}
+
+/// Non-cryptographic fingerprint of an auth token, used only to detect a
+/// change in the token *value* between settings snapshots so a rotated token
+/// forces a handle rebuild. Not stored or logged — just compared in-process.
+fn token_fp(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut h);
+    h.finish()
 }
 
 /// The offload `allowed_roots`, falling back to the launch project root when

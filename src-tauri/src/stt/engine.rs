@@ -151,9 +151,20 @@ impl SttEngine {
     }
 }
 
-/// True when `text` is a single fully-bracketed/parenthesized group with no
-/// other content — whisper's convention for non-speech segments. Guarded so a
-/// real sentence containing a bracketed aside isn't dropped.
+/// Known non-speech markers whisper emits inside a bracketed group. Matched
+/// case-insensitively as a substring of the inner text. Kept to an allowlist
+/// so a legitimate dictation that happens to be fully parenthesized (the user
+/// literally says "parenthesize this" → "(parenthesize this)", or "[TODO]") is
+/// NOT discarded — only whisper's actual non-speech annotations are.
+const NON_SPEECH_MARKERS: &[&str] = &[
+    "blank_audio", "blank audio", "silence", "music", "inaudible", "no speech",
+    "noise", "applause", "laughter", "background", "sound",
+];
+
+/// True when `text` is a single fully-bracketed/parenthesized group whose inner
+/// text matches a known non-speech marker — whisper's convention for non-speech
+/// segments. Guarded so neither a real sentence with a bracketed aside nor a
+/// wholly-bracketed genuine phrase is dropped.
 fn is_non_speech(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
@@ -165,7 +176,11 @@ fn is_non_speech(text: &str) -> bool {
         return false;
     }
     let inner = &t[1..t.len() - 1];
-    !inner.contains(['[', '(', ']', ')'])
+    if inner.contains(['[', '(', ']', ')']) {
+        return false;
+    }
+    let lower = inner.to_ascii_lowercase();
+    NON_SPEECH_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 #[cfg(test)]

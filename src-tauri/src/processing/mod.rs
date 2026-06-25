@@ -52,6 +52,11 @@ use crate::processing::tags::TagScanner;
 /// state is reset.
 pub const DEFAULT_MAX_HOLD: Duration = Duration::from_millis(500);
 
+/// Compact `raw_buffer` once the prefix consumed by both the emit cursor and
+/// the scanner read cursor grows past this. Below it we leave the buffer alone
+/// to avoid churning `Vec::drain` on every small burst.
+const RAW_COMPACT_THRESHOLD: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessingEvent {
     /// Bytes ready for the terminal display (tags stripped).
@@ -195,6 +200,17 @@ impl ProcessingLayer {
         // If everything has flushed, reset the global max-hold anchor.
         if !self.screen.has_pending() && !self.scanner.has_open_tag() {
             self.oldest_pending_at = None;
+        }
+
+        // Bound `raw_buffer`: bytes before the lesser of the emit cursor and the
+        // scanner's read cursor have been consumed by BOTH and will never be
+        // re-read, so drop them and rebase both cursors. While a tag is open the
+        // scanner cursor stalls, so the buffer is correctly retained until the
+        // close arrives. (Speak-all copies into `all_buf`, so trimming is safe.)
+        let watermark = self.screen.emitted_offset().min(self.scanner.scan_offset());
+        if watermark >= RAW_COMPACT_THRESHOLD {
+            let dropped = self.screen.compact_raw(watermark);
+            self.scanner.rebase_offset(dropped);
         }
 
         events

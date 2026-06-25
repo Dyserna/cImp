@@ -459,9 +459,18 @@ impl OffloadSupervisor {
 
     /// Stop *all* local backends (app exit / disable).
     pub async fn stop_all(&self) {
-        let names: Vec<String> = self.running.lock().await.keys().cloned().collect();
-        for name in names {
-            self.stop_backend(&name).await;
+        // Two passes: a backend started concurrently (e.g. a racing autostart
+        // on disable) between snapshotting the map and stopping each entry
+        // would survive a single pass. A second sweep catches that straggler
+        // without risking an unbounded loop if starts kept arriving.
+        for _ in 0..2 {
+            let names: Vec<String> = self.running.lock().await.keys().cloned().collect();
+            if names.is_empty() {
+                break;
+            }
+            for name in names {
+                self.stop_backend(&name).await;
+            }
         }
     }
 

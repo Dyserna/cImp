@@ -604,7 +604,11 @@ async fn http_rpc(
     params: Value,
     timeout: Duration,
 ) -> Result<Value, String> {
-    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    // Unique per-call id (JSON-RPC ids must be unique within a session; some
+    // servers reject a repeated id even on a stateless HTTP POST).
+    static HTTP_RPC_ID: AtomicU64 = AtomicU64::new(1);
+    let id = HTTP_RPC_ID.fetch_add(1, Ordering::Relaxed);
+    let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     let resp = client
         .post(url)
         .json(&body)

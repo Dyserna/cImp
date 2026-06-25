@@ -206,7 +206,9 @@ fn render(input: &str) -> String {
 fn humanize(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
-    } else if n < 1_000_000 {
+    } else if n < 999_500 {
+        // Upper bound is 999_500, not 1_000_000: above it the rounded
+        // thousands hit 1000 and would render the nonsensical "1000k".
         format!("{}k", ((n as f64) / 1_000.0).round() as u64)
     } else {
         format!("{:.1}M", (n as f64) / 1_000_000.0)
@@ -333,8 +335,10 @@ fn parse_hex(s: Option<&String>) -> Option<(u8, u8, u8)> {
     let s = s?.strip_prefix('#')?;
     let expand = |c: &str| u8::from_str_radix(c, 16).ok();
     match s.len() {
-        3 => {
-            // #rgb → each nibble doubled.
+        3 | 4 => {
+            // #rgb / #rgba → each nibble doubled; alpha (4th) ignored, as the
+            // theming layer accepts 4-digit hex and we'd otherwise silently
+            // fall back to defaults for it.
             let r = expand(&s[0..1])?;
             let g = expand(&s[1..2])?;
             let b = expand(&s[2..3])?;

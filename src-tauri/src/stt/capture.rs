@@ -127,6 +127,11 @@ fn start_capture(
     let sample_format = supported.sample_format();
     let sample_rate = supported.sample_rate().0;
     let channels = supported.channels() as usize;
+    // `data.chunks(channels)` in the callback panics on a zero chunk size, and
+    // a 0-channel config is meaningless for capture — reject it up front.
+    if channels == 0 {
+        return Err(AppError::Stt("input device reports zero channels".into()));
+    }
     let config: cpal::StreamConfig = supported.into();
 
     info!(
@@ -216,7 +221,12 @@ where
 /// Stop the stream and take the accumulated mono buffer + its native rate.
 fn finish(cap: ActiveCapture) -> (Vec<f32>, u32) {
     let rate = cap.sample_rate;
-    // Dropping `_stream` stops the device callback before we read the buffer.
+    // Pause first, then drop: on WASAPI a bare drop isn't guaranteed to tear
+    // the callback down synchronously, so an in-flight callback could still be
+    // appending when we take the buffer below. Pausing quiesces the device
+    // before we read, so trailing frames aren't lost to that race.
+    use cpal::traits::StreamTrait;
+    let _ = cap._stream.pause();
     drop(cap._stream);
     let samples = cap
         .accumulator

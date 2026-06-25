@@ -100,6 +100,13 @@ pub struct OffloadService {
     /// Warm remote backend handles, keyed by backend name (so `in_flight`
     /// persists across calls). Rebuilt when a backend's config changes.
     remote_pool: TokioMutex<HashMap<String, Arc<RemoteBackend>>>,
+    /// Transient local handles for servers NOT managed by our supervisor
+    /// (e.g. a llama-server the user launched themselves), keyed by backend
+    /// name. Cached for the same reason as `remote_pool`: a fresh handle per
+    /// call resets its slot gate, so `in_flight` would always read 0 and the
+    /// router would never see the backend as busy. Rebuilt when the base URL
+    /// changes.
+    local_pool: TokioMutex<HashMap<String, Arc<LlamaServer>>>,
     /// Long-timeout client for the agent loop's chat-completions calls
     /// (health/`/props` probes use each handle's own short-timeout client).
     client: reqwest::Client,
@@ -138,6 +145,7 @@ impl OffloadService {
             global_gate: Arc::new(Semaphore::new(global_cap as usize)),
             global_cap,
             remote_pool: TokioMutex::new(HashMap::new()),
+            local_pool: TokioMutex::new(HashMap::new()),
             client,
             change_tx,
             app,
@@ -443,11 +451,25 @@ impl OffloadService {
             });
         }
         // Try a transient handle for a server the user may have launched
-        // themselves (or one already warming from a prior offload).
-
-        let transient = Arc::new(
-            LlamaServer::with_config(&b.name, server_command, b.tier, b.tool_scope.clone()).ok()?,
-        );
+        // themselves (or one already warming from a prior offload). Cache it by
+        // name (reused while the base URL is unchanged) so its slot gate — and
+        // thus `in_flight` — persists across calls; a fresh handle each time
+        // would always report 0 in-flight and the router would never throttle.
+        let transient = {
+            let mut pool = self.local_pool.lock().await;
+            let reuse = pool.get(&b.name).filter(|h| h.base_url() == base_url);
+            match reuse {
+                Some(h) => h.clone(),
+                None => {
+                    let h = Arc::new(
+                        LlamaServer::with_config(&b.name, server_command, b.tier, b.tool_scope.clone())
+                            .ok()?,
+                    );
+                    pool.insert(b.name.clone(), h.clone());
+                    h
+                }
+            }
+        };
         let ready = transient.health_check().await;
         if ready {
             let _ = transient.refresh_props().await;

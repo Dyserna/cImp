@@ -134,6 +134,12 @@ impl AudioOutput {
         if samples.is_empty() {
             return;
         }
+        if sample_rate == 0 {
+            // A zero rate would break rodio's resampler and the duration math;
+            // a synthesizer that reports it has produced no usable audio.
+            warn!("audio: dropping chunk with zero sample rate");
+            return;
+        }
         if let Err(e) = self
             .cmd_tx
             .send(AudioCommand::Enqueue { samples, sample_rate, mark })
@@ -306,6 +312,10 @@ fn run_audio_thread(
                     marks.clear();
                     last_front = None;
                     pending_done = None;
+                    // The sink was just emptied; rebase the drain tracker so the
+                    // next tick doesn't see a phantom drop (`len < prev_len`) and
+                    // pop marks belonging to a freshly-enqueued selection.
+                    prev_len = 0;
                 }
                 AudioCommand::SetVolume(v) => sink.set_volume(v),
                 AudioCommand::SetPaused(paused) => {
@@ -384,12 +394,21 @@ fn run_audio_thread(
             // tab's avatar pinned in Speaking.
             let tab = current_active(&active);
             speaking_tab = Some(tab.clone());
-            let _ = state_signals.try_send(StateSignal::TtsPlaybackStarted { tab });
+            // Blocking (not try_) send: these two edges drive the avatar's
+            // Speaking state, and a dropped Stopped edge would pin the avatar
+            // in Speaking forever. This is a dedicated OS thread (never a tokio
+            // worker), so blocking_send is safe; it only stalls if the state
+            // consumer is wedged, in which case audio is already degraded.
+            if let Err(e) = state_signals.blocking_send(StateSignal::TtsPlaybackStarted { tab }) {
+                warn!("audio: dropped TtsPlaybackStarted edge: {e}");
+            }
         } else if !now_speaking && speaking {
             speaking = false;
             playing.store(false, Ordering::Relaxed);
             let tab = speaking_tab.take().unwrap_or_else(|| current_active(&active));
-            let _ = state_signals.try_send(StateSignal::TtsPlaybackStopped { tab });
+            if let Err(e) = state_signals.blocking_send(StateSignal::TtsPlaybackStopped { tab }) {
+                warn!("audio: dropped TtsPlaybackStopped edge: {e}");
+            }
             // Wake any task waiting on the next idle edge. `playing` is
             // already false above, so a `try_drain` running on this notify
             // will see `is_playing() == false` and proceed.
@@ -454,6 +473,11 @@ impl Source for TappedSource {
     }
 
     fn total_duration(&self) -> Option<Duration> {
+        if self.sample_rate == 0 {
+            // Unknown duration rather than a divide-by-zero: `secs` would be
+            // infinite and `Duration::from_secs_f64` panics on a non-finite.
+            return None;
+        }
         let secs = self.remaining as f64 / self.sample_rate as f64;
         Some(Duration::from_secs_f64(secs))
     }

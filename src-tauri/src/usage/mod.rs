@@ -81,10 +81,21 @@ struct UsageResponse {
 }
 
 /// Credentials file path: `<home>/.claude/.credentials.json`. Resolves the
-/// home dir from `USERPROFILE` on Windows, `HOME` elsewhere.
+/// home dir from `USERPROFILE` on Windows (falling back to `HOMEDRIVE`+
+/// `HOMEPATH`, which some domain/enterprise profiles set instead), `HOME`
+/// elsewhere.
 fn credentials_path() -> Option<PathBuf> {
     let home = if cfg!(windows) {
-        std::env::var_os("USERPROFILE")
+        std::env::var_os("USERPROFILE").or_else(|| {
+            match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+                (Some(drive), Some(path)) => {
+                    let mut h = drive;
+                    h.push(path);
+                    Some(h)
+                }
+                _ => None,
+            }
+        })
     } else {
         std::env::var_os("HOME")
     }?;

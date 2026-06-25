@@ -94,7 +94,10 @@ impl SystemStatsState {
 
     pub fn sample(&self) -> SystemStatsSnapshot {
         let (cpu_pct, mem_pct, net) = {
-            let mut guard = self.inner.lock().expect("sysmon mutex poisoned");
+            // Recover from a poisoned lock rather than panicking the caller
+            // (this runs on an IPC thread): the stats are advisory, and a prior
+            // panic mid-refresh leaves the data merely stale, not unsafe.
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
             guard.sys.refresh_cpu_usage();
             let cpu_pct = guard.sys.global_cpu_usage();

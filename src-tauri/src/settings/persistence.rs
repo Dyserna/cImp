@@ -143,7 +143,13 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         // custom overlay was in play, we recompute and rewrite the diff;
         // otherwise we rewrite global.
         if overlay_existed {
-            if let Err(e) = save(&settings, launch_cwd, &global) {
+            // Diff against a baseline that has had the SAME (idempotent)
+            // repairs applied, so invariants enforced on both sides (restored
+            // AI builtins, the offload server tab, canonical flags) don't get
+            // mistaken for user customizations and written into the overlay.
+            let mut baseline = global.clone();
+            let _ = integrity_check(&mut baseline);
+            if let Err(e) = save(&settings, launch_cwd, &baseline) {
                 tracing::warn!(error = %e, "settings: post-repair save (custom) failed");
             }
         } else if let Err(e) = save_global(&settings) {

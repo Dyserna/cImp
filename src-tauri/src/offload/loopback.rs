@@ -282,7 +282,13 @@ async fn handle_conn(
     service: Arc<OffloadService>,
     token: String,
 ) -> AppResult<()> {
-    let req = read_request(&mut stream).await?;
+    // Cap how long we'll wait for a complete request: a half-open or idle
+    // connection (TCP probe, crashed child holding the socket) would otherwise
+    // wedge this handler task forever, leaking one task per such connection.
+    let req = match tokio::time::timeout(Duration::from_secs(30), read_request(&mut stream)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(AppError::Offload("request read timed out".into())),
+    };
 
     if !authorized(&req, &token) {
         write_simple(&mut stream, 401, "text/plain", b"unauthorized").await?;

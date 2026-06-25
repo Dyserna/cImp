@@ -73,6 +73,19 @@ impl TagScanner {
         self.open_tag
     }
 
+    /// Absolute read cursor into the raw byte stream. The processing layer
+    /// uses this (paired with the screen's emit cursor) as the watermark below
+    /// which `raw_buffer` can be compacted.
+    pub fn scan_offset(&self) -> usize {
+        self.scan_offset
+    }
+
+    /// Rebase the read cursor after the raw buffer has had `by` leading bytes
+    /// dropped. Keeps `scan_offset` pointing at the same logical byte.
+    pub fn rebase_offset(&mut self, by: usize) {
+        self.scan_offset = self.scan_offset.saturating_sub(by);
+    }
+
     /// Walk the raw byte stream from `scan_offset` looking for closed
     /// `[[TTS]]...[[/TTS]]` pairs. Content between markers is ANSI-stripped
     /// (with `\x1b[<n>C` cursor-skips converted to N spaces, since Claude
@@ -176,7 +189,13 @@ impl TagScanner {
         }
         let scan = &raw[self.scan_offset..];
         let consume_to = if force {
-            scan.len()
+            // Max-hold flush: consume everything EXCEPT a trailing unterminated
+            // escape sequence. Consuming a half-escape would drop its prefix
+            // (strip_ansi discards incomplete escapes) while `scan_offset`
+            // advances past it, so the continuation bytes arriving next burst
+            // would be read as literal text and leak into speech. A normal
+            // flush ends at a newline, which can never fall inside an escape.
+            unterminated_escape_tail(scan)
         } else {
             match scan.iter().rposition(|&b| b == b'\n') {
                 Some(i) => i + 1,
@@ -272,6 +291,65 @@ impl Default for TagScanner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Index up to which `slice` can be consumed without ending inside an
+/// unterminated ANSI escape sequence. Returns `slice.len()` when the slice
+/// doesn't end mid-escape; otherwise the start index of the trailing
+/// incomplete escape so the caller can hold those bytes back. The escape
+/// grammar mirrors [`strip_ansi`] so the two stay consistent.
+fn unterminated_escape_tail(slice: &[u8]) -> usize {
+    let n = slice.len();
+    let mut i = 0;
+    while i < n {
+        if slice[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        let esc_start = i;
+        if i + 1 >= n {
+            return esc_start; // lone trailing ESC
+        }
+        match slice[i + 1] {
+            b'[' => {
+                // CSI: parameter/intermediate bytes then a final 0x40..=0x7e.
+                i += 2;
+                while i < n && !(0x40..=0x7e).contains(&slice[i]) {
+                    i += 1;
+                }
+                if i >= n {
+                    return esc_start; // no final byte yet
+                }
+                i += 1;
+            }
+            b']' => {
+                // OSC: terminated by BEL or ST (ESC \).
+                i += 2;
+                let mut terminated = false;
+                while i < n {
+                    if slice[i] == 0x07 {
+                        i += 1;
+                        terminated = true;
+                        break;
+                    }
+                    if slice[i] == 0x1b && i + 1 < n && slice[i + 1] == b'\\' {
+                        i += 2;
+                        terminated = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !terminated {
+                    return esc_start;
+                }
+            }
+            _ => {
+                // Two-byte ESC sequence; the following byte is present.
+                i += 2;
+            }
+        }
+    }
+    n
 }
 
 /// Collapse runs of whitespace (spaces, tabs, newlines) in `s` into a
@@ -476,6 +554,19 @@ mod tests {
         let mut raw2 = raw.clone();
         raw2.extend_from_slice(b"The capital of France is Paris.\n");
         assert_eq!(s.scan_all(&raw2, false), vec!["The capital of France is Paris."]);
+    }
+
+    #[test]
+    fn scan_all_force_does_not_split_a_trailing_escape() {
+        let mut s = TagScanner::new();
+        // A forced flush lands mid-escape: "Done." then an incomplete CSI.
+        let mut raw = b"Done.\x1b[31".to_vec();
+        // "Done." is spoken; the dangling "\x1b[31" must be held, not consumed.
+        assert_eq!(s.scan_all(&raw, true), vec!["Done."]);
+        // The continuation completes the escape and is correctly stripped, so
+        // the leftover "m" never leaks into speech as literal text.
+        raw.extend_from_slice(b"mMore text.\n");
+        assert_eq!(s.scan_all(&raw, false), vec!["More text."]);
     }
 
     #[test]

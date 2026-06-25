@@ -76,6 +76,11 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     let mut emitted = 0u64;
     let mut byte_budget = MAX_BYTES;
     let mut truncated = false;
+    // Set when the very first line we tried to emit was itself larger than the
+    // whole byte budget — distinct from "offset past EOF", which produces the
+    // same empty `out`. Without this the model is told "no lines at offset N"
+    // for a non-empty file and loops adjusting the offset that never helps.
+    let mut oversized_line = false;
     for (idx, line) in text.lines().enumerate() {
         let lineno = idx as u64;
         if lineno < start {
@@ -87,6 +92,9 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         }
         let rendered = format!("{}\t{}\n", lineno + 1, line);
         if rendered.len() > byte_budget {
+            if out.is_empty() {
+                oversized_line = true;
+            }
             truncated = true;
             break;
         }
@@ -96,10 +104,21 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     }
 
     if out.is_empty() {
+        let total_lines = text.lines().count();
+        if oversized_line {
+            return Ok(format!(
+                "(line {} is larger than the {}-byte single-call render budget, so no \
+                 lines could be returned — the file has {} line(s). This is an oversized \
+                 line, not a bad offset; the line is too large to display here.)",
+                start + 1,
+                MAX_BYTES,
+                total_lines
+            ));
+        }
         return Ok(format!(
             "(no lines at offset {} — file has {} line(s))",
             args.offset.max(1),
-            text.lines().count()
+            total_lines
         ));
     }
     if truncated {

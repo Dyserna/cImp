@@ -33,7 +33,10 @@ pub fn spawn_amplitude_streamer(app: AppHandle, audio: Arc<AudioOutput>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if !audio.is_playing() {
+            // Skip while silent OR paused: a paused sink keeps `is_playing()`
+            // true but no new samples arrive, so emitting would replay the
+            // frozen buffer tail and the avatar would lip-sync to stale audio.
+            if !audio.is_playing() || audio.is_paused() {
                 continue;
             }
             let samples = tap.recent_samples(SAMPLE_WINDOW);

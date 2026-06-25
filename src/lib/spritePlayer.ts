@@ -200,6 +200,14 @@ export class SpritePlayer {
   private async startAnim(name: string): Promise<void> {
     this.curName = name;
     const gen = ++this.gen;
+    // Stop the outgoing animation's frame timer immediately. Otherwise a timer
+    // scheduled by the previous animation's showFrame can fire advanceFrame()
+    // during the loadAnim() await below — painting one or more extra frames of
+    // the old animation before the new one lands, defeating the gen guard.
+    if (this.frameTimer !== null) {
+      clearTimeout(this.frameTimer);
+      this.frameTimer = null;
+    }
     let loaded: LoadedAnim;
     try {
       loaded = await this.loadAnim(name);

@@ -805,6 +805,19 @@ async fn run(
                     StateSignal::ClaudeOutputStopped { .. } => {
                         ts.claude_output_active = false;
                     }
+                    // Reset the output-active flag on any error edge / its
+                    // acknowledgment. A ClaudeOutputStarted with no matching
+                    // Stopped (the subprocess crashed or exited mid-output —
+                    // the normal exit path) would otherwise leave the flag
+                    // stuck true, so a later normal speech cycle resolves to
+                    // Thinking instead of Idle (avatar sticks; no idle
+                    // announcement). Runs before `transition()` below.
+                    StateSignal::SubprocessExited { .. }
+                    | StateSignal::AudioError { .. }
+                    | StateSignal::TtsError { .. }
+                    | StateSignal::ErrorAcknowledged { .. } => {
+                        ts.claude_output_active = false;
+                    }
                     _ => {}
                 }
 
@@ -896,6 +909,10 @@ async fn run(
                     info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "EmptyInputTimeout", "avatar state");
                     ts.avatar_state = AvatarState::Idle;
                     ts.has_unsent_input = false;
+                    // Forced back to Idle by inactivity — clear any lingering
+                    // output-active flag so it can't drive a later speech cycle
+                    // to Thinking.
+                    ts.claude_output_active = false;
                     emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
                     if *tab != active && !ts.done_while_away {
                         ts.done_while_away = true;

@@ -53,6 +53,11 @@ pub struct RemoteBackend {
     /// accessor then falls back to `declared_slots`). The gate grows to
     /// match as bigger values are discovered.
     slots: AtomicU32,
+    /// Set when `/props` reports *fewer* slots than the gate is sized for
+    /// (the server was restarted with a smaller `-np`). A live semaphore can't
+    /// be safely shrunk, so instead of mis-scheduling against the stale larger
+    /// gate we mark the handle stale; `resolve_remote` then rebuilds it.
+    needs_rebuild: AtomicBool,
     gate: Arc<Semaphore>,
     client: reqwest::Client,
 }
@@ -96,6 +101,7 @@ impl RemoteBackend {
             ready: AtomicBool::new(false),
             n_ctx: AtomicU32::new(0),
             slots: AtomicU32::new(0),
+            needs_rebuild: AtomicBool::new(false),
             gate: Arc::new(Semaphore::new(declared_slots as usize)),
             client,
         })
@@ -227,7 +233,15 @@ impl RemoteBackend {
         loop {
             let prev = self.slots.load(Ordering::Relaxed);
             let effective_prev = if prev == 0 { self.declared_slots } else { prev };
-            if t <= effective_prev {
+            if t < effective_prev {
+                // Server came back with a smaller `-np`. We can't shrink the
+                // live gate; mark the handle for rebuild so the next resolve
+                // constructs a correctly-sized backend instead of letting the
+                // router over-schedule against the stale larger gate.
+                self.needs_rebuild.store(true, Ordering::Relaxed);
+                break;
+            }
+            if t == effective_prev {
                 break;
             }
             if self
@@ -273,6 +287,12 @@ impl RemoteBackend {
 
     pub fn mark_stopped(&self) {
         self.ready.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether this handle should be discarded and rebuilt (the remote came
+    /// back with fewer slots than the live gate is sized for).
+    pub fn needs_rebuild(&self) -> bool {
+        self.needs_rebuild.load(Ordering::Relaxed)
     }
 }
 

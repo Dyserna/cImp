@@ -380,15 +380,35 @@ impl NotificationManager {
     /// should be suppressed). Counts down so each drained announcement
     /// suppresses exactly one closing echo.
     fn consume_dispatch(&mut self, tab: &TabId) -> bool {
-        match self.just_dispatched.get_mut(tab) {
-            Some(count) => {
-                *count -= 1;
-                if *count == 0 {
-                    self.just_dispatched.remove(tab);
-                }
-                true
+        // Prefer the exact tab (the common same-tab echo).
+        if let Some(count) = self.just_dispatched.get_mut(tab) {
+            *count -= 1;
+            if *count == 0 {
+                self.just_dispatched.remove(tab);
             }
-            None => false,
+            return true;
+        }
+        // Cross-tab fallback: the echo's `Speaking → Idle` is tagged with
+        // whatever tab is active when our announcement audio actually plays,
+        // which can differ from the tab we guessed at drain time if the active
+        // tab changed in between. Audio is globally serialized (one sink), so a
+        // `Speaking → Idle` arriving while a suppression is armed is our echo —
+        // consume one pending entry from any armed tab. Without this, the stale
+        // count left on the originally-guessed tab would silence that tab's
+        // next genuine Idle notification.
+        if let Some(key) = self.just_dispatched.keys().next().cloned() {
+            match self.just_dispatched.get_mut(&key) {
+                Some(count) => {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.just_dispatched.remove(&key);
+                    }
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
         }
     }
 

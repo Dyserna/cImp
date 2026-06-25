@@ -41,21 +41,23 @@ pub async fn pty_start(
     let settings = state.settings.clone();
     let restore_on_launch = settings.current().terminal.scrollback.restore_on_launch;
 
-    let registry = state.tabs.lock().await;
-    registry
-        .start_tab(
-            app,
-            tab.clone(),
-            channel,
-            rows,
-            cols,
-            &cwd,
-            &invocation_args,
-            tts_tx,
-            user_typed,
-            settings,
-        )
-        .await?;
+    {
+        let registry = state.tabs.lock().await;
+        registry
+            .start_tab(
+                app,
+                tab.clone(),
+                channel,
+                rows,
+                cols,
+                &cwd,
+                &invocation_args,
+                tts_tx,
+                user_typed,
+                settings,
+            )
+            .await?;
+    }
 
     // V1.4-04 D.5: read any persisted scrollback for this tab. Done
     // after a successful start so a spawn failure doesn't burn the
@@ -67,8 +69,15 @@ pub async fn pty_start(
     if !restore_on_launch {
         return Ok(None);
     }
+    // Read the scrollback file WITHOUT holding the registry lock: it's a
+    // synchronous `fs::read` of the whole file and only needs `&tab`. Holding
+    // the single registry TokioMutex across it (as the original code did)
+    // stalls every other registry-touching command (pty_write, pty_resize,
+    // tab_activate, …) behind disk latency / AV scans. Re-acquire only for the
+    // seed, which does touch the registry.
     let restored = crate::pty::scrollback::read(&tab);
     if let Some(bytes) = &restored {
+        let registry = state.tabs.lock().await;
         match registry.seed_scrollback(&tab, bytes).await {
             Ok(()) => crate::pty::scrollback::consume_after_read(&tab),
             Err(e) => {
@@ -201,14 +210,31 @@ pub async fn pty_write(
     // cleanly with `unknown tab` and no half-applied state remains.
     let registry = state.tabs.lock().await;
 
-    let len_counter = {
+    let existing = {
         let map = state
             .input_lengths
             .read()
             .map_err(|e| AppError::Pty(format!("input_lengths poisoned: {e}")))?;
-        map.get(&tab)
-            .cloned()
-            .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?
+        map.get(&tab).cloned()
+    };
+    let len_counter = match existing {
+        Some(c) => c,
+        None => {
+            // The state manager may not have drained `TabAdded` yet — there's
+            // no happens-before between `create_*_tab` returning and the
+            // manager inserting this tab's counter. A missing counter must NOT
+            // gate input delivery (it's only the idle-Listening heuristic), or
+            // the very first keystrokes into a just-created tab are silently
+            // dropped. Lazily insert one; the manager's own insert uses
+            // `or_insert_with`, so it won't clobber this.
+            let mut map = state
+                .input_lengths
+                .write()
+                .map_err(|e| AppError::Pty(format!("input_lengths poisoned: {e}")))?;
+            map.entry(tab.clone())
+                .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)))
+                .clone()
+        }
     };
 
     if !is_automatic_terminal_response(&input) {
@@ -603,10 +629,14 @@ pub async fn set_active_tab(state: State<'_, AppState>, tab: TabId) -> AppResult
         let mut registry = state.tabs.lock().await;
         registry.activate(tab).await?;
     }
-    let mut snap = state.settings.current();
-    if snap.session.active_tab_id.as_deref() != Some(id_string.as_str()) {
-        snap.session.active_tab_id = Some(id_string);
-        state.settings.set(snap);
+    // Atomic read-modify-write so a concurrent close_tab / settings_update
+    // can't clobber this with a stale whole-struct snapshot (lost-update). The
+    // outer `current()` check just skips the broadcast/save on a no-op
+    // re-activation; the real write re-checks under the held lock.
+    if state.settings.current().session.active_tab_id.as_deref() != Some(id_string.as_str()) {
+        state.settings.mutate(move |snap| {
+            snap.session.active_tab_id = Some(id_string);
+        });
     }
     Ok(())
 }
@@ -667,7 +697,18 @@ pub async fn settings_update(
     // on-disk subfolder before broadcasting, so switching theme switches the
     // avatar. User overrides are preserved; see `apply_portable_avatar_paths`.
     crate::settings::apply_portable_avatar_paths(&mut settings);
-    state.settings.set(settings);
+    // The Settings window holds a full snapshot and replaces wholesale, but it
+    // never edits `layout` or `session` (those are driven only by the main
+    // window's save_layout / set_active_tab commands). Preserve them from the
+    // live state so a stale snapshot from the settings webview can't clobber a
+    // layout the user just dragged or the active-tab the main window just set.
+    // `tabs` IS legitimately edited here (TabBar reorder, ConfigureTabDialog,
+    // reset-to-defaults), so it is taken from the incoming struct.
+    state.settings.mutate(move |cur| {
+        settings.layout = cur.layout.clone();
+        settings.session = cur.session.clone();
+        *cur = settings;
+    });
     Ok(())
 }
 

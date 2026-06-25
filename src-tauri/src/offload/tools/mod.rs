@@ -65,23 +65,38 @@ impl ToolCtx {
         } else {
             self.allowed_roots.iter().map(|r| r.join(&raw)).collect()
         };
+        // Collect every distinct in-root resolution. A relative path can
+        // resolve under more than one root when roots overlap/nest; silently
+        // returning the first is order-dependent and surprising, so flag the
+        // ambiguity instead. (Escape is still blocked by the canonical
+        // `starts_with` check; an absolute request has a single candidate and
+        // can never be ambiguous here.)
+        let mut matches: Vec<PathBuf> = Vec::new();
         for cand in candidates {
             let canon = match cand.canonicalize() {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            for root in &self.allowed_roots {
-                if let Ok(root_canon) = root.canonicalize() {
-                    if canon.starts_with(&root_canon) {
-                        return Ok(canon);
-                    }
-                }
+            let in_root = self.allowed_roots.iter().any(|root| {
+                root.canonicalize()
+                    .map(|rc| canon.starts_with(&rc))
+                    .unwrap_or(false)
+            });
+            if in_root && !matches.contains(&canon) {
+                matches.push(canon);
             }
         }
-        Err(format!(
-            "`{requested}` is outside the allowed roots ({} configured)",
-            self.allowed_roots.len()
-        ))
+        match matches.len() {
+            0 => Err(format!(
+                "`{requested}` is outside the allowed roots ({} configured)",
+                self.allowed_roots.len()
+            )),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            n => Err(format!(
+                "`{requested}` is ambiguous — it resolves to {n} different files across \
+                 the configured roots. Pass an absolute path to disambiguate."
+            )),
+        }
     }
 }
 

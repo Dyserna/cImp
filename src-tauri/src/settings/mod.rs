@@ -52,10 +52,19 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
         None => return Err(AppError::Settings(format!("path has no file name: {}", path.display()))),
     };
 
-    {
+    // Create/write/sync in a closure so any failure removes the temp before
+    // returning. Each write uses a fresh UUID temp name, so without this a
+    // repeated failure mode (full disk, transient I/O error) would leave a
+    // growing pile of orphaned `<name>.<uuid>.tmp` files next to the target.
+    let write_result = (|| -> AppResult<()> {
         let mut f = fs::File::create(&tmp).map_err(AppError::Io)?;
         f.write_all(bytes).map_err(AppError::Io)?;
         f.sync_all().map_err(AppError::Io)?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
 
     // On Unix, restrict the file to owner read/write only — settings

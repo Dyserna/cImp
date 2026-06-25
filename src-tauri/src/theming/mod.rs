@@ -118,13 +118,16 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// A palette color must look like `#rgb`..`#rrggbbaa` — `#` followed by 3–8
-/// hex digits. Matches the `^#[0-9a-fA-F]{3,8}$` assertion in `themes.test.ts`.
+/// A palette color must be a real CSS hex color: `#` followed by exactly 3
+/// (`#rgb`), 4 (`#rgba`), 6 (`#rrggbb`), or 8 (`#rrggbbaa`) hex digits. 5- and
+/// 7-digit strings are NOT valid CSS colors — accepting them (the old `3..=8`
+/// range did) lets a malformed value like `#12345` pass verification and reach
+/// xterm.js as an unparseable ITheme slot.
 fn valid_hex(s: &str) -> bool {
     let Some(rest) = s.strip_prefix('#') else {
         return false;
     };
-    (3..=8).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_hexdigit())
+    matches!(rest.len(), 3 | 4 | 6 | 8) && rest.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Build a verified `ThemeWire` from a `theme.json` body, its sibling

@@ -35,9 +35,29 @@ export interface TabWithThemeOverride {
 /// back to Default rather than throwing.
 export function themeFromSetting(t: TerminalThemeSettingsLike): ThemeColors {
   if (t.name === 'Custom' && t.custom) {
-    return { ...defaultPalette(), ...(t.custom as Partial<ThemeColors>) };
+    // Project `custom` through the KNOWN palette keys, accepting only valid
+    // `#hex` values. `custom` comes from settings.json (hand-editable) and its
+    // wire type is an open string map, so a blanket spread would leak
+    // arbitrary/misspelled keys — and, worse, a non-color string on a real key
+    // — straight into the xterm.js ITheme. Anything invalid falls back to the
+    // default channel.
+    const base = defaultPalette();
+    const custom = t.custom as Record<string, unknown>;
+    for (const key of Object.keys(base) as (keyof ThemeColors)[]) {
+      const v = custom[key as string];
+      if (typeof v === 'string' && isHexColor(v)) {
+        base[key] = v;
+      }
+    }
+    return base;
   }
   return resolveBundledTheme(t.name);
+}
+
+/// A valid CSS hex color: `#` followed by exactly 3, 4, 6, or 8 hex digits.
+/// Mirrors the backend `theming::valid_hex` gate.
+function isHexColor(s: string): boolean {
+  return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(s);
 }
 
 /// Tab-aware resolver. If the tab carries an explicit `theme_override`,

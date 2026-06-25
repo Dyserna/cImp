@@ -80,6 +80,61 @@ pub fn segment_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
+/// Byte index in `text` just past the end of the last *terminal* sentence
+/// boundary — the final `.?!` that is followed by whitespace/EOS and is NOT an
+/// ellipsis, decimal point, or abbreviation dot — including any trailing
+/// whitespace. Returns 0 when there is no complete sentence.
+///
+/// Unlike [`segment_sentences`] this does NOT run `sanitize_for_tts`, so the
+/// returned index is a valid slice point in the caller's *original* buffer
+/// (sanitize can change byte lengths). It exists so the "how much to flush"
+/// decision applies the same abbreviation/decimal/ellipsis suppression as the
+/// actual segmentation — otherwise a flush could cut "See Dr. Smith now." right
+/// after "Dr.", speaking it as two fragments.
+pub fn last_boundary(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut split = 0;
+    let mut i = 0;
+    while i < n {
+        let b = bytes[i];
+        if b == b'.' || b == b'?' || b == b'!' {
+            if b == b'.' {
+                let prev_dot = i > 0 && bytes[i - 1] == b'.';
+                let next_dot = i + 1 < n && bytes[i + 1] == b'.';
+                if prev_dot || next_dot {
+                    while i < n && bytes[i] == b'.' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                let prev_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+                let next_digit = i + 1 < n && bytes[i + 1].is_ascii_digit();
+                if prev_digit && next_digit {
+                    i += 1;
+                    continue;
+                }
+                if is_abbreviation(text, i) {
+                    i += 1;
+                    continue;
+                }
+            }
+            let end = i + 1;
+            if end >= n || bytes[end].is_ascii_whitespace() {
+                let mut j = end;
+                while j < n && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                split = j;
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    split
+}
+
 fn push_trim(sentences: &mut Vec<String>, s: &str) {
     let trimmed = s.trim();
     if !trimmed.is_empty() {

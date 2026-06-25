@@ -375,29 +375,53 @@ fn main() {
                 );
                 app.manage(service.clone());
 
-                let snap = settings_for_offload.current().offload;
-                if snap.enabled {
-                    // V8-02: autostart every Local backend that opted in.
-                    let sup = supervisor.clone();
-                    tauri::async_runtime::spawn(async move {
-                        sup.autostart_all().await;
-                    });
-                    // V8-03: warm the MCP host, start the loopback endpoint
-                    // (writes the discovery file), and watch backend health
-                    // so `/events` → `tools/list_changed` tracks up/down.
+                // The offload runtime (autostart, warm host, loopback discovery
+                // endpoint, health watch, metrics poller) is started by a
+                // single idempotent helper. `started` guards against a double
+                // start — both the launch path and the runtime-enable watcher
+                // below call it, but the loopback binds a port and the pollers
+                // spawn tasks, so it must run at most once.
+                let offload_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if settings_for_offload.current().offload.enabled {
+                    if !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        start_offload_runtime(
+                            app.handle().clone(),
+                            service.clone(),
+                            supervisor.clone(),
+                        );
+                    }
+                }
+                // V8: a user who launches with offload disabled and enables it
+                // later in Settings must still get the loopback discovery
+                // endpoint (without it, MCP children can't connect back).
+                // Watch for the enabled false→true transition and start once.
+                // (Disabling at runtime leaves the runtime up but harmless —
+                // `OffloadService::run` is gated on `enabled` and refuses; a
+                // full teardown happens on the next relaunch.)
+                {
                     let svc = service.clone();
+                    let sup = supervisor.clone();
                     let app_handle = app.handle().clone();
+                    let watch = settings_for_offload.clone();
+                    let started = offload_started.clone();
                     tauri::async_runtime::spawn(async move {
-                        svc.warm_host().await;
-                        svc.spawn_health_watch();
-                        // V8-03: Offload Server dashboard metrics poller.
-                        svc.spawn_metrics_poller();
-                        match crate::offload::loopback::Loopback::start(svc.clone()).await {
-                            Ok(lb) => {
-                                app_handle.manage(lb);
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "offload: loopback endpoint failed to start")
+                        let mut rx = watch.subscribe();
+                        loop {
+                            match rx.recv().await {
+                                Ok(s) => {
+                                    if s.offload.enabled
+                                        && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
+                                    {
+                                        info!("offload: enabled at runtime — starting offload runtime");
+                                        start_offload_runtime(
+                                            app_handle.clone(),
+                                            svc.clone(),
+                                            sup.clone(),
+                                        );
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }
                     });
@@ -509,6 +533,12 @@ fn main() {
                 let app = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppState>();
+                    // Flush any settings edit still inside the 500ms debounce
+                    // window before we tear down — otherwise an edit made and
+                    // immediately followed by quitting (common after toggling
+                    // one option and closing) never reaches disk, since the
+                    // debounced saver is still mid-sleep.
+                    state.settings.flush();
                     // V1.4-04 D.4: persist each tab's scrollback ring
                     // before shutting down. Best-effort — a failed
                     // persist for one tab doesn't block the others or
@@ -567,6 +597,37 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to launch tauri app");
+}
+
+/// Start the offload runtime: autostart opted-in Local backends, warm the MCP
+/// host, spawn the health watch + metrics poller, and bring up the loopback
+/// discovery endpoint. Call at most once (guarded by the caller) — the loopback
+/// binds a port and the pollers spawn long-lived tasks.
+fn start_offload_runtime(
+    app_handle: tauri::AppHandle,
+    service: std::sync::Arc<crate::offload::OffloadService>,
+    supervisor: std::sync::Arc<crate::offload::OffloadSupervisor>,
+) {
+    // V8-02: autostart every Local backend that opted in.
+    tauri::async_runtime::spawn(async move {
+        supervisor.autostart_all().await;
+    });
+    // V8-03: warm the MCP host, start the loopback endpoint (writes the
+    // discovery file), and watch backend health so `/events` →
+    // `tools/list_changed` tracks up/down.
+    tauri::async_runtime::spawn(async move {
+        service.warm_host().await;
+        service.spawn_health_watch();
+        service.spawn_metrics_poller();
+        match crate::offload::loopback::Loopback::start(service.clone()).await {
+            Ok(lb) => {
+                app_handle.manage(lb);
+            }
+            Err(e) => {
+                warn!(error = %e, "offload: loopback endpoint failed to start")
+            }
+        }
+    });
 }
 
 /// Resolve the project label used in the OS window title. Walks up

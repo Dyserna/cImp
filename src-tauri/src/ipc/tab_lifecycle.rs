@@ -205,20 +205,23 @@ pub async fn create_shell_tab(
     // broadcast triggered by `set` is also what the frontend's settings
     // store consumes to reflect the new entry in the Tabs section.
     {
-        let mut snap = state.settings.current();
         let entry = TabConfig::Shell(validated_to_shell_config(
             tab.as_str().to_string(),
             false,
             &validated,
             notifications,
         ));
-        // Idempotent on duplicate id (matches the registry's behavior).
-        if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == tab.as_str()) {
-            *existing = entry;
-        } else {
-            snap.tabs.push(entry);
-        }
-        state.settings.set(snap);
+        // Atomic mutate (not current()/set()) so a concurrent save_layout /
+        // settings_update / set_active_tab can't clobber the new tab with a
+        // stale whole-struct snapshot. Idempotent on duplicate id.
+        let id = tab.as_str().to_string();
+        state.settings.mutate(move |snap| {
+            if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == id) {
+                *existing = entry;
+            } else {
+                snap.tabs.push(entry);
+            }
+        });
     }
 
     let position = {
@@ -235,6 +238,11 @@ pub async fn create_shell_tab(
         .await
     {
         warn!(error = %e, "create_shell_tab: state-signal channel closed");
+        // Roll back the committed settings + registry entries so a phantom tab
+        // doesn't persist (and resurrect on next launch) with no frontend view.
+        let id = tab.as_str().to_string();
+        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
+        state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
 
@@ -314,11 +322,9 @@ pub async fn create_ai_tab(
     // once the frontend mounts the new tab and calls `pty_start` (same
     // ordering rationale as `create_shell_tab`). Append, like a shell tab —
     // the visible position is owned by the frontend layout.
-    {
-        let mut snap = state.settings.current();
+    state.settings.mutate(move |snap| {
         snap.tabs.push(TabConfig::AiTool(cfg));
-        state.settings.set(snap);
-    }
+    });
 
     let position = {
         let mut registry = state.tabs.lock().await;
@@ -334,6 +340,10 @@ pub async fn create_ai_tab(
         .await
     {
         warn!(error = %e, "create_ai_tab: state-signal channel closed");
+        // Roll back the committed settings + registry entries (see create_shell_tab).
+        let id = tab.as_str().to_string();
+        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
+        state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
 
@@ -432,15 +442,15 @@ pub async fn close_tab(
 
     // Remove the settings entry. Drop the active_tab_id pointer if it
     // referenced this tab — the frontend will set a new one on its next
-    // tab-switch event.
-    {
-        let mut snap = state.settings.current();
+    // tab-switch event. Atomic mutate so a concurrent save_layout /
+    // settings_update can't resurrect the just-closed tab from a stale
+    // whole-struct snapshot.
+    state.settings.mutate(|snap| {
         snap.tabs.retain(|t| t.id() != tab.as_str());
         if snap.session.active_tab_id.as_deref() == Some(tab.as_str()) {
             snap.session.active_tab_id = None;
         }
-        state.settings.set(snap);
-    }
+    });
 
     if let Err(e) = state
         .state_signals
@@ -477,13 +487,11 @@ pub async fn rename_tab(
         }
         registry.set_name(&tab, &trimmed);
     }
-    {
-        let mut snap = state.settings.current();
+    state.settings.mutate(|snap| {
         if let Some(entry) = snap.find_tab_mut(tab.as_str()) {
             entry.set_name(trimmed.clone());
         }
-        state.settings.set(snap);
-    }
+    });
     if let Err(e) = state
         .state_signals
         .send(StateSignal::TabRenameRequested {
@@ -537,27 +545,38 @@ pub async fn reconfigure_shell_tab(
             .unwrap_or(true)
     };
 
-    {
-        let mut snap = state.settings.current();
-        let Some(entry) = snap.find_tab_mut(tab.as_str()) else {
+    // Validate existence + kind on a read snapshot (so we can return a typed
+    // error), then apply atomically via mutate so a concurrent save_layout /
+    // settings_update can't clobber the reconfigured entry. The closure
+    // re-checks under the held lock and no-ops if the tab vanished meanwhile.
+    match state.settings.current().find_tab(tab.as_str()) {
+        None => {
             return Err(TabLifecycleError::TabNotFound {
                 tab: tab.as_str().to_string(),
-            });
-        };
-        let TabConfig::Shell(cfg) = entry else {
-            return Err(TabLifecycleError::WrongKind);
-        };
-        cfg.name = validated.name.clone();
-        cfg.command = validated.command.to_string_lossy().into_owned();
-        cfg.args = validated.args.clone();
-        cfg.cwd = validated.cwd.clone();
-        cfg.env = validated.env.clone();
-        cfg.notifications = notifications;
-        cfg.theme_override = theme_override;
-        cfg.background_override = background_override;
-        // builtin/id stay as they were.
-        state.settings.set(snap);
+            })
+        }
+        Some(TabConfig::Shell(_)) => {}
+        Some(TabConfig::AiTool(_)) => return Err(TabLifecycleError::WrongKind),
     }
+    let new_command = validated.command.to_string_lossy().into_owned();
+    let new_name = validated.name.clone();
+    let new_args = validated.args.clone();
+    let new_cwd = validated.cwd.clone();
+    let new_env = validated.env.clone();
+    let tab_id = tab.as_str().to_string();
+    state.settings.mutate(move |snap| {
+        if let Some(TabConfig::Shell(cfg)) = snap.find_tab_mut(&tab_id) {
+            cfg.name = new_name;
+            cfg.command = new_command;
+            cfg.args = new_args;
+            cfg.cwd = new_cwd;
+            cfg.env = new_env;
+            cfg.notifications = notifications;
+            cfg.theme_override = theme_override;
+            cfg.background_override = background_override;
+            // builtin/id stay as they were.
+        }
+    });
 
     if name_changed {
         {
@@ -755,12 +774,11 @@ pub async fn set_enabled_ai_tabs(
 
     // 4. Persist the new setting value alongside the post-step-1/3 tabs
     //    array.
-    {
-        let mut snap = state.settings.current();
-        if snap.enabled_ai_tabs != want_ordered {
-            snap.enabled_ai_tabs = want_ordered.clone();
-            state.settings.set(snap);
-        }
+    if state.settings.current().enabled_ai_tabs != want_ordered {
+        let v = want_ordered.clone();
+        state.settings.mutate(move |snap| {
+            snap.enabled_ai_tabs = v;
+        });
     }
 
     info!(?want_ordered, "enabled_ai_tabs updated");
@@ -828,8 +846,7 @@ pub async fn open_tool_tab(
     // Persist BEFORE registering so `build_launch_spec` finds the entry once
     // the frontend mounts the tab and calls `pty_start`.
     {
-        let mut snap = state.settings.current();
-        snap.tabs.push(TabConfig::Shell(ShellTabSettings {
+        let entry = TabConfig::Shell(ShellTabSettings {
             id: tab.as_str().to_string(),
             builtin: false,
             name: name.clone(),
@@ -840,8 +857,10 @@ pub async fn open_tool_tab(
             notifications: ShellNotificationConfig::default(),
             theme_override: None,
             background_override: None,
-        }));
-        state.settings.set(snap);
+        });
+        state.settings.mutate(move |snap| {
+            snap.tabs.push(entry);
+        });
     }
 
     let position = {
@@ -862,6 +881,10 @@ pub async fn open_tool_tab(
         .await
     {
         warn!(error = %e, "open_tool_tab: state-signal channel closed");
+        // Roll back the committed settings + registry entries (see create_shell_tab).
+        let id = tab.as_str().to_string();
+        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
+        state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
 
@@ -891,29 +914,30 @@ async fn add_ai_builtin_tab(
     };
 
     {
-        let mut snap = state.settings.current();
-        if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == tab.as_str()) {
-            *existing = config;
-        } else {
-            // Canonical position: walk the existing tabs and find the
-            // last reserved-AI tab whose canonical order is below this
-            // id's. Insert immediately after it. This keeps AI tabs in
-            // the canonical leading order regardless of which subset
-            // the user has enabled.
-            let target = id.canonical_order();
-            let mut pos = 0usize;
-            for (idx, tab) in snap.tabs.iter().enumerate() {
-                match AiTabId::from_id(tab.id()) {
-                    Some(other) if other.canonical_order() < target => {
-                        pos = idx + 1;
+        let tab_id = tab.as_str().to_string();
+        state.settings.mutate(move |snap| {
+            if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == tab_id) {
+                *existing = config;
+            } else {
+                // Canonical position: walk the existing tabs and find the
+                // last reserved-AI tab whose canonical order is below this
+                // id's. Insert immediately after it. This keeps AI tabs in
+                // the canonical leading order regardless of which subset
+                // the user has enabled.
+                let target = id.canonical_order();
+                let mut pos = 0usize;
+                for (idx, t) in snap.tabs.iter().enumerate() {
+                    match AiTabId::from_id(t.id()) {
+                        Some(other) if other.canonical_order() < target => {
+                            pos = idx + 1;
+                        }
+                        _ => break,
                     }
-                    _ => break,
                 }
+                let pos = pos.min(snap.tabs.len());
+                snap.tabs.insert(pos, config);
             }
-            let pos = pos.min(snap.tabs.len());
-            snap.tabs.insert(pos, config);
-        }
-        state.settings.set(snap);
+        });
     }
 
     let position = {
@@ -930,6 +954,10 @@ async fn add_ai_builtin_tab(
         .await
     {
         warn!(error = %e, "set_enabled_ai_tabs: state-signal channel closed (add)");
+        // Roll back the committed settings + registry entries.
+        let id_str = tab.as_str().to_string();
+        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id_str));
+        state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
     Ok(())
@@ -951,14 +979,12 @@ async fn remove_ai_builtin_tab(
         warn!(?tab, error = %e, "set_enabled_ai_tabs: scrollback delete failed");
     }
 
-    {
-        let mut snap = state.settings.current();
+    state.settings.mutate(|snap| {
         snap.tabs.retain(|t| t.id() != tab.as_str());
         if snap.session.active_tab_id.as_deref() == Some(tab.as_str()) {
             snap.session.active_tab_id = None;
         }
-        state.settings.set(snap);
-    }
+    });
 
     if let Err(e) = state
         .state_signals

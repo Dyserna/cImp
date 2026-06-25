@@ -37,6 +37,10 @@ pub struct SettingsHandle {
     inner: Arc<Mutex<Settings>>,
     tx: broadcast::Sender<Settings>,
     save_tx: mpsc::UnboundedSender<()>,
+    // Kept so `flush()` can persist synchronously (e.g. on shutdown) without
+    // routing through the debounced saver task. The saver owns its own copies.
+    global: Arc<Settings>,
+    launch_cwd: Arc<PathBuf>,
 }
 
 impl SettingsHandle {
@@ -45,12 +49,14 @@ impl SettingsHandle {
         let (save_tx, save_rx) = mpsc::unbounded_channel::<()>();
         let inner = Arc::new(Mutex::new(initial));
 
-        spawn_saver(inner.clone(), save_rx, global, launch_cwd);
+        spawn_saver(inner.clone(), save_rx, global.clone(), launch_cwd.clone());
 
         Self {
             inner,
             tx,
             save_tx,
+            global: Arc::new(global),
+            launch_cwd: Arc::new(launch_cwd),
         }
     }
 
@@ -71,6 +77,12 @@ impl SettingsHandle {
     }
 
     /// Replace the full settings struct, broadcast, and request a debounced save.
+    ///
+    /// Prefer [`Self::mutate`] for any read-modify-write: `current()` + `set()`
+    /// is a non-atomic clone-out/replace and two concurrent callers can clobber
+    /// each other (lost update). `set` is retained for a genuine wholesale
+    /// replace where the caller already holds the authoritative full struct.
+    #[allow(dead_code)]
     pub fn set(&self, new: Settings) {
         {
             // Recover from poisoning here too — same rationale as
@@ -90,6 +102,41 @@ impl SettingsHandle {
         // case we've lost persistence — log and continue running in-memory.
         if self.save_tx.send(()).is_err() {
             tracing::warn!("settings: saver task is gone; changes will not persist");
+        }
+    }
+
+    /// Atomically read-modify-write the settings under the held lock, then
+    /// broadcast and request a debounced save.
+    ///
+    /// Unlike `current()` followed by `set()`, this composes: the inner lock
+    /// is held across the whole closure, so two concurrent mutations cannot
+    /// each snapshot the pre-mutation state and clobber the other's write.
+    /// All settings-mutating IPC commands should funnel through this instead
+    /// of the clone-out/replace pattern.
+    pub fn mutate<F: FnOnce(&mut Settings)>(&self, f: F) {
+        let new = {
+            let mut g = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            f(&mut g);
+            g.clone()
+        };
+        let _ = self.tx.send(new);
+        if self.save_tx.send(()).is_err() {
+            tracing::warn!("settings: saver task is gone; changes will not persist");
+        }
+    }
+
+    /// Synchronously persist the current settings, bypassing the 500ms
+    /// debounce. Intended for shutdown so an edit made within the debounce
+    /// window is not silently lost when the saver task is still mid-sleep.
+    pub fn flush(&self) {
+        let snapshot = self.current();
+        if let Err(e) = persistence::save(&snapshot, &self.launch_cwd, &self.global) {
+            tracing::warn!(error = %e, "settings: flush save failed");
+        } else {
+            tracing::debug!("settings: flushed");
         }
     }
 }

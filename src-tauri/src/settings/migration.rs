@@ -1503,11 +1503,23 @@ fn migrate_v1_16_to_v1_17(value: &mut Value) {
 fn write_backup(path: &Path, from_version: &str, value: &Value) -> AppResult<()> {
     let primary = backup_path_for(path, &format!("{from_version}.bak"));
     let target = if primary.exists() {
-        let ts = SystemTime::now()
+        // Nanosecond resolution so two migrations within the same wall-clock
+        // second don't collide (second-granularity used to let a rapid
+        // relaunch / launch-loop overwrite the first timestamped backup). If
+        // even the nanos name is taken — or the clock is unusable and we fall
+        // back to 0 — probe with an incrementing counter for a free name so we
+        // never clobber an existing backup.
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_nanos())
             .unwrap_or(0);
-        backup_path_for(path, &format!("{from_version}.bak.{ts}"))
+        let mut candidate = backup_path_for(path, &format!("{from_version}.bak.{nanos}"));
+        let mut n = 0u32;
+        while candidate.exists() && n < 10_000 {
+            n += 1;
+            candidate = backup_path_for(path, &format!("{from_version}.bak.{nanos}.{n}"));
+        }
+        candidate
     } else {
         primary
     };

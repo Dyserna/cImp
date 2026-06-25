@@ -60,7 +60,14 @@ impl BackendView {
     /// `/props` reports `total / -np`), so it isn't divided by `slots` again.
     pub fn per_slot_budget(&self) -> Option<u32> {
         let n = self.n_ctx?;
-        Some(n.saturating_mul(self.budget_high_water_pct.min(100) as u32) / 100)
+        // Clamp to a non-zero floor: a hand-edited / mis-slidered
+        // `budget_high_water_pct` of 0 would otherwise yield a 0-token
+        // working budget and starve the agent loop of any context. The
+        // schema does no validation, so the floor lives here at the
+        // consumption point, mirroring the `.max()` guards on the other
+        // offload numerics.
+        let pct = self.budget_high_water_pct.clamp(1, 100) as u32;
+        Some(n.saturating_mul(pct) / 100)
     }
 
     /// A slot is free right now (spill target).
@@ -266,15 +273,19 @@ pub fn analyze_task(instructions: &str, context: Option<&str>, tier: TierHint) -
     let needs_local = local || !web;
     if needs_local {
         required.push("read_file".to_string());
-        if hay.contains("command") || hay.contains("build") || hay.contains("unit test")
-            || hay.contains("run ") || hay.contains("compile")
-        {
+        let mentions_run = hay.contains("command") || hay.contains("build")
+            || hay.contains("unit test") || hay.contains("run ") || hay.contains("compile");
+        // A git-related task needs the ability to run git. `git` is an MCP
+        // *server* name that may not be configured at all; a backend with the
+        // native `run_command` tool can shell out to git just fine. Require
+        // `run_command` (a real native tool) rather than a dedicated `git`
+        // MCP server, so a scoped local backend that lacks the server isn't
+        // wrongly refused with NoToolMatch for any task that merely mentions
+        // a diff or a commit.
+        let mentions_git = hay.contains("git ") || hay.contains("commit")
+            || hay.contains("blame") || hay.contains("diff");
+        if mentions_run || mentions_git {
             required.push("run_command".to_string());
-        }
-        if hay.contains("git ") || hay.contains("commit") || hay.contains("blame")
-            || hay.contains("diff")
-        {
-            required.push("git".to_string());
         }
     }
     debug_assert!(

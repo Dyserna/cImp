@@ -45,10 +45,15 @@ export function themeFromSetting(t: TerminalThemeSettingsLike): ThemeColors {
     // mutating it in place would corrupt every later resolve.
     const base = { ...defaultPalette() };
     const custom = t.custom as Record<string, unknown>;
+    // Write through a string-valued view: every palette channel we set is a
+    // color string, but `ThemeColors` (xterm `ITheme`) also carries the
+    // `string[]` `extendedAnsi` key, which widens an indexed write to
+    // `string & string[]`. We only ever assign validated `#hex` strings here.
+    const writable = base as Record<string, string>;
     for (const key of Object.keys(base) as (keyof ThemeColors)[]) {
       const v = custom[key as string];
       if (typeof v === 'string' && isHexColor(v)) {
-        base[key] = v;
+        writable[key as string] = v;
       }
     }
     return base;

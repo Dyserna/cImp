@@ -13,8 +13,11 @@ use super::ToolCtx;
 /// the result downstream).
 const DEFAULT_LIMIT: u64 = 400;
 const MAX_LIMIT: u64 = 4000;
-/// Hard byte ceiling regardless of line count.
+/// Hard byte ceiling on the rendered output regardless of line count.
 const MAX_BYTES: usize = 256 * 1024;
+/// Largest file (on disk) this tool will load into memory. Generous enough to
+/// page through ordinary source files; refuses multi-MB blobs before reading.
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct Args {
@@ -49,16 +52,24 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let start = args.offset.saturating_sub(1); // 1-based → 0-based; offset 0 or 1 → start 0
 
+    // Refuse oversized files BEFORE reading them into memory. The previous
+    // guard checked `limit >= MAX_LIMIT`, so a default-limit call on a huge
+    // file slipped through and allocated the whole thing. Size is the right
+    // criterion, and stat-then-refuse caps the allocation. The generous
+    // ceiling still lets offset/limit page through ordinary large source files.
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "file is {} bytes — too large to read (limit {} bytes for this tool)",
+            meta.len(),
+            MAX_FILE_BYTES
+        ));
+    }
     let content = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
-    if content.len() > MAX_BYTES && limit >= MAX_LIMIT {
-        // Whole-file path with a huge file: refuse and steer to paging.
-        return Err(format!(
-            "file is {} bytes — too large to read whole; pass offset/limit to page through it",
-            content.len()
-        ));
-    }
     let text = String::from_utf8_lossy(&content);
 
     let mut out = String::new();

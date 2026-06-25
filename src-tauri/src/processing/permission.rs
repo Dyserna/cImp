@@ -178,16 +178,49 @@ pub enum PatternTransition {
 
 pub struct PermissionDetector {
     patterns: Vec<PermissionPattern>,
+    /// Whitespace-normalized `all_of` substrings, index-aligned with
+    /// `patterns`. Precomputed once so `check` doesn't re-normalize the
+    /// (fixed) pattern set on every tick. See [`normalize_ws`].
+    norm_all_of: Vec<Vec<String>>,
     /// Currently-detected pattern name per kind. Tracked per kind so a
     /// permission edge and a question edge don't compete — both can be
     /// "in flight" at once if upstream UI ever interleaves them.
     last_detected: HashMap<PatternKind, String>,
 }
 
+/// Collapse every run of whitespace (spaces, tabs, and the `\n` the screen
+/// uses to join rows) to a single space and trim the ends. Applied to both
+/// the rendered tail and each pattern substring so a marker still matches
+/// when the TUI wraps it across two rows or pads it with variable-width
+/// `\x1b[<n>C` cursor-forward gaps (which the cell renderer fills with a
+/// variable number of spaces). The middle dot `·` (U+00B7) used in
+/// `cancel · Tab` is not whitespace, so separators are preserved.
+fn normalize_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
 impl PermissionDetector {
     pub fn new(patterns: Vec<PermissionPattern>) -> Self {
+        let norm_all_of = patterns
+            .iter()
+            .map(|p| p.all_of.iter().map(|s| normalize_ws(s)).collect())
+            .collect();
         Self {
             patterns,
+            norm_all_of,
             last_detected: HashMap::new(),
         }
     }
@@ -197,16 +230,25 @@ impl PermissionDetector {
     /// declaration order; the first match per kind wins (so list more-
     /// specific patterns first when stacking shared-chrome variants).
     pub fn check(&mut self, rendered: &str) -> Vec<PatternTransition> {
+        // Normalize the rendered tail once so a marker that the TUI wrapped
+        // across rows (rows are joined with `\n`) or padded with variable
+        // cursor-forward gaps still matches the normalized pattern.
+        let haystack = normalize_ws(rendered);
+
         // Find the winning pattern per kind in this scan.
         let mut hits: HashMap<PatternKind, &PermissionPattern> = HashMap::new();
-        for p in &self.patterns {
+        for (idx, p) in self.patterns.iter().enumerate() {
             if p.disabled || p.all_of.is_empty() {
                 continue;
             }
             if hits.contains_key(&p.kind) {
                 continue;
             }
-            if p.all_of.iter().all(|s| !s.is_empty() && rendered.contains(s.as_str())) {
+            let needles = &self.norm_all_of[idx];
+            if needles
+                .iter()
+                .all(|s| !s.is_empty() && haystack.contains(s.as_str()))
+            {
                 hits.insert(p.kind, p);
             }
         }
@@ -285,6 +327,42 @@ mod tests {
     fn empty_patterns_never_detect() {
         let mut d = PermissionDetector::new(no_patterns());
         assert!(d.check("Do you want to proceed?").is_empty());
+    }
+
+    #[test]
+    fn marker_matches_when_wrapped_across_rows() {
+        // The footer wrapped: "Esc to cancel ·" on one rendered row,
+        // "Tab to amend" on the next — rows joined with '\n'. Normalization
+        // collapses the newline to a space so the single-line pattern matches.
+        let mut d = PermissionDetector::new(default_patterns());
+        let wrapped = "some prompt body\nEsc to cancel ·\nTab to amend";
+        let out = d.check(wrapped);
+        assert!(
+            out.iter().any(|t| matches!(
+                t,
+                PatternTransition::Detected { kind: PatternKind::Permission, .. }
+            )),
+            "wrapped permission footer should still be detected"
+        );
+    }
+
+    #[test]
+    fn marker_matches_with_padded_whitespace() {
+        // Variable-width cursor-forward gaps render as runs of spaces.
+        let mut d = PermissionDetector::new(default_patterns());
+        let padded = "Esc to cancel   ·    Tab to amend";
+        let out = d.check(padded);
+        assert!(out.iter().any(|t| matches!(
+            t,
+            PatternTransition::Detected { kind: PatternKind::Permission, .. }
+        )));
+    }
+
+    #[test]
+    fn normalize_ws_collapses_runs_and_newlines() {
+        assert_eq!(normalize_ws("a  b\n\tc "), "a b c");
+        assert_eq!(normalize_ws("  leading and trailing  "), "leading and trailing");
+        assert_eq!(normalize_ws("cancel · Tab"), "cancel · Tab");
     }
 
     #[test]

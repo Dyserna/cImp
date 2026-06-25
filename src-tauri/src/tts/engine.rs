@@ -182,13 +182,28 @@ impl TtsEngine {
             ])
             .map_err(|e| AppError::Tts(format!("inference: {e}")))?;
 
+        // Guard against a model that produces no outputs (corrupt/wrong file
+        // in `models/`): `outputs[0]` would otherwise panic and permanently
+        // kill the TTS worker. Every other failure here is a graceful Err.
+        if outputs.len() == 0 {
+            return Err(AppError::Tts("model produced no outputs".into()));
+        }
         let (_shape, samples) = outputs[0]
             .try_extract_tensor::<f32>()
             .map_err(|e| AppError::Tts(format!("extract output: {e}")))?;
 
+        // Sanitize non-finite samples. A corrupt model or a silent EP fallback
+        // can emit NaN/inf, which clicks in the sink, poisons RMS metering
+        // (sumsq += NaN stays NaN), and serializes as invalid JSON over the
+        // amplitude IPC (NaN/Infinity aren't valid JSON). Clamp to silence.
+        let samples: Vec<f32> = samples
+            .iter()
+            .map(|&s| if s.is_finite() { s } else { 0.0 })
+            .collect();
+
         Ok(SynthesisResponse {
             request_id: req.request_id,
-            samples: samples.to_vec(),
+            samples,
             sample_rate: SAMPLE_RATE,
         })
     }

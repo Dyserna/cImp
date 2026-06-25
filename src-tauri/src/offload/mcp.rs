@@ -379,11 +379,18 @@ async fn proxy_run(
     let timeout = Duration::from_secs(settings.offload_timeout_secs.max(30) + 30);
     let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
 
+    // Forward this child's working directory (the session's project root) so
+    // the app scopes native tools to the repo Claude is in, not the app's own
+    // launch dir, when no explicit `allowed_roots` is configured.
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
     let body = json!({
         "instructions": instructions,
         "context": context,
         "thinking": thinking,
         "tier": tier,
+        "cwd": cwd,
     });
     let resp = client
         .post(format!("{base}/run"))
@@ -426,11 +433,22 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
                     .await
                 {
                     // Read the SSE byte stream chunk by chunk; emit a
-                    // notification each time a `change` event arrives.
+                    // notification each time a `change` event arrives. Keep a
+                    // small carry of the previous chunk's tail so a marker
+                    // split across a chunk boundary (TCP can break anywhere) is
+                    // still detected — otherwise a capability change would be
+                    // silently dropped.
+                    let mut carry: Vec<u8> = Vec::new();
                     while let Ok(Some(chunk)) = resp.chunk().await {
-                        if chunk.windows(SSE_CHANGE.len()).any(|w| w == SSE_CHANGE) {
+                        let mut buf = std::mem::take(&mut carry);
+                        buf.extend_from_slice(&chunk);
+                        if buf.windows(SSE_CHANGE.len()).any(|w| w == SSE_CHANGE) {
                             emit_list_changed(&stdout).await;
                         }
+                        // Retain only the bytes that could be a marker prefix
+                        // straddling into the next chunk (at most len-1).
+                        let keep = SSE_CHANGE.len().saturating_sub(1).min(buf.len());
+                        carry = buf[buf.len() - keep..].to_vec();
                     }
                 }
             }
@@ -540,7 +558,19 @@ async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u
         None => health,
     };
     let ready = match health.send().await {
-        Ok(r) => b.is_cloud || r.status().is_success(),
+        Ok(r) => {
+            let status = r.status();
+            if b.is_cloud {
+                // Cloud may lack /health (404/405 still proves reachability),
+                // but a bad token (401/403) or server error (5xx) means it's
+                // not actually usable — don't report it ready.
+                !(status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                    || status.is_server_error())
+            } else {
+                status.is_success()
+            }
+        }
         Err(_) => false,
     };
     if !ready {

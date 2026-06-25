@@ -73,14 +73,19 @@ pub fn write(tab: &TabId, bytes: &[u8]) {
     }
     let key = sanitize(tab.as_str());
     let dir = dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(dir = %dir.display(), error = %e, "content capture: mkdir failed");
-        return;
-    }
     let mut writers = match cap.writers.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
+    // Only stat/create the directory when opening a NEW writer, not on every
+    // burst — `write` is on the PTY reader's hot path and the dir is stable
+    // for the session once it exists.
+    if !writers.contains_key(&key) {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "content capture: mkdir failed");
+            return;
+        }
+    }
     let writer = writers.entry(key.clone()).or_insert_with(|| {
         // tracing-appender appends a `.YYYY-MM-DD` suffix to the
         // filename prefix on each rotation. The visible filename

@@ -11,7 +11,7 @@ import type { SplitDirection } from './types';
 import {
   layout,
   requestTabIntoSplit,
-  pendingTabPlacement,
+  cancelLastPlacement,
 } from './store';
 
 /// Split the focused pane in `direction` and put a fresh Shell tab in
@@ -73,7 +73,7 @@ export async function splitFocusedPaneWithNewShell(
       notificationsExited,
     });
   } catch (e) {
-    pendingTabPlacement.set(null);
+    cancelLastPlacement();
     console.error('create_shell_tab failed:', e);
   }
 }

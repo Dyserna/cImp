@@ -10,7 +10,7 @@
 //! `[[TTS]]` and `[[/TTS]]` markers are pure ASCII even when surrounded by
 //! ANSI styling, so byte-pattern scanning is safe.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::processing::screen::Screen;
@@ -18,6 +18,49 @@ use crate::processing::segmenter::segment_sentences;
 
 const OPEN: &[u8] = b"[[TTS]]";
 const CLOSE: &[u8] = b"[[/TTS]]";
+
+/// Cap on the dedup memory. Dedup only needs to catch *recent* repeats —
+/// a TUI redraw re-emits the same content moments later, separated by at
+/// most a screenful of other segments — so retaining the whole session is
+/// unnecessary. In speak-all mode the un-evicted set would otherwise grow
+/// without bound as distinct prose scrolls past (a slow session-long leak),
+/// while the raw buffer and `all_buf` are already capped. 8192 keys is far
+/// more than any redraw window yet bounds the footprint.
+const SPOKEN_DEDUP_CAP: usize = 8192;
+
+/// FIFO-bounded string dedup set. Drop-in for the `contains`/`insert` subset
+/// of `HashSet` the scanner uses, but evicts the oldest key once it fills so
+/// the memory can't grow unbounded over a long session.
+struct BoundedDedup {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl BoundedDedup {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.set.contains(key)
+    }
+
+    fn insert(&mut self, key: String) {
+        if self.set.insert(key.clone()) {
+            self.order.push_back(key);
+            while self.order.len() > self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
+}
 
 /// Drop the accumulated speak-all buffer once it grows past this without a
 /// sentence terminator. Unterminated runs this long are almost always TUI
@@ -33,7 +76,7 @@ pub struct TagScanner {
     /// produces different `\n` placement in the stripped byte stream but
     /// the same key here, so the segment is correctly recognized as a
     /// repeat instead of replaying.
-    spoken: HashSet<String>,
+    spoken: BoundedDedup,
     /// Was the last scan unable to match an opener with a closer?
     open_tag: bool,
     /// Byte offset into `raw_view` past which scanning starts on the next
@@ -61,7 +104,7 @@ impl TagScanner {
 
     pub fn with_user_typed_filter(user_typed: Arc<Mutex<HashSet<String>>>) -> Self {
         Self {
-            spoken: HashSet::new(),
+            spoken: BoundedDedup::new(SPOKEN_DEDUP_CAP),
             open_tag: false,
             scan_offset: 0,
             user_typed,
@@ -71,6 +114,19 @@ impl TagScanner {
 
     pub fn has_open_tag(&self) -> bool {
         self.open_tag
+    }
+
+    /// Absolute read cursor into the raw byte stream. The processing layer
+    /// uses this (paired with the screen's emit cursor) as the watermark below
+    /// which `raw_buffer` can be compacted.
+    pub fn scan_offset(&self) -> usize {
+        self.scan_offset
+    }
+
+    /// Rebase the read cursor after the raw buffer has had `by` leading bytes
+    /// dropped. Keeps `scan_offset` pointing at the same logical byte.
+    pub fn rebase_offset(&mut self, by: usize) {
+        self.scan_offset = self.scan_offset.saturating_sub(by);
     }
 
     /// Walk the raw byte stream from `scan_offset` looking for closed
@@ -96,7 +152,16 @@ impl TagScanner {
             match find_bytes(&scan[content_start..], CLOSE) {
                 Some(rel_close) => {
                     let content_end = content_start + rel_close;
-                    let content_bytes = &scan[content_start..content_end];
+                    // Re-anchor past any stray/nested opener inside the pair.
+                    // `[[TTS]]a[[TTS]]b[[/TTS]]` would otherwise yield content
+                    // `a[[TTS]]b`, and the literal `[[TTS]]` survives ANSI
+                    // stripping → it gets spoken as bracket-T-T-S noise. Treat
+                    // the latest opener before the close as the real start.
+                    let mut real_start = content_start;
+                    while let Some(inner) = find_bytes(&scan[real_start..content_end], OPEN) {
+                        real_start += inner + OPEN.len();
+                    }
+                    let content_bytes = &scan[real_start..content_end];
                     let content = strip_ansi(content_bytes).trim().to_string();
                     let key = normalize_for_dedup(&content);
                     if key.is_empty() {
@@ -176,7 +241,18 @@ impl TagScanner {
         }
         let scan = &raw[self.scan_offset..];
         let consume_to = if force {
-            scan.len()
+            // Max-hold flush: consume everything EXCEPT a trailing unterminated
+            // escape sequence. Consuming a half-escape would drop its prefix
+            // (strip_ansi discards incomplete escapes) while `scan_offset`
+            // advances past it, so the continuation bytes arriving next burst
+            // would be read as literal text and leak into speech. A normal
+            // flush ends at a newline, which can never fall inside an escape.
+            //
+            // Same hazard for a trailing partial `[[TTS]]`/`[[/TTS]]` marker:
+            // the `replace` below only matches a whole marker, so consuming half
+            // of one (`...[[TT`) would leak the literal text into speech. Hold
+            // back before whichever incomplete token starts first.
+            unterminated_escape_tail(scan).min(unterminated_marker_tail(scan))
         } else {
             match scan.iter().rposition(|&b| b == b'\n') {
                 Some(i) => i + 1,
@@ -272,6 +348,88 @@ impl Default for TagScanner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The TTS markers stripped in speak-all mode. Kept here so
+/// [`unterminated_marker_tail`] and the `replace` in `scan_all` agree.
+const TTS_MARKERS: [&[u8]; 2] = [b"[[TTS]]", b"[[/TTS]]"];
+
+/// Index up to which `slice` can be consumed without ending inside a *partial*
+/// `[[TTS]]`/`[[/TTS]]` marker. Returns `slice.len()` when the slice doesn't
+/// end with an incomplete marker prefix; otherwise the start index of that
+/// partial so the caller can hold those bytes back until the rest arrives.
+/// (A *complete* trailing marker is left to be consumed and stripped normally.)
+fn unterminated_marker_tail(slice: &[u8]) -> usize {
+    let n = slice.len();
+    for marker in TTS_MARKERS {
+        // Longest proper prefix of `marker` that is a suffix of `slice`.
+        let max_p = (marker.len() - 1).min(n);
+        for p in (1..=max_p).rev() {
+            if slice[n - p..] == marker[..p] {
+                return n - p;
+            }
+        }
+    }
+    n
+}
+
+/// Index up to which `slice` can be consumed without ending inside an
+/// unterminated ANSI escape sequence. Returns `slice.len()` when the slice
+/// doesn't end mid-escape; otherwise the start index of the trailing
+/// incomplete escape so the caller can hold those bytes back. The escape
+/// grammar mirrors [`strip_ansi`] so the two stay consistent.
+fn unterminated_escape_tail(slice: &[u8]) -> usize {
+    let n = slice.len();
+    let mut i = 0;
+    while i < n {
+        if slice[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        let esc_start = i;
+        if i + 1 >= n {
+            return esc_start; // lone trailing ESC
+        }
+        match slice[i + 1] {
+            b'[' => {
+                // CSI: parameter/intermediate bytes then a final 0x40..=0x7e.
+                i += 2;
+                while i < n && !(0x40..=0x7e).contains(&slice[i]) {
+                    i += 1;
+                }
+                if i >= n {
+                    return esc_start; // no final byte yet
+                }
+                i += 1;
+            }
+            b']' => {
+                // OSC: terminated by BEL or ST (ESC \).
+                i += 2;
+                let mut terminated = false;
+                while i < n {
+                    if slice[i] == 0x07 {
+                        i += 1;
+                        terminated = true;
+                        break;
+                    }
+                    if slice[i] == 0x1b && i + 1 < n && slice[i + 1] == b'\\' {
+                        i += 2;
+                        terminated = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !terminated {
+                    return esc_start;
+                }
+            }
+            _ => {
+                // Two-byte ESC sequence; the following byte is present.
+                i += 2;
+            }
+        }
+    }
+    n
 }
 
 /// Collapse runs of whitespace (spaces, tabs, newlines) in `s` into a
@@ -403,6 +561,28 @@ fn strip_ansi(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bounded_dedup_evicts_oldest_when_full() {
+        let mut d = BoundedDedup::new(2);
+        d.insert("a".to_string());
+        d.insert("b".to_string());
+        assert!(d.contains("a") && d.contains("b"));
+        // Inserting a third key evicts the oldest ("a").
+        d.insert("c".to_string());
+        assert!(!d.contains("a"), "oldest key should be evicted");
+        assert!(d.contains("b") && d.contains("c"));
+    }
+
+    #[test]
+    fn bounded_dedup_reinsert_does_not_grow_or_evict() {
+        let mut d = BoundedDedup::new(2);
+        d.insert("a".to_string());
+        d.insert("a".to_string()); // duplicate: no-op
+        d.insert("b".to_string());
+        // "a" must still be present — the duplicate insert didn't push it out.
+        assert!(d.contains("a") && d.contains("b"));
+    }
+
     /// Feed the scanner the way `ProcessingLayer` does: `raw` is the full
     /// append-only buffer, so each call passes the growing slice.
     #[test]
@@ -437,6 +617,24 @@ mod tests {
         assert_eq!(out, vec!["Spoken content here."]);
         // Make sure the literal marker text never leaks into speech.
         assert!(out.iter().all(|t| !t.contains("TTS")));
+    }
+
+    #[test]
+    fn scan_for_new_tags_reanchors_on_nested_opener() {
+        // A stray inner `[[TTS]]` must not leak as literal text; the latest
+        // opener before the close wins.
+        let mut s = TagScanner::new();
+        let raw = b"[[TTS]]first part [[TTS]]real part[[/TTS]]".to_vec();
+        let out = s.scan_for_new_tags(&raw);
+        assert_eq!(out, vec!["real part"]);
+        assert!(out.iter().all(|t| !t.contains("TTS")));
+    }
+
+    #[test]
+    fn scan_for_new_tags_plain_pair() {
+        let mut s = TagScanner::new();
+        let raw = b"[[TTS]]hello world[[/TTS]]".to_vec();
+        assert_eq!(s.scan_for_new_tags(&raw), vec!["hello world"]);
     }
 
     #[test]
@@ -476,6 +674,19 @@ mod tests {
         let mut raw2 = raw.clone();
         raw2.extend_from_slice(b"The capital of France is Paris.\n");
         assert_eq!(s.scan_all(&raw2, false), vec!["The capital of France is Paris."]);
+    }
+
+    #[test]
+    fn scan_all_force_does_not_split_a_trailing_escape() {
+        let mut s = TagScanner::new();
+        // A forced flush lands mid-escape: "Done." then an incomplete CSI.
+        let mut raw = b"Done.\x1b[31".to_vec();
+        // "Done." is spoken; the dangling "\x1b[31" must be held, not consumed.
+        assert_eq!(s.scan_all(&raw, true), vec!["Done."]);
+        // The continuation completes the escape and is correctly stripped, so
+        // the leftover "m" never leaks into speech as literal text.
+        raw.extend_from_slice(b"mMore text.\n");
+        assert_eq!(s.scan_all(&raw, false), vec!["More text."]);
     }
 
     #[test]

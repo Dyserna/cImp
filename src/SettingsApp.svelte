@@ -2573,7 +2573,10 @@
                     oninput={(e) =>
                       updateBackend(i, (b) => {
                         const v = (e.currentTarget as HTMLInputElement).value;
-                        b.declared_context = v === '' ? null : +v;
+                        const n = +v;
+                        // Empty / non-numeric → null (use /props), never NaN.
+                        b.declared_context =
+                          v === '' || Number.isNaN(n) ? null : Math.max(0, n);
                       })}
                     placeholder="e.g. 16000"
                   />
@@ -2624,8 +2627,14 @@
               min="10"
               max="100"
               value={snapshot.offload.budget_high_water_pct}
-              oninput={(e) =>
-                patch((s) => (s.offload.budget_high_water_pct = +(e.currentTarget as HTMLInputElement).value))}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.budget_high_water_pct = Math.min(
+                      100,
+                      Math.max(10, +(e.currentTarget as HTMLInputElement).value || 10),
+                    )),
+                )}
             />
             <small class="hint">
               Fraction of the per-slot window the loop works against,
@@ -2638,8 +2647,14 @@
               type="number"
               min="256"
               value={snapshot.offload.per_tool_result_token_cap}
-              oninput={(e) =>
-                patch((s) => (s.offload.per_tool_result_token_cap = +(e.currentTarget as HTMLInputElement).value))}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.per_tool_result_token_cap = Math.max(
+                      256,
+                      +(e.currentTarget as HTMLInputElement).value || 256,
+                    )),
+                )}
             />
           </label>
           <label>
@@ -2648,8 +2663,14 @@
               type="number"
               min="1"
               value={snapshot.offload.max_steps}
-              oninput={(e) =>
-                patch((s) => (s.offload.max_steps = +(e.currentTarget as HTMLInputElement).value))}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.max_steps = Math.max(
+                      1,
+                      +(e.currentTarget as HTMLInputElement).value || 1,
+                    )),
+                )}
             />
           </label>
           <label>
@@ -2658,8 +2679,14 @@
               type="number"
               min="30"
               value={snapshot.offload.offload_timeout_secs}
-              oninput={(e) =>
-                patch((s) => (s.offload.offload_timeout_secs = +(e.currentTarget as HTMLInputElement).value))}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.offload_timeout_secs = Math.max(
+                      30,
+                      +(e.currentTarget as HTMLInputElement).value || 30,
+                    )),
+                )}
             />
             <small class="hint">Bounds each offload, including the wait for a free slot.</small>
           </label>

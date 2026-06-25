@@ -123,19 +123,26 @@ impl RemoteBackend {
     }
 
     /// One `GET /health` probe. `true` iff the endpoint answered 2xx.
-    /// Cloud endpoints often lack `/health`; a 404/401 still proves the
-    /// host is reachable, so we treat any HTTP *response* (even an error
-    /// status) as "reachable" for cloud and only require 2xx for LAN
-    /// llama-server, which does expose `/health`.
+    /// Cloud endpoints often lack `/health`; a 404/405 still proves the
+    /// host is reachable, so for cloud we accept any response EXCEPT the ones
+    /// that mean it's actually unusable — a bad token (401/403) or a server
+    /// error (5xx). LAN llama-server exposes `/health`, so we require 2xx there.
     pub async fn health_check(&self) -> bool {
         let url = format!("{}/health", self.base_url);
         let resp = self.with_auth(self.client.get(&url)).send().await;
         let ok = match resp {
             Ok(r) => {
-                // LAN llama-server: require 2xx. Cloud: any response means
-                // the host answered (the real auth/route check happens on
-                // the first chat call).
-                self.is_cloud || r.status().is_success()
+                let status = r.status();
+                if self.is_cloud {
+                    // Host answered; only reject the statuses that prove it
+                    // can't serve us. The route/auth detail is re-checked on
+                    // the first chat call.
+                    !(status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN
+                        || status.is_server_error())
+                } else {
+                    status.is_success()
+                }
             }
             Err(_) => false,
         };
@@ -205,10 +212,33 @@ impl RemoteBackend {
     /// shrinking a live semaphore safely is fiddly. Idempotent.
     fn note_total_slots(&self, t: u32) {
         let t = t.max(1);
-        let prev = self.slots.swap(t, Ordering::Relaxed);
-        let effective_prev = if prev == 0 { self.declared_slots } else { prev };
-        if t > effective_prev {
-            self.gate.add_permits((t - effective_prev) as usize);
+        // CAS loop so concurrent callers (the metrics poller and a live `run()`
+        // both refresh `/props` on the same shared `Arc`) can't each add the
+        // same delta and over-grow the gate. Only the thread that successfully
+        // swaps `slots` prev->t adds the matching permits; losers retry against
+        // the fresh value and find nothing left to grow.
+        //
+        // We only ever grow: a live `tokio::Semaphore` can't be safely shrunk,
+        // so if a re-fetched `/props` reports *fewer* slots (server restarted
+        // with a smaller `-np`) we leave BOTH the gate and `self.slots`
+        // unchanged. Swapping `slots` down while the gate keeps the larger
+        // permit count would make `slots()`/`in_flight()` disagree with the
+        // real concurrency the gate allows, and the router would mis-schedule.
+        loop {
+            let prev = self.slots.load(Ordering::Relaxed);
+            let effective_prev = if prev == 0 { self.declared_slots } else { prev };
+            if t <= effective_prev {
+                break;
+            }
+            if self
+                .slots
+                .compare_exchange(prev, t, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.gate.add_permits((t - effective_prev) as usize);
+                break;
+            }
+            // Lost the race; another thread bumped `slots`. Retry.
         }
         debug!(backend = %self.name, total_slots = t, "offload: discovered remote slot count");
     }
@@ -338,9 +368,12 @@ mod tests {
         b.note_total_slots(2);
         assert_eq!(b.slots(), 2);
         assert_eq!(b.gate.available_permits(), 2);
-        // A zero/garbage value floors at one and never shrinks below it.
-        b.note_total_slots(0);
-        assert_eq!(b.slots(), 1);
+        // A later probe reporting FEWER slots must not shrink either the
+        // reported count or the gate: a live semaphore can't be shrunk safely,
+        // so lowering `slots()` alone would make it disagree with the gate.
+        b.note_total_slots(1);
+        assert_eq!(b.slots(), 2);
+        assert_eq!(b.gate.available_permits(), 2);
     }
 
     #[test]

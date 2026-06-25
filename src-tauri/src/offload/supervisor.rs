@@ -219,10 +219,15 @@ impl OffloadSupervisor {
             return Vec::new();
         }
         let backends = snap.effective_backends();
-        let running = self.running.lock().await;
+        // Do NOT hold the `running` lock across this loop: a remote backend's
+        // status is a live network health probe (up to the client timeout,
+        // ~10s), and holding the mutex across it would stall every concurrent
+        // start/stop/running_server call. `backend_status` takes the lock
+        // itself, briefly and await-free, only for the local branch that needs
+        // it.
         let mut out = Vec::with_capacity(backends.len());
         for b in &backends {
-            out.push(self.backend_status(b, &running, &snap).await);
+            out.push(self.backend_status(b, &snap).await);
         }
         out
     }
@@ -230,7 +235,6 @@ impl OffloadSupervisor {
     async fn backend_status(
         &self,
         b: &OffloadBackend,
-        running: &HashMap<String, Running>,
         snap: &crate::settings::OffloadSettings,
     ) -> BackendStatus {
         let tier = match b.tier {
@@ -240,6 +244,10 @@ impl OffloadSupervisor {
         let scope = scope_summary(&b.tool_scope, snap);
         match &b.kind {
             OffloadBackendKind::Local { .. } => {
+                // Short, await-free critical section: the `Server` accessors
+                // are all synchronous, so we never hold the lock across an
+                // `.await` (the remote probe path below holds no lock at all).
+                let running = self.running.lock().await;
                 let (state, n_ctx, slots, in_flight, error) = match running.get(&b.name) {
                     Some(r) if r.server.is_ready() => (
                         "ready",
@@ -459,9 +467,18 @@ impl OffloadSupervisor {
 
     /// Stop *all* local backends (app exit / disable).
     pub async fn stop_all(&self) {
-        let names: Vec<String> = self.running.lock().await.keys().cloned().collect();
-        for name in names {
-            self.stop_backend(&name).await;
+        // Two passes: a backend started concurrently (e.g. a racing autostart
+        // on disable) between snapshotting the map and stopping each entry
+        // would survive a single pass. A second sweep catches that straggler
+        // without risking an unbounded loop if starts kept arriving.
+        for _ in 0..2 {
+            let names: Vec<String> = self.running.lock().await.keys().cloned().collect();
+            if names.is_empty() {
+                break;
+            }
+            for name in names {
+                self.stop_backend(&name).await;
+            }
         }
     }
 

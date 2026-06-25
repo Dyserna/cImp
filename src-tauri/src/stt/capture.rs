@@ -127,6 +127,11 @@ fn start_capture(
     let sample_format = supported.sample_format();
     let sample_rate = supported.sample_rate().0;
     let channels = supported.channels() as usize;
+    // `data.chunks(channels)` in the callback panics on a zero chunk size, and
+    // a 0-channel config is meaningless for capture — reject it up front.
+    if channels == 0 {
+        return Err(AppError::Stt("input device reports zero channels".into()));
+    }
     let config: cpal::StreamConfig = supported.into();
 
     info!(
@@ -190,21 +195,49 @@ where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
 {
+    // Reusable downmix scratch so the realtime callback doesn't allocate per
+    // call after warm-up.
+    let mut scratch: Vec<f32> = Vec::new();
     device
         .build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
-                let Ok(mut buf) = accumulator.lock() else { return };
-                let Ok(mut ring) = mic.write() else { return };
+                // Downmix to mono FIRST, holding no lock. Then take each lock
+                // briefly and separately. The original held the `accumulator`
+                // mutex AND the `mic` write lock across the whole frame loop;
+                // because `recent_samples()` reads `mic` every ~16ms, that let a
+                // reader stall the audio driver callback (xruns / dropped input)
+                // and nested two locks unnecessarily.
                 let inv = 1.0 / channels.max(1) as f32;
+                scratch.clear();
+                scratch.reserve(data.len() / channels.max(1) + 1);
                 for frame in data.chunks(channels) {
                     let mut sum = 0.0f32;
                     for &s in frame {
                         sum += f32::from_sample(s);
                     }
+                    // Clamp non-finite samples to silence at the source so a
+                    // misbehaving device can't poison Whisper input, the RMS
+                    // meter, or the amplitude IPC (NaN isn't valid JSON).
                     let mono = sum * inv;
-                    buf.push(mono);
-                    ring.push(mono);
+                    scratch.push(if mono.is_finite() { mono } else { 0.0 });
+                }
+                if let Ok(mut buf) = accumulator.lock() {
+                    // Hard cap (~10 min at 48 kHz) so a session left recording
+                    // can't grow the accumulator unbounded (~11 MB/min). Past
+                    // the cap we drop further audio rather than risk OOM; a very
+                    // long dictation is truncated at the ceiling.
+                    const MAX_ACCUM_SAMPLES: usize = 28_800_000;
+                    let remaining = MAX_ACCUM_SAMPLES.saturating_sub(buf.len());
+                    if remaining > 0 {
+                        let take = scratch.len().min(remaining);
+                        buf.extend_from_slice(&scratch[..take]);
+                    }
+                }
+                if let Ok(mut ring) = mic.write() {
+                    for &m in &scratch {
+                        ring.push(m);
+                    }
                 }
             },
             err_fn,
@@ -216,7 +249,12 @@ where
 /// Stop the stream and take the accumulated mono buffer + its native rate.
 fn finish(cap: ActiveCapture) -> (Vec<f32>, u32) {
     let rate = cap.sample_rate;
-    // Dropping `_stream` stops the device callback before we read the buffer.
+    // Pause first, then drop: on WASAPI a bare drop isn't guaranteed to tear
+    // the callback down synchronously, so an in-flight callback could still be
+    // appending when we take the buffer below. Pausing quiesces the device
+    // before we read, so trailing frames aren't lost to that race.
+    use cpal::traits::StreamTrait;
+    let _ = cap._stream.pause();
     drop(cap._stream);
     let samples = cap
         .accumulator
@@ -283,11 +321,31 @@ fn resample_to_16k(input: Vec<f32>, in_rate: u32) -> AppResult<Vec<f32>> {
         out.extend_from_slice(&produced[0]);
         pos += need;
     }
-    // Feed the remainder (zero-padded internally) so trailing audio isn't lost.
+    // Feed the remainder (zero-padded internally). This is also the ONLY
+    // path taken for a sub-chunk recording (`input.len() < CHUNK`), where the
+    // main loop breaks immediately with `pos == 0` — e.g. a brief press-to-talk
+    // on a 44.1/48 kHz mic produces well under 1024 native samples.
     if pos < input.len() {
         let produced = resampler
             .process_partial(Some(&[&input[pos..]]), None)
             .map_err(|e| AppError::Stt(format!("resample tail: {e}")))?;
+        out.extend_from_slice(&produced[0]);
+    }
+
+    // Drain the resampler's internal delay line. `FftFixedIn` buffers up to
+    // one chunk of latency, so for a short clip (and for the tail of any clip)
+    // some output is still held inside after the input is consumed. A single
+    // `process_partial` doesn't recover it; flush with empty calls until we've
+    // produced the expected frame count or the resampler stops emitting.
+    // Without this, short dictations were silently truncated or dropped (the
+    // worker's ~150 ms minimum-sample guard would then reject a real clip).
+    while out.len() < expected {
+        let produced = resampler
+            .process_partial::<&[f32]>(None, None)
+            .map_err(|e| AppError::Stt(format!("resample flush: {e}")))?;
+        if produced[0].is_empty() {
+            break;
+        }
         out.extend_from_slice(&produced[0]);
     }
 
@@ -354,5 +412,29 @@ mod tests {
         let input = vec![0.1, -0.2, 0.3];
         let out = resample_to_16k(input.clone(), 16_000).unwrap();
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn resample_short_subchunk_input_is_not_dropped() {
+        // Fewer than one FFT chunk (1024) of native samples — a very short
+        // press-to-talk on a 48 kHz mic. Regression: this used to fall solely
+        // to a single `process_partial` that returned far fewer than the
+        // expected frames, mangling/dropping the clip. The drain loop must now
+        // recover ~proportional output.
+        let in_rate = 48_000u32;
+        let n = 480usize; // 10 ms at 48 kHz, < CHUNK
+        let input: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / in_rate as f32).sin())
+            .collect();
+        let expected = n * 16_000 / 48_000; // 160
+        let out = resample_to_16k(input, in_rate).expect("resample ok");
+        // Should be close to the proportional length, not near-zero. Allow a
+        // generous lower bound (resampler latency can shave a little).
+        assert!(
+            out.len() >= expected * 3 / 4,
+            "short clip resampled to {} frames, expected ~{}",
+            out.len(),
+            expected
+        );
     }
 }

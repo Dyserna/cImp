@@ -416,10 +416,18 @@ pub async fn tts_speak_selection(
     if chunks.is_empty() {
         return Ok(());
     }
-    // Mark this as the active read before sending so the worker (which reads
-    // the cell between chunks) keeps going for exactly this session.
-    state.speak_session.store(session, Ordering::SeqCst);
+    // Resolve the active tab FIRST (this awaits the registry lock), then arm
+    // the session cell immediately before the send with no await in between.
+    // Storing the session before the `.lock().await` left a window in which a
+    // concurrent `tts_stop` (Esc) could zero the cell and then this command
+    // would still proceed to send — racing the stop. With the store moved
+    // after the await, an Esc that lands before this point simply means the
+    // worker sees a superseding/zeroed cell and abandons, and one that lands
+    // after is a clean supersede. The worker re-checks `speak_session` both
+    // before and after each chunk's synthesis, so a stop during the read still
+    // cancels the remaining chunks.
     let active = state.tabs.lock().await.active();
+    state.speak_session.store(session, Ordering::SeqCst);
     state
         .tts_segments
         .send(crate::tts::TtsRequest::SpeakSelection { tab: active, session, chunks })
@@ -441,7 +449,13 @@ pub async fn tts_stop(state: State<'_, AppState>) -> AppResult<()> {
     // clears the flag. Notifications and selection reads are unaffected — they
     // ride other request variants the worker doesn't gate on this flag.
     state.ai_tts_suppressed.store(true, Ordering::SeqCst);
-    if let Some(audio) = state.audio.read().ok().and_then(|g| g.as_ref().cloned()) {
+    // Recover the guard even if the lock is poisoned: this is the Esc
+    // emergency-stop, so it must never silently no-op and leave audio playing
+    // with no way to stop it from the UI. `into_inner` hands back the guard;
+    // the data behind it (an `Option<AudioOutput>` handle) is not left in a
+    // broken state by a panicking writer.
+    let audio = state.audio.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(audio) = audio.as_ref().cloned() {
         audio.stop_all();
     }
     Ok(())
@@ -453,7 +467,10 @@ pub async fn tts_stop(state: State<'_, AppState>) -> AppResult<()> {
 /// only the audio sink is paused.
 #[tauri::command]
 pub async fn tts_set_paused(state: State<'_, AppState>, paused: bool) -> AppResult<()> {
-    if let Some(audio) = state.audio.read().ok().and_then(|g| g.as_ref().cloned()) {
+    // Recover a poisoned guard rather than swallowing it — a no-op pause/resume
+    // would leave the transport controls dead with no signal why.
+    let audio = state.audio.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(audio) = audio.as_ref().cloned() {
         audio.set_paused(paused);
     }
     Ok(())
@@ -517,7 +534,14 @@ pub async fn get_claude_usage() -> AppResult<crate::usage::UsageResult> {
 pub async fn get_system_stats(
     state: State<'_, AppState>,
 ) -> AppResult<crate::sysmon::SystemStatsSnapshot> {
-    Ok(state.sysmon.sample())
+    // `sample()` blocks: it does a synchronous sysinfo refresh (incl.
+    // `networks.refresh(true)`, which re-scans every interface) plus NVML
+    // device queries. Run it on the blocking pool so the 1 Hz poll doesn't
+    // stall other IPC futures on the async reactor thread.
+    let sysmon = state.sysmon.clone();
+    tauri::async_runtime::spawn_blocking(move || sysmon.sample())
+        .await
+        .map_err(|e| AppError::Ipc(format!("system stats join: {e}")))
 }
 
 #[tauri::command]

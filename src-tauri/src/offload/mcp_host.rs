@@ -56,6 +56,19 @@ const WRITE_VERBS: &[&str] = &[
     "clear", "purge", "apply", "checkout", "clone", "stage", "restore", "revert",
 ];
 
+/// Unambiguously-mutating leading verbs that essentially never appear as a noun
+/// in a read-only tool's name, so they disqualify a tool as the leading verb of
+/// *any* segment — not just the first two. This closes the gap where a mutating
+/// verb sits past the second segment (`repo_data_set_value`, `config_apply_patch`)
+/// and isn't destructive enough to be in [`HARD_WRITE_VERBS`]. Noun-ish verbs
+/// (`commit`, `merge`, `add`, `copy`, …) are deliberately NOT here — they stay
+/// first-two-only so reads like `get_latest_commit` aren't over-dropped.
+const ANYSEG_WRITE_VERBS: &[&str] = &[
+    "create", "mkdir", "update", "edit", "insert", "modify", "patch", "apply",
+    "append", "rename", "reset", "install", "uninstall", "publish", "upload",
+    "mutate", "set", "put",
+];
+
 /// The leading verb of one name segment: the leading lowercase run so
 /// camelCase (`searchWeb` → `search`) resolves, else the whole lowercased
 /// segment (`Get` → `get`).
@@ -80,13 +93,88 @@ fn leading_verb(name: &str) -> String {
     token_verb(seg)
 }
 
+/// Unambiguously destructive or code-executing verbs that never legitimately
+/// appear *anywhere* in a read-only tool's name — unlike noun-ish verbs
+/// (`commit`, `set`, `merge`, `add`, `copy`) which show up in plenty of read
+/// tools such as `get_latest_commit` or `list_set_members`. These are checked
+/// across every segment (and every camelCase sub-word) so a dangerous verb
+/// buried past the second segment (`search_and_replace`, `find_and_delete`,
+/// `git_force_push`) or hidden behind a leading lowercase run (`shellExec`)
+/// can't slip through.
+///
+/// The execution verbs (`exec`/`run`/`spawn`/`shell`/`eval`/`bash`/`sh`) are
+/// the highest-value entries: a tool like `command_run` or `shell_command_exec`
+/// hands the local offload worker arbitrary code execution. We deliberately
+/// err toward dropping a read tool that merely *contains* one of these words
+/// (e.g. a CI `getRunStatus`) over ever exposing an executor — a dropped read
+/// tool is harmless; an exposed executor is not.
+const HARD_WRITE_VERBS: &[&str] = &[
+    "write", "delete", "remove", "rm", "unlink", "destroy", "truncate",
+    "drop", "purge", "replace", "overwrite", "rename", "uninstall", "kill",
+    "wipe", "exec", "execute", "eval", "run", "spawn", "shell", "bash", "sh",
+];
+
+/// Split one name segment into lowercased word tokens, breaking on camelCase
+/// boundaries so `gitPush` → `["git", "push"]` and `shellExec` →
+/// `["shell", "exec"]`. Without this, [`token_verb`] only sees the leading
+/// lowercase run and a dangerous verb after the first capital hides.
+fn segment_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut prev_was_lower_or_digit = false;
+    for c in segment.chars() {
+        if c.is_ascii_uppercase() && prev_was_lower_or_digit && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        cur.push(c.to_ascii_lowercase());
+        prev_was_lower_or_digit = c.is_ascii_lowercase() || c.is_ascii_digit();
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
 /// Whether a tool name is read-class (safe to expose). The offload worker is
-/// read-only; mutating tools are dropped. A server may carry its verb in the
-/// **second** segment (`git_commit`, `git_push`), so a tool is write-class if
-/// *either* of its first two segments leads with a mutating verb.
+/// read-only; mutating tools are dropped. This is best-effort *defense in
+/// depth* — the real safety boundary for the native tools is server-side
+/// filesystem confinement; for third-party MCP servers it bounds what we
+/// advertise to the local model but a hostile/oddly-named server can still
+/// name a write tool to look like a read. Two-tier check:
+///
+/// 1. No camelCase sub-word of any segment may be a hard-destructive or
+///    execution verb ([`HARD_WRITE_VERBS`]) — catches a dangerous verb past
+///    the second segment (`git_force_push`) or behind a capital (`shellExec`).
+/// 2. Neither of the first two segments may lead with a (possibly noun-ish)
+///    write verb — catches category-prefixed names (`git_commit`, `git_push`)
+///    without dropping reads like `get_latest_commit` where the noun-verb sits
+///    later.
 fn is_read_class(name: &str) -> bool {
-    name.split(['_', '-', '.', ' ', ':'])
+    let segments: Vec<&str> = name
+        .split(['_', '-', '.', ' ', ':', '/'])
         .filter(|s| !s.is_empty())
+        .collect();
+
+    let hits_hard_verb = segments
+        .iter()
+        .flat_map(|seg| segment_words(seg))
+        .any(|w| HARD_WRITE_VERBS.contains(&w.as_str()));
+    if hits_hard_verb {
+        return false;
+    }
+
+    // Unambiguous mutation verbs disqualify as the leading verb of any segment.
+    let hits_anyseg = segments
+        .iter()
+        .any(|seg| ANYSEG_WRITE_VERBS.contains(&token_verb(seg).as_str()));
+    if hits_anyseg {
+        return false;
+    }
+
+    // Noun-ish write verbs only disqualify in the first two (category) segments,
+    // so a noun-verb later in the name (`get_latest_commit`) isn't over-dropped.
+    segments
+        .iter()
         .take(2)
         .all(|seg| !WRITE_VERBS.contains(&token_verb(seg).as_str()))
 }
@@ -134,7 +222,21 @@ impl StdioConn {
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        {
+            // Insert and re-check liveness *while holding the pending lock*.
+            // The reader sets `alive = false` and then drains `pending` under
+            // this same lock on EOF. Without the under-lock recheck there is a
+            // TOCTOU: the reader could drain between the top-of-fn check and
+            // this insert, orphaning our sender so the call blocks for the full
+            // timeout instead of failing fast. The mutex establishes the
+            // happens-before with the reader's store, so re-reading here is
+            // authoritative.
+            let mut pending = self.pending.lock().unwrap();
+            if !self.alive.load(Ordering::Relaxed) {
+                return Err("server connection is closed".into());
+            }
+            pending.insert(id, tx);
+        }
         let frame = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -250,7 +352,20 @@ impl McpServer {
         match result {
             Ok(v) => Ok(render_tool_result(&v)),
             Err(e) => {
-                self.set_unhealthy(format!("call failed: {e}"));
+                // A single failed call must NOT permanently disable the whole
+                // server — that drops *all* its tools (`tool_defs` returns
+                // empty once unhealthy) for the app's lifetime, even though a
+                // 45s per-call timeout or a JSON-RPC tool-level error leaves a
+                // perfectly live stdio process running. Only flip unhealthy
+                // when the connection is genuinely dead (reader saw EOF/fatal,
+                // so `alive` is false). HTTP calls are independent and
+                // reconnect on demand, so a transient failure there leaves
+                // health untouched and the next call can succeed.
+                if let Some(Conn::Stdio(c)) = &self.conn {
+                    if !c.alive.load(Ordering::Relaxed) {
+                        self.set_unhealthy(format!("connection lost: {e}"));
+                    }
+                }
                 Err(e)
             }
         }
@@ -370,10 +485,16 @@ impl McpHost {
 
     /// Route a namespaced `<server>__<tool>` call to its owning server.
     pub async fn call(&self, namespaced: &str, args: Value) -> Result<String, String> {
+        // Route by actual ownership (an exact match on the namespaced def
+        // name) rather than parsing a `<prefix>__` split — a server or raw
+        // tool name that itself contains `__` would make the split route to
+        // the wrong/nonexistent server.
         let server = {
             let servers = self.servers.read().await;
-            let prefix = namespaced.split("__").next().unwrap_or(namespaced);
-            servers.iter().find(|s| s.name == prefix).cloned()
+            servers
+                .iter()
+                .find(|s| s.raw_name(namespaced).is_some())
+                .cloned()
         };
         let Some(server) = server else {
             return Err(format!("no MCP server owns tool `{namespaced}`"));
@@ -555,8 +676,14 @@ async fn connect_stdio(
                 }
             }
             // Connection ended: fail every pending request and mark dead.
-            conn.alive.store(false, Ordering::Relaxed);
-            let pending: Vec<_> = conn.pending.lock().unwrap().drain().collect();
+            // Flip `alive` and drain under the same lock the request path
+            // takes, so a request can't insert into `pending` after we've
+            // drained it (which would orphan its sender until timeout).
+            let pending: Vec<_> = {
+                let mut p = conn.pending.lock().unwrap();
+                conn.alive.store(false, Ordering::Relaxed);
+                p.drain().collect()
+            };
             for (_, tx) in pending {
                 let _ = tx.send(Err("server connection closed".into()));
             }
@@ -604,7 +731,11 @@ async fn http_rpc(
     params: Value,
     timeout: Duration,
 ) -> Result<Value, String> {
-    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    // Unique per-call id (JSON-RPC ids must be unique within a session; some
+    // servers reject a repeated id even on a stateless HTTP POST).
+    static HTTP_RPC_ID: AtomicU64 = AtomicU64::new(1);
+    let id = HTTP_RPC_ID.fetch_add(1, Ordering::Relaxed);
+    let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     let resp = client
         .post(url)
         .json(&body)
@@ -710,13 +841,25 @@ fn render_tool_result(result: &Value) -> String {
     }
 }
 
-/// Confine a `filesystem` server to the offload `allowed_roots`: append each
+/// Whether this config is the standard filesystem MCP server, by name *or*
+/// by the package it launches. Keying on the configured `name` alone is
+/// fragile: a user who names the server `fs` or `local-files` would silently
+/// bypass confinement, exposing the whole filesystem to the offload model.
+fn is_filesystem_server(cfg: &McpServerConfig, args: &[String]) -> bool {
+    if cfg.name.eq_ignore_ascii_case("filesystem") {
+        return true;
+    }
+    const PKG: &str = "server-filesystem";
+    cfg.command.contains(PKG) || args.iter().any(|a| a.contains(PKG))
+}
+
+/// Confine a filesystem server to the offload `allowed_roots`: append each
 /// configured root not already present in the server's args. The standard
 /// `@modelcontextprotocol/server-filesystem` takes its allowed directories
 /// as trailing CLI args, so this is the confinement seam. No-op for other
 /// servers or when no roots are configured.
 fn confine_filesystem(cfg: &McpServerConfig, args: &mut Vec<String>, allowed_roots: &[PathBuf]) {
-    if cfg.name != "filesystem" || allowed_roots.is_empty() {
+    if !is_filesystem_server(cfg, args) || allowed_roots.is_empty() {
         return;
     }
     for root in allowed_roots {
@@ -747,6 +890,38 @@ mod tests {
         for bad in ["write_file", "create_directory", "git_commit", "delete_path", "move_file", "git_push", "run_shell"] {
             assert!(!is_read_class(bad), "{bad} should be filtered");
         }
+    }
+
+    #[test]
+    fn read_class_catches_buried_destructive_verbs() {
+        // A hard-destructive verb past the second segment must still drop.
+        for bad in ["search_and_replace", "find_and_delete", "list_then_remove", "scan_and_wipe"] {
+            assert!(!is_read_class(bad), "{bad} should be filtered");
+        }
+        // ...but a noun-ish verb in the 3rd+ segment must NOT over-drop a read
+        // (these are only checked in the first two segments, unchanged).
+        for ok in ["get_latest_commit", "get_repo_merge_status", "list_all_user_sets"] {
+            assert!(is_read_class(ok), "{ok} should be read-class");
+        }
+        // An unambiguous mutation verb past the second segment must drop, even
+        // though it isn't destructive enough to be a HARD verb.
+        for bad in ["repo_data_set_value", "config_apply_patch", "db_record_update", "file_meta_rename"] {
+            assert!(!is_read_class(bad), "{bad} should be filtered");
+        }
+    }
+
+    #[test]
+    fn filesystem_detected_by_package_not_just_name() {
+        let cfg = McpServerConfig {
+            name: "my-files".into(),
+            command: "npx".into(),
+            ..Default::default()
+        };
+        let args = vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()];
+        assert!(is_filesystem_server(&cfg, &args));
+        // A genuinely unrelated server is not confined.
+        let git = McpServerConfig { name: "git".into(), command: "uvx".into(), ..Default::default() };
+        assert!(!is_filesystem_server(&git, &["mcp-server-git".to_string()]));
     }
 
     #[test]

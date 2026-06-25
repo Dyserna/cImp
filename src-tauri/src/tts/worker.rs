@@ -144,7 +144,15 @@ pub fn spawn_tts_worker(
                         // TTS (announcements remain governed by their own
                         // `announce_focused_tab` rule and never hit this
                         // gate at all).
-                        let active_tab = active.read().expect("active tab poisoned").clone();
+                        // Benign fallback on a poisoned lock rather than
+                        // `.expect()`: a panic here would permanently kill the
+                        // TTS worker for the rest of the session. `TabId::Claude`
+                        // is the v2 default and matches how the audio thread
+                        // (`current_active`) handles the same poisoned lock.
+                        let active_tab = active
+                            .read()
+                            .map(|g| g.clone())
+                            .unwrap_or(crate::state::TabId::Claude);
                         let speak_background = settings.current().behavior.speak_background_tabs;
                         if tab != active_tab && !speak_background {
                             debug!(?tab, ?active_tab, "tts: dropping segment for inactive tab");

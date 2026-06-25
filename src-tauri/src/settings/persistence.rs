@@ -79,24 +79,29 @@ pub struct LoadOutcome {
 /// global baseline when it's absent or corrupt; the custom overlay is
 /// merely skipped if absent and quarantined if corrupt.
 ///
-/// Migration runs *separately* on the global value and the overlay value
-/// before they are merged, so a `.bak` file is written next to whichever
-/// source actually carried the legacy keys. Pre-V0.6 the migration ran on
-/// the merged value with the global path hardcoded as the backup target,
-/// which mis-named the backup of an overlay-only legacy shape and
-/// produced a confusing post-migration overlay diff against a still-old
-/// global baseline.
+/// Migration runs on the global value only. The overlay is a partial diff
+/// always written in the current schema, so it is merged as-is (see the
+/// inline note at step 2 for why running the legacy cascade on a partial
+/// overlay caused silent data loss and unbounded `.bak` growth).
 pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // 1. Load and migrate the global baseline. After this `global` is in
     //    the current schema shape; a v1.x file on disk has been backed up
     //    next to the global path and rewritten.
-    let global = load_global(default_shell);
+    let mut global = load_global(default_shell);
 
-    // 2. Load and migrate the overlay (if any). A migrated overlay's
-    //    `.bak` is written next to the overlay file — the right place
-    //    for a user looking at their per-folder config.
+    // 2. Load the overlay (if any). We deliberately DON'T run the legacy
+    //    migration cascade on it: the overlay is a *partial* diff (see
+    //    `diff`), always written by this app's `save` in the current schema.
+    //    The migration detectors (`looks_v1_2` etc.) key off absent top-level
+    //    fields, which a partial overlay legitimately lacks — so migrating it
+    //    both stamps full-object defaults that override global through the
+    //    merge (silent data loss) and, because the overlay never gains a
+    //    `schema_version`, re-fires every launch (unbounded `.v1.2.bak`
+    //    growth). Missing fields are handled correctly downstream anyway:
+    //    deep-merge fills from the (already-migrated) global, and serde
+    //    `#[serde(default)]` covers the rest.
     let custom_path = custom_path(launch_cwd);
-    let overlay_value = read_overlay_migrated(&custom_path, default_shell);
+    let overlay_value = read_overlay(&custom_path, true);
 
     // 3. Merge the (now both-current-shape) global + overlay.
     let mut merged = match serde_json::to_value(&global) {
@@ -137,12 +142,31 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // theme is known) and kept out of the persisted diff — it re-derives
     // from theme + on-disk folder each load, so there's nothing to save.
     apply_portable_avatar_paths(&mut settings);
+    // Stamp the baseline identically. The avatar paths are re-derived from
+    // `ui.theme` + the on-disk folder each load, so they must be present on
+    // BOTH sides of every diff to cancel out. Without this, after the user
+    // changes `ui.theme` the stamped (new-theme) paths in `settings` differ
+    // from the on-disk `global` (frozen at the seed-time theme) and the diff
+    // writes machine-specific absolute avatar paths into the portable
+    // per-folder overlay, pinning the avatar to the save-time theme.
+    apply_portable_avatar_paths(&mut global);
+    // Apply the SAME idempotent integrity repairs to the baseline we return.
+    // This `global` is what the long-lived saver task (broadcaster) and every
+    // later `set()` diff the live (integrity-checked) settings against. Without
+    // it, repairs enforced only on `settings` (restored AI builtins, the
+    // materialized offload-server tab, canonical flags) read as user
+    // customizations on every save and leak into the portable per-folder
+    // overlay. The load-time post-repair save below relies on this too.
+    let _ = integrity_check(&mut global);
 
     if repaired {
         // Persist the post-repair state back to its source of truth. If a
         // custom overlay was in play, we recompute and rewrite the diff;
         // otherwise we rewrite global.
         if overlay_existed {
+            // `global` is already integrity-checked (above), so invariants
+            // enforced on both sides don't get mistaken for user
+            // customizations and written into the overlay.
             if let Err(e) = save(&settings, launch_cwd, &global) {
                 tracing::warn!(error = %e, "settings: post-repair save (custom) failed");
             }
@@ -152,31 +176,6 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     }
 
     LoadOutcome { settings, global }
-}
-
-/// Read the overlay file, run any pending migration on it (writing a `.bak`
-/// next to the overlay file itself), and return the migrated Value. Returns
-/// `None` when the overlay is absent or the file was quarantined for
-/// corruption. On migration-backup failure we still return the raw value —
-/// callers can choose to abort if they want stricter behavior; here we
-/// prefer "boot up with the user's settings" over "boot defaults because
-/// we couldn't snapshot a backup".
-fn read_overlay_migrated(path: &Path, default_shell: &ShellSpec) -> Option<Value> {
-    let mut value = read_overlay(path)?;
-    match migration::migrate_if_needed(&mut value, path, default_shell) {
-        Ok(true) => {
-            tracing::info!(path = %path.display(), "settings: overlay migrated in place");
-        }
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "settings: overlay migration backup failed; using overlay raw",
-            );
-        }
-    }
-    Some(value)
 }
 
 /// V8-01: read-only settings load for a lightweight subprocess (the
@@ -198,7 +197,7 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         Some(v) => v,
         None => return Settings::default(),
     };
-    if let Some(overlay) = read_overlay(&custom_path(launch_cwd)) {
+    if let Some(overlay) = read_overlay(&custom_path(launch_cwd), false) {
         deep_merge(&mut merged, overlay);
     }
     serde_json::from_value(merged).unwrap_or_default()
@@ -298,7 +297,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
 /// `None` if absent. On parse failure the file is quarantined and `None`
 /// is returned — we want the app to come up cleanly even if a hand-edit
 /// broke the overlay.
-fn read_overlay(path: &Path) -> Option<Value> {
+fn read_overlay(path: &Path, quarantine: bool) -> Option<Value> {
     if !path.exists() {
         return None;
     }
@@ -312,12 +311,23 @@ fn read_overlay(path: &Path) -> Option<Value> {
     match serde_json::from_str(&text) {
         Ok(v) => Some(v),
         Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "settings: parse overlay failed; quarantining"
-            );
-            migration::quarantine_corrupt_file(path);
+            // `quarantine` is false for the read-only child path
+            // (`load_readonly`), whose contract is no side effects — a child
+            // process must never move the user's overlay file.
+            if quarantine {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "settings: parse overlay failed; quarantining"
+                );
+                migration::quarantine_corrupt_file(path);
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "settings: parse overlay failed; ignoring (read-only load)"
+                );
+            }
             None
         }
     }
@@ -758,6 +768,33 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         }
     }
 
+    // 3b. Backfill the `question` notification slot on reserved AI builtins.
+    //     The slot was added after the per-slot notification migration, which
+    //     only promoted keys already on disk — so every tab that upgraded got
+    //     a default-disabled, empty `question` and never the configured
+    //     "<tool> has a question" default that fresh installs receive. Seed it
+    //     ONLY when the slot is in its pure-default state (disabled AND empty
+    //     text): that's the upgrader signature. A user who set custom text, or
+    //     who deliberately disabled a populated slot, has non-empty text and is
+    //     left untouched.
+    for tab in settings.tabs.iter_mut() {
+        if let TabConfig::AiTool(c) = tab {
+            if let Some(reserved) = AiTabId::from_id(c.id.as_str()) {
+                let q = &c.notifications.question;
+                if !q.enabled && q.text.is_empty() {
+                    if let TabConfig::AiTool(d) = default_ai_tab(reserved) {
+                        c.notifications.question = d.notifications.question;
+                        changed = true;
+                        tracing::info!(
+                            id = c.id,
+                            "integrity: backfilled default question notification on AI builtin"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // 4. Reconcile AI builtin entries with `enabled_ai_tabs`. The list
     //    is the source of truth for which AI tabs exist: every enabled
     //    id is restored at its canonical position; every reserved id
@@ -909,6 +946,60 @@ mod tests {
         assert!(changed);
         assert_eq!(s.tabs.len(), 1);
         assert_eq!(s.tabs[0].id(), CLAUDE_LOCAL_TAB_ID);
+    }
+
+    #[test]
+    fn integrity_backfills_default_question_slot_on_upgraded_ai_tab() {
+        use crate::settings::schema::{NotificationSlot, TabConfig};
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = vec![AiTabId::Claude];
+        integrity_check(&mut s); // seed the claude tab
+
+        // Simulate a file that upgraded before the `question` slot existed:
+        // the slot deserialized to the pure default (disabled, empty text).
+        if let Some(TabConfig::AiTool(c)) =
+            s.tabs.iter_mut().find(|t| t.id() == CLAUDE_TAB_ID)
+        {
+            c.notifications.question = NotificationSlot::default();
+            assert!(!c.notifications.question.enabled);
+            assert!(c.notifications.question.text.is_empty());
+        }
+
+        let changed = integrity_check(&mut s);
+        assert!(changed, "backfill should report a change");
+        let q = match s.tabs.iter().find(|t| t.id() == CLAUDE_TAB_ID).unwrap() {
+            TabConfig::AiTool(c) => c.notifications.question.clone(),
+            _ => panic!("expected AI tab"),
+        };
+        assert!(q.enabled);
+        assert_eq!(q.text, "Claude has a question");
+    }
+
+    #[test]
+    fn integrity_does_not_clobber_user_customized_question_slot() {
+        use crate::settings::schema::{NotificationSlot, TabConfig};
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = vec![AiTabId::Claude];
+        integrity_check(&mut s);
+
+        // User deliberately disabled the slot but kept (non-empty) text.
+        if let Some(TabConfig::AiTool(c)) =
+            s.tabs.iter_mut().find(|t| t.id() == CLAUDE_TAB_ID)
+        {
+            c.notifications.question = NotificationSlot {
+                enabled: false,
+                text: "My custom question text".to_string(),
+            };
+        }
+
+        integrity_check(&mut s);
+        let q = match s.tabs.iter().find(|t| t.id() == CLAUDE_TAB_ID).unwrap() {
+            TabConfig::AiTool(c) => c.notifications.question.clone(),
+            _ => panic!(),
+        };
+        // Untouched: non-empty text is not the upgrader signature.
+        assert!(!q.enabled);
+        assert_eq!(q.text, "My custom question text");
     }
 
     #[test]

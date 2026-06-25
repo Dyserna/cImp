@@ -101,10 +101,22 @@ pub struct Settings {
     /// migration normally always builds a single-pane layout). The frontend
     /// builds a default single-root-pane tree containing every tab when
     /// this is `None`.
+    ///
+    /// Unlike the other settings structs (which tolerate missing/unknown
+    /// fields via `#[serde(default)]`), the recursive `LayoutNodePersisted`
+    /// has required fields per node, so a single malformed node (e.g. a
+    /// `Split` missing `ratio`) would otherwise fail the *entire* `Settings`
+    /// parse and silently discard the whole per-folder overlay. The lenient
+    /// deserializer degrades a bad layout to `None` — the frontend rebuilds
+    /// a default tree — keeping the rest of the config intact.
+    #[serde(default, deserialize_with = "deserialize_lenient_layout")]
     pub layout: Option<LayoutPersisted>,
     /// Named layout presets. Empty by default; populated via the Layouts
     /// menu's "Save current layout as..." entry. Restoring a preset
     /// replaces the live tree wholesale; the preset itself is unchanged.
+    /// Lenient like `layout`: a malformed preset is dropped individually
+    /// rather than taking the whole settings load down with it.
+    #[serde(default, deserialize_with = "deserialize_lenient_presets")]
     pub layout_presets: Vec<LayoutPreset>,
     /// UI chrome theme settings (V5). The `theme` field selects the
     /// design-token block applied to the ccimp chrome (tab bar, status
@@ -401,6 +413,54 @@ pub struct LayoutPreset {
     /// this — it remains the original creation time.
     pub created_at: String,
     pub tree: LayoutNodePersisted,
+}
+
+/// Tolerant deserializer for `Settings::layout`. Parses to a generic
+/// `Value` first, then attempts the typed conversion; any failure (a
+/// malformed/partial node, a `Split` missing `ratio`, a hand-edit that
+/// broke the tree) degrades to `None` with a warning instead of failing
+/// the whole `Settings` parse. The frontend rebuilds a default single-pane
+/// tree when the layout is `None`, so the user loses only the broken layout
+/// — not their entire per-folder overlay.
+fn deserialize_lenient_layout<'de, D>(d: D) -> Result<Option<LayoutPersisted>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(d)?;
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(val) => match serde_json::from_value::<LayoutPersisted>(val) {
+            Ok(layout) => Ok(Some(layout)),
+            Err(e) => {
+                tracing::warn!(error = %e, "settings: malformed layout dropped to None");
+                Ok(None)
+            }
+        },
+    }
+}
+
+/// Tolerant deserializer for `Settings::layout_presets`. Drops individual
+/// malformed presets (keeping the valid ones) and tolerates the field not
+/// being an array at all, rather than aborting the entire settings load.
+fn deserialize_lenient_presets<'de, D>(d: D) -> Result<Vec<LayoutPreset>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(d)?;
+    let serde_json::Value::Array(items) = raw else {
+        if !raw.is_null() {
+            tracing::warn!("settings: layout_presets was not an array; ignoring");
+        }
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match serde_json::from_value::<LayoutPreset>(item) {
+            Ok(p) => out.push(p),
+            Err(e) => tracing::warn!(error = %e, "settings: malformed layout preset dropped"),
+        }
+    }
+    Ok(out)
 }
 
 /// Discriminated tab config. The `kind` field is the JSON discriminator
@@ -2285,6 +2345,59 @@ impl Default for ProcessingSettings {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn malformed_layout_drops_to_none_without_losing_rest_of_settings() {
+        // A Split node missing `ratio` is invalid, but it must not take the
+        // whole Settings parse down with it. The layout degrades to None and
+        // a sibling field (session.active_tab_id) still loads.
+        let v = json!({
+            "session": { "active_tab_id": "claude" },
+            "layout": {
+                "tree": {
+                    "type": "split",
+                    "id": "s1",
+                    "direction": "horizontal",
+                    "first": { "type": "pane", "id": "p1", "tab_ids": ["claude"], "active_tab_id": "claude" },
+                    "second": { "type": "pane", "id": "p2", "tab_ids": [], "active_tab_id": null }
+                },
+                "focused_pane_id": "p1"
+            }
+        });
+        let parsed: Settings = serde_json::from_value(v).unwrap();
+        assert!(parsed.layout.is_none(), "malformed layout should drop to None");
+        assert_eq!(parsed.session.active_tab_id.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn valid_layout_still_parses() {
+        let v = json!({
+            "layout": {
+                "tree": { "type": "pane", "id": "p1", "tab_ids": ["claude"], "active_tab_id": "claude" },
+                "focused_pane_id": "p1"
+            }
+        });
+        let parsed: Settings = serde_json::from_value(v).unwrap();
+        assert!(parsed.layout.is_some(), "valid layout should parse");
+    }
+
+    #[test]
+    fn malformed_preset_is_dropped_individually() {
+        // First preset is valid; second is missing `tree`. Keep the good one.
+        let v = json!({
+            "layout_presets": [
+                {
+                    "name": "good",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "tree": { "type": "pane", "id": "p1", "tab_ids": [], "active_tab_id": null }
+                },
+                { "name": "bad", "created_at": "2026-01-01T00:00:00Z" }
+            ]
+        });
+        let parsed: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.layout_presets.len(), 1);
+        assert_eq!(parsed.layout_presets[0].name, "good");
+    }
 
     #[test]
     fn background_override_null_round_trips_as_none() {

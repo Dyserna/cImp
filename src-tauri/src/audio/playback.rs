@@ -134,6 +134,12 @@ impl AudioOutput {
         if samples.is_empty() {
             return;
         }
+        if sample_rate == 0 {
+            // A zero rate would break rodio's resampler and the duration math;
+            // a synthesizer that reports it has produced no usable audio.
+            warn!("audio: dropping chunk with zero sample rate");
+            return;
+        }
         if let Err(e) = self
             .cmd_tx
             .send(AudioCommand::Enqueue { samples, sample_rate, mark })
@@ -264,6 +270,12 @@ fn run_audio_thread(
     // mid-speech doesn't misattribute the stop (audio is no longer stopped on
     // tab switch — only Esc stops it).
     let mut speaking_tab: Option<TabId> = None;
+    // An owed-but-not-yet-delivered Started edge. Latched on the idle→speaking
+    // edge so that a very short utterance which drains before the edge can be
+    // delivered (channel transiently Full) still animates the avatar — without
+    // this, the start branch's retry could find `now_speaking` already false on
+    // the next tick and lose the Started/Stopped pair entirely.
+    let mut pending_start: Option<TabId> = None;
     // Selection-read progress: a per-source mark queue that mirrors the
     // rodio sink's FIFO. `None` entries stand in for ordinary AI/notification
     // audio so the deque length always equals `sink.len()` — that invariant
@@ -306,6 +318,19 @@ fn run_audio_thread(
                     marks.clear();
                     last_front = None;
                     pending_done = None;
+                    // Reset the amplitude ring too. It still holds up to 1 s
+                    // of the just-stopped utterance; without this the avatar /
+                    // visualizer reads those stale samples at the start of the
+                    // next utterance (the streamer gates on `is_playing()`,
+                    // which flips true before the new source's first batch
+                    // reaches the ring) and briefly lip-syncs to old audio.
+                    if let Ok(mut ring) = amplitude.write() {
+                        ring.clear();
+                    }
+                    // The sink was just emptied; rebase the drain tracker so the
+                    // next tick doesn't see a phantom drop (`len < prev_len`) and
+                    // pop marks belonging to a freshly-enqueued selection.
+                    prev_len = 0;
                 }
                 AudioCommand::SetVolume(v) => sink.set_volume(v),
                 AudioCommand::SetPaused(paused) => {
@@ -374,26 +399,58 @@ fn run_audio_thread(
         }
 
         let now_speaking = !sink.empty();
-        if now_speaking && !speaking {
-            speaking = true;
-            playing.store(true, Ordering::Relaxed);
-            // Remember which tab owns this stretch of speech so the matching
-            // stop edge is tagged with the SAME tab. Switching tabs mid-speech
-            // no longer stops audio (only Esc does), so reading `current_active`
-            // at the stop edge could tag the wrong tab and leave the speaking
-            // tab's avatar pinned in Speaking.
-            let tab = current_active(&active);
-            speaking_tab = Some(tab.clone());
-            let _ = state_signals.try_send(StateSignal::TtsPlaybackStarted { tab });
-        } else if !now_speaking && speaking {
-            speaking = false;
-            playing.store(false, Ordering::Relaxed);
-            let tab = speaking_tab.take().unwrap_or_else(|| current_active(&active));
-            let _ = state_signals.try_send(StateSignal::TtsPlaybackStopped { tab });
-            // Wake any task waiting on the next idle edge. `playing` is
-            // already false above, so a `try_drain` running on this notify
-            // will see `is_playing() == false` and proceed.
+        // `playing` is authoritative and cheap — keep it exact every tick so a
+        // `try_drain` sees the truth immediately, regardless of whether the
+        // avatar edge below has been delivered yet. Notify idle waiters on the
+        // true→false transition.
+        let was_playing = playing.swap(now_speaking, Ordering::Relaxed);
+        if was_playing && !now_speaking {
             idle_notify.notify_waiters();
+        }
+
+        // Deliver the avatar Started/Stopped edges WITHOUT blocking this loop —
+        // this is the only thread servicing the command queue (Esc/StopAll,
+        // volume, pause), so a blocking_send into a transiently-full
+        // `state_signals` would freeze all audio control. We also must not
+        // *drop* the Stopped edge (it would pin the avatar in Speaking), so we
+        // retry on the next poll tick: `speaking` only advances once the edge
+        // actually lands. The local state never sends an unbalanced edge, so a
+        // Started that never delivered means no Stopped is owed.
+        // Latch an owed Started on the idle→speaking edge. Remember which tab
+        // owns this stretch of speech so the matching stop edge is tagged with
+        // the SAME tab (tab switches mid-speech no longer stop audio, so reading
+        // `current_active` at the stop edge could mis-tag it).
+        if now_speaking && !speaking && pending_start.is_none() {
+            pending_start = Some(current_active(&active));
+        }
+        // Deliver the owed Started even if the audio has since drained (a short
+        // utterance under channel backpressure) — otherwise the avatar never
+        // animates for that read. The Stopped edge below then fires once
+        // `now_speaking` is false.
+        if let Some(tab) = pending_start.clone() {
+            match state_signals.try_send(StateSignal::TtsPlaybackStarted { tab: tab.clone() }) {
+                Ok(()) | Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                    speaking = true;
+                    speaking_tab = Some(tab);
+                    pending_start = None;
+                }
+                // Full: keep the latch and retry on the next tick.
+                Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
+            }
+        }
+        if !now_speaking && speaking {
+            let tab = speaking_tab.clone().unwrap_or_else(|| current_active(&active));
+            match state_signals.try_send(StateSignal::TtsPlaybackStopped { tab }) {
+                Ok(()) => {
+                    speaking = false;
+                    speaking_tab = None;
+                }
+                Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                    speaking = false;
+                    speaking_tab = None;
+                }
+                Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
+            }
         }
     }
     debug!("audio thread exiting");
@@ -402,14 +459,22 @@ fn run_audio_thread(
 }
 
 /// Source that streams f32 mono samples to rodio while mirroring each one
-/// into the amplitude ring buffer. Brief lock per sample; if it ever becomes
-/// a contention point, swap for a lock-free ring.
+/// into the amplitude ring buffer. The ring write is *batched*: taking the
+/// `RwLock::write()` once per sample inside rodio's real-time mixer callback
+/// (24 kHz) lets the waveform reader momentarily stall the audio driver and
+/// cause xruns. We accumulate samples locally and flush every `BATCH` of them
+/// (≈5 ms at 24 kHz) under a single lock acquisition instead.
 struct TappedSource {
     samples: std::vec::IntoIter<f32>,
     sample_rate: u32,
     remaining: usize,
     amplitude: Arc<RwLock<RingBuffer>>,
+    batch: Vec<f32>,
 }
+
+/// Samples buffered before one batched lock acquisition flushes them to the
+/// amplitude ring. ~5 ms of audio at 24 kHz.
+const AMPLITUDE_BATCH: usize = 128;
 
 impl TappedSource {
     fn new(samples: Vec<f32>, sample_rate: u32, amplitude: Arc<RwLock<RingBuffer>>) -> Self {
@@ -419,7 +484,22 @@ impl TappedSource {
             sample_rate,
             remaining,
             amplitude,
+            batch: Vec::with_capacity(AMPLITUDE_BATCH),
         }
+    }
+
+    /// Push the locally-buffered samples into the amplitude ring under one
+    /// lock, then clear the buffer. No-op when the buffer is empty.
+    fn flush_amplitude(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        if let Ok(mut ring) = self.amplitude.write() {
+            for &s in &self.batch {
+                ring.push(s);
+            }
+        }
+        self.batch.clear();
     }
 }
 
@@ -427,10 +507,18 @@ impl Iterator for TappedSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<f32> {
-        let s = self.samples.next()?;
+        let s = match self.samples.next() {
+            Some(s) => s,
+            None => {
+                // End of stream: flush any partial batch so the tail isn't lost.
+                self.flush_amplitude();
+                return None;
+            }
+        };
         self.remaining = self.remaining.saturating_sub(1);
-        if let Ok(mut ring) = self.amplitude.write() {
-            ring.push(s);
+        self.batch.push(s);
+        if self.batch.len() >= AMPLITUDE_BATCH {
+            self.flush_amplitude();
         }
         Some(s)
     }
@@ -454,6 +542,11 @@ impl Source for TappedSource {
     }
 
     fn total_duration(&self) -> Option<Duration> {
+        if self.sample_rate == 0 {
+            // Unknown duration rather than a divide-by-zero: `secs` would be
+            // infinite and `Duration::from_secs_f64` panics on a non-finite.
+            return None;
+        }
         let secs = self.remaining as f64 / self.sample_rate as f64;
         Some(Duration::from_secs_f64(secs))
     }

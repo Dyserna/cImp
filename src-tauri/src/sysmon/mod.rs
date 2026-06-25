@@ -94,23 +94,34 @@ impl SystemStatsState {
 
     pub fn sample(&self) -> SystemStatsSnapshot {
         let (cpu_pct, mem_pct, net) = {
-            let mut guard = self.inner.lock().expect("sysmon mutex poisoned");
+            // Recover from a poisoned lock rather than panicking the caller
+            // (this runs on an IPC thread): the stats are advisory, and a prior
+            // panic mid-refresh leaves the data merely stale, not unsafe.
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
             guard.sys.refresh_cpu_usage();
-            let cpu_pct = guard.sys.global_cpu_usage();
+            // Clamp to [0,100]: `global_cpu_usage` can momentarily exceed 100
+            // (sum-of-cores rounding) and the first sample right after the
+            // priming refresh can report a spurious value, both of which would
+            // otherwise spike the frontend sparkline.
+            let cpu_pct = guard.sys.global_cpu_usage().clamp(0.0, 100.0);
 
             guard.sys.refresh_memory();
             let total = guard.sys.total_memory();
             let used = guard.sys.used_memory();
             let mem_pct = if total > 0 {
-                (used as f32 / total as f32) * 100.0
+                ((used as f32 / total as f32) * 100.0).clamp(0.0, 100.0)
             } else {
                 0.0
             };
 
             // `received()`/`transmitted()` are bytes since the previous
             // refresh; divide by elapsed wall time for a stable bytes/sec.
-            guard.networks.refresh(false);
+            // `refresh(true)` re-scans the interface list each tick so
+            // interfaces that appear mid-session (VPN up, USB tethering) are
+            // counted and ones that vanish stop contributing a stale delta —
+            // `refresh(false)` only updates already-known interfaces.
+            guard.networks.refresh(true);
             let elapsed = guard.last_net.elapsed().as_secs_f64().max(0.001);
             guard.last_net = Instant::now();
             let (mut down, mut up) = (0u64, 0u64);
@@ -143,12 +154,12 @@ impl SystemStatsState {
         let mem = dev.memory_info().ok()?;
         let temp = dev.temperature(TemperatureSensor::Gpu).ok()?;
         let mem_pct = if mem.total > 0 {
-            (mem.used as f32 / mem.total as f32) * 100.0
+            ((mem.used as f32 / mem.total as f32) * 100.0).clamp(0.0, 100.0)
         } else {
             0.0
         };
         Some(GpuStats {
-            util_pct: util.gpu as f32,
+            util_pct: (util.gpu as f32).clamp(0.0, 100.0),
             mem_pct,
             temp_c: temp as f32,
         })

@@ -136,7 +136,23 @@ impl Loopback {
 
     /// Remove the discovery file (graceful exit / disable). The accept task
     /// is detached and dies with the process.
+    ///
+    /// Only removes the file if it still belongs to *this* process. The
+    /// discovery path is shared per exe-dir, so a second app instance can
+    /// overwrite it with its own port/token/pid; deleting that on our exit
+    /// would leave the surviving instance undiscoverable to its offload
+    /// children. (The start-time clobber itself is inherent to running two
+    /// instances from one install and is left as last-writer-wins.)
     pub fn stop(&self) {
+        if let Some(d) = read_discovery() {
+            if d.pid != std::process::id() {
+                debug!(
+                    owner_pid = d.pid,
+                    "offload loopback: discovery file owned by another instance; not removing"
+                );
+                return;
+            }
+        }
         if let Err(e) = std::fs::remove_file(&self.discovery) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 debug!(error = %e, "offload loopback: discovery cleanup failed");
@@ -169,6 +185,10 @@ struct RunBody {
     thinking: Option<String>,
     #[serde(default)]
     tier: Option<String>,
+    /// The calling session's working directory (the repo Claude Code runs in),
+    /// used as the native-tool root when no explicit `allowed_roots` is set.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// A `POST /run` response.
@@ -282,7 +302,13 @@ async fn handle_conn(
     service: Arc<OffloadService>,
     token: String,
 ) -> AppResult<()> {
-    let req = read_request(&mut stream).await?;
+    // Cap how long we'll wait for a complete request: a half-open or idle
+    // connection (TCP probe, crashed child holding the socket) would otherwise
+    // wedge this handler task forever, leaking one task per such connection.
+    let req = match tokio::time::timeout(Duration::from_secs(30), read_request(&mut stream)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(AppError::Offload("request read timed out".into())),
+    };
 
     if !authorized(&req, &token) {
         write_simple(&mut stream, 401, "text/plain", b"unauthorized").await?;
@@ -330,7 +356,10 @@ async fn handle_run(
     let thinking = ThinkingMode::parse(body.thinking.as_deref().unwrap_or("auto"));
     let tier = TierHint::parse(body.tier.as_deref().unwrap_or("auto"));
 
-    let result = service.run(body.instructions, body.context, thinking, tier).await;
+    let session_cwd = body.cwd.map(std::path::PathBuf::from);
+    let result = service
+        .run(body.instructions, body.context, thinking, tier, session_cwd)
+        .await;
     let r = match result {
         Ok(text) => RunResult {
             ok: true,

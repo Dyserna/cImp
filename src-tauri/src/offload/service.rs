@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -96,10 +97,20 @@ pub struct OffloadService {
     host: Arc<McpHost>,
     /// Total offloads in flight across the whole app.
     global_gate: Arc<Semaphore>,
-    global_cap: u32,
+    /// Current global cap. Atomic because it's reconciled at runtime when the
+    /// user changes backends / `global_concurrency` (see `reconcile_global_cap`),
+    /// alongside resizing `global_gate`'s permits.
+    global_cap: AtomicU32,
     /// Warm remote backend handles, keyed by backend name (so `in_flight`
     /// persists across calls). Rebuilt when a backend's config changes.
     remote_pool: TokioMutex<HashMap<String, Arc<RemoteBackend>>>,
+    /// Transient local handles for servers NOT managed by our supervisor
+    /// (e.g. a llama-server the user launched themselves), keyed by backend
+    /// name. Cached for the same reason as `remote_pool`: a fresh handle per
+    /// call resets its slot gate, so `in_flight` would always read 0 and the
+    /// router would never see the backend as busy. Rebuilt when the base URL
+    /// changes.
+    local_pool: TokioMutex<HashMap<String, Arc<LlamaServer>>>,
     /// Long-timeout client for the agent loop's chat-completions calls
     /// (health/`/props` probes use each handle's own short-timeout client).
     client: reqwest::Client,
@@ -136,8 +147,9 @@ impl OffloadService {
             supervisor,
             host,
             global_gate: Arc::new(Semaphore::new(global_cap as usize)),
-            global_cap,
+            global_cap: AtomicU32::new(global_cap),
             remote_pool: TokioMutex::new(HashMap::new()),
+            local_pool: TokioMutex::new(HashMap::new()),
             client,
             change_tx,
             app,
@@ -173,7 +185,38 @@ impl OffloadService {
     /// Total offloads currently in flight across the app (global gate).
     pub fn global_in_flight(&self) -> u32 {
         self.global_cap
+            .load(Ordering::Relaxed)
             .saturating_sub(self.global_gate.available_permits() as u32)
+    }
+
+    /// Bring `global_gate`/`global_cap` in line with current config. The gate
+    /// is sized once at construction, but the user can add/remove backends or
+    /// change `global_concurrency` at runtime; without this the app-wide cap
+    /// stays frozen at the startup value until restart. Grows by adding
+    /// permits; shrinks by acquiring+forgetting the excess as it frees.
+    fn reconcile_global_cap(self: &Arc<Self>, snap: &OffloadSettings) {
+        let target = compute_global_cap(snap);
+        let current = self.global_cap.load(Ordering::Relaxed);
+        if target == current {
+            return;
+        }
+        self.global_cap.store(target, Ordering::Relaxed);
+        if target > current {
+            self.global_gate.add_permits((target - current) as usize);
+        } else {
+            // Reclaim the excess permits as in-flight tasks release them.
+            let remove = (current - target) as usize;
+            let gate = self.global_gate.clone();
+            tauri::async_runtime::spawn(async move {
+                for _ in 0..remove {
+                    match gate.clone().acquire_owned().await {
+                        Ok(p) => p.forget(),
+                        Err(_) => break, // semaphore closed
+                    }
+                }
+            });
+        }
+        tracing::debug!(from = current, to = target, "offload: resized global gate");
     }
 
     /// Bring the warm MCP host in line with current config. Cheap when the
@@ -193,7 +236,7 @@ impl OffloadService {
     pub async fn status(&self) -> ServiceStatus {
         ServiceStatus {
             global_in_flight: self.global_in_flight(),
-            global_cap: self.global_cap,
+            global_cap: self.global_cap.load(Ordering::Relaxed),
             mcp_servers: self.host.health().await,
         }
     }
@@ -208,6 +251,12 @@ impl OffloadService {
         context: Option<String>,
         thinking: ThinkingMode,
         tier: TierHint,
+        // The working directory of the *calling session* (the repo Claude Code
+        // is running in), forwarded by the MCP child over the loopback. Used as
+        // the native-tool root when no explicit `allowed_roots` is configured,
+        // so an offload from a session in repo A reads repo A — not the app's
+        // own launch directory. `None` falls back to the app's cwd.
+        session_cwd: Option<PathBuf>,
     ) -> AppResult<String> {
         let snap = self.settings.current().offload;
         if !snap.enabled {
@@ -230,7 +279,7 @@ impl OffloadService {
             Err(_) => {
                 return Err(AppError::OffloadNotReady(format!(
                     "all {} global offload slots busy — timed out after {}s",
-                    self.global_cap,
+                    self.global_cap.load(Ordering::Relaxed),
                     timeout.as_secs()
                 )))
             }
@@ -276,7 +325,7 @@ impl OffloadService {
         );
 
         let result = self
-            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, overall_deadline)
+            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), overall_deadline)
             .await;
 
         // One fail-over on a connection-class failure: drop the failed
@@ -293,7 +342,7 @@ impl OffloadService {
                             reroute = %pool[next].name,
                             "offload: re-routing after connection failure (app service)"
                         );
-                        self.run_on(&pool[next], &views[next], &snap, &instructions, context, thinking, overall_deadline)
+                        self.run_on(&pool[next], &views[next], &snap, &instructions, context, thinking, session_cwd, overall_deadline)
                             .await
                     }
                     _ => Err(e),
@@ -314,17 +363,23 @@ impl OffloadService {
         instructions: &str,
         context: Option<String>,
         thinking: ThinkingMode,
+        session_cwd: Option<PathBuf>,
         deadline: Instant,
     ) -> AppResult<String> {
         let slot_timeout = deadline.saturating_duration_since(Instant::now());
         let _slot = entry.handle.acquire_slot(slot_timeout).await?;
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let ctx = ToolCtx::new(
-            effective_roots(snap),
-            snap.command_allowlist.clone(),
-            &cwd,
-        );
+        // Prefer the calling session's cwd (forwarded over the loopback) so
+        // tool resolution and the empty-`allowed_roots` fallback target the
+        // repo Claude is actually in, not the app's launch dir.
+        let cwd = session_cwd
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let roots = if snap.allowed_roots.is_empty() {
+            vec![cwd.clone()]
+        } else {
+            snap.allowed_roots.clone()
+        };
+        let ctx = ToolCtx::new(roots, snap.command_allowlist.clone(), &cwd);
         let native_defs = tools::enabled_defs(&snap.tools);
         let mcp_defs = self.host.tool_defs().await;
         let router = HostRouter::new(
@@ -443,11 +498,25 @@ impl OffloadService {
             });
         }
         // Try a transient handle for a server the user may have launched
-        // themselves (or one already warming from a prior offload).
-
-        let transient = Arc::new(
-            LlamaServer::with_config(&b.name, server_command, b.tier, b.tool_scope.clone()).ok()?,
-        );
+        // themselves (or one already warming from a prior offload). Cache it by
+        // name (reused while the base URL is unchanged) so its slot gate — and
+        // thus `in_flight` — persists across calls; a fresh handle each time
+        // would always report 0 in-flight and the router would never throttle.
+        let transient = {
+            let mut pool = self.local_pool.lock().await;
+            let reuse = pool.get(&b.name).filter(|h| h.base_url() == base_url);
+            match reuse {
+                Some(h) => h.clone(),
+                None => {
+                    let h = Arc::new(
+                        LlamaServer::with_config(&b.name, server_command, b.tier, b.tool_scope.clone())
+                            .ok()?,
+                    );
+                    pool.insert(b.name.clone(), h.clone());
+                    h
+                }
+            }
+        };
         let ready = transient.health_check().await;
         if ready {
             let _ = transient.refresh_props().await;
@@ -713,7 +782,7 @@ impl OffloadService {
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 let snap = this.settings.current().offload;
                 let in_flight = this.global_in_flight();
-                let cap = this.global_cap;
+                let cap = this.global_cap.load(Ordering::Relaxed);
 
                 let mut rows: Vec<BackendDashboard> = Vec::new();
                 if snap.enabled {
@@ -748,6 +817,9 @@ impl OffloadService {
             loop {
                 tokio::time::sleep(Duration::from_secs(12)).await;
                 let snap = this.settings.current().offload;
+                // Keep the app-wide gate sized to current config (backends or
+                // global_concurrency may have changed since startup).
+                this.reconcile_global_cap(&snap);
                 if !snap.enabled {
                     last.clear();
                     continue;

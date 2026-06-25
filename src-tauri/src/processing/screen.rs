@@ -19,6 +19,20 @@ use vte::{Params, Perform};
 
 use crate::processing::tags::{build_rendered, TagScanner};
 
+/// Hard ceiling on the cell-row buffer. Rows beyond this scroll off the top
+/// (oldest first), mirroring a terminal's scrollback limit. Bounds memory for
+/// long sessions and caps a single oversized cursor-down (`\x1b[65535B`) to one
+/// bounded allocation instead of 65 536 rows. Tail-based readers
+/// (`recent_rendered`, `build_rendered`) only ever look near the bottom, so
+/// dropping old rows is invisible to them.
+const MAX_ROWS: usize = 5_000;
+
+/// Hard ceiling on columns per row. Real terminals are a few hundred columns
+/// wide; this is far beyond any genuine width but small enough that a hostile
+/// `\x1b[<huge>C` (cursor-forward) followed by a printable char can't make a
+/// row's cell `Vec` balloon to billions of entries and OOM the process.
+const MAX_COLS: usize = 2_000;
+
 #[derive(Debug, Clone)]
 pub struct Cell {
     pub ch: char,
@@ -31,12 +45,17 @@ pub struct Row {
 
 impl Row {
     fn ensure_col(&mut self, col: usize) {
-        while self.cells.len() <= col {
+        let target = col.min(MAX_COLS - 1);
+        while self.cells.len() <= target {
             self.cells.push(None);
         }
     }
 
     fn put(&mut self, col: usize, cell: Cell) {
+        // Backstop against unbounded column growth: clamp the index so the
+        // cells `Vec` can never exceed MAX_COLS regardless of how far the
+        // cursor was advanced.
+        let col = col.min(MAX_COLS - 1);
         self.ensure_col(col);
         self.cells[col] = Some(cell);
     }
@@ -124,7 +143,12 @@ impl Screen {
         let mut total: usize = 0;
         for row in self.rows.iter().rev() {
             let line = row.rendered();
-            total += line.len() + 1;
+            // Count characters, not bytes: Claude's prompt chrome is full of
+            // multibyte glyphs (─ · ↑ ↓ em-dashes), and `String::len()` (bytes)
+            // would overcount by up to 3× per glyph, shrinking the captured tail
+            // to far fewer visible rows than `max_chars` implies and pushing a
+            // multi-row permission prompt's marker out of the window.
+            total += line.chars().count() + 1;
             parts.push(line);
             if total >= max_chars {
                 break;
@@ -146,6 +170,27 @@ impl Screen {
         &self.raw_buffer
     }
 
+    /// Number of leading raw bytes already emitted to the terminal. The
+    /// processing layer pairs this with the scanner's read cursor to decide
+    /// how much of `raw_buffer` is safe to drop.
+    pub fn emitted_offset(&self) -> usize {
+        self.raw_emitted_offset
+    }
+
+    /// Drop the leading `watermark` raw bytes (clamped to the emit cursor) and
+    /// rebase `raw_emitted_offset`. The caller is responsible for rebasing the
+    /// scanner's `scan_offset` by the SAME amount — both are absolute offsets
+    /// into `raw_buffer`. Returns the number of bytes actually dropped.
+    pub fn compact_raw(&mut self, watermark: usize) -> usize {
+        let drop = watermark.min(self.raw_emitted_offset);
+        if drop == 0 {
+            return 0;
+        }
+        self.raw_buffer.drain(..drop);
+        self.raw_emitted_offset -= drop;
+        drop
+    }
+
     /// Push raw bytes into the parser. Each byte is mirrored into `raw_buffer`
     /// before being advanced through `vte::Parser` so the Performer callbacks
     /// observe a consistent view of "bytes-so-far."
@@ -156,16 +201,33 @@ impl Screen {
         }
     }
 
-    fn ensure_row(&mut self, row: usize) {
+    /// Ensure row `row` exists, scrolling the oldest rows off the top if `row`
+    /// would push the buffer past [`MAX_ROWS`]. Returns the (possibly rebased)
+    /// row index to actually use — callers must use the return value, since a
+    /// scroll shifts every absolute row index down by the number dropped.
+    fn ensure_row(&mut self, row: usize) -> usize {
+        if row >= MAX_ROWS {
+            // Scroll: drop the oldest rows so the target lands at MAX_ROWS-1.
+            let drop = (row + 1 - MAX_ROWS).min(self.rows.len());
+            self.rows.drain(..drop);
+            self.cursor_row = self.cursor_row.saturating_sub(drop);
+            if let Some((r, c)) = self.saved_cursor {
+                self.saved_cursor = Some((r.saturating_sub(drop), c));
+            }
+            while self.rows.len() < MAX_ROWS {
+                self.rows.push(Row::default());
+            }
+            return MAX_ROWS - 1;
+        }
         while self.rows.len() <= row {
             self.rows.push(Row::default());
         }
+        row
     }
 
     fn move_cursor(&mut self, row: usize, col: usize) {
-        self.ensure_row(row);
-        self.cursor_row = row;
-        self.cursor_col = col;
+        self.cursor_row = self.ensure_row(row);
+        self.cursor_col = col.min(MAX_COLS);
     }
 
     /// Try to drain `raw_buffer` to a `Vec<u8>` of bytes safe to forward to
@@ -273,15 +335,17 @@ impl Perform for Screen {
         let row = self.cursor_row;
         let col = self.cursor_col;
         self.rows[row].put(col, cell);
-        self.cursor_col = col + 1;
+        self.cursor_col = (col + 1).min(MAX_COLS);
     }
 
     fn execute(&mut self, byte: u8) {
         match byte {
             b'\n' => {
-                let new_row = self.cursor_row + 1;
-                self.ensure_row(new_row);
-                self.cursor_row = new_row;
+                // Use the row ensure_row returns: past MAX_ROWS it scrolls and
+                // rebases indices, so assigning the raw `cursor_row + 1` would
+                // leave the cursor one past the end and panic the next erase CSI
+                // (`'K'`/`'J'` index `rows[cursor_row]` directly).
+                self.cursor_row = self.ensure_row(self.cursor_row + 1);
                 // \n alone: cursor down, column unchanged. TUIs commonly emit \r\n.
             }
             b'\r' => {
@@ -297,7 +361,7 @@ impl Perform for Screen {
             }
             b'\t' => {
                 // HT: advance to next tab stop (every 8 cols).
-                self.cursor_col = (self.cursor_col / 8 + 1) * 8;
+                self.cursor_col = ((self.cursor_col / 8 + 1) * 8).min(MAX_COLS);
             }
             _ => {}
         }
@@ -326,7 +390,7 @@ impl Perform for Screen {
             }
             'C' | 'a' => {
                 let n = p(0, 1) as usize;
-                self.cursor_col += n;
+                self.cursor_col = self.cursor_col.saturating_add(n).min(MAX_COLS);
             }
             'D' => {
                 let n = p(0, 1) as usize;
@@ -417,5 +481,57 @@ impl Perform for Screen {
 impl Default for Screen {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_cursor_down_allocates_bounded_rows() {
+        let mut s = Screen::new();
+        let mut p = vte::Parser::new();
+        // A single huge CUD must not allocate 65k rows.
+        s.feed(&mut p, b"\x1b[65535B");
+        assert!(s.rows().len() <= MAX_ROWS, "rows={}", s.rows().len());
+        assert!(s.cursor_row < MAX_ROWS);
+    }
+
+    #[test]
+    fn scrolling_bounds_rows_and_keeps_recent_content() {
+        let mut s = Screen::new();
+        let mut p = vte::Parser::new();
+        let total = MAX_ROWS + 500;
+        for i in 0..total {
+            s.feed(&mut p, format!("line{i}\r\n").as_bytes());
+        }
+        // Buffer stayed bounded despite far more lines than the cap.
+        assert!(s.rows().len() <= MAX_ROWS, "rows={}", s.rows().len());
+        // The most recently printed line survived the scroll.
+        let tail = s.recent_rendered(4096);
+        assert!(
+            tail.contains(&format!("line{}", total - 1)),
+            "recent tail missing newest line"
+        );
+        // The oldest line scrolled off the top.
+        assert!(!tail.contains("line0\n") && !tail.ends_with("line0"));
+    }
+
+    #[test]
+    fn erase_csi_after_scroll_overflow_does_not_panic() {
+        let mut s = Screen::new();
+        let mut p = vte::Parser::new();
+        // Push the cursor well past MAX_ROWS with bare newlines, then issue
+        // erase-line / erase-display / a print. These index rows[cursor_row]
+        // directly, so an un-rebased cursor would panic out of bounds.
+        for _ in 0..(MAX_ROWS + 50) {
+            s.feed(&mut p, b"\n");
+        }
+        s.feed(&mut p, b"\x1b[K"); // erase to end of line at cursor
+        s.feed(&mut p, b"\x1b[2J"); // erase whole display
+        s.feed(&mut p, b"text after overflow\r\n");
+        assert!(s.cursor_row < MAX_ROWS);
+        assert!(s.rows().len() <= MAX_ROWS);
     }
 }

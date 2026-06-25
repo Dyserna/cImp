@@ -98,6 +98,19 @@ pub fn migrate_if_needed(
         }
     }
 
+    // Fixpoint guard. A correct cascade leaves the value stamped at the current
+    // schema. If a future detector-ordering mistake leaves it under-migrated,
+    // this surfaces loudly instead of silently writing back a stale file that
+    // re-migrates (and regenerates a backup) on every launch.
+    let final_version = value.get("schema_version").and_then(|v| v.as_u64());
+    if final_version != Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64) {
+        tracing::error!(
+            ?final_version,
+            expected = crate::settings::schema::CURRENT_SCHEMA_VERSION,
+            "settings migration: cascade did not reach the current schema version"
+        );
+    }
+
     Ok(true)
 }
 

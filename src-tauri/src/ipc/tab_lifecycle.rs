@@ -395,9 +395,14 @@ pub async fn close_tab(
             });
         }
         if registry.active() == tab {
-            if let Some(target) = registry.previous_tab(&tab) {
+            // Prefer the left neighbor; if this is the leftmost tab (a closable
+            // non-builtin can legitimately be at index 0 once AI builtins are
+            // disabled), fall back to the right neighbor so `active` never
+            // dangles at the just-removed tab.
+            let target = registry.previous_tab(&tab).or_else(|| registry.next_tab(&tab));
+            if let Some(target) = target {
                 if let Err(e) = registry.activate(target).await {
-                    warn!(error = %e, "close_tab: activate previous failed");
+                    warn!(error = %e, "close_tab: activate neighbor failed");
                 }
             }
         }
@@ -415,6 +420,14 @@ pub async fn close_tab(
     // with the user's mental model.
     if let Err(e) = crate::pty::scrollback::delete(&tab) {
         warn!(?tab, error = %e, "close_tab: scrollback delete failed");
+    }
+
+    // Drop the closed tab's typed-input echo buffer. Other per-tab maps
+    // (input_lengths, settings, scrollback) are cleaned up on close; without
+    // this one a long session that opens/closes many tabs slowly leaks one
+    // map entry per closed tab.
+    if let Ok(mut buf) = state.user_input_buf.lock() {
+        buf.remove(&tab);
     }
 
     // Remove the settings entry. Drop the active_tab_id pointer if it

@@ -227,6 +227,11 @@ const LOCAL_SIGNALS: &[&str] = &[
     "grep", "function", "class", "module", "repo", "repository", "log file",
     "build", "compile", "unit test", "command", "run ", "git ", "diff", "blame",
     "callsite", "call site", "implementation", "codebase",
+    // Local-context phrases: a task scoped to the user's own project needs
+    // local tools even when it also mentions web-ish words (e.g. "summarize the
+    // documentation in this project"). Without these such a task matched only a
+    // WEB_SIGNAL and was wrongly routed cloud-eligible.
+    "project", "in this", "this repo", "this file", "our ", "the source",
 ];
 
 /// Keyword signals that a task is purely web/docs research — safe for a
@@ -449,6 +454,14 @@ mod tests {
     fn analyze_web_only_task_requires_no_local_tools() {
         let r = analyze_task("Search the web for the latest release notes of tokio", None, TierHint::Auto);
         assert!(r.required_tools.is_empty());
+    }
+
+    #[test]
+    fn analyze_local_task_with_web_word_stays_local() {
+        // Mentions "documentation" (a web signal) but is scoped to the local
+        // project — must require local tools, not be cloud-eligible.
+        let r = analyze_task("Summarize the documentation in this project", None, TierHint::Auto);
+        assert!(r.required_tools.contains(&"read_file".to_string()));
     }
 
     #[test]

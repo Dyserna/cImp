@@ -270,6 +270,12 @@ fn run_audio_thread(
     // mid-speech doesn't misattribute the stop (audio is no longer stopped on
     // tab switch — only Esc stops it).
     let mut speaking_tab: Option<TabId> = None;
+    // An owed-but-not-yet-delivered Started edge. Latched on the idle→speaking
+    // edge so that a very short utterance which drains before the edge can be
+    // delivered (channel transiently Full) still animates the avatar — without
+    // this, the start branch's retry could find `now_speaking` already false on
+    // the next tick and lose the Started/Stopped pair entirely.
+    let mut pending_start: Option<TabId> = None;
     // Selection-read progress: a per-source mark queue that mirrors the
     // rodio sink's FIFO. `None` entries stand in for ordinary AI/notification
     // audio so the deque length always equals `sink.len()` — that invariant
@@ -410,26 +416,29 @@ fn run_audio_thread(
         // retry on the next poll tick: `speaking` only advances once the edge
         // actually lands. The local state never sends an unbalanced edge, so a
         // Started that never delivered means no Stopped is owed.
-        if now_speaking && !speaking {
-            // Remember which tab owns this stretch of speech so the matching
-            // stop edge is tagged with the SAME tab (tab switches mid-speech no
-            // longer stop audio, so reading `current_active` at the stop edge
-            // could mis-tag it).
-            let tab = current_active(&active);
+        // Latch an owed Started on the idle→speaking edge. Remember which tab
+        // owns this stretch of speech so the matching stop edge is tagged with
+        // the SAME tab (tab switches mid-speech no longer stop audio, so reading
+        // `current_active` at the stop edge could mis-tag it).
+        if now_speaking && !speaking && pending_start.is_none() {
+            pending_start = Some(current_active(&active));
+        }
+        // Deliver the owed Started even if the audio has since drained (a short
+        // utterance under channel backpressure) — otherwise the avatar never
+        // animates for that read. The Stopped edge below then fires once
+        // `now_speaking` is false.
+        if let Some(tab) = pending_start.clone() {
             match state_signals.try_send(StateSignal::TtsPlaybackStarted { tab: tab.clone() }) {
-                Ok(()) => {
+                Ok(()) | Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
                     speaking = true;
                     speaking_tab = Some(tab);
+                    pending_start = None;
                 }
-                // Consumer gone: advance anyway so we don't spin retrying.
-                Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
-                    speaking = true;
-                    speaking_tab = Some(tab);
-                }
-                // Full: leave `speaking` false and retry on the next tick.
+                // Full: keep the latch and retry on the next tick.
                 Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
             }
-        } else if !now_speaking && speaking {
+        }
+        if !now_speaking && speaking {
             let tab = speaking_tab.clone().unwrap_or_else(|| current_active(&active));
             match state_signals.try_send(StateSignal::TtsPlaybackStopped { tab }) {
                 Ok(()) => {

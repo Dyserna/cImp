@@ -57,19 +57,24 @@ impl ToolCtx {
     /// the right behavior — offload is read-only.
     pub fn confine(&self, requested: &str) -> Result<PathBuf, String> {
         let raw = PathBuf::from(requested);
-        // Resolve relative paths against the first root.
-        let joined = if raw.is_absolute() {
-            raw
+        // Candidate locations: an absolute request as-is, else the request
+        // resolved against EACH root — a relative path may legitimately live
+        // under any configured root, not just the first.
+        let candidates: Vec<PathBuf> = if raw.is_absolute() {
+            vec![raw]
         } else {
-            self.allowed_roots[0].join(raw)
+            self.allowed_roots.iter().map(|r| r.join(&raw)).collect()
         };
-        let canon = joined
-            .canonicalize()
-            .map_err(|e| format!("cannot access `{requested}`: {e}"))?;
-        for root in &self.allowed_roots {
-            if let Ok(root_canon) = root.canonicalize() {
-                if canon.starts_with(&root_canon) {
-                    return Ok(canon);
+        for cand in candidates {
+            let canon = match cand.canonicalize() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for root in &self.allowed_roots {
+                if let Ok(root_canon) = root.canonicalize() {
+                    if canon.starts_with(&root_canon) {
+                        return Ok(canon);
+                    }
                 }
             }
         }

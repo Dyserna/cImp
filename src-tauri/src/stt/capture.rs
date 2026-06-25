@@ -216,7 +216,11 @@ where
                     for &s in frame {
                         sum += f32::from_sample(s);
                     }
-                    scratch.push(sum * inv);
+                    // Clamp non-finite samples to silence at the source so a
+                    // misbehaving device can't poison Whisper input, the RMS
+                    // meter, or the amplitude IPC (NaN isn't valid JSON).
+                    let mono = sum * inv;
+                    scratch.push(if mono.is_finite() { mono } else { 0.0 });
                 }
                 if let Ok(mut buf) = accumulator.lock() {
                     // Hard cap (~10 min at 48 kHz) so a session left recording

@@ -450,26 +450,22 @@ impl NotificationManager {
                 warn!(error = %e, "notifications: tts channel closed");
                 return;
             }
-            // Arm the echo-suppression guard. The audio thread tags its
-            // `TtsPlaybackStarted/Stopped` events with the *currently
-            // active* tab, not the notification's originating tab — so
-            // the `Idle → Speaking → Idle` cycle plays out on the active
-            // tab. In the common same-tab case the two are equal; in the
-            // cross-tab case (announcement for an inactive tab while
-            // `announce_focused_tab=true`) the active tab is the one
-            // whose echo would otherwise re-queue. Insert both so either
-            // surface gets suppressed.
-            // Arm one suppression on the originating tab and one on the active
-            // tab (the echo can surface on either). Skip the second when they're
-            // the same tab — otherwise the common same-tab case arms 2 for a
-            // single playback echo, and the leftover count silences the next
-            // genuine Idle.
-            *self.just_dispatched.entry(tab.clone()).or_insert(0) += 1;
-            if let Ok(active) = self.active.read() {
-                if *active != tab {
-                    *self.just_dispatched.entry(active.clone()).or_insert(0) += 1;
-                }
-            }
+            // Arm the echo-suppression guard on the tab whose avatar will
+            // actually produce the playback echo. The audio thread tags its
+            // `TtsPlaybackStarted/Stopped` events with the *currently active*
+            // tab, not the notification's originating tab, so the
+            // `Idle → Speaking → Idle` cycle plays out on the active tab. In the
+            // common same-tab case that's the originating tab; in the cross-tab
+            // case (announcement for an inactive tab while
+            // `announce_focused_tab=true`) it's the active tab. Arm exactly that
+            // one — arming the originating tab too would, in the cross-tab case,
+            // leave a count that no echo ever consumes, which then silences the
+            // next genuine Idle notification on that inactive tab.
+            let echo_tab = match self.active.read() {
+                Ok(active) => active.clone(),
+                Err(_) => tab.clone(),
+            };
+            *self.just_dispatched.entry(echo_tab).or_insert(0) += 1;
         }
     }
 }

@@ -192,9 +192,18 @@ impl TtsEngine {
             .try_extract_tensor::<f32>()
             .map_err(|e| AppError::Tts(format!("extract output: {e}")))?;
 
+        // Sanitize non-finite samples. A corrupt model or a silent EP fallback
+        // can emit NaN/inf, which clicks in the sink, poisons RMS metering
+        // (sumsq += NaN stays NaN), and serializes as invalid JSON over the
+        // amplitude IPC (NaN/Infinity aren't valid JSON). Clamp to silence.
+        let samples: Vec<f32> = samples
+            .iter()
+            .map(|&s| if s.is_finite() { s } else { 0.0 })
+            .collect();
+
         Ok(SynthesisResponse {
             request_id: req.request_id,
-            samples: samples.to_vec(),
+            samples,
             sample_rate: SAMPLE_RATE,
         })
     }

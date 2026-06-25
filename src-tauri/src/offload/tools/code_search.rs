@@ -21,8 +21,12 @@ const DEFAULT_MAX_RESULTS: usize = 100;
 const MAX_RESULTS_CAP: usize = 500;
 /// Skip files larger than this (likely binary/generated).
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
-/// Bound the walk so a huge tree can't hang the tool.
+/// Bound the number of files whose *content* we read+scan.
 const MAX_FILES_SCANNED: usize = 50_000;
+/// Bound the total directory entries *visited* (dirs + files of any suffix),
+/// so a `suffix`-filtered search over a huge tree of non-matching files (which
+/// never reach `MAX_FILES_SCANNED`) still can't walk forever.
+const MAX_ENTRIES_VISITED: usize = 1_000_000;
 const SNIPPET_MAX: usize = 240;
 
 const IGNORE_DIRS: &[&str] = &[
@@ -82,6 +86,7 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     let result = tokio::task::spawn_blocking(move || {
         let mut hits: Vec<String> = Vec::new();
         let mut scanned = 0usize;
+        let mut visited = 0usize;
         let mut truncated = false;
         'outer: for root in &roots {
             let mut stack = vec![root.clone()];
@@ -91,6 +96,11 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
                     Err(_) => continue,
                 };
                 for entry in entries.flatten() {
+                    visited += 1;
+                    if visited > MAX_ENTRIES_VISITED {
+                        truncated = true;
+                        break 'outer;
+                    }
                     let path = entry.path();
                     let file_type = match entry.file_type() {
                         Ok(t) => t,

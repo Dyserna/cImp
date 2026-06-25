@@ -136,7 +136,23 @@ impl Loopback {
 
     /// Remove the discovery file (graceful exit / disable). The accept task
     /// is detached and dies with the process.
+    ///
+    /// Only removes the file if it still belongs to *this* process. The
+    /// discovery path is shared per exe-dir, so a second app instance can
+    /// overwrite it with its own port/token/pid; deleting that on our exit
+    /// would leave the surviving instance undiscoverable to its offload
+    /// children. (The start-time clobber itself is inherent to running two
+    /// instances from one install and is left as last-writer-wins.)
     pub fn stop(&self) {
+        if let Some(d) = read_discovery() {
+            if d.pid != std::process::id() {
+                debug!(
+                    owner_pid = d.pid,
+                    "offload loopback: discovery file owned by another instance; not removing"
+                );
+                return;
+            }
+        }
         if let Err(e) = std::fs::remove_file(&self.discovery) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 debug!(error = %e, "offload loopback: discovery cleanup failed");

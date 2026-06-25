@@ -56,6 +56,19 @@ const WRITE_VERBS: &[&str] = &[
     "clear", "purge", "apply", "checkout", "clone", "stage", "restore", "revert",
 ];
 
+/// Unambiguously-mutating leading verbs that essentially never appear as a noun
+/// in a read-only tool's name, so they disqualify a tool as the leading verb of
+/// *any* segment — not just the first two. This closes the gap where a mutating
+/// verb sits past the second segment (`repo_data_set_value`, `config_apply_patch`)
+/// and isn't destructive enough to be in [`HARD_WRITE_VERBS`]. Noun-ish verbs
+/// (`commit`, `merge`, `add`, `copy`, …) are deliberately NOT here — they stay
+/// first-two-only so reads like `get_latest_commit` aren't over-dropped.
+const ANYSEG_WRITE_VERBS: &[&str] = &[
+    "create", "mkdir", "update", "edit", "insert", "modify", "patch", "apply",
+    "append", "rename", "reset", "install", "uninstall", "publish", "upload",
+    "mutate", "set", "put",
+];
+
 /// The leading verb of one name segment: the leading lowercase run so
 /// camelCase (`searchWeb` → `search`) resolves, else the whole lowercased
 /// segment (`Get` → `get`).
@@ -150,6 +163,16 @@ fn is_read_class(name: &str) -> bool {
         return false;
     }
 
+    // Unambiguous mutation verbs disqualify as the leading verb of any segment.
+    let hits_anyseg = segments
+        .iter()
+        .any(|seg| ANYSEG_WRITE_VERBS.contains(&token_verb(seg).as_str()));
+    if hits_anyseg {
+        return false;
+    }
+
+    // Noun-ish write verbs only disqualify in the first two (category) segments,
+    // so a noun-verb later in the name (`get_latest_commit`) isn't over-dropped.
     segments
         .iter()
         .take(2)
@@ -879,6 +902,11 @@ mod tests {
         // (these are only checked in the first two segments, unchanged).
         for ok in ["get_latest_commit", "get_repo_merge_status", "list_all_user_sets"] {
             assert!(is_read_class(ok), "{ok} should be read-class");
+        }
+        // An unambiguous mutation verb past the second segment must drop, even
+        // though it isn't destructive enough to be a HARD verb.
+        for bad in ["repo_data_set_value", "config_apply_patch", "db_record_update", "file_meta_rename"] {
+            assert!(!is_read_class(bad), "{bad} should be filtered");
         }
     }
 

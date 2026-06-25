@@ -101,7 +101,7 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     //    deep-merge fills from the (already-migrated) global, and serde
     //    `#[serde(default)]` covers the rest.
     let custom_path = custom_path(launch_cwd);
-    let overlay_value = read_overlay(&custom_path);
+    let overlay_value = read_overlay(&custom_path, true);
 
     // 3. Merge the (now both-current-shape) global + overlay.
     let mut merged = match serde_json::to_value(&global) {
@@ -150,19 +150,24 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // writes machine-specific absolute avatar paths into the portable
     // per-folder overlay, pinning the avatar to the save-time theme.
     apply_portable_avatar_paths(&mut global);
+    // Apply the SAME idempotent integrity repairs to the baseline we return.
+    // This `global` is what the long-lived saver task (broadcaster) and every
+    // later `set()` diff the live (integrity-checked) settings against. Without
+    // it, repairs enforced only on `settings` (restored AI builtins, the
+    // materialized offload-server tab, canonical flags) read as user
+    // customizations on every save and leak into the portable per-folder
+    // overlay. The load-time post-repair save below relies on this too.
+    let _ = integrity_check(&mut global);
 
     if repaired {
         // Persist the post-repair state back to its source of truth. If a
         // custom overlay was in play, we recompute and rewrite the diff;
         // otherwise we rewrite global.
         if overlay_existed {
-            // Diff against a baseline that has had the SAME (idempotent)
-            // repairs applied, so invariants enforced on both sides (restored
-            // AI builtins, the offload server tab, canonical flags) don't get
-            // mistaken for user customizations and written into the overlay.
-            let mut baseline = global.clone();
-            let _ = integrity_check(&mut baseline);
-            if let Err(e) = save(&settings, launch_cwd, &baseline) {
+            // `global` is already integrity-checked (above), so invariants
+            // enforced on both sides don't get mistaken for user
+            // customizations and written into the overlay.
+            if let Err(e) = save(&settings, launch_cwd, &global) {
                 tracing::warn!(error = %e, "settings: post-repair save (custom) failed");
             }
         } else if let Err(e) = save_global(&settings) {
@@ -192,7 +197,7 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         Some(v) => v,
         None => return Settings::default(),
     };
-    if let Some(overlay) = read_overlay(&custom_path(launch_cwd)) {
+    if let Some(overlay) = read_overlay(&custom_path(launch_cwd), false) {
         deep_merge(&mut merged, overlay);
     }
     serde_json::from_value(merged).unwrap_or_default()
@@ -292,7 +297,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
 /// `None` if absent. On parse failure the file is quarantined and `None`
 /// is returned — we want the app to come up cleanly even if a hand-edit
 /// broke the overlay.
-fn read_overlay(path: &Path) -> Option<Value> {
+fn read_overlay(path: &Path, quarantine: bool) -> Option<Value> {
     if !path.exists() {
         return None;
     }
@@ -306,12 +311,23 @@ fn read_overlay(path: &Path) -> Option<Value> {
     match serde_json::from_str(&text) {
         Ok(v) => Some(v),
         Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "settings: parse overlay failed; quarantining"
-            );
-            migration::quarantine_corrupt_file(path);
+            // `quarantine` is false for the read-only child path
+            // (`load_readonly`), whose contract is no side effects — a child
+            // process must never move the user's overlay file.
+            if quarantine {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "settings: parse overlay failed; quarantining"
+                );
+                migration::quarantine_corrupt_file(path);
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "settings: parse overlay failed; ignoring (read-only load)"
+                );
+            }
             None
         }
     }

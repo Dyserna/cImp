@@ -558,7 +558,19 @@ async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u
         None => health,
     };
     let ready = match health.send().await {
-        Ok(r) => b.is_cloud || r.status().is_success(),
+        Ok(r) => {
+            let status = r.status();
+            if b.is_cloud {
+                // Cloud may lack /health (404/405 still proves reachability),
+                // but a bad token (401/403) or server error (5xx) means it's
+                // not actually usable — don't report it ready.
+                !(status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                    || status.is_server_error())
+            } else {
+                status.is_success()
+            }
+        }
         Err(_) => false,
     };
     if !ready {

@@ -154,6 +154,14 @@ impl TabRegistry {
         }
     }
 
+    /// The tab to `tab`'s right, or `None` if it's the last (or unknown).
+    /// Used as a fallback activation target when closing the leftmost tab,
+    /// which has no previous tab.
+    pub fn next_tab(&self, tab: &TabId) -> Option<TabId> {
+        let idx = self.tab_order.iter().position(|t| t == tab)?;
+        self.tab_order.get(idx + 1).cloned()
+    }
+
     /// Update the display name. Idempotent; does nothing if the tab is
     /// unknown or the name is the same.
     pub fn set_name(&mut self, tab: &TabId, name: &str) {
@@ -292,9 +300,12 @@ impl TabRegistry {
         // state manager clears the closed flag (no-op when the tab was
         // never closed — covers both first-mount and restart paths).
         if result.is_ok() && matches!(tab.kind(), TabKind::Shell) {
-            let _ = self
-                .state_signals
-                .try_send(StateSignal::ShellRestarted { tab });
+            // Backpressuring send (not try_send): a dropped ShellRestarted
+            // leaves the tab pinned in the "closed" overlay even though the PTY
+            // respawned. Safe to await — see the note in `activate`.
+            if let Err(e) = self.state_signals.send(StateSignal::ShellRestarted { tab }).await {
+                warn!(error = %e, "shell restart: state-signal channel closed");
+            }
         }
         result
     }
@@ -343,9 +354,12 @@ impl TabRegistry {
             )
             .await;
         if result.is_ok() && matches!(tab.kind(), TabKind::Shell) {
-            let _ = self
-                .state_signals
-                .try_send(StateSignal::ShellRestarted { tab });
+            // Backpressuring send (not try_send): a dropped ShellRestarted
+            // leaves the tab pinned in the "closed" overlay even though the PTY
+            // respawned. Safe to await — see the note in `activate`.
+            if let Err(e) = self.state_signals.send(StateSignal::ShellRestarted { tab }).await {
+                warn!(error = %e, "shell restart: state-signal channel closed");
+            }
         }
         result
     }
@@ -473,10 +487,14 @@ impl TabRegistry {
         self.active = tab.clone();
         info!(?prev, ?tab, "tab activated");
 
-        // Tell the state manager so it can broadcast ActiveTabChanged.
-        let _ = self
-            .state_signals
-            .try_send(StateSignal::TabActivated { tab });
+        // Tell the state manager so it can broadcast ActiveTabChanged. Use a
+        // backpressuring `send` (this fn is async and the manager never locks
+        // the registry, so it keeps draining): a dropped `TabActivated` under a
+        // rapid tab-switch burst would leave the manager's active pointer and
+        // `ActiveTabChanged` broadcast out of sync with the registry.
+        if let Err(e) = self.state_signals.send(StateSignal::TabActivated { tab }).await {
+            warn!(error = %e, "activate: state-signal channel closed");
+        }
 
         Ok(())
     }

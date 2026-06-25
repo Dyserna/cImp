@@ -309,9 +309,13 @@ pub async fn run(
         // gets compacted NOW, rather than one round later after the server has
         // already rejected the oversized request with a hard 400/500.
         if let Some(budget) = cfg.budget_tokens {
+            // Treat a missing OR zero `prompt_tokens` (some servers send
+            // `usage:{}`) as "no usable count" and fall back to a local
+            // estimate — a real prompt is never 0 tokens, and trusting the 0
+            // would defeat the projection and let the next step overflow.
             let sent = match usage {
-                Some(u) => u.prompt_tokens as usize,
-                None => estimate_tokens(&messages[..pre_len]),
+                Some(u) if u.prompt_tokens > 0 => u.prompt_tokens as usize,
+                _ => estimate_tokens(&messages[..pre_len]),
             };
             let appended = estimate_tokens(&messages[pre_len..]);
             let projected = sent.saturating_add(appended);

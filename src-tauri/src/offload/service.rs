@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -96,7 +97,10 @@ pub struct OffloadService {
     host: Arc<McpHost>,
     /// Total offloads in flight across the whole app.
     global_gate: Arc<Semaphore>,
-    global_cap: u32,
+    /// Current global cap. Atomic because it's reconciled at runtime when the
+    /// user changes backends / `global_concurrency` (see `reconcile_global_cap`),
+    /// alongside resizing `global_gate`'s permits.
+    global_cap: AtomicU32,
     /// Warm remote backend handles, keyed by backend name (so `in_flight`
     /// persists across calls). Rebuilt when a backend's config changes.
     remote_pool: TokioMutex<HashMap<String, Arc<RemoteBackend>>>,
@@ -143,7 +147,7 @@ impl OffloadService {
             supervisor,
             host,
             global_gate: Arc::new(Semaphore::new(global_cap as usize)),
-            global_cap,
+            global_cap: AtomicU32::new(global_cap),
             remote_pool: TokioMutex::new(HashMap::new()),
             local_pool: TokioMutex::new(HashMap::new()),
             client,
@@ -181,7 +185,38 @@ impl OffloadService {
     /// Total offloads currently in flight across the app (global gate).
     pub fn global_in_flight(&self) -> u32 {
         self.global_cap
+            .load(Ordering::Relaxed)
             .saturating_sub(self.global_gate.available_permits() as u32)
+    }
+
+    /// Bring `global_gate`/`global_cap` in line with current config. The gate
+    /// is sized once at construction, but the user can add/remove backends or
+    /// change `global_concurrency` at runtime; without this the app-wide cap
+    /// stays frozen at the startup value until restart. Grows by adding
+    /// permits; shrinks by acquiring+forgetting the excess as it frees.
+    fn reconcile_global_cap(self: &Arc<Self>, snap: &OffloadSettings) {
+        let target = compute_global_cap(snap);
+        let current = self.global_cap.load(Ordering::Relaxed);
+        if target == current {
+            return;
+        }
+        self.global_cap.store(target, Ordering::Relaxed);
+        if target > current {
+            self.global_gate.add_permits((target - current) as usize);
+        } else {
+            // Reclaim the excess permits as in-flight tasks release them.
+            let remove = (current - target) as usize;
+            let gate = self.global_gate.clone();
+            tauri::async_runtime::spawn(async move {
+                for _ in 0..remove {
+                    match gate.clone().acquire_owned().await {
+                        Ok(p) => p.forget(),
+                        Err(_) => break, // semaphore closed
+                    }
+                }
+            });
+        }
+        tracing::debug!(from = current, to = target, "offload: resized global gate");
     }
 
     /// Bring the warm MCP host in line with current config. Cheap when the
@@ -201,7 +236,7 @@ impl OffloadService {
     pub async fn status(&self) -> ServiceStatus {
         ServiceStatus {
             global_in_flight: self.global_in_flight(),
-            global_cap: self.global_cap,
+            global_cap: self.global_cap.load(Ordering::Relaxed),
             mcp_servers: self.host.health().await,
         }
     }
@@ -244,7 +279,7 @@ impl OffloadService {
             Err(_) => {
                 return Err(AppError::OffloadNotReady(format!(
                     "all {} global offload slots busy — timed out after {}s",
-                    self.global_cap,
+                    self.global_cap.load(Ordering::Relaxed),
                     timeout.as_secs()
                 )))
             }
@@ -747,7 +782,7 @@ impl OffloadService {
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 let snap = this.settings.current().offload;
                 let in_flight = this.global_in_flight();
-                let cap = this.global_cap;
+                let cap = this.global_cap.load(Ordering::Relaxed);
 
                 let mut rows: Vec<BackendDashboard> = Vec::new();
                 if snap.enabled {
@@ -782,6 +817,9 @@ impl OffloadService {
             loop {
                 tokio::time::sleep(Duration::from_secs(12)).await;
                 let snap = this.settings.current().offload;
+                // Keep the app-wide gate sized to current config (backends or
+                // global_concurrency may have changed since startup).
+                this.reconcile_global_cap(&snap);
                 if !snap.enabled {
                     last.clear();
                     continue;

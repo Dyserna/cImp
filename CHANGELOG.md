@@ -5,6 +5,100 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.1] — 2026-06-25
+
+A sweep of 37 confirmed correctness issues surfaced by a multi-agent bug hunt
+and verified before fixing (full write-up in `docs/BUG-HUNT-2026-06-25.md`).
+Grouped by area below.
+
+### Fixed
+
+#### Offload
+
+- **Rotated auth tokens take effect immediately.** Editing a remote backend's
+  bearer token from one value to another no longer silently reuses the old
+  token — the cached handle's reuse check now fingerprints the actual token
+  value, not just whether one is present, so a rotated key forces a rebuild
+  instead of failing health/props probes with the stale credential.
+- **Read-only worker boundary tightened.** The tool-name filter that keeps the
+  local offload worker read-only now also catches common mutating verbs that
+  previously slipped through (`cancel`, `abort`, `force`, `sync`, `evict`,
+  `flush`, `upsert`, `amend`, `persist`).
+- **`run_command` git hardening.** `git config` (and `--git-dir` / `--work-tree`)
+  are now refused — writing `core.pager` / `core.sshCommand` / aliases let a
+  later allowlisted `git` invocation execute arbitrary code. Git is also spawned
+  with `GIT_PAGER=cat`, an empty `GIT_SSH_COMMAND`, and ambient config disabled
+  as defense in depth.
+- **Honest concurrency accounting.** The global concurrency gate is reconciled
+  under a lock and the cap is published only after permits are added/reclaimed,
+  so the in-flight count no longer transiently mis-reports during a resize. A
+  remote `llama-server` restarted with fewer slots (`-np`) is now rebuilt rather
+  than over-scheduled against a stale larger gate.
+- **Context-budget robustness.** Auto-compaction now hard-truncates an oversized
+  retained turn (or a huge original context) as a last resort, so it can't loop
+  re-sending an over-budget prompt. A git/diff/commit task now requires the real
+  `run_command` tool instead of a dedicated `git` MCP server, so a capable local
+  backend isn't wrongly refused. `budget_high_water_pct` is clamped to a non-zero
+  floor so a bad value can't zero out the working budget.
+- **Clearer native-tool feedback.** `read_file` distinguishes an oversized single
+  line from an offset past end-of-file, and flags an ambiguous relative path that
+  resolves under multiple roots instead of silently picking the first.
+- **Offload can be enabled mid-session.** Turning offload on in Settings after
+  launching with it off now starts the loopback discovery endpoint (and warm
+  host / health watch / metrics poller) instead of requiring a relaunch.
+
+#### Terminal, tabs & settings
+
+- **No more lost settings on concurrent edits.** Tab create/close/rename, layout
+  save, preset edits, and active-tab persistence now compose atomically, so a
+  layout auto-save (splitter drag) overlapping a tab operation — or an edit in
+  the Settings window — can no longer clobber the other and make a tab vanish or
+  a layout reset on next launch.
+- **No orphan tabs.** If creating a tab fails partway through, the settings and
+  registry entries are now rolled back instead of leaving a phantom tab that
+  reappears on next launch.
+- **First keystrokes into a new tab are no longer dropped** while the state
+  manager is still registering the tab.
+- **`pty_start` no longer stalls other terminal commands** by holding the tab
+  registry lock across a blocking scrollback file read.
+- **The last settings edit before quitting is saved.** Settings are flushed
+  synchronously on shutdown, so an edit made within the 500 ms debounce window
+  isn't lost; failed atomic writes no longer leave orphaned temp files; and a
+  rapid re-migration can no longer overwrite the original pre-migration backup.
+
+#### Audio & TTS
+
+- **Read-along highlight stays in sync.** The selection-read "now playing" and
+  "done" edges are retried instead of dropped when the state channel is briefly
+  full, so the highlight no longer sticks on the last sentence or skips a chunk.
+  A mark/queue desync on a same-tick drain-and-enqueue is also fixed.
+- **The avatar no longer lip-syncs to frozen audio while paused.**
+- **Cleaner sentence boundaries.** Speak-all no longer splits a sentence at an
+  abbreviation (`Dr.`, `e.g.`), and a long legitimate sentence is no longer
+  truncated at the head by the runaway-buffer guard.
+- **Avatar state recovers correctly** after a subprocess exit or error mid-output
+  (no longer stuck in *Thinking*), and a cross-tab idle announcement can no
+  longer be silently suppressed by a stale echo-suppression guard.
+
+#### Speech-to-text & theming
+
+- A fully bracketed/parenthesized real utterance (e.g. "(parenthesize this)") is
+  no longer discarded as a non-speech marker.
+- The mic waveform no longer briefly shows the previous recording's tail.
+- Palette verification now accepts only valid CSS hex lengths (3/4/6/8 digits).
+
+#### Frontend
+
+- **Escape only stops TTS when something is playing** (no per-keystroke IPC).
+- Custom terminal palettes from `settings.json` are validated key-by-key, so a
+  malformed value can't corrupt the xterm theme.
+- The usage meter distinguishes "not logged in" from a transport error, so it
+  appears within one poll after login instead of backing off up to ~5 minutes.
+- A stale sprite-animation frame timer is cleared before loading the next
+  animation; the terminal rebind fallback spawns at the live geometry; and
+  dictation is appended to a trimmed compose buffer (no double spaces / glued
+  lines).
+
 ## [0.16.2] — 2026-06-24
 
 ### Fixed

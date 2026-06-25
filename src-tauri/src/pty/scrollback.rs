@@ -10,12 +10,40 @@
 //! scrollback because `ExitRequested` doesn't fire — this is best-effort
 //! recovery, not durable storage. Documented in DESIGN.md.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 
 use crate::error::{AppError, AppResult};
 use crate::state::TabId;
+
+/// Trim the scrollback `ring` to at most `cap` bytes, then realign its front
+/// to a UTF-8 character boundary.
+///
+/// The ring holds raw terminal output, which is UTF-8. Popping to `cap` one
+/// byte at a time can leave the front on a continuation byte (`0b10xxxxxx`)
+/// when the cap boundary falls in the middle of a multibyte codepoint (any
+/// non-ASCII scrollback once the ring wraps — TUI box-drawing, emoji, accented
+/// text). A snapshot starting on a continuation byte renders as a replacement
+/// glyph on replay and breaks any `String::from_utf8` of the bytes. Dropping
+/// the orphaned continuation bytes (at most 3) restores a valid boundary.
+pub(crate) fn trim_ring(ring: &mut VecDeque<u8>, cap: usize) {
+    while ring.len() > cap {
+        ring.pop_front();
+    }
+    // A valid UTF-8 stream never *starts* with a continuation byte, so this
+    // only fires when a mid-codepoint pop above left the front misaligned.
+    let mut dropped = 0;
+    while dropped < 3 {
+        match ring.front() {
+            Some(&b) if b & 0xC0 == 0x80 => {
+                ring.pop_front();
+                dropped += 1;
+            }
+            _ => break,
+        }
+    }
+}
 
 /// Resolve `<exe-dir>/scrollback/`. Lives next to `settings.json` and
 /// `logs/` so the entire portable folder is self-contained.
@@ -147,5 +175,32 @@ pub fn prune_orphans(known: &HashSet<String>) {
         if !known.contains(&safe) {
             let _ = fs::remove_file(&path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_ring_realigns_front_to_utf8_boundary() {
+        // [A][é = C3 A9][B]; cap=2 pops A and the é lead byte, leaving an
+        // orphan continuation 0xA9 at the front that must then be dropped.
+        let mut ring: VecDeque<u8> = VecDeque::new();
+        ring.extend([0x41u8, 0xC3, 0xA9, 0x42]);
+        trim_ring(&mut ring, 2);
+        let bytes: Vec<u8> = ring.iter().copied().collect();
+        assert_eq!(bytes, vec![0x42]);
+        assert!(std::str::from_utf8(&bytes).is_ok());
+    }
+
+    #[test]
+    fn trim_ring_under_cap_is_unchanged() {
+        let mut ring: VecDeque<u8> = VecDeque::new();
+        ring.extend("héllo".as_bytes());
+        let before: Vec<u8> = ring.iter().copied().collect();
+        trim_ring(&mut ring, 100);
+        let after: Vec<u8> = ring.iter().copied().collect();
+        assert_eq!(before, after);
     }
 }

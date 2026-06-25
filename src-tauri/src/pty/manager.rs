@@ -7,7 +7,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
 use crate::processing::permission::PermissionPattern;
@@ -344,9 +344,7 @@ impl PtyManager {
             .lock()
             .map_err(|e| AppError::Pty(format!("scrollback poisoned: {e}")))?;
         ring.extend(bytes);
-        while ring.len() > cap {
-            ring.pop_front();
-        }
+        crate::pty::scrollback::trim_ring(&mut ring, cap);
         Ok(())
     }
 
@@ -376,8 +374,19 @@ impl PtyManager {
             handle.cancel.cancel();
             let killer = handle.killer.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(mut k) = killer.lock() {
-                    let _ = k.kill();
+                match killer.lock() {
+                    Ok(mut k) => {
+                        if let Err(e) = k.kill() {
+                            // A failed kill leaves the waiter task blocked in
+                            // child.wait() indefinitely — holding the child
+                            // handle and a blocking-pool thread, with the
+                            // process orphaned. Nothing more we can do
+                            // synchronously, but surface it instead of
+                            // swallowing it silently.
+                            warn!(error = %e, "PTY kill failed during shutdown; child may be orphaned");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "PTY killer mutex poisoned during shutdown"),
                 }
             })
             .await;

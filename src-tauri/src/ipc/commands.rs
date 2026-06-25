@@ -441,7 +441,13 @@ pub async fn tts_stop(state: State<'_, AppState>) -> AppResult<()> {
     // clears the flag. Notifications and selection reads are unaffected — they
     // ride other request variants the worker doesn't gate on this flag.
     state.ai_tts_suppressed.store(true, Ordering::SeqCst);
-    if let Some(audio) = state.audio.read().ok().and_then(|g| g.as_ref().cloned()) {
+    // Recover the guard even if the lock is poisoned: this is the Esc
+    // emergency-stop, so it must never silently no-op and leave audio playing
+    // with no way to stop it from the UI. `into_inner` hands back the guard;
+    // the data behind it (an `Option<AudioOutput>` handle) is not left in a
+    // broken state by a panicking writer.
+    let audio = state.audio.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(audio) = audio.as_ref().cloned() {
         audio.stop_all();
     }
     Ok(())
@@ -453,7 +459,10 @@ pub async fn tts_stop(state: State<'_, AppState>) -> AppResult<()> {
 /// only the audio sink is paused.
 #[tauri::command]
 pub async fn tts_set_paused(state: State<'_, AppState>, paused: bool) -> AppResult<()> {
-    if let Some(audio) = state.audio.read().ok().and_then(|g| g.as_ref().cloned()) {
+    // Recover a poisoned guard rather than swallowing it — a no-op pause/resume
+    // would leave the transport controls dead with no signal why.
+    let audio = state.audio.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(audio) = audio.as_ref().cloned() {
         audio.set_paused(paused);
     }
     Ok(())

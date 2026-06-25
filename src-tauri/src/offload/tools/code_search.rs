@@ -96,6 +96,15 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
                         Ok(t) => t,
                         Err(_) => continue,
                     };
+                    // Never traverse symlinks: a link under an allowed root
+                    // could point outside it and leak confined content to the
+                    // model. `file_type()` does not follow links (so this is
+                    // already true today), but assert it explicitly so a
+                    // future switch to `metadata()` can't silently open the
+                    // escape.
+                    if file_type.is_symlink() {
+                        continue;
+                    }
                     if file_type.is_dir() {
                         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                         if IGNORE_DIRS.contains(&name) {

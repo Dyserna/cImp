@@ -111,9 +111,7 @@ pub fn spawn_reader(
                     if scrollback_cap > 0 {
                         if let Ok(mut ring) = scrollback.lock() {
                             ring.extend(&buf[..n]);
-                            while ring.len() > scrollback_cap {
-                                ring.pop_front();
-                            }
+                            crate::pty::scrollback::trim_ring(&mut ring, scrollback_cap);
                         }
                     }
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {

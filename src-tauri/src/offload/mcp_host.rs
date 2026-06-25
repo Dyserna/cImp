@@ -80,15 +80,40 @@ fn leading_verb(name: &str) -> String {
     token_verb(seg)
 }
 
+/// Unambiguously destructive verbs that never legitimately appear *anywhere*
+/// in a read-only tool's name — unlike noun-ish verbs (`commit`, `set`,
+/// `merge`, `add`, `copy`) which show up in plenty of read tools such as
+/// `get_latest_commit` or `list_set_members`. These are checked across every
+/// segment so a write verb buried past the second segment
+/// (`search_and_replace`, `find_and_delete`) can't slip through.
+const HARD_WRITE_VERBS: &[&str] = &[
+    "write", "delete", "remove", "rm", "unlink", "destroy", "truncate",
+    "drop", "purge", "replace", "overwrite", "rename", "uninstall", "kill",
+    "wipe",
+];
+
 /// Whether a tool name is read-class (safe to expose). The offload worker is
-/// read-only; mutating tools are dropped. A server may carry its verb in the
-/// **second** segment (`git_commit`, `git_push`), so a tool is write-class if
-/// *either* of its first two segments leads with a mutating verb.
+/// read-only; mutating tools are dropped. Two-tier check:
+///
+/// 1. No segment anywhere may be a hard-destructive verb ([`HARD_WRITE_VERBS`])
+///    — catches a write verb past the second segment.
+/// 2. Neither of the first two segments may lead with a (possibly noun-ish)
+///    write verb — catches category-prefixed names (`git_commit`, `git_push`)
+///    without dropping reads like `get_latest_commit` where the noun-verb sits
+///    later.
 fn is_read_class(name: &str) -> bool {
-    name.split(['_', '-', '.', ' ', ':'])
+    let verbs: Vec<String> = name
+        .split(['_', '-', '.', ' ', ':'])
         .filter(|s| !s.is_empty())
+        .map(token_verb)
+        .collect();
+    if verbs.iter().any(|v| HARD_WRITE_VERBS.contains(&v.as_str())) {
+        return false;
+    }
+    verbs
+        .iter()
         .take(2)
-        .all(|seg| !WRITE_VERBS.contains(&token_verb(seg).as_str()))
+        .all(|v| !WRITE_VERBS.contains(&v.as_str()))
 }
 
 /// One namespaced, read-class tool offered by a server: the [`ToolDef`]
@@ -134,7 +159,21 @@ impl StdioConn {
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        {
+            // Insert and re-check liveness *while holding the pending lock*.
+            // The reader sets `alive = false` and then drains `pending` under
+            // this same lock on EOF. Without the under-lock recheck there is a
+            // TOCTOU: the reader could drain between the top-of-fn check and
+            // this insert, orphaning our sender so the call blocks for the full
+            // timeout instead of failing fast. The mutex establishes the
+            // happens-before with the reader's store, so re-reading here is
+            // authoritative.
+            let mut pending = self.pending.lock().unwrap();
+            if !self.alive.load(Ordering::Relaxed) {
+                return Err("server connection is closed".into());
+            }
+            pending.insert(id, tx);
+        }
         let frame = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -370,10 +409,16 @@ impl McpHost {
 
     /// Route a namespaced `<server>__<tool>` call to its owning server.
     pub async fn call(&self, namespaced: &str, args: Value) -> Result<String, String> {
+        // Route by actual ownership (an exact match on the namespaced def
+        // name) rather than parsing a `<prefix>__` split — a server or raw
+        // tool name that itself contains `__` would make the split route to
+        // the wrong/nonexistent server.
         let server = {
             let servers = self.servers.read().await;
-            let prefix = namespaced.split("__").next().unwrap_or(namespaced);
-            servers.iter().find(|s| s.name == prefix).cloned()
+            servers
+                .iter()
+                .find(|s| s.raw_name(namespaced).is_some())
+                .cloned()
         };
         let Some(server) = server else {
             return Err(format!("no MCP server owns tool `{namespaced}`"));
@@ -555,8 +600,14 @@ async fn connect_stdio(
                 }
             }
             // Connection ended: fail every pending request and mark dead.
-            conn.alive.store(false, Ordering::Relaxed);
-            let pending: Vec<_> = conn.pending.lock().unwrap().drain().collect();
+            // Flip `alive` and drain under the same lock the request path
+            // takes, so a request can't insert into `pending` after we've
+            // drained it (which would orphan its sender until timeout).
+            let pending: Vec<_> = {
+                let mut p = conn.pending.lock().unwrap();
+                conn.alive.store(false, Ordering::Relaxed);
+                p.drain().collect()
+            };
             for (_, tx) in pending {
                 let _ = tx.send(Err("server connection closed".into()));
             }
@@ -714,13 +765,25 @@ fn render_tool_result(result: &Value) -> String {
     }
 }
 
-/// Confine a `filesystem` server to the offload `allowed_roots`: append each
+/// Whether this config is the standard filesystem MCP server, by name *or*
+/// by the package it launches. Keying on the configured `name` alone is
+/// fragile: a user who names the server `fs` or `local-files` would silently
+/// bypass confinement, exposing the whole filesystem to the offload model.
+fn is_filesystem_server(cfg: &McpServerConfig, args: &[String]) -> bool {
+    if cfg.name.eq_ignore_ascii_case("filesystem") {
+        return true;
+    }
+    const PKG: &str = "server-filesystem";
+    cfg.command.contains(PKG) || args.iter().any(|a| a.contains(PKG))
+}
+
+/// Confine a filesystem server to the offload `allowed_roots`: append each
 /// configured root not already present in the server's args. The standard
 /// `@modelcontextprotocol/server-filesystem` takes its allowed directories
 /// as trailing CLI args, so this is the confinement seam. No-op for other
 /// servers or when no roots are configured.
 fn confine_filesystem(cfg: &McpServerConfig, args: &mut Vec<String>, allowed_roots: &[PathBuf]) {
-    if cfg.name != "filesystem" || allowed_roots.is_empty() {
+    if !is_filesystem_server(cfg, args) || allowed_roots.is_empty() {
         return;
     }
     for root in allowed_roots {
@@ -751,6 +814,33 @@ mod tests {
         for bad in ["write_file", "create_directory", "git_commit", "delete_path", "move_file", "git_push", "run_shell"] {
             assert!(!is_read_class(bad), "{bad} should be filtered");
         }
+    }
+
+    #[test]
+    fn read_class_catches_buried_destructive_verbs() {
+        // A hard-destructive verb past the second segment must still drop.
+        for bad in ["search_and_replace", "find_and_delete", "list_then_remove", "scan_and_wipe"] {
+            assert!(!is_read_class(bad), "{bad} should be filtered");
+        }
+        // ...but a noun-ish verb in the 3rd+ segment must NOT over-drop a read
+        // (these are only checked in the first two segments, unchanged).
+        for ok in ["get_latest_commit", "get_repo_merge_status", "list_all_user_sets"] {
+            assert!(is_read_class(ok), "{ok} should be read-class");
+        }
+    }
+
+    #[test]
+    fn filesystem_detected_by_package_not_just_name() {
+        let cfg = McpServerConfig {
+            name: "my-files".into(),
+            command: "npx".into(),
+            ..Default::default()
+        };
+        let args = vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()];
+        assert!(is_filesystem_server(&cfg, &args));
+        // A genuinely unrelated server is not confined.
+        let git = McpServerConfig { name: "git".into(), command: "uvx".into(), ..Default::default() };
+        assert!(!is_filesystem_server(&git, &["mcp-server-git".to_string()]));
     }
 
     #[test]

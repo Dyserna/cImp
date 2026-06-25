@@ -79,24 +79,29 @@ pub struct LoadOutcome {
 /// global baseline when it's absent or corrupt; the custom overlay is
 /// merely skipped if absent and quarantined if corrupt.
 ///
-/// Migration runs *separately* on the global value and the overlay value
-/// before they are merged, so a `.bak` file is written next to whichever
-/// source actually carried the legacy keys. Pre-V0.6 the migration ran on
-/// the merged value with the global path hardcoded as the backup target,
-/// which mis-named the backup of an overlay-only legacy shape and
-/// produced a confusing post-migration overlay diff against a still-old
-/// global baseline.
+/// Migration runs on the global value only. The overlay is a partial diff
+/// always written in the current schema, so it is merged as-is (see the
+/// inline note at step 2 for why running the legacy cascade on a partial
+/// overlay caused silent data loss and unbounded `.bak` growth).
 pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // 1. Load and migrate the global baseline. After this `global` is in
     //    the current schema shape; a v1.x file on disk has been backed up
     //    next to the global path and rewritten.
     let global = load_global(default_shell);
 
-    // 2. Load and migrate the overlay (if any). A migrated overlay's
-    //    `.bak` is written next to the overlay file — the right place
-    //    for a user looking at their per-folder config.
+    // 2. Load the overlay (if any). We deliberately DON'T run the legacy
+    //    migration cascade on it: the overlay is a *partial* diff (see
+    //    `diff`), always written by this app's `save` in the current schema.
+    //    The migration detectors (`looks_v1_2` etc.) key off absent top-level
+    //    fields, which a partial overlay legitimately lacks — so migrating it
+    //    both stamps full-object defaults that override global through the
+    //    merge (silent data loss) and, because the overlay never gains a
+    //    `schema_version`, re-fires every launch (unbounded `.v1.2.bak`
+    //    growth). Missing fields are handled correctly downstream anyway:
+    //    deep-merge fills from the (already-migrated) global, and serde
+    //    `#[serde(default)]` covers the rest.
     let custom_path = custom_path(launch_cwd);
-    let overlay_value = read_overlay_migrated(&custom_path, default_shell);
+    let overlay_value = read_overlay(&custom_path);
 
     // 3. Merge the (now both-current-shape) global + overlay.
     let mut merged = match serde_json::to_value(&global) {
@@ -158,31 +163,6 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     }
 
     LoadOutcome { settings, global }
-}
-
-/// Read the overlay file, run any pending migration on it (writing a `.bak`
-/// next to the overlay file itself), and return the migrated Value. Returns
-/// `None` when the overlay is absent or the file was quarantined for
-/// corruption. On migration-backup failure we still return the raw value —
-/// callers can choose to abort if they want stricter behavior; here we
-/// prefer "boot up with the user's settings" over "boot defaults because
-/// we couldn't snapshot a backup".
-fn read_overlay_migrated(path: &Path, default_shell: &ShellSpec) -> Option<Value> {
-    let mut value = read_overlay(path)?;
-    match migration::migrate_if_needed(&mut value, path, default_shell) {
-        Ok(true) => {
-            tracing::info!(path = %path.display(), "settings: overlay migrated in place");
-        }
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "settings: overlay migration backup failed; using overlay raw",
-            );
-        }
-    }
-    Some(value)
 }
 
 /// V8-01: read-only settings load for a lightweight subprocess (the

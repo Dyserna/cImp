@@ -195,7 +195,12 @@ impl TagScanner {
             // advances past it, so the continuation bytes arriving next burst
             // would be read as literal text and leak into speech. A normal
             // flush ends at a newline, which can never fall inside an escape.
-            unterminated_escape_tail(scan)
+            //
+            // Same hazard for a trailing partial `[[TTS]]`/`[[/TTS]]` marker:
+            // the `replace` below only matches a whole marker, so consuming half
+            // of one (`...[[TT`) would leak the literal text into speech. Hold
+            // back before whichever incomplete token starts first.
+            unterminated_escape_tail(scan).min(unterminated_marker_tail(scan))
         } else {
             match scan.iter().rposition(|&b| b == b'\n') {
                 Some(i) => i + 1,
@@ -291,6 +296,29 @@ impl Default for TagScanner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The TTS markers stripped in speak-all mode. Kept here so
+/// [`unterminated_marker_tail`] and the `replace` in `scan_all` agree.
+const TTS_MARKERS: [&[u8]; 2] = [b"[[TTS]]", b"[[/TTS]]"];
+
+/// Index up to which `slice` can be consumed without ending inside a *partial*
+/// `[[TTS]]`/`[[/TTS]]` marker. Returns `slice.len()` when the slice doesn't
+/// end with an incomplete marker prefix; otherwise the start index of that
+/// partial so the caller can hold those bytes back until the rest arrives.
+/// (A *complete* trailing marker is left to be consumed and stripped normally.)
+fn unterminated_marker_tail(slice: &[u8]) -> usize {
+    let n = slice.len();
+    for marker in TTS_MARKERS {
+        // Longest proper prefix of `marker` that is a suffix of `slice`.
+        let max_p = (marker.len() - 1).min(n);
+        for p in (1..=max_p).rev() {
+            if slice[n - p..] == marker[..p] {
+                return n - p;
+            }
+        }
+    }
+    n
 }
 
 /// Index up to which `slice` can be consumed without ending inside an

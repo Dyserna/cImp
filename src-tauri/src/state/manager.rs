@@ -594,6 +594,16 @@ async fn run(
                 // and re-derives from the per-tab cache it already has.
                 if let StateSignal::TabActivated { tab } = &signal {
                     let tab = tab.clone();
+                    // Never point `active` at a tab we don't know about: a stray
+                    // or out-of-order activation would leave `active` dangling
+                    // at a non-existent tab, breaking the idle sweep's
+                    // `*tab != active` checks and done-while-away routing.
+                    // `TabAdded` is always enqueued before its `TabActivated`,
+                    // so a legitimate activation always finds the tab present.
+                    if !tabs.contains_key(&tab) {
+                        debug!(?tab, "ignoring TabActivated for unknown tab");
+                        continue;
+                    }
                     if active != tab {
                         info!(from = ?active, to = ?tab, "active tab");
                         active = tab.clone();
@@ -862,7 +872,13 @@ async fn run(
                 // map is never mutated under it during the sweep.
                 let snapshot: HashMap<TabId, Arc<AtomicI32>> = match input_lengths.read() {
                     Ok(g) => g.clone(),
-                    Err(_) => continue,
+                    // Recover a poisoned lock rather than skipping the sweep —
+                    // `continue` here would permanently break the idle→Idle
+                    // avatar transition for the rest of the session if any
+                    // writer ever panicked. The map only holds Arcs to atomics,
+                    // so a poisoned writer can't leave it logically corrupt
+                    // (this mirrors how `sysmon` recovers via `into_inner`).
+                    Err(e) => e.into_inner().clone(),
                 };
                 for (tab, ts) in tabs.iter_mut() {
                     if ts.avatar_state != AvatarState::Listening { continue; }

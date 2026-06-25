@@ -132,7 +132,12 @@ impl Screen {
         let mut total: usize = 0;
         for row in self.rows.iter().rev() {
             let line = row.rendered();
-            total += line.len() + 1;
+            // Count characters, not bytes: Claude's prompt chrome is full of
+            // multibyte glyphs (─ · ↑ ↓ em-dashes), and `String::len()` (bytes)
+            // would overcount by up to 3× per glyph, shrinking the captured tail
+            // to far fewer visible rows than `max_chars` implies and pushing a
+            // multi-row permission prompt's marker out of the window.
+            total += line.chars().count() + 1;
             parts.push(line);
             if total >= max_chars {
                 break;

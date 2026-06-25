@@ -205,10 +205,19 @@ impl RemoteBackend {
     /// shrinking a live semaphore safely is fiddly. Idempotent.
     fn note_total_slots(&self, t: u32) {
         let t = t.max(1);
-        let prev = self.slots.swap(t, Ordering::Relaxed);
+        let prev = self.slots.load(Ordering::Relaxed);
         let effective_prev = if prev == 0 { self.declared_slots } else { prev };
         if t > effective_prev {
+            // Grow the gate and the reported slot count together. We only ever
+            // grow: a live `tokio::Semaphore` can't be safely shrunk, so if a
+            // re-fetched `/props` reports *fewer* slots (server restarted with
+            // a smaller `-np`) we must leave BOTH the gate and `self.slots`
+            // unchanged. Swapping `slots` down while the gate keeps the larger
+            // permit count would make `slots()`/`in_flight()` disagree with the
+            // real concurrency the gate allows, and the router would
+            // mis-schedule the backend.
             self.gate.add_permits((t - effective_prev) as usize);
+            self.slots.store(t, Ordering::Relaxed);
         }
         debug!(backend = %self.name, total_slots = t, "offload: discovered remote slot count");
     }
@@ -338,9 +347,12 @@ mod tests {
         b.note_total_slots(2);
         assert_eq!(b.slots(), 2);
         assert_eq!(b.gate.available_permits(), 2);
-        // A zero/garbage value floors at one and never shrinks below it.
-        b.note_total_slots(0);
-        assert_eq!(b.slots(), 1);
+        // A later probe reporting FEWER slots must not shrink either the
+        // reported count or the gate: a live semaphore can't be shrunk safely,
+        // so lowering `slots()` alone would make it disagree with the gate.
+        b.note_total_slots(1);
+        assert_eq!(b.slots(), 2);
+        assert_eq!(b.gate.available_permits(), 2);
     }
 
     #[test]

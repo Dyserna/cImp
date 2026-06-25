@@ -380,7 +380,16 @@ fn compact(messages: &mut Vec<ChatMessage>) {
         return;
     }
     let head: Vec<ChatMessage> = messages.iter().take(2).cloned().collect(); // system + user
-    let tail_start = messages.len() - KEEP_RECENT;
+    let mut tail_start = messages.len() - KEEP_RECENT;
+    // The tail must not begin with a `tool` message: its owning assistant turn
+    // (which carries the matching `tool_calls` id) would have been evicted, and
+    // OpenAI-compatible servers reject a `tool` message that doesn't follow the
+    // assistant that requested it. Advance past any leading orphan tool
+    // messages to the next real turn boundary (keeping slightly fewer messages
+    // is fine; sending an invalid sequence is not).
+    while tail_start < messages.len() && messages[tail_start].role == "tool" {
+        tail_start += 1;
+    }
     let tail: Vec<ChatMessage> = messages.iter().skip(tail_start).cloned().collect();
     let mut rebuilt = head;
     rebuilt.push(ChatMessage::user(
@@ -420,6 +429,36 @@ mod tests {
     fn cap_result_passes_short() {
         let small = "hello".to_string();
         assert_eq!(cap_result(small.clone(), 100), small);
+    }
+
+    #[test]
+    fn compact_tail_never_starts_with_tool() {
+        let assistant = || ChatMessage {
+            role: "assistant".into(),
+            content: Some("a".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+        // Arrange so the naive cutoff (len - KEEP_RECENT) lands on a `tool`
+        // message whose owning assistant turn is evicted.
+        let mut messages = vec![
+            ChatMessage::system("s"),
+            ChatMessage::user("u"),
+            assistant(),                       // 2: owns the tool calls below
+            ChatMessage::tool("c1", "r1"),     // 3
+            ChatMessage::tool("c2", "r2"),     // 4 <- naive tail_start (10-6)
+            assistant(),                       // 5
+            ChatMessage::tool("c3", "r3"),     // 6
+            assistant(),                       // 7
+            ChatMessage::tool("c4", "r4"),     // 8
+            assistant(),                       // 9
+        ];
+        compact(&mut messages);
+        // First message after the system+user+note head must not be a tool.
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].role, "user"); // the eviction note
+        assert_ne!(messages[3].role, "tool", "tail must not start with an orphan tool message");
     }
 
     #[test]

@@ -376,33 +376,31 @@ pub async fn close_tab(
         }
     }
 
-    let prev_tab = {
-        let registry = state.tabs.lock().await;
+    // Existence check, active-switch, and removal all happen under ONE lock
+    // acquisition. Splitting them lets a concurrent `tab_activate` /
+    // `set_active_tab` (which take `state.tabs` but NOT the lifecycle
+    // serializer) re-activate this tab in the gap between the switch and the
+    // remove, leaving `active` dangling at a removed tab. Holding the lock
+    // across the whole sequence closes that window.
+    //
+    // If we're closing the active tab, switch to its left neighbor first so the
+    // frontend's active-tab indicator (and the TTS active cell) points at a tab
+    // that still exists. Builtins always occupy the leftmost positions, so a
+    // previous tab always exists.
+    let removed = {
+        let mut registry = state.tabs.lock().await;
         if !registry.has_tab(&tab) {
             return Err(TabLifecycleError::TabNotFound {
                 tab: tab.as_str().to_string(),
             });
         }
-        registry.previous_tab(&tab)
-    };
-
-    // If we're closing the active tab, switch to its left neighbor first
-    // so the frontend's active-tab indicator (and the TTS active cell)
-    // points at a tab that still exists. Builtins always occupy the
-    // leftmost positions, so a previous tab always exists.
-    {
-        let mut registry = state.tabs.lock().await;
         if registry.active() == tab {
-            if let Some(target) = prev_tab {
+            if let Some(target) = registry.previous_tab(&tab) {
                 if let Err(e) = registry.activate(target).await {
                     warn!(error = %e, "close_tab: activate previous failed");
                 }
             }
         }
-    }
-
-    let removed = {
-        let mut registry = state.tabs.lock().await;
         registry.remove_tab(&tab).await
     };
     if !removed {

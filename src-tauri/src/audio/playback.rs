@@ -384,35 +384,55 @@ fn run_audio_thread(
         }
 
         let now_speaking = !sink.empty();
+        // `playing` is authoritative and cheap — keep it exact every tick so a
+        // `try_drain` sees the truth immediately, regardless of whether the
+        // avatar edge below has been delivered yet. Notify idle waiters on the
+        // true→false transition.
+        let was_playing = playing.swap(now_speaking, Ordering::Relaxed);
+        if was_playing && !now_speaking {
+            idle_notify.notify_waiters();
+        }
+
+        // Deliver the avatar Started/Stopped edges WITHOUT blocking this loop —
+        // this is the only thread servicing the command queue (Esc/StopAll,
+        // volume, pause), so a blocking_send into a transiently-full
+        // `state_signals` would freeze all audio control. We also must not
+        // *drop* the Stopped edge (it would pin the avatar in Speaking), so we
+        // retry on the next poll tick: `speaking` only advances once the edge
+        // actually lands. The local state never sends an unbalanced edge, so a
+        // Started that never delivered means no Stopped is owed.
         if now_speaking && !speaking {
-            speaking = true;
-            playing.store(true, Ordering::Relaxed);
             // Remember which tab owns this stretch of speech so the matching
-            // stop edge is tagged with the SAME tab. Switching tabs mid-speech
-            // no longer stops audio (only Esc does), so reading `current_active`
-            // at the stop edge could tag the wrong tab and leave the speaking
-            // tab's avatar pinned in Speaking.
+            // stop edge is tagged with the SAME tab (tab switches mid-speech no
+            // longer stop audio, so reading `current_active` at the stop edge
+            // could mis-tag it).
             let tab = current_active(&active);
-            speaking_tab = Some(tab.clone());
-            // Blocking (not try_) send: these two edges drive the avatar's
-            // Speaking state, and a dropped Stopped edge would pin the avatar
-            // in Speaking forever. This is a dedicated OS thread (never a tokio
-            // worker), so blocking_send is safe; it only stalls if the state
-            // consumer is wedged, in which case audio is already degraded.
-            if let Err(e) = state_signals.blocking_send(StateSignal::TtsPlaybackStarted { tab }) {
-                warn!("audio: dropped TtsPlaybackStarted edge: {e}");
+            match state_signals.try_send(StateSignal::TtsPlaybackStarted { tab: tab.clone() }) {
+                Ok(()) => {
+                    speaking = true;
+                    speaking_tab = Some(tab);
+                }
+                // Consumer gone: advance anyway so we don't spin retrying.
+                Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                    speaking = true;
+                    speaking_tab = Some(tab);
+                }
+                // Full: leave `speaking` false and retry on the next tick.
+                Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
             }
         } else if !now_speaking && speaking {
-            speaking = false;
-            playing.store(false, Ordering::Relaxed);
-            let tab = speaking_tab.take().unwrap_or_else(|| current_active(&active));
-            if let Err(e) = state_signals.blocking_send(StateSignal::TtsPlaybackStopped { tab }) {
-                warn!("audio: dropped TtsPlaybackStopped edge: {e}");
+            let tab = speaking_tab.clone().unwrap_or_else(|| current_active(&active));
+            match state_signals.try_send(StateSignal::TtsPlaybackStopped { tab }) {
+                Ok(()) => {
+                    speaking = false;
+                    speaking_tab = None;
+                }
+                Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                    speaking = false;
+                    speaking_tab = None;
+                }
+                Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
             }
-            // Wake any task waiting on the next idle edge. `playing` is
-            // already false above, so a `try_drain` running on this notify
-            // will see `is_playing() == false` and proceed.
-            idle_notify.notify_waiters();
         }
     }
     debug!("audio thread exiting");

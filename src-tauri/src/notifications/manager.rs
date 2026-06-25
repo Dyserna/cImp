@@ -363,7 +363,15 @@ impl NotificationManager {
         if self.settings.current().behavior.announce_focused_tab {
             return false;
         }
-        let active_tab = self.active.read().expect("active tab poisoned").clone();
+        // Benign fallback on a poisoned lock rather than `.expect()`: a panic
+        // here would permanently kill the notification task and silence all
+        // cross-tab announcements. `TabId::Claude` is the v2 default, matching
+        // how the rest of the codebase reads this shared lock.
+        let active_tab = self
+            .active
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or(TabId::Claude);
         *tab == active_tab
     }
 

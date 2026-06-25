@@ -195,21 +195,36 @@ where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
 {
+    // Reusable downmix scratch so the realtime callback doesn't allocate per
+    // call after warm-up.
+    let mut scratch: Vec<f32> = Vec::new();
     device
         .build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
-                let Ok(mut buf) = accumulator.lock() else { return };
-                let Ok(mut ring) = mic.write() else { return };
+                // Downmix to mono FIRST, holding no lock. Then take each lock
+                // briefly and separately. The original held the `accumulator`
+                // mutex AND the `mic` write lock across the whole frame loop;
+                // because `recent_samples()` reads `mic` every ~16ms, that let a
+                // reader stall the audio driver callback (xruns / dropped input)
+                // and nested two locks unnecessarily.
                 let inv = 1.0 / channels.max(1) as f32;
+                scratch.clear();
+                scratch.reserve(data.len() / channels.max(1) + 1);
                 for frame in data.chunks(channels) {
                     let mut sum = 0.0f32;
                     for &s in frame {
                         sum += f32::from_sample(s);
                     }
-                    let mono = sum * inv;
-                    buf.push(mono);
-                    ring.push(mono);
+                    scratch.push(sum * inv);
+                }
+                if let Ok(mut buf) = accumulator.lock() {
+                    buf.extend_from_slice(&scratch);
+                }
+                if let Ok(mut ring) = mic.write() {
+                    for &m in &scratch {
+                        ring.push(m);
+                    }
                 }
             },
             err_fn,

@@ -42,8 +42,8 @@ pub fn def() -> ToolDef {
 }
 
 /// Match the requested program against the allowlist by its file-stem
-/// name, case-insensitively (so `git`, `git.exe`, `/usr/bin/git` all
-/// match an allowlist entry of `git`).
+/// name, case-insensitively (so `git` and `git.exe` both match an
+/// allowlist entry of `git`).
 fn is_allowed(command: &str, allowlist: &[String]) -> bool {
     let stem = std::path::Path::new(command)
         .file_stem()
@@ -54,10 +54,30 @@ fn is_allowed(command: &str, allowlist: &[String]) -> bool {
         .any(|allowed| allowed.eq_ignore_ascii_case(stem) || allowed.eq_ignore_ascii_case(command))
 }
 
+/// True only for a bare program name with no path component (`git`,
+/// `git.exe`) — not `/usr/bin/git`, `./git`, `..\git`, or `C:\evil\git.exe`.
+///
+/// This is the security boundary: a stem-only allowlist check is
+/// meaningless on its own because the model could pass an absolute path
+/// to an arbitrary binary named `git` and we would spawn that exact file.
+/// By requiring a bare name we force resolution through PATH (see
+/// [`resolve_command`]), so only the operator's PATH decides which `git`
+/// runs.
+fn is_bare_command(command: &str) -> bool {
+    !command.is_empty() && !command.contains(['/', '\\', ':'])
+}
+
 pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, String> {
     let args: Args = serde_json::from_value(args).map_err(|e| format!("invalid run_command args: {e}"))?;
     if ctx.command_allowlist.is_empty() {
         return Err("run_command is disabled — no commands are allowlisted".into());
+    }
+    if !is_bare_command(&args.command) {
+        return Err(format!(
+            "`{}` must be a bare program name with no path — only allowlisted \
+             programs resolved through PATH may run",
+            args.command
+        ));
     }
     if !is_allowed(&args.command, &ctx.command_allowlist) {
         return Err(format!(
@@ -66,9 +86,16 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
             ctx.command_allowlist.join(", ")
         ));
     }
+    // Resolve through PATH so we spawn the operator's `git`, never a binary
+    // the model pointed us at (path components are already rejected above,
+    // but this also pins the result against a PATH/CWD-resolution surprise).
+    let program = crate::pty::resolve_command(&args.command)
+        .map_err(|_| format!("`{}` was not found on PATH", args.command))?;
 
-    let cwd = ctx.allowed_roots[0].clone();
-    let mut cmd = tokio::process::Command::new(&args.command);
+    let cwd = ctx.allowed_roots.first().cloned().ok_or_else(|| {
+        "run_command has no allowed root to execute in".to_string()
+    })?;
+    let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args.args)
         .current_dir(&cwd)
         .stdin(Stdio::null())
@@ -129,5 +156,21 @@ mod tests {
     #[test]
     fn empty_allowlist_denies() {
         assert!(!is_allowed("git", &[]));
+    }
+
+    #[test]
+    fn bare_command_rejects_paths() {
+        // Bare names are allowed (resolved via PATH).
+        assert!(is_bare_command("git"));
+        assert!(is_bare_command("git.exe"));
+        // Anything with a path component is rejected — this is the control
+        // that stops the model spawning an arbitrary on-disk binary that
+        // merely *stems* to an allowlisted name.
+        assert!(!is_bare_command("/usr/bin/git"));
+        assert!(!is_bare_command("./git"));
+        assert!(!is_bare_command("..\\git"));
+        assert!(!is_bare_command("C:\\evil\\git.exe"));
+        assert!(!is_bare_command("C:git"));
+        assert!(!is_bare_command(""));
     }
 }

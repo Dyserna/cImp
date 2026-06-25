@@ -426,11 +426,22 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
                     .await
                 {
                     // Read the SSE byte stream chunk by chunk; emit a
-                    // notification each time a `change` event arrives.
+                    // notification each time a `change` event arrives. Keep a
+                    // small carry of the previous chunk's tail so a marker
+                    // split across a chunk boundary (TCP can break anywhere) is
+                    // still detected — otherwise a capability change would be
+                    // silently dropped.
+                    let mut carry: Vec<u8> = Vec::new();
                     while let Ok(Some(chunk)) = resp.chunk().await {
-                        if chunk.windows(SSE_CHANGE.len()).any(|w| w == SSE_CHANGE) {
+                        let mut buf = std::mem::take(&mut carry);
+                        buf.extend_from_slice(&chunk);
+                        if buf.windows(SSE_CHANGE.len()).any(|w| w == SSE_CHANGE) {
                             emit_list_changed(&stdout).await;
                         }
+                        // Retain only the bytes that could be a marker prefix
+                        // straddling into the next chunk (at most len-1).
+                        let keep = SSE_CHANGE.len().saturating_sub(1).min(buf.len());
+                        carry = buf[buf.len() - keep..].to_vec();
                     }
                 }
             }

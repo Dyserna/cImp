@@ -34,6 +34,11 @@ pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// Shell-kind tab with `builtin: true` (so it can't be closed) and a reserved
 /// id the frontend keys off to render read-only, log-fed content with no PTY.
 pub const OFFLOAD_SERVER_TAB_ID: &str = "offload-server";
+/// V9-01: reserved id of the read-only, non-closable "Code Graph" monitor
+/// tab. Materialized iff `graph.enabled` (reconciled by the integrity check,
+/// like the Offload Server tab). Unlike the other reserved tabs it is
+/// app-rendered, not PTY-backed.
+pub const GRAPH_MONITOR_TAB_ID: &str = "graph-monitor";
 /// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
 /// longer a persistent builtin — it (like rustnet) launches on demand from
 /// the bottom-bar tool buttons into ordinary closable Shell tabs (uuid ids).
@@ -148,6 +153,12 @@ pub struct Settings {
     /// subtasks to the local model. Off by default. Additive — old
     /// settings files load with the feature disabled.
     pub offload: OffloadSettings,
+    /// V9-01: per-project code knowledge graph config. ccImp builds an
+    /// on-disk graph of code + docs at `<project>/<db_subdir>/graph.db`
+    /// and exposes `graph_*` query tools to Claude tabs (MCP) and the
+    /// offload worker (native). Off by default. Additive — old settings
+    /// files load with the feature disabled.
+    pub graph: GraphSettings,
     /// Which AI-tool tabs are enabled. Each id in this list corresponds
     /// to one of the four reserved AI builtins (`claude`, `claude-local`,
     /// `aider`, `aider-local`). Adding an id opens that tab; removing
@@ -187,6 +198,7 @@ impl Default for Settings {
             claude_local: ClaudeLocalSettings::default(),
             aider_local: AiderLocalSettings::default(),
             offload: OffloadSettings::default(),
+            graph: GraphSettings::default(),
             enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
         }
@@ -812,6 +824,84 @@ impl Default for OffloadSettings {
             offload_timeout_secs: 300,
             global_concurrency: None,
             max_queue_depth: None,
+        }
+    }
+}
+
+/// V9-01: per-project code knowledge graph configuration. The structural
+/// graph (symbols/refs/calls/imports/full-text docs) needs no embedding
+/// model; the `semantic_*` fields drive the optional Phase-G semantic search
+/// over a remote `/v1/embeddings` endpoint. No secrets here, so `Debug` is
+/// derived (unlike [`OffloadSettings`]). Additive `#[serde(default)]` — old
+/// settings files round-trip with the feature disabled.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct GraphSettings {
+    /// Master switch. Off = no indexing, no `graph_*` tools, no monitor tab.
+    pub enabled: bool,
+    /// Languages to index. Each maps to a tree-sitter grammar (+ `tags.scm`,
+    /// + optional stack-graphs `tsg`). Unsupported files are skipped.
+    pub languages: Vec<String>,
+    /// Extra ignore globs, additive to the project's `.gitignore`. Generated
+    /// / vendored / minified dirs are excluded by default to keep the graph
+    /// clean and the DB small.
+    pub ignore: Vec<String>,
+    /// Index markdown files + doc-comments as `doc_chunk` nodes linked to the
+    /// code they describe (powers `graph_search_docs`).
+    pub index_docs: bool,
+    /// Skip files larger than this many bytes (minified bundles, blobs).
+    pub max_file_bytes: u64,
+    /// Debounce window for the fs watcher's re-index pass (milliseconds).
+    pub watch_debounce_ms: u64,
+    /// Hard cap on rows returned by any single `graph_*` query (results feed
+    /// an LLM context, so they're bounded like V8's tool results).
+    pub max_rows_per_query: u32,
+    /// Hard cap on the snippet bytes attached to each result row.
+    pub max_snippet_bytes: u32,
+    /// Per-project subdirectory holding `graph.db`. Recommended git-ignored.
+    pub db_subdir: String,
+
+    // --- Semantic search (Phase G) ---
+    /// Enable embedding-based semantic search. Default off — it needs a
+    /// reachable embedding endpoint; the structural graph works without it.
+    pub semantic_search: bool,
+    /// OpenAI-compatible `/v1/embeddings` endpoint (e.g. a `llama-server
+    /// --embedding` on a spare GPU box).
+    pub embedding_endpoint: String,
+    /// Embedding model id requested from the endpoint. Baked into the vector
+    /// "epoch"; changing it forces a re-embed.
+    pub embedding_model: String,
+    /// Embedding vector dimension. `0` = auto-probe on the first embed. The
+    /// HNSW index never mixes dimensions.
+    pub embedding_dims: u32,
+    /// Also embed full symbol bodies (not just docs + signatures) for
+    /// semantic *code* search. Off by default — multiplies vector count.
+    pub embed_code_bodies: bool,
+    /// Number of chunks per `/v1/embeddings` request (amortizes round-trips).
+    pub embedding_batch: usize,
+}
+
+impl Default for GraphSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            languages: ["rust", "typescript", "javascript", "python", "markdown"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ignore: Vec::new(),
+            index_docs: true,
+            max_file_bytes: 1_048_576, // 1 MiB
+            watch_debounce_ms: 300,
+            max_rows_per_query: 100,
+            max_snippet_bytes: 2_000,
+            db_subdir: ".ccimp".to_string(),
+            semantic_search: false,
+            embedding_endpoint: String::new(),
+            embedding_model: String::new(),
+            embedding_dims: 0,
+            embed_code_bodies: false,
+            embedding_batch: 32,
         }
     }
 }

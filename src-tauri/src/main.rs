@@ -3,6 +3,7 @@
 mod audio;
 mod content;
 mod error;
+mod graph;
 mod ipc;
 mod logging;
 mod notifications;

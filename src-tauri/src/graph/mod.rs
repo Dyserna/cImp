@@ -19,7 +19,10 @@
 //! pipeline, and monitor event bus arrive in later stages.
 
 mod builder;
+mod index;
 mod model;
+mod schema;
 
 pub use builder::parse_file;
+pub use index::{GraphIndex, GraphStats, SymbolHit};
 pub use model::*;

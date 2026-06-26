@@ -62,4 +62,11 @@ Execution plan for [MILESTONE-V9-01](MILESTONE-V9-01-code-knowledge-graph.md), g
 ## Session progress
 
 - [x] Milestone doc committed (7a93e21).
-- [ ] Stage 1 (wiring) — in progress.
+- [x] **Stage 1 (wiring)** — settings/error/IR scaffold, committed (ea0bf82), `cargo test graph::` green.
+- [x] **Stage 2 (parser)** — tree-sitter Rust extraction, committed (a09edd2), 6 tests green.
+- [x] **Stage 3 (store)** — CozoDB (sqlite+rayon, no graph-algo/rocksdb) `GraphIndex`: open → `index_file_graph` → `find_symbol`/`stats`, idempotent per-file replace. Round-trip test green. This proves Phase A + the first slice of Phase B end-to-end.
+- [ ] **Stage 3b (query API)** — broaden `query.rs`: `references`/`callers`/`callees`/`imports`/`transitive`/`outline`/`search_docs`.
+- [ ] **Stage 4 (ast-grep)** — `struct_search`.
+- [ ] Phase B MCP wiring · Phase C service+loopback · Phase D watcher · E langs · F settings UI · G semantic · I monitor tab.
+
+> **cozo build note (resolved):** use `default-features = false, features = ["storage-sqlite", "rayon"]`. Default features pull `graph-algo` → `graph_builder 0.4.1`, which fails to compile against the current `rayon` (a real upstream incompatibility). We don't need cozo's built-in graph algorithms — transitive/reachability are plain recursive Datalog.

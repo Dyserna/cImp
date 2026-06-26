@@ -107,6 +107,12 @@ whisper-rs = "0.16"
 rubato = "0.16"
 tree-sitter = "0.26.9"
 tree-sitter-rust = "0.24.2"
+# Embedded code-knowledge-graph store (V9-01). `storage-sqlite` is the
+# single-file backend; `rayon` is required by cozo's core eval loop. We
+# deliberately omit `graph-algo` (its `graph_builder 0.4.1` dep is broken
+# against the current rayon, and we don't need PageRank/etc. — transitive
+# queries are plain recursive Datalog) and `storage-rocksdb` (C++, heavy).
+cozo = { version = "0.7.6", default-features = false, features = ["storage-sqlite", "rayon"] }
 
 # Windows-only: registry probe for Git Bash auto-detection in shell::detect.
 [target.'cfg(windows)'.dependencies]

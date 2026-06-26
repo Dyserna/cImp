@@ -852,6 +852,35 @@ pub async fn offload_server_metrics(
     Ok(service.server_metrics())
 }
 
+/// V9-01: known per-root code-graph status (idle/building/ready/error + row
+/// counts). The initial fill for the graph status surface; live transitions
+/// arrive via the `graph-status` event. Empty before the first build.
+#[tauri::command]
+pub async fn graph_status(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+) -> AppResult<Vec<crate::graph::GraphStatus>> {
+    Ok(service.statuses())
+}
+
+/// V9-01: trigger a full rebuild of the project's code graph. `root` defaults
+/// to the app's launch directory (the project ccImp was opened in). Returns
+/// immediately — the build runs on a worker thread and reports progress via
+/// the `graph-status` event. A no-op when a build for that root is already in
+/// flight. The store must be built before the `graph_*` MCP tools have data.
+#[tauri::command]
+pub async fn graph_rebuild(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<()> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir()
+            .map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    service.spawn_rebuild(root);
+    Ok(())
+}
+
 /// Open `<portable-root>/logs/content/` in the host file manager. Creates the
 /// folder first if it doesn't exist so the call doesn't 404 on a clean
 /// install. Windows uses `explorer.exe`; macOS `open`; Linux

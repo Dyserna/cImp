@@ -84,6 +84,21 @@ impl GraphIndex {
         Self::open(root, db_subdir)
     }
 
+    /// Drop every relation and recreate the schema empty. Used by a **full
+    /// rebuild** so rows for files that were deleted since the last build don't
+    /// linger (per-file `index_file_graph` only replaces a file's own rows, it
+    /// can't know a path vanished). `::remove` of a not-yet-created relation is
+    /// ignored so this is safe on a fresh store too.
+    pub fn reset(&self) -> AppResult<()> {
+        let existing = self.existing_relations()?;
+        for (name, _) in RELATIONS {
+            if existing.contains(*name) {
+                self.run_mut(&format!("::remove {name}"), BTreeMap::new())?;
+            }
+        }
+        self.ensure_schema()
+    }
+
     fn ensure_schema(&self) -> AppResult<()> {
         let existing = self.existing_relations()?;
         for (name, create) in RELATIONS {

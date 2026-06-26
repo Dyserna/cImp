@@ -35,7 +35,7 @@ use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
-    get_system_stats, list_tabs,
+    get_system_stats, graph_rebuild, graph_status, list_tabs,
     list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
     offload_server_log, offload_server_metrics, offload_server_restart, offload_server_start,
     offload_server_stop,
@@ -285,6 +285,7 @@ fn main() {
     let stt_runtime_for_setup = stt_runtime_slot.clone();
     let settings_for_stt = settings_handle.clone();
     let settings_for_offload = settings_handle.clone();
+    let settings_for_graph = settings_handle.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
@@ -430,6 +431,54 @@ fn main() {
                 }
             }
 
+            // V9-01 code knowledge graph: the app-owned graph service that
+            // builds `<root>/<db_subdir>/graph.db` so the `graph_*` MCP tools
+            // have data to read. Managed unconditionally (the IPC reaches it
+            // either way); a full build only runs when the feature is enabled.
+            // Like the supervisor, it's fail-soft — a build error surfaces as
+            // an `error` status, never blocks launch.
+            {
+                let graph_service = crate::graph::GraphService::new(
+                    app.handle().clone(),
+                    settings_for_graph.clone(),
+                );
+                app.manage(graph_service.clone());
+
+                // Build the launch project's graph in the background on startup
+                // so a session opened immediately after launch finds an index.
+                // Runtime enable (false→true) also kicks one build via the
+                // settings watcher below.
+                if settings_for_graph.current().graph.enabled {
+                    if let Ok(root) = std::env::current_dir() {
+                        graph_service.spawn_rebuild(root);
+                    }
+                }
+                {
+                    let svc = graph_service.clone();
+                    let watch = settings_for_graph.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let mut rx = watch.subscribe();
+                        let mut was_enabled = watch.current().graph.enabled;
+                        loop {
+                            match rx.recv().await {
+                                Ok(s) => {
+                                    let now = s.graph.enabled;
+                                    if now && !was_enabled {
+                                        if let Ok(root) = std::env::current_dir() {
+                                            info!("graph: enabled at runtime — building index");
+                                            svc.spawn_rebuild(root);
+                                        }
+                                    }
+                                    was_enabled = now;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    });
+                }
+            }
+
             spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
 
             // Apply the project-derived window title. The hardcoded
@@ -522,6 +571,8 @@ fn main() {
             offload_reload_mcp,
             offload_server_log,
             offload_server_metrics,
+            graph_status,
+            graph_rebuild,
             theming::themes_list,
             theming::palettes_list,
         ])
@@ -586,6 +637,10 @@ fn main() {
                     app.state::<std::sync::Arc<crate::offload::OffloadService>>()
                         .shutdown()
                         .await;
+                    // V9-01: drop the warm graph index handles (SQLite
+                    // connections close on drop).
+                    app.state::<std::sync::Arc<crate::graph::GraphService>>()
+                        .shutdown();
                     // Closing the main window also closes the settings window
                     // if it's open — otherwise it would keep the process alive
                     // with no main window. Destroy it before the main window.

@@ -23,8 +23,10 @@ mod index;
 mod mcp;
 mod model;
 mod schema;
+mod service;
 
 pub use builder::parse_file;
 pub use index::{GraphIndex, GraphStats, SymbolHit};
 pub use mcp::{handle_call as handle_mcp_call, tools as mcp_tools};
 pub use model::*;
+pub use service::{GraphService, GraphStatus};

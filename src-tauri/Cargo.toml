@@ -113,6 +113,10 @@ tree-sitter-rust = "0.24.2"
 # against the current rayon, and we don't need PageRank/etc. — transitive
 # queries are plain recursive Datalog) and `storage-rocksdb` (C++, heavy).
 cozo = { version = "0.7.6", default-features = false, features = ["storage-sqlite", "rayon"] }
+# Gitignore-respecting directory walker for the graph's full-tree indexer
+# (ripgrep's walker). Skips `target/`, `node_modules/`, etc. for free. The
+# live fs-watcher (`notify`) lands in Phase D.
+ignore = "0.4"
 
 # Windows-only: registry probe for Git Bash auto-detection in shell::detect.
 [target.'cfg(windows)'.dependencies]

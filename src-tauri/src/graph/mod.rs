@@ -18,6 +18,8 @@
 //! parser (tree-sitter), store (CozoDB), query API, watcher, embedding
 //! pipeline, and monitor event bus arrive in later stages.
 
+mod builder;
 mod model;
 
+pub use builder::parse_file;
 pub use model::*;

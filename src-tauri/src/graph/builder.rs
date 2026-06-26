@@ -28,12 +28,135 @@ pub fn parse_file(path: &str, src: &str, lang: Lang) -> FileGraph {
         ..Default::default()
     };
 
-    if lang == Lang::Rust {
-        parse_rust(src, path, &mut fg);
+    match lang {
+        Lang::Rust => parse_rust(src, path, &mut fg),
+        Lang::Markdown => parse_markdown(src, path, &mut fg),
+        // Other languages: file row only for now (symbols land in Phase E).
+        _ => {}
     }
-    // Other languages: file row only for now (symbols land in Phase E).
 
     fg
+}
+
+/// Chunk a Markdown file into `doc_chunk`s by heading section, so
+/// `graph_search_docs` can surface project documentation (READMEs, design
+/// docs) alongside code doc-comments. Each ATX heading (`#`..`######`) opens a
+/// new section; its text runs until the next heading. Content before the first
+/// heading becomes a chunk anchored to the file stem. Anchors are GitHub-style
+/// heading slugs, de-duplicated with a numeric suffix.
+fn parse_markdown(src: &str, file: &str, fg: &mut FileGraph) {
+    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    // Current section: (anchor, heading-title, accumulated lines).
+    let mut anchor = file_stem(file);
+    let mut title = String::new();
+    let mut body: Vec<String> = Vec::new();
+    let mut in_fence = false;
+
+    let flush = |anchor: &str, title: &str, body: &[String], fg: &mut FileGraph,
+                 seen: &mut std::collections::HashMap<String, u32>| {
+        let text = compose_chunk(title, body);
+        if text.trim().is_empty() {
+            return;
+        }
+        let uniq = dedup_anchor(anchor, seen);
+        let id = doc_chunk_id(file, &uniq);
+        fg.docs.push(DocChunk {
+            id,
+            source_path: file.to_string(),
+            anchor: uniq,
+            text,
+        });
+    };
+
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        // Track fenced code blocks so a `#` inside a fence isn't a heading.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            body.push(line.to_string());
+            continue;
+        }
+        if !in_fence {
+            if let Some(h) = heading_title(trimmed) {
+                // Close the previous section, open the new one.
+                flush(&anchor, &title, &body, fg, &mut seen);
+                anchor = slug(&h);
+                title = h;
+                body.clear();
+                continue;
+            }
+        }
+        body.push(line.to_string());
+    }
+    flush(&anchor, &title, &body, fg, &mut seen);
+}
+
+/// The title of an ATX heading line (`## Foo` → `Foo`), or `None`.
+fn heading_title(trimmed: &str) -> Option<String> {
+    if !trimmed.starts_with('#') {
+        return None;
+    }
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = &trimmed[hashes..];
+    // A real heading needs a space after the hashes (`#foo` is not a heading).
+    if !rest.starts_with(' ') && !rest.is_empty() {
+        return None;
+    }
+    Some(rest.trim().trim_end_matches('#').trim().to_string())
+}
+
+/// Heading text + body, joined. The title leads so a search for the heading
+/// term matches even when the body doesn't repeat it.
+fn compose_chunk(title: &str, body: &[String]) -> String {
+    let body_text = body.join("\n");
+    if title.is_empty() {
+        body_text.trim().to_string()
+    } else if body_text.trim().is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n{}", body_text.trim_end())
+    }
+}
+
+/// GitHub-style heading slug: lowercase, spaces → hyphens, drop other
+/// punctuation. Empty slugs fall back to `section`.
+fn slug(title: &str) -> String {
+    let mut s = String::new();
+    for ch in title.chars() {
+        if ch.is_alphanumeric() {
+            s.extend(ch.to_lowercase());
+        } else if ch == ' ' || ch == '-' || ch == '_' {
+            s.push('-');
+        }
+        // else: dropped
+    }
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() {
+        "section".to_string()
+    } else {
+        s
+    }
+}
+
+/// Disambiguate repeated anchors within one file (`foo`, `foo-1`, `foo-2`).
+fn dedup_anchor(anchor: &str, seen: &mut std::collections::HashMap<String, u32>) -> String {
+    let n = seen.entry(anchor.to_string()).or_insert(0);
+    let out = if *n == 0 {
+        anchor.to_string()
+    } else {
+        format!("{anchor}-{n}")
+    };
+    *n += 1;
+    out
+}
+
+/// The file stem (no directory, no extension) for the pre-heading chunk anchor.
+fn file_stem(file: &str) -> String {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name).to_string()
 }
 
 /// Deterministic FNV-1a 64-bit content hash. Stable across runs (unlike
@@ -384,5 +507,43 @@ pub trait Shape {
     fn hash_is_stable_and_content_sensitive() {
         assert_eq!(content_hash("abc"), content_hash("abc"));
         assert_ne!(content_hash("abc"), content_hash("abd"));
+    }
+
+    const MD: &str = r#"# Overview
+
+Intro paragraph about the project.
+
+## Setup
+
+Run `cargo build`. Note the `# not a heading` inside this code:
+
+```
+# this hash is inside a fence, not a heading
+```
+
+## Setup
+
+Duplicate heading to exercise de-dup.
+"#;
+
+    #[test]
+    fn markdown_chunks_by_heading() {
+        let fg = parse_file("docs/README.md", MD, Lang::Markdown);
+        assert_eq!(fg.lang_tag, "markdown");
+        // No code symbols/edges for markdown.
+        assert!(fg.symbols.is_empty());
+
+        let anchors: Vec<&str> = fg.docs.iter().map(|d| d.anchor.as_str()).collect();
+        assert!(anchors.contains(&"overview"));
+        assert!(anchors.contains(&"setup"));
+        // The duplicate "## Setup" is disambiguated.
+        assert!(anchors.contains(&"setup-1"));
+
+        // The fenced `# this hash…` line did NOT open a new section.
+        assert!(!anchors.iter().any(|a| a.contains("this-hash")));
+
+        // The Overview chunk carries its body text (searchable).
+        let overview = fg.docs.iter().find(|d| d.anchor == "overview").unwrap();
+        assert!(overview.text.contains("Intro paragraph"));
     }
 }

@@ -287,6 +287,9 @@ impl GraphService {
             let Some(lang) = lang_for(&path, &snap.languages) else {
                 continue;
             };
+            if lang == Lang::Markdown && !snap.index_docs {
+                continue;
+            }
             let rel = rel_path(root, &path);
 
             if !path.is_file() {
@@ -354,13 +357,34 @@ fn build_tree(
     let max_bytes = snap.max_file_bytes.max(1);
 
     let mut indexed: u64 = 0;
-    let walker = WalkBuilder::new(root)
-        .hidden(false) // index dotfiles like `.github/*.md`; the db dir is filtered below
+    let mut wb = WalkBuilder::new(root);
+    wb.hidden(false) // index dotfiles like `.github/*.md`; the db dir is filtered below
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .parents(true)
-        .build();
+        .parents(true);
+    // Honor the user's extra ignore globs (additive to `.gitignore`). An
+    // `Override` whose patterns are *ignore* globs needs each prefixed with
+    // `!` (overrides are whitelists; a leading `!` flips one to a blacklist).
+    if !snap.ignore.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        for pat in &snap.ignore {
+            let pat = pat.trim();
+            if pat.is_empty() {
+                continue;
+            }
+            let rule = if let Some(stripped) = pat.strip_prefix('!') {
+                stripped.to_string() // already a re-include
+            } else {
+                format!("!{pat}") // ignore this glob
+            };
+            let _ = ob.add(&rule);
+        }
+        if let Ok(ov) = ob.build() {
+            wb.overrides(ov);
+        }
+    }
+    let walker = wb.build();
 
     for entry in walker {
         let entry = match entry {
@@ -383,6 +407,11 @@ fn build_tree(
         let Some(lang) = lang_for(path, &snap.languages) else {
             continue;
         };
+        // `index_docs` off → skip pure-doc (markdown) files; code doc-comments
+        // still ride along with their symbols.
+        if lang == Lang::Markdown && !snap.index_docs {
+            continue;
+        }
 
         // Size guard before reading.
         match entry.metadata() {
@@ -482,6 +511,36 @@ mod tests {
         let (_, stats2) = build_tree(&idx, &dir, &snap, sub).expect("rebuild2");
         assert_eq!(stats2.files, 1);
         assert!(idx.find_symbol("gamma").unwrap().is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rebuild_indexes_markdown_docs_and_honors_index_docs_toggle() {
+        let dir = std::env::temp_dir().join(format!("ckg-md-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("src.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(
+            dir.join("docs/guide.md"),
+            "# Guide\n\nHow to configure the widget frobnicator.\n",
+        )
+        .unwrap();
+        let sub = ".ckg-test";
+
+        // index_docs on (default): the markdown chunk is searchable.
+        let snap_on = GraphSettings::default();
+        let idx = GraphIndex::open(&dir, sub).expect("open");
+        build_tree(&idx, &dir, &snap_on, sub).expect("rebuild");
+        let hits = idx.search_docs("frobnicator", 10, 200).expect("search");
+        assert!(hits.iter().any(|h| h.source_path == "docs/guide.md"));
+
+        // index_docs off: markdown is skipped (the file row is gone after a
+        // clean rebuild), so the doc search no longer matches.
+        let mut snap_off = GraphSettings::default();
+        snap_off.index_docs = false;
+        build_tree(&idx, &dir, &snap_off, sub).expect("rebuild2");
+        assert!(idx.search_docs("frobnicator", 10, 200).unwrap().is_empty());
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

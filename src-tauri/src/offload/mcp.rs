@@ -118,8 +118,21 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": [offload_task_tool_live().await] })),
-        "tools/call" => handle_tools_call(params).await,
+        "tools/list" => {
+            // The offload tool plus the V9-01 code-knowledge-graph tools
+            // (present only when the graph feature is enabled for this project).
+            let mut tools = vec![offload_task_tool_live().await];
+            tools.extend(crate::graph::mcp_tools());
+            Ok(json!({ "tools": tools }))
+        }
+        "tools/call" => {
+            let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if name.starts_with("graph_") {
+                crate::graph::handle_mcp_call(&params)
+            } else {
+                handle_tools_call(params).await
+            }
+        }
         _ => Err((-32601, format!("method not found: {method}"))),
     }
 }

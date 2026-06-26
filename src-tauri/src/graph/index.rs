@@ -27,6 +27,23 @@ pub struct SymbolHit {
     pub signature: String,
 }
 
+/// One reference (use site) returned by `references`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefHit {
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// One documentation hit returned by `search_docs`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocHit {
+    pub source_path: String,
+    pub anchor: String,
+    pub snippet: String,
+}
+
 /// Per-index counts for the status surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GraphStats {
@@ -51,6 +68,20 @@ impl GraphIndex {
         let index = GraphIndex { db };
         index.ensure_schema()?;
         Ok(index)
+    }
+
+    /// Open an **existing** graph store, erroring if it hasn't been built yet.
+    /// Used by read-only consumers (the MCP child) that must not create an
+    /// empty db for an unindexed project.
+    pub fn open_existing(root: &Path, db_subdir: &str) -> AppResult<GraphIndex> {
+        let db_path = root.join(db_subdir).join("graph.db");
+        if !db_path.exists() {
+            return Err(AppError::GraphNotReady(format!(
+                "no code graph at {} — enable the graph and index this project in ccImp",
+                db_path.display()
+            )));
+        }
+        Self::open(root, db_subdir)
     }
 
     fn ensure_schema(&self) -> AppResult<()> {
@@ -225,6 +256,143 @@ impl GraphIndex {
             .collect())
     }
 
+    /// Symbols that call `name` (callers). Joins call edges (whose `dst` is the
+    /// callee name) back to the caller symbol by `src` id.
+    pub fn callers(&self, name: &str) -> AppResult<Vec<SymbolHit>> {
+        let mut p = BTreeMap::new();
+        p.insert("name".to_string(), DataValue::Str(name.into()));
+        let rows = self.run(
+            r#"?[sid, sname, skind, file, start_line, signature] :=
+                *edge{kind: ek, src: sid, dst: dn}, ek == "call", dn == $name,
+                *symbol{id: sid, name: sname, kind: skind, file, start_line, signature}
+            :limit 500"#,
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows_to_symbols(&rows))
+    }
+
+    /// Symbols called by any symbol named `name` (callees, resolved by name).
+    pub fn callees(&self, name: &str) -> AppResult<Vec<SymbolHit>> {
+        let mut p = BTreeMap::new();
+        p.insert("name".to_string(), DataValue::Str(name.into()));
+        let rows = self.run(
+            r#"?[id2, nm, skind, file, start_line, signature] :=
+                *symbol{id: cid, name: cn}, cn == $name,
+                *edge{kind: ek, src: cid, dst: dn}, ek == "call",
+                *symbol{id: id2, name: nm, kind: skind, file, start_line, signature}, nm == dn
+            :limit 500"#,
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows_to_symbols(&rows))
+    }
+
+    /// All reference (use) sites of `name`.
+    pub fn references(&self, name: &str) -> AppResult<Vec<RefHit>> {
+        let mut p = BTreeMap::new();
+        p.insert("name".to_string(), DataValue::Str(name.into()));
+        let rows = self.run(
+            "?[name, file, line, col] := *ref{name, file, line, col}, name == $name\n:limit 1000",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| RefHit {
+                name: cell_str(r, 0),
+                file: cell_str(r, 1),
+                line: cell_i64(r, 2) as u32,
+                col: cell_i64(r, 3) as u32,
+            })
+            .collect())
+    }
+
+    /// Module/symbol paths imported by `file`.
+    pub fn imports(&self, file: &str) -> AppResult<Vec<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("file".to_string(), DataValue::Str(file.into()));
+        let rows = self.run(
+            r#"?[dst] := *edge{kind: ek, src, dst}, ek == "import", src == $file
+            :limit 500"#,
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.iter().map(|r| cell_str(r, 0)).collect())
+    }
+
+    /// Every definition in `file`, ordered by start line.
+    pub fn outline(&self, file: &str) -> AppResult<Vec<SymbolHit>> {
+        let mut p = BTreeMap::new();
+        p.insert("file".to_string(), DataValue::Str(file.into()));
+        let rows = self.run(
+            "?[id, name, kind, file, start_line, signature] := \
+                *symbol{id, name, kind, file, start_line, signature}, file == $file",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut syms = rows_to_symbols(&rows);
+        syms.sort_by_key(|s| s.start_line);
+        Ok(syms)
+    }
+
+    /// Transitive call-chain names. `forward = true` returns everything `name`
+    /// transitively calls; `false` returns everything that transitively calls
+    /// `name`. Recursive Datalog over a name-level call graph; terminates on
+    /// cycles (set saturation).
+    pub fn transitive(&self, name: &str, forward: bool) -> AppResult<Vec<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("name".to_string(), DataValue::Str(name.into()));
+        let head = if forward {
+            "?[y] := reach[x, y], x == $name"
+        } else {
+            "?[x] := reach[x, y], y == $name"
+        };
+        let script = format!(
+            r#"calls[cn, dn] := *symbol{{id: cid, name: cn}}, *edge{{kind: ek, src: cid, dst: dn}}, ek == "call"
+reach[x, y] := calls[x, y]
+reach[x, y] := reach[x, z], calls[z, y]
+{head}
+:limit 1000"#
+        );
+        let rows = self.run(&script, p, ScriptMutability::Immutable)?;
+        Ok(rows.rows.iter().map(|r| cell_str(r, 0)).collect())
+    }
+
+    /// Full-text-ish documentation search. MVP: a case-insensitive substring
+    /// match over chunked doc text (a real FTS index is a Phase-G refinement).
+    pub fn search_docs(
+        &self,
+        query: &str,
+        max_rows: usize,
+        max_snippet: usize,
+    ) -> AppResult<Vec<DocHit>> {
+        let rows = self.run(
+            "?[source_path, anchor, text] := *doc_chunk{source_path, anchor, text}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let needle = query.to_lowercase();
+        let mut hits = Vec::new();
+        for r in &rows.rows {
+            let source_path = cell_str(r, 0);
+            let anchor = cell_str(r, 1);
+            let text = cell_str(r, 2);
+            if text.to_lowercase().contains(&needle) || anchor.to_lowercase().contains(&needle) {
+                hits.push(DocHit {
+                    source_path,
+                    anchor,
+                    snippet: truncate_chars(&text, max_snippet),
+                });
+                if hits.len() >= max_rows {
+                    break;
+                }
+            }
+        }
+        Ok(hits)
+    }
+
     /// Row counts for the status surface.
     pub fn stats(&self) -> AppResult<GraphStats> {
         let count = |rel: &str| -> AppResult<u64> {
@@ -294,6 +462,35 @@ fn cell_i64(row: &[DataValue], i: usize) -> i64 {
     row.get(i).map(dv_i64).unwrap_or(0)
 }
 
+/// Map query rows shaped `[id, name, kind, file, start_line, signature]` to
+/// [`SymbolHit`]s.
+fn rows_to_symbols(rows: &cozo::NamedRows) -> Vec<SymbolHit> {
+    rows.rows
+        .iter()
+        .map(|r| SymbolHit {
+            id: cell_str(r, 0),
+            name: cell_str(r, 1),
+            kind: cell_str(r, 2),
+            file: cell_str(r, 3),
+            start_line: cell_i64(r, 4) as u32,
+            signature: cell_str(r, 5),
+        })
+        .collect()
+}
+
+/// Truncate a string to at most `n` characters (on a char boundary), adding an
+/// ellipsis when it was cut.
+fn truncate_chars(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => {
+            let mut out = s[..idx].to_string();
+            out.push('…');
+            out
+        }
+        None => s.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +526,41 @@ pub struct Point { x: i32 }
         assert_eq!(stats.files, 1);
         assert!(stats.symbols >= 3);
         assert!(stats.edges >= 1);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_api_callers_callees_refs_docs() {
+        let dir = std::env::temp_dir().join(format!("ckg-q-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust))
+            .expect("index");
+
+        // add() calls helper(); so add is a caller of helper, and helper is a callee of add.
+        let callers = idx.callers("helper").expect("callers");
+        assert!(callers.iter().any(|s| s.name == "add"));
+
+        let callees = idx.callees("add").expect("callees");
+        assert!(callees.iter().any(|s| s.name == "helper"));
+
+        // helper is referenced at least once (the call site in add).
+        let refs = idx.references("helper").expect("refs");
+        assert!(!refs.is_empty());
+
+        // outline lists the file's defs in line order.
+        let outline = idx.outline("src/geo.rs").expect("outline");
+        assert!(outline.iter().any(|s| s.name == "add"));
+        assert!(outline.windows(2).all(|w| w[0].start_line <= w[1].start_line));
+
+        // transitive: add -> helper.
+        let reach = idx.transitive("add", true).expect("transitive");
+        assert!(reach.contains(&"helper".to_string()));
+
+        // doc search finds the "Adds two numbers." chunk.
+        let docs = idx.search_docs("numbers", 10, 200).expect("docs");
+        assert!(docs.iter().any(|d| d.anchor == "add"));
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

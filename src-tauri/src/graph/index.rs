@@ -128,16 +128,14 @@ impl GraphIndex {
             .collect())
     }
 
-    /// Write one file's extracted graph, replacing any prior rows for that
-    /// path. Symbols/refs/doc-chunks are keyed by the file; edges are matched
-    /// by the file-embedded id prefix (`<file>#…`) or, for imports, `src == file`.
-    pub fn index_file_graph(&self, fg: &FileGraph) -> AppResult<()> {
-        let file = fg.path.clone();
+    /// Delete every row belonging to `file` (symbols, refs, doc-chunks, the
+    /// `file` row, and edges keyed by the file-embedded id prefix `<file>#…` or
+    /// `src == file` for imports). Used both by the per-file replace in
+    /// [`index_file_graph`] and by the watcher when a file is deleted.
+    pub fn remove_file(&self, file: &str) -> AppResult<()> {
         let prefix = format!("{file}#");
-
-        // --- delete prior rows for this file ---
         let mut p = BTreeMap::new();
-        p.insert("file".to_string(), DataValue::Str(file.as_str().into()));
+        p.insert("file".to_string(), DataValue::Str(file.into()));
         self.run_mut(
             "?[id] := *symbol{id, file}, file == $file\n:rm symbol {id}",
             p.clone(),
@@ -150,12 +148,27 @@ impl GraphIndex {
             "?[id] := *doc_chunk{id, source_path}, source_path == $file\n:rm doc_chunk {id}",
             p.clone(),
         )?;
-        let mut pe = p.clone();
+        self.run_mut(
+            "?[path] := *file{path}, path == $file\n:rm file {path}",
+            p.clone(),
+        )?;
+        let mut pe = p;
         pe.insert("prefix".to_string(), DataValue::Str(prefix.as_str().into()));
         self.run_mut(
             "?[kind, src, dst] := *edge{kind, src, dst}, (starts_with(src, $prefix) or src == $file)\n:rm edge {kind, src, dst}",
             pe,
         )?;
+        Ok(())
+    }
+
+    /// Write one file's extracted graph, replacing any prior rows for that
+    /// path. Symbols/refs/doc-chunks are keyed by the file; edges are matched
+    /// by the file-embedded id prefix (`<file>#…`) or, for imports, `src == file`.
+    pub fn index_file_graph(&self, fg: &FileGraph) -> AppResult<()> {
+        let file = fg.path.clone();
+
+        // Replace semantics: clear any prior rows for this path first.
+        self.remove_file(&file)?;
 
         // --- insert fresh rows ---
         let file_rows = vec![DataValue::List(vec![
@@ -576,6 +589,29 @@ pub struct Point { x: i32 }
         // doc search finds the "Adds two numbers." chunk.
         let docs = idx.search_docs("numbers", 10, 200).expect("docs");
         assert!(docs.iter().any(|d| d.anchor == "add"));
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_file_drops_all_rows_for_a_path() {
+        let dir = std::env::temp_dir().join(format!("ckg-rm-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust))
+            .expect("index");
+        assert!(!idx.find_symbol("add").unwrap().is_empty());
+        let before = idx.stats().unwrap();
+        assert_eq!(before.files, 1);
+
+        // The watcher's delete path: remove every row for the file.
+        idx.remove_file("src/geo.rs").expect("remove");
+        assert!(idx.find_symbol("add").unwrap().is_empty());
+        assert!(idx.references("helper").unwrap().is_empty());
+        let after = idx.stats().unwrap();
+        assert_eq!(after.files, 0);
+        assert_eq!(after.symbols, 0);
+        assert_eq!(after.edges, 0);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

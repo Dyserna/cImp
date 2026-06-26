@@ -114,9 +114,12 @@ tree-sitter-rust = "0.24.2"
 # queries are plain recursive Datalog) and `storage-rocksdb` (C++, heavy).
 cozo = { version = "0.7.6", default-features = false, features = ["storage-sqlite", "rayon"] }
 # Gitignore-respecting directory walker for the graph's full-tree indexer
-# (ripgrep's walker). Skips `target/`, `node_modules/`, etc. for free. The
-# live fs-watcher (`notify`) lands in Phase D.
+# (ripgrep's walker). Skips `target/`, `node_modules/`, etc. for free.
 ignore = "0.4"
+# Cross-platform fs watcher for incremental graph re-indexing (Phase D). On
+# Windows this is ReadDirectoryChangesW under the hood. Debounce + gitignore
+# filtering are done in `graph::watcher`.
+notify = "6"
 
 # Windows-only: registry probe for Git Bash auto-detection in shell::detect.
 [target.'cfg(windows)'.dependencies]

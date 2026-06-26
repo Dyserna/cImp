@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
+use ignore::gitignore::Gitignore;
 use ignore::WalkBuilder;
 use tauri::{AppHandle, Emitter};
 use tracing::{debug, info, warn};
@@ -78,6 +80,14 @@ pub struct GraphService {
     indices: StdMutex<HashMap<PathBuf, Arc<GraphIndex>>>,
     /// Per-root build status, the source of truth for the IPC + the event.
     status: StdMutex<HashMap<PathBuf, GraphStatus>>,
+    /// Live fs-watcher handle per watched root (Phase D). Kept alive here so
+    /// the OS watch (and its debounce thread) persist; dropped on shutdown.
+    watchers: StdMutex<HashMap<PathBuf, notify::RecommendedWatcher>>,
+    /// Serializes all store mutations (full rebuild vs incremental re-index)
+    /// so a watcher batch can't write into a store that a concurrent rebuild
+    /// is mid-`reset()`. Coarse (one lock for all roots), which is fine —
+    /// builds/re-indexes are infrequent and a project is usually one root.
+    write_lock: StdMutex<()>,
 }
 
 impl GraphService {
@@ -87,6 +97,8 @@ impl GraphService {
             settings,
             indices: StdMutex::new(HashMap::new()),
             status: StdMutex::new(HashMap::new()),
+            watchers: StdMutex::new(HashMap::new()),
+            write_lock: StdMutex::new(()),
         })
     }
 
@@ -206,6 +218,9 @@ impl GraphService {
     pub fn rebuild_blocking(&self, root: &Path) -> AppResult<GraphStats> {
         let snap = self.settings.current().graph;
         let idx = self.index_for(root)?;
+        // Hold the store-write lock across the whole rebuild so a concurrent
+        // watcher batch can't write into the store mid-`reset()`.
+        let _w = self.write_lock.lock().unwrap();
         let (indexed, stats) = build_tree(&idx, root, &snap, &self.db_subdir())?;
 
         // Record the visited-file count alongside the authoritative row counts.
@@ -217,8 +232,108 @@ impl GraphService {
         Ok(stats)
     }
 
-    /// Drop warm handles on shutdown (SQLite connections close on drop).
+    /// Start the Phase-D fs-watcher for `root` (idempotent; a no-op if already
+    /// watching or the feature is disabled). Incremental re-indexes flow
+    /// through [`reindex_paths`](Self::reindex_paths). Independent of the
+    /// initial build — they run in parallel and the `write_lock` serializes
+    /// their store writes.
+    pub fn start_watch(self: &Arc<Self>, root: PathBuf) {
+        if !self.settings.current().graph.enabled {
+            return;
+        }
+        let mut watchers = self.watchers.lock().unwrap();
+        if watchers.contains_key(&root) {
+            return;
+        }
+        let debounce =
+            Duration::from_millis(self.settings.current().graph.watch_debounce_ms.max(50));
+        match super::watcher::start(self.clone(), root.clone(), debounce) {
+            Ok(handle) => {
+                info!(root = %root.display(), "graph: watching for changes");
+                watchers.insert(root, handle);
+            }
+            Err(e) => warn!(root = %root.display(), error = %e, "graph: watcher failed to start"),
+        }
+    }
+
+    /// Apply one debounced batch of changed paths to `root`'s store: re-parse
+    /// created/modified files, drop rows for deleted ones, then refresh the
+    /// status counts. Called from the watcher thread.
+    pub fn reindex_paths(&self, root: &Path, paths: Vec<PathBuf>) {
+        let snap = self.settings.current().graph;
+        if !snap.enabled {
+            return;
+        }
+        let idx = match self.index_for(root) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(root = %root.display(), error = %e, "graph: reindex open failed");
+                return;
+            }
+        };
+        let sub = self.db_subdir();
+        let max_bytes = snap.max_file_bytes.max(1);
+        let gi = build_gitignore(root);
+
+        let _w = self.write_lock.lock().unwrap();
+        let mut changed = 0u64;
+        for path in paths {
+            // Never touch our own store directory.
+            if path.components().any(|c| c.as_os_str() == sub.as_str()) {
+                continue;
+            }
+            // Only files with a configured language matter (this also filters
+            // out directory events, whose path has no indexable extension).
+            let Some(lang) = lang_for(&path, &snap.languages) else {
+                continue;
+            };
+            let rel = rel_path(root, &path);
+
+            if !path.is_file() {
+                // Deleted/moved-away — drop its rows (no-op if never indexed).
+                if idx.remove_file(&rel).is_ok() {
+                    changed += 1;
+                }
+                continue;
+            }
+            // Respect gitignore so editing a build artifact doesn't churn.
+            if gi.matched_path_or_any_parents(&path, false).is_ignore() {
+                continue;
+            }
+            match std::fs::metadata(&path) {
+                Ok(m) if m.len() > max_bytes => continue,
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+            let src = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let fg = parse_file(&rel, &src, lang);
+            match idx.index_file_graph(&fg) {
+                Ok(()) => changed += 1,
+                Err(e) => debug!(file = %rel, error = %e, "graph: incremental index failed"),
+            }
+        }
+        drop(_w);
+
+        if changed > 0 {
+            if let Ok(stats) = idx.stats() {
+                let mut s = self.status(root);
+                s.state = "ready".into();
+                s.files = stats.files;
+                s.symbols = stats.symbols;
+                s.edges = stats.edges;
+                self.set_status(root, s);
+            }
+            debug!(root = %root.display(), changed, "graph: incremental re-index applied");
+        }
+    }
+
+    /// Drop warm handles + watchers on shutdown (SQLite connections close on
+    /// drop; dropping a watcher ends its debounce thread).
     pub fn shutdown(&self) {
+        self.watchers.lock().unwrap().clear();
         self.indices.lock().unwrap().clear();
     }
 }
@@ -237,7 +352,6 @@ fn build_tree(
     idx.reset()?;
 
     let max_bytes = snap.max_file_bytes.max(1);
-    let langs = &snap.languages; // matched against `Lang::tag()`
 
     let mut indexed: u64 = 0;
     let walker = WalkBuilder::new(root)
@@ -266,10 +380,9 @@ fn build_tree(
             continue;
         }
 
-        let lang = Lang::from_path(path);
-        if lang == Lang::Other || !langs.iter().any(|l| l == lang.tag()) {
+        let Some(lang) = lang_for(path, &snap.languages) else {
             continue;
-        }
+        };
 
         // Size guard before reading.
         match entry.metadata() {
@@ -301,6 +414,29 @@ fn build_tree(
 fn rel_path(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.to_string_lossy().replace('\\', "/")
+}
+
+/// The indexable language for `path`, or `None` if its extension is unknown or
+/// not in the configured `languages`. Shared by the full walk and the watcher
+/// so they agree on what's in scope.
+fn lang_for(path: &Path, languages: &[String]) -> Option<Lang> {
+    let lang = Lang::from_path(path);
+    if lang == Lang::Other || !languages.iter().any(|l| l == lang.tag()) {
+        None
+    } else {
+        Some(lang)
+    }
+}
+
+/// Build a gitignore matcher rooted at `root` from its top-level `.gitignore`,
+/// for per-path filtering in the watcher (the full walk gets this for free via
+/// `WalkBuilder`). Nested `.gitignore`s aren't merged here — the common case is
+/// a root-level ignore listing `target/`, `node_modules/`, etc.; an empty
+/// matcher (missing/invalid file) simply ignores nothing.
+fn build_gitignore(root: &Path) -> Gitignore {
+    let mut b = ignore::gitignore::GitignoreBuilder::new(root);
+    let _ = b.add(root.join(".gitignore"));
+    b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
 #[cfg(test)]
@@ -349,5 +485,18 @@ mod tests {
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lang_for_honors_configured_languages() {
+        use std::path::PathBuf;
+        let all = GraphSettings::default().languages;
+        // A configured language resolves; an unknown extension doesn't.
+        assert_eq!(lang_for(&PathBuf::from("src/a.rs"), &all), Some(Lang::Rust));
+        assert_eq!(lang_for(&PathBuf::from("a.bin"), &all), None);
+        // A recognized language that the user didn't opt into is filtered out.
+        let only_rust = vec!["rust".to_string()];
+        assert_eq!(lang_for(&PathBuf::from("a.py"), &only_rust), None);
+        assert_eq!(lang_for(&PathBuf::from("a.rs"), &only_rust), Some(Lang::Rust));
     }
 }

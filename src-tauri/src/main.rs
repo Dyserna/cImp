@@ -450,7 +450,9 @@ fn main() {
                 // settings watcher below.
                 if settings_for_graph.current().graph.enabled {
                     if let Ok(root) = std::env::current_dir() {
-                        graph_service.spawn_rebuild(root);
+                        graph_service.spawn_rebuild(root.clone());
+                        // Phase D: keep the index live as files change.
+                        graph_service.start_watch(root);
                     }
                 }
                 {
@@ -466,7 +468,8 @@ fn main() {
                                     if now && !was_enabled {
                                         if let Ok(root) = std::env::current_dir() {
                                             info!("graph: enabled at runtime — building index");
-                                            svc.spawn_rebuild(root);
+                                            svc.spawn_rebuild(root.clone());
+                                            svc.start_watch(root);
                                         }
                                     }
                                     was_enabled = now;

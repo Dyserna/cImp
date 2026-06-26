@@ -24,6 +24,7 @@ mod mcp;
 mod model;
 mod schema;
 mod service;
+mod watcher;
 
 pub use builder::parse_file;
 pub use index::{GraphIndex, GraphStats, SymbolHit};

@@ -818,6 +818,18 @@ pub async fn offload_service_status(
     Ok(service.status().await)
 }
 
+/// Reconcile the warm MCP host against the *current* settings and return the
+/// fresh status. The Settings MCP editor calls this right after persisting an
+/// add/remove/enable/disable so a server connects or drops live — no app
+/// restart. Cheap when the pool is already warm (unchanged servers are kept).
+#[tauri::command]
+pub async fn offload_reload_mcp(
+    service: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
+) -> AppResult<crate::offload::service::ServiceStatus> {
+    service.warm_host().await;
+    Ok(service.status().await)
+}
+
 /// V8-03: buffered `llama-server` output for a backend (primary when `name`
 /// is omitted) — the read-only Settings log panel's initial fill. Live lines
 /// arrive separately via the `offload-server-output` event.

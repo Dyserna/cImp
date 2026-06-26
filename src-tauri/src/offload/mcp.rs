@@ -211,7 +211,9 @@ fn offload_task_description(settings: &OffloadSettings) -> String {
     format!(
         "Delegate a token-heavy subtask (broad codebase search, large-file/log summarization, web \
          research) to a local/remote model to conserve this session's context. Pass a \
-         self-contained instruction; you get back only the synthesized result. Backends: {}.{}",
+         self-contained instruction; you get back only the synthesized result. You can run \
+         offloads in parallel — issue multiple offload_task calls at once to fan out independent \
+         subtasks; they queue if all slots are busy. Backends: {}.{}",
         parts.join("; "),
         routing_note
     )

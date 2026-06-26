@@ -37,7 +37,7 @@ use crate::settings::{
 };
 
 use super::agent::{self, AgentConfig, HostRouter, OffloadTask, ThinkingMode};
-use super::mcp_host::{McpHost, McpServerHealth};
+use super::mcp_host::{host_config_sig, McpHost, McpServerHealth};
 use super::metrics::{BackendDashboard, MetricsPoller, ServerMetrics};
 use super::remote::RemoteBackend;
 use super::router::{self, BackendView, RouteError, TierHint};
@@ -56,6 +56,8 @@ const GLOBAL_CONCURRENCY_MAX: u32 = 32;
 pub struct ServiceStatus {
     pub global_in_flight: u32,
     pub global_cap: u32,
+    /// Tasks waiting for a slot (queue depth) right now.
+    pub queue_depth: u32,
     pub mcp_servers: Vec<McpServerHealth>,
 }
 
@@ -101,6 +103,12 @@ pub struct OffloadService {
     /// user changes backends / `global_concurrency` (see `reconcile_global_cap`),
     /// alongside resizing `global_gate`'s permits.
     global_cap: AtomicU32,
+    /// Tasks currently *waiting* on the global gate (entered `run` but not yet
+    /// holding a permit). Drives the `max_queue_depth` fast-reject and the
+    /// live "N queued" dashboard readout. Incremented right before the gate
+    /// acquire and decremented the instant it resolves (slot, timeout, or
+    /// closed), so it counts only genuine waiters, never running tasks.
+    queue_depth: AtomicU32,
     /// Warm remote backend handles, keyed by backend name (so `in_flight`
     /// persists across calls). Rebuilt when a backend's config changes.
     remote_pool: TokioMutex<HashMap<String, Arc<RemoteBackend>>>,
@@ -126,11 +134,44 @@ pub struct OffloadService {
     /// can't interleave and leave the gate sized inconsistently with
     /// `global_cap` (see `reconcile_global_cap`).
     cap_reconcile_lock: TokioMutex<()>,
+    /// Serializes MCP-host reconciliation. `warm_host` is now driven from
+    /// several places — before each run, the 12s health watch, and the live
+    /// `offload_reload_mcp` IPC — so without this two concurrent reconciles
+    /// could both observe a newly-added server as missing and connect it
+    /// twice. Held across the whole `host.reconcile` call.
+    host_reconcile_lock: TokioMutex<()>,
+    /// Signature of the last config `warm_host` reconciled against. Lets the
+    /// per-run and health-watch `warm_host` calls skip the reconcile (and its
+    /// lock hold) when nothing changed, so an unreachable server's connect
+    /// attempt is paid once on the actual edit, not on every offload. Only
+    /// touched while holding `host_reconcile_lock`.
+    last_host_sig: StdMutex<Option<String>>,
     /// Set when a cap reconcile is wanted. Lets a single in-flight reconcile
     /// task absorb concurrent triggers (instead of one task piling up per
     /// trigger behind the lock during a slow shrink drain) and still converge
     /// to the latest config.
     reconcile_pending: AtomicBool,
+}
+
+/// RAII guard for the `queue_depth` waiter counter. Increments on `enter` and
+/// decrements on `Drop`, so the count is corrected on *every* exit from the
+/// gate-acquire await — including a cancelled/dropped `run` future (a client
+/// disconnect or aborted `offload_task`), which a bare `fetch_sub` after the
+/// await would leak, permanently inflating `queued()` and wedging the
+/// `max_queue_depth` fast-reject.
+struct QueueGuard<'a>(&'a AtomicU32);
+
+impl<'a> QueueGuard<'a> {
+    fn enter(counter: &'a AtomicU32) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        QueueGuard(counter)
+    }
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl OffloadService {
@@ -157,6 +198,7 @@ impl OffloadService {
             host,
             global_gate: Arc::new(Semaphore::new(global_cap as usize)),
             global_cap: AtomicU32::new(global_cap),
+            queue_depth: AtomicU32::new(0),
             remote_pool: TokioMutex::new(HashMap::new()),
             local_pool: TokioMutex::new(HashMap::new()),
             client,
@@ -164,6 +206,8 @@ impl OffloadService {
             app,
             latest_metrics: StdMutex::new(Vec::new()),
             cap_reconcile_lock: TokioMutex::new(()),
+            host_reconcile_lock: TokioMutex::new(()),
+            last_host_sig: StdMutex::new(None),
             reconcile_pending: AtomicBool::new(false),
         });
 
@@ -198,6 +242,11 @@ impl OffloadService {
         self.global_cap
             .load(Ordering::Relaxed)
             .saturating_sub(self.global_gate.available_permits() as u32)
+    }
+
+    /// Tasks currently waiting for a slot (queue depth) across the app.
+    pub fn queued(&self) -> u32 {
+        self.queue_depth.load(Ordering::Relaxed)
     }
 
     /// Bring `global_gate`/`global_cap` in line with current config. The gate
@@ -266,13 +315,25 @@ impl OffloadService {
     /// Bring the warm MCP host in line with current config. Cheap when the
     /// pool is already warm; called before each run and at startup.
     pub async fn warm_host(&self) {
+        // Serialize against other reconcile callers (pre-run, health watch,
+        // live reload IPC) so a freshly-added server isn't connected twice.
+        let _guard = self.host_reconcile_lock.lock().await;
         let snap = self.settings.current().offload;
         if !snap.enabled {
             self.host.shutdown().await;
+            *self.last_host_sig.lock().unwrap() = None;
             return;
         }
         let roots = effective_roots(&snap);
+        // Skip the reconcile (and its connect attempts) when the desired host
+        // config is unchanged since the last one — the common case on the
+        // per-run hot path and the 12s health watch.
+        let sig = host_config_sig(&snap.mcp_servers, &roots);
+        if self.last_host_sig.lock().unwrap().as_deref() == Some(sig.as_str()) {
+            return;
+        }
         self.host.reconcile(&snap.mcp_servers, &roots).await;
+        *self.last_host_sig.lock().unwrap() = Some(sig);
     }
 
     /// Aggregate service status for the Settings readout: the honest global
@@ -281,6 +342,7 @@ impl OffloadService {
         ServiceStatus {
             global_in_flight: self.global_in_flight(),
             global_cap: self.global_cap.load(Ordering::Relaxed),
+            queue_depth: self.queued(),
             mcp_servers: self.host.health().await,
         }
     }
@@ -314,10 +376,35 @@ impl OffloadService {
         // Keep the warm tool-server pool current before routing.
         self.warm_host().await;
 
+        // Optional fast-reject backpressure: when the pool is saturated (no
+        // free permit) and the configured number of tasks are already waiting,
+        // refuse immediately instead of stacking another long wait. `None`
+        // keeps the old unbounded blocking-queue behavior. The check is
+        // lock-free, so it's a *soft* cap — a burst of simultaneous arrivals
+        // can overshoot `max` by the burst size before any of them increment
+        // the counter; that's acceptable for backpressure. Snapshot `queued()`
+        // once so the condition and the error message can't disagree.
+        if let Some(max) = snap.max_queue_depth {
+            let waiting = self.queued();
+            if self.global_gate.available_permits() == 0 && waiting >= max {
+                return Err(AppError::OffloadNotReady(format!(
+                    "offload queue full — {} task(s) already waiting on {} busy slot(s); try again shortly",
+                    waiting,
+                    self.global_cap.load(Ordering::Relaxed)
+                )));
+            }
+        }
+
         // Global gate first: bound total in-flight across the whole app.
-        let _global = match tokio::time::timeout(timeout, self.global_gate.clone().acquire_owned())
-            .await
-        {
+        // Count as a waiter while blocked so `queued()` (and the fast-reject
+        // above) see genuine backpressure. The guard decrements on drop —
+        // when the acquire resolves *and* if this future is cancelled mid-wait
+        // (client disconnect / aborted offload) — so the counter can't leak.
+        let queue_guard = QueueGuard::enter(&self.queue_depth);
+        let acquired =
+            tokio::time::timeout(timeout, self.global_gate.clone().acquire_owned()).await;
+        drop(queue_guard);
+        let _global = match acquired {
             Ok(Ok(p)) => p,
             Ok(Err(_)) => return Err(AppError::Offload("global offload gate closed".into())),
             Err(_) => {
@@ -723,12 +810,24 @@ impl OffloadService {
             format!("tool servers up: {}", healthy_servers.join(", "))
         };
 
+        // Advertise parallelism + live capacity so Opus knows it can fan out
+        // (issue several `offload_task` calls at once) and roughly how many run
+        // concurrently before further calls queue. `global_cap` = summed
+        // per-backend slots (or the `global_concurrency` override).
+        let cap = self.global_cap.load(Ordering::Relaxed);
+        let in_flight = self.global_in_flight();
+        let parallel_note = format!(
+            " You can run offloads in parallel: issue multiple offload_task calls at once to fan \
+             out independent subtasks — up to {cap} run concurrently ({in_flight} busy now), and \
+             further calls queue for a slot rather than failing."
+        );
+
         format!(
             "Delegate a token-heavy subtask (broad codebase search, large-file/log summarization, \
              web research) to a local/remote model to conserve this session's context. Pass a \
              self-contained instruction; you get back only the synthesized result. Backends: {}. \
              {tools_note}. Pass `tier` (fast|quality) to bias the choice; local-file tasks run on \
-             a backend with file access (never a cloud backend).",
+             a backend with file access (never a cloud backend).{parallel_note}",
             parts.join("; ")
         )
     }
@@ -866,6 +965,13 @@ impl OffloadService {
                     rows.iter().map(|r| r.name.as_str()).collect();
                 pollers.retain(|k, _| live.contains(k.as_str()));
 
+                // Stamp the app-wide queue depth onto every row (it's a global,
+                // not per-backend, figure — the dashboard shows it once).
+                let queued = this.queued();
+                for r in rows.iter_mut() {
+                    r.metrics.queue_depth = queued;
+                }
+
                 *this.latest_metrics.lock().unwrap() = rows.clone();
                 let _ = this.app.emit("offload-server-metrics", &rows);
             }
@@ -886,6 +992,11 @@ impl OffloadService {
                 // Keep the app-wide gate sized to current config (backends or
                 // global_concurrency may have changed since startup).
                 this.reconcile_global_cap(&snap);
+                // Keep the MCP host membership live as a safety net: the live
+                // `offload_reload_mcp` IPC reconciles instantly on edit, but
+                // this also catches changes made another way (e.g. a direct
+                // settings.json edit) within one watch tick — no restart.
+                this.warm_host().await;
                 if !snap.enabled {
                     last.clear();
                     continue;

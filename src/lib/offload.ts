@@ -144,6 +144,8 @@ export interface McpServerHealth {
 export interface ServiceStatus {
   global_in_flight: number;
   global_cap: number;
+  /// Tasks waiting for a slot right now (app-wide queue depth).
+  queue_depth: number;
   mcp_servers: McpServerHealth[];
 }
 
@@ -155,6 +157,19 @@ export async function offloadServiceStatus(): Promise<ServiceStatus | null> {
     return await invoke<ServiceStatus>('offload_service_status');
   } catch (e) {
     console.warn('offload_service_status failed', e);
+    return null;
+  }
+}
+
+/// Reconcile the warm MCP host against the just-saved settings and return the
+/// fresh status. Called by the Settings MCP editor right after persisting an
+/// add/remove/enable/disable so the server connects or drops live — no
+/// restart. Returns `null` if the service isn't reachable.
+export async function offloadReloadMcp(): Promise<ServiceStatus | null> {
+  try {
+    return await invoke<ServiceStatus>('offload_reload_mcp');
+  } catch (e) {
+    console.warn('offload_reload_mcp failed', e);
     return null;
   }
 }
@@ -208,6 +223,8 @@ export interface ServerMetrics {
   aggregate_tps: number;
   global_in_flight: number;
   global_cap: number;
+  /// App-wide tasks waiting for a slot right now (stamped by the poller).
+  queue_depth: number;
   metrics_available: boolean;
   history: RequestRecord[];
 }

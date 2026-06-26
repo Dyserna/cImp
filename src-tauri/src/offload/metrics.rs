@@ -82,6 +82,9 @@ pub struct ServerMetrics {
     /// ccImp's global concurrency gate: offloads holding a permit / the cap.
     pub global_in_flight: u32,
     pub global_cap: u32,
+    /// Tasks waiting for a slot right now (app-wide queue depth). Stamped by
+    /// the poller from the live service counter.
+    pub queue_depth: u32,
     /// Whether `/metrics` answered (so the UI can hint to add `--metrics`).
     pub metrics_available: bool,
     /// Completed requests, newest first.
@@ -120,6 +123,7 @@ impl ServerMetrics {
             aggregate_tps: 0.0,
             global_in_flight,
             global_cap,
+            queue_depth: 0,
             metrics_available: false,
             history: Vec::new(),
         }
@@ -248,6 +252,7 @@ impl MetricsPoller {
             aggregate_tps,
             global_in_flight,
             global_cap,
+            queue_depth: 0,
             metrics_available,
             history: self.history.iter().cloned().collect(),
         }

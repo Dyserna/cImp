@@ -224,6 +224,9 @@ export interface ShortcutSettings {
   close_pane: string | null;
   /// V6-01 push-to-talk (hold) dictation trigger. Default bare `Ctrl+Shift`.
   push_to_talk: string | null;
+  /// Read the active terminal's selection aloud through TTS — the keyboard
+  /// equivalent of Ctrl+right-click. Default `Ctrl+Alt+S`.
+  speak_selection: string | null;
 }
 
 export interface TtsInjection {
@@ -707,6 +710,10 @@ export interface OffloadSettings {
   /// V8-03: global cap on offloads in flight across the whole app. `null`
   /// lets the service auto-size it from the summed per-backend slot counts.
   global_concurrency: number | null;
+  /// Max tasks allowed to wait for a slot when the pool is saturated. `null`
+  /// = unbounded blocking queue; a number fast-rejects once that many are
+  /// already waiting on busy slots.
+  max_queue_depth: number | null;
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
@@ -852,6 +859,7 @@ export function defaultSettings(): Settings {
       split_pane_vertical: 'Alt+\\',
       close_pane: 'Ctrl+Alt+W',
       push_to_talk: 'Ctrl+Shift',
+      speak_selection: 'Ctrl+Alt+S',
     },
     tabs: [
       {
@@ -999,6 +1007,7 @@ export function defaultSettings(): Settings {
       max_steps: 16,
       offload_timeout_secs: 300,
       global_concurrency: null,
+      max_queue_depth: null,
     },
     enabled_ai_tabs: ['claude'],
     logging: {

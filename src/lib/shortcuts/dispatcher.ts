@@ -33,6 +33,9 @@ export type ShortcutAction =
   | 'split_pane_horizontal'
   | 'split_pane_vertical'
   | 'close_pane'
+  /// Read the active terminal's current selection aloud through TTS — the
+  /// keyboard equivalent of the Ctrl+right-click gesture.
+  | 'speak_selection'
   /// Esc stops all in-flight TTS (the only thing that interrupts speech —
   /// typing never does). Bound directly to the Escape key, not a configurable
   /// shortcut. When a Ctrl+right-click selection read is active the key is
@@ -85,6 +88,7 @@ export function configureShortcuts(s: ShortcutSettings, h: ShortcutHandlers): vo
     split_pane_horizontal: parseShortcut(s.split_pane_horizontal),
     split_pane_vertical: parseShortcut(s.split_pane_vertical),
     close_pane: parseShortcut(s.close_pane),
+    speak_selection: parseShortcut(s.speak_selection),
   };
   handlers = h;
 }

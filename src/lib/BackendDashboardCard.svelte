@@ -112,8 +112,11 @@
       <div class="stat">
         <span class="label">Queue</span>
         <span class="value">
-          {metrics.requests_deferred ?? '—'} waiting
-          <span class="muted">· {metrics.global_in_flight}/{metrics.global_cap} in flight</span>
+          {metrics.queue_depth} queued
+          <span class="muted"
+            >· {metrics.global_in_flight}/{metrics.global_cap} in flight{#if metrics.requests_deferred}
+              · {metrics.requests_deferred} server-deferred{/if}</span
+          >
         </span>
       </div>
 

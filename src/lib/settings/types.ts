@@ -549,6 +549,8 @@ export interface Settings {
   /// `llama-server` and exposes an `offload_task` MCP tool into
   /// ccImp-launched Claude tabs. Off by default.
   offload: OffloadSettings;
+  /// V9-01: per-project code knowledge graph config. Off by default.
+  graph: GraphSettings;
   /// Which AI-tool tabs are enabled. The checkbox group in
   /// Settings → Tabs is the canonical way to flip this; the backend's
   /// `set_enabled_ai_tabs` IPC opens / closes the corresponding AI
@@ -588,6 +590,32 @@ export interface LoggingSettings {
   level: LogLevel;
   retention: LogRetention;
   content_capture: ContentCaptureSettings;
+}
+
+/// V9-01: per-project code-knowledge-graph config. Mirror of Rust
+/// `GraphSettings`. Only `enabled` and `allow_remote_worker_access` are
+/// surfaced in the UI today; the rest carry defaults until the full
+/// settings panel (Phase F) lands.
+export interface GraphSettings {
+  enabled: boolean;
+  languages: string[];
+  ignore: string[];
+  index_docs: boolean;
+  max_file_bytes: number;
+  watch_debounce_ms: number;
+  max_rows_per_query: number;
+  max_snippet_bytes: number;
+  db_subdir: string;
+  /// Let the offload worker query the graph when running on a *remote*
+  /// backend (LAN or cloud). The local worker always has access; a remote
+  /// one would receive the project's code structure, so it's opt-in.
+  allow_remote_worker_access: boolean;
+  semantic_search: boolean;
+  embedding_endpoint: string;
+  embedding_model: string;
+  embedding_dims: number;
+  embed_code_bodies: boolean;
+  embedding_batch: number;
 }
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
@@ -1008,6 +1036,24 @@ export function defaultSettings(): Settings {
       offload_timeout_secs: 300,
       global_concurrency: null,
       max_queue_depth: null,
+    },
+    graph: {
+      enabled: false,
+      languages: ['rust', 'typescript', 'javascript', 'python', 'markdown'],
+      ignore: [],
+      index_docs: true,
+      max_file_bytes: 1_048_576,
+      watch_debounce_ms: 300,
+      max_rows_per_query: 100,
+      max_snippet_bytes: 2_000,
+      db_subdir: '.ccimp',
+      allow_remote_worker_access: false,
+      semantic_search: false,
+      embedding_endpoint: '',
+      embedding_model: '',
+      embedding_dims: 0,
+      embed_code_bodies: false,
+      embedding_batch: 32,
     },
     enabled_ai_tabs: ['claude'],
     logging: {

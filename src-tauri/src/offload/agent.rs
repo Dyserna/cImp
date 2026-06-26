@@ -120,25 +120,32 @@ pub struct HostRouter {
     ctx: ToolCtx,
     host: std::sync::Arc<super::mcp_host::McpHost>,
     scope: ToolScope,
+    /// V9-01: whether the code-graph (`graph_*`) tools may run here. The caller
+    /// computes this from the feature flag + the local/remote opt-in; we re-gate
+    /// dispatch on it as defense-in-depth so a hallucinated `graph_*` call on a
+    /// non-opted-in remote backend can't reach the local index.
+    allow_graph: bool,
 }
 
 impl HostRouter {
     /// Build the merged, scope-filtered router. `native_defs` are the enabled
     /// native tool defs; `mcp_defs` are the host's namespaced read-class
-    /// tools (`McpHost::tool_defs().await`).
+    /// tools (`McpHost::tool_defs().await`). `allow_graph` gates the `graph_*`
+    /// tools (already reflected in `native_defs` by the caller).
     pub fn new(
         native_defs: Vec<ToolDef>,
         mcp_defs: Vec<ToolDef>,
         ctx: ToolCtx,
         host: std::sync::Arc<super::mcp_host::McpHost>,
         scope: ToolScope,
+        allow_graph: bool,
     ) -> Self {
         let defs: Vec<ToolDef> = native_defs
             .into_iter()
             .chain(mcp_defs)
             .filter(|d| scope.allows_namespaced(&d.function.name))
             .collect();
-        Self { defs, ctx, host, scope }
+        Self { defs, ctx, host, scope, allow_graph }
     }
 }
 
@@ -151,6 +158,14 @@ impl ToolRouter for HostRouter {
         if !self.scope.allows_namespaced(name) {
             return Err(format!(
                 "tool `{name}` is not available on this backend (denied by its tool scope)"
+            ));
+        }
+        // V9-01: re-gate the code-graph tools (defense-in-depth) — a remote
+        // backend the user didn't opt in must never reach the local index.
+        if name.starts_with("graph_") && !self.allow_graph {
+            return Err(format!(
+                "tool `{name}` is not available on this backend (code-graph access for a remote \
+                 offload worker is off — enable it in ccImp Settings → Code Graph)"
             ));
         }
         // Namespaced ids (`<server>__<tool>`) belong to an MCP server; bare

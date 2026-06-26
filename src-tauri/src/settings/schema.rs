@@ -860,6 +860,13 @@ pub struct GraphSettings {
     pub max_snippet_bytes: u32,
     /// Per-project subdirectory holding `graph.db`. Recommended git-ignored.
     pub db_subdir: String,
+    /// Let the **offload worker** query the graph when it's running on a
+    /// **remote** backend. The local worker always gets graph access; a remote
+    /// backend (LAN *or* cloud) sends your project's code structure off this
+    /// machine, so it's opt-in and off by default. The user decides per their
+    /// trust in the remote (a private LAN box vs. a public cloud API). The
+    /// cloud Opus session (via MCP) and a local worker are unaffected.
+    pub allow_remote_worker_access: bool,
 
     // --- Semantic search (Phase G) ---
     /// Enable embedding-based semantic search. Default off — it needs a
@@ -896,6 +903,7 @@ impl Default for GraphSettings {
             max_rows_per_query: 100,
             max_snippet_bytes: 2_000,
             db_subdir: ".ccimp".to_string(),
+            allow_remote_worker_access: false,
             semantic_search: false,
             embedding_endpoint: String::new(),
             embedding_model: String::new(),

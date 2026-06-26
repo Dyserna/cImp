@@ -1,11 +1,16 @@
-//! MCP adapter for the code knowledge graph — the `graph_*` tools exposed to
-//! Claude through the `ccimp --offload-mcp` server (V8's bridge, reused).
+//! Graph tool surface shared by both consumers:
+//! - the **cloud Opus session**, via the `ccimp --offload-mcp` server (this
+//!   module's [`tools`] descriptors + [`handle_call`]); and
+//! - the **local offload worker**, via [`offload_query`] (wired into the
+//!   offload native-tool router).
 //!
-//! This stage uses the **self-contained** path: the MCP child resolves the
-//! project root from its cwd and opens the on-disk `graph.db` read-only. The
-//! warm app-side service + loopback route (`POST /graph/query`) is the Phase-C
-//! upgrade; this adapter is the fallback that also makes the tools work before
-//! the app owns a warm index.
+//! Both go through the **self-contained** path: resolve the project root, open
+//! the on-disk `graph.db` read-only, and run the query. The single source of
+//! truth for the tool set is [`tool_specs`] (name + description + JSON schema),
+//! so the MCP descriptors and the offload `ToolDef`s can't drift; the single
+//! dispatch+format core is [`run_tool`]. The warm app-side service + loopback
+//! route is the Phase-C upgrade; this adapter is the fallback that also works
+//! before the app owns a warm index.
 
 use std::path::{Path, PathBuf};
 
@@ -13,49 +18,87 @@ use serde_json::{json, Value};
 
 use super::index::{DocHit, GraphIndex, RefHit, SymbolHit};
 
-/// The `graph_*` tool descriptors, or an empty list when the graph feature is
-/// disabled (so they're not advertised to Opus).
-pub fn tools() -> Vec<Value> {
-    let settings = current_settings();
-    if !settings.graph.enabled {
-        return Vec::new();
-    }
+/// One graph tool's identity, description, and JSON-Schema parameters — the
+/// shared definition both surfaces render into their own shape.
+pub struct GraphToolSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: Value,
+}
+
+/// The canonical graph tool set. Adding a tool here surfaces it to BOTH the
+/// MCP descriptors and the offload worker's `ToolDef`s.
+pub fn tool_specs() -> Vec<GraphToolSpec> {
+    let one = |name: &'static str, description: &'static str, params: &[(&str, &str)]| {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for (key, desc) in params {
+            props.insert((*key).to_string(), json!({ "type": "string", "description": desc }));
+            required.push(Value::String((*key).to_string()));
+        }
+        GraphToolSpec {
+            name,
+            description,
+            parameters: json!({
+                "type": "object",
+                "properties": Value::Object(props),
+                "required": required,
+            }),
+        }
+    };
+
     vec![
-        tool(
+        one(
             "graph_find_symbol",
             "Find where a symbol (function, struct, trait, etc.) is DEFINED in this project. \
              Returns each definition's file, line, kind, and signature. Prefer this over grep \
              for 'where is X defined'.",
             &[("name", "The exact symbol name to look up.")],
         ),
-        tool(
+        one(
             "graph_callers",
             "List the functions/methods that CALL the given symbol (its call sites, resolved to \
              the calling definition). Use for 'who calls X' / impact analysis.",
             &[("name", "The called symbol's name.")],
         ),
-        tool(
+        one(
             "graph_callees",
             "List the symbols CALLED BY the given symbol. Use for 'what does X call'.",
             &[("name", "The calling symbol's name.")],
         ),
-        tool(
+        one(
             "graph_references",
             "List every reference (use site) of a name — file, line, column.",
             &[("name", "The name to find references of.")],
         ),
-        tool(
+        one(
             "graph_imports",
             "List the modules/paths imported by a file.",
             &[("file", "Project-relative file path (as indexed).")],
         ),
-        tool(
+        one(
             "graph_outline",
             "List every definition in a file, in source order (a structural outline).",
             &[("file", "Project-relative file path (as indexed).")],
         ),
-        transitive_tool(),
-        tool(
+        GraphToolSpec {
+            name: "graph_transitive",
+            description: "Transitive call chain for a symbol. direction 'callees' (default) returns \
+                everything it transitively calls; 'callers' returns everything that transitively calls it.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The symbol name." },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["callees", "callers"],
+                        "description": "'callees' (what it reaches) or 'callers' (what reaches it). Default 'callees'."
+                    }
+                },
+                "required": ["name"]
+            }),
+        },
+        one(
             "graph_search_docs",
             "Search documentation and doc-comments for a keyword. Returns matching doc snippets \
              with their source.",
@@ -64,29 +107,62 @@ pub fn tools() -> Vec<Value> {
     ]
 }
 
-/// Dispatch a `graph_*` tool call. Returns a JSON-RPC `tools/call` result; a
-/// missing index or bad args come back as a (non-protocol) tool error so Opus
+/// The `graph_*` MCP tool descriptors, or an empty list when the graph feature
+/// is disabled (so they're not advertised to Opus).
+pub fn tools() -> Vec<Value> {
+    if !current_settings().graph.enabled {
+        return Vec::new();
+    }
+    tool_specs()
+        .into_iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "description": s.description,
+                "inputSchema": s.parameters,
+            })
+        })
+        .collect()
+}
+
+/// Dispatch a `graph_*` MCP tool call. Returns a JSON-RPC `tools/call` result;
+/// a missing index or bad args come back as a (non-protocol) tool error so Opus
 /// can read and adapt. Unknown tool names are a protocol error.
 pub fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-    let idx = match open_project_index() {
+    let settings = current_settings();
+    let (max_rows, max_snippet) = limits(&settings);
+    let sub = db_subdir(&settings);
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let idx = match open_project_index(&cwd, &sub) {
         Ok(i) => i,
         Err(msg) => return Ok(tool_error(&msg)),
     };
-    let settings = current_settings();
-    let max_rows = settings.graph.max_rows_per_query.max(1) as usize;
-    let max_snippet = settings.graph.max_snippet_bytes.max(40) as usize;
 
+    match run_tool(&idx, name, &args, max_rows, max_snippet) {
+        Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
+        Err(msg) if msg.starts_with("unknown graph tool") => Err((-32602, msg)),
+        Err(msg) => Ok(tool_error(&msg)),
+    }
+}
+
+/// Run one graph tool against an open index and format its result as compact,
+/// token-bounded text. Shared by the MCP adapter and the offload worker. `Err`
+/// is a human-readable message the caller surfaces to its model.
+pub fn run_tool(
+    idx: &GraphIndex,
+    name: &str,
+    args: &Value,
+    max_rows: usize,
+    max_snippet: usize,
+) -> Result<String, String> {
     let arg = |key: &str| -> String {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
+        args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
     };
-
-    let text: Result<String, String> = match name {
+    match name {
         "graph_find_symbol" => idx
             .find_symbol(&arg("name"))
             .map(|v| fmt_symbols(&v, max_rows))
@@ -121,56 +197,35 @@ pub fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
             .search_docs(&arg("query"), max_rows, max_snippet)
             .map(|v| fmt_docs(&v))
             .map_err(|e| e.to_string()),
-        other => return Err((-32602, format!("unknown graph tool: {other}"))),
-    };
-
-    match text {
-        Ok(t) => Ok(json!({ "content": [{ "type": "text", "text": t }] })),
-        Err(msg) => Ok(tool_error(&msg)),
+        other => Err(format!("unknown graph tool: {other}")),
     }
 }
 
-// ── tool descriptors ────────────────────────────────────────────────────
+/// The offload worker's entry point: resolve the graph store from `roots`
+/// (the worker's confinement roots), open it read-only, and run `name`. `Err`
+/// is fed back to the worker's model as a tool result. The caller is
+/// responsible for the local/remote opt-in gate — this just executes.
+pub fn offload_query(
+    roots: &[PathBuf],
+    name: &str,
+    args: &Value,
+) -> Result<String, String> {
+    let settings = current_settings();
+    let (max_rows, max_snippet) = limits(&settings);
+    let sub = db_subdir(&settings);
 
-fn tool(name: &str, description: &str, params: &[(&str, &str)]) -> Value {
-    let mut props = serde_json::Map::new();
-    let mut required = Vec::new();
-    for (key, desc) in params {
-        props.insert(
-            (*key).to_string(),
-            json!({ "type": "string", "description": desc }),
-        );
-        required.push(Value::String((*key).to_string()));
+    // First configured root that already has a built graph wins. (Most setups
+    // have a single root; multiple roots fall back to the first that's indexed.)
+    let mut last_err =
+        "no code graph found under the offload roots — enable + index the project in ccImp"
+            .to_string();
+    for root in roots {
+        match open_project_index(root, &sub) {
+            Ok(idx) => return run_tool(&idx, name, args, max_rows, max_snippet),
+            Err(e) => last_err = e,
+        }
     }
-    json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {
-            "type": "object",
-            "properties": Value::Object(props),
-            "required": required,
-        }
-    })
-}
-
-fn transitive_tool() -> Value {
-    json!({
-        "name": "graph_transitive",
-        "description": "Transitive call chain for a symbol. direction 'callees' (default) returns \
-            everything it transitively calls; 'callers' returns everything that transitively calls it.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "The symbol name." },
-                "direction": {
-                    "type": "string",
-                    "enum": ["callees", "callers"],
-                    "description": "'callees' (what it reaches) or 'callers' (what reaches it). Default 'callees'."
-                }
-            },
-            "required": ["name"]
-        }
-    })
+    Err(last_err)
 }
 
 // ── result formatting (compact, token-bounded text for the model) ────────
@@ -230,32 +285,39 @@ fn tool_error(message: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": message }], "isError": true })
 }
 
-// ── project resolution ──────────────────────────────────────────────────
+// ── project resolution + settings helpers ────────────────────────────────
 
 fn current_settings() -> crate::settings::Settings {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     crate::settings::load_readonly(&cwd)
 }
 
-/// Open the existing graph store for the current project, resolving the root by
-/// walking up from the cwd for a `<dir>/<db_subdir>/graph.db`.
-fn open_project_index() -> Result<GraphIndex, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let sub = {
-        let s = current_settings();
-        if s.graph.db_subdir.trim().is_empty() {
-            ".ccimp".to_string()
-        } else {
-            s.graph.db_subdir.clone()
-        }
-    };
-    let root = find_graph_root(&cwd, &sub).ok_or_else(|| {
+fn limits(settings: &crate::settings::Settings) -> (usize, usize) {
+    (
+        settings.graph.max_rows_per_query.max(1) as usize,
+        settings.graph.max_snippet_bytes.max(40) as usize,
+    )
+}
+
+fn db_subdir(settings: &crate::settings::Settings) -> String {
+    let s = &settings.graph.db_subdir;
+    if s.trim().is_empty() {
+        ".ccimp".to_string()
+    } else {
+        s.clone()
+    }
+}
+
+/// Open the existing graph store for the project containing `start`, resolving
+/// the root by walking up for a `<dir>/<sub>/graph.db`.
+fn open_project_index(start: &Path, sub: &str) -> Result<GraphIndex, String> {
+    let root = find_graph_root(start, sub).ok_or_else(|| {
         format!(
             "no code graph found from {} — enable the graph and index this project in ccImp",
-            cwd.display()
+            start.display()
         )
     })?;
-    GraphIndex::open_existing(&root, &sub).map_err(|e| e.to_string())
+    GraphIndex::open_existing(&root, sub).map_err(|e| e.to_string())
 }
 
 /// Walk up from `start` looking for an ancestor containing `<sub>/graph.db`.

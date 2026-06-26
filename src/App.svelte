@@ -46,7 +46,7 @@
     validateAndRepairLayout,
   } from './lib/layout/persistence';
   import { createTerminal } from './lib/terminals';
-  import { stopAllTts, isSelectionTtsActive } from './lib/selectionTts';
+  import { stopAllTts, isSelectionTtsActive, playSelectionTts } from './lib/selectionTts';
   import { listTabs } from './lib/ipc';
   import {
     configureShortcuts,
@@ -265,6 +265,7 @@
             void splitFocusedPaneWithNewShell('vertical');
           },
           close_pane: closeFocusedPane,
+          speak_selection: () => playSelectionTts(),
           stop_tts: {
             handler: () => {
               // Only issue the stop when something is plausibly playing — a

@@ -481,11 +481,7 @@ html[data-theme="tui-red"] .volume-control {
   color: var(--text-quiet) !important;
 }
 
-/* Hint text: dim, prefixed with `// ` to read as a TUI comment. */
-html[data-theme="tui-red"] small.hint::before {
-  content: '// ';
-  color: var(--text-faint);
-}
+/* Hint text: dim. */
 html[data-theme="tui-red"] small.hint {
   color: var(--text-quiet);
 }

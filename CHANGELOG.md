@@ -5,6 +5,54 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — 2026-06-26
+
+### Added
+
+- **HTTP MCP tool servers for offload.** The offload tool host now speaks the
+  MCP 2025-06-18 Streamable HTTP transport, so HTTP/SSE MCP servers (e.g. a LAN
+  DuckDuckGo + Context7) work alongside stdio servers and their read-class tools
+  are offered to offloaded subtasks.
+- **Live MCP server editor (Settings → Offload → Tools).** Add, remove, and
+  enable/disable MCP tool servers (name + url) and have the change applied
+  without restarting ccImp. A read-only "MCP server status" health section sits
+  above the editable list.
+- **Offload queue backpressure.** A configurable max queue depth fast-rejects new
+  offloads once the pool is saturated and that many tasks are already waiting
+  (blank = the old unbounded blocking queue). Live queue depth is shown in the
+  warm-pool readout and the per-backend dashboard card.
+- **Parallel-offload awareness.** The `offload_task` description now tells Claude
+  it can fan out independent subtasks concurrently and reports the live
+  concurrent-slot count, so subtasks are issued at once instead of serially.
+- **`speak_selection` keyboard shortcut** — read the active terminal's selection
+  aloud, the keyboard equivalent of the Ctrl+right-click gesture.
+
+### Fixed
+
+- **Offload queue counter could wedge the queue cap.** The app-wide waiter count
+  is now decremented via an RAII guard, so a cancelled/aborted offload no longer
+  leaks the counter and permanently triggers the "queue full" fast-reject.
+- **An unreachable MCP server could stall parallel offloads.** The HTTP client
+  gained a short connect timeout, and an unchanged tool-server config now skips
+  the host reconcile entirely, so one dead LAN server no longer serializes every
+  in-flight offload behind the reconcile lock or freezes the Settings save.
+- **Stale MCP session handling.** The `Mcp-Session-Id` is captured from the
+  tools/list response and refreshed on every call, so a server that assigns or
+  rotates the id late no longer wedges later calls with a `400`.
+- SSE response bodies are read incrementally and return on the first JSON-RPC
+  result, so a server that streams progress events first no longer blocks to the
+  request timeout. Content-type matching is now case-insensitive.
+- A freshly added MCP editor row with no endpoint is no longer connect-attempted
+  (no more confusing empty-command error), and text edits persist on blur instead
+  of a fire-and-forget write per keystroke that could land a half-typed URL.
+
+### Changed
+
+- **Selection-read diagnostics.** The TTS worker and frontend now log each
+  selection chunk's path and warn when a chunk produces no audio or fails, so a
+  dropped read can be pinned to a frontend split gap vs a backend skip.
+- Drop the `// ` comment prefix on hint text in the tui-green/orange/red themes.
+
 ## [0.17.3] — 2026-06-26
 
 ### Changed

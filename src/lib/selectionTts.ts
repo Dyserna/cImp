@@ -81,16 +81,33 @@ export async function beginSelectionTts(
   highlight: SelectionHighlightSettings,
 ): Promise<void> {
   const text = terminal.getSelection();
-  if (!text.trim()) return;
+  const pos = terminal.getSelectionPosition();
+  // Diagnostic: the raw selection as xterm sees it, before any of our
+  // reconstruction. Compare `getSelection` text against the reconstructed
+  // `model.text` below to spot a gap in `buildSelectionModel`.
+  console.debug(
+    `[selection-tts] getSelection=${JSON.stringify(text)} pos=${JSON.stringify(pos)}`,
+  );
+  if (!text.trim()) {
+    console.debug('[selection-tts] BAIL: getSelection is empty/whitespace');
+    return;
+  }
 
   // Tear down any previous read (audio + decorations) before starting.
   await stopAllTts();
 
   // Build chunk geometry before clearing the native selection.
   const model = buildSelectionModel(terminal);
-  if (!model) return;
+  if (!model) {
+    console.debug('[selection-tts] BAIL: buildSelectionModel returned null');
+    return;
+  }
+  console.debug(`[selection-tts] model.text=${JSON.stringify(model.text)}`);
   const parsed = splitIntoChunks(model.text);
-  if (parsed.length === 0) return;
+  if (parsed.length === 0) {
+    console.debug('[selection-tts] BAIL: splitIntoChunks produced 0 chunks');
+    return;
+  }
 
   // Clear xterm's own selection so it doesn't render on top of our
   // decorations (the canvas renderer always draws selection above decorations).
@@ -163,6 +180,13 @@ async function launch(
 
   await ensureListener();
   selectionTtsState.set('playing');
+  // Diagnostic: the exact chunk strings handed to the backend. Cross-check
+  // against the worker's per-chunk synth log to see whether a dropped read is
+  // a frontend split gap (missing/short chunk here) or a backend skip.
+  console.debug(
+    `[selection-tts] session=${session} chunks=${chunks.length}`,
+    chunks.map((c, i) => `[${i}] (${c.length}) ${JSON.stringify(c.slice(0, 60))}`),
+  );
   try {
     await ttsSpeakSelection(session, chunks);
   } catch (err) {

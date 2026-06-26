@@ -294,8 +294,19 @@ impl StdioConn {
 /// Transport for one server.
 enum Conn {
     Stdio(Arc<StdioConn>),
-    /// HTTP JSON-RPC: best-effort single POST per request.
-    Http { url: String, client: reqwest::Client },
+    /// Streamable HTTP (MCP 2025-06-18 transport): one POST per request. The
+    /// `Mcp-Session-Id` the server assigns at `initialize` is captured here and
+    /// resent on every later call (some servers hard-reject a session-less
+    /// `tools/list` with 400), and SSE-framed response bodies are decoded back
+    /// to JSON-RPC. The id is interior-mutable so a server that assigns it on a
+    /// later response (or rotates it mid-session) refreshes the stored value
+    /// instead of wedging subsequent calls with a stale `400`. No warm channel
+    /// is kept.
+    Http {
+        url: String,
+        client: reqwest::Client,
+        session_id: StdMutex<Option<String>>,
+    },
 }
 
 /// One connected (or failed) MCP tool server.
@@ -360,8 +371,21 @@ impl McpServer {
         let params = json!({ "name": raw_name, "arguments": args });
         let result = match &self.conn {
             Some(Conn::Stdio(c)) => c.request("tools/call", params, REQUEST_TIMEOUT).await,
-            Some(Conn::Http { url, client }) => {
-                http_rpc(client, url, "tools/call", params, REQUEST_TIMEOUT).await
+            Some(Conn::Http { url, client, session_id }) => {
+                let current = session_id.lock().unwrap().clone();
+                match http_request(client, url, "tools/call", params, current.as_deref(), REQUEST_TIMEOUT)
+                    .await
+                {
+                    Ok((new_session, v)) => {
+                        // Refresh the stored id if the server rotated/assigned
+                        // one on this response, so the next call isn't rejected.
+                        if let Some(s) = new_session {
+                            *session_id.lock().unwrap() = Some(s);
+                        }
+                        Ok(v)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             None => Err("server is not connected".into()),
         };
@@ -425,7 +449,14 @@ impl McpHost {
 
         let desired: Vec<&McpServerConfig> = configs
             .iter()
-            .filter(|c| c.enabled && !c.name.trim().is_empty())
+            // Skip rows with no endpoint yet (just added in the editor, no
+            // command or url typed) — connecting one would route to stdio with
+            // an empty command and surface a confusing `resolve ``` error.
+            .filter(|c| {
+                c.enabled
+                    && !c.name.trim().is_empty()
+                    && (!c.command.trim().is_empty() || !c.url.trim().is_empty())
+            })
             .collect();
         let desired_sigs: HashMap<String, String> = desired
             .iter()
@@ -568,6 +599,22 @@ fn config_sig(c: &McpServerConfig) -> String {
     let mut env: Vec<(&String, &String)> = c.env.iter().collect();
     env.sort();
     format!("{}|{}|{:?}|{}|{:?}", c.command, c.url, c.args, c.enabled, env)
+}
+
+/// A stable signature of the *whole* desired host configuration (every
+/// server's connection-relevant config, keyed by name, plus the allowed
+/// roots). `warm_host` compares this against the last reconcile so an
+/// unchanged config skips the work — and the `host_reconcile_lock` hold —
+/// on the per-run hot path.
+pub fn host_config_sig(configs: &[McpServerConfig], roots: &[PathBuf]) -> String {
+    let mut servers: Vec<String> = configs
+        .iter()
+        .map(|c| format!("{}={}", c.name, config_sig(c)))
+        .collect();
+    servers.sort();
+    let mut roots: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+    roots.sort();
+    format!("{servers:?}|roots:{roots:?}")
 }
 
 /// Connect (or fail-soft) one server from its config. A failure yields an
@@ -720,12 +767,18 @@ async fn connect_stdio(
     Ok((Conn::Stdio(conn), tools))
 }
 
-/// Connect an HTTP MCP server (best-effort: a single POST handshake +
-/// `tools/list`; calls POST per request). No warm channel is kept.
+/// Connect a Streamable-HTTP MCP server: `initialize` (capturing the assigned
+/// session id), the `notifications/initialized` confirmation, then `tools/list`
+/// — all carrying the session id. Calls POST per request; no warm channel.
 async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), String> {
     let url = cfg.url.trim_end_matches('/').to_string();
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
+        // Bound the connection phase tightly so an unreachable host (a LAN box
+        // that's powered off and blackholes the SYN) fails fast instead of
+        // pinning `host_reconcile_lock` for the full 30s `CONNECT_TIMEOUT` and
+        // stalling every concurrent offload's `warm_host`.
+        .connect_timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let init = json!({
@@ -733,39 +786,94 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
         "capabilities": {},
         "clientInfo": { "name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") }
     });
-    http_rpc(&client, &url, "initialize", init, CONNECT_TIMEOUT).await?;
-    let list = http_rpc(&client, &url, "tools/list", json!({}), CONNECT_TIMEOUT).await?;
+    // The session id is assigned on the initialize response and must be echoed
+    // back on every subsequent request (some servers — e.g. ddg-search —
+    // hard-reject a session-less `tools/list` with 400 "Missing session ID").
+    let (mut session_id, _init) =
+        http_request(&client, &url, "initialize", init, None, CONNECT_TIMEOUT).await?;
+    // The transport requires the client to confirm initialization before
+    // issuing further requests; send it (best-effort) carrying the session id.
+    http_notify(&client, &url, "notifications/initialized", json!({}), session_id.as_deref()).await;
+    let (list_session, list) =
+        http_request(&client, &url, "tools/list", json!({}), session_id.as_deref(), CONNECT_TIMEOUT).await?;
+    // Fall back to a session id assigned on the tools/list response if the
+    // initialize response carried none (some servers assign it late).
+    if session_id.is_none() {
+        session_id = list_session;
+    }
     let tools = parse_tools(&cfg.name, &list);
-    Ok((Conn::Http { url, client }, tools))
+    Ok((
+        Conn::Http {
+            url,
+            client,
+            session_id: StdMutex::new(session_id),
+        },
+        tools,
+    ))
 }
 
-/// One JSON-RPC request over HTTP POST.
-async fn http_rpc(
+/// Core Streamable-HTTP request: POST one JSON-RPC frame and return the
+/// `Mcp-Session-Id` the server assigned (if any) plus the JSON-RPC `result`.
+/// Sends the dual `Accept` the 2025 transport mandates (a server rejects a
+/// client that doesn't accept `text/event-stream` with 406), resends a prior
+/// `session_id`, and decodes an SSE-framed response body back to JSON.
+async fn http_request(
     client: &reqwest::Client,
     url: &str,
     method: &str,
     params: Value,
+    session_id: Option<&str>,
     timeout: Duration,
-) -> Result<Value, String> {
+) -> Result<(Option<String>, Value), String> {
     // Unique per-call id (JSON-RPC ids must be unique within a session; some
-    // servers reject a repeated id even on a stateless HTTP POST).
+    // servers reject a repeated id even on a stateless POST).
     static HTTP_RPC_ID: AtomicU64 = AtomicU64::new(1);
     let id = HTTP_RPC_ID.fetch_add(1, Ordering::Relaxed);
     let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    let resp = client
+    let mut req = client
         .post(url)
-        .json(&body)
         .timeout(timeout)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&body);
+    if let Some(s) = session_id {
+        req = req.header("Mcp-Session-Id", s);
+    }
+    let mut resp = req
         .send()
         .await
         .map_err(|e| format!("http request failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("http status {}", resp.status()));
+    let status = resp.status();
+    let new_session = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "http status {status}: {}",
+            body.chars().take(300).collect::<String>()
+        ));
     }
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("http parse failed: {e}"))?;
+    // For an SSE-framed body, read incrementally and return on the first frame
+    // carrying a JSON-RPC result/error — a server that streams progress events
+    // before the result must not block us until it closes the stream. A plain
+    // JSON body is read whole.
+    let v = if is_event_stream(&content_type) {
+        read_sse_result(&mut resp).await?
+    } else {
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("http body read failed: {e}"))?;
+        serde_json::from_str::<Value>(&text).map_err(|e| format!("http parse failed: {e}"))?
+    };
     if let Some(err) = v.get("error") {
         return Err(err
             .get("message")
@@ -773,7 +881,143 @@ async fn http_rpc(
             .unwrap_or("server error")
             .to_string());
     }
-    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+    Ok((new_session, v.get("result").cloned().unwrap_or(Value::Null)))
+}
+
+/// Fire a JSON-RPC notification over HTTP (no id, no result expected). Servers
+/// answer `202 Accepted` with an empty body; failures are non-fatal here.
+async fn http_notify(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: Value,
+    session_id: Option<&str>,
+) {
+    let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+    let mut req = client
+        .post(url)
+        .timeout(CONNECT_TIMEOUT)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&body);
+    if let Some(s) = session_id {
+        req = req.header("Mcp-Session-Id", s);
+    }
+    let _ = req.send().await;
+}
+
+/// True for a `text/event-stream` content type, case-insensitively and
+/// tolerant of parameters (`; charset=utf-8`). HTTP media types are
+/// case-insensitive, so a server sending `Text/Event-Stream` must still be
+/// routed through the SSE decoder rather than parsed as plain JSON.
+fn is_event_stream(content_type: &str) -> bool {
+    content_type.to_ascii_lowercase().contains("text/event-stream")
+}
+
+/// A single SSE `data:` frame parsed to JSON, kept only if it carries a
+/// JSON-RPC `result` or `error` (so non-response events — pings, progress —
+/// are skipped).
+fn sse_frame(data: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .filter(|v| v.get("result").is_some() || v.get("error").is_some())
+}
+
+/// Incremental SSE event assembler, shared by the streaming reader and the
+/// buffered [`decode_jsonrpc_body`] so both honor identical framing rules.
+/// Feed it one line at a time; it accumulates an event's `data:` lines and,
+/// on the blank line that ends the event, yields the JSON-RPC frame if that
+/// event carried a `result`/`error`.
+#[derive(Default)]
+struct SseAssembler {
+    data: String,
+}
+
+impl SseAssembler {
+    /// Feed one (newline-stripped) line. Returns `Some(frame)` when this line
+    /// closed an event whose data is a JSON-RPC response.
+    fn push_line(&mut self, line: &str) -> Option<Value> {
+        if let Some(rest) = line.strip_prefix("data:") {
+            // SSE spec: a single leading space after the colon is stripped;
+            // multiple `data:` lines in one event join with a newline.
+            if !self.data.is_empty() {
+                self.data.push('\n');
+            }
+            self.data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            None
+        } else if line.is_empty() {
+            // A truly empty line ends the event (a whitespace-only line is a
+            // data continuation, not a boundary).
+            self.finish()
+        } else {
+            // Other SSE fields (`event:`, `id:`, `:comment`) are ignored.
+            None
+        }
+    }
+
+    /// Flush the current event (e.g. a final one not terminated by a blank
+    /// line), clearing it. Returns the frame if it is a JSON-RPC response.
+    fn finish(&mut self) -> Option<Value> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let data = std::mem::take(&mut self.data);
+        sse_frame(&data)
+    }
+}
+
+/// Read an SSE-framed response incrementally, returning as soon as a frame
+/// carrying a JSON-RPC `result`/`error` arrives. Lines are assembled from raw
+/// chunks (decoded at line granularity, so a multibyte char split across two
+/// chunks isn't corrupted), so we never wait for the server to close a stream
+/// that keeps emitting progress notifications after the result.
+async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, String> {
+    let mut asm = SseAssembler::default();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(bytes)) => {
+                buf.extend_from_slice(&bytes);
+                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    if let Some(v) = asm.push_line(line.trim_end_matches(['\n', '\r'])) {
+                        return Ok(v);
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("http body read failed: {e}")),
+        }
+    }
+    // Stream ended: feed any unterminated trailing line, then flush.
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        if let Some(v) = asm.push_line(line.trim_end_matches(['\n', '\r'])) {
+            return Ok(v);
+        }
+    }
+    asm.finish()
+        .ok_or_else(|| "no JSON-RPC message found in SSE response".into())
+}
+
+/// Decode a fully-buffered Streamable-HTTP response body into the JSON-RPC
+/// message. Used for plain `application/json` bodies and as the buffered
+/// counterpart to [`read_sse_result`] (kept for the unit tests). A
+/// `text/event-stream` body is SSE-framed; a plain body is parsed directly.
+#[cfg(test)]
+fn decode_jsonrpc_body(content_type: &str, body: &str) -> Result<Value, String> {
+    if !is_event_stream(content_type) {
+        return serde_json::from_str::<Value>(body)
+            .map_err(|e| format!("http parse failed: {e}"));
+    }
+    let mut asm = SseAssembler::default();
+    for line in body.lines() {
+        if let Some(v) = asm.push_line(line) {
+            return Ok(v);
+        }
+    }
+    asm.finish()
+        .ok_or_else(|| "no JSON-RPC message found in SSE response".into())
 }
 
 /// Parse a `tools/list` result into namespaced, read-class [`HostTool`]s.
@@ -1006,5 +1250,101 @@ mod tests {
         let v = json!({ "isError": true, "content": [ { "type": "text", "text": "boom" } ] });
         assert!(render_tool_result(&v).contains("boom"));
         assert!(render_tool_result(&v).to_lowercase().contains("error"));
+    }
+
+    #[test]
+    fn decode_plain_json_body() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let v = decode_jsonrpc_body("application/json", body).unwrap();
+        assert_eq!(v["result"]["ok"], json!(true));
+    }
+
+    #[test]
+    fn decode_sse_body_extracts_jsonrpc() {
+        // The exact shape ddg-search / Context7 return: an `event:` line then a
+        // single `data:` line carrying the JSON-RPC response, ended by a blank.
+        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let v = decode_jsonrpc_body("text/event-stream", sse).unwrap();
+        assert_eq!(v["result"]["ok"], json!(true));
+    }
+
+    #[test]
+    fn decode_sse_skips_non_response_events_and_keeps_error() {
+        // A leading non-response event (a notification) is skipped; the frame
+        // carrying `error` is the one returned.
+        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n\
+                   event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-1,\"message\":\"boom\"}}\n\n";
+        let v = decode_jsonrpc_body("text/event-stream", sse).unwrap();
+        assert_eq!(v["error"]["message"], json!("boom"));
+    }
+
+    #[test]
+    fn decode_sse_no_response_frame_errors() {
+        let sse = "event: ping\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n\n";
+        assert!(decode_jsonrpc_body("text/event-stream", sse).is_err());
+    }
+
+    #[test]
+    fn decode_charset_suffixed_event_stream() {
+        // Content-Type may carry a charset/boundary suffix — substring match.
+        let sse = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"v\":7}}\n\n";
+        let v = decode_jsonrpc_body("text/event-stream; charset=utf-8", sse).unwrap();
+        assert_eq!(v["result"]["v"], json!(7));
+    }
+
+    #[test]
+    fn is_event_stream_is_case_insensitive() {
+        // HTTP media types are case-insensitive — an uppercased Content-Type
+        // must still route through the SSE decoder, not the plain-JSON branch.
+        assert!(is_event_stream("text/event-stream"));
+        assert!(is_event_stream("Text/Event-Stream"));
+        assert!(is_event_stream("TEXT/EVENT-STREAM; charset=utf-8"));
+        assert!(!is_event_stream("application/json"));
+    }
+
+    #[test]
+    fn sse_assembler_skips_progress_and_returns_first_result_frame() {
+        // The streaming reader feeds the assembler one line at a time and stops
+        // at the first JSON-RPC result/error frame — a progress notification
+        // emitted before the result must not block or be mistaken for it.
+        let mut asm = SseAssembler::default();
+        let lines = [
+            "event: message",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}",
+            "",
+            "event: message",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}",
+            "",
+        ];
+        let mut got = None;
+        for l in lines {
+            if let Some(v) = asm.push_line(l) {
+                got = Some(v);
+                break;
+            }
+        }
+        assert_eq!(got.unwrap()["result"]["ok"], json!(true));
+    }
+
+    #[test]
+    fn host_config_sig_detects_changes_and_is_stable() {
+        let a = McpServerConfig {
+            name: "ddg".into(),
+            url: "http://x/mcp".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let roots = vec![PathBuf::from("/work")];
+        let s1 = host_config_sig(std::slice::from_ref(&a), &roots);
+        // Stable for identical input (the warm_host skip relies on this).
+        assert_eq!(s1, host_config_sig(std::slice::from_ref(&a), &roots));
+        // Changes when a server field changes (enable/disable, url, …).
+        let b = McpServerConfig { enabled: false, ..a.clone() };
+        assert_ne!(s1, host_config_sig(std::slice::from_ref(&b), &roots));
+        // Changes when the allowed roots change.
+        assert_ne!(
+            s1,
+            host_config_sig(std::slice::from_ref(&a), &[PathBuf::from("/other")])
+        );
     }
 }

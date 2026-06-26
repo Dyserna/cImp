@@ -760,6 +760,12 @@ pub struct OffloadSettings {
     ///
     /// [`OffloadService`]: crate::offload::OffloadService
     pub global_concurrency: Option<u32>,
+    /// Max tasks allowed to *wait* for a slot when the pool is saturated.
+    /// `None` (default) = unbounded blocking queue (a new task waits up to
+    /// `offload_timeout_secs` for a slot). `Some(n)` fast-rejects a task with
+    /// a clear "queue full" error once `n` are already waiting and every slot
+    /// is busy — backpressure that fails fast instead of stacking long waits.
+    pub max_queue_depth: Option<u32>,
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -782,6 +788,7 @@ impl std::fmt::Debug for OffloadSettings {
             .field("max_steps", &self.max_steps)
             .field("offload_timeout_secs", &self.offload_timeout_secs)
             .field("global_concurrency", &self.global_concurrency)
+            .field("max_queue_depth", &self.max_queue_depth)
             .finish()
     }
 }
@@ -804,6 +811,7 @@ impl Default for OffloadSettings {
             max_steps: 16,
             offload_timeout_secs: 300,
             global_concurrency: None,
+            max_queue_depth: None,
         }
     }
 }
@@ -2367,6 +2375,11 @@ pub struct ShortcutSettings {
     /// chords. Optional so older settings files round-trip; the default
     /// supplies the binding when the key is absent.
     pub push_to_talk: Option<String>,
+    /// Read the active terminal's current selection aloud through TTS —
+    /// the keyboard equivalent of the Ctrl+right-click gesture. Toasts
+    /// "No text selected" when nothing is selected. Optional so older
+    /// settings files round-trip; the default supplies the binding.
+    pub speak_selection: Option<String>,
 }
 
 impl Default for ShortcutSettings {
@@ -2401,6 +2414,7 @@ impl Default for ShortcutSettings {
             split_pane_vertical: Some("Alt+\\".to_string()),
             close_pane: Some("Ctrl+Alt+W".to_string()),
             push_to_talk: Some("Ctrl+Shift".to_string()),
+            speak_selection: Some("Ctrl+Alt+S".to_string()),
         }
     }
 }

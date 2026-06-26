@@ -31,6 +31,7 @@
     offloadBackendRestart,
     describeBackendStatus,
     offloadServiceStatus,
+    offloadReloadMcp,
     describeMcpServerHealth,
     type BackendStatus,
     type ServiceStatus,
@@ -40,6 +41,7 @@
     ToolScope,
     BackendTier,
     CommandPolicy,
+    McpServerConfig,
   } from './lib/settings/types';
   import { LOCAL_DATA_TOOLS } from './lib/settings/types';
   import type { AiTabId } from './lib/tabs/types';
@@ -237,6 +239,75 @@
       fn(s.offload.command_policies[i]);
     });
   }
+  // ── MCP tool servers (Tools tab) ───────────────────────────────────────
+  // Add/remove/toggle with live host reload — no ccImp restart. Edits persist
+  // through the same awaited `applySettings` the rest of the panel uses; once
+  // the backend has the new value we call `offload_reload_mcp`, which
+  // reconciles the warm MCP host and returns fresh health for the status list.
+  function uniqueMcpName(base: string): string {
+    const names = new Set((snapshot?.offload.mcp_servers ?? []).map((m) => m.name));
+    if (!names.has(base)) return base;
+    let i = 2;
+    while (names.has(`${base}-${i}`)) i++;
+    return `${base}-${i}`;
+  }
+  // Persist `next` to the backend and wait for it (so the live reload below
+  // reconciles against the new config, not the stale one). Mirrors `patch` but
+  // awaitable.
+  async function applyMcp(updater: (s: Settings) => void): Promise<void> {
+    if (!snapshot) return;
+    const next = structuredClone($state.snapshot(snapshot));
+    updater(next);
+    snapshot = next;
+    await applySettings(next);
+  }
+  // Reconcile the warm host now and fold the fresh status into the read-only
+  // list above the editor.
+  async function reloadMcpHost(): Promise<void> {
+    const status = await offloadReloadMcp();
+    if (status) serviceStatus = status;
+  }
+  // A text-field edit (name/url): update the local snapshot ONLY — no backend
+  // write per keystroke. The full snapshot is persisted on blur/Enter
+  // (`commitMcpEdits`), which also reloads the host. Persisting per keystroke
+  // (the old `patch` path) raced: fire-and-forget `applySettings` calls could
+  // complete out of order and leave the backend holding a half-typed URL, which
+  // the 12s health watch would then flag as down.
+  function setMcpServer(i: number, fn: (m: McpServerConfig) => void): void {
+    if (!snapshot) return;
+    const next = structuredClone($state.snapshot(snapshot));
+    fn(next.offload.mcp_servers[i]);
+    snapshot = next;
+  }
+  // Blur handler for the name/url inputs: ensure the latest snapshot is
+  // persisted, then reload the host.
+  async function commitMcpEdits(): Promise<void> {
+    if (!snapshot) return;
+    await applySettings($state.snapshot(snapshot));
+    await reloadMcpHost();
+  }
+  function addMcpServer(): void {
+    // New rows default to an HTTP endpoint (empty url → shows "down" until
+    // filled); no reload yet since there's nothing to connect to.
+    patch((s) => {
+      s.offload.mcp_servers = [
+        ...s.offload.mcp_servers,
+        { name: uniqueMcpName('server'), command: '', args: [], env: {}, url: '', enabled: true },
+      ];
+    });
+  }
+  async function removeMcpServer(i: number): Promise<void> {
+    await applyMcp((s) => {
+      s.offload.mcp_servers = s.offload.mcp_servers.filter((_, idx) => idx !== i);
+    });
+    await reloadMcpHost();
+  }
+  async function toggleMcpServer(i: number, enabled: boolean): Promise<void> {
+    await applyMcp((s) => {
+      s.offload.mcp_servers[i].enabled = enabled;
+    });
+    await reloadMcpHost();
+  }
   // Comma-separated <-> string[] for the flag/subcommand inputs (mirrors the
   // allowlist input). Empty entries are dropped.
   function csvToList(value: string): string[] {
@@ -298,37 +369,29 @@
   let snapshot = $state<Settings | null>(null);
 
   // Sidebar nav: which group is visible. The template gates each <section>
-  // on this so only one group renders at a time. Default lands on 'audio'
-  // (TTS sat at the top of the original single-scroll layout).
+  // on this so only one group renders at a time. Default lands on 'theme'
+  // (Appearance sits at the top of the nav order).
   type SectionId =
     | 'audio'
     | 'stt'
     | 'avatar'
     | 'theme'
-    | 'background'
-    | 'display'
     | 'bottom-bar'
     | 'tabs'
     | 'shortcuts'
-    | 'local-llm'
-    | 'aider-local-llm'
     | 'offload'
     | 'advanced'
     | 'about';
-  let activeSection = $state<SectionId>('audio');
+  let activeSection = $state<SectionId>('theme');
   const SECTIONS: { id: SectionId; label: string }[] = [
-    { id: 'audio', label: 'Audio' },
-    { id: 'stt', label: 'Speech-to-text' },
+    { id: 'theme', label: 'Appearance' },
     { id: 'avatar', label: 'Avatar' },
-    { id: 'theme', label: 'Theme' },
-    { id: 'background', label: 'Background' },
-    { id: 'display', label: 'Display' },
+    { id: 'shortcuts', label: 'Keyboard controls' },
     { id: 'bottom-bar', label: 'Bottom bar' },
+    { id: 'audio', label: 'Text-to-speech' },
+    { id: 'stt', label: 'Speech-to-text' },
     { id: 'tabs', label: 'Tabs' },
-    { id: 'shortcuts', label: 'Shortcuts' },
-    { id: 'local-llm', label: 'Local LLM (Claude)' },
-    { id: 'aider-local-llm', label: 'Local LLM (Aider)' },
-    { id: 'offload', label: 'Offload' },
+    { id: 'offload', label: 'Offload task tools' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
@@ -661,7 +724,7 @@
     return v || '#bb55ff';
   });
 
-  /// Active-tab metadata, used by the Advanced → "Apply to global"
+  /// Active-tab metadata, used by the Appearance → "Apply to global"
   /// button. The session's `active_tab_id` is the canonical
   /// "currently focused tab" reference at the settings layer; if
   /// nothing has set it yet (fresh install before any tab focus),
@@ -1050,6 +1113,40 @@
             <span>Fallback silent on TTS error (always on in v1)</span>
           </label>
         </section>
+
+        <section>
+          <h2>Processing</h2>
+          <small class="hint top">
+            Stream-stability tuning for the segmenter. Increase if speech
+            chops mid-sentence; decrease if reactions feel sluggish.
+          </small>
+          <div class="row">
+            <label>
+              <span>Stability timeout (ms)</span>
+              <input
+                type="number"
+                min="0"
+                max="2000"
+                step="10"
+                value={snapshot.processing.stability_timeout_ms}
+                onchange={(e) =>
+                  patch((s) => (s.processing.stability_timeout_ms = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+            <label>
+              <span>Max hold (ms)</span>
+              <input
+                type="number"
+                min="50"
+                max="5000"
+                step="50"
+                value={snapshot.processing.max_hold_ms}
+                onchange={(e) =>
+                  patch((s) => (s.processing.max_hold_ms = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
+              />
+            </label>
+          </div>
+        </section>
       {:else if activeSection === 'stt'}
         <section>
           <h2>Speech-to-text</h2>
@@ -1157,19 +1254,9 @@
             </select>
           </label>
 
-          <label>
-            <span>Push-to-talk</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.push_to_talk,
-                (v) => patch((s) => (s.shortcuts.push_to_talk = v))
-              }
-            />
-          </label>
           <small class="hint">
-            Hold the chord to record, release to transcribe. The default is
-            bare <code>Ctrl+Shift</code> — a quick tap or a
-            <code>Ctrl+Shift+&lt;key&gt;</code> chord won't trigger a recording.
+            The push-to-talk shortcut (hold to record) lives in
+            <strong>Keyboard controls</strong>.
           </small>
         </section>
 
@@ -1499,7 +1586,6 @@
             />
           {/if}
         </section>
-      {:else if activeSection === 'background'}
         <section>
           <h2>Terminal background</h2>
           <small class="hint top">
@@ -1598,7 +1684,6 @@
             and tint always preview live.
           </small>
         </section>
-      {:else if activeSection === 'display'}
         <section>
           <h2>Display</h2>
           <label>
@@ -1661,6 +1746,30 @@
               />
             </label>
           </div>
+        </section>
+
+        <section>
+          <h2>Per-tab overrides</h2>
+          <small class="hint top">
+            Promote the active tab's terminal palette and background
+            overrides to the global defaults, then clear the overrides
+            on every tab so they inherit the new global. Useful after
+            dialing in one tab and wanting the rest to match.
+          </small>
+          <button
+            type="button"
+            class="promote-overrides"
+            onclick={applyActiveTabOverridesToGlobal}
+            disabled={!activeTabHasOverrides}
+          >
+            {#if activeTab && activeTabHasOverrides}
+              Apply "{activeTab.name}" overrides to global
+            {:else if activeTab}
+              No overrides on "{activeTab.name}" to promote
+            {:else}
+              No active tab
+            {/if}
+          </button>
         </section>
       {:else if activeSection === 'bottom-bar'}
         <section>
@@ -2048,6 +2157,86 @@
               {:else}
                 <small class="hint top">Claude (local) tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
+              <section>
+                <h2>Local LLM provider</h2>
+                <small class="hint top">
+                  Settings for this tab when <em>Use local LLM provider</em>
+                  is enabled. Run a LiteLLM (or compatible) proxy that translates the
+                  Anthropic Messages API to your local model — ccImp does not start
+                  the proxy. See the
+                  <a
+                    href="https://docs.litellm.ai/docs/proxy/quick_start"
+                    target="_blank"
+                    rel="noopener noreferrer">LiteLLM docs</a
+                  >.
+                </small>
+                <label>
+                  <span>Proxy URL</span>
+                  <input
+                    type="text"
+                    value={snapshot?.claude_local.base_url ?? ''}
+                    oninput={(e) =>
+                      patch(
+                        (s) =>
+                          (s.claude_local.base_url = (
+                            e.currentTarget as HTMLInputElement
+                          ).value),
+                      )}
+                    placeholder="http://localhost:4000"
+                  />
+                  <small class="hint">
+                    Becomes <code>ANTHROPIC_BASE_URL</code> on launch.
+                  </small>
+                </label>
+                <label>
+                  <span>Auth token</span>
+                  <div class="input-with-action">
+                    <input
+                      type={showLocalToken ? 'text' : 'password'}
+                      value={snapshot?.claude_local.auth_token ?? ''}
+                      oninput={(e) =>
+                        patch(
+                          (s) =>
+                            (s.claude_local.auth_token = (
+                              e.currentTarget as HTMLInputElement
+                            ).value),
+                        )}
+                      placeholder="sk-dummy"
+                    />
+                    <button
+                      type="button"
+                      class="secondary"
+                      onclick={() => (showLocalToken = !showLocalToken)}
+                    >
+                      {showLocalToken ? 'Hide' : 'Show'}
+                    </button>
+                  </div>
+                  <small class="hint">
+                    Becomes <code>ANTHROPIC_AUTH_TOKEN</code>. Stored cleartext;
+                    local proxies usually accept dummy tokens.
+                  </small>
+                </label>
+                <label>
+                  <span>Model alias (optional)</span>
+                  <input
+                    type="text"
+                    value={snapshot?.claude_local.model_alias ?? ''}
+                    oninput={(e) =>
+                      patch(
+                        (s) =>
+                          (s.claude_local.model_alias = (
+                            e.currentTarget as HTMLInputElement
+                          ).value),
+                      )}
+                    placeholder=""
+                  />
+                  <small class="hint">
+                    When non-empty, becomes <code>ANTHROPIC_MODEL</code>. Most
+                    users leave this blank and configure model mapping inside
+                    their LiteLLM proxy config.
+                  </small>
+                </label>
+              </section>
             </div>
           {:else if tabsSubSection === 'aider'}
             <div id="tab-section-aider">
@@ -2086,6 +2275,87 @@
               {:else}
                 <small class="hint top">Aider (local) tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
+              <section>
+                <h2>Local LLM provider</h2>
+                <small class="hint top">
+                  Settings for this tab. ccImp synthesizes
+                  <code>OPENAI_API_BASE</code> / <code>OPENAI_API_KEY</code>
+                  from the values below and (when <em>Model</em> is set) passes
+                  <code>--model &lt;model&gt;</code> on the spawn argv. Point
+                  this at any OpenAI-compatible endpoint (Ollama, LM Studio,
+                  vLLM, LiteLLM proxy, …); ccImp does not start the endpoint
+                  itself.
+                </small>
+                <label>
+                  <span>Endpoint URL</span>
+                  <input
+                    type="text"
+                    value={snapshot?.aider_local.base_url ?? ''}
+                    oninput={(e) =>
+                      patch(
+                        (s) =>
+                          (s.aider_local.base_url = (
+                            e.currentTarget as HTMLInputElement
+                          ).value),
+                      )}
+                    placeholder="http://localhost:11434/v1"
+                  />
+                  <small class="hint">
+                    Becomes <code>OPENAI_API_BASE</code> on launch. For Ollama,
+                    the default <code>:11434/v1</code> path serves the
+                    OpenAI-compatible API.
+                  </small>
+                </label>
+                <label>
+                  <span>Auth token</span>
+                  <div class="input-with-action">
+                    <input
+                      type={showAiderLocalToken ? 'text' : 'password'}
+                      value={snapshot?.aider_local.auth_token ?? ''}
+                      oninput={(e) =>
+                        patch(
+                          (s) =>
+                            (s.aider_local.auth_token = (
+                              e.currentTarget as HTMLInputElement
+                            ).value),
+                        )}
+                      placeholder="ollama"
+                    />
+                    <button
+                      type="button"
+                      class="secondary"
+                      onclick={() => (showAiderLocalToken = !showAiderLocalToken)}
+                    >
+                      {showAiderLocalToken ? 'Hide' : 'Show'}
+                    </button>
+                  </div>
+                  <small class="hint">
+                    Becomes <code>OPENAI_API_KEY</code>. Stored cleartext;
+                    local endpoints typically accept any non-empty value
+                    (Ollama defaults to the literal string <code>ollama</code>).
+                  </small>
+                </label>
+                <label>
+                  <span>Model</span>
+                  <input
+                    type="text"
+                    value={snapshot?.aider_local.model ?? ''}
+                    oninput={(e) =>
+                      patch(
+                        (s) =>
+                          (s.aider_local.model = (
+                            e.currentTarget as HTMLInputElement
+                          ).value),
+                      )}
+                    placeholder="qwen3:14b"
+                  />
+                  <small class="hint">
+                    When non-empty, passed as <code>--model &lt;model&gt;</code>
+                    on the aider spawn argv. Aider's own naming conventions
+                    apply (e.g. <code>openai/qwen3:14b</code> for some endpoints).
+                  </small>
+                </label>
+              </section>
             </div>
           {:else}
             <small class="hint top">
@@ -2197,7 +2467,7 @@
         </section>
       {:else if activeSection === 'shortcuts'}
         <section>
-          <h2>Shortcuts</h2>
+          <h2>Keyboard controls</h2>
           <label>
             <span>Open compose</span>
             <ShortcutCapture
@@ -2252,169 +2522,35 @@
               }
             />
           </label>
-        </section>
-      {:else if activeSection === 'local-llm'}
-        <section>
-          <h2>Local LLM provider — Claude</h2>
-          <small class="hint top">
-            Settings for the Claude AI tab when <em>Use local LLM provider</em>
-            is enabled. Run a LiteLLM (or compatible) proxy that translates the
-            Anthropic Messages API to your local model — ccImp does not start
-            the proxy. See the
-            <a
-              href="https://docs.litellm.ai/docs/proxy/quick_start"
-              target="_blank"
-              rel="noopener noreferrer">LiteLLM docs</a
-            >.
+          <label>
+            <span>Push-to-talk (speech-to-text)</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.push_to_talk,
+                (v) => patch((s) => (s.shortcuts.push_to_talk = v))
+              }
+            />
+          </label>
+          <small class="hint">
+            Hold the chord to record, release to transcribe. Works only when
+            speech-to-text is enabled. The default is bare
+            <code>Ctrl+Shift</code> — a quick tap or a
+            <code>Ctrl+Shift+&lt;key&gt;</code> chord won't trigger a recording.
           </small>
           <label>
-            <span>Proxy URL</span>
-            <input
-              type="text"
-              value={snapshot?.claude_local.base_url ?? ''}
-              oninput={(e) =>
-                patch(
-                  (s) =>
-                    (s.claude_local.base_url = (
-                      e.currentTarget as HTMLInputElement
-                    ).value),
-                )}
-              placeholder="http://localhost:4000"
+            <span>Speak selection (text-to-speech)</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.speak_selection,
+                (v) => patch((s) => (s.shortcuts.speak_selection = v))
+              }
             />
-            <small class="hint">
-              Becomes <code>ANTHROPIC_BASE_URL</code> on launch.
-            </small>
           </label>
-          <label>
-            <span>Auth token</span>
-            <div class="input-with-action">
-              <input
-                type={showLocalToken ? 'text' : 'password'}
-                value={snapshot?.claude_local.auth_token ?? ''}
-                oninput={(e) =>
-                  patch(
-                    (s) =>
-                      (s.claude_local.auth_token = (
-                        e.currentTarget as HTMLInputElement
-                      ).value),
-                  )}
-                placeholder="sk-dummy"
-              />
-              <button
-                type="button"
-                class="secondary"
-                onclick={() => (showLocalToken = !showLocalToken)}
-              >
-                {showLocalToken ? 'Hide' : 'Show'}
-              </button>
-            </div>
-            <small class="hint">
-              Becomes <code>ANTHROPIC_AUTH_TOKEN</code>. Stored cleartext;
-              local proxies usually accept dummy tokens.
-            </small>
-          </label>
-          <label>
-            <span>Model alias (optional)</span>
-            <input
-              type="text"
-              value={snapshot?.claude_local.model_alias ?? ''}
-              oninput={(e) =>
-                patch(
-                  (s) =>
-                    (s.claude_local.model_alias = (
-                      e.currentTarget as HTMLInputElement
-                    ).value),
-                )}
-              placeholder=""
-            />
-            <small class="hint">
-              When non-empty, becomes <code>ANTHROPIC_MODEL</code>. Most
-              users leave this blank and configure model mapping inside
-              their LiteLLM proxy config.
-            </small>
-          </label>
-        </section>
-      {:else if activeSection === 'aider-local-llm'}
-        <section>
-          <h2>Local LLM provider — Aider</h2>
-          <small class="hint top">
-            Settings for the Aider (local) tab. ccImp synthesizes
-            <code>OPENAI_API_BASE</code> / <code>OPENAI_API_KEY</code>
-            from the values below and (when <em>Model</em> is set) passes
-            <code>--model &lt;model&gt;</code> on the spawn argv. Point
-            this at any OpenAI-compatible endpoint (Ollama, LM Studio,
-            vLLM, LiteLLM proxy, …); ccImp does not start the endpoint
-            itself.
+          <small class="hint">
+            Reads the active terminal's current selection aloud — the keyboard
+            equivalent of Ctrl+right-click. Shows a "No text selected" notice
+            when nothing is selected.
           </small>
-          <label>
-            <span>Endpoint URL</span>
-            <input
-              type="text"
-              value={snapshot?.aider_local.base_url ?? ''}
-              oninput={(e) =>
-                patch(
-                  (s) =>
-                    (s.aider_local.base_url = (
-                      e.currentTarget as HTMLInputElement
-                    ).value),
-                )}
-              placeholder="http://localhost:11434/v1"
-            />
-            <small class="hint">
-              Becomes <code>OPENAI_API_BASE</code> on launch. For Ollama,
-              the default <code>:11434/v1</code> path serves the
-              OpenAI-compatible API.
-            </small>
-          </label>
-          <label>
-            <span>Auth token</span>
-            <div class="input-with-action">
-              <input
-                type={showAiderLocalToken ? 'text' : 'password'}
-                value={snapshot?.aider_local.auth_token ?? ''}
-                oninput={(e) =>
-                  patch(
-                    (s) =>
-                      (s.aider_local.auth_token = (
-                        e.currentTarget as HTMLInputElement
-                      ).value),
-                  )}
-                placeholder="ollama"
-              />
-              <button
-                type="button"
-                class="secondary"
-                onclick={() => (showAiderLocalToken = !showAiderLocalToken)}
-              >
-                {showAiderLocalToken ? 'Hide' : 'Show'}
-              </button>
-            </div>
-            <small class="hint">
-              Becomes <code>OPENAI_API_KEY</code>. Stored cleartext;
-              local endpoints typically accept any non-empty value
-              (Ollama defaults to the literal string <code>ollama</code>).
-            </small>
-          </label>
-          <label>
-            <span>Model</span>
-            <input
-              type="text"
-              value={snapshot?.aider_local.model ?? ''}
-              oninput={(e) =>
-                patch(
-                  (s) =>
-                    (s.aider_local.model = (
-                      e.currentTarget as HTMLInputElement
-                    ).value),
-                )}
-              placeholder="qwen3:14b"
-            />
-            <small class="hint">
-              When non-empty, passed as <code>--model &lt;model&gt;</code>
-              on the aider spawn argv. Aider's own naming conventions
-              apply (e.g. <code>openai/qwen3:14b</code> for some endpoints).
-            </small>
-          </label>
         </section>
       {:else if activeSection === 'offload'}
         <section>
@@ -2679,7 +2815,8 @@
               <span class="offload-status-label">Warm pool:</span>
               <span>
                 {serviceStatus.global_in_flight} / {serviceStatus.global_cap} offloads in flight
-                (global, across all Claude tabs)
+                (global, across all Claude tabs){#if serviceStatus.queue_depth > 0}, {serviceStatus.queue_depth}
+                  queued{/if}
               </span>
             </div>
           {/if}
@@ -2754,6 +2891,29 @@
                 )}
             />
             <small class="hint">Bounds each offload, including the wait for a free slot.</small>
+          </label>
+          <label>
+            <span>Max queue depth (blank = unlimited)</span>
+            <input
+              type="number"
+              min="0"
+              placeholder="unlimited"
+              value={snapshot.offload.max_queue_depth ?? ''}
+              onchange={(e) => {
+                const raw = (e.currentTarget as HTMLInputElement).value.trim();
+                const n = Math.floor(+raw);
+                patch(
+                  (s) =>
+                    (s.offload.max_queue_depth =
+                      raw === '' || !Number.isFinite(n) || n <= 0 ? null : n),
+                );
+              }}
+            />
+            <small class="hint">
+              When every slot is busy and this many tasks are already waiting,
+              new offloads are rejected immediately instead of queuing. Blank
+              keeps the unbounded queue (each waits up to the timeout above).
+            </small>
           </label>
           {:else}
           <h3>Native tools</h3>
@@ -2934,15 +3094,10 @@
             <button type="button" onclick={addCommandPolicy}>Add command policy</button>
           </div>
 
-          <h3>MCP tool servers</h3>
+          <h3>MCP server status</h3>
           <small class="hint top">
-            ccImp's warm MCP host aggregates the read-class tools from these
-            servers (web search, fetch, docs, git, filesystem) and keeps the
-            connections warm across offloads. Write/destructive tools are
-            filtered out; <code>filesystem</code> is confined to the allowed
-            roots. Configure servers in <code>settings.json</code> under
-            <code>offload.mcp_servers</code> (same shape as Claude's
-            <code>mcpServers</code>).
+            Live health of the warm MCP host's connections. Updates as you add,
+            remove, or enable/disable servers below — no restart needed.
           </small>
           {#if serviceStatus && serviceStatus.mcp_servers.length > 0}
             <ul class="mcp-health">
@@ -2957,73 +3112,70 @@
           {:else if snapshot.offload.mcp_servers.length > 0}
             <small class="hint">
               {snapshot.offload.mcp_servers.length} server(s) configured —
-              health appears here once the app's warm pool is running (enable
-              offload and reopen this panel).
+              health appears once offload is enabled and the warm pool is running.
             </small>
           {:else}
             <small class="hint">No MCP tool servers configured yet.</small>
           {/if}
+
+          <h3>MCP tool servers</h3>
+          <small class="hint top">
+            ccImp's warm MCP host aggregates the read-class tools from these
+            servers (web search, fetch, docs) and keeps the connections warm
+            across offloads. Add an HTTP MCP endpoint by name + URL; changes
+            apply live. Write/destructive tools are filtered out. Advanced stdio
+            servers (command/args/env) remain editable in
+            <code>settings.json</code> under <code>offload.mcp_servers</code>.
+          </small>
+          <!-- Keyed by index deliberately: name/url are editable and the
+               snapshot is replaced (cloned) on every edit, so a name/url/object
+               key would change mid-edit and drop input focus. Inputs are
+               controlled (`value={…}`), so values always track the data after a
+               removal/reorder, and removal is button-triggered (no focused text
+               field to bleed) — the index-key caveat is harmless here. -->
+          {#each snapshot.offload.mcp_servers as srv, i (i)}
+            <div class="mcp-row">
+              <label class="mcp-field">
+                <span>Name</span>
+                <input
+                  type="text"
+                  placeholder="duckduckgo"
+                  value={srv.name}
+                  oninput={(e) =>
+                    setMcpServer(i, (m) => (m.name = (e.currentTarget as HTMLInputElement).value.trim()))}
+                  onchange={commitMcpEdits}
+                />
+              </label>
+              <label class="mcp-field grow">
+                <span>URL</span>
+                <input
+                  type="text"
+                  placeholder="http://host:port/mcp"
+                  value={srv.url}
+                  oninput={(e) =>
+                    setMcpServer(i, (m) => (m.url = (e.currentTarget as HTMLInputElement).value.trim()))}
+                  onchange={commitMcpEdits}
+                />
+              </label>
+              <label class="mcp-enable">
+                <input
+                  type="checkbox"
+                  checked={srv.enabled}
+                  onchange={(e) => toggleMcpServer(i, (e.currentTarget as HTMLInputElement).checked)}
+                />
+                <span>Enabled</span>
+              </label>
+              <button type="button" class="secondary danger" onclick={() => removeMcpServer(i)}>
+                Remove
+              </button>
+            </div>
+          {/each}
+          <div class="button-row">
+            <button type="button" onclick={addMcpServer}>Add MCP server</button>
+          </div>
           {/if}
         </section>
       {:else if activeSection === 'advanced'}
-        <section>
-          <h2>Per-tab overrides</h2>
-          <small class="hint top">
-            Promote the active tab's terminal palette and background
-            overrides to the global defaults, then clear the overrides
-            on every tab so they inherit the new global. Useful after
-            dialing in one tab and wanting the rest to match.
-          </small>
-          <button
-            type="button"
-            class="promote-overrides"
-            onclick={applyActiveTabOverridesToGlobal}
-            disabled={!activeTabHasOverrides}
-          >
-            {#if activeTab && activeTabHasOverrides}
-              Apply "{activeTab.name}" overrides to global
-            {:else if activeTab}
-              No overrides on "{activeTab.name}" to promote
-            {:else}
-              No active tab
-            {/if}
-          </button>
-        </section>
-
-        <section>
-          <h2>Processing</h2>
-          <small class="hint top">
-            Stream-stability tuning for the segmenter. Increase if speech
-            chops mid-sentence; decrease if reactions feel sluggish.
-          </small>
-          <div class="row">
-            <label>
-              <span>Stability timeout (ms)</span>
-              <input
-                type="number"
-                min="0"
-                max="2000"
-                step="10"
-                value={snapshot.processing.stability_timeout_ms}
-                onchange={(e) =>
-                  patch((s) => (s.processing.stability_timeout_ms = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
-            <label>
-              <span>Max hold (ms)</span>
-              <input
-                type="number"
-                min="50"
-                max="5000"
-                step="50"
-                value={snapshot.processing.max_hold_ms}
-                onchange={(e) =>
-                  patch((s) => (s.processing.max_hold_ms = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
-          </div>
-        </section>
-
         <section>
           <h2>Logging</h2>
           <small class="hint top">
@@ -3250,6 +3402,35 @@
   }
   .mcp-detail {
     color: var(--text-secondary);
+  }
+  /* Editable MCP server rows (name + url + enable + remove). */
+  .mcp-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .mcp-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+  .mcp-field.grow {
+    flex: 1 1 16rem;
+  }
+  .mcp-field input {
+    width: 100%;
+  }
+  .mcp-enable {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    white-space: nowrap;
+    padding-bottom: 0.35rem;
+  }
+  .mcp-enable input {
+    width: auto;
   }
   .offload-test-result {
     margin-top: 0.5rem;
@@ -3627,13 +3808,34 @@
     display: block;
     color: var(--text-tertiary);
     font-size: var(--font-size-xs);
+    /* Generous leading so tall inline glyphs — e.g. the ▓░ shade blocks in
+       the Claude context-bar example below — don't bleed up into the line
+       above when their fallback-font ink overflows the line box. */
+    line-height: 1.6;
     margin: -8px 0 var(--space-3) 0;
+  }
+  /* Inline code inside a hint (the context-bar example, env-var names, …):
+     pin a monospace with tight metrics and clamp its line box so the shade
+     glyphs stay contained within the paragraph's leading. */
+  small.hint code {
+    font-family: Consolas, Menlo, monospace;
+    font-size: 0.95em;
+    line-height: 1;
   }
   /* hint placed directly under an h3 (rather than tucked under a label)
      needs normal top margin — it has no preceding label to overlap. */
   small.hint.top {
     margin-top: 0;
     margin-bottom: var(--space-3);
+  }
+  /* A hint that follows a bare button or a checkbox row has no tall block
+     label above it for the negative top margin to tuck under — that margin
+     would otherwise pull the hint up over the button/checkbox (e.g. the
+     Bottom bar → Status bar arrangement and Claude context bar sections).
+     Reset to a normal positive gap. */
+  button + small.hint,
+  label.checkbox + small.hint {
+    margin-top: var(--space-1);
   }
   /* V6-01: missing-model / device-not-found warning hint. */
   small.hint.warn {

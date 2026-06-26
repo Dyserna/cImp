@@ -272,4 +272,5 @@ mod tests {
         assert!(peak > 0.05, "output peak too low ({peak}) — likely silence");
         assert!(rms > 0.005, "output rms too low ({rms}) — likely silence");
     }
+
 }

@@ -56,6 +56,7 @@ pub fn spawn_tts_worker(
                     // playing it.
                     if let TtsRequest::SpeakSelection { tab, session, chunks } = req {
                         let count = chunks.len() as u32;
+                        debug!(session, count, "selection read: received chunks");
                         let mut enqueued_any = false;
                         let mut cancelled = false;
                         for (i, text) in chunks.into_iter().enumerate() {
@@ -64,6 +65,12 @@ pub fn spawn_tts_worker(
                                 cancelled = true;
                                 break;
                             }
+                            // Preview + length captured before `text` moves into
+                            // the request, so the per-chunk log can show which
+                            // chunk produced how much audio (parity with the
+                            // AI-output path, which logs every synthesis).
+                            let nchars = text.chars().count();
+                            let preview: String = text.chars().take(60).collect();
                             next_id += 1;
                             let synth_req = SynthesisRequest { text, request_id: next_id };
                             match engine.synthesize(synth_req) {
@@ -75,17 +82,32 @@ pub fn spawn_tts_worker(
                                         cancelled = true;
                                         break;
                                     }
+                                    let samples = resp.samples.len();
                                     if !resp.samples.is_empty() {
+                                        debug!(
+                                            session, chunk = i, nchars, samples,
+                                            "selection chunk synthesized; enqueuing"
+                                        );
                                         audio.enqueue_marked(
                                             resp.samples,
                                             resp.sample_rate,
                                             ChunkMark { session, index: i as u32 },
                                         );
                                         enqueued_any = true;
+                                    } else {
+                                        // No audio for this chunk: it is silently
+                                        // skipped and the highlight recedes over it
+                                        // as if read. Warn (not debug) so a dropped
+                                        // chunk is visible at default log levels.
+                                        warn!(
+                                            session, chunk = i, nchars, preview = %preview,
+                                            "selection chunk produced no audio; skipping (text dropped)"
+                                        );
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, chunk = i, "selection chunk synthesis failed");
+                                    warn!(error = %e, chunk = i, preview = %preview,
+                                        "selection chunk synthesis failed; skipping (text dropped)");
                                 }
                             }
                         }

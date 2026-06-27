@@ -104,6 +104,22 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
              with their source.",
             &[("query", "Keyword or phrase to search for.")],
         ),
+        GraphToolSpec {
+            name: "graph_struct_search",
+            description: "Find code by AST shape using a tree-sitter QUERY (an S-expression \
+                pattern), not text. Example (Rust, find every `.unwrap()`): \
+                `(call_expression function: (field_expression field: (field_identifier) @m) (#eq? @m \"unwrap\"))`. \
+                Returns the file, line, and snippet of each captured node. Use for structural \
+                questions text search can't express.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "A tree-sitter query S-expression with at least one @capture." },
+                    "lang": { "type": "string", "enum": ["rust", "typescript", "javascript", "python"], "description": "Which language's files to search." }
+                },
+                "required": ["query", "lang"]
+            }),
+        },
     ]
 }
 
@@ -142,14 +158,16 @@ pub async fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
     let sub = db_subdir(&settings);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let idx = match open_project_index(&cwd, &sub) {
-        Ok(i) => i,
+    let (root, idx) = match open_project_index(&cwd, &sub) {
+        Ok(pair) => pair,
         Err(msg) => return Ok(tool_error(&msg)),
     };
 
     let result = if name == "graph_semantic_docs" {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         semantic_query(&idx, &settings, query, max_rows, max_snippet).await
+    } else if name == "graph_struct_search" {
+        run_struct_search(&root, &idx, &args, max_rows, max_snippet)
     } else {
         run_tool(&idx, name, &args, max_rows, max_snippet)
     };
@@ -305,10 +323,12 @@ pub async fn offload_query(
             .to_string();
     for root in roots {
         match open_project_index(root, &sub) {
-            Ok(idx) => {
+            Ok((resolved, idx)) => {
                 return if name == "graph_semantic_docs" {
                     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                     semantic_query(&idx, &settings, query, max_rows, max_snippet).await
+                } else if name == "graph_struct_search" {
+                    run_struct_search(&resolved, &idx, args, max_rows, max_snippet)
                 } else {
                     run_tool(&idx, name, args, max_rows, max_snippet)
                 };
@@ -400,15 +420,58 @@ fn db_subdir(settings: &crate::settings::Settings) -> String {
 }
 
 /// Open the existing graph store for the project containing `start`, resolving
-/// the root by walking up for a `<dir>/<sub>/graph.db`.
-fn open_project_index(start: &Path, sub: &str) -> Result<GraphIndex, String> {
+/// the root by walking up for a `<dir>/<sub>/graph.db`. Returns the resolved
+/// project root alongside the index (structural search reads files from it).
+fn open_project_index(start: &Path, sub: &str) -> Result<(PathBuf, GraphIndex), String> {
     let root = find_graph_root(start, sub).ok_or_else(|| {
         format!(
             "no code graph found from {} — enable the graph and index this project in ccImp",
             start.display()
         )
     })?;
-    GraphIndex::open_existing(&root, sub).map_err(|e| e.to_string())
+    let idx = GraphIndex::open_existing(&root, sub).map_err(|e| e.to_string())?;
+    Ok((root, idx))
+}
+
+/// Execute `graph_struct_search`: re-parse the indexed files of `lang` under
+/// `root` and run the tree-sitter `query` over them. Bounded by `max_rows` and
+/// a file cap so a huge tree can't run away.
+fn run_struct_search(
+    root: &Path,
+    idx: &GraphIndex,
+    args: &Value,
+    max_rows: usize,
+    max_snippet: usize,
+) -> Result<String, String> {
+    const MAX_FILES: usize = 4000;
+    let pattern = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let lang_tag = args.get("lang").and_then(|v| v.as_str()).unwrap_or("");
+    if pattern.trim().is_empty() {
+        return Err("graph_struct_search needs a `query` (a tree-sitter S-expression)".into());
+    }
+    let lang = super::model::Lang::from_tag(lang_tag);
+    if super::builder::language_for(lang).is_none() {
+        return Err(format!(
+            "graph_struct_search `lang` must be one of rust/typescript/javascript/python (got `{lang_tag}`)"
+        ));
+    }
+
+    let paths = idx.files_for_lang(lang.tag()).map_err(|e| e.to_string())?;
+    let mut files: Vec<(String, String)> = Vec::new();
+    for rel in paths.into_iter().take(MAX_FILES) {
+        if let Ok(src) = std::fs::read_to_string(root.join(&rel)) {
+            files.push((rel, src));
+        }
+    }
+    let hits = super::builder::struct_search(lang, pattern, &files, max_rows, max_snippet)?;
+    if hits.is_empty() {
+        return Ok("No structural matches.".to_string());
+    }
+    Ok(hits
+        .iter()
+        .map(|h| format!("{}:{}  {}", h.file, h.line, h.snippet))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Walk up from `start` looking for an ancestor containing `<sub>/graph.db`.

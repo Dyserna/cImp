@@ -337,6 +337,19 @@ impl GraphIndex {
             .collect())
     }
 
+    /// Project-relative paths of every indexed file of `lang_tag` (e.g.
+    /// `"rust"`). Used by structural search to scope which files to re-parse.
+    pub fn files_for_lang(&self, lang_tag: &str) -> AppResult<Vec<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("lang".to_string(), DataValue::Str(lang_tag.into()));
+        let rows = self.run(
+            "?[path] := *file{path, lang}, lang == $lang",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.iter().map(|r| cell_str(r, 0)).collect())
+    }
+
     /// Module/symbol paths imported by `file`.
     pub fn imports(&self, file: &str) -> AppResult<Vec<String>> {
         let mut p = BTreeMap::new();

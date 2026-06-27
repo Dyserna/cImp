@@ -43,6 +43,19 @@ impl Lang {
         }
     }
 
+    /// Inverse of [`Self::tag`] — resolve a stored/CLI lang tag back to a
+    /// `Lang` (`Other` for anything unrecognized).
+    pub fn from_tag(tag: &str) -> Lang {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "rust" => Lang::Rust,
+            "typescript" => Lang::TypeScript,
+            "javascript" => Lang::JavaScript,
+            "python" => Lang::Python,
+            "markdown" => Lang::Markdown,
+            _ => Lang::Other,
+        }
+    }
+
     /// Stable lowercase tag stored in the `file.lang` column and matched
     /// against `GraphSettings::languages`.
     pub fn tag(self) -> &'static str {

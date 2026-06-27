@@ -425,6 +425,84 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").to_string()
 }
 
+// ── Structural search (Stage 4): tree-sitter query over source ───────────
+
+/// One structural-search match: where a capture landed.
+pub struct StructHit {
+    pub file: String,
+    pub line: u32,
+    pub snippet: String,
+}
+
+/// The tree-sitter grammar for `lang`, or `None` for languages without symbol
+/// extraction (Markdown/Other). `.tsx` uses the plain TS grammar here — the
+/// query engine is error-tolerant enough for declaration-level patterns.
+pub fn language_for(lang: Lang) -> Option<tree_sitter::Language> {
+    match lang {
+        Lang::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+        Lang::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        Lang::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+        Lang::Python => Some(tree_sitter_python::LANGUAGE.into()),
+        Lang::Markdown | Lang::Other => None,
+    }
+}
+
+/// Run a tree-sitter **query** (an S-expression pattern) over a set of
+/// `(path, source)` files of one language, returning each captured node's
+/// location + snippet, capped at `max_rows`. The query is compiled once; a
+/// malformed query returns an `Err` the model can read and fix.
+pub fn struct_search(
+    lang: Lang,
+    pattern: &str,
+    files: &[(String, String)],
+    max_rows: usize,
+    max_snippet: usize,
+) -> Result<Vec<StructHit>, String> {
+    use tree_sitter::StreamingIterator;
+
+    let language = language_for(lang).ok_or_else(|| {
+        format!("structural search isn't supported for language `{}`", lang.tag())
+    })?;
+    let query = tree_sitter::Query::new(&language, pattern)
+        .map_err(|e| format!("invalid tree-sitter query: {e}"))?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&language)
+        .map_err(|e| format!("grammar load failed: {e}"))?;
+
+    let mut out: Vec<StructHit> = Vec::new();
+    for (path, src) in files {
+        let Some(tree) = parser.parse(src, None) else {
+            continue;
+        };
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut it = cursor.matches(&query, tree.root_node(), src.as_bytes());
+        while let Some(m) = it.next() {
+            for cap in m.captures {
+                let node = cap.node;
+                out.push(StructHit {
+                    file: path.clone(),
+                    line: node.start_position().row as u32 + 1,
+                    snippet: snippet_of(src, node, max_snippet),
+                });
+                if out.len() >= max_rows {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A one-line, length-capped snippet of a matched node.
+fn snippet_of(src: &str, node: Node, max: usize) -> String {
+    let mut s = first_line(&node_text(src, node)).trim().to_string();
+    if s.chars().count() > max {
+        s = s.chars().take(max).collect::<String>() + "…";
+    }
+    s
+}
+
 // ── TypeScript / JavaScript ──────────────────────────────────────────────
 
 /// Parse a TS/JS/TSX/JSX file. `.tsx`/`.jsx` get the JSX-aware grammar so JSX
@@ -1019,6 +1097,25 @@ class Point:
     def origin(self):
         return os.getcwd()
 "#;
+
+    #[test]
+    fn struct_search_matches_by_ast_shape() {
+        let files = vec![(
+            "src/a.rs".to_string(),
+            "fn add() { x.unwrap() }\nfn helper() { y.unwrap() }\nfn no_unwrap() {}\n".to_string(),
+        )];
+        // Every `.unwrap()` call (a field_expression method call named unwrap).
+        let q = r#"(call_expression function: (field_expression field: (field_identifier) @m) (#eq? @m "unwrap"))"#;
+        let hits = struct_search(Lang::Rust, q, &files, 100, 80).expect("query ok");
+        assert_eq!(hits.len(), 2, "two unwrap() calls");
+        assert!(hits.iter().all(|h| h.file == "src/a.rs"));
+        assert!(hits.iter().any(|h| h.line == 1));
+        assert!(hits.iter().any(|h| h.line == 2));
+
+        // A malformed query is a readable error, not a panic.
+        let err = struct_search(Lang::Rust, "(not_a_node", &files, 10, 80);
+        assert!(err.is_err());
+    }
 
     #[test]
     fn extracts_python() {

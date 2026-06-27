@@ -466,6 +466,84 @@ pub async fn close_tab(
     Ok(())
 }
 
+/// V8-03/V9-01: materialize or tear down a reserved, app-rendered feature tab
+/// (Offload Server / Code Graph monitor) **live** when its feature flag is
+/// toggled in Settings, so the tab appears/disappears without an app restart.
+///
+/// The persisted `settings.tabs` list is kept consistent separately by
+/// [`crate::settings::reconcile_reserved_tabs`]; this drives the runtime
+/// registry plus the `tab-created`/`tab-closed` events the frontend uses to add
+/// the tab to the bar and place it in (or remove it from) a pane. Idempotent in
+/// both directions, so a redundant settings broadcast is a no-op. The caller
+/// should hold `lifecycle_serializer` so this can't race `create`/`close_tab`.
+pub(crate) async fn sync_reserved_feature_tab(state: &AppState, tab: TabId, enabled: bool) {
+    if enabled {
+        // Name + canonical position come from the (already-reconciled) settings.
+        let snap = state.settings.current();
+        let Some(entry) = snap.find_tab(tab.as_str()) else {
+            return; // reconcile didn't add it (feature still off) — nothing to do
+        };
+        let name = entry.name().to_string();
+        let position = snap
+            .tabs
+            .iter()
+            .position(|t| t.id() == tab.as_str())
+            .unwrap_or(snap.tabs.len());
+        {
+            let mut registry = state.tabs.lock().await;
+            if registry.has_tab(&tab) {
+                return; // already live
+            }
+            registry.insert_user_tab(tab.clone(), name.clone());
+        }
+        let meta = TabMeta {
+            id: tab.clone(),
+            kind: tab.kind(),
+            name,
+        };
+        if let Err(e) = state
+            .state_signals
+            .send(StateSignal::TabAdded { meta, position })
+            .await
+        {
+            warn!(error = %e, ?tab, "sync_reserved_feature_tab: add signal channel closed");
+            // Roll back the registry entry so it doesn't linger without a view.
+            state.tabs.lock().await.remove_tab(&tab).await;
+        } else {
+            info!(?tab, "reserved feature tab materialized (feature enabled)");
+        }
+    } else {
+        let removed = {
+            let mut registry = state.tabs.lock().await;
+            if !registry.has_tab(&tab) {
+                return; // already gone
+            }
+            // If the tab being removed is active, hand focus to a neighbor first
+            // so `active` never dangles at the removed tab (mirrors close_tab).
+            if registry.active() == tab {
+                let target = registry.previous_tab(&tab).or_else(|| registry.next_tab(&tab));
+                if let Some(target) = target {
+                    if let Err(e) = registry.activate(target).await {
+                        warn!(error = %e, "sync_reserved_feature_tab: activate neighbor failed");
+                    }
+                }
+            }
+            registry.remove_tab(&tab).await
+        };
+        if removed {
+            if let Err(e) = state
+                .state_signals
+                .send(StateSignal::TabRemoved { tab: tab.clone() })
+                .await
+            {
+                warn!(error = %e, ?tab, "sync_reserved_feature_tab: remove signal channel closed");
+            } else {
+                info!(?tab, "reserved feature tab removed (feature disabled)");
+            }
+        }
+    }
+}
+
 /// Rename any tab. Builtins are renamable too — only the display name
 /// changes; the underlying command/args are unaffected.
 #[tauri::command]

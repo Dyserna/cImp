@@ -719,6 +719,17 @@ fn reconcile_graph_monitor_tab(settings: &mut Settings) -> bool {
     }
 }
 
+/// Re-run the reserved feature-tab reconciles (Offload Server + Code Graph
+/// monitor) so the persisted tab list matches the current enable flags. The
+/// full [`integrity_check`] only runs at load-from-disk; the live
+/// settings-update path calls this so toggling a feature materializes/removes
+/// its reserved tab immediately. Returns `true` if `settings.tabs` changed.
+pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
+    let mut changed = reconcile_offload_server_tab(settings);
+    changed |= reconcile_graph_monitor_tab(settings);
+    changed
+}
+
 /// Insert position for the Code Graph monitor tab: after the leading AI
 /// builtins AND the Offload Server tab (if present), ahead of user shells.
 fn graph_monitor_insert_position(tabs: &[TabConfig]) -> usize {
@@ -1102,6 +1113,26 @@ mod tests {
         let changed = integrity_check(&mut s);
         assert!(changed);
         assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
+    }
+
+    #[test]
+    fn reconcile_reserved_tabs_materializes_and_removes_both_live() {
+        let mut s = Settings::default();
+        s.offload.enabled = true;
+        s.graph.enabled = true;
+        // The live toggle path uses reconcile_reserved_tabs (not the full
+        // integrity pass) to materialize both reserved tabs at once.
+        assert!(reconcile_reserved_tabs(&mut s));
+        assert!(s.tabs.iter().any(|t| t.id() == OFFLOAD_SERVER_TAB_ID));
+        assert!(s.tabs.iter().any(|t| t.id() == GRAPH_MONITOR_TAB_ID));
+        // Idempotent: no flag change → no tab change.
+        assert!(!reconcile_reserved_tabs(&mut s));
+        // Disabling both prunes both.
+        s.offload.enabled = false;
+        s.graph.enabled = false;
+        assert!(reconcile_reserved_tabs(&mut s));
+        assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
+        assert!(s.tabs.iter().all(|t| t.id() != GRAPH_MONITOR_TAB_ID));
     }
 
     #[test]

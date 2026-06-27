@@ -697,6 +697,16 @@ pub async fn settings_update(
     // on-disk subfolder before broadcasting, so switching theme switches the
     // avatar. User overrides are preserved; see `apply_portable_avatar_paths`.
     crate::settings::apply_portable_avatar_paths(&mut settings);
+
+    // Snapshot the pre-update feature flags so we can drive the reserved tabs'
+    // live materialize/remove after the mutate. The integrity pass that
+    // normally owns those tabs only runs at load, so without this a freshly
+    // enabled feature's tab wouldn't appear until the next launch.
+    let (was_graph, was_offload) = {
+        let old = state.settings.current();
+        (old.graph.enabled, old.offload.enabled)
+    };
+
     // The Settings window holds a full snapshot and replaces wholesale, but it
     // never edits `layout` or `session` (those are driven only by the main
     // window's save_layout / set_active_tab commands). Preserve them from the
@@ -708,7 +718,34 @@ pub async fn settings_update(
         settings.layout = cur.layout.clone();
         settings.session = cur.session.clone();
         *cur = settings;
+        // Keep the reserved feature tabs (Offload Server / Code Graph monitor)
+        // present-iff-enabled in the persisted list.
+        crate::settings::reconcile_reserved_tabs(cur);
     });
+
+    // On an actual enable/disable edge, mirror the change into the runtime so
+    // the reserved tab appears/disappears live (tab bar + pane placement).
+    let now = state.settings.current();
+    if now.graph.enabled != was_graph || now.offload.enabled != was_offload {
+        // Serialize against create/close_tab while we touch the registry.
+        let _serializer = state.lifecycle_serializer.lock().await;
+        if now.graph.enabled != was_graph {
+            super::tab_lifecycle::sync_reserved_feature_tab(
+                state.inner(),
+                TabId::GraphMonitor,
+                now.graph.enabled,
+            )
+            .await;
+        }
+        if now.offload.enabled != was_offload {
+            super::tab_lifecycle::sync_reserved_feature_tab(
+                state.inner(),
+                TabId::OffloadServer,
+                now.offload.enabled,
+            )
+            .await;
+        }
+    }
     Ok(())
 }
 

@@ -2,6 +2,149 @@
 
 Living list of dependencies and runtime concerns to revisit periodically. Each item: what to check, why it matters, where to look.
 
+---
+
+# Dependency & component inventory
+
+A complete, scannable inventory of everything ccImp depends on, for periodic
+"is there a newer version?" passes. Version columns reflect the pins in
+`src-tauri/Cargo.toml` and `package.json` as of **v0.19.0**. The deeper
+"Dependencies to track" sections below cover the *gotchas* for the hairy ones
+(`ort`, `whisper-rs`, offload) — this inventory is the breadth; those are the
+depth. Update both when you bump.
+
+## How to check for updates
+
+```bash
+# Rust crates — shows newest compatible + newest available per dep
+cargo install cargo-outdated        # one-time
+cd src-tauri && cargo outdated -R   # -R = root deps only (skip transitive noise)
+cargo update --dry-run              # what a `cargo update` would move (semver-compatible)
+
+# Frontend (npm)
+npm outdated                        # current vs wanted vs latest
+npx npm-check-updates               # proposes package.json bumps (review, don't blind-apply)
+
+# Tauri toolchain sanity
+cargo tauri --version ; node --version ; rustc --version
+```
+
+Bump policy: move one ecosystem at a time, run `cargo test` + `npm run check` +
+`npm test`, and for `ort` / `whisper-rs` / GPU features re-run the smoke tests
+called out in their sections. Pinned-exact deps (`ort = "=…"`) need a manual
+version edit — `cargo update` will not move them.
+
+## Rust crates (`src-tauri/Cargo.toml`)
+
+| Crate | Pin | Role | Watch / notes |
+|---|---|---|---|
+| `tauri` | `2` | App shell / IPC / windowing | Bump with `@tauri-apps/*` JS + `tauri-plugin-dialog` together (same major). |
+| `tauri-build` (build-dep) | `2` | Tauri codegen | Keep in lockstep with `tauri`. |
+| `tauri-plugin-dialog` | `2` | Native file dialogs | Pairs with the JS `@tauri-apps/plugin-dialog`. |
+| `serde` / `serde_json` | `1` / `1` | (De)serialization everywhere | Stable; rarely needs attention. |
+| `tokio` | `1` | Async runtime | Feature-rich pin (`rt-multi-thread,macros,sync,io-*,time,fs,process,net`). |
+| `tokio-util` | `0.7` | `rt` helpers | — |
+| `portable-pty` | `0.8` | PTY for the embedded terminals | Pre-1.0; check changelog on bump. |
+| `thiserror` | `1` | Error derives | — |
+| `tracing` / `tracing-subscriber` / `tracing-appender` | `0.1` / `0.3` / `0.2` | Logging + rolling file logs | `env-filter` feature; subscriber API shifts across 0.3.x. |
+| `base64` | `0.22` | Asset/data encoding | — |
+| `which` | `6` | Locate `claude` / shells on PATH | — |
+| `vte` | `0.13` | ANSI/terminal parser (processing layer) | Pre-1.0; tag-scanner depends on its escape parsing. |
+| `shlex` | `1` | Shell-word splitting | — |
+| `uuid` | `1` | IDs (`v4`) | — |
+| `async-trait` | `0.1` | Async `ToolRouter` trait (offload) | — |
+| `reqwest` | `0.12` | Usage tracker + offload HTTP | `rustls-tls` only (no system OpenSSL — keeps single-binary). |
+| `sysinfo` | `0.36` | System-monitor panel | Fast-moving pre-1.0; API churns — re-verify the monitor on bump. |
+| `nvml-wrapper` | `0.12` | NVIDIA GPU stats | Loads `nvml.dll` at runtime; degrades to n/a without driver. |
+| `misaki-rs` | `0.3` | TTS G2P phonemizer | **Pulls espeak-ng → binary is GPLv3** (see `NOTICE`); needs libclang to build. |
+| `ort` | `=2.0.0-rc.11` | ONNX Runtime bindings (Kokoro TTS) | **Exact-pinned.** Wraps ORT 1.20.x. See the deep `ort` section. |
+| `ndarray` | `0.16` | Tensor math for TTS pre/post | Keep aligned with what `ort` expects. |
+| `bytemuck` | `1` | Zero-copy casts | — |
+| `cpal` / `rodio` | `0.15` / `0.20` | Audio output | Pre-1.0; device-enumeration behavior changes across versions. |
+| `whisper-rs` | `0.16` | STT (whisper.cpp bindings) | → `whisper-rs-sys 0.15`. See the deep `whisper-rs` section + build toolchain. |
+| `rubato` | `0.16` | Mic resample → 16 kHz mono | — |
+| `tree-sitter` | `0.26.9` | Code-graph parsing core | Grammar crates ride the `tree-sitter-language` shim, so they need not match this exactly — only the parser ABI must. |
+| `tree-sitter-rust` | `0.24.2` | Rust grammar | — |
+| `tree-sitter-typescript` | `0.23.2` | TS/TSX grammar | — |
+| `tree-sitter-javascript` | `0.25.0` | JS grammar | — |
+| `tree-sitter-python` | `0.25.0` | Python grammar | — |
+| `cozo` | `0.7.6` | Embedded graph DB (code-knowledge graph) | `default-features = false` + `storage-sqlite,rayon`. **Deliberately omits** `graph-algo` (broken `graph_builder` vs rayon) and `storage-rocksdb` (heavy C++). |
+| `ignore` | `0.4` | Gitignore-aware tree walk (indexer) | ripgrep's walker. |
+| `notify` | `6` | FS watcher (incremental re-index) | `ReadDirectoryChangesW` on Windows. |
+| `winreg` *(windows only)* | `0.52` | Registry probe for Git Bash detection | `cfg(windows)` target dep. |
+
+## Frontend / npm (`package.json`)
+
+| Package | Pin | Role |
+|---|---|---|
+| `@tauri-apps/api` | `^2.1.1` | JS ↔ Rust IPC bridge |
+| `@tauri-apps/plugin-dialog` | `^2.0.0` | Dialog plugin (JS half) |
+| `@xterm/xterm` | `^5.5.0` | Terminal emulator widget |
+| `@xterm/addon-canvas` | `^0.7.0` | xterm canvas renderer |
+| `@xterm/addon-fit` | `^0.10.0` | xterm fit-to-container |
+| `@xterm/addon-serialize` | `^0.13.0` | xterm scrollback serialization |
+| `@sveltejs/vite-plugin-svelte` *(dev)* | `^4.0.0` | Svelte + Vite glue |
+| `@tauri-apps/cli` *(dev)* | `^2.1.0` | `tauri` build/dev CLI |
+| `@tsconfig/svelte` *(dev)* | `^5.0.4` | TS base config |
+| `svelte` *(dev)* | `^5.1.9` | UI framework (Svelte 5 / runes) |
+| `svelte-check` *(dev)* | `^4.0.5` | Svelte type-check |
+| `tslib` *(dev)* | `^2.8.0` | TS runtime helpers |
+| `typescript` *(dev)* | `^5.6.3` | Type system |
+| `vite` *(dev)* | `^5.4.10` | Bundler / dev server |
+| `vitest` *(dev)* | `^4.1.5` | Test runner |
+
+Keep `@tauri-apps/api` + `@tauri-apps/plugin-dialog` + `@tauri-apps/cli` aligned
+with the Rust `tauri` major. Svelte 5, Vite 5, and Vitest 4 are majors — read
+migration notes before bumping any of them.
+
+## Native libraries linked/vendored through crates
+
+Not separately installable — they ride in via a crate, but each has its own
+upstream cadence worth watching.
+
+| Component | Comes via | Effective version | Watch |
+|---|---|---|---|
+| ONNX Runtime | `ort = =2.0.0-rc.11` | **1.20.x** (static-linked) | <https://github.com/microsoft/onnxruntime/releases> — 1.21+ may fix CUDA-on-Blackwell. |
+| Dawn / WebGPU EP dylibs | `ort/webgpu` prebuilt | tracks the `ort` rc | `webgpu_dawn.dll` + `dxcompiler.dll` + `dxil.dll`; update `release.yml` staging if the set changes. |
+| whisper.cpp | `whisper-rs-sys 0.15` (from `whisper-rs 0.16`) | tracks the sys crate | Compiled from source via `cc`/`cmake`; bindgen #599 pitfall (build from PowerShell). |
+| espeak-ng | `espeak-rs-sys` (via `misaki-rs 0.3`) | tracks misaki | **GPLv3 source** → propagates to the binary license. Needs libclang. |
+| SQLite | `cozo` `storage-sqlite` | bundled by cozo | The code-graph on-disk backend. |
+
+## Build toolchain (host machine + CI)
+
+| Tool | Version / location | Needed for |
+|---|---|---|
+| Rust | edition 2021, **MSRV 1.77** (`Cargo.toml rust-version`) | everything |
+| Node + npm | LTS (CI: `windows-latest`) | frontend build |
+| MSVC | VS 2026, `_MSC_VER` 1950 (`cl.exe`, auto-found by `cc`) | native crates, GPU builds |
+| CMake | VS-bundled 4.2.3, on PATH | whisper.cpp + espeak builds |
+| Ninja | VS-bundled | `stt-vulkan` shader-gen sub-build (`CMAKE_GENERATOR=Ninja`) |
+| LLVM / libclang | `C:\Program Files\LLVM\bin` (pinned in `.cargo/config.toml`) | bindgen for whisper-rs / misaki / espeak |
+| Vulkan SDK (LunarG) | `C:\VulkanSDK\1.4.350.0` (`VULKAN_SDK`, pinned in `.cargo/config.toml`) | `--features stt-vulkan` only |
+| CUDA toolkit *(optional)* | 13.2 for `stt-cuda`; 12.x + cuDNN 9 for `tts-cuda` | the non-shipped NVIDIA-only GPU features |
+| cuDNN *(optional)* | 9.21 (`…\v9.21\bin\12.9\x64`, not on PATH by default) | `tts-cuda` / `ort` CUDA EP only |
+
+The default `cargo build` (CPU-only feature set) needs **none** of the GPU/SDK
+rows — only Rust + a C toolchain + CMake + libclang. The Vulkan/CUDA rows apply
+only when building those opt-in features.
+
+## External runtime components & models (not in the repo)
+
+Shipped in the portable zip or run as separate services. Not version-managed by
+cargo/npm — check their sources manually.
+
+| Component | What / where | Update check |
+|---|---|---|
+| Kokoro TTS model | `kokoro-v1.0.onnx` + `voices/af_heart.bin` (Apache 2.0) — downloaded at release time from HuggingFace | HF model card; bump the download URL in `release.yml`. |
+| Whisper STT model | `ggml-small.bin` (~466 MB, MIT) — committed via Git LFS, verified vs `models/CHECKSUMS.txt` | whisper.cpp ggml model releases. |
+| `llama-server` (llama.cpp) | offload backend **and** embedding server; user-run, not bundled | <https://github.com/ggml-org/llama.cpp/releases> — rebuild/redownload periodically. |
+| Offload model | Qwen3.6-35B-A3B (GGUF, quantized) on the local llama-server | newer Qwen / quant releases. |
+| Embedding model | Qwen3-Embedding-4B Q8_0, 2560-dim, on `mcp1:8085` (RTX 3070) | re-embed the graph if you change model/dims (auto-probed). |
+| Offload MCP servers | `ddg` + `context7` as Streamable-HTTP endpoints (`172.21.1.11:17201/17202`); plus stdio `git`/`fetch`/`fs`/`context7` | each MCP server's own repo; live-reloadable in Settings → Tools. |
+| WebView2 runtime | Windows system component (or installer-bundled) | OS-managed; relevant only if shipping an installer. |
+
+---
+
 ## Dependencies to track
 
 ### `ort` / ONNX Runtime — GPU TTS via the WebGPU EP (shipped); CUDA broken on Blackwell

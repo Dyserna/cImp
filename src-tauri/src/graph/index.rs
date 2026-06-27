@@ -471,8 +471,9 @@ reach[x, y] := reach[x, z], calls[z, y]
 
         if !have_doc_vec || existing_dim != Some(dim) {
             if have_doc_vec {
-                // A dim change: HNSW index goes away with its relation.
-                let _ = self.run_mut("::remove doc_vec", BTreeMap::new());
+                // A dim change: drop the store (its HNSW index must go first —
+                // CozoDB refuses to remove a relation with indices attached).
+                self.drop_vector_store()?;
                 reset = true;
             }
             self.run_mut(
@@ -504,8 +505,19 @@ reach[x, y] := reach[x, z], calls[z, y]
     /// silent model swap behind the same name. No-op if there's no store.
     pub fn clear_vectors(&self) -> AppResult<()> {
         if self.existing_relations()?.contains("doc_vec") {
-            self.run_mut("::remove doc_vec", BTreeMap::new())?;
+            self.drop_vector_store()?;
         }
+        Ok(())
+    }
+
+    /// Remove the `doc_vec` relation, dropping its HNSW index first. CozoDB
+    /// refuses to `::remove` a relation that still has an index attached, so the
+    /// index must go first. The index drop is best-effort — ignored if it's
+    /// absent (a partially-created store), leaving the relation removal to
+    /// surface any real error.
+    fn drop_vector_store(&self) -> AppResult<()> {
+        let _ = self.run_mut("::index drop doc_vec:vec_idx", BTreeMap::new());
+        self.run_mut("::remove doc_vec", BTreeMap::new())?;
         Ok(())
     }
 
@@ -1044,6 +1056,39 @@ pub struct Point { x: i32 }
             .expect("search");
         assert!(!hits.is_empty());
         assert_eq!(hits[0].0.anchor, "cats");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_vectors_drops_hnsw_indexed_store() {
+        // Regression: `clear_vectors` (Rebuild embeddings) and a dim-change must
+        // drop the HNSW index before `::remove`-ing `doc_vec` — CozoDB rejects
+        // removing a relation that still has an index attached.
+        let dir = std::env::temp_dir().join(format!("ckg-clr-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        idx.index_file_graph(&parse_file("docs/a.md", "# Cats\n\nFelines purr.\n", Lang::Markdown))
+            .expect("index");
+
+        let epoch = "e1";
+        idx.ensure_vector_store(3, "m", epoch).expect("ensure");
+        let need = idx.chunks_needing_vectors(epoch, 100).expect("need");
+        let vecs: Vec<(String, String, Vec<f32>)> = need
+            .iter()
+            .map(|(id, h, _)| (id.clone(), h.clone(), vec![1.0, 0.0, 0.0]))
+            .collect();
+        idx.put_doc_vectors(epoch, &vecs).expect("put");
+
+        // The HNSW index is attached now — clearing must not error.
+        idx.clear_vectors().expect("clear_vectors with index attached");
+        assert!(!idx.existing_relations().unwrap().contains("doc_vec"));
+
+        // A dim change re-exercises the same drop path inside ensure_vector_store.
+        idx.ensure_vector_store(3, "m", epoch).expect("recreate");
+        let reset = idx.ensure_vector_store(4, "m", "e2").expect("dim change");
+        assert!(reset, "a dim change is a reset");
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

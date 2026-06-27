@@ -166,7 +166,7 @@ pub async fn pty_write(
     // V8-03: the Offload Server tab is read-only — it has no PTY of its own
     // (its content is the live llama-server output stream), so swallow any
     // write. Defense-in-depth behind the frontend's read-only guard.
-    if matches!(tab, TabId::OffloadServer) {
+    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor) {
         return Ok(());
     }
     // Pre-register any TTS markers in the user's input so they don't fire
@@ -697,6 +697,16 @@ pub async fn settings_update(
     // on-disk subfolder before broadcasting, so switching theme switches the
     // avatar. User overrides are preserved; see `apply_portable_avatar_paths`.
     crate::settings::apply_portable_avatar_paths(&mut settings);
+
+    // Snapshot the pre-update feature flags so we can drive the reserved tabs'
+    // live materialize/remove after the mutate. The integrity pass that
+    // normally owns those tabs only runs at load, so without this a freshly
+    // enabled feature's tab wouldn't appear until the next launch.
+    let (was_graph, was_offload) = {
+        let old = state.settings.current();
+        (old.graph.enabled, old.offload.enabled)
+    };
+
     // The Settings window holds a full snapshot and replaces wholesale, but it
     // never edits `layout` or `session` (those are driven only by the main
     // window's save_layout / set_active_tab commands). Preserve them from the
@@ -708,7 +718,34 @@ pub async fn settings_update(
         settings.layout = cur.layout.clone();
         settings.session = cur.session.clone();
         *cur = settings;
+        // Keep the reserved feature tabs (Offload Server / Code Graph monitor)
+        // present-iff-enabled in the persisted list.
+        crate::settings::reconcile_reserved_tabs(cur);
     });
+
+    // On an actual enable/disable edge, mirror the change into the runtime so
+    // the reserved tab appears/disappears live (tab bar + pane placement).
+    let now = state.settings.current();
+    if now.graph.enabled != was_graph || now.offload.enabled != was_offload {
+        // Serialize against create/close_tab while we touch the registry.
+        let _serializer = state.lifecycle_serializer.lock().await;
+        if now.graph.enabled != was_graph {
+            super::tab_lifecycle::sync_reserved_feature_tab(
+                state.inner(),
+                TabId::GraphMonitor,
+                now.graph.enabled,
+            )
+            .await;
+        }
+        if now.offload.enabled != was_offload {
+            super::tab_lifecycle::sync_reserved_feature_tab(
+                state.inner(),
+                TabId::OffloadServer,
+                now.offload.enabled,
+            )
+            .await;
+        }
+    }
     Ok(())
 }
 
@@ -850,6 +887,78 @@ pub async fn offload_server_metrics(
     service: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
 ) -> AppResult<Vec<crate::offload::metrics::BackendDashboard>> {
     Ok(service.server_metrics())
+}
+
+/// V9-01: known per-root code-graph status (idle/building/ready/error + row
+/// counts). The initial fill for the graph status surface; live transitions
+/// arrive via the `graph-status` event. Empty before the first build.
+#[tauri::command]
+pub async fn graph_status(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+) -> AppResult<Vec<crate::graph::GraphStatus>> {
+    Ok(service.statuses())
+}
+
+/// V9-01: trigger a full rebuild of the project's code graph. `root` defaults
+/// to the app's launch directory (the project ccImp was opened in). Returns
+/// immediately — the build runs on a worker thread and reports progress via
+/// the `graph-status` event. A no-op when a build for that root is already in
+/// flight. The store must be built before the `graph_*` MCP tools have data.
+#[tauri::command]
+pub async fn graph_rebuild(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<()> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir()
+            .map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    service.spawn_rebuild(root);
+    Ok(())
+}
+
+/// V9-01 Phase G: force a full re-embed of the project's doc chunks (drops the
+/// vector store, then backfills). The "Rebuild embeddings" action; no-op when
+/// semantic search is off. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_rebuild_embeddings(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<()> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    service.spawn_rebuild_embeddings(root);
+    Ok(())
+}
+
+/// V9-01: probe the configured embedding endpoint on demand (the monitor tab's
+/// "Test connection" action). Returns reachability + the live vector dimension
+/// or the exact connection error, without running a full embed backfill.
+#[tauri::command]
+pub async fn graph_test_embedder(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+) -> AppResult<crate::graph::EmbedderProbe> {
+    Ok(service.test_embedder().await)
+}
+
+/// V9-01: recent graph tool calls (cloud Claude + offload worker), newest
+/// first — the monitor tab's activity list.
+#[tauri::command]
+pub async fn graph_history() -> AppResult<Vec<crate::graph::GraphCall>> {
+    Ok(crate::graph::graph_history())
+}
+
+/// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
+/// = file changes are ignored until resumed (a manual rebuild still works).
+#[tauri::command]
+pub async fn graph_set_watch_paused(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    paused: bool,
+) -> AppResult<bool> {
+    Ok(service.set_watch_paused(paused))
 }
 
 /// Open `<portable-root>/logs/content/` in the host file manager. Creates the

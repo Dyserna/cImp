@@ -15,7 +15,7 @@ mod persistence;
 mod schema;
 
 pub use broadcaster::SettingsHandle;
-pub use persistence::{apply_portable_avatar_paths, load_readonly};
+pub use persistence::{apply_portable_avatar_paths, load_readonly, reconcile_reserved_tabs};
 pub use schema::*;
 
 use std::fs;

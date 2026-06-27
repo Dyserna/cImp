@@ -5,6 +5,19 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] — 2026-06-27
+
+### Added
+
+- **Code knowledge graph (V9-01).** A per-project graph of code (files, symbols, references, calls, imports) and docs (Markdown + doc-comments), built in-process with tree-sitter and stored in an embedded CozoDB/SQLite database under `.ccimp/`. Queryable by both the cloud Claude session (MCP tools) and the local offload worker (native tools): `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`, `graph_semantic_docs`, and `graph_struct_search` (tree-sitter structural patterns). Covers Rust, TypeScript, JavaScript, Python, and Markdown.
+- **Semantic doc search.** Embeds doc chunks via an OpenAI-compatible `/v1/embeddings` endpoint and ranks them with a CozoDB HNSW vector index (epoch-scoped by model + dimension), degrading to full-text search when the embedder is unreachable.
+- **Live re-indexing + monitor tab.** A filesystem watcher incrementally re-indexes on change; a reserved, app-rendered **Code Graph** tab shows index/embedder status and counts, an on-demand embedder **Test connection** probe, and a unified **Recent calls** history (cloud + offload). Full Settings panel for languages, ignore globs, size limits, and the embedding endpoint.
+- **Warm query path.** Cloud Claude's graph queries now run against the app's single warm index over the loopback (with a direct read-only fallback when the app isn't running), eliminating a cross-process double-open of the SQLite store and feeding the call history.
+
+### Fixed
+
+- Reserved feature tabs (Offload Server, Code Graph) now materialize/disappear immediately when toggled in Settings, instead of only on the next launch.
+
 ## [0.18.0] — 2026-06-26
 
 ### Added

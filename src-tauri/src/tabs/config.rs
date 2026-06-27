@@ -134,6 +134,19 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         }
         addendum.push_str(OFFLOAD_GUIDANCE);
     }
+    // V9-01: when the code graph is enabled, tell Opus the `graph_*` tools
+    // exist — without a nudge it defaults to grep and never queries the index.
+    if settings.graph.enabled {
+        if !addendum.is_empty() {
+            addendum.push_str("\n\n");
+        }
+        addendum.push_str(GRAPH_GUIDANCE);
+        // `graph_semantic_docs` is only advertised to Opus when semantic search
+        // is on, so only guide toward it then.
+        if settings.graph.semantic_search {
+            addendum.push_str(GRAPH_SEMANTIC_GUIDANCE);
+        }
+    }
     if !addendum.is_empty() {
         args.push("--append-system-prompt".to_string());
         args.push(addendum);
@@ -154,7 +167,11 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     // (a `--mcp-config` overlay), never written to `~/.claude`. Claude
     // spawns the `command` as argv (no shell), so the raw exe path is
     // correct — no shell-quoting needed (unlike the statusLine command).
-    if settings.offload.enabled {
+    // V8-01 + V9-01: point Claude at our `ccimp --offload-mcp` server, which
+    // carries BOTH the `offload_task` tool and the `graph_*` tools. Inject it
+    // whenever EITHER feature is on — the graph tools must reach Claude even
+    // when offload is disabled (they ride the same MCP child).
+    if settings.offload.enabled || settings.graph.enabled {
         if let Ok(exe) = std::env::current_exe() {
             let mcp = serde_json::json!({
                 "mcpServers": {
@@ -181,6 +198,24 @@ files or logs, or web research — prefer calling `offload_task` with a self-con
 instead of doing the work yourself: it returns only a synthesized result, conserving your context \
 window. Keep work that needs your full reasoning or the conversation's context here. Set the \
 `thinking` arg to 'off' for simple lookups/extraction, 'on' for analysis, or leave it 'auto'.";
+
+/// V9-01: the system-prompt addendum telling Opus the code-knowledge-graph
+/// tools exist. Gated on `graph.enabled` (the tools are only injected then).
+const GRAPH_GUIDANCE: &str = "This project has a code knowledge graph (from the ccimp-offload MCP \
+server). Prefer the `graph_*` tools over grep for code-structure questions: `graph_find_symbol` \
+(where a symbol is defined), `graph_callers`/`graph_callees` (call relationships), \
+`graph_references`, `graph_imports`, `graph_outline` (a file's definitions), `graph_transitive` \
+(transitive call chains), `graph_search_docs` (documentation/doc-comments), and \
+`graph_struct_search` (find code by AST shape via a tree-sitter query — e.g. every `.unwrap()` or \
+every function with a given parameter pattern — when text search can't express the structure). They \
+return precise, token-bounded results from an index, so they're cheaper and more exact than text \
+search for 'where is X defined', 'who calls X', and impact analysis.";
+
+/// V9-01: appended after [`GRAPH_GUIDANCE`] only when semantic search is on
+/// (the `graph_semantic_docs` tool is advertised to Opus only then).
+const GRAPH_SEMANTIC_GUIDANCE: &str = " Also available: `graph_semantic_docs`, a meaning-based \
+(embedding) search over the project's docs and doc-comments — use it when you want relevant \
+material that may not share keywords with your query.";
 
 fn build_extra_args(
     cfg: &AiToolTabConfig,
@@ -400,9 +435,39 @@ mod tests {
 
     #[test]
     fn no_offload_injection_when_disabled() {
-        let settings = Settings::default(); // offload off by default
+        let settings = Settings::default(); // offload + graph off by default
         let args = build_pre_args(&claude_cfg(), &settings);
         assert!(!args.iter().any(|a| a == "--mcp-config"));
+    }
+
+    #[test]
+    fn graph_enabled_alone_injects_mcp_config() {
+        // V9-01: the graph tools ride the same `--offload-mcp` child, so the
+        // MCP config must be injected when graph is on even if offload is off.
+        let mut settings = Settings::default();
+        settings.offload.enabled = false;
+        settings.graph.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+
+        let i = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config present when graph is enabled");
+        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        assert_eq!(cfg["mcpServers"]["ccimp-offload"]["args"][0], "--offload-mcp");
+    }
+
+    #[test]
+    fn graph_enabled_injects_graph_guidance() {
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+
+        let i = args
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("graph guidance produces an --append-system-prompt");
+        assert!(args[i + 1].contains("graph_find_symbol"));
     }
 
     #[test]

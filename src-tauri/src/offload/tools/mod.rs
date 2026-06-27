@@ -17,6 +17,7 @@ use crate::offload::openai::ToolDef;
 use crate::settings::{CommandPolicy, OffloadToolToggles};
 
 pub mod code_search;
+pub mod graph_tools;
 pub mod read_file;
 pub mod run_command;
 
@@ -129,6 +130,10 @@ pub async fn dispatch(name: &str, args: serde_json::Value, ctx: &ToolCtx) -> Res
         "read_file" => read_file::execute(args, ctx).await,
         "code_search" => code_search::execute(args, ctx).await,
         "run_command" => run_command::execute(args, ctx).await,
+        // V9-01 graph tools (advertised only when the service decided to offer
+        // them — feature on + local-or-opted-in remote — and re-gated in the
+        // router's `call`).
+        n if n.starts_with("graph_") => graph_tools::dispatch(name, args, ctx).await,
         other => Err(format!("unknown native tool: {other}")),
     }
 }

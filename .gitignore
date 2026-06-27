@@ -41,6 +41,9 @@ Thumbs.db
 # previous file is renamed with a `.vN.M.bak` suffix (sometimes with a
 # trailing timestamp, e.g. `.bak.1778262818`).
 **/.ccimp.custom.config.json.*.bak*
+# Per-project code knowledge graph (V9-01) — the CozoDB/SQLite store the app
+# builds at runtime under each project's db subdir. Never commit.
+**/.ccimp/
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

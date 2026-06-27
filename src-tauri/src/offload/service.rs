@@ -85,6 +85,9 @@ struct PoolEntry {
     cloud_blocked: bool,
     tier: BackendTier,
     tool_scope: ToolScope,
+    /// Whether this backend is remote (LAN or cloud). Gates whether the
+    /// offload worker may use the local-data graph tools when running here.
+    is_remote: bool,
     handle: Handle,
     ready: bool,
     n_ctx: Option<u32>,
@@ -516,7 +519,20 @@ impl OffloadService {
             snap.command_policies.clone(),
             &cwd,
         );
-        let native_defs = tools::enabled_defs(&snap.tools);
+        let mut native_defs = tools::enabled_defs(&snap.tools);
+        // V9-01: offer the graph tools to the worker when the feature is on AND
+        // either this backend is local or the user opted a remote backend in
+        // (a remote — LAN or cloud — would receive the project's code
+        // structure). `allow_graph` re-gates dispatch as defense-in-depth.
+        let graph = self.settings.current().graph;
+        let allow_graph = worker_graph_allowed(
+            graph.enabled,
+            entry.is_remote,
+            graph.allow_remote_worker_access,
+        );
+        if allow_graph {
+            native_defs.extend(tools::graph_tools::defs());
+        }
         let mcp_defs = self.host.tool_defs().await;
         let router = HostRouter::new(
             native_defs,
@@ -524,6 +540,7 @@ impl OffloadService {
             ctx,
             self.host.clone(),
             entry.tool_scope.clone(),
+            allow_graph,
         );
         let cfg = AgentConfig {
             base_url: entry.base_url.clone(),
@@ -626,6 +643,7 @@ impl OffloadService {
                 n_ctx: server.n_ctx().or(b.declared_context),
                 slots: server.slots(),
                 in_flight: server.in_flight(),
+                is_remote: false,
                 handle: Handle::Local(server),
             });
         }
@@ -678,6 +696,7 @@ impl OffloadService {
             n_ctx: transient.n_ctx().or(b.declared_context),
             slots: transient.slots(),
             in_flight: transient.in_flight(),
+            is_remote: false,
             handle: Handle::Local(transient),
         })
     }
@@ -760,6 +779,7 @@ impl OffloadService {
             n_ctx: handle.n_ctx(),
             slots: handle.slots(),
             in_flight: handle.in_flight(),
+            is_remote: true,
             handle: Handle::Remote(handle),
         })
     }
@@ -1060,6 +1080,15 @@ fn compute_global_cap(snap: &OffloadSettings) -> u32 {
     sum.clamp(1, GLOBAL_CONCURRENCY_MAX)
 }
 
+/// Whether the offload worker may use the code-graph tools on the chosen
+/// backend: the feature must be on, and either the backend is local or the
+/// user opted remote workers in. A remote backend (LAN *or* cloud) would
+/// receive the project's code structure, so it's denied by default — the cloud
+/// Opus session and a local worker are unaffected.
+fn worker_graph_allowed(graph_enabled: bool, is_remote: bool, allow_remote: bool) -> bool {
+    graph_enabled && (!is_remote || allow_remote)
+}
+
 /// Whether an agent-loop error looks like a transport/connection failure (so
 /// a fail-over re-route is worth trying). Mirrors the child's heuristic.
 fn is_connection_error(e: &str) -> bool {
@@ -1113,5 +1142,18 @@ mod tests {
         assert!(is_connection_error("chat request failed: connection refused"));
         assert!(is_connection_error("request timed out"));
         assert!(!is_connection_error("server returned no choices"));
+    }
+
+    #[test]
+    fn worker_graph_gate_truth_table() {
+        // Feature off → never.
+        assert!(!worker_graph_allowed(false, false, false));
+        assert!(!worker_graph_allowed(false, true, true));
+        // Local backend → always when enabled, regardless of the remote opt-in.
+        assert!(worker_graph_allowed(true, false, false));
+        assert!(worker_graph_allowed(true, false, true));
+        // Remote backend → only with the explicit opt-in.
+        assert!(!worker_graph_allowed(true, true, false));
+        assert!(worker_graph_allowed(true, true, true));
     }
 }

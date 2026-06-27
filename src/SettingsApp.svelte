@@ -36,6 +36,7 @@
     type BackendStatus,
     type ServiceStatus,
   } from './lib/offload';
+  import { graphRebuild, graphStatus, type GraphStatus } from './lib/graph';
   import type {
     OffloadBackend,
     ToolScope,
@@ -116,6 +117,34 @@
       offloadBusy = false;
     }
   }
+  // V9-01 Code graph: rebuild trigger + status readout for the Settings panel.
+  let graphBusy = $state<boolean>(false);
+  let graphStatuses = $state<GraphStatus[]>([]);
+  async function refreshGraphStatus(): Promise<void> {
+    try {
+      graphStatuses = await graphStatus();
+    } catch {
+      graphStatuses = [];
+    }
+  }
+  async function runGraphRebuild(): Promise<void> {
+    graphBusy = true;
+    try {
+      await graphRebuild();
+      // Give the worker thread a moment to flip to "building", then poll a few
+      // times so the user sees counts land without a manual refresh.
+      for (let i = 0; i < 6; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        await refreshGraphStatus();
+        if (graphStatuses.every((s) => !s.building)) break;
+      }
+    } catch (e) {
+      console.error('graph rebuild failed', e);
+    } finally {
+      graphBusy = false;
+    }
+  }
+
   async function runOffloadTest(): Promise<void> {
     offloadBusy = true;
     offloadTestResult = 'Running…';
@@ -380,6 +409,7 @@
     | 'tabs'
     | 'shortcuts'
     | 'offload'
+    | 'graph'
     | 'advanced'
     | 'about';
   let activeSection = $state<SectionId>('theme');
@@ -392,6 +422,7 @@
     { id: 'stt', label: 'Speech-to-text' },
     { id: 'tabs', label: 'Tabs' },
     { id: 'offload', label: 'Offload task tools' },
+    { id: 'graph', label: 'Code graph' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
@@ -3173,6 +3204,209 @@
           <div class="button-row">
             <button type="button" onclick={addMcpServer}>Add MCP server</button>
           </div>
+          {/if}
+        </section>
+      {:else if activeSection === 'graph'}
+        <section>
+          <h2>Code knowledge graph</h2>
+          <small class="hint top">
+            Build a per-project graph of your code and docs (symbols, calls,
+            imports, doc-comments), stored at
+            <code>&lt;project&gt;/.ccimp/graph.db</code> and kept live by a file
+            watcher. The cloud Claude session queries it through
+            <code>graph_*</code> tools (re-launch a tab to pick them up) instead
+            of grepping. Off by default; everything stays on this machine.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.graph.enabled}
+              onchange={(e) =>
+                patch((s) => (s.graph.enabled = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Enable code graph</span>
+          </label>
+
+          {#if snapshot.graph.enabled}
+            <div class="button-row">
+              <button type="button" disabled={graphBusy} onclick={runGraphRebuild}>
+                {graphBusy ? 'Rebuilding…' : 'Rebuild index'}
+              </button>
+              <button type="button" class="secondary" disabled={graphBusy} onclick={refreshGraphStatus}>
+                Refresh status
+              </button>
+            </div>
+            {#if graphStatuses.length === 0}
+              <small class="hint">No index built yet — click <strong>Rebuild index</strong>.</small>
+            {:else}
+              {#each graphStatuses as gs (gs.root)}
+                <small class="hint">
+                  <strong>{gs.state}</strong> · {gs.files} files · {gs.symbols} symbols ·
+                  {gs.edges} edges
+                  {#if gs.last_error}<br />Error: {gs.last_error}{/if}
+                </small>
+              {/each}
+            {/if}
+
+            <h3>Indexing</h3>
+            <label>
+              <span>Languages (comma-separated)</span>
+              <input
+                type="text"
+                value={snapshot.graph.languages.join(', ')}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.languages = (e.currentTarget as HTMLInputElement).value
+                        .split(',')
+                        .map((x) => x.trim().toLowerCase())
+                        .filter((x) => x.length > 0)),
+                  )}
+              />
+            </label>
+            <small class="hint">
+              Supported: <code>rust</code>, <code>typescript</code>,
+              <code>javascript</code>, <code>python</code>, <code>markdown</code>.
+            </small>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.index_docs}
+                onchange={(e) =>
+                  patch((s) => (s.graph.index_docs = (e.currentTarget as HTMLInputElement).checked))}
+              />
+              <span>Index Markdown docs + doc-comments (powers doc search)</span>
+            </label>
+            <label>
+              <span>Max file size (bytes)</span>
+              <input
+                type="number"
+                min="1024"
+                value={snapshot.graph.max_file_bytes}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.max_file_bytes = Math.max(
+                        1024,
+                        Number((e.currentTarget as HTMLInputElement).value) || 1048576,
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Watcher debounce (ms)</span>
+              <input
+                type="number"
+                min="50"
+                value={snapshot.graph.watch_debounce_ms}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.watch_debounce_ms = Math.max(
+                        50,
+                        Number((e.currentTarget as HTMLInputElement).value) || 300,
+                      )),
+                  )}
+              />
+            </label>
+
+            <h3>Semantic search</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.semantic_search}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.semantic_search = (e.currentTarget as HTMLInputElement).checked),
+                  )}
+              />
+              <span>Enable semantic (embedding) doc search</span>
+            </label>
+            <small class="hint">
+              Needs an OpenAI-compatible <code>/v1/embeddings</code> endpoint
+              (e.g. a <code>llama-server --embedding</code> on a spare GPU box).
+              Degrades to full-text search when the endpoint is unreachable; the
+              structural graph never depends on it.
+            </small>
+            {#if snapshot.graph.semantic_search}
+              <label>
+                <span>Embedding endpoint</span>
+                <input
+                  type="text"
+                  placeholder="http://host:8081"
+                  value={snapshot.graph.embedding_endpoint}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.embedding_endpoint = (
+                          e.currentTarget as HTMLInputElement
+                        ).value.trim()),
+                    )}
+                />
+              </label>
+              <label>
+                <span>Embedding model</span>
+                <input
+                  type="text"
+                  placeholder="nomic-embed-text"
+                  value={snapshot.graph.embedding_model}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.embedding_model = (
+                          e.currentTarget as HTMLInputElement
+                        ).value.trim()),
+                    )}
+                />
+              </label>
+              <label>
+                <span>Embedding dimensions (0 = auto-probe)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.embedding_dims}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.embedding_dims = Math.max(
+                          0,
+                          Number((e.currentTarget as HTMLInputElement).value) || 0,
+                        )),
+                    )}
+                />
+              </label>
+              <small class="hint">
+                Changing the model or dimensions starts a background re-embed.
+                Use <strong>Rebuild embeddings</strong> on the Code Graph tab
+                after a silent model swap behind the same name.
+              </small>
+            {/if}
+
+            <h3>Offload worker access</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.allow_remote_worker_access}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.allow_remote_worker_access = (
+                        e.currentTarget as HTMLInputElement
+                      ).checked),
+                  )}
+              />
+              <span>Allow a <strong>remote</strong> offload worker to query the graph</span>
+            </label>
+            <small class="hint">
+              ⚠ <strong>Privacy:</strong> the local offload worker can always
+              query the graph. A <strong>remote</strong> backend — whether a box
+              on your LAN or a public cloud API — would receive your project's
+              code structure (symbol names, call relationships, doc snippets).
+              Leave this off unless you trust the remote. The cloud Claude
+              session's <code>graph_*</code> tools are unaffected by this
+              setting.
+            </small>
           {/if}
         </section>
       {:else if activeSection === 'advanced'}

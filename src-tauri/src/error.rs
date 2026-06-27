@@ -49,6 +49,17 @@ pub enum AppError {
     /// host, budget). Carries human-readable context for the IPC layer.
     #[error("offload error: {0}")]
     Offload(String),
+
+    /// V9-01: a code-knowledge-graph index for the requested project is
+    /// not built/ready yet. Surfaced to the caller as a clear "index
+    /// building" message rather than blocking.
+    #[error("graph index not ready: {0}")]
+    GraphNotReady(String),
+
+    /// V9-01: a generic code-knowledge-graph failure (parse, store,
+    /// query, embedding). Carries human-readable context for the IPC layer.
+    #[error("graph error: {0}")]
+    Graph(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

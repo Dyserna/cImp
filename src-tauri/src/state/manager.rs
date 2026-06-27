@@ -56,6 +56,11 @@ pub enum TabId {
     /// collides with a user shell and the close guard can refuse it. Renders
     /// the local `llama-server`'s live output; spawns no PTY of its own.
     OffloadServer,
+    /// V9-01: the read-only, non-closable Code Graph monitor tab. Like
+    /// [`Self::OffloadServer`] it's Shell-kind with a reserved identity and no
+    /// PTY, but it is app-rendered (an in-process dashboard of the graph
+    /// indexer/embedder), not a mirror of a child process's output.
+    GraphMonitor,
 }
 
 impl TabId {
@@ -66,6 +71,7 @@ impl TabId {
             TabId::Aider => "aider",
             TabId::AiderLocal => "aider-local",
             TabId::OffloadServer => "offload-server",
+            TabId::GraphMonitor => "graph-monitor",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
         }
@@ -78,6 +84,7 @@ impl TabId {
             "aider" => TabId::Aider,
             "aider-local" => TabId::AiderLocal,
             "offload-server" => TabId::OffloadServer,
+            "graph-monitor" => TabId::GraphMonitor,
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
             // `Shell`, so they keep AI-kind behavior on relaunch. The
@@ -105,7 +112,7 @@ impl TabId {
             // purposes (it never runs a PTY, so this is inert), keeping it off
             // the per-kind match explosion. Its read-only behavior is keyed
             // off the reserved id, not the kind.
-            TabId::Shell(_) | TabId::OffloadServer => TabKind::Shell,
+            TabId::Shell(_) | TabId::OffloadServer | TabId::GraphMonitor => TabKind::Shell,
         }
     }
 
@@ -123,8 +130,10 @@ impl TabId {
             | TabId::Aider
             | TabId::AiderLocal
             // Non-closable: the Offload Server tab is removed only by
-            // disabling offload, never by the close `×`.
-            | TabId::OffloadServer => true,
+            // disabling offload, never by the close `×`. The Code Graph
+            // monitor tab is likewise removed only by disabling the graph.
+            | TabId::OffloadServer
+            | TabId::GraphMonitor => true,
             TabId::Shell(_) | TabId::Ai(_) => false,
         }
     }

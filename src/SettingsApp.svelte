@@ -3248,6 +3248,141 @@
               {/each}
             {/if}
 
+            <h3>Indexing</h3>
+            <label>
+              <span>Languages (comma-separated)</span>
+              <input
+                type="text"
+                value={snapshot.graph.languages.join(', ')}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.languages = (e.currentTarget as HTMLInputElement).value
+                        .split(',')
+                        .map((x) => x.trim().toLowerCase())
+                        .filter((x) => x.length > 0)),
+                  )}
+              />
+            </label>
+            <small class="hint">
+              Supported: <code>rust</code>, <code>typescript</code>,
+              <code>javascript</code>, <code>python</code>, <code>markdown</code>.
+            </small>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.index_docs}
+                onchange={(e) =>
+                  patch((s) => (s.graph.index_docs = (e.currentTarget as HTMLInputElement).checked))}
+              />
+              <span>Index Markdown docs + doc-comments (powers doc search)</span>
+            </label>
+            <label>
+              <span>Max file size (bytes)</span>
+              <input
+                type="number"
+                min="1024"
+                value={snapshot.graph.max_file_bytes}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.max_file_bytes = Math.max(
+                        1024,
+                        Number((e.currentTarget as HTMLInputElement).value) || 1048576,
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Watcher debounce (ms)</span>
+              <input
+                type="number"
+                min="50"
+                value={snapshot.graph.watch_debounce_ms}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.watch_debounce_ms = Math.max(
+                        50,
+                        Number((e.currentTarget as HTMLInputElement).value) || 300,
+                      )),
+                  )}
+              />
+            </label>
+
+            <h3>Semantic search</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.semantic_search}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.semantic_search = (e.currentTarget as HTMLInputElement).checked),
+                  )}
+              />
+              <span>Enable semantic (embedding) doc search</span>
+            </label>
+            <small class="hint">
+              Needs an OpenAI-compatible <code>/v1/embeddings</code> endpoint
+              (e.g. a <code>llama-server --embedding</code> on a spare GPU box).
+              Degrades to full-text search when the endpoint is unreachable; the
+              structural graph never depends on it.
+            </small>
+            {#if snapshot.graph.semantic_search}
+              <label>
+                <span>Embedding endpoint</span>
+                <input
+                  type="text"
+                  placeholder="http://host:8081"
+                  value={snapshot.graph.embedding_endpoint}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.embedding_endpoint = (
+                          e.currentTarget as HTMLInputElement
+                        ).value.trim()),
+                    )}
+                />
+              </label>
+              <label>
+                <span>Embedding model</span>
+                <input
+                  type="text"
+                  placeholder="nomic-embed-text"
+                  value={snapshot.graph.embedding_model}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.embedding_model = (
+                          e.currentTarget as HTMLInputElement
+                        ).value.trim()),
+                    )}
+                />
+              </label>
+              <label>
+                <span>Embedding dimensions (0 = auto-probe)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.embedding_dims}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.embedding_dims = Math.max(
+                          0,
+                          Number((e.currentTarget as HTMLInputElement).value) || 0,
+                        )),
+                    )}
+                />
+              </label>
+              <small class="hint">
+                Changing the model or dimensions starts a background re-embed.
+                Use <strong>Rebuild embeddings</strong> on the Code Graph tab
+                after a silent model swap behind the same name.
+              </small>
+            {/if}
+
             <h3>Offload worker access</h3>
             <label class="checkbox">
               <input

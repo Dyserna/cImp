@@ -12,13 +12,17 @@
     graphRebuild,
     graphRebuildEmbeddings,
     graphSetWatchPaused,
+    graphTestEmbedder,
     onGraphStatus,
+    type EmbedderProbe,
     type GraphStatus,
   } from './graph';
 
   let roots = $state<GraphStatus[]>([]);
   let paused = $state<boolean>(false);
   let busy = $state<boolean>(false);
+  let probe = $state<EmbedderProbe | null>(null);
+  let probing = $state<boolean>(false);
   let unlisten: (() => void) | null = null;
   let poll: ReturnType<typeof setInterval> | null = null;
 
@@ -36,12 +40,26 @@
     }
   }
 
+  async function testEmbedder(): Promise<void> {
+    probing = true;
+    try {
+      probe = await graphTestEmbedder();
+    } catch (e) {
+      probe = { ok: false, dim: null, message: String(e) };
+    } finally {
+      probing = false;
+    }
+  }
+
   onMount(async () => {
     await refresh();
     unlisten = await onGraphStatus(upsert);
     // A light poll backstops the event for coverage/progress counters that
     // change without a discrete state transition.
     poll = setInterval(refresh, 2000);
+    // Probe the embedder once on open so reachability is visible immediately,
+    // without waiting for a backfill to populate the per-root embed status.
+    void testEmbedder();
   });
 
   onDestroy(() => {
@@ -91,11 +109,21 @@
     <div class="actions">
       <button onclick={doRebuild} disabled={busy}>Rebuild index</button>
       <button onclick={doRebuildEmbeddings} disabled={busy}>Rebuild embeddings</button>
+      <button class="secondary" onclick={testEmbedder} disabled={probing}>
+        {probing ? 'Testing…' : 'Test connection'}
+      </button>
       <button class="secondary" onclick={togglePause}>
         {paused ? 'Resume watch' : 'Pause watch'}
       </button>
     </div>
   </header>
+
+  {#if probe}
+    <p class="probe {probe.ok ? 'ok' : 'err'}">
+      <span class="probe-dot"></span>
+      Embedder: {probe.message}
+    </p>
+  {/if}
 
   {#if roots.length === 0}
     <p class="empty">
@@ -195,6 +223,33 @@
   }
   .empty {
     opacity: 0.7;
+  }
+  .probe {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: -4px 0 14px;
+    padding: 7px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    border: 1px solid var(--border, #444);
+  }
+  .probe.ok {
+    background: rgba(46, 125, 50, 0.18);
+    border-color: #2e7d32;
+    color: #b8e6bb;
+  }
+  .probe.err {
+    background: rgba(179, 38, 30, 0.18);
+    border-color: #b3261e;
+    color: #ffb4ab;
+  }
+  .probe-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    background: currentColor;
   }
   .card {
     border: 1px solid var(--border, #3a3a3a);

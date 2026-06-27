@@ -50,6 +50,21 @@ export function graphSetWatchPaused(paused: boolean): Promise<boolean> {
   return invoke<boolean>('graph_set_watch_paused', { paused });
 }
 
+/// Result of an on-demand embedder reachability probe. Mirror of Rust
+/// `graph::EmbedderProbe`.
+export interface EmbedderProbe {
+  ok: boolean;
+  dim: number | null;
+  message: string;
+}
+
+/// Probe the configured embedding endpoint without running a backfill — drives
+/// the monitor tab's "Test connection" action. Always resolves; `ok` is false
+/// (with `message` set) when the endpoint is unreachable or misconfigured.
+export function graphTestEmbedder(): Promise<EmbedderProbe> {
+  return invoke<EmbedderProbe>('graph_test_embedder');
+}
+
 /// Subscribe to live per-root status transitions (emitted as one status at a
 /// time). Returns an unlisten fn.
 export function onGraphStatus(cb: (status: GraphStatus) => void): Promise<UnlistenFn> {

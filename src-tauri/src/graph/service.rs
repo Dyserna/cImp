@@ -103,6 +103,19 @@ impl GraphStatus {
     }
 }
 
+/// Result of an on-demand embedder reachability probe (the monitor tab's
+/// "Test connection" action). Lets the user see whether the embedding endpoint
+/// answers — and the exact error if not — without running a full backfill.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EmbedderProbe {
+    /// Whether the endpoint answered with a usable embedding.
+    pub ok: bool,
+    /// The live vector dimension the endpoint returned (on success).
+    pub dim: Option<usize>,
+    /// Human-readable status / error message for display.
+    pub message: String,
+}
+
 /// The app-owned graph service. Held in `AppState` beside the offload service.
 pub struct GraphService {
     app: AppHandle,
@@ -207,6 +220,41 @@ impl GraphService {
             }
         }
         self.spawn_backfill(root);
+    }
+
+    /// Probe the configured embedding endpoint without running a backfill — the
+    /// monitor tab's "Test connection" action. Returns reachability + the live
+    /// vector dimension, or a human-readable error (connection refused, timeout,
+    /// HTTP status, decode failure), so the user can diagnose the endpoint
+    /// before kicking off a full embed.
+    pub async fn test_embedder(&self) -> EmbedderProbe {
+        let snap = self.settings.current().graph;
+        if !snap.semantic_search {
+            return EmbedderProbe {
+                ok: false,
+                dim: None,
+                message: "Semantic search is off — enable it in Settings → Code graph.".into(),
+            };
+        }
+        let Some(embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model) else {
+            return EmbedderProbe {
+                ok: false,
+                dim: None,
+                message: "No embedding endpoint configured.".into(),
+            };
+        };
+        match embedder.probe_dim().await {
+            Ok(dim) => EmbedderProbe {
+                ok: true,
+                dim: Some(dim),
+                message: format!("Reachable — {dim}-dim embeddings."),
+            },
+            Err(e) => EmbedderProbe {
+                ok: false,
+                dim: None,
+                message: e,
+            },
+        }
     }
 
     /// The configured per-project db subdirectory (default `.ccimp`).

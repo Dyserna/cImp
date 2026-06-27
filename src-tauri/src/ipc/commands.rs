@@ -934,6 +934,16 @@ pub async fn graph_rebuild_embeddings(
     Ok(())
 }
 
+/// V9-01: probe the configured embedding endpoint on demand (the monitor tab's
+/// "Test connection" action). Returns reachability + the live vector dimension
+/// or the exact connection error, without running a full embed backfill.
+#[tauri::command]
+pub async fn graph_test_embedder(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+) -> AppResult<crate::graph::EmbedderProbe> {
+    Ok(service.test_embedder().await)
+}
+
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
 /// = file changes are ignored until resumed (a manual rebuild still works).
 #[tauri::command]

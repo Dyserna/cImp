@@ -881,6 +881,32 @@ pub async fn graph_rebuild(
     Ok(())
 }
 
+/// V9-01 Phase G: force a full re-embed of the project's doc chunks (drops the
+/// vector store, then backfills). The "Rebuild embeddings" action; no-op when
+/// semantic search is off. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_rebuild_embeddings(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<()> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    service.spawn_rebuild_embeddings(root);
+    Ok(())
+}
+
+/// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
+/// = file changes are ignored until resumed (a manual rebuild still works).
+#[tauri::command]
+pub async fn graph_set_watch_paused(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    paused: bool,
+) -> AppResult<bool> {
+    Ok(service.set_watch_paused(paused))
+}
+
 /// Open `<portable-root>/logs/content/` in the host file manager. Creates the
 /// folder first if it doesn't exist so the call doesn't 404 on a clean
 /// install. Windows uses `explorer.exe`; macOS `open`; Linux

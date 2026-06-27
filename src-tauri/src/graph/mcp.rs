@@ -110,10 +110,15 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
 /// The `graph_*` MCP tool descriptors, or an empty list when the graph feature
 /// is disabled (so they're not advertised to Opus).
 pub fn tools() -> Vec<Value> {
-    if !current_settings().graph.enabled {
+    let settings = current_settings();
+    if !settings.graph.enabled {
         return Vec::new();
     }
-    tool_specs()
+    let mut specs = tool_specs();
+    if settings.graph.semantic_search {
+        specs.push(semantic_spec());
+    }
+    specs
         .into_iter()
         .map(|s| {
             json!({
@@ -128,7 +133,7 @@ pub fn tools() -> Vec<Value> {
 /// Dispatch a `graph_*` MCP tool call. Returns a JSON-RPC `tools/call` result;
 /// a missing index or bad args come back as a (non-protocol) tool error so Opus
 /// can read and adapt. Unknown tool names are a protocol error.
-pub fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
+pub async fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
@@ -142,7 +147,14 @@ pub fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
         Err(msg) => return Ok(tool_error(&msg)),
     };
 
-    match run_tool(&idx, name, &args, max_rows, max_snippet) {
+    let result = if name == "graph_semantic_docs" {
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        semantic_query(&idx, &settings, query, max_rows, max_snippet).await
+    } else {
+        run_tool(&idx, name, &args, max_rows, max_snippet)
+    };
+
+    match result {
         Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
         Err(msg) if msg.starts_with("unknown graph tool") => Err((-32602, msg)),
         Err(msg) => Ok(tool_error(&msg)),
@@ -197,7 +209,79 @@ pub fn run_tool(
             .search_docs(&arg("query"), max_rows, max_snippet)
             .map(|v| fmt_docs(&v))
             .map_err(|e| e.to_string()),
+        // Sync path / no-embedder fallback for semantic search: degrade to
+        // labelled full-text. The embedder-backed ranking is applied in the
+        // async wrappers ([`handle_call`] / [`offload_query`]).
+        "graph_semantic_docs" => idx
+            .search_docs(&arg("query"), max_rows, max_snippet)
+            .map(|v| {
+                let body = fmt_docs(&v);
+                format!("(full-text fallback — semantic embedder unavailable)\n{body}")
+            })
+            .map_err(|e| e.to_string()),
         other => Err(format!("unknown graph tool: {other}")),
+    }
+}
+
+/// The semantic-doc-search tool spec, advertised only when `semantic_search`
+/// is enabled (it degrades to full-text at runtime when the embedder is down).
+pub fn semantic_spec() -> GraphToolSpec {
+    GraphToolSpec {
+        name: "graph_semantic_docs",
+        description: "Semantic (meaning-based) search over the project's documentation and \
+            doc-comments — finds relevant chunks even when they don't share keywords with the \
+            query. Falls back to full-text search when the embedding backend is unavailable.",
+        parameters: json!({
+            "type": "object",
+            "properties": { "query": { "type": "string", "description": "A natural-language description of what you're looking for." } },
+            "required": ["query"]
+        }),
+    }
+}
+
+/// Embedder-backed semantic doc search, with a full-text fallback on any
+/// miss (no embedder configured/reachable, no vectors yet, or a dim mismatch
+/// after a model change). Used by the async tool wrappers.
+async fn semantic_query(
+    idx: &GraphIndex,
+    settings: &crate::settings::Settings,
+    query: &str,
+    max_rows: usize,
+    max_snippet: usize,
+) -> Result<String, String> {
+    let g = &settings.graph;
+    let fallback = |idx: &GraphIndex| {
+        idx.search_docs(query, max_rows, max_snippet)
+            .map(|v| format!("(full-text fallback)\n{}", fmt_docs(&v)))
+            .map_err(|e| e.to_string())
+    };
+
+    if !g.semantic_search {
+        return fallback(idx);
+    }
+    let epoch = match idx.current_epoch() {
+        Ok(Some(e)) => e,
+        _ => return fallback(idx),
+    };
+    let Some(embedder) = super::embed::Embedder::new(&g.embedding_endpoint, &g.embedding_model)
+    else {
+        return fallback(idx);
+    };
+    let qv = match embedder.embed_one(query).await {
+        Ok(v) => v,
+        Err(_) => return fallback(idx),
+    };
+    match idx.semantic_doc_search(&qv, &epoch, max_rows, max_snippet) {
+        Ok(hits) if !hits.is_empty() => {
+            let body = hits
+                .iter()
+                .map(|(d, dist)| format!("{} [{}] (score {:.3}): {}", d.source_path, d.anchor, dist, d.snippet))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!("(semantic)\n{body}"))
+        }
+        // No vectors matched yet (mid-backfill) or a query error → full-text.
+        _ => fallback(idx),
     }
 }
 
@@ -205,7 +289,7 @@ pub fn run_tool(
 /// (the worker's confinement roots), open it read-only, and run `name`. `Err`
 /// is fed back to the worker's model as a tool result. The caller is
 /// responsible for the local/remote opt-in gate — this just executes.
-pub fn offload_query(
+pub async fn offload_query(
     roots: &[PathBuf],
     name: &str,
     args: &Value,
@@ -221,7 +305,14 @@ pub fn offload_query(
             .to_string();
     for root in roots {
         match open_project_index(root, &sub) {
-            Ok(idx) => return run_tool(&idx, name, args, max_rows, max_snippet),
+            Ok(idx) => {
+                return if name == "graph_semantic_docs" {
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    semantic_query(&idx, &settings, query, max_rows, max_snippet).await
+                } else {
+                    run_tool(&idx, name, args, max_rows, max_snippet)
+                };
+            }
             Err(e) => last_err = e,
         }
     }

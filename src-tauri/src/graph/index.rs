@@ -421,6 +421,251 @@ reach[x, y] := reach[x, z], calls[z, y]
         Ok(hits)
     }
 
+    // ── Semantic search (Phase G): vector store + epoch + k-NN ───────────
+    //
+    // The vector store is created lazily because its column type bakes in the
+    // dimension (`<F32; N>`), which we only know once an embedder is configured
+    // (or auto-probed). Vectors are keyed by `(chunk_id, epoch)` so a model
+    // change (same dim) can keep old vectors alongside new; a dim change forces
+    // a drop+recreate (handled in `ensure_vector_store`). Each vector also
+    // stores its chunk's content hash, so a re-indexed chunk whose text changed
+    // is detected as needing a fresh embedding.
+
+    /// Ensure the `doc_vec` relation + HNSW index exist sized for `dim`, and
+    /// stamp `model`/`dim`/`epoch` into the `embed_meta` singleton. If a store
+    /// exists at a DIFFERENT dim, it's dropped and recreated (returns `true` so
+    /// the caller knows the old vectors are gone and a full re-embed is due).
+    pub fn ensure_vector_store(&self, dim: usize, model: &str, epoch: &str) -> AppResult<bool> {
+        self.ensure_meta_relation()?;
+        let existing_dim = self.stored_dim()?;
+        let mut reset = false;
+        let have_doc_vec = self.existing_relations()?.contains("doc_vec");
+
+        if !have_doc_vec || existing_dim != Some(dim) {
+            if have_doc_vec {
+                // A dim change: HNSW index goes away with its relation.
+                let _ = self.run_mut("::remove doc_vec", BTreeMap::new());
+                reset = true;
+            }
+            self.run_mut(
+                &format!("?[chunk_id, epoch, hash, vec] <- []\n:create doc_vec {{chunk_id: String, epoch: String => hash: String, vec: <F32; {dim}>}}"),
+                BTreeMap::new(),
+            )?;
+            self.run_mut(
+                &format!(
+                    "::hnsw create doc_vec:vec_idx {{dim: {dim}, m: 16, dtype: F32, fields: [vec], distance: Cosine, ef_construction: 50}}"
+                ),
+                BTreeMap::new(),
+            )?;
+        }
+
+        // Upsert the singleton meta row.
+        let mut p = BTreeMap::new();
+        p.insert("model".to_string(), DataValue::Str(model.into()));
+        p.insert("dim".to_string(), int(dim as u32));
+        p.insert("epoch".to_string(), DataValue::Str(epoch.into()));
+        self.run_mut(
+            "?[id, model, dim, epoch] <- [['1', $model, $dim, $epoch]]\n:put embed_meta {id => model, dim, epoch}",
+            p,
+        )?;
+        Ok(reset)
+    }
+
+    /// Drop the vector store (and its HNSW index) so the next backfill
+    /// re-embeds everything from scratch. Used by "Rebuild embeddings" / a
+    /// silent model swap behind the same name. No-op if there's no store.
+    pub fn clear_vectors(&self) -> AppResult<()> {
+        if self.existing_relations()?.contains("doc_vec") {
+            self.run_mut("::remove doc_vec", BTreeMap::new())?;
+        }
+        Ok(())
+    }
+
+    fn ensure_meta_relation(&self) -> AppResult<()> {
+        if !self.existing_relations()?.contains("embed_meta") {
+            self.run_mut(
+                "?[id, model, dim, epoch] <- []\n:create embed_meta {id: String => model: String, dim: Int, epoch: String}",
+                BTreeMap::new(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn stored_dim(&self) -> AppResult<Option<usize>> {
+        if !self.existing_relations()?.contains("embed_meta") {
+            return Ok(None);
+        }
+        let rows = self.run(
+            "?[dim] := *embed_meta{dim}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_i64(r, 0) as usize))
+    }
+
+    /// The current embedding epoch fingerprint, or `None` if never embedded.
+    pub fn current_epoch(&self) -> AppResult<Option<String>> {
+        if !self.existing_relations()?.contains("embed_meta") {
+            return Ok(None);
+        }
+        let rows = self.run(
+            "?[epoch] := *embed_meta{epoch}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_str(r, 0)))
+    }
+
+    /// Store `(chunk_id, embedding)` rows for the current `epoch`, stamping each
+    /// with its chunk content hash. Vectors are plain `f32` lists.
+    pub fn put_doc_vectors(
+        &self,
+        epoch: &str,
+        items: &[(String, String, Vec<f32>)], // (chunk_id, text_hash, vector)
+    ) -> AppResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<DataValue> = items
+            .iter()
+            .map(|(id, hash, vec)| {
+                let v = DataValue::List(
+                    vec.iter()
+                        .map(|f| DataValue::Num(Num::Float(*f as f64)))
+                        .collect(),
+                );
+                DataValue::List(vec![
+                    DataValue::Str(id.as_str().into()),
+                    DataValue::Str(epoch.into()),
+                    DataValue::Str(hash.as_str().into()),
+                    v,
+                ])
+            })
+            .collect();
+        self.put(
+            "?[chunk_id, epoch, hash, vec] <- $rows\n:put doc_vec {chunk_id, epoch => hash, vec}",
+            rows,
+        )
+    }
+
+    /// Doc chunks lacking a current-epoch vector whose hash matches their text
+    /// — i.e. new or changed chunks that need (re-)embedding. Bounded by `limit`.
+    /// Returns `(chunk_id, text_hash, text)`.
+    pub fn chunks_needing_vectors(
+        &self,
+        epoch: &str,
+        limit: usize,
+    ) -> AppResult<Vec<(String, String, String)>> {
+        // Current-epoch (chunk_id -> hash) already embedded.
+        let mut embedded: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if self.existing_relations()?.contains("doc_vec") {
+            let mut p = BTreeMap::new();
+            p.insert("epoch".to_string(), DataValue::Str(epoch.into()));
+            let rows = self.run(
+                "?[chunk_id, hash] := *doc_vec{chunk_id, epoch, hash}, epoch == $epoch",
+                p,
+                ScriptMutability::Immutable,
+            )?;
+            for r in &rows.rows {
+                embedded.insert(cell_str(r, 0), cell_str(r, 1));
+            }
+        }
+        let rows = self.run(
+            "?[id, text] := *doc_chunk{id, text}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut out = Vec::new();
+        for r in &rows.rows {
+            let id = cell_str(r, 0);
+            let text = cell_str(r, 1);
+            let hash = text_hash(&text);
+            if embedded.get(&id) != Some(&hash) {
+                out.push((id, hash, text));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// k-NN semantic doc search: nearest current-epoch chunk vectors to
+    /// `query_vec`, joined back to their doc text. Returns `(DocHit, distance)`
+    /// ascending by distance. Empty when there's no vector store/epoch.
+    pub fn semantic_doc_search(
+        &self,
+        query_vec: &[f32],
+        epoch: &str,
+        k: usize,
+        max_snippet: usize,
+    ) -> AppResult<Vec<(DocHit, f32)>> {
+        if !self.existing_relations()?.contains("doc_vec") {
+            return Ok(Vec::new());
+        }
+        let mut p = BTreeMap::new();
+        p.insert(
+            "q".to_string(),
+            DataValue::List(
+                query_vec
+                    .iter()
+                    .map(|f| DataValue::Num(Num::Float(*f as f64)))
+                    .collect(),
+            ),
+        );
+        p.insert("epoch".to_string(), DataValue::Str(epoch.into()));
+        p.insert("k".to_string(), int(k as u32));
+        p.insert("ef".to_string(), int((k * 10).max(50) as u32));
+        let rows = self.run(
+            r#"sem[chunk_id, dist] := ~doc_vec:vec_idx{chunk_id, epoch | query: q, k: $k, ef: $ef, bind_distance: dist, filter: epoch == $epoch}, q = vec($q)
+?[source_path, anchor, text, dist] := sem[cid, dist], *doc_chunk{id: cid, source_path, anchor, text}
+:order dist
+:limit $k"#,
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    DocHit {
+                        source_path: cell_str(r, 0),
+                        anchor: cell_str(r, 1),
+                        snippet: truncate_chars(&cell_str(r, 2), max_snippet),
+                    },
+                    cell_f64(r, 3) as f32,
+                )
+            })
+            .collect())
+    }
+
+    /// `(embedded_current_epoch, total_doc_chunks)` for the coverage readout.
+    pub fn embedding_coverage(&self, epoch: &str) -> AppResult<(u64, u64)> {
+        let total = {
+            let rows = self.run(
+                "?[count(id)] := *doc_chunk{id}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )?;
+            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+        };
+        let embedded = if self.existing_relations()?.contains("doc_vec") {
+            let mut p = BTreeMap::new();
+            p.insert("epoch".to_string(), DataValue::Str(epoch.into()));
+            let rows = self.run(
+                "?[count(chunk_id)] := *doc_vec{chunk_id, epoch}, epoch == $epoch",
+                p,
+                ScriptMutability::Immutable,
+            )?;
+            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+        } else {
+            0
+        };
+        Ok((embedded, total))
+    }
+
     /// Row counts for the status surface.
     pub fn stats(&self) -> AppResult<GraphStats> {
         let count = |rel: &str| -> AppResult<u64> {
@@ -488,6 +733,30 @@ fn cell_str(row: &[DataValue], i: usize) -> String {
 
 fn cell_i64(row: &[DataValue], i: usize) -> i64 {
     row.get(i).map(dv_i64).unwrap_or(0)
+}
+
+fn dv_f64(v: &DataValue) -> f64 {
+    match v {
+        DataValue::Num(Num::Float(f)) => *f,
+        DataValue::Num(Num::Int(i)) => *i as f64,
+        _ => 0.0,
+    }
+}
+
+fn cell_f64(row: &[DataValue], i: usize) -> f64 {
+    row.get(i).map(dv_f64).unwrap_or(0.0)
+}
+
+/// FNV-1a 64-bit hash of a chunk's text, hex — used to detect when a chunk's
+/// content changed so its stored embedding is re-computed. Matches the
+/// builder's `content_hash` algorithm (kept local to avoid a cross-module dep).
+fn text_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// Map query rows shaped `[id, name, kind, file, start_line, signature]` to
@@ -589,6 +858,55 @@ pub struct Point { x: i32 }
         // doc search finds the "Adds two numbers." chunk.
         let docs = idx.search_docs("numbers", 10, 200).expect("docs");
         assert!(docs.iter().any(|d| d.anchor == "add"));
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_vector_store_roundtrip() {
+        // Exercises the CozoDB HNSW path end-to-end with deterministic vectors
+        // (no embedding endpoint needed).
+        let dir = std::env::temp_dir().join(format!("ckg-vec-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        // Two doc chunks via a tiny markdown file.
+        let md = "# Cats\n\nFelines purr.\n\n# Engines\n\nMotors combust fuel.\n";
+        idx.index_file_graph(&parse_file("docs/a.md", md, Lang::Markdown))
+            .expect("index md");
+
+        let epoch = "test-epoch";
+        let reset = idx.ensure_vector_store(3, "fake-model", epoch).expect("ensure");
+        assert!(!reset, "fresh store isn't a reset");
+
+        // Every chunk needs a vector initially.
+        let need = idx.chunks_needing_vectors(epoch, 100).expect("need");
+        assert_eq!(need.len(), 2);
+
+        // Assign deterministic 3-d vectors: "cats" near [1,0,0], "engines" near [0,1,0].
+        let vecs: Vec<(String, String, Vec<f32>)> = need
+            .iter()
+            .map(|(id, hash, text)| {
+                let v = if text.to_lowercase().contains("felines") {
+                    vec![1.0, 0.0, 0.0]
+                } else {
+                    vec![0.0, 1.0, 0.0]
+                };
+                (id.clone(), hash.clone(), v)
+            })
+            .collect();
+        idx.put_doc_vectors(epoch, &vecs).expect("put vecs");
+
+        // Coverage is now full; nothing left to embed.
+        assert_eq!(idx.embedding_coverage(epoch).expect("cov"), (2, 2));
+        assert!(idx.chunks_needing_vectors(epoch, 100).expect("need2").is_empty());
+
+        // A query near [1,0,0] returns the "Cats" chunk first.
+        let hits = idx
+            .semantic_doc_search(&[0.9, 0.1, 0.0], epoch, 2, 200)
+            .expect("search");
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0.anchor, "cats");
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

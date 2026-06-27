@@ -128,7 +128,7 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             if name.starts_with("graph_") {
-                crate::graph::handle_mcp_call(&params)
+                crate::graph::handle_mcp_call(&params).await
             } else {
                 handle_tools_call(params).await
             }

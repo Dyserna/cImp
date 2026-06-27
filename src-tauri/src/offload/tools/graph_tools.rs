@@ -19,7 +19,14 @@ use super::ToolCtx;
 /// to include these (feature enabled + local/remote opt-in); this just renders
 /// them.
 pub fn defs() -> Vec<ToolDef> {
-    crate::graph::tool_specs()
+    let mut specs = crate::graph::tool_specs();
+    // Advertise semantic search to the worker only when it's enabled (it
+    // degrades to full-text at runtime if the embedder is down).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if crate::settings::load_readonly(&cwd).graph.semantic_search {
+        specs.push(crate::graph::semantic_spec());
+    }
+    specs
         .into_iter()
         .map(|s| ToolDef::function(s.name, s.description, s.parameters))
         .collect()
@@ -32,7 +39,7 @@ pub async fn dispatch(
     args: serde_json::Value,
     ctx: &ToolCtx,
 ) -> Result<String, String> {
-    crate::graph::offload_query(&ctx.allowed_roots, name, &args)
+    crate::graph::offload_query(&ctx.allowed_roots, name, &args).await
 }
 
 #[cfg(test)]

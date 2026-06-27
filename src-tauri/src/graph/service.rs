@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -28,9 +29,14 @@ use tracing::{debug, info, warn};
 use crate::error::AppResult;
 use crate::settings::{GraphSettings, SettingsHandle};
 
+use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats};
 use super::model::Lang;
 use super::parse_file;
+
+/// Bumped if the embedding schema/layout changes in a way that invalidates
+/// stored vectors. Part of the epoch fingerprint alongside model + dim.
+const EMBED_SCHEMA: &str = "v1";
 
 /// Tauri event carrying a [`GraphStatus`] snapshot whenever a root's build
 /// state changes (queued → building → ready/error). The Phase-I monitor tab
@@ -54,6 +60,24 @@ pub struct GraphStatus {
     pub edges: u64,
     /// Last build error, if the most recent attempt failed.
     pub last_error: Option<String>,
+
+    // ── Semantic search (Phase G) ──
+    /// Whether semantic search is enabled in settings.
+    pub semantic_enabled: bool,
+    /// Whether an embedder is configured (an endpoint is set).
+    pub embedder_configured: bool,
+    /// Whether the last embedder probe/batch succeeded (live reachability).
+    pub embedder_ready: bool,
+    /// Embedding state: `off` | `idle` | `embedding` | `degraded` | `error`.
+    pub embed_state: String,
+    /// Vectors stored for the current epoch.
+    pub embedded: u64,
+    /// Total doc chunks (the embedding denominator).
+    pub embed_total: u64,
+    /// Chunks still awaiting a current-epoch vector.
+    pub embed_pending: u64,
+    /// Last embedder error, if any.
+    pub embed_error: Option<String>,
 }
 
 impl GraphStatus {
@@ -67,6 +91,14 @@ impl GraphStatus {
             symbols: 0,
             edges: 0,
             last_error: None,
+            semantic_enabled: false,
+            embedder_configured: false,
+            embedder_ready: false,
+            embed_state: "off".into(),
+            embedded: 0,
+            embed_total: 0,
+            embed_pending: 0,
+            embed_error: None,
         }
     }
 }
@@ -88,6 +120,9 @@ pub struct GraphService {
     /// is mid-`reset()`. Coarse (one lock for all roots), which is fine —
     /// builds/re-indexes are infrequent and a project is usually one root.
     write_lock: StdMutex<()>,
+    /// When set, the watcher drops incremental re-index batches (the OS watch
+    /// keeps running; events are simply ignored). Drives `graph_set_watch_paused`.
+    paused: AtomicBool,
 }
 
 impl GraphService {
@@ -99,7 +134,31 @@ impl GraphService {
             status: StdMutex::new(HashMap::new()),
             watchers: StdMutex::new(HashMap::new()),
             write_lock: StdMutex::new(()),
+            paused: AtomicBool::new(false),
         })
+    }
+
+    /// Pause/resume incremental watcher re-indexing. Paused = changes are
+    /// ignored until resumed (a manual rebuild still works). Returns the new
+    /// state.
+    pub fn set_watch_paused(&self, paused: bool) -> bool {
+        self.paused.store(paused, Ordering::Relaxed);
+        paused
+    }
+
+    /// Force a fresh re-embed of all doc chunks (drops the vector store first),
+    /// then backfill. Used by the "Rebuild embeddings" action — the recovery
+    /// path for a silent model swap behind the same name. No-op when semantic
+    /// search is off.
+    pub fn spawn_rebuild_embeddings(self: &Arc<Self>, root: PathBuf) {
+        if !self.settings.current().graph.semantic_search {
+            return;
+        }
+        if let Ok(idx) = self.index_for(&root) {
+            let _w = self.write_lock.lock().unwrap();
+            let _ = idx.clear_vectors();
+        }
+        self.spawn_backfill(root);
     }
 
     /// The configured per-project db subdirectory (default `.ccimp`).
@@ -196,6 +255,9 @@ impl GraphService {
                         s.edges = stats.edges;
                         s.last_error = None;
                         this.set_status(&root, s);
+                        // Phase G: embed any new/changed doc chunks (no-op when
+                        // semantic search is off).
+                        this.spawn_backfill(root.clone());
                     }
                     Err(e) => {
                         warn!(root = %root.display(), error = %e, "graph: rebuild failed");
@@ -259,9 +321,9 @@ impl GraphService {
     /// Apply one debounced batch of changed paths to `root`'s store: re-parse
     /// created/modified files, drop rows for deleted ones, then refresh the
     /// status counts. Called from the watcher thread.
-    pub fn reindex_paths(&self, root: &Path, paths: Vec<PathBuf>) {
+    pub fn reindex_paths(self: &Arc<Self>, root: &Path, paths: Vec<PathBuf>) {
         let snap = self.settings.current().graph;
-        if !snap.enabled {
+        if !snap.enabled || self.paused.load(Ordering::Relaxed) {
             return;
         }
         let idx = match self.index_for(root) {
@@ -330,7 +392,178 @@ impl GraphService {
                 self.set_status(root, s);
             }
             debug!(root = %root.display(), changed, "graph: incremental re-index applied");
+            // Phase G: embed the new/changed doc chunks (no-op when off).
+            self.spawn_backfill(root.to_path_buf());
         }
+    }
+
+    /// Kick a background embedding backfill for `root` (Phase G). No-op unless
+    /// semantic search is enabled. Spawned on the async runtime (the embed
+    /// calls are network I/O); safe to call after every build/reindex — it
+    /// only embeds chunks that are new or changed since the last pass.
+    pub fn spawn_backfill(self: &Arc<Self>, root: PathBuf) {
+        if !self.settings.current().graph.semantic_search {
+            return;
+        }
+        let this = self.clone();
+        tauri::async_runtime::spawn(async move {
+            this.embed_backfill(&root).await;
+        });
+    }
+
+    /// Embed any doc chunks missing a current-epoch vector and store them.
+    /// Drives the embedding status fields. Degrades cleanly: an unconfigured or
+    /// unreachable embedder leaves chunks queryable via full-text (the
+    /// structural graph never depends on this).
+    async fn embed_backfill(&self, root: &Path) {
+        let snap = self.settings.current().graph;
+        if !snap.semantic_search {
+            return;
+        }
+        let configured = !snap.embedding_endpoint.trim().is_empty();
+        self.patch_embed_status(root, |s| {
+            s.semantic_enabled = true;
+            s.embedder_configured = configured;
+        });
+        let Some(embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model) else {
+            self.patch_embed_status(root, |s| {
+                s.embed_state = "degraded".into();
+                s.embedder_ready = false;
+                s.embed_error = Some("no embedding endpoint configured".into());
+            });
+            return;
+        };
+
+        // Resolve the vector dimension: the configured one, else probe live.
+        let dim = if snap.embedding_dims > 0 {
+            snap.embedding_dims as usize
+        } else {
+            match embedder.probe_dim().await {
+                Ok(d) => d,
+                Err(e) => {
+                    self.patch_embed_status(root, |s| {
+                        s.embed_state = "degraded".into();
+                        s.embedder_ready = false;
+                        s.embed_error = Some(e);
+                    });
+                    return;
+                }
+            }
+        };
+
+        let idx = match self.index_for(root) {
+            Ok(i) => i,
+            Err(e) => {
+                self.patch_embed_status(root, |s| {
+                    s.embed_state = "error".into();
+                    s.embed_error = Some(e.to_string());
+                });
+                return;
+            }
+        };
+        let epoch = embedding_epoch(&snap.embedding_model, dim);
+        {
+            let _w = self.write_lock.lock().unwrap();
+            if let Err(e) = idx.ensure_vector_store(dim, &snap.embedding_model, &epoch) {
+                self.patch_embed_status(root, |s| {
+                    s.embed_state = "error".into();
+                    s.embed_error = Some(e.to_string());
+                });
+                return;
+            }
+        }
+
+        self.patch_embed_status(root, |s| {
+            s.embed_state = "embedding".into();
+            s.embed_error = None;
+        });
+
+        let batch = snap.embedding_batch.clamp(1, 256);
+        loop {
+            let pending = match idx.chunks_needing_vectors(&epoch, batch) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.patch_embed_status(root, |s| {
+                        s.embed_state = "error".into();
+                        s.embed_error = Some(e.to_string());
+                    });
+                    return;
+                }
+            };
+            if pending.is_empty() {
+                break;
+            }
+            let texts: Vec<String> = pending.iter().map(|(_, _, t)| t.clone()).collect();
+            match embedder.embed(&texts).await {
+                Ok(vectors) if vectors.len() == pending.len() => {
+                    let rows: Vec<(String, String, Vec<f32>)> = pending
+                        .into_iter()
+                        .zip(vectors)
+                        .map(|((id, hash, _), v)| (id, hash, v))
+                        .collect();
+                    let put = {
+                        let _w = self.write_lock.lock().unwrap();
+                        idx.put_doc_vectors(&epoch, &rows)
+                    };
+                    if let Err(e) = put {
+                        self.patch_embed_status(root, |s| {
+                            s.embed_state = "error".into();
+                            s.embed_error = Some(e.to_string());
+                        });
+                        return;
+                    }
+                    self.refresh_embed_coverage(root, &idx, &epoch, true);
+                }
+                Ok(_) => {
+                    self.patch_embed_status(root, |s| {
+                        s.embed_state = "degraded".into();
+                        s.embedder_ready = false;
+                        s.embed_error = Some("embedding count mismatch".into());
+                    });
+                    return;
+                }
+                Err(e) => {
+                    // Endpoint went away mid-backfill — degrade, keep what we have.
+                    self.patch_embed_status(root, |s| {
+                        s.embed_state = "degraded".into();
+                        s.embedder_ready = false;
+                        s.embed_error = Some(e);
+                    });
+                    return;
+                }
+            }
+        }
+
+        self.refresh_embed_coverage(root, &idx, &epoch, true);
+        self.patch_embed_status(root, |s| {
+            s.embed_state = "idle".into();
+            s.embedder_ready = true;
+            s.embed_error = None;
+        });
+    }
+
+    /// Recompute `(embedded, total, pending)` for the status from the store.
+    fn refresh_embed_coverage(&self, root: &Path, idx: &GraphIndex, epoch: &str, ready: bool) {
+        let (embedded, total) = idx.embedding_coverage(epoch).unwrap_or((0, 0));
+        self.patch_embed_status(root, |s| {
+            s.embedded = embedded;
+            s.embed_total = total;
+            s.embed_pending = total.saturating_sub(embedded);
+            s.embedder_ready = ready;
+        });
+    }
+
+    /// Apply a mutation to a root's status and emit the change event.
+    fn patch_embed_status(&self, root: &Path, f: impl FnOnce(&mut GraphStatus)) {
+        let status = {
+            let mut guard = self.status.lock().unwrap();
+            let s = guard
+                .entry(root.to_path_buf())
+                .or_insert_with(|| GraphStatus::idle(root));
+            f(s);
+            s.clone()
+        };
+        let _ = self.app.emit(GRAPH_STATUS_EVENT, &status);
     }
 
     /// Drop warm handles + watchers on shutdown (SQLite connections close on
@@ -443,6 +676,16 @@ fn build_tree(
 fn rel_path(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.to_string_lossy().replace('\\', "/")
+}
+
+/// The embedding "epoch" fingerprint — a vector is only comparable to others
+/// sharing its `{model, dim, schema}`. A change to any of these bumps the
+/// epoch, scoping k-NN to matching vectors and triggering a background
+/// re-embed. Kept short and human-glanceable (model + dim + a schema tag).
+fn embedding_epoch(model: &str, dim: usize) -> String {
+    let m = model.trim();
+    let m = if m.is_empty() { "default" } else { m };
+    format!("{m}|{dim}|{EMBED_SCHEMA}")
 }
 
 /// The indexable language for `path`, or `None` if its extension is unknown or

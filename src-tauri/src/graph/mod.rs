@@ -19,6 +19,7 @@
 //! pipeline, and monitor event bus arrive in later stages.
 
 mod builder;
+mod embed;
 mod index;
 mod mcp;
 mod model;
@@ -29,7 +30,8 @@ mod watcher;
 pub use builder::parse_file;
 pub use index::{GraphIndex, GraphStats, SymbolHit};
 pub use mcp::{
-    handle_call as handle_mcp_call, offload_query, tool_specs, tools as mcp_tools, GraphToolSpec,
+    handle_call as handle_mcp_call, offload_query, semantic_spec, tool_specs, tools as mcp_tools,
+    GraphToolSpec,
 };
 pub use model::*;
 pub use service::{GraphService, GraphStatus};

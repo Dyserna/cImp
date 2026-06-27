@@ -11,8 +11,8 @@
 use tree_sitter::{Node, Parser};
 
 use super::model::{
-    doc_chunk_id, symbol_id, DocChunk, Edge, EdgeKind, FileGraph, Lang, Reference, Symbol,
-    SymbolKind,
+    doc_chunk_id, fnv1a_hex, symbol_doc_chunk_id, symbol_id, DocChunk, Edge, EdgeKind, FileGraph,
+    Lang, Reference, Symbol, SymbolKind,
 };
 
 /// Max characters kept for a symbol's one-line signature.
@@ -160,15 +160,10 @@ fn file_stem(file: &str) -> String {
     name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name).to_string()
 }
 
-/// Deterministic FNV-1a 64-bit content hash. Stable across runs (unlike
-/// `DefaultHasher`), so the watcher's staleness check survives a restart.
+/// Deterministic FNV-1a content hash for staleness detection. Delegates to the
+/// shared [`fnv1a_hex`] so the builder and the index can never disagree.
 fn content_hash(src: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in src.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
+    fnv1a_hex(src)
 }
 
 fn parse_rust(src: &str, file: &str, fg: &mut FileGraph) {
@@ -218,46 +213,8 @@ fn walk_items(
         }
 
         if let Some((name, skind)) = def_name_kind(src, child, in_impl) {
-            let start = child.start_position().row as u32 + 1;
-            let end = child.end_position().row as u32 + 1;
-            let id = symbol_id(file, &name, start);
-            let doc = if pending_doc.is_empty() {
-                None
-            } else {
-                Some(pending_doc.join("\n"))
-            };
-
-            fg.symbols.push(Symbol {
-                id: id.clone(),
-                name: name.clone(),
-                kind: skind,
-                file: file.to_string(),
-                start_line: start,
-                end_line: end,
-                signature: signature_of(src, child),
-                doc: doc.clone(),
-            });
-            if let Some(p) = parent {
-                fg.edges.push(Edge {
-                    kind: EdgeKind::Contains,
-                    src: p.to_string(),
-                    dst: id.clone(),
-                });
-            }
-            if let Some(text) = doc {
-                let cid = doc_chunk_id(file, &name);
-                fg.docs.push(DocChunk {
-                    id: cid.clone(),
-                    source_path: file.to_string(),
-                    anchor: name.clone(),
-                    text,
-                });
-                fg.edges.push(Edge {
-                    kind: EdgeKind::Documents,
-                    src: cid,
-                    dst: id.clone(),
-                });
-            }
+            let doc = take_doc(&mut pending_doc);
+            let id = emit_symbol(src, file, child, &name, skind, parent, doc, fg);
 
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                 collect_calls(src, file, child, &id, fg);
@@ -390,10 +347,16 @@ fn import_path(src: &str, node: Node) -> Option<String> {
 }
 
 /// A one-line signature: the node's first line, trimmed and length-capped.
+/// Capped by **character** count (not bytes) — `String::truncate` panics if a
+/// byte offset lands inside a multi-byte UTF-8 char, which a non-ASCII
+/// identifier or comment in a long first line can trigger.
 fn signature_of(src: &str, node: Node) -> String {
-    let mut s = first_line(&node_text(src, node));
-    s.truncate(MAX_SIGNATURE);
-    s.trim_end().to_string()
+    let line = first_line(&node_text(src, node));
+    let capped = match line.char_indices().nth(MAX_SIGNATURE) {
+        Some((idx, _)) => &line[..idx],
+        None => &line,
+    };
+    capped.trim_end().to_string()
 }
 
 /// Extract `///` / `//!` doc text from a comment node, or `None` if it's a
@@ -606,7 +569,9 @@ fn emit_symbol(
         fg.edges.push(Edge { kind: EdgeKind::Contains, src: p.to_string(), dst: id.clone() });
     }
     if let Some(text) = doc {
-        let cid = doc_chunk_id(file, name);
+        // Disambiguate the storage key by start line so two same-named defs in
+        // one file don't collide and overwrite each other's doc chunk.
+        let cid = symbol_doc_chunk_id(file, name, start);
         fg.docs.push(DocChunk {
             id: cid.clone(),
             source_path: file.to_string(),
@@ -983,6 +948,43 @@ pub trait Shape {
     fn hash_is_stable_and_content_sensitive() {
         assert_eq!(content_hash("abc"), content_hash("abc"));
         assert_ne!(content_hash("abc"), content_hash("abd"));
+    }
+
+    #[test]
+    fn signature_with_multibyte_utf8_past_cap_does_not_panic() {
+        // A first line longer than MAX_SIGNATURE chars whose boundary lands on
+        // a multi-byte char. Byte-offset truncation would panic here.
+        let pad = "α".repeat(MAX_SIGNATURE); // each 'α' is 2 bytes
+        let src = format!("/// doc\npub fn ɸunc_{pad}() {{}}\n");
+        let fg = parse_file("src/u.rs", &src, Lang::Rust);
+        let f = fg.symbols.iter().find(|s| s.name.starts_with("ɸunc_")).unwrap();
+        // Capped to MAX_SIGNATURE chars (not bytes), and valid UTF-8.
+        assert!(f.signature.chars().count() <= MAX_SIGNATURE);
+    }
+
+    #[test]
+    fn same_named_symbols_in_one_file_get_distinct_doc_chunks() {
+        // Two `fn new()` in two impl blocks: distinct doc chunks, no overwrite.
+        let src = r#"
+pub struct A;
+pub struct B;
+impl A {
+    /// Make an A.
+    pub fn new() -> A { A }
+}
+impl B {
+    /// Make a B.
+    pub fn new() -> B { B }
+}
+"#;
+        let fg = parse_file("src/dup.rs", src, Lang::Rust);
+        let new_docs: Vec<&DocChunk> = fg.docs.iter().filter(|d| d.anchor == "new").collect();
+        assert_eq!(new_docs.len(), 2, "both new() docs survive");
+        // Distinct storage ids (so neither upsert clobbers the other).
+        assert_ne!(new_docs[0].id, new_docs[1].id);
+        let texts: Vec<&str> = new_docs.iter().map(|d| d.text.as_str()).collect();
+        assert!(texts.contains(&"Make an A."));
+        assert!(texts.contains(&"Make a B."));
     }
 
     const MD: &str = r#"# Overview

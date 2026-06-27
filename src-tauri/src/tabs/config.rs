@@ -141,6 +141,11 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
             addendum.push_str("\n\n");
         }
         addendum.push_str(GRAPH_GUIDANCE);
+        // `graph_semantic_docs` is only advertised to Opus when semantic search
+        // is on, so only guide toward it then.
+        if settings.graph.semantic_search {
+            addendum.push_str(GRAPH_SEMANTIC_GUIDANCE);
+        }
     }
     if !addendum.is_empty() {
         args.push("--append-system-prompt".to_string());
@@ -200,9 +205,17 @@ const GRAPH_GUIDANCE: &str = "This project has a code knowledge graph (from the 
 server). Prefer the `graph_*` tools over grep for code-structure questions: `graph_find_symbol` \
 (where a symbol is defined), `graph_callers`/`graph_callees` (call relationships), \
 `graph_references`, `graph_imports`, `graph_outline` (a file's definitions), `graph_transitive` \
-(transitive call chains), and `graph_search_docs` (documentation/doc-comments). They return precise, \
-token-bounded results from an index, so they're cheaper and more exact than text search for \
-'where is X defined', 'who calls X', and impact analysis.";
+(transitive call chains), `graph_search_docs` (documentation/doc-comments), and \
+`graph_struct_search` (find code by AST shape via a tree-sitter query — e.g. every `.unwrap()` or \
+every function with a given parameter pattern — when text search can't express the structure). They \
+return precise, token-bounded results from an index, so they're cheaper and more exact than text \
+search for 'where is X defined', 'who calls X', and impact analysis.";
+
+/// V9-01: appended after [`GRAPH_GUIDANCE`] only when semantic search is on
+/// (the `graph_semantic_docs` tool is advertised to Opus only then).
+const GRAPH_SEMANTIC_GUIDANCE: &str = " Also available: `graph_semantic_docs`, a meaning-based \
+(embedding) search over the project's docs and doc-comments — use it when you want relevant \
+material that may not share keywords with your query.";
 
 fn build_extra_args(
     cfg: &AiToolTabConfig,

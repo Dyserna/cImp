@@ -888,6 +888,20 @@ pub struct GraphSettings {
     pub embedding_batch: usize,
 }
 
+impl GraphSettings {
+    /// The per-project db subdirectory, falling back to `.ccimp` when unset.
+    /// Single source of truth so the service and the MCP child can't open
+    /// different paths.
+    pub fn effective_db_subdir(&self) -> String {
+        let s = self.db_subdir.trim();
+        if s.is_empty() {
+            ".ccimp".to_string()
+        } else {
+            s.to_string()
+        }
+    }
+}
+
 impl Default for GraphSettings {
     fn default() -> Self {
         Self {

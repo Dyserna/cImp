@@ -7,6 +7,7 @@
 //! unreachable. The vector store, epoch bookkeeping, and k-NN live in `index`;
 //! the backfill loop lives in `service`.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -45,12 +46,8 @@ impl Embedder {
         if endpoint.is_empty() {
             return None;
         }
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .ok()?;
         Some(Embedder {
-            client,
+            client: shared_client(),
             endpoint: normalize_endpoint(endpoint),
             model: model.trim().to_string(),
         })
@@ -76,12 +73,10 @@ impl Embedder {
         if !resp.status().is_success() {
             return Err(format!("embeddings endpoint returned {}", resp.status()));
         }
-        let mut body: EmbedResponse = resp
+        let body: EmbedResponse = resp
             .json()
             .await
             .map_err(|e| format!("embeddings decode failed: {e}"))?;
-        // Defensive: the spec orders `data` by `index`, but don't assume it.
-        body.data.sort_by_key(|d| d.index);
         if body.data.len() != texts.len() {
             return Err(format!(
                 "embeddings count mismatch: asked {}, got {}",
@@ -89,7 +84,7 @@ impl Embedder {
                 body.data.len()
             ));
         }
-        Ok(body.data.into_iter().map(|d| d.embedding).collect())
+        Ok(ordered_embeddings(body.data))
     }
 
     /// Embed a single text (the query path).
@@ -108,6 +103,43 @@ impl Embedder {
             Ok(v.len())
         }
     }
+}
+
+/// Put embeddings back in input order. Reorders by `index` ONLY when the
+/// server returned a complete, unique set (`0..n`). Some OpenAI-compatible
+/// servers omit `index`, which serde fills as 0 for every item; a stable sort
+/// on all-zero keys is a silent no-op that would mis-pair vectors with inputs
+/// if the server also batched out of order. When the indices aren't a valid
+/// permutation we trust the response order (the spec returns data in input
+/// order) rather than a meaningless sort.
+fn ordered_embeddings(mut data: Vec<EmbedDatum>) -> Vec<Vec<f32>> {
+    let n = data.len();
+    let valid_indices = {
+        let mut seen = vec![false; n];
+        data.iter()
+            .all(|d| d.index < n && !std::mem::replace(&mut seen[d.index], true))
+    };
+    if valid_indices {
+        data.sort_by_key(|d| d.index);
+    }
+    data.into_iter().map(|d| d.embedding).collect()
+}
+
+/// One process-wide `reqwest::Client` (its connection pool is the whole point
+/// of reuse). Building a fresh client per `Embedder::new` — which the backfill
+/// does after every watcher batch — spins up a new pool each time and, under
+/// heavy churn on Windows, can exhaust ephemeral ports before old pools drain.
+/// `Client` is internally `Arc`, so cloning the shared one is cheap.
+fn shared_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_default()
+        })
+        .clone()
 }
 
 /// Append `/v1/embeddings` unless the user already pointed at a full path.
@@ -142,5 +174,24 @@ mod tests {
         assert!(Embedder::new("", "m").is_none());
         assert!(Embedder::new("   ", "m").is_none());
         assert!(Embedder::new("http://x", "m").is_some());
+    }
+
+    fn datum(index: usize, tag: f32) -> EmbedDatum {
+        EmbedDatum { embedding: vec![tag], index }
+    }
+
+    #[test]
+    fn ordered_embeddings_handles_index_present_absent_and_invalid() {
+        // Valid permutation (server returned out of order): reorder by index.
+        let got = ordered_embeddings(vec![datum(1, 1.0), datum(0, 0.0), datum(2, 2.0)]);
+        assert_eq!(got, vec![vec![0.0], vec![1.0], vec![2.0]]);
+
+        // `index` omitted → all default to 0 (not a 0..n permutation): trust
+        // the response order rather than collapsing everything onto key 0.
+        let got = ordered_embeddings(vec![datum(0, 10.0), datum(0, 11.0), datum(0, 12.0)]);
+        assert_eq!(got, vec![vec![10.0], vec![11.0], vec![12.0]]);
+
+        // Single element is trivially a valid permutation.
+        assert_eq!(ordered_embeddings(vec![datum(0, 5.0)]), vec![vec![5.0]]);
     }
 }

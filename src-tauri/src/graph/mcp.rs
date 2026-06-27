@@ -291,12 +291,14 @@ async fn semantic_query(
     };
     match idx.semantic_doc_search(&qv, &epoch, max_rows, max_snippet) {
         Ok(hits) if !hits.is_empty() => {
+            // `dist` is a cosine DISTANCE (lower = more similar); label it as
+            // such so the model doesn't read it as a higher-is-better score.
             let body = hits
                 .iter()
-                .map(|(d, dist)| format!("{} [{}] (score {:.3}): {}", d.source_path, d.anchor, dist, d.snippet))
+                .map(|(d, dist)| format!("{} [{}] (distance {:.3}): {}", d.source_path, d.anchor, dist, d.snippet))
                 .collect::<Vec<_>>()
                 .join("\n");
-            Ok(format!("(semantic)\n{body}"))
+            Ok(format!("(semantic — nearest first; lower distance = more similar)\n{body}"))
         }
         // No vectors matched yet (mid-backfill) or a query error → full-text.
         _ => fallback(idx),
@@ -322,7 +324,7 @@ pub async fn offload_query(
         "no code graph found under the offload roots — enable + index the project in ccImp"
             .to_string();
     for root in roots {
-        match open_project_index(root, &sub) {
+        match open_project_index_confined(root, &sub) {
             Ok((resolved, idx)) => {
                 return if name == "graph_semantic_docs" {
                     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -411,12 +413,7 @@ fn limits(settings: &crate::settings::Settings) -> (usize, usize) {
 }
 
 fn db_subdir(settings: &crate::settings::Settings) -> String {
-    let s = &settings.graph.db_subdir;
-    if s.trim().is_empty() {
-        ".ccimp".to_string()
-    } else {
-        s.clone()
-    }
+    settings.graph.effective_db_subdir()
 }
 
 /// Open the existing graph store for the project containing `start`, resolving
@@ -472,6 +469,33 @@ fn run_struct_search(
         .map(|h| format!("{}:{}  {}", h.file, h.line, h.snippet))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// Like [`open_project_index`] but **confined**: the resolved project root must
+/// be at or below `allowed_root`. The offload worker is sandboxed to its
+/// confinement roots; [`find_graph_root`] walks ancestors, so a `graph.db` in a
+/// *parent* directory (a project nested inside a larger indexed repo, or a
+/// stray `~/.ccimp/graph.db`) would otherwise let `graph_struct_search` read
+/// source files outside the sandbox. Since the search starts at `allowed_root`,
+/// "at or below" means the resolved root equals `allowed_root`.
+fn open_project_index_confined(
+    allowed_root: &Path,
+    sub: &str,
+) -> Result<(PathBuf, GraphIndex), String> {
+    let resolved = find_graph_root(allowed_root, sub).ok_or_else(|| {
+        format!(
+            "no code graph found from {} — enable the graph and index this project in ccImp",
+            allowed_root.display()
+        )
+    })?;
+    if !resolved.starts_with(allowed_root) {
+        return Err(format!(
+            "the code graph for {} lives above the offload worker's allowed root — refusing to read outside the sandbox",
+            allowed_root.display()
+        ));
+    }
+    let idx = GraphIndex::open_existing(&resolved, sub).map_err(|e| e.to_string())?;
+    Ok((resolved, idx))
 }
 
 /// Walk up from `start` looking for an ancestor containing `<sub>/graph.db`.

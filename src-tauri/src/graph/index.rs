@@ -136,6 +136,20 @@ impl GraphIndex {
         let prefix = format!("{file}#");
         let mut p = BTreeMap::new();
         p.insert("file".to_string(), DataValue::Str(file.into()));
+
+        // Names this file DEFINES, captured before we delete its symbols. After
+        // deletion, any of these names with no remaining definition anywhere is
+        // "dangling": its inbound call edges (owned by other files) would
+        // otherwise survive and make `callers()` report ghosts of a symbol that
+        // no longer exists. External/unresolved call targets (stdlib names that
+        // never had a symbol) are NOT in this set, so they're left untouched.
+        let defined = self.run(
+            "?[name] := *symbol{file, name}, file == $file",
+            p.clone(),
+            ScriptMutability::Immutable,
+        )?;
+        let defined_names: Vec<String> = defined.rows.iter().map(|r| cell_str(r, 0)).collect();
+
         self.run_mut(
             "?[id] := *symbol{id, file}, file == $file\n:rm symbol {id}",
             p.clone(),
@@ -158,6 +172,23 @@ impl GraphIndex {
             "?[kind, src, dst] := *edge{kind, src, dst}, (starts_with(src, $prefix) or src == $file)\n:rm edge {kind, src, dst}",
             pe,
         )?;
+
+        // Drop inbound call edges to names this file uniquely defined.
+        for name in defined_names {
+            let mut pn = BTreeMap::new();
+            pn.insert("name".to_string(), DataValue::Str(name.as_str().into()));
+            let still = self.run(
+                "?[id] := *symbol{id, name}, name == $name\n:limit 1",
+                pn.clone(),
+                ScriptMutability::Immutable,
+            )?;
+            if still.rows.is_empty() {
+                self.run_mut(
+                    "?[kind, src, dst] := *edge{kind, src, dst}, kind == \"call\", dst == $name\n:rm edge {kind, src, dst}",
+                    pn,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -494,6 +525,36 @@ reach[x, y] := reach[x, z], calls[z, y]
         Ok(())
     }
 
+    /// Delete vectors whose `doc_chunk` no longer exists — chunks dropped by a
+    /// file delete/rename or replaced under a new anchor when a file changed.
+    /// Without this, orphaned vectors keep being counted as "embedded" (so
+    /// coverage can read >100% and suppress backfill) and linger in the HNSW
+    /// index as dead candidates. Keeps every still-valid vector, so it never
+    /// forces a needless re-embed. No-op when there's no vector store. Returns
+    /// the number of orphans removed.
+    pub fn prune_orphan_vectors(&self) -> AppResult<u64> {
+        if !self.existing_relations()?.contains("doc_vec") {
+            return Ok(0);
+        }
+        // Count first — a `:rm` returns a status row, not the deleted rows.
+        let n = {
+            let rows = self.run(
+                "?[count(chunk_id)] := *doc_vec{chunk_id, epoch}, not *doc_chunk{id: chunk_id}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )?;
+            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+        };
+        if n > 0 {
+            self.run_mut(
+                "?[chunk_id, epoch] := *doc_vec{chunk_id, epoch}, not *doc_chunk{id: chunk_id}\n\
+                 :rm doc_vec {chunk_id, epoch}",
+                BTreeMap::new(),
+            )?;
+        }
+        Ok(n)
+    }
+
     fn ensure_meta_relation(&self) -> AppResult<()> {
         if !self.existing_relations()?.contains("embed_meta") {
             self.run_mut(
@@ -760,16 +821,11 @@ fn cell_f64(row: &[DataValue], i: usize) -> f64 {
     row.get(i).map(dv_f64).unwrap_or(0.0)
 }
 
-/// FNV-1a 64-bit hash of a chunk's text, hex — used to detect when a chunk's
-/// content changed so its stored embedding is re-computed. Matches the
-/// builder's `content_hash` algorithm (kept local to avoid a cross-module dep).
+/// FNV-1a hash of a chunk's text — used to detect when a chunk's content
+/// changed so its stored embedding is re-computed. Delegates to the shared
+/// [`fnv1a_hex`] so it can never drift from the builder's file-content hash.
 fn text_hash(s: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
+    super::model::fnv1a_hex(s)
 }
 
 /// Map query rows shaped `[id, name, kind, file, start_line, signature]` to
@@ -920,6 +976,87 @@ pub struct Point { x: i32 }
             .expect("search");
         assert!(!hits.is_empty());
         assert_eq!(hits[0].0.anchor, "cats");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_file_drops_ghost_inbound_call_edges() {
+        let dir = std::env::temp_dir().join(format!("ckg-ghost-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // a.rs defines `baz`; b.rs's `bar` calls it.
+        idx.index_file_graph(&parse_file("src/a.rs", "pub fn baz() {}\n", Lang::Rust))
+            .expect("index a");
+        idx.index_file_graph(&parse_file("src/b.rs", "pub fn bar() { baz() }\n", Lang::Rust))
+            .expect("index b");
+        assert!(idx.callers("baz").unwrap().iter().any(|s| s.name == "bar"));
+
+        // Delete a.rs: with `baz` gone, the inbound call edge from `bar` must
+        // not survive to report a ghost caller of a non-existent symbol.
+        idx.remove_file("src/a.rs").expect("remove");
+        assert!(idx.find_symbol("baz").unwrap().is_empty());
+        assert!(
+            idx.callers("baz").unwrap().is_empty(),
+            "no ghost callers of a deleted symbol"
+        );
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_orphan_vectors_drops_deleted_chunks() {
+        let dir = std::env::temp_dir().join(format!("ckg-prune-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file(
+            "docs/a.md",
+            "# Cats\n\nFelines.\n\n# Dogs\n\nCanines.\n",
+            Lang::Markdown,
+        ))
+        .expect("index md");
+
+        let epoch = "e";
+        idx.ensure_vector_store(3, "m", epoch).expect("ensure");
+        let need = idx.chunks_needing_vectors(epoch, 100).expect("need");
+        assert_eq!(need.len(), 2);
+        let vecs: Vec<(String, String, Vec<f32>)> = need
+            .iter()
+            .map(|(id, h, _)| (id.clone(), h.clone(), vec![1.0, 0.0, 0.0]))
+            .collect();
+        idx.put_doc_vectors(epoch, &vecs).expect("put");
+        assert_eq!(idx.embedding_coverage(epoch).unwrap(), (2, 2));
+
+        // Delete the file's chunks: doc_chunk rows go, doc_vec rows orphan.
+        // Coverage would now read "embedded > total" (the false-100% bug).
+        idx.remove_file("docs/a.md").expect("remove");
+        assert_eq!(idx.embedding_coverage(epoch).unwrap(), (2, 0));
+
+        // Pruning drops exactly the orphans and restores accurate coverage.
+        assert_eq!(idx.prune_orphan_vectors().unwrap(), 2);
+        assert_eq!(idx.embedding_coverage(epoch).unwrap(), (0, 0));
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_keeps_still_valid_vectors() {
+        // Pruning must NOT force a re-embed of chunks that still exist.
+        let dir = std::env::temp_dir().join(format!("ckg-keep-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("docs/a.md", "# Cats\n\nFelines.\n", Lang::Markdown))
+            .expect("index md");
+        let epoch = "e";
+        idx.ensure_vector_store(3, "m", epoch).expect("ensure");
+        let need = idx.chunks_needing_vectors(epoch, 100).expect("need");
+        let vecs: Vec<(String, String, Vec<f32>)> = need
+            .iter()
+            .map(|(id, h, _)| (id.clone(), h.clone(), vec![1.0, 0.0, 0.0]))
+            .collect();
+        idx.put_doc_vectors(epoch, &vecs).expect("put");
+        assert_eq!(idx.prune_orphan_vectors().unwrap(), 0, "nothing orphaned");
+        assert!(idx.chunks_needing_vectors(epoch, 100).unwrap().is_empty());
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

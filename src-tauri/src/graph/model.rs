@@ -210,9 +210,35 @@ pub fn symbol_id(file: &str, name: &str, start_line: u32) -> String {
     format!("{file}#{name}@{start_line}")
 }
 
-/// A stable doc-chunk id from its source path and anchor.
+/// A stable doc-chunk id from its source path and anchor. The anchor must be
+/// unique within the file (markdown slugs are de-duplicated by the builder);
+/// for a symbol's doc-comment use [`symbol_doc_chunk_id`], which folds in the
+/// start line so two same-named definitions in one file don't collide.
 pub fn doc_chunk_id(source_path: &str, anchor: &str) -> String {
     format!("{source_path}#doc:{anchor}")
+}
+
+/// A doc-chunk id for a symbol's doc-comment, disambiguated by start line.
+/// Without the line, two same-named definitions in one file (e.g. `fn new()`
+/// in two `impl` blocks) would map to the same id and the second's
+/// `:put doc_chunk` would silently overwrite the first — losing the first's
+/// doc and mis-pointing its `Documents` edge. The display anchor stays the
+/// bare name; only the storage key is disambiguated.
+pub fn symbol_doc_chunk_id(source_path: &str, name: &str, start_line: u32) -> String {
+    format!("{source_path}#doc:{name}@{start_line}")
+}
+
+/// Deterministic FNV-1a 64-bit hash of `s`, lowercase hex. Stable across runs
+/// (unlike `DefaultHasher`), so a content hash survives a restart. Shared by
+/// the builder's per-file content hash and the index's per-chunk text hash so
+/// the two can never disagree on what "changed".
+pub fn fnv1a_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 #[cfg(test)]

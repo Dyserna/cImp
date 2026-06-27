@@ -123,6 +123,19 @@ pub struct GraphService {
     /// When set, the watcher drops incremental re-index batches (the OS watch
     /// keeps running; events are simply ignored). Drives `graph_set_watch_paused`.
     paused: AtomicBool,
+    /// Single-flight guard for the embedding backfill, per root. Without it,
+    /// overlapping rebuilds/watcher batches each spawn a backfill task that
+    /// races on the same pending set and duplicates embedding-endpoint calls.
+    /// `again` records that a request arrived while a backfill was running, so
+    /// the in-flight task does one more pass and no late chunk is missed.
+    backfill: StdMutex<HashMap<PathBuf, BackfillFlag>>,
+}
+
+/// Per-root backfill liveness for the single-flight guard in [`spawn_backfill`].
+#[derive(Default)]
+struct BackfillFlag {
+    running: bool,
+    again: bool,
 }
 
 impl GraphService {
@@ -135,6 +148,7 @@ impl GraphService {
             watchers: StdMutex::new(HashMap::new()),
             write_lock: StdMutex::new(()),
             paused: AtomicBool::new(false),
+            backfill: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -155,20 +169,28 @@ impl GraphService {
             return;
         }
         if let Ok(idx) = self.index_for(&root) {
-            let _w = self.write_lock.lock().unwrap();
-            let _ = idx.clear_vectors();
+            let cleared = {
+                let _w = self.write_lock.lock().unwrap();
+                idx.clear_vectors()
+            };
+            // Don't silently no-op: if the clear failed (e.g. the store was
+            // briefly locked), the old vectors survive under the same epoch and
+            // `chunks_needing_vectors` would find nothing to do — leaving stale
+            // embeddings serving forever while the UI reads "100%". Surface it.
+            if let Err(e) = cleared {
+                self.patch_embed_status(&root, |s| {
+                    s.embed_state = "error".into();
+                    s.embed_error = Some(format!("failed to clear vectors: {e}"));
+                });
+                return;
+            }
         }
         self.spawn_backfill(root);
     }
 
     /// The configured per-project db subdirectory (default `.ccimp`).
     fn db_subdir(&self) -> String {
-        let s = self.settings.current().graph.db_subdir;
-        if s.trim().is_empty() {
-            ".ccimp".to_string()
-        } else {
-            s
-        }
+        self.settings.current().graph.effective_db_subdir()
     }
 
     /// Get (opening + caching if needed) the warm index for `root`.
@@ -335,7 +357,7 @@ impl GraphService {
         };
         let sub = self.db_subdir();
         let max_bytes = snap.max_file_bytes.max(1);
-        let gi = build_gitignore(root);
+        let gi = build_gitignore(root, &paths);
 
         let _w = self.write_lock.lock().unwrap();
         let mut changed = 0u64;
@@ -380,6 +402,10 @@ impl GraphService {
                 Err(e) => debug!(file = %rel, error = %e, "graph: incremental index failed"),
             }
         }
+        if changed > 0 {
+            // Drop vectors for chunks this batch deleted or re-anchored.
+            let _ = idx.prune_orphan_vectors();
+        }
         drop(_w);
 
         if changed > 0 {
@@ -405,9 +431,31 @@ impl GraphService {
         if !self.settings.current().graph.semantic_search {
             return;
         }
+        // Single-flight: if a backfill for this root is already running, just
+        // mark that another pass is wanted and let the in-flight task pick up
+        // the new chunks — don't spawn a racing duplicate.
+        {
+            let mut g = self.backfill.lock().unwrap();
+            let st = g.entry(root.clone()).or_default();
+            if st.running {
+                st.again = true;
+                return;
+            }
+            st.running = true;
+        }
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
-            this.embed_backfill(&root).await;
+            loop {
+                this.embed_backfill(&root).await;
+                let mut g = this.backfill.lock().unwrap();
+                let st = g.entry(root.clone()).or_default();
+                if st.again {
+                    st.again = false; // another request arrived mid-pass — loop once more
+                } else {
+                    st.running = false;
+                    break;
+                }
+            }
         });
     }
 
@@ -534,6 +582,13 @@ impl GraphService {
             }
         }
 
+        // A rebuild can delete doc chunks while an embed request is in flight
+        // (the write lock is released across the await). Drop any vectors that
+        // no longer have a chunk so coverage stays accurate.
+        {
+            let _w = self.write_lock.lock().unwrap();
+            let _ = idx.prune_orphan_vectors();
+        }
         self.refresh_embed_coverage(root, &idx, &epoch, true);
         self.patch_embed_status(root, |s| {
             s.embed_state = "idle".into();
@@ -667,6 +722,11 @@ fn build_tree(
         indexed += 1;
     }
 
+    // `reset()` deliberately keeps the vector store (so unchanged chunks aren't
+    // needlessly re-embedded), so vectors for files that vanished since the
+    // last build are now orphans — drop them before reporting stats.
+    let _ = idx.prune_orphan_vectors();
+
     Ok((indexed, idx.stats()?))
 }
 
@@ -700,14 +760,36 @@ fn lang_for(path: &Path, languages: &[String]) -> Option<Lang> {
     }
 }
 
-/// Build a gitignore matcher rooted at `root` from its top-level `.gitignore`,
-/// for per-path filtering in the watcher (the full walk gets this for free via
-/// `WalkBuilder`). Nested `.gitignore`s aren't merged here — the common case is
-/// a root-level ignore listing `target/`, `node_modules/`, etc.; an empty
-/// matcher (missing/invalid file) simply ignores nothing.
-fn build_gitignore(root: &Path) -> Gitignore {
+/// Build a gitignore matcher for per-path filtering in the watcher (the full
+/// walk gets this for free via `WalkBuilder`). Merges every `.gitignore` from
+/// `root` down to each changed path's directory so the watcher agrees with the
+/// full walk on nested ignores — a subdirectory `.gitignore` (e.g.
+/// `src/gen/.gitignore`) is honored, not just the root one. Only the dirs
+/// touched by this batch are scanned, so it stays cheap. An empty matcher
+/// (missing/invalid files) simply ignores nothing.
+fn build_gitignore(root: &Path, paths: &[PathBuf]) -> Gitignore {
     let mut b = ignore::gitignore::GitignoreBuilder::new(root);
-    let _ = b.add(root.join(".gitignore"));
+    let mut dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    dirs.insert(root.to_path_buf());
+    for p in paths {
+        for anc in p.ancestors() {
+            if !anc.starts_with(root) {
+                break;
+            }
+            if anc.is_dir() {
+                dirs.insert(anc.to_path_buf());
+            }
+            if anc == root {
+                break;
+            }
+        }
+    }
+    for dir in dirs {
+        let gi = dir.join(".gitignore");
+        if gi.is_file() {
+            let _ = b.add(gi);
+        }
+    }
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 

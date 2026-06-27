@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecursiveMode, Watcher};
 use tracing::debug;
@@ -37,6 +37,11 @@ pub fn start(
     })?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
+    // A continuous stream of events (a build writing artifacts, a formatter, a
+    // git checkout) would otherwise reset the debounce timer forever and starve
+    // the re-index. Cap any one batch's age so a never-quiet tree still flushes.
+    let max_batch = debounce.saturating_mul(40).max(Duration::from_secs(2));
+
     std::thread::Builder::new()
         .name("ccimp-graph-watch".into())
         .spawn(move || {
@@ -47,14 +52,22 @@ pub fn start(
                     Ok(ev) => ev,
                     Err(_) => break,
                 };
+                let batch_start = Instant::now();
                 let mut paths: HashSet<PathBuf> = HashSet::new();
                 collect(first, &mut paths);
 
                 // Drain follow-up events until the tree has been quiet for
-                // `debounce`, coalescing a burst of saves into one re-index.
+                // `debounce`, coalescing a burst of saves into one re-index —
+                // but force a flush once the batch has run for `max_batch` so a
+                // never-quiet stream can't pin re-indexing indefinitely.
                 loop {
                     match rx.recv_timeout(debounce) {
-                        Ok(ev) => collect(ev, &mut paths),
+                        Ok(ev) => {
+                            collect(ev, &mut paths);
+                            if batch_start.elapsed() >= max_batch {
+                                break;
+                            }
+                        }
                         Err(RecvTimeoutError::Timeout) => break,
                         Err(RecvTimeoutError::Disconnected) => return,
                     }

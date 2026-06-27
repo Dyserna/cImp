@@ -175,21 +175,24 @@
 
     <div class="history">
       <div class="history-head">History <span class="muted">(newest first)</span></div>
-      {#if metrics.history.length === 0}
-        <div class="history-empty">No requests yet.</div>
-      {:else}
-        <div class="history-rows">
-          {#each metrics.history as r (r.start_ms + '-' + r.slot)}
-            <div class="hrow">
-              <span class="htime">{fmtTime(r.start_ms)} → {fmtTime(r.end_ms)}</span>
-              <span class="hdur">{r.duration_s.toFixed(1)}s</span>
-              <span class="hslot">slot {r.slot}</span>
-              <span class="htok">{r.tokens.toLocaleString()} tok</span>
-              <span class="htps">{Math.round(r.avg_tps)} tok/s</span>
-            </div>
-          {/each}
-        </div>
-      {/if}
+      <!-- Body reserves exactly five rows from the start; older entries scroll. -->
+      <div class="history-body">
+        {#if metrics.history.length === 0}
+          <div class="history-empty">No requests yet.</div>
+        {:else}
+          <div class="history-rows">
+            {#each metrics.history as r (r.start_ms + '-' + r.slot)}
+              <div class="hrow">
+                <span class="htime">{fmtTime(r.start_ms)} → {fmtTime(r.end_ms)}</span>
+                <span class="hdur">{r.duration_s.toFixed(1)}s</span>
+                <span class="hslot">slot {r.slot}</span>
+                <span class="htok">{r.tokens.toLocaleString()} tok</span>
+                <span class="htps">{Math.round(r.avg_tps)} tok/s</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
     </div>
   {:else}
     <div class="status">{stateText()}</div>
@@ -329,9 +332,19 @@
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
+  .history {
+    /* One history row's box height; five of these are reserved below. */
+    --hrow-h: 1.5rem;
+  }
   .history-head {
     font-weight: 600;
     margin-bottom: 0.3rem;
+  }
+  .history-body {
+    /* Reserve five rows up front (no layout jump as requests arrive) and
+       scroll once history grows past five entries. */
+    height: calc(5 * var(--hrow-h));
+    overflow-y: auto;
   }
   .history-empty {
     color: var(--text-secondary, #8b949e);
@@ -344,11 +357,15 @@
   .hrow {
     display: grid;
     grid-template-columns: minmax(11rem, 1.5fr) 4rem 4rem 1fr 6rem;
+    align-items: center;
     gap: 0.5rem;
+    height: var(--hrow-h);
+    box-sizing: border-box;
     padding: 0.2rem 0.3rem;
     border-bottom: 1px solid var(--border-subtle, #21262d);
     font-variant-numeric: tabular-nums;
     font-size: 0.92em;
+    white-space: nowrap;
   }
   .hrow .htok,
   .hrow .htps {

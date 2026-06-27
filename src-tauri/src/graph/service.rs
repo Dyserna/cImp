@@ -138,6 +138,27 @@ struct BackfillFlag {
     again: bool,
 }
 
+/// RAII reset for the [`GraphService::spawn_backfill`] single-flight guard.
+/// Clearing `running` on `Drop` (rather than only at the end of the backfill
+/// loop) means that if the async runtime drops the backfill future before it
+/// finishes — e.g. during app shutdown — the root isn't left pinned with
+/// `running = true`, which would silently disable embedding for the rest of the
+/// service's lifetime.
+struct BackfillGuard {
+    svc: Arc<GraphService>,
+    root: PathBuf,
+}
+
+impl Drop for BackfillGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.svc.backfill.lock() {
+            if let Some(st) = g.get_mut(&self.root) {
+                st.running = false;
+            }
+        }
+    }
+}
+
 impl GraphService {
     pub fn new(app: AppHandle, settings: SettingsHandle) -> Arc<Self> {
         Arc::new(Self {
@@ -178,7 +199,7 @@ impl GraphService {
             // `chunks_needing_vectors` would find nothing to do — leaving stale
             // embeddings serving forever while the UI reads "100%". Surface it.
             if let Err(e) = cleared {
-                self.patch_embed_status(&root, |s| {
+                self.patch_status(&root, |s| {
                     s.embed_state = "error".into();
                     s.embed_error = Some(format!("failed to clear vectors: {e}"));
                 });
@@ -194,40 +215,27 @@ impl GraphService {
     }
 
     /// Get (opening + caching if needed) the warm index for `root`.
+    ///
+    /// The `indices` lock is held across the whole check-open-insert so two
+    /// concurrent first-callers for the same root can't both `open` and race to
+    /// insert (the loser would otherwise keep a live handle backed by a
+    /// connection no longer in the cache — split writes). Opens are infrequent
+    /// and this lock guards nothing on the hot query path, so holding it across
+    /// the open is cheap.
     fn index_for(&self, root: &Path) -> AppResult<Arc<GraphIndex>> {
         let root = root.to_path_buf();
-        if let Some(idx) = self.indices.lock().unwrap().get(&root).cloned() {
+        let mut guard = self.indices.lock().unwrap();
+        if let Some(idx) = guard.get(&root).cloned() {
             return Ok(idx);
         }
         let idx = Arc::new(GraphIndex::open(&root, &self.db_subdir())?);
-        self.indices
-            .lock()
-            .unwrap()
-            .insert(root, idx.clone());
+        guard.insert(root, idx.clone());
         Ok(idx)
-    }
-
-    /// Status snapshot for `root` (idle if never built/known).
-    pub fn status(&self, root: &Path) -> GraphStatus {
-        self.status
-            .lock()
-            .unwrap()
-            .get(root)
-            .cloned()
-            .unwrap_or_else(|| GraphStatus::idle(root))
     }
 
     /// Every known root's status (the IPC list surface).
     pub fn statuses(&self) -> Vec<GraphStatus> {
         self.status.lock().unwrap().values().cloned().collect()
-    }
-
-    fn set_status(&self, root: &Path, status: GraphStatus) {
-        self.status
-            .lock()
-            .unwrap()
-            .insert(root.to_path_buf(), status.clone());
-        let _ = self.app.emit(GRAPH_STATUS_EVENT, &status);
     }
 
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns
@@ -255,9 +263,11 @@ impl GraphService {
         }
 
         let this = self.clone();
-        std::thread::Builder::new()
+        let thread_root = root.clone();
+        let spawned = std::thread::Builder::new()
             .name("ccimp-graph-index".into())
             .spawn(move || {
+                let root = thread_root;
                 let started = std::time::Instant::now();
                 match this.rebuild_blocking(&root) {
                     Ok(stats) => {
@@ -269,29 +279,40 @@ impl GraphService {
                             ms = started.elapsed().as_millis() as u64,
                             "graph: rebuild complete"
                         );
-                        let mut s = this.status(&root);
-                        s.state = "ready".into();
-                        s.building = false;
-                        s.files = stats.files;
-                        s.symbols = stats.symbols;
-                        s.edges = stats.edges;
-                        s.last_error = None;
-                        this.set_status(&root, s);
+                        this.patch_status(&root, |s| {
+                            s.state = "ready".into();
+                            s.building = false;
+                            s.files = stats.files;
+                            s.symbols = stats.symbols;
+                            s.edges = stats.edges;
+                            s.last_error = None;
+                        });
                         // Phase G: embed any new/changed doc chunks (no-op when
                         // semantic search is off).
                         this.spawn_backfill(root.clone());
                     }
                     Err(e) => {
                         warn!(root = %root.display(), error = %e, "graph: rebuild failed");
-                        let mut s = this.status(&root);
-                        s.state = "error".into();
-                        s.building = false;
-                        s.last_error = Some(e.to_string());
-                        this.set_status(&root, s);
+                        this.patch_status(&root, |s| {
+                            s.state = "error".into();
+                            s.building = false;
+                            s.last_error = Some(e.to_string());
+                        });
                     }
                 }
-            })
-            .expect("spawn graph index thread");
+            });
+
+        // If the OS refuses the thread, don't leave the root pinned at
+        // `building=true` forever (the in-flight guard above would then skip
+        // every future rebuild). Roll the status back to `error`.
+        if let Err(e) = spawned {
+            warn!(root = %root.display(), error = %e, "graph: failed to spawn index thread");
+            self.patch_status(&root, |s| {
+                s.state = "error".into();
+                s.building = false;
+                s.last_error = Some(format!("failed to spawn index thread: {e}"));
+            });
+        }
     }
 
     /// Synchronous full rebuild: reset the store, walk the tree, parse every
@@ -308,11 +329,7 @@ impl GraphService {
         let (indexed, stats) = build_tree(&idx, root, &snap, &self.db_subdir())?;
 
         // Record the visited-file count alongside the authoritative row counts.
-        {
-            let mut s = self.status(root);
-            s.files_indexed = indexed;
-            self.status.lock().unwrap().insert(root.to_path_buf(), s);
-        }
+        self.patch_status(root, |s| s.files_indexed = indexed);
         Ok(stats)
     }
 
@@ -410,12 +427,17 @@ impl GraphService {
 
         if changed > 0 {
             if let Ok(stats) = idx.stats() {
-                let mut s = self.status(root);
-                s.state = "ready".into();
-                s.files = stats.files;
-                s.symbols = stats.symbols;
-                s.edges = stats.edges;
-                self.set_status(root, s);
+                self.patch_status(root, |s| {
+                    // A full rebuild may be in flight concurrently; don't stomp
+                    // its `building` state to `ready` — just refresh the counts
+                    // and let the rebuild own the final transition.
+                    if !s.building {
+                        s.state = "ready".into();
+                    }
+                    s.files = stats.files;
+                    s.symbols = stats.symbols;
+                    s.edges = stats.edges;
+                });
             }
             debug!(root = %root.display(), changed, "graph: incremental re-index applied");
             // Phase G: embed the new/changed doc chunks (no-op when off).
@@ -445,36 +467,65 @@ impl GraphService {
         }
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
+            // `running` is cleared by the guard's Drop, so it resets even if
+            // this future is dropped mid-pass (shutdown) instead of breaking
+            // cleanly.
+            let _guard = BackfillGuard {
+                svc: this.clone(),
+                root: root.clone(),
+            };
             loop {
                 this.embed_backfill(&root).await;
-                let mut g = this.backfill.lock().unwrap();
-                let st = g.entry(root.clone()).or_default();
-                if st.again {
-                    st.again = false; // another request arrived mid-pass — loop once more
-                } else {
-                    st.running = false;
-                    break;
+                let again = {
+                    let mut g = this.backfill.lock().unwrap();
+                    let st = g.entry(root.clone()).or_default();
+                    let again = st.again;
+                    st.again = false; // consume the request; loop once more if set
+                    again
+                };
+                if !again {
+                    break; // `_guard` clears `running` on drop
                 }
             }
         });
+    }
+
+    /// Run a store mutation under `write_lock` on a blocking thread, returning
+    /// its result. An `async` caller must use this instead of locking
+    /// `write_lock` directly: a full rebuild can hold the lock for many seconds,
+    /// and blocking a Tokio worker on it would starve every other async IPC
+    /// handler. `spawn_blocking` moves both the wait and the DB write off the
+    /// async worker.
+    async fn locked_write<T, F>(self: &Arc<Self>, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let this = self.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let _w = this.write_lock.lock().unwrap();
+            f()
+        })
+        .await
+        .expect("graph write-lock task panicked")
     }
 
     /// Embed any doc chunks missing a current-epoch vector and store them.
     /// Drives the embedding status fields. Degrades cleanly: an unconfigured or
     /// unreachable embedder leaves chunks queryable via full-text (the
     /// structural graph never depends on this).
-    async fn embed_backfill(&self, root: &Path) {
+    async fn embed_backfill(self: &Arc<Self>, root: &Path) {
         let snap = self.settings.current().graph;
         if !snap.semantic_search {
             return;
         }
         let configured = !snap.embedding_endpoint.trim().is_empty();
-        self.patch_embed_status(root, |s| {
+        self.patch_status(root, |s| {
             s.semantic_enabled = true;
             s.embedder_configured = configured;
         });
         let Some(embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model) else {
-            self.patch_embed_status(root, |s| {
+            self.patch_status(root, |s| {
                 s.embed_state = "degraded".into();
                 s.embedder_ready = false;
                 s.embed_error = Some("no embedding endpoint configured".into());
@@ -489,7 +540,7 @@ impl GraphService {
             match embedder.probe_dim().await {
                 Ok(d) => d,
                 Err(e) => {
-                    self.patch_embed_status(root, |s| {
+                    self.patch_status(root, |s| {
                         s.embed_state = "degraded".into();
                         s.embedder_ready = false;
                         s.embed_error = Some(e);
@@ -502,7 +553,7 @@ impl GraphService {
         let idx = match self.index_for(root) {
             Ok(i) => i,
             Err(e) => {
-                self.patch_embed_status(root, |s| {
+                self.patch_status(root, |s| {
                     s.embed_state = "error".into();
                     s.embed_error = Some(e.to_string());
                 });
@@ -511,9 +562,14 @@ impl GraphService {
         };
         let epoch = embedding_epoch(&snap.embedding_model, dim);
         {
-            let _w = self.write_lock.lock().unwrap();
-            if let Err(e) = idx.ensure_vector_store(dim, &snap.embedding_model, &epoch) {
-                self.patch_embed_status(root, |s| {
+            let idx = idx.clone();
+            let model = snap.embedding_model.clone();
+            let epoch = epoch.clone();
+            if let Err(e) = self
+                .locked_write(move || idx.ensure_vector_store(dim, &model, &epoch))
+                .await
+            {
+                self.patch_status(root, |s| {
                     s.embed_state = "error".into();
                     s.embed_error = Some(e.to_string());
                 });
@@ -521,7 +577,7 @@ impl GraphService {
             }
         }
 
-        self.patch_embed_status(root, |s| {
+        self.patch_status(root, |s| {
             s.embed_state = "embedding".into();
             s.embed_error = None;
         });
@@ -531,7 +587,7 @@ impl GraphService {
             let pending = match idx.chunks_needing_vectors(&epoch, batch) {
                 Ok(p) => p,
                 Err(e) => {
-                    self.patch_embed_status(root, |s| {
+                    self.patch_status(root, |s| {
                         s.embed_state = "error".into();
                         s.embed_error = Some(e.to_string());
                     });
@@ -550,11 +606,13 @@ impl GraphService {
                         .map(|((id, hash, _), v)| (id, hash, v))
                         .collect();
                     let put = {
-                        let _w = self.write_lock.lock().unwrap();
-                        idx.put_doc_vectors(&epoch, &rows)
+                        let idx = idx.clone();
+                        let epoch = epoch.clone();
+                        self.locked_write(move || idx.put_doc_vectors(&epoch, &rows))
+                            .await
                     };
                     if let Err(e) = put {
-                        self.patch_embed_status(root, |s| {
+                        self.patch_status(root, |s| {
                             s.embed_state = "error".into();
                             s.embed_error = Some(e.to_string());
                         });
@@ -563,7 +621,7 @@ impl GraphService {
                     self.refresh_embed_coverage(root, &idx, &epoch, true);
                 }
                 Ok(_) => {
-                    self.patch_embed_status(root, |s| {
+                    self.patch_status(root, |s| {
                         s.embed_state = "degraded".into();
                         s.embedder_ready = false;
                         s.embed_error = Some("embedding count mismatch".into());
@@ -572,7 +630,7 @@ impl GraphService {
                 }
                 Err(e) => {
                     // Endpoint went away mid-backfill — degrade, keep what we have.
-                    self.patch_embed_status(root, |s| {
+                    self.patch_status(root, |s| {
                         s.embed_state = "degraded".into();
                         s.embedder_ready = false;
                         s.embed_error = Some(e);
@@ -586,11 +644,14 @@ impl GraphService {
         // (the write lock is released across the await). Drop any vectors that
         // no longer have a chunk so coverage stays accurate.
         {
-            let _w = self.write_lock.lock().unwrap();
-            let _ = idx.prune_orphan_vectors();
+            let idx = idx.clone();
+            self.locked_write(move || {
+                let _ = idx.prune_orphan_vectors();
+            })
+            .await;
         }
         self.refresh_embed_coverage(root, &idx, &epoch, true);
-        self.patch_embed_status(root, |s| {
+        self.patch_status(root, |s| {
             s.embed_state = "idle".into();
             s.embedder_ready = true;
             s.embed_error = None;
@@ -600,7 +661,7 @@ impl GraphService {
     /// Recompute `(embedded, total, pending)` for the status from the store.
     fn refresh_embed_coverage(&self, root: &Path, idx: &GraphIndex, epoch: &str, ready: bool) {
         let (embedded, total) = idx.embedding_coverage(epoch).unwrap_or((0, 0));
-        self.patch_embed_status(root, |s| {
+        self.patch_status(root, |s| {
             s.embedded = embedded;
             s.embed_total = total;
             s.embed_pending = total.saturating_sub(embedded);
@@ -609,7 +670,7 @@ impl GraphService {
     }
 
     /// Apply a mutation to a root's status and emit the change event.
-    fn patch_embed_status(&self, root: &Path, f: impl FnOnce(&mut GraphStatus)) {
+    fn patch_status(&self, root: &Path, f: impl FnOnce(&mut GraphStatus)) {
         let status = {
             let mut guard = self.status.lock().unwrap();
             let s = guard

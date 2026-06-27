@@ -192,48 +192,74 @@ pub fn run_tool(
     let arg = |key: &str| -> String {
         args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
     };
+    // A required string arg. Rejects missing / blank / wrong-typed values rather
+    // than silently coercing them to "" — a `find_symbol("")` (from a `null` or
+    // numeric arg the LLM sent) would otherwise match everything or nothing and
+    // mislead the model instead of surfacing a clear error.
+    let req = |key: &str| -> Result<String, String> {
+        match args.get(key) {
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
+            Some(Value::String(_)) | None => {
+                Err(format!("{name} requires a non-empty string `{key}`"))
+            }
+            Some(_) => Err(format!("{name} argument `{key}` must be a string")),
+        }
+    };
     match name {
         "graph_find_symbol" => idx
-            .find_symbol(&arg("name"))
+            .find_symbol(&req("name")?)
             .map(|v| fmt_symbols(&v, max_rows))
             .map_err(|e| e.to_string()),
         "graph_callers" => idx
-            .callers(&arg("name"))
+            .callers(&req("name")?)
             .map(|v| fmt_symbols(&v, max_rows))
             .map_err(|e| e.to_string()),
         "graph_callees" => idx
-            .callees(&arg("name"))
+            .callees(&req("name")?)
             .map(|v| fmt_symbols(&v, max_rows))
             .map_err(|e| e.to_string()),
         "graph_references" => idx
-            .references(&arg("name"))
+            .references(&req("name")?)
             .map(|v| fmt_refs(&v, max_rows))
             .map_err(|e| e.to_string()),
         "graph_imports" => idx
-            .imports(&arg("file"))
+            .imports(&req("file")?)
             .map(|v| fmt_list(&v, max_rows))
             .map_err(|e| e.to_string()),
         "graph_outline" => idx
-            .outline(&arg("file"))
+            .outline(&req("file")?)
             .map(|v| fmt_symbols(&v, max_rows))
             .map_err(|e| e.to_string()),
         "graph_transitive" => {
-            let forward = !arg("direction").eq_ignore_ascii_case("callers");
-            idx.transitive(&arg("name"), forward)
+            let target = req("name")?;
+            let dir = arg("direction");
+            // Omitted defaults to callees/forward; reject any other value so a
+            // typo (e.g. "downstream") can't silently run the opposite traversal
+            // from what the caller asked for.
+            let forward = if dir.is_empty() || dir.eq_ignore_ascii_case("callees") {
+                true
+            } else if dir.eq_ignore_ascii_case("callers") {
+                false
+            } else {
+                return Err(format!(
+                    "graph_transitive `direction` must be \"callers\" or \"callees\" (got `{dir}`)"
+                ));
+            };
+            idx.transitive(&target, forward)
                 .map(|v| fmt_list(&v, max_rows))
                 .map_err(|e| e.to_string())
         }
         "graph_search_docs" => idx
-            .search_docs(&arg("query"), max_rows, max_snippet)
-            .map(|v| fmt_docs(&v))
+            .search_docs(&req("query")?, max_rows, max_snippet)
+            .map(|v| fmt_docs(&v, max_rows))
             .map_err(|e| e.to_string()),
         // Sync path / no-embedder fallback for semantic search: degrade to
         // labelled full-text. The embedder-backed ranking is applied in the
         // async wrappers ([`handle_call`] / [`offload_query`]).
         "graph_semantic_docs" => idx
-            .search_docs(&arg("query"), max_rows, max_snippet)
+            .search_docs(&req("query")?, max_rows, max_snippet)
             .map(|v| {
-                let body = fmt_docs(&v);
+                let body = fmt_docs(&v, max_rows);
                 format!("(full-text fallback — semantic embedder unavailable)\n{body}")
             })
             .map_err(|e| e.to_string()),
@@ -270,7 +296,7 @@ async fn semantic_query(
     let g = &settings.graph;
     let fallback = |idx: &GraphIndex| {
         idx.search_docs(query, max_rows, max_snippet)
-            .map(|v| format!("(full-text fallback)\n{}", fmt_docs(&v)))
+            .map(|v| format!("(full-text fallback)\n{}", fmt_docs(&v, max_rows)))
             .map_err(|e| e.to_string())
     };
 
@@ -293,11 +319,15 @@ async fn semantic_query(
         Ok(hits) if !hits.is_empty() => {
             // `dist` is a cosine DISTANCE (lower = more similar); label it as
             // such so the model doesn't read it as a higher-is-better score.
-            let body = hits
+            let mut lines: Vec<String> = hits
                 .iter()
+                .take(max_rows)
                 .map(|(d, dist)| format!("{} [{}] (distance {:.3}): {}", d.source_path, d.anchor, dist, d.snippet))
-                .collect::<Vec<_>>()
-                .join("\n");
+                .collect();
+            if hits.len() > max_rows {
+                lines.push(format!("… (+{} more)", hits.len() - max_rows));
+            }
+            let body = lines.join("\n");
             Ok(format!("(semantic — nearest first; lower distance = more similar)\n{body}"))
         }
         // No vectors matched yet (mid-backfill) or a query error → full-text.
@@ -373,14 +403,19 @@ fn fmt_refs(refs: &[RefHit], max_rows: usize) -> String {
     lines.join("\n")
 }
 
-fn fmt_docs(docs: &[DocHit]) -> String {
+fn fmt_docs(docs: &[DocHit], max_rows: usize) -> String {
     if docs.is_empty() {
         return "No documentation matches.".to_string();
     }
-    docs.iter()
+    let mut lines: Vec<String> = docs
+        .iter()
+        .take(max_rows)
         .map(|d| format!("{} [{}]: {}", d.source_path, d.anchor, d.snippet))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    if docs.len() > max_rows {
+        lines.push(format!("… (+{} more)", docs.len() - max_rows));
+    }
+    lines.join("\n")
 }
 
 fn fmt_list(items: &[String], max_rows: usize) -> String {
@@ -464,11 +499,15 @@ fn run_struct_search(
     if hits.is_empty() {
         return Ok("No structural matches.".to_string());
     }
-    Ok(hits
+    let mut lines: Vec<String> = hits
         .iter()
+        .take(max_rows)
         .map(|h| format!("{}:{}  {}", h.file, h.line, h.snippet))
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .collect();
+    if hits.len() > max_rows {
+        lines.push(format!("… (+{} more)", hits.len() - max_rows));
+    }
+    Ok(lines.join("\n"))
 }
 
 /// Like [`open_project_index`] but **confined**: the resolved project root must

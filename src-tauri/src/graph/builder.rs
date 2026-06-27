@@ -51,7 +51,10 @@ fn parse_markdown(src: &str, file: &str, fg: &mut FileGraph) {
     let mut anchor = file_stem(file);
     let mut title = String::new();
     let mut body: Vec<String> = Vec::new();
-    let mut in_fence = false;
+    // Which fence marker (if any) is currently open. A fence opened by ``` is
+    // only closed by ```; a `~~~` line inside it is literal content, and vice
+    // versa — tracking just a bool would let the other marker close it early.
+    let mut fence: Option<&str> = None;
 
     let flush = |anchor: &str, title: &str, body: &[String], fg: &mut FileGraph,
                  seen: &mut std::collections::HashMap<String, u32>| {
@@ -72,12 +75,23 @@ fn parse_markdown(src: &str, file: &str, fg: &mut FileGraph) {
     for line in src.lines() {
         let trimmed = line.trim_start();
         // Track fenced code blocks so a `#` inside a fence isn't a heading.
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        let marker = if trimmed.starts_with("```") {
+            Some("```")
+        } else if trimmed.starts_with("~~~") {
+            Some("~~~")
+        } else {
+            None
+        };
+        if let Some(m) = marker {
+            match fence {
+                None => fence = Some(m),                 // open a fence
+                Some(open) if open == m => fence = None, // matching close
+                Some(_) => {}                            // other marker inside fence: literal
+            }
             body.push(line.to_string());
             continue;
         }
-        if !in_fence {
+        if fence.is_none() {
             if let Some(h) = heading_title(trimmed) {
                 // Close the previous section, open the new one.
                 flush(&anchor, &title, &body, fg, &mut seen);
@@ -143,15 +157,22 @@ fn slug(title: &str) -> String {
 }
 
 /// Disambiguate repeated anchors within one file (`foo`, `foo-1`, `foo-2`).
+///
+/// `seen` doubles as the set of anchors already emitted: a generated suffix
+/// (`foo-1`) must not collide with a heading literally named `foo-1`, so we keep
+/// bumping the suffix until the candidate is one nobody has used. Presence in
+/// `seen` means "don't reuse this exact anchor"; the stored value is just a
+/// starting suffix hint for the base slug.
 fn dedup_anchor(anchor: &str, seen: &mut std::collections::HashMap<String, u32>) -> String {
-    let n = seen.entry(anchor.to_string()).or_insert(0);
-    let out = if *n == 0 {
-        anchor.to_string()
-    } else {
-        format!("{anchor}-{n}")
-    };
-    *n += 1;
-    out
+    let mut n = *seen.get(anchor).unwrap_or(&0);
+    let mut candidate = anchor.to_string();
+    while seen.contains_key(&candidate) {
+        n += 1;
+        candidate = format!("{anchor}-{n}");
+    }
+    seen.insert(anchor.to_string(), n); // next request for this base starts here
+    seen.insert(candidate.clone(), 0); // reserve the exact anchor we're emitting
+    candidate
 }
 
 /// The file stem (no directory, no extension) for the pre-heading chunk anchor.
@@ -217,7 +238,7 @@ fn walk_items(
             let id = emit_symbol(src, file, child, &name, skind, parent, doc, fg);
 
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
-                collect_calls(src, file, child, &id, fg);
+                collect_calls_in(src, file, child, &id, CallSyntax::Rust, fg);
             }
             let child_in_impl = matches!(kind, "impl_item" | "trait_item");
             walk_items(src, file, child, Some(&id), child_in_impl, fg);
@@ -278,13 +299,78 @@ fn impl_name(src: &str, node: Node) -> Option<String> {
     }
 }
 
+/// How each supported language spells the constructs the call-graph walk cares
+/// about. Keeping the per-language variants behind one walk ([`collect_calls_in`])
+/// means the recursion + attribution logic lives in a single place and only the
+/// node-kind names differ per grammar. (These were previously three
+/// near-identical copies whose nested-scope exclusion lists had silently
+/// diverged — e.g. the JS copy forgot the anonymous `generator_function`.)
+#[derive(Clone, Copy)]
+enum CallSyntax {
+    Rust,
+    Js,
+    Python,
+}
+
+impl CallSyntax {
+    /// The tree-sitter node kind of a call expression in this grammar.
+    fn call_kind(self) -> &'static str {
+        match self {
+            CallSyntax::Python => "call",
+            CallSyntax::Rust | CallSyntax::Js => "call_expression",
+        }
+    }
+
+    /// Best-effort callee name from a call node.
+    fn callee_name(self, src: &str, call: Node) -> Option<String> {
+        match self {
+            CallSyntax::Rust => callee_name(src, call),
+            CallSyntax::Js => js_callee_name(src, call),
+            CallSyntax::Python => py_callee_name(src, call),
+        }
+    }
+
+    /// Whether `kind` opens a nested scope whose calls belong to *it*, not the
+    /// current symbol — the walk must not descend into these (each gets its own
+    /// `collect_calls_in` from the item walk).
+    fn is_nested_scope(self, kind: &str) -> bool {
+        match self {
+            CallSyntax::Rust => matches!(
+                kind,
+                "function_item" | "closure_expression" | "function_signature_item"
+            ),
+            CallSyntax::Js => matches!(
+                kind,
+                "function_declaration"
+                    | "generator_function_declaration"
+                    | "function"
+                    | "generator_function"
+                    | "arrow_function"
+                    | "method_definition"
+            ),
+            CallSyntax::Python => {
+                matches!(kind, "function_definition" | "class_definition" | "lambda")
+            }
+        }
+    }
+}
+
 /// Walk a function body's subtree and emit a `Call` reference + edge for every
-/// call expression, attributed to the enclosing symbol `from_id`.
-fn collect_calls(src: &str, file: &str, node: Node, from_id: &str, fg: &mut FileGraph) {
+/// call expression, attributed to the enclosing symbol `from_id`. Shared across
+/// languages via [`CallSyntax`]; does not descend into nested definitions
+/// (their calls are attributed to them by their own walk).
+fn collect_calls_in(
+    src: &str,
+    file: &str,
+    node: Node,
+    from_id: &str,
+    syntax: CallSyntax,
+    fg: &mut FileGraph,
+) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "call_expression" {
-            if let Some(callee) = callee_name(src, child) {
+        if child.kind() == syntax.call_kind() {
+            if let Some(callee) = syntax.callee_name(src, child) {
                 let pos = child.start_position();
                 fg.references.push(Reference {
                     name: callee.clone(),
@@ -300,13 +386,8 @@ fn collect_calls(src: &str, file: &str, node: Node, from_id: &str, fg: &mut File
                 });
             }
         }
-        // Recurse — but not into nested function definitions, whose calls
-        // belong to them (they get their own `collect_calls` from the walk).
-        if !matches!(
-            child.kind(),
-            "function_item" | "closure_expression" | "function_signature_item"
-        ) {
-            collect_calls(src, file, child, from_id, fg);
+        if !syntax.is_nested_scope(child.kind()) {
+            collect_calls_in(src, file, child, from_id, syntax, fg);
         }
     }
 }
@@ -369,12 +450,11 @@ fn doc_comment_text(src: &str, node: Node) -> Option<String> {
     } else if let Some(rest) = t.strip_prefix("//!") {
         Some(rest.trim().to_string())
     } else if t.starts_with("/**") && !t.starts_with("/***") {
-        Some(
-            t.trim_start_matches("/**")
-                .trim_end_matches("*/")
-                .trim()
-                .to_string(),
-        )
+        // strip_prefix/suffix peel exactly one delimiter; trim_*_matches would
+        // greedily eat a repeated `/**` or `*/` that's part of the doc body.
+        let inner = t.strip_prefix("/**").unwrap_or(t);
+        let inner = inner.strip_suffix("*/").unwrap_or(inner);
+        Some(inner.trim().to_string())
     } else {
         None
     }
@@ -517,7 +597,7 @@ fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
             let doc = take_doc(&mut pending_doc);
             let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, fg);
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
-                collect_calls_js(src, file, def_node, &id, fg);
+                collect_calls_in(src, file, def_node, &id, CallSyntax::Js, fg);
             }
             let child_in_class = matches!(def_node.kind(), "class_declaration" | "abstract_class_declaration");
             walk_js(src, file, def_node, Some(&id), child_in_class, fg);
@@ -632,36 +712,8 @@ fn emit_js_var_functions(
         // Only the first declarator gets the leading doc-comment.
         let this_doc = if first { doc.clone() } else { None };
         let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, fg);
-        collect_calls_js(src, file, value, &id, fg);
+        collect_calls_in(src, file, value, &id, CallSyntax::Js, fg);
         first = false;
-    }
-}
-
-/// Emit a `Call` reference/edge for every call expression under `node`,
-/// attributed to `from_id`. Doesn't descend into nested function definitions
-/// (their calls are attributed to them).
-fn collect_calls_js(src: &str, file: &str, node: Node, from_id: &str, fg: &mut FileGraph) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "call_expression" {
-            if let Some(callee) = js_callee_name(src, child) {
-                let pos = child.start_position();
-                fg.references.push(Reference {
-                    name: callee.clone(),
-                    file: file.to_string(),
-                    line: pos.row as u32 + 1,
-                    col: pos.column as u32 + 1,
-                    resolved_id: None,
-                });
-                fg.edges.push(Edge { kind: EdgeKind::Call, src: from_id.to_string(), dst: callee });
-            }
-        }
-        if !matches!(
-            child.kind(),
-            "function_declaration" | "generator_function_declaration" | "function" | "arrow_function" | "method_definition"
-        ) {
-            collect_calls_js(src, file, child, from_id, fg);
-        }
     }
 }
 
@@ -697,7 +749,10 @@ fn js_doc_text(src: &str, node: Node) -> Option<String> {
     let raw = node_text(src, node);
     let t = raw.trim_start();
     if t.starts_with("/**") && !t.starts_with("/***") {
-        let body = t.trim_start_matches("/**").trim_end_matches("*/");
+        // Peel exactly one `/**` … `*/` pair; the per-line pass below still
+        // strips the leading ` * ` decorations.
+        let body = t.strip_prefix("/**").unwrap_or(t);
+        let body = body.strip_suffix("*/").unwrap_or(body);
         // Strip leading ` * ` from each JSDoc line.
         let cleaned: Vec<String> = body
             .lines()
@@ -755,7 +810,7 @@ fn walk_py(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
                 let doc = py_docstring(src, def_node);
                 let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, fg);
                 if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
-                    collect_calls_py(src, file, def_node, &id, fg);
+                    collect_calls_in(src, file, def_node, &id, CallSyntax::Python, fg);
                 }
                 let child_in_class = def_node.kind() == "class_definition";
                 walk_py(src, file, def_node, Some(&id), child_in_class, fg);
@@ -785,12 +840,14 @@ fn py_docstring(src: &str, def: Node) -> Option<String> {
         return None;
     }
     let raw = node_text(src, s);
+    // Drop an optional string prefix (r/b/u/f) that sits before the opening
+    // quote, then peel the quote delimiter itself — triple before single —
+    // exactly once at each end. `trim_matches('"')` would greedily eat quote
+    // characters that are part of the docstring content (e.g. `"""'x'"""`).
     let t = raw
         .trim()
-        .trim_start_matches(['r', 'b', 'u', 'R', 'B', 'U', 'f', 'F'])
-        .trim_matches('"')
-        .trim_matches('\'')
-        .trim();
+        .trim_start_matches(['r', 'b', 'u', 'R', 'B', 'U', 'f', 'F']);
+    let t = strip_py_quotes(t).trim();
     if t.is_empty() {
         None
     } else {
@@ -798,26 +855,16 @@ fn py_docstring(src: &str, def: Node) -> Option<String> {
     }
 }
 
-fn collect_calls_py(src: &str, file: &str, node: Node, from_id: &str, fg: &mut FileGraph) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "call" {
-            if let Some(callee) = py_callee_name(src, child) {
-                let pos = child.start_position();
-                fg.references.push(Reference {
-                    name: callee.clone(),
-                    file: file.to_string(),
-                    line: pos.row as u32 + 1,
-                    col: pos.column as u32 + 1,
-                    resolved_id: None,
-                });
-                fg.edges.push(Edge { kind: EdgeKind::Call, src: from_id.to_string(), dst: callee });
-            }
-        }
-        if !matches!(child.kind(), "function_definition" | "class_definition" | "lambda") {
-            collect_calls_py(src, file, child, from_id, fg);
+/// Strip one matching Python string delimiter (`"""`, `'''`, `"`, or `'`) from
+/// each end, preferring the triple forms. Leaves the content untouched if it
+/// isn't quote-delimited.
+fn strip_py_quotes(s: &str) -> &str {
+    for q in ["\"\"\"", "'''", "\"", "'"] {
+        if let Some(inner) = s.strip_prefix(q) {
+            return inner.strip_suffix(q).unwrap_or(inner);
         }
     }
+    s
 }
 
 /// Callee name for a Python `call` node (`f()` → `f`, `obj.m()` → `m`).
@@ -1138,5 +1185,54 @@ class Point:
         assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Import && e.dst == "pkg.sub"));
         let origin = fg.symbols.iter().find(|s| s.name == "origin").unwrap();
         assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == origin.id && e.dst == "getcwd"));
+    }
+
+    #[test]
+    fn dedup_anchor_avoids_collision_with_named_heading() {
+        let mut seen = std::collections::HashMap::new();
+        // A literal "foo-1" heading precedes a repeated "foo": the dedup of the
+        // second "foo" must not land on the already-used "foo-1".
+        let a = dedup_anchor("foo-1", &mut seen);
+        let b = dedup_anchor("foo", &mut seen);
+        let c = dedup_anchor("foo", &mut seen);
+        assert_eq!(a, "foo-1");
+        assert_eq!(b, "foo");
+        assert_ne!(c, a, "second 'foo' must not reuse the 'foo-1' anchor");
+        assert_eq!(c, "foo-2");
+    }
+
+    #[test]
+    fn markdown_other_fence_marker_inside_is_literal() {
+        // A `~~~` line inside a ``` fence must NOT close it, so the `#` line that
+        // follows stays fenced content and never becomes its own section.
+        let md = "# Top\n\n```\n~~~\n# not a heading\n```\n\n## Real\n\nbody\n";
+        let fg = parse_file("docs/x.md", md, Lang::Markdown);
+        let anchors: Vec<&str> = fg.docs.iter().map(|d| d.anchor.as_str()).collect();
+        assert!(!anchors.iter().any(|a| a.contains("not-a-heading")));
+        assert!(anchors.contains(&"top"));
+        assert!(anchors.contains(&"real"));
+    }
+
+    #[test]
+    fn py_docstring_preserves_trailing_inner_quote() {
+        // Content ending in a quote: greedy `trim_matches('\'')` would drop the
+        // closing quote; peeling the delimiter exactly once keeps it.
+        let py = "def f():\n    \"\"\"ends with 'q'\"\"\"\n    return 1\n";
+        let fg = parse_file("src/q.py", py, Lang::Python);
+        let f = fg.symbols.iter().find(|s| s.name == "f").unwrap();
+        assert_eq!(f.doc.as_deref(), Some("ends with 'q'"));
+    }
+
+    #[test]
+    fn js_calls_in_anonymous_generator_not_attributed_to_enclosing_fn() {
+        // The call inside an anonymous `function*(){}` belongs to the generator,
+        // not to `outer` — the JS exclusion list must skip `generator_function`.
+        let js = "function outer() { const g = function*() { inner(); }; }\n";
+        let fg = parse_file("src/g.js", js, Lang::JavaScript);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        assert!(!fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "inner"));
     }
 }

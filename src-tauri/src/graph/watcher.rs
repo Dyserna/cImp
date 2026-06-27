@@ -40,7 +40,12 @@ pub fn start(
     // A continuous stream of events (a build writing artifacts, a formatter, a
     // git checkout) would otherwise reset the debounce timer forever and starve
     // the re-index. Cap any one batch's age so a never-quiet tree still flushes.
-    let max_batch = debounce.saturating_mul(40).max(Duration::from_secs(2));
+    // The upper clamp matters: without it a large debounce (e.g. 60s) would push
+    // the forced-flush interval to ~40min, leaving the graph stale for an entire
+    // build session.
+    let max_batch = debounce
+        .saturating_mul(40)
+        .clamp(Duration::from_secs(2), Duration::from_secs(30));
 
     std::thread::Builder::new()
         .name("ccimp-graph-watch".into())
@@ -92,6 +97,14 @@ fn collect(res: notify::Result<notify::Event>, into: &mut HashSet<PathBuf>) {
                 return;
             }
             for p in ev.paths {
+                // Skip VCS internals up front: a checkout/commit/gc churns
+                // thousands of `.git` objects that can never be indexed, and
+                // letting them into the batch just bloats the set the service
+                // must walk and filter. (`target/`, `node_modules/`, etc. are
+                // still handled by the gitignore pass in `reindex_paths`.)
+                if p.components().any(|c| c.as_os_str() == ".git") {
+                    continue;
+                }
                 into.insert(p);
             }
         }

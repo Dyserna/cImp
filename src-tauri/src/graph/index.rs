@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use cozo::{DataValue, DbInstance, Num, ScriptMutability};
+use cozo::{DataValue, DbInstance, MultiTransaction, Num, ScriptMutability};
 
 use crate::error::{AppError, AppResult};
 
@@ -115,11 +115,17 @@ impl GraphIndex {
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
+        // Fail loudly rather than silently reading column 0 if a future CozoDB
+        // changes the `::relations` shape — guessing the wrong column would make
+        // every schema-existence check misfire (re-create conflicts on startup,
+        // or `reset` skipping live relations).
         let name_col = rows
             .headers
             .iter()
             .position(|h| h == "name")
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                AppError::Graph("::relations result has no 'name' column".to_string())
+            })?;
         Ok(rows
             .rows
             .iter()
@@ -133,63 +139,7 @@ impl GraphIndex {
     /// `src == file` for imports). Used both by the per-file replace in
     /// [`index_file_graph`] and by the watcher when a file is deleted.
     pub fn remove_file(&self, file: &str) -> AppResult<()> {
-        let prefix = format!("{file}#");
-        let mut p = BTreeMap::new();
-        p.insert("file".to_string(), DataValue::Str(file.into()));
-
-        // Names this file DEFINES, captured before we delete its symbols. After
-        // deletion, any of these names with no remaining definition anywhere is
-        // "dangling": its inbound call edges (owned by other files) would
-        // otherwise survive and make `callers()` report ghosts of a symbol that
-        // no longer exists. External/unresolved call targets (stdlib names that
-        // never had a symbol) are NOT in this set, so they're left untouched.
-        let defined = self.run(
-            "?[name] := *symbol{file, name}, file == $file",
-            p.clone(),
-            ScriptMutability::Immutable,
-        )?;
-        let defined_names: Vec<String> = defined.rows.iter().map(|r| cell_str(r, 0)).collect();
-
-        self.run_mut(
-            "?[id] := *symbol{id, file}, file == $file\n:rm symbol {id}",
-            p.clone(),
-        )?;
-        self.run_mut(
-            "?[file, line, col, name] := *ref{file, line, col, name}, file == $file\n:rm ref {file, line, col, name}",
-            p.clone(),
-        )?;
-        self.run_mut(
-            "?[id] := *doc_chunk{id, source_path}, source_path == $file\n:rm doc_chunk {id}",
-            p.clone(),
-        )?;
-        self.run_mut(
-            "?[path] := *file{path}, path == $file\n:rm file {path}",
-            p.clone(),
-        )?;
-        let mut pe = p;
-        pe.insert("prefix".to_string(), DataValue::Str(prefix.as_str().into()));
-        self.run_mut(
-            "?[kind, src, dst] := *edge{kind, src, dst}, (starts_with(src, $prefix) or src == $file)\n:rm edge {kind, src, dst}",
-            pe,
-        )?;
-
-        // Drop inbound call edges to names this file uniquely defined.
-        for name in defined_names {
-            let mut pn = BTreeMap::new();
-            pn.insert("name".to_string(), DataValue::Str(name.as_str().into()));
-            let still = self.run(
-                "?[id] := *symbol{id, name}, name == $name\n:limit 1",
-                pn.clone(),
-                ScriptMutability::Immutable,
-            )?;
-            if still.rows.is_empty() {
-                self.run_mut(
-                    "?[kind, src, dst] := *edge{kind, src, dst}, kind == \"call\", dst == $name\n:rm edge {kind, src, dst}",
-                    pn,
-                )?;
-            }
-        }
-        Ok(())
+        self.with_write_txn(|tx| remove_file_in_tx(tx, file))
     }
 
     /// Write one file's extracted graph, replacing any prior rows for that
@@ -198,16 +148,13 @@ impl GraphIndex {
     pub fn index_file_graph(&self, fg: &FileGraph) -> AppResult<()> {
         let file = fg.path.clone();
 
-        // Replace semantics: clear any prior rows for this path first.
-        self.remove_file(&file)?;
-
-        // --- insert fresh rows ---
+        // Build every row vector up front (pure data, no DB access) so the
+        // transaction below only does writes.
         let file_rows = vec![DataValue::List(vec![
             DataValue::Str(file.as_str().into()),
             DataValue::Str(fg.lang_tag.as_str().into()),
             DataValue::Str(fg.hash.as_str().into()),
         ])];
-        self.put("?[path, lang, hash] <- $rows\n:put file {path => lang, hash}", file_rows)?;
 
         let symbol_rows = fg
             .symbols
@@ -228,11 +175,6 @@ impl GraphIndex {
                 ])
             })
             .collect();
-        self.put(
-            "?[id, name, kind, file, start_line, end_line, signature, doc] <- $rows\n\
-             :put symbol {id => name, kind, file, start_line, end_line, signature, doc}",
-            symbol_rows,
-        )?;
 
         let ref_rows = fg
             .references
@@ -250,10 +192,6 @@ impl GraphIndex {
                 ])
             })
             .collect();
-        self.put(
-            "?[file, line, col, name, resolved_id] <- $rows\n:put ref {file, line, col, name => resolved_id}",
-            ref_rows,
-        )?;
 
         let doc_rows = fg
             .docs
@@ -267,10 +205,6 @@ impl GraphIndex {
                 ])
             })
             .collect();
-        self.put(
-            "?[id, source_path, anchor, text] <- $rows\n:put doc_chunk {id => source_path, anchor, text}",
-            doc_rows,
-        )?;
 
         let edge_rows = fg
             .edges
@@ -283,12 +217,62 @@ impl GraphIndex {
                 ])
             })
             .collect();
-        self.put(
-            "?[kind, src, dst] <- $rows\n:put edge {kind, src, dst}",
-            edge_rows,
-        )?;
 
-        Ok(())
+        // Replace-then-insert, all in one transaction: a mid-write failure
+        // (disk full, killed process) rolls back instead of leaving the file
+        // with, say, symbols but no edges.
+        self.with_write_txn(move |tx| {
+            remove_file_in_tx(tx, &file)?;
+            tx_put(
+                tx,
+                "?[path, lang, hash] <- $rows\n:put file {path => lang, hash}",
+                file_rows,
+            )?;
+            tx_put(
+                tx,
+                "?[id, name, kind, file, start_line, end_line, signature, doc] <- $rows\n\
+                 :put symbol {id => name, kind, file, start_line, end_line, signature, doc}",
+                symbol_rows,
+            )?;
+            tx_put(
+                tx,
+                "?[file, line, col, name, resolved_id] <- $rows\n:put ref {file, line, col, name => resolved_id}",
+                ref_rows,
+            )?;
+            tx_put(
+                tx,
+                "?[id, source_path, anchor, text] <- $rows\n:put doc_chunk {id => source_path, anchor, text}",
+                doc_rows,
+            )?;
+            tx_put(
+                tx,
+                "?[kind, src, dst] <- $rows\n:put edge {kind, src, dst}",
+                edge_rows,
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Run `f` inside a single write transaction: commit on `Ok`, abort on
+    /// `Err`. Lets a multi-step mutation (the per-file replace) be all-or-nothing
+    /// rather than a sequence of independently-committed scripts that can leave a
+    /// half-written file graph behind.
+    fn with_write_txn<T>(
+        &self,
+        f: impl FnOnce(&MultiTransaction) -> AppResult<T>,
+    ) -> AppResult<T> {
+        let tx = self.db.multi_transaction(true);
+        match f(&tx) {
+            Ok(v) => {
+                tx.commit()
+                    .map_err(|e| AppError::Graph(format!("transaction commit failed: {e}")))?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = tx.abort();
+                Err(e)
+            }
+        }
     }
 
     /// Find definitions by exact name.
@@ -780,6 +764,90 @@ reach[x, y] := reach[x, z], calls[z, y]
             .run_script(script, params, m)
             .map_err(|e| AppError::Graph(format!("query failed: {e}")))
     }
+}
+
+/// Run one script inside a multi-transaction, mapping cozo errors to [`AppError`].
+fn tx_run(
+    tx: &MultiTransaction,
+    script: &str,
+    params: BTreeMap<String, DataValue>,
+) -> AppResult<cozo::NamedRows> {
+    tx.run_script(script, params)
+        .map_err(|e| AppError::Graph(format!("query failed: {e}")))
+}
+
+/// `:put` a batch of rows (bound to `$rows`) inside a multi-transaction.
+fn tx_put(tx: &MultiTransaction, script: &str, rows: Vec<DataValue>) -> AppResult<()> {
+    let mut p = BTreeMap::new();
+    p.insert("rows".to_string(), DataValue::List(rows));
+    tx_run(tx, script, p)?;
+    Ok(())
+}
+
+/// Delete every row belonging to `file` within an open transaction (symbols,
+/// refs, doc-chunks, the `file` row, edges keyed by the file id-prefix or
+/// `src == file`, plus inbound call edges to names this file uniquely defined).
+/// The transaction makes this atomic with the re-insert in [`GraphIndex::index_file_graph`].
+fn remove_file_in_tx(tx: &MultiTransaction, file: &str) -> AppResult<()> {
+    let prefix = format!("{file}#");
+    let mut p = BTreeMap::new();
+    p.insert("file".to_string(), DataValue::Str(file.into()));
+
+    // Names this file DEFINES, captured before we delete its symbols. After
+    // deletion, any of these names with no remaining definition anywhere is
+    // "dangling": its inbound call edges (owned by other files) would otherwise
+    // survive and make `callers()` report ghosts of a symbol that no longer
+    // exists. External/unresolved call targets (stdlib names that never had a
+    // symbol) are NOT in this set, so they're left untouched.
+    let defined = tx_run(tx, "?[name] := *symbol{file, name}, file == $file", p.clone())?;
+    let defined_names: Vec<String> = defined.rows.iter().map(|r| cell_str(r, 0)).collect();
+
+    tx_run(
+        tx,
+        "?[id] := *symbol{id, file}, file == $file\n:rm symbol {id}",
+        p.clone(),
+    )?;
+    tx_run(
+        tx,
+        "?[file, line, col, name] := *ref{file, line, col, name}, file == $file\n:rm ref {file, line, col, name}",
+        p.clone(),
+    )?;
+    tx_run(
+        tx,
+        "?[id] := *doc_chunk{id, source_path}, source_path == $file\n:rm doc_chunk {id}",
+        p.clone(),
+    )?;
+    tx_run(
+        tx,
+        "?[path] := *file{path}, path == $file\n:rm file {path}",
+        p.clone(),
+    )?;
+    let mut pe = p;
+    pe.insert("prefix".to_string(), DataValue::Str(prefix.as_str().into()));
+    tx_run(
+        tx,
+        "?[kind, src, dst] := *edge{kind, src, dst}, (starts_with(src, $prefix) or src == $file)\n:rm edge {kind, src, dst}",
+        pe,
+    )?;
+
+    // Drop inbound call edges to names this file uniquely defined.
+    for name in defined_names {
+        let mut pn = BTreeMap::new();
+        pn.insert("name".to_string(), DataValue::Str(name.as_str().into()));
+        let still = tx_run(
+            tx,
+            "?[id] := *symbol{id, name}, name == $name\n:limit 1",
+            pn.clone(),
+        )?;
+        if still.rows.is_empty() {
+            tx_run(
+                tx,
+                "?[kind, src, dst] := *edge{kind, src, dst}, kind == \"call\", dst == $name\n:rm edge {kind, src, dst}",
+                pn,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn int(n: u32) -> DataValue {

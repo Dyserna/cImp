@@ -84,6 +84,20 @@ impl Embedder {
                 body.data.len()
             ));
         }
+        // Every vector must share one non-zero dimension. A misbehaving server
+        // that returns mixed-length vectors would otherwise be stored as-is and
+        // later panic (or silently produce NaN scores) when the HNSW index
+        // computes a distance between mismatched dimensions.
+        let dim = body.data.first().map_or(0, |d| d.embedding.len());
+        if dim == 0 {
+            return Err("embeddings endpoint returned zero-length vectors".to_string());
+        }
+        if let Some(bad) = body.data.iter().find(|d| d.embedding.len() != dim) {
+            return Err(format!(
+                "embeddings dimension mismatch: expected {dim}, got {}",
+                bad.embedding.len()
+            ));
+        }
         Ok(ordered_embeddings(body.data))
     }
 
@@ -134,10 +148,14 @@ fn shared_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
+            // Don't `unwrap_or_default()`: the default client has *no* timeout,
+            // so on the rare `build()` failure (a broken TLS backend) every
+            // embed call would hang forever instead of degrading. A build
+            // failure means the environment is broken — surface it loudly.
             reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .unwrap_or_default()
+                .expect("failed to build embedding HTTP client")
         })
         .clone()
 }

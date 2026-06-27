@@ -18,6 +18,7 @@
 //! parser (tree-sitter), store (CozoDB), query API, watcher, embedding
 //! pipeline, and monitor event bus arrive in later stages.
 
+mod activity;
 mod builder;
 mod embed;
 mod index;
@@ -27,6 +28,7 @@ mod schema;
 mod service;
 mod watcher;
 
+pub use activity::{snapshot as graph_history, GraphCall};
 pub use builder::parse_file;
 pub use index::{GraphIndex, GraphStats, SymbolHit};
 pub use mcp::{

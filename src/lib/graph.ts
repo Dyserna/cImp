@@ -65,6 +65,22 @@ export function graphTestEmbedder(): Promise<EmbedderProbe> {
   return invoke<EmbedderProbe>('graph_test_embedder');
 }
 
+/// One recorded graph tool call. Mirror of Rust `graph::GraphCall`.
+export interface GraphCall {
+  ts_ms: number;
+  source: 'claude' | 'offload';
+  tool: string;
+  target: string;
+  chars: number;
+  ms: number;
+  ok: boolean;
+}
+
+/// Recent graph tool calls (cloud Claude + offload worker), newest first.
+export function graphHistory(): Promise<GraphCall[]> {
+  return invoke<GraphCall[]>('graph_history');
+}
+
 /// Subscribe to live per-root status transitions (emitted as one status at a
 /// time). Returns an unlisten fn.
 export function onGraphStatus(cb: (status: GraphStatus) => void): Promise<UnlistenFn> {

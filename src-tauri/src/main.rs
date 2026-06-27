@@ -35,8 +35,8 @@ use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
-    get_system_stats, graph_rebuild, graph_rebuild_embeddings, graph_set_watch_paused,
-    graph_status, graph_test_embedder, list_tabs,
+    get_system_stats, graph_history, graph_rebuild, graph_rebuild_embeddings,
+    graph_set_watch_paused, graph_status, graph_test_embedder, list_tabs,
     list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
     offload_server_log, offload_server_metrics, offload_server_restart, offload_server_start,
     offload_server_stop,
@@ -580,6 +580,7 @@ fn main() {
             graph_rebuild_embeddings,
             graph_set_watch_paused,
             graph_test_embedder,
+            graph_history,
             theming::themes_list,
             theming::palettes_list,
         ])
@@ -684,7 +685,7 @@ fn start_offload_runtime(
         service.warm_host().await;
         service.spawn_health_watch();
         service.spawn_metrics_poller();
-        match crate::offload::loopback::Loopback::start(service.clone()).await {
+        match crate::offload::loopback::Loopback::start(service.clone(), app_handle.clone()).await {
             Ok(lb) => {
                 app_handle.manage(lb);
             }

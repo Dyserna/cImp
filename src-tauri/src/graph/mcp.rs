@@ -154,7 +154,6 @@ pub async fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
     let settings = current_settings();
-    let (max_rows, max_snippet) = limits(&settings);
     let sub = db_subdir(&settings);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -163,20 +162,59 @@ pub async fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
         Err(msg) => return Ok(tool_error(&msg)),
     };
 
-    let result = if name == "graph_semantic_docs" {
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        semantic_query(&idx, &settings, query, max_rows, max_snippet).await
-    } else if name == "graph_struct_search" {
-        run_struct_search(&root, &idx, &args, max_rows, max_snippet)
-    } else {
-        run_tool(&idx, name, &args, max_rows, max_snippet)
-    };
+    let result = dispatch_recorded(&root, &idx, &settings, "claude", name, &args).await;
 
     match result {
         Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
         Err(msg) if msg.starts_with("unknown graph tool") => Err((-32602, msg)),
         Err(msg) => Ok(tool_error(&msg)),
     }
+}
+
+/// Execute one resolved `graph_*` tool against an open index — dispatching to
+/// the semantic / structural / plain path — and record it in the activity ring
+/// for the monitor tab. `source` is `"claude"` (cloud) or `"offload"` (local
+/// worker). Shared by the cloud (warm + fallback) and worker paths so each call
+/// is captured exactly once.
+pub(crate) async fn dispatch_recorded(
+    root: &Path,
+    idx: &GraphIndex,
+    settings: &crate::settings::Settings,
+    source: &str,
+    name: &str,
+    args: &Value,
+) -> Result<String, String> {
+    let (max_rows, max_snippet) = limits(settings);
+    let started = super::activity::now_ms();
+    let result = if name == "graph_semantic_docs" {
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        semantic_query(idx, settings, query, max_rows, max_snippet).await
+    } else if name == "graph_struct_search" {
+        run_struct_search(root, idx, args, max_rows, max_snippet)
+    } else {
+        run_tool(idx, name, args, max_rows, max_snippet)
+    };
+    super::activity::record(super::activity::GraphCall {
+        ts_ms: started,
+        source: source.to_string(),
+        tool: name.to_string(),
+        target: arg_summary(name, args),
+        chars: result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
+        ms: super::activity::now_ms().saturating_sub(started),
+        ok: result.is_ok(),
+    });
+    result
+}
+
+/// The primary argument of a graph tool (symbol / file / query) for the
+/// history's at-a-glance column.
+fn arg_summary(name: &str, args: &Value) -> String {
+    let key = match name {
+        "graph_imports" | "graph_outline" => "file",
+        "graph_search_docs" | "graph_semantic_docs" | "graph_struct_search" => "query",
+        _ => "name",
+    };
+    args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
 }
 
 /// Run one graph tool against an open index and format its result as compact,
@@ -345,7 +383,6 @@ pub async fn offload_query(
     args: &Value,
 ) -> Result<String, String> {
     let settings = current_settings();
-    let (max_rows, max_snippet) = limits(&settings);
     let sub = db_subdir(&settings);
 
     // First configured root that already has a built graph wins. (Most setups
@@ -356,14 +393,7 @@ pub async fn offload_query(
     for root in roots {
         match open_project_index_confined(root, &sub) {
             Ok((resolved, idx)) => {
-                return if name == "graph_semantic_docs" {
-                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                    semantic_query(&idx, &settings, query, max_rows, max_snippet).await
-                } else if name == "graph_struct_search" {
-                    run_struct_search(&resolved, &idx, args, max_rows, max_snippet)
-                } else {
-                    run_tool(&idx, name, args, max_rows, max_snippet)
-                };
+                return dispatch_recorded(&resolved, &idx, &settings, "offload", name, args).await;
             }
             Err(e) => last_err = e,
         }
@@ -440,7 +470,7 @@ fn current_settings() -> crate::settings::Settings {
     crate::settings::load_readonly(&cwd)
 }
 
-fn limits(settings: &crate::settings::Settings) -> (usize, usize) {
+pub(crate) fn limits(settings: &crate::settings::Settings) -> (usize, usize) {
     (
         settings.graph.max_rows_per_query.max(1) as usize,
         settings.graph.max_snippet_bytes.max(40) as usize,
@@ -538,7 +568,7 @@ fn open_project_index_confined(
 }
 
 /// Walk up from `start` looking for an ancestor containing `<sub>/graph.db`.
-fn find_graph_root(start: &Path, sub: &str) -> Option<PathBuf> {
+pub(crate) fn find_graph_root(start: &Path, sub: &str) -> Option<PathBuf> {
     for dir in start.ancestors() {
         if dir.join(sub).join("graph.db").is_file() {
             return Some(dir.to_path_buf());

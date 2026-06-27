@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
@@ -86,7 +88,7 @@ impl Loopback {
     /// Bind the endpoint, write the discovery file, and spawn the accept
     /// loop. Returns the handle (managed in `AppState`). Idempotent at the
     /// file level — an existing (stale) discovery file is overwritten.
-    pub async fn start(service: Arc<OffloadService>) -> AppResult<Arc<Self>> {
+    pub async fn start(service: Arc<OffloadService>, app: AppHandle) -> AppResult<Arc<Self>> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|e| AppError::Offload(format!("loopback bind failed: {e}")))?;
@@ -112,9 +114,10 @@ impl Loopback {
                 match listener.accept().await {
                     Ok((stream, _peer)) => {
                         let svc = service.clone();
+                        let app = app.clone();
                         let tok = accept_token.clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Err(e) = handle_conn(stream, svc, tok).await {
+                            if let Err(e) = handle_conn(stream, svc, app, tok).await {
                                 debug!(error = %e, "offload loopback: connection ended");
                             }
                         });
@@ -316,6 +319,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 async fn handle_conn(
     mut stream: TcpStream,
     service: Arc<OffloadService>,
+    app: AppHandle,
     token: String,
 ) -> AppResult<()> {
     // Cap how long we'll wait for a complete request: a half-open or idle
@@ -333,6 +337,7 @@ async fn handle_conn(
 
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", "/run") => handle_run(&mut stream, &service, &req).await,
+        ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
         ("GET", "/describe") => {
             let text = service.describe().await;
             write_simple(&mut stream, 200, "text/plain; charset=utf-8", text.as_bytes()).await
@@ -390,6 +395,71 @@ async fn handle_run(
     };
     // 200 even on a task-level error: the child renders `error` as a tool
     // result so Claude can read + adapt, exactly like the in-process path.
+    write_json(stream, 200, &r).await
+}
+
+/// A `POST /graph_run` request body (the warm code-graph query path).
+#[derive(Deserialize)]
+struct GraphRunBody {
+    /// The calling session's working directory; the project root is resolved
+    /// from it (same ancestor-walk the MCP child uses).
+    #[serde(default)]
+    cwd: Option<String>,
+    /// The `graph_*` tool name.
+    name: String,
+    /// The tool arguments.
+    #[serde(default)]
+    args: Value,
+}
+
+/// `POST /graph_run`: run one `graph_*` tool against the app's WARM graph index
+/// (single shared connection — no second cross-process open of the SQLite store)
+/// and return its text. The `GraphService` is resolved from managed state at
+/// request time, so this is robust against the graph-vs-loopback startup order.
+async fn handle_graph_run(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: GraphRunBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(format!("bad request body: {e}")),
+            };
+            return write_json(stream, 400, &r).await;
+        }
+    };
+    let graph = match app.try_state::<Arc<crate::graph::GraphService>>() {
+        Some(g) => g.inner().clone(),
+        None => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some("graph service not ready".into()),
+            };
+            return write_json(stream, 200, &r).await;
+        }
+    };
+    let cwd = body
+        .cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let r = match graph.run_graph_tool(&cwd, &body.name, &body.args).await {
+        Ok(text) => RunResult {
+            ok: true,
+            text: Some(text),
+            error: None,
+        },
+        Err(e) => RunResult {
+            ok: false,
+            text: None,
+            error: Some(e),
+        },
+    };
+    // 200 even on a tool-level error: the child renders `error` as a tool result.
     write_json(stream, 200, &r).await
 }
 

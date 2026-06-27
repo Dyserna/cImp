@@ -13,8 +13,10 @@
     graphRebuildEmbeddings,
     graphSetWatchPaused,
     graphTestEmbedder,
+    graphHistory,
     onGraphStatus,
     type EmbedderProbe,
+    type GraphCall,
     type GraphStatus,
   } from './graph';
 
@@ -23,8 +25,16 @@
   let busy = $state<boolean>(false);
   let probe = $state<EmbedderProbe | null>(null);
   let probing = $state<boolean>(false);
+  let history = $state<GraphCall[]>([]);
   let unlisten: (() => void) | null = null;
   let poll: ReturnType<typeof setInterval> | null = null;
+
+  function fmtTime(ms: number): string {
+    return ms ? new Date(ms).toLocaleTimeString() : '—';
+  }
+  function fmtSize(chars: number): string {
+    return chars >= 1000 ? `${(chars / 1000).toFixed(1)}k chars` : `${chars} chars`;
+  }
 
   function upsert(s: GraphStatus): void {
     const i = roots.findIndex((r) => r.root === s.root);
@@ -37,6 +47,11 @@
       roots = await graphStatus();
     } catch (e) {
       console.warn('graph_status failed', e);
+    }
+    try {
+      history = await graphHistory();
+    } catch {
+      /* ignore — history is best-effort */
     }
   }
 
@@ -178,6 +193,29 @@
       </section>
     {/each}
   {/if}
+
+  <section class="card history">
+    <div class="history-head">Recent calls <span class="muted">(newest first)</span></div>
+    <div class="history-body">
+      {#if history.length === 0}
+        <div class="history-empty">
+          No graph calls yet — query the graph from a Claude tab or via offload_task.
+        </div>
+      {:else}
+        <div class="history-rows">
+          {#each history as c, i (i)}
+            <div class="hrow" class:err={!c.ok}>
+              <span class="htime">{fmtTime(c.ts_ms)}</span>
+              <span class="hsrc {c.source}">{c.source}</span>
+              <span class="htool">{c.tool.replace('graph_', '')}</span>
+              <span class="htarget" title={c.target}>{c.target}</span>
+              <span class="hmeta">{c.ms}ms · {fmtSize(c.chars)}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  </section>
 </div>
 
 <style>
@@ -342,5 +380,65 @@
     color: #ff8a80;
     font-size: 12px;
     margin: 6px 0 0;
+  }
+  .history {
+    /* One row's box height; five are reserved below, then it scrolls. */
+    --hrow-h: 1.55rem;
+  }
+  .history-head {
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .history-body {
+    height: calc(5 * var(--hrow-h));
+    overflow-y: auto;
+  }
+  .history-empty {
+    opacity: 0.6;
+    font-style: italic;
+  }
+  .history-rows {
+    display: flex;
+    flex-direction: column;
+  }
+  .hrow {
+    display: grid;
+    grid-template-columns: 5.5rem 4rem 6.5rem 1fr 8.5rem;
+    align-items: center;
+    gap: 8px;
+    height: var(--hrow-h);
+    box-sizing: border-box;
+    padding: 0 4px;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+    font-size: 0.86em;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .hrow.err {
+    color: #ff8a80;
+  }
+  .hsrc {
+    text-transform: uppercase;
+    font-size: 0.82em;
+    font-weight: 600;
+    opacity: 0.85;
+  }
+  .hsrc.claude {
+    color: #58a6ff;
+  }
+  .hsrc.offload {
+    color: #3fb950;
+  }
+  .htarget {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .hmeta {
+    text-align: right;
+    opacity: 0.7;
+  }
+  .muted {
+    opacity: 0.6;
+    font-weight: 400;
   }
 </style>

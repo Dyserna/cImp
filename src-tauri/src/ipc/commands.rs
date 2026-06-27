@@ -944,6 +944,13 @@ pub async fn graph_test_embedder(
     Ok(service.test_embedder().await)
 }
 
+/// V9-01: recent graph tool calls (cloud Claude + offload worker), newest
+/// first — the monitor tab's activity list.
+#[tauri::command]
+pub async fn graph_history() -> AppResult<Vec<crate::graph::GraphCall>> {
+    Ok(crate::graph::graph_history())
+}
+
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
 /// = file changes are ignored until resumed (a manual rebuild still works).
 #[tauri::command]

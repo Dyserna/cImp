@@ -257,6 +257,26 @@ impl GraphService {
         }
     }
 
+    /// Run a `graph_*` tool against this project's WARM index — the single
+    /// shared connection the indexer already owns — so cloud Claude's queries
+    /// don't open a second (cross-process) handle on the SQLite-backed store.
+    /// Resolves the project root from the caller's `cwd` (the same ancestor walk
+    /// the MCP child uses) and records the call in the monitor's activity ring.
+    /// Backs the loopback `/graph_run` route.
+    pub async fn run_graph_tool(
+        &self,
+        cwd: &Path,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<String, String> {
+        let settings = self.settings.current();
+        let sub = settings.graph.effective_db_subdir();
+        let root = super::mcp::find_graph_root(cwd, &sub)
+            .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
+        let idx = self.index_for(&root).map_err(|e| e.to_string())?;
+        super::mcp::dispatch_recorded(&root, &idx, &settings, "claude", name, args).await
+    }
+
     /// The configured per-project db subdirectory (default `.ccimp`).
     fn db_subdir(&self) -> String {
         self.settings.current().graph.effective_db_subdir()

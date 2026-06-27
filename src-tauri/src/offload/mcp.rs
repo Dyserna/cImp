@@ -128,7 +128,13 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             if name.starts_with("graph_") {
-                crate::graph::handle_mcp_call(&params).await
+                // Warm path: let the app's single index serve it (no second
+                // cross-process DB open; lets the app record it for the monitor).
+                // Fall back to a direct read-only open when the app isn't up.
+                match proxy_graph(&params).await {
+                    Some(r) => r,
+                    None => crate::graph::handle_mcp_call(&params).await,
+                }
             } else {
                 handle_tools_call(params).await
             }
@@ -430,6 +436,50 @@ async fn proxy_run(
             .unwrap_or("offload failed")
             .to_string();
         Some(Err(err))
+    }
+}
+
+/// Forward a `graph_*` tool call to the app's warm path (`POST /graph_run`), so
+/// the app's single warm index serves it instead of this child opening a second
+/// (cross-process) handle on the SQLite-backed store — and so the app can record
+/// the call for the monitor tab. Returns `None` when the app is unreachable (the
+/// caller falls back to opening graph.db directly); on success returns the same
+/// JSON-RPC tool result shape as [`crate::graph::handle_mcp_call`].
+async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
+    let (base, token) = proxy_base()?;
+    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()?;
+    let body = json!({ "cwd": cwd, "name": name, "args": args });
+    let resp = client
+        .post(format!("{base}/graph_run"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .ok()?; // transport failure → None → direct-open fallback
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+    if ok {
+        let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+        Some(Ok(json!({ "content": [{ "type": "text", "text": text }] })))
+    } else {
+        let err = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("graph query failed");
+        Some(Ok(
+            json!({ "content": [{ "type": "text", "text": err }], "isError": true }),
+        ))
     }
 }
 

@@ -182,7 +182,11 @@
 
 <style>
   .graph-monitor {
-    height: 100%;
+    /* Sit ABOVE the pane's absolutely-positioned (empty) terminal slot, the
+       same way OffloadServerView does — otherwise that transparent slot paints
+       on top of this static content and swallows every button click. */
+    position: absolute;
+    inset: 0;
     overflow-y: auto;
     padding: 16px;
     font-size: 13px;

@@ -65,7 +65,9 @@ pub type TabRegistryHandle = Arc<TokioMutex<TabRegistry>>;
 /// `rustnet` / `broot` tool tabs use uuid-based ids. Keep in sync with
 /// `TabId::is_builtin` in `state::manager`.
 fn is_builtin_id(id: &str) -> bool {
-    AiTabId::from_id(id).is_some() || id == crate::settings::OFFLOAD_SERVER_TAB_ID
+    AiTabId::from_id(id).is_some()
+        || id == crate::settings::OFFLOAD_SERVER_TAB_ID
+        || id == crate::settings::GRAPH_MONITOR_TAB_ID
 }
 
 /// V1.4-04 D: replicate the filename-sanitization done by

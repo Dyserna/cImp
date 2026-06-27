@@ -39,10 +39,10 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
-    default_ai_tab, default_offload_server_tab, default_shell_1_tab, AiTabId,
-    LayoutNodePersisted, Settings, TabConfig,
+    default_ai_tab, default_graph_monitor_tab, default_offload_server_tab, default_shell_1_tab,
+    AiTabId, LayoutNodePersisted, Settings, TabConfig,
     AIDER_LOCAL_TAB_ID, AIDER_TAB_ID, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
-    OFFLOAD_SERVER_TAB_ID, SHELL_DEFAULT_TAB_ID,
+    GRAPH_MONITOR_TAB_ID, OFFLOAD_SERVER_TAB_ID, SHELL_DEFAULT_TAB_ID,
 };
 use crate::shell::ShellSpec;
 
@@ -687,6 +687,52 @@ fn offload_insert_position(tabs: &[TabConfig]) -> usize {
     pos
 }
 
+/// V9-01: keep the read-only Code Graph monitor tab present iff `graph.enabled`
+/// — mirrors [`reconcile_offload_server_tab`]. Returns `true` if tabs changed.
+fn reconcile_graph_monitor_tab(settings: &mut Settings) -> bool {
+    let present = settings
+        .tabs
+        .iter()
+        .position(|t| t.id() == GRAPH_MONITOR_TAB_ID);
+    if settings.graph.enabled {
+        match present {
+            Some(i) => {
+                if !settings.tabs[i].builtin() {
+                    settings.tabs[i].set_builtin(true);
+                    return true;
+                }
+                false
+            }
+            None => {
+                let pos = graph_monitor_insert_position(&settings.tabs);
+                settings.tabs.insert(pos, default_graph_monitor_tab());
+                tracing::info!("integrity: materialized Code Graph monitor tab (graph enabled)");
+                true
+            }
+        }
+    } else if let Some(i) = present {
+        settings.tabs.remove(i);
+        tracing::info!("integrity: removed Code Graph monitor tab (graph disabled)");
+        true
+    } else {
+        false
+    }
+}
+
+/// Insert position for the Code Graph monitor tab: after the leading AI
+/// builtins AND the Offload Server tab (if present), ahead of user shells.
+fn graph_monitor_insert_position(tabs: &[TabConfig]) -> usize {
+    let mut pos = 0usize;
+    for (idx, tab) in tabs.iter().enumerate() {
+        if AiTabId::from_id(tab.id()).is_some() || tab.id() == OFFLOAD_SERVER_TAB_ID {
+            pos = idx + 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
 /// All four reserved AI tab ids. Used by the integrity check's "is this
 /// id one of our reserved AI builtins?" loops; a single source of truth
 /// keeps the `ai_builtins` membership check, the `use_local_provider`
@@ -816,6 +862,13 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
     //     pruned from the layout by step 5. Toggling `offload.enabled` takes
     //     effect on the next launch (like backend autostart / the loopback).
     if reconcile_offload_server_tab(settings) {
+        changed = true;
+    }
+
+    // 4c. V9-01: materialize the read-only Code Graph monitor tab while the
+    //     graph is enabled, remove it otherwise. Same ordering rationale as 4b;
+    //     sits after the Offload Server tab in the tab strip.
+    if reconcile_graph_monitor_tab(settings) {
         changed = true;
     }
 

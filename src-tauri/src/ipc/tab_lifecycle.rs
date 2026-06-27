@@ -370,9 +370,10 @@ pub async fn close_tab(
 ) -> Result<(), TabLifecycleError> {
     let _serializer = state.lifecycle_serializer.lock().await;
     // V8-03: the Offload Server tab is never closable (removed only by
-    // disabling offload). Guard explicitly so a hand-edit that clears its
-    // `builtin` flag still can't close it.
-    if matches!(tab, TabId::OffloadServer) {
+    // disabling offload). V9-01: the Code Graph monitor tab likewise (removed
+    // only by disabling the graph). Guard explicitly so a hand-edit that clears
+    // the `builtin` flag still can't close them.
+    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor) {
         return Err(TabLifecycleError::BuiltinNotClosable);
     }
     {

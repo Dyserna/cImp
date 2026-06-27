@@ -22,16 +22,28 @@ export function isOffloadTab(id: TabId): boolean {
   return id === OFFLOAD_SERVER_TAB_ID;
 }
 
+/// V9-01: the reserved id of the read-only, app-rendered Code Graph monitor
+/// tab. Like the Offload Server tab it's Shell-kind on the backend but the
+/// frontend keys off this id to render a dashboard (no PTY).
+export const GRAPH_MONITOR_TAB_ID = 'graph-monitor';
+
+/// True for the read-only Code Graph monitor tab.
+export function isGraphMonitorTab(id: TabId): boolean {
+  return id === GRAPH_MONITOR_TAB_ID;
+}
+
 /// Type guard for shell tabs — every non-AI-builtin ID is a shell, EXCEPT the
-/// Offload Server tab, which is read-only and log-fed (it must not get the
-/// shell closed-overlay / restart / keystroke behaviors).
+/// Offload Server and Code Graph monitor tabs, which are read-only and
+/// app-rendered (they must not get the shell closed-overlay / restart /
+/// keystroke behaviors).
 export function isShellTab(id: TabId): boolean {
   return (
     id !== 'claude' &&
     id !== 'claude-local' &&
     id !== 'aider' &&
     id !== 'aider-local' &&
-    id !== OFFLOAD_SERVER_TAB_ID
+    id !== OFFLOAD_SERVER_TAB_ID &&
+    id !== GRAPH_MONITOR_TAB_ID
   );
 }
 

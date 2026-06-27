@@ -1581,6 +1581,25 @@ pub fn default_offload_server_tab() -> TabConfig {
     })
 }
 
+/// V9-01: the reserved, non-closable Code Graph monitor tab. Like the Offload
+/// Server tab it's a Shell-kind entry with no command (never PTY-backed — its
+/// content is an app-rendered dashboard of the graph indexer/embedder).
+/// Materialized/removed by the integrity check per `graph.enabled`.
+pub fn default_graph_monitor_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: GRAPH_MONITOR_TAB_ID.to_string(),
+        builtin: true,
+        name: "Code Graph".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
+}
+
 /// Default Shell-1 entry. Takes the resolved platform default shell so the
 /// `command` and `args` fields land on the right binary for the host. The
 /// reserved id is just the seed value for the first shell tab on a fresh

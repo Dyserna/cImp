@@ -31,8 +31,9 @@ pub fn parse_file(path: &str, src: &str, lang: Lang) -> FileGraph {
     match lang {
         Lang::Rust => parse_rust(src, path, &mut fg),
         Lang::Markdown => parse_markdown(src, path, &mut fg),
-        // Other languages: file row only for now (symbols land in Phase E).
-        _ => {}
+        Lang::TypeScript | Lang::JavaScript => parse_js_ts(src, path, lang, &mut fg),
+        Lang::Python => parse_python(src, path, &mut fg),
+        Lang::Other => {}
     }
 
     fg
@@ -424,6 +425,403 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").to_string()
 }
 
+// ── TypeScript / JavaScript ──────────────────────────────────────────────
+
+/// Parse a TS/JS/TSX/JSX file. `.tsx`/`.jsx` get the JSX-aware grammar so JSX
+/// markup doesn't desync the parse around the surrounding declarations.
+fn parse_js_ts(src: &str, file: &str, lang: Lang, fg: &mut FileGraph) {
+    let lower = file.to_ascii_lowercase();
+    let language = match lang {
+        Lang::TypeScript if lower.ends_with(".tsx") => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        // tree-sitter-javascript's grammar already covers JSX.
+        _ => tree_sitter_javascript::LANGUAGE.into(),
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(src, None) else {
+        return;
+    };
+    walk_js(src, file, tree.root_node(), None, false, fg);
+}
+
+/// Recursive JS/TS item walk: declarations (functions, classes, methods,
+/// interfaces, enums, type aliases, arrow-fn consts), import edges, call
+/// references, JSDoc, and class→method containment.
+fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bool, fg: &mut FileGraph) {
+    let mut pending_doc: Vec<String> = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let kind = child.kind();
+
+        if kind == "comment" {
+            match js_doc_text(src, child) {
+                Some(d) => pending_doc.push(d),
+                None => pending_doc.clear(),
+            }
+            continue;
+        }
+
+        // `export function/class/...` and `export default …` wrap the real
+        // declaration; unwrap so the JSDoc that precedes the `export` attaches.
+        let def_node = if kind == "export_statement" {
+            child.child_by_field_name("declaration").unwrap_or(child)
+        } else {
+            child
+        };
+
+        if let Some((name, skind)) = js_def_name_kind(src, def_node, in_class) {
+            let doc = take_doc(&mut pending_doc);
+            let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, fg);
+            if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
+                collect_calls_js(src, file, def_node, &id, fg);
+            }
+            let child_in_class = matches!(def_node.kind(), "class_declaration" | "abstract_class_declaration");
+            walk_js(src, file, def_node, Some(&id), child_in_class, fg);
+            pending_doc.clear();
+        } else if matches!(def_node.kind(), "lexical_declaration" | "variable_declaration") {
+            // `const foo = () => {…}` / `const bar = function(){}` → a function.
+            let doc = take_doc(&mut pending_doc);
+            emit_js_var_functions(src, file, def_node, parent, doc, fg);
+            pending_doc.clear();
+        } else if kind == "import_statement" {
+            if let Some(srcpath) = js_import_source(src, child) {
+                fg.edges.push(Edge { kind: EdgeKind::Import, src: file.to_string(), dst: srcpath });
+            }
+            pending_doc.clear();
+        } else {
+            // Descend into wrappers (export of a name list, statement blocks,
+            // class bodies, namespaces) keeping the enclosing symbol/parent.
+            walk_js(src, file, def_node, parent, in_class, fg);
+            pending_doc.clear();
+        }
+    }
+}
+
+/// Emit one symbol (+ containment + doc edges) and return its id.
+fn emit_symbol(
+    src: &str,
+    file: &str,
+    node: Node,
+    name: &str,
+    skind: SymbolKind,
+    parent: Option<&str>,
+    doc: Option<String>,
+    fg: &mut FileGraph,
+) -> String {
+    let start = node.start_position().row as u32 + 1;
+    let end = node.end_position().row as u32 + 1;
+    let id = symbol_id(file, name, start);
+    fg.symbols.push(Symbol {
+        id: id.clone(),
+        name: name.to_string(),
+        kind: skind,
+        file: file.to_string(),
+        start_line: start,
+        end_line: end,
+        signature: signature_of(src, node),
+        doc: doc.clone(),
+    });
+    if let Some(p) = parent {
+        fg.edges.push(Edge { kind: EdgeKind::Contains, src: p.to_string(), dst: id.clone() });
+    }
+    if let Some(text) = doc {
+        let cid = doc_chunk_id(file, name);
+        fg.docs.push(DocChunk {
+            id: cid.clone(),
+            source_path: file.to_string(),
+            anchor: name.to_string(),
+            text,
+        });
+        fg.edges.push(Edge { kind: EdgeKind::Documents, src: cid, dst: id.clone() });
+    }
+    id
+}
+
+fn take_doc(pending: &mut Vec<String>) -> Option<String> {
+    if pending.is_empty() {
+        None
+    } else {
+        Some(pending.join("\n"))
+    }
+}
+
+/// If `node` is a JS/TS definition, its name + kind.
+fn js_def_name_kind(src: &str, node: Node, in_class: bool) -> Option<(String, SymbolKind)> {
+    let named = |field: &str| node.child_by_field_name(field).map(|n| node_text(src, n));
+    let pair = match node.kind() {
+        "function_declaration" | "generator_function_declaration" => (named("name")?, SymbolKind::Function),
+        "method_definition" => (named("name")?, SymbolKind::Method),
+        "class_declaration" | "abstract_class_declaration" => (named("name")?, SymbolKind::Class),
+        "interface_declaration" => (named("name")?, SymbolKind::Interface),
+        "enum_declaration" => (named("name")?, SymbolKind::Enum),
+        "type_alias_declaration" => (named("name")?, SymbolKind::TypeAlias),
+        // A bare function/method inside a class body without the above kinds.
+        "public_field_definition" if in_class => return None,
+        _ => return None,
+    };
+    Some(pair)
+}
+
+/// Emit `Function` symbols for `const f = () => …` / `= function(){}` inside a
+/// `lexical_declaration`/`variable_declaration`.
+fn emit_js_var_functions(
+    src: &str,
+    file: &str,
+    decl: Node,
+    parent: Option<&str>,
+    doc: Option<String>,
+    fg: &mut FileGraph,
+) {
+    let mut cursor = decl.walk();
+    let mut first = true;
+    for d in decl.named_children(&mut cursor) {
+        if d.kind() != "variable_declarator" {
+            continue;
+        }
+        let Some(value) = d.child_by_field_name("value") else { continue };
+        if !matches!(value.kind(), "arrow_function" | "function" | "function_expression" | "generator_function") {
+            continue;
+        }
+        let Some(name) = d.child_by_field_name("name").map(|n| node_text(src, n)) else { continue };
+        // Only the first declarator gets the leading doc-comment.
+        let this_doc = if first { doc.clone() } else { None };
+        let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, fg);
+        collect_calls_js(src, file, value, &id, fg);
+        first = false;
+    }
+}
+
+/// Emit a `Call` reference/edge for every call expression under `node`,
+/// attributed to `from_id`. Doesn't descend into nested function definitions
+/// (their calls are attributed to them).
+fn collect_calls_js(src: &str, file: &str, node: Node, from_id: &str, fg: &mut FileGraph) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "call_expression" {
+            if let Some(callee) = js_callee_name(src, child) {
+                let pos = child.start_position();
+                fg.references.push(Reference {
+                    name: callee.clone(),
+                    file: file.to_string(),
+                    line: pos.row as u32 + 1,
+                    col: pos.column as u32 + 1,
+                    resolved_id: None,
+                });
+                fg.edges.push(Edge { kind: EdgeKind::Call, src: from_id.to_string(), dst: callee });
+            }
+        }
+        if !matches!(
+            child.kind(),
+            "function_declaration" | "generator_function_declaration" | "function" | "arrow_function" | "method_definition"
+        ) {
+            collect_calls_js(src, file, child, from_id, fg);
+        }
+    }
+}
+
+/// Best-effort callee name for a JS/TS `call_expression`.
+fn js_callee_name(src: &str, call: Node) -> Option<String> {
+    let f = call.child_by_field_name("function")?;
+    let name = match f.kind() {
+        "identifier" => node_text(src, f),
+        // `x.method()` → `method`.
+        "member_expression" => f
+            .child_by_field_name("property")
+            .map(|n| node_text(src, n))
+            .unwrap_or_else(|| node_text(src, f)),
+        _ => first_line(&node_text(src, f)),
+    };
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// The module specifier of an `import_statement` (the quoted source), unquoted.
+fn js_import_source(src: &str, node: Node) -> Option<String> {
+    let s = node.child_by_field_name("source").map(|n| node_text(src, n))?;
+    Some(s.trim().trim_matches(['"', '\'', '`']).to_string())
+}
+
+/// JSDoc text from a comment node (a `/** … */` block), or `None` for ordinary
+/// `//` or `/* */` comments.
+fn js_doc_text(src: &str, node: Node) -> Option<String> {
+    let raw = node_text(src, node);
+    let t = raw.trim_start();
+    if t.starts_with("/**") && !t.starts_with("/***") {
+        let body = t.trim_start_matches("/**").trim_end_matches("*/");
+        // Strip leading ` * ` from each JSDoc line.
+        let cleaned: Vec<String> = body
+            .lines()
+            .map(|l| l.trim_start().trim_start_matches('*').trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let text = cleaned.join("\n");
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    } else {
+        None
+    }
+}
+
+// ── Python ───────────────────────────────────────────────────────────────
+
+fn parse_python(src: &str, file: &str, fg: &mut FileGraph) {
+    let mut parser = Parser::new();
+    if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(src, None) else {
+        return;
+    };
+    walk_py(src, file, tree.root_node(), None, false, fg);
+}
+
+/// Recursive Python walk: `def`/`class` definitions (incl. `@decorated`),
+/// docstrings, import edges, call references, class→method containment.
+fn walk_py(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bool, fg: &mut FileGraph) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let kind = child.kind();
+        // `@decorator`-wrapped def/class: the real definition is the inner node.
+        let def_node = if kind == "decorated_definition" {
+            child.child_by_field_name("definition").unwrap_or(child)
+        } else {
+            child
+        };
+        match def_node.kind() {
+            "function_definition" | "class_definition" => {
+                let Some(name) = def_node.child_by_field_name("name").map(|n| node_text(src, n)) else {
+                    continue;
+                };
+                let skind = if def_node.kind() == "class_definition" {
+                    SymbolKind::Class
+                } else if in_class {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                };
+                let doc = py_docstring(src, def_node);
+                let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, fg);
+                if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
+                    collect_calls_py(src, file, def_node, &id, fg);
+                }
+                let child_in_class = def_node.kind() == "class_definition";
+                walk_py(src, file, def_node, Some(&id), child_in_class, fg);
+            }
+            "import_statement" | "import_from_statement" => {
+                for m in py_import_modules(src, def_node) {
+                    fg.edges.push(Edge { kind: EdgeKind::Import, src: file.to_string(), dst: m });
+                }
+            }
+            _ => walk_py(src, file, def_node, parent, in_class, fg),
+        }
+    }
+}
+
+/// The docstring of a `function_definition`/`class_definition` (the first
+/// string statement in its block), unquoted and trimmed.
+fn py_docstring(src: &str, def: Node) -> Option<String> {
+    let body = def.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    let first = body.named_children(&mut cursor).next()?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    let mut c2 = first.walk();
+    let s = first.named_children(&mut c2).next()?;
+    if s.kind() != "string" {
+        return None;
+    }
+    let raw = node_text(src, s);
+    let t = raw
+        .trim()
+        .trim_start_matches(['r', 'b', 'u', 'R', 'B', 'U', 'f', 'F'])
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn collect_calls_py(src: &str, file: &str, node: Node, from_id: &str, fg: &mut FileGraph) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "call" {
+            if let Some(callee) = py_callee_name(src, child) {
+                let pos = child.start_position();
+                fg.references.push(Reference {
+                    name: callee.clone(),
+                    file: file.to_string(),
+                    line: pos.row as u32 + 1,
+                    col: pos.column as u32 + 1,
+                    resolved_id: None,
+                });
+                fg.edges.push(Edge { kind: EdgeKind::Call, src: from_id.to_string(), dst: callee });
+            }
+        }
+        if !matches!(child.kind(), "function_definition" | "class_definition" | "lambda") {
+            collect_calls_py(src, file, child, from_id, fg);
+        }
+    }
+}
+
+/// Callee name for a Python `call` node (`f()` → `f`, `obj.m()` → `m`).
+fn py_callee_name(src: &str, call: Node) -> Option<String> {
+    let f = call.child_by_field_name("function")?;
+    let name = match f.kind() {
+        "identifier" => node_text(src, f),
+        "attribute" => f
+            .child_by_field_name("attribute")
+            .map(|n| node_text(src, n))
+            .unwrap_or_else(|| node_text(src, f)),
+        _ => first_line(&node_text(src, f)),
+    };
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Module names imported by an `import_statement`/`import_from_statement`.
+fn py_import_modules(src: &str, node: Node) -> Vec<String> {
+    // `import_from_statement` has a `module_name` field; `import_statement`
+    // lists dotted names/aliases as its named children.
+    if node.kind() == "import_from_statement" {
+        if let Some(m) = node.child_by_field_name("module_name") {
+            return vec![node_text(src, m)];
+        }
+    }
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for c in node.named_children(&mut cursor) {
+        match c.kind() {
+            "dotted_name" | "relative_import" => out.push(node_text(src, c)),
+            // `import x as y` → the `name` (dotted_name) field of aliased_import.
+            "aliased_import" => {
+                if let Some(n) = c.child_by_field_name("name") {
+                    out.push(node_text(src, n));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +943,101 @@ Duplicate heading to exercise de-dup.
         // The Overview chunk carries its body text (searchable).
         let overview = fg.docs.iter().find(|d| d.anchor == "overview").unwrap();
         assert!(overview.text.contains("Intro paragraph"));
+    }
+
+    const TS: &str = r#"
+import { mount } from './host';
+
+/** Adds two numbers. */
+export function add(a: number, b: number): number {
+  return helper(a) + b;
+}
+
+function helper(x: number): number { return x * 2; }
+
+export const build = (n: number) => helper(n);
+
+export interface Shape { area(): number; }
+
+export type Id = string;
+
+export class Point {
+  origin(): Point { return mount(this); }
+}
+"#;
+
+    #[test]
+    fn extracts_typescript() {
+        let fg = parse_file("src/geo.ts", TS, Lang::TypeScript);
+        assert_eq!(fg.lang_tag, "typescript");
+
+        assert!(names(&fg, SymbolKind::Function).contains(&"add".to_string()));
+        assert!(names(&fg, SymbolKind::Function).contains(&"helper".to_string()));
+        // `const build = (n) => …` is captured as a function.
+        assert!(names(&fg, SymbolKind::Function).contains(&"build".to_string()));
+        assert!(names(&fg, SymbolKind::Class).contains(&"Point".to_string()));
+        assert!(names(&fg, SymbolKind::Interface).contains(&"Shape".to_string()));
+        assert!(names(&fg, SymbolKind::TypeAlias).contains(&"Id".to_string()));
+        assert!(names(&fg, SymbolKind::Method).contains(&"origin".to_string()));
+
+        // JSDoc attaches across the `export`.
+        let add = fg.symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(add.doc.as_deref(), Some("Adds two numbers."));
+
+        // `add` calls `helper`; the file imports './host'.
+        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == add.id && e.dst == "helper"));
+        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Import && e.dst == "./host"));
+        // class Point contains method origin.
+        let point = fg.symbols.iter().find(|s| s.name == "Point").unwrap();
+        let origin = fg.symbols.iter().find(|s| s.name == "origin").unwrap();
+        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Contains && e.src == point.id && e.dst == origin.id));
+    }
+
+    #[test]
+    fn extracts_javascript() {
+        let js = "export function go() { return run(); }\nconst f = () => go();\n";
+        let fg = parse_file("src/app.js", js, Lang::JavaScript);
+        assert_eq!(fg.lang_tag, "javascript");
+        assert!(names(&fg, SymbolKind::Function).contains(&"go".to_string()));
+        assert!(names(&fg, SymbolKind::Function).contains(&"f".to_string()));
+        let go = fg.symbols.iter().find(|s| s.name == "go").unwrap();
+        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == go.id && e.dst == "run"));
+    }
+
+    const PY: &str = r#"
+import os
+from pkg.sub import thing
+
+def add(a, b):
+    """Adds two numbers."""
+    return helper(a) + b
+
+def helper(x):
+    return x * 2
+
+class Point:
+    def origin(self):
+        return os.getcwd()
+"#;
+
+    #[test]
+    fn extracts_python() {
+        let fg = parse_file("src/geo.py", PY, Lang::Python);
+        assert_eq!(fg.lang_tag, "python");
+
+        assert!(names(&fg, SymbolKind::Function).contains(&"add".to_string()));
+        assert!(names(&fg, SymbolKind::Function).contains(&"helper".to_string()));
+        assert!(names(&fg, SymbolKind::Class).contains(&"Point".to_string()));
+        assert!(names(&fg, SymbolKind::Method).contains(&"origin".to_string()));
+
+        // Docstring → doc.
+        let add = fg.symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(add.doc.as_deref(), Some("Adds two numbers."));
+        // add calls helper; imports os + pkg.sub; origin calls getcwd (attr).
+        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == add.id && e.dst == "helper"));
+        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Import && e.dst == "os"));
+        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Import && e.dst == "pkg.sub"));
+        let origin = fg.symbols.iter().find(|s| s.name == "origin").unwrap();
+        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == origin.id && e.dst == "getcwd"));
     }
 }

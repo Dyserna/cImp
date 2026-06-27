@@ -50,12 +50,20 @@ mod tests {
     fn defs_mirror_the_shared_specs() {
         let specs = crate::graph::tool_specs();
         let defs = defs();
-        assert_eq!(defs.len(), specs.len());
+        // `defs()` is the shared base set plus an optional semantic tool when
+        // it's enabled in live settings, so assert the base set is covered
+        // (subset) rather than exact equality — the count is settings-dependent.
         assert!(!defs.is_empty());
-        for (spec, def) in specs.iter().zip(defs.iter()) {
-            assert_eq!(def.function.name, spec.name);
-            assert!(def.function.name.starts_with("graph_"));
+        assert!(defs.len() >= specs.len());
+        for spec in &specs {
+            let def = defs
+                .iter()
+                .find(|d| d.function.name == spec.name)
+                .unwrap_or_else(|| panic!("base graph tool `{}` missing from defs()", spec.name));
             assert_eq!(def.function.parameters, spec.parameters);
+        }
+        for def in &defs {
+            assert!(def.function.name.starts_with("graph_"));
         }
     }
 }

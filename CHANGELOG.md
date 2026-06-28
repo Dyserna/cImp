@@ -5,6 +5,18 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] — 2026-06-28
+
+### Added
+
+- **Bundled external tools (`ebin/`).** The portable zip now carries a sibling `ebin/` ("external binaries") folder with `broot` (MIT) and `rustnet` (Apache-2.0), so the bottom-bar quick-launch buttons and shell tabs work without the user installing those tools. Command resolution checks `ebin/` first, then PATH; drop any executable into `ebin/` to add a tool. (rustnet needs Npcap installed to capture traffic; aider is not bundled because pip's launcher isn't portable.)
+- **External-tool path override (Settings → Bottom bar).** Point `rustnet` or `broot` at a specific executable in any folder (with a file picker), overriding the `ebin/` → PATH lookup. Leave blank to resolve normally.
+
+### Fixed
+
+- **Crash-safe child reaping (Windows).** Offload child processes (`llama-server`, the warm MCP-host servers, `run_command`) are now assigned to a kill-on-job-close Job Object, so the OS terminates them whenever ccImp dies for any reason — a crash, `panic = abort`, `taskkill /F`, or the dev hot-reload — not just on a clean exit. Fixes orphaned `llama-server` processes piling up and holding VRAM across dev cycles.
+- **Aider tab gating.** Enabling an Aider tab (cloud or local) is now rejected with a clear message when the `aider` command can't be resolved (not in `ebin`, not on PATH), instead of materializing a dead "command not found" tab. Claude is not gated.
+
 ## [0.19.0] — 2026-06-27
 
 ### Added

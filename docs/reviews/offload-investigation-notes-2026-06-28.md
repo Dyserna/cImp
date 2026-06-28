@@ -1,0 +1,21 @@
+# Offload server — issues to investigate
+
+Observed during the 2026-06-28 Qwen-vs-Sonnet comparison run (local model `Qwen3.6-35B-A3B-UD-Q4_K_M`, llama-server on 127.0.0.1:12333).
+
+1. **Concurrent requests fail.** Firing 2+ offload_task calls so 2 run concurrently → the queued/2nd request returns `error sending request for url (http://127.0.0.1:12333/v1/chat/completions)` (connection-refused) and/or an empty result. Single (serial) calls are reliable. Both llama-server slots were live (~120 tok/s each, 75k ctx each) at the time, so the refusal looks like a **host-side queueing/dispatch bug**, not server capacity. The offload tool advertises "up to 2 concurrent" — that path is broken against this server.
+
+2. **Oversized unit → empty return.** A review unit whose files exceed a slot's context returns `completed with no output` (empty), even run solo. Mitigated by raising context (moved to 1 slot @ 180k). Want: detect/handle context overflow explicitly instead of silently returning empty.
+
+3. **Orphaned slot on client error (transport error, NOT a timeout).** When the host returns an error to the caller, the underlying llama-server job KEEPS RUNNING and holds the slot; its result is lost (the MCP call already errored). No cancel is propagated to the server.
+   - **Exact error string:** `offload error: chat request failed: error sending request for url (http://127.0.0.1:12333/v1/chat/completions)`
+   - This is a **reqwest transport-level error** (connect/send stage), **NOT a response timeout** (a timeout reads "operation timed out"/"elapsed", `reqwest::Error::is_timeout()`). The TCP connection failed/was dropped; the host did not wait out a deadline.
+   - **Contradiction to resolve:** the slot is observably generating, so the request DID reach llama-server — not a true failure-to-send. Likely causes:
+     a. **Pooled-connection reuse** — the host's reqwest `Client` reuses a keep-alive connection llama-server closed after the previous response; the next send on the stale socket fails. Fix: `.pool_max_idle_per_host(0)` or retry once on transport error.
+     b. **Header-stall during prompt processing** — at high ctx, llama-server accepts the socket and begins prompt eval before sending headers; a short read/overall timeout surfaces as a send/transport error.
+   - **Actions:** (i) audit the host's reqwest `Client` builder — connect vs read/overall timeout, pool settings; (ii) on transport error, send an explicit cancel to llama-server (slot-stop) so the slot frees; (iii) log `is_timeout()` vs `is_connect()` vs `is_request()` so it's diagnosable.
+
+3b. **Client interrupt/cancel does NOT stop the server job (confirmed live).** Issuing an offload_task and then interrupting/rejecting the tool call client-side still left llama-server running the job (slot active). The request is dispatched to the server at/around when the tool is issued, and aborting on the client (interrupt, dropped future, errored MCP call) leaves the server generating an orphaned job that holds the only slot — same end state as #3. **No cancel/abort propagation host→llama-server when the caller goes away.** Fix: tie the host's server-side request to the caller's cancellation token / dropped future, and issue a slot-stop on cancel. This makes every failed/aborted attempt cost a full generation and block the slot — the main thing making a serial review run fragile.
+
+4. **No slot availability/status check.** Need a way to query slot busy/free/queue depth before dispatching (poll llama-server `/slots` or `/health`), so the host can queue gracefully, report "busy", or pick a free slot instead of erroring. Surface in the Offload Server tab too.
+
+5. **Verbosity/format drift (model-side, minor).** Without a strict output cap, Qwen over-produced (one unit = 1863 lines / 81k chars, overflowed the tool's max-tokens). A tight "JSON only, <3500 tokens" instruction fixed it. Qwen also emitted confidence as floats (0.75) instead of high/med/low. Consider enforcing a response schema / max_tokens on the offload agent.

@@ -682,6 +682,9 @@ async fn connect_stdio(
     let mut child = command
         .spawn()
         .map_err(|e| format!("spawn `{}`: {e}", cfg.command))?;
+    // Backstop: reap this warm MCP-host server via the kill-on-job-close job
+    // if ccImp dies hard (kill_on_drop only covers a clean exit).
+    crate::process_guard::guard_child(&child);
 
     let stdin = child.stdin.take().ok_or("child has no stdin")?;
     let stdout = child.stdout.take().ok_or("child has no stdout")?;

@@ -637,6 +637,10 @@ fn spawn_child(
     let mut child = command
         .spawn()
         .map_err(|e| AppError::Spawn(format!("llama-server: {e}")))?;
+    // Backstop: assign to the kill-on-job-close job so the OS reaps this
+    // VRAM-holding server even if ccImp dies hard (crash / panic=abort /
+    // dev hot-reload TerminateProcess), where kill_on_drop never fires.
+    crate::process_guard::guard_child(&child);
 
     // Drain stdout/stderr into the log + capture buffer so they don't fill
     // the OS pipe buffer and stall the server, and so the panel can show them.

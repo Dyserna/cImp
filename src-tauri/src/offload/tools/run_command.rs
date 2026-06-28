@@ -205,6 +205,9 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn `{}`: {e}", args.command))?;
+    // Backstop: reap this command subprocess via the kill-on-job-close job if
+    // ccImp dies hard before kill_on_drop can fire.
+    crate::process_guard::guard_child(&child);
 
     // Read stdout/stderr concurrently with waiting, each capped so a command
     // that floods output (e.g. `git log -p` on a huge repo) can't balloon RSS

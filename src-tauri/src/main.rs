@@ -8,6 +8,7 @@ mod ipc;
 mod logging;
 mod notifications;
 mod offload;
+mod process_guard;
 mod processing;
 mod pty;
 mod settings;

@@ -307,11 +307,12 @@ jobs:
           # --- Slim variant (no Kokoro model, no voicepack) ----------------
           # Same exe + DLLs as the full build. Skip `models/` entirely so a
           # user extracting this zip over an existing install keeps their
-          # local model files untouched. Avatar videos are still bundled
-          # (3.8MB; cheap and keeps the layout symmetric across variants).
+          # local model files untouched. The `avatars/` and `sprites/` folders
+          # are omitted too: those are only on-disk copies for customization —
+          # the canonical sets are embedded in the frontend at build time by
+          # the Vite plugins, so the app still renders avatars and sprites
+          # without them. Leaving them out keeps the no-models update zip lean.
           New-Item -ItemType Directory -Force -Path "$stageSlim/bin" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$stageSlim/avatars" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$stageSlim/sprites" | Out-Null
 
           Copy-Item $env:CARGO_TARGET_DIR/release/ccimp.exe "$stageSlim/bin/"
           Get-ChildItem $env:CARGO_TARGET_DIR/release -Filter 'onnxruntime*.dll' |
@@ -324,9 +325,6 @@ jobs:
             if (Test-Path $src) { Copy-Item $src "$stageSlim/bin/" }
             else { Write-Host "::error::WebGPU runtime DLL missing from build output: $d"; exit 1 }
           }
-
-          Copy-Item -Recurse avatars/* "$stageSlim/avatars/"
-          Copy-Item -Recurse sprites/* "$stageSlim/sprites/"
 
           # UI themes + terminal palettes (see the full-variant note). Bundled
           # in the slim zip too so the app is themed after a no-models update;

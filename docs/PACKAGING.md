@@ -197,8 +197,10 @@ The `ccImp-avatars` Vite plugin in `vite.config.ts` serves them at
 `/avatar/<theme>/...` in dev and copies them to `dist/avatar/<theme>/...`
 at build time, where they're embedded in the Tauri output as part of
 `frontendDist`. The release workflow also stages the same `avatars/`
-tree into the portable zip's `avatars/` folder for on-disk discoverability.
-No separate step required.
+tree into the **full** portable zip's `avatars/` folder for on-disk
+discoverability. The slim / no-models update zip omits it — the embedded
+copies render fine, and the on-disk folder is customization-only. No
+separate step required.
 
 The **sprite** avatar variant works the same way: sets live at the
 top-level `sprites/<set>/` folder (each a `manifest.json` + frame
@@ -206,8 +208,9 @@ subfolders), served at `/sprites/<set>/...` in dev by the `ccImp-sprites`
 Vite plugin and copied to `dist/sprites/<set>/...` at build. Because the
 frontend loads them from the embedded `/sprites/...` URLs, sprite avatars
 function without any on-disk portable folder or Rust path-stamping — the
-release workflow still stages `sprites/` into the zip for discoverability
-and for dropping in new sets. Adding a new bundled set is two steps: drop
+release workflow still stages `sprites/` into the **full** zip for
+discoverability and for dropping in new sets (the slim / no-models update
+zip omits it, same as `avatars/`). Adding a new bundled set is two steps: drop
 the folder under `sprites/`, and add its name to `KNOWN_SPRITE_SETS` in
 `src/lib/avatarConfig.ts`.
 

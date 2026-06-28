@@ -48,6 +48,17 @@ const CLAUDE_BURST_MIN: Duration = Duration::from_millis(1000);
 /// the marker, not this timer, decides Idle while Claude is working.
 const CLAUDE_QUIET: Duration = Duration::from_millis(500);
 
+/// Grace window after a real PTY resize during which the byte-burst
+/// activity fallback is ignored. A resize pulses SIGWINCH and the child
+/// (Claude Code's TUI) repaints — a burst of bytes that would otherwise
+/// trip `burst_ready` and flip the avatar Idle → Thinking → Idle, firing a
+/// spurious "idle" notification. A drag refreshes the window on every
+/// dimension change, so this only needs to cover the gap between successive
+/// resizes plus the post-release repaint settle. The `claude_working`
+/// marker path is unaffected, so genuine work during a resize still shows
+/// Thinking.
+const RESIZE_BURST_GRACE: Duration = Duration::from_millis(1200);
+
 /// Safety valve: if the working marker is somehow still matched but the
 /// byte stream has been completely silent this long, treat it as stale
 /// (e.g. ghost footer text left in the cell grid) and release Idle. The
@@ -192,6 +203,10 @@ pub fn spawn_processor(
         let mut output_active = false;
         let mut burst_start: Option<tokio::time::Instant> = None;
         let mut last_byte_time: Option<tokio::time::Instant> = None;
+        // Set on each real PTY resize. While within `RESIZE_BURST_GRACE` of
+        // this, the byte-burst activity fallback is suppressed so a
+        // resize-driven TUI repaint doesn't masquerade as Claude output.
+        let mut last_resize: Option<tokio::time::Instant> = None;
         // True while the `claude_working` marker ("esc to interrupt") is on
         // screen. Authoritative for the avatar's Thinking state; the byte
         // timers above are only a fallback. Updated by run_permission_check.
@@ -231,6 +246,10 @@ pub fn spawn_processor(
                             // serialize-snapshot replay.
                             debug!(?tab, "pty processor: channel rebind");
                             channel = next;
+                        }
+                        Some(ProcessorControl::Resized) => {
+                            // Open the grace window. See RESIZE_BURST_GRACE.
+                            last_resize = Some(tokio::time::Instant::now());
                         }
                         None => {
                             // Sender dropped — only happens if PtyHandle
@@ -307,6 +326,22 @@ pub fn spawn_processor(
                             // Enter "working" on the marker, or — for a
                             // response that never paints it — a sustained
                             // byte burst.
+                            //
+                            // Suppress the burst path within the grace window
+                            // after a resize: the TUI repaint that a resize
+                            // triggers is a burst of bytes with no underlying
+                            // request, and letting it flip Idle → Thinking →
+                            // Idle fires a spurious "idle" notification. Clear
+                            // the accumulated burst too, so churn that ends
+                            // mid-grace can't trip `burst_ready` the instant
+                            // the window closes. The marker path is untouched,
+                            // so a real request mid-resize still shows Thinking.
+                            let in_resize_grace = last_resize
+                                .is_some_and(|t| t.elapsed() < RESIZE_BURST_GRACE);
+                            if in_resize_grace && !working_active {
+                                burst_start = None;
+                                last_byte_time = None;
+                            }
                             let burst_ready = burst_start
                                 .is_some_and(|s| s.elapsed() >= CLAUDE_BURST_MIN);
                             if working_active || burst_ready {

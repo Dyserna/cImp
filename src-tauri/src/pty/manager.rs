@@ -43,6 +43,15 @@ pub struct PtyManager {
 /// bytes to a freshly-constructed one.
 pub enum ProcessorControl {
     ChannelChange(Channel<String>),
+    /// A real (non-deduped) PTY resize just pulsed SIGWINCH at the child,
+    /// which makes a TUI like Claude Code repaint. That repaint is a burst
+    /// of bytes indistinguishable from genuine output, so it can trip the
+    /// processor's byte-burst activity fallback and spuriously flip the
+    /// avatar Idle → Thinking → Idle (firing an "idle" notification). The
+    /// processor uses this to open a short grace window during which the
+    /// burst fallback is suppressed; the `claude_working` marker path stays
+    /// live, so real activity during/after a resize is still detected.
+    Resized,
 }
 
 struct PtyHandle {
@@ -254,10 +263,14 @@ impl PtyManager {
         let rows = rows.max(1);
         let cols = cols.max(1);
 
-        let (master, last_size) = {
+        let (master, last_size, control_tx) = {
             let guard = self.inner.lock().await;
             let handle = guard.as_ref().ok_or(AppError::NotStarted)?;
-            (handle.master.clone(), handle.last_size.clone())
+            (
+                handle.master.clone(),
+                handle.last_size.clone(),
+                handle.control_tx.clone(),
+            )
         };
 
         {
@@ -288,6 +301,14 @@ impl PtyManager {
         if let Ok(mut last) = last_size.lock() {
             *last = (rows, cols);
         }
+
+        // Tell the processor a real resize just fired so it can ignore the
+        // resulting TUI-repaint burst (see `ProcessorControl::Resized`).
+        // `try_send` is deliberate: a full control queue during a fast drag
+        // means a Resized is already in flight, so dropping this one is
+        // harmless — the processor only needs to know a resize happened
+        // recently, not how many.
+        let _ = control_tx.try_send(ProcessorControl::Resized);
         Ok(())
     }
 

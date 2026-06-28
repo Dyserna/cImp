@@ -898,7 +898,8 @@ pub async fn set_enabled_ai_tabs(
 pub enum ToolKind {
     /// Terminal network monitor. Resolved as `rustnet` (ebin → PATH).
     Rustnet,
-    /// broot file browser with git info (`broot -g`). Resolved (ebin → PATH).
+    /// broot file browser with git info, showing hidden files
+    /// (`broot -g -h`). Resolved (ebin → PATH).
     Broot,
 }
 
@@ -909,7 +910,7 @@ impl ToolKind {
     fn spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
         match self {
             ToolKind::Rustnet => ("rustnet", "rustnet", &[]),
-            ToolKind::Broot => ("broot", "broot", &["-g"]),
+            ToolKind::Broot => ("broot", "broot", &["-g", "-h"]),
         }
     }
 

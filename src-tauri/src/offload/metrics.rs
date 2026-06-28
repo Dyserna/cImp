@@ -31,6 +31,9 @@ const HISTORY_CAP: usize = 50;
 pub struct SlotMetric {
     pub id: u32,
     pub processing: bool,
+    /// Prompt (input) tokens for the current/last request. Total context in
+    /// use on this slot is `n_prompt + n_decoded`.
+    pub n_prompt: u32,
     /// Tokens generated so far in the current (or last) request.
     pub n_decoded: u32,
     /// Per-slot context window (tokens).
@@ -48,6 +51,9 @@ pub struct RequestRecord {
     pub start_ms: u64,
     pub end_ms: u64,
     pub duration_s: f32,
+    /// Prompt (input) tokens for the request. Total tokens = `prompt_tokens
+    /// + tokens`; `tokens` alone is the generated (output) count.
+    pub prompt_tokens: u32,
     pub tokens: u32,
     pub avg_tps: f32,
 }
@@ -151,6 +157,7 @@ impl ServerMetrics {
 struct SlotTrack {
     was_processing: bool,
     last_decoded: u32,
+    last_prompt: u32,
     last_instant: Instant,
     start_ms: u64,
     last_task: i64,
@@ -214,18 +221,24 @@ impl MetricsPoller {
                     .or(n_ctx)
                     .unwrap_or(0);
                 let n_decoded = slot_decoded(s);
+                let n_prompt = s
+                    .get("n_prompt_tokens")
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as u32)
+                    .unwrap_or(0);
                 let task = s.get("id_task").and_then(|x| x.as_i64()).unwrap_or(-1);
 
                 if processing {
                     busy += 1;
                 }
-                let tps = self.fold_slot(id, processing, n_decoded, task, now, now_inst);
+                let tps = self.fold_slot(id, processing, n_decoded, n_prompt, task, now, now_inst);
                 if let Some(t) = tps {
                     aggregate_tps += t;
                 }
                 slots.push(SlotMetric {
                     id,
                     processing,
+                    n_prompt,
                     n_decoded,
                     n_ctx: slot_n_ctx,
                     tps,
@@ -265,6 +278,7 @@ impl MetricsPoller {
         id: u32,
         processing: bool,
         n_decoded: u32,
+        n_prompt: u32,
         task: i64,
         now_ms: u64,
         now_inst: Instant,
@@ -272,6 +286,7 @@ impl MetricsPoller {
         let track = self.tracks.entry(id).or_insert_with(|| SlotTrack {
             was_processing: false,
             last_decoded: n_decoded,
+            last_prompt: n_prompt,
             last_instant: now_inst,
             start_ms: now_ms,
             last_task: task,
@@ -284,6 +299,7 @@ impl MetricsPoller {
         if new_request {
             track.start_ms = now_ms;
             track.last_decoded = n_decoded;
+            track.last_prompt = n_prompt;
             track.last_instant = now_inst;
         } else if processing {
             let dt = now_inst.duration_since(track.last_instant).as_secs_f32();
@@ -306,6 +322,9 @@ impl MetricsPoller {
                 start_ms: track.start_ms,
                 end_ms: now_ms,
                 duration_s,
+                // Prompt size from the last processing tick (it's idle now, so
+                // the slot's live `n_prompt_tokens` may be stale/reset).
+                prompt_tokens: track.last_prompt,
                 tokens: n_decoded,
                 avg_tps,
             });
@@ -316,6 +335,7 @@ impl MetricsPoller {
 
         if processing {
             track.last_decoded = n_decoded;
+            track.last_prompt = n_prompt;
             track.last_instant = now_inst;
         }
         track.last_task = task;
@@ -460,17 +480,18 @@ mod tests {
     fn fold_slot_computes_tps_and_records_history() {
         let mut p = MetricsPoller::new();
         let t0 = Instant::now();
-        // Start a request: idle→busy at decoded 0.
-        let tps0 = p.fold_slot(0, true, 0, 7, 1_000, t0);
+        // Start a request: idle→busy at decoded 0, prompt 500.
+        let tps0 = p.fold_slot(0, true, 0, 500, 7, 1_000, t0);
         assert!(tps0.is_none()); // no delta yet
         // 1s later, 100 tokens decoded → ~100 tps.
-        let tps1 = p.fold_slot(0, true, 100, 7, 2_000, t0 + Duration::from_secs(1));
+        let tps1 = p.fold_slot(0, true, 100, 500, 7, 2_000, t0 + Duration::from_secs(1));
         assert!(tps1.unwrap() > 90.0 && tps1.unwrap() < 110.0);
-        // Finish: busy→idle → one history record of 100 tokens.
-        let _ = p.fold_slot(0, false, 100, 7, 3_000, t0 + Duration::from_secs(2));
+        // Finish: busy→idle → one history record of 100 output tokens, prompt 500.
+        let _ = p.fold_slot(0, false, 100, 500, 7, 3_000, t0 + Duration::from_secs(2));
         assert_eq!(p.history.len(), 1);
         let rec = &p.history[0];
         assert_eq!(rec.tokens, 100);
+        assert_eq!(rec.prompt_tokens, 500);
         assert_eq!(rec.slot, 0);
         assert!((rec.duration_s - 2.0).abs() < 0.01);
     }

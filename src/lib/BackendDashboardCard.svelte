@@ -162,11 +162,19 @@
           <span class="slot-state">
             {#if slot.processing}<span class="dot on pulse"></span> generating{:else}<span class="dot idle"></span> idle{/if}
           </span>
-          <span class="slot-tok">{slot.n_decoded.toLocaleString()} / {slot.n_ctx.toLocaleString()}</span>
+          <span
+            class="slot-tok"
+            title="{slot.n_prompt.toLocaleString()} prompt + {slot.n_decoded.toLocaleString()} generated = total context in use"
+          >
+            {(slot.n_prompt + slot.n_decoded).toLocaleString()} / {slot.n_ctx.toLocaleString()}
+          </span>
           <span class="slot-tps">{slot.processing ? fmtTps(slot.tps) : ''}</span>
           <div class="bar slim">
             {#if slot.n_ctx > 0}
-              <div class="fill" style="width:{clampPct((slot.n_decoded / slot.n_ctx) * 100)}%"></div>
+              <div
+                class="fill"
+                style="width:{clampPct(((slot.n_prompt + slot.n_decoded) / slot.n_ctx) * 100)}%"
+              ></div>
             {/if}
           </div>
         </div>
@@ -186,7 +194,13 @@
                 <span class="htime">{fmtTime(r.start_ms)} → {fmtTime(r.end_ms)}</span>
                 <span class="hdur">{r.duration_s.toFixed(1)}s</span>
                 <span class="hslot">slot {r.slot}</span>
-                <span class="htok">{r.tokens.toLocaleString()} tok</span>
+                <span
+                  class="htok"
+                  title="{r.prompt_tokens.toLocaleString()} prompt + {r.tokens.toLocaleString()} generated"
+                >
+                  {(r.prompt_tokens + r.tokens).toLocaleString()} tok
+                  <span class="muted">· {r.tokens.toLocaleString()} out</span>
+                </span>
                 <span class="htps">{Math.round(r.avg_tps)} tok/s</span>
               </div>
             {/each}
@@ -307,7 +321,7 @@
   }
   .slot {
     display: grid;
-    grid-template-columns: 3.5rem 7.5rem 9rem 5.5rem 1fr;
+    grid-template-columns: 3.5rem 7.5rem 11rem 5.5rem 1fr;
     align-items: center;
     gap: 0.5rem;
     padding: 0.3rem 0.5rem;
@@ -356,7 +370,7 @@
   }
   .hrow {
     display: grid;
-    grid-template-columns: minmax(11rem, 1.5fr) 4rem 4rem 1fr 6rem;
+    grid-template-columns: minmax(10rem, 1.3fr) 3.5rem 3.5rem minmax(9rem, 1.7fr) 5.5rem;
     align-items: center;
     gap: 0.5rem;
     height: var(--hrow-h);

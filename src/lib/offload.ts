@@ -198,6 +198,8 @@ export function onOffloadServerOutput(
 export interface SlotMetric {
   id: number;
   processing: boolean;
+  /// Prompt (input) tokens. Total context in use = n_prompt + n_decoded.
+  n_prompt: number;
   n_decoded: number;
   n_ctx: number;
   tps: number | null;
@@ -207,6 +209,9 @@ export interface RequestRecord {
   start_ms: number;
   end_ms: number;
   duration_s: number;
+  /// Prompt (input) tokens. Total tokens = prompt_tokens + tokens.
+  prompt_tokens: number;
+  /// Generated (output) tokens.
   tokens: number;
   avg_tps: number;
 }

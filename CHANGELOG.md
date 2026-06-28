@@ -5,6 +5,25 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.1] — 2026-06-28
+
+### Added
+
+- **Cancellable offload.** Local offload requests now stream, so interrupting an `offload_task` (or the calling session going away) aborts the in-flight generation and frees the `llama-server` slot immediately, instead of leaving an orphaned request running to completion and blocking the slot.
+- **Total token counts in the Offload Server dashboard.** The request history now shows total tokens (prompt + generated) with the generated count broken out (e.g. `41,841 tok · 7,939 out`), and the per-slot bar reflects true context fill (prompt + generated) rather than generated-only.
+- **`broot` launches with hidden files shown.** The bottom-bar broot button now runs `broot -g -h`.
+
+### Changed
+
+- **Bottom-bar controls regrouped.** Left-to-right: broot · rustnet | start dictation | play/pause/restart/stop · volume · mute TTS · mute notifications | settings, with dividers between groups. The avatar show/hide toggle was removed from the bar.
+- **Leaner no-models update zip.** The slim/no-models zip no longer ships the `avatars/` and `sprites/` folders — the canonical sets are embedded in the app, so it still renders them; the full zip is unchanged.
+
+### Fixed
+
+- **Window resize no longer fires the "idle" chime.** A resize repaints the terminal, which was tripping the avatar's byte-burst activity fallback (Idle → Thinking → Idle) and firing a spurious notification.
+- **Offload connection reliability.** The chat client now retries a transient transport (connect/send) error once and no longer reuses idle keep-alive sockets, fixing the `error sending request for url …` failures (including under concurrent requests) caused by the local server closing a pooled connection between requests.
+- **No more silent-empty offload results.** When the model ended a turn with no answer (e.g. it reasoned entirely inside a `<think>` block), the agent returned an empty string as success; it now makes one forced-final attempt and surfaces a real answer or an explicit placeholder.
+
 ## [0.20.0] — 2026-06-28
 
 ### Added

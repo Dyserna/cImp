@@ -348,6 +348,70 @@ jobs:
           Get-ChildItem -Recurse $stageSlim | Select-Object FullName, Length |
             Format-Table -AutoSize | Out-String | Write-Host
 
+      - name: Stage bundled tools into ebin (both variants)
+        shell: pwsh
+        env:
+          # Pinned for reproducible releases. Bump these to ship newer tools.
+          BROOT_VERSION: '1.57.0'      # Canop/broot — MIT
+          RUSTNET_VERSION: '1.4.0'     # domcyrus/rustnet — Apache-2.0
+        run: |
+          $stageFull = "${{ steps.tag.outputs.stage_dir_full }}"
+          $stageSlim = "${{ steps.tag.outputs.stage_dir_slim }}"
+
+          # The portable layout carries an `ebin/` (external binaries) folder as
+          # a sibling of `bin/`. ccImp resolves these tools from ebin first, then
+          # PATH — see src-tauri/src/pty/resolve.rs. Tools are downloaded here at
+          # release time rather than committed (large, separately licensed). Both
+          # the full and slim/update zips get them so the toolset survives a
+          # no-models update.
+          $ebinFull = "$stageFull/ebin"
+          $ebinSlim = "$stageSlim/ebin"
+          New-Item -ItemType Directory -Force -Path $ebinFull | Out-Null
+          New-Item -ItemType Directory -Force -Path $ebinSlim | Out-Null
+
+          $work = Join-Path $env:RUNNER_TEMP 'ebin-tools'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+          function Stage-Tool($name, $url, $exeName, $matchHint) {
+            Write-Host "Fetching $name from $url"
+            $zip = Join-Path $work "$name.zip"
+            curl.exe -L --fail -o $zip $url
+            $dest = Join-Path $work $name
+            Remove-Item -Recurse -Force $dest -ErrorAction SilentlyContinue
+            Expand-Archive -Path $zip -DestinationPath $dest -Force
+            # Some release zips carry every platform's build; pick the Windows
+            # one by filename + (optional) path hint.
+            $exe = Get-ChildItem -Recurse -Path $dest -Filter $exeName |
+              Where-Object { -not $matchHint -or $_.FullName -match $matchHint } |
+              Select-Object -First 1
+            if (-not $exe) {
+              Write-Host "::error::$exeName not found in $name archive"; exit 1
+            }
+            Copy-Item $exe.FullName "$ebinFull/$exeName"
+            Copy-Item $exe.FullName "$ebinSlim/$exeName"
+            Write-Host "Staged $exeName ($([math]::Round($exe.Length/1KB)) KB)"
+          }
+
+          # broot — MIT. The release zip bundles all platforms; the Windows build
+          # lives under an x86_64-pc-windows-* subdir.
+          Stage-Tool 'broot' `
+            "https://github.com/Canop/broot/releases/download/v$env:BROOT_VERSION/broot_$env:BROOT_VERSION.zip" `
+            'broot.exe' 'windows'
+
+          # rustnet — Apache-2.0. NOTE: capturing packets needs Npcap installed
+          # on the user's machine (WinPcap API-compatible mode); see README.txt.
+          Stage-Tool 'rustnet' `
+            "https://github.com/domcyrus/rustnet/releases/download/v$env:RUSTNET_VERSION/rustnet-v$env:RUSTNET_VERSION-x86_64-pc-windows-msvc.zip" `
+            'rustnet.exe' $null
+
+          # aider is intentionally NOT bundled: pip's aider.exe is a launcher
+          # that hardcodes the install machine's Python path, so it isn't
+          # portable. Users who want it can drop a working aider into ebin/
+          # (ccImp resolves it automatically); see README.txt.
+
+          Write-Host "Staged ebin (full):"
+          Get-ChildItem $ebinFull | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
       - name: Zip both variants
         id: zip
         shell: pwsh

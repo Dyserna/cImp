@@ -425,11 +425,6 @@ impl Default for PtyManager {
     }
 }
 
-/// Resolve a command name (e.g. "claude", "aider") via PATH.
-pub fn resolve_command(name: &str) -> AppResult<std::path::PathBuf> {
-    which::which(name).map_err(|_| AppError::CommandNotFound(name.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

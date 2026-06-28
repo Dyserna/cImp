@@ -52,6 +52,12 @@ pub enum TabLifecycleError {
     /// last-checked-is-locked rule prevents this from the user side; the
     /// IPC enforces it as defense-in-depth.
     EmptyAiTabsList,
+    /// An attempt to enable an Aider tab (cloud or local) while the `aider`
+    /// command can't be resolved (not in `ebin`, not on PATH). The tab is
+    /// left disabled and the UI surfaces this so the user can install aider
+    /// first — unlike Claude (the app's own front end), a missing Aider would
+    /// only ever show a dead "command not found" tab.
+    AiderNotFound,
     /// Internal error (lock poisoning, channel send failure, etc.). Not
     /// expected in practice — surfaces as a toast on the frontend.
     Internal { message: String },
@@ -802,6 +808,25 @@ pub async fn set_enabled_ai_tabs(
         return Ok(());
     }
 
+    // Gate: don't enable an Aider tab (cloud or local) unless the `aider`
+    // command actually resolves (ebin → PATH, the same resolution the spawn
+    // path uses). Without this an enabled-but-unresolvable Aider tab would just
+    // materialize as a dead "command not found" tab. We only probe when a NEW
+    // aider tab is being turned on, and reject before any state changes so the
+    // toggle is atomic (the UI then reverts the checkbox and shows the reason).
+    // Claude is intentionally not gated — it's the app's own front end.
+    let enabling_aider = [AiTabId::Aider, AiTabId::AiderLocal]
+        .iter()
+        .any(|id| want.contains(id) && !have.contains(id));
+    if enabling_aider {
+        let resolvable = tokio::task::spawn_blocking(|| crate::pty::resolve_command("aider").is_ok())
+            .await
+            .map_err(|e| TabLifecycleError::internal(format!("aider probe join: {e}")))?;
+        if !resolvable {
+            return Err(TabLifecycleError::AiderNotFound);
+        }
+    }
+
     // Canonical add order: claude → claude-local → aider → aider-local
     // so insertions land in the right relative slot.
     let canonical = [
@@ -871,19 +896,35 @@ pub async fn set_enabled_ai_tabs(
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
-    /// Terminal network monitor. Resolved via PATH as `rustnet`.
+    /// Terminal network monitor. Resolved as `rustnet` (ebin → PATH).
     Rustnet,
-    /// broot file browser with git info (`broot -g`). Resolved via PATH.
+    /// broot file browser with git info (`broot -g`). Resolved (ebin → PATH).
     Broot,
 }
 
 impl ToolKind {
     /// `(display name, command, args)` for the tool. The command is resolved
-    /// via PATH at spawn time, exactly like a user-typed Shell-tab command.
+    /// at spawn time (bundled `ebin/` first, then PATH — see `pty::resolve`),
+    /// exactly like a user-typed Shell-tab command.
     fn spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
         match self {
             ToolKind::Rustnet => ("rustnet", "rustnet", &[]),
             ToolKind::Broot => ("broot", "broot", &["-g"]),
+        }
+    }
+
+    /// The launch command for this tool: an explicit per-tool path from
+    /// `settings.external_tools` when the user set one (Settings → Bottom
+    /// bar), otherwise the default bare name (resolved ebin → PATH at spawn).
+    fn command_for(self, settings: &Settings) -> String {
+        let override_path = match self {
+            ToolKind::Rustnet => settings.external_tools.rustnet.trim(),
+            ToolKind::Broot => settings.external_tools.broot.trim(),
+        };
+        if override_path.is_empty() {
+            self.spec().1.to_string()
+        } else {
+            override_path.to_string()
         }
     }
 }
@@ -907,13 +948,17 @@ pub async fn open_tool_tab(
     tool: ToolKind,
 ) -> Result<TabId, TabLifecycleError> {
     let _serializer = state.lifecycle_serializer.lock().await;
-    let (base_name, command, args) = tool.spec();
+    let (base_name, _default_command, args) = tool.spec();
 
     let tab = TabId::Shell(format!("shell-{}", Uuid::new_v4()));
 
+    // One settings snapshot: drives the collision-free display name AND the
+    // launch command (honoring an explicit external-tool path override).
+    let snap = state.settings.current();
+    let command = tool.command_for(&snap);
+
     // Auto-numbered, collision-free display name (`rustnet`, `rustnet 2`, …).
     let name = {
-        let snap = state.settings.current();
         let taken = snap.tabs.iter().any(|t| t.name() == base_name);
         if taken {
             unique_tab_name(&snap, base_name)
@@ -929,7 +974,7 @@ pub async fn open_tool_tab(
             id: tab.as_str().to_string(),
             builtin: false,
             name: name.clone(),
-            command: command.to_string(),
+            command,
             args: args.iter().map(|a| a.to_string()).collect(),
             cwd: None,
             env: HashMap::new(),

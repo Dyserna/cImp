@@ -545,6 +545,9 @@ export interface Settings {
   /// reasons as `claude_local` (local proxies typically accept dummy
   /// tokens; OS-keychain integration is a future upgrade).
   aider_local: AiderLocalSettings;
+  /// Optional explicit executable paths for the bundled quick-launch tools
+  /// (rustnet / broot); empty fields resolve normally (ebin → PATH).
+  external_tools: ExternalToolsSettings;
   /// V8-01: local task-offload config. ccImp runs a user-supplied
   /// `llama-server` and exposes an `offload_task` MCP tool into
   /// ccImp-launched Claude tabs. Off by default.
@@ -637,6 +640,16 @@ export interface AiderLocalSettings {
   base_url: string;
   auth_token: string;
   model: string;
+}
+
+/// Optional explicit executable paths for the bundled quick-launch tools
+/// (rustnet / broot). A non-empty value overrides the normal `ebin/` → PATH
+/// resolution for that tool, letting the user point at an exe in any folder.
+/// Empty (the default) means "resolve normally". Mirrors the backend's
+/// `ExternalToolsSettings`.
+export interface ExternalToolsSettings {
+  rustnet: string;
+  broot: string;
 }
 
 /// V8-01: native baseline offload tool toggles (mirror of Rust
@@ -988,6 +1001,10 @@ export function defaultSettings(): Settings {
       base_url: 'http://localhost:11434/v1',
       auth_token: 'ollama',
       model: '',
+    },
+    external_tools: {
+      rustnet: '',
+      broot: '',
     },
     offload: {
       enabled: false,

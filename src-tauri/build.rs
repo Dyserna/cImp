@@ -6,13 +6,15 @@ fn main() {
     tauri_build::build()
 }
 
-/// Copy the repo-root `themes/` and `palettes/` folders next to the built
-/// binary (`target/{profile}/themes` etc.), the same place the portable
-/// release stages them (`<exe-dir>/themes`). The app reads themes/palettes
-/// purely from disk — nothing is embedded in the binary and nothing is seeded
-/// at runtime — so this build-time copy is what makes dev / local builds find
-/// them without hand-staging a portable layout. The release zip gets its copy
-/// from `.github/workflows/release.yml` instead.
+/// Copy the repo-root `themes/`, `palettes/`, and `ebin/` folders next to the
+/// built binary (`target/{profile}/themes` etc.), the same place the portable
+/// release stages them (`<exe-dir>/themes`, sibling `ebin/`). The app reads
+/// themes/palettes purely from disk and resolves bundled tools out of `ebin/`
+/// (see `pty::resolve`) — nothing is embedded or seeded at runtime — so this
+/// build-time copy is what makes dev / local builds find them without
+/// hand-staging a portable layout. `ebin/` carries no binaries in the repo
+/// (only a `.gitkeep`); drop a tool there to test resolution locally. The
+/// release zip gets its copies from `.github/workflows/release.yml` instead.
 fn copy_theming_assets() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     // OUT_DIR = target/{profile}/build/ccimp-{hash}/out → up 3 = target/{profile}.
@@ -26,7 +28,7 @@ fn copy_theming_assets() {
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let repo_root = manifest.parent().expect("manifest has no parent");
 
-    for folder in ["themes", "palettes"] {
+    for folder in ["themes", "palettes", "ebin"] {
         let src = repo_root.join(folder);
         println!("cargo:rerun-if-changed={}", src.display());
         if !src.is_dir() {

@@ -45,6 +45,8 @@ What is bundled
                                      then restart to pick it up
   bin\palettes\<name>.json           terminal color palettes (one file each);
                                      edit or add files, then restart
+  ebin\broot.exe                     bundled CLI tools (see "Bundled tools")
+  ebin\rustnet.exe
   models\kokoro-v1.0.onnx            Kokoro 82M TTS model
   models\voices\af_heart.bin         default voice
   avatars\Idle.mp4 / Listening.mp4 / Thinking.mp4 / Speaking.mp4 / Error.mp4
@@ -71,6 +73,35 @@ under `avatars\` are there if you want to swap one out:
 
 Until a state is overridden it keeps using the embedded default. Clear
 an override to fall back to the bundled video.
+
+
+Bundled tools (ebin\)
+---------------------
+
+The `ebin\` folder ("external binaries") holds CLI tools ccImp can launch
+from its bottom-bar quick-launch buttons and shell tabs. When ccImp
+resolves a command it looks in `ebin\` FIRST, then falls back to your
+PATH — so a copy you install yourself can be overridden by the bundled
+one, and you can add new tools just by dropping an executable in here.
+
+  ebin\broot.exe     broot — a file browser with git info (MIT licensed).
+  ebin\rustnet.exe   rustnet — a terminal network monitor (Apache-2.0).
+                     NOTE: to actually capture traffic, rustnet needs
+                     Npcap installed with "WinPcap API-compatible Mode"
+                     enabled — https://npcap.com/. Without it rustnet
+                     launches but can't see packets.
+
+Prefer your own build of a tool? Settings -> Bottom bar -> External tools
+lets you point rustnet or broot at a specific exe in any folder; that
+path overrides the ebin\ / PATH lookup. Leave it blank to resolve
+normally.
+
+Aider is NOT bundled: its Windows launcher hardcodes the install
+machine's Python path and isn't portable. If you want the Aider tab,
+install it yourself (`pip install aider-chat`) and make sure `aider` is
+on your PATH — ccImp checks for it before letting you enable the tab, and
+will refuse (with a message) if it can't find it. You can also drop a
+working `aider` into `ebin\` and ccImp will pick it up.
 
 
 Customizing prompt detection

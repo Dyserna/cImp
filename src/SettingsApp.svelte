@@ -102,6 +102,9 @@
   let showLocalToken = $state<boolean>(false);
   // V14: same toggle for the Aider local LLM section.
   let showAiderLocalToken = $state<boolean>(false);
+  // Inline error under the AI-tabs checkbox group — e.g. when enabling an
+  // Aider tab is rejected because `aider` isn't installed (ebin/PATH).
+  let aiTabsError = $state<string | null>(null);
   // V8-01 offload: test-box input/result and a busy guard for the
   // Start/Stop/Reset/Test buttons.
   let offloadTestInput = $state<string>('');
@@ -609,6 +612,7 @@
     const updated = structuredClone($state.snapshot(snapshot));
     updated.enabled_ai_tabs = next_ids;
     snapshot = updated;
+    aiTabsError = null;
     try {
       await setEnabledAiTabs(next_ids);
     } catch (e) {
@@ -616,6 +620,14 @@
       const restored = structuredClone($state.snapshot(snapshot));
       restored.enabled_ai_tabs = prev;
       snapshot = restored;
+      // The backend rejects enabling an Aider tab when `aider` can't be
+      // resolved (not in ebin, not on PATH) — surface that specifically so the
+      // user knows to install it; everything else is a generic failure.
+      const kind = (e as { kind?: string } | null)?.kind;
+      aiTabsError =
+        kind === 'aider-not-found'
+          ? 'Aider was not found in ebin or on your PATH. Install aider (pip install aider-chat) and make sure it’s on PATH, then try again.'
+          : 'Failed to update AI tabs — see logs for details.';
     }
   }
 
@@ -861,6 +873,13 @@
       console.error('dialog open failed', e);
       return null;
     }
+  }
+
+  // Browse for an external-tool exe and store its path (Settings → Bottom
+  // bar). Cancelling the dialog leaves the current value untouched.
+  async function pickToolExe(tool: keyof Settings['external_tools']) {
+    const p = await pickFile('Executable', ['exe']);
+    if (p) patch((s) => (s.external_tools[tool] = p));
   }
 
   function imagePicker(state: keyof Settings['avatar']['images']) {
@@ -2019,6 +2038,79 @@
             Takes effect on the next Claude tab launch (restart the tab to apply).
           </small>
         </section>
+
+        <section>
+          <h2>External tools</h2>
+          <small class="hint top">
+            The quick-launch buttons (and shell tabs) run these tools by name,
+            resolved from the bundled <code>ebin\</code> folder first, then your
+            PATH. To use a specific build instead — e.g. one in a folder that
+            isn't on PATH — point ccImp at the exe here. Leave blank to resolve
+            normally. Takes effect the next time you launch the tool.
+          </small>
+          <label>
+            <span>rustnet</span>
+            <div class="input-with-action">
+              <input
+                type="text"
+                placeholder="(use bundled ebin / PATH)"
+                value={snapshot.external_tools.rustnet}
+                oninput={(e) =>
+                  patch(
+                    (s) =>
+                      (s.external_tools.rustnet = (
+                        e.currentTarget as HTMLInputElement
+                      ).value),
+                  )}
+              />
+              <button
+                type="button"
+                class="secondary"
+                onclick={() => void pickToolExe('rustnet')}
+              >
+                Browse…
+              </button>
+              <button
+                type="button"
+                class="secondary"
+                onclick={() => patch((s) => (s.external_tools.rustnet = ''))}
+              >
+                Clear
+              </button>
+            </div>
+          </label>
+          <label>
+            <span>broot</span>
+            <div class="input-with-action">
+              <input
+                type="text"
+                placeholder="(use bundled ebin / PATH)"
+                value={snapshot.external_tools.broot}
+                oninput={(e) =>
+                  patch(
+                    (s) =>
+                      (s.external_tools.broot = (
+                        e.currentTarget as HTMLInputElement
+                      ).value),
+                  )}
+              />
+              <button
+                type="button"
+                class="secondary"
+                onclick={() => void pickToolExe('broot')}
+              >
+                Browse…
+              </button>
+              <button
+                type="button"
+                class="secondary"
+                onclick={() => patch((s) => (s.external_tools.broot = ''))}
+              >
+                Clear
+              </button>
+            </div>
+          </label>
+        </section>
       {:else if activeSection === 'tabs'}
         {@const claudeLive = aiTabAt('claude')}
         {@const claudeLocalLive = aiTabAt('claude-local')}
@@ -2099,6 +2191,9 @@
                 Aider (local)
               </label>
             </div>
+            {#if aiTabsError}
+              <small class="error">{aiTabsError}</small>
+            {/if}
           </fieldset>
           <div class="sub-tabs" role="tablist" aria-label="Tabs sub-sections">
             <button

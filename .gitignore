@@ -62,3 +62,11 @@ ccimp-portable-*.zip
 
 # Local build/run logs (transient, e.g. tauri-dev.log, release-build.log)
 /*.log
+
+# Bundled external tools staged into the portable `ebin/` (broot, rustnet,
+# aider.exe, …). The folder ships in every release and build.rs copies it next
+# to the dev binary, but the binaries themselves are downloaded at release time
+# or dropped in locally — never committed (large, separately licensed). Keep
+# the folder tracked via its .gitkeep.
+/ebin/*
+!/ebin/.gitkeep

@@ -1,0 +1,9 @@
+# This folder ("external binaries") holds bundled CLI tools the app resolves
+# before falling back to PATH — see src-tauri/src/pty/resolve.rs.
+#
+# Tool binaries are NOT committed here (they're large and separately licensed):
+# the release workflow downloads them into ebin/ at build time, and build.rs
+# copies this folder next to the dev binary. To test resolution locally, drop
+# an executable here (e.g. broot.exe) and rebuild.
+#
+# This .gitkeep keeps the otherwise-empty folder present in the repo.

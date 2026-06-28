@@ -147,6 +147,12 @@ pub struct Settings {
     /// spawned aider process. Per-tab `env` entries take precedence
     /// over synthesized values.
     pub aider_local: AiderLocalSettings,
+    /// Optional explicit executable paths for the bundled quick-launch
+    /// tools (rustnet / broot). A non-empty field overrides the normal
+    /// `ebin/` → PATH resolution for that tool, letting the user point at
+    /// an exe in any folder; empty means "resolve normally". Additive
+    /// `#[serde(default)]` — old settings files load with both empty.
+    pub external_tools: ExternalToolsSettings,
     /// V8-01: local task-offload config. ccImp runs a user-supplied
     /// `llama-server` and exposes an `offload_task` MCP tool into
     /// ccImp-launched Claude tabs so Opus can delegate token-heavy
@@ -197,6 +203,7 @@ impl Default for Settings {
             terminal: TerminalSettings::default(),
             claude_local: ClaudeLocalSettings::default(),
             aider_local: AiderLocalSettings::default(),
+            external_tools: ExternalToolsSettings::default(),
             offload: OffloadSettings::default(),
             graph: GraphSettings::default(),
             enabled_ai_tabs: vec![AiTabId::Claude],
@@ -675,6 +682,22 @@ impl Default for AiderLocalSettings {
             model: String::new(),
         }
     }
+}
+
+/// Optional explicit executable paths for the bundled quick-launch tools
+/// (the bottom-bar rustnet / broot buttons). Each field, when non-empty, is
+/// used as the launch command verbatim — overriding the normal `ebin/` → PATH
+/// resolution (see `pty::resolve`) — so a user who doesn't want the bundled
+/// build and doesn't have the tool on PATH can select an exe from any folder.
+/// Empty (the default) means "resolve normally". Additive `#[serde(default)]`
+/// block — old settings files round-trip with both fields empty.
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct ExternalToolsSettings {
+    /// Override for the `rustnet` tool; empty = resolve via ebin → PATH.
+    pub rustnet: String,
+    /// Override for the `broot` tool; empty = resolve via ebin → PATH.
+    pub broot: String,
 }
 
 /// V8-01: local task-offload configuration. ccImp runs a user-supplied

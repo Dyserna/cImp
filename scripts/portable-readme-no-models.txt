@@ -15,6 +15,10 @@ Compared to the full zip:
                                         same files are also embedded in
                                         ccimp.exe)
   LICENSE / NOTICE / README.txt      <- updated
+  ebin\broot.exe / rustnet.exe       <- updated (bundled CLI tools; see the
+                                        full README's "Bundled tools").
+                                        rustnet needs Npcap (npcap.com) to
+                                        capture traffic.
   bin\patterns.json                  <- NOT INCLUDED (your edited prompt
                                         patterns are preserved)
   models\kokoro-v1.0.onnx            <- NOT INCLUDED (preserved from your existing install)

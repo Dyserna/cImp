@@ -4,7 +4,15 @@ Observed during the 2026-06-28 Qwen-vs-Sonnet comparison run (local model `Qwen3
 
 1. **Concurrent requests fail.** Firing 2+ offload_task calls so 2 run concurrently → the queued/2nd request returns `error sending request for url (http://127.0.0.1:12333/v1/chat/completions)` (connection-refused) and/or an empty result. Single (serial) calls are reliable. Both llama-server slots were live (~120 tok/s each, 75k ctx each) at the time, so the refusal looks like a **host-side queueing/dispatch bug**, not server capacity. The offload tool advertises "up to 2 concurrent" — that path is broken against this server.
 
-2. **Oversized unit → empty return.** A review unit whose files exceed a slot's context returns `completed with no output` (empty), even run solo. Mitigated by raising context (moved to 1 slot @ 180k). Want: detect/handle context overflow explicitly instead of silently returning empty.
+2. **Empty return — NOT context overflow (corrected).** A unit sometimes returns `completed with no output` (empty). Originally assumed to be context overflow, but **disproven**: the full-scope `processing` unit (7 files) returned empty at **180k** ctx, where the prompt cannot overflow. Real cause is `agent.rs:295-297`:
+   ```rust
+   if msg.tool_calls.is_empty() {
+       let content = msg.content.unwrap_or_default();
+       return Ok(strip_think(&content));   // empty if content was None, or entirely a <think> block
+   }
+   ```
+   The model returned a final turn with no tool call and either empty content or **only a `<think>…</think>` block** (which `strip_think` removes entirely) → the loop returns `""` and reports it as success. This is the empty-answer path Qwen itself flagged. **Fix direction:** treat an empty post-strip final answer as an error (or one forced-final retry) instead of silently returning "".
+   - Note on the dashboard: the history `tokens` / per-slot `n_decoded` is **generated (output) tokens only** — it excludes the prompt. True context fill = `usage.prompt_tokens` + generated; only the `--metrics` `kv_cache_usage_ratio` gauge shows it. So history token counts cannot confirm/deny overflow.
 
 3. **Orphaned slot on client error (transport error, NOT a timeout).** When the host returns an error to the caller, the underlying llama-server job KEEPS RUNNING and holds the slot; its result is lost (the MCP call already errored). No cancel is propagated to the server.
    - **Exact error string:** `offload error: chat request failed: error sending request for url (http://127.0.0.1:12333/v1/chat/completions)`

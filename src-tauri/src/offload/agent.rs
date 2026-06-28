@@ -293,8 +293,23 @@ pub async fn run(
 
         // Final answer: no tool calls.
         if msg.tool_calls.is_empty() {
-            let content = msg.content.unwrap_or_default();
-            return Ok(strip_think(&content));
+            let answer = strip_think(&msg.content.unwrap_or_default());
+            if !answer.trim().is_empty() {
+                return Ok(answer);
+            }
+            // The model ended its turn with no tool call AND no usable answer —
+            // typically it spent the whole turn inside a <think> block that
+            // strip_think removed, leaving "". Returning that as success is the
+            // silent-empty offload result. Instead make one forced-final
+            // attempt (tools suppressed, thinking off, "answer now"); that path
+            // is guaranteed to return a non-empty string — a real answer, or an
+            // explicit "(offload produced no answer …)" placeholder the caller
+            // can see — never a bare empty string.
+            warn!(
+                target: "offload",
+                "offload: empty final answer (all-thinking?); forcing a final answer"
+            );
+            return force_final(client, &url, cfg, messages, task.thinking).await;
         }
 
         // Append the assistant turn (carrying the tool_calls), then each

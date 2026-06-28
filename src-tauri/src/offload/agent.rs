@@ -374,14 +374,33 @@ async fn post_chat(
     // Per-request timeout override: bounds this single POST (connect through
     // body read) to the caller's remaining budget, regardless of the client's
     // global `offload_timeout_secs` default.
-    let mut builder = client.post(url).timeout(req_timeout).json(&req);
-    if let Some(token) = cfg.auth_token.as_deref().filter(|t| !t.is_empty()) {
-        builder = builder.bearer_auth(token);
-    }
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| AppError::Offload(format!("chat request failed: {e}")))?;
+    // Send with one retry on a transport-level connect/send failure. The
+    // common cause against a local single-slot server is a stale pooled
+    // keep-alive socket the server closed between requests; the first send
+    // on that dead socket fails as "error sending request for url …" and a
+    // fresh connection then succeeds. Timeouts are deliberately NOT retried:
+    // a timed-out request may still be generating server-side, so retrying
+    // would double-run a long generation (and orphan a slot).
+    let mut attempt: u8 = 0;
+    let resp = loop {
+        let mut builder = client.post(url).timeout(req_timeout).json(&req);
+        if let Some(token) = cfg.auth_token.as_deref().filter(|t| !t.is_empty()) {
+            builder = builder.bearer_auth(token);
+        }
+        match builder.send().await {
+            Ok(r) => break r,
+            Err(e) if attempt == 0 && !e.is_timeout() && (e.is_connect() || e.is_request()) => {
+                attempt += 1;
+                warn!(
+                    target: "offload",
+                    error = %e,
+                    "chat send failed (transport); retrying once (likely stale pooled connection)"
+                );
+                continue;
+            }
+            Err(e) => return Err(AppError::Offload(format!("chat request failed: {e}"))),
+        }
+    };
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();

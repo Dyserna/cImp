@@ -19,3 +19,28 @@ Observed during the 2026-06-28 Qwen-vs-Sonnet comparison run (local model `Qwen3
 4. **No slot availability/status check.** Need a way to query slot busy/free/queue depth before dispatching (poll llama-server `/slots` or `/health`), so the host can queue gracefully, report "busy", or pick a free slot instead of erroring. Surface in the Offload Server tab too.
 
 5. **Verbosity/format drift (model-side, minor).** Without a strict output cap, Qwen over-produced (one unit = 1863 lines / 81k chars, overflowed the tool's max-tokens). A tight "JSON only, <3500 tokens" instruction fixed it. Qwen also emitted confidence as floats (0.75) instead of high/med/low. Consider enforcing a response schema / max_tokens on the offload agent.
+
+---
+
+## ROOT CAUSE (confirmed by code trace, 2026-06-28)
+
+The "error sending request" failures (#1, #3) trace to three concrete spots:
+
+- **`service.rs:469` — no same-backend retry.** The connection-failure fail-over only re-routes when `views.len() > 1`:
+  ```rust
+  Err(e) if is_connection_error(&e.to_string()) && views.len() > 1 => { ...reroute... }
+  Err(e) => Err(e),
+  ```
+  With a **single local backend** (the common setup), a connection-class send failure has **no retry** and propagates straight to the caller. A stale-pooled-connection blip is therefore fatal on the first try.
+
+- **`service.rs:191` — chat client config.** Built as `reqwest::Client::builder().timeout(offload_timeout_secs.max(30)).build()` with **no `connect_timeout` and default keep-alive pooling on**. reqwest reuses idle pooled connections; if llama-server closed the keep-alive socket after the previous response (or between concurrent requests), the next `.send()` on the dead socket fails as "error sending request for url" — exactly the observed error. (Contrast `mcp_host.rs:778-784`, which DOES set `connect_timeout`.)
+
+- **`agent.rs:381-384` — single send, no transport retry.** `builder.send().await.map_err(... "chat request failed: {e}")?` — one shot; any transport error is terminal.
+
+**Why concurrency made it worse:** two simultaneous requests are more likely to race a stale/!idle pooled connection; combined with "no retry on a single backend", one of the two reliably fell over. The global semaphore (`service.rs:407`) queues correctly — it is NOT the cause. The "empty return" is the separate context-overflow case (#2).
+
+### Recommended fix (low-risk, high-value), in priority order
+1. **Retry the same backend once on a *transport* connection error** (not on timeouts — `is_connection_error` currently lumps `request timed out` in at `service.rs:1143`, and retrying a timeout risks double-running a long generation). Either split `is_connection_error` into `is_transport_error` vs `is_timeout`, or add a dedicated one-shot retry inside `run_on`/`post_chat` for connect/send failures. This alone fixes both the solo transient failures and the concurrency failures.
+2. **Harden the chat client** (`service.rs:191`): add `.connect_timeout(Duration::from_secs(5))` and `.pool_max_idle_per_host(0)` for the local single-slot case (no idle reuse → no stale-socket sends). Pooling buys little against one local server.
+3. **Propagate cancel** (#3b): on caller drop / our own error, POST llama-server's slot-stop so the slot frees instead of running an orphan to completion.
+4. **Slot-status precheck** (#4): poll `/slots`/`/health` before dispatch; queue or report "busy" instead of erroring.

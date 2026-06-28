@@ -190,6 +190,16 @@ impl OffloadService {
         let global_cap = compute_global_cap(&snap);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(snap.offload_timeout_secs.max(30)))
+            // Bound connection establishment separately from the overall
+            // request budget so a dead endpoint fails fast instead of hanging
+            // for the whole offload timeout.
+            .connect_timeout(Duration::from_secs(5))
+            // Don't reuse idle keep-alive connections. Against a local
+            // single-slot llama-server the pool buys almost nothing, and a
+            // socket the server closed between requests gets reused and fails
+            // the next send as "error sending request for url …". Opening a
+            // fresh connection per request removes that whole failure mode.
+            .pool_max_idle_per_host(0)
             .build()
             .unwrap_or_default();
         let host = McpHost::new();

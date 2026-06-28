@@ -67,9 +67,6 @@
     flex-direction: row;
     align-items: center;
     gap: var(--space-1);
-    padding-right: var(--space-2);
-    margin-right: var(--space-1);
-    border-right: 1px solid var(--border-subtle);
   }
   .status-button {
     appearance: none;

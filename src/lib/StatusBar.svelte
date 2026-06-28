@@ -8,7 +8,6 @@
   import AnnouncementsButton from './status/AnnouncementsButton.svelte';
   import VolumeSlider from './status/VolumeSlider.svelte';
   import SettingsButton from './status/SettingsButton.svelte';
-  import AvatarToggleButton from './status/AvatarToggleButton.svelte';
   import StatusBarArrangement from './status/StatusBarArrangement.svelte';
   import SelectionTtsControls from './status/SelectionTtsControls.svelte';
   import ToolLaunchButton from './status/ToolLaunchButton.svelte';
@@ -18,18 +17,21 @@
 <div class="status-bar">
   <StatusBarArrangement />
   <div class="status-bar-right">
+    <span class="sep" aria-hidden="true"></span>
+    <ToolLaunchButton tool="broot" glyph="🌳" label="New broot tab" />
+    <ToolLaunchButton tool="rustnet" glyph="🌐" label="New rustnet tab" />
+    {#if $settings.stt.enabled}
+      <span class="sep" aria-hidden="true"></span>
+      <RecordButton />
+    {/if}
+    <span class="sep" aria-hidden="true"></span>
     {#if $settings.tts.show_selection_controls}
       <SelectionTtsControls />
     {/if}
-    <AvatarToggleButton />
-    {#if $settings.stt.enabled}
-      <RecordButton />
-    {/if}
-    <ToolLaunchButton tool="rustnet" glyph="🌐" label="New rustnet tab" />
-    <ToolLaunchButton tool="broot" glyph="🌳" label="New broot tab" />
+    <VolumeSlider />
     <MuteButton />
     <AnnouncementsButton />
-    <VolumeSlider />
+    <span class="sep" aria-hidden="true"></span>
     <SettingsButton />
   </div>
 </div>
@@ -53,5 +55,12 @@
     align-items: center;
     gap: var(--space-2);
     flex: 0 0 auto;
+  }
+  /* Group divider — same hairline as the one that used to sit after the
+     selection-TTS stop button. */
+  .sep {
+    width: 0;
+    height: 22px;
+    border-right: 1px solid var(--border-subtle);
   }
 </style>

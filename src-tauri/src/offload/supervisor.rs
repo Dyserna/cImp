@@ -549,7 +549,9 @@ impl OffloadSupervisor {
             thinking,
         };
         let deadline = std::time::Instant::now() + timeout;
-        super::agent::run(server.client(), &cfg, &router, task, deadline).await
+        // Self-test path: no external cancel source.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        super::agent::run(server.client(), &cfg, &router, task, deadline, &cancel).await
     }
 }
 

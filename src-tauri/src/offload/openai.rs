@@ -111,6 +111,15 @@ pub struct ChatRequest {
     /// to `{"enable_thinking": false}` to suppress `<think>` blocks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// `Some(true)` requests an SSE token stream. We stream so that dropping
+    /// the request mid-generation makes llama-server detect the disconnect
+    /// and abort — the basis for cancellation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// `{"include_usage": true}` asks the server to emit a final usage chunk
+    /// when streaming, so we still get `prompt_tokens` for budget policing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -130,6 +139,122 @@ pub struct Choice {
 pub struct Usage {
     #[serde(default)]
     pub prompt_tokens: u32,
+}
+
+// ── Streaming (SSE) wire types ────────────────────────────────────────────
+// With `stream:true` the server emits `data: {ChatChunk}` lines and a final
+// `data: [DONE]`. Each chunk carries incremental `delta`s; tool calls arrive
+// fragmented (name in the first fragment, `arguments` concatenated across
+// many), keyed by `index`. `StreamAccumulator` folds them back into the same
+// `ChatResponse` the non-streaming path produced, so the agent loop is
+// agnostic to the transport.
+
+/// One streamed chunk.
+#[derive(Debug, Deserialize)]
+pub struct ChatChunk {
+    #[serde(default)]
+    pub choices: Vec<ChunkChoice>,
+    /// Present only on the final usage chunk (`stream_options.include_usage`).
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChunkChoice {
+    #[serde(default)]
+    pub delta: Delta,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Delta {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeltaToolCall {
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub function: Option<DeltaFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeltaFunction {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+}
+
+/// Folds streamed `ChatChunk`s back into a single `ChatResponse`.
+#[derive(Default)]
+pub struct StreamAccumulator {
+    content: String,
+    tool_calls: Vec<ToolCall>,
+    usage: Option<Usage>,
+}
+
+impl StreamAccumulator {
+    pub fn push_chunk(&mut self, chunk: ChatChunk) {
+        if let Some(u) = chunk.usage {
+            self.usage = Some(u);
+        }
+        for choice in chunk.choices {
+            if let Some(c) = choice.delta.content {
+                self.content.push_str(&c);
+            }
+            for tc in choice.delta.tool_calls {
+                // Grow to cover `index` (fragments can arrive sparsely).
+                while self.tool_calls.len() <= tc.index {
+                    self.tool_calls.push(ToolCall {
+                        id: String::new(),
+                        kind: default_tool_type(),
+                        function: FunctionCall {
+                            name: String::new(),
+                            arguments: String::new(),
+                        },
+                    });
+                }
+                let slot = &mut self.tool_calls[tc.index];
+                if let Some(id) = tc.id.filter(|s| !s.is_empty()) {
+                    slot.id = id;
+                }
+                if let Some(f) = tc.function {
+                    if let Some(n) = f.name.filter(|s| !s.is_empty()) {
+                        slot.function.name = n;
+                    }
+                    if let Some(a) = f.arguments {
+                        slot.function.arguments.push_str(&a);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build the assembled response. Mirrors the non-streaming shape: one
+    /// assistant choice carrying the merged content + tool calls.
+    pub fn into_response(self) -> ChatResponse {
+        ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: if self.content.is_empty() {
+                        None
+                    } else {
+                        Some(self.content)
+                    },
+                    tool_calls: self.tool_calls,
+                    tool_call_id: None,
+                },
+            }],
+            usage: self.usage,
+        }
+    }
 }
 
 /// Strip Qwen `<think>…</think>` reasoning blocks from a final answer
@@ -169,6 +294,48 @@ mod tests {
     #[test]
     fn strips_unterminated_think() {
         assert_eq!(strip_think("answer<think>cut off"), "answer");
+    }
+
+    #[test]
+    fn stream_accumulator_merges_content_tool_calls_and_usage() {
+        let mut acc = StreamAccumulator::default();
+        let feed = |acc: &mut StreamAccumulator, s: &str| {
+            acc.push_chunk(serde_json::from_str::<ChatChunk>(s).unwrap());
+        };
+        // Content arrives in two deltas.
+        feed(&mut acc, r#"{"choices":[{"delta":{"content":"Hel"}}]}"#);
+        feed(&mut acc, r#"{"choices":[{"delta":{"content":"lo"}}]}"#);
+        // A tool call: id+name in the first fragment, arguments across two more.
+        feed(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file"}}]}}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]}"#,
+        );
+        // A second tool call at index 1.
+        feed(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"code_search","arguments":"{}"}}]}}]}"#,
+        );
+        // Final usage chunk (empty choices).
+        feed(&mut acc, r#"{"choices":[],"usage":{"prompt_tokens":42}}"#);
+
+        let resp = acc.into_response();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.content.as_deref(), Some("Hello"));
+        assert_eq!(msg.tool_calls.len(), 2);
+        assert_eq!(msg.tool_calls[0].id, "call_1");
+        assert_eq!(msg.tool_calls[0].function.name, "read_file");
+        assert_eq!(msg.tool_calls[0].function.arguments, r#"{"path":"x"}"#);
+        assert_eq!(msg.tool_calls[1].id, "call_2");
+        assert_eq!(msg.tool_calls[1].function.name, "code_search");
+        assert_eq!(resp.usage.unwrap().prompt_tokens, 42);
     }
 
     #[test]

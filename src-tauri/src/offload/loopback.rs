@@ -28,6 +28,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
@@ -378,9 +379,41 @@ async fn handle_run(
     let tier = TierHint::parse(body.tier.as_deref().unwrap_or("auto"));
 
     let session_cwd = body.cwd.map(std::path::PathBuf::from);
-    let result = service
-        .run(body.instructions, body.context, thinking, tier, session_cwd)
-        .await;
+
+    // Cancellation: trip the token if the calling client disconnects while the
+    // task runs, so the in-flight chat stream is dropped and llama-server frees
+    // the slot instead of finishing an orphaned generation. After the request
+    // body a well-behaved client (reqwest, in the MCP child) sends nothing and
+    // does NOT half-close its write half until it has the response — so a probe
+    // read returning 0 bytes (EOF) means the whole connection went away.
+    let cancel = CancellationToken::new();
+    let run_fut = service.run(
+        body.instructions,
+        body.context,
+        thinking,
+        tier,
+        session_cwd,
+        cancel.clone(),
+    );
+    tokio::pin!(run_fut);
+    let result = loop {
+        let mut probe = [0u8; 1];
+        tokio::select! {
+            biased;
+            r = &mut run_fut => break r,
+            read = stream.read(&mut probe) => match read {
+                Ok(0) | Err(_) => {
+                    debug!("offload loopback: caller disconnected mid-task; cancelling");
+                    cancel.cancel();
+                    // Let the task unwind (the stream drop frees the slot).
+                    break (&mut run_fut).await;
+                }
+                // A stray byte before the response is unexpected on this
+                // one-shot protocol; ignore it and keep waiting.
+                Ok(_) => continue,
+            },
+        }
+    };
     let r = match result {
         Ok(text) => RunResult {
             ok: true,

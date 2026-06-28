@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{broadcast, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
@@ -376,6 +377,10 @@ impl OffloadService {
         // so an offload from a session in repo A reads repo A — not the app's
         // own launch directory. `None` falls back to the app's cwd.
         session_cwd: Option<PathBuf>,
+        // Trips when the calling session goes away (loopback disconnect) so the
+        // in-flight chat stream is dropped and llama-server frees the slot
+        // instead of running an orphan to completion.
+        cancel: CancellationToken,
     ) -> AppResult<String> {
         let snap = self.settings.current().offload;
         if !snap.enabled {
@@ -469,7 +474,7 @@ impl OffloadService {
         );
 
         let result = self
-            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), overall_deadline)
+            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), overall_deadline, &cancel)
             .await;
 
         // One fail-over on a connection-class failure: drop the failed
@@ -486,7 +491,7 @@ impl OffloadService {
                             reroute = %pool[next].name,
                             "offload: re-routing after connection failure (app service)"
                         );
-                        self.run_on(&pool[next], &views[next], &snap, &instructions, context, thinking, session_cwd, overall_deadline)
+                        self.run_on(&pool[next], &views[next], &snap, &instructions, context, thinking, session_cwd, overall_deadline, &cancel)
                             .await
                     }
                     _ => Err(e),
@@ -509,6 +514,7 @@ impl OffloadService {
         thinking: ThinkingMode,
         session_cwd: Option<PathBuf>,
         deadline: Instant,
+        cancel: &CancellationToken,
     ) -> AppResult<String> {
         let slot_timeout = deadline.saturating_duration_since(Instant::now());
         let _slot = entry.handle.acquire_slot(slot_timeout).await?;
@@ -565,7 +571,7 @@ impl OffloadService {
             context,
             thinking,
         };
-        agent::run(&self.client, &cfg, &router, task, deadline).await
+        agent::run(&self.client, &cfg, &router, task, deadline, cancel).await
     }
 
     /// Resolve the enabled backend pool from live state: live local handles

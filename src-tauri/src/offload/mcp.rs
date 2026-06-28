@@ -842,7 +842,10 @@ async fn run_on_backend(
         thinking,
     };
     let deadline = Instant::now() + Duration::from_secs(settings.offload_timeout_secs.max(30));
-    agent::run(client, &cfg, &router, task, deadline)
+    // Self-contained child path: no external cancel source, so a never-tripped
+    // token. The request is still bounded by the deadline and the stream.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    agent::run(client, &cfg, &router, task, deadline, &cancel)
         .await
         .map_err(|e| e.to_string())
 }

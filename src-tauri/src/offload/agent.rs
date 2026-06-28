@@ -21,8 +21,10 @@ use crate::error::{AppError, AppResult};
 
 use crate::settings::ToolScope;
 
+use tokio_util::sync::CancellationToken;
+
 use super::openai::{
-    strip_think, ChatMessage, ChatRequest, ChatResponse, ToolDef,
+    strip_think, ChatChunk, ChatMessage, ChatRequest, ChatResponse, StreamAccumulator, ToolDef,
 };
 use super::tools::{self, ToolCtx};
 
@@ -255,6 +257,7 @@ pub async fn run(
     router: &dyn ToolRouter,
     task: OffloadTask,
     deadline: Instant,
+    cancel: &CancellationToken,
 ) -> AppResult<String> {
     let url = format!("{}/v1/chat/completions", cfg.base_url);
     let tools = router.tool_defs();
@@ -271,7 +274,7 @@ pub async fn run(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             debug!("offload: deadline reached at step {step}; forcing final synthesis");
-            return force_final(client, &url, cfg, messages, task.thinking).await;
+            return force_final(client, &url, cfg, messages, task.thinking, cancel).await;
         }
         let is_planning = step == 0;
         let enable_thinking = think_on_turn(task.thinking, is_planning, false);
@@ -281,8 +284,10 @@ pub async fn run(
         // before the deadline could still block for the full timeout, then
         // `force_final` would block for another — letting one offload run for
         // ~2× its budget and overrun the proxy headroom.
-        let resp =
-            post_chat(client, &url, cfg, &messages, &tools, enable_thinking, true, remaining).await?;
+        let resp = post_chat(
+            client, &url, cfg, &messages, &tools, enable_thinking, true, remaining, cancel,
+        )
+        .await?;
         let usage = resp.usage;
         let choice = resp
             .choices
@@ -309,7 +314,7 @@ pub async fn run(
                 target: "offload",
                 "offload: empty final answer (all-thinking?); forcing a final answer"
             );
-            return force_final(client, &url, cfg, messages, task.thinking).await;
+            return force_final(client, &url, cfg, messages, task.thinking, cancel).await;
         }
 
         // Append the assistant turn (carrying the tool_calls), then each
@@ -363,11 +368,18 @@ pub async fn run(
 
     // Ran out of steps — force a final answer.
     debug!("offload: max_steps reached; forcing final synthesis");
-    force_final(client, &url, cfg, messages, task.thinking).await
+    force_final(client, &url, cfg, messages, task.thinking, cancel).await
 }
 
-/// One chat-completions POST. `with_tools` lets the forced-final turn
-/// suppress further tool calls.
+/// One streaming chat-completions POST. `with_tools` lets the forced-final
+/// turn suppress further tool calls. The response is consumed as an SSE token
+/// stream and reassembled into a `ChatResponse`, so callers are unchanged.
+///
+/// Streaming is what makes cancellation work: if `cancel` fires (or this
+/// future is dropped) mid-generation, we stop reading and drop the request,
+/// which closes the connection — llama-server detects the disconnect on its
+/// next token and aborts, freeing the slot instead of running an orphan to
+/// completion.
 async fn post_chat(
     client: &reqwest::Client,
     url: &str,
@@ -377,6 +389,7 @@ async fn post_chat(
     enable_thinking: bool,
     with_tools: bool,
     req_timeout: Duration,
+    cancel: &CancellationToken,
 ) -> AppResult<ChatResponse> {
     let req = ChatRequest {
         messages: messages.to_vec(),
@@ -385,24 +398,29 @@ async fn post_chat(
         model: cfg.model.clone(),
         temperature: Some(0.2),
         chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": enable_thinking })),
+        stream: Some(true),
+        stream_options: Some(serde_json::json!({ "include_usage": true })),
     };
-    // Per-request timeout override: bounds this single POST (connect through
-    // body read) to the caller's remaining budget, regardless of the client's
-    // global `offload_timeout_secs` default.
+
     // Send with one retry on a transport-level connect/send failure. The
     // common cause against a local single-slot server is a stale pooled
-    // keep-alive socket the server closed between requests; the first send
-    // on that dead socket fails as "error sending request for url …" and a
-    // fresh connection then succeeds. Timeouts are deliberately NOT retried:
-    // a timed-out request may still be generating server-side, so retrying
-    // would double-run a long generation (and orphan a slot).
+    // keep-alive socket the server closed between requests; the first send on
+    // that dead socket fails as "error sending request for url …" and a fresh
+    // connection then succeeds. Timeouts are NOT retried (a timed-out request
+    // may still be generating server-side). The per-request timeout bounds the
+    // whole stream to the caller's remaining budget.
     let mut attempt: u8 = 0;
-    let resp = loop {
+    let mut resp = loop {
         let mut builder = client.post(url).timeout(req_timeout).json(&req);
         if let Some(token) = cfg.auth_token.as_deref().filter(|t| !t.is_empty()) {
             builder = builder.bearer_auth(token);
         }
-        match builder.send().await {
+        let sent = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AppError::Offload("offload cancelled".into())),
+            r = builder.send() => r,
+        };
+        match sent {
             Ok(r) => break r,
             Err(e) if attempt == 0 && !e.is_timeout() && (e.is_connect() || e.is_request()) => {
                 attempt += 1;
@@ -424,9 +442,57 @@ async fn post_chat(
             body.chars().take(500).collect::<String>()
         )));
     }
-    resp.json::<ChatResponse>()
-        .await
-        .map_err(|e| AppError::Offload(format!("chat response parse failed: {e}")))
+
+    // Consume the SSE stream. On cancel we return an error and drop `resp`,
+    // closing the socket so the server aborts.
+    let mut acc = StreamAccumulator::default();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AppError::Offload("offload cancelled".into())),
+            c = resp.chunk() => c,
+        };
+        match chunk {
+            Ok(Some(bytes)) => {
+                buf.extend_from_slice(&bytes);
+                if drain_sse_lines(&mut buf, &mut acc) {
+                    break; // saw [DONE]
+                }
+            }
+            Ok(None) => break, // stream closed without an explicit [DONE]
+            Err(e) => return Err(AppError::Offload(format!("chat stream failed: {e}"))),
+        }
+    }
+    Ok(acc.into_response())
+}
+
+/// Drain complete `\n`-terminated lines from `buf`, feeding each `data:`
+/// payload to `acc`. Leaves any trailing partial line in `buf` for the next
+/// chunk. Returns true once the `[DONE]` sentinel is seen. Non-JSON lines
+/// (SSE comments / keep-alives) are tolerated and skipped.
+fn drain_sse_lines(buf: &mut Vec<u8>, acc: &mut StreamAccumulator) -> bool {
+    let mut done = false;
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let raw: Vec<u8> = buf.drain(..=nl).collect();
+        let text = String::from_utf8_lossy(&raw);
+        let line = text.trim();
+        let Some(data) = line.strip_prefix("data:") else {
+            continue; // comment, event:, or blank separator line
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            done = true;
+            continue;
+        }
+        if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
+            acc.push_chunk(chunk);
+        }
+    }
+    done
 }
 
 /// Force a final answer from the conversation so far (tools suppressed).
@@ -436,6 +502,7 @@ async fn force_final(
     cfg: &AgentConfig,
     mut messages: Vec<ChatMessage>,
     thinking: ThinkingMode,
+    cancel: &CancellationToken,
 ) -> AppResult<String> {
     messages.push(ChatMessage::user(
         "You are out of budget. Stop using tools and answer now, as completely as you can, \
@@ -454,6 +521,7 @@ async fn force_final(
         enable_thinking,
         false,
         FINAL_SYNTHESIS_GRACE,
+        cancel,
     )
     .await?;
     let content = resp
@@ -583,6 +651,25 @@ mod tests {
         assert!(think_on_turn(ThinkingMode::Auto, true, false)); // planning
         assert!(think_on_turn(ThinkingMode::Auto, false, true)); // final
         assert!(!think_on_turn(ThinkingMode::Auto, false, false)); // ingestion
+    }
+
+    #[test]
+    fn drain_sse_reassembles_across_partial_chunks_and_stops_on_done() {
+        let mut acc = StreamAccumulator::default();
+        let mut buf: Vec<u8> = Vec::new();
+
+        // A data line split across two network chunks (no newline yet).
+        buf.extend_from_slice(b"data: {\"choices\":[{\"delta\":{\"content\":\"He");
+        assert!(!drain_sse_lines(&mut buf, &mut acc));
+        buf.extend_from_slice(b"llo\"}}]}\n");
+        assert!(!drain_sse_lines(&mut buf, &mut acc));
+
+        // An SSE comment / keep-alive line is ignored; then [DONE] terminates.
+        buf.extend_from_slice(b": keep-alive\n\ndata: [DONE]\n");
+        assert!(drain_sse_lines(&mut buf, &mut acc));
+
+        let resp = acc.into_response();
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello"));
     }
 
     #[test]

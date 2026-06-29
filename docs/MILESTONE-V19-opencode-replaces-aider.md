@@ -76,12 +76,13 @@ Five phases, ordered by risk: A (the integration spine: launch with `--mini`
    `mcp`, `instructions`, and (when local) `provider` blocks (Phases C/D), and
    set it as `OPENCODE_CONFIG_CONTENT`. Also set the noise-suppression env vars
    above. Per-tab `env` still wins (same `.entry()`-style precedence as today).
-3. **Config merge vs hermetic.** *Decision at impl time:* whether to also set
-   `OPENCODE_DISABLE_PROJECT_CONFIG=1`. **Recommend additive** (do *not* set
-   it) so a user's project `AGENTS.md` / `.opencode.json` still applies, with
-   the cctts `mcp` server + instructions layered on top via the env content.
-   Confirm OpenCode's merge precedence (env content vs project file) and
-   document it. Provide a setting to force hermetic if collisions bite.
+3. **Config merge vs hermetic. → STARTING additive (with a hermetic toggle).**
+   cctts does *not* set `OPENCODE_DISABLE_PROJECT_CONFIG=1` by default, so a
+   user's project `AGENTS.md` / `.opencode.json` still applies with the cctts
+   `mcp` server + instructions layered on top via the env content. Verify
+   OpenCode's merge precedence (env content vs project file) during A.4; expose
+   a setting to force hermetic (`OPENCODE_DISABLE_PROJECT_CONFIG=1`) if
+   collisions bite. This is reversible, so it does not gate the milestone.
 4. **Marker-stripping + permission-detection verification against `--mini`.**
    This is the one residual unknown the deep dive could not fully exercise from
    a non-TTY pipe. Launch an `opencode --mini` tab and confirm: (a) assistant
@@ -145,15 +146,14 @@ Five phases, ordered by risk: A (the integration spine: launch with `--mini`
 16. **Per-tab UI** (`TabSettingsSection.svelte`): the `use_local_provider`
     toggle and effective-config helper text now describe the OpenCode env
     injection (show that `OPENCODE_CONFIG_CONTENT` is synthesized).
-17. **Binary availability / bundling decision.** OpenCode is a single ~158 MB
-    native binary. *Decision:* **(a)** require the user to install it (gate +
-    helpful error, mirroring today's aider gate), or **(b)** bundle
-    `opencode.exe` in the existing `ebin/` external-tools folder (v0.20.0
-    mechanism: `ebin/` resolved before PATH). **Recommend (a) for this
-    milestone** (158 MB inflates the portable zip materially), with (b) tracked
-    as a followup once demand is clear. The Windows binary is
-    `opencode-windows-x64`; resolution should accept `opencode` from `ebin/`
-    or PATH.
+17. **Binary availability / bundling decision. → DECIDED: require install.**
+    OpenCode is a single ~158 MB native binary. cctts does **not** bundle it:
+    `resolve_command("opencode")` accepts `opencode` from `ebin/` (resolved
+    before PATH) or PATH, and an unresolvable binary produces a clear gate error
+    pointing at `https://opencode.ai/docs` (or "drop `opencode.exe` in `ebin/`"),
+    mirroring today's aider gate. Bundling `opencode.exe` in `ebin/` is tracked
+    as a followup once demand is clear (158 MB inflates the portable zip
+    materially). The Windows binary is `opencode-windows-x64`.
 
 ### Phase D — MCP, code graph, and offload reach OpenCode
 
@@ -177,19 +177,17 @@ via the injected `mcp` block.
 
     Mirror the existing Claude gate (`build_pre_args`) so the server is injected
     whenever offload, graph, **or** an OpenCode-exposed MCP server is in play.
-19. **Per-consumer MCP exposure.** `McpServerConfig` currently carries
-    `claude_access` + `offload_access`. *Decision:* add **`opencode_access:
-    bool`** for symmetric per-server control, and teach the `--offload-mcp`
-    child to select the OpenCode server set when invoked with
-    `--consumer opencode` (the `mcp_host` already branches claude vs offload
-    tool-defs at `mcp_host.rs:534`; add an opencode branch). Migration defaults
-    `opencode_access` to each server's existing `claude_access` value so
-    upgraders keep their web-research tools. **Lower-scope alternative:** skip
-    the new flag and have OpenCode ride the existing Claude surface (no
-    `--consumer`, reuse `claude_access`); cheaper but conflates two consumers
-    in the UI. **Recommend the dedicated flag** — the Settings MCP editor
-    already renders per-server checkboxes, so a third column is a small,
-    honest addition.
+19. **Per-consumer MCP exposure. → DECIDED: dedicated `opencode_access` flag.**
+    `McpServerConfig` gains **`opencode_access: bool`** alongside `claude_access`
+    + `offload_access` for symmetric per-server control. The `--offload-mcp`
+    child learns a **`--consumer opencode`** discriminator: today it is hard-wired
+    to the Claude tool set (`mcp.rs` → `tool_defs_for_claude`), so this means
+    parsing `--consumer` in `main.rs`/`offload::mcp::run`, threading it to the
+    loopback/host so `tool_defs_filtered(consumer)` selects the OpenCode server
+    set (generalize the `claude: bool` arg at `mcp_host.rs:530` to a consumer
+    enum, add an opencode arm). Migration defaults `opencode_access` to each
+    server's existing `claude_access` value so upgraders keep their web-research
+    tools. The Settings MCP editor gains a third per-server checkbox column.
 20. **`instructions` injection (TTS + offload + graph guidance).** OpenCode's
     `instructions` key takes file paths, so write a managed instructions file
     (e.g. `<config-dir>/opencode/instructions.md`) composed from the same

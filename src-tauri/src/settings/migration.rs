@@ -172,6 +172,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.14", detect: looks_v1_14, transform: migrate_v1_14_to_v1_15_step },
     MigrationStep { from_version: "v1.15", detect: looks_v1_15, transform: migrate_v1_15_to_v1_16_step },
     MigrationStep { from_version: "v1.16", detect: looks_v1_16, transform: migrate_v1_16_to_v1_17_step },
+    MigrationStep { from_version: "v1.17", detect: looks_v1_17, transform: migrate_v1_17_to_v1_18_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -226,6 +227,9 @@ fn migrate_v1_15_to_v1_16_step(value: &mut Value, _shell: &ShellSpec) {
 }
 fn migrate_v1_16_to_v1_17_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v1_16_to_v1_17(value)
+}
+fn migrate_v1_17_to_v1_18_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v1_17_to_v1_18(value)
 }
 
 fn looks_v1(value: &Value) -> bool {
@@ -1489,6 +1493,47 @@ fn migrate_v1_16_to_v1_17(value: &mut Value) {
         }
     }
 
+    // Stamp a *literal* 17 (not CURRENT_SCHEMA_VERSION): the v17 → v18 step
+    // below runs next in the same cascade pass and must still detect this file.
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(17u8)),
+    );
+}
+
+/// Is this a v1.17 file (schema_version == 17) that pre-dates the per-consumer
+/// MCP access split (single `enabled` → `claude_access` + `offload_access`)?
+fn looks_v1_17(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 17)
+}
+
+/// v1.17 → v1.18: split each MCP server's single `enabled` flag into
+/// `claude_access` (new, opt-in → `false`) and `offload_access` (the legacy
+/// behavior → the old `enabled` value, defaulting to `true` when absent).
+fn migrate_v1_17_to_v1_18(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Object(offload)) = root.get_mut("offload") {
+        if let Some(Value::Array(servers)) = offload.get_mut("mcp_servers") {
+            for srv in servers.iter_mut() {
+                if let Some(obj) = srv.as_object_mut() {
+                    let enabled = obj
+                        .remove("enabled")
+                        .as_ref()
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    obj.entry("offload_access").or_insert(Value::Bool(enabled));
+                    obj.entry("claude_access").or_insert(Value::Bool(false));
+                }
+            }
+        }
+    }
+
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(
@@ -1630,6 +1675,32 @@ mod tests {
     }
 
     #[test]
+    fn v17_to_v18_splits_mcp_enabled_into_two_flags() {
+        let mut v = json!({
+            "schema_version": 17,
+            "offload": { "mcp_servers": [
+                { "name": "ddg", "url": "http://x", "enabled": true },
+                { "name": "git", "command": "uvx", "enabled": false },
+                { "name": "fs", "command": "uvx" }, // missing enabled → defaults true
+            ]}
+        });
+        migrate_v1_17_to_v1_18(&mut v);
+        let s = v["offload"]["mcp_servers"].as_array().unwrap();
+        // enabled:true → offload on, claude off; legacy key dropped.
+        assert_eq!(s[0]["offload_access"], json!(true));
+        assert_eq!(s[0]["claude_access"], json!(false));
+        assert!(s[0].get("enabled").is_none());
+        // enabled:false → offload off.
+        assert_eq!(s[1]["offload_access"], json!(false));
+        // absent → defaults to on (behavior-preserving for the common case).
+        assert_eq!(s[2]["offload_access"], json!(true));
+        assert_eq!(
+            v["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
     fn v1_1_to_v1_2_collapses_extra_flags_into_args() {
         let mut v: Value = serde_json::from_str(
             r#"{
@@ -1716,7 +1787,7 @@ mod tests {
         // the whole cascade and write a fresh `.v1.2.bak` on every launch.
         let v: Value = serde_json::from_str(
             r#"{
-                "schema_version": 17,
+                "schema_version": 18,
                 "tabs": [
                     { "kind": "ai_tool", "id": "claude", "name": "Claude" }
                 ]
@@ -2997,10 +3068,9 @@ mod tests {
         );
         assert_eq!(b.pointer("/kind/autostart").unwrap(), &json!(true));
         assert_eq!(b.pointer("/tool_scope/mode").unwrap(), "all");
-        assert_eq!(
-            v.get("schema_version").and_then(Value::as_u64),
-            Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64)
-        );
+        // This step stamps a *literal* 17 (the v17→v18 step runs next in the
+        // full cascade); see the comment in `migrate_v1_16_to_v1_17`.
+        assert_eq!(v.get("schema_version").and_then(Value::as_u64), Some(17));
         assert!(!looks_v1_16(&v));
     }
 

@@ -575,7 +575,7 @@ fn scope_summary(scope: &ToolScope, snap: &crate::settings::OffloadSettings) -> 
                     }
                 }
                 for s in &snap.mcp_servers {
-                    if s.enabled && scope.allows(&s.name) {
+                    if s.offload_access && scope.allows(&s.name) {
                         n += 1;
                     }
                 }

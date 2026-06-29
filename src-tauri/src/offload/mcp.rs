@@ -163,6 +163,9 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             // (present only when the graph feature is enabled for this project).
             let mut tools = vec![offload_task_tool_live().await, offload_batch_tool()];
             tools.extend(crate::graph::mcp_tools());
+            // Claude-Code-exposed MCP servers (those with `claude_access`),
+            // proxied through the app's warm host. Empty when the app is down.
+            tools.extend(proxy_mcp_list().await);
             Ok(json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -177,6 +180,10 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                 }
             } else if name == "offload_batch" {
                 handle_batch_tool(params).await
+            } else if name.contains("__") {
+                // A namespaced `<server>__<tool>` from a Claude-exposed MCP
+                // server — route to the app's warm host.
+                proxy_mcp_call(&params).await
             } else {
                 handle_tools_call(params).await
             }
@@ -318,7 +325,7 @@ fn tool_scope_summary(scope: &ToolScope, settings: &OffloadSettings) -> String {
         pool.push("run_command".into());
     }
     for s in &settings.mcp_servers {
-        if s.enabled && !s.name.is_empty() {
+        if s.offload_access && !s.name.is_empty() {
             pool.push(s.name.clone());
         }
     }
@@ -720,6 +727,87 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
         Some(Ok(
             json!({ "content": [{ "type": "text", "text": err }], "isError": true }),
         ))
+    }
+}
+
+/// Fetch the Claude-Code-exposed MCP tool descriptors from the app
+/// (`POST /mcp/list`) so the child can advertise them in its `tools/list`.
+/// Returns an empty vec when the app is unreachable or has no Claude-enabled
+/// servers — the child still lists its own (offload + graph) tools.
+async fn proxy_mcp_list() -> Vec<Value> {
+    let Some((base, token)) = proxy_base() else {
+        return Vec::new();
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    else {
+        return Vec::new();
+    };
+    let resp = match client
+        .post(format!("{base}/mcp/list"))
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    let Ok(v) = resp.json::<Value>().await else {
+        return Vec::new();
+    };
+    v.get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Forward a Claude-exposed MCP tool call (`<server>__<tool>`) to the app's
+/// warm host via `POST /mcp/call`, returning the JSON-RPC tool-result shape.
+/// There is no local fallback — these tools live behind the app's host — so an
+/// unreachable app surfaces as an `isError` tool result, not a hard failure.
+async fn proxy_mcp_call(params: &Value) -> Result<Value, (i64, String)> {
+    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let Some((base, token)) = proxy_base() else {
+        return Ok(tool_error(
+            "ccImp app is not running — its MCP tools are only available while the app is up",
+        ));
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|e| (-32603, format!("client build failed: {e}")))?;
+    let body = json!({ "name": name, "arguments": args });
+    let resp = match client
+        .post(format!("{base}/mcp/call"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Ok(tool_error(&format!("MCP tool call transport error: {e}"))),
+    };
+    if !resp.status().is_success() {
+        return Ok(tool_error(&format!(
+            "MCP tool call failed: HTTP {}",
+            resp.status()
+        )));
+    }
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| (-32603, format!("bad MCP call response: {e}")))?;
+    if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+        let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+        Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+    } else {
+        let err = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("MCP tool call failed");
+        Ok(tool_error(err))
     }
 }
 

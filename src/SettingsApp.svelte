@@ -324,7 +324,15 @@
     patch((s) => {
       s.offload.mcp_servers = [
         ...s.offload.mcp_servers,
-        { name: uniqueMcpName('server'), command: '', args: [], env: {}, url: '', enabled: true },
+        {
+          name: uniqueMcpName('server'),
+          command: '',
+          args: [],
+          env: {},
+          url: '',
+          claude_access: false,
+          offload_access: true,
+        },
       ];
     });
   }
@@ -334,9 +342,13 @@
     });
     await reloadMcpHost();
   }
-  async function toggleMcpServer(i: number, enabled: boolean): Promise<void> {
+  async function setMcpAccess(
+    i: number,
+    field: 'claude_access' | 'offload_access',
+    value: boolean,
+  ): Promise<void> {
     await applyMcp((s) => {
-      s.offload.mcp_servers[i].enabled = enabled;
+      s.offload.mcp_servers[i][field] = value;
     });
     await reloadMcpHost();
   }
@@ -3283,13 +3295,23 @@
                   onchange={commitMcpEdits}
                 />
               </label>
-              <label class="mcp-enable">
+              <label class="mcp-enable" title="Expose this server's tools to Claude Code">
                 <input
                   type="checkbox"
-                  checked={srv.enabled}
-                  onchange={(e) => toggleMcpServer(i, (e.currentTarget as HTMLInputElement).checked)}
+                  checked={srv.claude_access}
+                  onchange={(e) =>
+                    setMcpAccess(i, 'claude_access', (e.currentTarget as HTMLInputElement).checked)}
                 />
-                <span>Enabled</span>
+                <span>Claude Code</span>
+              </label>
+              <label class="mcp-enable" title="Expose this server's tools to the offload worker">
+                <input
+                  type="checkbox"
+                  checked={srv.offload_access}
+                  onchange={(e) =>
+                    setMcpAccess(i, 'offload_access', (e.currentTarget as HTMLInputElement).checked)}
+                />
+                <span>Offload</span>
               </label>
               <button type="button" class="secondary danger" onclick={() => removeMcpServer(i)}>
                 Remove

@@ -54,7 +54,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 17;
+pub const CURRENT_SCHEMA_VERSION: u8 = 18;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -1074,8 +1074,12 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
     /// HTTP transport: the server base URL. Empty when `command` is set.
     pub url: String,
-    /// Per-server enable toggle.
-    pub enabled: bool,
+    /// Expose this server's tools to **Claude Code** (proxied through the
+    /// per-session `ccimp-offload` child). Off by default — a deliberate opt-in.
+    pub claude_access: bool,
+    /// Expose this server's tools to the **offload worker** (the local model,
+    /// via the warm `McpHost`). This is the legacy `enabled` behavior.
+    pub offload_access: bool,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -1088,7 +1092,8 @@ impl std::fmt::Debug for McpServerConfig {
             // Redact values; show only which keys are present.
             .field("env_keys", &env_keys)
             .field("url", &self.url)
-            .field("enabled", &self.enabled)
+            .field("claude_access", &self.claude_access)
+            .field("offload_access", &self.offload_access)
             .finish()
     }
 }
@@ -1101,7 +1106,8 @@ impl Default for McpServerConfig {
             args: Vec::new(),
             env: HashMap::new(),
             url: String::new(),
-            enabled: true,
+            claude_access: false,
+            offload_access: true,
         }
     }
 }

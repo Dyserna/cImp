@@ -670,7 +670,11 @@ export interface McpServerConfig {
   args: string[];
   env: Record<string, string>;
   url: string;
-  enabled: boolean;
+  /// Expose this server's tools to Claude Code (proxied through the
+  /// `ccimp-offload` child). Off by default — a deliberate opt-in.
+  claude_access: boolean;
+  /// Expose this server's tools to the offload worker (the legacy `enabled`).
+  offload_access: boolean;
 }
 
 /// V8-02: which capability tier a backend serves (mirror of Rust

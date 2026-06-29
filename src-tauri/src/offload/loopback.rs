@@ -339,6 +339,8 @@ async fn handle_conn(
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", "/run") => handle_run(&mut stream, &service, &req).await,
         ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
+        ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service).await,
+        ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
         ("GET", "/describe") => {
             let text = service.describe().await;
             write_simple(&mut stream, 200, "text/plain; charset=utf-8", text.as_bytes()).await
@@ -498,6 +500,16 @@ struct GraphRunBody {
     args: Value,
 }
 
+/// A `POST /mcp/call` request body (a Claude-exposed MCP tool invocation).
+#[derive(Deserialize)]
+struct McpCallBody {
+    /// The namespaced `<server>__<tool>` name.
+    name: String,
+    /// The tool arguments.
+    #[serde(default)]
+    arguments: Value,
+}
+
 /// `POST /graph_run`: run one `graph_*` tool against the app's WARM graph index
 /// (single shared connection — no second cross-process open of the SQLite store)
 /// and return its text. The `GraphService` is resolved from managed state at
@@ -546,6 +558,41 @@ async fn handle_graph_run(
         },
     };
     // 200 even on a tool-level error: the child renders `error` as a tool result.
+    write_json(stream, 200, &r).await
+}
+
+/// `POST /mcp/list`: the Claude-Code-exposed MCP tool descriptors (servers
+/// with `claude_access`), for the per-session child to merge into its
+/// `tools/list`. Returns `{ "tools": [ {name, description, inputSchema}, … ] }`.
+async fn handle_mcp_list(stream: &mut TcpStream, service: &Arc<OffloadService>) -> AppResult<()> {
+    let tools = service.mcp_claude_tool_descriptors().await;
+    write_json(stream, 200, &serde_json::json!({ "tools": tools })).await
+}
+
+/// `POST /mcp/call`: run one Claude-exposed MCP tool. Body `{name, arguments}`.
+/// The service guards the call against any tool not offered by a
+/// `claude_access` server. 200 even on a tool-level error (the child renders
+/// `error` as a tool result).
+async fn handle_mcp_call(
+    stream: &mut TcpStream,
+    service: &Arc<OffloadService>,
+    req: &Request,
+) -> AppResult<()> {
+    let body: McpCallBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(format!("bad request body: {e}")),
+            };
+            return write_json(stream, 400, &r).await;
+        }
+    };
+    let r = match service.mcp_claude_call(&body.name, body.arguments).await {
+        Ok(text) => RunResult { ok: true, text: Some(text), error: None },
+        Err(e) => RunResult { ok: false, text: None, error: Some(e) },
+    };
     write_json(stream, 200, &r).await
 }
 

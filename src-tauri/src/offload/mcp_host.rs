@@ -319,6 +319,11 @@ pub struct McpServer {
     tools: Vec<HostTool>,
     healthy: AtomicBool,
     error: StdMutex<Option<String>>,
+    /// Expose this server's tools to Claude Code (proxied through the child).
+    claude_access: bool,
+    /// Expose this server's tools to the offload worker. A flag change forces a
+    /// reconnect (it's part of `config_sig`), so these are always fresh.
+    offload_access: bool,
 }
 
 impl McpServer {
@@ -453,7 +458,8 @@ impl McpHost {
             // command or url typed) — connecting one would route to stdio with
             // an empty command and surface a confusing `resolve ``` error.
             .filter(|c| {
-                c.enabled
+                // Connect if either consumer wants it; both off ⇒ fully disabled.
+                (c.claude_access || c.offload_access)
                     && !c.name.trim().is_empty()
                     && (!c.command.trim().is_empty() || !c.url.trim().is_empty())
             })
@@ -518,16 +524,50 @@ impl McpHost {
         }
     }
 
-    /// All healthy servers' namespaced, read-class tool defs, for merging
-    /// into the chat `tools` array (the caller then applies the backend's
-    /// `ToolScope`).
-    pub async fn tool_defs(&self) -> Vec<ToolDef> {
+    /// Healthy servers' namespaced tool defs, filtered to one consumer's
+    /// access flag. `claude == true` selects the Claude-exposed servers;
+    /// `false` selects the offload-worker ones.
+    async fn tool_defs_filtered(&self, claude: bool) -> Vec<ToolDef> {
         let servers = self.servers.read().await;
         let mut out = Vec::new();
         for s in servers.iter() {
-            out.extend(s.tool_defs());
+            let want = if claude { s.claude_access } else { s.offload_access };
+            if want {
+                out.extend(s.tool_defs());
+            }
         }
         out
+    }
+
+    /// Offload-worker tool defs (servers with `offload_access`), for merging
+    /// into the chat `tools` array (the caller then applies the backend's
+    /// `ToolScope`).
+    pub async fn tool_defs_for_offload(&self) -> Vec<ToolDef> {
+        self.tool_defs_filtered(false).await
+    }
+
+    /// Claude-Code tool defs (servers with `claude_access`), proxied to Claude
+    /// through the per-session child's `tools/list`.
+    pub async fn tool_defs_for_claude(&self) -> Vec<ToolDef> {
+        self.tool_defs_filtered(true).await
+    }
+
+    /// Route a namespaced `<server>__<tool>` call to its owning server, but
+    /// only if that server is exposed to Claude — Claude must never reach an
+    /// offload-only server's tools.
+    pub async fn call_for_claude(&self, namespaced: &str, args: Value) -> Result<String, String> {
+        let owns_for_claude = {
+            let servers = self.servers.read().await;
+            servers
+                .iter()
+                .any(|s| s.claude_access && s.raw_name(namespaced).is_some())
+        };
+        if !owns_for_claude {
+            return Err(format!(
+                "tool `{namespaced}` is not available to Claude Code (no Claude-enabled MCP server offers it)"
+            ));
+        }
+        self.call(namespaced, args).await
     }
 
     /// Route a namespaced `<server>__<tool>` call to its owning server.
@@ -598,7 +638,12 @@ impl McpServer {
 fn config_sig(c: &McpServerConfig) -> String {
     let mut env: Vec<(&String, &String)> = c.env.iter().collect();
     env.sort();
-    format!("{}|{}|{:?}|{}|{:?}", c.command, c.url, c.args, c.enabled, env)
+    // Include both access flags: a Claude-only toggle must still re-key the
+    // signature so `warm_host` reconciles and re-emits a capability pulse.
+    format!(
+        "{}|{}|{:?}|{}|{}|{:?}",
+        c.command, c.url, c.args, c.claude_access, c.offload_access, env
+    )
 }
 
 /// A stable signature of the *whole* desired host configuration (every
@@ -632,6 +677,8 @@ async fn connect_server(cfg: &McpServerConfig, allowed_roots: &[PathBuf]) -> Mcp
         tools: Vec::new(),
         healthy: AtomicBool::new(false),
         error: StdMutex::new(None),
+        claude_access: cfg.claude_access,
+        offload_access: cfg.offload_access,
     };
 
     let outcome = if use_http {
@@ -1137,6 +1184,47 @@ fn confine_filesystem(cfg: &McpServerConfig, args: &mut Vec<String>, allowed_roo
 mod tests {
     use super::*;
 
+    /// A fake healthy server (no real connection) carrying one namespaced tool,
+    /// for exercising the per-consumer filtering without spawning an MCP server.
+    fn fake_server(name: &str, claude: bool, offload: bool, namespaced: &str) -> McpServer {
+        let raw = namespaced.split("__").nth(1).unwrap_or(namespaced).to_string();
+        McpServer {
+            name: name.into(),
+            sig: String::new(),
+            transport_label: "http",
+            conn: None,
+            tools: vec![HostTool {
+                def: ToolDef::function(namespaced, "", json!({ "type": "object" })),
+                raw_name: raw,
+            }],
+            healthy: AtomicBool::new(true),
+            error: StdMutex::new(None),
+            claude_access: claude,
+            offload_access: offload,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_defs_and_calls_partition_by_access_flag() {
+        let host = McpHost::new();
+        host.servers.write().await.extend([
+            Arc::new(fake_server("alpha", true, false, "alpha__x")), // Claude-only
+            Arc::new(fake_server("beta", false, true, "beta__y")),   // offload-only
+        ]);
+
+        let claude = host.tool_defs_for_claude().await;
+        assert_eq!(claude.len(), 1);
+        assert_eq!(claude[0].function.name, "alpha__x");
+
+        let offload = host.tool_defs_for_offload().await;
+        assert_eq!(offload.len(), 1);
+        assert_eq!(offload[0].function.name, "beta__y");
+
+        // Claude must not be able to invoke the offload-only server's tool.
+        let err = host.call_for_claude("beta__y", json!({})).await.unwrap_err();
+        assert!(err.contains("not available to Claude"), "got: {err}");
+    }
+
     #[test]
     fn leading_verb_handles_snake_and_camel() {
         assert_eq!(leading_verb("read_file"), "read");
@@ -1334,15 +1422,15 @@ mod tests {
         let a = McpServerConfig {
             name: "ddg".into(),
             url: "http://x/mcp".into(),
-            enabled: true,
+            offload_access: true,
             ..Default::default()
         };
         let roots = vec![PathBuf::from("/work")];
         let s1 = host_config_sig(std::slice::from_ref(&a), &roots);
         // Stable for identical input (the warm_host skip relies on this).
         assert_eq!(s1, host_config_sig(std::slice::from_ref(&a), &roots));
-        // Changes when a server field changes (enable/disable, url, …).
-        let b = McpServerConfig { enabled: false, ..a.clone() };
+        // Changes when a server field changes (access toggle, url, …).
+        let b = McpServerConfig { offload_access: false, ..a.clone() };
         assert_ne!(s1, host_config_sig(std::slice::from_ref(&b), &roots));
         // Changes when the allowed roots change.
         assert_ne!(

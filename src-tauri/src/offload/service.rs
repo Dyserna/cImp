@@ -373,6 +373,35 @@ impl OffloadService {
         }
     }
 
+    /// Claude-Code-exposed MCP tools as MCP `tools/list` descriptors
+    /// (`{name, description, inputSchema}`), for the per-session child to merge
+    /// into the tools it advertises to Claude. Empty when no server has
+    /// `claude_access`.
+    pub async fn mcp_claude_tool_descriptors(&self) -> Vec<serde_json::Value> {
+        self.host
+            .tool_defs_for_claude()
+            .await
+            .into_iter()
+            .map(|d| {
+                serde_json::json!({
+                    "name": d.function.name,
+                    "description": d.function.description,
+                    "inputSchema": d.function.parameters,
+                })
+            })
+            .collect()
+    }
+
+    /// Execute one Claude-exposed MCP tool call. Guarded — refuses any tool
+    /// that isn't offered by a `claude_access` server.
+    pub async fn mcp_claude_call(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<String, String> {
+        self.host.call_for_claude(name, args).await
+    }
+
     /// Run one offload task end-to-end against the live pool and return the
     /// synthesized answer. Acquires the global permit *and* the chosen
     /// backend's slot, so `in_flight` is honest and the global gate queues a
@@ -687,7 +716,7 @@ impl OffloadService {
         if allow_graph {
             native_defs.extend(tools::graph_tools::defs());
         }
-        let mcp_defs = self.host.tool_defs().await;
+        let mcp_defs = self.host.tool_defs_for_offload().await;
         let router = HostRouter::new(
             native_defs,
             mcp_defs,

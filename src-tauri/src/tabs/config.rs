@@ -351,6 +351,10 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
 
     // Reference the managed instructions file when any guidance applies. The
     // file itself is written at launch (see `build_ai_tool_spec`).
+    // NOTE: `instructions` is emitted as an array-of-paths (the documented
+    // shape); confirm against the live schema at F1 alongside the provider
+    // block — if OpenCode silently ignores it, the TTS/offload/graph guidance
+    // never reaches the session (no launch error surfaces).
     if !compose_capability_guidance(cfg, settings).is_empty() {
         let path = opencode_instructions_path(cfg);
         config.insert(

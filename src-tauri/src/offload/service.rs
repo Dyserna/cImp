@@ -391,8 +391,11 @@ impl OffloadService {
     pub async fn mcp_tool_descriptors(&self, consumer: Consumer) -> Vec<serde_json::Value> {
         let defs = match consumer {
             Consumer::Opencode => self.host.tool_defs_for_opencode().await,
-            // Offload uses the worker path, not this proxy; treat it as Claude
-            // here for safety (it never reaches this route in practice).
+            // This loopback proxy only serves the interactive Claude/OpenCode
+            // children; the offload worker reaches the host in-process, never via
+            // this route. An unexpected `offload` query value therefore can't
+            // arrive in practice — fall back to the Claude set (the conservative,
+            // claude_access-guarded default) rather than leaking the offload set.
             Consumer::Claude | Consumer::Offload => self.host.tool_defs_for_claude().await,
         };
         defs.into_iter()
@@ -416,6 +419,8 @@ impl OffloadService {
     ) -> Result<String, String> {
         match consumer {
             Consumer::Opencode => self.host.call_for_opencode(name, args).await,
+            // See `mcp_tool_descriptors`: `offload` never legitimately reaches
+            // this proxy; fall back to the Claude-guarded set.
             Consumer::Claude | Consumer::Offload => self.host.call_for_claude(name, args).await,
         }
     }

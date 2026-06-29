@@ -16,7 +16,7 @@
 //! by their discriminator fields and routed through the `migration`
 //! module after the merge so a hand-imported old file at the new path
 //! still upgrades cleanly. After migration an integrity check reconciles
-//! the four reserved AI builtins (claude, claude-local, aider, aider-local)
+//! the four reserved AI builtins (claude, claude-local, opencode, opencode-local)
 //! with `enabled_ai_tabs`: every enabled id is forced present with
 //! `builtin: true`, every reserved id absent from the list is dropped.
 //! The `shell-default-1` reserved id is *not* re-seeded by the integrity
@@ -769,8 +769,8 @@ const AI_BUILTIN_IDS: [&str; 4] = [
 /// a hand-edited file.
 ///
 /// Restored AI tabs land at their canonical position (claude → 0,
-/// claude-local → after claude, aider → after claude-local,
-/// aider-local → after aider). User-created Shell tabs retain their
+/// claude-local → after claude, opencode → after claude-local,
+/// opencode-local → after opencode). User-created Shell tabs retain their
 /// relative ordering after the AI builtins. The `shell-default-1`
 /// reserved id is *not* re-seeded here: it's a closable shell that
 /// ships only on fresh installs (see `seeded_defaults`).
@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn integrity_inserts_aider_between_claude_local_and_user_shell() {
+    fn integrity_inserts_opencode_between_claude_local_and_user_shell() {
         // User has [claude, claude-local, shell-foo] and now enables
         // opencode. The new tab should land at index 2 (after claude-local,
         // before the shell), not at the end.

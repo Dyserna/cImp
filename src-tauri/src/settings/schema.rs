@@ -310,7 +310,14 @@ impl LogRetention {
 pub enum AiTabId {
     Claude,
     ClaudeLocal,
+    // Explicit renames: serde's kebab-case would split the camelCase variant
+    // names into `open-code` / `open-code-local`, but the wire format must be
+    // the single-word tab ids `opencode` / `opencode-local` (matching
+    // OPENCODE_TAB_ID, the migration output, and the frontend literals). A
+    // mismatch quarantines settings on load — see the round-trip test.
+    #[serde(rename = "opencode")]
     OpenCode,
+    #[serde(rename = "opencode-local")]
     OpenCodeLocal,
 }
 
@@ -2646,6 +2653,27 @@ impl Default for ProcessingSettings {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn ai_tab_id_serde_wire_format_matches_tab_ids() {
+        // The serde wire string for each AiTabId MUST equal its tab-id constant
+        // (and the frontend literal + the migration output). A mismatch
+        // quarantines settings on load. Round-trip both directions.
+        for (variant, id) in [
+            (AiTabId::Claude, "claude"),
+            (AiTabId::ClaudeLocal, "claude-local"),
+            (AiTabId::OpenCode, "opencode"),
+            (AiTabId::OpenCodeLocal, "opencode-local"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(id), "serialize {id}");
+            assert_eq!(
+                serde_json::from_value::<AiTabId>(json!(id)).unwrap(),
+                variant,
+                "deserialize {id}"
+            );
+            assert_eq!(variant.as_str(), id, "as_str {id}");
+        }
+    }
 
     #[test]
     fn malformed_layout_drops_to_none_without_losing_rest_of_settings() {

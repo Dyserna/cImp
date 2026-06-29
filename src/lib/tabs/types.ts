@@ -1,5 +1,5 @@
 // Frontend mirror of `state::TabId`. JSON-serialized as a string —
-// `"claude"` / `"claude-local"` / `"aider"` / `"aider-local"` for the
+// `"claude"` / `"claude-local"` / `"opencode"` for the
 // AI builtins, `"shell-default-1"` for the reserved default Shell tab,
 // or `shell-<uuid>` for user-created shell tabs. The union shape
 // preserves autocomplete on the well-known IDs while leaving room for
@@ -8,8 +8,7 @@
 export type TabId =
   | 'claude'
   | 'claude-local'
-  | 'aider'
-  | 'aider-local'
+  | 'opencode'
   | (string & {});
 
 /// V8-03: the reserved id of the read-only Offload Server tab. Internally a
@@ -40,8 +39,7 @@ export function isShellTab(id: TabId): boolean {
   return (
     id !== 'claude' &&
     id !== 'claude-local' &&
-    id !== 'aider' &&
-    id !== 'aider-local' &&
+    id !== 'opencode' &&
     id !== OFFLOAD_SERVER_TAB_ID &&
     id !== GRAPH_MONITOR_TAB_ID
   );
@@ -50,19 +48,16 @@ export function isShellTab(id: TabId): boolean {
 /// Subset of TabId covering only the AI builtins. Used by call sites that
 /// need to iterate over just the AI tabs (e.g. the Settings window's
 /// "Reset to default" wiring, which is meaningful only for AI tabs).
-export type AiTabId = 'claude' | 'claude-local' | 'aider' | 'aider-local';
+export type AiTabId = 'claude' | 'claude-local' | 'opencode';
 export const AI_TABS: readonly AiTabId[] = [
   'claude',
   'claude-local',
-  'aider',
-  'aider-local',
+  'opencode',
 ] as const;
 
-/// Type guard for the Aider pair — useful when the Settings UI gates
-/// per-tool behavior (e.g. hiding the TTS-injection rows because Aider
-/// has no `--append-system-prompt` equivalent).
-export function isAiderTabId(id: string): boolean {
-  return id === 'aider' || id === 'aider-local';
+/// Type guard for the single OpenCode tab.
+export function isOpencodeTabId(id: string): boolean {
+  return id === 'opencode';
 }
 
 export type TabKind = 'ai-tool' | 'shell';

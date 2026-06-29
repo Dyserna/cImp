@@ -8,16 +8,17 @@
 //! unknown id is a hard error (the registry shouldn't know about a tab
 //! whose entry is missing from settings).
 //!
-//! V14: AI tabs cover Claude Code (`claude` / `claude-local`) and Aider
-//! (`aider` / `aider-local`). The `use_local_provider` flag on each AI
-//! tab gates env synthesis: Claude pairs read from `claude_local` and
-//! receive `ANTHROPIC_*` env vars; Aider pairs read from `aider_local`
-//! and receive `OPENAI_*` env vars (plus a `--model <model>` arg when
-//! set). Per-tab `env` entries take precedence over synthesized values.
-//! TTS prompt injection (`--append-system-prompt`) is Claude-only —
-//! Aider's CLI has no equivalent flag, so the spawn path drops pre-args
-//! for Aider tabs regardless of the per-tab `tts_injection.enabled`
-//! setting.
+//! V19: AI tabs cover Claude Code (`claude` / `claude-local`) and a single
+//! OpenCode tab (`opencode`). Claude's `use_local_provider` flag reads from
+//! `claude_local` and synthesizes `ANTHROPIC_*` env vars. OpenCode manages its
+//! own providers/credentials, so cctts injects no provider — just the mcp +
+//! instructions. Per-tab `env` entries take precedence over synthesized values.
+//!
+//! System-prompt / capability injection differs by tool: Claude uses CLI
+//! flags (`--append-system-prompt` / `--settings` / `--mcp-config`, see
+//! `build_pre_args`); OpenCode uses a single `OPENCODE_CONFIG_CONTENT` env
+//! var carrying the equivalent `mcp` / `instructions` JSON
+//! (see `compose_ai_env` + `build_opencode_config`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -78,6 +79,12 @@ fn build_ai_tool_spec(
         .cwd
         .clone()
         .unwrap_or_else(|| launch_cwd.to_path_buf());
+    // V19: OpenCode reads its guidance from a file referenced in the injected
+    // config (`instructions`), so write that managed file at launch — kept off
+    // the pure `compose_ai_env` path so the config builder stays test-safe.
+    if command_is(&cfg.command, "opencode") {
+        write_opencode_instructions(cfg, settings);
+    }
     let env = compose_ai_env(cfg, settings);
     Ok(PtyLaunchSpec {
         tab,
@@ -104,8 +111,9 @@ fn command_is(command: &str, name: &str) -> bool {
 }
 
 /// Pre-args injected ahead of the tab's own `args` and the wrapper's
-/// invocation args. Claude-only — both injections target Claude Code's
-/// CLI and Aider understands neither, so Aider tabs get empty pre-args:
+/// invocation args. Claude-only — these injections target Claude Code's CLI
+/// flags; OpenCode gets the equivalents via `OPENCODE_CONFIG_CONTENT` (see
+/// `build_opencode_config`), so non-Claude tabs get empty pre-args:
 ///
 ///   * `--append-system-prompt <instructions>` — TTS markup convention,
 ///     gated on the per-tab `tts_injection` toggle.
@@ -120,33 +128,12 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     }
     let mut args = Vec::new();
 
-    // Compose a single `--append-system-prompt` from every addendum we
-    // inject (TTS markup convention + the V8-01 offload guidance nudge),
-    // joined with a blank line. Merging into one flag avoids relying on
-    // Claude Code concatenating repeated `--append-system-prompt` flags.
-    let mut addendum = String::new();
-    if cfg.tts_injection.enabled && !cfg.tts_injection.instructions.is_empty() {
-        addendum.push_str(&cfg.tts_injection.instructions);
-    }
-    if settings.offload.enabled && settings.offload.inject_guidance {
-        if !addendum.is_empty() {
-            addendum.push_str("\n\n");
-        }
-        addendum.push_str(OFFLOAD_GUIDANCE);
-    }
-    // V9-01: when the code graph is enabled, tell Opus the `graph_*` tools
-    // exist — without a nudge it defaults to grep and never queries the index.
-    if settings.graph.enabled {
-        if !addendum.is_empty() {
-            addendum.push_str("\n\n");
-        }
-        addendum.push_str(GRAPH_GUIDANCE);
-        // `graph_semantic_docs` is only advertised to Opus when semantic search
-        // is on, so only guide toward it then.
-        if settings.graph.semantic_search {
-            addendum.push_str(GRAPH_SEMANTIC_GUIDANCE);
-        }
-    }
+    // Compose a single `--append-system-prompt` from every addendum we inject
+    // (TTS markup convention + offload + graph guidance). Merging into one flag
+    // avoids relying on Claude Code concatenating repeated flags. The same
+    // composition feeds OpenCode's instructions file (see `build_opencode_config`)
+    // so the two agents stay in lockstep.
+    let addendum = compose_capability_guidance(cfg, settings);
     if !addendum.is_empty() {
         args.push("--append-system-prompt".to_string());
         args.push(addendum);
@@ -168,10 +155,11 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     // spawns the `command` as argv (no shell), so the raw exe path is
     // correct — no shell-quoting needed (unlike the statusLine command).
     // V8-01 + V9-01: point Claude at our `ccimp --offload-mcp` server, which
-    // carries BOTH the `offload_task` tool and the `graph_*` tools. Inject it
-    // whenever EITHER feature is on — the graph tools must reach Claude even
-    // when offload is disabled (they ride the same MCP child).
-    if settings.offload.enabled || settings.graph.enabled {
+    // carries the `offload_task` tool, the `graph_*` tools, AND any MCP server
+    // exposed to Claude Code. Inject it whenever ANY of those is in play — the
+    // graph tools and Claude-exposed MCP servers must reach Claude even when
+    // offload is disabled (they ride the same MCP child).
+    if settings.offload.enabled || settings.graph.enabled || settings.offload.any_claude_mcp() {
         if let Ok(exe) = std::env::current_exe() {
             let mcp = serde_json::json!({
                 "mcpServers": {
@@ -187,6 +175,36 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     }
 
     args
+}
+
+/// Compose the capability-guidance addendum shared by Claude
+/// (`--append-system-prompt`) and OpenCode (the managed instructions file):
+/// the per-tab TTS-markup convention (gated on `tts_injection.enabled`), the
+/// offload nudge (gated on `offload.enabled && offload.inject_guidance`), and
+/// the code-graph nudge (gated on `graph.enabled`, with the semantic addendum
+/// when `graph.semantic_search`). Sections are joined by a blank line. Reusing
+/// the exact same sources keeps both agents in lockstep.
+fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> String {
+    let mut addendum = String::new();
+    if cfg.tts_injection.enabled && !cfg.tts_injection.instructions.is_empty() {
+        addendum.push_str(&cfg.tts_injection.instructions);
+    }
+    if settings.offload.enabled && settings.offload.inject_guidance {
+        if !addendum.is_empty() {
+            addendum.push_str("\n\n");
+        }
+        addendum.push_str(OFFLOAD_GUIDANCE);
+    }
+    if settings.graph.enabled {
+        if !addendum.is_empty() {
+            addendum.push_str("\n\n");
+        }
+        addendum.push_str(GRAPH_GUIDANCE);
+        if settings.graph.semantic_search {
+            addendum.push_str(GRAPH_SEMANTIC_GUIDANCE);
+        }
+    }
+    addendum
 }
 
 /// V8-01: the system-prompt addendum telling Opus *when* to reach for
@@ -219,29 +237,30 @@ material that may not share keywords with your query.";
 
 fn build_extra_args(
     cfg: &AiToolTabConfig,
-    settings: &Settings,
+    _settings: &Settings,
     invocation_args: &[String],
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
-    // Aider against a local provider: prepend `--model <name>` if
-    // configured. Placed ahead of the user's own `cfg.args` so a user can
-    // still override by adding `--model …` themselves (Aider takes the
-    // last `--model` it sees).
-    if command_is(&cfg.command, "aider")
-        && cfg.use_local_provider
-        && !settings.aider_local.model.is_empty()
-    {
-        out.push("--model".to_string());
-        out.push(settings.aider_local.model.clone());
+    // V19: OpenCode's default TUI takes the alternate screen (full-screen
+    // redraw), which breaks ccImp's linear, append-only stream model the same
+    // way Claude's fullscreen renderer does. `--mini` renders inline into the
+    // normal scrollback instead — the same rendering class as Claude's
+    // `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. It is mandatory and always
+    // prepended (ahead of the user's own `cfg.args`) so the linear-stream
+    // contract holds regardless of what the user adds. `--mini` requires a real
+    // TTY, which the PTY supplies.
+    if command_is(&cfg.command, "opencode") {
+        out.push("--mini".to_string());
     }
 
     out.extend(cfg.args.iter().filter(|s| !s.is_empty()).cloned());
 
     // ccimp is documented as a drop-in replacement for `claude`, so
     // invocation args (`ccimp --resume <id>`, etc.) flow into every
-    // Claude tab. Aider ignores unknown flags less gracefully than
-    // Claude, so we only forward invocation args to Claude tabs.
+    // Claude tab. OpenCode's model/provider selection arrives via the
+    // injected config, not flags, so we only forward invocation args to
+    // Claude tabs.
     if command_is(&cfg.command, "claude") {
         for arg in invocation_args {
             if !arg.is_empty() {
@@ -250,6 +269,105 @@ fn build_extra_args(
         }
     }
     out
+}
+
+/// Deterministic path of the managed OpenCode instructions file for `cfg`.
+/// One file per tab id (the TTS toggle is per-tab) under a managed dir next to
+/// the exe (the portable root, like the offload discovery file), falling back
+/// to the OS temp dir. Pure — computing the path never touches the filesystem,
+/// so `build_opencode_config` stays test-safe; the actual write happens on the
+/// real launch path (`build_ai_tool_spec`).
+fn opencode_instructions_path(cfg: &AiToolTabConfig) -> std::path::PathBuf {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("opencode-instructions");
+    // Tab ids are kebab-case reserved ids or `ai-<uuid>` duplicates — safe as a
+    // filename stem.
+    dir.join(format!("{}.md", cfg.id))
+}
+
+/// Write the managed OpenCode instructions file for `cfg` (idempotent
+/// overwrite at each launch so it tracks live settings). Best-effort: a write
+/// failure just means OpenCode launches without the guidance addendum, exactly
+/// like a Claude tab with TTS injection disabled. Removes a stale file when no
+/// guidance applies so a since-disabled toggle doesn't leave dead instructions.
+fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
+    let path = opencode_instructions_path(cfg);
+    let text = compose_capability_guidance(cfg, settings);
+    if text.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::write(&path, text);
+}
+
+/// V19: synthesize OpenCode's session-scoped config — the JSON document that
+/// `OPENCODE_CONFIG_CONTENT` carries (the env-var analog of Claude's
+/// `--mcp-config` / `--settings` / `--append-system-prompt`):
+///
+/// - `$schema` marker.
+/// - `mcp.ccimp-offload` → `ccimp --offload-mcp --consumer opencode`, injected
+///   whenever offload, the graph, or an OpenCode-exposed MCP server is in play
+///   (mirrors the Claude `--mcp-config` gate in `build_pre_args`).
+/// - `instructions` → the managed guidance file (TTS + offload + graph), when
+///   any guidance applies. The file content is written on the launch path; here
+///   we only reference its (deterministic) path.
+///
+/// No `provider` block: OpenCode manages its own providers/credentials (global
+/// config, switchable in-session), so cctts never injects one.
+///
+/// Additive by default — cctts does not set `OPENCODE_DISABLE_PROJECT_CONFIG`,
+/// so a user's project config still merges underneath. Pure: no filesystem I/O.
+fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_json::Value {
+    let mut config = serde_json::Map::new();
+    config.insert(
+        "$schema".to_string(),
+        serde_json::Value::String("https://opencode.ai/config.json".to_string()),
+    );
+
+    // The single `ccimp --offload-mcp` child carries `offload_task`, the
+    // `graph_*` tools, and any OpenCode-exposed MCP server. Inject it whenever
+    // ANY of those is in play (same shape as the Claude gate).
+    if settings.offload.enabled || settings.graph.enabled || settings.offload.any_opencode_mcp() {
+        if let Ok(exe) = std::env::current_exe() {
+            config.insert(
+                "mcp".to_string(),
+                serde_json::json!({
+                    "ccimp-offload": {
+                        "type": "local",
+                        "command": [exe.to_string_lossy(), "--offload-mcp", "--consumer", "opencode"]
+                    }
+                }),
+            );
+        }
+    }
+
+    // Reference the managed instructions file when any guidance applies. The
+    // file itself is written at launch (see `build_ai_tool_spec`).
+    // NOTE: `instructions` is emitted as an array-of-paths (the documented
+    // shape); confirm against the live schema at F1 alongside the provider
+    // block — if OpenCode silently ignores it, the TTS/offload/graph guidance
+    // never reaches the session (no launch error surfaces).
+    if !compose_capability_guidance(cfg, settings).is_empty() {
+        let path = opencode_instructions_path(cfg);
+        config.insert(
+            "instructions".to_string(),
+            serde_json::json!([path.to_string_lossy()]),
+        );
+    }
+
+    // V19: no `provider` block. The single OpenCode tab uses OpenCode's own
+    // provider config + credentials (global `~/.config/opencode` + `auth.json`,
+    // switchable in-session), so cctts injects only the mcp + instructions and
+    // leaves provider/model selection entirely to OpenCode.
+    serde_json::Value::Object(config)
 }
 
 /// V1.4-07 / V14: compose the spawn environment for an AI tab. Per-tab
@@ -264,12 +382,12 @@ fn build_extra_args(
 /// - Claude binary + `use_local_provider`: synthesize
 ///   `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`
 ///   from `claude_local`.
-/// - Aider binary + `use_local_provider`: synthesize
-///   `OPENAI_API_BASE` / `OPENAI_API_KEY` from `aider_local`. The
-///   model selection is passed via `--model` (see `build_extra_args`)
-///   rather than env, since Aider has stronger CLI-flag conventions.
-/// - Anything else (cloud Claude/Aider, `use_local_provider` off): no
-///   synthesized env — the user's existing configuration is in charge.
+/// - OpenCode binary: always set `OPENCODE_CONFIG_CONTENT` (the synthesized
+///   session config) plus the noise-suppression env vars. When
+///   `use_local_provider`, the local endpoint is carried inside that config
+///   as a `provider` block (see `build_opencode_config`), not as env.
+/// - Anything else (cloud Claude, `use_local_provider` off): no synthesized
+///   provider env — the user's existing configuration is in charge.
 fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
 
@@ -293,29 +411,46 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
         );
     }
 
-    if cfg.use_local_provider {
-        if command_is(&cfg.command, "claude") {
-            let cl = &settings.claude_local;
-            if !cl.base_url.is_empty() {
-                env.insert("ANTHROPIC_BASE_URL".to_string(), cl.base_url.clone());
+    // V19: OpenCode launch env. `--mini` (see `build_extra_args`) puts the
+    // renderer inline; here we (1) inject the session-scoped config as one
+    // `OPENCODE_CONFIG_CONTENT` env var — the env-var analog of Claude's
+    // `--mcp-config` / `--settings` / `--append-system-prompt` CLI flags — and
+    // (2) quiet terminal features that fight ccImp's own selection/title
+    // handling. Set before the per-tab `env` merge below so a user can override
+    // any of these per tab.
+    if command_is(&cfg.command, "opencode") {
+        let config = build_opencode_config(cfg, settings);
+        env.insert("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string());
+        env.insert(
+            "OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT".to_string(),
+            "1".to_string(),
+        );
+        env.insert("OPENCODE_DISABLE_TERMINAL_TITLE".to_string(), "1".to_string());
+        // Windows: OpenCode shells out via Git Bash. Pass the path through when
+        // the parent environment already names it, so the `--mini` child finds it.
+        if let Ok(bash) = std::env::var("OPENCODE_GIT_BASH_PATH") {
+            if !bash.is_empty() {
+                env.insert("OPENCODE_GIT_BASH_PATH".to_string(), bash);
             }
-            if !cl.auth_token.is_empty() {
-                env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), cl.auth_token.clone());
-            }
-            if !cl.model_alias.is_empty() {
-                // Claude Code primarily uses --model flag for model
-                // selection, but ANTHROPIC_MODEL is honored by some
-                // proxies; setting both is harmless.
-                env.insert("ANTHROPIC_MODEL".to_string(), cl.model_alias.clone());
-            }
-        } else if command_is(&cfg.command, "aider") {
-            let al = &settings.aider_local;
-            if !al.base_url.is_empty() {
-                env.insert("OPENAI_API_BASE".to_string(), al.base_url.clone());
-            }
-            if !al.auth_token.is_empty() {
-                env.insert("OPENAI_API_KEY".to_string(), al.auth_token.clone());
-            }
+        }
+    }
+
+    // Claude against a local provider: synthesize `ANTHROPIC_*` env. OpenCode's
+    // local provider arrives inside `OPENCODE_CONFIG_CONTENT` (a `provider`
+    // block, see `build_opencode_config`), not as env vars, so it is handled
+    // there rather than here.
+    if cfg.use_local_provider && command_is(&cfg.command, "claude") {
+        let cl = &settings.claude_local;
+        if !cl.base_url.is_empty() {
+            env.insert("ANTHROPIC_BASE_URL".to_string(), cl.base_url.clone());
+        }
+        if !cl.auth_token.is_empty() {
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), cl.auth_token.clone());
+        }
+        if !cl.model_alias.is_empty() {
+            // Claude Code primarily uses --model flag for model selection, but
+            // ANTHROPIC_MODEL is honored by some proxies; setting both is harmless.
+            env.insert("ANTHROPIC_MODEL".to_string(), cl.model_alias.clone());
         }
     }
     // Per-tab env wins over synthesized values.
@@ -328,7 +463,7 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{default_aider_tab, default_claude_tab};
+    use crate::settings::{default_claude_tab, default_opencode_tab};
 
     fn claude_cfg() -> AiToolTabConfig {
         match default_claude_tab() {
@@ -337,10 +472,11 @@ mod tests {
         }
     }
 
-    fn aider_cfg() -> AiToolTabConfig {
-        match default_aider_tab() {
+    /// An AI-tool tab whose command resolves to `opencode`.
+    fn opencode_cfg() -> AiToolTabConfig {
+        match default_opencode_tab() {
             TabConfig::AiTool(c) => c,
-            _ => unreachable!("default_aider_tab is an AI tool tab"),
+            _ => unreachable!("default_opencode_tab is an AI tool tab"),
         }
     }
 
@@ -378,12 +514,13 @@ mod tests {
 
     #[test]
     fn statusline_overlay_is_claude_only() {
-        // Aider understands neither --append-system-prompt nor --settings,
-        // so its pre-args stay empty even with the global toggle on.
+        // OpenCode understands neither --append-system-prompt nor --settings
+        // (its config arrives via OPENCODE_CONFIG_CONTENT), so its pre-args stay
+        // empty even with the global toggle on.
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
-        let args = build_pre_args(&aider_cfg(), &settings);
-        assert!(args.is_empty(), "aider must get no pre-args, got: {args:?}");
+        let args = build_pre_args(&opencode_cfg(), &settings);
+        assert!(args.is_empty(), "opencode must get no pre-args, got: {args:?}");
     }
 
     #[test]
@@ -458,6 +595,27 @@ mod tests {
     }
 
     #[test]
+    fn claude_exposed_mcp_server_alone_injects_mcp_config() {
+        // A server exposed to Claude Code rides the same `--offload-mcp` child,
+        // so the MCP config must be injected even with offload + graph both off.
+        let mut settings = Settings::default();
+        settings.offload.enabled = false;
+        settings.graph.enabled = false;
+        settings.offload.mcp_servers = vec![crate::settings::McpServerConfig {
+            name: "duckduckgo".to_string(),
+            url: "http://host:1/mcp".to_string(),
+            claude_access: true,
+            offload_access: false,
+            ..Default::default()
+        }];
+        let args = build_pre_args(&claude_cfg(), &settings);
+        assert!(
+            args.iter().any(|a| a == "--mcp-config"),
+            "--mcp-config present when a server is exposed to Claude Code"
+        );
+    }
+
+    #[test]
     fn graph_enabled_injects_graph_guidance() {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
@@ -474,8 +632,8 @@ mod tests {
     fn offload_injection_is_claude_only() {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
-        let args = build_pre_args(&aider_cfg(), &settings);
-        assert!(args.is_empty(), "aider must get no pre-args, got: {args:?}");
+        let args = build_pre_args(&opencode_cfg(), &settings);
+        assert!(args.is_empty(), "opencode must get no pre-args, got: {args:?}");
     }
 
     #[test]
@@ -492,10 +650,135 @@ mod tests {
     #[test]
     fn fullscreen_optout_is_claude_only() {
         let settings = Settings::default();
-        let env = compose_ai_env(&aider_cfg(), &settings);
+        let env = compose_ai_env(&opencode_cfg(), &settings);
         assert!(
             !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
-            "Aider doesn't understand the Claude fullscreen flag",
+            "OpenCode doesn't understand the Claude fullscreen flag",
+        );
+    }
+
+    // ---- V19: OpenCode launch spine ----
+
+    #[test]
+    fn prepends_mini_for_opencode() {
+        let settings = Settings::default();
+        let args = build_extra_args(&opencode_cfg(), &settings, &[]);
+        assert_eq!(args.first().map(String::as_str), Some("--mini"),
+            "opencode must launch with --mini as the first arg, got: {args:?}");
+    }
+
+    #[test]
+    fn no_mini_for_claude_or_shell() {
+        let settings = Settings::default();
+        let claude = build_extra_args(&claude_cfg(), &settings, &[]);
+        assert!(!claude.iter().any(|a| a == "--mini"), "claude must not get --mini");
+        // A non-opencode, non-claude AI command must not get --mini either.
+        let mut other = claude_cfg();
+        other.command = "some-other-tool".to_string();
+        let other = build_extra_args(&other, &settings, &[]);
+        assert!(!other.iter().any(|a| a == "--mini"), "non-opencode tabs must not get --mini");
+    }
+
+    #[test]
+    fn opencode_config_content_is_valid_json() {
+        let settings = Settings::default();
+        let env = compose_ai_env(&opencode_cfg(), &settings);
+        let raw = env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("opencode tab sets OPENCODE_CONFIG_CONTENT");
+        let cfg: serde_json::Value =
+            serde_json::from_str(raw).expect("OPENCODE_CONFIG_CONTENT is valid JSON");
+        assert_eq!(cfg["$schema"], "https://opencode.ai/config.json");
+    }
+
+    #[test]
+    fn opencode_config_injects_mcp_when_offload_enabled() {
+        let mut settings = Settings::default();
+        settings.offload.enabled = true;
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let cmd = &cfg["mcp"]["ccimp-offload"]["command"];
+        assert_eq!(cfg["mcp"]["ccimp-offload"]["type"], "local");
+        // The child is launched with the opencode consumer discriminator.
+        let args: Vec<&str> = cmd
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--offload-mcp"), "got: {args:?}");
+        assert!(args.windows(2).any(|w| w == ["--consumer", "opencode"]), "got: {args:?}");
+    }
+
+    #[test]
+    fn opencode_config_no_mcp_when_all_off() {
+        let settings = Settings::default(); // offload + graph off, no servers
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        assert!(cfg.get("mcp").is_none(), "no mcp block when nothing is in play");
+    }
+
+    #[test]
+    fn opencode_config_injects_mcp_when_graph_enabled() {
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        assert!(cfg["mcp"]["ccimp-offload"].is_object(), "graph alone injects the mcp block");
+    }
+
+    #[test]
+    fn opencode_config_references_instructions_when_tts_enabled() {
+        // The default opencode tab has TTS injection enabled with the runtime
+        // prompt, so the config references the managed instructions file.
+        let settings = Settings::default();
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let path = cfg["instructions"][0].as_str().expect("instructions path");
+        assert!(path.ends_with(".md"), "got: {path}");
+        assert!(path.contains("opencode"), "got: {path}");
+    }
+
+    #[test]
+    fn opencode_config_no_instructions_when_no_guidance() {
+        let settings = Settings::default(); // offload + graph off
+        let mut cfg = opencode_cfg();
+        cfg.tts_injection.enabled = false; // and no TTS guidance
+        let config = build_opencode_config(&cfg, &settings);
+        assert!(config.get("instructions").is_none(), "no guidance ⇒ no instructions key");
+    }
+
+    #[test]
+    fn opencode_config_never_injects_provider() {
+        // The single OpenCode tab manages its own providers; cctts never
+        // injects a `provider`/`model` block, even with use_local_provider set.
+        let settings = Settings::default();
+        let mut cfg = opencode_cfg();
+        cfg.use_local_provider = true;
+        let config = build_opencode_config(&cfg, &settings);
+        assert!(config.get("provider").is_none(), "opencode gets no provider block");
+        assert!(config.get("model").is_none());
+    }
+
+    #[test]
+    fn opencode_sets_noise_suppression_env() {
+        let settings = Settings::default();
+        let env = compose_ai_env(&opencode_cfg(), &settings);
+        assert_eq!(
+            env.get("OPENCODE_DISABLE_TERMINAL_TITLE").map(String::as_str),
+            Some("1"),
+        );
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            "opencode must not get the Claude fullscreen flag");
+    }
+
+    #[test]
+    fn per_tab_env_overrides_opencode_config_content() {
+        let settings = Settings::default();
+        let mut cfg = opencode_cfg();
+        cfg.env
+            .insert("OPENCODE_CONFIG_CONTENT".to_string(), "custom".to_string());
+        let env = compose_ai_env(&cfg, &settings);
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            Some("custom"),
+            "an explicit per-tab value must win over the synthesized config",
         );
     }
 

@@ -1,112 +1,112 @@
-/* tui-green theme — "TUI - Aider". The Aider Green palette + Aider's terminal
-   green accent. Self-contained per the theme isolation policy (see
-   src/theme.css): the token block below plus the structural overrides that
-   follow are this theme's complete definition. The accent family is keyed off
-   #2eb82e — a brightened take on Aider's logo green (#14b014) / its green-on-
-   black terminal aesthetic. The counterpart to the imp's red (ccImp/Claude
-   Code) and Claude's orange: this one is for the Aider front-end. */
-[data-theme="tui-green"] {
-  /* Surfaces — near-black with a faint green tint. Tight contrast between
+/* tui-grey theme ("TUI - Grey") — OpenCode's monochrome aesthetic. Neutral
+   slate surfaces + a cool light-grey accent, no warm/cool hue in the chrome.
+   Self-contained per the theme isolation policy (see src/theme.css): the token
+   block below plus the structural overrides that follow are this theme's
+   complete definition. The accent family is keyed off #c8ccd0 — a clean cool
+   light-grey, the understated counterpart to Claude Code's orange and the
+   imp's red, matched to the OpenCode tab. Paired with the OpenCode Grey
+   terminal palette. */
+[data-theme="tui-grey"] {
+  /* Surfaces — neutral near-black to slate-grey. Tight contrast between
      layers; depth comes from borders. Follow the terminal palette so the
-     chrome integrates with the Aider Green terminal background. */
-  --surface-0:       var(--term-bg, #0c130c);   /* body bg — follows terminal palette */
-  --surface-1:       var(--term-bg, #111a11);   /* panes — follows terminal palette */
-  --surface-2:       var(--term-bg, #182418);   /* tab bar / dialog body — follows terminal palette */
-  --surface-3:       #1f2f1f;   /* hover-elevated */
-  --surface-4:       #2c3f2c;   /* deeper hover */
+     chrome integrates with the OpenCode Grey terminal background. */
+  --surface-0:       var(--term-bg, #131516);   /* body bg — follows terminal palette */
+  --surface-1:       var(--term-bg, #191b1c);   /* panes — follows terminal palette */
+  --surface-2:       var(--term-bg, #1f2123);   /* tab bar / dialog body — follows terminal palette */
+  --surface-3:       #2a2d2f;   /* hover-elevated */
+  --surface-4:       #353a3d;   /* deeper hover */
 
-  --surface-sunken:  var(--term-bg, #0c130c);
-  --surface-deep:    var(--term-bg, #080d08);
-  --surface-input:   var(--term-bg, #18241f);
+  --surface-sunken:  var(--term-bg, #131516);
+  --surface-deep:    var(--term-bg, #0e1011);
+  --surface-input:   var(--term-bg, #1f2123);
 
-  /* Text — soft green-white → muted sage. */
-  --text-primary:    var(--term-fg, #c8e6c8);   /* main text — follows terminal palette fg */
-  --text-bright:     var(--term-fg, #f0fbf0);   /* brightest text — follows terminal fg */
-  --text-on-accent:  #08140a;   /* dark text reads on the bright green fill */
+  /* Text — neutral grey → near-white. */
+  --text-primary:    var(--term-fg, #d4d6d8);   /* main text — follows terminal palette fg */
+  --text-bright:     var(--term-fg, #f0f2f4);   /* brightest text — follows terminal fg */
+  --text-on-accent:  #131516;   /* dark text reads on the light-grey fill */
   /* Neutral text ramp from the terminal palette (term-fg → term-bg blend).
      Keeps the whole chrome/body text in-palette; accent + semantics stay
      theme-defined. */
-  --text-secondary:  color-mix(in srgb, var(--term-fg, #b6d6b6) 88%, var(--term-bg, #0c130c));
-  --text-quiet:      color-mix(in srgb, var(--term-fg, #9cc09c) 72%, var(--term-bg, #0c130c));
-  --text-quiet-strong: color-mix(in srgb, var(--term-fg, #8caf8c) 80%, var(--term-bg, #0c130c));
-  --text-tertiary:   color-mix(in srgb, var(--term-fg, #6e8e6e) 58%, var(--term-bg, #0c130c));
-  --text-faint:      color-mix(in srgb, var(--term-fg, #5c7c5c) 46%, var(--term-bg, #0c130c));
-  --text-disabled:   color-mix(in srgb, var(--term-fg, #4a644a) 38%, var(--term-bg, #0c130c));
-  --text-disabled-deep: color-mix(in srgb, var(--term-fg, #374f37) 30%, var(--term-bg, #0c130c));
+  --text-secondary:  color-mix(in srgb, var(--term-fg, #c2c5c8) 88%, var(--term-bg, #131516));
+  --text-quiet:      color-mix(in srgb, var(--term-fg, #a8acaf) 72%, var(--term-bg, #131516));
+  --text-quiet-strong: color-mix(in srgb, var(--term-fg, #989da0) 80%, var(--term-bg, #131516));
+  --text-tertiary:   color-mix(in srgb, var(--term-fg, #7e8488) 58%, var(--term-bg, #131516));
+  --text-faint:      color-mix(in srgb, var(--term-fg, #6a7074) 46%, var(--term-bg, #131516));
+  --text-disabled:   color-mix(in srgb, var(--term-fg, #565c60) 38%, var(--term-bg, #131516));
+  --text-disabled-deep: color-mix(in srgb, var(--term-fg, #454a4d) 30%, var(--term-bg, #131516));
 
-  /* Accent — Aider terminal green. #2eb82e is a brightened, readable take on
-     Aider's logo green (#14b014); the brighter and softer steps are tuned
-     around it. */
-  --accent:          #2eb82e;   /* Aider green */
-  --accent-hover:    #3fd13f;
-  --accent-bright:   #6ee86e;
-  --accent-soft:     #1a7a1a;   /* faded green for muted CTAs */
-  --accent-soft-hover: #259025;
-  --accent-info:     #5a9bd0;   /* palette blue */
-  --accent-fg:       #08140a;
-  --accent-muted:    rgba(46, 184, 46, 0.15);
+  /* Accent — OpenCode cool light-grey. #c8ccd0 is the neutral counterpart to
+     Claude Code's terracotta orange; the brighter and softer steps are tuned
+     around it as a monochrome ramp. */
+  --accent:          #c8ccd0;   /* OpenCode light grey */
+  --accent-hover:    #dfe3e6;
+  --accent-bright:   #f0f2f4;
+  --accent-soft:     #6b7075;   /* faded slate for muted CTAs */
+  --accent-soft-hover: #888d92;
+  --accent-info:     #8aa3c0;   /* muted blue */
+  --accent-fg:       #131516;
+  --accent-muted:    rgba(200, 204, 208, 0.15);
 
-  /* Waveform / avatar-border default — matches the green accent. */
-  --waveform-color:  #2eb82e;
+  /* Waveform / avatar-border default — matches the grey accent. */
+  --waveform-color:  #c8ccd0;
 
-  /* Semantics — warning stays yellow on purpose; semantic colors do not
-     follow the accent. Danger is kept clearly red so it reads as distinct
-     from the green accent. */
-  --success:         #4ade4a;   /* bright green */
-  --warning:         #d6b84a;   /* warm yellow */
-  --danger:          #f06464;   /* clear red */
+  /* Semantics — desaturated variants tuned to the neutral surfaces. Warning
+     stays yellow on purpose; semantic colors do not follow the accent. */
+  --success:         #9bb38a;   /* muted green */
+  --warning:         #cdb88a;   /* muted yellow */
+  --danger:          #d9a3a3;   /* muted red */
   --awaiting:        var(--warning);
 
-  /* Danger — red on warm-neutral dark surfaces. */
-  --surface-danger:         #3a2626;
-  --surface-danger-strong:  #482626;
-  --surface-danger-hover:   #5a2a2a;
-  --surface-danger-bg:      #281b1b;
-  --surface-danger-deep:    #1b1313;
-  --surface-danger-soft:    #2a1e1e;
-  --surface-danger-faint:   #181212;
-  --text-danger-soft:       #f06464;
-  --text-danger-strong:     #fe8181;
-  --text-danger-bright:     #f06464;
-  --text-danger-quiet:      #cc4444;
-  --text-danger-faint:      #9d2020;
-  --text-danger-pale:       #fb6e6e;
-  --text-danger-pastel:     #fb8888;
-  --text-danger-extra:      #fbafaf;
-  --text-danger-mute:       #d5a5a5;
-  --border-danger-strong:   #f06464;
-  --border-danger:          #cc4444;
-  --border-danger-soft:     #803838;
+  /* Danger — muted red, neutral-tinted surfaces. */
+  --surface-danger:         #332a2a;
+  --surface-danger-strong:  #3d2c2c;
+  --surface-danger-hover:   #4a3030;
+  --surface-danger-bg:      #241d1d;
+  --surface-danger-deep:    #181414;
+  --surface-danger-soft:    #282020;
+  --surface-danger-faint:   #161313;
+  --text-danger-soft:       #d9a3a3;
+  --text-danger-strong:     #e8b7b7;
+  --text-danger-bright:     #e8b7b7;
+  --text-danger-quiet:      #c98a8a;
+  --text-danger-faint:      #a16d6d;
+  --text-danger-pale:       #e0adad;
+  --text-danger-pastel:     #e8baba;
+  --text-danger-extra:      #f0cccc;
+  --text-danger-mute:       #c6a8a8;
+  --border-danger-strong:   #d9a3a3;
+  --border-danger:          #b58484;
+  --border-danger-soft:     #5e4444;
 
-  /* Warning — amber on green-tinted dark. */
-  --surface-warning:        #322e16;
-  --surface-warning-deep:   #24200e;
-  --surface-warning-faint:  #181406;
-  --text-warning:           #d6b84a;
-  --text-warning-bright:    #ecd06a;
-  --border-warning:         #b8973a;
+  /* Warning — muted yellow on neutral dark. */
+  --surface-warning:        #332e1f;
+  --surface-warning-deep:   #262214;
+  --surface-warning-faint:  #18150c;
+  --text-warning:           #cdb88a;
+  --text-warning-bright:    #e3d3a8;
+  --border-warning:         #b09a6e;
 
-  /* Success — Aider green. */
-  --surface-success:        #18301a;
-  --text-success:           #4ade4a;
-  --text-success-bright:    #6ee86e;
+  /* Success — muted green. */
+  --surface-success:        #283128;
+  --text-success:           #9bb38a;
+  --text-success-bright:    #bccfac;
 
-  /* Info — palette blue/cyan. */
-  --surface-info:           #16282e;
-  --surface-info-deep:      #0e1c20;
-  --surface-info-faint:     #0a1216;
-  --text-info:              #4db8a8;   /* palette cyan */
-  --text-info-bright:       #70d0c0;
-  --text-info-quiet:        #3f9484;
-  --border-info:            #3f9484;
-  --border-info-soft:       #2a3f3a;
-  --accent-purple:          #b07ec0;   /* palette magenta (kind-color) */
+  /* Info — muted blue/slate. */
+  --surface-info:           #1f2a33;
+  --surface-info-deep:      #161f26;
+  --surface-info-faint:     #0e151a;
+  --text-info:              #8aa3c0;   /* muted blue */
+  --text-info-bright:       #aec0d6;
+  --text-info-quiet:        #708aa6;
+  --border-info:            #708aa6;
+  --border-info-soft:       #3a444f;
+  --accent-purple:          #b39ac0;   /* muted purple (kind-color) */
 
-  /* Borders — sage gray to match the palette. */
-  --border-faint:    #1f2f1f;
-  --border-subtle:   #2c3f2c;
-  --border-default:  #44644a;
-  --border-strong:   #5c7c5c;
+  /* Borders — neutral slate-grey to match the palette. */
+  --border-faint:    #2a2d2f;
+  --border-subtle:   #353a3d;
+  --border-default:  #4a5054;
+  --border-strong:   #5e6569;
   --border-focus:    var(--accent);
 
   /* Radii — fully square. Terminals don't round. */
@@ -129,22 +129,22 @@
     'Source Code Pro', Consolas, 'Courier New', monospace;
 }
 
-/* Structural overrides for `tui-green`. Where the base `:root` look relies
+/* Structural overrides for `tui-grey`. Where the base `:root` look relies
    on filled surfaces, shadows, and rounded corners, the TUI look uses 1px
    box borders, transparent fills, square corners, and titles embedded
    in the top border of each pane (the ratatui aesthetic).
 
    This file is self-contained on purpose: see the "Theme isolation
-   policy" comment at the top of `theme.css`. Even though `tui-red` and
-   `tui-orange` have identical structural rules today, each theme gets its
-   own copy — the duplication is the point.
+   policy" comment at the top of `theme.css`. Even though `tui-orange` has
+   identical structural rules today, each theme gets its own copy — the
+   duplication is the point.
 
    Specificity note: most existing per-component rules are Svelte
    scoped (`.s-HASH section { … }`, specificity 0,1,1). To win source-
    order ties without `!important`, these rules use `html[data-theme]`
    selectors (specificity 0,1,1 + 1 element = 0,1,2). */
 
-html[data-theme="tui-green"] body {
+html[data-theme="tui-grey"] body {
   font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code',
     'Source Code Pro', Consolas, 'Courier New', monospace;
 }
@@ -154,7 +154,7 @@ html[data-theme="tui-green"] body {
    draw our own 1px frame. The custom TuiTitleBar provides the top
    horizontal line via its border-bottom; the window only paints the
    three remaining sides. */
-html[data-theme="tui-green"] main {
+html[data-theme="tui-grey"] main {
   border-left: 1px solid var(--border-default);
   border-right: 1px solid var(--border-default);
   border-bottom: 1px solid var(--border-default);
@@ -168,7 +168,7 @@ html[data-theme="tui-green"] main {
    Selector pinned to `#app > .root` so the height rule targets only the
    top-level container, not any nested `.root` wrappers elsewhere in the
    chrome (which would otherwise inherit the 100vh-minus-titlebar height). */
-html[data-theme="tui-green"] #app > .root {
+html[data-theme="tui-grey"] #app > .root {
   height: calc(100vh - 22px);
   border-left: 1px solid var(--border-default);
   border-right: 1px solid var(--border-default);
@@ -179,7 +179,7 @@ html[data-theme="tui-green"] #app > .root {
 /* Bordered pane with title-on-border. The title element (h2, or the
    first h3 if no h2) is absolutely positioned over the top edge with a
    matching background slice that masks the underlying border line. */
-html[data-theme="tui-green"] section {
+html[data-theme="tui-grey"] section {
   background: transparent;
   border: 1px solid var(--border-default);
   border-radius: 0;
@@ -188,8 +188,8 @@ html[data-theme="tui-green"] section {
   position: relative;
 }
 
-html[data-theme="tui-green"] section > h2,
-html[data-theme="tui-green"] section > h3:first-of-type {
+html[data-theme="tui-grey"] section > h2,
+html[data-theme="tui-grey"] section > h3:first-of-type {
   position: absolute;
   top: -0.7em;
   left: 1.5ch;
@@ -207,14 +207,14 @@ html[data-theme="tui-green"] section > h3:first-of-type {
 /* Sub-headings inside a panel: no top divider, no border-top, just
    bold accent text. Tokens already handle color via `--accent`,
    we just need to neutralise the existing styled divider. */
-html[data-theme="tui-green"] section h3 {
+html[data-theme="tui-grey"] section h3 {
   border-top: none;
   padding-top: 0;
   margin-top: var(--space-4);
   color: var(--accent);
   font-weight: 400;
 }
-html[data-theme="tui-green"] section h3::before {
+html[data-theme="tui-grey"] section h3::before {
   content: '─ ';
   color: var(--border-default);
 }
@@ -222,7 +222,7 @@ html[data-theme="tui-green"] section h3::before {
 /* Dialogs get the same bordered-pane treatment so modals match the
    panel aesthetic. The title element varies (h1/h2/.title) per dialog
    — we cover the common cases. */
-html[data-theme="tui-green"] dialog {
+html[data-theme="tui-grey"] dialog {
   background: var(--surface-0);
   border: 1px solid var(--border-strong);
   border-radius: 0;
@@ -230,14 +230,14 @@ html[data-theme="tui-green"] dialog {
   padding: 1.4em 1.5ch 1ch;
   position: relative;
 }
-html[data-theme="tui-green"] dialog::backdrop {
+html[data-theme="tui-grey"] dialog::backdrop {
   background: rgba(0, 0, 0, 0.6);
 }
-html[data-theme="tui-green"] dialog > h1,
-html[data-theme="tui-green"] dialog > h2,
-html[data-theme="tui-green"] dialog > header > h1,
-html[data-theme="tui-green"] dialog > header > h2,
-html[data-theme="tui-green"] dialog > .title {
+html[data-theme="tui-grey"] dialog > h1,
+html[data-theme="tui-grey"] dialog > h2,
+html[data-theme="tui-grey"] dialog > header > h1,
+html[data-theme="tui-grey"] dialog > header > h2,
+html[data-theme="tui-grey"] dialog > .title {
   position: absolute;
   top: -0.7em;
   left: 1.5ch;
@@ -253,14 +253,14 @@ html[data-theme="tui-green"] dialog > .title {
 
 /* Inputs and selects: flat, no fill, single underline-style border.
    Focus inverts to the accent color rather than glowing. */
-html[data-theme="tui-green"] input[type='text'],
-html[data-theme="tui-green"] input[type='number'],
-html[data-theme="tui-green"] input[type='password'],
-html[data-theme="tui-green"] input[type='search'],
-html[data-theme="tui-green"] input[type='email'],
-html[data-theme="tui-green"] input[type='url'],
-html[data-theme="tui-green"] select,
-html[data-theme="tui-green"] textarea {
+html[data-theme="tui-grey"] input[type='text'],
+html[data-theme="tui-grey"] input[type='number'],
+html[data-theme="tui-grey"] input[type='password'],
+html[data-theme="tui-grey"] input[type='search'],
+html[data-theme="tui-grey"] input[type='email'],
+html[data-theme="tui-grey"] input[type='url'],
+html[data-theme="tui-grey"] select,
+html[data-theme="tui-grey"] textarea {
   background: transparent;
   border: 1px solid var(--border-default);
   border-radius: 0;
@@ -268,14 +268,14 @@ html[data-theme="tui-green"] textarea {
   font-family: inherit;
   box-shadow: none;
 }
-html[data-theme="tui-green"] input[type='text']:focus,
-html[data-theme="tui-green"] input[type='number']:focus,
-html[data-theme="tui-green"] input[type='password']:focus,
-html[data-theme="tui-green"] input[type='search']:focus,
-html[data-theme="tui-green"] input[type='email']:focus,
-html[data-theme="tui-green"] input[type='url']:focus,
-html[data-theme="tui-green"] select:focus,
-html[data-theme="tui-green"] textarea:focus {
+html[data-theme="tui-grey"] input[type='text']:focus,
+html[data-theme="tui-grey"] input[type='number']:focus,
+html[data-theme="tui-grey"] input[type='password']:focus,
+html[data-theme="tui-grey"] input[type='search']:focus,
+html[data-theme="tui-grey"] input[type='email']:focus,
+html[data-theme="tui-grey"] input[type='url']:focus,
+html[data-theme="tui-grey"] select:focus,
+html[data-theme="tui-grey"] textarea:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: none;
@@ -285,18 +285,18 @@ html[data-theme="tui-green"] textarea:focus {
    popup is OS-rendered and falls back to a light background unless we
    style `<option>` explicitly. Chromium honors these on the popup
    surface. */
-html[data-theme="tui-green"] select option,
-html[data-theme="tui-green"] select optgroup {
+html[data-theme="tui-grey"] select option,
+html[data-theme="tui-grey"] select optgroup {
   background-color: var(--surface-sunken);
   color: var(--text-primary);
 }
-html[data-theme="tui-green"] select option:checked,
-html[data-theme="tui-green"] select option:hover {
+html[data-theme="tui-grey"] select option:checked,
+html[data-theme="tui-grey"] select option:hover {
   background-color: var(--accent-muted);
   color: var(--text-primary);
 }
 
-html[data-theme="tui-green"] input[type='checkbox'] {
+html[data-theme="tui-grey"] input[type='checkbox'] {
   appearance: none;
   width: 1.2ch;
   height: 1.2ch;
@@ -307,11 +307,11 @@ html[data-theme="tui-green"] input[type='checkbox'] {
   cursor: pointer;
   vertical-align: middle;
 }
-html[data-theme="tui-green"] input[type='checkbox']:checked {
+html[data-theme="tui-grey"] input[type='checkbox']:checked {
   background: transparent;
   border-color: var(--accent);
 }
-html[data-theme="tui-green"] input[type='checkbox']:checked::after {
+html[data-theme="tui-grey"] input[type='checkbox']:checked::after {
   content: '×';
   position: absolute;
   inset: 0;
@@ -327,10 +327,10 @@ html[data-theme="tui-green"] input[type='checkbox']:checked::after {
    section, or a recognised action row. This avoids hijacking icon-only
    buttons elsewhere (tab close X, scroll arrows, the new-tab + button).
    Bracket framing is the TUI convention, e.g. "[ Save ]". */
-html[data-theme="tui-green"] dialog button,
-html[data-theme="tui-green"] section button,
-html[data-theme="tui-green"] .actions button,
-html[data-theme="tui-green"] .button-row button {
+html[data-theme="tui-grey"] dialog button,
+html[data-theme="tui-grey"] section button,
+html[data-theme="tui-grey"] .actions button,
+html[data-theme="tui-grey"] .button-row button {
   background: transparent;
   border: none;
   border-radius: 0;
@@ -342,78 +342,78 @@ html[data-theme="tui-green"] .button-row button {
   cursor: pointer;
   transition: color 0ms;
 }
-html[data-theme="tui-green"] dialog button:not(.icon)::before,
-html[data-theme="tui-green"] section button:not(.icon)::before,
-html[data-theme="tui-green"] .actions button:not(.icon)::before,
-html[data-theme="tui-green"] .button-row button:not(.icon)::before {
+html[data-theme="tui-grey"] dialog button:not(.icon)::before,
+html[data-theme="tui-grey"] section button:not(.icon)::before,
+html[data-theme="tui-grey"] .actions button:not(.icon)::before,
+html[data-theme="tui-grey"] .button-row button:not(.icon)::before {
   content: '[ ';
   color: var(--text-quiet);
 }
-html[data-theme="tui-green"] dialog button:not(.icon)::after,
-html[data-theme="tui-green"] section button:not(.icon)::after,
-html[data-theme="tui-green"] .actions button:not(.icon)::after,
-html[data-theme="tui-green"] .button-row button:not(.icon)::after {
+html[data-theme="tui-grey"] dialog button:not(.icon)::after,
+html[data-theme="tui-grey"] section button:not(.icon)::after,
+html[data-theme="tui-grey"] .actions button:not(.icon)::after,
+html[data-theme="tui-grey"] .button-row button:not(.icon)::after {
   content: ' ]';
   color: var(--text-quiet);
 }
-html[data-theme="tui-green"] dialog button:hover,
-html[data-theme="tui-green"] section button:hover,
-html[data-theme="tui-green"] .actions button:hover,
-html[data-theme="tui-green"] .button-row button:hover {
+html[data-theme="tui-grey"] dialog button:hover,
+html[data-theme="tui-grey"] section button:hover,
+html[data-theme="tui-grey"] .actions button:hover,
+html[data-theme="tui-grey"] .button-row button:hover {
   background: transparent;
   color: var(--accent);
 }
-html[data-theme="tui-green"] dialog button:hover::before,
-html[data-theme="tui-green"] dialog button:hover::after,
-html[data-theme="tui-green"] section button:hover::before,
-html[data-theme="tui-green"] section button:hover::after,
-html[data-theme="tui-green"] .actions button:hover::before,
-html[data-theme="tui-green"] .actions button:hover::after,
-html[data-theme="tui-green"] .button-row button:hover::before,
-html[data-theme="tui-green"] .button-row button:hover::after {
+html[data-theme="tui-grey"] dialog button:hover::before,
+html[data-theme="tui-grey"] dialog button:hover::after,
+html[data-theme="tui-grey"] section button:hover::before,
+html[data-theme="tui-grey"] section button:hover::after,
+html[data-theme="tui-grey"] .actions button:hover::before,
+html[data-theme="tui-grey"] .actions button:hover::after,
+html[data-theme="tui-grey"] .button-row button:hover::before,
+html[data-theme="tui-grey"] .button-row button:hover::after {
   color: var(--accent);
 }
 
 /* Tab bar: pipe-separated list, no rounded fills. The Svelte-scoped
    .tab styles cover most of it; we just neutralise the colored fill on
    the active tab and add a `>` indicator instead. */
-html[data-theme="tui-green"] .tab {
+html[data-theme="tui-grey"] .tab {
   background: transparent !important;
   border-radius: 0 !important;
   border: 1px solid transparent !important;
 }
-html[data-theme="tui-green"] .tab.active {
+html[data-theme="tui-grey"] .tab.active {
   background: transparent !important;
   border: 1px solid var(--accent) !important;
   color: var(--accent) !important;
 }
-html[data-theme="tui-green"] .tab:hover {
+html[data-theme="tui-grey"] .tab:hover {
   background: transparent !important;
   color: var(--text-bright) !important;
 }
 
 /* Selection: invert to accent. The classic TUI focus signal. */
-html[data-theme="tui-green"] ::selection {
+html[data-theme="tui-grey"] ::selection {
   background: var(--accent);
   color: var(--text-on-accent);
 }
 
 /* Settings sidebar nav: flat list, no fills, just a `>` cursor on the
    active item. */
-html[data-theme="tui-green"] .sidebar button.active,
-html[data-theme="tui-green"] nav button.active,
-html[data-theme="tui-green"] [role='tab'][aria-selected='true'] {
+html[data-theme="tui-grey"] .sidebar button.active,
+html[data-theme="tui-grey"] nav button.active,
+html[data-theme="tui-grey"] [role='tab'][aria-selected='true'] {
   background: transparent !important;
   color: var(--accent) !important;
 }
 
 /* Scrollbar restyle: thin gray block, no rounding, no fade-on-hover. */
-html[data-theme="tui-green"] *::-webkit-scrollbar-thumb {
+html[data-theme="tui-grey"] *::-webkit-scrollbar-thumb {
   background-color: var(--border-default);
   border-radius: 0;
   border: 0;
 }
-html[data-theme="tui-green"] *::-webkit-scrollbar-thumb:hover {
+html[data-theme="tui-grey"] *::-webkit-scrollbar-thumb:hover {
   background-color: var(--border-strong);
 }
 
@@ -421,7 +421,7 @@ html[data-theme="tui-green"] *::-webkit-scrollbar-thumb:hover {
    usage meter (current + weekly session rows). Drop the filled background;
    the top border is enough separation. Tighter horizontal padding (1ch
    instead of 12px) to align with the TUI grid. */
-html[data-theme="tui-green"] .status-bar {
+html[data-theme="tui-grey"] .status-bar {
   height: 44px !important;
   flex: 0 0 44px !important;
   background: transparent !important;
@@ -431,7 +431,7 @@ html[data-theme="tui-green"] .status-bar {
 
 /* Status buttons (Mute, Announce, Settings, Avatar toggle): flat,
    narrow, accent-on-hover. The 22px height matches the strip. */
-html[data-theme="tui-green"] .status-button {
+html[data-theme="tui-grey"] .status-button {
   height: 22px !important;
   width: auto !important;
   min-width: 3ch;
@@ -441,30 +441,30 @@ html[data-theme="tui-green"] .status-button {
   border-radius: 0 !important;
   color: var(--text-quiet) !important;
 }
-html[data-theme="tui-green"] .status-button:hover:not([aria-pressed='true']) {
+html[data-theme="tui-grey"] .status-button:hover:not([aria-pressed='true']) {
   background: transparent !important;
   color: var(--accent) !important;
 }
-html[data-theme="tui-green"] .status-button[aria-pressed='true'] {
+html[data-theme="tui-grey"] .status-button[aria-pressed='true'] {
   background: transparent !important;
   border: 1px solid var(--accent) !important;
   color: var(--accent) !important;
 }
-html[data-theme="tui-green"] .status-button:focus-visible {
+html[data-theme="tui-grey"] .status-button:focus-visible {
   outline: 1px solid var(--accent) !important;
   outline-offset: -1px !important;
 }
 
-/* Glyphs (emoji icons): force monochrome rendering and tint to match the
-   palette. `font-variant-emoji: text` is the modern way to coerce text-
-   style rendering; the filter chain is a fallback for browsers that don't
-   honor it yet.
+/* Glyphs (emoji icons): force monochrome rendering and neutral-tint to
+   match the palette. `font-variant-emoji: text` is the modern way to
+   coerce text-style rendering; the filter chain is a fallback for
+   browsers that don't honor it yet.
 
    `translateY(1px)` nudges the glyphs into the optical center of the
    22px bar — emoji baselines sit slightly above the visual middle of
    the line box, so flex `align-items: center` alone leaves them
    reading as too high. */
-html[data-theme="tui-green"] .glyph {
+html[data-theme="tui-grey"] .glyph {
   font-variant-emoji: text;
   filter: grayscale(1) brightness(1.1);
   transform: translateY(1px);
@@ -474,17 +474,17 @@ html[data-theme="tui-green"] .glyph {
    inside its line box than the others, so its translation gets bumped
    to 2px to match. Targeted via the AnnouncementsButton's `title` —
    only it carries the word "announcement". */
-html[data-theme="tui-green"] [title*="announcement" i] .glyph {
+html[data-theme="tui-grey"] [title*="announcement" i] .glyph {
   transform: translateY(2px);
 }
 
 /* VolumeSlider: keep the slider but flatten any chrome around it. */
-html[data-theme="tui-green"] .volume-control {
+html[data-theme="tui-grey"] .volume-control {
   color: var(--text-quiet) !important;
 }
 
 /* Hint text: dim. */
-html[data-theme="tui-green"] small.hint {
+html[data-theme="tui-grey"] small.hint {
   color: var(--text-quiet);
 }
 
@@ -496,16 +496,16 @@ html[data-theme="tui-green"] small.hint {
    flex space, and the 1px border must count INSIDE that allocation,
    otherwise nested splits overflow the viewport and push StatusBar
    off the bottom. No outer margin for the same reason. */
-html[data-theme="tui-green"] .pane {
+html[data-theme="tui-grey"] .pane {
   border: 1px solid var(--border-default);
   box-sizing: border-box;
 }
-html[data-theme="tui-green"] .pane.focused {
+html[data-theme="tui-grey"] .pane.focused {
   border-color: var(--accent);
 }
 /* Suppress the modern-dark inset shadow on the focused pane's tab bar —
    the box border carries focus now. */
-html[data-theme="tui-green"] .pane.focused .tab-bar {
+html[data-theme="tui-grey"] .pane.focused .tab-bar {
   box-shadow: none !important;
 }
 
@@ -517,7 +517,7 @@ html[data-theme="tui-green"] .pane.focused .tab-bar {
    row and terminal area, drawn in the pane's border color. Bar height
    shrinks to ~22px so the row reads as a single line of monospace
    text rather than a chunky GUI strip. */
-html[data-theme="tui-green"] .tab-bar {
+html[data-theme="tui-grey"] .tab-bar {
   background: transparent !important;
   border-bottom: 1px solid var(--border-default) !important;
   height: 22px !important;
@@ -527,7 +527,7 @@ html[data-theme="tui-green"] .tab-bar {
 /* Tabs themselves: monospace (the Svelte-scoped style hardcodes
    system-ui sans-serif), no pill margin, single-line. The .tab.active
    accent-bordered rule lower down still applies. */
-html[data-theme="tui-green"] .tab {
+html[data-theme="tui-grey"] .tab {
   font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code',
     'Source Code Pro', Consolas, 'Courier New', monospace !important;
   height: 100% !important;
@@ -538,7 +538,7 @@ html[data-theme="tui-green"] .tab {
 }
 
 /* New-tab + button width matches the slimmer bar. */
-html[data-theme="tui-green"] .new-tab {
+html[data-theme="tui-grey"] .new-tab {
   width: 22px !important;
   line-height: 20px !important;
 }
@@ -546,19 +546,19 @@ html[data-theme="tui-green"] .new-tab {
 /* Edge-fade gradients: the modern-dark version fades into surface-2
    (the tab bar's own background). Under TUI the bar is transparent, so
    re-aim the gradient at the body background (surface-0) instead. */
-html[data-theme="tui-green"] .tab-list.fade-left::before {
+html[data-theme="tui-grey"] .tab-list.fade-left::before {
   background: linear-gradient(to right, var(--surface-0), transparent) !important;
 }
-html[data-theme="tui-green"] .tab-list.fade-right::after {
+html[data-theme="tui-grey"] .tab-list.fade-right::after {
   background: linear-gradient(to left, var(--surface-0), transparent) !important;
 }
 
 /* `+` new-tab button: lose the hover fill, keep the divider as a
    single TUI-line on its left edge. */
-html[data-theme="tui-green"] .tab-bar-end {
+html[data-theme="tui-grey"] .tab-bar-end {
   border-left: 1px solid var(--border-default) !important;
 }
-html[data-theme="tui-green"] .new-tab:hover {
+html[data-theme="tui-grey"] .new-tab:hover {
   background: transparent !important;
   color: var(--accent) !important;
 }
@@ -566,38 +566,38 @@ html[data-theme="tui-green"] .new-tab:hover {
 /* Splitter — visually a single 1px line, but with a 5px-wide hit area
    so the mouse can actually grab it. The painted line is a pseudo-
    element centered inside the transparent splitter element. */
-html[data-theme="tui-green"] .splitter {
+html[data-theme="tui-grey"] .splitter {
   background: transparent !important;
   position: relative;
   outline: none !important;
 }
-html[data-theme="tui-green"] .split.horizontal > .splitter {
+html[data-theme="tui-grey"] .split.horizontal > .splitter {
   width: 5px !important;
 }
-html[data-theme="tui-green"] .split.vertical > .splitter {
+html[data-theme="tui-grey"] .split.vertical > .splitter {
   height: 5px !important;
 }
-html[data-theme="tui-green"] .splitter::after {
+html[data-theme="tui-grey"] .splitter::after {
   content: '';
   position: absolute;
   background: var(--border-default);
   pointer-events: none;
 }
-html[data-theme="tui-green"] .split.horizontal > .splitter::after {
+html[data-theme="tui-grey"] .split.horizontal > .splitter::after {
   top: 0;
   bottom: 0;
   left: 50%;
   width: 1px;
   transform: translateX(-0.5px);
 }
-html[data-theme="tui-green"] .split.vertical > .splitter::after {
+html[data-theme="tui-grey"] .split.vertical > .splitter::after {
   left: 0;
   right: 0;
   top: 50%;
   height: 1px;
   transform: translateY(-0.5px);
 }
-html[data-theme="tui-green"] .splitter:hover::after,
-html[data-theme="tui-green"] .splitter:focus-visible::after {
+html[data-theme="tui-grey"] .splitter:hover::after,
+html[data-theme="tui-grey"] .splitter:focus-visible::after {
   background: var(--accent);
 }

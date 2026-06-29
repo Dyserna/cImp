@@ -80,15 +80,27 @@ fn main() {
         return;
     }
 
-    // V8-01 offload MCP server: Claude Code invokes `ccimp --offload-mcp`
-    // (injected via `--mcp-config`) and speaks newline-delimited JSON-RPC
-    // over stdio. Handle it before any Tauri/audio/settings init so it
-    // stays GUI-free and fast to spawn per Claude session — same contract
-    // as `--statusline`. It connects to the app-owned llama-server over
-    // HTTP and never loads its own model.
-    if std::env::args().skip(1).any(|a| a == "--offload-mcp") {
-        offload::mcp::run();
-        return;
+    // V8-01 offload MCP server: a host agent invokes `ccimp --offload-mcp`
+    // (Claude via `--mcp-config`; OpenCode via the injected `mcp` block) and
+    // speaks newline-delimited JSON-RPC over stdio. Handle it before any
+    // Tauri/audio/settings init so it stays GUI-free and fast to spawn per
+    // session — same contract as `--statusline`. It connects to the app-owned
+    // llama-server over HTTP and never loads its own model.
+    //
+    // V19: an optional `--consumer <name>` (default `claude`, or `opencode`)
+    // selects which per-consumer MCP-server set the app proxies to this child.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.iter().any(|a| a == "--offload-mcp") {
+            let consumer = args
+                .iter()
+                .position(|a| a == "--consumer")
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+                .unwrap_or("claude");
+            offload::mcp::run(consumer);
+            return;
+        }
     }
 
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -394,7 +406,10 @@ fn main() {
                 // below call it, but the loopback binds a port and the pollers
                 // spawn tasks, so it must run at most once.
                 let offload_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                if settings_for_offload.current().offload.enabled {
+                // Start the runtime (loopback + warm host) when offload is enabled
+                // OR a server is exposed to Claude Code — Claude reaches MCP tools
+                // over the loopback independent of offload.
+                if settings_for_offload.current().offload.mcp_host_needed() {
                     if !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         start_offload_runtime(
                             app.handle().clone(),
@@ -405,8 +420,9 @@ fn main() {
                 }
                 // V8: a user who launches with offload disabled and enables it
                 // later in Settings must still get the loopback discovery
-                // endpoint (without it, MCP children can't connect back).
-                // Watch for the enabled false→true transition and start once.
+                // endpoint (without it, MCP children can't connect back). Same
+                // for adding a Claude-Code-exposed MCP server while offload is
+                // off. Watch for either transition and start once.
                 // (Disabling at runtime leaves the runtime up but harmless —
                 // `OffloadService::run` is gated on `enabled` and refuses; a
                 // full teardown happens on the next relaunch.)
@@ -421,10 +437,10 @@ fn main() {
                         loop {
                             match rx.recv().await {
                                 Ok(s) => {
-                                    if s.offload.enabled
+                                    if s.offload.mcp_host_needed()
                                         && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
                                     {
-                                        info!("offload: enabled at runtime — starting offload runtime");
+                                        info!("offload: MCP host needed at runtime — starting offload runtime");
                                         start_offload_runtime(
                                             app_handle.clone(),
                                             svc.clone(),

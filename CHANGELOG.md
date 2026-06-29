@@ -5,6 +5,51 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.22.0] — 2026-06-29
+
+### Changed
+
+- **OpenCode replaces Aider (V19).** The two Aider AI-tool tabs are replaced by
+  a **single OpenCode** tab (`opencode`), launched inline via `opencode --mini`
+  with its session config injected through a single `OPENCODE_CONFIG_CONTENT`
+  env var. Unlike Claude (which needs a separate local tab because the local
+  endpoint is set by a launch-time env var), OpenCode addresses many providers
+  as `provider/model` and switches between them in-session from global config +
+  credentials — so one tab covers cloud and local and cctts injects no provider
+  block. OpenCode reaches the same ccImp capabilities the Claude tabs use — the
+  offload tool, the code knowledge graph, and the web-research MCP servers — via
+  the injected `mcp` block pointing at `ccimp --offload-mcp --consumer opencode`.
+  Unlike the silent Aider tabs, OpenCode is given the TTS-markup convention
+  through an instructions file, so the OpenCode tab can speak. cctts does **not**
+  bundle OpenCode (~158 MB); install it from <https://opencode.ai/docs> (or drop
+  the binary in `ebin/`). A dedicated `opencode_access` per-server flag controls
+  which MCP servers OpenCode sees.
+- **New `TUI - Grey` theme (OpenCode); `TUI - Red` and `TUI - Aider` removed.**
+  The theme set is now `tui-orange` (Claude Code, default) and `tui-grey` — an
+  OpenCode-flavored monochrome theme keyed off a cool light-grey accent
+  (`#c8ccd0`) and paired with a new `OpenCode Grey` terminal palette. The
+  `tui-red` (Imp Red) and `tui-green` (Aider Green) themes and their dedicated
+  `Imp Red` / `Aider Green` terminal palettes are dropped. The compiled-in
+  last-resort fallback (used only when the on-disk `themes/` folder is empty)
+  moves from `tui-red` + `Imp Red` to `tui-orange` + `GitHub Dark`, so the
+  embedded fallback now matches the new-install defaults. Settings holding a
+  removed theme/palette name keep their string and fall back gracefully at
+  load (unknown theme → `tui-orange` chrome; unknown palette → `Default`).
+
+### Migration
+
+- **Schema 18 → 19 (`migrate_v18_to_v19`).** Both reserved `aider` and
+  `aider-local` tabs collapse into the single `opencode` tab (id, command, name;
+  per-tab `env` preserved; `use_local_provider` reset and stored `--model` args
+  dropped; TTS injection enabled; duplicate `opencode` tabs de-duplicated). The
+  legacy `aider_local` provider settings are dropped (OpenCode manages its own
+  providers). Layout-tree, layout-preset, and active-tab references are rewritten
+  and de-duplicated, `enabled_ai_tabs` is remapped, and each MCP server's new
+  `opencode_access` defaults to its existing `claude_access`. A `.bak` of the
+  v18 file is written before the upgrade.
+
 ## [0.21.0] — 2026-06-29
 
 A correctness-and-hardening release: a full-codebase baseline review (security, systemic, and per-area correctness) was triaged and the confirmed issues fixed.

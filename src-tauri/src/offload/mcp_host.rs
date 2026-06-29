@@ -309,6 +309,45 @@ enum Conn {
     },
 }
 
+/// Which consumer a tool-defs / tool-call request is filtered for. Each maps
+/// to one per-server access flag; the offload worker uses its own backend
+/// `ToolScope` on top of `offload_access`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consumer {
+    Claude,
+    Offload,
+    Opencode,
+}
+
+impl Consumer {
+    /// Parse the `--consumer` discriminator the per-session child is launched
+    /// with. Unknown / absent ⇒ Claude (the original, default consumer).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "opencode" => Consumer::Opencode,
+            "offload" => Consumer::Offload,
+            _ => Consumer::Claude,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Consumer::Claude => "Claude Code",
+            Consumer::Offload => "the offload worker",
+            Consumer::Opencode => "OpenCode",
+        }
+    }
+
+    /// Whether `server` is exposed to this consumer.
+    fn wants(self, server: &McpServer) -> bool {
+        match self {
+            Consumer::Claude => server.claude_access,
+            Consumer::Offload => server.offload_access,
+            Consumer::Opencode => server.opencode_access,
+        }
+    }
+}
+
 /// One connected (or failed) MCP tool server.
 pub struct McpServer {
     name: String,
@@ -324,6 +363,9 @@ pub struct McpServer {
     /// Expose this server's tools to the offload worker. A flag change forces a
     /// reconnect (it's part of `config_sig`), so these are always fresh.
     offload_access: bool,
+    /// V19: expose this server's tools to OpenCode (proxied through the
+    /// `--consumer opencode` child). Like the others, part of `config_sig`.
+    opencode_access: bool,
 }
 
 impl McpServer {
@@ -458,8 +500,8 @@ impl McpHost {
             // command or url typed) — connecting one would route to stdio with
             // an empty command and surface a confusing `resolve ``` error.
             .filter(|c| {
-                // Connect if either consumer wants it; both off ⇒ fully disabled.
-                (c.claude_access || c.offload_access)
+                // Connect if any consumer wants it; all off ⇒ fully disabled.
+                (c.claude_access || c.offload_access || c.opencode_access)
                     && !c.name.trim().is_empty()
                     && (!c.command.trim().is_empty() || !c.url.trim().is_empty())
             })
@@ -525,14 +567,12 @@ impl McpHost {
     }
 
     /// Healthy servers' namespaced tool defs, filtered to one consumer's
-    /// access flag. `claude == true` selects the Claude-exposed servers;
-    /// `false` selects the offload-worker ones.
-    async fn tool_defs_filtered(&self, claude: bool) -> Vec<ToolDef> {
+    /// access flag.
+    async fn tool_defs_filtered(&self, consumer: Consumer) -> Vec<ToolDef> {
         let servers = self.servers.read().await;
         let mut out = Vec::new();
         for s in servers.iter() {
-            let want = if claude { s.claude_access } else { s.offload_access };
-            if want {
+            if consumer.wants(s) {
                 out.extend(s.tool_defs());
             }
         }
@@ -543,31 +583,55 @@ impl McpHost {
     /// into the chat `tools` array (the caller then applies the backend's
     /// `ToolScope`).
     pub async fn tool_defs_for_offload(&self) -> Vec<ToolDef> {
-        self.tool_defs_filtered(false).await
+        self.tool_defs_filtered(Consumer::Offload).await
     }
 
     /// Claude-Code tool defs (servers with `claude_access`), proxied to Claude
     /// through the per-session child's `tools/list`.
     pub async fn tool_defs_for_claude(&self) -> Vec<ToolDef> {
-        self.tool_defs_filtered(true).await
+        self.tool_defs_filtered(Consumer::Claude).await
+    }
+
+    /// V19: OpenCode tool defs (servers with `opencode_access`), proxied to
+    /// OpenCode through the `--consumer opencode` child's `tools/list`.
+    pub async fn tool_defs_for_opencode(&self) -> Vec<ToolDef> {
+        self.tool_defs_filtered(Consumer::Opencode).await
     }
 
     /// Route a namespaced `<server>__<tool>` call to its owning server, but
-    /// only if that server is exposed to Claude — Claude must never reach an
-    /// offload-only server's tools.
-    pub async fn call_for_claude(&self, namespaced: &str, args: Value) -> Result<String, String> {
-        let owns_for_claude = {
+    /// only if that server is exposed to `consumer` — a proxied agent must
+    /// never reach a server it isn't granted.
+    async fn call_for_consumer(
+        &self,
+        consumer: Consumer,
+        namespaced: &str,
+        args: Value,
+    ) -> Result<String, String> {
+        let owns = {
             let servers = self.servers.read().await;
             servers
                 .iter()
-                .any(|s| s.claude_access && s.raw_name(namespaced).is_some())
+                .any(|s| consumer.wants(s) && s.raw_name(namespaced).is_some())
         };
-        if !owns_for_claude {
+        if !owns {
             return Err(format!(
-                "tool `{namespaced}` is not available to Claude Code (no Claude-enabled MCP server offers it)"
+                "tool `{namespaced}` is not available to {} (no {}-enabled MCP server offers it)",
+                consumer.label(),
+                consumer.label(),
             ));
         }
         self.call(namespaced, args).await
+    }
+
+    /// Route a Claude-exposed namespaced call. Claude must never reach an
+    /// offload-only server's tools.
+    pub async fn call_for_claude(&self, namespaced: &str, args: Value) -> Result<String, String> {
+        self.call_for_consumer(Consumer::Claude, namespaced, args).await
+    }
+
+    /// V19: route an OpenCode-exposed namespaced call.
+    pub async fn call_for_opencode(&self, namespaced: &str, args: Value) -> Result<String, String> {
+        self.call_for_consumer(Consumer::Opencode, namespaced, args).await
     }
 
     /// Route a namespaced `<server>__<tool>` call to its owning server.
@@ -638,11 +702,12 @@ impl McpServer {
 fn config_sig(c: &McpServerConfig) -> String {
     let mut env: Vec<(&String, &String)> = c.env.iter().collect();
     env.sort();
-    // Include both access flags: a Claude-only toggle must still re-key the
-    // signature so `warm_host` reconciles and re-emits a capability pulse.
+    // Include all access flags: a per-consumer toggle (Claude / offload /
+    // OpenCode) must still re-key the signature so `warm_host` reconciles and
+    // re-emits a capability pulse.
     format!(
-        "{}|{}|{:?}|{}|{}|{:?}",
-        c.command, c.url, c.args, c.claude_access, c.offload_access, env
+        "{}|{}|{:?}|{}|{}|{}|{:?}",
+        c.command, c.url, c.args, c.claude_access, c.offload_access, c.opencode_access, env
     )
 }
 
@@ -679,6 +744,7 @@ async fn connect_server(cfg: &McpServerConfig, allowed_roots: &[PathBuf]) -> Mcp
         error: StdMutex::new(None),
         claude_access: cfg.claude_access,
         offload_access: cfg.offload_access,
+        opencode_access: cfg.opencode_access,
     };
 
     let outcome = if use_http {
@@ -1196,7 +1262,13 @@ mod tests {
 
     /// A fake healthy server (no real connection) carrying one namespaced tool,
     /// for exercising the per-consumer filtering without spawning an MCP server.
-    fn fake_server(name: &str, claude: bool, offload: bool, namespaced: &str) -> McpServer {
+    fn fake_server(
+        name: &str,
+        claude: bool,
+        offload: bool,
+        opencode: bool,
+        namespaced: &str,
+    ) -> McpServer {
         let raw = namespaced.split("__").nth(1).unwrap_or(namespaced).to_string();
         McpServer {
             name: name.into(),
@@ -1211,6 +1283,7 @@ mod tests {
             error: StdMutex::new(None),
             claude_access: claude,
             offload_access: offload,
+            opencode_access: opencode,
         }
     }
 
@@ -1218,8 +1291,9 @@ mod tests {
     async fn tool_defs_and_calls_partition_by_access_flag() {
         let host = McpHost::new();
         host.servers.write().await.extend([
-            Arc::new(fake_server("alpha", true, false, "alpha__x")), // Claude-only
-            Arc::new(fake_server("beta", false, true, "beta__y")),   // offload-only
+            Arc::new(fake_server("alpha", true, false, false, "alpha__x")), // Claude-only
+            Arc::new(fake_server("beta", false, true, false, "beta__y")),   // offload-only
+            Arc::new(fake_server("gamma", false, false, true, "gamma__z")), // OpenCode-only
         ]);
 
         let claude = host.tool_defs_for_claude().await;
@@ -1230,9 +1304,16 @@ mod tests {
         assert_eq!(offload.len(), 1);
         assert_eq!(offload[0].function.name, "beta__y");
 
+        let opencode = host.tool_defs_for_opencode().await;
+        assert_eq!(opencode.len(), 1);
+        assert_eq!(opencode[0].function.name, "gamma__z");
+
         // Claude must not be able to invoke the offload-only server's tool.
         let err = host.call_for_claude("beta__y", json!({})).await.unwrap_err();
         assert!(err.contains("not available to Claude"), "got: {err}");
+        // OpenCode must not reach the Claude-only server's tool.
+        let err2 = host.call_for_opencode("alpha__x", json!({})).await.unwrap_err();
+        assert!(err2.contains("not available to OpenCode"), "got: {err2}");
     }
 
     #[test]

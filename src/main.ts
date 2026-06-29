@@ -44,7 +44,7 @@ setTimeout(showMainWindowOnce, 3000);
 // the theme's metadata (`decorations`) rather than its name. The chrome is
 // (re)applied both when the settings theme changes and when the theme registry
 // finishes loading — the latter so a non-default persisted theme's real
-// metadata wins over the tui-red fallback used before the fetch resolves.
+// metadata wins over the tui-orange fallback used before the fetch resolves.
 let currentThemeId = 'tui-orange';
 let lastDecorations: boolean | null = null;
 

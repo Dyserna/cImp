@@ -184,6 +184,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.15", detect: looks_v1_15, transform: migrate_v1_15_to_v1_16_step },
     MigrationStep { from_version: "v1.16", detect: looks_v1_16, transform: migrate_v1_16_to_v1_17_step },
     MigrationStep { from_version: "v1.17", detect: looks_v1_17, transform: migrate_v1_17_to_v1_18_step },
+    MigrationStep { from_version: "v18", detect: looks_v18, transform: migrate_v18_to_v19_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -1551,12 +1552,257 @@ fn migrate_v1_17_to_v1_18(value: &mut Value) {
         }
     }
 
+    // Stamp a *literal* 18 (not CURRENT_SCHEMA_VERSION): the v18 → v19 step
+    // below runs next in the same cascade pass and must still detect this file.
     root.insert(
         "schema_version".to_string(),
-        Value::Number(serde_json::Number::from(
-            crate::settings::schema::CURRENT_SCHEMA_VERSION,
-        )),
+        Value::Number(serde_json::Number::from(18u8)),
     );
+}
+
+/// Is this a v1.18 file (schema_version == 18) that pre-dates the V19
+/// Aider → OpenCode replacement?
+fn looks_v18(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 18)
+}
+
+fn migrate_v18_to_v19_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v18_to_v19(value)
+}
+
+/// The legacy V14 Aider reserved tab ids. BOTH collapse into the single V19
+/// `opencode` tab (OpenCode has no cloud/local split — it switches providers
+/// in-session), so a user with both aider tabs lands on one opencode tab.
+const LEGACY_AIDER_LOCAL_TAB_ID: &str = "aider-local";
+
+/// True for a legacy Aider reserved tab id (`aider` or `aider-local`).
+fn is_legacy_aider_id(id: &str) -> bool {
+    id == LEGACY_AIDER_TAB_ID || id == LEGACY_AIDER_LOCAL_TAB_ID
+}
+
+/// Remove later `"opencode"` string entries from a JSON array, keeping the
+/// first occurrence and preserving the order of everything else. Used after
+/// the id rewrite collapses both aider ids onto `opencode`, which can produce
+/// duplicates in `tab_ids` / `enabled_ai_tabs`.
+fn dedup_opencode_entries(arr: &mut Vec<Value>) {
+    let mut seen = false;
+    arr.retain(|v| {
+        if v.as_str() == Some("opencode") {
+            if seen {
+                return false;
+            }
+            seen = true;
+        }
+        true
+    });
+}
+
+/// v18 → v19: replace BOTH Aider reserved tabs with the single OpenCode tab.
+///
+/// 1. Drop the legacy `aider_local` provider settings group (OpenCode manages
+///    its own providers — there is no `opencode_local`).
+/// 2. Rewrite each reserved `aider` / `aider-local` tab in place to `opencode`:
+///    id, command, name "OpenCode"; PRESERVE per-tab `env`; reset
+///    `use_local_provider` to false and `args` to `[]` (dropping any stored
+///    `--model`); enable TTS injection (OpenCode can speak); rewrite canonical
+///    "Aider …" notification text. Then drop duplicate `opencode` tabs (a user
+///    with both aider tabs keeps the first, i.e. the cloud one's config).
+/// 3. Rewrite + dedupe layout-tree, layout-preset, and `session.active_tab_id`
+///    references.
+/// 4. Remap + dedupe `enabled_ai_tabs`.
+/// 5. Default each MCP server's new `opencode_access` from `claude_access`.
+///
+/// Idempotent: a second pass finds `schema_version == 19` so `looks_v18` is
+/// false, and no tab still carries an aider id.
+fn migrate_v18_to_v19(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    // 1. Drop the legacy aider_local provider group (no opencode_local).
+    root.remove("aider_local");
+
+    // 2. Rewrite each reserved aider tab in place to `opencode`.
+    if let Some(tabs) = root.get_mut("tabs").and_then(Value::as_array_mut) {
+        for tab in tabs.iter_mut() {
+            let Some(obj) = tab.as_object_mut() else {
+                continue;
+            };
+            let old_id = obj.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            if !is_legacy_aider_id(&old_id) {
+                continue;
+            }
+            let was_local = old_id == LEGACY_AIDER_LOCAL_TAB_ID;
+
+            obj.insert("id".to_string(), Value::String("opencode".to_string()));
+            obj.insert("command".to_string(), Value::String("opencode".to_string()));
+            // Reset args (drops any stored `--model`) and use_local_provider
+            // (OpenCode picks its own provider); env is preserved.
+            obj.insert("args".to_string(), Value::Array(Vec::new()));
+            obj.insert("use_local_provider".to_string(), Value::Bool(false));
+
+            // Rewrite the canonical name only; leave a user-customized name.
+            let old_name = if was_local { "Aider (local)" } else { "Aider" };
+            if obj.get("name").and_then(Value::as_str) == Some(old_name) {
+                obj.insert("name".to_string(), Value::String("OpenCode".to_string()));
+            }
+
+            // OpenCode can speak (instructions file): enable TTS injection and
+            // seed the runtime prompt when empty. Ensure the object exists.
+            let tts_entry = obj
+                .entry("tts_injection".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(tts) = tts_entry.as_object_mut() {
+                tts.insert("enabled".to_string(), Value::Bool(true));
+                let needs_default = tts
+                    .get("instructions")
+                    .and_then(Value::as_str)
+                    .map(str::is_empty)
+                    .unwrap_or(true);
+                if needs_default {
+                    tts.insert(
+                        "instructions".to_string(),
+                        Value::String(crate::tts::RUNTIME_SYSTEM_PROMPT.to_string()),
+                    );
+                }
+            }
+
+            // Rewrite canonical "Aider …" / "Aider (local) …" notification text
+            // → "OpenCode …".
+            if let Some(notifs) = obj.get_mut("notifications").and_then(Value::as_object_mut) {
+                let prefix = if was_local { "Aider (local)" } else { "Aider" };
+                for field in ["idle", "awaiting_permission", "question", "error"] {
+                    let suffix = match field {
+                        "idle" => " is idle",
+                        "awaiting_permission" => " is awaiting permission",
+                        "question" => " has a question",
+                        _ => " encountered an error",
+                    };
+                    let from_text = format!("{prefix}{suffix}");
+                    if notifs.get(field).and_then(Value::as_str) == Some(from_text.as_str()) {
+                        notifs.insert(
+                            field.to_string(),
+                            Value::String(format!("OpenCode{suffix}")),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Drop duplicate `opencode` tabs (both aider tabs collapsed): keep the
+        // first occurrence (canonical order puts the cloud `aider` tab first).
+        let mut seen_opencode = false;
+        tabs.retain(|t| {
+            let is_opencode = t.get("id").and_then(Value::as_str) == Some("opencode");
+            if is_opencode {
+                if seen_opencode {
+                    return false;
+                }
+                seen_opencode = true;
+            }
+            true
+        });
+    }
+
+    // 3. Rewrite + dedupe layout-tree / preset / session id references.
+    rewrite_opencode_tab_ids(root);
+
+    // 4. Remap + dedupe enabled_ai_tabs.
+    if let Some(enabled) = root.get_mut("enabled_ai_tabs").and_then(Value::as_array_mut) {
+        for entry in enabled.iter_mut() {
+            if entry.as_str().is_some_and(is_legacy_aider_id) {
+                *entry = Value::String("opencode".to_string());
+            }
+        }
+        dedup_opencode_entries(enabled);
+    }
+
+    // 5. Default each MCP server's opencode_access from claude_access.
+    if let Some(Value::Object(offload)) = root.get_mut("offload") {
+        if let Some(Value::Array(servers)) = offload.get_mut("mcp_servers") {
+            for srv in servers.iter_mut() {
+                if let Some(obj) = srv.as_object_mut() {
+                    let claude = obj
+                        .get("claude_access")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    obj.entry("opencode_access").or_insert(Value::Bool(claude));
+                }
+            }
+        }
+    }
+
+    // 6. Stamp the new schema version (the final cascade step ⇒ CURRENT).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(19u8)),
+    );
+}
+
+/// Walk layout-tree-shaped JSON inside the settings root and rewrite any
+/// `aider` / `aider-local` tab-id reference to `opencode`, de-duplicating the
+/// `opencode` entries each `tab_ids` array then collapses to. Covers
+/// `layout.tree`, every `layout_presets[].tree`, and `session.active_tab_id`.
+fn rewrite_opencode_tab_ids(root: &mut Map<String, Value>) {
+    fn rewrite_node(node: &mut Value) {
+        let Some(obj) = node.as_object_mut() else {
+            return;
+        };
+        if let Some(arr) = obj.get_mut("tab_ids").and_then(Value::as_array_mut) {
+            for entry in arr.iter_mut() {
+                if entry.as_str().is_some_and(is_legacy_aider_id) {
+                    *entry = Value::String("opencode".to_string());
+                }
+            }
+            dedup_opencode_entries(arr);
+        }
+        if obj
+            .get("active_tab_id")
+            .and_then(Value::as_str)
+            .is_some_and(is_legacy_aider_id)
+        {
+            obj.insert(
+                "active_tab_id".to_string(),
+                Value::String("opencode".to_string()),
+            );
+        }
+        if let Some(child) = obj.get_mut("first") {
+            rewrite_node(child);
+        }
+        if let Some(child) = obj.get_mut("second") {
+            rewrite_node(child);
+        }
+    }
+
+    if let Some(layout) = root.get_mut("layout") {
+        if let Some(tree) = layout.get_mut("tree") {
+            rewrite_node(tree);
+        }
+    }
+    if let Some(presets) = root.get_mut("layout_presets").and_then(Value::as_array_mut) {
+        for preset in presets.iter_mut() {
+            if let Some(obj) = preset.as_object_mut() {
+                if let Some(tree) = obj.get_mut("tree") {
+                    rewrite_node(tree);
+                }
+            }
+        }
+    }
+    if let Some(session) = root.get_mut("session").and_then(Value::as_object_mut) {
+        if session
+            .get("active_tab_id")
+            .and_then(Value::as_str)
+            .is_some_and(is_legacy_aider_id)
+        {
+            session.insert(
+                "active_tab_id".to_string(),
+                Value::String("opencode".to_string()),
+            );
+        }
+    }
 }
 
 // --- Backup helpers ---------------------------------------------------------
@@ -1711,10 +1957,97 @@ mod tests {
         assert_eq!(s[1]["offload_access"], json!(false));
         // absent → defaults to on (behavior-preserving for the common case).
         assert_eq!(s[2]["offload_access"], json!(true));
-        assert_eq!(
-            v["schema_version"],
-            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)
-        );
+        // Stamps a literal 18 (no longer the final cascade step since V19).
+        assert_eq!(v["schema_version"], json!(18));
+    }
+
+    #[test]
+    fn v18_to_v19_collapses_both_aider_tabs_into_single_opencode() {
+        let mut v = json!({
+            "schema_version": 18,
+            "aider_local": { "base_url": "http://host:9/v1", "auth_token": "tok", "model": "m" },
+            "enabled_ai_tabs": ["claude", "aider", "aider-local"],
+            "tabs": [
+                { "id": "claude", "kind": "ai_tool", "command": "claude" },
+                {
+                    "id": "aider", "kind": "ai_tool", "command": "aider", "name": "Aider",
+                    "args": ["--model", "gpt"], "use_local_provider": false,
+                    "env": { "FOO": "bar" },
+                    "notifications": { "idle": "Aider is idle" }
+                },
+                {
+                    "id": "aider-local", "kind": "ai_tool", "command": "aider",
+                    "name": "Aider (local)", "args": [], "use_local_provider": true,
+                    "env": {}
+                }
+            ],
+            "layout": { "tree": { "type": "pane", "id": "p1",
+                "tab_ids": ["claude", "aider", "aider-local"], "active_tab_id": "aider" } },
+            "session": { "active_tab_id": "aider-local" },
+            "offload": { "mcp_servers": [
+                { "name": "ddg", "url": "http://x", "claude_access": true, "offload_access": false },
+                { "name": "git", "command": "uvx", "claude_access": false, "offload_access": true }
+            ]}
+        });
+        migrate_v18_to_v19(&mut v);
+
+        // Legacy provider group dropped; no opencode_local.
+        assert!(v.get("aider_local").is_none());
+        assert!(v.get("opencode_local").is_none());
+
+        // Both aider tabs collapse into ONE opencode tab (the first/cloud one's
+        // config wins): claude + opencode, length 2.
+        let tabs = v["tabs"].as_array().unwrap();
+        assert_eq!(tabs.len(), 2, "the two aider tabs collapse into one opencode");
+        assert_eq!(tabs[0]["id"], "claude");
+        assert_eq!(tabs[1]["id"], "opencode");
+        assert_eq!(tabs[1]["command"], "opencode");
+        assert_eq!(tabs[1]["name"], "OpenCode");
+        assert_eq!(tabs[1]["args"], json!([])); // stored --model dropped
+        assert_eq!(tabs[1]["env"]["FOO"], "bar"); // env preserved (from the cloud tab)
+        assert_eq!(tabs[1]["use_local_provider"], json!(false)); // reset
+        assert_eq!(tabs[1]["tts_injection"]["enabled"], json!(true));
+        assert_eq!(tabs[1]["notifications"]["idle"], "OpenCode is idle");
+
+        // Layout / session refs rewritten + deduped to a single opencode.
+        let tree = &v["layout"]["tree"];
+        assert_eq!(tree["tab_ids"], json!(["claude", "opencode"]));
+        assert_eq!(tree["active_tab_id"], "opencode");
+        assert_eq!(v["session"]["active_tab_id"], "opencode");
+
+        // enabled_ai_tabs remapped + deduped.
+        assert_eq!(v["enabled_ai_tabs"], json!(["claude", "opencode"]));
+
+        // opencode_access defaults from claude_access.
+        let s = v["offload"]["mcp_servers"].as_array().unwrap();
+        assert_eq!(s[0]["opencode_access"], json!(true)); // claude_access true
+        assert_eq!(s[1]["opencode_access"], json!(false)); // claude_access false
+
+        // Stamped to the current version; not re-detected.
+        assert_eq!(v["schema_version"], json!(19));
+        assert!(!looks_v18(&v));
+    }
+
+    #[test]
+    fn v18_to_v19_local_only_aider_becomes_opencode() {
+        // A user who had ONLY the aider-local tab still lands on an opencode tab.
+        let mut v = json!({
+            "schema_version": 18,
+            "enabled_ai_tabs": ["claude", "aider-local"],
+            "tabs": [
+                { "id": "claude", "kind": "ai_tool", "command": "claude" },
+                { "id": "aider-local", "kind": "ai_tool", "command": "aider",
+                  "name": "Aider (local)", "use_local_provider": true, "env": { "K": "v" } }
+            ]
+        });
+        migrate_v18_to_v19(&mut v);
+        let tabs = v["tabs"].as_array().unwrap();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[1]["id"], "opencode");
+        assert_eq!(tabs[1]["use_local_provider"], json!(false));
+        assert_eq!(tabs[1]["env"]["K"], "v");
+        assert_eq!(v["enabled_ai_tabs"], json!(["claude", "opencode"]));
+        assert_eq!(v["schema_version"], json!(19));
     }
 
     #[test]
@@ -1804,7 +2137,7 @@ mod tests {
         // the whole cascade and write a fresh `.v1.2.bak` on every launch.
         let v: Value = serde_json::from_str(
             r#"{
-                "schema_version": 18,
+                "schema_version": 19,
                 "tabs": [
                     { "kind": "ai_tool", "id": "claude", "name": "Claude" }
                 ]

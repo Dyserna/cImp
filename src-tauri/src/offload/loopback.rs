@@ -34,6 +34,7 @@ use tracing::{debug, info, warn};
 use crate::error::{AppError, AppResult};
 
 use super::agent::ThinkingMode;
+use super::mcp_host::Consumer;
 use super::router::TierHint;
 use super::service::OffloadService;
 
@@ -336,10 +337,13 @@ async fn handle_conn(
         return Ok(());
     }
 
-    match (req.method.as_str(), req.path.as_str()) {
+    // Match on the path without its query string (`/mcp/list?consumer=opencode`
+    // must route the same as `/mcp/list`); handlers read the query themselves.
+    let route = req.path.split('?').next().unwrap_or(&req.path);
+    match (req.method.as_str(), route) {
         ("POST", "/run") => handle_run(&mut stream, &service, &req).await,
         ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
-        ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service).await,
+        ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
         ("GET", "/describe") => {
             let text = service.describe().await;
@@ -561,17 +565,24 @@ async fn handle_graph_run(
     write_json(stream, 200, &r).await
 }
 
-/// `POST /mcp/list`: the Claude-Code-exposed MCP tool descriptors (servers
-/// with `claude_access`), for the per-session child to merge into its
-/// `tools/list`. Returns `{ "tools": [ {name, description, inputSchema}, … ] }`.
-async fn handle_mcp_list(stream: &mut TcpStream, service: &Arc<OffloadService>) -> AppResult<()> {
-    let tools = service.mcp_claude_tool_descriptors().await;
+/// `POST /mcp/list`: the proxied MCP tool descriptors for the requesting
+/// consumer (servers with that consumer's access flag), for the per-session
+/// child to merge into its `tools/list`. The consumer is taken from the
+/// `?consumer=` query (Claude when absent). Returns
+/// `{ "tools": [ {name, description, inputSchema}, … ] }`.
+async fn handle_mcp_list(
+    stream: &mut TcpStream,
+    service: &Arc<OffloadService>,
+    req: &Request,
+) -> AppResult<()> {
+    let tools = service.mcp_tool_descriptors(consumer_of(req)).await;
     write_json(stream, 200, &serde_json::json!({ "tools": tools })).await
 }
 
-/// `POST /mcp/call`: run one Claude-exposed MCP tool. Body `{name, arguments}`.
-/// The service guards the call against any tool not offered by a
-/// `claude_access` server. 200 even on a tool-level error (the child renders
+/// `POST /mcp/call`: run one proxied MCP tool for the requesting consumer.
+/// Body `{name, arguments}`; consumer from `?consumer=` (Claude when absent).
+/// The service guards the call against any tool not offered by a server
+/// exposed to that consumer. 200 even on a tool-level error (the child renders
 /// `error` as a tool result).
 async fn handle_mcp_call(
     stream: &mut TcpStream,
@@ -589,11 +600,25 @@ async fn handle_mcp_call(
             return write_json(stream, 400, &r).await;
         }
     };
-    let r = match service.mcp_claude_call(&body.name, body.arguments).await {
+    let r = match service.mcp_call(consumer_of(req), &body.name, body.arguments).await {
         Ok(text) => RunResult { ok: true, text: Some(text), error: None },
         Err(e) => RunResult { ok: false, text: None, error: Some(e) },
     };
     write_json(stream, 200, &r).await
+}
+
+/// Parse the `?consumer=<name>` query value off a request path into a
+/// [`Consumer`]. Absent / unknown ⇒ Claude (the original default).
+fn consumer_of(req: &Request) -> Consumer {
+    let raw = req
+        .path
+        .split_once('?')
+        .and_then(|(_, q)| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("consumer="))
+        })
+        .unwrap_or("claude");
+    Consumer::parse(raw)
 }
 
 /// `GET /events`: an SSE stream emitting a `change` event per capability

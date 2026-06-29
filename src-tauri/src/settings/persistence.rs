@@ -16,7 +16,7 @@
 //! by their discriminator fields and routed through the `migration`
 //! module after the merge so a hand-imported old file at the new path
 //! still upgrades cleanly. After migration an integrity check reconciles
-//! the four reserved AI builtins (claude, claude-local, aider, aider-local)
+//! the three reserved AI builtins (claude, claude-local, opencode)
 //! with `enabled_ai_tabs`: every enabled id is forced present with
 //! `builtin: true`, every reserved id absent from the list is dropped.
 //! The `shell-default-1` reserved id is *not* re-seeded by the integrity
@@ -41,8 +41,9 @@ use crate::settings::write_atomic;
 use crate::settings::schema::{
     default_ai_tab, default_graph_monitor_tab, default_offload_server_tab, default_shell_1_tab,
     AiTabId, LayoutNodePersisted, Settings, TabConfig,
-    AIDER_LOCAL_TAB_ID, AIDER_TAB_ID, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
-    GRAPH_MONITOR_TAB_ID, OFFLOAD_SERVER_TAB_ID, SHELL_DEFAULT_TAB_ID,
+    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
+    GRAPH_MONITOR_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
+    SHELL_DEFAULT_TAB_ID,
 };
 use crate::shell::ShellSpec;
 
@@ -595,14 +596,13 @@ fn drop_disabled_ai_builtins(settings: &mut Settings) -> bool {
 /// the default config at the canonical position. Returns `true` if any
 /// entry was inserted.
 fn restore_enabled_ai_builtins(settings: &mut Settings) -> bool {
-    // Iterate in canonical order (claude → claude-local → aider →
-    // aider-local) so successive insertions land in the right relative
+    // Iterate in canonical order (claude → claude-local → opencode) so
+    // successive insertions land in the right relative
     // slot regardless of the user's `enabled_ai_tabs` ordering.
     let order = [
         AiTabId::Claude,
         AiTabId::ClaudeLocal,
-        AiTabId::Aider,
-        AiTabId::AiderLocal,
+        AiTabId::OpenCode,
     ];
     let mut changed = false;
     for &id in &order {
@@ -749,15 +749,14 @@ fn graph_monitor_insert_position(tabs: &[TabConfig]) -> usize {
     pos
 }
 
-/// All four reserved AI tab ids. Used by the integrity check's "is this
+/// All three reserved AI tab ids. Used by the integrity check's "is this
 /// id one of our reserved AI builtins?" loops; a single source of truth
 /// keeps the `ai_builtins` membership check, the `use_local_provider`
 /// expectation table, and the drop-disabled-tab pass in sync.
-const AI_BUILTIN_IDS: [&str; 4] = [
+const AI_BUILTIN_IDS: [&str; 3] = [
     CLAUDE_TAB_ID,
     CLAUDE_LOCAL_TAB_ID,
-    AIDER_TAB_ID,
-    AIDER_LOCAL_TAB_ID,
+    OPENCODE_TAB_ID,
 ];
 
 /// Reconcile the `tabs` array with `enabled_ai_tabs`. Every enabled AI
@@ -768,8 +767,8 @@ const AI_BUILTIN_IDS: [&str; 4] = [
 /// a hand-edited file.
 ///
 /// Restored AI tabs land at their canonical position (claude → 0,
-/// claude-local → after claude, aider → after claude-local,
-/// aider-local → after aider). User-created Shell tabs retain their
+/// claude-local → after claude, opencode → after claude-local).
+/// User-created Shell tabs retain their
 /// relative ordering after the AI builtins. The `shell-default-1`
 /// reserved id is *not* re-seeded here: it's a closable shell that
 /// ships only on fresh installs (see `seeded_defaults`).
@@ -1072,18 +1071,18 @@ mod tests {
     }
 
     #[test]
-    fn integrity_seeds_aider_pair_at_canonical_positions() {
+    fn integrity_seeds_opencode_at_canonical_position() {
         let mut s = Settings::default();
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
-            AiTabId::Aider,
-            AiTabId::AiderLocal,
+            AiTabId::ClaudeLocal,
+            AiTabId::OpenCode,
         ];
         integrity_check(&mut s);
         assert_eq!(s.tabs.len(), 3);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
-        assert_eq!(s.tabs[1].id(), AIDER_TAB_ID);
-        assert_eq!(s.tabs[2].id(), AIDER_LOCAL_TAB_ID);
+        assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
+        assert_eq!(s.tabs[2].id(), OPENCODE_TAB_ID);
     }
 
     #[test]
@@ -1141,15 +1140,15 @@ mod tests {
     }
 
     #[test]
-    fn integrity_inserts_aider_between_claude_local_and_user_shell() {
+    fn integrity_inserts_opencode_between_claude_local_and_user_shell() {
         // User has [claude, claude-local, shell-foo] and now enables
-        // aider. The new tab should land at index 2 (after claude-local,
+        // opencode. The new tab should land at index 2 (after claude-local,
         // before the shell), not at the end.
         let mut s = Settings::default();
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
             AiTabId::ClaudeLocal,
-            AiTabId::Aider,
+            AiTabId::OpenCode,
         ];
         integrity_check(&mut s);
         // Insert a user shell tab to simulate the existing layout.
@@ -1165,13 +1164,13 @@ mod tests {
             theme_override: None,
             background_override: None,
         }));
-        // Drop aider, then re-add via integrity.
-        s.tabs.retain(|t| t.id() != AIDER_TAB_ID);
+        // Drop opencode, then re-add via integrity.
+        s.tabs.retain(|t| t.id() != OPENCODE_TAB_ID);
         let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
         assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
-        assert_eq!(s.tabs[2].id(), AIDER_TAB_ID);
+        assert_eq!(s.tabs[2].id(), OPENCODE_TAB_ID);
         assert_eq!(s.tabs[3].id(), "shell-foo");
     }
 
@@ -1344,28 +1343,18 @@ mod tests {
     }
 
     #[test]
-    fn integrity_corrects_use_local_provider_on_aider_pair() {
+    fn integrity_corrects_use_local_provider_on_opencode() {
         let mut s = Settings::default();
-        s.enabled_ai_tabs = vec![AiTabId::Aider, AiTabId::AiderLocal];
+        s.enabled_ai_tabs = vec![AiTabId::OpenCode];
         integrity_check(&mut s);
-        // Tamper: aider → local, aider-local → not local.
-        if let TabConfig::AiTool(c) = s.tabs.iter_mut().find(|t| t.id() == AIDER_TAB_ID).unwrap() {
+        // Tamper: opencode → local (it has no local variant; canonical is false).
+        if let TabConfig::AiTool(c) = s.tabs.iter_mut().find(|t| t.id() == OPENCODE_TAB_ID).unwrap() {
             c.use_local_provider = true;
-        }
-        if let TabConfig::AiTool(c) =
-            s.tabs.iter_mut().find(|t| t.id() == AIDER_LOCAL_TAB_ID).unwrap()
-        {
-            c.use_local_provider = false;
         }
         let changed = integrity_check(&mut s);
         assert!(changed);
-        if let TabConfig::AiTool(c) = s.tabs.iter().find(|t| t.id() == AIDER_TAB_ID).unwrap() {
-            assert!(!c.use_local_provider, "aider must have use_local_provider=false");
-        }
-        if let TabConfig::AiTool(c) =
-            s.tabs.iter().find(|t| t.id() == AIDER_LOCAL_TAB_ID).unwrap()
-        {
-            assert!(c.use_local_provider, "aider-local must have use_local_provider=true");
+        if let TabConfig::AiTool(c) = s.tabs.iter().find(|t| t.id() == OPENCODE_TAB_ID).unwrap() {
+            assert!(!c.use_local_provider, "opencode must have use_local_provider=false");
         }
     }
 
@@ -1376,12 +1365,12 @@ mod tests {
         assert_eq!(s.ui.theme, "tui-orange");
 
         // Round-trip preserves a hand-edited value (here: a user who
-        // switched to tui-red or set a future theme).
+        // switched to tui-grey or set a future theme).
         let mut s = Settings::default();
-        s.ui.theme = "tui-red".to_string();
+        s.ui.theme = "tui-grey".to_string();
         let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed.ui.theme, "tui-red");
+        assert_eq!(parsed.ui.theme, "tui-grey");
 
         // A v1.3 file without the `ui` field still parses (serde(default)).
         let v1_3_json = r#"{"tabs":[]}"#;

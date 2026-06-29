@@ -21,12 +21,12 @@ pub const CLAUDE_TAB_ID: &str = "claude";
 /// `aider` reserved id (the v1.7 → v1.8 migration rewrites the aider
 /// tab in place to this id).
 pub const CLAUDE_LOCAL_TAB_ID: &str = "claude-local";
-/// Aider AI-tool tab using whatever provider Aider's own config selects
-/// (cloud/keys/etc). Reserved in V14 alongside `aider-local`.
-pub const AIDER_TAB_ID: &str = "aider";
-/// Aider AI-tool tab pointed at a local OpenAI-compatible endpoint via
-/// the global `aider_local` provider settings.
-pub const AIDER_LOCAL_TAB_ID: &str = "aider-local";
+/// The single OpenCode AI-tool tab. OpenCode picks its own provider/model
+/// (global config + credentials, switchable in-session), so unlike Claude
+/// there is no cloud/local pair. Reserved in V19, replacing BOTH the V14
+/// `aider` and `aider-local` reserved ids (the v18 → v19 migration collapses
+/// them into this one id).
+pub const OPENCODE_TAB_ID: &str = "opencode";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// V8-03: the read-only, non-closable Offload Server tab. Materialized only
 /// while `offload.enabled` (integrity check), it shows the local
@@ -54,7 +54,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 18;
+pub const CURRENT_SCHEMA_VERSION: u8 = 19;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -139,14 +139,6 @@ pub struct Settings {
     /// (and `ANTHROPIC_MODEL` if set) into the spawned process's env.
     /// Per-tab `env` entries take precedence over synthesized values.
     pub claude_local: ClaudeLocalSettings,
-    /// V14: local-LLM provider config for Aider tabs whose
-    /// `use_local_provider` flag is `true`. The launch-time env
-    /// composition reads `base_url`/`auth_token`/`model` from here and
-    /// synthesizes `OPENAI_API_BASE` / `OPENAI_API_KEY` (and a
-    /// `--model <model>` CLI arg when `model` is non-empty) into the
-    /// spawned aider process. Per-tab `env` entries take precedence
-    /// over synthesized values.
-    pub aider_local: AiderLocalSettings,
     /// Optional explicit executable paths for the bundled quick-launch
     /// tools (rustnet / broot). A non-empty field overrides the normal
     /// `ebin/` → PATH resolution for that tool, letting the user point at
@@ -202,7 +194,6 @@ impl Default for Settings {
             ui: UiSettings::default(),
             terminal: TerminalSettings::default(),
             claude_local: ClaudeLocalSettings::default(),
-            aider_local: AiderLocalSettings::default(),
             external_tools: ExternalToolsSettings::default(),
             offload: OffloadSettings::default(),
             graph: GraphSettings::default(),
@@ -299,17 +290,27 @@ impl LogRetention {
     }
 }
 
-/// One of the four reserved AI-tool tab ids. Wire format is the kebab-
-/// case tab-id string (`"claude"`, `"claude-local"`, `"aider"`,
-/// `"aider-local"`); the type exists so `enabled_ai_tabs` can be a
-/// strongly-typed `Vec<AiTabId>` instead of an untyped string list.
+/// One of the three reserved AI-tool tab ids. Wire format is the kebab-
+/// case tab-id string (`"claude"`, `"claude-local"`, `"opencode"`); the type
+/// exists so `enabled_ai_tabs` can be a strongly-typed `Vec<AiTabId>` instead
+/// of an untyped string list.
+///
+/// V19 ships a single OpenCode tab (not a cloud/local pair like Claude):
+/// OpenCode addresses many providers as `provider/model`, switches between
+/// them in-session, and reads global config/credentials, so a local variant
+/// would be redundant — the one tab covers cloud and local.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum AiTabId {
     Claude,
     ClaudeLocal,
-    Aider,
-    AiderLocal,
+    // Explicit rename: serde's kebab-case would split the camelCase variant
+    // name into `open-code`, but the wire format must be the single-word tab id
+    // `opencode` (matching OPENCODE_TAB_ID, the migration output, and the
+    // frontend literals). A mismatch quarantines settings on load — see the
+    // round-trip test.
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 impl AiTabId {
@@ -317,8 +318,7 @@ impl AiTabId {
         match self {
             Self::Claude => CLAUDE_TAB_ID,
             Self::ClaudeLocal => CLAUDE_LOCAL_TAB_ID,
-            Self::Aider => AIDER_TAB_ID,
-            Self::AiderLocal => AIDER_LOCAL_TAB_ID,
+            Self::OpenCode => OPENCODE_TAB_ID,
         }
     }
 
@@ -326,29 +326,27 @@ impl AiTabId {
         match id {
             CLAUDE_TAB_ID => Some(Self::Claude),
             CLAUDE_LOCAL_TAB_ID => Some(Self::ClaudeLocal),
-            AIDER_TAB_ID => Some(Self::Aider),
-            AIDER_LOCAL_TAB_ID => Some(Self::AiderLocal),
+            OPENCODE_TAB_ID => Some(Self::OpenCode),
             _ => None,
         }
     }
 
-    /// True for the local-provider variants (`claude-local`,
-    /// `aider-local`). The integrity check uses this as the canonical
-    /// `use_local_provider` value for each reserved id.
+    /// True for the local-provider variants (`claude-local`). The integrity
+    /// check uses this as the canonical `use_local_provider` value for each
+    /// reserved id. OpenCode picks its own provider, so it is never "local".
     pub fn uses_local_provider(self) -> bool {
-        matches!(self, Self::ClaudeLocal | Self::AiderLocal)
+        matches!(self, Self::ClaudeLocal)
     }
 
-    /// Canonical tab-bar position: claude (0) → claude-local → aider →
-    /// aider-local, with shells trailing afterwards. Used by
-    /// `add_ai_builtin_tab` and `integrity_check` so re-adding a
-    /// previously-disabled AI tab lands in the same slot every time.
+    /// Canonical tab-bar position: claude (0) → claude-local → opencode,
+    /// with shells trailing afterwards. Used by `add_ai_builtin_tab` and
+    /// `integrity_check` so re-adding a previously-disabled AI tab lands in
+    /// the same slot every time.
     pub fn canonical_order(self) -> usize {
         match self {
             Self::Claude => 0,
             Self::ClaudeLocal => 1,
-            Self::Aider => 2,
-            Self::AiderLocal => 3,
+            Self::OpenCode => 2,
         }
     }
 }
@@ -637,49 +635,6 @@ impl Default for ClaudeLocalSettings {
             base_url: "http://localhost:4000".to_string(),
             auth_token: "sk-dummy".to_string(),
             model_alias: String::new(),
-        }
-    }
-}
-
-/// V14: local-LLM provider configuration for Aider tabs whose
-/// `use_local_provider: true`. The launch flow synthesizes
-/// `OPENAI_API_BASE` from `base_url`, `OPENAI_API_KEY` from
-/// `auth_token`, and (when `model` is non-empty) appends
-/// `--model <model>` to the spawn argv. Stored cleartext for the same
-/// reasons as `ClaudeLocalSettings` (local proxies typically accept
-/// dummy tokens; OS-keychain integration is a future upgrade).
-///
-/// The hand-rolled `Debug` impl redacts `auth_token` so a stray
-/// `?settings` log line cannot leak the secret to the rolling log.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AiderLocalSettings {
-    pub base_url: String,
-    pub auth_token: String,
-    pub model: String,
-}
-
-impl std::fmt::Debug for AiderLocalSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted = if self.auth_token.is_empty() {
-            "<empty>"
-        } else {
-            "<redacted>"
-        };
-        f.debug_struct("AiderLocalSettings")
-            .field("base_url", &self.base_url)
-            .field("auth_token", &redacted)
-            .field("model", &self.model)
-            .finish()
-    }
-}
-
-impl Default for AiderLocalSettings {
-    fn default() -> Self {
-        Self {
-            base_url: "http://localhost:11434/v1".to_string(),
-            auth_token: "ollama".to_string(),
-            model: String::new(),
         }
     }
 }
@@ -1080,6 +1035,11 @@ pub struct McpServerConfig {
     /// Expose this server's tools to the **offload worker** (the local model,
     /// via the warm `McpHost`). This is the legacy `enabled` behavior.
     pub offload_access: bool,
+    /// V19: expose this server's tools to **OpenCode** (proxied through the
+    /// per-session `ccimp-offload --consumer opencode` child). Off by default;
+    /// the v18 → v19 migration seeds it from `claude_access` so upgraders keep
+    /// their web-research tools across both agents.
+    pub opencode_access: bool,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -1094,6 +1054,7 @@ impl std::fmt::Debug for McpServerConfig {
             .field("url", &self.url)
             .field("claude_access", &self.claude_access)
             .field("offload_access", &self.offload_access)
+            .field("opencode_access", &self.opencode_access)
             .finish()
     }
 }
@@ -1108,6 +1069,7 @@ impl Default for McpServerConfig {
             url: String::new(),
             claude_access: false,
             offload_access: true,
+            opencode_access: false,
         }
     }
 }
@@ -1362,6 +1324,25 @@ impl OffloadSettings {
             tool_scope: ToolScope::All,
         }]
     }
+
+    /// Whether at least one MCP server is exposed to Claude Code.
+    pub fn any_claude_mcp(&self) -> bool {
+        self.mcp_servers.iter().any(|m| m.claude_access)
+    }
+
+    /// V19: whether at least one MCP server is exposed to OpenCode.
+    pub fn any_opencode_mcp(&self) -> bool {
+        self.mcp_servers.iter().any(|m| m.opencode_access)
+    }
+
+    /// Whether the warm MCP host + loopback endpoint need to run. True when
+    /// offload is enabled (the worker needs the host) OR any MCP server is
+    /// exposed to Claude Code or OpenCode directly (each reaches it over the
+    /// loopback, independent of offload). Drives runtime startup, the warm-host
+    /// lifecycle, and the per-tab MCP injection.
+    pub fn mcp_host_needed(&self) -> bool {
+        self.enabled || self.any_claude_mcp() || self.any_opencode_mcp()
+    }
 }
 
 /// One notification slot: a per-event `{ enabled, text }` pair. The
@@ -1534,61 +1515,37 @@ pub fn default_claude_local_tab() -> TabConfig {
     })
 }
 
-/// V14: Aider AI-tool tab using whatever provider Aider's own config
-/// selects (cloud / API keys / per-project `.aider.conf.yml`). ccimp
-/// does not synthesize provider env vars for this tab — the user's
-/// existing aider configuration is in charge. TTS prompt injection is
-/// disabled by default because Aider's CLI has no
-/// `--append-system-prompt` equivalent (the spawn path enforces this
-/// regardless of the toggle).
-pub fn default_aider_tab() -> TabConfig {
+/// V19: OpenCode AI-tool tab using whatever provider OpenCode's own config
+/// selects (cloud / API keys / project config) when `use_local_provider` is
+/// off. TTS prompt injection is enabled by default: OpenCode accepts an
+/// instructions file (injected via `OPENCODE_CONFIG_CONTENT`), so it honors
+/// the TTS-markup convention and the tab can speak.
+pub fn default_opencode_tab() -> TabConfig {
     TabConfig::AiTool(AiToolTabConfig {
-        id: AIDER_TAB_ID.to_string(),
+        id: OPENCODE_TAB_ID.to_string(),
         builtin: true,
-        name: "Aider".to_string(),
-        command: "aider".to_string(),
+        name: "OpenCode".to_string(),
+        command: "opencode".to_string(),
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),
-        tts_injection: TtsInjection::default(),
+        // V19: unlike Aider, OpenCode accepts an instructions file (injected
+        // via OPENCODE_CONFIG_CONTENT), so the TTS-markup convention applies
+        // and the tab can speak. Seeded with the same runtime prompt as Claude.
+        tts_injection: TtsInjection {
+            enabled: true,
+            instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
+        },
         notifications: AiNotificationConfig {
-            idle: NotificationSlot::enabled("Aider is idle"),
-            awaiting_permission: NotificationSlot::enabled("Aider is awaiting permission"),
-            question: NotificationSlot::enabled("Aider has a question"),
-            error: NotificationSlot::enabled("Aider encountered an error"),
+            idle: NotificationSlot::enabled("OpenCode is idle"),
+            awaiting_permission: NotificationSlot::enabled("OpenCode is awaiting permission"),
+            question: NotificationSlot::enabled("OpenCode has a question"),
+            error: NotificationSlot::enabled("OpenCode encountered an error"),
         },
         first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
         use_local_provider: false,
-        tts_all_output: false,
-    })
-}
-
-/// V14: second Aider tab preconfigured to use a local OpenAI-compatible
-/// LLM via the global `aider_local` provider settings.
-pub fn default_aider_local_tab() -> TabConfig {
-    TabConfig::AiTool(AiToolTabConfig {
-        id: AIDER_LOCAL_TAB_ID.to_string(),
-        builtin: true,
-        name: "Aider (local)".to_string(),
-        command: "aider".to_string(),
-        args: Vec::new(),
-        cwd: None,
-        env: HashMap::new(),
-        tts_injection: TtsInjection::default(),
-        notifications: AiNotificationConfig {
-            idle: NotificationSlot::enabled("Aider (local) is idle"),
-            awaiting_permission: NotificationSlot::enabled(
-                "Aider (local) is awaiting permission",
-            ),
-            question: NotificationSlot::enabled("Aider (local) has a question"),
-            error: NotificationSlot::enabled("Aider (local) encountered an error"),
-        },
-        first_launch_notice_dismissed: true,
-        theme_override: None,
-        background_override: None,
-        use_local_provider: true,
         tts_all_output: false,
     })
 }
@@ -1600,8 +1557,7 @@ pub fn default_ai_tab(id: AiTabId) -> TabConfig {
     match id {
         AiTabId::Claude => default_claude_tab(),
         AiTabId::ClaudeLocal => default_claude_local_tab(),
-        AiTabId::Aider => default_aider_tab(),
-        AiTabId::AiderLocal => default_aider_local_tab(),
+        AiTabId::OpenCode => default_opencode_tab(),
     }
 }
 
@@ -1836,8 +1792,8 @@ impl Default for AvatarSettings {
 #[serde(rename_all = "kebab-case")]
 pub enum AvatarKind {
     Media,
-    /// Default render mode: the animated pixel-art mascot, paired with the
-    /// default `tui-red` theme. The default set is `impSprites` (the imp).
+    /// Default render mode: the animated pixel-art mascot. The default set is
+    /// `impSprites` (the imp), independent of the active UI theme.
     #[default]
     Sprite,
 }
@@ -2130,14 +2086,13 @@ impl Default for StatuslineSettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UiSettings {
-    /// Active UI chrome theme. Three values currently ship, all ratatui-style
-    /// (custom title bar, square borders): `"tui-red"` (the Imp Red palette +
-    /// the imp's scarlet accent, #e23c3c), `"tui-orange"` (Gruvbox surfaces +
-    /// Claude Code's accent orange, #d77757), and `"tui-green"` (the Aider
-    /// Green palette + Aider's terminal green accent, #2eb82e). New installs
-    /// land on `"tui-orange"` so the chrome accent matches Claude Code's
-    /// orange. The avatar still defaults to the animated `impSprites` mascot
-    /// independently (see [`AvatarKind`] / [`SpriteSettings`]).
+    /// Active UI chrome theme. Two values currently ship, both ratatui-style
+    /// (custom title bar, square borders): `"tui-orange"` (Gruvbox surfaces +
+    /// Claude Code's accent orange, #d77757) and `"tui-grey"` (the OpenCode Grey
+    /// palette + OpenCode's cool light-grey accent, #c8ccd0). New installs land
+    /// on `"tui-orange"` so the chrome accent matches Claude Code's orange. The
+    /// avatar still defaults to the animated `impSprites` mascot independently
+    /// (see [`AvatarKind`] / [`SpriteSettings`]).
     /// The pre-V1.13 `"tui"` value is rewritten to `"tui-orange"` by the
     /// v12 → v13 migration so existing users keep a Gruvbox look. Existing
     /// settings.json files otherwise keep whatever value they were
@@ -2609,6 +2564,26 @@ impl Default for ProcessingSettings {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn ai_tab_id_serde_wire_format_matches_tab_ids() {
+        // The serde wire string for each AiTabId MUST equal its tab-id constant
+        // (and the frontend literal + the migration output). A mismatch
+        // quarantines settings on load. Round-trip both directions.
+        for (variant, id) in [
+            (AiTabId::Claude, "claude"),
+            (AiTabId::ClaudeLocal, "claude-local"),
+            (AiTabId::OpenCode, "opencode"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(id), "serialize {id}");
+            assert_eq!(
+                serde_json::from_value::<AiTabId>(json!(id)).unwrap(),
+                variant,
+                "deserialize {id}"
+            );
+            assert_eq!(variant.as_str(), id, "as_str {id}");
+        }
+    }
 
     #[test]
     fn malformed_layout_drops_to_none_without_losing_rest_of_settings() {

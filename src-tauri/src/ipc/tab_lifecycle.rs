@@ -52,12 +52,13 @@ pub enum TabLifecycleError {
     /// last-checked-is-locked rule prevents this from the user side; the
     /// IPC enforces it as defense-in-depth.
     EmptyAiTabsList,
-    /// An attempt to enable an Aider tab (cloud or local) while the `aider`
-    /// command can't be resolved (not in `ebin`, not on PATH). The tab is
-    /// left disabled and the UI surfaces this so the user can install aider
-    /// first — unlike Claude (the app's own front end), a missing Aider would
-    /// only ever show a dead "command not found" tab.
-    AiderNotFound,
+    /// An attempt to enable an OpenCode tab (cloud or local) while the
+    /// `opencode` command can't be resolved (not in `ebin`, not on PATH). The
+    /// tab is left disabled and the UI surfaces this so the user can install
+    /// OpenCode first — unlike Claude (the app's own front end), a missing
+    /// OpenCode would only ever show a dead "command not found" tab. cctts does
+    /// not bundle the ~158 MB binary (V19 require-install decision).
+    OpencodeNotFound,
     /// Internal error (lock poisoning, channel send failure, etc.). Not
     /// expected in practice — surfaces as a toast on the frontend.
     Internal { message: String },
@@ -814,32 +815,32 @@ pub async fn set_enabled_ai_tabs(
         return Ok(());
     }
 
-    // Gate: don't enable an Aider tab (cloud or local) unless the `aider`
+    // Gate: don't enable an OpenCode tab (cloud or local) unless the `opencode`
     // command actually resolves (ebin → PATH, the same resolution the spawn
-    // path uses). Without this an enabled-but-unresolvable Aider tab would just
-    // materialize as a dead "command not found" tab. We only probe when a NEW
-    // aider tab is being turned on, and reject before any state changes so the
-    // toggle is atomic (the UI then reverts the checkbox and shows the reason).
-    // Claude is intentionally not gated — it's the app's own front end.
-    let enabling_aider = [AiTabId::Aider, AiTabId::AiderLocal]
+    // path uses). Without this an enabled-but-unresolvable OpenCode tab would
+    // just materialize as a dead "command not found" tab. We only probe when a
+    // NEW opencode tab is being turned on, and reject before any state changes
+    // so the toggle is atomic (the UI then reverts the checkbox and shows the
+    // reason). Claude is intentionally not gated — it's the app's own front end.
+    let enabling_opencode = [AiTabId::OpenCode]
         .iter()
         .any(|id| want.contains(id) && !have.contains(id));
-    if enabling_aider {
-        let resolvable = tokio::task::spawn_blocking(|| crate::pty::resolve_command("aider").is_ok())
-            .await
-            .map_err(|e| TabLifecycleError::internal(format!("aider probe join: {e}")))?;
+    if enabling_opencode {
+        let resolvable =
+            tokio::task::spawn_blocking(|| crate::pty::resolve_command("opencode").is_ok())
+                .await
+                .map_err(|e| TabLifecycleError::internal(format!("opencode probe join: {e}")))?;
         if !resolvable {
-            return Err(TabLifecycleError::AiderNotFound);
+            return Err(TabLifecycleError::OpencodeNotFound);
         }
     }
 
-    // Canonical add order: claude → claude-local → aider → aider-local
-    // so insertions land in the right relative slot.
+    // Canonical add order: claude → claude-local → opencode so insertions
+    // land in the right relative slot.
     let canonical = [
         AiTabId::Claude,
         AiTabId::ClaudeLocal,
-        AiTabId::Aider,
-        AiTabId::AiderLocal,
+        AiTabId::OpenCode,
     ];
 
     // 1. Add any newly-enabled tabs.

@@ -321,13 +321,12 @@ export interface ProcessingSettings {
 }
 
 export interface UiSettings {
-  /// Active UI chrome theme. Three values currently ship, all ratatui-style
-  /// (custom title bar, square borders): `"tui-red"` (Imp Red palette + the
-  /// imp's scarlet accent), `"tui-orange"` (Gruvbox surfaces + Claude Code's
-  /// accent orange), and `"tui-green"` (Aider Green palette + Aider's terminal
-  /// green accent). New installs default to `"tui-orange"` so the chrome
-  /// accent matches Claude Code's orange; the avatar still defaults to the
-  /// animated `impSprites` mascot independently. Distinct from
+  /// Active UI chrome theme. Two values currently ship, both ratatui-style
+  /// (custom title bar, square borders): `"tui-orange"` (Gruvbox surfaces +
+  /// Claude Code's accent orange) and `"tui-grey"` (OpenCode Grey palette +
+  /// OpenCode's cool light-grey accent). New installs default to `"tui-orange"`
+  /// so the chrome accent matches Claude Code's orange; the avatar still
+  /// defaults to the animated `impSprites` mascot independently. Distinct from
   /// `terminal.theme`, which governs the xterm.js terminal palette inside
   /// each tab.
   theme: string;
@@ -540,11 +539,6 @@ export interface Settings {
   /// `use_local_provider` flag is `true`. Stored cleartext on disk —
   /// local proxies typically accept dummy tokens, so this is acceptable.
   claude_local: ClaudeLocalSettings;
-  /// V14: local-LLM provider config for Aider tabs whose
-  /// `use_local_provider: true`. Stored cleartext on disk for the same
-  /// reasons as `claude_local` (local proxies typically accept dummy
-  /// tokens; OS-keychain integration is a future upgrade).
-  aider_local: AiderLocalSettings;
   /// Optional explicit executable paths for the bundled quick-launch tools
   /// (rustnet / broot); empty fields resolve normally (ebin → PATH).
   external_tools: ExternalToolsSettings;
@@ -632,16 +626,6 @@ export interface ClaudeLocalSettings {
   model_alias: string;
 }
 
-/// V14: local-LLM provider configuration for Aider tabs whose
-/// `use_local_provider: true`. `base_url` becomes `OPENAI_API_BASE`
-/// and `auth_token` becomes `OPENAI_API_KEY` on launch; `model`,
-/// when non-empty, is passed as `--model <model>` on the spawn argv.
-export interface AiderLocalSettings {
-  base_url: string;
-  auth_token: string;
-  model: string;
-}
-
 /// Optional explicit executable paths for the bundled quick-launch tools
 /// (rustnet / broot). A non-empty value overrides the normal `ebin/` → PATH
 /// resolution for that tool, letting the user point at an exe in any folder.
@@ -675,6 +659,9 @@ export interface McpServerConfig {
   claude_access: boolean;
   /// Expose this server's tools to the offload worker (the legacy `enabled`).
   offload_access: boolean;
+  /// V19: expose this server's tools to OpenCode (proxied through the
+  /// `--consumer opencode` child). Off by default.
+  opencode_access: boolean;
 }
 
 /// V8-02: which capability tier a backend serves (mirror of Rust
@@ -764,15 +751,13 @@ export interface OffloadSettings {
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
 /// User-created shell tabs use uuid-based ids that never collide with these.
 export const CLAUDE_TAB_ID = 'claude';
-/// V1.4-07: replaces the pre-V1.4-07 `AIDER_TAB_ID = 'aider'`. The
-/// v1.7 → v1.8 migration rewrites the aider tab to this id in place.
+/// V1.4-07: second Claude tab preconfigured for a local LLM provider.
 export const CLAUDE_LOCAL_TAB_ID = 'claude-local';
-/// V14: Aider AI-tool tab using whatever provider Aider's own config
-/// selects (cloud / API keys / per-project `.aider.conf.yml`).
-export const AIDER_TAB_ID = 'aider';
-/// V14: Aider tab pointed at a local OpenAI-compatible endpoint via
-/// the `aider_local` provider settings.
-export const AIDER_LOCAL_TAB_ID = 'aider-local';
+/// V19: the single OpenCode AI-tool tab. OpenCode picks its own provider/model
+/// (global config + credentials, switchable in-session), so there is no
+/// cloud/local pair. Replaces BOTH V14 aider ids (the v18 → v19 migration
+/// collapses them into this one).
+export const OPENCODE_TAB_ID = 'opencode';
 export const SHELL_DEFAULT_TAB_ID = 'shell-default-1';
 
 /// Look up a tab entry by id. Returns undefined for unknown ids; callers
@@ -1000,11 +985,6 @@ export function defaultSettings(): Settings {
       base_url: 'http://localhost:4000',
       auth_token: 'sk-dummy',
       model_alias: '',
-    },
-    aider_local: {
-      base_url: 'http://localhost:11434/v1',
-      auth_token: 'ollama',
-      model: '',
     },
     external_tools: {
       rustnet: '',

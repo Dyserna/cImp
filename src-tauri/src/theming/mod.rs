@@ -18,12 +18,14 @@
 //! before it joins the registry, and anything that fails verification is
 //! skipped with a `tracing::warn!` (it never appears in Settings).
 //!
-//! As a last-resort fallback, the embedded theme (`tui-red`) and embedded
-//! palette (`Imp Red`) are compiled into the binary via `include_str!`
+//! As a last-resort fallback, the embedded theme (`tui-orange`) and embedded
+//! palette (`GitHub Dark`) are compiled into the binary via `include_str!`
 //! — so even if both folders are missing/empty or every file on disk is
-//! malformed, those two are always present and the app stays usable. A valid
-//! on-disk copy of the same id/name overrides its embedded namesake, so the
-//! embed is invisible whenever the files are present (the normal case).
+//! malformed, those two are always present and the app stays usable. They are
+//! also the defaults new installs land on, so the fallback matches the normal
+//! look. A valid on-disk copy of the same id/name overrides its embedded
+//! namesake, so the embed is invisible whenever the files are present (the
+//! normal case).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -192,39 +194,39 @@ fn build_palette(json: &str) -> Result<PaletteWire, String> {
 
 // ---- embedded fallback ---------------------------------------------------
 //
-// Only two themes/palettes are embedded as last-resort fallbacks — `tui-red`
-// and `Imp Red`. Compiled in from the same repo-root source files that ship in
-// the release, so the embed can never drift from the on-disk copy. (The
-// default UI theme is `tui-orange` and the default terminal palette is
-// `GitHub Dark`; both live on disk and are not embedded.)
+// Only one theme/palette is embedded as a last-resort fallback — `tui-orange`
+// and `GitHub Dark`. These are also the defaults new installs land on, so the
+// fallback matches the normal look. Compiled in from the same repo-root source
+// files that ship in the release, so the embed can never drift from the
+// on-disk copy.
 
-const EMBEDDED_THEME_ID: &str = "tui-red";
+const EMBEDDED_THEME_ID: &str = "tui-orange";
 const EMBEDDED_THEME_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-red/theme.json"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-orange/theme.json"));
 const EMBEDDED_THEME_CSS: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-red/theme.css"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-orange/theme.css"));
 
 const EMBEDDED_PALETTE_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../palettes/Imp Red.json"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../palettes/GitHub Dark.json"));
 
-/// The compiled-in `tui-red` theme. `None` only if the embedded source
+/// The compiled-in `tui-orange` theme. `None` only if the embedded source
 /// somehow fails verification, which a unit test guards against.
 fn embedded_theme() -> Option<ThemeWire> {
     match build_theme(EMBEDDED_THEME_ID, EMBEDDED_THEME_JSON, EMBEDDED_THEME_CSS) {
         Ok(t) => Some(t),
         Err(e) => {
-            tracing::error!(error = %e, "theming: embedded tui-red failed verification");
+            tracing::error!(error = %e, "theming: embedded tui-orange failed verification");
             None
         }
     }
 }
 
-/// The compiled-in `Imp Red` palette. See [`embedded_theme`].
+/// The compiled-in `GitHub Dark` palette. See [`embedded_theme`].
 fn embedded_palette() -> Option<PaletteWire> {
     match build_palette(EMBEDDED_PALETTE_JSON) {
         Ok(p) => Some(p),
         Err(e) => {
-            tracing::error!(error = %e, "theming: embedded Imp Red failed verification");
+            tracing::error!(error = %e, "theming: embedded GitHub Dark failed verification");
             None
         }
     }
@@ -233,7 +235,7 @@ fn embedded_palette() -> Option<PaletteWire> {
 // ---- load ----------------------------------------------------------------
 
 /// Discover + verify every theme under `<exe-dir>/themes`, with the embedded
-/// `tui-red` as a base so the list is never empty. A valid on-disk theme
+/// `tui-orange` as a base so the list is never empty. A valid on-disk theme
 /// with the same id overrides the embedded copy. Sorted by id.
 fn load_themes() -> Vec<ThemeWire> {
     let mut map: BTreeMap<String, ThemeWire> = BTreeMap::new();
@@ -273,7 +275,7 @@ fn load_themes() -> Vec<ThemeWire> {
 }
 
 /// Discover + verify every palette under `<exe-dir>/palettes`, with the
-/// embedded `Imp Red` as a base so the list is never empty. A valid
+/// embedded `GitHub Dark` as a base so the list is never empty. A valid
 /// on-disk palette with the same name overrides the embedded copy. Sorted by
 /// name.
 fn load_palettes() -> Vec<PaletteWire> {
@@ -360,7 +362,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("shipped theme {id} invalid: {e}"));
             count += 1;
         }
-        assert_eq!(count, 3, "expected 3 shipped themes");
+        assert_eq!(count, 2, "expected 2 shipped themes");
     }
 
     #[test]
@@ -377,7 +379,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("shipped palette {:?} invalid: {e}", path));
             count += 1;
         }
-        assert_eq!(count, 14, "expected 14 shipped palettes");
+        assert_eq!(count, 13, "expected 13 shipped palettes");
     }
 
     #[test]
@@ -388,37 +390,37 @@ mod tests {
         // The embedded defaults must still be present.
         assert!(
             load_themes().iter().any(|t| t.id == EMBEDDED_THEME_ID),
-            "load_themes must include the embedded tui-red fallback"
+            "load_themes must include the embedded tui-orange fallback"
         );
         assert!(
-            load_palettes().iter().any(|p| p.name == "Imp Red"),
-            "load_palettes must include the embedded Imp Red fallback"
+            load_palettes().iter().any(|p| p.name == "GitHub Dark"),
+            "load_palettes must include the embedded GitHub Dark fallback"
         );
     }
 
     #[test]
     fn embedded_fallbacks_verify() {
         // The compiled-in last-resort fallbacks must always be valid and be the
-        // two documented defaults.
-        let theme = embedded_theme().expect("embedded tui-red verifies");
+        // two documented defaults (also the new-install defaults).
+        let theme = embedded_theme().expect("embedded tui-orange verifies");
         assert_eq!(theme.id, EMBEDDED_THEME_ID);
         assert!(!theme.decorations);
         assert_eq!(theme.palette, "GitHub Dark");
 
-        let palette = embedded_palette().expect("embedded Imp Red verifies");
-        assert_eq!(palette.name, "Imp Red");
+        let palette = embedded_palette().expect("embedded GitHub Dark verifies");
+        assert_eq!(palette.name, "GitHub Dark");
         assert_eq!(palette.colors.len(), REQUIRED_PALETTE_KEYS.len());
     }
 
     #[test]
-    fn embedded_tui_red_theme_pairs_with_github_dark() {
-        // The embedded `tui-red` fallback theme must exist on disk, hide the OS
-        // chrome, and pair with the GitHub Dark palette. (The default UI theme
-        // is now `tui-orange`; `tui-red` remains the compiled-in fallback.)
-        let dir = repo_themes().join("tui-red");
-        let json = std::fs::read_to_string(dir.join("theme.json")).expect("tui-red theme.json");
-        let css = std::fs::read_to_string(dir.join("theme.css")).expect("tui-red theme.css");
-        let t = build_theme("tui-red", &json, &css).expect("tui-red valid");
+    fn embedded_tui_orange_theme_pairs_with_github_dark() {
+        // The embedded `tui-orange` fallback theme — also the default new-install
+        // theme — must exist on disk, hide the OS chrome, and pair with the
+        // GitHub Dark palette (the embedded + default terminal palette).
+        let dir = repo_themes().join("tui-orange");
+        let json = std::fs::read_to_string(dir.join("theme.json")).expect("tui-orange theme.json");
+        let css = std::fs::read_to_string(dir.join("theme.css")).expect("tui-orange theme.css");
+        let t = build_theme("tui-orange", &json, &css).expect("tui-orange valid");
         assert!(!t.decorations);
         assert_eq!(t.palette, "GitHub Dark");
     }

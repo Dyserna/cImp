@@ -63,7 +63,8 @@ pub struct PermissionPattern {
 /// fresh installs and after a hand-edit accident. Mirrors the layout the
 /// loader writes to disk on first launch. Pattern matching is pure
 /// substring containment against the ANSI-stripped tail; the same shape
-/// covers Claude Code chrome and Aider's prompts.
+/// covers Claude Code chrome and OpenCode's `--mini` prompts (the latter
+/// shipped as disabled templates until characterized live — V19 task A4).
 pub fn default_patterns() -> Vec<PermissionPattern> {
     vec![
         PermissionPattern {
@@ -120,37 +121,34 @@ pub fn default_patterns() -> Vec<PermissionPattern> {
             all_of: vec!["esc to interrupt".to_string()],
             disabled: false,
         },
-        // Aider's "Apply edits?" prompt. Aider prints a (Y)es/(N)o/etc.
-        // option line; the trailing `(Y)es` is the most stable marker
-        // across versions.
+        // OpenCode (`opencode --mini`) permission prompt. OpenCode asks for
+        // tool/edit/bash approval with its own inline footer. The exact marker
+        // substring must be captured live against `opencode --mini` (the
+        // alternate-screen TUI is never launched) — run a permission-triggering
+        // action with `RUST_LOG=perm_capture=debug` and replace the placeholder
+        // below with a distinctive substring from the dumped tail (e.g. the
+        // footer chrome or the "Allow"/"Deny" option line). Shipped `disabled`
+        // until characterized (V19 task A4) so a wrong guess can't mis-fire;
+        // flip to `disabled: false` once the real marker is in place.
         PermissionPattern {
-            name: "aider_apply_edits".to_string(),
+            name: "opencode_permission".to_string(),
             kind: PatternKind::Permission,
             all_of: vec![
-                "Apply edits?".to_string(),
-                "(Y)es".to_string(),
+                "<replace with a substring unique to opencode --mini's permission prompt>".to_string(),
             ],
-            disabled: false,
+            disabled: true,
         },
-        // Aider's "Add file to chat?" prompt. The phrasing is "Add … to
-        // the chat?" — the open-ended middle is matched by absence of a
-        // substring constraint there.
+        // OpenCode's "busy"/working footer while a request is in flight (drives
+        // the avatar's Thinking↔Idle state, like `claude_working`). Capture the
+        // live `--mini` working chrome the same way and replace the placeholder;
+        // shipped `disabled` until characterized (V19 task A4).
         PermissionPattern {
-            name: "aider_add_to_chat".to_string(),
-            kind: PatternKind::Permission,
+            name: "opencode_working".to_string(),
+            kind: PatternKind::Working,
             all_of: vec![
-                "Add ".to_string(),
-                " to the chat?".to_string(),
+                "<replace with a substring unique to opencode --mini's working footer>".to_string(),
             ],
-            disabled: false,
-        },
-        // Aider's "Run shell command?" confirmation. Used when the user
-        // (or the model) proposes a shell action via /run.
-        PermissionPattern {
-            name: "aider_run_shell".to_string(),
-            kind: PatternKind::Permission,
-            all_of: vec!["Run shell command?".to_string()],
-            disabled: false,
+            disabled: true,
         },
     ]
 }

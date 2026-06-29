@@ -9,8 +9,8 @@
 // so the resolver returns a complete xterm.js `ITheme` *synchronously* — before
 // the backend registry has loaded, and after any IPC failure: `Default` (the
 // merge base for "Custom" palettes; its fg/bg preserves the pre-V1.4 hardcoded
-// look), `Imp Red` (the default terminal palette, paired with the default
-// tui-red theme), and `Tomorrow Night` (paired with tui-orange).
+// look), `GitHub Dark` (the default terminal palette, paired with the default
+// tui-orange theme and embedded as the backend fallback), and `Tomorrow Night`.
 
 import type { ITheme } from '@xterm/xterm';
 
@@ -66,29 +66,29 @@ export const FALLBACK_PALETTES: Record<string, ThemeColors> = {
     brightCyan: '#8abeb7',
     brightWhite: '#ffffff',
   },
-  'Imp Red': {
-    foreground: '#e6d8d4',
-    background: '#1a1413',
-    cursor: '#e23c3c',
-    cursorAccent: '#1a1413',
-    selectionBackground: '#3a2222',
-    selectionForeground: '#f5e9e6',
-    black: '#1a1413',
-    red: '#e23c3c',
-    green: '#98bd6a',
-    yellow: '#e0b24a',
-    blue: '#6a9bd0',
-    magenta: '#c87ba0',
-    cyan: '#6fb8b0',
-    white: '#d8c8c4',
-    brightBlack: '#6e5d5a',
-    brightRed: '#f25a5a',
-    brightGreen: '#b0cf86',
-    brightYellow: '#f0c674',
-    brightBlue: '#8fb6e0',
-    brightMagenta: '#d99cbb',
-    brightCyan: '#8fd0c8',
-    brightWhite: '#fbf1ee',
+  'GitHub Dark': {
+    foreground: '#c9d1d9',
+    background: '#0d1117',
+    cursor: '#c9d1d9',
+    cursorAccent: '#0d1117',
+    selectionBackground: '#264f78',
+    selectionForeground: '#c9d1d9',
+    black: '#484f58',
+    red: '#ff7b72',
+    green: '#3fb950',
+    yellow: '#d29922',
+    blue: '#58a6ff',
+    magenta: '#bc8cff',
+    cyan: '#39c5cf',
+    white: '#b1bac4',
+    brightBlack: '#6e7681',
+    brightRed: '#ffa198',
+    brightGreen: '#56d364',
+    brightYellow: '#e3b341',
+    brightBlue: '#79c0ff',
+    brightMagenta: '#d2a8ff',
+    brightCyan: '#56d4dd',
+    brightWhite: '#f0f6fc',
   },
 };
 
@@ -102,8 +102,8 @@ let paletteOrder: string[] = Object.keys(FALLBACK_PALETTES);
 
 /// Replace the live palette map from the backend registry. Fallback palettes
 /// are always retained underneath so `Default` (the Custom merge base),
-/// `Imp Red` (the default terminal palette), and `Tomorrow Night` survive even
-/// if the disk folder somehow omits them.
+/// `GitHub Dark` (the default terminal palette), and `Tomorrow Night` survive
+/// even if the disk folder somehow omits them.
 export function setPalettes(palettes: { name: string; colors: ThemeColors }[]): void {
   const map: Record<string, ThemeColors> = { ...FALLBACK_PALETTES };
   for (const p of palettes) map[p.name] = p.colors;

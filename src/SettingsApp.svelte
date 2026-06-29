@@ -100,10 +100,8 @@
   // between password and text via this flag (no keychain integration in
   // this milestone — the token sits cleartext in settings.json).
   let showLocalToken = $state<boolean>(false);
-  // V14: same toggle for the Aider local LLM section.
-  let showAiderLocalToken = $state<boolean>(false);
   // Inline error under the AI-tabs checkbox group — e.g. when enabling an
-  // Aider tab is rejected because `aider` isn't installed (ebin/PATH).
+  // OpenCode tab is rejected because `opencode` isn't installed (ebin/PATH).
   let aiTabsError = $state<string | null>(null);
   // V8-01 offload: test-box input/result and a busy guard for the
   // Start/Stop/Reset/Test buttons.
@@ -271,7 +269,7 @@
       fn(s.offload.command_policies[i]);
     });
   }
-  // ── MCP tool servers (Tools tab) ───────────────────────────────────────
+  // ── MCP tool servers (MCP servers section) ─────────────────────────────
   // Add/remove/toggle with live host reload — no ccImp restart. Edits persist
   // through the same awaited `applySettings` the rest of the panel uses; once
   // the backend has the new value we call `offload_reload_mcp`, which
@@ -332,6 +330,7 @@
           url: '',
           claude_access: false,
           offload_access: true,
+          opencode_access: false,
         },
       ];
     });
@@ -344,7 +343,7 @@
   }
   async function setMcpAccess(
     i: number,
-    field: 'claude_access' | 'offload_access',
+    field: 'claude_access' | 'offload_access' | 'opencode_access',
     value: boolean,
   ): Promise<void> {
     await applyMcp((s) => {
@@ -424,6 +423,7 @@
     | 'tabs'
     | 'shortcuts'
     | 'offload'
+    | 'mcp'
     | 'graph'
     | 'advanced'
     | 'about';
@@ -437,6 +437,7 @@
     { id: 'stt', label: 'Speech-to-text' },
     { id: 'tabs', label: 'Tabs' },
     { id: 'offload', label: 'Offload task tools' },
+    { id: 'mcp', label: 'MCP servers' },
     { id: 'graph', label: 'Code graph' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
@@ -449,16 +450,16 @@
   type TabsSubSection = AiTabId | 'shells';
   let tabsSubSection = $state<TabsSubSection>('claude');
   // Sub-tab nav within the Offload section: the backend pool + limits live
-  // under 'pool'; native tools, allowlist, command policies, and MCP servers
-  // under 'tools'.
+  // under 'pool'; native tools, allowlist, and command policies under 'tools'.
+  // (MCP servers moved to their own top-level `mcp` section — they're usable by
+  // Claude Code directly now, not just the offload worker.)
   type OffloadSubSection = 'pool' | 'tools';
   let offloadSubSection = $state<OffloadSubSection>('pool');
   function subSectionForTabId(tabId: string): TabsSubSection {
     if (
       tabId === 'claude' ||
       tabId === 'claude-local' ||
-      tabId === 'aider' ||
-      tabId === 'aider-local'
+      tabId === 'opencode'
     ) {
       return tabId;
     }
@@ -609,7 +610,7 @@
     if (enable) {
       // Insert in canonical order so the persisted list mirrors the
       // tab-bar order users see.
-      const order: AiTabId[] = ['claude', 'claude-local', 'aider', 'aider-local'];
+      const order: AiTabId[] = ['claude', 'claude-local', 'opencode'];
       next_ids = order.filter((x) => prev.includes(x) || x === id);
     } else {
       if (prev.length <= 1) return; // last-one lock (also guarded by the disabled attribute)
@@ -617,7 +618,7 @@
     }
     if (!enable && tabsSubSection === id) {
       // Jump to the first surviving id in canonical order.
-      const order: AiTabId[] = ['claude', 'claude-local', 'aider', 'aider-local'];
+      const order: AiTabId[] = ['claude', 'claude-local', 'opencode'];
       const survivor = order.find((x) => next_ids.includes(x));
       if (survivor) tabsSubSection = survivor;
     }
@@ -632,13 +633,13 @@
       const restored = structuredClone($state.snapshot(snapshot));
       restored.enabled_ai_tabs = prev;
       snapshot = restored;
-      // The backend rejects enabling an Aider tab when `aider` can't be
+      // The backend rejects enabling an OpenCode tab when `opencode` can't be
       // resolved (not in ebin, not on PATH) — surface that specifically so the
       // user knows to install it; everything else is a generic failure.
       const kind = (e as { kind?: string } | null)?.kind;
       aiTabsError =
-        kind === 'aider-not-found'
-          ? 'Aider was not found in ebin or on your PATH. Install aider (pip install aider-chat) and make sure it’s on PATH, then try again.'
+        kind === 'opencode-not-found'
+          ? 'OpenCode was not found in ebin or on your PATH. Install it from https://opencode.ai/docs (or drop opencode.exe in ebin/), then try again.'
           : 'Failed to update AI tabs — see logs for details.';
     }
   }
@@ -2126,8 +2127,7 @@
       {:else if activeSection === 'tabs'}
         {@const claudeLive = aiTabAt('claude')}
         {@const claudeLocalLive = aiTabAt('claude-local')}
-        {@const aiderLive = aiTabAt('aider')}
-        {@const aiderLocalLive = aiTabAt('aider-local')}
+        {@const opencodeLive = aiTabAt('opencode')}
         {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
         {@const enabledAiTabs = snapshot.enabled_ai_tabs}
         {@const lastChecked = enabledAiTabs.length === 1 ? enabledAiTabs[0] : null}
@@ -2176,31 +2176,16 @@
                 <input
                   type="checkbox"
                   name="ai-tabs-enabled"
-                  value="aider"
-                  checked={enabledAiTabs.includes('aider')}
-                  disabled={lastChecked === 'aider'}
+                  value="opencode"
+                  checked={enabledAiTabs.includes('opencode')}
+                  disabled={lastChecked === 'opencode'}
                   onchange={(e) =>
                     void toggleAiTabEnabled(
-                      'aider',
+                      'opencode',
                       (e.currentTarget as HTMLInputElement).checked,
                     )}
                 />
-                Aider (cloud)
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  name="ai-tabs-enabled"
-                  value="aider-local"
-                  checked={enabledAiTabs.includes('aider-local')}
-                  disabled={lastChecked === 'aider-local'}
-                  onchange={(e) =>
-                    void toggleAiTabEnabled(
-                      'aider-local',
-                      (e.currentTarget as HTMLInputElement).checked,
-                    )}
-                />
-                Aider (local)
+                OpenCode
               </label>
             </div>
             {#if aiTabsError}
@@ -2229,20 +2214,11 @@
             <button
               type="button"
               role="tab"
-              class:active={tabsSubSection === 'aider'}
-              aria-selected={tabsSubSection === 'aider'}
-              onclick={() => (tabsSubSection = 'aider')}
+              class:active={tabsSubSection === 'opencode'}
+              aria-selected={tabsSubSection === 'opencode'}
+              onclick={() => (tabsSubSection = 'opencode')}
             >
-              Aider
-            </button>
-            <button
-              type="button"
-              role="tab"
-              class:active={tabsSubSection === 'aider-local'}
-              aria-selected={tabsSubSection === 'aider-local'}
-              onclick={() => (tabsSubSection = 'aider-local')}
-            >
-              Aider (local)
+              OpenCode
             </button>
             <button
               type="button"
@@ -2376,124 +2352,24 @@
                 </label>
               </section>
             </div>
-          {:else if tabsSubSection === 'aider'}
-            <div id="tab-section-aider">
-              {#if aiderLive}
+          {:else if tabsSubSection === 'opencode'}
+            <div id="tab-section-opencode">
+              {#if opencodeLive}
                 <TabSettingsSection
-                  tabId={'aider'}
-                  displayName={'Aider'}
+                  tabId={'opencode'}
+                  displayName={'OpenCode'}
                   bind:settings={
-                    () => aiderLive,
-                    (v) => patchAiTab('aider', v)
+                    () => opencodeLive,
+                    (v) => patchAiTab('opencode', v)
                   }
-                  defaults={tabDefaults['aider'] ?? null}
-                  restartRequired={restartRequired['aider'] ?? false}
+                  defaults={tabDefaults['opencode'] ?? null}
+                  restartRequired={restartRequired['opencode'] ?? false}
                   onchange={() => {}}
-                  onrestart={() => restartTab('aider')}
+                  onrestart={() => restartTab('opencode')}
                 />
               {:else}
-                <small class="hint top">Aider tab is disabled — tick the checkbox above to enable it.</small>
+                <small class="hint top">OpenCode tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
-            </div>
-          {:else if tabsSubSection === 'aider-local'}
-            <div id="tab-section-aider-local">
-              {#if aiderLocalLive}
-                <TabSettingsSection
-                  tabId={'aider-local'}
-                  displayName={'Aider (local)'}
-                  bind:settings={
-                    () => aiderLocalLive,
-                    (v) => patchAiTab('aider-local', v)
-                  }
-                  defaults={tabDefaults['aider-local'] ?? null}
-                  restartRequired={restartRequired['aider-local'] ?? false}
-                  onchange={() => {}}
-                  onrestart={() => restartTab('aider-local')}
-                />
-              {:else}
-                <small class="hint top">Aider (local) tab is disabled — tick the checkbox above to enable it.</small>
-              {/if}
-              <section>
-                <h2>Local LLM provider</h2>
-                <small class="hint top">
-                  Settings for this tab. ccImp synthesizes
-                  <code>OPENAI_API_BASE</code> / <code>OPENAI_API_KEY</code>
-                  from the values below and (when <em>Model</em> is set) passes
-                  <code>--model &lt;model&gt;</code> on the spawn argv. Point
-                  this at any OpenAI-compatible endpoint (Ollama, LM Studio,
-                  vLLM, LiteLLM proxy, …); ccImp does not start the endpoint
-                  itself.
-                </small>
-                <label>
-                  <span>Endpoint URL</span>
-                  <input
-                    type="text"
-                    value={snapshot?.aider_local.base_url ?? ''}
-                    oninput={(e) =>
-                      patch(
-                        (s) =>
-                          (s.aider_local.base_url = (
-                            e.currentTarget as HTMLInputElement
-                          ).value),
-                      )}
-                    placeholder="http://localhost:11434/v1"
-                  />
-                  <small class="hint">
-                    Becomes <code>OPENAI_API_BASE</code> on launch. For Ollama,
-                    the default <code>:11434/v1</code> path serves the
-                    OpenAI-compatible API.
-                  </small>
-                </label>
-                <label>
-                  <span>Auth token</span>
-                  <div class="input-with-action">
-                    <input
-                      type={showAiderLocalToken ? 'text' : 'password'}
-                      value={snapshot?.aider_local.auth_token ?? ''}
-                      oninput={(e) =>
-                        patch(
-                          (s) =>
-                            (s.aider_local.auth_token = (
-                              e.currentTarget as HTMLInputElement
-                            ).value),
-                        )}
-                      placeholder="ollama"
-                    />
-                    <button
-                      type="button"
-                      class="secondary"
-                      onclick={() => (showAiderLocalToken = !showAiderLocalToken)}
-                    >
-                      {showAiderLocalToken ? 'Hide' : 'Show'}
-                    </button>
-                  </div>
-                  <small class="hint">
-                    Becomes <code>OPENAI_API_KEY</code>. Stored cleartext;
-                    local endpoints typically accept any non-empty value
-                    (Ollama defaults to the literal string <code>ollama</code>).
-                  </small>
-                </label>
-                <label>
-                  <span>Model</span>
-                  <input
-                    type="text"
-                    value={snapshot?.aider_local.model ?? ''}
-                    oninput={(e) =>
-                      patch(
-                        (s) =>
-                          (s.aider_local.model = (
-                            e.currentTarget as HTMLInputElement
-                          ).value),
-                      )}
-                    placeholder="qwen3:14b"
-                  />
-                  <small class="hint">
-                    When non-empty, passed as <code>--model &lt;model&gt;</code>
-                    on the aider spawn argv. Aider's own naming conventions
-                    apply (e.g. <code>openai/qwen3:14b</code> for some endpoints).
-                  </small>
-                </label>
-              </section>
             </div>
           {:else}
             <small class="hint top">
@@ -3231,8 +3107,21 @@
           <div class="button-row">
             <button type="button" onclick={addCommandPolicy}>Add command policy</button>
           </div>
+          {/if}
+        </section>
+      {:else if activeSection === 'mcp'}
+        <section>
+          <h2>MCP servers</h2>
+          <small class="hint top">
+            Model Context Protocol servers ccImp connects to and keeps warm. Each
+            server's read-class tools (web search, fetch, docs, …) can be exposed
+            to <strong>Claude Code</strong> directly and/or to the
+            <strong>offload worker</strong> — toggle per server below.
+            Write/destructive tools are filtered out. Exposing a server to Claude
+            Code works whether or not offload is enabled.
+          </small>
 
-          <h3>MCP server status</h3>
+          <h3>Server status</h3>
           <small class="hint top">
             Live health of the warm MCP host's connections. Updates as you add,
             remove, or enable/disable servers below — no restart needed.
@@ -3250,20 +3139,20 @@
           {:else if snapshot.offload.mcp_servers.length > 0}
             <small class="hint">
               {snapshot.offload.mcp_servers.length} server(s) configured —
-              health appears once offload is enabled and the warm pool is running.
+              health appears once the warm MCP host is running (it starts when
+              offload is enabled or any server is exposed to Claude Code).
             </small>
           {:else}
-            <small class="hint">No MCP tool servers configured yet.</small>
+            <small class="hint">No MCP servers configured yet.</small>
           {/if}
 
-          <h3>MCP tool servers</h3>
+          <h3>Tool servers</h3>
           <small class="hint top">
-            ccImp's warm MCP host aggregates the read-class tools from these
-            servers (web search, fetch, docs) and keeps the connections warm
-            across offloads. Add an HTTP MCP endpoint by name + URL; changes
-            apply live. Write/destructive tools are filtered out. Advanced stdio
-            servers (command/args/env) remain editable in
-            <code>settings.json</code> under <code>offload.mcp_servers</code>.
+            Add an HTTP MCP endpoint by name + URL; changes apply live. ccImp's
+            warm MCP host aggregates the read-class tools from these servers and
+            keeps the connections warm. Advanced stdio servers (command/args/env)
+            remain editable in <code>settings.json</code> under
+            <code>offload.mcp_servers</code>.
           </small>
           <!-- Keyed by index deliberately: name/url are editable and the
                snapshot is replaced (cloned) on every edit, so a name/url/object
@@ -3313,6 +3202,15 @@
                 />
                 <span>Offload</span>
               </label>
+              <label class="mcp-enable" title="Expose this server's tools to OpenCode">
+                <input
+                  type="checkbox"
+                  checked={srv.opencode_access}
+                  onchange={(e) =>
+                    setMcpAccess(i, 'opencode_access', (e.currentTarget as HTMLInputElement).checked)}
+                />
+                <span>OpenCode</span>
+              </label>
               <button type="button" class="secondary danger" onclick={() => removeMcpServer(i)}>
                 Remove
               </button>
@@ -3321,7 +3219,6 @@
           <div class="button-row">
             <button type="button" onclick={addMcpServer}>Add MCP server</button>
           </div>
-          {/if}
         </section>
       {:else if activeSection === 'graph'}
         <section>

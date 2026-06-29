@@ -212,8 +212,8 @@ fn build_tab_command(tab_id: TabId, settings: &Settings, launch_cwd: &Path, invo
     }
     
     // Invocation arguments (only for Claude in v2 — aider is its own command and v2 doesn't accept aider-specific
-    // invocation args; user-provided arguments to cctts go to claude. This keeps backward compatibility
-    // with v1's "cctts is a drop-in replacement for claude" promise.)
+    // invocation args; user-provided arguments to cimp go to claude. This keeps backward compatibility
+    // with v1's "cimp is a drop-in replacement for claude" promise.)
     if tab_id == TabId::Claude {
         for arg in invocation_args {
             cmd.arg(arg);
@@ -224,7 +224,7 @@ fn build_tab_command(tab_id: TabId, settings: &Settings, launch_cwd: &Path, invo
 }
 ```
 
-The `invocation_args` decision: cctts continues to accept CLI arguments and forward them to the Claude subprocess only, preserving v1's drop-in-replacement behavior. The aider tab gets only its persistent settings flags, no invocation passthrough. This keeps the user's expectation stable: `cctts --resume <id>` still resumes a Claude session, just like v1.
+The `invocation_args` decision: cimp continues to accept CLI arguments and forward them to the Claude subprocess only, preserving v1's drop-in-replacement behavior. The aider tab gets only its persistent settings flags, no invocation passthrough. This keeps the user's expectation stable: `cimp --resume <id>` still resumes a Claude session, just like v1.
 
 #### State Manager refactor
 
@@ -530,8 +530,8 @@ fn migrate_v1_to_v2(v1: V1Settings) -> Settings {
 ### PTY behavior
 
 7. **Both subprocesses spawned**: at app launch, check the OS process list. Verify both `claude` and `aider` are running.
-8. **Both in launch directory**: in each tab, verify the working directory matches where cctts was launched.
-9. **Aider not installed**: temporarily rename the `aider` binary (or set the path to something invalid). Launch cctts. Verify the Claude tab still works and the aider tab shows an error or empty terminal without crashing the app.
+8. **Both in launch directory**: in each tab, verify the working directory matches where cimp was launched.
+9. **Aider not installed**: temporarily rename the `aider` binary (or set the path to something invalid). Launch cimp. Verify the Claude tab still works and the aider tab shows an error or empty terminal without crashing the app.
 10. **Background output**: send a long-running command to the Claude tab, then switch to aider, wait for Claude to finish in the background, then switch back. Verify Claude's full output is visible (not truncated or lost).
 
 ### TTS handoff

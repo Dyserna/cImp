@@ -17,7 +17,7 @@
 //! - `tools` (Phase B/C) — native baseline tools (`read_file`,
 //!   `code_search`, `run_command`).
 //! - `mcp` (Phase B) — the stdio JSON-RPC MCP server toward Claude
-//!   (`ccimp --offload-mcp`).
+//!   (`cimp --offload-mcp`).
 //! - `mcp_host` (Phase C) — the MCP client aggregating the user's tool
 //!   servers.
 //!

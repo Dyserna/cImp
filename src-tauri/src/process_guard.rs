@@ -1,9 +1,9 @@
-//! Windows Job Object backstop for ccImp-spawned child processes.
+//! Windows Job Object backstop for cImp-spawned child processes.
 //!
 //! Every offload child (`llama-server`, the warm MCP-host servers, and
 //! `run_command` subprocesses) is spawned with `kill_on_drop(true)`, and the
 //! graceful `CloseRequested` path explicitly kills them. Both of those only
-//! fire when ccImp exits *cleanly* — i.e. when Rust destructors run. They do
+//! fire when cImp exits *cleanly* — i.e. when Rust destructors run. They do
 //! **nothing** when the process dies hard:
 //!
 //! * `panic = "abort"` (the release profile) terminates instantly, no Drop;
@@ -14,8 +14,8 @@
 //! holding VRAM across dev cycles. A Job Object closes the gap at the OS
 //! level: a job created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` terminates
 //! every process assigned to it the instant the *last* handle to the job
-//! closes. ccImp holds that handle for its whole lifetime (we deliberately
-//! never close it), so when ccImp dies for ANY reason the kernel reaps the
+//! closes. cImp holds that handle for its whole lifetime (we deliberately
+//! never close it), so when cImp dies for ANY reason the kernel reaps the
 //! whole group. This is the mechanism Chrome / VS Code use, and the only
 //! backstop that survives a hard kill.
 //!
@@ -25,11 +25,11 @@
 use tokio::process::Child;
 
 /// Assign a freshly spawned child to the process-lifetime kill-on-close job so
-/// the OS reaps it even if ccImp dies hard. Best-effort and idempotent-safe:
+/// the OS reaps it even if cImp dies hard. Best-effort and idempotent-safe:
 /// any failure is logged and the child simply falls back to `kill_on_drop`.
 /// No-op on non-Windows.
 ///
-/// There is a microsecond race between `spawn()` and this call: if ccImp died
+/// There is a microsecond race between `spawn()` and this call: if cImp died
 /// in that exact window the child would still leak. That window is irrelevant
 /// for the motivating cases (crashes/hot-reloads happen long after spawn); a
 /// `CREATE_SUSPENDED`-then-assign-then-resume sequence would close it fully if
@@ -119,7 +119,7 @@ mod imp {
         // SAFETY: `raw` is a live process handle from a just-spawned child;
         // `job` is our process-wide job handle. Adding an already-assigned
         // process is harmless. Windows 8+ permits nested jobs, so this works
-        // even if a dev runner/terminal already placed ccImp in a job.
+        // even if a dev runner/terminal already placed cImp in a job.
         let ok = unsafe { AssignProcessToJobObject(job, raw as HANDLE) };
         if ok == 0 {
             warn!("process_guard: AssignProcessToJobObject failed; child relies on kill_on_drop");

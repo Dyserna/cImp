@@ -41,7 +41,7 @@ pub enum AppError {
 
     /// V8-01: the offload `llama-server` is not running / not yet healthy
     /// when an operation needed it. Surfaced to Claude as a clear "enable
-    /// or start offload in ccImp" message rather than a hang.
+    /// or start offload in cImp" message rather than a hang.
     #[error("offload server not ready: {0}")]
     OffloadNotReady(String),
 

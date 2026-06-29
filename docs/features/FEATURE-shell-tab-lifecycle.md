@@ -113,7 +113,7 @@ Idempotent and additive. Bump settings version, follow v1.2/v1.3 backup pattern.
   - `ExitEntry { tab_id, tab_name_at_exit, command, exit_code, timestamp, retry_count_at_this_exit }`.
   - Default capacity 100.
 - Append on every subprocess exit (whether user-initiated, crash, or auto-restart-triggered).
-- Persistence: in-memory only by default. Optional follow-on: persist to a sidecar file (`<config_dir>/ccImp/shell_exits.jsonl`) so history survives restarts. Defer the persistence; in-memory is enough to debug "why does my shell keep dying" within a single session.
+- Persistence: in-memory only by default. Optional follow-on: persist to a sidecar file (`<config_dir>/cImp/shell_exits.jsonl`) so history survives restarts. Defer the persistence; in-memory is enough to debug "why does my shell keep dying" within a single session.
 - Frontend: new "Subprocess Log" sub-section in Settings General tab. Read via a new Tauri command `get_shell_exit_history()`. Render as a simple table with columns Timestamp, Tab, Command, Exit Code, Retry Count.
 - "Clear history" button. No filters in the initial ship.
 

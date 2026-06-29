@@ -2,7 +2,7 @@
 //!
 //! An on-disk graph of a project's code (files, symbols, references, calls,
 //! imports) and its documentation (markdown + doc-comments), built and
-//! maintained inside the ccImp binary and stored at
+//! maintained inside the cImp binary and stored at
 //! `<project>/<db_subdir>/graph.db`. It is queried by two consumers through
 //! the surfaces V8 already established: the cloud Opus session (MCP tools on
 //! the `--offload-mcp` server) and the local offload worker (native tools).

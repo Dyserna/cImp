@@ -32,18 +32,22 @@ Thumbs.db
 **/.claude/settings.local.json
 **/.claude/scheduled_tasks.lock
 
-# CCIMP local custom config (per-machine layout / session / avatar /
+# CIMP local custom config (per-machine layout / session / avatar /
 # TTS state; the app writes these alongside the regular config).
+**/.cimp.custom.config.json
+# Stale pre-rebrand local custom configs (old `ccimp`/`cctts` names); never commit.
 **/.ccimp.custom.config.json
-# Stale pre-rebrand local custom config (old `cctts` name); never commit.
 **/.cctts.custom.config.json
 # Schema-migration backups: when the backend bumps schema_version, the
 # previous file is renamed with a `.vN.M.bak` suffix (sometimes with a
 # trailing timestamp, e.g. `.bak.1778262818`).
-**/.ccimp.custom.config.json.*.bak*
+**/.cimp.custom.config.json.*.bak*
 # Per-project code knowledge graph (V9-01) — the CozoDB/SQLite store the app
 # builds at runtime under each project's db subdir. Never commit.
+**/.cimp/
+# Stale pre-rebrand graph dirs (old `ccimp`/`cctts` names); never commit.
 **/.ccimp/
+**/.cctts/
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
@@ -58,7 +62,7 @@ Thumbs.db
 staging/
 download/
 release-notes.md
-ccimp-portable-*.zip
+cimp-portable-*.zip
 
 # Local build/run logs (transient, e.g. tauri-dev.log, release-build.log)
 /*.log

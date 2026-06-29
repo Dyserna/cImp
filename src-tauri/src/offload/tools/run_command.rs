@@ -217,7 +217,7 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         .spawn()
         .map_err(|e| format!("failed to spawn `{}`: {e}", args.command))?;
     // Backstop: reap this command subprocess via the kill-on-job-close job if
-    // ccImp dies hard before kill_on_drop can fire.
+    // cImp dies hard before kill_on_drop can fire.
     crate::process_guard::guard_child(&child);
 
     // Read stdout/stderr concurrently with waiting, each capped so a command

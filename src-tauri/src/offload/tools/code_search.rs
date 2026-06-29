@@ -1,7 +1,7 @@
 //! Native `code_search` tool — case-insensitive literal/substring search
 //! across an `allowed_root`, returning `path:line: snippet` hits. This is
 //! the deep-search case that motivated the milestone: the local model
-//! greps the tree and ccImp returns only the hits, so Opus never sees the
+//! greps the tree and cImp returns only the hits, so Opus never sees the
 //! raw bytes.
 //!
 //! Dependency-free (no `regex`/`ripgrep`): a bounded manual walk with

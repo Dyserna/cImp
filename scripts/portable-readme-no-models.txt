@@ -1,14 +1,14 @@
-ccImp portable (Windows x64) — no-models update zip
+cImp portable (Windows x64) — no-models update zip
 =====================================================
 
-This zip is the same self-contained build of ccImp as the full portable
+This zip is the same self-contained build of cImp as the full portable
 zip, with one difference: it does NOT contain the Kokoro TTS model file
 or the default voicepack. Use this zip when you already have a working
-ccImp install and just want to update the executable.
+cImp install and just want to update the executable.
 
 Compared to the full zip:
 
-  bin\ccimp.exe                      <- updated
+  bin\cimp.exe                      <- updated
   bin\onnxruntime*.dll               <- updated (matched to the new exe)
   LICENSE / NOTICE / README.txt      <- updated
   ebin\broot.exe / rustnet.exe       <- updated (bundled CLI tools; see the
@@ -17,7 +17,7 @@ Compared to the full zip:
                                         capture traffic.
   avatars\ / sprites\                <- NOT INCLUDED (the canonical avatar
                                         videos and sprite sets are embedded
-                                        in ccimp.exe, so the app still shows
+                                        in cimp.exe, so the app still shows
                                         them; the on-disk copies are only for
                                         customization and are left out of this
                                         update zip. The full zip ships them.)
@@ -30,16 +30,16 @@ Compared to the full zip:
 How to use (updating an existing install)
 ------------------------------------------
 
-  1. Close any running ccImp windows.
-  2. Unzip OVER your existing ccImp folder (the one that contains the
+  1. Close any running cImp windows.
+  2. Unzip OVER your existing cImp folder (the one that contains the
      `bin\` and `models\` directories from a previous full release).
      Windows will overwrite the exe + DLLs and leave your `models\`
      folder untouched.
-  3. Launch ccImp as usual.
+  3. Launch cImp as usual.
 
-Your settings file (settings.json next to ccimp.exe), your edited
+Your settings file (settings.json next to cimp.exe), your edited
 prompt-detection patterns (bin\patterns.json), and any per-folder
-overlay files (.ccimp.custom.config.json) are not affected — the zip
+overlay files (.cimp.custom.config.json) are not affected — the zip
 never touches them.
 
 
@@ -48,7 +48,7 @@ Don't have an existing install?
 
 You probably want the full zip instead:
 
-  ccimp-portable-win-x64-<version>.zip
+  cimp-portable-win-x64-<version>.zip
 
 …which bundles the model + default voice. If you'd rather keep this
 no-models zip and supply the model files yourself, drop them at:
@@ -70,4 +70,4 @@ discovery, GPU acceleration, uninstall, and troubleshooting — see the
 full README that ships with the standard portable zip, or the project
 docs:
 
-  https://github.com/Dyserna/ccImp
+  https://github.com/Dyserna/cImp

@@ -28,12 +28,12 @@ use super::Backend;
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 
-/// Connection facts ccImp needs from the user's `server_command`.
+/// Connection facts cImp needs from the user's `server_command`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerCommand {
     /// The `llama-server` executable (first shlex token).
     pub program: String,
-    /// All arguments after the program, verbatim — ccImp spawns these
+    /// All arguments after the program, verbatim — cImp spawns these
     /// unchanged.
     pub args: Vec<String>,
     /// Host to connect to. `0.0.0.0`/`::` (bind-all) are normalized to
@@ -45,7 +45,7 @@ pub struct ServerCommand {
     /// window divides across these.
     pub parallel: u32,
     /// Whether `--jinja` is present. Tool-calling silently won't work
-    /// without it — ccImp warns rather than failing obscurely.
+    /// without it — cImp warns rather than failing obscurely.
     pub has_jinja: bool,
 }
 
@@ -79,7 +79,7 @@ fn normalize_host(host: &str) -> String {
 impl ServerCommand {
     /// Parse a `server_command` string. Errors only when the command is
     /// empty or has unbalanced quotes; unrecognized flags are ignored
-    /// (ccImp doesn't presume to know llama.cpp's full flag set).
+    /// (cImp doesn't presume to know llama.cpp's full flag set).
     pub fn parse(command: &str) -> AppResult<ServerCommand> {
         let tokens = shlex::split(command)
             .ok_or_else(|| AppError::Offload("server_command has unbalanced quotes".into()))?;

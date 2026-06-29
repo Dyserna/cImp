@@ -1,6 +1,6 @@
 //! V8-03 MCP host — the warm client pool toward the user's tool servers.
 //!
-//! Completes V8-01's never-built Phase C: an MCP **client** (ccImp is the
+//! Completes V8-01's never-built Phase C: an MCP **client** (cImp is the
 //! host) that keeps long-lived connections to each configured tool server
 //! (`duckduckgo`, `fetch`, `context7`, `git`, `filesystem`, …) so the
 //! offload worker can reach real tools without paying an `npx`/`uvx`
@@ -36,7 +36,7 @@ use crate::settings::McpServerConfig;
 use super::openai::ToolDef;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
-const CLIENT_NAME: &str = "ccimp-offload-host";
+const CLIENT_NAME: &str = "cimp-offload-host";
 /// Per-request timeout for an MCP server call (initialize / tools/list /
 /// tools/call). A server that doesn't answer in this window is treated as
 /// hung — the call fails and the loop moves on rather than blocking.
@@ -796,7 +796,7 @@ async fn connect_stdio(
         .spawn()
         .map_err(|e| format!("spawn `{}`: {e}", cfg.command))?;
     // Backstop: reap this warm MCP-host server via the kill-on-job-close job
-    // if ccImp dies hard (kill_on_drop only covers a clean exit).
+    // if cImp dies hard (kill_on_drop only covers a clean exit).
     crate::process_guard::guard_child(&child);
 
     let stdin = child.stdin.take().ok_or("child has no stdin")?;

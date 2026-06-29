@@ -1,10 +1,10 @@
-# Design Document: ccImp
+# Design Document: cImp
 
 ## Purpose of This Document
 
-This document captures the current architecture and design decisions of ccImp. It is the authoritative reference for implementation. When a milestone specification is unclear or a design choice is not covered, this document is the fallback.
+This document captures the current architecture and design decisions of cImp. It is the authoritative reference for implementation. When a milestone specification is unclear or a design choice is not covered, this document is the fallback.
 
-Where granular history matters (which decision changed when, what a particular milestone introduced), see the per-milestone `MILESTONE-V[N]-[N].md` files. Where deferred work is tracked, see `FUTURE-FEATURES.md`. This doc describes how ccImp is, not how it evolved.
+Where granular history matters (which decision changed when, what a particular milestone introduced), see the per-milestone `MILESTONE-V[N]-[N].md` files. Where deferred work is tracked, see `FUTURE-FEATURES.md`. This doc describes how cImp is, not how it evolved.
 
 The audience is Claude Code working on implementation across sessions, plus any human reviewer.
 
@@ -132,7 +132,7 @@ The shape: PTY bytes per tab flow through a per-tab processing layer that fans t
 
 ### PTY Manager and Tab Registry
 
-The Rust backend owns one PTY per tab. The `TabRegistry` (`src-tauri/src/tabs/`) holds the live set of tabs and per-tab PTY managers; it eagerly spawns every persisted tab's subprocess at app launch, so the user never sees a startup delay when switching tabs. Each subprocess is spawned with the configured command, args, working directory (defaulting to ccImp's launch directory), and environment.
+The Rust backend owns one PTY per tab. The `TabRegistry` (`src-tauri/src/tabs/`) holds the live set of tabs and per-tab PTY managers; it eagerly spawns every persisted tab's subprocess at app launch, so the user never sees a startup delay when switching tabs. Each subprocess is spawned with the configured command, args, working directory (defaulting to cImp's launch directory), and environment.
 
 Per-tab responsibilities:
 
@@ -143,7 +143,7 @@ Per-tab responsibilities:
 - Handle PTY resize when the terminal area changes size
 - Detect subprocess exit and route to the state manager (Error for AI-tool tabs, Closed sub-state for Shell tabs — see below)
 
-The wrapper acts as a drop-in replacement for `claude` for the Claude tab specifically: any CLI arguments passed to `ccimp` are captured at startup (`std::env::args().skip(1)`) and forwarded to the spawned `claude`. CLI args from settings (per-tab `args`) are applied first, then invocation args from the ccImp command line, so persistent flags and one-shot flags compose.
+The wrapper acts as a drop-in replacement for `claude` for the Claude tab specifically: any CLI arguments passed to `cimp` are captured at startup (`std::env::args().skip(1)`) and forwarded to the spawned `claude`. CLI args from settings (per-tab `args`) are applied first, then invocation args from the cImp command line, so persistent flags and one-shot flags compose.
 
 Implementation:
 
@@ -545,9 +545,9 @@ Behavior is straightforward bindings: mute toggles `tts.mute`, announcements tog
 Two JSON files participate, both under `src-tauri/src/settings/`:
 
 - **Global baseline** — `<exe-dir>/settings.json`. Portable; written once on first launch when missing and rewritten only on migration / integrity repair. Hand-edit to change defaults.
-- **Per-folder custom overlay** — `<launch_cwd>/.ccimp.custom.config.json`. Partial JSON object containing only the keys that differ from the global baseline. Created automatically the first time the user customizes anything from a given working directory, deleted automatically when the diff is empty. Layered on top of global at load via deep-merge.
+- **Per-folder custom overlay** — `<launch_cwd>/.cimp.custom.config.json`. Partial JSON object containing only the keys that differ from the global baseline. Created automatically the first time the user customizes anything from a given working directory, deleted automatically when the diff is empty. Layered on top of global at load via deep-merge.
 
-This replaces an earlier design that wrote a single file under `dirs::config_dir().join("ccImp")`. The portable + overlay model lets the user (a) carry the binary as a self-contained portable directory, and (b) keep per-project customizations alongside the project rather than in OS-global config.
+This replaces an earlier design that wrote a single file under `dirs::config_dir().join("cImp")`. The portable + overlay model lets the user (a) carry the binary as a self-contained portable directory, and (b) keep per-project customizations alongside the project rather than in OS-global config.
 
 `load(default_shell, launch_cwd)`:
 
@@ -595,26 +595,26 @@ The frontend's `validateAndRepairLayout` runs after this on hydration and handle
 
 ### Offload: local task delegation (V8-01) + backend pool (V8-02) + warm pool & MCP host (V8-03)
 
-Offload lets the main cloud Claude (Opus) session hand a self-contained, token-heavy subtask to a **subordinate local/remote model** and receive only the synthesized result — Opus stays in charge, but the intermediate search/read/summarize tokens never enter its window. It is exposed to Claude as a single `offload_task` MCP tool, injected session-scoped into ccImp-launched Claude tabs via `--mcp-config` (never writing `~/.claude`).
+Offload lets the main cloud Claude (Opus) session hand a self-contained, token-heavy subtask to a **subordinate local/remote model** and receive only the synthesized result — Opus stays in charge, but the intermediate search/read/summarize tokens never enter its window. It is exposed to Claude as a single `offload_task` MCP tool, injected session-scoped into cImp-launched Claude tabs via `--mcp-config` (never writing `~/.claude`).
 
-ccImp bridges two MCP roles: toward Claude it is an MCP **server** (the hidden `ccimp --offload-mcp` subcommand); toward any user tool servers it is an MCP **host/client**. The `llama-server` itself never speaks MCP — ccImp runs the agent loop (`offload/agent.rs`), translating between the model's OpenAI-style `tool_calls` and each tool's executor.
+cImp bridges two MCP roles: toward Claude it is an MCP **server** (the hidden `cimp --offload-mcp` subcommand); toward any user tool servers it is an MCP **host/client**. The `llama-server` itself never speaks MCP — cImp runs the agent loop (`offload/agent.rs`), translating between the model's OpenAI-style `tool_calls` and each tool's executor.
 
-**Where the loop lives (V8-03).** The agent loop, the backend pool, the router, and the MCP host all run in the **long-lived ccImp app** (`offload/service.rs::OffloadService`), not in the per-session child. Only the app sees every in-flight offload across all Claude tabs, so it owns a **global concurrency gate** and feeds the router honest `in_flight` (which is why V8-02's spill/fail-over finally works), keeps **warm** MCP-host connections across calls, and renders the capability description from **live** health. The `--offload-mcp` child shrinks to a **proxy with a self-contained fallback**: when the app is up it forwards to an authenticated loopback endpoint; when the app is down (headless cron, mid-restart) it runs the V8-02 path itself (native-only, no warm host). Both paths share the pure router and the agent loop, so they can't drift.
+**Where the loop lives (V8-03).** The agent loop, the backend pool, the router, and the MCP host all run in the **long-lived cImp app** (`offload/service.rs::OffloadService`), not in the per-session child. Only the app sees every in-flight offload across all Claude tabs, so it owns a **global concurrency gate** and feeds the router honest `in_flight` (which is why V8-02's spill/fail-over finally works), keeps **warm** MCP-host connections across calls, and renders the capability description from **live** health. The `--offload-mcp` child shrinks to a **proxy with a self-contained fallback**: when the app is up it forwards to an authenticated loopback endpoint; when the app is down (headless cron, mid-restart) it runs the V8-02 path itself (native-only, no warm host). Both paths share the pure router and the agent loop, so they can't drift.
 
 ```
-  Claude tab (Opus) ──offload_task──▶ ccimp --offload-mcp  (thin proxy per session)
+  Claude tab (Opus) ──offload_task──▶ cimp --offload-mcp  (thin proxy per session)
                                          │  POST /run · GET /describe · GET /events
                                          │  (127.0.0.1, ephemeral port + bearer token,
                                          │   discovery file next to the exe)
                                          ▼
-                          ccImp app · OffloadService
+                          cImp app · OffloadService
                             ├─ global concurrency gate (all tabs)
                             ├─ router::select(task, LIVE in_flight) ─▶ ONE backend
                             ├─ MCP host (warm): ddg/fetch/context7/git/filesystem
                             │     namespaced, read-class only, fs confined
                             └─ agent loop, scoped to the chosen backend
         ┌──────────────── backend pool ────────────────┐
-        │  Local  (ccImp owns the llama-server process) │
+        │  Local  (cImp owns the llama-server process) │
         │  Remote LAN  (health-checked URL, no process) │
         │  Remote Cloud (URL + auth + consent)          │
         └───────────────────────────────────────────────┘
@@ -629,8 +629,8 @@ Key types (all behind the `Backend` seam so the pool is additive over V8-01's si
 - **`offload/service.rs::OffloadService`** — app-owned home of the loop + pool + router + global gate + MCP host. Resolves the pool from **live** state (the supervisor's running `LlamaServer` handles for honest `in_flight`/`n_ctx`, plus cached warm `RemoteBackend` handles), routes, and runs the loop with a host-aware scoped router. Exposes `run`/`describe`/`status` and a change channel for `/events`.
 - **`offload/loopback.rs::Loopback`** — the authenticated localhost endpoint (`POST /run`, `GET /describe`, `GET /events`) bound to `127.0.0.1:0`, gated by a per-launch bearer token advertised in a `{port, token, pid}` discovery file under the portable root (removed on exit). Loopback-only + token auth is the security boundary; the residual local-trust assumption is documented in `MAINTENANCE.md`.
 - **`offload/mcp_host.rs::McpHost`** — the warm MCP **client** pool: per server it runs `initialize`+`tools/list`, **namespaces** tools (`ddg__search`), drops write/destructive tools (**read-class only**), confines a `filesystem` server to the allowed roots, multiplexes stdio JSON-RPC by id, tracks per-server health, and pulses a change event when a server connects/drops. Tools merge into the chat `tools` array (then filtered by the backend's `ToolScope`).
-- **`offload/server.rs::LlamaServer`** — the Local backend: ccImp owns the process (Start/Stop/Reset, autostart), parses the command for host/port/`-np`/`--jinja`, and discovers `n_ctx` from `/props`.
-- **`offload/remote.rs::RemoteBackend`** — a Remote backend (LAN or cloud): a `base_url` (+ optional auth) ccImp only health-checks and connects to; `n_ctx` from `/props` or a configured `declared_context`. No process, no tab.
+- **`offload/server.rs::LlamaServer`** — the Local backend: cImp owns the process (Start/Stop/Reset, autostart), parses the command for host/port/`-np`/`--jinja`, and discovers `n_ctx` from `/props`.
+- **`offload/remote.rs::RemoteBackend`** — a Remote backend (LAN or cloud): a `base_url` (+ optional auth) cImp only health-checks and connects to; `n_ctx` from `/props` or a configured `declared_context`. No process, no tab.
 - **`offload/router.rs::select`** — the per-task router: a pure function over `BackendView` snapshots that filters by **tool need** (the privacy hard filter — a local-data task never reaches a cloud backend), then **required context**, then **tier/complexity** and Claude's `tier` hint, then **availability** (spill on busy, fail over on down). One enabled backend → no-op.
 - **Per-backend `ToolScope`** — the allow-list over the global tool pool. Local/LAN default to all tools; **cloud defaults to web/docs only**, denying `read_file`/`code_search`/`run_command`/`filesystem`/`git`. Enforced twice: the router won't route a local-data task to cloud, and the agent loop filters the `tools` array *and* refuses a disallowed call.
 - **`offload/supervisor.rs::OffloadSupervisor`** — app-owned lifecycle for the Local backends (keyed by name) plus health-probe of Remote backends for the Settings status rows.
@@ -641,7 +641,7 @@ Cloud backends are gated behind an explicit data-egress consent toggle and badge
 
 ## Settings Schema
 
-The on-disk JSON shape, current as of v1.9. The example below shows the fully-resolved global file; the per-folder overlay (`.ccimp.custom.config.json`) is a partial subset of the same shape.
+The on-disk JSON shape, current as of v1.9. The example below shows the fully-resolved global file; the per-folder overlay (`.cimp.custom.config.json`) is a partial subset of the same shape.
 
 ```json
 {
@@ -813,7 +813,7 @@ The on-disk JSON shape, current as of v1.9. The example below shows the fully-re
 Notes:
 
 - Every Rust struct uses `#[serde(default)]` so a settings file written by a future or past version still loads — missing fields get defaults, unknown fields are ignored.
-- `tts_injection.enabled` controls whether ccImp injects system-prompt content for an AI tab via `--append-system-prompt`. On by default for both AI builtins (subscription Claude and Claude (local)); local models vary in how reliably they honor the markup convention, so the local-tab version is best-effort.
+- `tts_injection.enabled` controls whether cImp injects system-prompt content for an AI tab via `--append-system-prompt`. On by default for both AI builtins (subscription Claude and Claude (local)); local models vary in how reliably they honor the markup convention, so the local-tab version is best-effort.
 - `use_local_provider` (V1.4-07) gates env synthesis from the global `claude_local` settings group. When `true`, the launch-time spawn merges `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL` if the alias is non-empty) into the process env, with per-tab `env` entries always winning over synthesized values.
 - `claude_tabs_enabled` (V1.9) drives the integrity-check reconciliation of the AI builtins: `Cloud` keeps only `claude`, `Local` keeps only `claude-local`, `Both` keeps both. Default is `Cloud`. Changing the value at runtime closes / re-opens the affected tabs (kills the PTY and drops scrollback when removing; re-creates with defaults when adding).
 - AI builtins (`claude`, `claude-local`) cannot be deleted by hand-edits — the integrity check restores them at canonical positions when `claude_tabs_enabled` says they should exist, and corrects `use_local_provider` if a hand-edit flipped it. The `shell-default-1` id is *not* a builtin: it ships as the first shell tab on a fresh install but is fully closable, and the integrity check does not re-seed it. User-created Shell tab ids are uuid-based and never collide with reserved ids.
@@ -824,7 +824,7 @@ Notes:
 - `terminal.background` (V1.4-02) has independent `image` and `color` fields plus opacity/blur/size/position controls that apply only when an image is set. The four-cell rendering matrix (image × color, each Some/None) drives a discriminated `RenderingMode` — `'none'` and `'color'` use xterm.js's canvas renderer (fast); `'image'` uses the in-core DOM renderer with `allowTransparency: true` and CSS layering on the host. Toggling between fast and image categories triggers a debounced Terminal recreate; same-category changes (color tweak, slider drag) apply in place. Per-tab `background_override` is three-state: `null` inherits the global, `"disabled"` opts out (theme bg only), an object replaces the global wholesale. The Configure Tab dialog (shell tabs) and the per-AI-tab Settings section both surface the override row, both reusing the shared `BackgroundConfigEditor` component. `terminal.background.presets` (V1.4-04 B) holds named global presets the user can apply from the Background editor; `preview_category_flips` (V1.4-04 C.4) gates whether per-tab Configure dialog edits that would flip renderer category preview live or are deferred to Save. See `MILESTONE-V1.4-02-terminal-background.md` and `MILESTONE-V1.4-03-terminal-background.md`.
 - `terminal.scrollback` (V1.4-04 D) configures the per-tab cross-restart scrollback ring buffer. `ring_bytes` caps in-memory size (default 256 KB); `persist` flushes on graceful exit; `restore_on_launch` replays on next `pty_start`.
 
-- **PTY rebind protocol (V1.4-03).** xterm.js's renderer is decided at `Terminal` construction (`allowTransparency` and the canvas vs. DOM split are constructor-only), so toggling the image background requires destroying the xterm Terminal and constructing a new one. To preserve the shell session across this destroy/create cycle, ccImp uses `pty_rebind_channel` — the PTY and its child stay alive; only the IPC `Channel<String>` is swapped. Implementation: a per-PTY `mpsc::Sender<ProcessorControl>` (capacity 4) lets the manager push `ChannelChange(new_channel)` to the processor task's select loop, where the existing `mpsc::Receiver::recv` cancel-safety guarantee keeps byte ordering intact. `@xterm/addon-serialize` captures a snapshot of the visible scrollback before destroy and replays it into the new xterm via `term.write` *before* `pty_rebind_channel` resolves; xterm's FIFO write queue ensures the snapshot lands ahead of any live byte arriving after the rebind. The new `Terminal` is constructed with the previous instance's `rows`/`cols` so replayed cursor positions align with the new grid.
+- **PTY rebind protocol (V1.4-03).** xterm.js's renderer is decided at `Terminal` construction (`allowTransparency` and the canvas vs. DOM split are constructor-only), so toggling the image background requires destroying the xterm Terminal and constructing a new one. To preserve the shell session across this destroy/create cycle, cImp uses `pty_rebind_channel` — the PTY and its child stay alive; only the IPC `Channel<String>` is swapped. Implementation: a per-PTY `mpsc::Sender<ProcessorControl>` (capacity 4) lets the manager push `ChannelChange(new_channel)` to the processor task's select loop, where the existing `mpsc::Receiver::recv` cancel-safety guarantee keeps byte ordering intact. `@xterm/addon-serialize` captures a snapshot of the visible scrollback before destroy and replays it into the new xterm via `term.write` *before* `pty_rebind_channel` resolves; xterm's FIFO write queue ensures the snapshot lands ahead of any live byte arriving after the rebind. The new `Terminal` is constructed with the previous instance's `rows`/`cols` so replayed cursor positions align with the new grid.
 
 - **Cross-restart scrollback (V1.4-04 D).** Every PTY's output is mirrored into a per-tab ring buffer capped at `terminal.scrollback.ring_bytes` (default 256 KB ≈ 600 lines of dense ANSI). On graceful exit (`tauri::RunEvent::ExitRequested`) each tab's buffer is flushed to disk under the app data dir, keyed by sanitized tab id; on next `pty_start` the file is read back and replayed into the new xterm before any live PTY bytes. Settings: `persist` and `restore_on_launch` (both default `true`) gate the disk write and read-back independently. Orphan files (tabs that no longer exist) are pruned at startup against the registry's known ids.
 
@@ -873,7 +873,7 @@ If a complete response contains no TTS tags, the wrapper does not speak any of i
 
 ### Local-LLM TTS reliability
 
-The Claude (local) tab passes the same TTS injection instructions as the subscription Claude tab (Claude Code is identical between the two — only the auth/endpoint env differs). Whether `[[TTS]]…[[/TTS]]` markup actually appears in output depends on the model behind the local proxy. Smaller models (e.g., 7-13B class) often don't follow the markup convention reliably even when instructed; larger models (32B+ or proprietary class) tend to be more compliant. ccImp treats missing markup the same way it treats any non-markup output — silently. This is fallback behavior, not an error.
+The Claude (local) tab passes the same TTS injection instructions as the subscription Claude tab (Claude Code is identical between the two — only the auth/endpoint env differs). Whether `[[TTS]]…[[/TTS]]` markup actually appears in output depends on the model behind the local proxy. Smaller models (e.g., 7-13B class) often don't follow the markup convention reliably even when instructed; larger models (32B+ or proprietary class) tend to be more compliant. cImp treats missing markup the same way it treats any non-markup output — silently. This is fallback behavior, not an error.
 
 ---
 
@@ -892,9 +892,9 @@ The full set is in the settings schema above. Behavior of `switch_to_tab_N` is b
 Settings paths on every platform:
 
 - Global baseline: `<exe-dir>/settings.json`
-- Per-folder overlay: `<launch_cwd>/.ccimp.custom.config.json`
+- Per-folder overlay: `<launch_cwd>/.cimp.custom.config.json`
 
-These replace the OS-config-dir paths used in earlier versions. The portable design means ccImp can be packaged as a self-contained directory, and per-project tweaks live alongside the project rather than in OS-global config.
+These replace the OS-config-dir paths used in earlier versions. The portable design means cImp can be packaged as a self-contained directory, and per-project tweaks live alongside the project rather than in OS-global config.
 
 ### Windows
 

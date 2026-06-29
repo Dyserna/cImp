@@ -9,7 +9,7 @@ This file scopes the work to move secrets out of the plaintext settings JSON and
 `claude_local.auth_token` lives in:
 
 - `<exe-dir>/settings.json` (portable global baseline)
-- `<launch_cwd>/.ccimp.custom.config.json` (per-folder overlay)
+- `<launch_cwd>/.cimp.custom.config.json` (per-folder overlay)
 
 Per-tab `env` entries (`AiToolTabConfig.env`, `ShellTabConfig.env`) can also carry credentials — anything the user typed into the *Environment* table in **Configure tab → Environment**. Those values may include real `ANTHROPIC_API_KEY`, OAuth bearer tokens, AWS keys, Slack webhooks, etc.
 
@@ -69,7 +69,7 @@ Default-off keyring integration shipped in v1, opt-in via a Settings toggle, def
 
 For v1: **Option C** with the existing Slice 1 redaction + Unix-mode hardening. The cost of A is real (Linux dep tree, fallback policy, schema migration with redacted-field backup) and the benefit is small for the dummy-token happy path the docs describe.
 
-For v1.x: revisit if anyone reports a leaked-token incident or if ccImp grows a feature where the local-LLM tab routes through a paid third-party proxy that requires a real key (in which case Option A becomes table stakes).
+For v1.x: revisit if anyone reports a leaked-token incident or if cImp grows a feature where the local-LLM tab routes through a paid third-party proxy that requires a real key (in which case Option A becomes table stakes).
 
 ## Decision needed before merging
 

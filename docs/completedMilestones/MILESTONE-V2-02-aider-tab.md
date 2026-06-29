@@ -230,7 +230,7 @@ listen(`tab-error-${tabId}`, (event) => {
     term.clear();
     term.writeln('\x1b[31m' + message + '\x1b[0m');  // red error text
     term.writeln('');
-    term.writeln('Press the Retry button below or restart cctts after fixing the issue.');
+    term.writeln('Press the Retry button below or restart cimp after fixing the issue.');
     showRetryButton.set(true);  // trigger UI to render retry button
 });
 ```
@@ -276,7 +276,7 @@ fn format_aider_error(e: &AppError) -> String {
 Different error categories may warrant different hints:
 
 - "command not found": "Aider does not appear to be installed."
-- Permission errors: "cctts could not execute aider — check file permissions."
+- Permission errors: "cimp could not execute aider — check file permissions."
 - Other: generic "Failed to start aider:" with the raw error
 
 For v2, just one general format with the error included is fine. Refine later if specific errors come up frequently.
@@ -320,7 +320,7 @@ When the user activates the aider tab and `first_launch_notice_dismissed` is fal
     </p>
     <p>
       Spoken TTS output is limited in this tab because aider does not yet support
-      system prompt injection via CLI. When that feature lands upstream, cctts will
+      system prompt injection via CLI. When that feature lands upstream, cimp will
       automatically use it. See FUTURE-FEATURES.md for details.
     </p>
     <button on:click={dismiss}>Got it</button>
@@ -357,7 +357,7 @@ The README content should match the FUTURE-FEATURES.md framing — be honest abo
 
 ### Aider error handling
 
-9. **Aider not installed**: rename or remove the `aider` binary so it's not on PATH. Launch cctts. Verify the Claude tab works normally and the aider tab shows the error message with installation hint and Retry button.
+9. **Aider not installed**: rename or remove the `aider` binary so it's not on PATH. Launch cimp. Verify the Claude tab works normally and the aider tab shows the error message with installation hint and Retry button.
 10. **Retry**: install aider (or restore the binary). Click Retry on the aider tab. Verify aider starts normally and the error message is replaced by aider's startup output.
 11. **Mid-session exit**: while aider is running, kill its process via task manager / `kill`. Verify the aider tab transitions to Error state, terminal shows an exit message, Retry button appears. Click Retry. Verify aider restarts.
 12. **Claude tab unaffected**: throughout aider failures, verify the Claude tab continues to work without disruption.

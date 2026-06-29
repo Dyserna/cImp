@@ -29,7 +29,7 @@ pub(crate) fn spawn_stt_worker(
     state: Arc<RwLock<SttState>>,
 ) {
     std::thread::Builder::new()
-        .name("ccimp-stt-worker".into())
+        .name("cimp-stt-worker".into())
         .spawn(move || {
             // NOTE: the whisper/ggml logging hooks are installed lazily in
             // `load_engine` (right before the first engine creation), NOT here.

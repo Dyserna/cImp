@@ -1,7 +1,7 @@
-//! V8-02 remote offload backend — a LAN box or a cloud API ccImp only
+//! V8-02 remote offload backend — a LAN box or a cloud API cImp only
 //! health-checks and connects to over HTTP.
 //!
-//! Unlike [`LlamaServer`](super::LlamaServer), ccImp does **not** own the
+//! Unlike [`LlamaServer`](super::LlamaServer), cImp does **not** own the
 //! process: there is no command to spawn, no PTY, and no read-only tab —
 //! a remote backend surfaces only as a Settings status line. It exposes
 //! the same [`Backend`](super::Backend) accessors so the router treats it

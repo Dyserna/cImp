@@ -201,7 +201,7 @@ ui: { theme: 'modern-dark' },
 
 `src/SettingsApp.svelte`: add a section header "Appearance" with a single labelled select bound to `snapshot.ui.theme`. Use the existing pattern that other sections follow. The `<option>` list has one entry (`<option value="modern-dark">Modern Dark</option>`); a comment notes that V5-02's iteration may add variants.
 
-Persistence flows through the existing `patch()` helper. Verify the field round-trips: open Settings → change selection (no-op since one option, but the bind:value path runs) → check `~/.config/cctts/settings.json` (or platform equivalent) shows `"ui": { "theme": "modern-dark" }`.
+Persistence flows through the existing `patch()` helper. Verify the field round-trips: open Settings → change selection (no-op since one option, but the bind:value path runs) → check `~/.config/cimp/settings.json` (or platform equivalent) shows `"ui": { "theme": "modern-dark" }`.
 
 ### 5. Mechanical token sweep — replacement table
 

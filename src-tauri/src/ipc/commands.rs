@@ -898,7 +898,7 @@ pub async fn graph_status(
 }
 
 /// V9-01: trigger a full rebuild of the project's code graph. `root` defaults
-/// to the app's launch directory (the project ccImp was opened in). Returns
+/// to the app's launch directory (the project cImp was opened in). Returns
 /// immediately — the build runs on a worker thread and reports progress via
 /// the `graph-status` event. A no-op when a build for that root is already in
 /// flight. The store must be built before the `graph_*` MCP tools have data.

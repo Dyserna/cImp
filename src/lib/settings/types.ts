@@ -180,11 +180,11 @@ export interface SystemStatsSettings {
   show_network: boolean;
 }
 
-/// Context-window status line for ccImp-launched Claude Code tabs.
+/// Context-window status line for cImp-launched Claude Code tabs.
 /// When enabled, the backend injects a session-scoped `--settings`
-/// overlay pointing Claude Code's `statusLine` at `ccimp --statusline`,
+/// overlay pointing Claude Code's `statusLine` at `cimp --statusline`,
 /// which renders a themed context-usage bar. Global (not per-tab) and
-/// scoped to ccImp sessions only — the user's ~/.claude config is
+/// scoped to cImp sessions only — the user's ~/.claude config is
 /// untouched. Mirrors `StatuslineSettings` in the backend schema.
 export interface StatuslineSettings {
   /// Overall on/off for the context bar.
@@ -514,7 +514,7 @@ export interface Settings {
   behavior: BehaviorSettings;
   usage: UsageSettings;
   system_stats: SystemStatsSettings;
-  /// Claude Code context-window status line bar (global, ccImp-scoped).
+  /// Claude Code context-window status line bar (global, cImp-scoped).
   statusline: StatuslineSettings;
   compose: ComposeSettings;
   shortcuts: ShortcutSettings;
@@ -542,9 +542,9 @@ export interface Settings {
   /// Optional explicit executable paths for the bundled quick-launch tools
   /// (rustnet / broot); empty fields resolve normally (ebin → PATH).
   external_tools: ExternalToolsSettings;
-  /// V8-01: local task-offload config. ccImp runs a user-supplied
+  /// V8-01: local task-offload config. cImp runs a user-supplied
   /// `llama-server` and exposes an `offload_task` MCP tool into
-  /// ccImp-launched Claude tabs. Off by default.
+  /// cImp-launched Claude tabs. Off by default.
   offload: OffloadSettings;
   /// V9-01: per-project code knowledge graph config. Off by default.
   graph: GraphSettings;
@@ -655,7 +655,7 @@ export interface McpServerConfig {
   env: Record<string, string>;
   url: string;
   /// Expose this server's tools to Claude Code (proxied through the
-  /// `ccimp-offload` child). Off by default — a deliberate opt-in.
+  /// `cimp-offload` child). Off by default — a deliberate opt-in.
   claude_access: boolean;
   /// Expose this server's tools to the offload worker (the legacy `enabled`).
   offload_access: boolean;
@@ -682,7 +682,7 @@ export type ToolScope =
 export const LOCAL_DATA_TOOLS = ['read_file', 'code_search', 'run_command', 'filesystem', 'git'];
 
 /// V8-02: kind-specific config for one backend (mirror of Rust
-/// `OffloadBackendKind`). Local = ccImp owns the process; Remote = a
+/// `OffloadBackendKind`). Local = cImp owns the process; Remote = a
 /// health-checked URL (LAN or cloud).
 export type OffloadBackendKind =
   | { type: 'local'; server_command: string; autostart: boolean }
@@ -1047,7 +1047,7 @@ export function defaultSettings(): Settings {
       watch_debounce_ms: 300,
       max_rows_per_query: 100,
       max_snippet_bytes: 2_000,
-      db_subdir: '.ccimp',
+      db_subdir: '.cimp',
       allow_remote_worker_access: false,
       semantic_search: false,
       embedding_endpoint: '',

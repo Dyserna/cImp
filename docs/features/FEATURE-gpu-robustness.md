@@ -2,7 +2,7 @@
 
 ## Purpose
 
-When `CCIMP_GPU=cuda` is set, probe the GPU's compute capability *before* registering the CUDA execution provider with `ort`. If the CC isn't supported by the bundled ONNX Runtime prebuilt — currently `sm_120` (Blackwell, RTX 5090 era) — log a clear warning at startup and fall back to CPU automatically. Replace today's behavior of "registration succeeds, session commits, every per-segment inference fails with `cudaErrorSymbolNotFound`, audio is silent."
+When `CIMP_GPU=cuda` is set, probe the GPU's compute capability *before* registering the CUDA execution provider with `ort`. If the CC isn't supported by the bundled ONNX Runtime prebuilt — currently `sm_120` (Blackwell, RTX 5090 era) — log a clear warning at startup and fall back to CPU automatically. Replace today's behavior of "registration succeeds, session commits, every per-segment inference fails with `cudaErrorSymbolNotFound`, audio is silent."
 
 A pre-flight check converts a cryptic per-segment failure mode into a single readable startup message.
 
@@ -12,7 +12,7 @@ See `FUTURE-FEATURES.md` § "Auto-detect Blackwell..." for the full rationale; t
 
 This is a single-item feature; no group. It's listed standalone in `FUTURE-FEATURES.md` and lives in this group of feature docs because it's discrete enough to handle separately from the larger UX features.
 
-The underlying ORT 1.20 + Blackwell mismatch is also tracked in `docs/MAINTENANCE.md` under "ort / ONNX Runtime." This feature complements that maintenance entry — the maintenance entry tracks the upstream upgrade; this feature improves ccImp's behavior *until* the upstream upgrade lands and *after* it lands for any next-gen-GPU regression class.
+The underlying ORT 1.20 + Blackwell mismatch is also tracked in `docs/MAINTENANCE.md` under "ort / ONNX Runtime." This feature complements that maintenance entry — the maintenance entry tracks the upstream upgrade; this feature improves cImp's behavior *until* the upstream upgrade lands and *after* it lands for any next-gen-GPU regression class.
 
 ## Two viable approaches
 
@@ -48,11 +48,11 @@ The work is small — one PR's worth — and isolated to the TTS init path.
 
 ### 1. Locate the CUDA EP registration site
 
-Find where `ort` is initialized today and where the CUDA EP is registered. Likely in `src-tauri/src/tts/...` (a `tts/init.rs` or similar). Confirm the `CCIMP_GPU=cuda` env var is read there.
+Find where `ort` is initialized today and where the CUDA EP is registered. Likely in `src-tauri/src/tts/...` (a `tts/init.rs` or similar). Confirm the `CIMP_GPU=cuda` env var is read there.
 
 ### 2. Add the CC probe
 
-Before EP registration, when `CCIMP_GPU=cuda`:
+Before EP registration, when `CIMP_GPU=cuda`:
 
 ```rust
 // Pseudocode — adapt to actual cudarc API
@@ -71,7 +71,7 @@ The supported list is the source of truth for "what does our bundled ort prebuil
 ### 3. Branch on the probe result
 
 ```rust
-if env::var("CCIMP_GPU").as_deref() == Ok("cuda") {
+if env::var("CIMP_GPU").as_deref() == Ok("cuda") {
     match probe_cuda_supported() {
         Ok(true) => {
             tracing::info!("CUDA EP enabled (compute capability {major}.{minor})");
@@ -92,7 +92,7 @@ if env::var("CCIMP_GPU").as_deref() == Ok("cuda") {
 }
 ```
 
-The warning message is the user-visible payoff. Include the CC numbers and a doc reference so users know what to do (upgrade ccImp when an ort bump lands; until then, accept CPU).
+The warning message is the user-visible payoff. Include the CC numbers and a doc reference so users know what to do (upgrade cImp when an ort bump lands; until then, accept CPU).
 
 ### 4. Surface the fallback in the UI
 
@@ -107,8 +107,8 @@ Add to `docs/MAINTENANCE.md` under the existing "ort / ONNX Runtime" entry:
 ## Open questions
 
 - **Multiple GPUs**: `cudarc::CudaDevice::new(0)` probes device 0. If a user has multiple GPUs and ort would have selected a different one, we may probe the wrong device. Decide at implementation time: probe all visible CUDA devices and pass if any is supported, or probe the device ort would actually select. The latter requires inspecting ort's device-selection logic. Likely not worth the complexity for v1; document the limitation.
-- **AMD ROCm / Intel oneAPI / Apple MPS**: out of scope. ccImp targets Windows and Linux with NVIDIA, per `DESIGN.md`.
-- **What if `cudarc` itself fails to load** (e.g., no NVIDIA driver, no CUDA runtime)? Treat as "probe failed → fall back to CPU." User probably set `CCIMP_GPU=cuda` accidentally on a machine without CUDA. Don't crash; warn and continue.
+- **AMD ROCm / Intel oneAPI / Apple MPS**: out of scope. cImp targets Windows and Linux with NVIDIA, per `DESIGN.md`.
+- **What if `cudarc` itself fails to load** (e.g., no NVIDIA driver, no CUDA runtime)? Treat as "probe failed → fall back to CPU." User probably set `CIMP_GPU=cuda` accidentally on a machine without CUDA. Don't crash; warn and continue.
 
 ## Milestone recommendation
 

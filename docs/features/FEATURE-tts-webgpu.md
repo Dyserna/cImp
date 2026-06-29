@@ -10,7 +10,7 @@
 
 ## Purpose
 
-Replace the NVIDIA-only, Blackwell-broken `CCIMP_GPU=cuda` TTS path with a
+Replace the NVIDIA-only, Blackwell-broken `CIMP_GPU=cuda` TTS path with a
 **portable, any-vendor GPU backend** for Kokoro — the **ONNX Runtime WebGPU
 execution provider** (native, non-browser; Dawn-backed → D3D12 on Windows,
 **Vulkan on Linux**, Metal on macOS). End state mirrors what `stt-vulkan`
@@ -36,7 +36,7 @@ whisper.cpp/ggml-Vulkan; only TTS moves.
 ## Current state (what we're changing)
 
 - `src-tauri/src/tts/engine.rs` — `TtsEngine::new` builds an `ort::Session` and
-  registers an EP from a `match` on `CCIMP_GPU`: `"cuda"` → `CUDAExecutionProvider`,
+  registers an EP from a `match` on `CIMP_GPU`: `"cuda"` → `CUDAExecutionProvider`,
   everything else → `CPUExecutionProvider`. Each arm already falls back to CPU on
   registration failure and sets a `bound_ep` label string for logging. The new
   WebGPU arm slots into this exact pattern.
@@ -142,11 +142,11 @@ Mirror the STT pattern for consistency:
 - Switch TTS from "runtime env opt-in only" to STT's **compile-time backend +
   GPU-by-default** model:
   - When `tts-webgpu` is compiled: default to registering the WebGPU EP; on
-    registration failure (or `CCIMP_GPU=cpu`) fall back to CPU. This makes the
+    registration failure (or `CIMP_GPU=cpu`) fall back to CPU. This makes the
     shipped binary "GPU when present, CPU otherwise" with zero config — matching
     STT.
   - When `tts-cuda` is compiled (optional builds only): keep the explicit
-    `CCIMP_GPU=cuda` opt-in (CUDA stays opt-in because it's non-portable and
+    `CIMP_GPU=cuda` opt-in (CUDA stays opt-in because it's non-portable and
     Blackwell-broken).
   - Plain build (no TTS GPU feature): CPU only, as today.
 - Add the WebGPU arm using the existing fallback-to-CPU pattern:
@@ -180,8 +180,8 @@ Mirror the STT pattern for consistency:
 
 ## Phase 4 — Runtime & UX
 
-- **DONE — `CCIMP_GPU` semantics reconciled.** `CCIMP_GPU=cpu` now forces CPU for
-  **both** TTS and STT; the old TTS-only `CCIMP_GPU=cuda` runtime opt-in is gone
+- **DONE — `CIMP_GPU` semantics reconciled.** `CIMP_GPU=cpu` now forces CPU for
+  **both** TTS and STT; the old TTS-only `CIMP_GPU=cuda` runtime opt-in is gone
   (CUDA is now the compile-time `tts-cuda` feature). The GPU backend is otherwise
   on-by-default-with-CPU-fallback, identical to `stt/engine.rs`.
 - **DEFERRED (scoped to log-only) — UI backend indicator.** The active TTS backend
@@ -225,7 +225,7 @@ Mirror the STT pattern for consistency:
 - `src-tauri/Cargo.toml` — `tts-webgpu` / `tts-cuda` features; drop hard-wired `ort/cuda`.
 - `src-tauri/build.rs` — stage Dawn dylibs next to the exe.
 - `.github/workflows/release.yml` — build `--features stt-vulkan,tts-webgpu`; stage dylibs.
-- Status-indicator frontend + `CCIMP_GPU` handling — backend label + unified env semantics.
+- Status-indicator frontend + `CIMP_GPU` handling — backend label + unified env semantics.
 - `docs/MAINTENANCE.md`, `docs/FUTURE-FEATURES.md`, `docs/PACKAGING.md` — as above.
 
 ## Sequencing

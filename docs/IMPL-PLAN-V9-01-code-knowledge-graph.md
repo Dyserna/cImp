@@ -1,6 +1,6 @@
 # Implementation Plan — V9-01 Code Knowledge Graph
 
-Execution plan for [MILESTONE-V9-01](MILESTONE-V9-01-code-knowledge-graph.md), grounded in the actual ccImp codebase (single `ccimp` crate, edition 2021, Tauri 2 + Svelte). This is the *how/sequence*; the milestone doc is the *what/why*.
+Execution plan for [MILESTONE-V9-01](MILESTONE-V9-01-code-knowledge-graph.md), grounded in the actual cImp codebase (single `cimp` crate, edition 2021, Tauri 2 + Svelte). This is the *how/sequence*; the milestone doc is the *what/why*.
 
 ## Guiding principles
 

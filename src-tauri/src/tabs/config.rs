@@ -11,7 +11,7 @@
 //! V19: AI tabs cover Claude Code (`claude` / `claude-local`) and a single
 //! OpenCode tab (`opencode`). Claude's `use_local_provider` flag reads from
 //! `claude_local` and synthesizes `ANTHROPIC_*` env vars. OpenCode manages its
-//! own providers/credentials, so cctts injects no provider — just the mcp +
+//! own providers/credentials, so cimp injects no provider — just the mcp +
 //! instructions. Per-tab `env` entries take precedence over synthesized values.
 //!
 //! System-prompt / capability injection differs by tool: Claude uses CLI
@@ -118,10 +118,10 @@ fn command_is(command: &str, name: &str) -> bool {
 ///   * `--append-system-prompt <instructions>` — TTS markup convention,
 ///     gated on the per-tab `tts_injection` toggle.
 ///   * `--settings <json>` — a session-scoped overlay pointing Claude
-///     Code's `statusLine` at our `ccimp --statusline` renderer, gated on
+///     Code's `statusLine` at our `cimp --statusline` renderer, gated on
 ///     the global `statusline.enabled`. The overlay merges with the
 ///     user's own Claude settings (only `statusLine` is set), so it
-///     scopes the context bar to ccImp without touching `~/.claude`.
+///     scopes the context bar to cImp without touching `~/.claude`.
 fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     if !command_is(&cfg.command, "claude") {
         return Vec::new();
@@ -149,12 +149,12 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         }
     }
 
-    // V8-01: point Claude at our own `ccimp --offload-mcp` MCP server so
+    // V8-01: point Claude at our own `cimp --offload-mcp` MCP server so
     // the `offload_task` tool is available in this session. Session-scoped
     // (a `--mcp-config` overlay), never written to `~/.claude`. Claude
     // spawns the `command` as argv (no shell), so the raw exe path is
     // correct — no shell-quoting needed (unlike the statusLine command).
-    // V8-01 + V9-01: point Claude at our `ccimp --offload-mcp` server, which
+    // V8-01 + V9-01: point Claude at our `cimp --offload-mcp` server, which
     // carries the `offload_task` tool, the `graph_*` tools, AND any MCP server
     // exposed to Claude Code. Inject it whenever ANY of those is in play — the
     // graph tools and Claude-exposed MCP servers must reach Claude even when
@@ -163,7 +163,7 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         if let Ok(exe) = std::env::current_exe() {
             let mcp = serde_json::json!({
                 "mcpServers": {
-                    "ccimp-offload": {
+                    "cimp-offload": {
                         "command": exe.to_string_lossy(),
                         "args": ["--offload-mcp"]
                     }
@@ -210,7 +210,7 @@ fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> St
 /// V8-01: the system-prompt addendum telling Opus *when* to reach for
 /// `offload_task`. Without this nudge the model rarely offloads. Gated by
 /// `offload.inject_guidance`.
-const OFFLOAD_GUIDANCE: &str = "You have an `offload_task` tool (from the ccimp-offload MCP server) \
+const OFFLOAD_GUIDANCE: &str = "You have an `offload_task` tool (from the cimp-offload MCP server) \
 backed by a local model. For token-heavy subtasks — broad codebase searches, summarizing large \
 files or logs, or web research — prefer calling `offload_task` with a self-contained instruction \
 instead of doing the work yourself: it returns only a synthesized result, conserving your context \
@@ -219,7 +219,7 @@ window. Keep work that needs your full reasoning or the conversation's context h
 
 /// V9-01: the system-prompt addendum telling Opus the code-knowledge-graph
 /// tools exist. Gated on `graph.enabled` (the tools are only injected then).
-const GRAPH_GUIDANCE: &str = "This project has a code knowledge graph (from the ccimp-offload MCP \
+const GRAPH_GUIDANCE: &str = "This project has a code knowledge graph (from the cimp-offload MCP \
 server). Prefer the `graph_*` tools over grep for code-structure questions: `graph_find_symbol` \
 (where a symbol is defined), `graph_callers`/`graph_callees` (call relationships), \
 `graph_references`, `graph_imports`, `graph_outline` (a file's definitions), `graph_transitive` \
@@ -243,7 +243,7 @@ fn build_extra_args(
     let mut out: Vec<String> = Vec::new();
 
     // V19: OpenCode's default TUI takes the alternate screen (full-screen
-    // redraw), which breaks ccImp's linear, append-only stream model the same
+    // redraw), which breaks cImp's linear, append-only stream model the same
     // way Claude's fullscreen renderer does. `--mini` renders inline into the
     // normal scrollback instead — the same rendering class as Claude's
     // `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. It is mandatory and always
@@ -256,8 +256,8 @@ fn build_extra_args(
 
     out.extend(cfg.args.iter().filter(|s| !s.is_empty()).cloned());
 
-    // ccimp is documented as a drop-in replacement for `claude`, so
-    // invocation args (`ccimp --resume <id>`, etc.) flow into every
+    // cimp is documented as a drop-in replacement for `claude`, so
+    // invocation args (`cimp --resume <id>`, etc.) flow into every
     // Claude tab. OpenCode's model/provider selection arrives via the
     // injected config, not flags, so we only forward invocation args to
     // Claude tabs.
@@ -313,7 +313,7 @@ fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
 /// `--mcp-config` / `--settings` / `--append-system-prompt`):
 ///
 /// - `$schema` marker.
-/// - `mcp.ccimp-offload` → `ccimp --offload-mcp --consumer opencode`, injected
+/// - `mcp.cimp-offload` → `cimp --offload-mcp --consumer opencode`, injected
 ///   whenever offload, the graph, or an OpenCode-exposed MCP server is in play
 ///   (mirrors the Claude `--mcp-config` gate in `build_pre_args`).
 /// - `instructions` → the managed guidance file (TTS + offload + graph), when
@@ -321,9 +321,9 @@ fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
 ///   we only reference its (deterministic) path.
 ///
 /// No `provider` block: OpenCode manages its own providers/credentials (global
-/// config, switchable in-session), so cctts never injects one.
+/// config, switchable in-session), so cimp never injects one.
 ///
-/// Additive by default — cctts does not set `OPENCODE_DISABLE_PROJECT_CONFIG`,
+/// Additive by default — cimp does not set `OPENCODE_DISABLE_PROJECT_CONFIG`,
 /// so a user's project config still merges underneath. Pure: no filesystem I/O.
 fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_json::Value {
     let mut config = serde_json::Map::new();
@@ -332,7 +332,7 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
         serde_json::Value::String("https://opencode.ai/config.json".to_string()),
     );
 
-    // The single `ccimp --offload-mcp` child carries `offload_task`, the
+    // The single `cimp --offload-mcp` child carries `offload_task`, the
     // `graph_*` tools, and any OpenCode-exposed MCP server. Inject it whenever
     // ANY of those is in play (same shape as the Claude gate).
     if settings.offload.enabled || settings.graph.enabled || settings.offload.any_opencode_mcp() {
@@ -340,7 +340,7 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
             config.insert(
                 "mcp".to_string(),
                 serde_json::json!({
-                    "ccimp-offload": {
+                    "cimp-offload": {
                         "type": "local",
                         "command": [exe.to_string_lossy(), "--offload-mcp", "--consumer", "opencode"]
                     }
@@ -365,7 +365,7 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
 
     // V19: no `provider` block. The single OpenCode tab uses OpenCode's own
     // provider config + credentials (global `~/.config/opencode` + `auth.json`,
-    // switchable in-session), so cctts injects only the mcp + instructions and
+    // switchable in-session), so cimp injects only the mcp + instructions and
     // leaves provider/model selection entirely to OpenCode.
     serde_json::Value::Object(config)
 }
@@ -394,7 +394,7 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
     // Force Claude Code's classic inline renderer by opting out of the
     // alternate-screen "fullscreen" TUI (introduced ~v2.1.89). That mode
     // repaints the whole screen and enables mouse tracking, both of which
-    // break ccImp's core assumption of a linear, append-only output stream:
+    // break cImp's core assumption of a linear, append-only output stream:
     //   - the `[[TTS]]` marker stripper (processing/screen.rs) can't locate
     //     markers in full-screen repaints, so the literal tags leak into the
     //     terminal and show up on selection;
@@ -415,7 +415,7 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
     // renderer inline; here we (1) inject the session-scoped config as one
     // `OPENCODE_CONFIG_CONTENT` env var — the env-var analog of Claude's
     // `--mcp-config` / `--settings` / `--append-system-prompt` CLI flags — and
-    // (2) quiet terminal features that fight ccImp's own selection/title
+    // (2) quiet terminal features that fight cImp's own selection/title
     // handling. Set before the per-tab `env` merge below so a user can override
     // any of these per tab.
     if command_is(&cfg.command, "opencode") {
@@ -549,7 +549,7 @@ mod tests {
             .position(|a| a == "--mcp-config")
             .expect("--mcp-config present");
         let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
-        assert_eq!(cfg["mcpServers"]["ccimp-offload"]["args"][0], "--offload-mcp");
+        assert_eq!(cfg["mcpServers"]["cimp-offload"]["args"][0], "--offload-mcp");
     }
 
     #[test]
@@ -591,7 +591,7 @@ mod tests {
             .position(|a| a == "--mcp-config")
             .expect("--mcp-config present when graph is enabled");
         let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
-        assert_eq!(cfg["mcpServers"]["ccimp-offload"]["args"][0], "--offload-mcp");
+        assert_eq!(cfg["mcpServers"]["cimp-offload"]["args"][0], "--offload-mcp");
     }
 
     #[test]
@@ -696,8 +696,8 @@ mod tests {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
         let cfg = build_opencode_config(&opencode_cfg(), &settings);
-        let cmd = &cfg["mcp"]["ccimp-offload"]["command"];
-        assert_eq!(cfg["mcp"]["ccimp-offload"]["type"], "local");
+        let cmd = &cfg["mcp"]["cimp-offload"]["command"];
+        assert_eq!(cfg["mcp"]["cimp-offload"]["type"], "local");
         // The child is launched with the opencode consumer discriminator.
         let args: Vec<&str> = cmd
             .as_array()
@@ -721,7 +721,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
         let cfg = build_opencode_config(&opencode_cfg(), &settings);
-        assert!(cfg["mcp"]["ccimp-offload"].is_object(), "graph alone injects the mcp block");
+        assert!(cfg["mcp"]["cimp-offload"].is_object(), "graph alone injects the mcp block");
     }
 
     #[test]
@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn opencode_config_never_injects_provider() {
-        // The single OpenCode tab manages its own providers; cctts never
+        // The single OpenCode tab manages its own providers; cimp never
         // injects a `provider`/`model` block, even with use_local_provider set.
         let settings = Settings::default();
         let mut cfg = opencode_cfg();

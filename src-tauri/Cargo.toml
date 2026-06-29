@@ -1,13 +1,13 @@
 [package]
-name = "ccimp"
-version = "0.22.0"
+name = "cimp"
+version = "0.23.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
 rust-version = "1.77"
 
 [[bin]]
-name = "ccimp"
+name = "cimp"
 path = "src/main.rs"
 
 [features]
@@ -99,7 +99,7 @@ rodio = "0.20"
 
 # STT (Whisper via whisper.cpp bindings). Statically links one C library;
 # needs a C/C++ toolchain + CMake at build time (see MAINTENANCE.md). CUDA is
-# a compile-time feature (`stt-cuda`) wired to the same CCIMP_GPU=cuda runtime
+# a compile-time feature (`stt-cuda`) wired to the same CIMP_GPU=cuda runtime
 # opt-in as ort — see [features] below. Default build is CPU-only so it works
 # on any machine without the CUDA toolkit.
 whisper-rs = "0.16"
@@ -132,7 +132,7 @@ notify = "6"
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 # Windows-only: Job Object backstop so OS reaps spawned children (llama-server,
-# MCP host, run_command) when ccImp dies hard. See `process_guard`. Version
+# MCP host, run_command) when cImp dies hard. See `process_guard`. Version
 # matched to the one Tauri already pulls in to avoid a duplicate dep.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

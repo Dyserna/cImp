@@ -33,11 +33,11 @@ The bump script rewrites the three version files and refreshes
    non-comment entries. If not, logs the computed SHAs so you can pin
    them on the next release.
 6. `npm ci && npm run tauri build -- --no-bundle`.
-7. Stages a portable layout under `ccimp-portable-win-x64-vX.Y.Z/`:
+7. Stages a portable layout under `cimp-portable-win-x64-vX.Y.Z/`:
 
    ```
    bin/
-     ccimp.exe
+     cimp.exe
      onnxruntime*.dll
    models/
      kokoro-v1.0.onnx
@@ -81,12 +81,12 @@ You can also exercise the portable layout locally without the workflow:
 
 ```sh
 npm run tauri build -- --no-bundle
-mkdir -p staging/ccimp-portable/bin staging/ccimp-portable/models/voices
-cp src-tauri/target/release/ccimp.exe staging/ccimp-portable/bin/
-cp src-tauri/target/release/onnxruntime*.dll staging/ccimp-portable/bin/
-# Drop kokoro-v1.0.onnx into staging/ccimp-portable/models/ and the
-# voicepacks under staging/ccimp-portable/models/voices/, then run
-# staging/ccimp-portable/bin/ccimp.exe — `model_dir()` in
+mkdir -p staging/cimp-portable/bin staging/cimp-portable/models/voices
+cp src-tauri/target/release/cimp.exe staging/cimp-portable/bin/
+cp src-tauri/target/release/onnxruntime*.dll staging/cimp-portable/bin/
+# Drop kokoro-v1.0.onnx into staging/cimp-portable/models/ and the
+# voicepacks under staging/cimp-portable/models/voices/, then run
+# staging/cimp-portable/bin/cimp.exe — `model_dir()` in
 # src-tauri/src/tts/mod.rs resolves to `<exe-dir>/../models/`.
 ```
 

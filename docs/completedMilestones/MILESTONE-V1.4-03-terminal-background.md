@@ -43,7 +43,7 @@ V1.4-03 closes both. The per-tab UI is a refactor + a new dialog row. Scrollback
 
 ## What This Milestone Does NOT Do
 
-- **Cross-app-restart scrollback.** When cctts exits, the PTY exits with it. Scrollback is gone. Restoring it across cctts restarts requires a backend ring buffer with persistence, which is a separate, larger feature (memory cap, on-disk format, replay timing). Defer until users ask.
+- **Cross-app-restart scrollback.** When cimp exits, the PTY exits with it. Scrollback is gone. Restoring it across cimp restarts requires a backend ring buffer with persistence, which is a separate, larger feature (memory cap, on-disk format, replay timing). Defer until users ask.
 - **Animated/video backgrounds.** Still out of scope per V1.4-02.
 - **Project-local relative-path resolution for `terminal.background.image`.** Still pending `FEATURE-config-scope.md`.
 - **Background-config presets.** No "save this background as 'Pinky Floyd' and apply to multiple tabs." Users hand-edit JSON or copy the override structure manually for now.
@@ -576,7 +576,7 @@ Add a per-tab background sentence near the existing per-tab themes mention:
 
 DESIGN.md — extend the Settings section with a paragraph:
 
-> **PTY rebind protocol (V1.4-03).** The xterm.js renderer is decided at Terminal construction (`allowTransparency` and the canvas vs. DOM split are constructor-only). Toggling the image background therefore requires destroying the xterm Terminal and constructing a new one. To preserve the shell session across this destroy/create cycle, cctts uses `pty_rebind_channel` — the PTY and its child process stay alive, only the IPC `Channel<String>` is swapped. `@xterm/addon-serialize` captures a snapshot of the visible scrollback before destroy and replays it into the new xterm after construct. Bytes emitted by the PTY during the rebind window queue in the existing reader→processor mpsc and dispatch to the new channel on the next select-loop iteration. Cross-app-restart scrollback survival is *not* in scope — when cctts exits, the PTYs exit with it. A backend ring buffer would close that gap and is tracked separately.
+> **PTY rebind protocol (V1.4-03).** The xterm.js renderer is decided at Terminal construction (`allowTransparency` and the canvas vs. DOM split are constructor-only). Toggling the image background therefore requires destroying the xterm Terminal and constructing a new one. To preserve the shell session across this destroy/create cycle, cimp uses `pty_rebind_channel` — the PTY and its child process stay alive, only the IPC `Channel<String>` is swapped. `@xterm/addon-serialize` captures a snapshot of the visible scrollback before destroy and replays it into the new xterm after construct. Bytes emitted by the PTY during the rebind window queue in the existing reader→processor mpsc and dispatch to the new channel on the next select-loop iteration. Cross-app-restart scrollback survival is *not* in scope — when cimp exits, the PTYs exit with it. A backend ring buffer would close that gap and is tracked separately.
 
 ## Test Plan
 

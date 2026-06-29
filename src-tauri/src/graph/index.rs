@@ -58,7 +58,7 @@ pub struct GraphIndex {
 
 impl GraphIndex {
     /// Open (creating if needed) the graph store for `root`, ensuring the
-    /// schema. `db_subdir` is the per-project home (default `.ccimp`).
+    /// schema. `db_subdir` is the per-project home (default `.cimp`).
     pub fn open(root: &Path, db_subdir: &str) -> AppResult<GraphIndex> {
         let dir = root.join(db_subdir);
         std::fs::create_dir_all(&dir).map_err(AppError::Io)?;
@@ -77,7 +77,7 @@ impl GraphIndex {
         let db_path = root.join(db_subdir).join("graph.db");
         if !db_path.exists() {
             return Err(AppError::GraphNotReady(format!(
-                "no code graph at {} — enable the graph and index this project in ccImp",
+                "no code graph at {} — enable the graph and index this project in cImp",
                 db_path.display()
             )));
         }

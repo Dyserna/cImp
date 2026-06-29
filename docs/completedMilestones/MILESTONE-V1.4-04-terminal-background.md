@@ -53,7 +53,7 @@ Project-local relative-path resolution for `terminal.background.image` is still 
 
 **Cross-cutting**
 
-21. README updates per phase: a paragraph on presets under the V1.4-02 / V1.4-03 background sections, a positive note about cross-restart scrollback ("your shell history survives a cctts restart"), a heads-up on the preview opt-out for power users.
+21. README updates per phase: a paragraph on presets under the V1.4-02 / V1.4-03 background sections, a positive note about cross-restart scrollback ("your shell history survives a cimp restart"), a heads-up on the preview opt-out for power users.
 22. DESIGN.md gains paragraphs on (a) the alt-screen replay trade-off, (b) the on-disk scrollback format and its lifecycle, (c) the cancel-revert protocol for live preview.
 
 ## Key Deltas vs V1.4-03
@@ -74,9 +74,9 @@ Project-local relative-path resolution for `terminal.background.image` is still 
 
 - **Project-local relative-path resolution for `terminal.background.image`** (and now also for paths inside presets). Still pending `FEATURE-config-scope.md`. Until then, all paths are absolute.
 - **Animated/video backgrounds.** Still out of scope per V1.4-02.
-- **Cross-app-restart alt-screen-buffer state.** D's ring buffer captures raw PTY bytes; the alt buffer's contents were xterm-side. A user who exits cctts while in `vim` will, on restore, see the bytes that took them into the alt screen but not the buffer's contents. Document; no fix.
+- **Cross-app-restart alt-screen-buffer state.** D's ring buffer captures raw PTY bytes; the alt buffer's contents were xterm-side. A user who exits cimp while in `vim` will, on restore, see the bytes that took them into the alt screen but not the buffer's contents. Document; no fix.
 - **Snapshot compression on disk.** Phase D's on-disk format is uncompressed bytes. At 256 KB cap × 20 tabs = 5 MB on disk. Acceptable; revisit only if reports surface.
-- **Per-preset image-file copy.** Presets reference image paths by absolute path same as the live config. Saving a preset doesn't snapshot the image into cctts data dir. If the user moves the image, the preset breaks — same way the live config would. Documented in the preset save dialog's helper text.
+- **Per-preset image-file copy.** Presets reference image paths by absolute path same as the live config. Saving a preset doesn't snapshot the image into cimp data dir. If the user moves the image, the preset breaks — same way the live config would. Documented in the preset save dialog's helper text.
 - **Sharing presets across machines.** Presets live in the global settings.json. Project-local presets (when `FEATURE-config-scope.md` ships) inherit naturally; cross-machine export is a separate feature.
 - **Live preview on the global Settings → Appearance page.** Phase C is per-tab-dialog only. The global page already updates live (V1.4-02 wired this) and has no Cancel button; if the user changes the global background and decides they don't like it, they manually change it back. Adding cancel-revert to the global page is a different shape (no dialog-open lifecycle to snapshot from) and out of scope.
 - **Asymmetric preview opt-out.** The opt-out is global (one bool in settings). Per-tab opt-out for preview ("preview on Claude tab but not on shells") is unwarranted complexity for a polish toggle.
@@ -841,7 +841,7 @@ if let Some(bytes) = &restored_for_seed {
 }
 ```
 
-So a user who restarts cctts twice in a row preserves continuity across both restarts (truncated by the cap on the second restart, naturally).
+So a user who restarts cimp twice in a row preserves continuity across both restarts (truncated by the cap on the second restart, naturally).
 
 #### D.7 Cleanup
 
@@ -889,10 +889,10 @@ TypeScript:
 - `pty_start_with_restored_scrollback_writes_before_live_bytes` — mock the new `PtyStartResult.restored_scrollback`, assert `term.write` runs before `bindBytesChannel`'s callback.
 
 Manual:
-- Start cctts, run `seq 1 200` in a Shell tab. Exit cctts gracefully (window close). Restart. The Shell tab restores with the 200 lines visible above the new prompt.
-- Start cctts, run `seq 1 200000` (way over the 256 KB cap). Exit. Restart. The last few thousand lines are visible; earlier ones are gone (cap behavior).
+- Start cimp, run `seq 1 200` in a Shell tab. Exit cimp gracefully (window close). Restart. The Shell tab restores with the 200 lines visible above the new prompt.
+- Start cimp, run `seq 1 200000` (way over the 256 KB cap). Exit. Restart. The last few thousand lines are visible; earlier ones are gone (cap behavior).
 - Disable `terminal.scrollback.persist`. Run a session, exit, restart — no restoration; tab starts fresh. Confirm no file was written either.
-- Hard-kill cctts (Task Manager / `taskkill /F`). Restart. Tab starts fresh; no file or stale file from previous session (no contract guarantee for crash; documented).
+- Hard-kill cimp (Task Manager / `taskkill /F`). Restart. Tab starts fresh; no file or stale file from previous session (no contract guarantee for crash; documented).
 
 ### Phase ordering and dependency notes
 
@@ -914,7 +914,7 @@ Manual:
 - **Manual — save / load preset** — Configure a non-trivial background (image + opacity 0.5 + blur 10), Save as preset "Frosted." Open a per-tab Custom branch, Load preset "Frosted," confirm fields populate identically.
 - **Manual — duplicate name rejection** — Save "Frosted" twice; second save shows error.
 - **Manual — manage presets** — Rename "Frosted" → "Glass," confirm rename in dropdowns. Delete, confirm dropdown clears.
-- **Manual — preset survives migration cascade** — Hand-build a v1.4 file, launch cctts, confirm v1.4 → v1.5 → v1.6 cascade lands at v1.6 with `presets: []`.
+- **Manual — preset survives migration cascade** — Hand-build a v1.4 file, launch cimp, confirm v1.4 → v1.5 → v1.6 cascade lands at v1.6 with `presets: []`.
 
 ### Phase C
 - **Unit (TS)** — see C.5.
@@ -926,11 +926,11 @@ Manual:
 
 ### Phase D
 - **Unit (Rust)** — see D.8.
-- **Manual — happy path** — Run shell commands in a tab, exit cctts gracefully, relaunch. Tab restores scrollback above a fresh prompt. Live commands work normally afterward.
+- **Manual — happy path** — Run shell commands in a tab, exit cimp gracefully, relaunch. Tab restores scrollback above a fresh prompt. Live commands work normally afterward.
 - **Manual — cap behavior** — `seq 1 200000`, exit, relaunch. Last few thousand lines visible; counter near 200000 at the bottom.
 - **Manual — opt-out** — `terminal.scrollback.persist: false`, exit, relaunch — no restoration, no file written. Re-enable, exit, relaunch — restoration works.
-- **Manual — orphan prune** — Delete a tab via UI, confirm `<config-dir>/scrollback/<tab-id>.bin` is gone. Drop a fake `99999999-9999-9999-9999-999999999999.bin` into the dir, restart cctts, confirm pruned.
-- **Manual — alt-screen on restore** — Run `vim`, exit cctts. Relaunch. The tab restores the bytes that *led into* vim, but vim's buffer content is gone (Ctrl+L doesn't recover it because the alt buffer was xterm-side, not PTY-side). Documented behavior.
+- **Manual — orphan prune** — Delete a tab via UI, confirm `<config-dir>/scrollback/<tab-id>.bin` is gone. Drop a fake `99999999-9999-9999-9999-999999999999.bin` into the dir, restart cimp, confirm pruned.
+- **Manual — alt-screen on restore** — Run `vim`, exit cimp. Relaunch. The tab restores the bytes that *led into* vim, but vim's buffer content is gone (Ctrl+L doesn't recover it because the alt buffer was xterm-side, not PTY-side). Documented behavior.
 - **Manual — double restart** — Restore once, run more commands, exit, relaunch. Continuity preserved across both restarts (truncated by cap).
 
 ## Files Most Likely Touched
@@ -992,7 +992,7 @@ Manual:
 ### Phase D
 - **Ring-buffer mid-byte truncation produces broken UTF-8 / ANSI** — When the ring overflows, `pop_front` removes bytes one at a time until cap is met. If a multi-byte UTF-8 codepoint or a multi-byte ANSI escape sequence is straddling the truncation point, the leading bytes get dropped while the trailing bytes survive. xterm tolerates broken sequences (drops them visually), and `TextDecoder({ fatal: false })` replaces orphan bytes with `U+FFFD`. So replay shows a brief glitch at the start of the scrollback, then settles into normal output. Acceptable; the alternative (truncate to next codepoint boundary) adds complexity for a one-frame-of-display benefit.
 - **PTY rebinds and ring buffer interaction** — V1.4-03's PTY rebind keeps the same `PtyHandle` (and thus the same ring) across renderer flips. Good — no special handling. But if a user-initiated Restart fires (`pty_restart`), the PTY's child is killed and respawned but the same `PtyHandle` persists. Should the ring carry over? Plan: clear the ring on restart (the user explicitly asked to restart; old scrollback is no longer relevant). Add a `clear_scrollback` step to `pty_restart`'s respawn flow. Document.
-- **Hard-kill loses scrollback even with persist enabled** — `RunEvent::ExitRequested` doesn't fire on SIGKILL / Task Manager / power loss. Users who hard-kill cctts and complain that scrollback didn't restore should see a short README note: this is best-effort recovery, not durable storage. A future enhancement could write the ring to disk periodically (every N bytes or N seconds), trading I/O for crash robustness; defer until the use case is real.
+- **Hard-kill loses scrollback even with persist enabled** — `RunEvent::ExitRequested` doesn't fire on SIGKILL / Task Manager / power loss. Users who hard-kill cimp and complain that scrollback didn't restore should see a short README note: this is best-effort recovery, not durable storage. A future enhancement could write the ring to disk periodically (every N bytes or N seconds), trading I/O for crash robustness; defer until the use case is real.
 - **Restored bytes seeding the new ring is lossy on the cap boundary** — When restoring 256 KB into a 256 KB ring, the ring starts full. Subsequent live bytes immediately push out the restored bytes. After ~256 KB of new output, the restored bytes are gone. Acceptable — by then the user has had plenty of new context — but worth mentioning in DESIGN.md.
 
 ## Followups Tracked Elsewhere

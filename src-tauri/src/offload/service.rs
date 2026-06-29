@@ -449,7 +449,7 @@ impl OffloadService {
         let snap = self.settings.current().offload;
         if !snap.enabled {
             return Err(AppError::OffloadNotReady(
-                "offload is disabled — enable it in ccImp settings".into(),
+                "offload is disabled — enable it in cImp settings".into(),
             ));
         }
         let timeout = Duration::from_secs(snap.offload_timeout_secs.max(30));
@@ -503,7 +503,7 @@ impl OffloadService {
         let pool = self.resolve_pool(&snap, true).await;
         if pool.is_empty() {
             return Err(AppError::OffloadNotReady(
-                "no offload backend is configured — add one in ccImp Settings → Offload".into(),
+                "no offload backend is configured — add one in cImp Settings → Offload".into(),
             ));
         }
 
@@ -1014,7 +1014,7 @@ impl OffloadService {
             .collect();
         if backends.is_empty() {
             return "Delegate a token-heavy subtask to a local model to conserve this session's \
-                    context. (No offload backend is configured/enabled — set one up in ccImp \
+                    context. (No offload backend is configured/enabled — set one up in cImp \
                     Settings → Offload.)"
                 .to_string();
         }

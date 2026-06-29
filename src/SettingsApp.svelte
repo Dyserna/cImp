@@ -270,7 +270,7 @@
     });
   }
   // ── MCP tool servers (MCP servers section) ─────────────────────────────
-  // Add/remove/toggle with live host reload — no ccImp restart. Edits persist
+  // Add/remove/toggle with live host reload — no cImp restart. Edits persist
   // through the same awaited `applySettings` the rest of the panel uses; once
   // the backend has the new value we call `offload_reload_mcp`, which
   // reconciles the warm MCP host and returns fresh health for the status list.
@@ -442,7 +442,7 @@
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
-  const REPO_URL = 'https://github.com/Dyserna/ccImp';
+  const REPO_URL = 'https://github.com/Dyserna/cImp';
 
   // Sub-tab nav within the Tabs section. Each AI builtin gets its own
   // sub-tab; every Shell tab is grouped under 'shells'. Keeps the
@@ -938,7 +938,7 @@
 </script>
 
 {#if useCustomTitleBar}
-  <TuiTitleBar title="ccImp settings" />
+  <TuiTitleBar title="cImp settings" />
 {/if}
 {#if !snapshot}
   <div class="loading">Loading settings…</div>
@@ -1354,7 +1354,7 @@
                 onchange={(e) =>
                   patch((s) => (s.avatar.sprite.set = (e.currentTarget as HTMLSelectElement).value))}
               >
-                <option value="impSprites">ccImp (pixel art)</option>
+                <option value="impSprites">cImp (pixel art)</option>
                 <option value="claudeSprites">Claude (pixel art)</option>
               </select>
             </label>
@@ -1569,7 +1569,7 @@
 
           <h3>UI theme</h3>
           <small class="hint top">
-            Governs the ccImp chrome — tab bar, status bar, dialogs.
+            Governs the cImp chrome — tab bar, status bar, dialogs.
             Distinct from the terminal palette below.
           </small>
           <label>
@@ -2034,7 +2034,7 @@
           <small class="hint top">
             Adds a context-window usage bar to Claude Code's own status line
             inside each Claude tab — e.g. <code>Opus ▓▓▓▓▓░░░░░ 50% (100k/200k)</code>,
-            themed to your terminal palette. ccImp wires this up only for the
+            themed to your terminal palette. cImp wires this up only for the
             Claude tabs it launches; your global Claude Code configuration is
             left untouched.
           </small>
@@ -2058,7 +2058,7 @@
             The quick-launch buttons (and shell tabs) run these tools by name,
             resolved from the bundled <code>ebin\</code> folder first, then your
             PATH. To use a specific build instead — e.g. one in a folder that
-            isn't on PATH — point ccImp at the exe here. Leave blank to resolve
+            isn't on PATH — point cImp at the exe here. Leave blank to resolve
             normally. Takes effect the next time you launch the tool.
           </small>
           <label>
@@ -2276,7 +2276,7 @@
                 <small class="hint top">
                   Settings for this tab when <em>Use local LLM provider</em>
                   is enabled. Run a LiteLLM (or compatible) proxy that translates the
-                  Anthropic Messages API to your local model — ccImp does not start
+                  Anthropic Messages API to your local model — cImp does not start
                   the proxy. See the
                   <a
                     href="https://docs.litellm.ai/docs/proxy/quick_start"
@@ -2571,7 +2571,7 @@
           <h2>Local task offload</h2>
           <small class="hint top">
             Run a local <code>llama-server</code> and expose an
-            <code>offload_task</code> tool into ccImp-launched Claude tabs.
+            <code>offload_task</code> tool into cImp-launched Claude tabs.
             The main session can hand token-heavy subtasks (broad codebase
             searches, large-file/log summarization, web research) to the
             local model and get back only the synthesized result —
@@ -2588,7 +2588,7 @@
             <span>Enable offload</span>
           </label>
           <small class="hint">
-            When on, ccImp injects the <code>offload_task</code> tool into
+            When on, cImp injects the <code>offload_task</code> tool into
             Claude tabs (re-launch a tab to pick it up). Configure your
             local/remote models in the <strong>Backend pool</strong> below.
           </small>
@@ -3113,7 +3113,7 @@
         <section>
           <h2>MCP servers</h2>
           <small class="hint top">
-            Model Context Protocol servers ccImp connects to and keeps warm. Each
+            Model Context Protocol servers cImp connects to and keeps warm. Each
             server's read-class tools (web search, fetch, docs, …) can be exposed
             to <strong>Claude Code</strong> directly and/or to the
             <strong>offload worker</strong> — toggle per server below.
@@ -3148,7 +3148,7 @@
 
           <h3>Tool servers</h3>
           <small class="hint top">
-            Add an HTTP MCP endpoint by name + URL; changes apply live. ccImp's
+            Add an HTTP MCP endpoint by name + URL; changes apply live. cImp's
             warm MCP host aggregates the read-class tools from these servers and
             keeps the connections warm. Advanced stdio servers (command/args/env)
             remain editable in <code>settings.json</code> under
@@ -3226,7 +3226,7 @@
           <small class="hint top">
             Build a per-project graph of your code and docs (symbols, calls,
             imports, doc-comments), stored at
-            <code>&lt;project&gt;/.ccimp/graph.db</code> and kept live by a file
+            <code>&lt;project&gt;/.cimp/graph.db</code> and kept live by a file
             watcher. The cloud Claude session queries it through
             <code>graph_*</code> tools (re-launch a tab to pick them up) instead
             of grepping. Off by default; everything stays on this machine.
@@ -3427,7 +3427,7 @@
         <section>
           <h2>Logging</h2>
           <small class="hint top">
-            Log files roll daily into <code>logs/</code> next to the ccImp
+            Log files roll daily into <code>logs/</code> next to the cImp
             executable. Changing the level applies live; the
             <code>RUST_LOG</code> env var, when set at launch, overrides
             this until you change it here.

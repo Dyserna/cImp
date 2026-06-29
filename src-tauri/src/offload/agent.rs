@@ -190,7 +190,7 @@ impl ToolRouter for HostRouter {
         if name.starts_with("graph_") && !self.allow_graph {
             return Err(format!(
                 "tool `{name}` is not available on this backend (code-graph access for a remote \
-                 offload worker is off — enable it in ccImp Settings → Code Graph)"
+                 offload worker is off — enable it in cImp Settings → Code Graph)"
             ));
         }
         // Namespaced ids (`<server>__<tool>`) belong to an MCP server; bare

@@ -69,7 +69,7 @@ use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsEngine, TtsRequest};
 
 fn main() {
-    // Status-line subcommand: Claude Code invokes `ccimp --statusline`,
+    // Status-line subcommand: Claude Code invokes `cimp --statusline`,
     // pipes the session JSON to our stdin, and reads the rendered context
     // bar from our stdout. Handle it before any Tauri/audio/settings init
     // so it's instant and never spins up the GUI. Works under the release
@@ -80,7 +80,7 @@ fn main() {
         return;
     }
 
-    // V8-01 offload MCP server: a host agent invokes `ccimp --offload-mcp`
+    // V8-01 offload MCP server: a host agent invokes `cimp --offload-mcp`
     // (Claude via `--mcp-config`; OpenCode via the injected `mcp` block) and
     // speaks newline-delimited JSON-RPC over stdio. Handle it before any
     // Tauri/audio/settings init so it stays GUI-free and fast to spawn per
@@ -109,9 +109,9 @@ fn main() {
     // Window title reflects the project the user launched from. If the
     // launch cwd is anywhere inside a git working copy, the title uses
     // the repo-root folder name; otherwise it falls back to the launch
-    // dir's own folder name. Format is "<project> - ccImp". Applied to
+    // dir's own folder name. Format is "<project> - cImp". Applied to
     // the main window in the Tauri setup hook below.
-    let window_title = format!("{} - ccImp", project_label_for(&launch_cwd));
+    let window_title = format!("{} - cImp", project_label_for(&launch_cwd));
 
     // Tracing comes up before settings load so the load path's own logs
     // hit the file. The default-level guard is replaced once settings
@@ -122,7 +122,7 @@ fn main() {
         cwd = %launch_cwd.display(),
         args = ?extra_args,
         logs_dir = %logging::logs_dir().display(),
-        "ccimp starting"
+        "cimp starting"
     );
 
     // Probe the platform default shell once and cache it for every Shell
@@ -510,7 +510,7 @@ fn main() {
             spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
 
             // Apply the project-derived window title. The hardcoded
-            // "ccImp" from tauri.conf.json is what the OS sees before
+            // "cImp" from tauri.conf.json is what the OS sees before
             // this fires; this overwrite happens during setup so the
             // user only briefly sees the bare default.
             if let Some(win) = app.get_webview_window("main") {
@@ -725,7 +725,7 @@ fn start_offload_runtime(
 /// and worktrees use a `.git` file pointing at the parent's gitdir).
 /// The first ancestor that has one wins, and its folder name becomes
 /// the label. With no `.git` anywhere along the chain, the launch
-/// directory's own folder name is used. A final fallback to "ccImp"
+/// directory's own folder name is used. A final fallback to "cImp"
 /// covers degenerate paths like a drive root with no file_name segment.
 fn project_label_for(cwd: &Path) -> String {
     let mut dir = cwd;
@@ -743,7 +743,7 @@ fn project_label_for(cwd: &Path) -> String {
     }
     cwd.file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("ccImp")
+        .unwrap_or("cImp")
         .to_string()
 }
 

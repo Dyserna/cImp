@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Broaden where settings live: in addition to the single global config at `%APPDATA%\ccImp\settings.json` (Windows) / platform equivalents, allow each project directory to carry its own complete settings file. On launch, ccImp checks the cwd for a project-local file; if found, that file becomes the source of truth for the session — *every* setting (TTS, avatar, themes, background image, tabs, layout, presets, shortcuts) loads from and persists to it. The global file is left untouched.
+Broaden where settings live: in addition to the single global config at `%APPDATA%\cImp\settings.json` (Windows) / platform equivalents, allow each project directory to carry its own complete settings file. On launch, cImp checks the cwd for a project-local file; if found, that file becomes the source of truth for the session — *every* setting (TTS, avatar, themes, background image, tabs, layout, presets, shortcuts) loads from and persists to it. The global file is left untouched.
 
 This subsumes the older "per-cwd / per-project layout memory" item from `FUTURE-FEATURES.md` — instead of a `Map<cwd, LayoutPersisted>` inside one global file, we generalize to "a whole settings file per directory." Same shape, different location, simpler runtime architecture.
 
@@ -16,20 +16,20 @@ The deferred per-cwd-layout item proposed keying just the `layout` field by cwd.
 
 ### Path resolution
 
-Today, `src-tauri/src/settings/persistence.rs` computes one path: `<config_dir>/ccImp/settings.json`. After this feature:
+Today, `src-tauri/src/settings/persistence.rs` computes one path: `<config_dir>/cImp/settings.json`. After this feature:
 
 ```rust
 fn resolved_config_path(launch_cwd: &Path) -> ResolvedPath {
     if let Some(decision) = read_cwd_decisions().get(launch_cwd) {
         match decision {
-            "project-local" => ProjectLocal(launch_cwd.join(".ccImp/settings.json")),
+            "project-local" => ProjectLocal(launch_cwd.join(".cImp/settings.json")),
             "global"        => Global(global_path()),
         }
     } else {
         // First launch in this cwd. Probe filesystem.
-        let project_path = launch_cwd.join(".ccImp/settings.json");
+        let project_path = launch_cwd.join(".cImp/settings.json");
         if project_path.exists() {
-            // Probably created by another ccImp user (committed to repo) or
+            // Probably created by another cImp user (committed to repo) or
             // by this user previously. Don't auto-adopt — prompt at startup.
             Unresolved(launch_cwd, project_path)
         } else {
@@ -45,7 +45,7 @@ Once resolved, the existing `SettingsHandle` runtime is unchanged — it reads/w
 
 A small file in the global dir tracks the user's choice for each known cwd, so the prompt only fires on first launch in a directory:
 
-`<config_dir>/ccImp/cwd_decisions.json`:
+`<config_dir>/cImp/cwd_decisions.json`:
 ```json
 {
   "/abs/path/to/project-a": "project-local",
@@ -63,7 +63,7 @@ A "Reset preference for this directory" entry in the Layouts/Settings menu un-re
 A small modal on first launch in an unrecognized cwd. Three explicit buttons:
 
 - **Use global config** — sets `cwd_decisions[cwd] = "global"`. No project file created.
-- **Create project config here** — copies current in-memory global state to `<cwd>/.ccImp/settings.json`, sets `cwd_decisions[cwd] = "project-local"`. Reload the SettingsHandle from the new path.
+- **Create project config here** — copies current in-memory global state to `<cwd>/.cImp/settings.json`, sets `cwd_decisions[cwd] = "project-local"`. Reload the SettingsHandle from the new path.
 - **Cancel** — uses global for *this session only*, doesn't record a preference. Re-prompts next launch.
 
 Dismissable, never blocks the app, only appears on truly first launch in a cwd.
@@ -72,23 +72,23 @@ The "Don't ask again" checkbox is implicit — picking either of the first two o
 
 ### Switching modes mid-session: out of scope
 
-If a user wants to switch a directory from global to project-local, they restart ccImp after creating the file (or via a menu entry that does the copy + initiates a clean restart). Hot-swap mid-run would require tearing down and re-broadcasting every settings subscriber (TTS pipeline, audio output, tab registry, frontend store) — doable but the complexity isn't justified for a workflow that naturally aligns with launching ccImp per project.
+If a user wants to switch a directory from global to project-local, they restart cImp after creating the file (or via a menu entry that does the copy + initiates a clean restart). Hot-swap mid-run would require tearing down and re-broadcasting every settings subscriber (TTS pipeline, audio output, tab registry, frontend store) — doable but the complexity isn't justified for a workflow that naturally aligns with launching cImp per project.
 
 ### No upward directory walk
 
-Only the exact launch cwd is checked. Don't traverse parents looking for `.ccImp/`. Predictable behavior ("I launched here, so this is what's active"), and avoids picking up a stale config from an unrelated parent directory. Document and leave.
+Only the exact launch cwd is checked. Don't traverse parents looking for `.cImp/`. Predictable behavior ("I launched here, so this is what's active"), and avoids picking up a stale config from an unrelated parent directory. Document and leave.
 
 ### Migration: existing v1.3 users
 
 First launch after this lands: synthesize a `cwd_decisions[current_cwd] = "global"` entry, so no prompt fires for the directory the user is already running in. Subsequent launches in *new* cwds prompt as designed. No data loss — the global file remains the source of truth until the user explicitly creates a project file.
 
-### File location: `.ccImp/settings.json`
+### File location: `.cImp/settings.json`
 
 Hidden directory, namespaced — same idiom as `.git/`, `.vscode/`. Migration backups (`config.json.v1.X.bak`) live alongside whichever file is active.
 
 ### Avatar / background / image paths inside project configs
 
-Today, asset paths in settings are absolute. For shared (gitted) project configs, users want path *relative-ness* — an asset stored at `.ccImp/avatars/idle.png` should resolve regardless of where the repo is cloned.
+Today, asset paths in settings are absolute. For shared (gitted) project configs, users want path *relative-ness* — an asset stored at `.cImp/avatars/idle.png` should resolve regardless of where the repo is cloned.
 
 **Rule**: when the active settings file is project-local, paths starting with `./` or relative paths are resolved relative to the project dir; absolute paths still work. Same rule applies to background images. Global config keeps absolute-paths-only behavior since there's no project root to resolve against.
 
@@ -98,7 +98,7 @@ A small helper `resolveAssetPath(rawPath, settingsScope)` centralizes the rule. 
 
 ### Settings window scope
 
-The Settings window operates on whatever file is currently active. A small indicator in the title bar shows "Editing project config (`/abs/path/.ccImp`)" vs. "Editing global config" so the user knows which file they're modifying. **No mode-switching dropdown** — the file is fixed at launch.
+The Settings window operates on whatever file is currently active. A small indicator in the title bar shows "Editing project config (`/abs/path/.cImp`)" vs. "Editing global config" so the user knows which file they're modifying. **No mode-switching dropdown** — the file is fixed at launch.
 
 ### Layout presets
 
@@ -106,9 +106,9 @@ Project-local presets only apply to that project. Cross-project preset sharing i
 
 ### Git/VCS interaction
 
-A project file at `.ccImp/settings.json` is naturally project-scoped — some users will commit it (team shares workspace defaults), others will gitignore it (personal preferences don't leak). ccImp doesn't enforce either. Document the trade-off in the README.
+A project file at `.cImp/settings.json` is naturally project-scoped — some users will commit it (team shares workspace defaults), others will gitignore it (personal preferences don't leak). cImp doesn't enforce either. Document the trade-off in the README.
 
-**Auto-write a sibling `.gitignore`**: when creating a project file, also write `.ccImp/.gitignore` containing at least `*.bak\n` so backup files never end up in version control even if `settings.json` itself is tracked. Worth doing — backups are user-machine state regardless of whether config is shared.
+**Auto-write a sibling `.gitignore`**: when creating a project file, also write `.cImp/.gitignore` containing at least `*.bak\n` so backup files never end up in version control even if `settings.json` itself is tracked. Worth doing — backups are user-machine state regardless of whether config is shared.
 
 ## Implementation outline
 
@@ -139,8 +139,8 @@ The work splits along three reasonably-independent seams:
 
 ## Open questions
 
-- **What if `.ccImp/settings.json` exists in the cwd but the user has never launched ccImp there?** (e.g., they cloned a repo with a committed project config.) The startup prompt copy needs to handle this: offer a third option "**Use existing project config**" that adopts the file as-is. Decide at implementation time whether that's a separate button or whether the existing "Use this project config" button just behaves contextually based on whether the file pre-exists.
-- **Settings file format compatibility across ccImp versions**: a teammate runs ccImp v1.5 with a committed project config; a coworker on ccImp v1.4 clones the repo. The v1.4 user's migration logic kicks in. Migration is already idempotent and additive, so this should work — but verify with a test (drop a v1.5-shaped file in front of a v1.4 build).
+- **What if `.cImp/settings.json` exists in the cwd but the user has never launched cImp there?** (e.g., they cloned a repo with a committed project config.) The startup prompt copy needs to handle this: offer a third option "**Use existing project config**" that adopts the file as-is. Decide at implementation time whether that's a separate button or whether the existing "Use this project config" button just behaves contextually based on whether the file pre-exists.
+- **Settings file format compatibility across cImp versions**: a teammate runs cImp v1.5 with a committed project config; a coworker on cImp v1.4 clones the repo. The v1.4 user's migration logic kicks in. Migration is already idempotent and additive, so this should work — but verify with a test (drop a v1.5-shaped file in front of a v1.4 build).
 - **Reset cwd preference UI affordance**: Layouts menu, Settings menu, or both? Probably Settings (Appearance or General tab), since Layouts is reserved for layout presets.
 
 ## Milestone recommendation

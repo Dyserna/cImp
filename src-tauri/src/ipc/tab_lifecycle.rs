@@ -56,7 +56,7 @@ pub enum TabLifecycleError {
     /// `opencode` command can't be resolved (not in `ebin`, not on PATH). The
     /// tab is left disabled and the UI surfaces this so the user can install
     /// OpenCode first — unlike Claude (the app's own front end), a missing
-    /// OpenCode would only ever show a dead "command not found" tab. cctts does
+    /// OpenCode would only ever show a dead "command not found" tab. cimp does
     /// not bundle the ~158 MB binary (V19 require-install decision).
     OpencodeNotFound,
     /// Internal error (lock poisoning, channel send failure, etc.). Not

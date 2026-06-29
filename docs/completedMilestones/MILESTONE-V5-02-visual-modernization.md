@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Turn cctts's visual language from the v1.3.1 dated dark-on-dark look into a modern desktop UI matching the visual reference (Atom-style cool slate-blue surfaces, mint/teal accent, coral semantics, pill-shaped active tabs, generous radii). This is the user-visible payoff of the V5 modernization.
+Turn cimp's visual language from the v1.3.1 dated dark-on-dark look into a modern desktop UI matching the visual reference (Atom-style cool slate-blue surfaces, mint/teal accent, coral semantics, pill-shaped active tabs, generous radii). This is the user-visible payoff of the V5 modernization.
 
 V5-01 stood up the token system and converted every component to reference tokens. V5-02 changes the *values* of those tokens in `theme.css`, introduces a small set of new UI primitives, and runs a per-component polish pass. Because the substrate is in place, the visual rewrite is mostly a single-file diff plus targeted component changes — not a 31-file sweep.
 
@@ -316,7 +316,7 @@ If any pair fails, nudge the failing token by 5-10% lightness toward whichever s
 
 ### 10. Terminal palette compatibility
 
-Open a Claude tab and a Shell tab side-by-side in a split layout. Try the default xterm theme, Solarized Dark, and Dracula. The cctts chrome (`--surface-1` panes, `--surface-2` tab bar) should contrast clearly with each terminal background — the tab bar shouldn't blend into the terminal interior.
+Open a Claude tab and a Shell tab side-by-side in a split layout. Try the default xterm theme, Solarized Dark, and Dracula. The cimp chrome (`--surface-1` panes, `--surface-2` tab bar) should contrast clearly with each terminal background — the tab bar shouldn't blend into the terminal interior.
 
 If the slate-blue chrome reads too close to a particular terminal palette, adjust the surface values in step 1 by 3-5% steps. The user's terminal is more important than the chrome's exact tint, so chrome adjusts to make terminal palettes pop.
 
@@ -363,7 +363,7 @@ README screenshots: if README has UI screenshots, mark them stale or replace. Sc
 ## Edge Cases and Gotchas
 
 - **Active-tab geometry change.** Today the tab is flush with the pane below; the bottom-border accent fits this geometry. The pill treatment requires a small gap above and below the tab. Verify the pane viewport doesn't overlap the tab bar after the geometry change — `Pane.svelte`'s top edge may need a small adjustment.
-- **xterm.js scrollback area.** The terminal renders into its own canvas/DOM; the chrome around it changes color. Verify there's no visible seam between the chrome's `--surface-1` and the xterm.js container's background. xterm.js's background comes from its own theme, not cctts's tokens — keep them visually compatible.
+- **xterm.js scrollback area.** The terminal renders into its own canvas/DOM; the chrome around it changes color. Verify there's no visible seam between the chrome's `--surface-1` and the xterm.js container's background. xterm.js's background comes from its own theme, not cimp's tokens — keep them visually compatible.
 - **Per-pane edge-fade gradients.** V4-05's tab-bar overflow uses CSS gradients that fade to the bar background. Update these to fade to the new `--surface-2`. A wrong fade color reads as a hard line.
 - **Focused-pane indicator visibility.** V4-05 explicitly tuned this to "clearly present but not visually noisy." With slate-blue surfaces and a mint accent, a 2px top accent on the focused pane's tab bar may be more visible than v1.3's version. If it dominates, fall back to a 1px accent or reduce to `--accent-muted` (low alpha).
 - **Compose overlay's slide-up clipping.** Top corners get `--radius-lg` but bottom corners stay 0. Some browsers / WebView2 versions render `border-radius: 16px 16px 0 0` with subpixel artifacts at the corners. Add `overflow: hidden` on the overlay container to mask any.

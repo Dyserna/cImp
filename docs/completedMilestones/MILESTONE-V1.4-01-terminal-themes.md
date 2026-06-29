@@ -115,7 +115,7 @@ pub struct Settings {
     pub layout_presets: Vec<LayoutPreset>,
     pub ui: UiSettings,
     /// Terminal-pane settings: xterm.js theme (V1.4-01) and background image
-    /// (V1.4-02). Distinct from `ui`, which themes the cctts chrome.
+    /// (V1.4-02). Distinct from `ui`, which themes the cimp chrome.
     pub terminal: TerminalSettings,
 }
 

@@ -1,7 +1,7 @@
 //! V8-02 offload supervisor — the app-owned lifecycle for the **pool** of
 //! offload backends.
 //!
-//! ccImp owns the *process* of each **Local** backend (a `llama-server`
+//! cImp owns the *process* of each **Local** backend (a `llama-server`
 //! spawned from its `server_command`), driven by `enabled`/`autostart` and
 //! the per-backend Start/Stop/Restart IPC. **Remote** backends have no
 //! process — the supervisor only health-probes them for the Settings status
@@ -108,7 +108,7 @@ struct Running {
 
 /// App-owned supervisor. Held in `AppState` behind an `Arc`.
 pub struct OffloadSupervisor {
-    /// Local backends ccImp owns the process of, keyed by backend name.
+    /// Local backends cImp owns the process of, keyed by backend name.
     running: TokioMutex<HashMap<String, Running>>,
     /// Aggregate state of the primary backend (for the `offload-state`
     /// event + legacy single-status IPC).
@@ -650,7 +650,7 @@ fn spawn_child(
         .spawn()
         .map_err(|e| AppError::Spawn(format!("llama-server: {e}")))?;
     // Backstop: assign to the kill-on-job-close job so the OS reaps this
-    // VRAM-holding server even if ccImp dies hard (crash / panic=abort /
+    // VRAM-holding server even if cImp dies hard (crash / panic=abort /
     // dev hot-reload TerminateProcess), where kill_on_drop never fires.
     crate::process_guard::guard_child(&child);
 

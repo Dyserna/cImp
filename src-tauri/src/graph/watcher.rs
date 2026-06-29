@@ -48,7 +48,7 @@ pub fn start(
         .clamp(Duration::from_secs(2), Duration::from_secs(30));
 
     std::thread::Builder::new()
-        .name("ccimp-graph-watch".into())
+        .name("cimp-graph-watch".into())
         .spawn(move || {
             loop {
                 // Block for the first event of a batch. `Err` means every

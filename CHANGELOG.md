@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bundle OpenCode (~158 MB); install it from <https://opencode.ai/docs> (or drop
   the binary in `ebin/`). A dedicated `opencode_access` per-server flag controls
   which MCP servers OpenCode sees.
+- **New `TUI - Grey` theme (OpenCode); `TUI - Red` and `TUI - Aider` removed.**
+  The theme set is now `tui-orange` (Claude Code, default) and `tui-grey` — an
+  OpenCode-flavored monochrome theme keyed off a cool light-grey accent
+  (`#c8ccd0`) and paired with a new `OpenCode Grey` terminal palette. The
+  `tui-red` (Imp Red) and `tui-green` (Aider Green) themes and their dedicated
+  `Imp Red` / `Aider Green` terminal palettes are dropped. The compiled-in
+  last-resort fallback (used only when the on-disk `themes/` folder is empty)
+  moves from `tui-red` + `Imp Red` to `tui-orange` + `GitHub Dark`, so the
+  embedded fallback now matches the new-install defaults. Settings holding a
+  removed theme/palette name keep their string and fall back gracefully at
+  load (unknown theme → `tui-orange` chrome; unknown palette → `Default`).
 
 ### Migration
 

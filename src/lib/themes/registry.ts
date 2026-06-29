@@ -7,8 +7,8 @@
 // Settings UI plus a synchronous `themeMeta(id)` lookup used by the window
 // entry points to drive `data-theme` and the OS-chrome (decorations) toggle.
 //
-// Everything degrades to a built-in `tui-red` fallback: the backend always
-// includes the embedded tui-red theme even when the on-disk folder is empty,
+// Everything degrades to a built-in `tui-orange` fallback: the backend always
+// includes the embedded tui-orange theme even when the on-disk folder is empty,
 // and if the IPC itself fails we still hold the metadata fallback below so the
 // chrome logic never sees `undefined`.
 
@@ -33,15 +33,15 @@ export interface PaletteWire {
 }
 
 /// Metadata fallback used before the registry loads and if the fetch fails.
-/// Matches the embedded tui-red theme.json on the Rust side. `css` is empty
+/// Matches the embedded tui-orange theme.json on the Rust side. `css` is empty
 /// here — the real CSS arrives from the backend (or, in the empty-folder case,
 /// from the backend's embedded copy); a fetch failure leaves the base
 /// `theme.css` :root tokens in effect, which is a usable degraded state.
 const FALLBACK_THEME: ThemeEntry = {
-  id: 'tui-red',
-  name: 'TUI - Red',
+  id: 'tui-orange',
+  name: 'TUI - Orange',
   decorations: false,
-  palette: 'Imp Red',
+  palette: 'GitHub Dark',
   css: '',
 };
 
@@ -60,7 +60,7 @@ export const paletteRegistry: Readable<PaletteWire[]> = palettesStore;
 
 let byId = new Map<string, ThemeEntry>([[FALLBACK_THEME.id, FALLBACK_THEME]]);
 
-/// Synchronous metadata lookup. Unknown ids fall back to tui-red so the
+/// Synchronous metadata lookup. Unknown ids fall back to tui-orange so the
 /// chrome logic (decorations toggle, palette pairing) always has an answer.
 export function themeMeta(id: string): ThemeEntry {
   return byId.get(id) ?? byId.get(FALLBACK_THEME.id) ?? FALLBACK_THEME;

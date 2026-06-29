@@ -1792,8 +1792,8 @@ impl Default for AvatarSettings {
 #[serde(rename_all = "kebab-case")]
 pub enum AvatarKind {
     Media,
-    /// Default render mode: the animated pixel-art mascot, paired with the
-    /// default `tui-red` theme. The default set is `impSprites` (the imp).
+    /// Default render mode: the animated pixel-art mascot. The default set is
+    /// `impSprites` (the imp), independent of the active UI theme.
     #[default]
     Sprite,
 }
@@ -2086,14 +2086,13 @@ impl Default for StatuslineSettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UiSettings {
-    /// Active UI chrome theme. Three values currently ship, all ratatui-style
-    /// (custom title bar, square borders): `"tui-red"` (the Imp Red palette +
-    /// the imp's scarlet accent, #e23c3c), `"tui-orange"` (Gruvbox surfaces +
-    /// Claude Code's accent orange, #d77757), and `"tui-green"` (the Aider
-    /// Green palette + Aider's terminal green accent, #2eb82e). New installs
-    /// land on `"tui-orange"` so the chrome accent matches Claude Code's
-    /// orange. The avatar still defaults to the animated `impSprites` mascot
-    /// independently (see [`AvatarKind`] / [`SpriteSettings`]).
+    /// Active UI chrome theme. Two values currently ship, both ratatui-style
+    /// (custom title bar, square borders): `"tui-orange"` (Gruvbox surfaces +
+    /// Claude Code's accent orange, #d77757) and `"tui-grey"` (the OpenCode Grey
+    /// palette + OpenCode's cool light-grey accent, #c8ccd0). New installs land
+    /// on `"tui-orange"` so the chrome accent matches Claude Code's orange. The
+    /// avatar still defaults to the animated `impSprites` mascot independently
+    /// (see [`AvatarKind`] / [`SpriteSettings`]).
     /// The pre-V1.13 `"tui"` value is rewritten to `"tui-orange"` by the
     /// v12 → v13 migration so existing users keep a Gruvbox look. Existing
     /// settings.json files otherwise keep whatever value they were

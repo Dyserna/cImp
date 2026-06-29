@@ -132,7 +132,7 @@
    in the top border of each pane (the ratatui aesthetic).
 
    This file is self-contained on purpose: see the "Theme isolation
-   policy" comment at the top of `theme.css`. Even though `tui-red` has
+   policy" comment at the top of `theme.css`. Even though `tui-grey` has
    identical structural rules today, each theme gets its own copy — the
    duplication is the point.
 

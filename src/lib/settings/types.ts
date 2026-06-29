@@ -321,13 +321,12 @@ export interface ProcessingSettings {
 }
 
 export interface UiSettings {
-  /// Active UI chrome theme. Three values currently ship, all ratatui-style
-  /// (custom title bar, square borders): `"tui-red"` (Imp Red palette + the
-  /// imp's scarlet accent), `"tui-orange"` (Gruvbox surfaces + Claude Code's
-  /// accent orange), and `"tui-green"` (a green palette + terminal
-  /// green accent). New installs default to `"tui-orange"` so the chrome
-  /// accent matches Claude Code's orange; the avatar still defaults to the
-  /// animated `impSprites` mascot independently. Distinct from
+  /// Active UI chrome theme. Two values currently ship, both ratatui-style
+  /// (custom title bar, square borders): `"tui-orange"` (Gruvbox surfaces +
+  /// Claude Code's accent orange) and `"tui-grey"` (OpenCode Grey palette +
+  /// OpenCode's cool light-grey accent). New installs default to `"tui-orange"`
+  /// so the chrome accent matches Claude Code's orange; the avatar still
+  /// defaults to the animated `impSprites` mascot independently. Distinct from
   /// `terminal.theme`, which governs the xterm.js terminal palette inside
   /// each tab.
   theme: string;

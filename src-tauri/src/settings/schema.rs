@@ -643,7 +643,7 @@ impl Default for ClaudeLocalSettings {
     }
 }
 
-/// V14: local-LLM provider configuration for Aider tabs whose
+/// V19: local-LLM provider configuration for OpenCode tabs whose
 /// `use_local_provider: true`. The launch flow synthesizes an
 /// OpenAI-compatible `provider` block (pointing `options.baseURL` at
 /// `base_url` and `options.apiKey` at `auth_token`, with `model` as the
@@ -1564,13 +1564,11 @@ pub fn default_claude_local_tab() -> TabConfig {
     })
 }
 
-/// V14: Aider AI-tool tab using whatever provider Aider's own config
-/// selects (cloud / API keys / per-project `.aider.conf.yml`). ccimp
-/// does not synthesize provider env vars for this tab — the user's
-/// existing aider configuration is in charge. TTS prompt injection is
-/// disabled by default because Aider's CLI has no
-/// `--append-system-prompt` equivalent (the spawn path enforces this
-/// regardless of the toggle).
+/// V19: OpenCode AI-tool tab using whatever provider OpenCode's own config
+/// selects (cloud / API keys / project config) when `use_local_provider` is
+/// off. TTS prompt injection is enabled by default: OpenCode accepts an
+/// instructions file (injected via `OPENCODE_CONFIG_CONTENT`), so it honors
+/// the TTS-markup convention and the tab can speak.
 pub fn default_opencode_tab() -> TabConfig {
     TabConfig::AiTool(AiToolTabConfig {
         id: OPENCODE_TAB_ID.to_string(),

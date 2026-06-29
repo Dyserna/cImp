@@ -113,8 +113,9 @@ fn command_is(command: &str, name: &str) -> bool {
 }
 
 /// Pre-args injected ahead of the tab's own `args` and the wrapper's
-/// invocation args. Claude-only — both injections target Claude Code's
-/// CLI and Aider understands neither, so Aider tabs get empty pre-args:
+/// invocation args. Claude-only — these injections target Claude Code's CLI
+/// flags; OpenCode gets the equivalents via `OPENCODE_CONFIG_CONTENT` (see
+/// `build_opencode_config`), so non-Claude tabs get empty pre-args:
 ///
 ///   * `--append-system-prompt <instructions>` — TTS markup convention,
 ///     gated on the per-tab `tts_injection` toggle.

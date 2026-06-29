@@ -8,18 +8,16 @@
 //! unknown id is a hard error (the registry shouldn't know about a tab
 //! whose entry is missing from settings).
 //!
-//! V19: AI tabs cover Claude Code (`claude` / `claude-local`) and OpenCode
-//! (`opencode` / `opencode-local`). The `use_local_provider` flag on each
-//! AI tab gates env/config synthesis: Claude pairs read from `claude_local`
-//! and receive `ANTHROPIC_*` env vars; OpenCode pairs read from
-//! `opencode_local` and receive a local `provider` block inside the
-//! synthesized `OPENCODE_CONFIG_CONTENT` (see `build_opencode_config`).
-//! Per-tab `env` entries take precedence over synthesized values.
+//! V19: AI tabs cover Claude Code (`claude` / `claude-local`) and a single
+//! OpenCode tab (`opencode`). Claude's `use_local_provider` flag reads from
+//! `claude_local` and synthesizes `ANTHROPIC_*` env vars. OpenCode manages its
+//! own providers/credentials, so cctts injects no provider — just the mcp +
+//! instructions. Per-tab `env` entries take precedence over synthesized values.
 //!
 //! System-prompt / capability injection differs by tool: Claude uses CLI
 //! flags (`--append-system-prompt` / `--settings` / `--mcp-config`, see
 //! `build_pre_args`); OpenCode uses a single `OPENCODE_CONFIG_CONTENT` env
-//! var carrying the equivalent `mcp` / `instructions` / `provider` JSON
+//! var carrying the equivalent `mcp` / `instructions` JSON
 //! (see `compose_ai_env` + `build_opencode_config`).
 
 use std::collections::HashMap;
@@ -321,7 +319,9 @@ fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
 /// - `instructions` → the managed guidance file (TTS + offload + graph), when
 ///   any guidance applies. The file content is written on the launch path; here
 ///   we only reference its (deterministic) path.
-/// - the local `provider` block (Phase D3).
+///
+/// No `provider` block: OpenCode manages its own providers/credentials (global
+/// config, switchable in-session), so cctts never injects one.
 ///
 /// Additive by default — cctts does not set `OPENCODE_DISABLE_PROJECT_CONFIG`,
 /// so a user's project config still merges underneath. Pure: no filesystem I/O.
@@ -363,56 +363,12 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
         );
     }
 
-    // V19 (D3): local provider. When the tab uses the local provider, declare
-    // an OpenAI-compatible provider pointing at the `opencode_local` endpoint
-    // and (when a model is set) make it the default `model`. Cloud OpenCode
-    // (`use_local_provider: false`) injects no provider block and uses
-    // OpenCode's own credentials.
-    //
-    // NOTE: the exact `provider` shape (the `@ai-sdk/openai-compatible` npm id
-    // and `options.{baseURL,apiKey}` keys) is the documented OpenAI-compatible
-    // form; confirm against the live `$defs.ProviderConfig` at F1 — the local
-    // path is gated on getting this right, the cloud path is unaffected.
-    if cfg.use_local_provider {
-        let local = &settings.opencode_local;
-        if !local.base_url.is_empty() {
-            let mut models = serde_json::Map::new();
-            if !local.model.is_empty() {
-                models.insert(local.model.clone(), serde_json::json!({}));
-            }
-            config.insert(
-                "provider".to_string(),
-                serde_json::json!({
-                    OPENCODE_LOCAL_PROVIDER_ID: {
-                        "npm": "@ai-sdk/openai-compatible",
-                        "name": "ccImp local",
-                        "options": {
-                            "baseURL": local.base_url,
-                            "apiKey": local.auth_token,
-                        },
-                        "models": models,
-                    }
-                }),
-            );
-            if !local.model.is_empty() {
-                config.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(format!(
-                        "{OPENCODE_LOCAL_PROVIDER_ID}/{}",
-                        local.model
-                    )),
-                );
-            }
-        }
-    }
-
+    // V19: no `provider` block. The single OpenCode tab uses OpenCode's own
+    // provider config + credentials (global `~/.config/opencode` + `auth.json`,
+    // switchable in-session), so cctts injects only the mcp + instructions and
+    // leaves provider/model selection entirely to OpenCode.
     serde_json::Value::Object(config)
 }
-
-/// Provider id for the synthesized OpenCode local provider. Namespaced to
-/// ccImp so it can't collide with a user's own configured providers; the
-/// default model is selected as `<this>/<model>`.
-const OPENCODE_LOCAL_PROVIDER_ID: &str = "ccimp-local";
 
 /// V1.4-07 / V14: compose the spawn environment for an AI tab. Per-tab
 /// `env` entries are the user's most-specific scope and take
@@ -789,29 +745,14 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_injects_local_provider_when_enabled() {
-        let mut settings = Settings::default();
-        settings.opencode_local.base_url = "http://localhost:1234/v1".to_string();
-        settings.opencode_local.auth_token = "local".to_string();
-        settings.opencode_local.model = "qwen2.5-coder".to_string();
+    fn opencode_config_never_injects_provider() {
+        // The single OpenCode tab manages its own providers; cctts never
+        // injects a `provider`/`model` block, even with use_local_provider set.
+        let settings = Settings::default();
         let mut cfg = opencode_cfg();
         cfg.use_local_provider = true;
         let config = build_opencode_config(&cfg, &settings);
-        let prov = &config["provider"]["ccimp-local"];
-        assert_eq!(prov["options"]["baseURL"], "http://localhost:1234/v1");
-        assert_eq!(prov["options"]["apiKey"], "local");
-        assert!(prov["models"]["qwen2.5-coder"].is_object());
-        // The default model is the namespaced provider/model.
-        assert_eq!(config["model"], "ccimp-local/qwen2.5-coder");
-    }
-
-    #[test]
-    fn opencode_config_no_provider_when_cloud() {
-        let mut settings = Settings::default();
-        settings.opencode_local.base_url = "http://localhost:1234/v1".to_string();
-        let cfg = opencode_cfg(); // use_local_provider = false (cloud)
-        let config = build_opencode_config(&cfg, &settings);
-        assert!(config.get("provider").is_none(), "cloud opencode gets no provider block");
+        assert!(config.get("provider").is_none(), "opencode gets no provider block");
         assert!(config.get("model").is_none());
     }
 

@@ -45,7 +45,10 @@
     onrestart: () => void;
   } = $props();
 
-  let isOpencode = $derived(tabId === 'opencode' || tabId === 'opencode-local');
+  // OpenCode manages its own provider/model (global config, switchable
+  // in-session), so the "use local provider" toggle does not apply to it —
+  // it's hidden for the OpenCode tab. The flag still drives Claude (local).
+  let isOpencode = $derived(tabId === 'opencode');
 
   function update<K extends keyof AiToolTabConfig>(key: K, value: AiToolTabConfig[K]) {
     settings = { ...settings, [key]: value };
@@ -197,45 +200,40 @@
       </small>
     </label>
 
-    <label class="checkbox">
-      <input
-        type="checkbox"
-        checked={settings.use_local_provider}
-        onchange={(e) =>
-          update(
-            'use_local_provider',
-            (e.currentTarget as HTMLInputElement).checked,
-          )}
-      />
-      <span>
-        Use local LLM provider
-        {#if restartRequired}
-          <Pill variant="orange" size="xs">restart required</Pill>
-        {/if}
-      </span>
-    </label>
-    {#if settings.use_local_provider && !isOpencode}
+    {#if !isOpencode}
+      <label class="checkbox">
+        <input
+          type="checkbox"
+          checked={settings.use_local_provider}
+          onchange={(e) =>
+            update(
+              'use_local_provider',
+              (e.currentTarget as HTMLInputElement).checked,
+            )}
+        />
+        <span>
+          Use local LLM provider
+          {#if restartRequired}
+            <Pill variant="orange" size="xs">restart required</Pill>
+          {/if}
+        </span>
+      </label>
+      {#if settings.use_local_provider}
+        <p class="hint hint-effective-env">
+          On launch this tab synthesizes
+          <code>ANTHROPIC_BASE_URL={$settingsStore.claude_local.base_url}</code>,
+          <code>ANTHROPIC_AUTH_TOKEN=…</code>{$settingsStore.claude_local.model_alias
+            ? `, ANTHROPIC_MODEL=${$settingsStore.claude_local.model_alias}`
+            : ''}
+          from the global <em>Local LLM provider — Claude</em> settings.
+          Per-tab env entries below override these.
+        </p>
+      {/if}
+    {:else}
       <p class="hint hint-effective-env">
-        On launch this tab synthesizes
-        <code>ANTHROPIC_BASE_URL={$settingsStore.claude_local.base_url}</code>,
-        <code>ANTHROPIC_AUTH_TOKEN=…</code>{$settingsStore.claude_local.model_alias
-          ? `, ANTHROPIC_MODEL=${$settingsStore.claude_local.model_alias}`
-          : ''}
-        from the global <em>Local LLM provider — Claude</em> settings.
-        Per-tab env entries below override these.
-      </p>
-    {/if}
-    {#if settings.use_local_provider && isOpencode}
-      <p class="hint hint-effective-env">
-        On launch this tab injects an OpenAI-compatible
-        <code>provider</code> block into
-        <code>OPENCODE_CONFIG_CONTENT</code> pointing at
-        <code>{$settingsStore.opencode_local.base_url}</code>{$settingsStore
-          .opencode_local.model
-          ? ` with model ${$settingsStore.opencode_local.model}`
-          : ''}
-        from the global <em>Local LLM provider — OpenCode</em> settings.
-        Per-tab env entries below override these.
+        OpenCode manages its own providers and credentials (global config,
+        switchable in-session). Configure providers in OpenCode itself; cctts
+        injects only its MCP tools and the TTS/offload/graph guidance.
       </p>
     {/if}
   </div>

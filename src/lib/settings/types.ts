@@ -540,11 +540,6 @@ export interface Settings {
   /// `use_local_provider` flag is `true`. Stored cleartext on disk —
   /// local proxies typically accept dummy tokens, so this is acceptable.
   claude_local: ClaudeLocalSettings;
-  /// V19: local-LLM provider config for OpenCode tabs whose
-  /// `use_local_provider: true`. Stored cleartext on disk for the same
-  /// reasons as `claude_local` (local proxies typically accept dummy
-  /// tokens; OS-keychain integration is a future upgrade).
-  opencode_local: OpencodeLocalSettings;
   /// Optional explicit executable paths for the bundled quick-launch tools
   /// (rustnet / broot); empty fields resolve normally (ebin → PATH).
   external_tools: ExternalToolsSettings;
@@ -630,17 +625,6 @@ export interface ClaudeLocalSettings {
   base_url: string;
   auth_token: string;
   model_alias: string;
-}
-
-/// V19: local-LLM provider configuration for OpenCode tabs whose
-/// `use_local_provider: true`. On launch these become an OpenAI-compatible
-/// `provider` block inside the injected `OPENCODE_CONFIG_CONTENT`:
-/// `base_url` → `options.baseURL`, `auth_token` → `options.apiKey`, and
-/// `model` (when non-empty) the default model.
-export interface OpencodeLocalSettings {
-  base_url: string;
-  auth_token: string;
-  model: string;
 }
 
 /// Optional explicit executable paths for the bundled quick-launch tools
@@ -770,13 +754,11 @@ export interface OffloadSettings {
 export const CLAUDE_TAB_ID = 'claude';
 /// V1.4-07: second Claude tab preconfigured for a local LLM provider.
 export const CLAUDE_LOCAL_TAB_ID = 'claude-local';
-/// V19: OpenCode AI-tool tab using whatever provider OpenCode's own config
-/// selects (cloud / API keys / project config). Replaces the V14 aider id
-/// (the v18 → v19 migration rewrites the old tab in place).
+/// V19: the single OpenCode AI-tool tab. OpenCode picks its own provider/model
+/// (global config + credentials, switchable in-session), so there is no
+/// cloud/local pair. Replaces BOTH V14 aider ids (the v18 → v19 migration
+/// collapses them into this one).
 export const OPENCODE_TAB_ID = 'opencode';
-/// V19: OpenCode tab pointed at a local OpenAI-compatible endpoint via
-/// the `opencode_local` provider settings.
-export const OPENCODE_LOCAL_TAB_ID = 'opencode-local';
 export const SHELL_DEFAULT_TAB_ID = 'shell-default-1';
 
 /// Look up a tab entry by id. Returns undefined for unknown ids; callers
@@ -1004,11 +986,6 @@ export function defaultSettings(): Settings {
       base_url: 'http://localhost:4000',
       auth_token: 'sk-dummy',
       model_alias: '',
-    },
-    opencode_local: {
-      base_url: 'http://localhost:1234/v1',
-      auth_token: 'local',
-      model: '',
     },
     external_tools: {
       rustnet: '',

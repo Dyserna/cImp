@@ -21,15 +21,12 @@ pub const CLAUDE_TAB_ID: &str = "claude";
 /// `aider` reserved id (the v1.7 → v1.8 migration rewrites the aider
 /// tab in place to this id).
 pub const CLAUDE_LOCAL_TAB_ID: &str = "claude-local";
-/// OpenCode AI-tool tab using whatever provider OpenCode's own config
-/// selects (cloud/keys/etc). Reserved in V19, replacing the V14 `aider`
-/// reserved id (the v18 → v19 migration rewrites the aider tab in place to
-/// this id).
+/// The single OpenCode AI-tool tab. OpenCode picks its own provider/model
+/// (global config + credentials, switchable in-session), so unlike Claude
+/// there is no cloud/local pair. Reserved in V19, replacing BOTH the V14
+/// `aider` and `aider-local` reserved ids (the v18 → v19 migration collapses
+/// them into this one id).
 pub const OPENCODE_TAB_ID: &str = "opencode";
-/// OpenCode AI-tool tab pointed at a local OpenAI-compatible endpoint via
-/// the global `opencode_local` provider settings. Replaces the V14
-/// `aider-local` reserved id.
-pub const OPENCODE_LOCAL_TAB_ID: &str = "opencode-local";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// V8-03: the read-only, non-closable Offload Server tab. Materialized only
 /// while `offload.enabled` (integrity check), it shows the local
@@ -142,13 +139,6 @@ pub struct Settings {
     /// (and `ANTHROPIC_MODEL` if set) into the spawned process's env.
     /// Per-tab `env` entries take precedence over synthesized values.
     pub claude_local: ClaudeLocalSettings,
-    /// V19: local-LLM provider config for OpenCode tabs whose
-    /// `use_local_provider` flag is `true`. The launch-time config
-    /// composition reads `base_url`/`auth_token`/`model` from here and
-    /// synthesizes an OpenAI-compatible `provider` block inside
-    /// `OPENCODE_CONFIG_CONTENT` (see `tabs::config::build_opencode_config`).
-    /// Per-tab `env` entries take precedence over synthesized values.
-    pub opencode_local: OpencodeLocalSettings,
     /// Optional explicit executable paths for the bundled quick-launch
     /// tools (rustnet / broot). A non-empty field overrides the normal
     /// `ebin/` → PATH resolution for that tool, letting the user point at
@@ -204,7 +194,6 @@ impl Default for Settings {
             ui: UiSettings::default(),
             terminal: TerminalSettings::default(),
             claude_local: ClaudeLocalSettings::default(),
-            opencode_local: OpencodeLocalSettings::default(),
             external_tools: ExternalToolsSettings::default(),
             offload: OffloadSettings::default(),
             graph: GraphSettings::default(),
@@ -301,24 +290,27 @@ impl LogRetention {
     }
 }
 
-/// One of the four reserved AI-tool tab ids. Wire format is the kebab-
-/// case tab-id string (`"claude"`, `"claude-local"`, `"opencode"`,
-/// `"opencode-local"`); the type exists so `enabled_ai_tabs` can be a
-/// strongly-typed `Vec<AiTabId>` instead of an untyped string list.
+/// One of the three reserved AI-tool tab ids. Wire format is the kebab-
+/// case tab-id string (`"claude"`, `"claude-local"`, `"opencode"`); the type
+/// exists so `enabled_ai_tabs` can be a strongly-typed `Vec<AiTabId>` instead
+/// of an untyped string list.
+///
+/// V19 ships a single OpenCode tab (not a cloud/local pair like Claude):
+/// OpenCode addresses many providers as `provider/model`, switches between
+/// them in-session, and reads global config/credentials, so a local variant
+/// would be redundant — the one tab covers cloud and local.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum AiTabId {
     Claude,
     ClaudeLocal,
-    // Explicit renames: serde's kebab-case would split the camelCase variant
-    // names into `open-code` / `open-code-local`, but the wire format must be
-    // the single-word tab ids `opencode` / `opencode-local` (matching
-    // OPENCODE_TAB_ID, the migration output, and the frontend literals). A
-    // mismatch quarantines settings on load — see the round-trip test.
+    // Explicit rename: serde's kebab-case would split the camelCase variant
+    // name into `open-code`, but the wire format must be the single-word tab id
+    // `opencode` (matching OPENCODE_TAB_ID, the migration output, and the
+    // frontend literals). A mismatch quarantines settings on load — see the
+    // round-trip test.
     #[serde(rename = "opencode")]
     OpenCode,
-    #[serde(rename = "opencode-local")]
-    OpenCodeLocal,
 }
 
 impl AiTabId {
@@ -327,7 +319,6 @@ impl AiTabId {
             Self::Claude => CLAUDE_TAB_ID,
             Self::ClaudeLocal => CLAUDE_LOCAL_TAB_ID,
             Self::OpenCode => OPENCODE_TAB_ID,
-            Self::OpenCodeLocal => OPENCODE_LOCAL_TAB_ID,
         }
     }
 
@@ -336,28 +327,26 @@ impl AiTabId {
             CLAUDE_TAB_ID => Some(Self::Claude),
             CLAUDE_LOCAL_TAB_ID => Some(Self::ClaudeLocal),
             OPENCODE_TAB_ID => Some(Self::OpenCode),
-            OPENCODE_LOCAL_TAB_ID => Some(Self::OpenCodeLocal),
             _ => None,
         }
     }
 
-    /// True for the local-provider variants (`claude-local`,
-    /// `opencode-local`). The integrity check uses this as the canonical
-    /// `use_local_provider` value for each reserved id.
+    /// True for the local-provider variants (`claude-local`). The integrity
+    /// check uses this as the canonical `use_local_provider` value for each
+    /// reserved id. OpenCode picks its own provider, so it is never "local".
     pub fn uses_local_provider(self) -> bool {
-        matches!(self, Self::ClaudeLocal | Self::OpenCodeLocal)
+        matches!(self, Self::ClaudeLocal)
     }
 
-    /// Canonical tab-bar position: claude (0) → claude-local → opencode →
-    /// opencode-local, with shells trailing afterwards. Used by
-    /// `add_ai_builtin_tab` and `integrity_check` so re-adding a
-    /// previously-disabled AI tab lands in the same slot every time.
+    /// Canonical tab-bar position: claude (0) → claude-local → opencode,
+    /// with shells trailing afterwards. Used by `add_ai_builtin_tab` and
+    /// `integrity_check` so re-adding a previously-disabled AI tab lands in
+    /// the same slot every time.
     pub fn canonical_order(self) -> usize {
         match self {
             Self::Claude => 0,
             Self::ClaudeLocal => 1,
             Self::OpenCode => 2,
-            Self::OpenCodeLocal => 3,
         }
     }
 }
@@ -646,51 +635,6 @@ impl Default for ClaudeLocalSettings {
             base_url: "http://localhost:4000".to_string(),
             auth_token: "sk-dummy".to_string(),
             model_alias: String::new(),
-        }
-    }
-}
-
-/// V19: local-LLM provider configuration for OpenCode tabs whose
-/// `use_local_provider: true`. The launch flow synthesizes an
-/// OpenAI-compatible `provider` block (pointing `options.baseURL` at
-/// `base_url` and `options.apiKey` at `auth_token`, with `model` as the
-/// default model) inside the injected `OPENCODE_CONFIG_CONTENT`. Stored
-/// cleartext for the same reasons as `ClaudeLocalSettings` (local proxies
-/// typically accept dummy tokens; OS-keychain integration is a future upgrade).
-///
-/// The hand-rolled `Debug` impl redacts `auth_token` so a stray
-/// `?settings` log line cannot leak the secret to the rolling log.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct OpencodeLocalSettings {
-    pub base_url: String,
-    pub auth_token: String,
-    pub model: String,
-}
-
-impl std::fmt::Debug for OpencodeLocalSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted = if self.auth_token.is_empty() {
-            "<empty>"
-        } else {
-            "<redacted>"
-        };
-        f.debug_struct("OpencodeLocalSettings")
-            .field("base_url", &self.base_url)
-            .field("auth_token", &redacted)
-            .field("model", &self.model)
-            .finish()
-    }
-}
-
-impl Default for OpencodeLocalSettings {
-    fn default() -> Self {
-        Self {
-            // OpenCode expects the OpenAI-compatible `/v1` suffix, like LM
-            // Studio / llama-server / Ollama's OpenAI shim.
-            base_url: "http://localhost:1234/v1".to_string(),
-            auth_token: "local".to_string(),
-            model: String::new(),
         }
     }
 }
@@ -1606,37 +1550,6 @@ pub fn default_opencode_tab() -> TabConfig {
     })
 }
 
-/// V19: second OpenCode tab preconfigured to use a local OpenAI-compatible
-/// LLM via the global `opencode_local` provider settings.
-pub fn default_opencode_local_tab() -> TabConfig {
-    TabConfig::AiTool(AiToolTabConfig {
-        id: OPENCODE_LOCAL_TAB_ID.to_string(),
-        builtin: true,
-        name: "OpenCode (local)".to_string(),
-        command: "opencode".to_string(),
-        args: Vec::new(),
-        cwd: None,
-        env: HashMap::new(),
-        tts_injection: TtsInjection {
-            enabled: true,
-            instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
-        },
-        notifications: AiNotificationConfig {
-            idle: NotificationSlot::enabled("OpenCode (local) is idle"),
-            awaiting_permission: NotificationSlot::enabled(
-                "OpenCode (local) is awaiting permission",
-            ),
-            question: NotificationSlot::enabled("OpenCode (local) has a question"),
-            error: NotificationSlot::enabled("OpenCode (local) encountered an error"),
-        },
-        first_launch_notice_dismissed: true,
-        theme_override: None,
-        background_override: None,
-        use_local_provider: true,
-        tts_all_output: false,
-    })
-}
-
 /// Look up the default `TabConfig` for a reserved AI tab id. Used by
 /// the integrity check and the lifecycle IPC when materializing a tab
 /// the user just enabled.
@@ -1645,7 +1558,6 @@ pub fn default_ai_tab(id: AiTabId) -> TabConfig {
         AiTabId::Claude => default_claude_tab(),
         AiTabId::ClaudeLocal => default_claude_local_tab(),
         AiTabId::OpenCode => default_opencode_tab(),
-        AiTabId::OpenCodeLocal => default_opencode_local_tab(),
     }
 }
 
@@ -2663,7 +2575,6 @@ mod tests {
             (AiTabId::Claude, "claude"),
             (AiTabId::ClaudeLocal, "claude-local"),
             (AiTabId::OpenCode, "opencode"),
-            (AiTabId::OpenCodeLocal, "opencode-local"),
         ] {
             assert_eq!(serde_json::to_value(variant).unwrap(), json!(id), "serialize {id}");
             assert_eq!(

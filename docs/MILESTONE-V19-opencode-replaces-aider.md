@@ -4,6 +4,19 @@
 > the schema version (V14 stamped 14, …, V18 stamped 18), so this milestone
 > is V19 and its migration step is `migrate_v18_to_v19`.
 
+> **REVISION (single OpenCode tab).** This spec originally proposed a cloud/local
+> *pair* (`opencode` + `opencode-local`) mirroring Claude. That was dropped
+> during implementation: OpenCode addresses many providers as `provider/model`,
+> switches between them in-session, and reads global config + credentials
+> (`~/.config/opencode` + `~/.local/share/opencode/auth.json`), so one tab covers
+> cloud and local. The implementation therefore ships a **single `opencode`
+> tab**, drops the `opencode-local` tab, the `opencode_local` settings group, and
+> the local-provider injection (Phase D3 — cctts injects no `provider` block;
+> users configure providers in OpenCode itself). The v18→v19 migration **collapses
+> both** legacy aider tabs into the one `opencode` tab (with de-duplication).
+> Where this doc still describes the local tab / provider block below, read it as
+> superseded by this note.
+
 ## Purpose
 
 Replace the two Aider AI-tool tabs (`aider`, `aider-local`) with two

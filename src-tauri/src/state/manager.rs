@@ -37,12 +37,10 @@ pub enum TabId {
     /// variant; the v1.7 → v1.8 migration rewrites the aider tab to
     /// this id.
     ClaudeLocal,
-    /// V19: OpenCode AI-tool tab using whatever provider OpenCode's own
-    /// configuration selects. Replaces the V14 `Aider` variant.
+    /// V19: the single OpenCode AI-tool tab — OpenCode picks its own
+    /// provider/model, so (unlike Claude) there is no local variant. Replaces
+    /// both the V14 `Aider` and `AiderLocal` variants.
     OpenCode,
-    /// V19: OpenCode tab pointed at a local OpenAI-compatible endpoint via
-    /// the `opencode_local` provider settings.
-    OpenCodeLocal,
     /// A user-spawned *duplicate* of one of the AI builtins (the `+` on
     /// a Claude/OpenCode tab). Carries a `"ai-<uuid>"` id and is a closable,
     /// non-builtin AI-kind tab. Its launch behavior (env synthesis,
@@ -69,7 +67,6 @@ impl TabId {
             TabId::Claude => "claude",
             TabId::ClaudeLocal => "claude-local",
             TabId::OpenCode => "opencode",
-            TabId::OpenCodeLocal => "opencode-local",
             TabId::OffloadServer => "offload-server",
             TabId::GraphMonitor => "graph-monitor",
             TabId::Ai(s) => s.as_str(),
@@ -82,14 +79,13 @@ impl TabId {
             "claude" => TabId::Claude,
             "claude-local" => TabId::ClaudeLocal,
             "opencode" => TabId::OpenCode,
-            "opencode-local" => TabId::OpenCodeLocal,
             "offload-server" => TabId::OffloadServer,
             "graph-monitor" => TabId::GraphMonitor,
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
             // `Shell`, so they keep AI-kind behavior on relaunch. The
             // reserved exact-matches above are checked first, and
-            // `"opencode"` / `"opencode-local"` don't start with `"ai-"`, so
+            // `"opencode"` doesn't start with `"ai-"`, so
             // there's no collision.
             other if other.starts_with("ai-") => TabId::Ai(other.to_string()),
             other => TabId::Shell(other.to_string()),
@@ -106,7 +102,6 @@ impl TabId {
             TabId::Claude
             | TabId::ClaudeLocal
             | TabId::OpenCode
-            | TabId::OpenCodeLocal
             | TabId::Ai(_) => TabKind::AiTool,
             // The Offload Server tab reuses Shell-kind for processing/state
             // purposes (it never runs a PTY, so this is inert), keeping it off
@@ -128,7 +123,6 @@ impl TabId {
             TabId::Claude
             | TabId::ClaudeLocal
             | TabId::OpenCode
-            | TabId::OpenCodeLocal
             // Non-closable: the Offload Server tab is removed only by
             // disabling offload, never by the close `×`. The Code Graph
             // monitor tab is likewise removed only by disabling the graph.
@@ -1337,7 +1331,6 @@ mod tests {
             TabId::Claude,
             TabId::ClaudeLocal,
             TabId::OpenCode,
-            TabId::OpenCodeLocal,
             TabId::Ai("ai-1234".to_string()),
             TabId::Shell("shell-1".to_string()),
             TabId::Shell("user-bash".to_string()),
@@ -1351,16 +1344,15 @@ mod tests {
     #[test]
     fn spawned_ai_id_routes_to_ai_not_shell() {
         // Spawned duplicates carry an "ai-<uuid>" id and must come back as
-        // `Ai` (AI-kind, non-builtin) on relaunch — not `Shell`. The
-        // reserved "opencode"/"opencode-local" ids must stay their own variants
-        // despite sharing the "ai" prefix-without-dash (they don't, but the
-        // routing guard still must not capture them).
+        // `Ai` (AI-kind, non-builtin) on relaunch — not `Shell`. The reserved
+        // "opencode" id must stay its own variant despite sharing the "ai"
+        // prefix-without-dash (it doesn't, but the routing guard still must not
+        // capture it).
         assert_eq!(
             TabId::from_str("ai-abc123"),
             TabId::Ai("ai-abc123".to_string())
         );
         assert_eq!(TabId::from_str("opencode"), TabId::OpenCode);
-        assert_eq!(TabId::from_str("opencode-local"), TabId::OpenCodeLocal);
         assert_eq!(
             TabId::from_str("shell-xyz"),
             TabId::Shell("shell-xyz".to_string())
@@ -1375,7 +1367,7 @@ mod tests {
         // Only the reserved AI tabs are builtins. All Shell tabs — including
         // the retired `shell-broot` id and on-demand tool tabs — are closable.
         assert!(TabId::Claude.is_builtin());
-        assert!(TabId::OpenCodeLocal.is_builtin());
+        assert!(TabId::OpenCode.is_builtin());
         assert!(!TabId::Shell("shell-broot".into()).is_builtin());
         assert!(!TabId::Shell("shell-1".into()).is_builtin());
     }
@@ -1392,10 +1384,6 @@ mod tests {
             "\"opencode\""
         );
         assert_eq!(
-            serde_json::to_string(&TabId::OpenCodeLocal).unwrap(),
-            "\"opencode-local\""
-        );
-        assert_eq!(
             serde_json::to_string(&TabId::Shell("shell-1".to_string())).unwrap(),
             "\"shell-1\""
         );
@@ -1406,7 +1394,6 @@ mod tests {
         assert_eq!(TabId::Claude.kind(), TabKind::AiTool);
         assert_eq!(TabId::ClaudeLocal.kind(), TabKind::AiTool);
         assert_eq!(TabId::OpenCode.kind(), TabKind::AiTool);
-        assert_eq!(TabId::OpenCodeLocal.kind(), TabKind::AiTool);
         assert_eq!(TabId::Ai("ai-1".into()).kind(), TabKind::AiTool);
         assert_eq!(TabId::Shell("anything".into()).kind(), TabKind::Shell);
     }

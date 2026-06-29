@@ -100,8 +100,6 @@
   // between password and text via this flag (no keychain integration in
   // this milestone — the token sits cleartext in settings.json).
   let showLocalToken = $state<boolean>(false);
-  // V19: same toggle for the OpenCode local LLM section.
-  let showOpencodeLocalToken = $state<boolean>(false);
   // Inline error under the AI-tabs checkbox group — e.g. when enabling an
   // OpenCode tab is rejected because `opencode` isn't installed (ebin/PATH).
   let aiTabsError = $state<string | null>(null);
@@ -461,8 +459,7 @@
     if (
       tabId === 'claude' ||
       tabId === 'claude-local' ||
-      tabId === 'opencode' ||
-      tabId === 'opencode-local'
+      tabId === 'opencode'
     ) {
       return tabId;
     }
@@ -613,7 +610,7 @@
     if (enable) {
       // Insert in canonical order so the persisted list mirrors the
       // tab-bar order users see.
-      const order: AiTabId[] = ['claude', 'claude-local', 'opencode', 'opencode-local'];
+      const order: AiTabId[] = ['claude', 'claude-local', 'opencode'];
       next_ids = order.filter((x) => prev.includes(x) || x === id);
     } else {
       if (prev.length <= 1) return; // last-one lock (also guarded by the disabled attribute)
@@ -621,7 +618,7 @@
     }
     if (!enable && tabsSubSection === id) {
       // Jump to the first surviving id in canonical order.
-      const order: AiTabId[] = ['claude', 'claude-local', 'opencode', 'opencode-local'];
+      const order: AiTabId[] = ['claude', 'claude-local', 'opencode'];
       const survivor = order.find((x) => next_ids.includes(x));
       if (survivor) tabsSubSection = survivor;
     }
@@ -2131,7 +2128,6 @@
         {@const claudeLive = aiTabAt('claude')}
         {@const claudeLocalLive = aiTabAt('claude-local')}
         {@const opencodeLive = aiTabAt('opencode')}
-        {@const opencodeLocalLive = aiTabAt('opencode-local')}
         {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
         {@const enabledAiTabs = snapshot.enabled_ai_tabs}
         {@const lastChecked = enabledAiTabs.length === 1 ? enabledAiTabs[0] : null}
@@ -2189,22 +2185,7 @@
                       (e.currentTarget as HTMLInputElement).checked,
                     )}
                 />
-                OpenCode (cloud)
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  name="ai-tabs-enabled"
-                  value="opencode-local"
-                  checked={enabledAiTabs.includes('opencode-local')}
-                  disabled={lastChecked === 'opencode-local'}
-                  onchange={(e) =>
-                    void toggleAiTabEnabled(
-                      'opencode-local',
-                      (e.currentTarget as HTMLInputElement).checked,
-                    )}
-                />
-                OpenCode (local)
+                OpenCode
               </label>
             </div>
             {#if aiTabsError}
@@ -2238,15 +2219,6 @@
               onclick={() => (tabsSubSection = 'opencode')}
             >
               OpenCode
-            </button>
-            <button
-              type="button"
-              role="tab"
-              class:active={tabsSubSection === 'opencode-local'}
-              aria-selected={tabsSubSection === 'opencode-local'}
-              onclick={() => (tabsSubSection = 'opencode-local')}
-            >
-              OpenCode (local)
             </button>
             <button
               type="button"
@@ -2398,106 +2370,6 @@
               {:else}
                 <small class="hint top">OpenCode tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
-            </div>
-          {:else if tabsSubSection === 'opencode-local'}
-            <div id="tab-section-opencode-local">
-              {#if opencodeLocalLive}
-                <TabSettingsSection
-                  tabId={'opencode-local'}
-                  displayName={'OpenCode (local)'}
-                  bind:settings={
-                    () => opencodeLocalLive,
-                    (v) => patchAiTab('opencode-local', v)
-                  }
-                  defaults={tabDefaults['opencode-local'] ?? null}
-                  restartRequired={restartRequired['opencode-local'] ?? false}
-                  onchange={() => {}}
-                  onrestart={() => restartTab('opencode-local')}
-                />
-              {:else}
-                <small class="hint top">OpenCode (local) tab is disabled — tick the checkbox above to enable it.</small>
-              {/if}
-              <section>
-                <h2>Local LLM provider — OpenCode</h2>
-                <small class="hint top">
-                  Settings for this tab. ccImp injects an OpenAI-compatible
-                  <code>provider</code> block into
-                  <code>OPENCODE_CONFIG_CONTENT</code> from the values below
-                  (and sets <em>Model</em> as the default model). Point this at
-                  any OpenAI-compatible endpoint (LM Studio, llama-server, vLLM,
-                  LiteLLM proxy, …); ccImp does not start the endpoint itself and
-                  does not install OpenCode. See
-                  <a href="https://opencode.ai/docs" target="_blank" rel="noreferrer">opencode.ai/docs</a>.
-                </small>
-                <label>
-                  <span>Endpoint URL</span>
-                  <input
-                    type="text"
-                    value={snapshot?.opencode_local.base_url ?? ''}
-                    oninput={(e) =>
-                      patch(
-                        (s) =>
-                          (s.opencode_local.base_url = (
-                            e.currentTarget as HTMLInputElement
-                          ).value),
-                      )}
-                    placeholder="http://localhost:1234/v1"
-                  />
-                  <small class="hint">
-                    Becomes the provider's <code>options.baseURL</code>. OpenCode
-                    expects the OpenAI-compatible <code>/v1</code> suffix (LM
-                    Studio / llama-server / Ollama's OpenAI shim).
-                  </small>
-                </label>
-                <label>
-                  <span>Auth token</span>
-                  <div class="input-with-action">
-                    <input
-                      type={showOpencodeLocalToken ? 'text' : 'password'}
-                      value={snapshot?.opencode_local.auth_token ?? ''}
-                      oninput={(e) =>
-                        patch(
-                          (s) =>
-                            (s.opencode_local.auth_token = (
-                              e.currentTarget as HTMLInputElement
-                            ).value),
-                        )}
-                      placeholder="local"
-                    />
-                    <button
-                      type="button"
-                      class="secondary"
-                      onclick={() => (showOpencodeLocalToken = !showOpencodeLocalToken)}
-                    >
-                      {showOpencodeLocalToken ? 'Hide' : 'Show'}
-                    </button>
-                  </div>
-                  <small class="hint">
-                    Becomes the provider's <code>options.apiKey</code>. Stored
-                    cleartext; local endpoints typically accept any non-empty
-                    value.
-                  </small>
-                </label>
-                <label>
-                  <span>Model</span>
-                  <input
-                    type="text"
-                    value={snapshot?.opencode_local.model ?? ''}
-                    oninput={(e) =>
-                      patch(
-                        (s) =>
-                          (s.opencode_local.model = (
-                            e.currentTarget as HTMLInputElement
-                          ).value),
-                      )}
-                    placeholder="qwen2.5-coder"
-                  />
-                  <small class="hint">
-                    When non-empty, set as the default model for the synthesized
-                    local provider.
-                  </small>
-                </label>
-              </section>
             </div>
           {:else}
             <small class="hint top">

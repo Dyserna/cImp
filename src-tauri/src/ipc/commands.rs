@@ -7,9 +7,8 @@ use crate::error::{AppError, AppResult};
 use crate::ipc::windows::{open_or_focus_settings, SETTINGS_LABEL};
 use crate::ipc::AppState;
 use crate::settings::{
-    default_claude_local_tab, default_claude_tab, default_opencode_local_tab, default_opencode_tab,
-    AiToolTabConfig, Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
-    OPENCODE_LOCAL_TAB_ID, OPENCODE_TAB_ID,
+    default_claude_local_tab, default_claude_tab, default_opencode_tab,
+    AiToolTabConfig, Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID,
 };
 use crate::state::{StateSignal, TabId};
 
@@ -673,7 +672,6 @@ pub async fn ai_tool_tab_defaults(tab: TabId) -> AppResult<AiToolTabConfig> {
         CLAUDE_TAB_ID => default_claude_tab(),
         CLAUDE_LOCAL_TAB_ID => default_claude_local_tab(),
         OPENCODE_TAB_ID => default_opencode_tab(),
-        OPENCODE_LOCAL_TAB_ID => default_opencode_local_tab(),
         other => {
             return Err(AppError::Pty(format!(
                 "ai_tool_tab_defaults: tab {other} has no AI defaults"

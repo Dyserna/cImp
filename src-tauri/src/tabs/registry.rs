@@ -215,7 +215,7 @@ impl TabRegistry {
 
     /// Re-insert an AI builtin tab at its canonical position
     /// (claude → 0, claude-local → after claude, opencode → after
-    /// claude-local, opencode-local → after opencode). Used by
+    /// claude-local). Used by
     /// `set_enabled_ai_tabs` when the user re-enables a previously-
     /// removed tab. Idempotent; returns the resulting position.
     /// Distinct from `insert_user_shell_tab` because AI builtins land

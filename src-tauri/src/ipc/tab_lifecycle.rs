@@ -822,7 +822,7 @@ pub async fn set_enabled_ai_tabs(
     // NEW opencode tab is being turned on, and reject before any state changes
     // so the toggle is atomic (the UI then reverts the checkbox and shows the
     // reason). Claude is intentionally not gated — it's the app's own front end.
-    let enabling_opencode = [AiTabId::OpenCode, AiTabId::OpenCodeLocal]
+    let enabling_opencode = [AiTabId::OpenCode]
         .iter()
         .any(|id| want.contains(id) && !have.contains(id));
     if enabling_opencode {
@@ -835,13 +835,12 @@ pub async fn set_enabled_ai_tabs(
         }
     }
 
-    // Canonical add order: claude → claude-local → opencode → opencode-local
-    // so insertions land in the right relative slot.
+    // Canonical add order: claude → claude-local → opencode so insertions
+    // land in the right relative slot.
     let canonical = [
         AiTabId::Claude,
         AiTabId::ClaudeLocal,
         AiTabId::OpenCode,
-        AiTabId::OpenCodeLocal,
     ];
 
     // 1. Add any newly-enabled tabs.

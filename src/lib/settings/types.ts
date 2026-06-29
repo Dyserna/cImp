@@ -676,6 +676,9 @@ export interface McpServerConfig {
   claude_access: boolean;
   /// Expose this server's tools to the offload worker (the legacy `enabled`).
   offload_access: boolean;
+  /// V19: expose this server's tools to OpenCode (proxied through the
+  /// `--consumer opencode` child). Off by default.
+  opencode_access: boolean;
 }
 
 /// V8-02: which capability tier a backend serves (mirror of Rust

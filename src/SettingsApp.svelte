@@ -332,6 +332,7 @@
           url: '',
           claude_access: false,
           offload_access: true,
+          opencode_access: false,
         },
       ];
     });
@@ -344,7 +345,7 @@
   }
   async function setMcpAccess(
     i: number,
-    field: 'claude_access' | 'offload_access',
+    field: 'claude_access' | 'offload_access' | 'opencode_access',
     value: boolean,
   ): Promise<void> {
     await applyMcp((s) => {
@@ -3328,6 +3329,15 @@
                     setMcpAccess(i, 'offload_access', (e.currentTarget as HTMLInputElement).checked)}
                 />
                 <span>Offload</span>
+              </label>
+              <label class="mcp-enable" title="Expose this server's tools to OpenCode">
+                <input
+                  type="checkbox"
+                  checked={srv.opencode_access}
+                  onchange={(e) =>
+                    setMcpAccess(i, 'opencode_access', (e.currentTarget as HTMLInputElement).checked)}
+                />
+                <span>OpenCode</span>
               </label>
               <button type="button" class="secondary danger" onclick={() => removeMcpServer(i)}>
                 Remove

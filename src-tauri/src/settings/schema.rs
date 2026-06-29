@@ -1084,6 +1084,11 @@ pub struct McpServerConfig {
     /// Expose this server's tools to the **offload worker** (the local model,
     /// via the warm `McpHost`). This is the legacy `enabled` behavior.
     pub offload_access: bool,
+    /// V19: expose this server's tools to **OpenCode** (proxied through the
+    /// per-session `ccimp-offload --consumer opencode` child). Off by default;
+    /// the v18 → v19 migration seeds it from `claude_access` so upgraders keep
+    /// their web-research tools across both agents.
+    pub opencode_access: bool,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -1098,6 +1103,7 @@ impl std::fmt::Debug for McpServerConfig {
             .field("url", &self.url)
             .field("claude_access", &self.claude_access)
             .field("offload_access", &self.offload_access)
+            .field("opencode_access", &self.opencode_access)
             .finish()
     }
 }
@@ -1112,6 +1118,7 @@ impl Default for McpServerConfig {
             url: String::new(),
             claude_access: false,
             offload_access: true,
+            opencode_access: false,
         }
     }
 }
@@ -1372,13 +1379,18 @@ impl OffloadSettings {
         self.mcp_servers.iter().any(|m| m.claude_access)
     }
 
+    /// V19: whether at least one MCP server is exposed to OpenCode.
+    pub fn any_opencode_mcp(&self) -> bool {
+        self.mcp_servers.iter().any(|m| m.opencode_access)
+    }
+
     /// Whether the warm MCP host + loopback endpoint need to run. True when
     /// offload is enabled (the worker needs the host) OR any MCP server is
-    /// exposed to Claude Code directly (Claude reaches it over the loopback,
-    /// independent of offload). Drives runtime startup, the warm-host lifecycle,
-    /// and the per-tab `--mcp-config` injection.
+    /// exposed to Claude Code or OpenCode directly (each reaches it over the
+    /// loopback, independent of offload). Drives runtime startup, the warm-host
+    /// lifecycle, and the per-tab MCP injection.
     pub fn mcp_host_needed(&self) -> bool {
-        self.enabled || self.any_claude_mcp()
+        self.enabled || self.any_claude_mcp() || self.any_opencode_mcp()
     }
 }
 

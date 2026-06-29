@@ -80,15 +80,27 @@ fn main() {
         return;
     }
 
-    // V8-01 offload MCP server: Claude Code invokes `ccimp --offload-mcp`
-    // (injected via `--mcp-config`) and speaks newline-delimited JSON-RPC
-    // over stdio. Handle it before any Tauri/audio/settings init so it
-    // stays GUI-free and fast to spawn per Claude session — same contract
-    // as `--statusline`. It connects to the app-owned llama-server over
-    // HTTP and never loads its own model.
-    if std::env::args().skip(1).any(|a| a == "--offload-mcp") {
-        offload::mcp::run();
-        return;
+    // V8-01 offload MCP server: a host agent invokes `ccimp --offload-mcp`
+    // (Claude via `--mcp-config`; OpenCode via the injected `mcp` block) and
+    // speaks newline-delimited JSON-RPC over stdio. Handle it before any
+    // Tauri/audio/settings init so it stays GUI-free and fast to spawn per
+    // session — same contract as `--statusline`. It connects to the app-owned
+    // llama-server over HTTP and never loads its own model.
+    //
+    // V19: an optional `--consumer <name>` (default `claude`, or `opencode`)
+    // selects which per-consumer MCP-server set the app proxies to this child.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.iter().any(|a| a == "--offload-mcp") {
+            let consumer = args
+                .iter()
+                .position(|a| a == "--consumer")
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+                .unwrap_or("claude");
+            offload::mcp::run(consumer);
+            return;
+        }
     }
 
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

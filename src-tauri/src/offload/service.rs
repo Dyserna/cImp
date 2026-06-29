@@ -38,7 +38,7 @@ use crate::settings::{
 };
 
 use super::agent::{self, AgentConfig, HostRouter, OffloadTask, RunTrace, ThinkingMode};
-use super::mcp_host::{host_config_sig, McpHost, McpServerHealth};
+use super::mcp_host::{host_config_sig, Consumer, McpHost, McpServerHealth};
 use super::metrics::{BackendDashboard, CallRecord, MetricsPoller, RunRecord, ServerMetrics};
 use super::remote::RemoteBackend;
 use super::router::{self, BackendView, RouteError, TierHint};
@@ -383,15 +383,19 @@ impl OffloadService {
         }
     }
 
-    /// Claude-Code-exposed MCP tools as MCP `tools/list` descriptors
+    /// A proxied consumer's MCP tools as MCP `tools/list` descriptors
     /// (`{name, description, inputSchema}`), for the per-session child to merge
-    /// into the tools it advertises to Claude. Empty when no server has
-    /// `claude_access`.
-    pub async fn mcp_claude_tool_descriptors(&self) -> Vec<serde_json::Value> {
-        self.host
-            .tool_defs_for_claude()
-            .await
-            .into_iter()
+    /// into the tools it advertises. Empty when no server is exposed to that
+    /// consumer. V19: parameterized by `Consumer` so the same loopback serves
+    /// Claude and OpenCode children from their respective access flags.
+    pub async fn mcp_tool_descriptors(&self, consumer: Consumer) -> Vec<serde_json::Value> {
+        let defs = match consumer {
+            Consumer::Opencode => self.host.tool_defs_for_opencode().await,
+            // Offload uses the worker path, not this proxy; treat it as Claude
+            // here for safety (it never reaches this route in practice).
+            Consumer::Claude | Consumer::Offload => self.host.tool_defs_for_claude().await,
+        };
+        defs.into_iter()
             .map(|d| {
                 serde_json::json!({
                     "name": d.function.name,
@@ -402,14 +406,18 @@ impl OffloadService {
             .collect()
     }
 
-    /// Execute one Claude-exposed MCP tool call. Guarded — refuses any tool
-    /// that isn't offered by a `claude_access` server.
-    pub async fn mcp_claude_call(
+    /// Execute one proxied-consumer MCP tool call. Guarded — refuses any tool
+    /// not offered by a server exposed to `consumer`.
+    pub async fn mcp_call(
         &self,
+        consumer: Consumer,
         name: &str,
         args: serde_json::Value,
     ) -> Result<String, String> {
-        self.host.call_for_claude(name, args).await
+        match consumer {
+            Consumer::Opencode => self.host.call_for_opencode(name, args).await,
+            Consumer::Claude | Consumer::Offload => self.host.call_for_claude(name, args).await,
+        }
     }
 
     /// Run one offload task end-to-end against the live pool and return the

@@ -45,10 +45,23 @@ use crate::settings::{
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "ccimp-offload";
 
-/// Entry point for `ccimp --offload-mcp`. Builds a current-thread tokio
-/// runtime and serves the stdio loop until stdin closes. Never panics —
-/// a crash here would garble Claude Code's MCP session.
-pub fn run() {
+/// The consumer this child serves (from `--consumer <name>`, default
+/// `"claude"`). Threaded onto the loopback `/mcp/*` queries so the app returns
+/// the right per-consumer MCP-server tool set. Set once at startup.
+static CONSUMER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The configured consumer name, lowercased; `"claude"` when unset.
+fn consumer() -> &'static str {
+    CONSUMER.get().map(String::as_str).unwrap_or("claude")
+}
+
+/// Entry point for `ccimp --offload-mcp [--consumer <name>]`. Builds a
+/// current-thread tokio runtime and serves the stdio loop until stdin closes.
+/// `consumer` selects which MCP-server set the app proxies to this child
+/// (`claude` default, or `opencode`). Never panics — a crash here would garble
+/// the host agent's MCP session.
+pub fn run(consumer: &str) {
+    let _ = CONSUMER.set(consumer.trim().to_ascii_lowercase());
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -752,7 +765,7 @@ async fn proxy_mcp_list() -> Vec<Value> {
         return Vec::new();
     };
     let resp = match client
-        .post(format!("{base}/mcp/list"))
+        .post(format!("{base}/mcp/list?consumer={}", consumer()))
         .bearer_auth(&token)
         .send()
         .await
@@ -787,7 +800,7 @@ async fn proxy_mcp_call(params: &Value) -> Result<Value, (i64, String)> {
         .map_err(|e| (-32603, format!("client build failed: {e}")))?;
     let body = json!({ "name": name, "arguments": args });
     let resp = match client
-        .post(format!("{base}/mcp/call"))
+        .post(format!("{base}/mcp/call?consumer={}", consumer()))
         .bearer_auth(&token)
         .json(&body)
         .send()

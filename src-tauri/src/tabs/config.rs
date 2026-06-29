@@ -8,16 +8,19 @@
 //! unknown id is a hard error (the registry shouldn't know about a tab
 //! whose entry is missing from settings).
 //!
-//! V14: AI tabs cover Claude Code (`claude` / `claude-local`) and Aider
-//! (`aider` / `aider-local`). The `use_local_provider` flag on each AI
-//! tab gates env synthesis: Claude pairs read from `claude_local` and
-//! receive `ANTHROPIC_*` env vars; Aider pairs read from `aider_local`
-//! and receive `OPENAI_*` env vars (plus a `--model <model>` arg when
-//! set). Per-tab `env` entries take precedence over synthesized values.
-//! TTS prompt injection (`--append-system-prompt`) is Claude-only —
-//! Aider's CLI has no equivalent flag, so the spawn path drops pre-args
-//! for Aider tabs regardless of the per-tab `tts_injection.enabled`
-//! setting.
+//! V19: AI tabs cover Claude Code (`claude` / `claude-local`) and OpenCode
+//! (`opencode` / `opencode-local`). The `use_local_provider` flag on each
+//! AI tab gates env/config synthesis: Claude pairs read from `claude_local`
+//! and receive `ANTHROPIC_*` env vars; OpenCode pairs read from
+//! `opencode_local` and receive a local `provider` block inside the
+//! synthesized `OPENCODE_CONFIG_CONTENT` (see `build_opencode_config`).
+//! Per-tab `env` entries take precedence over synthesized values.
+//!
+//! System-prompt / capability injection differs by tool: Claude uses CLI
+//! flags (`--append-system-prompt` / `--settings` / `--mcp-config`, see
+//! `build_pre_args`); OpenCode uses a single `OPENCODE_CONFIG_CONTENT` env
+//! var carrying the equivalent `mcp` / `instructions` / `provider` JSON
+//! (see `compose_ai_env` + `build_opencode_config`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -220,7 +223,7 @@ material that may not share keywords with your query.";
 
 fn build_extra_args(
     cfg: &AiToolTabConfig,
-    settings: &Settings,
+    _settings: &Settings,
     invocation_args: &[String],
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -237,24 +240,13 @@ fn build_extra_args(
         out.push("--mini".to_string());
     }
 
-    // Aider against a local provider: prepend `--model <name>` if
-    // configured. Placed ahead of the user's own `cfg.args` so a user can
-    // still override by adding `--model …` themselves (Aider takes the
-    // last `--model` it sees).
-    if command_is(&cfg.command, "aider")
-        && cfg.use_local_provider
-        && !settings.aider_local.model.is_empty()
-    {
-        out.push("--model".to_string());
-        out.push(settings.aider_local.model.clone());
-    }
-
     out.extend(cfg.args.iter().filter(|s| !s.is_empty()).cloned());
 
     // ccimp is documented as a drop-in replacement for `claude`, so
     // invocation args (`ccimp --resume <id>`, etc.) flow into every
-    // Claude tab. Aider ignores unknown flags less gracefully than
-    // Claude, so we only forward invocation args to Claude tabs.
+    // Claude tab. OpenCode's model/provider selection arrives via the
+    // injected config, not flags, so we only forward invocation args to
+    // Claude tabs.
     if command_is(&cfg.command, "claude") {
         for arg in invocation_args {
             if !arg.is_empty() {
@@ -291,12 +283,12 @@ fn build_opencode_config(_cfg: &AiToolTabConfig, _settings: &Settings) -> serde_
 /// - Claude binary + `use_local_provider`: synthesize
 ///   `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`
 ///   from `claude_local`.
-/// - Aider binary + `use_local_provider`: synthesize
-///   `OPENAI_API_BASE` / `OPENAI_API_KEY` from `aider_local`. The
-///   model selection is passed via `--model` (see `build_extra_args`)
-///   rather than env, since Aider has stronger CLI-flag conventions.
-/// - Anything else (cloud Claude/Aider, `use_local_provider` off): no
-///   synthesized env — the user's existing configuration is in charge.
+/// - OpenCode binary: always set `OPENCODE_CONFIG_CONTENT` (the synthesized
+///   session config) plus the noise-suppression env vars. When
+///   `use_local_provider`, the local endpoint is carried inside that config
+///   as a `provider` block (see `build_opencode_config`), not as env.
+/// - Anything else (cloud Claude, `use_local_provider` off): no synthesized
+///   provider env — the user's existing configuration is in charge.
 fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
 
@@ -344,29 +336,22 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
         }
     }
 
-    if cfg.use_local_provider {
-        if command_is(&cfg.command, "claude") {
-            let cl = &settings.claude_local;
-            if !cl.base_url.is_empty() {
-                env.insert("ANTHROPIC_BASE_URL".to_string(), cl.base_url.clone());
-            }
-            if !cl.auth_token.is_empty() {
-                env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), cl.auth_token.clone());
-            }
-            if !cl.model_alias.is_empty() {
-                // Claude Code primarily uses --model flag for model
-                // selection, but ANTHROPIC_MODEL is honored by some
-                // proxies; setting both is harmless.
-                env.insert("ANTHROPIC_MODEL".to_string(), cl.model_alias.clone());
-            }
-        } else if command_is(&cfg.command, "aider") {
-            let al = &settings.aider_local;
-            if !al.base_url.is_empty() {
-                env.insert("OPENAI_API_BASE".to_string(), al.base_url.clone());
-            }
-            if !al.auth_token.is_empty() {
-                env.insert("OPENAI_API_KEY".to_string(), al.auth_token.clone());
-            }
+    // Claude against a local provider: synthesize `ANTHROPIC_*` env. OpenCode's
+    // local provider arrives inside `OPENCODE_CONFIG_CONTENT` (a `provider`
+    // block, see `build_opencode_config`), not as env vars, so it is handled
+    // there rather than here.
+    if cfg.use_local_provider && command_is(&cfg.command, "claude") {
+        let cl = &settings.claude_local;
+        if !cl.base_url.is_empty() {
+            env.insert("ANTHROPIC_BASE_URL".to_string(), cl.base_url.clone());
+        }
+        if !cl.auth_token.is_empty() {
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), cl.auth_token.clone());
+        }
+        if !cl.model_alias.is_empty() {
+            // Claude Code primarily uses --model flag for model selection, but
+            // ANTHROPIC_MODEL is honored by some proxies; setting both is harmless.
+            env.insert("ANTHROPIC_MODEL".to_string(), cl.model_alias.clone());
         }
     }
     // Per-tab env wins over synthesized values.

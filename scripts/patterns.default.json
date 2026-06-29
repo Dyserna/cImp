@@ -35,30 +35,20 @@
       "disabled": false
     },
     {
-      "name": "aider_apply_edits",
+      "name": "opencode_permission",
       "kind": "permission",
       "all_of": [
-        "Apply edits?",
-        "(Y)es"
+        "<replace with a substring unique to opencode --mini's permission prompt>"
       ],
-      "disabled": false
+      "disabled": true
     },
     {
-      "name": "aider_add_to_chat",
-      "kind": "permission",
+      "name": "opencode_working",
+      "kind": "working",
       "all_of": [
-        "Add ",
-        " to the chat?"
+        "<replace with a substring unique to opencode --mini's working footer>"
       ],
-      "disabled": false
-    },
-    {
-      "name": "aider_run_shell",
-      "kind": "permission",
-      "all_of": [
-        "Run shell command?"
-      ],
-      "disabled": false
+      "disabled": true
     }
   ]
 }

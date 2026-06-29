@@ -41,8 +41,9 @@ use crate::settings::write_atomic;
 use crate::settings::schema::{
     default_ai_tab, default_graph_monitor_tab, default_offload_server_tab, default_shell_1_tab,
     AiTabId, LayoutNodePersisted, Settings, TabConfig,
-    AIDER_LOCAL_TAB_ID, AIDER_TAB_ID, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
-    GRAPH_MONITOR_TAB_ID, OFFLOAD_SERVER_TAB_ID, SHELL_DEFAULT_TAB_ID,
+    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
+    GRAPH_MONITOR_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_LOCAL_TAB_ID, OPENCODE_TAB_ID,
+    SHELL_DEFAULT_TAB_ID,
 };
 use crate::shell::ShellSpec;
 
@@ -595,14 +596,14 @@ fn drop_disabled_ai_builtins(settings: &mut Settings) -> bool {
 /// the default config at the canonical position. Returns `true` if any
 /// entry was inserted.
 fn restore_enabled_ai_builtins(settings: &mut Settings) -> bool {
-    // Iterate in canonical order (claude → claude-local → aider →
-    // aider-local) so successive insertions land in the right relative
+    // Iterate in canonical order (claude → claude-local → opencode →
+    // opencode-local) so successive insertions land in the right relative
     // slot regardless of the user's `enabled_ai_tabs` ordering.
     let order = [
         AiTabId::Claude,
         AiTabId::ClaudeLocal,
-        AiTabId::Aider,
-        AiTabId::AiderLocal,
+        AiTabId::OpenCode,
+        AiTabId::OpenCodeLocal,
     ];
     let mut changed = false;
     for &id in &order {
@@ -756,8 +757,8 @@ fn graph_monitor_insert_position(tabs: &[TabConfig]) -> usize {
 const AI_BUILTIN_IDS: [&str; 4] = [
     CLAUDE_TAB_ID,
     CLAUDE_LOCAL_TAB_ID,
-    AIDER_TAB_ID,
-    AIDER_LOCAL_TAB_ID,
+    OPENCODE_TAB_ID,
+    OPENCODE_LOCAL_TAB_ID,
 ];
 
 /// Reconcile the `tabs` array with `enabled_ai_tabs`. Every enabled AI
@@ -1072,18 +1073,18 @@ mod tests {
     }
 
     #[test]
-    fn integrity_seeds_aider_pair_at_canonical_positions() {
+    fn integrity_seeds_opencode_pair_at_canonical_positions() {
         let mut s = Settings::default();
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
-            AiTabId::Aider,
-            AiTabId::AiderLocal,
+            AiTabId::OpenCode,
+            AiTabId::OpenCodeLocal,
         ];
         integrity_check(&mut s);
         assert_eq!(s.tabs.len(), 3);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
-        assert_eq!(s.tabs[1].id(), AIDER_TAB_ID);
-        assert_eq!(s.tabs[2].id(), AIDER_LOCAL_TAB_ID);
+        assert_eq!(s.tabs[1].id(), OPENCODE_TAB_ID);
+        assert_eq!(s.tabs[2].id(), OPENCODE_LOCAL_TAB_ID);
     }
 
     #[test]
@@ -1143,13 +1144,13 @@ mod tests {
     #[test]
     fn integrity_inserts_aider_between_claude_local_and_user_shell() {
         // User has [claude, claude-local, shell-foo] and now enables
-        // aider. The new tab should land at index 2 (after claude-local,
+        // opencode. The new tab should land at index 2 (after claude-local,
         // before the shell), not at the end.
         let mut s = Settings::default();
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
             AiTabId::ClaudeLocal,
-            AiTabId::Aider,
+            AiTabId::OpenCode,
         ];
         integrity_check(&mut s);
         // Insert a user shell tab to simulate the existing layout.
@@ -1165,13 +1166,13 @@ mod tests {
             theme_override: None,
             background_override: None,
         }));
-        // Drop aider, then re-add via integrity.
-        s.tabs.retain(|t| t.id() != AIDER_TAB_ID);
+        // Drop opencode, then re-add via integrity.
+        s.tabs.retain(|t| t.id() != OPENCODE_TAB_ID);
         let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
         assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
-        assert_eq!(s.tabs[2].id(), AIDER_TAB_ID);
+        assert_eq!(s.tabs[2].id(), OPENCODE_TAB_ID);
         assert_eq!(s.tabs[3].id(), "shell-foo");
     }
 
@@ -1344,28 +1345,28 @@ mod tests {
     }
 
     #[test]
-    fn integrity_corrects_use_local_provider_on_aider_pair() {
+    fn integrity_corrects_use_local_provider_on_opencode_pair() {
         let mut s = Settings::default();
-        s.enabled_ai_tabs = vec![AiTabId::Aider, AiTabId::AiderLocal];
+        s.enabled_ai_tabs = vec![AiTabId::OpenCode, AiTabId::OpenCodeLocal];
         integrity_check(&mut s);
-        // Tamper: aider → local, aider-local → not local.
-        if let TabConfig::AiTool(c) = s.tabs.iter_mut().find(|t| t.id() == AIDER_TAB_ID).unwrap() {
+        // Tamper: opencode → local, opencode-local → not local.
+        if let TabConfig::AiTool(c) = s.tabs.iter_mut().find(|t| t.id() == OPENCODE_TAB_ID).unwrap() {
             c.use_local_provider = true;
         }
         if let TabConfig::AiTool(c) =
-            s.tabs.iter_mut().find(|t| t.id() == AIDER_LOCAL_TAB_ID).unwrap()
+            s.tabs.iter_mut().find(|t| t.id() == OPENCODE_LOCAL_TAB_ID).unwrap()
         {
             c.use_local_provider = false;
         }
         let changed = integrity_check(&mut s);
         assert!(changed);
-        if let TabConfig::AiTool(c) = s.tabs.iter().find(|t| t.id() == AIDER_TAB_ID).unwrap() {
-            assert!(!c.use_local_provider, "aider must have use_local_provider=false");
+        if let TabConfig::AiTool(c) = s.tabs.iter().find(|t| t.id() == OPENCODE_TAB_ID).unwrap() {
+            assert!(!c.use_local_provider, "opencode must have use_local_provider=false");
         }
         if let TabConfig::AiTool(c) =
-            s.tabs.iter().find(|t| t.id() == AIDER_LOCAL_TAB_ID).unwrap()
+            s.tabs.iter().find(|t| t.id() == OPENCODE_LOCAL_TAB_ID).unwrap()
         {
-            assert!(c.use_local_provider, "aider-local must have use_local_provider=true");
+            assert!(c.use_local_provider, "opencode-local must have use_local_provider=true");
         }
     }
 

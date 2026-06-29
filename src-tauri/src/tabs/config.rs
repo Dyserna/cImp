@@ -379,7 +379,7 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{default_aider_tab, default_claude_tab};
+    use crate::settings::{default_claude_tab, default_opencode_tab};
 
     fn claude_cfg() -> AiToolTabConfig {
         match default_claude_tab() {
@@ -388,20 +388,12 @@ mod tests {
         }
     }
 
-    fn aider_cfg() -> AiToolTabConfig {
-        match default_aider_tab() {
-            TabConfig::AiTool(c) => c,
-            _ => unreachable!("default_aider_tab is an AI tool tab"),
-        }
-    }
-
-    /// An AI-tool tab whose command resolves to `opencode`. Built from the
-    /// Claude default with the command swapped so these tests don't depend on
-    /// the Phase B `default_opencode_tab` builder.
+    /// An AI-tool tab whose command resolves to `opencode`.
     fn opencode_cfg() -> AiToolTabConfig {
-        let mut c = claude_cfg();
-        c.command = "opencode".to_string();
-        c
+        match default_opencode_tab() {
+            TabConfig::AiTool(c) => c,
+            _ => unreachable!("default_opencode_tab is an AI tool tab"),
+        }
     }
 
     /// The value following the first `--settings` flag in `args`, parsed
@@ -438,12 +430,13 @@ mod tests {
 
     #[test]
     fn statusline_overlay_is_claude_only() {
-        // Aider understands neither --append-system-prompt nor --settings,
-        // so its pre-args stay empty even with the global toggle on.
+        // OpenCode understands neither --append-system-prompt nor --settings
+        // (its config arrives via OPENCODE_CONFIG_CONTENT), so its pre-args stay
+        // empty even with the global toggle on.
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
-        let args = build_pre_args(&aider_cfg(), &settings);
-        assert!(args.is_empty(), "aider must get no pre-args, got: {args:?}");
+        let args = build_pre_args(&opencode_cfg(), &settings);
+        assert!(args.is_empty(), "opencode must get no pre-args, got: {args:?}");
     }
 
     #[test]
@@ -555,8 +548,8 @@ mod tests {
     fn offload_injection_is_claude_only() {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
-        let args = build_pre_args(&aider_cfg(), &settings);
-        assert!(args.is_empty(), "aider must get no pre-args, got: {args:?}");
+        let args = build_pre_args(&opencode_cfg(), &settings);
+        assert!(args.is_empty(), "opencode must get no pre-args, got: {args:?}");
     }
 
     #[test]
@@ -573,10 +566,10 @@ mod tests {
     #[test]
     fn fullscreen_optout_is_claude_only() {
         let settings = Settings::default();
-        let env = compose_ai_env(&aider_cfg(), &settings);
+        let env = compose_ai_env(&opencode_cfg(), &settings);
         assert!(
             !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
-            "Aider doesn't understand the Claude fullscreen flag",
+            "OpenCode doesn't understand the Claude fullscreen flag",
         );
     }
 
@@ -595,8 +588,11 @@ mod tests {
         let settings = Settings::default();
         let claude = build_extra_args(&claude_cfg(), &settings, &[]);
         assert!(!claude.iter().any(|a| a == "--mini"), "claude must not get --mini");
-        let aider = build_extra_args(&aider_cfg(), &settings, &[]);
-        assert!(!aider.iter().any(|a| a == "--mini"), "non-opencode tabs must not get --mini");
+        // A non-opencode, non-claude AI command must not get --mini either.
+        let mut other = claude_cfg();
+        other.command = "some-other-tool".to_string();
+        let other = build_extra_args(&other, &settings, &[]);
+        assert!(!other.iter().any(|a| a == "--mini"), "non-opencode tabs must not get --mini");
     }
 
     #[test]

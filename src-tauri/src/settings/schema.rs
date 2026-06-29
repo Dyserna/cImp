@@ -21,12 +21,15 @@ pub const CLAUDE_TAB_ID: &str = "claude";
 /// `aider` reserved id (the v1.7 → v1.8 migration rewrites the aider
 /// tab in place to this id).
 pub const CLAUDE_LOCAL_TAB_ID: &str = "claude-local";
-/// Aider AI-tool tab using whatever provider Aider's own config selects
-/// (cloud/keys/etc). Reserved in V14 alongside `aider-local`.
-pub const AIDER_TAB_ID: &str = "aider";
-/// Aider AI-tool tab pointed at a local OpenAI-compatible endpoint via
-/// the global `aider_local` provider settings.
-pub const AIDER_LOCAL_TAB_ID: &str = "aider-local";
+/// OpenCode AI-tool tab using whatever provider OpenCode's own config
+/// selects (cloud/keys/etc). Reserved in V19, replacing the V14 `aider`
+/// reserved id (the v18 → v19 migration rewrites the aider tab in place to
+/// this id).
+pub const OPENCODE_TAB_ID: &str = "opencode";
+/// OpenCode AI-tool tab pointed at a local OpenAI-compatible endpoint via
+/// the global `opencode_local` provider settings. Replaces the V14
+/// `aider-local` reserved id.
+pub const OPENCODE_LOCAL_TAB_ID: &str = "opencode-local";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// V8-03: the read-only, non-closable Offload Server tab. Materialized only
 /// while `offload.enabled` (integrity check), it shows the local
@@ -300,16 +303,16 @@ impl LogRetention {
 }
 
 /// One of the four reserved AI-tool tab ids. Wire format is the kebab-
-/// case tab-id string (`"claude"`, `"claude-local"`, `"aider"`,
-/// `"aider-local"`); the type exists so `enabled_ai_tabs` can be a
+/// case tab-id string (`"claude"`, `"claude-local"`, `"opencode"`,
+/// `"opencode-local"`); the type exists so `enabled_ai_tabs` can be a
 /// strongly-typed `Vec<AiTabId>` instead of an untyped string list.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum AiTabId {
     Claude,
     ClaudeLocal,
-    Aider,
-    AiderLocal,
+    OpenCode,
+    OpenCodeLocal,
 }
 
 impl AiTabId {
@@ -317,8 +320,8 @@ impl AiTabId {
         match self {
             Self::Claude => CLAUDE_TAB_ID,
             Self::ClaudeLocal => CLAUDE_LOCAL_TAB_ID,
-            Self::Aider => AIDER_TAB_ID,
-            Self::AiderLocal => AIDER_LOCAL_TAB_ID,
+            Self::OpenCode => OPENCODE_TAB_ID,
+            Self::OpenCodeLocal => OPENCODE_LOCAL_TAB_ID,
         }
     }
 
@@ -326,29 +329,29 @@ impl AiTabId {
         match id {
             CLAUDE_TAB_ID => Some(Self::Claude),
             CLAUDE_LOCAL_TAB_ID => Some(Self::ClaudeLocal),
-            AIDER_TAB_ID => Some(Self::Aider),
-            AIDER_LOCAL_TAB_ID => Some(Self::AiderLocal),
+            OPENCODE_TAB_ID => Some(Self::OpenCode),
+            OPENCODE_LOCAL_TAB_ID => Some(Self::OpenCodeLocal),
             _ => None,
         }
     }
 
     /// True for the local-provider variants (`claude-local`,
-    /// `aider-local`). The integrity check uses this as the canonical
+    /// `opencode-local`). The integrity check uses this as the canonical
     /// `use_local_provider` value for each reserved id.
     pub fn uses_local_provider(self) -> bool {
-        matches!(self, Self::ClaudeLocal | Self::AiderLocal)
+        matches!(self, Self::ClaudeLocal | Self::OpenCodeLocal)
     }
 
-    /// Canonical tab-bar position: claude (0) → claude-local → aider →
-    /// aider-local, with shells trailing afterwards. Used by
+    /// Canonical tab-bar position: claude (0) → claude-local → opencode →
+    /// opencode-local, with shells trailing afterwards. Used by
     /// `add_ai_builtin_tab` and `integrity_check` so re-adding a
     /// previously-disabled AI tab lands in the same slot every time.
     pub fn canonical_order(self) -> usize {
         match self {
             Self::Claude => 0,
             Self::ClaudeLocal => 1,
-            Self::Aider => 2,
-            Self::AiderLocal => 3,
+            Self::OpenCode => 2,
+            Self::OpenCodeLocal => 3,
         }
     }
 }
@@ -1555,21 +1558,24 @@ pub fn default_claude_local_tab() -> TabConfig {
 /// disabled by default because Aider's CLI has no
 /// `--append-system-prompt` equivalent (the spawn path enforces this
 /// regardless of the toggle).
-pub fn default_aider_tab() -> TabConfig {
+pub fn default_opencode_tab() -> TabConfig {
     TabConfig::AiTool(AiToolTabConfig {
-        id: AIDER_TAB_ID.to_string(),
+        id: OPENCODE_TAB_ID.to_string(),
         builtin: true,
-        name: "Aider".to_string(),
-        command: "aider".to_string(),
+        name: "OpenCode".to_string(),
+        command: "opencode".to_string(),
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),
+        // V19: unlike Aider, OpenCode accepts an instructions file (injected
+        // via OPENCODE_CONFIG_CONTENT), so the TTS-markup convention applies
+        // and the tab can speak. Enabled by default.
         tts_injection: TtsInjection::default(),
         notifications: AiNotificationConfig {
-            idle: NotificationSlot::enabled("Aider is idle"),
-            awaiting_permission: NotificationSlot::enabled("Aider is awaiting permission"),
-            question: NotificationSlot::enabled("Aider has a question"),
-            error: NotificationSlot::enabled("Aider encountered an error"),
+            idle: NotificationSlot::enabled("OpenCode is idle"),
+            awaiting_permission: NotificationSlot::enabled("OpenCode is awaiting permission"),
+            question: NotificationSlot::enabled("OpenCode has a question"),
+            error: NotificationSlot::enabled("OpenCode encountered an error"),
         },
         first_launch_notice_dismissed: true,
         theme_override: None,
@@ -1579,25 +1585,25 @@ pub fn default_aider_tab() -> TabConfig {
     })
 }
 
-/// V14: second Aider tab preconfigured to use a local OpenAI-compatible
-/// LLM via the global `aider_local` provider settings.
-pub fn default_aider_local_tab() -> TabConfig {
+/// V19: second OpenCode tab preconfigured to use a local OpenAI-compatible
+/// LLM via the global `opencode_local` provider settings.
+pub fn default_opencode_local_tab() -> TabConfig {
     TabConfig::AiTool(AiToolTabConfig {
-        id: AIDER_LOCAL_TAB_ID.to_string(),
+        id: OPENCODE_LOCAL_TAB_ID.to_string(),
         builtin: true,
-        name: "Aider (local)".to_string(),
-        command: "aider".to_string(),
+        name: "OpenCode (local)".to_string(),
+        command: "opencode".to_string(),
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),
         tts_injection: TtsInjection::default(),
         notifications: AiNotificationConfig {
-            idle: NotificationSlot::enabled("Aider (local) is idle"),
+            idle: NotificationSlot::enabled("OpenCode (local) is idle"),
             awaiting_permission: NotificationSlot::enabled(
-                "Aider (local) is awaiting permission",
+                "OpenCode (local) is awaiting permission",
             ),
-            question: NotificationSlot::enabled("Aider (local) has a question"),
-            error: NotificationSlot::enabled("Aider (local) encountered an error"),
+            question: NotificationSlot::enabled("OpenCode (local) has a question"),
+            error: NotificationSlot::enabled("OpenCode (local) encountered an error"),
         },
         first_launch_notice_dismissed: true,
         theme_override: None,
@@ -1614,8 +1620,8 @@ pub fn default_ai_tab(id: AiTabId) -> TabConfig {
     match id {
         AiTabId::Claude => default_claude_tab(),
         AiTabId::ClaudeLocal => default_claude_local_tab(),
-        AiTabId::Aider => default_aider_tab(),
-        AiTabId::AiderLocal => default_aider_local_tab(),
+        AiTabId::OpenCode => default_opencode_tab(),
+        AiTabId::OpenCodeLocal => default_opencode_local_tab(),
     }
 }
 

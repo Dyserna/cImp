@@ -5,6 +5,35 @@ All notable changes to ccImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] — 2026-06-29
+
+A correctness-and-hardening release: a full-codebase baseline review (security, systemic, and per-area correctness) was triaged and the confirmed issues fixed.
+
+### Security
+
+- **`run_command` short-flag bypass closed.** A glued short flag (`-ccore.hooksPath=/x`) now hits the same denial as the spaced form — previously the glued spelling slipped past the `git -c` guard.
+- **Palette path traversal blocked.** The status-line palette name is rejected if it contains a path component, so a crafted `settings.json` can't read outside `palettes/`.
+- **`read_file` TOCTOU.** The read is now byte-bounded (not just the pre-stat), so a file growing between the size check and the read can't blow past the limit.
+
+### Changed
+
+- **State signals are must-deliver.** The avatar/permission signal channel is larger and the terminal subprocess-exit edge is delivered with backpressure instead of a silent drop, so a burst can't desync the avatar/permission state machine.
+- **Heavy work off the async runtime.** Per-tab content capture runs on a dedicated writer thread, TTS synthesis runs on the blocking pool, and the offload supervisor releases its lock before killing a child — keeping IPC, audio, and amplitude responsive.
+
+### Fixed
+
+- **TTS suppression no longer leaks across tabs.** An Esc-silenced tab stays silent when a different tab produces output; only the active tab's fresh output clears the suppression.
+- **Idle-notification edge cases.** The audio idle edge uses `notify_one` (no missed edge), Idle is suppressed while a question is pending (symmetric with permission prompts), and `StopAll` no longer emits a spurious Started→Stopped pair after Esc.
+- **Speech-to-text errors surface.** A microphone stream error sets the error state instead of yielding a silent empty transcript, and a mid-hold record-mode flip still releases.
+- **Settings reliability.** A rejected settings update rolls back the optimistic UI change, an init-time event race no longer leaves a stale store, a failed overlay removal is no longer reported as success, a backup-write failure no longer wipes settings for the session, and two migration steps were corrected (TTS-injection enable, avatar-margin overlay leak).
+- **Offload robustness.** Nested `<think>` blocks strip cleanly, compaction no longer emits consecutive `user` turns, the remote-backend cache key tolerates a trailing slash, the SSE relay reconnects on a half-open socket (and reuses one HTTP client), and the in-flight count stays accurate while the global cap shrinks.
+- **Terminal/processing.** The TTS tag scanner advances even with no markers present (fixing an unbounded buffer and O(n²) rescans), cursor-column clamps to a valid column, and multi-parameter cursor-forward sequences emit the right spacing.
+- **Frontend.** Fixed Tauri-listener leaks on component churn, a blank-pane layout-repair gap, a `NaN` poll interval that busy-polled, a status-bar drag lockout (pointercancel), a double-click that raced two selection-TTS sessions, a context menu that could open off-screen, and the code-graph monitor's pause-button label.
+
+### Internal
+
+- Graph file-watch and backfill no longer panic or orphan work on thread exhaustion / a lock-gap race; assorted dead code, stale comments, and a swallowed read error were cleaned up.
+
 ## [0.20.1] — 2026-06-28
 
 ### Added

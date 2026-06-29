@@ -26,7 +26,7 @@
 //! Settings "Test offload" button. It returns the chosen *index* into the
 //! caller's slice, which the caller maps back to its concrete backend.
 
-use crate::settings::{BackendTier, ToolScope, LOCAL_DATA_TOOLS, WEB_DOCS_TOOLS};
+use crate::settings::{BackendTier, ToolScope, LOCAL_DATA_TOOLS};
 
 /// Below this estimated input size, an `auto`-tier task is considered small
 /// enough to prefer a fast backend (when one is eligible). Larger tasks
@@ -289,8 +289,7 @@ pub fn analyze_task(instructions: &str, context: Option<&str>, tier: TierHint) -
         }
     }
     debug_assert!(
-        required.iter().all(|t| LOCAL_DATA_TOOLS.contains(&t.as_str()))
-            || WEB_DOCS_TOOLS.is_empty(),
+        required.iter().all(|t| LOCAL_DATA_TOOLS.contains(&t.as_str())),
         "required tools should be local-data names"
     );
 

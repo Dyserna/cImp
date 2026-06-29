@@ -1127,7 +1127,10 @@ pub const LOCAL_DATA_TOOLS: &[&str] = &[
 ];
 
 /// V8-02: web/docs tool names a cloud backend is allowed by default — they
-/// reach out to the public internet, not the user's machine.
+/// reach out to the public internet, not the user's machine. Kept as the
+/// documented counterpart to [`LOCAL_DATA_TOOLS`] (the cloud-allow taxonomy)
+/// even though no code path currently reads it.
+#[allow(dead_code)]
 pub const WEB_DOCS_TOOLS: &[&str] = &["duckduckgo", "fetch", "context7"];
 
 /// V8-02: which capability tier a backend serves. The router prefers a

@@ -80,7 +80,9 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     };
     let max_results = args.max_results.unwrap_or(DEFAULT_MAX_RESULTS).min(MAX_RESULTS_CAP);
     let needle = args.query.to_lowercase();
-    let suffix = args.suffix.clone();
+    // Lowercased so the suffix match is case-insensitive — otherwise a `.sql`
+    // filter would miss `.SQL` (common on Windows / case-insensitive volumes).
+    let suffix = args.suffix.as_ref().map(|s| s.to_ascii_lowercase());
 
     // Filesystem walk is blocking — run it off the async runtime.
     let result = tokio::task::spawn_blocking(move || {
@@ -128,7 +130,7 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
                     }
                     if let Some(suf) = &suffix {
                         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if !name.ends_with(suf.as_str()) {
+                        if !name.to_ascii_lowercase().ends_with(suf.as_str()) {
                             continue;
                         }
                     }

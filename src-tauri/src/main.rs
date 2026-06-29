@@ -296,10 +296,13 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .setup(move |app| {
+            // Recover a poisoned guard rather than `.ok()` skipping it: silently
+            // not spawning the state manager would leave the whole avatar /
+            // permission state machine dead with no diagnostic.
             if let Some(rx) = state_rx_for_setup
                 .lock()
-                .ok()
-                .and_then(|mut g| g.take())
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
             {
                 spawn_state_manager(
                     app.handle().clone(),

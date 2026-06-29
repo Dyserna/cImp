@@ -194,7 +194,10 @@ pub async fn create_shell_tab(
     notifications_exited: String,
 ) -> Result<TabId, TabLifecycleError> {
     let _serializer = state.lifecycle_serializer.lock().await;
-    let args = shlex::split(&args_string).unwrap_or_default();
+    let args = shlex::split(&args_string).unwrap_or_else(|| {
+        warn!(args = %args_string, "tab args have unbalanced quotes; treating as no args");
+        Vec::new()
+    });
     let validated = validate_inputs(name, command, args, cwd, env).await?;
     let notifications = notifications_from_dialog(notifications_error, notifications_exited);
 
@@ -612,7 +615,10 @@ pub async fn reconfigure_shell_tab(
     if !matches!(tab.kind(), TabKind::Shell) {
         return Err(TabLifecycleError::WrongKind);
     }
-    let args = shlex::split(&args_string).unwrap_or_default();
+    let args = shlex::split(&args_string).unwrap_or_else(|| {
+        warn!(args = %args_string, "tab args have unbalanced quotes; treating as no args");
+        Vec::new()
+    });
     let validated = validate_inputs(name, command, args, cwd, env).await?;
     let notifications = notifications_from_dialog(notifications_error, notifications_exited);
 

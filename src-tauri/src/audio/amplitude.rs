@@ -1,12 +1,12 @@
-//! Ring buffer that mirrors recently-played samples for the future visualizer
-//! (Milestone 5). The audio iterator pushes each consumed sample into the
-//! ring; the visualizer reads via [`AmplitudeTap::recent_samples`] / `rms`.
+//! Ring buffer that mirrors recently-played samples for the waveform
+//! visualizer. The audio iterator pushes each consumed sample into the ring;
+//! the visualizer reads via [`AmplitudeTap::recent_samples`] / `rms`.
 //!
 //! Locking is `std::sync::RwLock` with brief, bounded critical sections — the
 //! audio iterator holds the write lock just long enough to push one sample.
 //! If profiling later reveals stalls under contention, switch to a lock-free
-//! ring (`ringbuf` crate or similar). For Milestone 3 the simple version is
-//! sufficient and keeps test surface small.
+//! ring (`ringbuf` crate or similar); the simple version keeps the test surface
+//! small.
 
 use std::sync::{Arc, RwLock};
 

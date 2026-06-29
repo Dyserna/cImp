@@ -815,10 +815,15 @@ async fn proxy_mcp_call(params: &Value) -> Result<Value, (i64, String)> {
 /// `GET /events` SSE connection and relay each `change` event to Claude as a
 /// `notifications/tools/list_changed`. Reconnects when the app comes/goes.
 async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
+    // Build the client once and reuse it across reconnects — the old code
+    // rebuilt a fresh reqwest::Client on every 2s retry (~1800/hr while the app
+    // is down). No client timeout: this is a long-lived streaming connection.
+    let Ok(client) = reqwest::Client::builder().build() else {
+        return;
+    };
     loop {
         if let Some((base, token)) = proxy_base() {
-            // No client timeout — this is a streaming connection.
-            if let Ok(client) = reqwest::Client::builder().build() {
+            {
                 if let Ok(mut resp) = client
                     .get(format!("{base}/events"))
                     .bearer_auth(&token)

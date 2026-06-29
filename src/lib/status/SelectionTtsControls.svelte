@@ -17,9 +17,9 @@
   } from '../selectionTts';
 
   // $selectionTtsState is 'idle' | 'playing' | 'paused'.
-  $: playing = $selectionTtsState === 'playing';
-  $: paused = $selectionTtsState === 'paused';
-  $: active = playing || paused;
+  const playing = $derived($selectionTtsState === 'playing');
+  const paused = $derived($selectionTtsState === 'paused');
+  const active = $derived(playing || paused);
 </script>
 
 <div class="selection-tts" role="group" aria-label="Selection text-to-speech controls">

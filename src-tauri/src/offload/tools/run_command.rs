@@ -285,7 +285,14 @@ async fn read_capped<R: AsyncRead + Unpin>(reader: Option<R>, cap: usize) -> Cap
         let mut chunk = [0u8; 8192];
         loop {
             match reader.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    // A read error mid-stream means the captured output may be
+                    // incomplete — flag it like a cap so the caller doesn't
+                    // present partial output as the whole result.
+                    capped = true;
+                    break;
+                }
                 Ok(n) => {
                     if bytes.len() < cap {
                         let take = n.min(cap - bytes.len());
@@ -352,6 +359,20 @@ mod tests {
         assert!(dangerous_args("git", &argv(&["--work-tree", "/"]), &policies).is_some());
         // Denied subcommand as the first non-flag token.
         assert!(dangerous_args("git", &argv(&["config", "core.pager", "x"]), &policies).is_some());
+    }
+
+    #[test]
+    fn glued_short_flag_value_is_blocked() {
+        // Regression (S1): a POSIX short flag accepts its value glued on with no
+        // separator. `-ccore.hooksPath=/x` must be refused exactly like
+        // `-c core.hooksPath=/x` — the glued spelling previously bypassed the
+        // `-c` guard entirely.
+        let policies = crate::settings::default_command_policies();
+        assert!(dangerous_args("git", &argv(&["-ccore.hooksPath=/x", "status"]), &policies).is_some());
+        assert!(dangerous_args("git", &argv(&["-C/etc"]), &policies).is_some());
+        // A long flag that merely starts with a denied short flag's letters is
+        // NOT a glued short flag and must not be over-matched.
+        assert!(dangerous_args("git", &argv(&["--color", "log"]), &policies).is_none());
     }
 
     #[test]

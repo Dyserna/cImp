@@ -271,7 +271,7 @@
       fn(s.offload.command_policies[i]);
     });
   }
-  // ── MCP tool servers (Tools tab) ───────────────────────────────────────
+  // ── MCP tool servers (MCP servers section) ─────────────────────────────
   // Add/remove/toggle with live host reload — no ccImp restart. Edits persist
   // through the same awaited `applySettings` the rest of the panel uses; once
   // the backend has the new value we call `offload_reload_mcp`, which
@@ -424,6 +424,7 @@
     | 'tabs'
     | 'shortcuts'
     | 'offload'
+    | 'mcp'
     | 'graph'
     | 'advanced'
     | 'about';
@@ -437,6 +438,7 @@
     { id: 'stt', label: 'Speech-to-text' },
     { id: 'tabs', label: 'Tabs' },
     { id: 'offload', label: 'Offload task tools' },
+    { id: 'mcp', label: 'MCP servers' },
     { id: 'graph', label: 'Code graph' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
@@ -449,8 +451,9 @@
   type TabsSubSection = AiTabId | 'shells';
   let tabsSubSection = $state<TabsSubSection>('claude');
   // Sub-tab nav within the Offload section: the backend pool + limits live
-  // under 'pool'; native tools, allowlist, command policies, and MCP servers
-  // under 'tools'.
+  // under 'pool'; native tools, allowlist, and command policies under 'tools'.
+  // (MCP servers moved to their own top-level `mcp` section — they're usable by
+  // Claude Code directly now, not just the offload worker.)
   type OffloadSubSection = 'pool' | 'tools';
   let offloadSubSection = $state<OffloadSubSection>('pool');
   function subSectionForTabId(tabId: string): TabsSubSection {
@@ -3231,8 +3234,20 @@
           <div class="button-row">
             <button type="button" onclick={addCommandPolicy}>Add command policy</button>
           </div>
+          {/if}
+        </section>
+      {:else if activeSection === 'mcp'}
+        <section>
+          <h2>MCP servers</h2>
+          <small class="hint top">
+            Model Context Protocol servers ccImp connects to and keeps warm. Each
+            server's read-class tools (web search, fetch, docs, …) can be exposed
+            to <strong>Claude Code</strong> directly and/or to the
+            <strong>offload worker</strong> — toggle per server below.
+            Write/destructive tools are filtered out.
+          </small>
 
-          <h3>MCP server status</h3>
+          <h3>Server status</h3>
           <small class="hint top">
             Live health of the warm MCP host's connections. Updates as you add,
             remove, or enable/disable servers below — no restart needed.
@@ -3250,20 +3265,20 @@
           {:else if snapshot.offload.mcp_servers.length > 0}
             <small class="hint">
               {snapshot.offload.mcp_servers.length} server(s) configured —
-              health appears once offload is enabled and the warm pool is running.
+              health appears once the warm MCP host is running (it starts when
+              <strong>offload</strong> is enabled).
             </small>
           {:else}
-            <small class="hint">No MCP tool servers configured yet.</small>
+            <small class="hint">No MCP servers configured yet.</small>
           {/if}
 
-          <h3>MCP tool servers</h3>
+          <h3>Tool servers</h3>
           <small class="hint top">
-            ccImp's warm MCP host aggregates the read-class tools from these
-            servers (web search, fetch, docs) and keeps the connections warm
-            across offloads. Add an HTTP MCP endpoint by name + URL; changes
-            apply live. Write/destructive tools are filtered out. Advanced stdio
-            servers (command/args/env) remain editable in
-            <code>settings.json</code> under <code>offload.mcp_servers</code>.
+            Add an HTTP MCP endpoint by name + URL; changes apply live. ccImp's
+            warm MCP host aggregates the read-class tools from these servers and
+            keeps the connections warm. Advanced stdio servers (command/args/env)
+            remain editable in <code>settings.json</code> under
+            <code>offload.mcp_servers</code>.
           </small>
           <!-- Keyed by index deliberately: name/url are editable and the
                snapshot is replaced (cloned) on every edit, so a name/url/object
@@ -3321,7 +3336,6 @@
           <div class="button-row">
             <button type="button" onclick={addMcpServer}>Add MCP server</button>
           </div>
-          {/if}
         </section>
       {:else if activeSection === 'graph'}
         <section>

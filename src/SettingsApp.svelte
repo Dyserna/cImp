@@ -3244,7 +3244,8 @@
             server's read-class tools (web search, fetch, docs, …) can be exposed
             to <strong>Claude Code</strong> directly and/or to the
             <strong>offload worker</strong> — toggle per server below.
-            Write/destructive tools are filtered out.
+            Write/destructive tools are filtered out. Exposing a server to Claude
+            Code works whether or not offload is enabled.
           </small>
 
           <h3>Server status</h3>
@@ -3266,7 +3267,7 @@
             <small class="hint">
               {snapshot.offload.mcp_servers.length} server(s) configured —
               health appears once the warm MCP host is running (it starts when
-              <strong>offload</strong> is enabled).
+              offload is enabled or any server is exposed to Claude Code).
             </small>
           {:else}
             <small class="hint">No MCP servers configured yet.</small>

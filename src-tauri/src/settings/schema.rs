@@ -1362,6 +1362,20 @@ impl OffloadSettings {
             tool_scope: ToolScope::All,
         }]
     }
+
+    /// Whether at least one MCP server is exposed to Claude Code.
+    pub fn any_claude_mcp(&self) -> bool {
+        self.mcp_servers.iter().any(|m| m.claude_access)
+    }
+
+    /// Whether the warm MCP host + loopback endpoint need to run. True when
+    /// offload is enabled (the worker needs the host) OR any MCP server is
+    /// exposed to Claude Code directly (Claude reaches it over the loopback,
+    /// independent of offload). Drives runtime startup, the warm-host lifecycle,
+    /// and the per-tab `--mcp-config` injection.
+    pub fn mcp_host_needed(&self) -> bool {
+        self.enabled || self.any_claude_mcp()
+    }
 }
 
 /// One notification slot: a per-event `{ enabled, text }` pair. The

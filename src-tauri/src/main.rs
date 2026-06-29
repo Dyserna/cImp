@@ -394,7 +394,10 @@ fn main() {
                 // below call it, but the loopback binds a port and the pollers
                 // spawn tasks, so it must run at most once.
                 let offload_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                if settings_for_offload.current().offload.enabled {
+                // Start the runtime (loopback + warm host) when offload is enabled
+                // OR a server is exposed to Claude Code — Claude reaches MCP tools
+                // over the loopback independent of offload.
+                if settings_for_offload.current().offload.mcp_host_needed() {
                     if !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         start_offload_runtime(
                             app.handle().clone(),
@@ -405,8 +408,9 @@ fn main() {
                 }
                 // V8: a user who launches with offload disabled and enables it
                 // later in Settings must still get the loopback discovery
-                // endpoint (without it, MCP children can't connect back).
-                // Watch for the enabled false→true transition and start once.
+                // endpoint (without it, MCP children can't connect back). Same
+                // for adding a Claude-Code-exposed MCP server while offload is
+                // off. Watch for either transition and start once.
                 // (Disabling at runtime leaves the runtime up but harmless —
                 // `OffloadService::run` is gated on `enabled` and refuses; a
                 // full teardown happens on the next relaunch.)
@@ -421,10 +425,10 @@ fn main() {
                         loop {
                             match rx.recv().await {
                                 Ok(s) => {
-                                    if s.offload.enabled
+                                    if s.offload.mcp_host_needed()
                                         && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
                                     {
-                                        info!("offload: enabled at runtime — starting offload runtime");
+                                        info!("offload: MCP host needed at runtime — starting offload runtime");
                                         start_offload_runtime(
                                             app_handle.clone(),
                                             svc.clone(),

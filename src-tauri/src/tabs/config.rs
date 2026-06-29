@@ -168,10 +168,11 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     // spawns the `command` as argv (no shell), so the raw exe path is
     // correct — no shell-quoting needed (unlike the statusLine command).
     // V8-01 + V9-01: point Claude at our `ccimp --offload-mcp` server, which
-    // carries BOTH the `offload_task` tool and the `graph_*` tools. Inject it
-    // whenever EITHER feature is on — the graph tools must reach Claude even
-    // when offload is disabled (they ride the same MCP child).
-    if settings.offload.enabled || settings.graph.enabled {
+    // carries the `offload_task` tool, the `graph_*` tools, AND any MCP server
+    // exposed to Claude Code. Inject it whenever ANY of those is in play — the
+    // graph tools and Claude-exposed MCP servers must reach Claude even when
+    // offload is disabled (they ride the same MCP child).
+    if settings.offload.enabled || settings.graph.enabled || settings.offload.any_claude_mcp() {
         if let Ok(exe) = std::env::current_exe() {
             let mcp = serde_json::json!({
                 "mcpServers": {
@@ -455,6 +456,27 @@ mod tests {
             .expect("--mcp-config present when graph is enabled");
         let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
         assert_eq!(cfg["mcpServers"]["ccimp-offload"]["args"][0], "--offload-mcp");
+    }
+
+    #[test]
+    fn claude_exposed_mcp_server_alone_injects_mcp_config() {
+        // A server exposed to Claude Code rides the same `--offload-mcp` child,
+        // so the MCP config must be injected even with offload + graph both off.
+        let mut settings = Settings::default();
+        settings.offload.enabled = false;
+        settings.graph.enabled = false;
+        settings.offload.mcp_servers = vec![crate::settings::McpServerConfig {
+            name: "duckduckgo".to_string(),
+            url: "http://host:1/mcp".to_string(),
+            claude_access: true,
+            offload_access: false,
+            ..Default::default()
+        }];
+        let args = build_pre_args(&claude_cfg(), &settings);
+        assert!(
+            args.iter().any(|a| a == "--mcp-config"),
+            "--mcp-config present when a server is exposed to Claude Code"
+        );
     }
 
     #[test]

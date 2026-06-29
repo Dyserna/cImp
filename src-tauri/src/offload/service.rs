@@ -352,7 +352,10 @@ impl OffloadService {
         // live reload IPC) so a freshly-added server isn't connected twice.
         let _guard = self.host_reconcile_lock.lock().await;
         let snap = self.settings.current().offload;
-        if !snap.enabled {
+        // Keep the host up when offload is enabled OR a server is exposed to
+        // Claude Code (Claude reaches it over the loopback independent of
+        // offload). Only tear it down when neither consumer needs it.
+        if !snap.mcp_host_needed() {
             self.host.shutdown().await;
             *self.last_host_sig.lock().unwrap() = None;
             return;

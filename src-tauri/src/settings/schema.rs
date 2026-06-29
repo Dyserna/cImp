@@ -1582,8 +1582,11 @@ pub fn default_opencode_tab() -> TabConfig {
         env: HashMap::new(),
         // V19: unlike Aider, OpenCode accepts an instructions file (injected
         // via OPENCODE_CONFIG_CONTENT), so the TTS-markup convention applies
-        // and the tab can speak. Enabled by default.
-        tts_injection: TtsInjection::default(),
+        // and the tab can speak. Seeded with the same runtime prompt as Claude.
+        tts_injection: TtsInjection {
+            enabled: true,
+            instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
+        },
         notifications: AiNotificationConfig {
             idle: NotificationSlot::enabled("OpenCode is idle"),
             awaiting_permission: NotificationSlot::enabled("OpenCode is awaiting permission"),
@@ -1609,7 +1612,10 @@ pub fn default_opencode_local_tab() -> TabConfig {
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),
-        tts_injection: TtsInjection::default(),
+        tts_injection: TtsInjection {
+            enabled: true,
+            instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
+        },
         notifications: AiNotificationConfig {
             idle: NotificationSlot::enabled("OpenCode (local) is idle"),
             awaiting_permission: NotificationSlot::enabled(

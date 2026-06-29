@@ -81,6 +81,12 @@ fn build_ai_tool_spec(
         .cwd
         .clone()
         .unwrap_or_else(|| launch_cwd.to_path_buf());
+    // V19: OpenCode reads its guidance from a file referenced in the injected
+    // config (`instructions`), so write that managed file at launch — kept off
+    // the pure `compose_ai_env` path so the config builder stays test-safe.
+    if command_is(&cfg.command, "opencode") {
+        write_opencode_instructions(cfg, settings);
+    }
     let env = compose_ai_env(cfg, settings);
     Ok(PtyLaunchSpec {
         tab,
@@ -123,33 +129,12 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     }
     let mut args = Vec::new();
 
-    // Compose a single `--append-system-prompt` from every addendum we
-    // inject (TTS markup convention + the V8-01 offload guidance nudge),
-    // joined with a blank line. Merging into one flag avoids relying on
-    // Claude Code concatenating repeated `--append-system-prompt` flags.
-    let mut addendum = String::new();
-    if cfg.tts_injection.enabled && !cfg.tts_injection.instructions.is_empty() {
-        addendum.push_str(&cfg.tts_injection.instructions);
-    }
-    if settings.offload.enabled && settings.offload.inject_guidance {
-        if !addendum.is_empty() {
-            addendum.push_str("\n\n");
-        }
-        addendum.push_str(OFFLOAD_GUIDANCE);
-    }
-    // V9-01: when the code graph is enabled, tell Opus the `graph_*` tools
-    // exist — without a nudge it defaults to grep and never queries the index.
-    if settings.graph.enabled {
-        if !addendum.is_empty() {
-            addendum.push_str("\n\n");
-        }
-        addendum.push_str(GRAPH_GUIDANCE);
-        // `graph_semantic_docs` is only advertised to Opus when semantic search
-        // is on, so only guide toward it then.
-        if settings.graph.semantic_search {
-            addendum.push_str(GRAPH_SEMANTIC_GUIDANCE);
-        }
-    }
+    // Compose a single `--append-system-prompt` from every addendum we inject
+    // (TTS markup convention + offload + graph guidance). Merging into one flag
+    // avoids relying on Claude Code concatenating repeated flags. The same
+    // composition feeds OpenCode's instructions file (see `build_opencode_config`)
+    // so the two agents stay in lockstep.
+    let addendum = compose_capability_guidance(cfg, settings);
     if !addendum.is_empty() {
         args.push("--append-system-prompt".to_string());
         args.push(addendum);
@@ -191,6 +176,36 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     }
 
     args
+}
+
+/// Compose the capability-guidance addendum shared by Claude
+/// (`--append-system-prompt`) and OpenCode (the managed instructions file):
+/// the per-tab TTS-markup convention (gated on `tts_injection.enabled`), the
+/// offload nudge (gated on `offload.enabled && offload.inject_guidance`), and
+/// the code-graph nudge (gated on `graph.enabled`, with the semantic addendum
+/// when `graph.semantic_search`). Sections are joined by a blank line. Reusing
+/// the exact same sources keeps both agents in lockstep.
+fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> String {
+    let mut addendum = String::new();
+    if cfg.tts_injection.enabled && !cfg.tts_injection.instructions.is_empty() {
+        addendum.push_str(&cfg.tts_injection.instructions);
+    }
+    if settings.offload.enabled && settings.offload.inject_guidance {
+        if !addendum.is_empty() {
+            addendum.push_str("\n\n");
+        }
+        addendum.push_str(OFFLOAD_GUIDANCE);
+    }
+    if settings.graph.enabled {
+        if !addendum.is_empty() {
+            addendum.push_str("\n\n");
+        }
+        addendum.push_str(GRAPH_GUIDANCE);
+        if settings.graph.semantic_search {
+            addendum.push_str(GRAPH_SEMANTIC_GUIDANCE);
+        }
+    }
+    addendum
 }
 
 /// V8-01: the system-prompt addendum telling Opus *when* to reach for
@@ -257,19 +272,142 @@ fn build_extra_args(
     out
 }
 
+/// Deterministic path of the managed OpenCode instructions file for `cfg`.
+/// One file per tab id (the TTS toggle is per-tab) under a managed dir next to
+/// the exe (the portable root, like the offload discovery file), falling back
+/// to the OS temp dir. Pure — computing the path never touches the filesystem,
+/// so `build_opencode_config` stays test-safe; the actual write happens on the
+/// real launch path (`build_ai_tool_spec`).
+fn opencode_instructions_path(cfg: &AiToolTabConfig) -> std::path::PathBuf {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("opencode-instructions");
+    // Tab ids are kebab-case reserved ids or `ai-<uuid>` duplicates — safe as a
+    // filename stem.
+    dir.join(format!("{}.md", cfg.id))
+}
+
+/// Write the managed OpenCode instructions file for `cfg` (idempotent
+/// overwrite at each launch so it tracks live settings). Best-effort: a write
+/// failure just means OpenCode launches without the guidance addendum, exactly
+/// like a Claude tab with TTS injection disabled. Removes a stale file when no
+/// guidance applies so a since-disabled toggle doesn't leave dead instructions.
+fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
+    let path = opencode_instructions_path(cfg);
+    let text = compose_capability_guidance(cfg, settings);
+    if text.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::write(&path, text);
+}
+
 /// V19: synthesize OpenCode's session-scoped config — the JSON document that
 /// `OPENCODE_CONFIG_CONTENT` carries (the env-var analog of Claude's
-/// `--mcp-config` / `--settings` / `--append-system-prompt`). Starts from the
-/// `$schema` marker; the `mcp` block (→ `ccimp --offload-mcp --consumer
-/// opencode`), the `instructions` file (TTS + offload + graph guidance), and
-/// the local `provider` block are layered on in Phase D. Additive by default —
-/// cctts does not set `OPENCODE_DISABLE_PROJECT_CONFIG`, so a user's project
-/// config still merges underneath.
-fn build_opencode_config(_cfg: &AiToolTabConfig, _settings: &Settings) -> serde_json::Value {
-    serde_json::json!({
-        "$schema": "https://opencode.ai/config.json"
-    })
+/// `--mcp-config` / `--settings` / `--append-system-prompt`):
+///
+/// - `$schema` marker.
+/// - `mcp.ccimp-offload` → `ccimp --offload-mcp --consumer opencode`, injected
+///   whenever offload, the graph, or an OpenCode-exposed MCP server is in play
+///   (mirrors the Claude `--mcp-config` gate in `build_pre_args`).
+/// - `instructions` → the managed guidance file (TTS + offload + graph), when
+///   any guidance applies. The file content is written on the launch path; here
+///   we only reference its (deterministic) path.
+/// - the local `provider` block (Phase D3).
+///
+/// Additive by default — cctts does not set `OPENCODE_DISABLE_PROJECT_CONFIG`,
+/// so a user's project config still merges underneath. Pure: no filesystem I/O.
+fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_json::Value {
+    let mut config = serde_json::Map::new();
+    config.insert(
+        "$schema".to_string(),
+        serde_json::Value::String("https://opencode.ai/config.json".to_string()),
+    );
+
+    // The single `ccimp --offload-mcp` child carries `offload_task`, the
+    // `graph_*` tools, and any OpenCode-exposed MCP server. Inject it whenever
+    // ANY of those is in play (same shape as the Claude gate).
+    if settings.offload.enabled || settings.graph.enabled || settings.offload.any_opencode_mcp() {
+        if let Ok(exe) = std::env::current_exe() {
+            config.insert(
+                "mcp".to_string(),
+                serde_json::json!({
+                    "ccimp-offload": {
+                        "type": "local",
+                        "command": [exe.to_string_lossy(), "--offload-mcp", "--consumer", "opencode"]
+                    }
+                }),
+            );
+        }
+    }
+
+    // Reference the managed instructions file when any guidance applies. The
+    // file itself is written at launch (see `build_ai_tool_spec`).
+    if !compose_capability_guidance(cfg, settings).is_empty() {
+        let path = opencode_instructions_path(cfg);
+        config.insert(
+            "instructions".to_string(),
+            serde_json::json!([path.to_string_lossy()]),
+        );
+    }
+
+    // V19 (D3): local provider. When the tab uses the local provider, declare
+    // an OpenAI-compatible provider pointing at the `opencode_local` endpoint
+    // and (when a model is set) make it the default `model`. Cloud OpenCode
+    // (`use_local_provider: false`) injects no provider block and uses
+    // OpenCode's own credentials.
+    //
+    // NOTE: the exact `provider` shape (the `@ai-sdk/openai-compatible` npm id
+    // and `options.{baseURL,apiKey}` keys) is the documented OpenAI-compatible
+    // form; confirm against the live `$defs.ProviderConfig` at F1 — the local
+    // path is gated on getting this right, the cloud path is unaffected.
+    if cfg.use_local_provider {
+        let local = &settings.opencode_local;
+        if !local.base_url.is_empty() {
+            let mut models = serde_json::Map::new();
+            if !local.model.is_empty() {
+                models.insert(local.model.clone(), serde_json::json!({}));
+            }
+            config.insert(
+                "provider".to_string(),
+                serde_json::json!({
+                    OPENCODE_LOCAL_PROVIDER_ID: {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "ccImp local",
+                        "options": {
+                            "baseURL": local.base_url,
+                            "apiKey": local.auth_token,
+                        },
+                        "models": models,
+                    }
+                }),
+            );
+            if !local.model.is_empty() {
+                config.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(format!(
+                        "{OPENCODE_LOCAL_PROVIDER_ID}/{}",
+                        local.model
+                    )),
+                );
+            }
+        }
+    }
+
+    serde_json::Value::Object(config)
 }
+
+/// Provider id for the synthesized OpenCode local provider. Namespaced to
+/// ccImp so it can't collide with a user's own configured providers; the
+/// default model is selected as `<this>/<model>`.
+const OPENCODE_LOCAL_PROVIDER_ID: &str = "ccimp-local";
 
 /// V1.4-07 / V14: compose the spawn environment for an AI tab. Per-tab
 /// `env` entries are the user's most-specific scope and take
@@ -590,6 +728,86 @@ mod tests {
         let cfg: serde_json::Value =
             serde_json::from_str(raw).expect("OPENCODE_CONFIG_CONTENT is valid JSON");
         assert_eq!(cfg["$schema"], "https://opencode.ai/config.json");
+    }
+
+    #[test]
+    fn opencode_config_injects_mcp_when_offload_enabled() {
+        let mut settings = Settings::default();
+        settings.offload.enabled = true;
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let cmd = &cfg["mcp"]["ccimp-offload"]["command"];
+        assert_eq!(cfg["mcp"]["ccimp-offload"]["type"], "local");
+        // The child is launched with the opencode consumer discriminator.
+        let args: Vec<&str> = cmd
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--offload-mcp"), "got: {args:?}");
+        assert!(args.windows(2).any(|w| w == ["--consumer", "opencode"]), "got: {args:?}");
+    }
+
+    #[test]
+    fn opencode_config_no_mcp_when_all_off() {
+        let settings = Settings::default(); // offload + graph off, no servers
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        assert!(cfg.get("mcp").is_none(), "no mcp block when nothing is in play");
+    }
+
+    #[test]
+    fn opencode_config_injects_mcp_when_graph_enabled() {
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        assert!(cfg["mcp"]["ccimp-offload"].is_object(), "graph alone injects the mcp block");
+    }
+
+    #[test]
+    fn opencode_config_references_instructions_when_tts_enabled() {
+        // The default opencode tab has TTS injection enabled with the runtime
+        // prompt, so the config references the managed instructions file.
+        let settings = Settings::default();
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let path = cfg["instructions"][0].as_str().expect("instructions path");
+        assert!(path.ends_with(".md"), "got: {path}");
+        assert!(path.contains("opencode"), "got: {path}");
+    }
+
+    #[test]
+    fn opencode_config_no_instructions_when_no_guidance() {
+        let settings = Settings::default(); // offload + graph off
+        let mut cfg = opencode_cfg();
+        cfg.tts_injection.enabled = false; // and no TTS guidance
+        let config = build_opencode_config(&cfg, &settings);
+        assert!(config.get("instructions").is_none(), "no guidance ⇒ no instructions key");
+    }
+
+    #[test]
+    fn opencode_config_injects_local_provider_when_enabled() {
+        let mut settings = Settings::default();
+        settings.opencode_local.base_url = "http://localhost:1234/v1".to_string();
+        settings.opencode_local.auth_token = "local".to_string();
+        settings.opencode_local.model = "qwen2.5-coder".to_string();
+        let mut cfg = opencode_cfg();
+        cfg.use_local_provider = true;
+        let config = build_opencode_config(&cfg, &settings);
+        let prov = &config["provider"]["ccimp-local"];
+        assert_eq!(prov["options"]["baseURL"], "http://localhost:1234/v1");
+        assert_eq!(prov["options"]["apiKey"], "local");
+        assert!(prov["models"]["qwen2.5-coder"].is_object());
+        // The default model is the namespaced provider/model.
+        assert_eq!(config["model"], "ccimp-local/qwen2.5-coder");
+    }
+
+    #[test]
+    fn opencode_config_no_provider_when_cloud() {
+        let mut settings = Settings::default();
+        settings.opencode_local.base_url = "http://localhost:1234/v1".to_string();
+        let cfg = opencode_cfg(); // use_local_provider = false (cloud)
+        let config = build_opencode_config(&cfg, &settings);
+        assert!(config.get("provider").is_none(), "cloud opencode gets no provider block");
+        assert!(config.get("model").is_none());
     }
 
     #[test]

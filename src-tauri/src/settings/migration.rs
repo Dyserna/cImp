@@ -85,7 +85,18 @@ pub fn migrate_if_needed(
     if entry.is_none() {
         return Ok(false);
     }
-    write_backup(path, entry.unwrap(), value)?;
+    // A failed backup is NOT fatal: the user's settings are intact in `value`,
+    // and aborting here would make the caller fall back to blank defaults for the
+    // whole session (and, with a persistent cause like an AV file lock, every
+    // session). Log it and migrate anyway — losing the safety backup is far less
+    // harmful than discarding valid settings.
+    if let Err(e) = write_backup(path, entry.unwrap(), value) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "settings migration: backup write failed; proceeding without a backup"
+        );
+    }
 
     // Walk the dispatcher table once. Each step's `detect` is gated on
     // the previous step's marker being present, so a value entering the
@@ -1024,10 +1035,14 @@ fn migrate_v1_7_to_v1_8(value: &mut Value) {
                 obj.insert("use_local_provider".to_string(), Value::Bool(true));
                 // Aider's default had tts_injection.enabled=false; the
                 // rewritten tab is Claude, which does honor TTS injection.
-                if let Some(tts) = obj
-                    .get_mut("tts_injection")
-                    .and_then(Value::as_object_mut)
-                {
+                // Ensure the object exists before enabling — otherwise an aider
+                // tab serialized without a `tts_injection` field would skip the
+                // enable entirely, leaving the rewritten Claude (local) tab with
+                // TTS injection off.
+                let tts_entry = obj
+                    .entry("tts_injection".to_string())
+                    .or_insert_with(|| json!({}));
+                if let Some(tts) = tts_entry.as_object_mut() {
                     tts.insert("enabled".to_string(), Value::Bool(true));
                     let needs_default = tts
                         .get("instructions")
@@ -1252,17 +1267,19 @@ fn migrate_v1_11_to_v1_12(value: &mut Value) {
         return;
     };
     if let Some(avatar) = root.get_mut("avatar").and_then(Value::as_object_mut) {
-        let legacy = avatar
-            .remove("margin_px")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(16);
-        avatar.insert(
-            "margin".to_string(),
-            json!({
-                "x_px": legacy,
-                "y_px": legacy,
-            }),
-        );
+        // Only convert when the legacy field was actually present. Inserting a
+        // default `margin` when `margin_px` is absent pollutes the overlay (which
+        // holds only diffs from global) with a phantom default that then
+        // overrides global forever. Absent → let `AvatarMargin::default()` fill it.
+        if let Some(legacy) = avatar.remove("margin_px").and_then(|v| v.as_u64()) {
+            avatar.insert(
+                "margin".to_string(),
+                json!({
+                    "x_px": legacy,
+                    "y_px": legacy,
+                }),
+            );
+        }
     }
     // V1.13 raised CURRENT_SCHEMA_VERSION; this step only promotes the
     // file to v1.12, so stamp the literal 12 rather than the moving
@@ -2825,19 +2842,19 @@ mod tests {
     }
 
     #[test]
-    fn v1_11_to_v1_12_falls_back_to_default_when_legacy_field_missing() {
-        // A v1.11 file in which the user already had a partially-migrated
-        // avatar block (e.g. settings hand-edits) — the migration should
-        // still produce a valid `margin` object so the schema's
-        // serde-default doesn't have to silently absorb the gap.
+    fn v1_11_to_v1_12_leaves_margin_absent_when_legacy_field_missing() {
+        // No legacy `margin_px` → the migration must NOT synthesize a `margin`
+        // object. Doing so pollutes the custom overlay (which holds only diffs
+        // from global) with a phantom default that then overrides global forever.
+        // The schema's `AvatarMargin::default()` supplies the value at parse time.
         let mut v = json!({
             "schema_version": 11,
             "avatar": {}
         });
         migrate_v1_11_to_v1_12(&mut v);
-        let margin = v.get("avatar").unwrap().get("margin").unwrap();
-        assert_eq!(margin.get("x_px").unwrap(), 16);
-        assert_eq!(margin.get("y_px").unwrap(), 16);
+        assert!(v.get("avatar").unwrap().get("margin").is_none());
+        // The version stamp still advances regardless.
+        assert_eq!(v.get("schema_version").and_then(Value::as_u64), Some(12));
     }
 
     #[test]

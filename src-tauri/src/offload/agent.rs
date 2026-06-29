@@ -829,9 +829,28 @@ impl Convo {
     /// the flattened list never starts a `tool` message without its owning
     /// assistant — no orphan-tool repair needed.
     fn flatten(&self) -> Vec<ChatMessage> {
-        let mut out = self.head.clone();
-        for t in &self.turns {
-            out.extend(t.msgs.iter().cloned());
+        let mut out: Vec<ChatMessage> = Vec::with_capacity(self.head.len() + self.turns.len() * 2);
+        let all = self.head.iter().chain(self.turns.iter().flat_map(|t| t.msgs.iter()));
+        for m in all {
+            // Coalesce adjacent `user` messages. Compaction prepends a synthetic
+            // `user` eviction note right after the head's `user` task — sending
+            // two consecutive user turns trips strict servers (400/422). Merging
+            // keeps the wire conversation role-alternating.
+            if m.role == "user" {
+                if let Some(last) = out.last_mut() {
+                    if last.role == "user" {
+                        let prev = last.content.take().unwrap_or_default();
+                        let cur = m.content.clone().unwrap_or_default();
+                        last.content = Some(if prev.is_empty() {
+                            cur
+                        } else {
+                            format!("{prev}\n\n{cur}")
+                        });
+                        continue;
+                    }
+                }
+            }
+            out.push(m.clone());
         }
         out
     }

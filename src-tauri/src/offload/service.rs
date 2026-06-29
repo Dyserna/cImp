@@ -320,13 +320,20 @@ impl OffloadService {
                     let remove = (current - target) as usize;
                     for _ in 0..remove {
                         match this.global_gate.clone().acquire_owned().await {
-                            Ok(p) => p.forget(),
+                            Ok(p) => {
+                                p.forget();
+                                // Decrement the published cap in lock-step with
+                                // each reclaimed permit so global_in_flight
+                                // (cap - available) stays accurate throughout
+                                // the drain — neither saturating to 0 (store
+                                // target up front) nor over-reporting by the
+                                // permits still being reclaimed (store at the end).
+                                this.global_cap.fetch_sub(1, Ordering::Relaxed);
+                            }
                             Err(_) => break, // semaphore closed
                         }
                     }
-                    // Publish the smaller cap only after the drain completes —
-                    // storing it up front (against the still-large permit count)
-                    // saturates global_in_flight to 0 and masks real load.
+                    // Land exactly on target even if the semaphore closed mid-drain.
                     this.global_cap.store(target, Ordering::Relaxed);
                     tracing::debug!(from = current, to = target, "offload: resized global gate");
                 }

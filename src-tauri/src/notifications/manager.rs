@@ -279,6 +279,13 @@ impl NotificationManager {
                             debug!(?tab, "notifications: suppressing Idle (awaiting permission)");
                             return;
                         }
+                        // Symmetric guard for a pending question: the avatar also
+                        // drops to Idle just before a question prompt, so without
+                        // this the user hears "idle" instead of "awaiting question".
+                        if self.last_awaiting_question.get(&tab).copied().unwrap_or(false) {
+                            debug!(?tab, "notifications: suppressing Idle (awaiting question)");
+                            return;
+                        }
                         NotificationEvent::Idle
                     }
                     AvatarState::Error => NotificationEvent::Error,

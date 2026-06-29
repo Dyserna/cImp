@@ -130,7 +130,14 @@ export function validateAndRepairLayout(
   // 1. Drop unknown tab ids per pane.
   let tree: LayoutNode = walkPanes(persisted.tree, (pane) => {
     const filtered = pane.tab_ids.filter((id) => validTabIds.has(id));
-    if (filtered.length === pane.tab_ids.length && pane.active_tab_id !== null) {
+    // Early-out only when nothing was dropped AND the active tab is actually one
+    // of this pane's tabs. Skipping the membership check left a pane whose
+    // `active_tab_id` isn't in its own `tab_ids` untouched → blank display.
+    if (
+      filtered.length === pane.tab_ids.length &&
+      pane.active_tab_id !== null &&
+      filtered.includes(pane.active_tab_id)
+    ) {
       return pane;
     }
     let active = pane.active_tab_id;

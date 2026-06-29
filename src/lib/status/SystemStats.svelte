@@ -25,7 +25,11 @@
 
   const stats = $derived($settings.system_stats);
   const enabled = $derived(stats.enabled);
-  const pollMs = $derived(Math.max(1, stats.poll_interval_secs) * 1000);
+  // `Math.max(1, NaN)` is NaN → setTimeout(…, NaN) coerces to 0 and busy-polls.
+  // Coerce a non-finite interval to the floor first.
+  const pollMs = $derived(
+    Math.max(1, Number.isFinite(stats.poll_interval_secs) ? stats.poll_interval_secs : 1) * 1000,
+  );
   const netMax = $derived(netHist.length ? Math.max(...netHist, 1) : 1);
 
   // Each visible "column" is a stacked pair: CPU/RAM, GPU/VRAM, NET

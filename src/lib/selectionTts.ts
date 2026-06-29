@@ -197,6 +197,11 @@ async function launch(
 
 // --- Bottom-bar transport ---------------------------------------------------
 
+/// Guards against a begin already in flight — `beginSelectionTts` is async and
+/// only sets state to 'playing' after an await, so a rapid double-click would
+/// otherwise launch a second session that tears down the first mid-setup.
+let startingSelection = false;
+
 /// Play: resume if paused, otherwise read the current terminal selection.
 /// Toasts when nothing is selected (the requested "no text selected" notice).
 export function playSelectionTts(): void {
@@ -209,7 +214,11 @@ export function playSelectionTts(): void {
     showToast('No text selected');
     return;
   }
-  void beginSelectionTts(terminal, get(settings).tts.selection_highlight);
+  if (startingSelection) return; // a begin is already in flight — ignore the repeat
+  startingSelection = true;
+  void beginSelectionTts(terminal, get(settings).tts.selection_highlight).finally(() => {
+    startingSelection = false;
+  });
 }
 
 /// Pause in-flight playback (no-op unless currently playing).

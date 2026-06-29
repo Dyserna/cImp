@@ -294,20 +294,42 @@ impl StreamAccumulator {
 /// before returning it to Opus. Tolerates an unterminated trailing
 /// `<think>` (truncated reasoning) by dropping from the tag to the end.
 pub fn strip_think(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find("<think>") {
+    while let Some(start) = rest.find(OPEN) {
         out.push_str(&rest[..start]);
-        match rest[start..].find("</think>") {
-            Some(end) => {
-                rest = &rest[start + end + "</think>".len()..];
-            }
-            None => {
-                // Unterminated — drop the rest.
-                rest = "";
-                break;
+        // Walk from just after this opener, counting NESTED opens, until the
+        // matching close brings depth back to 0. A naive "find the first
+        // </think>" would mismatch `<think>a<think>b</think>c</think>` and leak
+        // the stray trailing `</think>` (and the text after it) into the answer.
+        let mut i = start + OPEN.len();
+        let mut depth = 1usize;
+        loop {
+            let tail = &rest[i..];
+            let next_open = tail.find(OPEN);
+            let next_close = tail.find(CLOSE);
+            match (next_open, next_close) {
+                (Some(o), Some(c)) if o < c => {
+                    depth += 1;
+                    i += o + OPEN.len();
+                }
+                (_, Some(c)) => {
+                    depth -= 1;
+                    i += c + CLOSE.len();
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {
+                    // No matching close (unterminated) — drop to the end.
+                    i = rest.len();
+                    break;
+                }
             }
         }
+        rest = &rest[i..];
     }
     out.push_str(rest);
     out.trim().to_string()
@@ -322,6 +344,12 @@ mod tests {
         assert_eq!(strip_think("<think>reason</think>answer"), "answer");
         assert_eq!(strip_think("before<think>x</think>after"), "beforeafter");
         assert_eq!(strip_think("plain"), "plain");
+        // Nested blocks must balance — no stray </think> in the output.
+        assert_eq!(strip_think("<think>a<think>b</think>c</think>answer"), "answer");
+        assert_eq!(
+            strip_think("x<think>a<think>b</think>c</think>y"),
+            "xy"
+        );
     }
 
     #[test]

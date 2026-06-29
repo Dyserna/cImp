@@ -16,6 +16,8 @@ export interface GraphStatus {
   symbols: number;
   edges: number;
   last_error: string | null;
+  // Whether file-watch re-indexing is currently paused (global toggle).
+  watch_paused: boolean;
   // Phase G semantic-search status.
   semantic_enabled: boolean;
   embedder_configured: boolean;

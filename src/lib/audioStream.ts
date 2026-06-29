@@ -42,10 +42,15 @@ let started = false;
 export function startAmplitudeListener(): void {
   if (started) return;
   started = true;
-  void listen<number[]>('audio-amplitude', (event) => {
+  listen<number[]>('audio-amplitude', (event) => {
     latestSamples.current = new Float32Array(event.payload);
     latestSamples.seq++;
     notifySamples();
+  }).catch((e) => {
+    // Surface the failure (the waveform would otherwise just stay flat) and
+    // allow a later retry instead of latching `started` on a failed attempt.
+    started = false;
+    console.error('audio-amplitude listen failed', e);
   });
 }
 
@@ -60,9 +65,12 @@ let micStarted = false;
 export function startMicAmplitudeListener(): void {
   if (micStarted) return;
   micStarted = true;
-  void listen<number[]>('mic-amplitude', (event) => {
+  listen<number[]>('mic-amplitude', (event) => {
     latestSamples.current = new Float32Array(event.payload);
     latestSamples.seq++;
     notifySamples();
+  }).catch((e) => {
+    micStarted = false;
+    console.error('mic-amplitude listen failed', e);
   });
 }

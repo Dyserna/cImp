@@ -55,7 +55,7 @@ mod imp {
     use std::sync::OnceLock;
 
     use tracing::{debug, warn};
-    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -104,6 +104,9 @@ mod imp {
                     "process_guard: SetInformationJobObject failed; children rely on \
                      kill_on_drop only"
                 );
+                // Close the freshly-created job handle — we're abandoning it, so
+                // leaving it open would leak a kernel handle for the process life.
+                CloseHandle(handle);
                 return None;
             }
             debug!("process_guard: kill-on-job-close job created");

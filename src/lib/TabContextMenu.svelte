@@ -80,6 +80,28 @@
   let submenuOpen = $state(false);
   let layoutsOpen = $state(false);
 
+  // Clamp the menu into the viewport: opened at the raw cursor coords it would
+  // overflow off-screen (and be unreachable) near the right/bottom edges.
+  // Seeded from the open coords; the $effect below re-clamps on any change.
+  // svelte-ignore state_referenced_locally
+  let posX = $state(x);
+  // svelte-ignore state_referenced_locally
+  let posY = $state(y);
+  $effect(() => {
+    // Re-read x/y so a reposition re-clamps.
+    const wantX = x;
+    const wantY = y;
+    if (!menuEl) {
+      posX = wantX;
+      posY = wantY;
+      return;
+    }
+    const rect = menuEl.getBoundingClientRect();
+    const margin = 4;
+    posX = Math.max(margin, Math.min(wantX, window.innerWidth - rect.width - margin));
+    posY = Math.max(margin, Math.min(wantY, window.innerHeight - rect.height - margin));
+  });
+
   // Top 5 layout presets, most-recent first. ISO 8601 `created_at`
   // strings sort lexicographically, so localeCompare orders them by date.
   const recentPresets = $derived(
@@ -182,7 +204,7 @@
 <div
   bind:this={menuEl}
   class="menu"
-  style="left: {x}px; top: {y}px;"
+  style="left: {posX}px; top: {posY}px;"
   role="menu"
 >
   {#if tab}

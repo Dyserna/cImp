@@ -30,13 +30,19 @@
     // 'transcribing' → disabled, no-op
   }
 
-  // Hold-mode pointer handlers.
+  // Hold-mode pointer handlers. Track whether THIS interaction began as a hold
+  // so the release stops it regardless of a mid-hold `button_mode` flip — keying
+  // the release off the live mode would leave recording stuck on if the setting
+  // changed (or synced) while the button was held down.
+  let holding = false;
   function onPointerDown() {
     if ($sttSettings.button_mode !== 'hold') return;
+    holding = true;
     start();
   }
   function onPointerUp() {
-    if ($sttSettings.button_mode !== 'hold') return;
+    if (!holding) return;
+    holding = false;
     stop();
   }
 

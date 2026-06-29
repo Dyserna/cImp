@@ -40,11 +40,15 @@
     const i = roots.findIndex((r) => r.root === s.root);
     if (i >= 0) roots[i] = s;
     else roots = [...roots, s];
+    // `watch_paused` is a global toggle mirrored into every status — sync the
+    // button state from it so a remount doesn't show the wrong label.
+    paused = s.watch_paused;
   }
 
   async function refresh(): Promise<void> {
     try {
       roots = await graphStatus();
+      if (roots.length > 0) paused = roots[0].watch_paused;
     } catch (e) {
       console.warn('graph_status failed', e);
     }

@@ -273,16 +273,23 @@ impl PtyManager {
             )
         };
 
-        {
-            let last = last_size
+        // Claim the new target under the lock — dedup check AND update together —
+        // so a concurrent resize back to the previous size isn't wrongly
+        // suppressed against a `last_size` this call hasn't published yet (which
+        // would leave the PTY at the wrong size).
+        let prev = {
+            let mut last = last_size
                 .lock()
                 .map_err(|e| AppError::Pty(format!("last_size poisoned: {e}")))?;
             if *last == (rows, cols) {
                 return Ok(());
             }
-        }
+            let prev = *last;
+            *last = (rows, cols);
+            prev
+        };
 
-        tokio::task::spawn_blocking(move || -> AppResult<()> {
+        let result = tokio::task::spawn_blocking(move || -> AppResult<()> {
             let m = master
                 .lock()
                 .map_err(|e| AppError::Pty(format!("master poisoned: {e}")))?;
@@ -296,10 +303,17 @@ impl PtyManager {
             Ok(())
         })
         .await
-        .map_err(|e| AppError::Pty(format!("blocking task: {e}")))??;
+        .map_err(|e| AppError::Pty(format!("blocking task: {e}")));
 
-        if let Ok(mut last) = last_size.lock() {
-            *last = (rows, cols);
+        // Roll back the claimed size on failure so a retry to this size isn't
+        // suppressed — but only if no later resize already superseded our claim.
+        if let Err(e) = result.and_then(|r| r) {
+            if let Ok(mut last) = last_size.lock() {
+                if *last == (rows, cols) {
+                    *last = prev;
+                }
+            }
+            return Err(e);
         }
 
         // Tell the processor a real resize just fired so it can ignore the

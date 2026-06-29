@@ -345,6 +345,9 @@ fn run_audio_thread(
                     marks.clear();
                     last_front = None;
                     pending_done = None;
+                    // Drop any owed Started edge: the audio is gone, so delivering
+                    // it now would fire a spurious Started→Stopped pair after Esc.
+                    pending_start = None;
                     // Reset the amplitude ring too. It still holds up to 1 s
                     // of the just-stopped utterance; without this the avatar /
                     // visualizer reads those stale samples at the start of the
@@ -523,6 +526,9 @@ struct TappedSource {
     samples: std::vec::IntoIter<f32>,
     sample_rate: u32,
     remaining: usize,
+    /// Constant total sample count, for the `Source::total_duration` contract
+    /// (which must report the source's full length, not what's left to play).
+    total: usize,
     amplitude: Arc<RwLock<RingBuffer>>,
     batch: Vec<f32>,
 }
@@ -538,6 +544,7 @@ impl TappedSource {
             samples: samples.into_iter(),
             sample_rate,
             remaining,
+            total: remaining,
             amplitude,
             batch: Vec::with_capacity(AMPLITUDE_BATCH),
         }
@@ -602,7 +609,7 @@ impl Source for TappedSource {
             // infinite and `Duration::from_secs_f64` panics on a non-finite.
             return None;
         }
-        let secs = self.remaining as f64 / self.sample_rate as f64;
+        let secs = self.total as f64 / self.sample_rate as f64;
         Some(Duration::from_secs_f64(secs))
     }
 }

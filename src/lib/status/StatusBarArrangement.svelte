@@ -84,6 +84,27 @@
     moved = false;
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
+    // Also handle pointercancel: the OS can cancel a gesture (touch
+    // interruption, focus loss) without ever firing pointerup, which would
+    // otherwise leave `activePointer` set and the move/up listeners attached —
+    // locking out all further dragging.
+    window.addEventListener('pointercancel', onPointerCancel);
+  }
+
+  function detachDragListeners(): void {
+    window.removeEventListener('pointermove', onPointerMove);
+    window.removeEventListener('pointerup', onPointerUp);
+    window.removeEventListener('pointercancel', onPointerCancel);
+  }
+
+  function onPointerCancel(e: PointerEvent): void {
+    if (activePointer === null || e.pointerId !== activePointer) return;
+    detachDragListeners();
+    activePointer = null;
+    // Cancelled gesture: discard the in-progress reorder rather than commit it.
+    working = null;
+    dragIndex = null;
+    moved = false;
   }
 
   function onPointerMove(e: PointerEvent): void {
@@ -137,8 +158,7 @@
 
   function onPointerUp(e: PointerEvent): void {
     if (activePointer === null || e.pointerId !== activePointer) return;
-    window.removeEventListener('pointermove', onPointerMove);
-    window.removeEventListener('pointerup', onPointerUp);
+    detachDragListeners();
     activePointer = null;
     if (moved && working) commit(working);
     working = null;
@@ -176,8 +196,7 @@
     return () => {
       document.removeEventListener('mousedown', onDocMouseDown, true);
       window.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('pointerup', onPointerUp);
+      detachDragListeners();
     };
   });
 </script>

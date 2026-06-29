@@ -60,6 +60,10 @@ pub struct GraphStatus {
     pub edges: u64,
     /// Last build error, if the most recent attempt failed.
     pub last_error: Option<String>,
+    /// Whether file-watch re-indexing is currently paused (a global toggle,
+    /// mirrored into every status so the monitor UI can render the right
+    /// button label without a separate query).
+    pub watch_paused: bool,
 
     // ── Semantic search (Phase G) ──
     /// Whether semantic search is enabled in settings.
@@ -91,6 +95,7 @@ impl GraphStatus {
             symbols: 0,
             edges: 0,
             last_error: None,
+            watch_paused: false,
             semantic_enabled: false,
             embedder_configured: false,
             embedder_ready: false,
@@ -310,7 +315,17 @@ impl GraphService {
 
     /// Every known root's status (the IPC list surface).
     pub fn statuses(&self) -> Vec<GraphStatus> {
-        self.status.lock().unwrap().values().cloned().collect()
+        let paused = self.paused.load(Ordering::Relaxed);
+        self.status
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .map(|mut s| {
+                s.watch_paused = paused;
+                s
+            })
+            .collect()
     }
 
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns
@@ -334,6 +349,7 @@ impl GraphService {
             building.building = true;
             building.last_error = None;
             guard.insert(root.clone(), building.clone());
+            building.watch_paused = self.paused.load(Ordering::Relaxed);
             let _ = self.app.emit(GRAPH_STATUS_EVENT, &building);
         }
 
@@ -757,6 +773,8 @@ impl GraphService {
             f(s);
             s.clone()
         };
+        let mut status = status;
+        status.watch_paused = self.paused.load(Ordering::Relaxed);
         let _ = self.app.emit(GRAPH_STATUS_EVENT, &status);
     }
 

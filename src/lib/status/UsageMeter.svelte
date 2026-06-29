@@ -35,7 +35,14 @@
   // re-fetching) on unrelated settings edits — and collapses the
   // default→loaded settings swap at startup into a single fetch.
   const enabled = $derived(usage.enabled);
-  const pollMs = $derived(Math.max(MIN_POLL_SECS, usage.poll_interval_secs) * 1000);
+  // Coerce a non-finite interval to the floor: `Math.max(MIN, NaN)` is NaN →
+  // setTimeout(…, NaN) coerces to 0 and busy-polls the usage endpoint.
+  const pollMs = $derived(
+    Math.max(
+      MIN_POLL_SECS,
+      Number.isFinite(usage.poll_interval_secs) ? usage.poll_interval_secs : MIN_POLL_SECS,
+    ) * 1000,
+  );
   const showCountdown = $derived(usage.show_countdown);
   const showResetClock = $derived(usage.show_reset_clock);
 

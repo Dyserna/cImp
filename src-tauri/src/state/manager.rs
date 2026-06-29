@@ -579,6 +579,16 @@ async fn run(
                         if let Ok(mut g) = input_lengths.write() {
                             g.remove(&tab);
                         }
+                        // If the active tab was just removed, repoint `active` at
+                        // a surviving tab. Leaving it on the dead id breaks the
+                        // idle sweep's `*tab != active` checks, marking every
+                        // survivor done-while-away (a spurious badge). The
+                        // frontend's follow-up TabActivated sets the real one.
+                        if active == tab {
+                            if let Some(next) = tabs.keys().next().cloned() {
+                                active = next;
+                            }
+                        }
                         info!(?tab, "tab removed");
                         emit_tab_closed_event(&app, &state_events, tab);
                     }

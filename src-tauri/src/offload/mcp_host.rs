@@ -1021,12 +1021,22 @@ impl SseAssembler {
 /// chunks isn't corrupted), so we never wait for the server to close a stream
 /// that keeps emitting progress notifications after the result.
 async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, String> {
+    // Bound the unframed accumulation: complete lines are drained below, so this
+    // caps a SINGLE newline-less line. Without it a server that streams bytes
+    // without a newline grows `buf` until OOM (the caller's timeout is the only
+    // other bound).
+    const MAX_SSE_BYTES: usize = 16 * 1024 * 1024;
     let mut asm = SseAssembler::default();
     let mut buf: Vec<u8> = Vec::new();
     loop {
         match resp.chunk().await {
             Ok(Some(bytes)) => {
                 buf.extend_from_slice(&bytes);
+                if buf.len() > MAX_SSE_BYTES {
+                    return Err(format!(
+                        "SSE response exceeded {MAX_SSE_BYTES} bytes without a complete line"
+                    ));
+                }
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
                     let line = String::from_utf8_lossy(&line_bytes);

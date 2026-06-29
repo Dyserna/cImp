@@ -535,10 +535,14 @@ fn strip_ansi(bytes: &[u8]) -> String {
                     match final_byte {
                         b'C' | b'a' => {
                             // Cursor forward: emit N spaces (capped to keep
-                            // unrelated jumps from blowing up the buffer).
+                            // unrelated jumps from blowing up the buffer). Use
+                            // only the FIRST CSI parameter — a multi-param form
+                            // like `ESC[5;1C` otherwise fails to parse as a whole
+                            // and collapses to one space, fusing adjacent words.
                             let n_skip = std::str::from_utf8(params)
                                 .ok()
-                                .and_then(|s| s.parse::<usize>().ok())
+                                .and_then(|s| s.split(';').next())
+                                .and_then(|s| s.trim().parse::<usize>().ok())
                                 .unwrap_or(1)
                                 .clamp(1, 64);
                             out.resize(out.len() + n_skip, b' ');

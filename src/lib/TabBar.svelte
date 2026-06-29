@@ -128,7 +128,7 @@
     });
   }
 
-  /// Spawn a duplicate of an AI builtin (the `+` on a Claude/Aider tab).
+  /// Spawn a duplicate of an AI builtin (the `+` on a Claude/OpenCode tab).
   /// Routes the new tab into this pane via the same pending-placement
   /// cell the New Shell Tab `+` uses, so it lands next to its origin.
   function onSpawnAiTab(template: TabId): void {

@@ -22,11 +22,11 @@
   // Tab button. The parent owns baseline tracking and computes
   // `restartRequired`; this component just shows the indicator and routes
   // the restart click back up.
-  // V14: `tabId` drives per-id conditionals — most importantly, hiding
-  // the TTS-injection group for Aider tabs (Aider's CLI has no
-  // `--append-system-prompt` equivalent; the spawn path drops the
-  // pre-args regardless of the toggle, but exposing the field would
-  // mislead the user).
+  // V19: `tabId` drives per-id conditionals — the local-provider helper
+  // text differs (Claude synthesizes ANTHROPIC_* env; OpenCode synthesizes a
+  // provider block inside OPENCODE_CONFIG_CONTENT). The TTS-injection group
+  // applies to every AI tab now: unlike Aider, OpenCode accepts an
+  // instructions file (via the injected config), so it can speak.
   let {
     tabId,
     displayName,
@@ -45,7 +45,7 @@
     onrestart: () => void;
   } = $props();
 
-  let isAider = $derived(tabId === 'aider' || tabId === 'aider-local');
+  let isOpencode = $derived(tabId === 'opencode' || tabId === 'opencode-local');
 
   function update<K extends keyof AiToolTabConfig>(key: K, value: AiToolTabConfig[K]) {
     settings = { ...settings, [key]: value };
@@ -214,7 +214,7 @@
         {/if}
       </span>
     </label>
-    {#if settings.use_local_provider && !isAider}
+    {#if settings.use_local_provider && !isOpencode}
       <p class="hint hint-effective-env">
         On launch this tab synthesizes
         <code>ANTHROPIC_BASE_URL={$settingsStore.claude_local.base_url}</code>,
@@ -225,22 +225,23 @@
         Per-tab env entries below override these.
       </p>
     {/if}
-    {#if settings.use_local_provider && isAider}
+    {#if settings.use_local_provider && isOpencode}
       <p class="hint hint-effective-env">
-        On launch this tab synthesizes
-        <code>OPENAI_API_BASE={$settingsStore.aider_local.base_url}</code>,
-        <code>OPENAI_API_KEY=…</code>{$settingsStore.aider_local.model
-          ? ` and adds --model ${$settingsStore.aider_local.model} to the spawn argv`
+        On launch this tab injects an OpenAI-compatible
+        <code>provider</code> block into
+        <code>OPENCODE_CONFIG_CONTENT</code> pointing at
+        <code>{$settingsStore.opencode_local.base_url}</code>{$settingsStore
+          .opencode_local.model
+          ? ` with model ${$settingsStore.opencode_local.model}`
           : ''}
-        from the global <em>Local LLM provider — Aider</em> settings.
+        from the global <em>Local LLM provider — OpenCode</em> settings.
         Per-tab env entries below override these.
       </p>
     {/if}
   </div>
 
-  {#if !isAider}
-    <div class="group">
-      <h4>TTS injection</h4>
+  <div class="group">
+    <h4>TTS injection</h4>
       <label class="checkbox">
         <input
           type="checkbox"
@@ -269,14 +270,13 @@
           defaultValue={defaults?.tts_injection.instructions ?? ''}
           disabled={!settings.tts_injection.enabled}
           rows={6}
-          placeholder="Instructions injected via --append-system-prompt"
+          placeholder="Instructions injected on launch (Claude: --append-system-prompt; OpenCode: instructions file)"
         />
         <small class="hint">
           Injected on subprocess start when the toggle above is on.
         </small>
       </label>
     </div>
-  {/if}
 
   <div class="group">
     <h4>Notifications</h4>

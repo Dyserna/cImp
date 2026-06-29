@@ -231,7 +231,7 @@ export async function createShellTab(input: CreateShellTabInput): Promise<TabId>
   return invoke<TabId>('create_shell_tab', input as unknown as Record<string, unknown>);
 }
 
-/// Spawn a duplicate of an existing AI tab (the `+` on a Claude/Aider
+/// Spawn a duplicate of an existing AI tab (the `+` on a Claude/OpenCode
 /// builtin). `template` is the id of the tab to clone; the backend copies
 /// its live config, assigns a fresh `ai-<uuid>` id, and returns the new
 /// tab id. The new tab is closable (`builtin: false`) and persists across

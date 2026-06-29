@@ -1,5 +1,11 @@
 # Milestone V1.4-07: Claude Code Local-Provider Tab + Aider Removal
 
+> **Superseded by V19.** This earlier plan removed the original aider tab in
+> favor of a Claude local-provider tab. Aider was later re-introduced (V14) and
+> is now replaced by OpenCode in `docs/MILESTONE-V19-opencode-replaces-aider.md`.
+> Retained for the in-place reserved-tab-rewrite + layout-id-rewrite migration
+> pattern that V19's `migrate_v18_to_v19` reuses.
+
 > **Release tag:** the user has chosen to ship this as `v1.3.3`. Milestone series numbering (V1.4-XX) is independent of the git tag, mirroring V1.4-01..04 which shipped as v1.3.2. Numbers V1.4-05 and V1.4-06 belong to the cancelled per-tab avatar / TTS plans (deleted in v1.3.2); this milestone takes the next free slot.
 
 ## Purpose

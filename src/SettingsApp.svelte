@@ -100,10 +100,10 @@
   // between password and text via this flag (no keychain integration in
   // this milestone — the token sits cleartext in settings.json).
   let showLocalToken = $state<boolean>(false);
-  // V14: same toggle for the Aider local LLM section.
-  let showAiderLocalToken = $state<boolean>(false);
+  // V19: same toggle for the OpenCode local LLM section.
+  let showOpencodeLocalToken = $state<boolean>(false);
   // Inline error under the AI-tabs checkbox group — e.g. when enabling an
-  // Aider tab is rejected because `aider` isn't installed (ebin/PATH).
+  // OpenCode tab is rejected because `opencode` isn't installed (ebin/PATH).
   let aiTabsError = $state<string | null>(null);
   // V8-01 offload: test-box input/result and a busy guard for the
   // Start/Stop/Reset/Test buttons.
@@ -460,8 +460,8 @@
     if (
       tabId === 'claude' ||
       tabId === 'claude-local' ||
-      tabId === 'aider' ||
-      tabId === 'aider-local'
+      tabId === 'opencode' ||
+      tabId === 'opencode-local'
     ) {
       return tabId;
     }
@@ -612,7 +612,7 @@
     if (enable) {
       // Insert in canonical order so the persisted list mirrors the
       // tab-bar order users see.
-      const order: AiTabId[] = ['claude', 'claude-local', 'aider', 'aider-local'];
+      const order: AiTabId[] = ['claude', 'claude-local', 'opencode', 'opencode-local'];
       next_ids = order.filter((x) => prev.includes(x) || x === id);
     } else {
       if (prev.length <= 1) return; // last-one lock (also guarded by the disabled attribute)
@@ -620,7 +620,7 @@
     }
     if (!enable && tabsSubSection === id) {
       // Jump to the first surviving id in canonical order.
-      const order: AiTabId[] = ['claude', 'claude-local', 'aider', 'aider-local'];
+      const order: AiTabId[] = ['claude', 'claude-local', 'opencode', 'opencode-local'];
       const survivor = order.find((x) => next_ids.includes(x));
       if (survivor) tabsSubSection = survivor;
     }
@@ -635,13 +635,13 @@
       const restored = structuredClone($state.snapshot(snapshot));
       restored.enabled_ai_tabs = prev;
       snapshot = restored;
-      // The backend rejects enabling an Aider tab when `aider` can't be
+      // The backend rejects enabling an OpenCode tab when `opencode` can't be
       // resolved (not in ebin, not on PATH) — surface that specifically so the
       // user knows to install it; everything else is a generic failure.
       const kind = (e as { kind?: string } | null)?.kind;
       aiTabsError =
-        kind === 'aider-not-found'
-          ? 'Aider was not found in ebin or on your PATH. Install aider (pip install aider-chat) and make sure it’s on PATH, then try again.'
+        kind === 'opencode-not-found'
+          ? 'OpenCode was not found in ebin or on your PATH. Install it from https://opencode.ai/docs (or drop opencode.exe in ebin/), then try again.'
           : 'Failed to update AI tabs — see logs for details.';
     }
   }
@@ -2129,8 +2129,8 @@
       {:else if activeSection === 'tabs'}
         {@const claudeLive = aiTabAt('claude')}
         {@const claudeLocalLive = aiTabAt('claude-local')}
-        {@const aiderLive = aiTabAt('aider')}
-        {@const aiderLocalLive = aiTabAt('aider-local')}
+        {@const opencodeLive = aiTabAt('opencode')}
+        {@const opencodeLocalLive = aiTabAt('opencode-local')}
         {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
         {@const enabledAiTabs = snapshot.enabled_ai_tabs}
         {@const lastChecked = enabledAiTabs.length === 1 ? enabledAiTabs[0] : null}
@@ -2179,31 +2179,31 @@
                 <input
                   type="checkbox"
                   name="ai-tabs-enabled"
-                  value="aider"
-                  checked={enabledAiTabs.includes('aider')}
-                  disabled={lastChecked === 'aider'}
+                  value="opencode"
+                  checked={enabledAiTabs.includes('opencode')}
+                  disabled={lastChecked === 'opencode'}
                   onchange={(e) =>
                     void toggleAiTabEnabled(
-                      'aider',
+                      'opencode',
                       (e.currentTarget as HTMLInputElement).checked,
                     )}
                 />
-                Aider (cloud)
+                OpenCode (cloud)
               </label>
               <label>
                 <input
                   type="checkbox"
                   name="ai-tabs-enabled"
-                  value="aider-local"
-                  checked={enabledAiTabs.includes('aider-local')}
-                  disabled={lastChecked === 'aider-local'}
+                  value="opencode-local"
+                  checked={enabledAiTabs.includes('opencode-local')}
+                  disabled={lastChecked === 'opencode-local'}
                   onchange={(e) =>
                     void toggleAiTabEnabled(
-                      'aider-local',
+                      'opencode-local',
                       (e.currentTarget as HTMLInputElement).checked,
                     )}
                 />
-                Aider (local)
+                OpenCode (local)
               </label>
             </div>
             {#if aiTabsError}
@@ -2232,20 +2232,20 @@
             <button
               type="button"
               role="tab"
-              class:active={tabsSubSection === 'aider'}
-              aria-selected={tabsSubSection === 'aider'}
-              onclick={() => (tabsSubSection = 'aider')}
+              class:active={tabsSubSection === 'opencode'}
+              aria-selected={tabsSubSection === 'opencode'}
+              onclick={() => (tabsSubSection = 'opencode')}
             >
-              Aider
+              OpenCode
             </button>
             <button
               type="button"
               role="tab"
-              class:active={tabsSubSection === 'aider-local'}
-              aria-selected={tabsSubSection === 'aider-local'}
-              onclick={() => (tabsSubSection = 'aider-local')}
+              class:active={tabsSubSection === 'opencode-local'}
+              aria-selected={tabsSubSection === 'opencode-local'}
+              onclick={() => (tabsSubSection = 'opencode-local')}
             >
-              Aider (local)
+              OpenCode (local)
             </button>
             <button
               type="button"
@@ -2379,121 +2379,121 @@
                 </label>
               </section>
             </div>
-          {:else if tabsSubSection === 'aider'}
-            <div id="tab-section-aider">
-              {#if aiderLive}
+          {:else if tabsSubSection === 'opencode'}
+            <div id="tab-section-opencode">
+              {#if opencodeLive}
                 <TabSettingsSection
-                  tabId={'aider'}
-                  displayName={'Aider'}
+                  tabId={'opencode'}
+                  displayName={'OpenCode'}
                   bind:settings={
-                    () => aiderLive,
-                    (v) => patchAiTab('aider', v)
+                    () => opencodeLive,
+                    (v) => patchAiTab('opencode', v)
                   }
-                  defaults={tabDefaults['aider'] ?? null}
-                  restartRequired={restartRequired['aider'] ?? false}
+                  defaults={tabDefaults['opencode'] ?? null}
+                  restartRequired={restartRequired['opencode'] ?? false}
                   onchange={() => {}}
-                  onrestart={() => restartTab('aider')}
+                  onrestart={() => restartTab('opencode')}
                 />
               {:else}
-                <small class="hint top">Aider tab is disabled — tick the checkbox above to enable it.</small>
+                <small class="hint top">OpenCode tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
             </div>
-          {:else if tabsSubSection === 'aider-local'}
-            <div id="tab-section-aider-local">
-              {#if aiderLocalLive}
+          {:else if tabsSubSection === 'opencode-local'}
+            <div id="tab-section-opencode-local">
+              {#if opencodeLocalLive}
                 <TabSettingsSection
-                  tabId={'aider-local'}
-                  displayName={'Aider (local)'}
+                  tabId={'opencode-local'}
+                  displayName={'OpenCode (local)'}
                   bind:settings={
-                    () => aiderLocalLive,
-                    (v) => patchAiTab('aider-local', v)
+                    () => opencodeLocalLive,
+                    (v) => patchAiTab('opencode-local', v)
                   }
-                  defaults={tabDefaults['aider-local'] ?? null}
-                  restartRequired={restartRequired['aider-local'] ?? false}
+                  defaults={tabDefaults['opencode-local'] ?? null}
+                  restartRequired={restartRequired['opencode-local'] ?? false}
                   onchange={() => {}}
-                  onrestart={() => restartTab('aider-local')}
+                  onrestart={() => restartTab('opencode-local')}
                 />
               {:else}
-                <small class="hint top">Aider (local) tab is disabled — tick the checkbox above to enable it.</small>
+                <small class="hint top">OpenCode (local) tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
               <section>
-                <h2>Local LLM provider</h2>
+                <h2>Local LLM provider — OpenCode</h2>
                 <small class="hint top">
-                  Settings for this tab. ccImp synthesizes
-                  <code>OPENAI_API_BASE</code> / <code>OPENAI_API_KEY</code>
-                  from the values below and (when <em>Model</em> is set) passes
-                  <code>--model &lt;model&gt;</code> on the spawn argv. Point
-                  this at any OpenAI-compatible endpoint (Ollama, LM Studio,
-                  vLLM, LiteLLM proxy, …); ccImp does not start the endpoint
-                  itself.
+                  Settings for this tab. ccImp injects an OpenAI-compatible
+                  <code>provider</code> block into
+                  <code>OPENCODE_CONFIG_CONTENT</code> from the values below
+                  (and sets <em>Model</em> as the default model). Point this at
+                  any OpenAI-compatible endpoint (LM Studio, llama-server, vLLM,
+                  LiteLLM proxy, …); ccImp does not start the endpoint itself and
+                  does not install OpenCode. See
+                  <a href="https://opencode.ai/docs" target="_blank" rel="noreferrer">opencode.ai/docs</a>.
                 </small>
                 <label>
                   <span>Endpoint URL</span>
                   <input
                     type="text"
-                    value={snapshot?.aider_local.base_url ?? ''}
+                    value={snapshot?.opencode_local.base_url ?? ''}
                     oninput={(e) =>
                       patch(
                         (s) =>
-                          (s.aider_local.base_url = (
+                          (s.opencode_local.base_url = (
                             e.currentTarget as HTMLInputElement
                           ).value),
                       )}
-                    placeholder="http://localhost:11434/v1"
+                    placeholder="http://localhost:1234/v1"
                   />
                   <small class="hint">
-                    Becomes <code>OPENAI_API_BASE</code> on launch. For Ollama,
-                    the default <code>:11434/v1</code> path serves the
-                    OpenAI-compatible API.
+                    Becomes the provider's <code>options.baseURL</code>. OpenCode
+                    expects the OpenAI-compatible <code>/v1</code> suffix (LM
+                    Studio / llama-server / Ollama's OpenAI shim).
                   </small>
                 </label>
                 <label>
                   <span>Auth token</span>
                   <div class="input-with-action">
                     <input
-                      type={showAiderLocalToken ? 'text' : 'password'}
-                      value={snapshot?.aider_local.auth_token ?? ''}
+                      type={showOpencodeLocalToken ? 'text' : 'password'}
+                      value={snapshot?.opencode_local.auth_token ?? ''}
                       oninput={(e) =>
                         patch(
                           (s) =>
-                            (s.aider_local.auth_token = (
+                            (s.opencode_local.auth_token = (
                               e.currentTarget as HTMLInputElement
                             ).value),
                         )}
-                      placeholder="ollama"
+                      placeholder="local"
                     />
                     <button
                       type="button"
                       class="secondary"
-                      onclick={() => (showAiderLocalToken = !showAiderLocalToken)}
+                      onclick={() => (showOpencodeLocalToken = !showOpencodeLocalToken)}
                     >
-                      {showAiderLocalToken ? 'Hide' : 'Show'}
+                      {showOpencodeLocalToken ? 'Hide' : 'Show'}
                     </button>
                   </div>
                   <small class="hint">
-                    Becomes <code>OPENAI_API_KEY</code>. Stored cleartext;
-                    local endpoints typically accept any non-empty value
-                    (Ollama defaults to the literal string <code>ollama</code>).
+                    Becomes the provider's <code>options.apiKey</code>. Stored
+                    cleartext; local endpoints typically accept any non-empty
+                    value.
                   </small>
                 </label>
                 <label>
                   <span>Model</span>
                   <input
                     type="text"
-                    value={snapshot?.aider_local.model ?? ''}
+                    value={snapshot?.opencode_local.model ?? ''}
                     oninput={(e) =>
                       patch(
                         (s) =>
-                          (s.aider_local.model = (
+                          (s.opencode_local.model = (
                             e.currentTarget as HTMLInputElement
                           ).value),
                       )}
-                    placeholder="qwen3:14b"
+                    placeholder="qwen2.5-coder"
                   />
                   <small class="hint">
-                    When non-empty, passed as <code>--model &lt;model&gt;</code>
-                    on the aider spawn argv. Aider's own naming conventions
-                    apply (e.g. <code>openai/qwen3:14b</code> for some endpoints).
+                    When non-empty, set as the default model for the synthesized
+                    local provider.
                   </small>
                 </label>
               </section>

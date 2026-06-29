@@ -142,14 +142,13 @@ pub struct Settings {
     /// (and `ANTHROPIC_MODEL` if set) into the spawned process's env.
     /// Per-tab `env` entries take precedence over synthesized values.
     pub claude_local: ClaudeLocalSettings,
-    /// V14: local-LLM provider config for Aider tabs whose
-    /// `use_local_provider` flag is `true`. The launch-time env
+    /// V19: local-LLM provider config for OpenCode tabs whose
+    /// `use_local_provider` flag is `true`. The launch-time config
     /// composition reads `base_url`/`auth_token`/`model` from here and
-    /// synthesizes `OPENAI_API_BASE` / `OPENAI_API_KEY` (and a
-    /// `--model <model>` CLI arg when `model` is non-empty) into the
-    /// spawned aider process. Per-tab `env` entries take precedence
-    /// over synthesized values.
-    pub aider_local: AiderLocalSettings,
+    /// synthesizes an OpenAI-compatible `provider` block inside
+    /// `OPENCODE_CONFIG_CONTENT` (see `tabs::config::build_opencode_config`).
+    /// Per-tab `env` entries take precedence over synthesized values.
+    pub opencode_local: OpencodeLocalSettings,
     /// Optional explicit executable paths for the bundled quick-launch
     /// tools (rustnet / broot). A non-empty field overrides the normal
     /// `ebin/` → PATH resolution for that tool, letting the user point at
@@ -205,7 +204,7 @@ impl Default for Settings {
             ui: UiSettings::default(),
             terminal: TerminalSettings::default(),
             claude_local: ClaudeLocalSettings::default(),
-            aider_local: AiderLocalSettings::default(),
+            opencode_local: OpencodeLocalSettings::default(),
             external_tools: ExternalToolsSettings::default(),
             offload: OffloadSettings::default(),
             graph: GraphSettings::default(),
@@ -645,31 +644,31 @@ impl Default for ClaudeLocalSettings {
 }
 
 /// V14: local-LLM provider configuration for Aider tabs whose
-/// `use_local_provider: true`. The launch flow synthesizes
-/// `OPENAI_API_BASE` from `base_url`, `OPENAI_API_KEY` from
-/// `auth_token`, and (when `model` is non-empty) appends
-/// `--model <model>` to the spawn argv. Stored cleartext for the same
-/// reasons as `ClaudeLocalSettings` (local proxies typically accept
-/// dummy tokens; OS-keychain integration is a future upgrade).
+/// `use_local_provider: true`. The launch flow synthesizes an
+/// OpenAI-compatible `provider` block (pointing `options.baseURL` at
+/// `base_url` and `options.apiKey` at `auth_token`, with `model` as the
+/// default model) inside the injected `OPENCODE_CONFIG_CONTENT`. Stored
+/// cleartext for the same reasons as `ClaudeLocalSettings` (local proxies
+/// typically accept dummy tokens; OS-keychain integration is a future upgrade).
 ///
 /// The hand-rolled `Debug` impl redacts `auth_token` so a stray
 /// `?settings` log line cannot leak the secret to the rolling log.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AiderLocalSettings {
+pub struct OpencodeLocalSettings {
     pub base_url: String,
     pub auth_token: String,
     pub model: String,
 }
 
-impl std::fmt::Debug for AiderLocalSettings {
+impl std::fmt::Debug for OpencodeLocalSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let redacted = if self.auth_token.is_empty() {
             "<empty>"
         } else {
             "<redacted>"
         };
-        f.debug_struct("AiderLocalSettings")
+        f.debug_struct("OpencodeLocalSettings")
             .field("base_url", &self.base_url)
             .field("auth_token", &redacted)
             .field("model", &self.model)
@@ -677,11 +676,13 @@ impl std::fmt::Debug for AiderLocalSettings {
     }
 }
 
-impl Default for AiderLocalSettings {
+impl Default for OpencodeLocalSettings {
     fn default() -> Self {
         Self {
-            base_url: "http://localhost:11434/v1".to_string(),
-            auth_token: "ollama".to_string(),
+            // OpenCode expects the OpenAI-compatible `/v1` suffix, like LM
+            // Studio / llama-server / Ollama's OpenAI shim.
+            base_url: "http://localhost:1234/v1".to_string(),
+            auth_token: "local".to_string(),
             model: String::new(),
         }
     }

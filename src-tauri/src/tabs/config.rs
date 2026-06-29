@@ -225,6 +225,18 @@ fn build_extra_args(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
+    // V19: OpenCode's default TUI takes the alternate screen (full-screen
+    // redraw), which breaks ccImp's linear, append-only stream model the same
+    // way Claude's fullscreen renderer does. `--mini` renders inline into the
+    // normal scrollback instead — the same rendering class as Claude's
+    // `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. It is mandatory and always
+    // prepended (ahead of the user's own `cfg.args`) so the linear-stream
+    // contract holds regardless of what the user adds. `--mini` requires a real
+    // TTY, which the PTY supplies.
+    if command_is(&cfg.command, "opencode") {
+        out.push("--mini".to_string());
+    }
+
     // Aider against a local provider: prepend `--model <name>` if
     // configured. Placed ahead of the user's own `cfg.args` so a user can
     // still override by adding `--model …` themselves (Aider takes the
@@ -251,6 +263,20 @@ fn build_extra_args(
         }
     }
     out
+}
+
+/// V19: synthesize OpenCode's session-scoped config — the JSON document that
+/// `OPENCODE_CONFIG_CONTENT` carries (the env-var analog of Claude's
+/// `--mcp-config` / `--settings` / `--append-system-prompt`). Starts from the
+/// `$schema` marker; the `mcp` block (→ `ccimp --offload-mcp --consumer
+/// opencode`), the `instructions` file (TTS + offload + graph guidance), and
+/// the local `provider` block are layered on in Phase D. Additive by default —
+/// cctts does not set `OPENCODE_DISABLE_PROJECT_CONFIG`, so a user's project
+/// config still merges underneath.
+fn build_opencode_config(_cfg: &AiToolTabConfig, _settings: &Settings) -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://opencode.ai/config.json"
+    })
 }
 
 /// V1.4-07 / V14: compose the spawn environment for an AI tab. Per-tab
@@ -292,6 +318,30 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
             "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
             "1".to_string(),
         );
+    }
+
+    // V19: OpenCode launch env. `--mini` (see `build_extra_args`) puts the
+    // renderer inline; here we (1) inject the session-scoped config as one
+    // `OPENCODE_CONFIG_CONTENT` env var — the env-var analog of Claude's
+    // `--mcp-config` / `--settings` / `--append-system-prompt` CLI flags — and
+    // (2) quiet terminal features that fight ccImp's own selection/title
+    // handling. Set before the per-tab `env` merge below so a user can override
+    // any of these per tab.
+    if command_is(&cfg.command, "opencode") {
+        let config = build_opencode_config(cfg, settings);
+        env.insert("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string());
+        env.insert(
+            "OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT".to_string(),
+            "1".to_string(),
+        );
+        env.insert("OPENCODE_DISABLE_TERMINAL_TITLE".to_string(), "1".to_string());
+        // Windows: OpenCode shells out via Git Bash. Pass the path through when
+        // the parent environment already names it, so the `--mini` child finds it.
+        if let Ok(bash) = std::env::var("OPENCODE_GIT_BASH_PATH") {
+            if !bash.is_empty() {
+                env.insert("OPENCODE_GIT_BASH_PATH".to_string(), bash);
+            }
+        }
     }
 
     if cfg.use_local_provider {
@@ -343,6 +393,15 @@ mod tests {
             TabConfig::AiTool(c) => c,
             _ => unreachable!("default_aider_tab is an AI tool tab"),
         }
+    }
+
+    /// An AI-tool tab whose command resolves to `opencode`. Built from the
+    /// Claude default with the command swapped so these tests don't depend on
+    /// the Phase B `default_opencode_tab` builder.
+    fn opencode_cfg() -> AiToolTabConfig {
+        let mut c = claude_cfg();
+        c.command = "opencode".to_string();
+        c
     }
 
     /// The value following the first `--settings` flag in `args`, parsed
@@ -518,6 +577,63 @@ mod tests {
         assert!(
             !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
             "Aider doesn't understand the Claude fullscreen flag",
+        );
+    }
+
+    // ---- V19: OpenCode launch spine ----
+
+    #[test]
+    fn prepends_mini_for_opencode() {
+        let settings = Settings::default();
+        let args = build_extra_args(&opencode_cfg(), &settings, &[]);
+        assert_eq!(args.first().map(String::as_str), Some("--mini"),
+            "opencode must launch with --mini as the first arg, got: {args:?}");
+    }
+
+    #[test]
+    fn no_mini_for_claude_or_shell() {
+        let settings = Settings::default();
+        let claude = build_extra_args(&claude_cfg(), &settings, &[]);
+        assert!(!claude.iter().any(|a| a == "--mini"), "claude must not get --mini");
+        let aider = build_extra_args(&aider_cfg(), &settings, &[]);
+        assert!(!aider.iter().any(|a| a == "--mini"), "non-opencode tabs must not get --mini");
+    }
+
+    #[test]
+    fn opencode_config_content_is_valid_json() {
+        let settings = Settings::default();
+        let env = compose_ai_env(&opencode_cfg(), &settings);
+        let raw = env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("opencode tab sets OPENCODE_CONFIG_CONTENT");
+        let cfg: serde_json::Value =
+            serde_json::from_str(raw).expect("OPENCODE_CONFIG_CONTENT is valid JSON");
+        assert_eq!(cfg["$schema"], "https://opencode.ai/config.json");
+    }
+
+    #[test]
+    fn opencode_sets_noise_suppression_env() {
+        let settings = Settings::default();
+        let env = compose_ai_env(&opencode_cfg(), &settings);
+        assert_eq!(
+            env.get("OPENCODE_DISABLE_TERMINAL_TITLE").map(String::as_str),
+            Some("1"),
+        );
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            "opencode must not get the Claude fullscreen flag");
+    }
+
+    #[test]
+    fn per_tab_env_overrides_opencode_config_content() {
+        let settings = Settings::default();
+        let mut cfg = opencode_cfg();
+        cfg.env
+            .insert("OPENCODE_CONFIG_CONTENT".to_string(), "custom".to_string());
+        let env = compose_ai_env(&cfg, &settings);
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            Some("custom"),
+            "an explicit per-tab value must win over the synthesized config",
         );
     }
 

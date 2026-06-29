@@ -3,7 +3,7 @@
   // reachable LAN llama-servers render the full live dashboard (slots,
   // throughput, queue, context, history); cloud/down backends render a
   // compact status line. The raw server log is available only for Local
-  // backends (ccImp owns their process); remote logs live on the box.
+  // backends (cImp owns their process); remote logs live on the box.
   import { onMount } from 'svelte';
   import {
     offloadServerLog,

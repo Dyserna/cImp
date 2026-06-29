@@ -1,17 +1,17 @@
 # Milestone V7-01: Voice Cloning TTS (clone a voice from a short clip)
 
-> **Release tag:** TBD by the user at ship time (V-series numbering is independent of the git tag, per the V6-01 convention). The "V7-01" label is a placeholder — adjust if you'd rather slot this as V6-02 under the audio pillar. This milestone is a **TTS *engine* expansion**: it adds a second, cloning-capable synthesis backend alongside the existing Kokoro engine, so the user can supply an audio file of a voice and have cctts speak in that voice.
+> **Release tag:** TBD by the user at ship time (V-series numbering is independent of the git tag, per the V6-01 convention). The "V7-01" label is a placeholder — adjust if you'd rather slot this as V6-02 under the audio pillar. This milestone is a **TTS *engine* expansion**: it adds a second, cloning-capable synthesis backend alongside the existing Kokoro engine, so the user can supply an audio file of a voice and have cimp speak in that voice.
 >
 > **Relation to V6-01.** The chosen engine (Chatterbox-Turbo) clones from audio **alone** and needs no reference transcript, so this milestone has **no hard dependency** on [MILESTONE-V6-01-speech-to-text.md](MILESTONE-V6-01-speech-to-text.md). V6-01 is only reused opportunistically: its `stt/capture.rs` mic-capture lets the user *record* a reference clip in-app (file upload works without it). V7-01 can ship before or after V6-01.
 
 ## Purpose
 
-Let the user **clone a voice** and have cctts speak in it. The user provides:
+Let the user **clone a voice** and have cimp speak in it. The user provides:
 
 1. **An audio file** containing a sample of the target voice (record via the existing mic capture or pick a file). Optimal length **≈ 10 seconds** (usable range ~5–30 s; longer gives no benefit and can hurt).
 2. **An optional transcript** of what the sample says — **purely optional and currently unused**: Chatterbox-Turbo clones from the audio alone. The field is kept in the UI/profile for future engine-swaps, but the chosen engine ignores it.
 
-cctts processes this once into a reusable **voice profile**, and from then on the avatar speaks AI prose in that voice. Everything stays **fully offline, no Python, no cloud** — same portability promise as Kokoro.
+cimp processes this once into a reusable **voice profile**, and from then on the avatar speaks AI prose in that voice. Everything stays **fully offline, no Python, no cloud** — same portability promise as Kokoro.
 
 ### Why this is a *replacement* engine, not a config tweak
 

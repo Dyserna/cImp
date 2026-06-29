@@ -1,5 +1,5 @@
 //! Graph tool surface shared by both consumers:
-//! - the **cloud Opus session**, via the `ccimp --offload-mcp` server (this
+//! - the **cloud Opus session**, via the `cimp --offload-mcp` server (this
 //!   module's [`tools`] descriptors + [`handle_call`]); and
 //! - the **local offload worker**, via [`offload_query`] (wired into the
 //!   offload native-tool router).
@@ -388,7 +388,7 @@ pub async fn offload_query(
     // First configured root that already has a built graph wins. (Most setups
     // have a single root; multiple roots fall back to the first that's indexed.)
     let mut last_err =
-        "no code graph found under the offload roots — enable + index the project in ccImp"
+        "no code graph found under the offload roots — enable + index the project in cImp"
             .to_string();
     for root in roots {
         match open_project_index_confined(root, &sub) {
@@ -487,7 +487,7 @@ fn db_subdir(settings: &crate::settings::Settings) -> String {
 fn open_project_index(start: &Path, sub: &str) -> Result<(PathBuf, GraphIndex), String> {
     let root = find_graph_root(start, sub).ok_or_else(|| {
         format!(
-            "no code graph found from {} — enable the graph and index this project in ccImp",
+            "no code graph found from {} — enable the graph and index this project in cImp",
             start.display()
         )
     })?;
@@ -544,7 +544,7 @@ fn run_struct_search(
 /// be at or below `allowed_root`. The offload worker is sandboxed to its
 /// confinement roots; [`find_graph_root`] walks ancestors, so a `graph.db` in a
 /// *parent* directory (a project nested inside a larger indexed repo, or a
-/// stray `~/.ccimp/graph.db`) would otherwise let `graph_struct_search` read
+/// stray `~/.cimp/graph.db`) would otherwise let `graph_struct_search` read
 /// source files outside the sandbox. Since the search starts at `allowed_root`,
 /// "at or below" means the resolved root equals `allowed_root`.
 fn open_project_index_confined(
@@ -553,7 +553,7 @@ fn open_project_index_confined(
 ) -> Result<(PathBuf, GraphIndex), String> {
     let resolved = find_graph_root(allowed_root, sub).ok_or_else(|| {
         format!(
-            "no code graph found from {} — enable the graph and index this project in ccImp",
+            "no code graph found from {} — enable the graph and index this project in cImp",
             allowed_root.display()
         )
     })?;

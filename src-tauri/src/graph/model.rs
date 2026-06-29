@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-/// A source language ccImp knows how to index. `Other` is parsed-but-skipped
+/// A source language cImp knows how to index. `Other` is parsed-but-skipped
 /// (logged, never fatal) so an unknown extension can't break a build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {

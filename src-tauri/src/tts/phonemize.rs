@@ -250,7 +250,7 @@ mod tests {
         assert_eq!(toks.padded_ids.len(), toks.raw_count + 2);
     }
 
-    /// Run with: `cargo test --bin ccimp -- --ignored --nocapture espeak_fallback`.
+    /// Run with: `cargo test --bin cimp -- --ignored --nocapture espeak_fallback`.
     /// espeak-ng (statically linked via misaki-rs's default features) handles
     /// out-of-vocabulary words. The check is that "eBook" doesn't degrade to
     /// misaki's letter-by-letter pattern (stress-marked individual letters).

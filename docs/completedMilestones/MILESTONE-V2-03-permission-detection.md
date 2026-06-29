@@ -81,7 +81,7 @@ Multi-tab is functional after V2-01 and polished after V2-02. The next layer of 
 Before implementation, do a small research task:
 
 1. Run Claude Code interactively and trigger several permission prompts (use the bash tool, edit a file, etc., to provoke the prompt UI)
-2. Capture the rendered text of each prompt (e.g., by running cctts and logging the rendered-view content from the processing layer)
+2. Capture the rendered text of each prompt (e.g., by running cimp and logging the rendered-view content from the processing layer)
 3. Identify distinctive substrings that uniquely identify a permission prompt
 4. Document these patterns in a constants file with a comment noting which Claude Code version was tested
 
@@ -396,7 +396,7 @@ To make pattern updates easy as Claude Code evolves:
 
 - Patterns live in `src-tauri/src/processing/permission_patterns.rs` as a documented `const`
 - A comment block at the top notes which Claude Code version was tested
-- When patterns need updating (Claude Code changes its prompts), update the const, recompile, ship a new version of cctts
+- When patterns need updating (Claude Code changes its prompts), update the const, recompile, ship a new version of cimp
 
 For v2 this is sufficient. If pattern updates become frequent, consider loading from a JSON file the user can edit, but that's not needed yet.
 

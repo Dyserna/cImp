@@ -16,7 +16,7 @@ The PTY + xterm.js integration is the architectural foundation. If it doesn't wo
 - A single main window containing one terminal pane (no avatar pane yet — full window width is the terminal)
 - PTY allocation and management on both Windows (ConPTY) and Linux (Unix PTY) via `portable-pty`
 - Spawning `claude` as a subprocess in the PTY, with the working directory set to the directory the wrapper app was launched from
-- CLI argument pass-through: any arguments passed to `cctts` are forwarded to the spawned `claude` subprocess. The wrapper itself accepts no CLI arguments of its own in v1 — it is a drop-in replacement for `claude`. Running `cctts --resume <session-id>` invokes `claude --resume <session-id>` inside the PTY.
+- CLI argument pass-through: any arguments passed to `cimp` are forwarded to the spawned `claude` subprocess. The wrapper itself accepts no CLI arguments of its own in v1 — it is a drop-in replacement for `claude`. Running `cimp --resume <session-id>` invokes `claude --resume <session-id>` inside the PTY.
 - Forwarding raw bytes from PTY → frontend → xterm.js for display
 - Forwarding keystrokes from xterm.js → frontend → PTY for input
 - Handling terminal resize events (window resize → xterm.js resize → PTY resize)
@@ -43,7 +43,7 @@ The milestone is complete when all of the following are true:
 6. Closing the window terminates the `claude` subprocess cleanly (no orphaned processes)
 7. The above works on both Windows 10/11 (with WebView2) and a modern Linux distribution (with WebKitGTK)
 8. The working directory inside Claude Code matches the directory the wrapper app was launched from
-9. CLI arguments passed to `cctts` are forwarded to the underlying `claude` subprocess. For example, `cctts --resume <session-id>` is equivalent to running `claude --resume <session-id>` directly. Verify with at least one Claude Code flag (e.g., `--help` or `--resume`) that the argument reaches Claude Code and is interpreted correctly.
+9. CLI arguments passed to `cimp` are forwarded to the underlying `claude` subprocess. For example, `cimp --resume <session-id>` is equivalent to running `claude --resume <session-id>` directly. Verify with at least one Claude Code flag (e.g., `--help` or `--resume`) that the argument reaches Claude Code and is interpreted correctly.
 
 ## Implementation Approach
 
@@ -130,7 +130,7 @@ let claude_args: Vec<String> = std::env::args().skip(1).collect();
 
 Pass both into the PTY manager when spawning Claude Code. `std::env::args().skip(1)` drops the binary name itself, leaving everything else to be forwarded as-is to `claude`.
 
-Since `cctts` accepts no arguments of its own in v1, every received argument is forwarded blindly. If `cctts`-specific arguments are added in a future version, they would need to be parsed and stripped before the remainder is forwarded — but that's out of scope here.
+Since `cimp` accepts no arguments of its own in v1, every received argument is forwarded blindly. If `cimp`-specific arguments are added in a future version, they would need to be parsed and stripped before the remainder is forwarded — but that's out of scope here.
 
 #### IPC Surface
 
@@ -282,7 +282,7 @@ Run through these manually before declaring the milestone complete:
 6. **Color rendering**: Verify Claude Code's colored output (syntax highlighting, status indicators) renders correctly
 7. **Working directory**: Inside Claude Code, ask it to confirm the working directory; verify it matches where you launched the app
 8. **Clean exit**: Close the window; check OS process list to confirm `claude` is not orphaned
-9. **CLI argument passthrough**: launch the app with an argument that Claude Code recognizes (e.g., `cctts --resume <some-session-id>` or `cctts --help` if Claude Code supports it). Verify the argument reaches Claude Code (by behavior — the resumed session loads, or `--help` output is rendered in the terminal). Verify launching with no arguments still works as plain `claude` invocation.
+9. **CLI argument passthrough**: launch the app with an argument that Claude Code recognizes (e.g., `cimp --resume <some-session-id>` or `cimp --help` if Claude Code supports it). Verify the argument reaches Claude Code (by behavior — the resumed session loads, or `--help` output is rendered in the terminal). Verify launching with no arguments still works as plain `claude` invocation.
 10. **Cross-platform**: Repeat all of the above on the second platform (Windows if developed on Linux, or vice versa)
 
 ## Known Risks and Mitigation

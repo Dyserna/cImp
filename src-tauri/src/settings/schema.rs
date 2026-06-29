@@ -82,10 +82,10 @@ pub struct Settings {
     /// Bottom-bar system-monitor panel config.
     pub system_stats: SystemStatsSettings,
     /// Claude Code context-window status line bar. Global (like the avatar
-    /// and TTS voice) — applies to every ccImp-launched Claude tab rather
+    /// and TTS voice) — applies to every cImp-launched Claude tab rather
     /// than per-tab. Drives a `--settings` overlay injected at launch (see
     /// `tabs::config`) that points Claude Code's `statusLine` at our own
-    /// `ccimp --statusline` renderer.
+    /// `cimp --statusline` renderer.
     pub statusline: StatuslineSettings,
     pub compose: ComposeSettings,
     pub shortcuts: ShortcutSettings,
@@ -124,13 +124,13 @@ pub struct Settings {
     #[serde(default, deserialize_with = "deserialize_lenient_presets")]
     pub layout_presets: Vec<LayoutPreset>,
     /// UI chrome theme settings (V5). The `theme` field selects the
-    /// design-token block applied to the ccimp chrome (tab bar, status
+    /// design-token block applied to the cimp chrome (tab bar, status
     /// bar, dialogs, settings). Distinct from `terminal.theme`, which
     /// governs the xterm.js terminal palette inside each tab.
     pub ui: UiSettings,
     /// Terminal-pane settings (V1.4-01+): xterm.js theme today, plus
     /// the V1.4-02 background image/color group when that ships.
-    /// Distinct from `ui`, which themes the ccimp chrome.
+    /// Distinct from `ui`, which themes the cimp chrome.
     pub terminal: TerminalSettings,
     /// V1.4-07: local-LLM provider config for AI tabs whose
     /// `use_local_provider` flag is `true`. The launch-time env
@@ -145,13 +145,13 @@ pub struct Settings {
     /// an exe in any folder; empty means "resolve normally". Additive
     /// `#[serde(default)]` — old settings files load with both empty.
     pub external_tools: ExternalToolsSettings,
-    /// V8-01: local task-offload config. ccImp runs a user-supplied
+    /// V8-01: local task-offload config. cImp runs a user-supplied
     /// `llama-server` and exposes an `offload_task` MCP tool into
-    /// ccImp-launched Claude tabs so Opus can delegate token-heavy
+    /// cImp-launched Claude tabs so Opus can delegate token-heavy
     /// subtasks to the local model. Off by default. Additive — old
     /// settings files load with the feature disabled.
     pub offload: OffloadSettings,
-    /// V9-01: per-project code knowledge graph config. ccImp builds an
+    /// V9-01: per-project code knowledge graph config. cImp builds an
     /// on-disk graph of code + docs at `<project>/<db_subdir>/graph.db`
     /// and exposes `graph_*` query tools to Claude tabs (MCP) and the
     /// offload worker (native). Off by default. Additive — old settings
@@ -204,7 +204,7 @@ impl Default for Settings {
 }
 
 /// Logging configuration. The file path is fixed at
-/// `<portable-root>/logs/ccimp.log.<YYYY-MM-DD>`; the `level` field drives
+/// `<portable-root>/logs/cimp.log.<YYYY-MM-DD>`; the `level` field drives
 /// the live filter and `retention` drives the startup cleanup pass.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
@@ -655,9 +655,9 @@ pub struct ExternalToolsSettings {
     pub broot: String,
 }
 
-/// V8-01: local task-offload configuration. ccImp runs a user-supplied
+/// V8-01: local task-offload configuration. cImp runs a user-supplied
 /// `llama-server` (the single source of truth is `server_command`) and
-/// exposes an `offload_task` MCP tool into ccImp-launched Claude tabs so
+/// exposes an `offload_task` MCP tool into cImp-launched Claude tabs so
 /// the main Opus session can delegate token-heavy subtasks (deep search,
 /// large-file/log summarization, web research) to the local model and
 /// receive only the synthesized result. Off by default (`enabled` and
@@ -687,10 +687,10 @@ pub struct OffloadSettings {
     pub inject_guidance: bool,
     /// The single source-of-truth `llama-server` command, e.g.
     /// `llama-server --model …\Qwen3.6-35B-A3B-Q4.gguf --port 8080
-    /// --jinja -ngl 99 --ctx-size 150000 --flash-attn`. ccImp
+    /// --jinja -ngl 99 --ctx-size 150000 --flash-attn`. cImp
     /// `shlex`-parses it to spawn, parses host/port + `-np` to know
     /// where to connect and how many slots exist, and validates
-    /// `--jinja` is present (tool-calling needs it). ccImp never
+    /// `--jinja` is present (tool-calling needs it). cImp never
     /// silently mutates the command. Empty on a fresh install.
     pub server_command: String,
     /// Native baseline tool on/off toggles (`read_file`, `code_search`,
@@ -713,7 +713,7 @@ pub struct OffloadSettings {
     /// in Settings → Offload → Tools. A program with no matching policy gets
     /// only the allowlist + bare-name/PATH guard.
     pub command_policies: Vec<CommandPolicy>,
-    /// User-installed MCP tool servers aggregated by ccImp's MCP host
+    /// User-installed MCP tool servers aggregated by cImp's MCP host
     /// and exposed to the local model as OpenAI tools. Mirrors Claude's
     /// own `mcpServers` config shape so users can paste familiar config.
     pub mcp_servers: Vec<McpServerConfig>,
@@ -867,13 +867,13 @@ pub struct GraphSettings {
 }
 
 impl GraphSettings {
-    /// The per-project db subdirectory, falling back to `.ccimp` when unset.
+    /// The per-project db subdirectory, falling back to `.cimp` when unset.
     /// Single source of truth so the service and the MCP child can't open
     /// different paths.
     pub fn effective_db_subdir(&self) -> String {
         let s = self.db_subdir.trim();
         if s.is_empty() {
-            ".ccimp".to_string()
+            ".cimp".to_string()
         } else {
             s.to_string()
         }
@@ -894,7 +894,7 @@ impl Default for GraphSettings {
             watch_debounce_ms: 300,
             max_rows_per_query: 100,
             max_snippet_bytes: 2_000,
-            db_subdir: ".ccimp".to_string(),
+            db_subdir: ".cimp".to_string(),
             allow_remote_worker_access: false,
             semantic_search: false,
             embedding_endpoint: String::new(),
@@ -983,7 +983,7 @@ pub fn default_command_policies() -> Vec<CommandPolicy> {
 }
 
 /// On/off toggles for the native baseline offload tools (built into
-/// ccImp, zero external deps). All default on so offload works with no
+/// cImp, zero external deps). All default on so offload works with no
 /// MCP servers installed.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 #[serde(default)]
@@ -1007,7 +1007,7 @@ impl Default for OffloadToolToggles {
     }
 }
 
-/// One user-installed MCP tool server, aggregated by ccImp's MCP host.
+/// One user-installed MCP tool server, aggregated by cImp's MCP host.
 /// Mirrors Claude Code's own `mcpServers` entry shape: either a stdio
 /// server (`command` + `args` + `env`) or an HTTP server (`url`). Only
 /// read-class tools from each server are exposed this milestone.
@@ -1030,13 +1030,13 @@ pub struct McpServerConfig {
     /// HTTP transport: the server base URL. Empty when `command` is set.
     pub url: String,
     /// Expose this server's tools to **Claude Code** (proxied through the
-    /// per-session `ccimp-offload` child). Off by default — a deliberate opt-in.
+    /// per-session `cimp-offload` child). Off by default — a deliberate opt-in.
     pub claude_access: bool,
     /// Expose this server's tools to the **offload worker** (the local model,
     /// via the warm `McpHost`). This is the legacy `enabled` behavior.
     pub offload_access: bool,
     /// V19: expose this server's tools to **OpenCode** (proxied through the
-    /// per-session `ccimp-offload --consumer opencode` child). Off by default;
+    /// per-session `cimp-offload --consumer opencode` child). Off by default;
     /// the v18 → v19 migration seeds it from `claude_access` so upgraders keep
     /// their web-research tools across both agents.
     pub opencode_access: bool,
@@ -1173,14 +1173,14 @@ impl ToolScope {
 
 /// V8-02: kind-specific configuration for one offload backend.
 ///
-/// `Local` mirrors V8-01's single-server config (the command ccImp owns +
-/// spawns as a read-only tab). `Remote` is a `base_url` ccImp only
+/// `Local` mirrors V8-01's single-server config (the command cImp owns +
+/// spawns as a read-only tab). `Remote` is a `base_url` cImp only
 /// health-checks and connects to — no process, no tab. The hand-rolled
 /// `Debug` on [`OffloadBackend`] redacts the Remote `auth_token`.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum OffloadBackendKind {
-    /// ccImp owns the process: the V8-01 `server_command` + `autostart` +
+    /// cImp owns the process: the V8-01 `server_command` + `autostart` +
     /// read-only Offload Server tab + Start/Stop/Reset.
     Local {
         /// The single source-of-truth `llama-server` command (shlex-parsed
@@ -1189,7 +1189,7 @@ pub enum OffloadBackendKind {
         /// Spawn at app launch and keep warm (else lazy on first offload).
         autostart: bool,
     },
-    /// ccImp holds a `base_url` (+ optional auth) and health-checks it; it
+    /// cImp holds a `base_url` (+ optional auth) and health-checks it; it
     /// cannot start/stop the process. A LAN box or a cloud API.
     Remote {
         /// HTTP origin of the OpenAI-compatible endpoint, e.g.
@@ -2060,13 +2060,13 @@ impl Default for SystemStatsSettings {
 }
 
 /// Context-window status line config. When `enabled`, the AI launch path
-/// injects a session-scoped `--settings` overlay into ccImp-launched
-/// Claude Code tabs that points `statusLine.command` at `ccimp
+/// injects a session-scoped `--settings` overlay into cImp-launched
+/// Claude Code tabs that points `statusLine.command` at `cimp
 /// --statusline` — our own renderer for a themed context-usage bar
 /// (`Opus  ▓▓▓▓▓░░░░░ 50% (100k/200k)`). The overlay *merges* with the
 /// user's own Claude Code settings (CLI flags outrank settings files and
 /// only `statusLine` is set), so the user's global `~/.claude` config is
-/// left untouched and the bar appears only inside ccImp.
+/// left untouched and the bar appears only inside cImp.
 ///
 /// Additive `#[serde(default)]` field — settings files written before this
 /// landed round-trip with the bar enabled. Enabled by default, mirroring
@@ -2164,7 +2164,7 @@ impl Default for StatusBarLayout {
 
 /// Terminal-pane settings (V1.4-01+). Holds the xterm.js palette config
 /// (V1.4-01) and the background image / solid-color sub-group (V1.4-02).
-/// Distinct from `ui`, which themes the ccimp chrome.
+/// Distinct from `ui`, which themes the cimp chrome.
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct TerminalSettings {

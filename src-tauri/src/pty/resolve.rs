@@ -13,7 +13,7 @@
 //! present, which is deterministic and needs no per-tool probing.
 //!
 //! `ebin` is located relative to the executable, covering both the packaged
-//! layout (`<zip>/bin/ccimp.exe` with a sibling `<zip>/ebin/`) and a flat
+//! layout (`<zip>/bin/cimp.exe` with a sibling `<zip>/ebin/`) and a flat
 //! `<exe-dir>/ebin/` (what `build.rs` stages next to the dev binary). An
 //! explicit path argument (absolute, or containing a separator) bypasses
 //! `ebin` and is resolved verbatim.
@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn lookup_finds_bundled_binary_and_misses_cleanly() {
         // Unique temp dir so parallel tests don't collide.
-        let dir = std::env::temp_dir().join(format!("ccimp-ebin-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("cimp-ebin-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Create a file under the first candidate name for "demo-tool" so this

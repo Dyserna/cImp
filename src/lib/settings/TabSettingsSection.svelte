@@ -232,7 +232,7 @@
     {:else}
       <p class="hint hint-effective-env">
         OpenCode manages its own providers and credentials (global config,
-        switchable in-session). Configure providers in OpenCode itself; cctts
+        switchable in-session). Configure providers in OpenCode itself; cimp
         injects only its MCP tools and the TTS/offload/graph guidance.
       </p>
     {/if}

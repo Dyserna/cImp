@@ -1,7 +1,7 @@
-ccImp
+cImp
 Copyright 2026 Amir Amashe
 
-The source code of ccImp is licensed under the Apache License, Version
+The source code of cImp is licensed under the Apache License, Version
 2.0 — see LICENSE for the full text.
 
 ------------------------------------------------------------------------
@@ -9,7 +9,7 @@ The source code of ccImp is licensed under the Apache License, Version
 The compiled binary statically links espeak-ng (via misaki-rs), which
 is licensed under the GNU General Public License version 3 or later
 (GPLv3+). Per GPLv3 §5, the combined binary distribution is governed
-by the GPLv3+; the source code of ccImp itself remains under the
+by the GPLv3+; the source code of cImp itself remains under the
 Apache License 2.0 above.
 
 espeak-ng:
@@ -20,17 +20,17 @@ espeak-ng:
 
 ------------------------------------------------------------------------
 
-The portable Windows zip distribution of ccImp bundles the Kokoro 82M
+The portable Windows zip distribution of cImp bundles the Kokoro 82M
 ONNX model and the af_heart voicepack. These files are not included in
 the source repository and are downloaded at build time from the
 onnx-community mirror on HuggingFace; their license is independent of
-the ccImp source license above.
+the cImp source license above.
 
 Kokoro-82M-v1.0-ONNX:
   Source: https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX
   Files bundled: onnx/model.onnx (renamed kokoro-v1.0.onnx),
                  voices/af_heart.bin
-  License: Apache License 2.0 — same text as ccImp's own LICENSE file.
+  License: Apache License 2.0 — same text as cImp's own LICENSE file.
 
 ------------------------------------------------------------------------
 
@@ -49,7 +49,7 @@ whisper.cpp:
 The portable Windows zip (full variant only) bundles a ggml Whisper
 speech-to-text model (default `ggml-small.bin`). Like the Kokoro model,
 it is tracked via Git LFS rather than committed to source, and its
-license is independent of the ccImp source license above.
+license is independent of the cImp source license above.
 
 Whisper (ggml models):
   Source: https://huggingface.co/ggerganov/whisper.cpp
@@ -69,7 +69,7 @@ Clawdmeter / Clawd sprites:
   Pixel art: https://claudepix.vercel.app
   Project code license: MIT
   The Clawd mascot character is property of Anthropic PBC. The sprite
-  artwork is bundled here as-is for ccImp's animated-avatar variant with
+  artwork is bundled here as-is for cImp's animated-avatar variant with
   attribution to the sources above.
 
 ------------------------------------------------------------------------
@@ -88,7 +88,7 @@ broot:
 rustnet:
   Copyright (c) domcyrus and contributors
   Source: https://github.com/domcyrus/rustnet
-  License: Apache License 2.0 — same text as ccImp's own LICENSE file.
+  License: Apache License 2.0 — same text as cImp's own LICENSE file.
   Note: rustnet requires Npcap (https://npcap.com/) installed on the
   user's machine to capture network traffic; it is not bundled.
 
@@ -96,12 +96,12 @@ rustnet:
 
 Data-egress notice — cloud offload backends (V8-02).
 
-ccImp's task-offload feature is local and offline by default: the model,
+cImp's task-offload feature is local and offline by default: the model,
 the agent loop, and the tools all run on your machine. The optional
 offload "backend pool" can additionally include a *cloud*
 OpenAI-compatible endpoint. When — and only when — you add a backend
 marked "cloud" and grant the explicit data-egress consent toggle, and the
-router selects that backend for a task, ccImp sends that task's
+router selects that backend for a task, cImp sends that task's
 instructions (and any context the calling session passes, plus any tool
 results if you widen the backend's tool scope beyond the web/docs-only
 default) to that third-party endpoint over the network. By default a cloud
@@ -110,4 +110,4 @@ run_command, filesystem, git) and a task that needs them is never routed
 to it. LAN/remote backends on your own network keep data on your network.
 No cloud egress occurs unless you configure and consent to a cloud
 backend. The third-party endpoint's data handling is governed by that
-provider, independent of the ccImp licenses above.
+provider, independent of the cImp licenses above.

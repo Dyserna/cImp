@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 /// keystroke per tab); a plain RwLock is simpler than a third dependency.
 pub type InputLengths = Arc<RwLock<HashMap<TabId, Arc<AtomicI32>>>>;
 
-/// Identifier for one of the multi-tab subprocesses ccimp owns. Four
+/// Identifier for one of the multi-tab subprocesses cimp owns. Four
 /// reserved AI variants cover the V14 builtins (subscription / local
 /// pairs for Claude Code and Aider); `Shell(id)` carries the
 /// user-managed tab IDs introduced in v3 (M1 had a hardcoded "shell-1";

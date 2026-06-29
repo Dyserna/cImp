@@ -311,11 +311,11 @@ When the migration backup is written (step 2), don't overwrite an existing backu
 - **A v1.2 settings file with extra unknown fields**: serde with `#[serde(default)]` on optional fields and no `deny_unknown_fields` is forgiving. Unknown fields are dropped on save (which the user may not want for forward compatibility). Acceptable for v1.2; revisit if forward-compat becomes a concern.
 - **The migration's backup write fails (e.g., disk full)**: fail the migration loudly. Don't proceed without a backup. The user sees an error dialog: "Settings migration could not back up your existing config. Free disk space and restart."
 - **A user-edited settings file with a builtin entry having `builtin: false`**: the integrity check ignores the field on builtins (force `builtin: true` for `claude` / `aider` IDs). This handles users intentionally trying to delete builtins via settings — they fail, but cleanly.
-- **A user creates a tab, then editing settings.json by hand removes the entry while cctts is running**: cctts doesn't watch the file for external changes in v1.2 (this matches v1.1 behavior). The user's hand-edit is overwritten on the next debounced save. Acceptable; document.
+- **A user creates a tab, then editing settings.json by hand removes the entry while cimp is running**: cimp doesn't watch the file for external changes in v1.2 (this matches v1.1 behavior). The user's hand-edit is overwritten on the next debounced save. Acceptable; document.
 - **`active_tab_id` points to a closed shell**: closed Shell tabs are still real tabs (with a closed overlay). The active-tab restoration honors them; the user sees the closed overlay on launch and can press Enter to restart.
 - **`active_tab_id` points to a tab that hits "command not found" at launch**: same as above — the tab exists in closed state, restoration works, the user sees the "command not found" message.
 - **Switching schema mid-debounce**: a tab is created (creates a debounced write), the user closes it before the debounce fires. The final state should be no tab in the array. This is the standard "last write wins" behavior of the debounce; verify it works as expected (the close handler should mutate the in-memory settings before the debounced write fires).
-- **Two cctts instances writing to the same settings file**: not supported in v1.2 (and not supported in v1.1 either). Document.
+- **Two cimp instances writing to the same settings file**: not supported in v1.2 (and not supported in v1.1 either). Document.
 - **Settings file location**: use the existing v1 path (`%APPDATA%\<app>\config.json` on Windows, `~/.config/<app>/config.json` on Linux). Don't change paths during a migration; that adds complications.
 
 ## Manual Verification Checklist

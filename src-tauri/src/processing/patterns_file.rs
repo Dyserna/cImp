@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn missing_file_seeds_with_defaults() {
         let dir = std::env::temp_dir().join(format!(
-            "ccimp_patterns_seed_{}",
+            "cimp_patterns_seed_{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn corrupt_file_returns_err() {
         let dir = std::env::temp_dir().join(format!(
-            "ccimp_patterns_corrupt_{}",
+            "cimp_patterns_corrupt_{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).unwrap();

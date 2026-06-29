@@ -1,9 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ccImp",
-  "mainBinaryName": "ccimp",
-  "version": "0.22.0",
-  "identifier": "com.ccimp.app",
+  "productName": "cImp",
+  "mainBinaryName": "cimp",
+  "version": "0.23.0",
+  "identifier": "com.cimp.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "ccImp",
+        "title": "cImp",
         "width": 1200,
         "height": 800,
         "minWidth": 600,

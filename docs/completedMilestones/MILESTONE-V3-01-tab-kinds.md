@@ -290,7 +290,7 @@ Alternative considered: skip persistence entirely in M1, hardcode the notificati
 ## Edge Cases and Gotchas
 
 - **PowerShell fallback on Windows when Git Bash is missing**: M1 returns `powershell.exe` with no banner UI yet (banner comes in M2's dialog). The Shell tab still works; the user just gets PowerShell. Verify a fresh Windows VM without Git installed lands on PowerShell cleanly.
-- **`$SHELL` unset on Linux**: rare but possible (some minimal containers). The fallback chain handles it. Test by running `unset SHELL && ./cctts`.
+- **`$SHELL` unset on Linux**: rare but possible (some minimal containers). The fallback chain handles it. Test by running `unset SHELL && ./cimp`.
 - **`$SHELL` set to a binary that doesn't exist**: e.g., user changed shell paths. Treat as "not found" and fall through to `/bin/bash`.
 - **Restart while audio is playing on a different tab**: shouldn't matter — audio belongs to the AI tab, restarting the Shell tab doesn't touch it. But verify.
 - **PTY reader task lifecycle on restart**: when restarting, the old PTY reader task has already exited (that's what triggered `SubprocessExited`). Make sure the new spawn creates a fresh task; do not try to reuse the old one.

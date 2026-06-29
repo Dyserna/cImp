@@ -289,7 +289,7 @@ impl GraphService {
         super::mcp::dispatch_recorded(&root, &idx, &settings, "claude", name, args).await
     }
 
-    /// The configured per-project db subdirectory (default `.ccimp`).
+    /// The configured per-project db subdirectory (default `.cimp`).
     fn db_subdir(&self) -> String {
         self.settings.current().graph.effective_db_subdir()
     }
@@ -356,7 +356,7 @@ impl GraphService {
         let this = self.clone();
         let thread_root = root.clone();
         let spawned = std::thread::Builder::new()
-            .name("ccimp-graph-index".into())
+            .name("cimp-graph-index".into())
             .spawn(move || {
                 let root = thread_root;
                 let started = std::time::Instant::now();
@@ -970,7 +970,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("src/extra.rs"), "pub fn gamma() {}\n").unwrap();
 
-        // Distinct subdir so the test never touches a real `.ccimp`.
+        // Distinct subdir so the test never touches a real `.cimp`.
         let sub = ".ckg-test";
         let snap = GraphSettings::default();
         let idx = GraphIndex::open(&dir, sub).expect("open");

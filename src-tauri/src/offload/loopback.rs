@@ -39,7 +39,7 @@ use super::router::TierHint;
 use super::service::OffloadService;
 
 /// Discovery-file name under the portable root (next to `settings.json`).
-const DISCOVERY_FILE: &str = ".ccimp-offload.json";
+const DISCOVERY_FILE: &str = ".cimp-offload.json";
 
 /// The discovery file the child reads to find + authenticate to the app.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,7 +49,7 @@ pub struct Discovery {
     pub pid: u32,
 }
 
-/// `<exe-dir>/.ccimp-offload.json` — the portable-root discovery path. Falls
+/// `<exe-dir>/.cimp-offload.json` — the portable-root discovery path. Falls
 /// back to the cwd if `current_exe()` is unavailable (mirrors
 /// `settings::global_path`).
 pub fn discovery_path() -> PathBuf {

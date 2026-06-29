@@ -1,4 +1,4 @@
-//! Context-window status line for ccImp-launched Claude Code sessions.
+//! Context-window status line for cImp-launched Claude Code sessions.
 //!
 //! Two halves live here:
 //!
@@ -7,7 +7,7 @@
 //!     `tabs::config`). It points at *this very binary* re-invoked with
 //!     `--statusline`, so there is no external script to ship and no
 //!     dependency on node/python/PowerShell — the bar renders in Rust.
-//!   * [`run`] is that re-invocation: Claude Code runs `ccimp
+//!   * [`run`] is that re-invocation: Claude Code runs `cimp
 //!     --statusline`, pipes the session JSON to our stdin, and reads the
 //!     rendered bar from our stdout. `main()` dispatches to it before any
 //!     Tauri/audio/settings init so it is instant and never spins up the
@@ -15,9 +15,9 @@
 //!
 //! Scope: the `--settings` overlay *merges* (CLI flags sit above the
 //! user's `settings.json` in Claude Code's precedence and only the keys
-//! we set are overridden), so this affects ccImp-launched Claude tabs
+//! we set are overridden), so this affects cImp-launched Claude tabs
 //! only — the user's global `~/.claude/settings.json` is never written.
-//! That keeps ccImp's "writes only next to the exe" portability rule
+//! That keeps cImp's "writes only next to the exe" portability rule
 //! intact.
 //!
 //! Windows shell note: Claude Code runs the status line command through
@@ -102,7 +102,7 @@ fn short_path(p: &Path) -> Option<String> {
     Some(std::ffi::OsString::from_wide(&buf).to_string_lossy().into_owned())
 }
 
-// ---- render side (`ccimp --statusline` child process) --------------------
+// ---- render side (`cimp --statusline` child process) --------------------
 
 /// Entry point for the `--statusline` subcommand. Reads Claude Code's
 /// session JSON from stdin and writes one rendered status line to stdout.
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn shell_safe_path_uses_forward_slashes() {
-        let p = Path::new(r"C:\Users\me\ccimp\ccimp.exe");
-        assert_eq!(shell_safe_path(p), "C:/Users/me/ccimp/ccimp.exe");
+        let p = Path::new(r"C:\Users\me\cimp\cimp.exe");
+        assert_eq!(shell_safe_path(p), "C:/Users/me/cimp/cimp.exe");
     }
 }

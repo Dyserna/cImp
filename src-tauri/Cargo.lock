@@ -469,51 +469,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ccimp"
-version = "0.22.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytemuck",
- "cozo",
- "cpal",
- "ignore",
- "misaki-rs",
- "ndarray 0.16.1",
- "notify",
- "nvml-wrapper",
- "ort",
- "portable-pty",
- "reqwest 0.12.28",
- "rodio",
- "rubato",
- "serde",
- "serde_json",
- "shlex",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "uuid",
- "vte",
- "which 6.0.3",
- "whisper-rs",
- "windows-sys 0.59.0",
- "winreg 0.52.0",
-]
-
-[[package]]
 name = "cedarwood"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -604,6 +559,51 @@ dependencies = [
  "parse-zoneinfo",
  "phf 0.11.3",
  "phf_codegen 0.11.3",
+]
+
+[[package]]
+name = "cimp"
+version = "0.23.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytemuck",
+ "cozo",
+ "cpal",
+ "ignore",
+ "misaki-rs",
+ "ndarray 0.16.1",
+ "notify",
+ "nvml-wrapper",
+ "ort",
+ "portable-pty",
+ "reqwest 0.12.28",
+ "rodio",
+ "rubato",
+ "serde",
+ "serde_json",
+ "shlex",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "uuid",
+ "vte",
+ "which 6.0.3",
+ "whisper-rs",
+ "windows-sys 0.59.0",
+ "winreg 0.52.0",
 ]
 
 [[package]]

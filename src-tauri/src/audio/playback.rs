@@ -101,7 +101,7 @@ impl AudioOutput {
         let initial_volume = effective_volume(&settings.current().tts);
 
         std::thread::Builder::new()
-            .name("ccimp-audio".into())
+            .name("cimp-audio".into())
             .spawn(move || {
                 run_audio_thread(
                     cmd_rx,

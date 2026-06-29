@@ -68,7 +68,7 @@ The `--offload-mcp` child does not go away: it stays as the **MCP-stdio bridge t
 ## What This Milestone Does NOT Do
 
 - **Remove the per-session child.** Claude Code only speaks MCP to a subprocess, so `--offload-mcp` stays — as the stdio bridge and the headless fallback. It just stops doing the heavy lifting when the app is up.
-- **Cross-machine tool execution.** Tools still execute on the **ccImp host**; results travel to whichever backend ran the task. A remote box running its *own* MCP servers stays a followup.
+- **Cross-machine tool execution.** Tools still execute on the **cImp host**; results travel to whichever backend ran the task. A remote box running its *own* MCP servers stays a followup.
 - **Write/edit tools.** The offload worker stays read-only (search/read/web/docs/git-read/allowlisted-run). Write/destructive tools are filtered out even when a server offers them.
 - **Per-provider hardening** of non-llama.cpp endpoints (Ollama / LM Studio / vLLM / hosted APIs) — still best-effort, a followup.
 - **Streaming partial results** into Opus — one final string per call, unchanged.
@@ -107,8 +107,8 @@ The `--offload-mcp` child does not go away: it stays as the **MCP-stdio bridge t
 
 ## Followups (FUTURE-FEATURES candidates)
 
-- **Remote-host-local MCP servers** — let a remote backend run its own MCP servers (tools executing near that model) instead of all tools executing on the ccImp host.
+- **Remote-host-local MCP servers** — let a remote backend run its own MCP servers (tools executing near that model) instead of all tools executing on the cImp host.
 - **Per-provider hardening** of non-llama.cpp endpoints (tool-calling / thinking-flag / `/props` quirks).
 - **Idle-evicting warm pool** — lazy-connect MCP servers on first use and drop them after an idle window to cut the resident footprint.
-- **Streaming offload progress** surfaced in ccImp's UI (now feasible — the loop runs in the app, so a transient panel can show the worker's tool round-trips live).
+- **Streaming offload progress** surfaced in cImp's UI (now feasible — the loop runs in the app, so a transient panel can show the worker's tool round-trips live).
 - **Write/edit offload tools** behind an explicit safety design (diff preview, confirmation).

@@ -5,12 +5,12 @@
 //! reused across calls and only rebuilt when the user picks a different model.
 //!
 //! GPU handling differs from `tts/engine.rs` (which is opt-in via
-//! `CCIMP_GPU=cuda`). whisper.cpp's GPU backend is a *compile-time* feature —
+//! `CIMP_GPU=cuda`). whisper.cpp's GPU backend is a *compile-time* feature —
 //! `stt-vulkan` (default, portable, any GPU vendor) or the optional
 //! `stt-cuda` (NVIDIA-only). When a GPU backend is compiled in, STT uses the
 //! GPU **by default** and falls back to CPU automatically if GPU init fails or
 //! no GPU is present — so the same Vulkan binary runs on any machine, GPU or
-//! not. `CCIMP_GPU=cpu` forces CPU. Built `--no-default-features`, there is no
+//! not. `CIMP_GPU=cpu` forces CPU. Built `--no-default-features`, there is no
 //! GPU backend and STT always runs on CPU.
 
 use std::path::Path;
@@ -50,12 +50,12 @@ impl SttEngine {
         }
 
         // GPU is the default whenever a GPU backend is compiled in (default
-        // `stt-vulkan`, or the optional `stt-cuda`). `CCIMP_GPU=cpu` forces
+        // `stt-vulkan`, or the optional `stt-cuda`). `CIMP_GPU=cpu` forces
         // CPU. On a GPU init failure — including no GPU present on the machine
         // — we retry on CPU automatically, which is what makes the Vulkan build
         // portable: the binary launches everywhere and silently uses the CPU
         // when there's no usable GPU.
-        let force_cpu = std::env::var("CCIMP_GPU").as_deref() == Ok("cpu");
+        let force_cpu = std::env::var("CIMP_GPU").as_deref() == Ok("cpu");
         let gpu_compiled = cfg!(any(feature = "stt-vulkan", feature = "stt-cuda"));
 
         if gpu_compiled && !force_cpu {
@@ -112,7 +112,7 @@ impl SttEngine {
         }
         params.set_translate(translate);
         // whisper.cpp prints decoding progress / special tokens to stdout by
-        // default — silence both so they don't pollute the terminal ccimp is
+        // default — silence both so they don't pollute the terminal cimp is
         // wrapping.
         params.set_print_progress(false);
         params.set_print_realtime(false);

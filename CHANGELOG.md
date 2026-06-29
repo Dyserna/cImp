@@ -1,11 +1,39 @@
 # Changelog
 
-All notable changes to ccImp are documented in this file.
+All notable changes to cImp are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.23.0] — 2026-06-30
+
+### Changed
+
+- **Rebrand `ccImp` → `cImp`.** The app now hosts both **Claude Code** and
+  **OpenCode** (V19), so a name tied to "Claude Code" no longer fits. `cImp` =
+  "**c**ode **Imp**" — an editor-/agent-agnostic name for the same mischievous
+  helper. (The fuller "code imp" / "CodeImp" spelling is already taken
+  elsewhere, hence the compact `cImp`.) The imp mascot is unchanged. This is a
+  clean rename with **no backward compatibility**, mirroring the earlier
+  `cctts` → `ccImp` rebrand:
+  - Display / brand `ccImp` → **`cImp`**; binary, Cargo crate + `[[bin]]`, npm
+    package, and Tauri `mainBinaryName` `ccimp` → **`cimp`** (output is now
+    `cimp.exe`); Tauri `productName` → `cImp`; bundle `identifier`
+    `com.ccimp.app` → `com.cimp.app`; window titles → `cImp`.
+  - GPU env var `CCIMP_GPU` → **`CIMP_GPU`**; `RUST_LOG`/log target → `cimp`;
+    daily log files `ccimp.log.*` → **`cimp.log.*`**.
+  - Per-folder overlay file `.ccimp.custom.config.json` →
+    **`.cimp.custom.config.json`** (the old `.ccimp.*` / `.cctts.*` overlays and
+    any `CCIMP_GPU` usage are simply abandoned — re-set them under the new
+    names). `settings.json` keeps its generic name. Per-project code-graph dir
+    `.ccimp/` → `.cimp/`.
+  - Statusline subcommand is now `cimp --statusline`; portable zips are
+    `cimp-portable-win-x64-*`.
+  - The GitHub repo `Dyserna/ccImp` should be renamed to `Dyserna/cImp`
+    **after** this release's CI is green (GitHub auto-redirects old URLs); then
+    `git remote set-url origin <new>`. The local clone folder is left as-is.
 
 ## [0.22.0] — 2026-06-29
 
@@ -17,12 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   env var. Unlike Claude (which needs a separate local tab because the local
   endpoint is set by a launch-time env var), OpenCode addresses many providers
   as `provider/model` and switches between them in-session from global config +
-  credentials — so one tab covers cloud and local and cctts injects no provider
-  block. OpenCode reaches the same ccImp capabilities the Claude tabs use — the
+  credentials — so one tab covers cloud and local and cimp injects no provider
+  block. OpenCode reaches the same cImp capabilities the Claude tabs use — the
   offload tool, the code knowledge graph, and the web-research MCP servers — via
-  the injected `mcp` block pointing at `ccimp --offload-mcp --consumer opencode`.
+  the injected `mcp` block pointing at `cimp --offload-mcp --consumer opencode`.
   Unlike the silent Aider tabs, OpenCode is given the TTS-markup convention
-  through an instructions file, so the OpenCode tab can speak. cctts does **not**
+  through an instructions file, so the OpenCode tab can speak. cimp does **not**
   bundle OpenCode (~158 MB); install it from <https://opencode.ai/docs> (or drop
   the binary in `ebin/`). A dedicated `opencode_access` per-server flag controls
   which MCP servers OpenCode sees.
@@ -107,14 +135,14 @@ A correctness-and-hardening release: a full-codebase baseline review (security, 
 
 ### Fixed
 
-- **Crash-safe child reaping (Windows).** Offload child processes (`llama-server`, the warm MCP-host servers, `run_command`) are now assigned to a kill-on-job-close Job Object, so the OS terminates them whenever ccImp dies for any reason — a crash, `panic = abort`, `taskkill /F`, or the dev hot-reload — not just on a clean exit. Fixes orphaned `llama-server` processes piling up and holding VRAM across dev cycles.
+- **Crash-safe child reaping (Windows).** Offload child processes (`llama-server`, the warm MCP-host servers, `run_command`) are now assigned to a kill-on-job-close Job Object, so the OS terminates them whenever cImp dies for any reason — a crash, `panic = abort`, `taskkill /F`, or the dev hot-reload — not just on a clean exit. Fixes orphaned `llama-server` processes piling up and holding VRAM across dev cycles.
 - **Aider tab gating.** Enabling an Aider tab (cloud or local) is now rejected with a clear message when the `aider` command can't be resolved (not in `ebin`, not on PATH), instead of materializing a dead "command not found" tab. Claude is not gated.
 
 ## [0.19.0] — 2026-06-27
 
 ### Added
 
-- **Code knowledge graph (V9-01).** A per-project graph of code (files, symbols, references, calls, imports) and docs (Markdown + doc-comments), built in-process with tree-sitter and stored in an embedded CozoDB/SQLite database under `.ccimp/`. Queryable by both the cloud Claude session (MCP tools) and the local offload worker (native tools): `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`, `graph_semantic_docs`, and `graph_struct_search` (tree-sitter structural patterns). Covers Rust, TypeScript, JavaScript, Python, and Markdown.
+- **Code knowledge graph (V9-01).** A per-project graph of code (files, symbols, references, calls, imports) and docs (Markdown + doc-comments), built in-process with tree-sitter and stored in an embedded CozoDB/SQLite database under `.cimp/`. Queryable by both the cloud Claude session (MCP tools) and the local offload worker (native tools): `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`, `graph_semantic_docs`, and `graph_struct_search` (tree-sitter structural patterns). Covers Rust, TypeScript, JavaScript, Python, and Markdown.
 - **Semantic doc search.** Embeds doc chunks via an OpenAI-compatible `/v1/embeddings` endpoint and ranks them with a CozoDB HNSW vector index (epoch-scoped by model + dimension), degrading to full-text search when the embedder is unreachable.
 - **Live re-indexing + monitor tab.** A filesystem watcher incrementally re-indexes on change; a reserved, app-rendered **Code Graph** tab shows index/embedder status and counts, an on-demand embedder **Test connection** probe, and a unified **Recent calls** history (cloud + offload). Full Settings panel for languages, ignore globs, size limits, and the embedding endpoint.
 - **Warm query path.** Cloud Claude's graph queries now run against the app's single warm index over the loopback (with a direct read-only fallback when the app isn't running), eliminating a cross-process double-open of the SQLite store and feeding the call history.
@@ -133,7 +161,7 @@ A correctness-and-hardening release: a full-codebase baseline review (security, 
   are offered to offloaded subtasks.
 - **Live MCP server editor (Settings → Offload → Tools).** Add, remove, and
   enable/disable MCP tool servers (name + url) and have the change applied
-  without restarting ccImp. A read-only "MCP server status" health section sits
+  without restarting cImp. A read-only "MCP server status" health section sits
   above the editable list.
 - **Offload queue backpressure.** A configurable max queue depth fast-rejects new
   offloads once the pool is saturated and that many tasks are already waiting
@@ -179,7 +207,7 @@ A correctness-and-hardening release: a full-codebase baseline review (security, 
   rescheduled its `requestAnimationFrame` render loop unconditionally,
   repainting the canvas (with a `shadowBlur` glow) at display rate even in
   silence. In the WebView2/Chromium compositor that held the GPU at ~10–15%
-  while ccImp was otherwise idle — unrelated to the loaded TTS/STT/LLM weights,
+  while cImp was otherwise idle — unrelated to the loaded TTS/STT/LLM weights,
   which only compute on an in-flight request. The loop now parks itself once
   the buffer drains to a flat line (~1s after audio stops) and restarts the
   instant TTS or microphone audio resumes.
@@ -346,7 +374,7 @@ Grouped by area below.
   `llama-server` gets the full dashboard — slots busy/total, queue depth,
   throughput, context-fill %, per-slot rows, and request history — just like a
   Local backend; cloud and unreachable backends show a compact status row. The
-  raw server log stays available for Local backends (ccImp owns their process).
+  raw server log stays available for Local backends (cImp owns their process).
 
 ### Fixed
 
@@ -374,7 +402,7 @@ Grouped by area below.
   guidance instead of a false "ready" with an unknown context window. The tab
   appears/disappears on the next launch after toggling **Enable offload**.
 - **Warm offload pool + MCP host (V8-03).** The offload machinery moves out of the
-  per-call `ccimp --offload-mcp` child and into the long-lived ccImp app, which now
+  per-call `cimp --offload-mcp` child and into the long-lived cImp app, which now
   owns the agent loop, the backend pool, the router, and — finally — the **MCP
   host**: warm, long-lived connections to your configured tool servers
   (`duckduckgo`, `fetch`, `context7`, `git`, `filesystem`) so an offload reaches
@@ -392,7 +420,7 @@ Grouped by area below.
   without the app.
 - **Offload backend pool + capability-aware routing (V8-02).** The single local
   offload server generalizes into a **pool of backends** — a local `llama-server`,
-  a LAN machine, and/or a cloud OpenAI-compatible endpoint — and ccImp routes each
+  a LAN machine, and/or a cloud OpenAI-compatible endpoint — and cImp routes each
   `offload_task` to the right one. The router picks a backend by required tools,
   required context, tier (`fast`/`quality`), and live availability (spilling when
   one is busy, failing over when one is down); Claude can bias it with a new
@@ -405,18 +433,18 @@ Grouped by area below.
   data on your network. Manage it all in **Settings → Offload → Backend pool**.
   Additive settings migration: an existing single `server_command` becomes one
   Local backend in the pool.
-- **Local task offload (V8-01).** ccImp can now hand token-heavy subtasks —
+- **Local task offload (V8-01).** cImp can now hand token-heavy subtasks —
   broad codebase searches, large-file/log summarization, web research — from the
   main Claude (Opus) session to a local LLM, so the cloud session's context grows
-  by a paragraph instead of a megabyte. You point ccImp at a `llama-server`
+  by a paragraph instead of a megabyte. You point cImp at a `llama-server`
   command (e.g. Qwen3.6-35B-A3B) in **Settings → Offload**; it injects an
   `offload_task` MCP tool into the Claude tabs it launches (session-scoped via
   `--mcp-config`, never touching `~/.claude`), and the local model does the
   searching/reading/summarizing while only the synthesized result returns to
   Opus. The agent loop, the MCP server toward Claude (the hidden
-  `ccimp --offload-mcp` subcommand), and the native tools (`read_file`,
-  `code_search`, allowlisted `run_command`) all live in the single ccImp binary —
-  no Node/Python sidecar. ccImp discovers the server's context window and slot
+  `cimp --offload-mcp` subcommand), and the native tools (`read_file`,
+  `code_search`, allowlisted `run_command`) all live in the single cImp binary —
+  no Node/Python sidecar. cImp discovers the server's context window and slot
   count, budgets each task against the per-slot window, and bounds it by step
   count and a wall-clock timeout. Off by default; the model is user-supplied
   (not bundled). File access is confined to configurable `allowed_roots` and
@@ -425,7 +453,7 @@ Grouped by area below.
 ### Fixed
 
 - **Offload per-slot budget (V8-03).** llama.cpp's `/props` reports the *per-slot*
-  context window (the total `--ctx-size` already divided by `-np`), but ccImp
+  context window (the total `--ctx-size` already divided by `-np`), but cImp
   divided by the slot count a second time — so every offload got roughly half its
   real working window. Fixed; offloads now budget against the full per-slot window.
 - **Cross-backend offload spill now works (V8-03).** Because each per-call
@@ -437,9 +465,9 @@ Grouped by area below.
   coherently behind the global gate) as designed.
 - **Claude Code fullscreen renderer disabled.** Recent Claude Code versions default
   to an alternate-screen "fullscreen" TUI that repaints the whole screen and enables
-  mouse tracking — both break ccImp's core assumption of a linear, append-only output
+  mouse tracking — both break cImp's core assumption of a linear, append-only output
   stream. The result was leaked literal `[[TTS]]` markers (visible on select), double
-  paste and double copy-on-select, and a dead Ctrl+right-click speak-selection. ccImp
+  paste and double copy-on-select, and a dead Ctrl+right-click speak-selection. cImp
   now forces the classic inline renderer by setting
   `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` for every Claude tab (overridable via per-tab
   env), restoring all four behaviors.
@@ -448,12 +476,12 @@ Grouped by area below.
 
 ### Added
 
-- **Context-window bar in Claude's status line.** ccImp now injects a status
+- **Context-window bar in Claude's status line.** cImp now injects a status
   line into the Claude Code tabs it launches, showing live context usage —
   e.g. `Opus  ▓▓▓▓▓░░░░░ 50% (100k/200k)` — themed to your terminal palette.
-  It renders from the new hidden `ccimp --statusline` subcommand (no external
+  It renders from the new hidden `cimp --statusline` subcommand (no external
   script, no Node/Python/PowerShell dependency) and is wired up via a
-  session-scoped `--settings` overlay, so it appears only inside ccImp and
+  session-scoped `--settings` overlay, so it appears only inside cImp and
   never touches your global `~/.claude` configuration. Enabled by default;
   toggle it in Settings → Bottom bar → Claude context bar.
 
@@ -511,12 +539,12 @@ Grouped by area below.
 
 ### Added
 
-- **ccImp imp mascot is now the default avatar.** The `impSprites` set ships
+- **cImp imp mascot is now the default avatar.** The `impSprites` set ships
   its first art pass — six pixel-art animations (idle blink, dance bounce, two
   think loops, a burning-tokens loop, and a surprise expression) that cover all
   five avatar states via the manifest's `groups`. New installs default to the
   imp; Clawd (`claudeSprites`) stays selectable in Settings → Avatar.
-- **`tui-red` theme — the new ccImp default.** A ratatui-style theme keyed off
+- **`tui-red` theme — the new cImp default.** A ratatui-style theme keyed off
   the imp's scarlet accent (`#e23c3c`), paired with a new `Imp Red` terminal
   palette. New installs land here.
 - **`tui-green` theme ("TUI - Aider").** A selectable theme keyed off Aider's
@@ -554,7 +582,7 @@ Grouped by area below.
   status line / box-drawing / input prompt) is dropped rather than spoken.
   `Esc` still stops playback until the next output burst. The toggle is
   per-tab, applies live (no restart), skips the existing backlog, and
-  persists in the per-folder overlay (`.ccimp.custom.config.json`). Cleanest
+  persists in the per-folder overlay (`.cimp.custom.config.json`). Cleanest
   for plain/line-oriented output (e.g. a local-LLM tab with no markers). The
   user's own typed/submitted input is registered and skipped when the TUI
   echoes it (even behind the `> ` prompt prefix), so the question isn't read
@@ -570,12 +598,12 @@ Grouped by area below.
 
 ### Changed
 
-- **Renamed `cctts` → `ccImp`.** The app, binary (`ccimp.exe`), crate, npm
-  package, window titles, log prefix (`ccimp.log`), per-folder overlay
-  (`.ccimp.custom.config.json`), and GPU env var (`CCTTS_GPU` → `CCIMP_GPU`)
+- **Renamed `cimp` → `cImp`.** The app, binary (`cimp.exe`), crate, npm
+  package, window titles, log prefix (`cimp.log`), per-folder overlay
+  (`.cimp.custom.config.json`), and GPU env var (`CIMP_GPU` → `CIMP_GPU`)
   all move to the new name — renaming the project after its mascot rather
   than a single feature. Still fully portable (writes only next to the exe).
-  Re-set any `.cctts.*` overlay or `CCTTS_GPU` usage under the new names.
+  Re-set any `.cimp.*` overlay or `CIMP_GPU` usage under the new names.
 - **Stronger TTS injection prompt for full-answer coverage.** The default
   runtime prompt now makes "wrap your whole answer, not a summary" the
   headline rule, so Claude marks its entire prose answer for speech instead
@@ -600,15 +628,15 @@ Grouped by area below.
   CPU automatically, exactly like the Vulkan STT path. Measured ~5× faster than
   CPU, and it works on GPUs where the old CUDA path couldn't (including Blackwell
   / RTX 50-series). Nothing CUDA-specific is bundled — just three small Dawn
-  dylibs. (`CCTTS_GPU=cpu` forces CPU.) Source builds default to CPU; build
+  dylibs. (`CIMP_GPU=cpu` forces CPU.) Source builds default to CPU; build
   `--features tts-webgpu` for the GPU variant. See `docs/features/FEATURE-tts-webgpu.md`.
 
 ### Changed
 
-- **TTS GPU is now a compile-time feature, not the `CCTTS_GPU=cuda` runtime
+- **TTS GPU is now a compile-time feature, not the `CIMP_GPU=cuda` runtime
   opt-in.** The released binary ships `tts-webgpu`; the old NVIDIA-only CUDA path
   survives only as the optional, non-default `tts-cuda` build (mutually exclusive
-  with `tts-webgpu`, and not shipped). `CCTTS_GPU=cpu` forces CPU for both TTS
+  with `tts-webgpu`, and not shipped). `CIMP_GPU=cpu` forces CPU for both TTS
   and STT.
 
 ## [0.10.0] — 2026-06-15
@@ -626,7 +654,7 @@ Grouped by area below.
   between them. The released portable binary is **GPU-accelerated via Vulkan**:
   it automatically uses any GPU (NVIDIA/AMD/Intel) and falls back to CPU when
   none is present — no install, the only requirement is Windows' built-in
-  `vulkan-1.dll`. (`CCTTS_GPU=cpu` forces CPU.) Source builds default to CPU;
+  `vulkan-1.dll`. (`CIMP_GPU=cpu` forces CPU.) Source builds default to CPU;
   build `--features stt-vulkan` for the GPU variant. See `docs/MAINTENANCE.md`.
 
 ### Changed
@@ -675,7 +703,7 @@ Grouped by area below.
 - **Default `broot` tab.** Fresh installs now ship a `broot` tab alongside
   the default shell. It launches `broot -g` (the broot file browser with
   git info shown in the tree) with no `cwd`, so it opens in the directory
-  cctts was started in. `broot` is resolved via `PATH` at spawn time; if it
+  cimp was started in. `broot` is resolved via `PATH` at spawn time; if it
   isn't installed the tab shows the standard "command not found" overlay
   until you install it. Existing installs get the tab injected by the
   v14 → v15 settings migration (schema bumped to 15); the frontend's layout
@@ -701,7 +729,7 @@ Grouped by area below.
 - **Local LLM provider settings group.** New `claude_local: { base_url,
   auth_token, model_alias }` settings group exposed in *Settings → Local
   LLM provider*. The auth-token field is password-masked with a show /
-  hide toggle. Helper text links to the LiteLLM docs and notes that cctts
+  hide toggle. Helper text links to the LiteLLM docs and notes that cimp
   does not start the proxy itself.
 - **Per-AI-tab `Use local LLM provider` toggle.** A checkbox on each AI
   tab in *Settings → Tabs* gates env synthesis from the global
@@ -782,7 +810,7 @@ Grouped by area below.
   in the field.
 - TTS markup compliance on the Claude (local) tab depends on the
   underlying model. Smaller local models often don't honor the
-  `[[TTS]]…[[/TTS]]` convention reliably; cctts treats missing markup
+  `[[TTS]]…[[/TTS]]` convention reliably; cimp treats missing markup
   as silent (the existing fallback behavior).
 - Tool-use (Edit / Write / Bash / etc.) on the Claude (local) tab
   depends on the local model supporting Anthropic-style tool calling —
@@ -800,7 +828,7 @@ Grouped by area below.
   surface (surfaces, text, accent, semantics, borders, radii, shadows,
   spacing, motion, typography). Components reference `var(--*)` everywhere;
   no more component-local hex literals.
-- **Settings → Appearance → UI theme.** A theme picker for the cctts chrome,
+- **Settings → Appearance → UI theme.** A theme picker for the cimp chrome,
   distinct from the per-tab terminal palette under Display. Initial release
   ships only "Modern Dark"; the entry exists so future themes (light,
   high-contrast) plug in without UI plumbing churn. Persisted as
@@ -892,7 +920,7 @@ Grouped by area below.
 
 - **Per-tab avatar configuration** and **Per-tab TTS settings** — both were
   planned as items 3 and 4 of `docs/features/FEATURE-per-tab-overrides.md`
-  and slated for V1.4-05 / V1.4-06. Cancelled as a scope decision: cctts
+  and slated for V1.4-05 / V1.4-06. Cancelled as a scope decision: cimp
   ships exactly one avatar and one TTS voice, customized globally only.
   The skeleton plans were removed; the feature doc and `FUTURE-FEATURES.md`
   were updated to reflect the decision. No code or schema changes (the

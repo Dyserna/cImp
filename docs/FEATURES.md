@@ -1,6 +1,6 @@
-# ccImp — Feature Inventory
+# cImp — Feature Inventory
 
-A scannable, one-line-per-feature inventory of everything ccImp does, grouped by
+A scannable, one-line-per-feature inventory of everything cImp does, grouped by
 area. Current as of **v0.19.0**. Companion to `MAINTENANCE.md` (which covers the
 dependency/component breadth) — this is the *capability* breadth.
 
@@ -37,7 +37,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Speak-selection gesture and speak-all-output per-tab mode
 - User-input echo suppression
 - WebGPU GPU backend (shipped, vendor-agnostic) with automatic CPU fallback; optional CUDA (not shipped)
-- `CCIMP_GPU=cpu` forces CPU
+- `CIMP_GPU=cpu` forces CPU
 
 ## Speech-to-Text (Dictation)
 - Offline dictation via whisper.cpp (MIT), selectable GGML models (default `small`)
@@ -69,7 +69,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Read-only Offload Server dashboard tab: per-backend metrics, queue depth, throughput, request history
 
 ## Code Knowledge Graph (V9-01)
-- Per-project incremental graph in `.ccimp/graph.db` (CozoDB + SQLite)
+- Per-project incremental graph in `.cimp/graph.db` (CozoDB + SQLite)
 - Languages: Rust, TypeScript, JavaScript, Python, Markdown via tree-sitter
 - Symbol extraction, call/import graphs, transitive reachability, cross-file name binding
 - Markdown/doc-comment parsing + full-text search; semantic search via Qwen3-Embedding + HNSW
@@ -84,7 +84,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Configurable terminal font family and size
 
 ## Settings & Config
-- Portable global `settings.json` next to the exe; per-folder `.ccimp.custom.config.json` overlay (auto-deleted when empty)
+- Portable global `settings.json` next to the exe; per-folder `.cimp.custom.config.json` overlay (auto-deleted when empty)
 - Per-tab settings: command, CLI flags, TTS injection prompt, notification text, appearance
 - Migration system with timestamped backups + per-key load validation
 - Runtime TTS-markup injection via `--append-system-prompt` (no CLAUDE.md edit)
@@ -97,7 +97,7 @@ dependency/component breadth) — this is the *capability* breadth.
 
 ## Integration, Monitoring & Build
 - Claude Code permission detection (matches the Esc/Tab footer)
-- Statusline subcommand (`ccimp --statusline`) with context-window bar + `--settings` overlay injection
+- Statusline subcommand (`cimp --statusline`) with context-window bar + `--settings` overlay injection
 - System monitor panel (CPU/mem/GPU via sysinfo + nvml) with graceful degradation
 - Anonymous usage tracking with retry/backoff
 - Rolling file logs (tracing) with env-filter levels

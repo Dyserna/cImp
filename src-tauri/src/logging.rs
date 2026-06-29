@@ -1,6 +1,6 @@
 //! File-logger init for the portable build.
 //!
-//! Writes daily-rolling files to `<exe-dir>/../logs/ccimp.log.<YYYY-MM-DD>` via
+//! Writes daily-rolling files to `<exe-dir>/../logs/cimp.log.<YYYY-MM-DD>` via
 //! `tracing-appender` — the `logs/` folder sits next to `bin/` and `models/`
 //! at the portable root, not inside `bin/`. The filter is wrapped in a
 //! `reload::Layer` so changes to `settings.logging.level` apply live without
@@ -16,7 +16,7 @@
 //!      field of a broadcast settings update differs from the previous one.
 //!
 //! `RUST_LOG`, when set, overrides the saved level at step 1 — the dev
-//! workflow (`RUST_LOG=ccimp=trace npm run tauri dev`) keeps working.
+//! workflow (`RUST_LOG=cimp=trace npm run tauri dev`) keeps working.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -53,7 +53,7 @@ pub fn init(initial: LogLevel) -> WorkerGuard {
         // though the file logger can't write.
         eprintln!("logging: failed to create {}: {}", dir.display(), e);
     }
-    let appender = rolling::daily(&dir, "ccimp.log");
+    let appender = rolling::daily(&dir, "cimp.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
     let filter = EnvFilter::try_from_default_env()
@@ -100,10 +100,10 @@ pub fn run_cleanup(retention: LogRetention) {
         if !path.is_file() {
             continue;
         }
-        // Match the appender's filename pattern: "ccimp.log" prefix plus
+        // Match the appender's filename pattern: "cimp.log" prefix plus
         // a date suffix. Anything else in `logs/` is ignored.
         let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) if n.starts_with("ccimp.log") => n.to_string(),
+            Some(n) if n.starts_with("cimp.log") => n.to_string(),
             _ => continue,
         };
         let modified = match entry.metadata().and_then(|m| m.modified()) {

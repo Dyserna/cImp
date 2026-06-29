@@ -6,7 +6,7 @@ Living list of dependencies and runtime concerns to revisit periodically. Each i
 
 # Dependency & component inventory
 
-A complete, scannable inventory of everything ccImp depends on, for periodic
+A complete, scannable inventory of everything cImp depends on, for periodic
 "is there a newer version?" passes. Version columns reflect the pins in
 `src-tauri/Cargo.toml` and `package.json` as of **v0.19.0**. The deeper
 "Dependencies to track" sections below cover the *gotchas* for the hairy ones
@@ -151,7 +151,7 @@ cargo/npm — check their sources manually.
 
 - **Current pin:** `ort = "=2.0.0-rc.11"` (`src-tauri/Cargo.toml`), `features = ["download-binaries"]` + a per-build GPU feature (below). Wraps **ORT 1.20.x**. The optional `cuda` prebuilt is hard-linked to CUDA major 12 (`onnxruntime_providers_cuda.dll` references `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`, `cudnn64_9.dll`); CUDA 13.x won't load with this version.
 
-- **IMPLEMENTED — `tts-webgpu` is the shipped GPU TTS backend.** Kokoro runs on ONNX Runtime's native **WebGPU EP** (Dawn-backed → D3D12 on Windows, Vulkan on Linux, Metal on macOS). Validated on the dev box (RTX 5090 / Blackwell) 2026-06-15: correct output matching the CPU reference, genuinely on-GPU (ORT node-placement logs show WebGPU shader programs for every op, incl. the `ConvTranspose2D` that broke DirectML), **~5× faster than CPU** at steady state. Wired in `tts/engine.rs` as GPU-by-default with automatic CPU fallback, `CCIMP_GPU=cpu` forces CPU — mirrors `stt/engine.rs`. Runtime deps: three Dawn dylibs (`webgpu_dawn.dll`, `dxcompiler.dll`, `dxil.dll`) staged into the zip by `release.yml`; `download-binaries` static-links core ONNX Runtime into `ccimp.exe` (no `onnxruntime.dll`). Full write-up: `docs/features/FEATURE-tts-webgpu.md`.
+- **IMPLEMENTED — `tts-webgpu` is the shipped GPU TTS backend.** Kokoro runs on ONNX Runtime's native **WebGPU EP** (Dawn-backed → D3D12 on Windows, Vulkan on Linux, Metal on macOS). Validated on the dev box (RTX 5090 / Blackwell) 2026-06-15: correct output matching the CPU reference, genuinely on-GPU (ORT node-placement logs show WebGPU shader programs for every op, incl. the `ConvTranspose2D` that broke DirectML), **~5× faster than CPU** at steady state. Wired in `tts/engine.rs` as GPU-by-default with automatic CPU fallback, `CIMP_GPU=cpu` forces CPU — mirrors `stt/engine.rs`. Runtime deps: three Dawn dylibs (`webgpu_dawn.dll`, `dxcompiler.dll`, `dxil.dll`) staged into the zip by `release.yml`; `download-binaries` static-links core ONNX Runtime into `cimp.exe` (no `onnxruntime.dll`). Full write-up: `docs/features/FEATURE-tts-webgpu.md`.
 
 - **GPU backend is a compile-time feature; default is CPU.** Kokoro is near-real-time on CPU, so the default feature set has **no** GPU EP (routine `cargo build`/test/rust-analyzer pull the CPU-only ORT prebuilt, no GPU SDK). GPU is opt-in at build time, exactly mirroring STT:
   - **`tts-webgpu` (shipped, portable, any vendor)** — `["ort/webgpu"]`. The release builds `--features stt-vulkan,tts-webgpu`.
@@ -169,7 +169,7 @@ cargo/npm — check their sources manually.
 - **Why the failure matrix no longer bites us:** `tts-webgpu` sidesteps both broken EPs — it runs on Blackwell where the CUDA prebuilt can't, and it runs the `ConvTranspose` that DirectML rejects. The matrix above is retained as the rationale for *why* WebGPU is the shipped path. The optional `tts-cuda` build still inherits the CUDA row's Blackwell breakage (per-segment `cudaErrorSymbolNotFound`, silent output) — it's expected to work only on Pascal..Ada, which is why it's neither default nor shipped. See `FEATURE-gpu-robustness.md` for the (still-relevant) CC pre-flight idea for `tts-cuda` users.
 
 - **What to check for on `ort` updates:**
-  - The WebGPU EP is flagged **experimental** upstream. On an `ort` bump, re-run the `tts-webgpu` smoke test (`cargo test --features tts-webgpu --bin ccImp -- --ignored --nocapture synthesizes`) to confirm Kokoro still produces correct audio and stays on-GPU. Watch <https://github.com/pykeio/ort/releases> and <https://crates.io/crates/ort>.
+  - The WebGPU EP is flagged **experimental** upstream. On an `ort` bump, re-run the `tts-webgpu` smoke test (`cargo test --features tts-webgpu --bin cImp -- --ignored --nocapture synthesizes`) to confirm Kokoro still produces correct audio and stays on-GPU. Watch <https://github.com/pykeio/ort/releases> and <https://crates.io/crates/ort>.
   - A newer `ort` wrapping ORT 1.21+ may fix the CUDA EP for Blackwell (1.21 adds sm_120 cubins) — relevant only for the optional `tts-cuda` build.
   - Watch whether the Dawn dylib set (`webgpu_dawn.dll`/`dxcompiler.dll`/`dxil.dll`) changes — if so, update the staging list in `release.yml` (both zip variants) and the layout in `PACKAGING.md`.
   - Upstream ORT release notes: <https://github.com/microsoft/onnxruntime/releases>.
@@ -208,7 +208,7 @@ cargo/npm — check their sources manually.
   - Runtime (`stt/engine.rs`): when a GPU backend is compiled, STT uses the GPU
     by default and **falls back to CPU automatically** if GPU init fails or no
     GPU is present (this is what makes the Vulkan binary universal).
-    `CCIMP_GPU=cpu` forces CPU.
+    `CIMP_GPU=cpu` forces CPU.
 
 - **Building `--features stt-vulkan` (the saga — three Windows gotchas):**
   1. **Vulkan SDK** (LunarG) provides `glslc` + headers + `vulkan-1.lib`.
@@ -224,7 +224,7 @@ cargo/npm — check their sources manually.
   3. **MAX_PATH on a deep repo.** The nested shader-gen path is ~264 chars from
      this repo's deep location and `cl` fails (`C1041`) even with
      `LongPathsEnabled=1`. Local fix: build with a short `CARGO_TARGET_DIR`
-     (e.g. `C:\ct`). CI is unaffected — the runner path (`D:\a\ccImp\ccImp`) is
+     (e.g. `C:\ct`). CI is unaffected — the runner path (`D:\a\cImp\cImp`) is
      short enough. Validated 2026-06-14: with all three, a local Vulkan build
      produces a clean binary importing **only** `vulkan-1.dll` (no CUDA DLLs).
 - **CI (`release.yml`):** a `Setup MSVC dev environment` step (`ilammy/msvc-dev-cmd`)
@@ -321,7 +321,7 @@ Notes when maintaining this:
   disallowed call. Keep both — they're tested in `router.rs` and `agent.rs`.
 - **Warm pool vs. fallback child (V8-03)**: when the app is running it owns the
   loop + pool + router + global gate + MCP host (`offload/service.rs`), and the
-  `ccimp --offload-mcp` child is a thin proxy to it. Only the app sees all
+  `cimp --offload-mcp` child is a thin proxy to it. Only the app sees all
   in-flight offloads, so cross-backend spill/fail-over works there. The child
   still carries the **self-contained fallback** (the V8-02 path) for when the app
   is down — keep it first-class (headless `claude -p` / cron paths depend on it),
@@ -331,7 +331,7 @@ Notes when maintaining this:
 
 When the app is up, the offload service (`offload/service.rs::OffloadService`,
 held in `AppState`) is the single owner of the warm pool, the global concurrency
-gate, and the MCP host. The per-session `ccimp --offload-mcp` child forwards to it
+gate, and the MCP host. The per-session `cimp --offload-mcp` child forwards to it
 over a small authenticated loopback HTTP endpoint.
 
 **Loopback endpoint + discovery file (`offload/loopback.rs`).**
@@ -340,7 +340,7 @@ over a small authenticated loopback HTTP endpoint.
   Routes: `POST /run`, `GET /describe`, `GET /events` (SSE). Purpose-built for
   offload — not a general local API.
 - Advertises `{port, token, pid}` in a discovery file at
-  **`<exe-dir>/.ccimp-offload.json`** (the portable root, next to `settings.json`
+  **`<exe-dir>/.cimp-offload.json`** (the portable root, next to `settings.json`
   — *never* `~/.claude`), written when `offload.enabled` and **removed on graceful
   exit**. The token rotates every launch; on Unix the file is `chmod 600`
   (best-effort; Windows ACL tightening is a TODO).

@@ -1,4 +1,4 @@
-//! V8-01 native baseline offload tools — built into ccImp, zero
+//! V8-01 native baseline offload tools — built into cImp, zero
 //! external deps, so offload works before any MCP server is installed:
 //!
 //! - [`read_file`] — bounded line/byte reads within an `allowed_root`.

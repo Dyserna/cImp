@@ -102,14 +102,14 @@ impl TtsEngine {
     /// is compiled in (`tts-webgpu` / `tts-cuda`), the GPU is the default and we
     /// fall back to CPU automatically if its registration fails (no usable GPU,
     /// driver issue, …) — so the same binary runs everywhere, mirroring
-    /// `stt/engine.rs`. `CCIMP_GPU=cpu` forces CPU. Built with no GPU feature,
+    /// `stt/engine.rs`. `CIMP_GPU=cpu` forces CPU. Built with no GPU feature,
     /// this is always CPU.
     ///
     /// NB: a successful GPU registration means the EP is *active*, not that
     /// every op runs on the GPU — the WebGPU EP can place unsupported ops on CPU.
     #[cfg(any(feature = "tts-webgpu", feature = "tts-cuda"))]
     fn register_execution_provider(builder: &mut SessionBuilder) -> AppResult<&'static str> {
-        if std::env::var("CCIMP_GPU").as_deref() == Ok("cpu") {
+        if std::env::var("CIMP_GPU").as_deref() == Ok("cpu") {
             Self::register_cpu(builder)?;
             return Ok("CPU (forced)");
         }
@@ -220,8 +220,8 @@ mod tests {
     /// garbage. Ignored by default: needs the model files under `<repo>/models`
     /// and, on a GPU build, pulls the GPU.
     ///
-    /// Run:        `cargo test --bin ccimp [--features tts-webgpu] -- --ignored --nocapture synthesizes`
-    /// CPU baseline: prefix with `CCIMP_GPU=cpu`.
+    /// Run:        `cargo test --bin cimp [--features tts-webgpu] -- --ignored --nocapture synthesizes`
+    /// CPU baseline: prefix with `CIMP_GPU=cpu`.
     #[test]
     #[ignore]
     fn synthesizes() {

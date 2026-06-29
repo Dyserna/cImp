@@ -177,7 +177,7 @@ pub fn delete_all() -> u32 {
 /// Delete files whose mtime is older than `retention`. `Never` is a
 /// no-op. Same shape as `logging::run_cleanup` but scoped to the
 /// content subdirectory and matches every regular file (not just
-/// `ccimp.log.*` — every file under `content/` is owned by us).
+/// `cimp.log.*` — every file under `content/` is owned by us).
 pub fn run_cleanup(retention: LogRetention) {
     let Some(max_age) = retention.max_age() else {
         return;

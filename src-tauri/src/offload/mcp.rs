@@ -1,4 +1,4 @@
-//! MCP server toward Claude — the `ccimp --offload-mcp` subcommand.
+//! MCP server toward Claude — the `cimp --offload-mcp` subcommand.
 //!
 //! A minimal, hand-rolled stdio JSON-RPC 2.0 MCP server (newline-delimited
 //! messages on stdin/stdout). Implements `initialize` (declaring
@@ -43,7 +43,7 @@ use crate::settings::{
 };
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
-const SERVER_NAME: &str = "ccimp-offload";
+const SERVER_NAME: &str = "cimp-offload";
 
 /// The consumer this child serves (from `--consumer <name>`, default
 /// `"claude"`). Threaded onto the loopback `/mcp/*` queries so the app returns
@@ -55,7 +55,7 @@ fn consumer() -> &'static str {
     CONSUMER.get().map(String::as_str).unwrap_or("claude")
 }
 
-/// Entry point for `ccimp --offload-mcp [--consumer <name>]`. Builds a
+/// Entry point for `cimp --offload-mcp [--consumer <name>]`. Builds a
 /// current-thread tokio runtime and serves the stdio loop until stdin closes.
 /// `consumer` selects which MCP-server set the app proxies to this child
 /// (`claude` default, or `opencode`). Never panics — a crash here would garble
@@ -276,7 +276,7 @@ fn offload_task_description(settings: &OffloadSettings) -> String {
 
     if backends.is_empty() {
         return "Delegate a token-heavy subtask to a local model to conserve this session's \
-                context. (No offload backend is configured/enabled — set one up in ccImp \
+                context. (No offload backend is configured/enabled — set one up in cImp \
                 Settings → Offload.)"
             .to_string();
     }
@@ -791,7 +791,7 @@ async fn proxy_mcp_call(params: &Value) -> Result<Value, (i64, String)> {
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
     let Some((base, token)) = proxy_base() else {
         return Ok(tool_error(
-            "ccImp app is not running — its MCP tools are only available while the app is up",
+            "cImp app is not running — its MCP tools are only available while the app is up",
         ));
     };
     let client = reqwest::Client::builder()
@@ -1052,7 +1052,7 @@ async fn run_offload(
     let settings = current_offload_settings();
 
     if !settings.enabled {
-        return Err("offload is disabled — enable it in ccImp settings".into());
+        return Err("offload is disabled — enable it in cImp settings".into());
     }
 
     // Resolve the enabled pool.
@@ -1064,7 +1064,7 @@ async fn run_offload(
         .collect();
     if resolved.is_empty() {
         return Err(
-            "no offload backend is configured — add one in ccImp Settings → Offload".into(),
+            "no offload backend is configured — add one in cImp Settings → Offload".into(),
         );
     }
 

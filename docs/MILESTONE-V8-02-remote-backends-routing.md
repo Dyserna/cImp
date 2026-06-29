@@ -27,8 +27,8 @@ Three capabilities land here:
 ## Decisions locked (from discussion)
 
 - **Backends = a pool (Local | Remote-LAN | Remote-Cloud).**
-  - **Local** — ccImp owns the process: V8-01's `server_command` + read-only tab + autostart + Start/Stop/Reset. Capabilities (`n_ctx`/`np`/model) discovered from `/props`.
-  - **Remote (LAN or cloud)** — ccImp holds a `base_url` (+ optional `auth_token`); it **health-checks and connects**, cannot start/stop it. **No tab** (no local process) — surfaced as a Settings **status line**. Capabilities discovered from `/props` when the endpoint exposes it (a remote llama-server does), else **declared** in config (`declared_context`, `declared_model`) for endpoints that don't (many cloud APIs).
+  - **Local** — cImp owns the process: V8-01's `server_command` + read-only tab + autostart + Start/Stop/Reset. Capabilities (`n_ctx`/`np`/model) discovered from `/props`.
+  - **Remote (LAN or cloud)** — cImp holds a `base_url` (+ optional `auth_token`); it **health-checks and connects**, cannot start/stop it. **No tab** (no local process) — surfaced as a Settings **status line**. Capabilities discovered from `/props` when the endpoint exposes it (a remote llama-server does), else **declared** in config (`declared_context`, `declared_model`) for endpoints that don't (many cloud APIs).
   - Each backend has its **own** budget (`n_ctx/np × high_water`), concurrency gate (`np`), and health — exactly V8-01's per-server machinery, now per-backend.
 - **Routing is per `offload_task`, never per step.** One backend runs the whole task (conversation state lives on one server's slot — no mid-loop migration). Selection:
   1. **Tool-need is a hard filter** — the task's required tools must be a subset of the backend's allowed tools (see scoping). A "read these local files" task is ineligible for a cloud backend that lacks local-file tools.
@@ -39,7 +39,7 @@ Three capabilities land here:
   - **Uncertainty errs toward capability.** Required-tool/required-context estimation is heuristic (you don't know a file's size until you read it). When unsure, route to a **more-capable** backend; if a routed backend overflows or the model requests a disallowed tool, the agent degrades (truncate/map-reduce) or the router **re-routes/fails over** rather than returning garbage.
 - **Per-backend tool scoping (privacy + capability).** Each backend carries an **allow-list** over the global pool (native tools + configured MCP servers); only allowed tools are put in the `tools` array sent to that backend's model. Defaults by kind:
   - **Local** → all tools.
-  - **Remote LAN** (e.g. the 3070) → all tools by default (trusted network) — *note:* ccImp still **executes** tools on the ccImp host, so a local file the model reads travels over the **LAN** to that box; data stays on the user's network.
+  - **Remote LAN** (e.g. the 3070) → all tools by default (trusted network) — *note:* cImp still **executes** tools on the cImp host, so a local file the model reads travels over the **LAN** to that box; data stays on the user's network.
   - **Remote Cloud** → **web/docs only by default** (`duckduckgo`, `fetch`, `context7`); **`read_file`/`code_search`/`run_command`/`filesystem`/`git` are denied** so local file contents / command output never leave the machine. The user can opt a cloud backend into local-data tools **explicitly, with a warning**.
 - **Cloud = data leaves the machine.** A cloud backend is gated behind an **explicit consent toggle**, labeled distinctly from LAN-remote in the UI, and documented in README/`NOTICE`. It still protects the *Opus* context, but breaks the local/offline property. The LAN 3070 case keeps data on the user's network.
 - **Capability reporting becomes a union** across enabled backends, kept coarse: e.g. *"Backends: large (150k ctx, all tools) + fast (16k ctx, web/docs only). Pass `tier` to bias; local-file tasks run on the large backend."* So Opus knows a fast tier exists and that it can't read local files. Re-rendered on `tools/list` and on `notifications/tools/list_changed` (now also fired on backend health/membership change), per V8-01's mechanism.
@@ -79,7 +79,7 @@ Three capabilities land here:
 - **Per-step / mid-loop backend switching.** One backend per `offload_task`; a task's whole loop runs there. (A single overflow-triggered re-route restarts the task, it doesn't split it.)
 - **Be a general LLM gateway.** The router is purpose-built for offload (context/complexity/tool-scope/availability), not a configurable LiteLLM-style proxy with arbitrary policies, rate-limit accounting, or cost optimization.
 - **Deeply validate every provider.** `llama-server` (local or remote LAN) is the validated path; cloud / Ollama / LM Studio / vLLM / hosted APIs work via `base_url` + declared capabilities, best-effort (per-provider tool-calling / `/props` / thinking-flag quirks are a followup).
-- **Cross-machine tool execution.** Tools always execute on the **ccImp host**; results travel to whichever backend ran the task. (A remote box running its *own* MCP servers is a followup.)
+- **Cross-machine tool execution.** Tools always execute on the **cImp host**; results travel to whichever backend ran the task. (A remote box running its *own* MCP servers is a followup.)
 - **GGUF auto-download or write/edit tools** — unchanged from V8-01 (still out).
 
 ## Test Plan
@@ -113,5 +113,5 @@ Three capabilities land here:
 
 - **Per-provider hardening** of non-llama.cpp endpoints (Ollama / LM Studio / vLLM / hosted APIs) — provider-specific tool-calling / thinking-flag / `/props` quirks.
 - **Finer routing** — per-tool / per-capability backend selection (a coder backend for code, an instruct backend for research) and cost/latency-aware policies.
-- **Remote-host-local MCP servers** — let a remote box run its own MCP servers (tools executing near that model) rather than all tools executing on the ccImp host.
+- **Remote-host-local MCP servers** — let a remote box run its own MCP servers (tools executing near that model) rather than all tools executing on the cImp host.
 - **Multimodal routing** — route image/PDF offloads to a vision-capable backend.

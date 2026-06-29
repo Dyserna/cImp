@@ -128,7 +128,7 @@ pub struct ServerMetrics {
     /// Sum of per-slot computed tokens/sec — an always-available throughput
     /// figure even when `--metrics` is off.
     pub aggregate_tps: f32,
-    /// ccImp's global concurrency gate: offloads holding a permit / the cap.
+    /// cImp's global concurrency gate: offloads holding a permit / the cap.
     pub global_in_flight: u32,
     pub global_cap: u32,
     /// Tasks waiting for a slot right now (app-wide queue depth). Stamped by

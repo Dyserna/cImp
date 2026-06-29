@@ -11,7 +11,7 @@
 > (`~/.config/opencode` + `~/.local/share/opencode/auth.json`), so one tab covers
 > cloud and local. The implementation therefore ships a **single `opencode`
 > tab**, drops the `opencode-local` tab, the `opencode_local` settings group, and
-> the local-provider injection (Phase D3 — cctts injects no `provider` block;
+> the local-provider injection (Phase D3 — cimp injects no `provider` block;
 > users configure providers in OpenCode itself). The v18→v19 migration **collapses
 > both** legacy aider tabs into the one `opencode` tab (with de-duplication).
 > Where this doc still describes the local tab / provider block below, read it as
@@ -21,9 +21,9 @@
 
 Replace the two Aider AI-tool tabs (`aider`, `aider-local`) with two
 **OpenCode** tabs (`opencode`, `opencode-local`), and wire OpenCode into the
-same ccImp capabilities the Claude tabs already enjoy: the **offload tool**,
+same cImp capabilities the Claude tabs already enjoy: the **offload tool**,
 the **code knowledge graph**, and the **web-research MCP servers** — all of
-which already ride the single `ccimp --offload-mcp` child. The decision to go
+which already ride the single `cimp --offload-mcp` child. The decision to go
 with OpenCode (over keeping Aider) is recorded in the research that preceded
 this milestone: OpenCode is an autonomous, MCP-native, multi-model agent that
 is far closer to Claude Code's model than Aider's manual pair-programming flow.
@@ -35,20 +35,20 @@ The integration hinges on two facts verified against the installed binary
   into the normal scrollback buffer (it maintains a replay buffer and replays
   on resize) rather than taking the alternate screen. This is the *same
   rendering class* as Claude Code's `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`
-  inline renderer that cctts already processes — so the TTS marker stripper
+  inline renderer that cimp already processes — so the TTS marker stripper
   (`processing/screen.rs`) and permission detector (`processing/permission.rs`)
   have a fighting chance. The **default** `opencode` TUI is a full-screen
   redraw (synchronized-update + absolute cursor addressing) and **must not**
-  be used. `--mini` requires a real TTY — cctts spawns every tab in a PTY, so
+  be used. `--mini` requires a real TTY — cimp spawns every tab in a PTY, so
   that requirement is satisfied.
 - **`OPENCODE_CONFIG_CONTENT`** is an env var that takes the *entire* OpenCode
   config as an inline JSON string. Combined with `OPENCODE_DISABLE_PROJECT_CONFIG`
-  this lets cctts inject MCP servers, instructions, and the local provider
+  this lets cimp inject MCP servers, instructions, and the local provider
   **session-scoped via env**, never writing to `~/.config/opencode` or the
   project — the exact analog of how the Claude tabs get `--mcp-config` /
   `--settings` / `--append-system-prompt`, just delivered as one env var.
 
-Unlike Aider (which cctts never spoke through — no `--append-system-prompt`
+Unlike Aider (which cimp never spoke through — no `--append-system-prompt`
 equivalent, line-based REPL), OpenCode can be given the TTS-markup convention
 via the `instructions` config key, so **the OpenCode tabs can speak** like the
 Claude tabs. That is a capability upgrade, gated behind a verification step.
@@ -90,8 +90,8 @@ Five phases, ordered by risk: A (the integration spine: launch with `--mini`
    set it as `OPENCODE_CONFIG_CONTENT`. Also set the noise-suppression env vars
    above. Per-tab `env` still wins (same `.entry()`-style precedence as today).
 3. **Config merge vs hermetic. → STARTING additive (with a hermetic toggle).**
-   cctts does *not* set `OPENCODE_DISABLE_PROJECT_CONFIG=1` by default, so a
-   user's project `AGENTS.md` / `.opencode.json` still applies with the cctts
+   cimp does *not* set `OPENCODE_DISABLE_PROJECT_CONFIG=1` by default, so a
+   user's project `AGENTS.md` / `.opencode.json` still applies with the cimp
    `mcp` server + instructions layered on top via the env content. Verify
    OpenCode's merge precedence (env content vs project file) during A.4; expose
    a setting to force hermetic (`OPENCODE_DISABLE_PROJECT_CONFIG=1`) if
@@ -154,13 +154,13 @@ Five phases, ordered by risk: A (the integration spine: launch with `--mini`
     `src/lib/settings/store.ts`): `opencode_local`, default tab `command`.
 15. **Settings UI AI section** (`SettingsApp.svelte`): rename "Aider local
     provider" → "OpenCode local provider"; base URL / token / model fields;
-    help text naming OpenCode + that cctts launches it with `--mini` and does
+    help text naming OpenCode + that cimp launches it with `--mini` and does
     not install it. Link `https://opencode.ai/docs`.
 16. **Per-tab UI** (`TabSettingsSection.svelte`): the `use_local_provider`
     toggle and effective-config helper text now describe the OpenCode env
     injection (show that `OPENCODE_CONFIG_CONTENT` is synthesized).
 17. **Binary availability / bundling decision. → DECIDED: require install.**
-    OpenCode is a single ~158 MB native binary. cctts does **not** bundle it:
+    OpenCode is a single ~158 MB native binary. cimp does **not** bundle it:
     `resolve_command("opencode")` accepts `opencode` from `ebin/` (resolved
     before PATH) or PATH, and an unresolvable binary produces a clear gate error
     pointing at `https://opencode.ai/docs` (or "drop `opencode.exe` in `ebin/`"),
@@ -170,7 +170,7 @@ Five phases, ordered by risk: A (the integration spine: launch with `--mini`
 
 ### Phase D — MCP, code graph, and offload reach OpenCode
 
-The single `ccimp --offload-mcp` child already exposes `offload_task`, the
+The single `cimp --offload-mcp` child already exposes `offload_task`, the
 `graph_*` tools, and the user MCP servers flagged for a given consumer. The
 Claude tabs reach it via `--mcp-config`. OpenCode reaches the **same child**
 via the injected `mcp` block.
@@ -181,7 +181,7 @@ via the injected `mcp` block.
 
     ```jsonc
     "mcp": {
-      "ccimp-offload": {
+      "cimp-offload": {
         "type": "local",
         "command": ["<current_exe>", "--offload-mcp", "--consumer", "opencode"]
       }
@@ -273,7 +273,7 @@ via the injected `mcp` block.
 - **Use the default full-screen OpenCode TUI.** `--mini` only. The default TUI
   is incompatible with the linear-stream model and is never launched.
 - **Install or bundle OpenCode** (unless Phase C.17 picks bundling). The user
-  installs `opencode`; cctts gates a clear error when it's unresolvable.
+  installs `opencode`; cimp gates a clear error when it's unresolvable.
 - **Headless `opencode run` integration.** The tab is interactive (`--mini`).
   A non-interactive `opencode run` backend (e.g. as an offload-style tool) is
   out of scope; track as a followup if useful.
@@ -332,14 +332,14 @@ via the injected `mcp` block.
 - **Build:** `cargo build` + `npm run build` clean.
 
 ### Phase C/D
-- **Unit (Rust):** injected config includes the `ccimp-offload` `mcp` entry
+- **Unit (Rust):** injected config includes the `cimp-offload` `mcp` entry
   when offload/graph/an opencode-exposed server is on, and omits it when all
   are off; the instructions file contains TTS + offload + graph guidance under
   the right gates; `opencode_access` selects the right server set under
   `--consumer opencode`.
 - **Manual (end-to-end):** in an OpenCode `--mini` tab, confirm `offload_task`,
   a `graph_*` query, and a web-research MCP tool all work — proving OpenCode
-  reaches the same ccImp child the Claude tabs use. Local-provider variant:
+  reaches the same cImp child the Claude tabs use. Local-provider variant:
   point `opencode_local` at a running local endpoint, confirm the model
   responds.
 
@@ -391,6 +391,6 @@ via the injected `mcp` block.
 - **Headless `opencode run` as an offload-style tool** — a second way to use
   OpenCode non-interactively.
 - **Per-tab OpenCode agent/model selection** (build vs plan agent, model
-  switching) surfaced in cctts settings rather than OpenCode's own UI.
+  switching) surfaced in cimp settings rather than OpenCode's own UI.
 - **OAuth MCP servers** — OpenCode supports `mcp auth`; if a user adds an
-  OAuth-gated remote MCP server, the auth flow lives in OpenCode, not cctts.
+  OAuth-gated remote MCP server, the auth flow lives in OpenCode, not cimp.

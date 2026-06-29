@@ -151,6 +151,8 @@ impl TagScanner {
         let mut i: usize = 0;
         let mut local_open = false;
         let mut last_consumed: usize = 0;
+        // Position (in `scan` coords) of an unclosed opener, if one is found.
+        let mut open_at: usize = 0;
 
         while let Some(rel_open) = find_bytes(&scan[i..], OPEN) {
             let abs_open = i + rel_open;
@@ -189,16 +191,33 @@ impl TagScanner {
                 }
                 None => {
                     local_open = true;
+                    open_at = abs_open;
                     break;
                 }
             }
         }
 
         self.open_tag = local_open;
-        // Advance only past closed pairs; an open opener stays in scan range
-        // so the next call (with more data) can complete the match.
-        if !local_open {
-            self.scan_offset += last_consumed;
+        if local_open {
+            // Advance past everything before the unclosed opener — consumed
+            // closed pairs plus any outside-tag text — but keep the opener (and
+            // what follows) so the next call can complete the match. Advancing
+            // here also fixes a stale-opener bug: when a closed pair is followed
+            // by an unclosed opener, leaving `scan_offset` before the closed
+            // pair made `recover_unclosed` later re-find that already-closed
+            // opener instead of the real pending one.
+            self.scan_offset += open_at;
+        } else {
+            // No open tag: the whole scanned region is consumed for matching.
+            // Advance past it (not merely past the last closed pair) so the
+            // compaction watermark can move even when the stream has NO markers
+            // at all — otherwise `scan_offset` stays at 0 forever, `raw_buffer`
+            // never compacts (unbounded growth), and every burst rescans the
+            // whole buffer (O(session²)). Retain up to OPEN.len()-1 trailing
+            // bytes that could be the prefix of an opener split across the next
+            // burst's boundary.
+            let advance = last_consumed.max(scan.len().saturating_sub(OPEN.len() - 1));
+            self.scan_offset += advance;
         }
         new_speech
     }

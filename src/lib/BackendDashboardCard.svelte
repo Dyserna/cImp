@@ -4,12 +4,13 @@
   // throughput, queue, context, history); cloud/down backends render a
   // compact status line. The raw server log is available only for Local
   // backends (ccImp owns their process); remote logs live on the box.
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import {
     offloadServerLog,
     onOffloadServerOutput,
     type BackendDashboard,
   } from './offload';
+  import { listenManaged } from './listenManaged';
 
   let { dash }: { dash: BackendDashboard } = $props();
 
@@ -49,7 +50,19 @@
   let showLog = $state(false);
   let logLines = $state<string[]>([]);
   let logEl = $state<HTMLElement | null>(null);
-  let unlistenLog: (() => void) | null = null;
+
+  // Armed at init (not in the async onMount) so teardown survives an unmount
+  // during the await. Local backends only — remote logs live on the box.
+  // `dash.kind`/`dash.name` are stable for a card's lifetime (a card is keyed
+  // by backend), so reading them at init is intentional.
+  // svelte-ignore state_referenced_locally
+  if (dash.kind === 'local') {
+    listenManaged(() =>
+      onOffloadServerOutput((l) => {
+        if (l.backend === dash.name) logLines = [...logLines, l.line].slice(-800);
+      }),
+    );
+  }
 
   onMount(async () => {
     if (!isLocal) return;
@@ -58,13 +71,6 @@
     } catch {
       /* ignore */
     }
-    unlistenLog = await onOffloadServerOutput((l) => {
-      if (l.backend === dash.name) logLines = [...logLines, l.line].slice(-800);
-    });
-  });
-
-  onDestroy(() => {
-    unlistenLog?.();
   });
 
   $effect(() => {

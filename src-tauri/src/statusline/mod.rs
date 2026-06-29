@@ -315,6 +315,11 @@ fn active_palette_colors() -> HashMap<String, String> {
 
 /// Read `<dir>/palettes/<name>.json` and return its `colors` map.
 fn read_palette_file(dir: &Path, name: &str) -> Option<HashMap<String, String>> {
+    // `name` comes from settings.json; refuse any path component so a crafted
+    // name (`../../secret`) can't traverse out of the `palettes/` directory.
+    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+        return None;
+    }
     let path = dir.join("palettes").join(format!("{name}.json"));
     let text = std::fs::read_to_string(path).ok()?;
     let file: PaletteFileProbe = serde_json::from_str(&text).ok()?;

@@ -59,7 +59,7 @@ pub(crate) fn spawn_capture_thread(
                             debug!(target: "stt", "start ignored: already recording");
                             continue;
                         }
-                        match start_capture(&settings, mic.clone()) {
+                        match start_capture(&settings, mic.clone(), &app, &state, &recording) {
                             Ok(cap) => {
                                 active = Some(cap);
                                 recording.store(true, Ordering::SeqCst);
@@ -128,6 +128,9 @@ pub(crate) fn spawn_capture_thread(
 fn start_capture(
     settings: &SettingsHandle,
     mic: Arc<RwLock<RingBuffer>>,
+    app: &AppHandle,
+    state: &Arc<RwLock<SttState>>,
+    recording: &Arc<AtomicBool>,
 ) -> AppResult<ActiveCapture> {
     let host = cpal::default_host();
     let wanted = settings.current().stt.input_device;
@@ -156,7 +159,18 @@ fn start_capture(
     );
 
     let accumulator = Arc::new(Mutex::new(Vec::<f32>::new()));
-    let err_fn = |e| warn!(target: "stt", error = %e, "input stream error");
+    // A mid-capture stream error (e.g. the device is unplugged) fires on cpal's
+    // thread. Surface it as SttState::Error and clear `recording` — otherwise
+    // Stop later yields a silent empty transcript and the user thinks they
+    // recorded successfully.
+    let err_app = app.clone();
+    let err_state = state.clone();
+    let err_recording = recording.clone();
+    let err_fn = move |e| {
+        warn!(target: "stt", error = %e, "input stream error");
+        err_recording.store(false, Ordering::SeqCst);
+        set_state(&err_app, &err_state, SttState::Error);
+    };
 
     let stream = match sample_format {
         SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, accumulator.clone(), mic, err_fn),

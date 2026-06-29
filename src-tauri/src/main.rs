@@ -148,8 +148,12 @@ fn main() {
     let (tts_tx, tts_rx) = mpsc::channel::<TtsRequest>(64);
     let tts_rx_slot = Arc::new(Mutex::new(Some(tts_rx)));
 
-    // State-machine input channel.
-    let (state_tx, state_rx) = mpsc::channel::<StateSignal>(64);
+    // State-machine input channel. Shared by every tab and every signal kind,
+    // so it must be large enough that a burst of control edges (output
+    // start/stop, permission resolve, subprocess exit) never overflows and
+    // drops a state transition — a dropped edge desyncs the avatar/permission
+    // state machine. Sized generously for that reason.
+    let (state_tx, state_rx) = mpsc::channel::<StateSignal>(512);
     let state_rx_slot = Arc::new(Mutex::new(Some(state_rx)));
 
     // In-process broadcast of every StateEvent the manager emits to the

@@ -4,7 +4,7 @@
 // listen on the same event, so a change made in either window is reflected
 // in the other (and persisted to disk by the backend's debounced saver).
 
-import { writable, derived, type Readable } from 'svelte/store';
+import { writable, derived, get, type Readable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import { settingsGet, settingsUpdate } from './ipc';
 import { defaultSettings, type Settings } from './types';
@@ -20,15 +20,21 @@ let initPromise: Promise<void> | null = null;
 export function initSettings(): Promise<void> {
   if (initPromise) return initPromise;
   initPromise = (async () => {
+    // Register the listener BEFORE the initial get so a change broadcast that
+    // lands while the get is in flight isn't missed. The `gotEvent` guard then
+    // prevents the (possibly older) get snapshot from clobbering a newer event
+    // value that already arrived.
+    let gotEvent = false;
+    await listen<Settings>('settings-changed', (event) => {
+      gotEvent = true;
+      settings.set(event.payload);
+    });
     try {
       const initial = await settingsGet();
-      settings.set(initial);
+      if (!gotEvent) settings.set(initial);
     } catch (e) {
       console.warn('settings_get failed; using defaults', e);
     }
-    await listen<Settings>('settings-changed', (event) => {
-      settings.set(event.payload);
-    });
   })();
   return initPromise;
 }
@@ -39,11 +45,15 @@ export function initSettings(): Promise<void> {
 /// path handles it. We DO update locally first for snappy UI, then let the
 /// broadcast reconcile.
 export async function applySettings(updated: Settings): Promise<void> {
+  const previous = get(settings);
   settings.set(updated);
   try {
     await settingsUpdate(updated);
   } catch (e) {
-    console.error('settings_update failed', e);
+    // Roll back the optimistic update — otherwise the UI shows a change the
+    // backend rejected, and the divergence is silently lost on next restart.
+    console.error('settings_update failed; rolling back optimistic update', e);
+    settings.set(previous);
   }
 }
 

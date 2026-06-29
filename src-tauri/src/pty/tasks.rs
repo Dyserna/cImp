@@ -536,7 +536,11 @@ pub fn spawn_waiter(
             Ok(status) => (format!("{:?}", status), Some(status.exit_code() as i32)),
             Err(e) => (format!("error: {}", e), None),
         };
-        let _ = state_signals.try_send(StateSignal::SubprocessExited { tab: tab.clone(), code });
+        // Terminal signal: a dropped SubprocessExited leaves the backend and
+        // frontend desynced about whether the tab's child is alive. We're on
+        // the blocking pool here (can't await), so use blocking_send to apply
+        // backpressure instead of try_send's silent drop on a full channel.
+        let _ = state_signals.blocking_send(StateSignal::SubprocessExited { tab: tab.clone(), code });
         if let Err(e) = app.emit(
             "pty-exit",
             PtyExitPayload {

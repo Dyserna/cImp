@@ -454,7 +454,13 @@ fn run_audio_thread(
         // true→false transition.
         let was_playing = playing.swap(now_speaking, Ordering::Relaxed);
         if was_playing && !now_speaking {
-            idle_notify.notify_waiters();
+            // `notify_one`, NOT `notify_waiters`: the sole consumer is a
+            // `select!` loop, so between iterations there's a window with no
+            // registered `notified()` future. `notify_waiters` would drop the
+            // edge in that window (sticking the notification queue until the
+            // next edge/deadline); `notify_one` stores a permit so the next
+            // `notified()` returns immediately.
+            idle_notify.notify_one();
         }
 
         // Deliver the avatar Started/Stopped edges WITHOUT blocking this loop —

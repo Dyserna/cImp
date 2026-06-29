@@ -19,6 +19,7 @@
     type GraphCall,
     type GraphStatus,
   } from './graph';
+  import { listenManaged } from './listenManaged';
 
   let roots = $state<GraphStatus[]>([]);
   let paused = $state<boolean>(false);
@@ -26,7 +27,6 @@
   let probe = $state<EmbedderProbe | null>(null);
   let probing = $state<boolean>(false);
   let history = $state<GraphCall[]>([]);
-  let unlisten: (() => void) | null = null;
   let poll: ReturnType<typeof setInterval> | null = null;
 
   function fmtTime(ms: number): string {
@@ -66,9 +66,12 @@
     }
   }
 
+  // Registered at component init (not in the async onMount) so its teardown is
+  // armed before any await — avoids the unmount-during-await listener leak.
+  listenManaged(() => onGraphStatus(upsert));
+
   onMount(async () => {
     await refresh();
-    unlisten = await onGraphStatus(upsert);
     // A light poll backstops the event for coverage/progress counters that
     // change without a discrete state transition.
     poll = setInterval(refresh, 2000);
@@ -78,7 +81,6 @@
   });
 
   onDestroy(() => {
-    unlisten?.();
     if (poll) clearInterval(poll);
   });
 

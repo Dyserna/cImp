@@ -912,7 +912,16 @@ impl OffloadService {
         // rotation) would match the cached signature and keep reusing the
         // handle built with the stale token (its reqwest client + health/props
         // probe would authenticate with the old credential).
-        let sig = format!("{base_url}|{}|{is_cloud}", token_fp(auth_token));
+        // Trim the trailing slash to match `remote_sig`, which fingerprints the
+        // handle's already-trimmed `base_url()`. Without this, a configured URL
+        // with a trailing slash never matches its cached handle's signature →
+        // every resolve rebuilds the handle, resetting `in_flight` to 0 so the
+        // router believes the backend is perpetually idle and never spills.
+        let sig = format!(
+            "{}|{}|{is_cloud}",
+            base_url.trim_end_matches('/'),
+            token_fp(auth_token)
+        );
         let handle = {
             let mut pool = self.remote_pool.lock().await;
             let reuse = pool.get(&b.name).filter(|h| h.base_url() == base_url.trim_end_matches('/'));

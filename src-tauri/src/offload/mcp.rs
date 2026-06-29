@@ -831,8 +831,16 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
                     // split across a chunk boundary (TCP can break anywhere) is
                     // still detected — otherwise a capability change would be
                     // silently dropped.
+                    // Bound each read: the app sends an SSE keep-alive every
+                    // 20s, so a 60s gap means the connection went half-open
+                    // (e.g. the app was hard-killed without a FIN). Break to
+                    // reconnect rather than hang here forever — otherwise
+                    // list_changed notifications would stop reaching Claude.
+                    const READ_IDLE: Duration = Duration::from_secs(60);
                     let mut carry: Vec<u8> = Vec::new();
-                    while let Ok(Some(chunk)) = resp.chunk().await {
+                    while let Ok(Ok(Some(chunk))) =
+                        tokio::time::timeout(READ_IDLE, resp.chunk()).await
+                    {
                         let mut buf = std::mem::take(&mut carry);
                         buf.extend_from_slice(&chunk);
                         if buf.windows(SSE_CHANGE.len()).any(|w| w == SSE_CHANGE) {

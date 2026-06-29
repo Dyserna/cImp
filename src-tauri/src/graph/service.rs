@@ -152,18 +152,25 @@ struct BackfillFlag {
 }
 
 /// RAII reset for the [`GraphService::spawn_backfill`] single-flight guard.
-/// Clearing `running` on `Drop` (rather than only at the end of the backfill
-/// loop) means that if the async runtime drops the backfill future before it
-/// finishes — e.g. during app shutdown — the root isn't left pinned with
-/// `running = true`, which would silently disable embedding for the rest of the
-/// service's lifetime.
+/// Clearing `running` on `Drop` covers ABNORMAL termination only — e.g. the
+/// async runtime drops the backfill future before it finishes (app shutdown) —
+/// so the root isn't left pinned with `running = true`, which would silently
+/// disable embedding for the service's lifetime. The NORMAL exit path clears
+/// `running` itself, under the same lock as the final `again` check (so a
+/// late-arriving request can't be orphaned in the gap), and sets `clean` to
+/// suppress this Drop — otherwise it could clobber the `running = true` of a
+/// fresh task that started in the window between break and Drop.
 struct BackfillGuard {
     svc: Arc<GraphService>,
     root: PathBuf,
+    clean: bool,
 }
 
 impl Drop for BackfillGuard {
     fn drop(&mut self) {
+        if self.clean {
+            return;
+        }
         if let Ok(mut g) = self.svc.backfill.lock() {
             if let Some(st) = g.get_mut(&self.root) {
                 st.running = false;
@@ -535,25 +542,28 @@ impl GraphService {
         }
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
-            // `running` is cleared by the guard's Drop, so it resets even if
-            // this future is dropped mid-pass (shutdown) instead of breaking
-            // cleanly.
-            let _guard = BackfillGuard {
+            // The guard clears `running` only if this future is dropped mid-pass
+            // (shutdown). The normal path below clears it under the lock.
+            let mut guard = BackfillGuard {
                 svc: this.clone(),
                 root: root.clone(),
+                clean: false,
             };
             loop {
                 this.embed_backfill(&root).await;
-                let again = {
-                    let mut g = this.backfill.lock().unwrap();
-                    let st = g.entry(root.clone()).or_default();
-                    let again = st.again;
-                    st.again = false; // consume the request; loop once more if set
-                    again
-                };
-                if !again {
-                    break; // `_guard` clears `running` on drop
+                let mut g = this.backfill.lock().unwrap();
+                let st = g.entry(root.clone()).or_default();
+                if st.again {
+                    st.again = false; // consume the request and loop once more
+                    continue;
                 }
+                // No further request: clear `running` and the `again` check in
+                // the SAME locked section so a request arriving after this can't
+                // be lost. Mark the guard clean so its Drop won't later clobber a
+                // fresh task that may start once we release the lock.
+                st.running = false;
+                guard.clean = true;
+                break;
             }
         });
     }

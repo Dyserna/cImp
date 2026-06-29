@@ -207,6 +207,8 @@ async function ensureModuleListeners(): Promise<void> {
 function displayNameFor(t: TabId): string {
   if (t === 'claude') return 'Claude Code';
   if (t === 'claude-local') return 'Claude Code (local)';
+  if (t === 'aider') return 'Aider';
+  if (t === 'aider-local') return 'Aider (local)';
   return 'Shell';
 }
 

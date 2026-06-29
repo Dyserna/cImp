@@ -242,7 +242,17 @@ impl NotificationManager {
                 // suppressed cleanly without our flag stale-suppressing a
                 // genuine future Idle.
                 if state != AvatarState::Speaking && state != AvatarState::Idle {
-                    self.just_dispatched.remove(&tab);
+                    // Real activity beat the echo for ONE armed suppression.
+                    // Decrement a single pending count — `remove` would wipe
+                    // every queued suppression for this tab at once, so the
+                    // remaining N-1 closing echoes would each fire a spurious
+                    // "idle" notification (a cascade).
+                    if let Some(count) = self.just_dispatched.get_mut(&tab) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.just_dispatched.remove(&tab);
+                        }
+                    }
                 }
                 if self.suppress_for_focus(&tab) {
                     return;

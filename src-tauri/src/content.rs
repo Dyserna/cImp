@@ -16,29 +16,85 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::OnceLock;
 
 use tracing_appender::rolling::RollingFileAppender;
 
 use crate::settings::LogRetention;
 use crate::state::TabId;
 
+/// Messages to the dedicated capture writer thread. All disk I/O happens on
+/// that thread so `write()` (called on the PTY reader's async task) never blocks
+/// a tokio worker. Per-tab ordering is preserved because the channel is FIFO and
+/// a single thread drains it.
+enum Msg {
+    Write { key: String, bytes: Vec<u8> },
+    /// Drop every open appender and acknowledge — used before deleting files
+    /// (Windows can't unlink a file with a live handle).
+    DropAll(Sender<()>),
+}
+
 struct ContentCapture {
     enabled: AtomicBool,
-    /// Per-tab appenders, keyed by sanitized tab id. `None` until first
-    /// write or after `delete_all()` drops handles. `Mutex` is the
-    /// serialization point for concurrent reader threads — terminal
-    /// output is bursty, contention is minimal in practice.
-    writers: Mutex<HashMap<String, RollingFileAppender>>,
+    tx: Sender<Msg>,
 }
 
 static INSTANCE: OnceLock<ContentCapture> = OnceLock::new();
 
+/// Owns the per-tab appenders and serves [`Msg`]s from the channel. Runs on a
+/// dedicated OS thread for the life of the process.
+fn writer_loop(rx: Receiver<Msg>) {
+    let mut writers: HashMap<String, RollingFileAppender> = HashMap::new();
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            Msg::Write { key, bytes } => {
+                let dir = dir();
+                // Only stat/create the directory when opening a NEW writer.
+                if !writers.contains_key(&key) {
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        tracing::warn!(dir = %dir.display(), error = %e, "content capture: mkdir failed");
+                        continue;
+                    }
+                }
+                let writer = writers.entry(key.clone()).or_insert_with(|| {
+                    // tracing-appender appends a `.YYYY-MM-DD` suffix to the
+                    // filename prefix on each rotation, e.g. `claude.log.2026-05-08`.
+                    tracing_appender::rolling::daily(&dir, format!("{key}.log"))
+                });
+                let _ = writer
+                    .write_all(&bytes)
+                    .inspect_err(|e| tracing::warn!(tab = %key, error = %e, "content capture: write failed"));
+            }
+            Msg::DropAll(ack) => {
+                writers.clear();
+                let _ = ack.send(());
+            }
+        }
+    }
+}
+
 fn instance() -> &'static ContentCapture {
-    INSTANCE.get_or_init(|| ContentCapture {
-        enabled: AtomicBool::new(false),
-        writers: Mutex::new(HashMap::new()),
+    INSTANCE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("content-capture".into())
+            .spawn(move || writer_loop(rx))
+            .expect("spawn content-capture thread");
+        ContentCapture {
+            enabled: AtomicBool::new(false),
+            tx,
+        }
     })
+}
+
+/// Tell the writer thread to drop every open appender and block until it has —
+/// so a subsequent file delete won't hit a still-open handle.
+fn drop_all_handles(cap: &ContentCapture) {
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    if cap.tx.send(Msg::DropAll(ack_tx)).is_ok() {
+        let _ = ack_rx.recv();
+    }
 }
 
 /// `<portable-root>/logs/content/`.
@@ -53,9 +109,7 @@ pub fn set_enabled(enabled: bool) {
     let cap = instance();
     cap.enabled.store(enabled, Ordering::Relaxed);
     if !enabled {
-        if let Ok(mut writers) = cap.writers.lock() {
-            writers.clear();
-        }
+        drop_all_handles(cap);
     }
 }
 
@@ -72,29 +126,10 @@ pub fn write(tab: &TabId, bytes: &[u8]) {
         return;
     }
     let key = sanitize(tab.as_str());
-    let dir = dir();
-    let mut writers = match cap.writers.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    // Only stat/create the directory when opening a NEW writer, not on every
-    // burst — `write` is on the PTY reader's hot path and the dir is stable
-    // for the session once it exists.
-    if !writers.contains_key(&key) {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            tracing::warn!(dir = %dir.display(), error = %e, "content capture: mkdir failed");
-            return;
-        }
-    }
-    let writer = writers.entry(key.clone()).or_insert_with(|| {
-        // tracing-appender appends a `.YYYY-MM-DD` suffix to the
-        // filename prefix on each rotation. The visible filename
-        // becomes e.g. `claude.log.2026-05-08`.
-        tracing_appender::rolling::daily(&dir, format!("{key}.log"))
-    });
-    let _ = writer
-        .write_all(bytes)
-        .inspect_err(|e| tracing::warn!(tab = %key, error = %e, "content capture: write failed"));
+    // Hand the bytes to the dedicated writer thread. `send` on an unbounded
+    // channel never blocks (and only errors if the thread died), so the PTY
+    // hot path stays off the disk entirely.
+    let _ = cap.tx.send(Msg::Write { key, bytes: bytes.to_vec() });
 }
 
 /// Sanitize a tab id for use as a filename. Tab ids are already
@@ -116,9 +151,8 @@ fn sanitize(id: &str) -> String {
 /// and skipped.
 pub fn delete_all() -> u32 {
     let cap = instance();
-    if let Ok(mut writers) = cap.writers.lock() {
-        writers.clear();
-    }
+    // Drop open handles on the writer thread first, then unlink (Windows).
+    drop_all_handles(cap);
     let dir = dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,

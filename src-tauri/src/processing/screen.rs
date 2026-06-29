@@ -227,7 +227,11 @@ impl Screen {
 
     fn move_cursor(&mut self, row: usize, col: usize) {
         self.cursor_row = self.ensure_row(row);
-        self.cursor_col = col.min(MAX_COLS);
+        // Rest on a VALID column. Clamping to MAX_COLS (one past the last
+        // column) parks the cursor out of bounds after a huge CSI column param,
+        // so every subsequent write clamps back onto the last column — a
+        // persistent one-column write error.
+        self.cursor_col = col.min(MAX_COLS - 1);
     }
 
     /// Try to drain `raw_buffer` to a `Vec<u8>` of bytes safe to forward to
@@ -360,8 +364,9 @@ impl Perform for Screen {
                 // BEL: ignore (terminals beep, we don't track).
             }
             b'\t' => {
-                // HT: advance to next tab stop (every 8 cols).
-                self.cursor_col = ((self.cursor_col / 8 + 1) * 8).min(MAX_COLS);
+                // HT: advance to next tab stop (every 8 cols). Rest on a valid
+                // column (see `move_cursor`).
+                self.cursor_col = ((self.cursor_col / 8 + 1) * 8).min(MAX_COLS - 1);
             }
             _ => {}
         }
@@ -390,7 +395,8 @@ impl Perform for Screen {
             }
             'C' | 'a' => {
                 let n = p(0, 1) as usize;
-                self.cursor_col = self.cursor_col.saturating_add(n).min(MAX_COLS);
+                // CUF: rest on a valid column (see `move_cursor`).
+                self.cursor_col = self.cursor_col.saturating_add(n).min(MAX_COLS - 1);
             }
             'D' => {
                 let n = p(0, 1) as usize;

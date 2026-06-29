@@ -67,9 +67,23 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
             MAX_FILE_BYTES
         ));
     }
-    let content = tokio::fs::read(&path)
+    // Bound the read itself, not just the pre-stat: a file growing between the
+    // metadata() check and the read() would otherwise allocate its full
+    // post-growth size (TOCTOU → OOM). `take` caps the bytes pulled regardless.
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(&path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
+    let mut content = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut content)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    if content.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!(
+            "file grew past {MAX_FILE_BYTES} bytes while reading — too large for this tool"
+        ));
+    }
     let text = String::from_utf8_lossy(&content);
 
     let mut out = String::new();

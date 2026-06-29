@@ -355,9 +355,14 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
         }
         None => {
             if path.exists() {
-                if let Err(e) = fs::remove_file(&path) {
+                // Propagate, don't swallow: if the now-empty overlay can't be
+                // removed it stays on disk and is re-merged next launch,
+                // silently undoing the user's revert. The caller must learn the
+                // save did not actually take effect.
+                fs::remove_file(&path).map_err(|e| {
                     tracing::warn!(error = %e, path = %path.display(), "settings: remove empty overlay failed");
-                }
+                    AppError::Io(e)
+                })?;
             }
         }
     }

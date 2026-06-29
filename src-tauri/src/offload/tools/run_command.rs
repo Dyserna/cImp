@@ -86,13 +86,24 @@ fn policy_for<'a>(command: &str, policies: &'a [CommandPolicy]) -> Option<&'a Co
     policies.iter().find(|p| p.program.eq_ignore_ascii_case(&stem))
 }
 
+/// True for a POSIX short flag (`-c`, `-C`) — a single dash followed by exactly
+/// one non-dash byte. Such flags accept their value glued on with no separator.
+fn is_short_flag(d: &str) -> bool {
+    let b = d.as_bytes();
+    b.len() == 2 && b[0] == b'-' && b[1] != b'-'
+}
+
 /// Whether `arg` is refused by `denied`: it matches when it equals an entry OR
-/// starts with `<entry>=` (covers both `--flag value` and `--flag=value`, and
-/// short flags like `-c`).
+/// starts with `<entry>=` (covers both `--flag value` and `--flag=value`). For
+/// short flags it ALSO matches the glued form `-ccore.hooksPath=/x` — git (and
+/// any getopt program) accepts a short flag's value with no separator, so
+/// without this the glued spelling slips past the `-c` guard entirely.
 fn flag_denied(arg: &str, denied: &[String]) -> bool {
-    denied
-        .iter()
-        .any(|d| arg == d || arg.starts_with(&format!("{d}=")))
+    denied.iter().any(|d| {
+        arg == d
+            || arg.starts_with(&format!("{d}="))
+            || (is_short_flag(d) && arg.len() > d.len() && arg.starts_with(d.as_str()))
+    })
 }
 
 /// Reject argument patterns, per the program's [`CommandPolicy`], that would

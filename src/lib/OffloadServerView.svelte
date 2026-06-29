@@ -5,24 +5,22 @@
   // `offload-server-metrics` event (one row per backend). Each card renders
   // its own slots/throughput/history (and, for Local backends, a collapsible
   // raw server log).
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import BackendDashboardCard from './BackendDashboardCard.svelte';
   import {
     offloadServerMetrics,
     onOffloadServerMetrics,
     type BackendDashboard,
   } from './offload';
+  import { listenManaged } from './listenManaged';
 
   let dashboards = $state<BackendDashboard[]>([]);
-  let unlistenMetrics: (() => void) | null = null;
+
+  // Armed at init so teardown survives an unmount during the async await.
+  listenManaged(() => onOffloadServerMetrics((rows) => (dashboards = rows)));
 
   onMount(async () => {
     dashboards = await offloadServerMetrics();
-    unlistenMetrics = await onOffloadServerMetrics((rows) => (dashboards = rows));
-  });
-
-  onDestroy(() => {
-    unlistenMetrics?.();
   });
 
   const local = $derived(dashboards.filter((d) => d.kind === 'local'));

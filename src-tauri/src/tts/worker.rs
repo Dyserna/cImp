@@ -73,7 +73,19 @@ pub fn spawn_tts_worker(
                             let preview: String = text.chars().take(60).collect();
                             next_id += 1;
                             let synth_req = SynthesisRequest { text, request_id: next_id };
-                            match engine.synthesize(synth_req) {
+                            // Synthesis is CPU/GPU-bound ONNX work (hundreds of
+                            // ms). Run it on the blocking pool, not this tokio
+                            // worker, so IPC/audio/amplitude tasks aren't starved.
+                            // Move the engine in and back out (it's used across
+                            // loop iterations).
+                            let (result, eng) = tokio::task::spawn_blocking(move || {
+                                let r = engine.synthesize(synth_req);
+                                (r, engine)
+                            })
+                            .await
+                            .expect("tts selection synth task panicked");
+                            engine = eng;
+                            match result {
                                 Ok(resp) => {
                                     // A cancel may have arrived during synthesis;
                                     // skip the enqueue so no extra audio plays
@@ -185,7 +197,16 @@ pub fn spawn_tts_worker(
                     next_id += 1;
                     let synth_req = SynthesisRequest { text, request_id: next_id };
                     let started = std::time::Instant::now();
-                    match engine.synthesize(synth_req) {
+                    // Off the async runtime: blocking ONNX synthesis would
+                    // otherwise stall IPC/audio. Engine moves in and back out.
+                    let (result, eng) = tokio::task::spawn_blocking(move || {
+                        let r = engine.synthesize(synth_req);
+                        (r, engine)
+                    })
+                    .await
+                    .expect("tts synth task panicked");
+                    engine = eng;
+                    match result {
                         Ok(resp) => {
                             // Re-check suppression AFTER synthesis: an Esc may
                             // have arrived during the (few-hundred-ms) synth of

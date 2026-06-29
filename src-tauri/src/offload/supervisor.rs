@@ -357,6 +357,9 @@ impl OffloadSupervisor {
             return Ok(()); // already running/starting
         }
         if command.trim().is_empty() {
+            // Drop the `running` lock before the set_state await so a slow
+            // event emit can't block other backend start/stop calls.
+            drop(guard);
             self.set_state(OffloadState::Error {
                 message: format!("`{name}`: server_command is not configured"),
             })
@@ -446,15 +449,19 @@ impl OffloadSupervisor {
 
     /// Stop one named Local backend (kill the child) if running. Idempotent.
     pub async fn stop_backend(&self, name: &str) {
-        let mut guard = self.running.lock().await;
-        if let Some(mut running) = guard.remove(name) {
+        // Remove under the lock, then release it BEFORE the kill().await — a
+        // slow child kill must not block start/stop of other backends.
+        let removed = {
+            let mut guard = self.running.lock().await;
+            guard.remove(name)
+        };
+        if let Some(mut running) = removed {
             running.server.mark_stopped();
             if let Err(e) = running.child.kill().await {
                 warn!(backend = name, error = %e, "offload: failed to kill server child");
             }
             debug!(backend = name, "offload: server stopped");
         }
-        drop(guard);
         if self.primary_name().as_deref() == Some(name) {
             let next = if self.settings.current().offload.enabled {
                 OffloadState::Stopped

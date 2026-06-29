@@ -83,7 +83,9 @@ pub fn start(
                 }
             }
         })
-        .expect("spawn graph watch thread");
+        // Don't panic the process on thread exhaustion — surface it as a watch
+        // error so the caller can degrade to no live re-indexing.
+        .map_err(|e| notify::Error::generic(&format!("spawn graph watch thread: {e}")))?;
 
     Ok(watcher)
 }

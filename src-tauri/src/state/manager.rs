@@ -634,8 +634,15 @@ async fn run(
                 // the user stopped the *previous* burst's tagged speech, but a
                 // fresh burst should speak again. Done as a peek (no `continue`)
                 // so the signal still drives the avatar transition below.
-                if let StateSignal::ClaudeOutputStarted { .. } = &signal {
-                    ai_tts_suppressed.store(false, std::sync::atomic::Ordering::SeqCst);
+                //
+                // Only the ACTIVE tab's fresh output clears it: the suppression
+                // is global (one voice), but it was armed against the tab the
+                // user Esc-silenced while looking at it. Clearing on ANY tab's
+                // output would let a background tab's output un-silence that tab.
+                if let StateSignal::ClaudeOutputStarted { tab } = &signal {
+                    if *tab == active {
+                        ai_tts_suppressed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
 
                 // Selection-read progress is a pure pass-through to the

@@ -18,6 +18,7 @@
   // flicker focus to whichever pane the splitter happens to be inside
   // of).
 
+  import { onDestroy } from 'svelte';
   import LayoutNodeRenderer from './LayoutNodeRenderer.svelte';
   import { setSplitRatio } from './layout/store';
   import {
@@ -27,6 +28,12 @@
   import type { SplitNode } from './layout/types';
 
   let { split }: { split: SplitNode } = $props();
+
+  // Teardown for an in-progress splitter drag. Held here so it can be invoked
+  // both on mouseup AND on component destroy — otherwise unmounting mid-drag
+  // (or the window losing focus) leaks the window listeners and leaves the body
+  // cursor/user-select overrides stuck on.
+  let dragCleanup: (() => void) | null = null;
 
   let containerEl: HTMLDivElement | undefined = $state();
   let containerSize = $state({ width: 0, height: 0 });
@@ -114,13 +121,23 @@
     function onUp(): void {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      // A drag interrupted by the window losing focus never sees a mouseup;
+      // 'blur' releases it so listeners and body styles don't stick.
+      window.removeEventListener('blur', onUp);
       document.body.style.cursor = previousCursor;
       document.body.style.userSelect = previousUserSelect;
+      dragCleanup = null;
     }
 
+    dragCleanup = onUp;
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
+    window.addEventListener('blur', onUp);
   }
+
+  // Component destroyed mid-drag: release the window listeners and restore the
+  // body styles instead of leaking them.
+  onDestroy(() => dragCleanup?.());
 </script>
 
 <div

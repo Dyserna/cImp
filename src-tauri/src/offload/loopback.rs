@@ -349,7 +349,19 @@ async fn handle_conn(
     }
 }
 
-/// `POST /run`: decode the task, run it on the warm pool, return the result.
+/// How often the streamed `/run` response emits a heartbeat line while the task
+/// is still running. The proxy treats a gap several times this long as "the
+/// worker wedged" (see `mcp.rs`), so this must stay well under that idle window.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// `POST /run`: decode the task, run it on the warm pool, and **stream** the
+/// result as newline-delimited JSON — periodic `{"hb":true}` heartbeats while
+/// the (possibly minutes-long) task runs, then a final `{"ok":..}` line.
+///
+/// The heartbeats are the whole point of this being a stream: they let the
+/// proxy distinguish a slow-but-alive job (keep waiting) from a dead app
+/// (fall back), so a long run is never abandoned and re-executed. The response
+/// has no `Content-Length`; the body is delimited by connection close.
 async fn handle_run(
     stream: &mut TcpStream,
     service: &Arc<OffloadService>,
@@ -396,22 +408,54 @@ async fn handle_run(
         cancel.clone(),
     );
     tokio::pin!(run_fut);
+
+    // Split so heartbeats/result (write half) and the disconnect probe (read
+    // half) can run concurrently on the one connection.
+    let (mut rd, mut wr) = stream.split();
+    // Stream head — no Content-Length; the body is close-delimited NDJSON. Sent
+    // up front so the proxy's `send()` resolves immediately and it knows the app
+    // is alive before the (possibly long) task even starts.
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: application/x-ndjson\r\n\
+                Cache-Control: no-cache\r\n\
+                Connection: close\r\n\r\n";
+    wr.write_all(head.as_bytes())
+        .await
+        .map_err(|e| AppError::Offload(format!("run head: {e}")))?;
+    wr.flush().await.ok();
+
+    let mut beat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    beat.tick().await; // consume the immediate first tick
+
     let result = loop {
         let mut probe = [0u8; 1];
         tokio::select! {
             biased;
             r = &mut run_fut => break r,
-            read = stream.read(&mut probe) => match read {
+            // Check for a caller disconnect *before* the heartbeat branch: a
+            // clean FIN should cancel promptly, not wait out a heartbeat write
+            // that still succeeds (the FIN is on the read half) and holds the
+            // slot for up to one HEARTBEAT_INTERVAL longer.
+            read = rd.read(&mut probe) => match read {
                 Ok(0) | Err(_) => {
                     debug!("offload loopback: caller disconnected mid-task; cancelling");
                     cancel.cancel();
-                    // Let the task unwind (the stream drop frees the slot).
                     break (&mut run_fut).await;
                 }
                 // A stray byte before the response is unexpected on this
                 // one-shot protocol; ignore it and keep waiting.
                 Ok(_) => continue,
             },
+            _ = beat.tick() => {
+                // A failed heartbeat write means the client went away; cancel
+                // and let the task unwind (its stream drop frees the slot).
+                if wr.write_all(b"{\"hb\":true}\n").await.is_err() {
+                    debug!("offload loopback: heartbeat write failed; caller gone, cancelling");
+                    cancel.cancel();
+                    break (&mut run_fut).await;
+                }
+                wr.flush().await.ok();
+            }
         }
     };
     let r = match result {
@@ -426,9 +470,18 @@ async fn handle_run(
             error: Some(e.to_string()),
         },
     };
-    // 200 even on a task-level error: the child renders `error` as a tool
-    // result so Claude can read + adapt, exactly like the in-process path.
-    write_json(stream, 200, &r).await
+    // Final line: one JSON object (serde emits no embedded newlines) + `\n`,
+    // then the connection closes. `ok:false` here too is a task-level error the
+    // child renders as a tool result so Claude can read + adapt.
+    let mut line = serde_json::to_vec(&r).unwrap_or_else(|_| {
+        br#"{"ok":false,"error":"failed to serialize result"}"#.to_vec()
+    });
+    line.push(b'\n');
+    wr.write_all(&line)
+        .await
+        .map_err(|e| AppError::Offload(format!("run result: {e}")))?;
+    wr.flush().await.ok();
+    Ok(())
 }
 
 /// A `POST /graph_run` request body (the warm code-graph query path).

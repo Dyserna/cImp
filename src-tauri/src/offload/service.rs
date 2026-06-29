@@ -21,9 +21,9 @@
 //! paths share the pure router ([`super::router`]) and the agent loop
 //! ([`super::agent`]) so they can't drift on routing or loop semantics.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -37,15 +37,18 @@ use crate::settings::{
     BackendTier, OffloadBackend, OffloadBackendKind, OffloadSettings, SettingsHandle, ToolScope,
 };
 
-use super::agent::{self, AgentConfig, HostRouter, OffloadTask, ThinkingMode};
+use super::agent::{self, AgentConfig, HostRouter, OffloadTask, RunTrace, ThinkingMode};
 use super::mcp_host::{host_config_sig, McpHost, McpServerHealth};
-use super::metrics::{BackendDashboard, MetricsPoller, ServerMetrics};
+use super::metrics::{BackendDashboard, CallRecord, MetricsPoller, RunRecord, ServerMetrics};
 use super::remote::RemoteBackend;
 use super::router::{self, BackendView, RouteError, TierHint};
 use super::server::{LlamaServer, ServerCommand};
 use super::supervisor::OffloadSupervisor;
 use super::tools::{self, ToolCtx};
 use super::Backend;
+
+/// Per-backend cap on retained offload run records (newest first).
+const RUN_LOG_CAP: usize = 30;
 
 /// Ceiling on the auto-sized global gate so a wildly-configured pool can't
 /// open thousands of concurrent loops.
@@ -155,6 +158,13 @@ pub struct OffloadService {
     /// trigger behind the lock during a slow shrink drain) and still converge
     /// to the latest config.
     reconcile_pending: AtomicBool,
+    /// Per-backend offload run log (one `RunRecord` per `offload_task`, newest
+    /// first, each grouping its LLM calls). Written as runs begin/finish and
+    /// read by the dashboard emit loop, which stamps it onto each backend's
+    /// metrics snapshot. Capped per backend.
+    run_log: StdMutex<HashMap<String, VecDeque<RunRecord>>>,
+    /// Monotonic id source for run records (deterministic; no wall-clock/RNG).
+    run_id_seq: AtomicU64,
 }
 
 /// RAII guard for the `queue_depth` waiter counter. Increments on `enter` and
@@ -223,6 +233,8 @@ impl OffloadService {
             host_reconcile_lock: TokioMutex::new(()),
             last_host_sig: StdMutex::new(None),
             reconcile_pending: AtomicBool::new(false),
+            run_log: StdMutex::new(HashMap::new()),
+            run_id_seq: AtomicU64::new(1),
         });
 
         // Relay MCP-host change pulses into the service change channel so a
@@ -473,13 +485,25 @@ impl OffloadService {
             views[chosen].name
         );
 
-        let result = self
-            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), overall_deadline, &cancel)
+        // Open a run-log record for this offload (one row per `offload_task`,
+        // grouping every LLM call) so the dashboard can show it live as
+        // `running` and color it on completion.
+        let mut backend_name = views[chosen].name.clone();
+        // Index of the backend actually serving the run; advances on fail-over so
+        // the On→Auto retry below targets the live backend, not the failed one.
+        let mut active = chosen;
+        let run_id = self.run_id_seq.fetch_add(1, Ordering::Relaxed);
+        self.run_begin(&backend_name, run_id, &instructions, thinking);
+        let mut trace = RunTrace::default();
+
+        // First attempt with the requested thinking mode.
+        let first = self
+            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), overall_deadline, Some(&mut trace), &cancel)
             .await;
 
         // One fail-over on a connection-class failure: drop the failed
         // backend and re-select among the rest.
-        match result {
+        let mut result = match first {
             Ok(text) => Ok(text),
             Err(e) if is_connection_error(&e.to_string()) && views.len() > 1 => {
                 let mut alt = views.clone();
@@ -491,14 +515,127 @@ impl OffloadService {
                             reroute = %pool[next].name,
                             "offload: re-routing after connection failure (app service)"
                         );
-                        self.run_on(&pool[next], &views[next], &snap, &instructions, context, thinking, session_cwd, overall_deadline, &cancel)
+                        // Move the run record to the backend that will actually
+                        // run it, so it's not mis-grouped under the failed one.
+                        let new_name = pool[next].name.clone();
+                        self.run_rekey(&backend_name, &new_name, run_id);
+                        backend_name = new_name;
+                        active = next;
+                        self.run_on(&pool[next], &views[next], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), overall_deadline, Some(&mut trace), &cancel)
                             .await
                     }
                     _ => Err(e),
                 }
             }
             Err(e) => Err(e),
+        };
+
+        // On→Auto retry: a `thinking:on` run that produced no usable answer
+        // (the model spent its output budget thinking) gets ONE more shot with
+        // `auto` — thinking only on the plan + final, quiet on ingestion, which
+        // is what avoids the runaway. Not retried with `off`: thinking was
+        // explicitly wanted. If auto also fails, the run is marked failed.
+        let mut recovered = false;
+        if matches!(result, Err(AppError::OffloadNoAnswer(_))) && thinking == ThinkingMode::On {
+            warn!(
+                target: "offload",
+                run_id,
+                "offload: thinking:on produced no answer; retrying once with auto"
+            );
+            // Retry on the backend that actually served the first attempt
+            // (`active` — fail-over may have advanced it past `chosen`), not the
+            // originally-selected one, which may be the backend that just failed.
+            let retry_deadline = Instant::now() + timeout;
+            let pre_retry = trace.calls.len();
+            result = self
+                .run_on(&pool[active], &views[active], &snap, &instructions, context.clone(), ThinkingMode::Auto, session_cwd.clone(), retry_deadline, Some(&mut trace), &cancel)
+                .await;
+            recovered = result.is_ok();
+            // The retry's agent loop numbers its calls from step 0 again; offset
+            // them so they continue after the first attempt's steps instead of
+            // colliding with them in the run log.
+            let base = trace.calls[..pre_retry]
+                .iter()
+                .map(|c| c.step)
+                .max()
+                .map_or(0, |m| m + 1);
+            for c in trace.calls[pre_retry..].iter_mut() {
+                c.step += base;
+            }
         }
+
+        // Close the run-log record: color by outcome (failed = red, recovered
+        // = amber, success = normal).
+        let outcome = match (&result, recovered) {
+            (Ok(_), true) => "recovered",
+            (Ok(_), false) => "success",
+            (Err(_), _) => "failed",
+        };
+        self.run_finish(&backend_name, run_id, outcome, std::mem::take(&mut trace.calls));
+        result
+    }
+
+    /// Insert a `running` run record at the front of a backend's run log.
+    fn run_begin(&self, backend: &str, id: u64, instructions: &str, thinking: ThinkingMode) {
+        let rec = RunRecord {
+            id,
+            instructions: instructions.chars().take(160).collect(),
+            thinking: thinking_label(thinking).into(),
+            started_ms: now_ms(),
+            ended_ms: 0,
+            outcome: "running".into(),
+            calls: Vec::new(),
+        };
+        let mut log = self.run_log.lock().unwrap();
+        let dq = log.entry(backend.to_string()).or_default();
+        dq.push_front(rec);
+        while dq.len() > RUN_LOG_CAP {
+            dq.pop_back();
+        }
+    }
+
+    /// Move a run record to another backend after a fail-over re-route, so it's
+    /// grouped under the backend that actually ran it (not the one that failed).
+    fn run_rekey(&self, old: &str, new: &str, id: u64) {
+        if old == new {
+            return;
+        }
+        let mut log = self.run_log.lock().unwrap();
+        let rec = log
+            .get_mut(old)
+            .and_then(|dq| dq.iter().position(|r| r.id == id).and_then(|i| dq.remove(i)));
+        if let Some(rec) = rec {
+            let dq = log.entry(new.to_string()).or_default();
+            dq.push_front(rec);
+            while dq.len() > RUN_LOG_CAP {
+                dq.pop_back();
+            }
+        }
+    }
+
+    /// Finalize a run record with its captured calls + final outcome.
+    fn run_finish(&self, backend: &str, id: u64, outcome: &str, calls: Vec<CallRecord>) {
+        let mut log = self.run_log.lock().unwrap();
+        if let Some(dq) = log.get_mut(backend) {
+            if let Some(rec) = dq.iter_mut().find(|r| r.id == id) {
+                rec.calls = calls;
+                rec.outcome = outcome.into();
+                rec.ended_ms = now_ms();
+            }
+        }
+    }
+
+    /// Snapshot **every** backend's run log (each newest first) under a single
+    /// lock acquisition. Taking it once — rather than once per row — means a
+    /// concurrent fail-over re-key can't relocate a run between two per-row reads
+    /// and make it appear under two backends in the same dashboard emit.
+    fn run_logs_snapshot(&self) -> HashMap<String, Vec<RunRecord>> {
+        self.run_log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, dq)| (k.clone(), dq.iter().cloned().collect()))
+            .collect()
     }
 
     /// Run the agent loop against one chosen backend: acquire its slot,
@@ -514,6 +651,7 @@ impl OffloadService {
         thinking: ThinkingMode,
         session_cwd: Option<PathBuf>,
         deadline: Instant,
+        trace: Option<&mut RunTrace>,
         cancel: &CancellationToken,
     ) -> AppResult<String> {
         let slot_timeout = deadline.saturating_duration_since(Instant::now());
@@ -563,15 +701,18 @@ impl OffloadService {
             model: None,
             max_steps: snap.max_steps.max(1),
             budget_tokens: view.per_slot_budget(),
+            n_ctx: view.n_ctx,
+            slots: view.slots,
             per_tool_result_token_cap: snap.per_tool_result_token_cap.max(256),
             auth_token: entry.auth_token.clone(),
+            per_call_timeout: Duration::from_secs(snap.offload_timeout_secs.max(30)),
         };
         let task = OffloadTask {
             instructions: instructions.to_string(),
             context,
             thinking,
         };
-        agent::run(&self.client, &cfg, &router, task, deadline, cancel).await
+        agent::run(&self.client, &cfg, &router, task, deadline, trace, cancel).await
     }
 
     /// Resolve the enabled backend pool from live state: live local handles
@@ -1004,8 +1145,15 @@ impl OffloadService {
                 // Stamp the app-wide queue depth onto every row (it's a global,
                 // not per-backend, figure — the dashboard shows it once).
                 let queued = this.queued();
+                // One atomic snapshot of all backends' run logs (a fail-over
+                // re-key between per-row reads could otherwise show one run under
+                // two backends at once).
+                let mut run_logs = this.run_logs_snapshot();
                 for r in rows.iter_mut() {
                     r.metrics.queue_depth = queued;
+                    // Attach this backend's offload run log (the poller tracks
+                    // slot activity; the service owns task-level run outcomes).
+                    r.metrics.runs = run_logs.remove(&r.name).unwrap_or_default();
                 }
 
                 *this.latest_metrics.lock().unwrap() = rows.clone();
@@ -1105,11 +1253,30 @@ fn worker_graph_allowed(graph_enabled: bool, is_remote: bool, allow_remote: bool
     graph_enabled && (!is_remote || allow_remote)
 }
 
+/// The run log's thinking-mode label (`"on"`/`"off"`/`"auto"`).
+fn thinking_label(m: ThinkingMode) -> &'static str {
+    match m {
+        ThinkingMode::On => "on",
+        ThinkingMode::Off => "off",
+        ThinkingMode::Auto => "auto",
+    }
+}
+
+/// Current wall-clock as epoch millis (formatted on the frontend).
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Whether an agent-loop error looks like a transport/connection failure (so
 /// a fail-over re-route is worth trying). Mirrors the child's heuristic.
 fn is_connection_error(e: &str) -> bool {
     let e = e.to_lowercase();
     e.contains("chat request failed")
+        || e.contains("chat stream failed")
         || e.contains("connection")
         || e.contains("timed out")
         || e.contains("timeout")

@@ -50,6 +50,14 @@ pub enum AppError {
     #[error("offload error: {0}")]
     Offload(String),
 
+    /// The agent loop finished but produced no usable answer — e.g. a
+    /// thinking turn consumed the whole output budget and emitted only a
+    /// `<think>` block that stripped to empty. Kept distinct from `Offload`
+    /// so the service can retry a `thinking:on` run once with `auto` before
+    /// surfacing it to the caller as a failed task.
+    #[error("offload produced no answer: {0}")]
+    OffloadNoAnswer(String),
+
     /// V9-01: a code-knowledge-graph index for the requested project is
     /// not built/ready yet. Surfaced to the caller as a clear "index
     /// building" message rather than blocking.

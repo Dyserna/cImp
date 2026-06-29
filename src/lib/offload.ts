@@ -215,6 +215,32 @@ export interface RequestRecord {
   tokens: number;
   avg_tps: number;
 }
+/// One LLM call within an offload run (mirror of Rust `CallRecord`).
+export interface CallRecord {
+  step: number;
+  /// 'planning' | 'ingestion' | 'final'.
+  kind: string;
+  thinking: boolean;
+  prompt_tokens: number;
+  output_tokens: number;
+  duration_ms: number;
+  tps: number;
+  /// 'tool_calls(N)' | 'answer' | 'empty' | 'leaked' | 'error'.
+  result: string;
+}
+/// One offload run grouping its LLM calls (mirror of Rust `RunRecord`).
+export interface RunRecord {
+  id: number;
+  instructions: string;
+  /// Initial thinking mode: 'on' | 'off' | 'auto'.
+  thinking: string;
+  started_ms: number;
+  /// 0 while still running.
+  ended_ms: number;
+  /// 'running' | 'success' | 'recovered' | 'failed'.
+  outcome: string;
+  calls: CallRecord[];
+}
 export interface ServerMetrics {
   running: boolean;
   total_slots: number;
@@ -232,6 +258,8 @@ export interface ServerMetrics {
   queue_depth: number;
   metrics_available: boolean;
   history: RequestRecord[];
+  /// Offload runs (one per offload_task), newest first, each grouping calls.
+  runs: RunRecord[];
 }
 
 /// One backend's dashboard card (mirror of Rust `BackendDashboard`). `kind`

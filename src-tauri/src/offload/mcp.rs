@@ -21,12 +21,16 @@
 //! Dispatched in `main()` before Tauri init, exactly like `--statusline`,
 //! so it stays GUI-free and fast to spawn.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Semaphore;
+
+use crate::error::AppError;
 
 use super::loopback::read_discovery;
 
@@ -71,41 +75,77 @@ async fn serve() {
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
 
+    // Set by a spawned handler when its response write fails (Claude closed
+    // stdout): stop accepting new work whose results could never be delivered.
+    let shutdown = Arc::new(AtomicBool::new(false));
+
     while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim();
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
-        let req: Value = match serde_json::from_str(line) {
+        let req: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue, // ignore malformed frames
         };
         let id = req.get("id").cloned();
-        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let method = req
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-        // Notifications (no id) get no response.
-        let is_notification = id.is_none();
-        let response = handle(method, params).await;
-
-        if is_notification {
+        // Notifications (no id) get no response — don't spawn a handler for them
+        // (it would run `handle` only to discard the result).
+        if id.is_none() {
             continue;
         }
-        let id = id.unwrap_or(Value::Null);
-        let frame = match response {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err((code, message)) => {
-                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+
+        // Spawn each request so multiple in-flight tool calls run concurrently
+        // — e.g. two parallel `offload_task`s must occupy both llama-server
+        // slots at once. Awaiting `handle` inline here serialized them: the read
+        // loop wouldn't pull the second request off stdin until the first
+        // (minutes-long) offload finished. Responses are matched by `id`, so
+        // out-of-order completion is fine; the shared `stdout` mutex serializes
+        // the writes.
+        let stdout = stdout.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            // Run the handler on its own task so a panic inside it surfaces as a
+            // JSON-RPC error (the client gets a reply) rather than being swallowed
+            // by the dropped JoinHandle — which would hang the caller forever
+            // waiting on a response that never comes.
+            let response = match tokio::spawn(handle_owned(method, params)).await {
+                Ok(r) => r,
+                Err(e) => Err((-32603, format!("offload handler panicked: {e}"))),
+            };
+            let id = id.unwrap_or(Value::Null);
+            let frame = match response {
+                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                Err((code, message)) => {
+                    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+                }
+            };
+            let mut bytes = frame.to_string();
+            bytes.push('\n');
+            let mut out = stdout.lock().await;
+            if out.write_all(bytes.as_bytes()).await.is_err() || out.flush().await.is_err() {
+                // stdout is gone (Claude closed the pipe): signal the read loop to
+                // stop spawning handlers whose results can't be delivered.
+                shutdown.store(true, Ordering::Relaxed);
             }
-        };
-        let mut bytes = frame.to_string();
-        bytes.push('\n');
-        let mut out = stdout.lock().await;
-        if out.write_all(bytes.as_bytes()).await.is_err() {
-            break;
-        }
-        let _ = out.flush().await;
+        });
     }
+}
+
+/// Owned-argument wrapper around [`handle`] so it can run on its own
+/// `tokio::spawn`ed task (which requires a `'static` future) for panic capture.
+async fn handle_owned(method: String, params: Value) -> Result<Value, (i64, String)> {
+    handle(&method, params).await
 }
 
 /// Dispatch one JSON-RPC method. Returns `Ok(result)` or
@@ -119,9 +159,9 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         })),
         "ping" => Ok(json!({})),
         "tools/list" => {
-            // The offload tool plus the V9-01 code-knowledge-graph tools
+            // The offload tool(s) plus the V9-01 code-knowledge-graph tools
             // (present only when the graph feature is enabled for this project).
-            let mut tools = vec![offload_task_tool_live().await];
+            let mut tools = vec![offload_task_tool_live().await, offload_batch_tool()];
             tools.extend(crate::graph::mcp_tools());
             Ok(json!({ "tools": tools }))
         }
@@ -135,6 +175,8 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                     Some(r) => r,
                     None => crate::graph::handle_mcp_call(&params).await,
                 }
+            } else if name == "offload_batch" {
+                handle_batch_tool(params).await
             } else {
                 handle_tools_call(params).await
             }
@@ -324,21 +366,7 @@ async fn handle_tools_call(params: Value) -> Result<Value, (i64, String)> {
         .and_then(|v| v.as_str())
         .unwrap_or("auto")
         .to_string();
-    let thinking = ThinkingMode::parse(&thinking_str);
-    let tier = TierHint::parse(&tier_str);
-
-    // Prefer the app's warm pool when reachable; degrade to the
-    // self-contained path otherwise. `proxy_run` returns `None` only when
-    // the app is unreachable (transport failure / no discovery file) — a
-    // task-level error from the app comes back as `Some(Err(..))` and is
-    // surfaced as a tool result, not retried locally.
-    let outcome = match proxy_run(&instructions, context.as_deref(), &thinking_str, &tier_str).await
-    {
-        Some(r) => r,
-        None => run_offload(instructions, context, thinking, tier).await,
-    };
-
-    match outcome {
+    match run_one(instructions, context, thinking_str, tier_str).await {
         Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
         // A "not ready/busy" condition is returned as a tool result (not a
         // protocol error) so Opus can read it and retry/adapt.
@@ -346,8 +374,153 @@ async fn handle_tools_call(params: Value) -> Result<Value, (i64, String)> {
     }
 }
 
+/// Run one offload subtask: prefer the app's warm pool when reachable, degrade
+/// to the self-contained path otherwise. `proxy_run` returns `None` only when
+/// the app is unreachable (transport failure / no discovery file) — a
+/// task-level error from the app comes back as `Some(Err(..))` and is surfaced
+/// as-is, not retried locally. Shared by the single (`offload_task`) and batch
+/// (`offload_batch`) tools.
+async fn run_one(
+    instructions: String,
+    context: Option<String>,
+    thinking_str: String,
+    tier_str: String,
+) -> Result<String, String> {
+    let thinking = ThinkingMode::parse(&thinking_str);
+    let tier = TierHint::parse(&tier_str);
+    match proxy_run(&instructions, context.as_deref(), &thinking_str, &tier_str).await {
+        Some(r) => r,
+        None => run_offload(instructions, context, thinking, tier).await,
+    }
+}
+
+/// `offload_batch`: run several subtasks **in parallel** from a single tool
+/// call. This is the way to get genuine concurrency from one session — the MCP
+/// client serializes separate `offload_task` calls, but here the child fans the
+/// subtasks out to the app at once (each is a normal `/run`, so the app's warm
+/// pool + global gate bound real parallelism to the backend's slots; extras
+/// queue). Results come back as one section per subtask, errors inline.
+async fn handle_batch_tool(params: Value) -> Result<Value, (i64, String)> {
+    /// Backstop on a single call's fan-out (the app's slot gate is the real
+    /// throttle; this just bounds a runaway request).
+    const MAX_TASKS: usize = 16;
+
+    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let tasks = args
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if tasks.is_empty() {
+        return Ok(tool_error("offload_batch requires a non-empty `tasks` array"));
+    }
+    if tasks.len() > MAX_TASKS {
+        return Ok(tool_error(&format!(
+            "offload_batch accepts at most {MAX_TASKS} tasks per call (got {})",
+            tasks.len()
+        )));
+    }
+
+    // Spawn every subtask concurrently. The app gates real parallelism to the
+    // slot count, so excess subtasks simply wait their turn on the gate.
+    let handles: Vec<_> = tasks
+        .iter()
+        .map(|t| {
+            let instructions = t
+                .get("instructions")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let context = t
+                .get("context")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let thinking_str = t
+                .get("thinking")
+                .and_then(|v| v.as_str())
+                .unwrap_or("auto")
+                .to_string();
+            let tier_str = t
+                .get("tier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("auto")
+                .to_string();
+            tokio::spawn(async move {
+                if instructions.trim().is_empty() {
+                    return Err("subtask requires non-empty `instructions`".to_string());
+                }
+                run_one(instructions, context, thinking_str, tier_str).await
+            })
+        })
+        .collect();
+
+    let mut sections = Vec::with_capacity(handles.len());
+    let mut ok_count = 0usize;
+    for (i, h) in handles.into_iter().enumerate() {
+        let n = i + 1;
+        match h.await {
+            Ok(Ok(text)) => {
+                ok_count += 1;
+                sections.push(format!("## Subtask {n} — OK\n\n{text}"));
+            }
+            Ok(Err(msg)) => sections.push(format!("## Subtask {n} — ERROR\n\n{msg}")),
+            Err(_) => sections.push(format!("## Subtask {n} — ERROR\n\n(subtask was cancelled)")),
+        }
+    }
+    let combined = sections.join("\n\n---\n\n");
+    // Surface partial success normally (so the orchestrator gets whatever
+    // completed); only flag `isError` when *every* subtask failed.
+    if ok_count == 0 {
+        Ok(tool_error(&combined))
+    } else {
+        Ok(json!({ "content": [{ "type": "text", "text": combined }] }))
+    }
+}
+
 fn tool_error(message: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": message }], "isError": true })
+}
+
+/// The `offload_batch` tool descriptor.
+fn offload_batch_tool() -> Value {
+    json!({
+        "name": "offload_batch",
+        "description": "Run several offload subtasks IN PARALLEL across the local worker's slots in a single call. Prefer this over issuing multiple `offload_task` calls when you want real concurrency: separate tool calls are serialized by the MCP client, but this one call fans its subtasks out to the app at once (bounded by the backend's slot count; extras queue). Each subtask is independent and self-contained; you get back all results, one section per subtask, with per-subtask errors inline.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "The subtasks to run in parallel (1–16). Each is independent.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "instructions": {
+                                "type": "string",
+                                "description": "A self-contained subtask. The local worker sees only this (plus optional context) and returns one synthesized answer."
+                            },
+                            "context": {
+                                "type": "string",
+                                "description": "Optional extra context (paths, prior findings) for this subtask."
+                            },
+                            "thinking": {
+                                "type": "string",
+                                "enum": ["auto", "off", "on"],
+                                "description": "Reasoning effort for this subtask. 'off' for deterministic extract/list, 'on' for genuine analysis, 'auto' (default) to let the worker decide."
+                            },
+                            "tier": {
+                                "type": "string",
+                                "enum": ["auto", "fast", "quality"],
+                                "description": "Backend bias for this subtask: 'fast', 'quality', or 'auto' (default)."
+                            }
+                        },
+                        "required": ["instructions"]
+                    }
+                }
+            },
+            "required": ["tasks"]
+        }
+    })
 }
 
 // ── Proxy toward the app's loopback endpoint ────────────────────────────
@@ -394,11 +567,17 @@ async fn proxy_run(
     tier: &str,
 ) -> Option<Result<String, String>> {
     let (base, token) = proxy_base()?;
-    let settings = current_offload_settings();
-    // Allow generous headroom over the app's own task timeout so the proxy
-    // doesn't cut a run the app is still finishing.
-    let timeout = Duration::from_secs(settings.offload_timeout_secs.max(30) + 30);
-    let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
+    // Short connect timeout to fast-detect "app not listening" (→ `None` →
+    // fallback). Deliberately NO overall request timeout: once connected we read
+    // the app's heartbeat-streamed `/run` body and rely on the per-chunk idle
+    // window below to tell a slow-but-alive job from a wedged one. That's the
+    // whole refactor — a long thinking job is waited out, never abandoned and
+    // re-executed locally where it would only contend for the same slot.
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .pool_max_idle_per_host(0)
+        .build()
+        .ok()?;
 
     // Forward this child's working directory (the session's project root) so
     // the app scopes native tools to the repo Claude is in, not the app's own
@@ -413,29 +592,90 @@ async fn proxy_run(
         "tier": tier,
         "cwd": cwd,
     });
-    let resp = client
+    let mut resp = match client
         .post(format!("{base}/run"))
         .bearer_auth(&token)
         .json(&body)
         .send()
         .await
-        .ok()?; // transport failure → fallback
-    let v: Value = resp.json().await.ok()?;
+    {
+        Ok(r) => r,
+        // Could not even get response headers → app unreachable → fallback.
+        Err(_) => return None,
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        return Some(Err(format!(
+            "offload app returned {status}: {}",
+            txt.chars().take(300).collect::<String>()
+        )));
+    }
+
+    // Read the NDJSON body chunk by chunk. As long as bytes (heartbeats or the
+    // result) keep arriving within IDLE, the app is alive — wait however long
+    // the job takes. A full IDLE gap means it wedged: surface an error rather
+    // than fall back (a local re-run would just fight for the busy slot).
+    const IDLE: Duration = Duration::from_secs(45);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut result: Option<Result<String, String>> = None;
+    loop {
+        match tokio::time::timeout(IDLE, resp.chunk()).await {
+            Err(_) => {
+                return Some(Err(
+                    "offload worker stopped responding (no heartbeat) — it may be stuck; \
+                     not retried locally"
+                        .into(),
+                ))
+            }
+            Ok(Ok(Some(bytes))) => {
+                buf.extend_from_slice(&bytes);
+                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let raw: Vec<u8> = buf.drain(..=nl).collect();
+                    if let Some(r) = parse_run_line(&raw) {
+                        result = Some(r);
+                    }
+                }
+            }
+            Ok(Ok(None)) => break, // EOF (connection closed)
+            Ok(Err(e)) => return Some(Err(format!("offload stream error: {e}"))),
+        }
+    }
+    // A trailing unterminated line (e.g. a one-shot non-streamed error body
+    // that carries no final newline).
+    if result.is_none() && !buf.is_empty() {
+        if let Some(r) = parse_run_line(&buf) {
+            result = Some(r);
+        }
+    }
+    Some(result.unwrap_or_else(|| Err("offload stream ended without a result".into())))
+}
+
+/// Parse one NDJSON line from the streamed `/run` body. Returns `None` for a
+/// heartbeat (`{"hb":true}`) or unparseable line, `Some(Ok(text))` for the
+/// final success line, `Some(Err(..))` for a task-level error line.
+fn parse_run_line(raw: &[u8]) -> Option<Result<String, String>> {
+    let line = std::str::from_utf8(raw).ok()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v.get("hb").is_some() {
+        return None; // heartbeat
+    }
     let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
     if ok {
-        let text = v
+        Some(Ok(v
             .get("text")
             .and_then(|t| t.as_str())
             .unwrap_or_default()
-            .to_string();
-        Some(Ok(text))
+            .to_string()))
     } else {
-        let err = v
+        Some(Err(v
             .get("error")
             .and_then(|e| e.as_str())
             .unwrap_or("offload failed")
-            .to_string();
-        Some(Err(err))
+            .to_string()))
     }
 }
 
@@ -675,6 +915,12 @@ async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u
 /// Resolve, probe, and route the configured backend pool, then run the
 /// agent loop against the chosen backend. On a connection-class failure it
 /// asks the router for one fail-over backend and retries once.
+/// Bounds how many self-contained agent loops the **child** runs at once when
+/// the app isn't reachable. The proxy path is gated app-side; this degraded
+/// fallback has no global gate, so without this an `offload_batch` of N tasks
+/// would open N simultaneous streams to a one- or two-slot server.
+static CHILD_GATE: Semaphore = Semaphore::const_new(3);
+
 async fn run_offload(
     instructions: String,
     context: Option<String>,
@@ -833,21 +1079,44 @@ async fn run_on_backend(
         model: None,
         max_steps: settings.max_steps.max(1),
         budget_tokens: view.per_slot_budget(),
+        n_ctx: view.n_ctx,
+        slots: view.slots,
         per_tool_result_token_cap: settings.per_tool_result_token_cap.max(256),
         auth_token: backend.auth_token.clone(),
+        per_call_timeout: Duration::from_secs(settings.offload_timeout_secs.max(30)),
     };
     let task = OffloadTask {
         instructions: instructions.to_string(),
-        context,
+        context: context.clone(),
         thinking,
     };
-    let deadline = Instant::now() + Duration::from_secs(settings.offload_timeout_secs.max(30));
+    let secs = settings.offload_timeout_secs.max(30);
+    let deadline = Instant::now() + Duration::from_secs(secs);
     // Self-contained child path: no external cancel source, so a never-tripped
     // token. The request is still bounded by the deadline and the stream.
     let cancel = tokio_util::sync::CancellationToken::new();
-    agent::run(client, &cfg, &router, task, deadline, &cancel)
-        .await
-        .map_err(|e| e.to_string())
+    // Bound concurrent self-contained runs — this fallback path has no app-side
+    // slot gate (acquire is infallible; the semaphore is never closed).
+    let _permit = CHILD_GATE.acquire().await.expect("CHILD_GATE never closed");
+    // The headless child path doesn't feed the dashboard run log → no trace.
+    let first = agent::run(client, &cfg, &router, task, deadline, None, &cancel).await;
+    // Mirror the app's On→Auto retry: a `thinking:on` run that produced no
+    // answer (the model spent its output budget thinking) gets one more shot
+    // with `auto`. Without this, the degraded child path surfaces a hard error
+    // for a task the app path would have recovered.
+    let result = match first {
+        Err(AppError::OffloadNoAnswer(_)) if thinking == ThinkingMode::On => {
+            let task = OffloadTask {
+                instructions: instructions.to_string(),
+                context,
+                thinking: ThinkingMode::Auto,
+            };
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            agent::run(client, &cfg, &router, task, deadline, None, &cancel).await
+        }
+        other => other,
+    };
+    result.map_err(|e| e.to_string())
 }
 
 /// Whether an agent-loop error looks like a transport/connection failure
@@ -856,6 +1125,7 @@ async fn run_on_backend(
 fn is_connection_error(e: &str) -> bool {
     let e = e.to_lowercase();
     e.contains("chat request failed")
+        || e.contains("chat stream failed")
         || e.contains("connection")
         || e.contains("timed out")
         || e.contains("timeout")
@@ -867,4 +1137,31 @@ fn is_connection_error(e: &str) -> bool {
 fn current_offload_settings() -> OffloadSettings {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     crate::settings::load_readonly(&cwd).offload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_run_line_skips_heartbeats_and_blanks() {
+        assert!(parse_run_line(b"{\"hb\":true}\n").is_none());
+        assert!(parse_run_line(b"   \n").is_none());
+        assert!(parse_run_line(b"not json").is_none());
+    }
+
+    #[test]
+    fn parse_run_line_reads_success_and_error() {
+        let ok = parse_run_line(b"{\"ok\":true,\"text\":\"done\"}\n");
+        assert_eq!(ok, Some(Ok("done".to_string())));
+
+        let err = parse_run_line(b"{\"ok\":false,\"error\":\"no backend\"}");
+        assert_eq!(err, Some(Err("no backend".to_string())));
+
+        // `ok:false` with no message falls back to a generic error.
+        assert_eq!(
+            parse_run_line(b"{\"ok\":false}"),
+            Some(Err("offload failed".to_string()))
+        );
+    }
 }

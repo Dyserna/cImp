@@ -120,14 +120,25 @@ pub struct ChatRequest {
     /// when streaming, so we still get `prompt_tokens` for budget policing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<serde_json::Value>,
+    /// Hard ceiling on generated tokens (`n_predict`). Set from the slot's free
+    /// context so `prompt + generation` can't exceed `n_ctx` — the server stops
+    /// cleanly at the cap instead of running into the context wall and dropping
+    /// the stream. `None` leaves generation unbounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct ChatResponse {
     #[serde(default)]
     pub choices: Vec<Choice>,
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// Measured generation throughput (tokens/sec) from the server's `timings`,
+    /// used to size the next request's `max_tokens` to its time budget. `None`
+    /// if the server didn't report it. Not a wire field on requests.
+    #[serde(default)]
+    pub gen_tps: Option<f32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -135,10 +146,14 @@ pub struct Choice {
     pub message: ChatMessage,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub prompt_tokens: u32,
+    /// Generated (output) tokens for the request. Reported on the streamed
+    /// final usage chunk; surfaced per-call in the run log. `0` if absent.
+    #[serde(default)]
+    pub completion_tokens: u32,
 }
 
 // ── Streaming (SSE) wire types ────────────────────────────────────────────
@@ -157,6 +172,19 @@ pub struct ChatChunk {
     /// Present only on the final usage chunk (`stream_options.include_usage`).
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// llama.cpp's per-request `timings`, carried on the final chunk. We read
+    /// `predicted_per_second` to size the next request's output budget.
+    #[serde(default)]
+    pub timings: Option<Timings>,
+}
+
+/// llama.cpp generation timings (final chunk only). Only the generation rate
+/// is modeled.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Timings {
+    /// Tokens generated per second for this request.
+    #[serde(default)]
+    pub predicted_per_second: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,12 +225,16 @@ pub struct StreamAccumulator {
     content: String,
     tool_calls: Vec<ToolCall>,
     usage: Option<Usage>,
+    gen_tps: Option<f32>,
 }
 
 impl StreamAccumulator {
     pub fn push_chunk(&mut self, chunk: ChatChunk) {
         if let Some(u) = chunk.usage {
             self.usage = Some(u);
+        }
+        if let Some(t) = chunk.timings.and_then(|t| t.predicted_per_second) {
+            self.gen_tps = Some(t);
         }
         for choice in chunk.choices {
             if let Some(c) = choice.delta.content {
@@ -253,6 +285,7 @@ impl StreamAccumulator {
                 },
             }],
             usage: self.usage,
+            gen_tps: self.gen_tps,
         }
     }
 }
@@ -323,10 +356,14 @@ mod tests {
             &mut acc,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"code_search","arguments":"{}"}}]}}]}"#,
         );
-        // Final usage chunk (empty choices).
-        feed(&mut acc, r#"{"choices":[],"usage":{"prompt_tokens":42}}"#);
+        // Final usage chunk (empty choices) carrying usage + timings.
+        feed(
+            &mut acc,
+            r#"{"choices":[],"usage":{"prompt_tokens":42},"timings":{"predicted_per_second":172.3}}"#,
+        );
 
         let resp = acc.into_response();
+        assert_eq!(resp.gen_tps, Some(172.3));
         let msg = &resp.choices[0].message;
         assert_eq!(msg.content.as_deref(), Some("Hello"));
         assert_eq!(msg.tool_calls.len(), 2);

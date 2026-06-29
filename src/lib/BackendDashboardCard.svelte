@@ -44,7 +44,8 @@
     }
   }
 
-  // ── Raw log (Local only) ──────────────────────────────────────────────
+  // ── Offload runs (run log) + raw log ──────────────────────────────────
+  let showRuns = $state(false);
   let showLog = $state(false);
   let logLines = $state<string[]>([]);
   let logEl = $state<HTMLElement | null>(null);
@@ -77,6 +78,24 @@
   }
   function fmtTps(n: number | null | undefined): string {
     return n == null ? '—' : `${Math.round(n)} tok/s`;
+  }
+  // Outcome → color, applied via a `style:` directive (always wins over the
+  // stylesheet, never pruned). Hardcoded hex — NOT theme vars — so it can't be
+  // remapped to a theme's coral/magenta. green=success, red=failed,
+  // amber=recovered, blue=running.
+  function outcomeColor(outcome: string): string {
+    switch (outcome) {
+      case 'success':
+        return '#3fb950';
+      case 'failed':
+        return '#f85149';
+      case 'recovered':
+        return '#d29922';
+      case 'running':
+        return '#58a6ff';
+      default:
+        return '#6e7681';
+    }
   }
   function clampPct(n: number): number {
     return Math.max(0, Math.min(100, n));
@@ -210,6 +229,65 @@
     </div>
   {:else}
     <div class="status">{stateText()}</div>
+  {/if}
+
+  {#if metrics.runs.length > 0}
+    <div class="runs">
+      <button type="button" class="runs-toggle" onclick={() => (showRuns = !showRuns)}>
+        <span class="caret" class:open={showRuns}>▸</span> Offload runs
+        <span class="muted">({metrics.runs.length})</span>
+      </button>
+      {#if showRuns}
+        <div class="runs-view">
+          {#each metrics.runs as run (run.id)}
+            <details class="run" style:border-left-color={outcomeColor(run.outcome)}>
+              <summary class="run-sum">
+                <span
+                  class="run-dot"
+                  class:running={run.outcome === 'running'}
+                  style:background={outcomeColor(run.outcome)}
+                ></span>
+                <span class="run-id">#{run.id}</span>
+                <span class="run-mode" title="thinking mode">{run.thinking}</span>
+                <span class="run-instr" title={run.instructions}>{run.instructions || '(no instructions)'}</span>
+                <span class="run-meta">
+                  {run.calls.length} call{run.calls.length === 1 ? '' : 's'}{#if run.ended_ms}
+                    · {((run.ended_ms - run.started_ms) / 1000).toFixed(1)}s{/if}
+                  · <span class="run-outcome" style:color={outcomeColor(run.outcome)}>{run.outcome}</span>
+                </span>
+              </summary>
+              <div class="run-calls">
+                {#if run.calls.length === 0}
+                  <div class="crow muted">No calls recorded{run.outcome === 'running' ? ' yet…' : '.'}</div>
+                {:else}
+                  {#each run.calls as c, i (i)}
+                    <div class="crow">
+                      <span class="ckind {c.kind}">{c.kind}{#if c.thinking} 🧠{/if}</span>
+                      <span class="cstep">step {c.step}</span>
+                      <span
+                        class="ctok"
+                        title="{c.prompt_tokens.toLocaleString()} prompt + {c.output_tokens.toLocaleString()} output"
+                      >
+                        {(c.prompt_tokens + c.output_tokens).toLocaleString()} tok
+                        <span class="muted">· {c.output_tokens.toLocaleString()} out</span>
+                      </span>
+                      <span class="cdur">{(c.duration_ms / 1000).toFixed(1)}s</span>
+                      <span class="ctps">{Math.round(c.tps)} tok/s</span>
+                      <span
+                        class="cresult"
+                        class:bad={c.result === 'empty' ||
+                          c.result === 'leaked' ||
+                          c.result.startsWith('error')}>{c.result}</span
+                      >
+                    </div>
+                  {/each}
+                {/if}
+              </div>
+            </details>
+          {/each}
+        </div>
+      {/if}
+    </div>
   {/if}
 
   {#if isLocal}
@@ -466,6 +544,145 @@
   .rawline {
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  /* ── Offload runs (run log) ── */
+  .runs {
+    margin-top: 0.6rem;
+    border-top: 1px solid var(--border-subtle, #21262d);
+    padding-top: 0.5rem;
+  }
+  .runs-toggle {
+    background: none;
+    border: none;
+    color: var(--text-secondary, #8b949e);
+    cursor: pointer;
+    font: inherit;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.2rem 0;
+  }
+  .runs-view {
+    margin-top: 0.4rem;
+    max-height: 18rem;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .run {
+    border: 1px solid var(--border-subtle, #21262d);
+    /* Outcome accent set inline (border-left-color) — green=success,
+       red=failed, amber=recovered, blue=running. */
+    border-left: 3px solid var(--text-tertiary, #6e7681);
+    border-radius: 4px;
+    background: var(--surface-sunken, #161b22);
+  }
+  .run-sum {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    cursor: pointer;
+    font-size: 0.85em;
+    list-style: none;
+  }
+  .run-sum::-webkit-details-marker {
+    display: none;
+  }
+  .run-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    /* background color set inline from the outcome. */
+    background: var(--text-tertiary, #6e7681);
+  }
+  .run-dot.running {
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+  /* Run-log text uses hardcoded neutrals (not the --text-* tokens, which
+     follow the terminal palette's --term-fg and can render pink/magenta) so the
+     diagnostic panel stays legible in any palette. */
+  .run-id {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    color: #6e7681;
+    flex: 0 0 auto;
+  }
+  .run-mode {
+    flex: 0 0 auto;
+    text-transform: uppercase;
+    font-size: 0.78em;
+    letter-spacing: 0.04em;
+    color: #8b949e;
+    border: 1px solid var(--border-subtle, #21262d);
+    border-radius: 3px;
+    padding: 0 0.25rem;
+  }
+  .run-instr {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #adbac7;
+  }
+  .run-meta {
+    flex: 0 0 auto;
+    color: #768390;
+    font-size: 0.92em;
+  }
+  .run-outcome {
+    /* color set inline from the outcome. */
+    font-weight: 600;
+  }
+  .run-calls {
+    border-top: 1px solid var(--border-subtle, #21262d);
+    padding: 0.25rem 0.5rem 0.4rem;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.82em;
+    line-height: 1.5;
+    /* Hardcoded neutral text — NOT the --text-* tokens, which follow the
+       terminal palette's --term-fg and can be pink/magenta. The run log is a
+       diagnostic table; it should stay legible in any palette. */
+    color: #adbac7;
+  }
+  .run-calls .muted {
+    color: #6e7681;
+  }
+  .crow {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    white-space: nowrap;
+  }
+  .ckind {
+    flex: 0 0 6.5rem;
+    color: #8b949e;
+  }
+  .ckind.final {
+    color: #58a6ff;
+  }
+  .cstep {
+    flex: 0 0 3.5rem;
+    color: #6e7681;
+  }
+  .ctok {
+    flex: 0 0 auto;
+  }
+  .cdur,
+  .ctps {
+    flex: 0 0 auto;
+    color: #768390;
+  }
+  .cresult {
+    flex: 1 1 auto;
+    text-align: right;
+    color: #768390;
+  }
+  .cresult.bad {
+    color: #f85149;
+    font-weight: 600;
   }
   code {
     font-family: var(--font-mono, ui-monospace, monospace);

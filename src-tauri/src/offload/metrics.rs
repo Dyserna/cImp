@@ -58,6 +58,49 @@ pub struct RequestRecord {
     pub avg_tps: f32,
 }
 
+/// One LLM call within an offload run (a single agent step, or the forced-
+/// final synthesis), captured for the run log's expandable detail.
+#[derive(Clone, Debug, Serialize)]
+pub struct CallRecord {
+    /// 0-based agent step index. The forced-final synthesis reuses the step it
+    /// fired on and is distinguished by `kind == "final"`.
+    pub step: u32,
+    /// `"planning"` (step 0) | `"ingestion"` (tool turns) | `"final"`.
+    pub kind: String,
+    /// Whether thinking was enabled for this call.
+    pub thinking: bool,
+    /// Server-reported prompt (input) tokens for this call (`0` if unknown).
+    pub prompt_tokens: u32,
+    /// Generated (output) tokens for this call (`0` if unknown).
+    pub output_tokens: u32,
+    /// Wall-clock duration of the call, milliseconds.
+    pub duration_ms: u64,
+    /// Measured generation rate (tokens/sec) for this call (`0` if unknown).
+    pub tps: f32,
+    /// What the call produced: `"tool_calls(N)"` | `"answer"` | `"empty"` |
+    /// `"leaked"` | `"error"`.
+    pub result: String,
+}
+
+/// One offload run — a single `offload_task` — for the run log. Every LLM call
+/// is grouped under one `id` so the dashboard can show job → calls, and the
+/// `outcome` drives the row color (failed = red, recovered = amber).
+#[derive(Clone, Debug, Serialize)]
+pub struct RunRecord {
+    pub id: u64,
+    /// Truncated instruction text — the job's headline.
+    pub instructions: String,
+    /// Initial thinking mode requested: `"on"` | `"off"` | `"auto"`.
+    pub thinking: String,
+    pub started_ms: u64,
+    /// `0` while the run is still in flight.
+    pub ended_ms: u64,
+    /// `"running"` | `"success"` | `"recovered"` (on→auto retry worked) |
+    /// `"failed"`.
+    pub outcome: String,
+    pub calls: Vec<CallRecord>,
+}
+
 /// A full dashboard snapshot.
 #[derive(Clone, Debug, Serialize)]
 pub struct ServerMetrics {
@@ -95,6 +138,10 @@ pub struct ServerMetrics {
     pub metrics_available: bool,
     /// Completed requests, newest first.
     pub history: Vec<RequestRecord>,
+    /// Offload runs (one per `offload_task`), newest first, each grouping its
+    /// LLM calls. Stamped onto the snapshot by the service's emit loop from its
+    /// per-backend run store (the poller itself doesn't track app-level runs).
+    pub runs: Vec<RunRecord>,
 }
 
 /// One backend's dashboard card for the Offload Server tab. Wraps the live
@@ -132,6 +179,7 @@ impl ServerMetrics {
             queue_depth: 0,
             metrics_available: false,
             history: Vec::new(),
+            runs: Vec::new(),
         }
     }
 
@@ -268,6 +316,8 @@ impl MetricsPoller {
             queue_depth: 0,
             metrics_available,
             history: self.history.iter().cloned().collect(),
+            // Stamped by the service emit loop from its per-backend run store.
+            runs: Vec::new(),
         }
     }
 

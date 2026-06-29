@@ -540,8 +540,11 @@ impl OffloadSupervisor {
             model: None,
             max_steps: snap.max_steps.max(1),
             budget_tokens: server.per_slot_budget(snap.budget_high_water_pct),
+            n_ctx: server.n_ctx(),
+            slots: server.slots(),
             per_tool_result_token_cap: snap.per_tool_result_token_cap.max(256),
             auth_token: None,
+            per_call_timeout: timeout,
         };
         let task = super::agent::OffloadTask {
             instructions,
@@ -551,7 +554,7 @@ impl OffloadSupervisor {
         let deadline = std::time::Instant::now() + timeout;
         // Self-test path: no external cancel source.
         let cancel = tokio_util::sync::CancellationToken::new();
-        super::agent::run(server.client(), &cfg, &router, task, deadline, &cancel).await
+        super::agent::run(server.client(), &cfg, &router, task, deadline, None, &cancel).await
     }
 }
 

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-06-29
+
 ### Changed
 
 - **OpenCode replaces Aider (V19).** The two Aider AI-tool tabs are replaced by

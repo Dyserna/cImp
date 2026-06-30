@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-06-30
+
+Fullscreen-only AI tabs + out-of-band TTS (milestone V20). Both **Claude Code**
+and **OpenCode** now run their **native fullscreen TUI**, and text-to-speech is
+sourced from each tool's structured side channel instead of scraping the
+terminal. (Version jumps 0.23 → 0.30, skipping the unused 0.24–0.29.)
+
+### Changed
+
+- **AI tabs launch fullscreen.** Removed the two settings that forced an inline
+  renderer — OpenCode's `--mini` (which hid commands like `/connect`) and
+  Claude's `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. Both tools now run their full
+  native TUI with the complete command palette.
+- **TTS is out-of-band.** Speech no longer comes from scraping `[[TTS]]` markers
+  out of the terminal. A new `oob` layer reads assistant prose from structured
+  sources and feeds the existing segmenter/synthesizer unchanged:
+  - **Claude** — tails the session transcript JSONL
+    (`~/.claude/projects/<slug>/<id>.jsonl`), speaking each assistant text block
+    (skipping `thinking`/tool blocks).
+  - **OpenCode** — taps the fullscreen TUI's `GET /event` SSE stream (cImp
+    launches it with a known `--port`), speaking each assistant message on
+    completion and **excluding reasoning** parts. The same stream drives the
+    avatar Thinking/Idle state.
+  - Assistant markdown is reduced to speakable prose (fenced code blocks and
+    markup dropped) before segmentation.
+- **Mouse stays local in AI tabs.** A fullscreen TUI enables mouse tracking,
+  which would route drags/clicks to the app and break local selection. cImp now
+  suppresses mouse tracking for AI tabs so drag-to-select, copy-on-select,
+  right-click paste, and Ctrl+right-click speak-selection all behave like a
+  shell — with a **hold-Alt bypass** to hand the mouse to the app when needed.
+  Shell tabs are unaffected.
+
+### Removed
+
+- The terminal **TTS-scraping pipeline** (the `[[TTS]]` marker convention, its
+  runtime prompt injection for AI tabs, and the tag scanner). The processing
+  layer is now a raw-stream forwarder plus the cell model used by permission
+  detection.
+- The per-tab **"TTS all output"** (`speak_all` / `tts_all_output`) mode and its
+  context-menu toggle — it rode the scrape path and doesn't map onto structured
+  sources.
+
+### Fixed
+
+- OpenCode no longer announces a spurious **"idle"** notification on tab open
+  (the fullscreen startup paint tripped the byte-burst activity fallback, which
+  is now skipped for tabs whose Thinking/Idle is event-driven).
+
+### Migrated
+
+- v19 → v20: strips any stored `--mini` from AI-tab `args` and drops the retired
+  `tts_all_output` field; `copy_on_select` and everything else are preserved. A
+  `settings.json.v19.bak` backup is written before the rewrite.
+
 ## [0.23.0] — 2026-06-30
 
 ### Changed

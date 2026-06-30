@@ -3,7 +3,6 @@ mod phonemize;
 mod voice;
 mod worker;
 
-pub use engine::TtsEngine;
 pub use worker::spawn_tts_worker;
 
 use std::path::PathBuf;

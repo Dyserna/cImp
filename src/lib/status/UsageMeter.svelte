@@ -29,12 +29,16 @@
   let now = $state(Date.now());
 
   const usage = $derived($settings.usage);
+  // The Claude Code usage quota only makes sense when the subscription Claude
+  // tab is enabled — it's that tab's session/weekly limit. With Claude
+  // disabled there's nothing to meter, so the widget hides and stops polling.
+  const claudeTabEnabled = $derived($settings.enabled_ai_tabs.includes('claude'));
   // Derive the individual primitives the effects depend on, rather than the
   // whole `usage` object. Svelte only re-runs an effect when a value it reads
   // actually changes, so this keeps the poll/tick effects from re-arming (and
   // re-fetching) on unrelated settings edits — and collapses the
   // default→loaded settings swap at startup into a single fetch.
-  const enabled = $derived(usage.enabled);
+  const enabled = $derived(usage.enabled && claudeTabEnabled);
   // Coerce a non-finite interval to the floor: `Math.max(MIN, NaN)` is NaN →
   // setTimeout(…, NaN) coerces to 0 and busy-polls the usage endpoint.
   const pollMs = $derived(
@@ -187,7 +191,7 @@
   ]);
 </script>
 
-{#if usage.enabled && visible}
+{#if enabled && visible}
   <div
     class="usage-meter"
     title={rateLimited && !snapshot ? 'Claude Code usage — rate limited, retrying…' : 'Claude Code usage'}

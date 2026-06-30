@@ -69,6 +69,9 @@ export interface AvatarSettings {
 }
 
 export interface TtsSettings {
+  /// Master enable for TTS. When false the Kokoro model is unloaded and no
+  /// synthesis runs; distinct from `mute` (which keeps the model loaded).
+  enabled: boolean;
   voice: string;
   speed: number;
   volume: number;
@@ -775,6 +778,7 @@ export function defaultSettings(): Settings {
   return {
     schema_version: CURRENT_SCHEMA_VERSION,
     tts: {
+      enabled: true,
       voice: 'af_heart',
       speed: 1.0,
       volume: 1.0,

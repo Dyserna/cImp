@@ -52,18 +52,35 @@ pub(crate) enum CaptureCmd {
     Cancel,
 }
 
-/// `.manage`d handle: just the command channel into the capture thread.
+/// Message to the transcription worker. Finished recordings (`Transcribe`)
+/// arrive from the capture thread; `Preload`/`Unload` arrive from the IPC layer
+/// when `stt.enabled` toggles, so the Whisper model is loaded on enable and
+/// dropped (freeing CPU/GPU memory) on disable. All three ride one channel so
+/// the worker can stay a simple single-`recv` loop.
+pub(crate) enum WorkerMsg {
+    Transcribe(Vec<f32>),
+    Preload,
+    Unload,
+}
+
+/// `.manage`d handle: the command channel into the capture thread plus a
+/// control channel into the transcription worker (for model load/unload).
 /// Recording state and transcripts flow back to the frontend via the
 /// `stt-state` / `stt-transcription` events, not through this handle. The
 /// `Mutex<Sender>` keeps it `Send + Sync` for `AppState`.
 pub struct SttHandle {
     cmd_tx: Mutex<Sender<CaptureCmd>>,
+    worker_tx: Mutex<Sender<WorkerMsg>>,
 }
 
 /// The receiver/shared-cell half handed to [`spawn`] in the Tauri `setup`
 /// hook (which is where the AppHandle the threads need becomes available).
 pub struct SttRuntime {
     cmd_rx: mpsc::Receiver<CaptureCmd>,
+    /// Sender the capture thread uses to hand finished recordings to the worker.
+    jobs_tx: Sender<WorkerMsg>,
+    /// The worker's receiving end (jobs + preload/unload control).
+    jobs_rx: mpsc::Receiver<WorkerMsg>,
     recording: Arc<AtomicBool>,
     state: Arc<RwLock<SttState>>,
     mic: Arc<RwLock<RingBuffer>>,
@@ -74,14 +91,22 @@ impl SttHandle {
     /// `AppState`; the runtime is stashed until `setup` calls [`spawn`].
     pub fn new() -> (Self, SttRuntime) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
+        // One channel feeds the worker both transcription jobs (from capture)
+        // and load/unload control (from the IPC layer); the handle keeps a
+        // clone of the sender for the latter.
+        let (jobs_tx, jobs_rx) = mpsc::channel::<WorkerMsg>();
+        let worker_tx = jobs_tx.clone();
         let recording = Arc::new(AtomicBool::new(false));
         let state = Arc::new(RwLock::new(SttState::Idle));
         let mic = Arc::new(RwLock::new(RingBuffer::new(MIC_RING_CAPACITY)));
         let handle = Self {
             cmd_tx: Mutex::new(cmd_tx),
+            worker_tx: Mutex::new(worker_tx),
         };
         let runtime = SttRuntime {
             cmd_rx,
+            jobs_tx,
+            jobs_rx,
             recording,
             state,
             mic,
@@ -97,6 +122,14 @@ impl SttHandle {
         }
     }
 
+    fn send_worker(&self, msg: WorkerMsg) {
+        if let Ok(tx) = self.worker_tx.lock() {
+            if tx.send(msg).is_err() {
+                warn!(target: "stt", "transcription worker gone; control message dropped");
+            }
+        }
+    }
+
     pub fn start(&self) {
         self.send(CaptureCmd::Start);
     }
@@ -107,6 +140,19 @@ impl SttHandle {
 
     pub fn cancel(&self) {
         self.send(CaptureCmd::Cancel);
+    }
+
+    /// Eagerly load the Whisper model (on the worker thread, off the UI). Sent
+    /// when `stt.enabled` flips on so the first dictation isn't slowed by a
+    /// cold model load.
+    pub fn preload(&self) {
+        self.send_worker(WorkerMsg::Preload);
+    }
+
+    /// Drop the loaded Whisper model, freeing its memory. Sent when
+    /// `stt.enabled` flips off.
+    pub fn unload(&self) {
+        self.send_worker(WorkerMsg::Unload);
     }
 }
 
@@ -120,14 +166,13 @@ pub fn spawn(app: AppHandle, settings: SettingsHandle, runtime: SttRuntime) {
     // in, touching whisper/ggml symbols here triggers GPU backend init
     // (device enumeration) and stalls setup, so the main window never gets
     // shown or titled. Keep this function to channel/thread wiring only.
-    let (jobs_tx, jobs_rx) = mpsc::channel::<Vec<f32>>();
-    worker::spawn_stt_worker(app.clone(), settings.clone(), jobs_rx, runtime.state.clone());
+    worker::spawn_stt_worker(app.clone(), settings.clone(), runtime.jobs_rx, runtime.state.clone());
     spawn_mic_streamer(app.clone(), runtime.recording.clone(), runtime.mic.clone());
     capture::spawn_capture_thread(
         app,
         settings,
         runtime.cmd_rx,
-        jobs_tx,
+        runtime.jobs_tx,
         runtime.recording,
         runtime.state,
         runtime.mic,

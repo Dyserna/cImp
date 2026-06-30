@@ -363,12 +363,6 @@ impl Settings {
         self.tabs.iter_mut().find(|t| t.id() == id)
     }
 
-    /// Whether the given tab is in "speak all output" mode — true only for
-    /// an AI tab with `tts_all_output` set. Read live by the per-tab
-    /// processor on each settings broadcast. Unknown / shell tabs are false.
-    pub fn tab_speak_all_output(&self, id: &str) -> bool {
-        matches!(self.find_tab(id), Some(TabConfig::AiTool(c)) if c.tts_all_output)
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]

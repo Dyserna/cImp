@@ -230,16 +230,18 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
 
 /// Compose the capability-guidance addendum shared by Claude
 /// (`--append-system-prompt`) and OpenCode (the managed instructions file):
-/// the per-tab TTS-markup convention (gated on `tts_injection.enabled`), the
-/// offload nudge (gated on `offload.enabled && offload.inject_guidance`), and
-/// the code-graph nudge (gated on `graph.enabled`, with the semantic addendum
-/// when `graph.semantic_search`). Sections are joined by a blank line. Reusing
-/// the exact same sources keeps both agents in lockstep.
-fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> String {
+/// the offload nudge (gated on `offload.enabled && offload.inject_guidance`)
+/// and the code-graph nudge (gated on `graph.enabled`, with the semantic
+/// addendum when `graph.semantic_search`). Sections are joined by a blank line.
+/// Reusing the exact same sources keeps both agents in lockstep.
+///
+/// V20: the `[[TTS]]` markup convention is NO LONGER injected — AI tabs are
+/// fullscreen and TTS is sourced out-of-band (`crate::oob`), which speaks all
+/// assistant prose directly. The per-tab `tts_injection.enabled` flag is now
+/// the "speak this tab" gate read by the out-of-band sources, not a prompt
+/// injection toggle; `tts_injection.instructions` is vestigial.
+fn compose_capability_guidance(_cfg: &AiToolTabConfig, settings: &Settings) -> String {
     let mut addendum = String::new();
-    if cfg.tts_injection.enabled && !cfg.tts_injection.instructions.is_empty() {
-        addendum.push_str(&cfg.tts_injection.instructions);
-    }
     if settings.offload.enabled && settings.offload.inject_guidance {
         if !addendum.is_empty() {
             addendum.push_str("\n\n");
@@ -555,15 +557,14 @@ mod tests {
     }
 
     #[test]
-    fn tts_and_statusline_coexist() {
-        // A default Claude tab has TTS injection enabled; with the status
+    fn guidance_and_statusline_coexist() {
+        // V20: TTS markup is no longer injected, but capability guidance
+        // (graph/offload) still feeds --append-system-prompt; with the status
         // line also on, both pre-arg pairs are present.
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
-        let mut cfg = claude_cfg();
-        cfg.tts_injection.enabled = true;
-        cfg.tts_injection.instructions = "wrap prose".to_string();
-        let args = build_pre_args(&cfg, &settings);
+        settings.graph.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
 
         assert!(args.iter().any(|a| a == "--append-system-prompt"));
         assert!(args.iter().any(|a| a == "--settings"));
@@ -584,21 +585,20 @@ mod tests {
     }
 
     #[test]
-    fn offload_guidance_merges_with_tts_addendum() {
+    fn offload_and_graph_guidance_merge_into_one_flag() {
+        // V20: with both offload and graph guidance on, they merge into a
+        // single --append-system-prompt (TTS markup no longer participates).
         let mut settings = Settings::default();
         settings.offload.enabled = true;
         settings.offload.inject_guidance = true;
-        let mut cfg = claude_cfg();
-        cfg.tts_injection.enabled = true;
-        cfg.tts_injection.instructions = "wrap prose".to_string();
-        let args = build_pre_args(&cfg, &settings);
+        settings.graph.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
 
-        // Exactly one --append-system-prompt, carrying both addenda.
         let count = args.iter().filter(|a| *a == "--append-system-prompt").count();
         assert_eq!(count, 1, "addenda must merge into one flag");
         let i = args.iter().position(|a| a == "--append-system-prompt").unwrap();
-        assert!(args[i + 1].contains("wrap prose"));
         assert!(args[i + 1].contains("offload_task"));
+        assert!(args[i + 1].contains("graph_find_symbol"));
     }
 
     #[test]
@@ -767,10 +767,11 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_references_instructions_when_tts_enabled() {
-        // The default opencode tab has TTS injection enabled with the runtime
-        // prompt, so the config references the managed instructions file.
-        let settings = Settings::default();
+    fn opencode_config_references_instructions_when_guidance_applies() {
+        // V20: TTS markup is no longer injected, so the instructions file is
+        // referenced only when capability guidance (graph/offload) applies.
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
         let cfg = build_opencode_config(&opencode_cfg(), &settings);
         let path = cfg["instructions"][0].as_str().expect("instructions path");
         assert!(path.ends_with(".md"), "got: {path}");
@@ -779,10 +780,10 @@ mod tests {
 
     #[test]
     fn opencode_config_no_instructions_when_no_guidance() {
-        let settings = Settings::default(); // offload + graph off
-        let mut cfg = opencode_cfg();
-        cfg.tts_injection.enabled = false; // and no TTS guidance
-        let config = build_opencode_config(&cfg, &settings);
+        // V20: default settings (offload + graph off) ⇒ no guidance ⇒ no
+        // instructions key, regardless of the (now-vestigial) tts_injection.
+        let settings = Settings::default();
+        let config = build_opencode_config(&opencode_cfg(), &settings);
         assert!(config.get("instructions").is_none(), "no guidance ⇒ no instructions key");
     }
 

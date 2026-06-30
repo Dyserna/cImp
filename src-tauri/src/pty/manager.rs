@@ -107,7 +107,9 @@ impl PtyManager {
         initial_rows: u16,
         initial_cols: u16,
         tts_segments: mpsc::Sender<TtsRequest>,
-        user_typed_tts: Arc<StdMutex<HashSet<String>>>,
+        // V20: retained for the registry's call shape; the processing layer no
+        // longer consumes a user-typed echo filter (TTS is out-of-band).
+        _user_typed_tts: Arc<StdMutex<HashSet<String>>>,
         state_signals: mpsc::Sender<StateSignal>,
         patterns: Arc<Vec<PermissionPattern>>,
     ) -> AppResult<()> {
@@ -232,9 +234,7 @@ impl PtyManager {
             bytes_rx,
             output_channel,
             control_rx,
-            tts_segments,
             cancel.clone(),
-            user_typed_tts,
             state_signals.clone(),
             settings,
             patterns,
@@ -491,7 +491,6 @@ mod tests {
     use crate::pty::tasks::spawn_processor;
     use crate::settings::SettingsHandle;
     use crate::state::TabId;
-    use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -536,10 +535,8 @@ mod tests {
 
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(16);
         let (control_tx, control_rx) = mpsc::channel::<ProcessorControl>(4);
-        let (tts_tx, _tts_rx) = mpsc::channel(1);
         let (state_tx, _state_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
-        let typed = Arc::new(StdMutex::new(HashSet::new()));
 
         // SettingsHandle uses defaults; no `.set()` is ever called so the
         // debounced saver task stays idle and never touches disk.
@@ -557,9 +554,7 @@ mod tests {
             bytes_rx,
             channel_a,
             control_rx,
-            tts_tx,
             cancel.clone(),
-            typed,
             state_tx,
             settings,
             patterns,
@@ -603,10 +598,8 @@ mod tests {
 
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(16);
         let (control_tx, control_rx) = mpsc::channel::<ProcessorControl>(8);
-        let (tts_tx, _tts_rx) = mpsc::channel(1);
         let (state_tx, _state_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
-        let typed = Arc::new(StdMutex::new(HashSet::new()));
         let defaults = crate::settings::Settings::default();
         let settings = SettingsHandle::new(
             defaults.clone(),
@@ -623,9 +616,7 @@ mod tests {
             bytes_rx,
             initial,
             control_rx,
-            tts_tx,
             cancel.clone(),
-            typed,
             state_tx,
             settings,
             patterns,

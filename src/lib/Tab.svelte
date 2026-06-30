@@ -16,7 +16,6 @@
     avatarState = 'Idle' as AvatarState,
     awaitingPermission = false,
     doneWhileAway = false,
-    ttsAllOutput = false,
     onclick,
     onclose,
     onnew,
@@ -42,9 +41,6 @@
     avatarState?: AvatarState;
     awaitingPermission?: boolean;
     doneWhileAway?: boolean;
-    /// When true, this AI tab speaks all output (ignores `[[TTS]]` markers);
-    /// shows a small speaker icon so the active mode is visible at a glance.
-    ttsAllOutput?: boolean;
     onclick: () => void;
     /// Invoked when the user confirms the close (or skips the confirm).
     /// Optional because builtin tabs render no close button.
@@ -229,21 +225,6 @@
         aria-label={`status: ${indicator}`}
       ></span>
     {/if}
-    {#if ttsAllOutput}
-      <svg
-        class="tts-icon"
-        viewBox="0 0 24 24"
-        width="13"
-        height="13"
-        aria-label="Speaking all output"
-        role="img"
-      >
-        <path
-          fill="currentColor"
-          d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.26 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"
-        />
-      </svg>
-    {/if}
     <span class="label">{label}</span>
     {#if onnew}
       <span
@@ -347,11 +328,6 @@
     height: 8px;
     border-radius: 50%;
     flex: 0 0 auto;
-  }
-  .tts-icon {
-    flex: 0 0 auto;
-    color: var(--accent);
-    opacity: 0.9;
   }
   .indicator-working {
     background: currentColor;

@@ -54,7 +54,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 19;
+pub const CURRENT_SCHEMA_VERSION: u8 = 20;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -557,13 +557,6 @@ pub struct AiToolTabConfig {
     /// `claude_local` settings group. Per-tab `env` entries override
     /// synthesized values.
     pub use_local_provider: bool,
-    /// When `true`, the processing layer speaks ALL new terminal output
-    /// for this tab (sentence-segmented, deduped) and ignores
-    /// `[[TTS]]…[[/TTS]]` markers entirely, rather than speaking only the
-    /// marked segments. Toggled from the tab's right-click menu; persists
-    /// in the per-folder overlay like any other per-tab field. Read live by
-    /// the per-tab processor via the settings broadcast — no tab restart.
-    pub tts_all_output: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -1472,9 +1465,7 @@ pub fn default_claude_tab() -> TabConfig {
         first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
-        use_local_provider: false,
-        tts_all_output: false,
-    })
+        use_local_provider: false,    })
 }
 
 /// V1.4-07: second Claude tab, preconfigured to talk to a local LLM
@@ -1504,9 +1495,7 @@ pub fn default_claude_local_tab() -> TabConfig {
         first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
-        use_local_provider: true,
-        tts_all_output: false,
-    })
+        use_local_provider: true,    })
 }
 
 /// V19: OpenCode AI-tool tab using whatever provider OpenCode's own config
@@ -1539,9 +1528,7 @@ pub fn default_opencode_tab() -> TabConfig {
         first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
-        use_local_provider: false,
-        tts_all_output: false,
-    })
+        use_local_provider: false,    })
 }
 
 /// Look up the default `TabConfig` for a reserved AI tab id. Used by

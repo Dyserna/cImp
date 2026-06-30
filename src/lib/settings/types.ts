@@ -284,11 +284,6 @@ export interface AiToolTabConfig {
   /// `claude_local` settings group. Per-tab `env` entries override
   /// synthesized values.
   use_local_provider: boolean;
-  /// When true, the processing layer speaks ALL new terminal output for this
-  /// tab (sentence-segmented, deduped) and ignores `[[TTS]]…[[/TTS]]` markers,
-  /// rather than speaking only the marked segments. Toggled from the tab's
-  /// right-click menu; surfaced as a speaker icon on the tab.
-  tts_all_output: boolean;
 }
 
 export interface ShellTabConfig {
@@ -914,9 +909,7 @@ export function defaultSettings(): Settings {
         first_launch_notice_dismissed: true,
         theme_override: null,
         background_override: null,
-        use_local_provider: false,
-        tts_all_output: false,
-      },
+        use_local_provider: false,      },
       {
         kind: 'ai_tool',
         id: CLAUDE_LOCAL_TAB_ID,
@@ -942,9 +935,7 @@ export function defaultSettings(): Settings {
         first_launch_notice_dismissed: true,
         theme_override: null,
         background_override: null,
-        use_local_provider: true,
-        tts_all_output: false,
-      },
+        use_local_provider: true,      },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
     session: { active_tab_id: null },

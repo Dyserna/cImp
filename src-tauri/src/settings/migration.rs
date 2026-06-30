@@ -185,6 +185,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.16", detect: looks_v1_16, transform: migrate_v1_16_to_v1_17_step },
     MigrationStep { from_version: "v1.17", detect: looks_v1_17, transform: migrate_v1_17_to_v1_18_step },
     MigrationStep { from_version: "v18", detect: looks_v18, transform: migrate_v18_to_v19_step },
+    MigrationStep { from_version: "v19", detect: looks_v19, transform: migrate_v19_to_v20_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -1735,10 +1736,59 @@ fn migrate_v18_to_v19(value: &mut Value) {
         }
     }
 
-    // 6. Stamp the new schema version (the final cascade step ⇒ CURRENT).
+    // 6. Stamp this step's target version. The cascade continues to v20.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(19u8)),
+    );
+}
+
+/// Is this a v19 file (schema_version == 19) that pre-dates the V20
+/// fullscreen-only switch?
+fn looks_v19(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 19)
+}
+
+fn migrate_v19_to_v20_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v19_to_v20(value)
+}
+
+/// V19 → V20: fullscreen-only AI tabs + out-of-band TTS.
+///
+/// - Strip any stored `--mini` from every tab's `args` (OpenCode now launches
+///   in its native fullscreen TUI; the flag was the inline-mode forcing).
+/// - Drop the retired `tts_all_output` field from every tab (the "speak all
+///   output" scrape mode is gone — TTS is sourced out-of-band).
+///
+/// Everything else (including `copy_on_select` and the per-tab
+/// `tts_injection`, now repurposed as the out-of-band speak gate) is preserved.
+fn migrate_v19_to_v20(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(tabs) = root.get_mut("tabs").and_then(Value::as_array_mut) {
+        for tab in tabs.iter_mut() {
+            let Some(obj) = tab.as_object_mut() else {
+                continue;
+            };
+            // Retire the speak-all field (serde would ignore it anyway, but
+            // keep the on-disk file self-describing).
+            obj.remove("tts_all_output");
+            // Strip stored `--mini` from the tab's args.
+            if let Some(Value::Array(args)) = obj.get_mut("args") {
+                args.retain(|a| a.as_str() != Some("--mini"));
+            }
+        }
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (20).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(20u8)),
     );
 }
 
@@ -2051,6 +2101,63 @@ mod tests {
     }
 
     #[test]
+    fn looks_v19_detects_v19_and_not_others() {
+        assert!(looks_v19(&json!({ "schema_version": 19 })));
+        assert!(!looks_v19(&json!({ "schema_version": 18 })));
+        assert!(!looks_v19(&json!({ "schema_version": 20 })));
+        assert!(!looks_v19(&json!({})));
+    }
+
+    #[test]
+    fn v19_to_v20_strips_mini_and_drops_tts_all_output() {
+        let mut v = json!({
+            "schema_version": 19,
+            "tabs": [
+                {
+                    "id": "opencode", "kind": "ai_tool", "command": "opencode",
+                    "args": ["--mini", "--model", "x"],
+                    "tts_all_output": true,
+                    "tts_injection": { "enabled": true, "instructions": "wrap" }
+                },
+                {
+                    "id": "claude", "kind": "ai_tool", "command": "claude",
+                    "args": ["--resume"], "tts_all_output": false
+                }
+            ],
+            "behavior": { "copy_on_select": true }
+        });
+        migrate_v19_to_v20(&mut v);
+
+        let tabs = v["tabs"].as_array().unwrap();
+        // --mini stripped, other args intact.
+        assert_eq!(tabs[0]["args"], json!(["--model", "x"]));
+        assert_eq!(tabs[1]["args"], json!(["--resume"]));
+        // tts_all_output removed from every tab.
+        assert!(tabs[0].get("tts_all_output").is_none());
+        assert!(tabs[1].get("tts_all_output").is_none());
+        // Repurposed gate + unrelated settings preserved.
+        assert_eq!(tabs[0]["tts_injection"]["enabled"], json!(true));
+        assert_eq!(v["behavior"]["copy_on_select"], json!(true));
+        // Stamped CURRENT.
+        assert_eq!(v["schema_version"], json!(20));
+        assert!(!looks_v19(&v));
+    }
+
+    #[test]
+    fn v19_to_v20_is_idempotent() {
+        let mut v = json!({
+            "schema_version": 19,
+            "tabs": [{ "id": "opencode", "kind": "ai_tool", "command": "opencode", "args": [] }]
+        });
+        migrate_v19_to_v20(&mut v);
+        let once = v.clone();
+        // A second pass changes nothing material (no --mini, no tts_all_output).
+        migrate_v19_to_v20(&mut v);
+        assert_eq!(v, once);
+        assert_eq!(v["schema_version"], json!(20));
+    }
+
+    #[test]
     fn v1_1_to_v1_2_collapses_extra_flags_into_args() {
         let mut v: Value = serde_json::from_str(
             r#"{
@@ -2137,7 +2244,7 @@ mod tests {
         // the whole cascade and write a fresh `.v1.2.bak` on every launch.
         let v: Value = serde_json::from_str(
             r#"{
-                "schema_version": 19,
+                "schema_version": 20,
                 "tabs": [
                     { "kind": "ai_tool", "id": "claude", "name": "Claude" }
                 ]

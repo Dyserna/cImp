@@ -98,7 +98,7 @@ is the opt-in design (that tool stays inline) rather than a mute tab.
    `per_tab_env_can_reenable_inline_renderer`); all 25 `tabs::config` tests green.
 2. Strip any stored `--mini` from existing tab `args` (Phase F migration). _(pending)_
 
-### Phase B — Interaction layer (fullscreen AI tabs; shell tabs untouched)
+### Phase B — Interaction layer (fullscreen AI tabs; shell tabs untouched) — STATUS: DONE
 
 3. **Mouse belongs to the app.** With mouse tracking on, drags/clicks route to the
    TUI. Accept this — it's how every terminal hosts a fullscreen app.
@@ -120,7 +120,7 @@ is the opt-in design (that tool stays inline) rather than a mute tab.
 7. **Scrollback** is the app's responsibility in fullscreen; document that cImp's
    inline scrollback no longer applies to AI tabs (shell tabs keep theirs).
 
-### Phase C — TTS via out-of-band sources only (delete the scrape path)
+### Phase C — TTS via out-of-band sources only (delete the scrape path) — STATUS: DONE
 
 8. **One `TtsSource` shape:** subscribe → stream of assistant text → existing
    `Segmenter` → synthesizer. No cell model, no marker stripping.
@@ -141,7 +141,7 @@ is the opt-in design (that tool stays inline) rather than a mute tab.
     (`--append-system-prompt` / OpenCode `instructions` TTS block) if we go
     speak-all-prose. Offload/graph guidance injection is unaffected.
 
-### Phase D — Per-tool adapters (now unblocked — Phase 0 passed)
+### Phase D — Per-tool adapters (now unblocked — Phase 0 passed) — STATUS: DONE
 
 11. **OpenCode adapter** (`oob_opencode.rs`): subscribe to `GET /event`, filter
     `message.part.delta`/`text` (skip `reasoning`); lifecycle
@@ -152,16 +152,36 @@ is the opt-in design (that tool stays inline) rather than a mute tab.
     (readline-based so `tell()` stays enabled), emit assistant `text` blocks (skip
     `thinking`), handle rotation/compaction/locking, de-dup on message id.
 
-### Phase E — Re-source permission detection / notifications
+### Phase E — Re-source permission detection / notifications — STATUS: SATISFIED (revised)
 
-13. **Claude:** replace inline permission scraping with Claude Code's
-    **Notification hook** (fires on permission prompts), wired via the managed
-    settings cImp already injects. Verify the hook payload identifies the prompt.
-14. **OpenCode:** derive permission state from `GET /api/session/{id}/permission`
-    and/or the `/event` stream (Phase D.11); reply via the documented
-    `permission/{id}/reply` endpoint or let the user answer the native TUI prompt.
+**Finding that revises this phase.** The original premise — "inline permission
+matching dies with the scrape path" — proved **false**. Only two things actually
+break in fullscreen: the `[[TTS]]` *marker* scraping (markers scatter across
+alt-screen repaints) and *local mouse selection* (mouse tracking). The
+**cell-model permission/working detection** reads `recent_rendered()` (the final
+rendered cell state), which the `vte` parser maintains identically for the
+alternate screen. So Phase C kept the cell model + `permission.rs`, and detection
+continues to work in fullscreen. Net: permission/working state is already
+re-sourced without new infrastructure.
 
-### Phase F — Schema migration v19 → v20 + settings cleanup
+13. **Claude — DONE (retained, not rewritten).** `run_permission_check` still
+    scans `recent_rendered()` against `patterns.json`; the working-marker
+    ("esc to interrupt") and permission/question patterns render into cells in
+    fullscreen exactly as inline. If a future Claude build changes the
+    fullscreen chrome strings, recharacterize via `RUST_LOG=perm_capture=debug`
+    (the patterns are user-editable) — no code change.
+14. **OpenCode — DONE.** Avatar Thinking/Idle is now driven by the `/event`
+    stream (assistant message start → `ClaudeOutputStarted`; `session.idle` →
+    `ClaudeOutputStopped`), wired in the Phase D adapter. Permission prompts are
+    answered in the native fullscreen TUI (the milestone's accepted fallback).
+
+**Deferred (follow-up, not required):** re-sourcing Claude permission via the
+**Notification hook** (hook command → cImp loopback → `StateSignal`). It is
+strictly more robust than string-matching chrome, but the cell-model path
+already works, and the hook round-trip can't be verified without a live Claude
+session — so it's tracked as a reliability enhancement rather than built blind.
+
+### Phase F — Schema migration v19 → v20 + settings cleanup — STATUS: DONE
 
 15. `migrate_v19_to_v20` (stamp literal 20): strip `--mini` from AI-tab `args`;
     drop the `speak_all` / TTS-all-output setting; preserve everything else

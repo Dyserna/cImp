@@ -1,71 +1,88 @@
 # cImp
 
 Multi-tab AI assistant wrapper with text-to-speech and a state-driven
-animated avatar. A Tauri desktop app that hosts **Claude Code** — your
-subscription tab, a local-LLM tab, or both — extracts `[[TTS]]…[[/TTS]]`
-markers from output, synthesizes them with a local Kokoro ONNX model,
-and drives a per-tab avatar overlay (Idle / Listening / Thinking /
-Speaking / Error) plus a real-time waveform.
+animated avatar. A Tauri desktop app that hosts agentic coding tools —
+**Claude Code** and **OpenCode** — each in its native fullscreen TUI, reads
+their assistant prose aloud through a local Kokoro ONNX voice, and drives a
+per-tab avatar overlay (Idle / Listening / Thinking / Speaking / Error)
+plus a real-time waveform.
+
+Speech is sourced **out of band** from each tool's own structured output —
+Claude Code's transcript JSONL, OpenCode's event stream — rather than by
+scraping the terminal, so the fullscreen UIs render untouched while cImp
+still knows what was said.
 
 Local, offline-after-install, no audio leaves the machine.
 
-## Claude Code tabs
+## AI tabs
 
-cImp can host two flavors of Claude Code:
+cImp hosts three kinds of agentic-coding tab, each running its tool's
+native fullscreen TUI:
 
 - **Claude** — your normal Claude Code, running with whatever auth flow
   you configured (Pro/Max subscription via OAuth, or `ANTHROPIC_API_KEY`).
-- **Claude (local)** — a second `claude` instance with
-  `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` injected at spawn time
-  so it talks to a local backend (LM Studio, Ollama, vLLM, llama-server)
-  instead of `api.anthropic.com`. Configured in
-  *Settings → Local LLM provider*.
+- **Claude (local)** — a second `claude` instance with `ANTHROPIC_BASE_URL`
+  / `ANTHROPIC_AUTH_TOKEN` (and optionally `ANTHROPIC_MODEL`) injected at
+  spawn time so it talks to a local Anthropic-compatible proxy instead of
+  `api.anthropic.com`. Configured in *Settings → Tabs → Claude (local) →
+  Local LLM provider*.
+- **OpenCode** — the [OpenCode](https://opencode.ai) agent, which manages
+  its own providers and credentials (configured inside OpenCode, switchable
+  in-session). cImp injects only its MCP tools and TTS / offload / code-graph
+  guidance.
 
-Which tabs exist is controlled by the **Claude tabs enabled** radio in
-*Settings → Tabs* (Cloud / Local / Both). Default on a fresh install is
-**Cloud** (subscription tab only). Switching the radio at runtime closes
-the affected tab (kills its PTY, drops scrollback) or re-creates it from
-the built-in defaults.
+Which of the three exist is controlled by the **AI tabs enabled**
+checkboxes in *Settings → Tabs*. A fresh install enables **Claude** only.
+Ticking or unticking a box at runtime creates the tab from its built-in
+defaults or closes it (kills its PTY, drops its session). Enabling OpenCode
+requires the `opencode` binary on `PATH` (or dropped into `ebin/`).
 
 - Switch between tabs with `Ctrl+1`..`Ctrl+9` (within the focused pane), or click the tab.
-- Both subprocesses, when present, spawn at app launch in the directory
-  cImp was started in. They run independently — switching tabs doesn't
-  stop either one.
+- Enabled AI subprocesses spawn at app launch in the directory cImp was
+  started in. They run independently — switching tabs doesn't stop any of them.
 - The compose overlay submits to whichever tab is currently active.
 
-### Multiple tabs of the same type (v0.6.7+)
+### Fullscreen interaction
 
-Each builtin Claude tab carries a **`+` button** (revealed on hover, or
-while the tab is active). Click it to spawn **another tab of the same
-type** — `+` on **Claude** opens a second subscription Claude, `+` on
-**Claude (local)** opens a second local-LLM Claude. A duplicate:
+AI tabs render their tool's fullscreen (alternate-screen) interface, so the
+tool owns the screen — there is no cImp inline scrollback for these tabs
+(shell tabs keep theirs). cImp suppresses the TUI's mouse tracking by
+default so the mouse behaves shell-like: drag to select-and-copy,
+`Shift`+right-click to paste, `Ctrl`+right-click to speak the selection.
+**Hold `Alt`** to hand the mouse straight to the fullscreen app when you
+need to click its own UI.
 
-- clones the origin tab's live config (CLI flags, environment, TTS
-  injection, *Use local LLM provider*), so a Claude (local) duplicate gets
-  the same `ANTHROPIC_*` injection as the tab it came from;
+### Multiple tabs of the same type
+
+Each builtin AI tab carries a **`+` button** (revealed on hover, or while
+the tab is active). Click it to spawn **another tab of the same type** — a
+second Claude, a second Claude (local), or a second OpenCode. A duplicate:
+
+- clones the origin tab's live config (CLI flags, environment, per-tab speak
+  toggle, *Use local LLM provider*), so a Claude (local) duplicate gets the
+  same `ANTHROPIC_*` injection as the tab it came from;
 - is auto-named `Claude 2`, `Claude 3`, … — rename via double-click;
 - is **closable** — it shows a `×` and accepts `Ctrl+W`, unlike the builtin
   it was spawned from;
 - persists across restarts, reopening with your saved layout.
 
-Each duplicate is an independent subprocess with its own PTY, scrollback,
-and avatar / TTS state, launched in the directory cImp was started in.
-Duplicates aren't listed in *Settings → Tabs* — they inherit the origin
-tab's configuration.
+Each duplicate is an independent subprocess with its own PTY and avatar /
+TTS state, launched in the directory cImp was started in. Duplicates aren't
+listed in *Settings → Tabs* — they inherit the origin tab's configuration.
 
-## Shell Tabs (v1.2+)
+## Shell Tabs
 
-In addition to the two AI builtins, cImp hosts **Shell tabs** — plain
-configurable terminal sessions running alongside the Claude tabs, with
-no TTS, no permission detection, and a reduced notification set (`error`
-and `exited` only).
+In addition to the AI builtins, cImp hosts **Shell tabs** — plain
+configurable terminal sessions running alongside the AI tabs, with no TTS,
+no permission detection, and a reduced notification set (`error` and
+`exited` only).
 
 ### Creating and managing Shell tabs
 
 - **Create:** click the `+` button at the **right end of the tab bar**
-  (distinct from the per-tab `+` on Claude tabs, which spawns AI
-  duplicates), or press `Ctrl+T`. The New Shell Tab dialog pre-fills the
-  platform default shell.
+  (distinct from the per-tab `+` on AI tabs, which spawns AI duplicates), or
+  press `Ctrl+T`. The New Shell Tab dialog pre-fills the platform default
+  shell.
 - **Rename:** right-click a tab → *Rename*, or double-click the tab name.
 - **Configure:** right-click a Shell tab → *Configure…* to change command,
   args, working directory, or notification text. Spawn-affecting changes
@@ -74,15 +91,15 @@ and `exited` only).
   subprocess and respawns it with the current configuration. Useful after
   changing the command in Configure.
 - **Close:** click the `×` on the tab, or press `Ctrl+W` while the tab is
-  active. The **builtin** AI tabs (Claude, Claude (local)) cannot be closed
-  via the `×` — toggle them via the **Claude tabs enabled** radio in
-  Settings instead — but **spawned duplicates** (see *Multiple tabs of the
+  active. The **builtin** AI tabs (Claude, Claude (local), OpenCode) cannot
+  be closed via the `×` — toggle them via the **AI tabs enabled** checkboxes
+  in Settings instead — but **spawned duplicates** (see *Multiple tabs of the
   same type*) are closable like any shell. The default first shell tab
   (`shell-default-1`) is closable like any other shell.
 - **Switch by position:** `Ctrl+1`..`Ctrl+9` switch to the tab at that
-  ordinal position **within the focused pane** (v1.3 change — see
-  *Multi-pane Layout* below). `Ctrl+9` with fewer than 9 tabs in the focused
-  pane is a silent no-op.
+  ordinal position **within the focused pane** (see *Multi-pane Layout*
+  below). `Ctrl+9` with fewer than 9 tabs in the focused pane is a silent
+  no-op.
 
 ### Default shell per platform
 
@@ -130,16 +147,16 @@ Common alternatives, paste into Configure → command + arguments:
   type `exit` and press Enter on the closed-shell overlay.
 - **How do I delete a Shell tab?** Hover the tab and click `×`, or press
   `Ctrl+W` while the tab is active. The *builtin* AI tabs (Claude, Claude
-  (local)) aren't closable from the tab bar — use the *Claude tabs enabled*
-  radio in *Settings → Tabs*; *spawned* AI duplicates are closable with `×`
-  like any shell.
+  (local), OpenCode) aren't closable from the tab bar — use the *AI tabs
+  enabled* checkboxes in *Settings → Tabs*; *spawned* AI duplicates are
+  closable with `×` like any shell.
 - **My settings.json got corrupted.** Each migration writes a backup
-  alongside the source file (e.g. `settings.json.v1.7.bak.<ts>`). For
-  other corruption, delete the global `<exe-dir>/settings.json` (and the
-  per-folder `.cimp.custom.config.json` overlay if present) and the app
-  writes fresh defaults on next launch.
+  alongside the source file (e.g. `settings.json.v<n>.bak.<ts>`). For other
+  corruption, delete the global `<exe-dir>/settings.json` (and the per-folder
+  `.cimp.custom.config.json` overlay if present) and the app writes fresh
+  defaults on next launch.
 
-## Multi-pane Layout (v1.3+)
+## Multi-pane Layout
 
 The terminal area is a recursive tree of panes — split horizontally or
 vertically, drag tabs between them, save named layouts. The avatar, audio
@@ -153,7 +170,7 @@ tab**; switching pane focus retargets all three.
   pane gets focus.
 - **`Ctrl+\`** splits the focused pane horizontally (side-by-side) with a
   fresh Shell tab on the right.
-- **`Ctrl+Shift+\`** splits vertically (stacked) with a fresh Shell tab below.
+- **`Alt+\`** splits vertically (stacked) with a fresh Shell tab below.
 - **Right-click the tab bar background** (not on a tab) for a context menu
   with Split horizontally / Split vertically and other pane operations.
 
@@ -170,7 +187,7 @@ tab**; switching pane focus retargets all three.
 
 - **Drag the last tab out** of a pane and the pane auto-collapses (its
   parent split is replaced by the surviving sibling).
-- **`Ctrl+Shift+W`** closes the focused pane; its tabs migrate to the
+- **`Ctrl+Alt+W`** closes the focused pane; its tabs migrate to the
   surviving sibling subtree's leftmost leaf, then the empty pane collapses.
   No-op when the focused pane is the root.
 
@@ -203,8 +220,8 @@ in the bottom-left of the status bar.
 
 ### Keyboard shortcuts
 
-| Action                       | Default              |
-|------------------------------|----------------------|
+| Action                          | Default              |
+|---------------------------------|----------------------|
 | Switch to tab N in focused pane | `Ctrl+1` … `Ctrl+9`  |
 | New shell tab in focused pane   | `Ctrl+T`             |
 | Close active tab in focused pane| `Ctrl+W`             |
@@ -219,76 +236,46 @@ in the bottom-left of the status bar.
 
 All shortcuts are rebindable in *Settings → Shortcuts*.
 
-> **v6 note:** Open compose, Split-vertical, and Close-pane moved off
-> `Ctrl+Shift+…` (they were `Ctrl+Shift+E` / `Ctrl+Shift+\` / `Ctrl+Shift+W`)
-> so they no longer collide with the bare-`Ctrl+Shift` push-to-talk chord.
-> These are new-install defaults — upgrading keeps your existing bindings; the
-> table above reflects fresh installs.
-
 ### Known shortcut conflicts
 
-- **`Ctrl+Shift+W` may collide with WebView2's "close window"** on some
-  Windows configurations — if the press closes the app instead of the pane,
-  remap `close_pane` to e.g. `Ctrl+Q` or `Ctrl+Alt+W`.
 - **`Ctrl+Alt+Arrow` may collide with GNOME / KDE workspace switching** on
   Linux. Remap `focus_pane_*` to `Ctrl+Shift+Arrow` if needed.
 
-Defaults aren't changed for either — different setups have different
-conflicts; the rebind path covers them.
-
-### Migrating from v1.2
-
-On first v1.3 launch, an existing v1.2 settings file gets migrated to a
-single root pane containing every tab in order, with the previously-active
-tab focused. A `settings.json.v1.2.bak` backup is written alongside before
-the rewrite. All v1.2 features (tabs, settings, notifications, presets,
-TTS, avatar) carry over unchanged. The only behavior change is that
-`Ctrl+1`..`Ctrl+9` are now **scoped to the focused pane** rather than the
-global tab list.
+The default isn't changed — different setups have different conflicts; the
+rebind path covers them.
 
 ## Local LLM provider (the Claude (local) tab)
 
 The **Claude (local)** tab runs the same `claude` binary as the
-subscription tab but with two environment variables injected at spawn
-time:
+subscription tab but with environment injected at spawn time:
 
 ```
-ANTHROPIC_BASE_URL=<your local backend URL>
-ANTHROPIC_AUTH_TOKEN=<token your backend expects>
+ANTHROPIC_BASE_URL=<your proxy URL>
+ANTHROPIC_AUTH_TOKEN=<token your proxy expects>
+ANTHROPIC_MODEL=<optional model alias>
 ```
 
-Configure both under *Settings → Local LLM provider*. cImp does **not**
-start the backend itself — you run it separately. The supported backends
-all expose a native Anthropic Messages API (`/v1/messages`), so no
-translation proxy is needed:
-
-| Backend                                                                                  | Default port | Notes                                            |
-|------------------------------------------------------------------------------------------|--------------|--------------------------------------------------|
-| [LM Studio](https://lmstudio.ai/docs/developer/anthropic-compat) (≥ 0.4.1)               | `1234`       | Easiest path: load a model, enable the server.   |
-| [llama-server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) | `8080`       | Run with `--jinja` for tool use.                 |
-| Ollama                                                                                   | `11434`      | Native Anthropic compatibility.                  |
-| vLLM                                                                                     | `8000`       | Native Anthropic compatibility.                  |
+Configure these under *Settings → Tabs → Claude (local) → Local LLM
+provider*. Claude Code speaks only the Anthropic Messages API, so to point
+it at a local model you run a translating proxy — **LiteLLM** (or any
+Anthropic-compatible bridge) in front of Ollama, LM Studio, vLLM, or
+llama-server. cImp does **not** start the proxy; you run it separately.
 
 A typical setup:
 
-1. Start your backend with whichever model you want (e.g. LM Studio's
-   "Start server" toggle on a loaded model).
-2. In cImp: *Settings → Tabs → Claude tabs enabled* → switch to **Local**
-   or **Both**.
-3. *Settings → Local LLM provider* → set Endpoint URL to the backend's
-   base URL (e.g. `http://localhost:1234`) and Auth token to whatever
-   the backend expects (a dummy string like `sk-dummy` works for all
-   four).
+1. Run a LiteLLM proxy (default port `4000`) mapping a model name to your
+   local backend. See the
+   [LiteLLM docs](https://docs.litellm.ai/docs/proxy/quick_start).
+2. In cImp: *Settings → Tabs → AI tabs enabled* → tick **Claude (local)**.
+3. *Settings → Tabs → Claude (local) → Local LLM provider* → set the Proxy
+   URL (e.g. `http://localhost:4000`), an Auth token (a dummy like
+   `sk-dummy` works for most proxies), and optionally a Model alias.
 4. Restart the Claude (local) tab.
 
-For OpenAI-only backends (no native Anthropic endpoint) run a translator
-like [`anthropic-proxy-rs`](https://github.com/m0n0x41d/anthropic-proxy-rs)
-in front of it and point cImp at the translator.
-
-Per-tab `env` entries always take precedence over the synthesized
-values, so you can also point a single tab at a different endpoint by
-setting `ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local)
-→ Environment*.
+Per-tab `env` entries always take precedence over the synthesized values,
+so you can also point a single tab at a different endpoint by setting
+`ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local) →
+Environment*.
 
 **Caveats:**
 
@@ -301,24 +288,54 @@ setting `ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local)
   per-folder `.cimp.custom.config.json` overlay) — fine for local
   dummies; don't put a real Anthropic API key there.
 
+## How TTS works
+
+cImp speaks each AI tab's **assistant prose** as the tool produces it,
+sourced out of band from the tool's own structured output:
+
+- **Claude** — cImp tails Claude Code's transcript JSONL
+  (`~/.claude/projects/<slug>/<session>.jsonl`) and speaks each assistant
+  `text` block as it lands (sub-second after it appears on screen).
+- **OpenCode** — cImp taps OpenCode's event stream (`GET /event` on a port
+  it injects at launch) and speaks assistant text as it streams.
+
+Either way the markdown is reduced to speakable prose first: code blocks,
+inline code, tables, tool output, and "thinking" / reasoning are dropped,
+so only the conversational sentences are read. Speech is sentence-segmented
+and `Esc` stops the current burst until the next assistant message.
+
+There are **no `[[TTS]]` markers** — cImp reads the structure of the
+transcript / event stream rather than asking the model to tag its prose.
+
+**Per-tab speak toggle.** Each AI tab has a toggle under *Settings → Tabs →
+\<tab\> → TTS injection*. It gates whether that tab speaks its assistant
+prose aloud — turn it off for a tab you want to read silently. The toggle is
+read live, so muting or unmuting a tab takes effect without a restart.
+
+You can also speak an arbitrary selection on demand: hold no modifier, drag
+to select, then `Ctrl`+right-click to read it aloud (see *Fullscreen
+interaction*).
+
 ## System Requirements
 
 - **OS:** Windows 10/11 (primary). Linux is feasible but not part of the
   validation matrix — see `docs/completedMilestones/MILESTONE-V1-08-polish.md`.
 - **GPU:** optional. The app defaults to CPU inference (Kokoro is small
   enough for near-real-time CPU). NVIDIA CUDA 12.x can be opted into via
-  `setx CIMP_GPU cuda` and a restart — see `MAINTENANCE.md` for the
+  `setx CIMP_GPU cuda` and a restart — see `docs/MAINTENANCE.md` for the
   current GPU support matrix and Blackwell caveat.
-- **Claude Code:** the `claude` binary must be on `PATH`. cImp spawns it
-  as a subprocess and passes `--append-system-prompt` so Claude knows to
-  emit the TTS markers.
-- **Local backend (optional, for the Claude (local) tab):** if the
-  Claude (local) tab's *Use local LLM provider* flag is on, you need a
-  running Anthropic-compatible backend (LM Studio, Ollama, vLLM, or
-  llama-server) at the URL configured under *Settings → Local LLM
-  provider*. cImp does not start the backend. If it isn't reachable,
-  the tab will fail on first message — disable the flag, or just stop
-  using that tab; the subscription Claude tab is unaffected.
+- **Claude Code:** the `claude` binary must be on `PATH` for the Claude and
+  Claude (local) tabs. cImp spawns it as a subprocess.
+- **OpenCode (optional):** the `opencode` binary must be on `PATH` (or in
+  `ebin/`) to enable the OpenCode tab. OpenCode manages its own providers
+  and credentials.
+- **Local proxy (optional, for the Claude (local) tab):** if that tab's
+  *Use local LLM provider* flag is on, you need a running Anthropic-
+  compatible proxy (e.g. LiteLLM bridging to Ollama / LM Studio / vLLM /
+  llama-server) at the URL configured under *Local LLM provider*. cImp does
+  not start it. If it isn't reachable, the tab fails on first message —
+  disable the flag, or just stop using that tab; the other tabs are
+  unaffected.
 - **WebView2 (Windows):** preinstalled on updated Windows 10/11. Older
   systems may need the WebView2 runtime installed manually.
 
@@ -524,7 +541,7 @@ a cloud backend never sees a local-data MCP server (`git`, `filesystem`).
 
 **How the warm pool runs.** When the cImp app is running it owns the loop, the
 backend pool, the global concurrency gate, and the MCP host; the hidden
-`cimp --offload-mcp` server in each Claude tab is a thin proxy to it over a
+`cimp --offload-mcp` server in each AI tab is a thin proxy to it over a
 **token-authenticated loopback endpoint** (`127.0.0.1`, ephemeral port). If the
 app isn't running (e.g. a headless `claude -p` run), the child falls back to a
 self-contained path so offload still works — just without the warm tool pool,
@@ -532,66 +549,45 @@ global concurrency, or live health. Changes to a server's config take effect whe
 the app next warms the pool; toggling **Enable offload** itself takes effect on
 the next app launch.
 
-## Speak all output (per-tab)
+## Code knowledge graph
 
-By default cImp only speaks the text Claude wraps in `[[TTS]]…[[/TTS]]`
-markers. **Right-click any Claude tab → "TTS all output"** to flip that tab
-into a mode where it speaks **all** new terminal output and **ignores the
-`[[TTS]]` markers** entirely. A small **speaker icon** appears on the tab so
-you can see at a glance which tabs have it on.
-
-- The toggle is **per tab** and **persists in the per-folder overlay**
-  (`.cimp.custom.config.json`) like any other per-tab setting. It applies
-  live — no tab restart — and only affects output produced *after* you turn
-  it on (the existing backlog isn't replayed).
-- Output is **sentence-segmented and deduped**: ANSI is stripped, complete
-  sentences are spoken, and an in-progress trailing sentence is held until it
-  finishes. Unterminated chrome (the spinner / "esc to interrupt" status
-  line, box-drawing, the input prompt) is held and dropped rather than
-  spoken, so the synthesizer stays focused on prose.
-- **Your own input isn't read back.** Text you type (or submit from the
-  compose overlay) is registered as you go, so when the TUI echoes your
-  prompt it's recognized and skipped — even behind the `> ` prompt prefix.
-  (Pasted input via bracketed paste is the one gap; it isn't captured.)
-- **`Esc` still stops playback until new output** — the same interrupt that
-  works for marked segments. Speaking resumes on the tab's next output burst.
-
-This mode is cleanest for plain, line-oriented output — e.g. a **Claude
-(local)** tab whose model doesn't emit `[[TTS]]` markers, or any model you
-just want fully read aloud. **It reads everything Claude prints** — including
-"thinking"/reasoning shown above the answer — because raw terminal output has
-no reliable marker that separates the answer from thinking or status chrome.
-If you want **only Claude's answer** spoken (no question, no thinking), that's
-exactly what the default `[[TTS]]` marker mode does — leave "TTS all output"
-**off** on the subscription Claude tab and let Claude mark its answer.
+cImp builds a per-project **code + docs knowledge graph** (CozoDB + tree-sitter
+over `.cimp/graph.db`) that Opus and offload workers can query through MCP tools —
+`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`,
+`graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`, and
+`graph_struct_search`. It covers Rust, TypeScript/JavaScript, Python, and
+Markdown, with symbol/call/import edges, transitive reachability, full-text and
+(optionally) embedding-based semantic doc search, and a filesystem watcher for
+incremental re-index. A reserved **Code Graph** monitor tab shows build status,
+node/edge counts, embedder health, and recent-query history.
 
 ## Configuring Tabs
 
 Per-tab subprocess configuration lives under **Settings → Tabs**, split
-into three sub-sections: **Claude**, **Claude (local)**, and **Shells**.
-Each tab exposes:
+into four sub-sections: **Claude**, **Claude (local)**, **OpenCode**, and
+**Shells**. Each AI tab exposes:
 
 - **Command** (read-only on AI tabs): the binary cImp spawns — `claude`
-  for both AI tabs.
+  for the Claude tabs, `opencode` for the OpenCode tab.
 - **Persistent CLI flags:** flags appended to every spawn of that tab.
-- **Use local LLM provider** (AI tabs): toggle that gates env synthesis
+- **Use local LLM provider** (Claude tabs): toggle that gates env synthesis
   from the global *Local LLM provider* settings (off by default for the
   subscription Claude tab; on by default for the Claude (local) tab).
-- **TTS markup injection** (AI tabs): toggle plus an editable
-  instructions block. Instructions are passed via
-  `--append-system-prompt` on each spawn. The Reset button restores
-  cImp's built-in runtime prompt
-  (`src-tauri/src/tts/runtime_prompt.md`).
+- **TTS injection** (AI tabs): the toggle that gates whether the tab speaks
+  its assistant prose (out of band), plus an editable instructions block
+  injected on each spawn (Claude via `--append-system-prompt`, OpenCode via
+  its instructions file). The Reset button restores cImp's built-in runtime
+  prompt.
 - **Notifications:** text spoken when the tab transitions to a notable
   state and the user is focused elsewhere. AI tabs have four slots
   (`idle`, `awaiting_permission`, `question`, `error`); shell tabs have
   two (`error`, `exited`). Empty string disables that specific
   notification while leaving the others active.
-- **Appearance:** per-tab terminal-palette and background overrides
-  (V1.4-01 / V1.4-02); each travels with the tab through drag-and-drop.
+- **Appearance:** per-tab terminal-palette and background overrides; each
+  travels with the tab through drag-and-drop.
 - **Restart Tab:** apply changes that require respawning the subprocess
-  (command, CLI flags, TTS injection, `use_local_provider`). Notification
-  text and appearance changes apply live — no restart needed.
+  (command, CLI flags, TTS injection instructions, `use_local_provider`).
+  Notification text and appearance changes apply live — no restart needed.
 
 Settings are persisted to two files: a **portable global baseline** at
 `<exe-dir>/settings.json`, and a **per-folder overlay** at
@@ -604,8 +600,8 @@ file is deleted automatically when the diff is empty.
 **End users (Windows):** download the latest portable zip from the
 [Releases page](https://github.com/Dyserna/cImp/releases), unzip it, add
 `bin/` to your PATH, and run `cimp`. The zip ships with the Kokoro
-model and the default voice — no extra setup beyond Claude Code itself
-being on PATH.
+model and the default voice — no extra setup beyond Claude Code (and,
+optionally, OpenCode) being on PATH.
 
 **Developers:**
 
@@ -629,8 +625,8 @@ Open with `Ctrl+,` or the cog button on the avatar.
 
 - **TTS:** voice picker (auto-discovered from `voices/`), speed, volume,
   mute.
-- **Avatar:** a **Type** picker — *Picture / Video* (the default) or
-  *Animated sprites* — plus visibility, position, size, opacity. In
+- **Avatar:** a **Type** picker — *Picture / Video* or *Animated sprites*
+  (the default) — plus visibility, position, size, opacity. In
   Picture / Video mode: per-state image / video overrides and a transition
   video + duration (empty transition path or `duration = 0` falls back to a
   150 ms crossfade). In Animated sprites mode: a **Sprite set** picker that
@@ -640,31 +636,30 @@ Open with `Ctrl+,` or the cog button on the avatar.
 - **Waveform:** color, line width, glow, opacity.
 - **Display:** terminal font family + size, toggle to render TTS markup
   verbatim in the terminal (debug aid).
-- **Appearance:** UI chrome theme — Modern Dark plus the TUI variants
-  (Yellow, Purple, Orange); new installs default to **TUI Orange**, which
-  also defaults the avatar to the animated `claudeSprites` mascot — and the
-  **terminal palette** —
+- **Appearance:** UI chrome theme — two ratatui-style variants ship,
+  **TUI Orange** (Gruvbox surfaces + Claude Code's accent orange) and
+  **TUI Grey** (OpenCode's cool light-grey accent); new installs default to
+  **TUI Orange**. The avatar independently defaults to the animated
+  `impSprites` mascot. Plus the **terminal palette** —
   12 bundled palettes (Default, Dracula, Solarized Dark/Light, Nord,
   Tomorrow Night, Gruvbox Dark/Light, One Dark, Monokai, Tokyo Night,
   GitHub Dark) plus a 22-color Custom editor for foreground, background,
   cursor, selection, ANSI 8, and bright 8. Each tab can override the
   global palette via Configure Tab → Appearance — useful for color-coding
-  Claude (subscription) vs. Claude (local) vs. shells. Per-tab overrides
+  Claude vs. Claude (local) vs. OpenCode vs. shells. Per-tab overrides
   travel with the tab through drag-and-drop. Plus **terminal background**
   — a solid color or user-supplied image rendered beneath the terminal
   text, with named **global presets** you can save and apply across tabs.
   Solid color has no performance cost; image mode forces the slower DOM
   renderer (2-5× slower for high-throughput output like `tail -F`).
   Toggling the image switches xterm.js renderers cleanly — your shell
-  session, scrollback, and running processes all survive the switch
-  (V1.4-03), and the visible scrollback also survives an app restart via
-  a per-tab on-disk ring buffer (V1.4-04 D). Image mode adds opacity,
-  blur, size, position, and an optional tint color for the dimming
-  overlay. **Per-tab Background row** in Configure Tab gives each tab
-  its own image/color or a "Disabled" opt-out that forces plain theme
-  background regardless of the global setting.
-- **Audio / Behavior:** interrupt TTS on input, auto-speak detected
-  segments, fall back to silence on responses with no TTS markup,
+  session, scrollback, and running processes all survive the switch, and the
+  visible scrollback also survives an app restart via a per-tab on-disk ring
+  buffer. Image mode adds opacity, blur, size, position, and an optional tint
+  color for the dimming overlay. **Per-tab Background row** in Configure Tab
+  gives each tab its own image/color or a "Disabled" opt-out that forces
+  plain theme background regardless of the global setting.
+- **Audio / Behavior:** interrupt behavior, speak TTS from background tabs,
   enable/disable announcements globally, **announce focused tab** (let
   notifications fire even for the tab you're looking at; default off),
   **follow avatar** (auto-mute when the avatar is hidden; default off).
@@ -673,17 +668,17 @@ Open with `Ctrl+,` or the cog button on the avatar.
   open settings, switch-to-tab-N (within focused pane), pane focus and
   splits, new shell tab, close active tab, and close pane. The full
   default set is in *Multi-pane Layout → Keyboard shortcuts* above.
-- **Tabs:** the **Claude tabs enabled** radio (Cloud / Local / Both)
-  plus per-tab command, CLI flags, TTS injection, notification text,
-  and appearance overrides — see *Configuring Tabs* above.
-- **Processing:** stability and max-hold timers for the byte-burst /
-  segment-detection pipeline.
+- **Tabs:** the **AI tabs enabled** checkboxes (Claude / Claude (local) /
+  OpenCode) plus per-tab command, CLI flags, TTS injection, notification
+  text, and appearance overrides — see *Configuring Tabs* above.
+- **Processing:** stability and max-hold timers for the byte-burst
+  pipeline.
 
 ## Animated sprite avatars
 
 cImp can render a **frame-animated pixel-art mascot** instead of the
-image/video avatar. It is the **default** on new installs (paired with the
-default TUI Orange theme); switch between it and the image/video avatar in
+image/video avatar. It is the **default** on new installs (the `impSprites`
+mascot); switch between it and the image/video avatar in
 *Settings → Avatar → Type*.
 
 How it works:
@@ -698,15 +693,15 @@ How it works:
   **Idle** drifts between breathing, blinking, looking around and the
   occasional **dance**; **Listening** looks around; **Thinking** and
   **Speaking** show the work animations; **Error** shows a surprise. A state
-  with no group falls back to the set's `Idle` group. (This behaviour used
-  to be hardcoded in `SPRITE_STATE_ANIMS`; it now lives entirely in each
-  set's manifest, so a sprite set fully defines its own behaviour.)
+  with no group falls back to the set's `Idle` group. A sprite set fully
+  defines its own behaviour through its manifest.
 - Frames are drawn on a canvas with nearest-neighbor scaling, so the small
   source art (20×20) stays crisp pixel art at any avatar size.
 
-The bundled `claudeSprites` set is sourced from the **Clawdmeter** project
-(see *Credits* below); an `impSprites` set scaffolds the project's own imp
-mascot. To add another set, drop a `sprites/<name>/` folder in (with a
+The default `impSprites` set is cImp's own imp mascot; the `claudeSprites`
+set (the Clawd character, sourced from the **Clawdmeter** project — see
+*Credits* below) stays selectable. To add another set, drop a
+`sprites/<name>/` folder in (with a
 `manifest.json` defining its `groups`) and register `<name>` in
 `KNOWN_SPRITE_SETS` in `src/lib/avatarConfig.ts` — no other app-code changes
 are needed, since the per-state behaviour comes from the manifest.
@@ -715,46 +710,49 @@ are needed, since the per-state behaviour comes from the manifest.
 
 - **TTS silent.** Check the log for `TTS disabled: Kokoro model files not found.`
   Place the model + voicepack under `<exe-dir>/../models/` as documented above.
+  Also confirm the per-tab **TTS injection** toggle is on for the tab you expect
+  to hear.
 - **`claude` not found.** cImp looks up `claude` via `PATH`. Either install
   Claude Code so it's on `PATH` or add its install dir.
-- **Claude (local) tab errors.** Most often: the local backend isn't
-  running or the URL in *Settings → Local LLM provider* is wrong.
-  Confirm the backend is reachable (e.g.
-  `curl http://localhost:1234/v1/models` for LM Studio). Until you fix
-  the backend you can simply use the subscription Claude tab, which is
+- **OpenCode tab won't enable.** The `opencode` binary isn't on `PATH` or in
+  `ebin/`. Install it from https://opencode.ai/docs (or drop `opencode.exe`
+  in `ebin/`), then tick the checkbox again.
+- **Claude (local) tab errors.** Most often: the local proxy isn't running or
+  the URL in *Local LLM provider* is wrong. Confirm the proxy is reachable.
+  Until you fix it you can simply use the subscription Claude tab, which is
   unaffected.
 - **CUDA EP errors per segment (silent output).** You're on a GPU not yet
-  covered by the bundled ORT 1.20 prebuilt (Blackwell / RTX 5090). Unset
-  `CIMP_GPU` to fall back to CPU. See `MAINTENANCE.md`.
-- **Audio interrupted by typing.** That's `Behavior → Interrupt TTS when typing`.
-  Disable it if you'd rather keep playback rolling.
+  covered by the bundled ORT prebuilt (Blackwell / RTX 5090). Unset
+  `CIMP_GPU` to fall back to CPU. See `docs/MAINTENANCE.md`.
 - **Avatar doesn't move.** Confirm `Settings → Avatar → Visible` is on
   and the per-state image paths point to readable files (or are blank to use
   the bundled defaults). In *Animated sprites* mode, confirm the chosen
   sprite set exists under `sprites/<set>/` with a valid `manifest.json`.
-- **`Ctrl+R` / `Ctrl+Shift+R` / `F5` don't reload the app.** Intentional
-  (v0.6.6+) — a reload would tear down every tab's session and lose
-  scrollback. The keystrokes still reach the terminal, so `Ctrl+R` works
-  as your shell's reverse-history search as usual.
+- **The mouse doesn't work in an AI tab the way I expect.** AI tabs run the
+  tool's fullscreen TUI; cImp keeps the mouse shell-like (select-to-copy,
+  Shift+right-click paste) by default. **Hold `Alt`** to hand the mouse to
+  the fullscreen app.
+- **`Ctrl+R` / `Ctrl+Shift+R` / `F5` don't reload the app.** Intentional —
+  a reload would tear down every tab's session and lose scrollback. The
+  keystrokes still reach the terminal, so `Ctrl+R` works as your shell's
+  reverse-history search as usual.
 
 ## Known Limitations
 
-- TTS markup compliance for the **Claude (local)** tab depends on the
-  underlying model. Smaller local models may not wrap content in
-  `[[TTS]]…[[/TTS]]` reliably even when the system prompt asks them to.
-  cImp will be silent for those segments — this is fallback behavior,
-  not an error.
+- Automatic TTS for an AI tab depends on that tool's out-of-band source —
+  Claude Code's transcript JSONL and OpenCode's event stream. A tool with no
+  such source (or a future format change in one) would speak nothing until
+  the adapter is updated.
 - Tool-use (Edit / Write / Bash / etc.) on the Claude (local) tab depends
   on the local model supporting Anthropic-style tool calling. Test before
   committing to a particular model.
-- cImp does not bundle or auto-spawn the local backend — you run
-  LM Studio / Ollama / vLLM / llama-server yourself.
+- cImp does not bundle or auto-spawn the local proxy/backend — you run
+  LiteLLM / Ollama / LM Studio / vLLM / llama-server yourself.
 - Single audio output device — no UI selector.
 - No conversation/session UI on top of the terminal.
-- No STT input.
 - No voice mixing.
 - Linux is not part of the validation matrix; behavior is best-effort.
-- Kokoro model is user-provided, not bundled.
+- The Kokoro model ships in the portable zip; source builds are user-provided.
 
 See `docs/completedMilestones/MILESTONE-V1-08-polish.md` "After Milestone
 8" and `docs/FUTURE-FEATURES.md` for the post-v1 parking lot.

@@ -1,7 +1,7 @@
 # cImp — Feature Inventory
 
 A scannable, one-line-per-feature inventory of everything cImp does, grouped by
-area. Current as of **v0.19.0**. Companion to `MAINTENANCE.md` (which covers the
+area. Current as of **v0.30.0**. Companion to `MAINTENANCE.md` (which covers the
 dependency/component breadth) — this is the *capability* breadth.
 
 ## Core App & Terminal
@@ -14,11 +14,14 @@ dependency/component breadth) — this is the *capability* breadth.
 - Platform shell detection (Git Bash on Windows w/ registry probe, `$SHELL` on Linux)
 - Windows console-window suppression for spawned subprocesses
 
-## Claude Code Tabs
+## AI Tabs
+- Three AI-tool tab types, each running its tool's native fullscreen TUI
 - Cloud Claude tab (subscription OAuth or `ANTHROPIC_API_KEY`)
-- Claude (local) tab with `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` injected at spawn
-- Local backend support: LM Studio, Ollama, vLLM, llama-server (native Anthropic API)
-- "Claude tabs enabled" radio: Cloud / Local / Both
+- Claude (local) tab with `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL` injected at spawn
+- Claude (local) targets a local Anthropic-compatible proxy (LiteLLM bridging Ollama / LM Studio / vLLM / llama-server)
+- OpenCode tab — manages its own providers/credentials; cImp injects only MCP tools + TTS/offload/graph guidance
+- "AI tabs enabled" checkboxes (Claude / Claude (local) / OpenCode); Claude only on a fresh install
+- Fullscreen interaction: mouse kept shell-like (select-copy, Shift+right-click paste) with a hold-`Alt` bypass to the TUI
 - Per-type tab duplication via the `+` button, cloning live config, auto-named & closable
 - Tab context menu: Configure / Restart / Rename / TTS toggle
 - Compose submits to the focused pane's active tab
@@ -31,11 +34,12 @@ dependency/component breadth) — this is the *capability* breadth.
 
 ## Text-to-Speech
 - Local Kokoro-82M ONNX synthesis (Apache 2.0), offline
-- `[[TTS]]…[[/TTS]]` markup parsing with sentence segmentation and dedup
+- Out-of-band sourcing: Claude transcript JSONL tail + OpenCode `/event` stream (no terminal scraping, no `[[TTS]]` markers)
+- Markdown reduced to speakable prose (code/tables/tool output/reasoning dropped), sentence-segmented and deduped
+- Per-tab speak toggle (gates whether a tab reads its assistant prose), read live; `Esc` stops the current burst
 - Voice-pack selection auto-discovered from `models/voices/`
 - Speed and volume controls
-- Speak-selection gesture and speak-all-output per-tab mode
-- User-input echo suppression
+- Speak-selection gesture (`Ctrl`+right-click)
 - WebGPU GPU backend (shipped, vendor-agnostic) with automatic CPU fallback; optional CUDA (not shipped)
 - `CIMP_GPU=cpu` forces CPU
 
@@ -47,7 +51,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Vulkan GPU backend (shipped, vendor-agnostic) + optional CUDA; CPU default
 
 ## Avatar & Visualizer
-- Picture/Video avatar with per-state overrides; animated frame-based sprite avatars
+- Picture/Video avatar with per-state overrides; animated frame-based sprite avatars (default `impSprites`)
 - Five states: Idle / Listening / Thinking / Speaking / Error, with crossfade transitions
 - Visibility, position, size, opacity controls; nearest-neighbor pixel scaling
 - Real-time waveform visualizer (playback + mic), configurable color/width/glow/opacity
@@ -66,6 +70,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Warm-pool MCP host (stdio + Streamable-HTTP servers), tool namespacing, read-class-only filter, filesystem confinement, per-server health isolation
 - Native tools `read_file` / `code_search` / `run_command` with command security policies
 - Loopback endpoint + discovery file with per-launch bearer token; self-contained fallback for headless runs
+- `offload_task` + graph tools exposed to both Claude and OpenCode tabs (OpenCode via a `--consumer opencode` child)
 - Read-only Offload Server dashboard tab: per-backend metrics, queue depth, throughput, request history
 
 ## Code Knowledge Graph (V9-01)
@@ -79,7 +84,7 @@ dependency/component breadth) — this is the *capability* breadth.
 
 ## Theming & Appearance
 - 12 bundled terminal palettes + custom 22-color ANSI palette editor; per-tab palette override
-- UI theme selector (Modern Dark, TUI Orange default, TUI Purple, TUI Yellow); external theme/palette files
+- UI theme selector: TUI Orange (default) + TUI Grey, ratatui-style; external theme/palette files
 - Terminal background: solid color or image (opacity/blur/size/tint), global presets + per-tab override
 - Configurable terminal font family and size
 
@@ -87,7 +92,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Portable global `settings.json` next to the exe; per-folder `.cimp.custom.config.json` overlay (auto-deleted when empty)
 - Per-tab settings: command, CLI flags, TTS injection prompt, notification text, appearance
 - Migration system with timestamped backups + per-key load validation
-- Runtime TTS-markup injection via `--append-system-prompt` (no CLAUDE.md edit)
+- Per-tab instructions injection on launch (Claude `--append-system-prompt`, OpenCode instructions file)
 
 ## Notifications, Shortcuts & Status Bar
 - Tab-state announcements (idle / awaiting-permission / question / error; shells: error / exited)

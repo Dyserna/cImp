@@ -33,7 +33,6 @@ use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{info, warn};
 
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
-use crate::error::AppError;
 use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
@@ -67,7 +66,7 @@ use crate::settings::{
 use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::stt::SttHandle;
 use crate::tabs::{TabRegistry, TabRegistryHandle};
-use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsEngine, TtsRequest};
+use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
 
 fn main() {
     // Status-line subcommand: Claude Code invokes `cimp --statusline`,
@@ -825,47 +824,19 @@ fn init_tts_pipeline(
 
     spawn_amplitude_streamer(app, audio.clone());
 
-    let model_path = match tts::default_model_path() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "cannot resolve model dir");
-            drop(tts_rx);
-            return;
-        }
-    };
-    let initial_voice = settings.current().tts.voice;
-    let voice_path = match tts::default_voice_path(&initial_voice) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "cannot resolve voice path");
-            drop(tts_rx);
-            return;
-        }
-    };
-
-    match TtsEngine::new(&model_path, &voice_path) {
-        Ok(engine) => {
-            spawn_tts_worker(
-                engine,
-                audio,
-                tts_rx,
-                state_signals,
-                settings,
-                active,
-                speak_session,
-                ai_tts_suppressed,
-            );
-        }
-        Err(AppError::ModelNotFound(_)) => {
-            tts::report_missing_model_files();
-            drop(tts_rx);
-        }
-        Err(e) => {
-            warn!(error = %e, "TTS engine init failed; TTS disabled");
-            let _ = state_signals.try_send(StateSignal::TtsError { tab: initial_active.clone() });
-            drop(tts_rx);
-        }
-    }
+    // The worker owns the engine lifecycle now: it loads the Kokoro model when
+    // `tts.enabled` is on (and reloads/unloads it as that toggles), so this
+    // setup no longer constructs the engine eagerly. (`initial_active` above
+    // labels the audio-error signal.)
+    spawn_tts_worker(
+        audio,
+        tts_rx,
+        state_signals,
+        settings,
+        active,
+        speak_session,
+        ai_tts_suppressed,
+    );
 }
 
 fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle) {

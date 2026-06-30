@@ -700,9 +700,9 @@ pub async fn settings_update(
     // live materialize/remove after the mutate. The integrity pass that
     // normally owns those tabs only runs at load, so without this a freshly
     // enabled feature's tab wouldn't appear until the next launch.
-    let (was_graph, was_offload) = {
+    let (was_graph, was_offload, was_stt) = {
         let old = state.settings.current();
-        (old.graph.enabled, old.offload.enabled)
+        (old.graph.enabled, old.offload.enabled, old.stt.enabled)
     };
 
     // The Settings window holds a full snapshot and replaces wholesale, but it
@@ -721,9 +721,19 @@ pub async fn settings_update(
         crate::settings::reconcile_reserved_tabs(cur);
     });
 
+    // On an `stt.enabled` edge, load or unload the Whisper model so the toggle
+    // actually frees/reclaims memory (not just hides the record button).
+    let now = state.settings.current();
+    if now.stt.enabled != was_stt {
+        if now.stt.enabled {
+            state.stt.preload();
+        } else {
+            state.stt.unload();
+        }
+    }
+
     // On an actual enable/disable edge, mirror the change into the runtime so
     // the reserved tab appears/disappears live (tab bar + pane placement).
-    let now = state.settings.current();
     if now.graph.enabled != was_graph || now.offload.enabled != was_offload {
         // Serialize against create/close_tab while we touch the registry.
         let _serializer = state.lifecycle_serializer.lock().await;

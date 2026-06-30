@@ -34,6 +34,7 @@ dependency/component breadth) — this is the *capability* breadth.
 
 ## Text-to-Speech
 - Local Kokoro-82M ONNX synthesis (Apache 2.0), offline
+- Master enable that loads/unloads the Kokoro model (frees memory when off; distinct from mute), built off the async runtime
 - Out-of-band sourcing: Claude transcript JSONL tail + OpenCode `/event` stream (no terminal scraping, no `[[TTS]]` markers)
 - Markdown reduced to speakable prose (code/tables/tool output/reasoning dropped), sentence-segmented and deduped
 - Per-tab speak toggle (gates whether a tab reads its assistant prose), read live; `Esc` stops the current burst
@@ -45,6 +46,7 @@ dependency/component breadth) — this is the *capability* breadth.
 
 ## Speech-to-Text (Dictation)
 - Offline dictation via whisper.cpp (MIT), selectable GGML models (default `small`)
+- Enable toggle loads/unloads the Whisper model (frees memory when off) and gates the record button + push-to-talk
 - Toggle-button and push-to-talk (hold `Ctrl+Shift`) capture, with debounce + abort-on-other-key
 - Microphone device selection; VAD / silence handling; rubato resample to 16 kHz mono
 - Transcript appended to the compose overlay for review
@@ -99,6 +101,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Done-while-away indicator, focused-tab announcement toggle, global mute
 - Fully rebindable, context-aware keyboard shortcuts with conflict detection
 - Status bar: mute, announcements toggle, volume, record button, usage meter, layouts popover
+- Claude usage meter hides (and stops polling) when the Claude tab is disabled
 
 ## Integration, Monitoring & Build
 - Claude Code permission detection (matches the Esc/Tab footer)

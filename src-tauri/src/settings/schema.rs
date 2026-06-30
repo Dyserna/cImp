@@ -1607,6 +1607,13 @@ pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct TtsSettings {
+    /// Master enable for the whole TTS feature. When false, the Kokoro ONNX
+    /// model is **unloaded** (freeing CPU/GPU memory) and no synthesis runs;
+    /// flipping it back on reloads the model. Distinct from `mute`, which
+    /// keeps the model loaded and only silences playback. Back-compat via the
+    /// struct-level `#[serde(default)]` — files predating the field load as
+    /// `true`.
+    pub enabled: bool,
     pub voice: String,
     pub speed: f32,
     pub volume: f32,
@@ -1622,6 +1629,7 @@ pub struct TtsSettings {
 impl Default for TtsSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             voice: "af_heart".to_string(),
             speed: 1.0,
             volume: 1.0,

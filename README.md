@@ -307,6 +307,11 @@ and `Esc` stops the current burst until the next assistant message.
 There are **no `[[TTS]]` markers** — cImp reads the structure of the
 transcript / event stream rather than asking the model to tag its prose.
 
+**Master enable.** *Settings → TTS → Enable text-to-speech* loads the Kokoro
+model when on and **unloads it** (freeing CPU/GPU memory) when off — no AI
+output is spoken while disabled. This is distinct from *Mute*, which keeps the
+model loaded and only silences playback.
+
 **Per-tab speak toggle.** Each AI tab has a toggle under *Settings → Tabs →
 \<tab\> → TTS injection*. It gates whether that tab speaks its assistant
 prose aloud — turn it off for a tab you want to read silently. The toggle is
@@ -369,7 +374,9 @@ prints the expected path to the log.
 ## Speech-to-text (dictation)
 
 cImp can transcribe your voice into the compose overlay, fully offline. It
-is **off by default** — enable it under *Settings → Speech-to-text*.
+is **off by default** — enable it under *Settings → Speech-to-text*. Enabling
+loads the Whisper model (and the record button / push-to-talk become active);
+disabling unloads it to free memory.
 
 **Usage**
 
@@ -623,8 +630,10 @@ for the tag-driven release workflow.
 
 Open with `Ctrl+,` or the cog button on the avatar.
 
-- **TTS:** voice picker (auto-discovered from `voices/`), speed, volume,
-  mute.
+- **TTS:** an **Enable text-to-speech** master toggle (loads the Kokoro
+  model when on; unloads it to free CPU/GPU memory when off — distinct from
+  *Mute*, which keeps the model loaded and only silences playback), plus a
+  voice picker (auto-discovered from `voices/`), speed, volume, and mute.
 - **Avatar:** a **Type** picker — *Picture / Video* or *Animated sprites*
   (the default) — plus visibility, position, size, opacity. In
   Picture / Video mode: per-state image / video overrides and a transition

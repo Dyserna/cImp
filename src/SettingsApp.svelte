@@ -963,10 +963,25 @@
       {#if activeSection === 'audio'}
         <section>
           <h2>TTS</h2>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.tts.enabled}
+              onchange={(e) =>
+                patch((s) => (s.tts.enabled = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Enable text-to-speech</span>
+          </label>
+          <small class="hint top">
+            Loads the Kokoro voice model. Turn off to unload it and free
+            memory — no AI output is spoken while disabled. (To keep the model
+            loaded but silence playback, use <em>Mute</em> instead.)
+          </small>
           <label>
             <span>Voice</span>
             <select
               value={snapshot.tts.voice}
+              disabled={!snapshot.tts.enabled}
               onchange={(e) => patch((s) => (s.tts.voice = (e.currentTarget as HTMLSelectElement).value))}
             >
               {#each voices as v}
@@ -982,6 +997,7 @@
               max="2"
               step="0.05"
               value={snapshot.tts.speed}
+              disabled={!snapshot.tts.enabled}
               oninput={(e) =>
                 patch((s) => (s.tts.speed = +(e.currentTarget as HTMLInputElement).value))}
             />
@@ -994,6 +1010,7 @@
               max="1"
               step="0.01"
               value={snapshot.tts.volume}
+              disabled={!snapshot.tts.enabled}
               oninput={(e) =>
                 patch((s) => (s.tts.volume = +(e.currentTarget as HTMLInputElement).value))}
             />
@@ -1002,6 +1019,7 @@
             <input
               type="checkbox"
               checked={snapshot.tts.mute}
+              disabled={!snapshot.tts.enabled}
               onchange={(e) =>
                 patch((s) => (s.tts.mute = (e.currentTarget as HTMLInputElement).checked))}
             />

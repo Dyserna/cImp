@@ -24,13 +24,17 @@
       <span class="sep" aria-hidden="true"></span>
       <RecordButton />
     {/if}
-    <span class="sep" aria-hidden="true"></span>
-    {#if $settings.tts.show_selection_controls}
-      <SelectionTtsControls />
+    <!-- TTS playback controls only make sense when TTS is enabled (the model is
+         loaded); they hide with the feature, mirroring the record button. -->
+    {#if $settings.tts.enabled}
+      <span class="sep" aria-hidden="true"></span>
+      {#if $settings.tts.show_selection_controls}
+        <SelectionTtsControls />
+      {/if}
+      <VolumeSlider />
+      <MuteButton />
+      <AnnouncementsButton />
     {/if}
-    <VolumeSlider />
-    <MuteButton />
-    <AnnouncementsButton />
     <span class="sep" aria-hidden="true"></span>
     <SettingsButton />
   </div>

@@ -26,7 +26,7 @@ use crate::audio::amplitude::RingBuffer;
 use crate::error::{AppError, AppResult};
 use crate::settings::SettingsHandle;
 use crate::stt::engine::WHISPER_SAMPLE_RATE;
-use crate::stt::{set_state, CaptureCmd, SttState};
+use crate::stt::{set_state, CaptureCmd, SttState, WorkerMsg};
 
 /// Live capture session state, owned entirely by the capture thread.
 struct ActiveCapture {
@@ -43,7 +43,7 @@ pub(crate) fn spawn_capture_thread(
     app: AppHandle,
     settings: SettingsHandle,
     cmd_rx: Receiver<CaptureCmd>,
-    jobs_tx: Sender<Vec<f32>>,
+    jobs_tx: Sender<WorkerMsg>,
     recording: Arc<AtomicBool>,
     state: Arc<RwLock<SttState>>,
     mic: Arc<RwLock<RingBuffer>>,
@@ -93,7 +93,7 @@ pub(crate) fn spawn_capture_thread(
                             Ok(ready) => {
                                 let (peak, rms) = peak_rms(&ready);
                                 info!(target: "stt", frames_16k = ready.len(), peak, rms, "resampled for whisper");
-                                if jobs_tx.send(ready).is_err() {
+                                if jobs_tx.send(WorkerMsg::Transcribe(ready)).is_err() {
                                     warn!(target: "stt", "transcription worker gone; dropping recording");
                                     set_state(&app, &state, SttState::Idle);
                                 }

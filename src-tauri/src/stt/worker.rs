@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::settings::SettingsHandle;
 use crate::stt::engine::{SttEngine, WHISPER_SAMPLE_RATE};
-use crate::stt::{set_state, SttState};
+use crate::stt::{set_state, SttState, WorkerMsg};
 
 /// Recordings shorter than this (in 16 kHz samples) are treated as "didn't
 /// catch that" — too brief to be real speech. ~150 ms.
@@ -25,7 +25,7 @@ const MIN_SAMPLES: usize = (WHISPER_SAMPLE_RATE as usize) * 3 / 20;
 pub(crate) fn spawn_stt_worker(
     app: AppHandle,
     settings: SettingsHandle,
-    jobs_rx: Receiver<Vec<f32>>,
+    jobs_rx: Receiver<WorkerMsg>,
     state: Arc<RwLock<SttState>>,
 ) {
     std::thread::Builder::new()
@@ -40,7 +40,39 @@ pub(crate) fn spawn_stt_worker(
             // window never appears. Deferring it to the first recording keeps
             // startup clean: this thread just blocks on `recv` until then.
             let mut engine: Option<SttEngine> = None;
-            while let Ok(samples) = jobs_rx.recv() {
+            while let Ok(msg) = jobs_rx.recv() {
+                let samples = match msg {
+                    WorkerMsg::Transcribe(samples) => samples,
+                    WorkerMsg::Unload => {
+                        // `stt.enabled` flipped off: drop the model, freeing its
+                        // (potentially GPU) memory. Lazy-reloads on the next
+                        // recording or `Preload`.
+                        if engine.take().is_some() {
+                            info!(target: "stt", "STT disabled; Whisper model unloaded");
+                        }
+                        continue;
+                    }
+                    WorkerMsg::Preload => {
+                        // `stt.enabled` flipped on: warm the model in the
+                        // background so the first dictation isn't slowed by a
+                        // cold load. Best-effort — a missing model just logs and
+                        // is retried (and reported) on the first real recording.
+                        let cfg = settings.current().stt;
+                        if engine.as_ref().map(|e| e.model_file() != cfg.model_file).unwrap_or(true) {
+                            match load_engine(&cfg.model_file) {
+                                Ok(e) => {
+                                    info!(target: "stt", model = %cfg.model_file, "Whisper model preloaded");
+                                    engine = Some(e);
+                                }
+                                Err(e) => {
+                                    debug!(target: "stt", error = %e, model = %cfg.model_file, "preload deferred (model unavailable)");
+                                    engine = None;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                };
                 let cfg = settings.current().stt;
 
                 if samples.len() < MIN_SAMPLES {

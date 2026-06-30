@@ -246,32 +246,89 @@ const MOUSE_TRACKING_MODES = new Set([1000, 1001, 1002, 1003, 1005, 1006, 1015, 
 
 /**
  * V20: keep the mouse LOCAL in a fullscreen AI tab so cImp's selection works
- * like it does in a shell. Both Claude and OpenCode enable mouse tracking
- * (DECSET 1000/1002/1003/1006) in their fullscreen TUI, which routes
- * drags/clicks to the app — breaking copy-on-select, right-click paste, and
- * select-to-speak (the selection never becomes local, so `getSelection()` is
- * empty → "no text selected"). We swallow the mouse-tracking mode set/reset
- * sequences so xterm never starts forwarding mouse events; the app still works
- * keyboard-driven. All other private modes (alt-screen 1049, bracketed paste
- * 2004, cursor 25, focus 1004) pass through untouched. AI tabs only — shell
- * tabs are never altered.
+ * like it does in a shell, with a **hold-Alt bypass** to hand the mouse to the
+ * app when the user actually wants it.
+ *
+ * Both Claude and OpenCode enable mouse tracking (DECSET 1000/1002/1003/1006)
+ * in their fullscreen TUI, which routes drags/clicks to the app — breaking
+ * copy-on-select, right-click paste, and select-to-speak (no local selection
+ * ever forms, so `getSelection()` is empty → "no text selected"). We intercept
+ * the mouse-tracking mode set/reset sequences:
+ *
+ *  - **Default (Alt up):** swallow them, so xterm never forwards mouse events
+ *    and all gestures are local (select/copy/paste/speak), exactly like a shell.
+ *  - **While Alt is held:** re-enable exactly the modes the app asked for, so
+ *    drags/clicks reach the app (on Windows, Alt is not an xterm selection
+ *    modifier, so the events forward cleanly); released → back to local.
+ *
+ * Other private modes (alt-screen 1049, bracketed paste 2004, cursor 25, focus
+ * 1004) always pass through. AI tabs only; shell tabs are never altered. The
+ * key listeners live on `host` (which xterm's textarea sits inside), so they're
+ * garbage-collected with the host on teardown — no explicit cleanup needed.
  */
-function suppressMouseTracking(term: Terminal): void {
-  // Swallow only when EVERY mode in the sequence is mouse tracking, so a
-  // combined `?25;1002h` (cursor + mouse) still applies its non-mouse modes.
-  // Apps emit mouse modes alone or combined with each other (e.g. 1002;1006),
-  // so this covers the real cases without dropping unrelated modes.
-  const swallowIfAllMouse = (params: (number | number[])[]): boolean => {
-    if (params.length === 0) return false;
+function installAiMouseControl(term: Terminal, host: HTMLElement): void {
+  const appModes = new Set<number>(); // mouse modes the app currently wants on
+  let passthrough = false; // true while Alt is held (forward to app)
+  let injecting = false; // true while WE write an enable/disable to xterm
+
+  const allMouse = (params: (number | number[])[]): number[] | null => {
+    if (params.length === 0) return null;
     const nums = params.map((p) => (Array.isArray(p) ? p[0] : p));
-    return nums.every((n) => MOUSE_TRACKING_MODES.has(n));
+    return nums.every((n) => MOUSE_TRACKING_MODES.has(n)) ? nums : null;
   };
+
+  const makeHandler =
+    (final: 'h' | 'l') =>
+    (params: (number | number[])[]): boolean => {
+      if (injecting) return false; // our own enable/disable — let xterm apply it
+      const nums = allMouse(params);
+      if (!nums) return false; // not a mouse-only sequence — leave it alone
+      for (const n of nums) {
+        if (final === 'h') appModes.add(n);
+        else appModes.delete(n);
+      }
+      // Swallow by default (stay local). While passing through, apply the
+      // app's live changes so its mode stays current.
+      return !passthrough;
+    };
+
   try {
-    term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, swallowIfAllMouse);
-    term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, swallowIfAllMouse);
+    term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, makeHandler('h'));
+    term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, makeHandler('l'));
   } catch (e) {
-    console.warn('mouse-tracking suppression registration failed:', e);
+    console.warn('mouse-tracking control registration failed:', e);
+    return;
   }
+
+  const setXtermMouse = (on: boolean): void => {
+    if (appModes.size === 0) return; // app never asked for the mouse
+    const list = [...appModes].join(';');
+    injecting = true;
+    term.write(`\x1b[?${list}${on ? 'h' : 'l'}`, () => {
+      injecting = false;
+    });
+  };
+
+  host.addEventListener('keydown', (e) => {
+    if (e.key === 'Alt' && !passthrough && appModes.size > 0) {
+      passthrough = true;
+      setXtermMouse(true);
+    }
+  });
+  host.addEventListener('keyup', (e) => {
+    if (e.key === 'Alt' && passthrough) {
+      passthrough = false;
+      setXtermMouse(false);
+    }
+  });
+  // Focus leaving the terminal (Alt+Tab, click elsewhere) can swallow the Alt
+  // keyup — reset so the mouse doesn't stay stuck in passthrough.
+  host.addEventListener('focusout', () => {
+    if (passthrough) {
+      passthrough = false;
+      setXtermMouse(false);
+    }
+  });
 }
 
 function fitAndResize(entry: TerminalEntry): void {
@@ -427,10 +484,11 @@ export function createTerminal(
   });
   // V20: AI tabs keep the mouse local (shell-like selection: copy-on-select,
   // right-click paste, select-to-speak) by suppressing the fullscreen app's
-  // mouse-tracking modes. Registered before the PTY binds so the app's initial
-  // DECSET burst is caught. Shell tabs are untouched.
+  // mouse-tracking modes, with a hold-Alt bypass to hand the mouse to the app.
+  // Registered before the PTY binds so the app's initial DECSET burst is
+  // caught. Shell tabs are untouched.
   if (!isShellTab(tabId)) {
-    suppressMouseTracking(term);
+    installAiMouseControl(term, host);
   }
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);

@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -18,7 +18,6 @@ use crate::processing::{ProcessingEvent, ProcessingLayer};
 use super::manager::ProcessorControl;
 use crate::settings::SettingsHandle;
 use crate::state::{StateSignal, TabId, TabKind};
-use crate::tts::TtsRequest;
 
 /// Tail size scanned by the permission detector after each ingest/flush.
 /// Large enough for multi-line prompt UIs, small enough not to cost real
@@ -161,12 +160,17 @@ pub fn spawn_processor(
     mut rx: mpsc::Receiver<Vec<u8>>,
     channel: Channel<String>,
     mut control_rx: mpsc::Receiver<ProcessorControl>,
-    tts_segments: mpsc::Sender<TtsRequest>,
     cancel: CancellationToken,
-    user_typed_tts: Arc<StdMutex<HashSet<String>>>,
     state_signals: mpsc::Sender<StateSignal>,
     settings: SettingsHandle,
     patterns: Arc<Vec<PermissionPattern>>,
+    // V20: true when an out-of-band source authoritatively drives this tab's
+    // avatar Thinking/Idle (OpenCode's event stream). When set, the byte-burst
+    // activity fallback below is skipped — otherwise the fullscreen TUI's
+    // startup/repaint bursts spuriously flip Idle→Thinking→Idle and fire an
+    // "idle" notification. Claude keeps the fallback (its working state comes
+    // from the cell-model marker, not an OOB stream).
+    oob_drives_activity: bool,
 ) {
     tokio::spawn(async move {
         // V1.4-03: `channel` is `mut` so the `ProcessorControl::ChannelChange`
@@ -179,12 +183,7 @@ pub fn spawn_processor(
         let kind = tab.kind();
         let is_shell = matches!(kind, TabKind::Shell);
 
-        let mut layer = ProcessingLayer::with_user_typed_filter(user_typed_tts);
-        {
-            let s = settings.current();
-            layer.set_max_hold(Duration::from_millis(s.processing.max_hold_ms as u64));
-            layer.set_speak_all(s.tab_speak_all_output(tab.as_str()));
-        }
+        let mut layer = ProcessingLayer::new();
         let mut settings_rx = settings.subscribe();
         let mut tick = tokio::time::interval(FLUSH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -220,14 +219,10 @@ pub fn spawn_processor(
                 }
                 changed = settings_rx.recv() => {
                     match changed {
-                        Ok(s) => {
-                            layer.set_max_hold(Duration::from_millis(
-                                s.processing.max_hold_ms as u64,
-                            ));
-                            // Pick up a live toggle of "speak all output" for
-                            // this tab — no PTY restart needed.
-                            layer.set_speak_all(s.tab_speak_all_output(tab.as_str()));
-                        }
+                        // V20: the layer has no live-tunable knobs anymore (TTS
+                        // is out-of-band); we still drain the channel so it
+                        // doesn't lag, but there's nothing to reconfigure here.
+                        Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             debug!("pty processor: settings channel closed");
@@ -270,7 +265,7 @@ pub fn spawn_processor(
                                 e,
                                 ProcessingEvent::TerminalBytes(b) if !b.is_empty()
                             ));
-                            if dispatch_events(&tab, is_shell, events, &channel, &tts_segments).await.is_err() {
+                            if dispatch_events(events, &channel).await.is_err() {
                                 break;
                             }
                             if saw_terminal_bytes && !is_shell {
@@ -300,7 +295,7 @@ pub fn spawn_processor(
                         e,
                         ProcessingEvent::TerminalBytes(b) if !b.is_empty()
                     ));
-                    if dispatch_events(&tab, is_shell, events, &channel, &tts_segments).await.is_err() {
+                    if dispatch_events(events, &channel).await.is_err() {
                         break;
                     }
                     if saw_terminal_bytes && !is_shell {
@@ -320,8 +315,10 @@ pub fn spawn_processor(
 
                     // Avatar activity (Thinking↔Idle). Content-first: the
                     // `claude_working` marker is authoritative while it's on
-                    // screen; the byte timers are fallbacks.
-                    if !is_shell {
+                    // screen; the byte timers are fallbacks. Skipped entirely
+                    // when an out-of-band stream drives activity (V20: OpenCode),
+                    // so a fullscreen startup/repaint burst can't fake a cycle.
+                    if !is_shell && !oob_drives_activity {
                         if !output_active {
                             // Enter "working" on the marker, or — for a
                             // response that never paints it — a sustained
@@ -439,11 +436,8 @@ fn run_permission_check(
 }
 
 async fn dispatch_events(
-    tab: &TabId,
-    is_shell: bool,
     events: Vec<ProcessingEvent>,
     channel: &Channel<String>,
-    tts_segments: &mpsc::Sender<TtsRequest>,
 ) -> Result<(), ()> {
     for ev in events {
         match ev {
@@ -466,20 +460,6 @@ async fn dispatch_events(
                 if let Err(e) = channel.send(encoded) {
                     warn!(error = %e, "pty processor: terminal channel send failed");
                     return Err(());
-                }
-            }
-            ProcessingEvent::TtsSegment(text) => {
-                if is_shell {
-                    // Shell tabs never speak. The vte parser still ran (we
-                    // need it for xterm bytes), but any tag content the
-                    // scanner picked out is dropped on the floor.
-                    debug!(target: "tts_stub", ?tab, text = %text, "shell tab: dropping TTS segment");
-                    continue;
-                }
-                debug!(target: "tts_stub", ?tab, text = %text, "extracted TTS segment");
-                let req = TtsRequest::Synthesize { tab: tab.clone(), text, suppressible: true };
-                if tts_segments.send(req).await.is_err() {
-                    debug!("pty processor: TTS segment channel closed (worker not running)");
                 }
             }
         }

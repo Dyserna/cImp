@@ -60,6 +60,8 @@ pub fn build_launch_spec(
                 extra_args: cfg.args.clone(),
                 working_dir,
                 env: cfg.env.clone(),
+                // Shell tabs have no AI assistant output to speak.
+                oob: None,
             })
         }
     }
@@ -74,7 +76,7 @@ fn build_ai_tool_spec(
 ) -> AppResult<PtyLaunchSpec> {
     let binary = resolve_command(&cfg.command)?;
     let pre_args = build_pre_args(cfg, settings);
-    let extra_args = build_extra_args(cfg, settings, invocation_args);
+    let mut extra_args = build_extra_args(cfg, settings, invocation_args);
     let working_dir = cfg
         .cwd
         .clone()
@@ -85,6 +87,11 @@ fn build_ai_tool_spec(
     if command_is(&cfg.command, "opencode") {
         write_opencode_instructions(cfg, settings);
     }
+    // V20: resolve the out-of-band TTS source. For OpenCode this also injects
+    // the `--port`/`--hostname` the fullscreen TUI hosts its event server on
+    // (which the adapter taps). Mutates `extra_args`, so it runs on the real
+    // launch path only — the pure `build_extra_args` stays test-stable.
+    let oob = resolve_oob_source(cfg, &working_dir, &mut extra_args);
     let env = compose_ai_env(cfg, settings);
     Ok(PtyLaunchSpec {
         tab,
@@ -93,7 +100,51 @@ fn build_ai_tool_spec(
         extra_args,
         working_dir,
         env,
+        oob,
     })
+}
+
+/// V20: pick the out-of-band TTS source for an AI tab, and for OpenCode inject
+/// the loopback `--port`/`--hostname` its TUI exposes the event stream on.
+///
+/// - **Claude** (`claude` / `claude-local`): tail the project's transcript
+///   JSONL rooted at `working_dir`.
+/// - **OpenCode**: allocate a free loopback port, append `--port <N>
+///   --hostname 127.0.0.1` (appended last so it wins over any user `--port`),
+///   and tap `http://127.0.0.1:<N>/event`. If no port can be allocated, the
+///   tab still launches — just without automatic TTS.
+/// - **Anything else**: no source.
+fn resolve_oob_source(
+    cfg: &AiToolTabConfig,
+    working_dir: &Path,
+    extra_args: &mut Vec<String>,
+) -> Option<crate::oob::OobSpec> {
+    if command_is(&cfg.command, "claude") {
+        return Some(crate::oob::OobSpec::ClaudeTranscript {
+            project_dir: working_dir.to_path_buf(),
+        });
+    }
+    if command_is(&cfg.command, "opencode") {
+        let port = alloc_loopback_port()?;
+        extra_args.push("--port".to_string());
+        extra_args.push(port.to_string());
+        extra_args.push("--hostname".to_string());
+        extra_args.push("127.0.0.1".to_string());
+        return Some(crate::oob::OobSpec::OpenCodeEvent { port });
+    }
+    None
+}
+
+/// Reserve a free loopback TCP port by binding `127.0.0.1:0` and reading the
+/// OS-assigned port, then releasing it. There is a small window between release
+/// and OpenCode re-binding it, but on loopback at launch this is reliable in
+/// practice; a collision just means the event tap fails to connect and the tab
+/// has no automatic TTS (it still works otherwise).
+fn alloc_loopback_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|addr| addr.port())
 }
 
 /// True when `command` resolves to the named binary, comparing on the
@@ -179,16 +230,18 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
 
 /// Compose the capability-guidance addendum shared by Claude
 /// (`--append-system-prompt`) and OpenCode (the managed instructions file):
-/// the per-tab TTS-markup convention (gated on `tts_injection.enabled`), the
-/// offload nudge (gated on `offload.enabled && offload.inject_guidance`), and
-/// the code-graph nudge (gated on `graph.enabled`, with the semantic addendum
-/// when `graph.semantic_search`). Sections are joined by a blank line. Reusing
-/// the exact same sources keeps both agents in lockstep.
-fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> String {
+/// the offload nudge (gated on `offload.enabled && offload.inject_guidance`)
+/// and the code-graph nudge (gated on `graph.enabled`, with the semantic
+/// addendum when `graph.semantic_search`). Sections are joined by a blank line.
+/// Reusing the exact same sources keeps both agents in lockstep.
+///
+/// V20: the `[[TTS]]` markup convention is NO LONGER injected — AI tabs are
+/// fullscreen and TTS is sourced out-of-band (`crate::oob`), which speaks all
+/// assistant prose directly. The per-tab `tts_injection.enabled` flag is now
+/// the "speak this tab" gate read by the out-of-band sources, not a prompt
+/// injection toggle; `tts_injection.instructions` is vestigial.
+fn compose_capability_guidance(_cfg: &AiToolTabConfig, settings: &Settings) -> String {
     let mut addendum = String::new();
-    if cfg.tts_injection.enabled && !cfg.tts_injection.instructions.is_empty() {
-        addendum.push_str(&cfg.tts_injection.instructions);
-    }
     if settings.offload.enabled && settings.offload.inject_guidance {
         if !addendum.is_empty() {
             addendum.push_str("\n\n");
@@ -242,18 +295,11 @@ fn build_extra_args(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
-    // V19: OpenCode's default TUI takes the alternate screen (full-screen
-    // redraw), which breaks cImp's linear, append-only stream model the same
-    // way Claude's fullscreen renderer does. `--mini` renders inline into the
-    // normal scrollback instead — the same rendering class as Claude's
-    // `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. It is mandatory and always
-    // prepended (ahead of the user's own `cfg.args`) so the linear-stream
-    // contract holds regardless of what the user adds. `--mini` requires a real
-    // TTY, which the PTY supplies.
-    if command_is(&cfg.command, "opencode") {
-        out.push("--mini".to_string());
-    }
-
+    // V20: OpenCode launches in its native fullscreen (alternate-screen) TUI —
+    // no `--mini`. The earlier inline forcing (`--mini`) was dropped because the
+    // reduced palette hid commands like `/connect`; cImp now drives every AI tab
+    // fullscreen and sources TTS out-of-band (OpenCode's `GET /event` stream),
+    // not by scraping the linear terminal stream. See MILESTONE-V20.
     out.extend(cfg.args.iter().filter(|s| !s.is_empty()).cloned());
 
     // cimp is documented as a drop-in replacement for `claude`, so
@@ -391,31 +437,18 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
 fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
 
-    // Force Claude Code's classic inline renderer by opting out of the
-    // alternate-screen "fullscreen" TUI (introduced ~v2.1.89). That mode
-    // repaints the whole screen and enables mouse tracking, both of which
-    // break cImp's core assumption of a linear, append-only output stream:
-    //   - the `[[TTS]]` marker stripper (processing/screen.rs) can't locate
-    //     markers in full-screen repaints, so the literal tags leak into the
-    //     terminal and show up on selection;
-    //   - mouse tracking routes drags/right-clicks to Claude Code, producing
-    //     double paste / double copy-on-select and killing local selection
-    //     (so Ctrl+right-click speak-selection has nothing to read).
-    // Disabling the alternate screen (not just the mouse) is what restores
-    // all four behaviors at once. Set before the per-tab `env` merge below so
-    // a user can still override it per tab.
-    if command_is(&cfg.command, "claude") {
-        env.insert(
-            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
-            "1".to_string(),
-        );
-    }
+    // V20: Claude Code runs in its native fullscreen (alternate-screen) TUI —
+    // cImp no longer sets `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. The old
+    // inline forcing existed so the scrape pipeline could find `[[TTS]]` markers
+    // and keep mouse gestures local; both concerns are retired. TTS for AI tabs
+    // is now sourced out-of-band (Claude's transcript JSONL), and the terminal
+    // hosts the fullscreen app like any other terminal would. See MILESTONE-V20.
 
-    // V19: OpenCode launch env. `--mini` (see `build_extra_args`) puts the
-    // renderer inline; here we (1) inject the session-scoped config as one
+    // V19: OpenCode launch env. Now that the renderer is fullscreen (no
+    // `--mini`), this still (1) injects the session-scoped config as one
     // `OPENCODE_CONFIG_CONTENT` env var — the env-var analog of Claude's
     // `--mcp-config` / `--settings` / `--append-system-prompt` CLI flags — and
-    // (2) quiet terminal features that fight cImp's own selection/title
+    // (2) quiets terminal features that fight cImp's own selection/title
     // handling. Set before the per-tab `env` merge below so a user can override
     // any of these per tab.
     if command_is(&cfg.command, "opencode") {
@@ -427,7 +460,7 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
         );
         env.insert("OPENCODE_DISABLE_TERMINAL_TITLE".to_string(), "1".to_string());
         // Windows: OpenCode shells out via Git Bash. Pass the path through when
-        // the parent environment already names it, so the `--mini` child finds it.
+        // the parent environment already names it, so the child finds it.
         if let Ok(bash) = std::env::var("OPENCODE_GIT_BASH_PATH") {
             if !bash.is_empty() {
                 env.insert("OPENCODE_GIT_BASH_PATH".to_string(), bash);
@@ -524,15 +557,14 @@ mod tests {
     }
 
     #[test]
-    fn tts_and_statusline_coexist() {
-        // A default Claude tab has TTS injection enabled; with the status
+    fn guidance_and_statusline_coexist() {
+        // V20: TTS markup is no longer injected, but capability guidance
+        // (graph/offload) still feeds --append-system-prompt; with the status
         // line also on, both pre-arg pairs are present.
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
-        let mut cfg = claude_cfg();
-        cfg.tts_injection.enabled = true;
-        cfg.tts_injection.instructions = "wrap prose".to_string();
-        let args = build_pre_args(&cfg, &settings);
+        settings.graph.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
 
         assert!(args.iter().any(|a| a == "--append-system-prompt"));
         assert!(args.iter().any(|a| a == "--settings"));
@@ -553,21 +585,20 @@ mod tests {
     }
 
     #[test]
-    fn offload_guidance_merges_with_tts_addendum() {
+    fn offload_and_graph_guidance_merge_into_one_flag() {
+        // V20: with both offload and graph guidance on, they merge into a
+        // single --append-system-prompt (TTS markup no longer participates).
         let mut settings = Settings::default();
         settings.offload.enabled = true;
         settings.offload.inject_guidance = true;
-        let mut cfg = claude_cfg();
-        cfg.tts_injection.enabled = true;
-        cfg.tts_injection.instructions = "wrap prose".to_string();
-        let args = build_pre_args(&cfg, &settings);
+        settings.graph.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
 
-        // Exactly one --append-system-prompt, carrying both addenda.
         let count = args.iter().filter(|a| *a == "--append-system-prompt").count();
         assert_eq!(count, 1, "addenda must merge into one flag");
         let i = args.iter().position(|a| a == "--append-system-prompt").unwrap();
-        assert!(args[i + 1].contains("wrap prose"));
         assert!(args[i + 1].contains("offload_task"));
+        assert!(args[i + 1].contains("graph_find_symbol"));
     }
 
     #[test]
@@ -637,41 +668,52 @@ mod tests {
     }
 
     #[test]
-    fn disables_claude_fullscreen_renderer() {
+    fn claude_launches_fullscreen_by_default() {
+        // V20: cImp no longer forces Claude's inline renderer. Without an
+        // explicit per-tab override, no `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`
+        // is synthesized, so Claude runs in its native fullscreen TUI.
         let settings = Settings::default();
         let env = compose_ai_env(&claude_cfg(), &settings);
-        assert_eq!(
-            env.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN").map(String::as_str),
-            Some("1"),
-            "every Claude tab must opt out of the fullscreen renderer",
+        assert!(
+            !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            "V20: cImp must not force Claude's inline renderer",
         );
     }
 
     #[test]
-    fn fullscreen_optout_is_claude_only() {
+    fn no_ai_tab_forces_inline_renderer() {
+        // V20: neither AI tool gets the alt-screen opt-out; both go fullscreen.
         let settings = Settings::default();
-        let env = compose_ai_env(&opencode_cfg(), &settings);
-        assert!(
-            !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
-            "OpenCode doesn't understand the Claude fullscreen flag",
-        );
+        for env in [
+            compose_ai_env(&claude_cfg(), &settings),
+            compose_ai_env(&opencode_cfg(), &settings),
+        ] {
+            assert!(
+                !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+                "no AI tab should set the Claude fullscreen opt-out in V20",
+            );
+        }
     }
 
     // ---- V19: OpenCode launch spine ----
 
     #[test]
-    fn prepends_mini_for_opencode() {
+    fn opencode_launches_without_mini() {
+        // V20: OpenCode runs its full fullscreen TUI — no `--mini` is injected,
+        // so the complete command palette (e.g. `/connect`) is available.
         let settings = Settings::default();
         let args = build_extra_args(&opencode_cfg(), &settings, &[]);
-        assert_eq!(args.first().map(String::as_str), Some("--mini"),
-            "opencode must launch with --mini as the first arg, got: {args:?}");
+        assert!(!args.iter().any(|a| a == "--mini"),
+            "V20: opencode must NOT get --mini, got: {args:?}");
     }
 
     #[test]
-    fn no_mini_for_claude_or_shell() {
+    fn no_mini_for_any_ai_tab() {
         let settings = Settings::default();
         let claude = build_extra_args(&claude_cfg(), &settings, &[]);
         assert!(!claude.iter().any(|a| a == "--mini"), "claude must not get --mini");
+        let opencode = build_extra_args(&opencode_cfg(), &settings, &[]);
+        assert!(!opencode.iter().any(|a| a == "--mini"), "opencode must not get --mini in V20");
         // A non-opencode, non-claude AI command must not get --mini either.
         let mut other = claude_cfg();
         other.command = "some-other-tool".to_string();
@@ -725,10 +767,11 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_references_instructions_when_tts_enabled() {
-        // The default opencode tab has TTS injection enabled with the runtime
-        // prompt, so the config references the managed instructions file.
-        let settings = Settings::default();
+    fn opencode_config_references_instructions_when_guidance_applies() {
+        // V20: TTS markup is no longer injected, so the instructions file is
+        // referenced only when capability guidance (graph/offload) applies.
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
         let cfg = build_opencode_config(&opencode_cfg(), &settings);
         let path = cfg["instructions"][0].as_str().expect("instructions path");
         assert!(path.ends_with(".md"), "got: {path}");
@@ -737,10 +780,10 @@ mod tests {
 
     #[test]
     fn opencode_config_no_instructions_when_no_guidance() {
-        let settings = Settings::default(); // offload + graph off
-        let mut cfg = opencode_cfg();
-        cfg.tts_injection.enabled = false; // and no TTS guidance
-        let config = build_opencode_config(&cfg, &settings);
+        // V20: default settings (offload + graph off) ⇒ no guidance ⇒ no
+        // instructions key, regardless of the (now-vestigial) tts_injection.
+        let settings = Settings::default();
+        let config = build_opencode_config(&opencode_cfg(), &settings);
         assert!(config.get("instructions").is_none(), "no guidance ⇒ no instructions key");
     }
 
@@ -783,18 +826,21 @@ mod tests {
     }
 
     #[test]
-    fn per_tab_env_overrides_fullscreen_optout() {
+    fn per_tab_env_can_reenable_inline_renderer() {
+        // V20: cImp no longer synthesizes the alt-screen opt-out, but a user who
+        // wants the old inline renderer can still set it per tab; the per-tab env
+        // merge carries it through untouched.
         let settings = Settings::default();
         let mut cfg = claude_cfg();
         cfg.env.insert(
             "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
-            "0".to_string(),
+            "1".to_string(),
         );
         let env = compose_ai_env(&cfg, &settings);
         assert_eq!(
             env.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN").map(String::as_str),
-            Some("0"),
-            "an explicit per-tab value must win over the synthesized default",
+            Some("1"),
+            "an explicit per-tab value must pass through the env merge",
         );
     }
 }

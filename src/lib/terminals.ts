@@ -223,6 +223,114 @@ function hostIsFittable(entry: TerminalEntry): boolean {
   return host.offsetWidth > 0 && host.offsetHeight > 0;
 }
 
+/**
+ * V20: true when the running program has enabled mouse tracking (DECSET
+ * 1000/1002/1003/1006), i.e. it owns the pointer — the case for a fullscreen
+ * AI TUI. xterm exposes this via `term.modes.mouseTrackingMode` ('none' when
+ * off). Used to decide whether cImp's right-click paste would double-act with
+ * the app's own mouse handling. Defensive: any access error reads as "off".
+ */
+function isMouseTrackingActive(term: Terminal): boolean {
+  try {
+    const mode = (term as unknown as { modes?: { mouseTrackingMode?: string } })
+      .modes?.mouseTrackingMode;
+    return !!mode && mode !== 'none';
+  } catch {
+    return false;
+  }
+}
+
+/** DECSET/DECRST private modes that enable mouse reporting (X10/VT200/drag/
+ * any-event tracking + the SGR/urxvt coordinate encodings). */
+const MOUSE_TRACKING_MODES = new Set([1000, 1001, 1002, 1003, 1005, 1006, 1015, 1016]);
+
+/**
+ * V20: keep the mouse LOCAL in a fullscreen AI tab so cImp's selection works
+ * like it does in a shell, with a **hold-Alt bypass** to hand the mouse to the
+ * app when the user actually wants it.
+ *
+ * Both Claude and OpenCode enable mouse tracking (DECSET 1000/1002/1003/1006)
+ * in their fullscreen TUI, which routes drags/clicks to the app — breaking
+ * copy-on-select, right-click paste, and select-to-speak (no local selection
+ * ever forms, so `getSelection()` is empty → "no text selected"). We intercept
+ * the mouse-tracking mode set/reset sequences:
+ *
+ *  - **Default (Alt up):** swallow them, so xterm never forwards mouse events
+ *    and all gestures are local (select/copy/paste/speak), exactly like a shell.
+ *  - **While Alt is held:** re-enable exactly the modes the app asked for, so
+ *    drags/clicks reach the app (on Windows, Alt is not an xterm selection
+ *    modifier, so the events forward cleanly); released → back to local.
+ *
+ * Other private modes (alt-screen 1049, bracketed paste 2004, cursor 25, focus
+ * 1004) always pass through. AI tabs only; shell tabs are never altered. The
+ * key listeners live on `host` (which xterm's textarea sits inside), so they're
+ * garbage-collected with the host on teardown — no explicit cleanup needed.
+ */
+function installAiMouseControl(term: Terminal, host: HTMLElement): void {
+  const appModes = new Set<number>(); // mouse modes the app currently wants on
+  let passthrough = false; // true while Alt is held (forward to app)
+  let injecting = false; // true while WE write an enable/disable to xterm
+
+  const allMouse = (params: (number | number[])[]): number[] | null => {
+    if (params.length === 0) return null;
+    const nums = params.map((p) => (Array.isArray(p) ? p[0] : p));
+    return nums.every((n) => MOUSE_TRACKING_MODES.has(n)) ? nums : null;
+  };
+
+  const makeHandler =
+    (final: 'h' | 'l') =>
+    (params: (number | number[])[]): boolean => {
+      if (injecting) return false; // our own enable/disable — let xterm apply it
+      const nums = allMouse(params);
+      if (!nums) return false; // not a mouse-only sequence — leave it alone
+      for (const n of nums) {
+        if (final === 'h') appModes.add(n);
+        else appModes.delete(n);
+      }
+      // Swallow by default (stay local). While passing through, apply the
+      // app's live changes so its mode stays current.
+      return !passthrough;
+    };
+
+  try {
+    term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, makeHandler('h'));
+    term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, makeHandler('l'));
+  } catch (e) {
+    console.warn('mouse-tracking control registration failed:', e);
+    return;
+  }
+
+  const setXtermMouse = (on: boolean): void => {
+    if (appModes.size === 0) return; // app never asked for the mouse
+    const list = [...appModes].join(';');
+    injecting = true;
+    term.write(`\x1b[?${list}${on ? 'h' : 'l'}`, () => {
+      injecting = false;
+    });
+  };
+
+  host.addEventListener('keydown', (e) => {
+    if (e.key === 'Alt' && !passthrough && appModes.size > 0) {
+      passthrough = true;
+      setXtermMouse(true);
+    }
+  });
+  host.addEventListener('keyup', (e) => {
+    if (e.key === 'Alt' && passthrough) {
+      passthrough = false;
+      setXtermMouse(false);
+    }
+  });
+  // Focus leaving the terminal (Alt+Tab, click elsewhere) can swallow the Alt
+  // keyup — reset so the mouse doesn't stay stuck in passthrough.
+  host.addEventListener('focusout', () => {
+    if (passthrough) {
+      passthrough = false;
+      setXtermMouse(false);
+    }
+  });
+}
+
 function fitAndResize(entry: TerminalEntry): void {
   if (!hostIsFittable(entry)) return;
   entry.fitAddon.fit();
@@ -374,6 +482,14 @@ export function createTerminal(
     // host-size differences after the snapshot lands.
     ...(options.initialGeometry ?? {}),
   });
+  // V20: AI tabs keep the mouse local (shell-like selection: copy-on-select,
+  // right-click paste, select-to-speak) by suppressing the fullscreen app's
+  // mouse-tracking modes, with a hold-Alt bypass to hand the mouse to the app.
+  // Registered before the PTY binds so the app's initial DECSET burst is
+  // caught. Shell tabs are untouched.
+  if (!isShellTab(tabId)) {
+    installAiMouseControl(term, host);
+  }
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
   // V1.4-03: serialize addon captures scrollback as ANSI for replay
@@ -535,6 +651,17 @@ export function createTerminal(
       return;
     }
     if (!behavior.paste_on_right_click) return;
+    // V20: in a fullscreen AI tab the app enables mouse tracking and owns the
+    // pointer, so a plain right-click is already delivered to the app as a
+    // mouse event. Pasting on top of that double-acts. When the app owns the
+    // mouse, require Shift (xterm's bypass for local gestures) before cImp
+    // pastes; suppress the OS menu either way. Shell tabs and normal-buffer
+    // programs don't enable mouse tracking, so they paste on a plain
+    // right-click exactly as before.
+    if (isMouseTrackingActive(term) && !e.shiftKey) {
+      e.preventDefault();
+      return;
+    }
     e.preventDefault();
     navigator.clipboard
       .readText()

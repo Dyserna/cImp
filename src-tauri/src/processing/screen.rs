@@ -17,8 +17,6 @@
 
 use vte::{Params, Perform};
 
-use crate::processing::tags::{build_rendered, TagScanner};
-
 /// Hard ceiling on the cell-row buffer. Rows beyond this scroll off the top
 /// (oldest first), mirroring a terminal's scrollback limit. Bounds memory for
 /// long sessions and caps a single oversized cursor-down (`\x1b[65535B`) to one
@@ -130,6 +128,7 @@ impl Screen {
         }
     }
 
+    #[cfg(test)]
     pub fn rows(&self) -> &[Row] {
         &self.rows
     }
@@ -162,25 +161,16 @@ impl Screen {
         self.raw_emitted_offset < self.raw_buffer.len()
     }
 
-    /// Append-only raw byte stream, including all ANSI sequences. The tag
-    /// scanner reads from this rather than the cell-derived rendered text:
-    /// raw bytes are accurate to what Claude actually emitted, while cells
-    /// can carry stale chars in cursor-skipped positions.
-    pub fn raw_view(&self) -> &[u8] {
-        &self.raw_buffer
-    }
-
     /// Number of leading raw bytes already emitted to the terminal. The
-    /// processing layer pairs this with the scanner's read cursor to decide
-    /// how much of `raw_buffer` is safe to drop.
+    /// processing layer uses this as the compaction watermark — bytes below it
+    /// have been forwarded and can be dropped.
     pub fn emitted_offset(&self) -> usize {
         self.raw_emitted_offset
     }
 
     /// Drop the leading `watermark` raw bytes (clamped to the emit cursor) and
-    /// rebase `raw_emitted_offset`. The caller is responsible for rebasing the
-    /// scanner's `scan_offset` by the SAME amount — both are absolute offsets
-    /// into `raw_buffer`. Returns the number of bytes actually dropped.
+    /// rebase `raw_emitted_offset`. Returns the number of bytes actually
+    /// dropped.
     pub fn compact_raw(&mut self, watermark: usize) -> usize {
         let drop = watermark.min(self.raw_emitted_offset);
         if drop == 0 {
@@ -234,102 +224,23 @@ impl Screen {
         self.cursor_col = col.min(MAX_COLS - 1);
     }
 
-    /// Try to drain `raw_buffer` to a `Vec<u8>` of bytes safe to forward to
-    /// xterm.
+    /// Drain all pending `raw_buffer` bytes to forward to xterm.
     ///
-    /// Smart flush strategy:
-    ///
-    /// - Hold while the scanner has an open tag (an `[[TTS]]` with no matching
-    ///   closer yet). Otherwise the user would briefly see literal marker text.
-    /// - Hold while the rendered tail is a *partial* opener prefix (`[`, `[[`,
-    ///   `[[T`, … `[[TTS]`). One more byte could turn that into a real opener.
-    /// - Otherwise — including the typing-feedback path, where Claude is just
-    ///   echoing keystrokes back through TUI redraws — flush immediately. This
-    ///   is the difference between visible-on-keystroke and
-    ///   visible-after-stability-timeout.
-    ///
-    /// On force (max-hold expired with an open tag pending) we emit raw bytes
-    /// without stripping markers, so the user sees the literal `[[TTS]]` per
-    /// the unclosed-tag recovery rule. The caller resets the scanner's open
-    /// state after this call.
-    pub fn drain_flushable(&mut self, scanner: &TagScanner, force: bool) -> Vec<u8> {
+    /// V20: the identity forward of the PTY stream. With the `[[TTS]]` marker
+    /// convention retired (TTS is sourced out-of-band), there is nothing to
+    /// hold for or strip — every byte the child emitted is forwarded verbatim,
+    /// in order, exactly once. This is also zero-lag: bytes are visible the
+    /// instant they arrive.
+    pub fn drain_flushable(&mut self) -> Vec<u8> {
         if !self.has_pending() {
             return Vec::new();
         }
-
-        if !force {
-            if scanner.has_open_tag() {
-                return Vec::new();
-            }
-            let rendered = build_rendered(self);
-            if tail_might_be_opener_prefix(&rendered) {
-                return Vec::new();
-            }
-        }
-
         let start = self.raw_emitted_offset;
         let end = self.raw_buffer.len();
-        let slice = &self.raw_buffer[start..end];
-
-        // When force-flushing with an unclosed tag, emit the bytes as-is so the
-        // user sees the literal `[[TTS]]`. Otherwise strip every marker
-        // occurrence in the range — markers are ASCII even when Claude wraps
-        // them in ANSI styling.
-        let strip_markers = !scanner.has_open_tag();
-        let out = if strip_markers {
-            strip_marker_bytes(slice)
-        } else {
-            slice.to_vec()
-        };
-
+        let out = self.raw_buffer[start..end].to_vec();
         self.raw_emitted_offset = end;
         out
     }
-}
-
-/// Returns true if `rendered` ends with any non-empty proper prefix of the
-/// opener marker `[[TTS]]`. The full opener itself flips `has_open_tag`, so
-/// it's handled separately and excluded here.
-fn tail_might_be_opener_prefix(rendered: &str) -> bool {
-    const PREFIXES: &[&str] = &["[", "[[", "[[T", "[[TT", "[[TTS", "[[TTS]"];
-    PREFIXES.iter().any(|p| rendered.ends_with(p))
-}
-
-/// Replace `[[TTS]]` (7 bytes) and `[[/TTS]]` (8 bytes) markers in the
-/// outgoing byte stream so the user doesn't see them in the terminal.
-///
-/// Naive stripping (removing the bytes outright) shifts everything to the
-/// left of where Claude expected, so subsequent cursor-relative motions like
-/// `\x1b[1C` land on different absolute columns. In Claude Code's TUI those
-/// motions sit between words; in our window the post-shift skipped cells
-/// land on stale spinner/status content from earlier frames, painting
-/// adjacent words together (`kinds` + stale `t` + `of` -> `kindstof`).
-///
-/// Instead we substitute each marker with `\x1b[<n>X\x1b[<n>C`: erase N
-/// cells starting at cursor, then advance the cursor N. Cursor ends in the
-/// same column Claude expected, and the cells under the marker are cleared
-/// so nothing stale leaks through.
-fn strip_marker_bytes(slice: &[u8]) -> Vec<u8> {
-    const OPEN: &[u8] = b"[[TTS]]";
-    const CLOSE: &[u8] = b"[[/TTS]]";
-    const OPEN_SUB: &[u8] = b"\x1b[7X\x1b[7C";
-    const CLOSE_SUB: &[u8] = b"\x1b[8X\x1b[8C";
-    let n = slice.len();
-    let mut out = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        if i + OPEN.len() <= n && &slice[i..i + OPEN.len()] == OPEN {
-            out.extend_from_slice(OPEN_SUB);
-            i += OPEN.len();
-        } else if i + CLOSE.len() <= n && &slice[i..i + CLOSE.len()] == CLOSE {
-            out.extend_from_slice(CLOSE_SUB);
-            i += CLOSE.len();
-        } else {
-            out.push(slice[i]);
-            i += 1;
-        }
-    }
-    out
 }
 
 impl Perform for Screen {

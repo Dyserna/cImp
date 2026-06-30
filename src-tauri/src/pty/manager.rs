@@ -31,6 +31,11 @@ pub struct PtyLaunchSpec {
     /// environment. Empty for AI builtins; user Shell tabs may set per-tab
     /// vars (the M2 dialog leaves env empty — schema reserved, UI deferred).
     pub env: std::collections::HashMap<String, String>,
+    /// V20: the out-of-band TTS source to attach once the child is up (Claude
+    /// transcript tail / OpenCode event stream). `None` for shell tabs and any
+    /// AI tab whose source can't be resolved. The source rides the tab's PTY
+    /// cancel token, so it starts with the tab and dies with it.
+    pub oob: Option<crate::oob::OobSpec>,
 }
 
 pub struct PtyManager {
@@ -102,7 +107,9 @@ impl PtyManager {
         initial_rows: u16,
         initial_cols: u16,
         tts_segments: mpsc::Sender<TtsRequest>,
-        user_typed_tts: Arc<StdMutex<HashSet<String>>>,
+        // V20: retained for the registry's call shape; the processing layer no
+        // longer consumes a user-typed echo filter (TTS is out-of-band).
+        _user_typed_tts: Arc<StdMutex<HashSet<String>>>,
         state_signals: mpsc::Sender<StateSignal>,
         patterns: Arc<Vec<PermissionPattern>>,
     ) -> AppResult<()> {
@@ -199,6 +206,26 @@ impl PtyManager {
             VecDeque::with_capacity(scrollback_cap.min(1 << 20)),
         ));
 
+        // V20: build the out-of-band TTS source context before the senders are
+        // moved into the processor/waiter. The source rides `cancel`, so it
+        // starts now and dies when the tab's PTY does.
+        let oob_ctx = spec.oob.clone().map(|oob_spec| {
+            (
+                oob_spec,
+                crate::oob::OobContext {
+                    tab: tab.clone(),
+                    tts: tts_segments.clone(),
+                    state_signals: state_signals.clone(),
+                    settings: settings.clone(),
+                    cancel: cancel.clone(),
+                },
+            )
+        });
+        // OpenCode's event stream authoritatively drives Thinking/Idle, so the
+        // processor must not also run its byte-burst activity fallback.
+        let oob_drives_activity =
+            matches!(spec.oob, Some(crate::oob::OobSpec::OpenCodeEvent { .. }));
+
         tasks::spawn_reader(
             reader,
             bytes_tx,
@@ -211,14 +238,17 @@ impl PtyManager {
             bytes_rx,
             output_channel,
             control_rx,
-            tts_segments,
             cancel.clone(),
-            user_typed_tts,
             state_signals.clone(),
             settings,
             patterns,
+            oob_drives_activity,
         );
         tasks::spawn_waiter(tab.clone(), child, app, cancel.clone(), state_signals);
+
+        if let Some((oob_spec, ctx)) = oob_ctx {
+            crate::oob::spawn(oob_spec, ctx);
+        }
 
         *guard = Some(PtyHandle {
             writer,
@@ -466,7 +496,6 @@ mod tests {
     use crate::pty::tasks::spawn_processor;
     use crate::settings::SettingsHandle;
     use crate::state::TabId;
-    use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -511,10 +540,8 @@ mod tests {
 
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(16);
         let (control_tx, control_rx) = mpsc::channel::<ProcessorControl>(4);
-        let (tts_tx, _tts_rx) = mpsc::channel(1);
         let (state_tx, _state_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
-        let typed = Arc::new(StdMutex::new(HashSet::new()));
 
         // SettingsHandle uses defaults; no `.set()` is ever called so the
         // debounced saver task stays idle and never touches disk.
@@ -532,12 +559,11 @@ mod tests {
             bytes_rx,
             channel_a,
             control_rx,
-            tts_tx,
             cancel.clone(),
-            typed,
             state_tx,
             settings,
             patterns,
+            false,
         );
 
         // Bytes before the rebind. The processor's flush tick is 50ms;
@@ -578,10 +604,8 @@ mod tests {
 
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(16);
         let (control_tx, control_rx) = mpsc::channel::<ProcessorControl>(8);
-        let (tts_tx, _tts_rx) = mpsc::channel(1);
         let (state_tx, _state_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
-        let typed = Arc::new(StdMutex::new(HashSet::new()));
         let defaults = crate::settings::Settings::default();
         let settings = SettingsHandle::new(
             defaults.clone(),
@@ -598,12 +622,11 @@ mod tests {
             bytes_rx,
             initial,
             control_rx,
-            tts_tx,
             cancel.clone(),
-            typed,
             state_tx,
             settings,
             patterns,
+            false,
         );
 
         // Three rapid rebinds. The last channel is the one whose buffer

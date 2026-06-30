@@ -7,6 +7,7 @@ mod graph;
 mod ipc;
 mod logging;
 mod notifications;
+mod oob;
 mod offload;
 mod process_guard;
 mod processing;

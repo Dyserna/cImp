@@ -17,8 +17,6 @@
   } from './ipc';
   import { openConfigureTabDialog, openNewShellTabDialog } from './dialog/store';
   import { openSettingsWindowToTab } from './settings/ipc';
-  import { settings, applySettings } from './settings/store';
-  import { get } from 'svelte/store';
   import { isShellTab, type TabId } from './tabs/types';
   import { tabMeta } from './tabs/store';
   import { requestTabIntoPane, setFocusedPane, setPaneActiveTab } from './layout/store';
@@ -154,28 +152,6 @@
     menu = { x: e.clientX, y: e.clientY, tab: { id: tab, builtin } };
   }
 
-  /// Current "speak all output" state for an AI tab (false for shells /
-  /// unknown ids). Read reactively in the template via `$settings`.
-  function ttsAllOutputFor(id: TabId, all: typeof $settings.tabs): boolean {
-    const cfg = all.find((t) => t.id === id);
-    return cfg?.kind === 'ai_tool' ? cfg.tts_all_output : false;
-  }
-
-  /// Toggle the per-tab "speak all output" flag. Persists via the normal
-  /// settings update path (broadcast + debounced save into the per-folder
-  /// overlay); the running processor picks it up live — no PTY restart.
-  function onToggleTtsAllOutput(tab: TabId): void {
-    const s = get(settings);
-    const idx = s.tabs.findIndex((t) => t.id === tab);
-    if (idx < 0) return;
-    const cfg = s.tabs[idx];
-    if (cfg.kind !== 'ai_tool') return;
-    const tabsNext = [...s.tabs];
-    tabsNext[idx] = { ...cfg, tts_all_output: !cfg.tts_all_output };
-    void applySettings({ ...s, tabs: tabsNext }).catch((e) =>
-      console.error('toggle tts_all_output failed:', e),
-    );
-  }
 
   function dismissMenu(): void {
     menu = null;
@@ -232,7 +208,6 @@
           avatarState={$perTabAvatarState[id] ?? 'Idle'}
           awaitingPermission={$perTabAwaitingPermission[id] ?? false}
           doneWhileAway={$perTabDoneWhileAway[id] ?? false}
-          ttsAllOutput={ttsAllOutputFor(id, $settings.tabs)}
           bind:renaming={
             () => renamingTab === id,
             (v) => {
@@ -282,8 +257,6 @@
           canRestart: isShell && !closed,
         }
       : null}
-    ttsAllOutput={t ? ttsAllOutputFor(t.id, $settings.tabs) : false}
-    onToggleTtsAllOutput={t ? () => onToggleTtsAllOutput(t.id) : undefined}
     onRename={t ? () => (renamingTab = t.id) : undefined}
     onConfigure={t
       ? () => {

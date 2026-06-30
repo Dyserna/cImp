@@ -60,6 +60,8 @@ pub fn build_launch_spec(
                 extra_args: cfg.args.clone(),
                 working_dir,
                 env: cfg.env.clone(),
+                // Shell tabs have no AI assistant output to speak.
+                oob: None,
             })
         }
     }
@@ -74,7 +76,7 @@ fn build_ai_tool_spec(
 ) -> AppResult<PtyLaunchSpec> {
     let binary = resolve_command(&cfg.command)?;
     let pre_args = build_pre_args(cfg, settings);
-    let extra_args = build_extra_args(cfg, settings, invocation_args);
+    let mut extra_args = build_extra_args(cfg, settings, invocation_args);
     let working_dir = cfg
         .cwd
         .clone()
@@ -85,6 +87,11 @@ fn build_ai_tool_spec(
     if command_is(&cfg.command, "opencode") {
         write_opencode_instructions(cfg, settings);
     }
+    // V20: resolve the out-of-band TTS source. For OpenCode this also injects
+    // the `--port`/`--hostname` the fullscreen TUI hosts its event server on
+    // (which the adapter taps). Mutates `extra_args`, so it runs on the real
+    // launch path only — the pure `build_extra_args` stays test-stable.
+    let oob = resolve_oob_source(cfg, &working_dir, &mut extra_args);
     let env = compose_ai_env(cfg, settings);
     Ok(PtyLaunchSpec {
         tab,
@@ -93,7 +100,51 @@ fn build_ai_tool_spec(
         extra_args,
         working_dir,
         env,
+        oob,
     })
+}
+
+/// V20: pick the out-of-band TTS source for an AI tab, and for OpenCode inject
+/// the loopback `--port`/`--hostname` its TUI exposes the event stream on.
+///
+/// - **Claude** (`claude` / `claude-local`): tail the project's transcript
+///   JSONL rooted at `working_dir`.
+/// - **OpenCode**: allocate a free loopback port, append `--port <N>
+///   --hostname 127.0.0.1` (appended last so it wins over any user `--port`),
+///   and tap `http://127.0.0.1:<N>/event`. If no port can be allocated, the
+///   tab still launches — just without automatic TTS.
+/// - **Anything else**: no source.
+fn resolve_oob_source(
+    cfg: &AiToolTabConfig,
+    working_dir: &Path,
+    extra_args: &mut Vec<String>,
+) -> Option<crate::oob::OobSpec> {
+    if command_is(&cfg.command, "claude") {
+        return Some(crate::oob::OobSpec::ClaudeTranscript {
+            project_dir: working_dir.to_path_buf(),
+        });
+    }
+    if command_is(&cfg.command, "opencode") {
+        let port = alloc_loopback_port()?;
+        extra_args.push("--port".to_string());
+        extra_args.push(port.to_string());
+        extra_args.push("--hostname".to_string());
+        extra_args.push("127.0.0.1".to_string());
+        return Some(crate::oob::OobSpec::OpenCodeEvent { port });
+    }
+    None
+}
+
+/// Reserve a free loopback TCP port by binding `127.0.0.1:0` and reading the
+/// OS-assigned port, then releasing it. There is a small window between release
+/// and OpenCode re-binding it, but on loopback at launch this is reliable in
+/// practice; a collision just means the event tap fails to connect and the tab
+/// has no automatic TTS (it still works otherwise).
+fn alloc_loopback_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|addr| addr.port())
 }
 
 /// True when `command` resolves to the named binary, comparing on the

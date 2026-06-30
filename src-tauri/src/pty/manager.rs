@@ -31,6 +31,11 @@ pub struct PtyLaunchSpec {
     /// environment. Empty for AI builtins; user Shell tabs may set per-tab
     /// vars (the M2 dialog leaves env empty — schema reserved, UI deferred).
     pub env: std::collections::HashMap<String, String>,
+    /// V20: the out-of-band TTS source to attach once the child is up (Claude
+    /// transcript tail / OpenCode event stream). `None` for shell tabs and any
+    /// AI tab whose source can't be resolved. The source rides the tab's PTY
+    /// cancel token, so it starts with the tab and dies with it.
+    pub oob: Option<crate::oob::OobSpec>,
 }
 
 pub struct PtyManager {
@@ -199,6 +204,22 @@ impl PtyManager {
             VecDeque::with_capacity(scrollback_cap.min(1 << 20)),
         ));
 
+        // V20: build the out-of-band TTS source context before the senders are
+        // moved into the processor/waiter. The source rides `cancel`, so it
+        // starts now and dies when the tab's PTY does.
+        let oob_ctx = spec.oob.clone().map(|oob_spec| {
+            (
+                oob_spec,
+                crate::oob::OobContext {
+                    tab: tab.clone(),
+                    tts: tts_segments.clone(),
+                    state_signals: state_signals.clone(),
+                    settings: settings.clone(),
+                    cancel: cancel.clone(),
+                },
+            )
+        });
+
         tasks::spawn_reader(
             reader,
             bytes_tx,
@@ -219,6 +240,10 @@ impl PtyManager {
             patterns,
         );
         tasks::spawn_waiter(tab.clone(), child, app, cancel.clone(), state_signals);
+
+        if let Some((oob_spec, ctx)) = oob_ctx {
+            crate::oob::spawn(oob_spec, ctx);
+        }
 
         *guard = Some(PtyHandle {
             writer,

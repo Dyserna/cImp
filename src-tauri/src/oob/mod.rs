@@ -1,0 +1,128 @@
+//! V20: out-of-band TTS sources for fullscreen AI tabs.
+//!
+//! Before V20, cImp forced its AI tools into an inline renderer so the
+//! processing layer could scrape `[[TTS]]` markers out of the linear terminal
+//! stream. V20 runs both tools in their native fullscreen (alternate-screen)
+//! TUIs, where screen-scraping is impossible — so the speakable text is read
+//! from each tool's *structured* side channel instead:
+//!
+//!   * **Claude Code** appends a transcript JSONL under
+//!     `~/.claude/projects/<slug>/<id>.jsonl`; assistant `text` blocks are
+//!     written complete at message finish ([`claude`]).
+//!   * **OpenCode** exposes an SSE event stream at `GET /event` on the same
+//!     port the TUI is launched with (`--port`); assistant text arrives as
+//!     token-level `message.part.delta` events ([`opencode`]).
+//!
+//! Both adapters convert assistant prose to sentence segments (reusing
+//! [`crate::processing::segment_sentences`]) and push them onto the shared
+//! [`TtsRequest`] channel — the exact same channel the old scrape path fed, so
+//! the segmenter, synthesizer, active-tab filter, and Esc-suppression all work
+//! unchanged. The source is the only thing that changed.
+//!
+//! Each source runs as a task tied to the tab's PTY [`CancellationToken`]: it
+//! starts when the AI tab spawns and stops when the tab's process exits.
+
+use std::path::PathBuf;
+
+use tokio_util::sync::CancellationToken;
+use tracing::debug;
+
+use crate::settings::{SettingsHandle, TabConfig};
+use crate::state::{StateSignal, TabId};
+use crate::tts::TtsRequest;
+
+pub mod claude;
+pub mod opencode;
+pub mod prose;
+
+/// Describes which out-of-band source (if any) a tab's launch should attach.
+/// Resolved by `tabs::config` at launch time and carried on the `PtyLaunchSpec`
+/// so `PtyManager::start` can spawn the matching adapter once the child is up.
+#[derive(Debug, Clone)]
+pub enum OobSpec {
+    /// Tail Claude Code's transcript JSONL for the project rooted at this dir.
+    ClaudeTranscript { project_dir: PathBuf },
+    /// Subscribe to an OpenCode TUI's event stream on this loopback port (the
+    /// `--port` cImp launched the TUI with).
+    OpenCodeEvent { port: u16 },
+}
+
+/// Everything an out-of-band adapter needs to feed TTS + avatar state for one
+/// tab. Cloned from the per-tab launch context in `PtyManager::start`.
+#[derive(Clone)]
+pub struct OobContext {
+    pub tab: TabId,
+    pub tts: tokio::sync::mpsc::Sender<TtsRequest>,
+    pub state_signals: tokio::sync::mpsc::Sender<StateSignal>,
+    pub settings: SettingsHandle,
+    pub cancel: CancellationToken,
+}
+
+/// Spawn the adapter described by `spec`, tied to `ctx.cancel`. Non-blocking:
+/// returns immediately, the adapter runs until the token is cancelled (tab
+/// exit) or the source ends.
+pub fn spawn(spec: OobSpec, ctx: OobContext) {
+    match spec {
+        OobSpec::ClaudeTranscript { project_dir } => {
+            debug!(tab = ?ctx.tab, ?project_dir, "spawning Claude transcript OOB source");
+            tauri::async_runtime::spawn(claude::run(project_dir, ctx));
+        }
+        OobSpec::OpenCodeEvent { port } => {
+            debug!(tab = ?ctx.tab, port, "spawning OpenCode event OOB source");
+            tauri::async_runtime::spawn(opencode::run(port, ctx));
+        }
+    }
+}
+
+impl OobContext {
+    /// Whether this tab should speak its assistant output. Reuses the per-tab
+    /// `tts_injection.enabled` toggle (V20 repurposes it from "inject the
+    /// `[[TTS]]` markup convention" to "speak this tab's assistant prose"; the
+    /// markup convention itself is retired with the scrape path). Read live so
+    /// a settings toggle takes effect without a relaunch.
+    pub fn tts_enabled(&self) -> bool {
+        matches!(
+            self.settings.current().find_tab(self.tab.as_str()),
+            Some(TabConfig::AiTool(c)) if c.tts_injection.enabled
+        )
+    }
+
+    /// Segment `text` into sentences and push each onto the TTS channel as a
+    /// suppressible `Synthesize` request (so Esc/`tts_stop` cuts the rest of
+    /// the burst, exactly like the old scrape path). Markdown is reduced to
+    /// speakable prose first; empty/code-only input speaks nothing.
+    pub async fn speak(&self, text: &str) {
+        if !self.tts_enabled() {
+            return;
+        }
+        let prose = prose::to_speakable(text);
+        if prose.trim().is_empty() {
+            return;
+        }
+        for sentence in crate::processing::segment_sentences(&prose) {
+            if self.cancel.is_cancelled() {
+                return;
+            }
+            // Bounded channel; if the worker is backed up, awaiting applies
+            // natural backpressure rather than dropping speech.
+            if self
+                .tts
+                .send(TtsRequest::Synthesize {
+                    tab: self.tab.clone(),
+                    text: sentence,
+                    suppressible: true,
+                })
+                .await
+                .is_err()
+            {
+                return; // worker gone — stop feeding.
+            }
+        }
+    }
+
+    /// Emit a state signal, ignoring a full/closed channel (state is
+    /// edge-triggered and best-effort, matching the PTY processor's `try_send`).
+    pub fn signal(&self, sig: StateSignal) {
+        let _ = self.state_signals.try_send(sig);
+    }
+}

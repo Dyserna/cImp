@@ -242,18 +242,11 @@ fn build_extra_args(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
-    // V19: OpenCode's default TUI takes the alternate screen (full-screen
-    // redraw), which breaks cImp's linear, append-only stream model the same
-    // way Claude's fullscreen renderer does. `--mini` renders inline into the
-    // normal scrollback instead — the same rendering class as Claude's
-    // `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. It is mandatory and always
-    // prepended (ahead of the user's own `cfg.args`) so the linear-stream
-    // contract holds regardless of what the user adds. `--mini` requires a real
-    // TTY, which the PTY supplies.
-    if command_is(&cfg.command, "opencode") {
-        out.push("--mini".to_string());
-    }
-
+    // V20: OpenCode launches in its native fullscreen (alternate-screen) TUI —
+    // no `--mini`. The earlier inline forcing (`--mini`) was dropped because the
+    // reduced palette hid commands like `/connect`; cImp now drives every AI tab
+    // fullscreen and sources TTS out-of-band (OpenCode's `GET /event` stream),
+    // not by scraping the linear terminal stream. See MILESTONE-V20.
     out.extend(cfg.args.iter().filter(|s| !s.is_empty()).cloned());
 
     // cimp is documented as a drop-in replacement for `claude`, so
@@ -391,31 +384,18 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
 fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
 
-    // Force Claude Code's classic inline renderer by opting out of the
-    // alternate-screen "fullscreen" TUI (introduced ~v2.1.89). That mode
-    // repaints the whole screen and enables mouse tracking, both of which
-    // break cImp's core assumption of a linear, append-only output stream:
-    //   - the `[[TTS]]` marker stripper (processing/screen.rs) can't locate
-    //     markers in full-screen repaints, so the literal tags leak into the
-    //     terminal and show up on selection;
-    //   - mouse tracking routes drags/right-clicks to Claude Code, producing
-    //     double paste / double copy-on-select and killing local selection
-    //     (so Ctrl+right-click speak-selection has nothing to read).
-    // Disabling the alternate screen (not just the mouse) is what restores
-    // all four behaviors at once. Set before the per-tab `env` merge below so
-    // a user can still override it per tab.
-    if command_is(&cfg.command, "claude") {
-        env.insert(
-            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
-            "1".to_string(),
-        );
-    }
+    // V20: Claude Code runs in its native fullscreen (alternate-screen) TUI —
+    // cImp no longer sets `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. The old
+    // inline forcing existed so the scrape pipeline could find `[[TTS]]` markers
+    // and keep mouse gestures local; both concerns are retired. TTS for AI tabs
+    // is now sourced out-of-band (Claude's transcript JSONL), and the terminal
+    // hosts the fullscreen app like any other terminal would. See MILESTONE-V20.
 
-    // V19: OpenCode launch env. `--mini` (see `build_extra_args`) puts the
-    // renderer inline; here we (1) inject the session-scoped config as one
+    // V19: OpenCode launch env. Now that the renderer is fullscreen (no
+    // `--mini`), this still (1) injects the session-scoped config as one
     // `OPENCODE_CONFIG_CONTENT` env var — the env-var analog of Claude's
     // `--mcp-config` / `--settings` / `--append-system-prompt` CLI flags — and
-    // (2) quiet terminal features that fight cImp's own selection/title
+    // (2) quiets terminal features that fight cImp's own selection/title
     // handling. Set before the per-tab `env` merge below so a user can override
     // any of these per tab.
     if command_is(&cfg.command, "opencode") {
@@ -427,7 +407,7 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
         );
         env.insert("OPENCODE_DISABLE_TERMINAL_TITLE".to_string(), "1".to_string());
         // Windows: OpenCode shells out via Git Bash. Pass the path through when
-        // the parent environment already names it, so the `--mini` child finds it.
+        // the parent environment already names it, so the child finds it.
         if let Ok(bash) = std::env::var("OPENCODE_GIT_BASH_PATH") {
             if !bash.is_empty() {
                 env.insert("OPENCODE_GIT_BASH_PATH".to_string(), bash);
@@ -637,41 +617,52 @@ mod tests {
     }
 
     #[test]
-    fn disables_claude_fullscreen_renderer() {
+    fn claude_launches_fullscreen_by_default() {
+        // V20: cImp no longer forces Claude's inline renderer. Without an
+        // explicit per-tab override, no `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`
+        // is synthesized, so Claude runs in its native fullscreen TUI.
         let settings = Settings::default();
         let env = compose_ai_env(&claude_cfg(), &settings);
-        assert_eq!(
-            env.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN").map(String::as_str),
-            Some("1"),
-            "every Claude tab must opt out of the fullscreen renderer",
+        assert!(
+            !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            "V20: cImp must not force Claude's inline renderer",
         );
     }
 
     #[test]
-    fn fullscreen_optout_is_claude_only() {
+    fn no_ai_tab_forces_inline_renderer() {
+        // V20: neither AI tool gets the alt-screen opt-out; both go fullscreen.
         let settings = Settings::default();
-        let env = compose_ai_env(&opencode_cfg(), &settings);
-        assert!(
-            !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
-            "OpenCode doesn't understand the Claude fullscreen flag",
-        );
+        for env in [
+            compose_ai_env(&claude_cfg(), &settings),
+            compose_ai_env(&opencode_cfg(), &settings),
+        ] {
+            assert!(
+                !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+                "no AI tab should set the Claude fullscreen opt-out in V20",
+            );
+        }
     }
 
     // ---- V19: OpenCode launch spine ----
 
     #[test]
-    fn prepends_mini_for_opencode() {
+    fn opencode_launches_without_mini() {
+        // V20: OpenCode runs its full fullscreen TUI — no `--mini` is injected,
+        // so the complete command palette (e.g. `/connect`) is available.
         let settings = Settings::default();
         let args = build_extra_args(&opencode_cfg(), &settings, &[]);
-        assert_eq!(args.first().map(String::as_str), Some("--mini"),
-            "opencode must launch with --mini as the first arg, got: {args:?}");
+        assert!(!args.iter().any(|a| a == "--mini"),
+            "V20: opencode must NOT get --mini, got: {args:?}");
     }
 
     #[test]
-    fn no_mini_for_claude_or_shell() {
+    fn no_mini_for_any_ai_tab() {
         let settings = Settings::default();
         let claude = build_extra_args(&claude_cfg(), &settings, &[]);
         assert!(!claude.iter().any(|a| a == "--mini"), "claude must not get --mini");
+        let opencode = build_extra_args(&opencode_cfg(), &settings, &[]);
+        assert!(!opencode.iter().any(|a| a == "--mini"), "opencode must not get --mini in V20");
         // A non-opencode, non-claude AI command must not get --mini either.
         let mut other = claude_cfg();
         other.command = "some-other-tool".to_string();
@@ -783,18 +774,21 @@ mod tests {
     }
 
     #[test]
-    fn per_tab_env_overrides_fullscreen_optout() {
+    fn per_tab_env_can_reenable_inline_renderer() {
+        // V20: cImp no longer synthesizes the alt-screen opt-out, but a user who
+        // wants the old inline renderer can still set it per tab; the per-tab env
+        // merge carries it through untouched.
         let settings = Settings::default();
         let mut cfg = claude_cfg();
         cfg.env.insert(
             "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
-            "0".to_string(),
+            "1".to_string(),
         );
         let env = compose_ai_env(&cfg, &settings);
         assert_eq!(
             env.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN").map(String::as_str),
-            Some("0"),
-            "an explicit per-tab value must win over the synthesized default",
+            Some("1"),
+            "an explicit per-tab value must pass through the env merge",
         );
     }
 }

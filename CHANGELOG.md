@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-06-30
+
+TTS and STT can now be fully turned off, loading and unloading their models on
+the toggle, and the bottom bar reflects each feature's enabled state.
+
+### Added
+
+- **Enable text-to-speech** master toggle (*Settings → TTS*). Turning TTS off
+  **unloads the Kokoro ONNX model**, freeing CPU/GPU memory; turning it on
+  reloads it. This is distinct from *Mute*, which keeps the model loaded and
+  only silences playback. The remaining TTS controls disable while it's off.
+
+### Changed
+
+- **STT enable now loads/unloads the Whisper model.** Previously the
+  *Speech-to-text* toggle only hid the record button; it now drops the
+  whisper.cpp model on disable (freeing memory) and warms it on enable, via a
+  control channel to the transcription worker.
+- **Bottom bar reflects feature state.** The TTS controls (volume, mute,
+  announcements, selection-TTS transport) hide when TTS is disabled, mirroring
+  the record button, which already hides when STT is disabled.
+- **Claude usage meter is gated on the Claude tab.** The bottom-bar session /
+  weekly quota widget hides and stops polling when the subscription Claude tab
+  isn't enabled.
+
+### Fixed
+
+- TTS model construction (the ONNX session build, seconds on a GPU EP) now runs
+  on the blocking pool instead of inline on the async runtime, so toggling TTS
+  on no longer parks a runtime worker thread.
+
 ## [0.30.0] — 2026-06-30
 
 Fullscreen-only AI tabs + out-of-band TTS (milestone V20). Both **Claude Code**

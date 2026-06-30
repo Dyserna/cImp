@@ -1,4 +1,0 @@
-data: {"id":"evt_f17bb3a7e001SW4a7X7vKqCXyV","type":"server.connected","properties":{}}
-
-data: {"id":"evt_f17bb3a98002xtegXQ7UInLsJJ","type":"session.created","properties":{"sessionID":"ses_0e844c567ffe7YFVPmZKdFaO1i","info":{"id":"ses_0e844c567ffe7YFVPmZKdFaO1i","slug":"quiet-comet","version":"1.17.11","projectID":"2af6c1917e937d1c34cbc163f0d2557f37148c6e","directory":"P:\\Documents\\AI-private\\cc-avatar\\cctts\\docs\\spikes\\v20","path":"docs/spikes/v20","title":"New session - 2026-06-30T08:52:54.040Z","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1782809574040,"updated":1782809574040}}}}
-

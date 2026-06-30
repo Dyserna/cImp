@@ -164,6 +164,13 @@ pub fn spawn_processor(
     state_signals: mpsc::Sender<StateSignal>,
     settings: SettingsHandle,
     patterns: Arc<Vec<PermissionPattern>>,
+    // V20: true when an out-of-band source authoritatively drives this tab's
+    // avatar Thinking/Idle (OpenCode's event stream). When set, the byte-burst
+    // activity fallback below is skipped — otherwise the fullscreen TUI's
+    // startup/repaint bursts spuriously flip Idle→Thinking→Idle and fire an
+    // "idle" notification. Claude keeps the fallback (its working state comes
+    // from the cell-model marker, not an OOB stream).
+    oob_drives_activity: bool,
 ) {
     tokio::spawn(async move {
         // V1.4-03: `channel` is `mut` so the `ProcessorControl::ChannelChange`
@@ -308,8 +315,10 @@ pub fn spawn_processor(
 
                     // Avatar activity (Thinking↔Idle). Content-first: the
                     // `claude_working` marker is authoritative while it's on
-                    // screen; the byte timers are fallbacks.
-                    if !is_shell {
+                    // screen; the byte timers are fallbacks. Skipped entirely
+                    // when an out-of-band stream drives activity (V20: OpenCode),
+                    // so a fullscreen startup/repaint burst can't fake a cycle.
+                    if !is_shell && !oob_drives_activity {
                         if !output_active {
                             // Enter "working" on the marker, or — for a
                             // response that never paints it — a sustained

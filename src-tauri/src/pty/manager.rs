@@ -221,6 +221,10 @@ impl PtyManager {
                 },
             )
         });
+        // OpenCode's event stream authoritatively drives Thinking/Idle, so the
+        // processor must not also run its byte-burst activity fallback.
+        let oob_drives_activity =
+            matches!(spec.oob, Some(crate::oob::OobSpec::OpenCodeEvent { .. }));
 
         tasks::spawn_reader(
             reader,
@@ -238,6 +242,7 @@ impl PtyManager {
             state_signals.clone(),
             settings,
             patterns,
+            oob_drives_activity,
         );
         tasks::spawn_waiter(tab.clone(), child, app, cancel.clone(), state_signals);
 
@@ -558,6 +563,7 @@ mod tests {
             state_tx,
             settings,
             patterns,
+            false,
         );
 
         // Bytes before the rebind. The processor's flush tick is 50ms;
@@ -620,6 +626,7 @@ mod tests {
             state_tx,
             settings,
             patterns,
+            false,
         );
 
         // Three rapid rebinds. The last channel is the one whose buffer

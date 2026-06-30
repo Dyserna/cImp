@@ -240,6 +240,40 @@ function isMouseTrackingActive(term: Terminal): boolean {
   }
 }
 
+/** DECSET/DECRST private modes that enable mouse reporting (X10/VT200/drag/
+ * any-event tracking + the SGR/urxvt coordinate encodings). */
+const MOUSE_TRACKING_MODES = new Set([1000, 1001, 1002, 1003, 1005, 1006, 1015, 1016]);
+
+/**
+ * V20: keep the mouse LOCAL in a fullscreen AI tab so cImp's selection works
+ * like it does in a shell. Both Claude and OpenCode enable mouse tracking
+ * (DECSET 1000/1002/1003/1006) in their fullscreen TUI, which routes
+ * drags/clicks to the app — breaking copy-on-select, right-click paste, and
+ * select-to-speak (the selection never becomes local, so `getSelection()` is
+ * empty → "no text selected"). We swallow the mouse-tracking mode set/reset
+ * sequences so xterm never starts forwarding mouse events; the app still works
+ * keyboard-driven. All other private modes (alt-screen 1049, bracketed paste
+ * 2004, cursor 25, focus 1004) pass through untouched. AI tabs only — shell
+ * tabs are never altered.
+ */
+function suppressMouseTracking(term: Terminal): void {
+  // Swallow only when EVERY mode in the sequence is mouse tracking, so a
+  // combined `?25;1002h` (cursor + mouse) still applies its non-mouse modes.
+  // Apps emit mouse modes alone or combined with each other (e.g. 1002;1006),
+  // so this covers the real cases without dropping unrelated modes.
+  const swallowIfAllMouse = (params: (number | number[])[]): boolean => {
+    if (params.length === 0) return false;
+    const nums = params.map((p) => (Array.isArray(p) ? p[0] : p));
+    return nums.every((n) => MOUSE_TRACKING_MODES.has(n));
+  };
+  try {
+    term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, swallowIfAllMouse);
+    term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, swallowIfAllMouse);
+  } catch (e) {
+    console.warn('mouse-tracking suppression registration failed:', e);
+  }
+}
+
 function fitAndResize(entry: TerminalEntry): void {
   if (!hostIsFittable(entry)) return;
   entry.fitAddon.fit();
@@ -391,6 +425,13 @@ export function createTerminal(
     // host-size differences after the snapshot lands.
     ...(options.initialGeometry ?? {}),
   });
+  // V20: AI tabs keep the mouse local (shell-like selection: copy-on-select,
+  // right-click paste, select-to-speak) by suppressing the fullscreen app's
+  // mouse-tracking modes. Registered before the PTY binds so the app's initial
+  // DECSET burst is caught. Shell tabs are untouched.
+  if (!isShellTab(tabId)) {
+    suppressMouseTracking(term);
+  }
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
   // V1.4-03: serialize addon captures scrollback as ANSI for replay

@@ -223,6 +223,23 @@ function hostIsFittable(entry: TerminalEntry): boolean {
   return host.offsetWidth > 0 && host.offsetHeight > 0;
 }
 
+/**
+ * V20: true when the running program has enabled mouse tracking (DECSET
+ * 1000/1002/1003/1006), i.e. it owns the pointer — the case for a fullscreen
+ * AI TUI. xterm exposes this via `term.modes.mouseTrackingMode` ('none' when
+ * off). Used to decide whether cImp's right-click paste would double-act with
+ * the app's own mouse handling. Defensive: any access error reads as "off".
+ */
+function isMouseTrackingActive(term: Terminal): boolean {
+  try {
+    const mode = (term as unknown as { modes?: { mouseTrackingMode?: string } })
+      .modes?.mouseTrackingMode;
+    return !!mode && mode !== 'none';
+  } catch {
+    return false;
+  }
+}
+
 function fitAndResize(entry: TerminalEntry): void {
   if (!hostIsFittable(entry)) return;
   entry.fitAddon.fit();
@@ -535,6 +552,17 @@ export function createTerminal(
       return;
     }
     if (!behavior.paste_on_right_click) return;
+    // V20: in a fullscreen AI tab the app enables mouse tracking and owns the
+    // pointer, so a plain right-click is already delivered to the app as a
+    // mouse event. Pasting on top of that double-acts. When the app owns the
+    // mouse, require Shift (xterm's bypass for local gestures) before cImp
+    // pastes; suppress the OS menu either way. Shell tabs and normal-buffer
+    // programs don't enable mouse tracking, so they paste on a plain
+    // right-click exactly as before.
+    if (isMouseTrackingActive(term) && !e.shiftKey) {
+      e.preventDefault();
+      return;
+    }
     e.preventDefault();
     navigator.clipboard
       .readText()

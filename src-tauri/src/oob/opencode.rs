@@ -102,10 +102,27 @@ async fn consume(client: &reqwest::Client, url: &str, ctx: &OobContext) -> reqwe
 }
 
 /// Per-connection accumulation of assistant messages and working state.
+///
+/// Text is buffered per **part** (`partID`), not per message, because OpenCode
+/// streams a message's reasoning and its answer as separate parts — and BOTH
+/// arrive as `message.part.delta` events with `field:"text"`. The only thing
+/// that distinguishes them is the part's `type` (`reasoning` vs `text`), which
+/// comes from `message.part.updated`. So we key text by part, learn each part's
+/// type, and at flush time speak only the non-reasoning parts of the message.
 #[derive(Default)]
 struct Tracker {
-    /// messageID -> accumulated text-field delta buffer.
-    buffers: HashMap<String, String>,
+    /// partID -> accumulated delta text.
+    part_text: HashMap<String, String>,
+    /// partID -> latest full-text snapshot (from `message.part.updated`),
+    /// used when a part arrives without deltas (e.g. a short message).
+    part_snapshot: HashMap<String, String>,
+    /// partID -> part type ("text" / "reasoning" / ...). Unknown ⇒ treated as
+    /// speakable text (reasoning parts are reliably declared).
+    part_type: HashMap<String, String>,
+    /// partID -> owning messageID.
+    part_msg: HashMap<String, String>,
+    /// messageID -> partIDs in first-seen order (preserves answer order).
+    msg_parts: HashMap<String, Vec<String>>,
     /// messageIDs known to be assistant messages.
     assistant: HashSet<String>,
     /// messageIDs already spoken (don't double-flush on idle).
@@ -135,14 +152,33 @@ impl Tracker {
                     }
                 }
             }
-            "message.part.delta" => {
-                if props.get("field").and_then(Value::as_str) == Some("text") {
-                    if let (Some(mid), Some(delta)) = (
-                        props.get("messageID").and_then(Value::as_str),
-                        props.get("delta").and_then(Value::as_str),
-                    ) {
-                        self.buffers.entry(mid.to_string()).or_default().push_str(delta);
+            "message.part.updated" => {
+                // Learn the part's type (text vs reasoning) and capture its
+                // full-text snapshot. `part.id` is the partID.
+                let part = props.get("part").unwrap_or(&Value::Null);
+                if let Some(pid) = part.get("id").and_then(Value::as_str) {
+                    if let Some(ty) = part.get("type").and_then(Value::as_str) {
+                        self.part_type.insert(pid.to_string(), ty.to_string());
                     }
+                    if let Some(mid) = part.get("messageID").and_then(Value::as_str) {
+                        self.register_part(mid, pid);
+                    }
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        self.part_snapshot.insert(pid.to_string(), text.to_string());
+                    }
+                }
+            }
+            "message.part.delta" => {
+                // Every delta is `field:"text"` (even for reasoning parts), so
+                // we DON'T filter on field — we buffer per part and decide by
+                // part type at flush.
+                if let (Some(pid), Some(mid), Some(delta)) = (
+                    props.get("partID").and_then(Value::as_str),
+                    props.get("messageID").and_then(Value::as_str),
+                    props.get("delta").and_then(Value::as_str),
+                ) {
+                    self.register_part(mid, pid);
+                    self.part_text.entry(pid.to_string()).or_default().push_str(delta);
                 }
             }
             "session.idle" => {
@@ -153,26 +189,58 @@ impl Tracker {
         }
     }
 
-    /// Flush a single assistant message's buffer to TTS, once.
+    /// Record a part under its message, preserving first-seen order, and its
+    /// owning messageID.
+    fn register_part(&mut self, mid: &str, pid: &str) {
+        self.part_msg.entry(pid.to_string()).or_insert_with(|| mid.to_string());
+        let parts = self.msg_parts.entry(mid.to_string()).or_default();
+        if !parts.iter().any(|p| p == pid) {
+            parts.push(pid.to_string());
+        }
+    }
+
+    /// Speak a single assistant message once: concatenate its non-reasoning
+    /// parts in order and hand them to TTS.
     async fn flush(&mut self, mid: &str, ctx: &OobContext) {
         if self.flushed.contains(mid) || !self.assistant.contains(mid) {
             return;
         }
-        if let Some(text) = self.buffers.remove(mid) {
+        self.flushed.insert(mid.to_string());
+        let Some(parts) = self.msg_parts.get(mid) else {
+            return;
+        };
+        let mut out = String::new();
+        for pid in parts {
+            // Skip reasoning; unknown type defaults to speakable text.
+            if self.part_type.get(pid).map(String::as_str) == Some("reasoning") {
+                continue;
+            }
+            let text = self
+                .part_text
+                .get(pid)
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| self.part_snapshot.get(pid))
+                .map(String::as_str)
+                .unwrap_or("");
             if !text.trim().is_empty() {
-                trace!(tab = ?ctx.tab, "OpenCode OOB: speaking assistant message");
-                ctx.speak(&text).await;
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
             }
         }
-        self.flushed.insert(mid.to_string());
+        if !out.trim().is_empty() {
+            trace!(tab = ?ctx.tab, "OpenCode OOB: speaking assistant message (reasoning excluded)");
+            ctx.speak(&out).await;
+        }
     }
 
-    /// Flush every assistant message that still has a buffer (turn ended).
+    /// Flush every not-yet-spoken assistant message (turn ended).
     async fn flush_all(&mut self, ctx: &OobContext) {
         let ids: Vec<String> = self
-            .buffers
-            .keys()
-            .filter(|id| self.assistant.contains(*id) && !self.flushed.contains(*id))
+            .assistant
+            .iter()
+            .filter(|id| !self.flushed.contains(*id))
             .cloned()
             .collect();
         for id in ids {
@@ -238,7 +306,12 @@ mod tests {
         )
         .await;
         t.handle(
-            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","field":"text","delta":"Hello world."}}"#),
+            &ev(r#"{"type":"message.part.updated","properties":{"part":{"id":"p1","type":"text","messageID":"m1","text":""}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":"Hello world."}}"#),
             &ctx,
         )
         .await;
@@ -256,7 +329,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_deltas_are_skipped() {
+    async fn reasoning_part_is_skipped_answer_is_spoken() {
+        // Regression: reasoning and answer BOTH stream as field:"text" deltas;
+        // only the part type (from message.part.updated) tells them apart. The
+        // reasoning part must not be spoken; the text part must.
         let (ctx, mut tts_rx, _sig) = ctx_with("opencode");
         let mut t = Tracker::default();
         t.handle(
@@ -264,27 +340,79 @@ mod tests {
             &ctx,
         )
         .await;
+        // Reasoning part (declared reasoning) — deltas use field:"text".
         t.handle(
-            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","field":"reasoning","delta":"thinking..."}}"#),
+            &ev(r#"{"type":"message.part.updated","properties":{"part":{"id":"pr","type":"reasoning","messageID":"m1","text":""}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"pr","field":"text","delta":"Let me think about this."}}"#),
+            &ctx,
+        )
+        .await;
+        // Answer part.
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"part":{"id":"pt","type":"text","messageID":"m1","text":""}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"pt","field":"text","delta":"The answer is 42."}}"#),
             &ctx,
         )
         .await;
         t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
-        assert!(tts_rx.try_recv().is_err(), "reasoning must not be spoken");
+
+        match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => {
+                assert!(text.contains("The answer is 42."), "got: {text}");
+                assert!(!text.contains("Let me think"), "reasoning leaked: {text}");
+            }
+            other => panic!("expected the answer to be spoken, got {other:?}"),
+        }
+        // Only the answer — nothing else queued.
+        assert!(tts_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reasoning_part_ordering_independent() {
+        // The reasoning delta can arrive BEFORE its part-type is declared; the
+        // decision is made at flush, so it's still skipped.
+        let (ctx, mut tts_rx, _sig) = ctx_with("opencode");
+        let mut t = Tracker::default();
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{}}}}"#),
+            &ctx,
+        )
+        .await;
+        // Delta first, type declaration after.
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"pr","field":"text","delta":"secret thoughts"}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"part":{"id":"pr","type":"reasoning","messageID":"m1","text":""}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        assert!(tts_rx.try_recv().is_err(), "reasoning must not be spoken even if declared late");
     }
 
     #[tokio::test]
     async fn user_message_text_is_not_spoken() {
         let (ctx, mut tts_rx, _sig) = ctx_with("opencode");
         let mut t = Tracker::default();
-        // A user message + its echoed text delta must never reach TTS.
+        // A user message + its echoed text part must never reach TTS.
         t.handle(
             &ev(r#"{"type":"message.updated","properties":{"info":{"id":"u1","role":"user","time":{}}}}"#),
             &ctx,
         )
         .await;
         t.handle(
-            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"u1","field":"text","delta":"my prompt"}}"#),
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"u1","partID":"pu","field":"text","delta":"my prompt"}}"#),
             &ctx,
         )
         .await;
@@ -301,8 +429,9 @@ mod tests {
             &ctx,
         )
         .await;
+        // No part-type declaration: unknown ⇒ treated as speakable text.
         t.handle(
-            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m9","field":"text","delta":"Done now."}}"#),
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m9","partID":"p9","field":"text","delta":"Done now."}}"#),
             &ctx,
         )
         .await;

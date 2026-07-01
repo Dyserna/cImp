@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] — 2026-07-01
+
+The per-project code knowledge graph now understands ~29 languages through a
+generic tree-sitter `tags.scm` engine, and fullscreen AI tabs get working
+mouse-wheel scroll and right-click paste.
+
+### Added
+
+- **Multi-language code graph (V9-02).** A generic `tags.scm` extraction engine
+  adds full symbol + call graphs for Go, Java, C, C++, C#, PHP, Bash, Scala,
+  OCaml, Ruby, Haskell, Kotlin, Swift, SQL, Erlang, R, Perl, and Ada — joining
+  Rust, TypeScript, JavaScript, and Python — plus structural search for HTML,
+  CSS, JSON, YAML, XML, and assembly. Adding a language is now a vendored query
+  plus a grammar crate, not a bespoke walker. Tier-1 code languages index by
+  default; markup/data are opt-in via *Settings → Code Graph → Languages*.
+
+### Fixed
+
+- **Mouse-wheel scroll in fullscreen AI tabs** (Claude / OpenCode). The wheel is
+  now forwarded as native mouse-report sequences instead of being translated to
+  arrow keys, so scrolling works while click/drag selection stays local.
+- **Right-click paste in fullscreen AI tabs.** Clipboard access now goes through
+  the Tauri clipboard plugin; WebView2 blocks `navigator.clipboard.readText`,
+  which had silently broken paste.
+
 ## [0.31.0] — 2026-06-30
 
 TTS and STT can now be fully turned off, loading and unloading their models on

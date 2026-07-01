@@ -202,6 +202,20 @@ impl ErrorInfo {
 /// Same rule as v1, applied per-tab.
 const EMPTY_INPUT_IDLE: Duration = Duration::from_secs(5);
 
+/// Backstop for a wedged `agents_active`. The transcript is the authoritative
+/// signal — a `Task` id clears when its `tool_result` lands — but that result
+/// can be missing (the user pressed Esc to interrupt the agent), unparseable, or
+/// its `AgentsActiveChanged` edge dropped under channel backpressure, leaving the
+/// avatar stuck in Thinking forever. This forces it back to Idle when a tab has
+/// sat in Thinking with agents nominally active but the parent producing NO
+/// output for this long. Safe against a genuinely in-flight turn: Claude Code's
+/// footer (spinner + elapsed counter, which carries the `esc to interrupt`
+/// marker) repaints ~once/second while any turn is live, so `claude_output_active`
+/// stays true throughout real work and resets this timer every tick — only a
+/// truly stopped parent leaves it continuously false. Longer than the PTY's
+/// `CLAUDE_WORKING_STALE` (6 s) so the marker path always concludes first.
+const AGENTS_STALL_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Tick rate for the auto-leave-Listening sweep across all tabs.
 const TICK: Duration = Duration::from_millis(500);
 
@@ -228,6 +242,13 @@ pub enum StateSignal {
     UserSubmit { tab: TabId },
     ClaudeOutputStarted { tab: TabId },
     ClaudeOutputStopped { tab: TabId },
+    /// Out-of-band (transcript): the count of in-flight `Task` sub-agents for
+    /// `tab` crossed the zero boundary. `active: true` when Claude launches
+    /// one or more agents and none had been running; `active: false` when the
+    /// last outstanding agent's result lands. Holds the avatar in Thinking
+    /// while agents run so a marker blink between agent batches can't settle it
+    /// to Idle. Emitted by `oob::claude`, which tails the transcript JSONL.
+    AgentsActiveChanged { tab: TabId, active: bool },
     TtsPlaybackStarted { tab: TabId },
     TtsPlaybackStopped { tab: TabId },
     /// A selection-read (Ctrl+right-click) crossed a sentence boundary in
@@ -302,6 +323,7 @@ impl StateSignal {
             | Self::UserSubmit { tab }
             | Self::ClaudeOutputStarted { tab }
             | Self::ClaudeOutputStopped { tab }
+            | Self::AgentsActiveChanged { tab, .. }
             | Self::TtsPlaybackStarted { tab }
             | Self::TtsPlaybackStopped { tab }
             | Self::TtsSelectionProgress { tab, .. }
@@ -431,6 +453,18 @@ struct TabState {
     /// of Idle when Claude is still emitting output (the TTS tag was a
     /// commentary tag, not a final answer). Always false for Shell tabs.
     claude_output_active: bool,
+    /// True while one or more `Task` sub-agents are in flight, per the
+    /// transcript (`AgentsActiveChanged`). Like `claude_output_active` it
+    /// blocks the settle to Idle — while agents run the parent's `esc to
+    /// interrupt` footer blinks, and neither the marker nor a byte pause means
+    /// the turn is done. Always false for Shell tabs.
+    agents_active: bool,
+    /// When the `AGENTS_STALL_TIMEOUT` backstop first observed this tab wedged
+    /// (Thinking + `agents_active` + parent output quiet). `None` whenever that
+    /// condition doesn't hold; the tick sweep sets it on entry and forces Idle
+    /// once it has held long enough. Guards against a `Task` whose result never
+    /// arrives (Esc-interrupt, dropped edge) pinning the avatar in Thinking.
+    agents_stall_since: Option<Instant>,
 }
 
 impl TabState {
@@ -449,6 +483,8 @@ impl TabState {
             closed_exit_code: None,
             closed_message: None,
             claude_output_active: false,
+            agents_active: false,
+            agents_stall_since: None,
         }
     }
 }
@@ -825,18 +861,24 @@ async fn run(
                     StateSignal::ClaudeOutputStopped { .. } => {
                         ts.claude_output_active = false;
                     }
+                    StateSignal::AgentsActiveChanged { active, .. } => {
+                        ts.agents_active = *active;
+                    }
                     // Reset the output-active flag on any error edge / its
                     // acknowledgment. A ClaudeOutputStarted with no matching
                     // Stopped (the subprocess crashed or exited mid-output —
                     // the normal exit path) would otherwise leave the flag
                     // stuck true, so a later normal speech cycle resolves to
                     // Thinking instead of Idle (avatar sticks; no idle
-                    // announcement). Runs before `transition()` below.
+                    // announcement). Runs before `transition()` below. Clear
+                    // `agents_active` too — a crash mid-agent-run would
+                    // otherwise leave the avatar wedged in Thinking forever.
                     StateSignal::SubprocessExited { .. }
                     | StateSignal::AudioError { .. }
                     | StateSignal::TtsError { .. }
                     | StateSignal::ErrorAcknowledged { .. } => {
                         ts.claude_output_active = false;
+                        ts.agents_active = false;
                     }
                     _ => {}
                 }
@@ -876,6 +918,7 @@ async fn run(
                         ts.has_unsent_input,
                         ts.composing,
                         ts.claude_output_active,
+                        ts.agents_active,
                     )
                 };
                 if next != prev_state {
@@ -914,6 +957,34 @@ async fn run(
                     Err(e) => e.into_inner().clone(),
                 };
                 for (tab, ts) in tabs.iter_mut() {
+                    // Agents-stall backstop. Recover a tab wedged in Thinking by
+                    // an `agents_active` that never cleared (Task result missing
+                    // after an Esc-interrupt, unparseable, or its edge dropped).
+                    // Only arms while the parent is producing NO output — a live
+                    // turn keeps `claude_output_active` true via the ~1 Hz footer
+                    // repaint, so this can't clip real work. See AGENTS_STALL_TIMEOUT.
+                    if ts.avatar_state == AvatarState::Thinking
+                        && ts.agents_active
+                        && !ts.claude_output_active
+                    {
+                        let since = *ts.agents_stall_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= AGENTS_STALL_TIMEOUT {
+                            info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "AgentsStallTimeout", "avatar state");
+                            ts.agents_active = false;
+                            ts.agents_stall_since = None;
+                            ts.avatar_state = AvatarState::Idle;
+                            emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
+                            if *tab != active && !ts.done_while_away {
+                                ts.done_while_away = true;
+                                info!(?tab, "done while away: set (agents stall)");
+                                emit_done_while_away(&app, &state_events, tab.clone(), true);
+                            }
+                            continue;
+                        }
+                    } else {
+                        ts.agents_stall_since = None;
+                    }
+
                     if ts.avatar_state != AvatarState::Listening { continue; }
                     if ts.composing { continue; }
                     let len = snapshot
@@ -969,9 +1040,14 @@ fn transition(
     has_unsent_input: bool,
     composing: bool,
     claude_output_active: bool,
+    agents_active: bool,
 ) -> AvatarState {
     use AvatarState::*;
     use StateSignal::*;
+
+    // Claude is still working — the marker/byte stream OR an in-flight
+    // sub-agent. Either one blocks the settle to Idle.
+    let still_working = claude_output_active || agents_active;
 
     if matches!(
         signal,
@@ -994,10 +1070,11 @@ fn transition(
         (Speaking, TtsPlaybackStopped { .. }) => {
             if has_unsent_input || composing {
                 Listening
-            } else if claude_output_active {
+            } else if still_working {
                 // TTS tag was an interstitial comment ("about to do X");
-                // Claude is still producing output, so go back to
-                // Thinking instead of falsely announcing Idle.
+                // Claude is still producing output (or a sub-agent is in
+                // flight), so go back to Thinking instead of falsely
+                // announcing Idle.
                 Thinking
             } else {
                 Idle
@@ -1006,7 +1083,13 @@ fn transition(
         (Speaking, _) => Speaking,
 
         (Thinking, TtsPlaybackStarted { .. }) => Speaking,
-        (Thinking, ClaudeOutputStopped { .. }) => Idle,
+        // Output stopped, but hold Thinking while sub-agents are still running
+        // — their results haven't landed, so the turn isn't done.
+        (Thinking, ClaudeOutputStopped { .. }) => if agents_active { Thinking } else { Idle },
+        // The last agent finished (or a crash cleared the flag). Settle to Idle
+        // only if Claude isn't also mid-output; otherwise stay Thinking and let
+        // the eventual ClaudeOutputStopped release it.
+        (Thinking, AgentsActiveChanged { .. }) => if still_working { Thinking } else { Idle },
         (Thinking, _) => Thinking,
 
         (Listening, UserSubmit { .. }) => Thinking,
@@ -1019,6 +1102,9 @@ fn transition(
         // session, slash command, hook-driven turn). The marker-driven
         // ClaudeOutputStarted is reliable enough to surface Thinking.
         (Idle, ClaudeOutputStarted { .. }) => Thinking,
+        // Agents launched while somehow Idle (out-of-band signal beat the
+        // marker) — surface Thinking so the run doesn't look finished.
+        (Idle, AgentsActiveChanged { active, .. }) if *active => Thinking,
         (Idle, _) => Idle,
     }
 }
@@ -1149,19 +1235,23 @@ mod tests {
     }
 
     fn t(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, false, false, false)
+        transition(current, &signal, false, false, false, false)
     }
 
     fn t_with_input(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, true, false, false)
+        transition(current, &signal, true, false, false, false)
     }
 
     fn t_composing(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, false, true, false)
+        transition(current, &signal, false, true, false, false)
     }
 
     fn t_with_output(current: AvatarState, signal: StateSignal) -> AvatarState {
-        transition(current, &signal, false, false, true)
+        transition(current, &signal, false, false, true, false)
+    }
+
+    fn t_with_agents(current: AvatarState, signal: StateSignal) -> AvatarState {
+        transition(current, &signal, false, false, false, true)
     }
 
     #[test]
@@ -1298,8 +1388,61 @@ mod tests {
                 true,  // has_unsent_input
                 false, // composing
                 true,  // claude_output_active
+                false, // agents_active
             ),
             Listening
+        );
+    }
+
+    #[test]
+    fn thinking_output_stopped_holds_while_agents_run() {
+        // The parent's `esc to interrupt` footer blinked out (ClaudeOutputStopped)
+        // while sub-agents are still in flight — hold Thinking, don't settle to
+        // Idle (this is the flicker + repeated-"idle" bug).
+        assert_eq!(
+            t_with_agents(Thinking, ClaudeOutputStopped { tab: tab() }),
+            Thinking
+        );
+        // With no agents running the same signal settles to Idle as before.
+        assert_eq!(t(Thinking, ClaudeOutputStopped { tab: tab() }), Idle);
+    }
+
+    #[test]
+    fn agents_finishing_settles_to_idle_when_output_quiet() {
+        // Last agent's result landed (agents_active already flipped false in the
+        // caller) and Claude isn't mid-output — settle to Idle.
+        assert_eq!(
+            t(Thinking, AgentsActiveChanged { tab: tab(), active: false }),
+            Idle
+        );
+    }
+
+    #[test]
+    fn agents_finishing_holds_thinking_while_output_active() {
+        // Agents done but Claude is streaming its final answer — stay Thinking
+        // and let the eventual ClaudeOutputStopped release to Idle.
+        assert_eq!(
+            t_with_output(Thinking, AgentsActiveChanged { tab: tab(), active: false }),
+            Thinking
+        );
+    }
+
+    #[test]
+    fn agents_launching_from_idle_surfaces_thinking() {
+        // Out-of-band agent signal beat the marker while Idle — show Thinking.
+        assert_eq!(
+            t(Idle, AgentsActiveChanged { tab: tab(), active: true }),
+            Thinking
+        );
+    }
+
+    #[test]
+    fn speaking_tts_stop_holds_thinking_while_agents_run() {
+        // A cross-tab notification's playback ends mid-agent-run: fall back to
+        // Thinking, not Idle, because agents are still outstanding.
+        assert_eq!(
+            t_with_agents(Speaking, TtsPlaybackStopped { tab: tab() }),
+            Thinking
         );
     }
 

@@ -20,6 +20,7 @@ use tokio::time::sleep;
 use tracing::{debug, trace};
 
 use super::OobContext;
+use crate::state::StateSignal;
 
 const POLL: Duration = Duration::from_millis(200);
 
@@ -37,6 +38,11 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     debug!(tab = ?ctx.tab, root = %root.display(), "Claude OOB: watching transcripts");
 
     let mut seen: HashSet<String> = HashSet::new();
+    // Tool-use IDs of `Task` sub-agents launched but not yet resolved. Non-
+    // empty ⇒ at least one agent is running, which holds the avatar in Thinking
+    // (see `update_agents`). Keyed by the `toolu_…` id so out-of-order results
+    // and parallel launches are matched exactly.
+    let mut agents: HashSet<String> = HashSet::new();
     let mut cur: Option<PathBuf> = None;
     let mut offset: u64 = 0;
     // The first file we attach to may already hold a long backlog from before
@@ -59,6 +65,17 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 };
                 first_attach = false;
                 cur = Some(path);
+                // Any agents we were tracking belonged to the previous session
+                // file; a new file is a new session. Clear and, if we had
+                // announced "agents active", release the avatar so it can't
+                // wedge in Thinking across the rotation.
+                if !agents.is_empty() {
+                    agents.clear();
+                    ctx.signal(StateSignal::AgentsActiveChanged {
+                        tab: ctx.tab.clone(),
+                        active: false,
+                    });
+                }
             }
             Some(_) => {}
             None => {
@@ -71,7 +88,7 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
         }
 
         if let Some(path) = cur.clone() {
-            offset = drain_new_lines(&path, offset, &mut seen, &ctx).await;
+            offset = drain_new_lines(&path, offset, &mut seen, &mut agents, &ctx).await;
         }
 
         tokio::select! {
@@ -87,6 +104,7 @@ async fn drain_new_lines(
     path: &Path,
     mut offset: u64,
     seen: &mut HashSet<String>,
+    agents: &mut HashSet<String>,
     ctx: &OobContext,
 ) -> u64 {
     use std::io::{Read, Seek, SeekFrom};
@@ -122,6 +140,7 @@ async fn drain_new_lines(
             continue;
         }
         if let Ok(obj) = serde_json::from_str::<Value>(line) {
+            update_agents(&obj, agents, ctx);
             for (key, text) in assistant_texts(&obj) {
                 if seen.insert(key) {
                     trace!(tab = ?ctx.tab, "Claude OOB: speaking assistant block");
@@ -133,6 +152,22 @@ async fn drain_new_lines(
     offset
 }
 
+/// The `tool_use` name Claude Code emits when it launches a sub-agent. Keyed
+/// as a named constant so the one dependency on this string is greppable if a
+/// future release renames it (see also the `esc to interrupt` marker in
+/// `processing::permission`).
+const TASK_TOOL_NAME: &str = "Task";
+
+/// The content-block array of a transcript line's `message`, or `None` when the
+/// line has no array content (a plain-string user prompt, or a non-message
+/// line). Shared by `assistant_texts` and `update_agents` so the
+/// `message.content[]` shape is unwrapped in exactly one place.
+fn message_parts(obj: &Value) -> Option<&Vec<Value>> {
+    obj.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+}
+
 /// Extract `(dedup_key, text)` for each assistant `text` block in a transcript
 /// line. `thinking` and tool blocks are skipped. The key is `messageID` +
 /// content prefix so a re-read (rotation/compaction) doesn't re-speak.
@@ -140,13 +175,13 @@ fn assistant_texts(obj: &Value) -> Vec<(String, String)> {
     if obj.get("type").and_then(Value::as_str) != Some("assistant") {
         return Vec::new();
     }
-    let msg = match obj.get("message") {
-        Some(m) => m,
-        None => return Vec::new(),
-    };
-    let mid = msg.get("id").and_then(Value::as_str).unwrap_or("");
+    let mid = obj
+        .get("message")
+        .and_then(|m| m.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let mut out = Vec::new();
-    if let Some(parts) = msg.get("content").and_then(Value::as_array) {
+    if let Some(parts) = message_parts(obj) {
         for part in parts {
             if part.get("type").and_then(Value::as_str) == Some("text") {
                 let text = part.get("text").and_then(Value::as_str).unwrap_or("");
@@ -160,6 +195,84 @@ fn assistant_texts(obj: &Value) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// True when `obj` is a genuine user prompt — a `type:"user"` line whose content
+/// is plain text (a string, or an array carrying a non-`tool_result` block)
+/// rather than a tool-result carrier. Such a line is a turn boundary: the prior
+/// turn is over, so any still-tracked `Task` ids (e.g. orphaned by an
+/// Esc-interrupt that never wrote their `tool_result`) can be reclaimed.
+fn is_user_prompt(obj: &Value) -> bool {
+    if obj.get("type").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    match obj.get("message").and_then(|m| m.get("content")) {
+        Some(Value::String(_)) => true,
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .any(|p| p.get("type").and_then(Value::as_str) != Some("tool_result")),
+        _ => false,
+    }
+}
+
+/// Update the in-flight `Task` sub-agent set from one transcript line and emit
+/// `AgentsActiveChanged` when the running count crosses the zero boundary.
+///
+/// A `Task` launch is a `tool_use` block with `"name":"Task"` (in an assistant
+/// message); its completion is a `tool_result` block whose `tool_use_id` matches
+/// (in the following user message). `agents` holds only Task ids, so removing a
+/// non-Task `tool_use_id` is a harmless no-op — we don't need to know which tool
+/// a result belongs to, only whether it clears a tracked Task.
+///
+/// Sidechain lines (a sub-agent's own internal messages, `isSidechain:true`) are
+/// skipped so a nested tool_use/result inside an agent can't perturb the parent
+/// count. The empty↔non-empty edge is all the state machine needs: parallel
+/// launches in one message flip active once, and only the last result flips it
+/// back.
+///
+/// A genuine new user prompt ([`is_user_prompt`]) is treated as a turn boundary
+/// that clears the whole set: an Esc-interrupt can abort an agent without ever
+/// writing its `tool_result`, so without this a stale id would keep the avatar
+/// wedged in Thinking until the process exits. (The state manager also has a
+/// time-based backstop for the walk-away case.)
+fn update_agents(obj: &Value, agents: &mut HashSet<String>, ctx: &OobContext) {
+    if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+
+    let was_active = !agents.is_empty();
+    if is_user_prompt(obj) {
+        agents.clear();
+    } else if let Some(parts) = message_parts(obj) {
+        for part in parts {
+            match part.get("type").and_then(Value::as_str) {
+                Some("tool_use")
+                    if part.get("name").and_then(Value::as_str) == Some(TASK_TOOL_NAME) =>
+                {
+                    if let Some(id) = part.get("id").and_then(Value::as_str) {
+                        agents.insert(id.to_string());
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(id) = part.get("tool_use_id").and_then(Value::as_str) {
+                        agents.remove(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else {
+        return;
+    }
+
+    let now_active = !agents.is_empty();
+    if now_active != was_active {
+        debug!(tab = ?ctx.tab, count = agents.len(), active = now_active, "Claude OOB: agents active edge");
+        ctx.signal(StateSignal::AgentsActiveChanged {
+            tab: ctx.tab.clone(),
+            active: now_active,
+        });
+    }
 }
 
 /// `~/.claude/projects/<slug>/` for `project_dir`. `None` if no home dir.
@@ -245,5 +358,215 @@ mod tests {
         )
         .unwrap();
         assert!(assistant_texts(&obj).is_empty());
+    }
+
+    // --- Task sub-agent tracking (update_agents) ---
+
+    use crate::settings::{Settings, SettingsHandle};
+    use crate::state::TabId;
+    use crate::tts::TtsRequest;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    fn agent_ctx() -> (OobContext, mpsc::Receiver<StateSignal>) {
+        let (tts_tx, _tts_rx) = mpsc::channel::<TtsRequest>(64);
+        let (sig_tx, sig_rx) = mpsc::channel::<StateSignal>(64);
+        let defaults = Settings::default();
+        let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
+        let ctx = OobContext {
+            tab: TabId::Claude,
+            tts: tts_tx,
+            state_signals: sig_tx,
+            settings,
+            cancel: CancellationToken::new(),
+        };
+        (ctx, sig_rx)
+    }
+
+    fn obj(s: &str) -> Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    /// Assistant message launching one Task agent.
+    fn launch(id: &str) -> Value {
+        obj(&format!(
+            r#"{{"type":"assistant","message":{{"id":"a1","content":[
+                {{"type":"tool_use","id":"{id}","name":"Task","input":{{}}}}
+            ]}}}}"#
+        ))
+    }
+
+    /// User message carrying the tool_result for `id`.
+    fn result(id: &str) -> Value {
+        obj(&format!(
+            r#"{{"type":"user","message":{{"content":[
+                {{"type":"tool_result","tool_use_id":"{id}","content":"done"}}
+            ]}}}}"#
+        ))
+    }
+
+    #[test]
+    fn launch_then_result_emits_active_then_inactive() {
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+
+        update_agents(&launch("toolu_a"), &mut agents, &ctx);
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+        ));
+
+        update_agents(&result("toolu_a"), &mut agents, &ctx);
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+        ));
+        assert!(sig.try_recv().is_err(), "no further edges");
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn parallel_launch_flips_active_once_and_inactive_on_last() {
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+
+        // Two agents launched in one assistant message → single active edge.
+        let both = obj(
+            r#"{"type":"assistant","message":{"id":"a1","content":[
+                {"type":"tool_use","id":"toolu_1","name":"Task","input":{}},
+                {"type":"tool_use","id":"toolu_2","name":"Task","input":{}}
+            ]}}"#,
+        );
+        update_agents(&both, &mut agents, &ctx);
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+        ));
+        assert!(sig.try_recv().is_err(), "only one active edge for a batch");
+
+        // First result: still one outstanding → no edge.
+        update_agents(&result("toolu_1"), &mut agents, &ctx);
+        assert!(sig.try_recv().is_err(), "still one agent running");
+
+        // Last result: crosses to zero → inactive edge.
+        update_agents(&result("toolu_2"), &mut agents, &ctx);
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+        ));
+    }
+
+    #[test]
+    fn non_task_tool_use_is_ignored() {
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        let bash = obj(
+            r#"{"type":"assistant","message":{"id":"a1","content":[
+                {"type":"tool_use","id":"toolu_b","name":"Bash","input":{}}
+            ]}}"#,
+        );
+        update_agents(&bash, &mut agents, &ctx);
+        assert!(sig.try_recv().is_err(), "non-Task tool must not mark agents active");
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn sidechain_lines_do_not_perturb_the_count() {
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        // A sub-agent's own internal Task-shaped line, marked isSidechain.
+        let side = obj(
+            r#"{"type":"assistant","isSidechain":true,"message":{"id":"s1","content":[
+                {"type":"tool_use","id":"toolu_nested","name":"Task","input":{}}
+            ]}}"#,
+        );
+        update_agents(&side, &mut agents, &ctx);
+        assert!(sig.try_recv().is_err(), "sidechain must be ignored");
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn stray_result_for_untracked_id_is_noop() {
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        // Result for a tool we never tracked (e.g. a Read) must not emit.
+        update_agents(&result("toolu_never_seen"), &mut agents, &ctx);
+        assert!(sig.try_recv().is_err());
+    }
+
+    #[test]
+    fn user_prompt_clears_orphaned_agents() {
+        // Esc-interrupt: a Task launched but its tool_result never arrives.
+        // The next genuine user prompt is a turn boundary that reclaims it,
+        // emitting the inactive edge so the avatar can settle.
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        update_agents(&launch("toolu_orphan"), &mut agents, &ctx);
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+        ));
+
+        // Plain-string user prompt.
+        let prompt = obj(r#"{"type":"user","message":{"role":"user","content":"try again please"}}"#);
+        update_agents(&prompt, &mut agents, &ctx);
+        assert!(agents.is_empty(), "turn boundary must clear orphaned agents");
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+        ));
+    }
+
+    #[test]
+    fn user_prompt_with_text_block_is_a_boundary() {
+        // Some prompts arrive as a content array with a text block rather than
+        // a bare string — still a turn boundary.
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        update_agents(&launch("toolu_x"), &mut agents, &ctx);
+        let _ = sig.try_recv();
+        let prompt = obj(
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"next"}]}}"#,
+        );
+        update_agents(&prompt, &mut agents, &ctx);
+        assert!(agents.is_empty());
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+        ));
+    }
+
+    #[test]
+    fn tool_result_carrier_is_not_a_boundary() {
+        // A user message that carries only tool_results (the normal agent-
+        // result path) must NOT be treated as a turn boundary — it should
+        // remove just its own id, leaving other agents outstanding.
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        let both = obj(
+            r#"{"type":"assistant","message":{"id":"a1","content":[
+                {"type":"tool_use","id":"toolu_1","name":"Task","input":{}},
+                {"type":"tool_use","id":"toolu_2","name":"Task","input":{}}
+            ]}}"#,
+        );
+        update_agents(&both, &mut agents, &ctx);
+        assert!(matches!(sig.try_recv(), Ok(StateSignal::AgentsActiveChanged { active: true, .. })));
+
+        // tool_result for one — is_user_prompt is false (only tool_result
+        // parts), so it removes toolu_1 and leaves toolu_2 running: no edge.
+        update_agents(&result("toolu_1"), &mut agents, &ctx);
+        assert!(sig.try_recv().is_err(), "one agent still outstanding");
+        assert_eq!(agents.len(), 1);
+        assert!(agents.contains("toolu_2"));
+    }
+
+    #[test]
+    fn user_prompt_with_no_agents_is_silent() {
+        // A turn boundary with nothing outstanding must not emit a phantom edge.
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        let prompt = obj(r#"{"type":"user","message":{"content":"hello"}}"#);
+        update_agents(&prompt, &mut agents, &ctx);
+        assert!(sig.try_recv().is_err());
     }
 }

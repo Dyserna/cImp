@@ -30,7 +30,7 @@ use crate::error::AppResult;
 use crate::settings::{GraphSettings, SettingsHandle};
 
 use super::embed::Embedder;
-use super::index::{GraphIndex, GraphStats};
+use super::index::{GraphIndex, GraphStats, LangCount};
 use super::model::Lang;
 use super::parse_file;
 
@@ -58,6 +58,9 @@ pub struct GraphStatus {
     pub files: u64,
     pub symbols: u64,
     pub edges: u64,
+    /// Indexed files grouped by language, biggest first (languages with zero
+    /// files are omitted). Drives the monitor tab's per-language table.
+    pub langs: Vec<LangCount>,
     /// Last build error, if the most recent attempt failed.
     pub last_error: Option<String>,
     /// Whether file-watch re-indexing is currently paused (a global toggle,
@@ -94,6 +97,7 @@ impl GraphStatus {
             files: 0,
             symbols: 0,
             edges: 0,
+            langs: Vec::new(),
             last_error: None,
             watch_paused: false,
             semantic_enabled: false,
@@ -376,6 +380,7 @@ impl GraphService {
                             s.files = stats.files;
                             s.symbols = stats.symbols;
                             s.edges = stats.edges;
+                            s.langs = stats.by_lang.clone();
                             s.last_error = None;
                         });
                         // Phase G: embed any new/changed doc chunks (no-op when
@@ -528,6 +533,7 @@ impl GraphService {
                     s.files = stats.files;
                     s.symbols = stats.symbols;
                     s.edges = stats.edges;
+                    s.langs = stats.by_lang.clone();
                 });
             }
             debug!(root = %root.display(), changed, "graph: incremental re-index applied");

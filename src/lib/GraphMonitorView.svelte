@@ -168,6 +168,17 @@
           <div><span class="num">{r.files_indexed}</span><span class="lbl">last scan</span></div>
         </div>
 
+        {#if r.langs && r.langs.length > 0}
+          <div class="langs" title="Indexed files per language">
+            {#each r.langs as l (l.lang)}
+              <span class="lang-cell">
+                <span class="lang-name" title={l.lang}>{l.lang}</span>
+                <span class="lang-n">{l.files}</span>
+              </span>
+            {/each}
+          </div>
+        {/if}
+
         {#if r.last_error}
           <p class="error">Index error: {r.last_error}</p>
         {/if}
@@ -351,6 +362,40 @@
   .counts .lbl {
     font-size: 11px;
     opacity: 0.6;
+  }
+  /* Per-language file counts. A grid of auto-filled columns: each cell is a
+     single line ("lang  N"); the column count grows/shrinks with the tab
+     width, so more languages pack horizontally and vertical growth is
+     minimized. */
+  .langs {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+    gap: 2px 10px;
+    margin: 0 0 10px;
+  }
+  .lang-cell {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px;
+    min-width: 0;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .lang-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.8;
+  }
+  .lang-n {
+    flex: 0 0 auto;
+    font-weight: 600;
+    opacity: 0.95;
   }
   .section-label {
     font-size: 11px;

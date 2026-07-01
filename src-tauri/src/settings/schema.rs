@@ -871,10 +871,17 @@ impl Default for GraphSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            languages: ["rust", "typescript", "javascript", "python", "markdown"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            // Tier-1 code languages are on by default; markup/data languages
+            // (html/css/json) stay opt-in to keep a fresh index lean (V9-02).
+            languages: [
+                "rust", "typescript", "javascript", "python", "markdown",
+                "go", "java", "c", "cpp", "csharp", "php", "bash", "scala",
+                "ocaml", "ruby", "haskell", "kotlin", "swift", "sql", "erlang",
+                "r", "perl", "ada",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             ignore: Vec::new(),
             index_docs: true,
             max_file_bytes: 1_048_576, // 1 MiB

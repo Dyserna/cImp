@@ -26,6 +26,7 @@ mod mcp;
 mod model;
 mod schema;
 mod service;
+mod tags;
 mod watcher;
 
 pub use activity::{snapshot as graph_history, GraphCall};

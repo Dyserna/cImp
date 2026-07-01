@@ -1035,7 +1035,12 @@ export function defaultSettings(): Settings {
     },
     graph: {
       enabled: false,
-      languages: ['rust', 'typescript', 'javascript', 'python', 'markdown'],
+      languages: [
+        'rust', 'typescript', 'javascript', 'python', 'markdown',
+        'go', 'java', 'c', 'cpp', 'csharp', 'php', 'bash', 'scala',
+        'ocaml', 'ruby', 'haskell', 'kotlin', 'swift', 'sql', 'erlang',
+        'r', 'perl', 'ada',
+      ],
       ignore: [],
       index_docs: true,
       max_file_bytes: 1_048_576,

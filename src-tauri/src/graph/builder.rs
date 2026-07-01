@@ -33,6 +33,33 @@ pub fn parse_file(path: &str, src: &str, lang: Lang) -> FileGraph {
         Lang::Markdown => parse_markdown(src, path, &mut fg),
         Lang::TypeScript | Lang::JavaScript => parse_js_ts(src, path, lang, &mut fg),
         Lang::Python => parse_python(src, path, &mut fg),
+        // V9-02: code languages driven by the generic tags engine.
+        Lang::Go
+        | Lang::Java
+        | Lang::C
+        | Lang::Cpp
+        | Lang::CSharp
+        | Lang::Php
+        | Lang::Bash
+        | Lang::Scala
+        | Lang::Ocaml
+        | Lang::Ruby
+        | Lang::Haskell
+        | Lang::Kotlin
+        | Lang::Swift
+        | Lang::Sql
+        | Lang::Erlang
+        | Lang::R
+        | Lang::Perl
+        | Lang::Ada
+        | Lang::Asm => {
+            if let Some(spec) = crate::graph::tags::tag_spec(lang) {
+                crate::graph::tags::parse_with_tags(src, path, &spec, &mut fg);
+            }
+        }
+        // V9-02: markup/data languages are struct-search-only (registered in
+        // `language_for`); no symbol/call extraction.
+        Lang::Html | Lang::Css | Lang::Json | Lang::Yaml | Lang::Xml => {}
         Lang::Other => {}
     }
 
@@ -486,6 +513,32 @@ pub fn language_for(lang: Lang) -> Option<tree_sitter::Language> {
         Lang::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         Lang::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Lang::Python => Some(tree_sitter_python::LANGUAGE.into()),
+        // V9-02 grammars. Registering here unlocks `graph_struct_search` for
+        // every language, independent of whether it has a tags query.
+        Lang::Go => Some(tree_sitter_go::LANGUAGE.into()),
+        Lang::Java => Some(tree_sitter_java::LANGUAGE.into()),
+        Lang::C => Some(tree_sitter_c::LANGUAGE.into()),
+        Lang::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+        Lang::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        Lang::Php => Some(tree_sitter_php::LANGUAGE_PHP.into()),
+        Lang::Bash => Some(tree_sitter_bash::LANGUAGE.into()),
+        Lang::Scala => Some(tree_sitter_scala::LANGUAGE.into()),
+        Lang::Ocaml => Some(tree_sitter_ocaml::LANGUAGE_OCAML.into()),
+        Lang::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
+        Lang::Haskell => Some(tree_sitter_haskell::LANGUAGE.into()),
+        Lang::Html => Some(tree_sitter_html::LANGUAGE.into()),
+        Lang::Css => Some(tree_sitter_css::LANGUAGE.into()),
+        Lang::Json => Some(tree_sitter_json::LANGUAGE.into()),
+        Lang::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+        Lang::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
+        Lang::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
+        Lang::Yaml => Some(tree_sitter_yaml::LANGUAGE.into()),
+        Lang::Xml => Some(tree_sitter_xml::LANGUAGE_XML.into()),
+        Lang::Erlang => Some(tree_sitter_erlang::LANGUAGE.into()),
+        Lang::R => Some(tree_sitter_r::LANGUAGE.into()),
+        Lang::Perl => Some(tree_sitter_perl::LANGUAGE.into()),
+        Lang::Ada => Some(tree_sitter_ada::LANGUAGE.into()),
+        Lang::Asm => Some(tree_sitter_asm::LANGUAGE.into()),
         Lang::Markdown | Lang::Other => None,
     }
 }
@@ -622,7 +675,7 @@ fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
 }
 
 /// Emit one symbol (+ containment + doc edges) and return its id.
-fn emit_symbol(
+pub(crate) fn emit_symbol(
     src: &str,
     file: &str,
     node: Node,

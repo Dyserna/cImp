@@ -375,6 +375,35 @@ offloads in flight; `null` auto-sizes from the summed per-backend slot counts,
 clamped to 32. The gate is created at app launch — changing the cap needs a
 relaunch.
 
+## Code graph grammars & tags queries (V9-02)
+
+The code graph extracts symbols/calls via a generic tree-sitter `tags.scm`
+engine (`src-tauri/src/graph/tags.rs`). **To add a language:**
+
+1. Add its `tree-sitter-<lang>` grammar crate to `src-tauri/Cargo.toml` (must be
+   ABI-compatible with `tree-sitter = 0.26` — exposes a `LANGUAGE` `LanguageFn`;
+   check with `cargo add <crate> --dry-run` + a build).
+2. Add a `Lang` variant + file extensions in `graph/model.rs` (`from_path`,
+   `tag`, `from_tag`) and a `language_for` arm in `graph/builder.rs`.
+3. For a **code** language: vendor a query at `src-tauri/queries/<lang>/tags.scm`
+   (prefer the grammar's upstream `queries/tags.scm`; trim over-broad
+   `@reference.call` patterns that rely on `#is-not?`/`#not-match?` predicates —
+   the base `Query` engine doesn't enforce them). Add an `include_str!` arm to
+   `tag_spec` and route the variant through the engine in `parse_file`. For a
+   **markup/data** language, skip the query — registering it in `language_for`
+   already enables `graph_struct_search`.
+4. Add the tag to the default `languages` list (`settings/schema.rs` +
+   `lib/settings/types.ts`) if it should index by default, and to the Settings
+   "Supported" hint in `SettingsApp.svelte`.
+5. Add a fixture test in `graph/tags.rs`; the `every_vendored_query_compiles`
+   test already guards that every vendored query compiles against its grammar
+   (catches a node/field name that drifted in a grammar update).
+
+The engine derives containment and caller attribution purely from byte spans, so
+a `tags.scm` whose `@definition.<kind>` capture sits on the actual construct node
+(not an enclosing scope) works with no engine changes. Capture suffixes map to
+`SymbolKind` in `kind_from_suffix`.
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

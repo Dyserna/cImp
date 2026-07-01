@@ -3297,8 +3297,15 @@
               />
             </label>
             <small class="hint">
-              Supported: <code>rust</code>, <code>typescript</code>,
-              <code>javascript</code>, <code>python</code>, <code>markdown</code>.
+              Full symbol + call graph: <code>rust</code>, <code>typescript</code>,
+              <code>javascript</code>, <code>python</code>, <code>go</code>,
+              <code>java</code>, <code>c</code>, <code>cpp</code>, <code>csharp</code>,
+              <code>php</code>, <code>bash</code>, <code>scala</code>, <code>ocaml</code>,
+              <code>ruby</code>, <code>haskell</code>, <code>kotlin</code>,
+              <code>swift</code>, <code>sql</code>, <code>erlang</code>, <code>r</code>,
+              <code>perl</code>, <code>ada</code>. Docs: <code>markdown</code>.
+              Struct-search only (add to enable): <code>html</code>, <code>css</code>,
+              <code>json</code>, <code>yaml</code>, <code>xml</code>, <code>asm</code>.
             </small>
             <label class="checkbox">
               <input

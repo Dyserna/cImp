@@ -6,6 +6,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
+/// Mirror of Rust `graph::index::LangCount` — indexed file count for one
+/// language. Only languages with at least one file are present.
+export interface LangCount {
+  lang: string;
+  files: number;
+}
+
 /// Mirror of Rust `graph::GraphStatus`.
 export interface GraphStatus {
   root: string;
@@ -15,6 +22,8 @@ export interface GraphStatus {
   files: number;
   symbols: number;
   edges: number;
+  // Indexed files grouped by language, biggest first.
+  langs: LangCount[];
   last_error: string | null;
   // Whether file-watch re-indexing is currently paused (global toggle).
   watch_paused: boolean;

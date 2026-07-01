@@ -44,12 +44,23 @@ pub struct DocHit {
     pub snippet: String,
 }
 
+/// Indexed-file count for one language, for the status surface's per-language
+/// breakdown. `lang` is the stored language tag (e.g. `"rust"`, `"markdown"`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LangCount {
+    pub lang: String,
+    pub files: u64,
+}
+
 /// Per-index counts for the status surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GraphStats {
     pub files: u64,
     pub symbols: u64,
     pub edges: u64,
+    /// Indexed files grouped by language, biggest first (zero-file languages
+    /// are absent — a language only appears once it has at least one file).
+    pub by_lang: Vec<LangCount>,
 }
 
 pub struct GraphIndex {
@@ -752,7 +763,29 @@ reach[x, y] := reach[x, z], calls[z, y]
             files: count("file")?,
             symbols: count("symbol")?,
             edges: count("edge")?,
+            by_lang: self.files_by_lang()?,
         })
+    }
+
+    /// Indexed-file count per language, biggest first (ties broken by language
+    /// name so the order is stable across scans). Feeds the monitor tab's
+    /// per-language table.
+    fn files_by_lang(&self) -> AppResult<Vec<LangCount>> {
+        let rows = self.run(
+            "?[lang, count(path)] := *file{path, lang}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut out: Vec<LangCount> = rows
+            .rows
+            .iter()
+            .map(|r| LangCount {
+                lang: cell_str(r, 0),
+                files: cell_i64(r, 1) as u64,
+            })
+            .collect();
+        out.sort_by(|a, b| b.files.cmp(&a.files).then_with(|| a.lang.cmp(&b.lang)));
+        Ok(out)
     }
 
     fn put(&self, script: &str, rows: Vec<DataValue>) -> AppResult<()> {

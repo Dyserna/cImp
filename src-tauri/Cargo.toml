@@ -55,6 +55,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "io-std", "time", "fs", "process", "net"] }
@@ -114,6 +115,34 @@ tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
+# V9-02 multi-language fan-out. Same `LanguageFn` shim contract as the Phase E
+# grammars above — version-independent, ABI-matched. Tier 1 (full code graph):
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-php = "0.24.2"
+tree-sitter-bash = "0.25.1"
+tree-sitter-scala = "0.26.0"
+tree-sitter-ocaml = "0.25.0"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-haskell = "0.23.1"
+# Tier 2/3 (markup/data — struct-search + anchors, no call graph):
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.25.0"
+tree-sitter-json = "0.24.8"
+# Medium-risk mainstream + exotic tail. Vetted to build against ts 0.26.
+tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-swift = "0.7.3"
+tree-sitter-sequel = "0.3.11"
+tree-sitter-yaml = "0.7.2"
+tree-sitter-xml = "0.7.0"
+tree-sitter-erlang = "0.19.0"
+tree-sitter-r = "1.3.0"
+tree-sitter-perl = "1.1.2"
+tree-sitter-ada = "0.1.0"
+tree-sitter-asm = "0.24.0"
 # Embedded code-knowledge-graph store (V9-01). `storage-sqlite` is the
 # single-file backend; `rayon` is required by cozo's core eval loop. We
 # deliberately omit `graph-algo` (its `graph_builder 0.4.1` dep is broken

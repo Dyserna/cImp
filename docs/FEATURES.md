@@ -77,7 +77,10 @@ dependency/component breadth) — this is the *capability* breadth.
 
 ## Code Knowledge Graph (V9-01)
 - Per-project incremental graph in `.cimp/graph.db` (CozoDB + SQLite)
-- Languages: Rust, TypeScript, JavaScript, Python, Markdown via tree-sitter
+- Languages (V9-02): full symbol/call graph for Rust, TypeScript, JavaScript,
+  Python, Go, Java, C, C++, C#, PHP, Bash, Scala, OCaml, Ruby, Haskell, Kotlin,
+  Swift, SQL, Erlang, R, Perl, Ada (generic tree-sitter `tags.scm` engine);
+  struct-search for HTML, CSS, JSON, YAML, XML, assembly; Markdown for docs
 - Symbol extraction, call/import graphs, transitive reachability, cross-file name binding
 - Markdown/doc-comment parsing + full-text search; semantic search via Qwen3-Embedding + HNSW
 - Structural AST pattern search; FS watcher for incremental re-index

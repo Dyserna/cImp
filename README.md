@@ -562,8 +562,12 @@ cImp builds a per-project **code + docs knowledge graph** (CozoDB + tree-sitter
 over `.cimp/graph.db`) that Opus and offload workers can query through MCP tools —
 `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`,
 `graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`, and
-`graph_struct_search`. It covers Rust, TypeScript/JavaScript, Python, and
-Markdown, with symbol/call/import edges, transitive reachability, full-text and
+`graph_struct_search`. It covers **20+ languages** — Rust, TypeScript/JavaScript,
+Python, Go, Java, C, C++, C#, PHP, Bash, Scala, OCaml, Ruby, Haskell, Kotlin,
+Swift, SQL, Erlang, R, Perl, and Ada get full symbol/call graphs (via a generic
+tree-sitter `tags.scm` engine); HTML, CSS, JSON, YAML, XML, and assembly are
+struct-searchable; Markdown feeds docs — with symbol/call/import edges,
+transitive reachability, full-text and
 (optionally) embedding-based semantic doc search, and a filesystem watcher for
 incremental re-index. A reserved **Code Graph** monitor tab shows build status,
 node/edge counts, embedder health, and recent-query history.

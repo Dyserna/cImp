@@ -34,6 +34,10 @@ import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import './terminals.css';
 import { listen } from '@tauri-apps/api/event';
+import {
+  readText as clipboardReadText,
+  writeText as clipboardWriteText,
+} from '@tauri-apps/plugin-clipboard-manager';
 import { get } from 'svelte/store';
 
 import {
@@ -266,7 +270,11 @@ const MOUSE_TRACKING_MODES = new Set([1000, 1001, 1002, 1003, 1005, 1006, 1015, 
  * key listeners live on `host` (which xterm's textarea sits inside), so they're
  * garbage-collected with the host on teardown — no explicit cleanup needed.
  */
-function installAiMouseControl(term: Terminal, host: HTMLElement): void {
+function installAiMouseControl(
+  term: Terminal,
+  host: HTMLElement,
+  tabId: string,
+): void {
   const appModes = new Set<number>(); // mouse modes the app currently wants on
   let passthrough = false; // true while Alt is held (forward to app)
   let injecting = false; // true while WE write an enable/disable to xterm
@@ -329,6 +337,58 @@ function installAiMouseControl(term: Terminal, host: HTMLElement): void {
       setXtermMouse(false);
     }
   });
+
+  // V20: forward the mouse WHEEL to the app even though we suppress the app's
+  // mouse-tracking modes (to keep click/drag selection local). Without this,
+  // xterm — alt buffer, mouse tracking off — translates the wheel into
+  // cursor-arrow keys (ESC O A / ESC O B), which Claude/OpenCode treat as input
+  // navigation, not scrolling. We synthesize the exact wheel sequence the app's
+  // chosen encoding expects (SGR 1006 or legacy X10) and write it straight to
+  // the PTY, so scroll works natively while clicks/drags stay local (copy-on-
+  // select and right-click paste keep working).
+  term.attachCustomWheelEventHandler((e) => {
+    // App owns the mouse (Alt-held passthrough): let xterm encode the wheel.
+    if (passthrough) return true;
+    // App never asked for the mouse (e.g. a normal-buffer program in an AI
+    // tab): let xterm scroll its own scrollback as usual.
+    if (appModes.size === 0) return true;
+    if (e.deltaY === 0) return true;
+    const seq = wheelSequence(e.deltaY < 0, appModes);
+    // One notch per DOM wheel event for a mouse; for high-resolution (pixel)
+    // deltas — trackpads — send a few proportional notches, capped so a fast
+    // flick can't flood the PTY.
+    const notches =
+      e.deltaMode === WheelEvent.DOM_DELTA_PIXEL
+        ? Math.min(5, Math.max(1, Math.round(Math.abs(e.deltaY) / 40)))
+        : 1;
+    ptyWrite(tabId, seq.repeat(notches)).catch((err) =>
+      console.error('wheel-forward pty_write failed:', err),
+    );
+    // xterm does NOT call preventDefault when a custom wheel handler returns
+    // false — it just skips its own handling — so consume the event ourselves,
+    // otherwise the browser default (overscroll / WebView2 gesture-nav) fires.
+    e.preventDefault();
+    return false; // stop xterm's arrow-key (alternate-scroll) translation
+  });
+}
+
+/**
+ * V20: encode a single mouse-wheel notch the way a TUI expects it. Wheel-up is
+ * button 64, wheel-down 65. We report a fixed cell (1;1) — Claude/OpenCode
+ * scroll the transcript regardless of the wheel's grid coordinate. Uses the SGR
+ * (1006) encoding when the app enabled it, else the legacy X10 form (each byte
+ * offset by 32).
+ */
+function wheelSequence(up: boolean, appModes: Set<number>): string {
+  const button = up ? 64 : 65;
+  const col = 1;
+  const row = 1;
+  if (appModes.has(1006)) {
+    return `\x1b[<${button};${col};${row}M`;
+  }
+  return `\x1b[M${String.fromCharCode(32 + button)}${String.fromCharCode(
+    32 + col,
+  )}${String.fromCharCode(32 + row)}`;
 }
 
 function fitAndResize(entry: TerminalEntry): void {
@@ -488,7 +548,7 @@ export function createTerminal(
   // Registered before the PTY binds so the app's initial DECSET burst is
   // caught. Shell tabs are untouched.
   if (!isShellTab(tabId)) {
-    installAiMouseControl(term, host);
+    installAiMouseControl(term, host, tabId);
   }
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
@@ -618,7 +678,10 @@ export function createTerminal(
     if (!get(settingsStore).behavior.copy_on_select) return;
     const text = term.getSelection();
     if (!text) return;
-    void navigator.clipboard.writeText(text).catch((e) =>
+    // Tauri/WebView2 gates the web Clipboard API (readText especially); route
+    // through the clipboard-manager plugin so copy and paste both go via the
+    // native clipboard and behave consistently.
+    void clipboardWriteText(text).catch((e) =>
       console.warn('copy-on-select clipboard write failed:', e),
     );
   });
@@ -663,8 +726,7 @@ export function createTerminal(
       return;
     }
     e.preventDefault();
-    navigator.clipboard
-      .readText()
+    clipboardReadText()
       .then((text) => {
         if (!text) return;
         term.paste(text);

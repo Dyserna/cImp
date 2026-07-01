@@ -47,6 +47,28 @@ const CLAUDE_BURST_MIN: Duration = Duration::from_millis(1000);
 /// the marker, not this timer, decides Idle while Claude is working.
 const CLAUDE_QUIET: Duration = Duration::from_millis(500);
 
+/// Grace window the `claude_working` marker must stay *continuously absent*
+/// before a marker-driven session is allowed to settle to Idle. While Claude
+/// orchestrates parallel sub-agents (the Task tool) its `esc to interrupt`
+/// footer blinks in and out roughly once a second — it repaints between agent
+/// batches and while the parent is blocked waiting on results. Each gap used
+/// to trip the 500 ms `CLAUDE_QUIET` release and fire `ClaudeOutputStopped`,
+/// so the avatar cycled Thinking → Idle → Thinking every second and announced
+/// "idle" on each cycle. Requiring the marker to be gone for this long instead
+/// coalesces those blinks: as long as the footer reappears within the window,
+/// `working_last_seen` keeps refreshing and no Idle fires.
+///
+/// The *authoritative* hold during agent runs is now the transcript-driven
+/// `agents_active` flag in the state manager (`oob::claude` tracks in-flight
+/// `Task` ids); this window only has to bridge the brief gap at the very start
+/// of a run before that out-of-band signal is read (transcript poll + write
+/// latency, well under a second). So it can be short — kept just above that
+/// latency, which also keeps the extra delay on an ordinary (no-agent)
+/// completion's idle cue small. Only applies once the marker has actually been
+/// seen this session; the pure byte-burst fallback still releases on
+/// `CLAUDE_QUIET` alone.
+const CLAUDE_MARKER_GRACE: Duration = Duration::from_millis(1200);
+
 /// Grace window after a real PTY resize during which the byte-burst
 /// activity fallback is ignored. A resize pulses SIGWINCH and the child
 /// (Claude Code's TUI) repaints — a burst of bytes that would otherwise
@@ -210,6 +232,12 @@ pub fn spawn_processor(
         // screen. Authoritative for the avatar's Thinking state; the byte
         // timers above are only a fallback. Updated by run_permission_check.
         let mut working_active = false;
+        // Last tick the marker was observed on screen during the current
+        // output session, or `None` if it has never been seen (pure byte-burst
+        // fallback). Gates the Idle release by `CLAUDE_MARKER_GRACE` so the
+        // footer blinking out mid-orchestration doesn't flip the avatar to
+        // Idle. Reset to `None` whenever a session ends (release/stale).
+        let mut working_last_seen: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -319,6 +347,12 @@ pub fn spawn_processor(
                     // when an out-of-band stream drives activity (V20: OpenCode),
                     // so a fullscreen startup/repaint burst can't fake a cycle.
                     if !is_shell && !oob_drives_activity {
+                        // Track the marker's presence so the release path below
+                        // can require it gone for a grace window, not just a
+                        // single tick. Refreshed every tick it's on screen.
+                        if working_active {
+                            working_last_seen = Some(tokio::time::Instant::now());
+                        }
                         if !output_active {
                             // Enter "working" on the marker, or — for a
                             // response that never paints it — a sustained
@@ -352,11 +386,12 @@ pub fn spawn_processor(
                             // the marker still up must NOT release Idle. The
                             // stale guard frees a marker left ghosting in the
                             // grid with no underlying byte activity.
-                            let quiet = last_byte_time
-                                .is_some_and(|t| t.elapsed() >= CLAUDE_QUIET);
-                            let stale = last_byte_time
-                                .is_some_and(|t| t.elapsed() >= CLAUDE_WORKING_STALE);
-                            if (!working_active && quiet) || stale {
+                            let (release, stale) = should_release_idle(
+                                last_byte_time.map(|t| t.elapsed()),
+                                working_last_seen.map(|t| t.elapsed()),
+                                working_active,
+                            );
+                            if release {
                                 if stale && working_active {
                                     // Looked stuck — drop the detector's
                                     // latched Working state so a genuine
@@ -365,6 +400,7 @@ pub fn spawn_processor(
                                     working_active = false;
                                 }
                                 output_active = false;
+                                working_last_seen = None;
                                 let _ = state_signals
                                     .try_send(StateSignal::ClaudeOutputStopped { tab: tab.clone() });
                                 burst_start = None;
@@ -377,6 +413,38 @@ pub fn spawn_processor(
         }
         debug!(?tab, "pty processor task exiting");
     });
+}
+
+/// Decide whether an active output session (`output_active == true`) should
+/// settle back to Idle, i.e. fire `ClaudeOutputStopped`. Pure so the timing
+/// logic is unit-testable without a running clock — the caller measures the
+/// elapsed times against `Instant::now()` and passes them in.
+///
+/// - `since_last_byte`: time since the last terminal byte, or `None` if no
+///   byte has arrived this session.
+/// - `since_marker_seen`: time since the `claude_working` marker was last on
+///   screen, or `None` if it was never seen this session (the pure byte-burst
+///   fallback path, which releases on quiet alone).
+/// - `working_active`: whether the marker is currently matched on screen.
+///
+/// Returns `(release, stale)`: `release` is whether to emit
+/// `ClaudeOutputStopped`; `stale` flags the 6 s safety-valve path so the
+/// caller can force-clear the latched Working state before releasing.
+fn should_release_idle(
+    since_last_byte: Option<Duration>,
+    since_marker_seen: Option<Duration>,
+    working_active: bool,
+) -> (bool, bool) {
+    let quiet = since_last_byte.is_some_and(|d| d >= CLAUDE_QUIET);
+    let stale = since_last_byte.is_some_and(|d| d >= CLAUDE_WORKING_STALE);
+    // Require the marker gone for the full grace window before settling to
+    // Idle — bridges the ~1 Hz footer blink while Claude drives sub-agents so
+    // a brief gap can't fire a spurious ClaudeOutputStopped (avatar flicker +
+    // repeated "idle" announcements). Sessions that never painted the marker
+    // fall back to `quiet` alone, preserving the pure byte-burst path.
+    let marker_gone_long_enough = since_marker_seen.is_none_or(|d| d >= CLAUDE_MARKER_GRACE);
+    let release = (!working_active && quiet && marker_gone_long_enough) || stale;
+    (release, stale)
 }
 
 /// Scan the rendered tail for known prompt patterns and forward edge
@@ -532,4 +600,99 @@ pub fn spawn_waiter(
         }
         debug!(?tab, "pty waiter task exiting");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helpers for readable elapsed-time inputs.
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn holds_thinking_while_marker_on_screen() {
+        // Marker currently matched: never release regardless of byte silence,
+        // short of the stale safety valve. A thinking pause with the footer up
+        // must stay Thinking.
+        let (release, stale) = should_release_idle(Some(ms(3000)), Some(ms(0)), true);
+        assert!(!release, "marker on screen must hold Thinking");
+        assert!(!stale);
+    }
+
+    #[test]
+    fn brief_marker_gap_does_not_release() {
+        // The footer blinked out and bytes went quiet, but the marker was on
+        // screen well within the grace window — the ~1 Hz sub-agent blink. Must
+        // NOT release, or the avatar flickers Idle and re-announces.
+        let (release, _) = should_release_idle(Some(ms(600)), Some(ms(800)), false);
+        assert!(!release, "sub-grace marker gap must not settle to Idle");
+    }
+
+    #[test]
+    fn sustained_marker_absence_releases() {
+        // Marker gone past the grace window and the stream is quiet — Claude is
+        // genuinely done. Release to Idle.
+        let (release, stale) = should_release_idle(
+            Some(ms(600)),
+            Some(CLAUDE_MARKER_GRACE + ms(1)),
+            false,
+        );
+        assert!(release, "marker gone past grace + quiet must settle to Idle");
+        assert!(!stale);
+    }
+
+    #[test]
+    fn grace_gates_release_even_when_quiet() {
+        // Quiet threshold is met but the marker vanished only just now. The
+        // grace gate must still block the release.
+        let (release, _) = should_release_idle(
+            Some(CLAUDE_WORKING_STALE - ms(1)),
+            Some(ms(10)),
+            false,
+        );
+        assert!(!release, "grace must gate release until the marker is gone long enough");
+    }
+
+    #[test]
+    fn no_marker_session_releases_on_quiet_alone() {
+        // Pure byte-burst fallback (a response that never painted the footer):
+        // `since_marker_seen == None` bypasses the grace, so plain quiet
+        // releases — preserving pre-fix behavior for that path.
+        let (release, stale) = should_release_idle(Some(CLAUDE_QUIET), None, false);
+        assert!(release, "no-marker session must release on quiet alone");
+        assert!(!stale);
+    }
+
+    #[test]
+    fn no_marker_session_holds_while_bytes_flow() {
+        // Same fallback path, but bytes are still flowing (under the quiet
+        // threshold) — hold Thinking.
+        let (release, _) = should_release_idle(Some(CLAUDE_QUIET - ms(1)), None, false);
+        assert!(!release);
+    }
+
+    #[test]
+    fn stale_safety_valve_fires_even_with_marker_active() {
+        // The marker is somehow still matched (ghost footer) but bytes have
+        // been silent past the stale window — the safety valve releases and
+        // flags stale so the caller force-clears the latched Working state.
+        let (release, stale) = should_release_idle(
+            Some(CLAUDE_WORKING_STALE),
+            Some(ms(0)),
+            true,
+        );
+        assert!(release, "stale window must release even with the marker active");
+        assert!(stale, "stale flag must be set so the caller clears Working");
+    }
+
+    #[test]
+    fn no_bytes_yet_never_releases() {
+        // Session opened but no byte has arrived — neither quiet nor stale can
+        // be true, so we can't yet conclude anything. Hold.
+        let (release, stale) = should_release_idle(None, Some(CLAUDE_MARKER_GRACE + ms(1)), false);
+        assert!(!release);
+        assert!(!stale);
+    }
 }

@@ -1517,10 +1517,7 @@ pub fn default_claude_tab() -> TabConfig {
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),
-        tts_injection: TtsInjection {
-            enabled: true,
-            instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
-        },
+        tts_injection: TtsInjection { enabled: true },
         notifications: AiNotificationConfig {
             idle: NotificationSlot::enabled("Claude is idle"),
             awaiting_permission: NotificationSlot::enabled("Claude is awaiting permission"),
@@ -1548,10 +1545,7 @@ pub fn default_claude_local_tab() -> TabConfig {
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),
-        tts_injection: TtsInjection {
-            enabled: true,
-            instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
-        },
+        tts_injection: TtsInjection { enabled: true },
         notifications: AiNotificationConfig {
             idle: NotificationSlot::enabled("Claude (local) is idle"),
             awaiting_permission: NotificationSlot::enabled(
@@ -1583,10 +1577,7 @@ pub fn default_opencode_tab() -> TabConfig {
         // V19: unlike Aider, OpenCode accepts an instructions file (injected
         // via OPENCODE_CONFIG_CONTENT), so the TTS-markup convention applies
         // and the tab can speak. Seeded with the same runtime prompt as Claude.
-        tts_injection: TtsInjection {
-            enabled: true,
-            instructions: crate::tts::RUNTIME_SYSTEM_PROMPT.to_string(),
-        },
+        tts_injection: TtsInjection { enabled: true },
         notifications: AiNotificationConfig {
             idle: NotificationSlot::enabled("OpenCode is idle"),
             awaiting_permission: NotificationSlot::enabled("OpenCode is awaiting permission"),
@@ -2007,7 +1998,6 @@ impl Default for WaveformSettings {
 pub struct DisplaySettings {
     pub terminal_font_family: String,
     pub terminal_font_size: u32,
-    pub show_tts_markup: bool,
 }
 
 impl Default for DisplaySettings {
@@ -2016,7 +2006,6 @@ impl Default for DisplaySettings {
             terminal_font_family: "Consolas, Menlo, \"DejaVu Sans Mono\", monospace"
                 .to_string(),
             terminal_font_size: 14,
-            show_tts_markup: false,
         }
     }
 }
@@ -2037,8 +2026,7 @@ pub struct BehaviorSettings {
     /// don't want to hear "awaiting permission" for the tab they're
     /// staring at.
     pub announce_focused_tab: bool,
-    /// When true, tagged-content TTS (the `[[TTS]]…[[/TTS]]` segments
-    /// produced by AI tabs) plays even when the originating tab is not
+    /// When true, an AI tab's spoken prose plays even when that tab is not
     /// the active one. Default off keeps the v2 behavior — only the
     /// foreground tab's TTS plays. Independent of announcement TTS,
     /// which is gated by `announce_focused_tab` and never dropped for
@@ -2620,11 +2608,18 @@ impl Default for ShortcutSettings {
     }
 }
 
+/// Per-tab gate for whether cImp speaks this AI tab's assistant prose. V20
+/// retired the `[[TTS]]` markup convention (out-of-band adapters now read the
+/// tool's structured transcript/event stream and speak all prose), so this is
+/// a plain on/off toggle — the former free-text `instructions` field is gone.
+/// Kept as a struct (not a bare bool) so the serialized shape stays an object
+/// and every historical settings file / migration that carries
+/// `tts_injection` as `{ "enabled": … }` round-trips without a schema bump; an
+/// old file's leftover `instructions` key is simply ignored on load.
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct TtsInjection {
     pub enabled: bool,
-    pub instructions: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

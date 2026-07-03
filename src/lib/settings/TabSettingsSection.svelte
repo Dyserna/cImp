@@ -7,7 +7,6 @@
     ThemeColorsWire,
   } from './types';
   import ArrayEditor from './ArrayEditor.svelte';
-  import TextAreaWithReset from './TextAreaWithReset.svelte';
   import NotificationEditor from './NotificationEditor.svelte';
   import Pill from '../Pill.svelte';
   import ThemeSwatch from './ThemeSwatch.svelte';
@@ -18,15 +17,15 @@
   import { settings as settingsStore } from './store';
 
   // Renders the per-AI-tab settings form: command (read-only), CLI args,
-  // TTS injection toggle + instructions, notification texts, and a Restart
-  // Tab button. The parent owns baseline tracking and computes
-  // `restartRequired`; this component just shows the indicator and routes
-  // the restart click back up.
+  // a TTS speak toggle, notification texts, and a Restart Tab button. The
+  // parent owns baseline tracking and computes `restartRequired`; this
+  // component just shows the indicator and routes the restart click back up.
   // V19: `tabId` drives per-id conditionals — the local-provider helper
   // text differs (Claude synthesizes ANTHROPIC_* env; OpenCode synthesizes a
-  // provider block inside OPENCODE_CONFIG_CONTENT). The TTS-injection group
-  // applies to every AI tab now: unlike Aider, OpenCode accepts an
-  // instructions file (via the injected config), so it can speak.
+  // provider block inside OPENCODE_CONFIG_CONTENT).
+  // V20: the TTS toggle is a plain per-tab speak gate (the `[[TTS]]` markup
+  // convention is retired — prose is spoken from each tool's out-of-band
+  // transcript/event stream), so there is no longer an instructions field.
   let {
     tabId,
     displayName,
@@ -55,14 +54,8 @@
     onchange();
   }
 
-  function updateInjection<K extends 'enabled' | 'instructions'>(
-    key: K,
-    value: K extends 'enabled' ? boolean : string,
-  ) {
-    settings = {
-      ...settings,
-      tts_injection: { ...settings.tts_injection, [key]: value },
-    };
+  function setSpeakEnabled(value: boolean) {
+    settings = { ...settings, tts_injection: { enabled: value } };
     onchange();
   }
 
@@ -239,41 +232,20 @@
   </div>
 
   <div class="group">
-    <h4>TTS injection</h4>
+    <h4>Text-to-speech</h4>
       <label class="checkbox">
         <input
           type="checkbox"
           checked={settings.tts_injection.enabled}
           onchange={(e) =>
-            updateInjection(
-              'enabled',
-              (e.currentTarget as HTMLInputElement).checked,
-            )}
+            setSpeakEnabled((e.currentTarget as HTMLInputElement).checked)}
         />
-        <span>
-          TTS markup injection enabled
-          {#if restartRequired}
-            <Pill variant="orange" size="xs">restart required</Pill>
-          {/if}
-        </span>
+        <span>Speak this tab's replies aloud</span>
       </label>
-
-      <label class="field">
-        <span>TTS markup instructions</span>
-        <TextAreaWithReset
-          bind:value={
-            () => settings.tts_injection.instructions,
-            (v) => updateInjection('instructions', v)
-          }
-          defaultValue={defaults?.tts_injection.instructions ?? ''}
-          disabled={!settings.tts_injection.enabled}
-          rows={6}
-          placeholder="Instructions injected on launch (Claude: --append-system-prompt; OpenCode: instructions file)"
-        />
-        <small class="hint">
-          Injected on subprocess start when the toggle above is on.
-        </small>
-      </label>
+      <small class="hint">
+        Reads the assistant's prose through the TTS voice while this tab is
+        active. Takes effect immediately — no restart needed.
+      </small>
     </div>
 
   <div class="group">

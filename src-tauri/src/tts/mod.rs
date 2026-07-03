@@ -15,10 +15,6 @@ use crate::state::TabId;
 pub const DEFAULT_VOICE: &str = "af_heart";
 pub const MODEL_FILE: &str = "kokoro-v1.0.onnx";
 
-/// Embedded TTS markup convention. Each tab's `tts_injection.instructions`
-/// defaults to this string; the user can override per tab in settings.
-pub const RUNTIME_SYSTEM_PROMPT: &str = include_str!("runtime_prompt.md");
-
 /// Worker-level request type carried over the shared mpsc from each tab's
 /// processing layer to the single TTS worker. The worker filters by the
 /// shared `active` cell — requests for inactive tabs are dropped, satisfying

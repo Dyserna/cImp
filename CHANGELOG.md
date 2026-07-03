@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-07-04
+
+Linux support: cImp now builds, runs, and ships on Linux (x86-64, Ubuntu 24.04+)
+as a portable tarball with the same GPU-accelerated TTS/STT as Windows. Plus a
+fix for stray `[[TTS]]` markup that could leak into the terminal and speech.
+
+### Added
+
+- **Linux build + portable tarball (Ubuntu 24.04+).** A new `build-linux` CI job
+  produces full and no-models `.tar.gz` portable layouts, GPU-accelerated out of
+  the box — Kokoro TTS on ort's WebGPU (Dawn→Vulkan) backend and Whisper STT on
+  whisper.cpp's Vulkan backend — with automatic CPU fallback, on any GPU vendor
+  including Intel. The runtime floor is Ubuntu 24.04 / glibc 2.39 (set by ort's
+  WebGPU prebuilt). See `docs/MAINTENANCE.md` (Linux build) and
+  `docs/LINUX-VALIDATION.md`.
+
+### Fixed
+
+- **Stray `[[TTS]]` markup leaking into the terminal and TTS.** V20's fullscreen
+  TUI retired the `[[TTS]]` marker convention (prose is now spoken from each
+  tool's out-of-band transcript/event stream), but a stale `docs/CLAUDE.md` still
+  told the model to emit the tags — so they appeared on-screen and were read
+  aloud whenever a session touched `docs/`. Removed it.
+
+### Removed
+
+- The vestigial per-tab `tts_injection` free-text instructions field and the
+  dead `display.show_tts_markup` toggle — both obsolete since V20's out-of-band
+  TTS. Old settings files round-trip unchanged (no schema bump).
+
 ## [0.32.2] — 2026-07-03
 
 Runtime GPU/CPU selection for TTS and STT, reusable offload backend templates,

@@ -128,6 +128,40 @@ The default `cargo build` (CPU-only feature set) needs **none** of the GPU/SDK
 rows — only Rust + a C toolchain + CMake + libclang. The Vulkan/CUDA rows apply
 only when building those opt-in features.
 
+### Linux build (Ubuntu 24.04) — GPU parity
+
+The Linux release (`release.yml` `build-linux`) builds the same
+`stt-vulkan,tts-webgpu` feature set as Windows. Validated on Ubuntu 24.04 (WSL2);
+CI runs on `ubuntu-24.04`.
+
+**Distro floor is 24.04, not 22.04.** ort's WebGPU Linux prebuilt is a *static*
+`libonnxruntime` compiled against **glibc ≥ 2.38 + libstdc++ from GCC 13/14**
+(its objects reference `__isoc23_strtoll@GLIBC_2.38`,
+`std::ios_base_library_init()@GLIBCXX_3.4.32`). Ubuntu 22.04 (glibc 2.35, GCC 11)
+cannot link or run it, and glibc can't be upgraded in place. ort is the only TTS
+runtime, so the whole build+runtime floor is 24.04 (glibc 2.39). The shipped
+binary's floor is therefore Ubuntu 24.04+.
+
+Build inputs beyond the obvious Tauri/ALSA `-dev` packages:
+
+| Input | Why | How |
+|---|---|---|
+| `libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev` | Tauri v2 webview | apt |
+| `libasound2-dev` | cpal/rodio (ALSA) — **new on Linux** | apt |
+| `cmake clang libclang-dev llvm` | whisper.cpp/espeak-ng cmake + bindgen | apt |
+| `LIBCLANG_PATH=/usr/lib/llvm-<N>/lib` | bindgen can't find libclang otherwise | `dirname $(find /usr/lib/llvm-* -name libclang.so ...)` |
+| `libssl-dev` | **build-time only** — `ort-sys` build-dep `ureq`→`native-tls`→openssl on Linux; not linked into the binary | apt |
+| `glslc` + recent Vulkan headers | whisper's ggml-vulkan shader-gen; Ubuntu ships neither new enough (needs `VK_EXT_layer_settings` etc.) | LunarG apt repo (`lunarg-vulkan-noble.list`) → `shaderc vulkan-headers libvulkan-dev` |
+| `espeak-ng-data` | espeak-rs-sys builds only the lib on Linux, not the compiled phoneme tables; `build.rs` copies the system package's data next to the binary | apt |
+
+Two Linux-specific bits in `build.rs`: `find_system_espeak_data()` sources
+espeak-ng-data from the system pkg (and warns instead of panicking off Windows),
+and `set_linux_origin_rpath()` adds an `$ORIGIN` rpath so the bundled
+`libwebgpu_dawn.so` (ort's WebGPU/Dawn runtime dylib — the Linux analog of
+`webgpu_dawn.dll`; there is no `dxcompiler`/`dxil` off Windows) resolves next to
+the binary. The portable tarball ships `bin/cimp` + `bin/libwebgpu_dawn.so` +
+`bin/espeak-ng-data/`.
+
 ## External runtime components & models (not in the repo)
 
 Shipped in the portable zip or run as separate services. Not version-managed by

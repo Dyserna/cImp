@@ -12,6 +12,10 @@
 
   import { onMount } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  // Windows 11 Snap Layouts: the plugin drops a transparent native child HWND
+  // over the maximize button (matched by id "snap-max-btn") so hovering it
+  // shows the OS snap-zone flyout. attach/detach are safe no-ops off Win11.
+  import { attach, detach } from 'tauri-plugin-snap-layout';
 
   let { title = 'cImp' }: { title?: string } = $props();
 
@@ -23,8 +27,16 @@
     const unlisten = win.onResized(() => {
       void win.isMaximized().then((v) => (isMaximized = v));
     });
+    // Bind the snap overlay to this window's maximize button. This bar only
+    // mounts for borderless (decorations:false) themes, so tying attach/detach
+    // to the component lifetime keeps the overlay off native-chrome themes
+    // (whose real OS maximize button already drives snap) and re-binds it when
+    // switching back — the overlay HWND must be recreated after a decorations
+    // toggle. Per-webview, so the main and settings windows stay isolated.
+    attach('snap-max-btn');
     return () => {
       void unlisten.then((u) => u());
+      void detach();
     };
   });
 
@@ -46,6 +58,7 @@
       _
     </button>
     <button
+      id="snap-max-btn"
       type="button"
       onclick={onToggleMaximize}
       title={isMaximized ? 'Restore' : 'Maximize'}
@@ -107,7 +120,12 @@
     height: 22px;
     border-radius: 0;
   }
-  .tui-controls button:hover {
+  .tui-controls button:hover,
+  /* The snap overlay swallows pointer events, so `:hover` never fires on the
+     maximize button; the plugin toggles `.is-hovered` on cursor enter/leave.
+     `:global(...)` keeps Svelte from pruning this runtime-added class as an
+     unused selector (it can't see the plugin applying it). */
+  #snap-max-btn:global(.is-hovered) {
     background: var(--surface-3);
     color: var(--text-bright);
   }

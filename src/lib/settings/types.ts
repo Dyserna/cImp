@@ -135,7 +135,6 @@ export interface SelectionHighlightSettings {
 export interface DisplaySettings {
   terminal_font_family: string;
   terminal_font_size: number;
-  show_tts_markup: boolean;
 }
 
 export interface BehaviorSettings {
@@ -243,9 +242,12 @@ export interface ShortcutSettings {
   speak_selection: string | null;
 }
 
+// V20: plain per-tab speak gate. The `[[TTS]]` markup convention was retired
+// (TTS is sourced out-of-band and speaks all assistant prose), so the former
+// free-text `instructions` field is gone. Kept as an object (not a bare bool)
+// to match the Rust `TtsInjection` wire shape.
 export interface TtsInjection {
   enabled: boolean;
-  instructions: string;
 }
 
 /// V1.11 per-event notification slot. Both `enabled === true` AND a
@@ -868,7 +870,6 @@ export function defaultSettings(): Settings {
     display: {
       terminal_font_family: 'Consolas, Menlo, "DejaVu Sans Mono", monospace',
       terminal_font_size: 14,
-      show_tts_markup: false,
     },
     behavior: {
       auto_speak: true,
@@ -936,7 +937,7 @@ export function defaultSettings(): Settings {
         args: [],
         cwd: null,
         env: {},
-        tts_injection: { enabled: true, instructions: '' },
+        tts_injection: { enabled: true },
         notifications: {
           idle: { enabled: true, text: 'Claude is idle' },
           awaiting_permission: {
@@ -959,7 +960,7 @@ export function defaultSettings(): Settings {
         args: [],
         cwd: null,
         env: {},
-        tts_injection: { enabled: true, instructions: '' },
+        tts_injection: { enabled: true },
         notifications: {
           idle: { enabled: true, text: 'Claude (local) is idle' },
           awaiting_permission: {

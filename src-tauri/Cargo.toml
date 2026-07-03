@@ -1,6 +1,6 @@
 [package]
 name = "cimp"
-version = "0.32.2"
+version = "0.33.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
@@ -56,6 +56,12 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
+# Windows 11 Snap Layouts on our custom (frameless) title bar: injects a
+# transparent Win32 child HWND over the maximize button that returns
+# HTMAXBUTTON from WM_NCHITTEST so hovering it shows the OS snap-zone flyout.
+# Compiles cross-platform — a real impl on Windows, a no-op stub on Linux/macOS
+# and pre-Win11 — so it needs no cfg gating and adds nothing to the Linux build.
+tauri-plugin-snap-layout = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "io-std", "time", "fs", "process", "net"] }

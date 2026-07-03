@@ -239,7 +239,7 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
 /// fullscreen and TTS is sourced out-of-band (`crate::oob`), which speaks all
 /// assistant prose directly. The per-tab `tts_injection.enabled` flag is now
 /// the "speak this tab" gate read by the out-of-band sources, not a prompt
-/// injection toggle; `tts_injection.instructions` is vestigial.
+/// injection toggle (the former free-text `instructions` field is gone).
 fn compose_capability_guidance(_cfg: &AiToolTabConfig, settings: &Settings) -> String {
     let mut addendum = String::new();
     if settings.offload.enabled && settings.offload.inject_guidance {

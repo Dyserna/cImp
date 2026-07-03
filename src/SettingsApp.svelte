@@ -512,8 +512,7 @@
   // so additional AI tabs in future versions plug in without a refactor.
   let tabBaselines = $state<Record<string, AiToolTabConfig | null>>({});
   // Per-tab default settings, fetched from the backend so "Reset to default"
-  // buttons match the Rust-side defaults exactly (in particular the embedded
-  // RUNTIME_SYSTEM_PROMPT for Claude's TTS instructions).
+  // buttons match the Rust-side defaults exactly.
   let tabDefaults = $state<Record<string, AiToolTabConfig | null>>({});
   let snapshot = $state<Settings | null>(null);
 
@@ -837,16 +836,16 @@
     });
   }
 
-  // Restart-affecting subset: command + args + cwd + env + TTS injection.
-  // Notifications and first_launch_notice_dismissed apply live and are
-  // excluded.
+  // Restart-affecting subset: command + args + cwd + env. Notifications,
+  // first_launch_notice_dismissed, and (V20) the tts_injection speak gate
+  // apply live and are excluded — the out-of-band TTS source reads the toggle
+  // per-utterance, so flipping it takes effect without relaunching the tab.
   function restartShape(t: AiToolTabConfig) {
     return {
       command: t.command,
       args: t.args,
       cwd: t.cwd,
       env: t.env,
-      tts_injection: t.tts_injection,
     };
   }
 
@@ -1925,15 +1924,6 @@
               onchange={(e) =>
                 patch((s) => (s.display.terminal_font_size = Math.max(8, +(e.currentTarget as HTMLInputElement).value)))}
             />
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.display.show_tts_markup}
-              onchange={(e) =>
-                patch((s) => (s.display.show_tts_markup = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Show TTS markup in terminal (debug)</span>
           </label>
         </section>
 

@@ -16,6 +16,11 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    # Exposed so build-linux (which `needs` this job) can reuse the resolved tag
+    # and upload its tarballs to the release this job creates.
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
     env:
       # Opt into the Node 24 actions runtime ahead of the June 2026 cutoff
       # so we don't see the "Node 20 actions deprecated" warning each run.
@@ -504,3 +509,215 @@ jobs:
               --title "$tag" \
               --notes-file release-notes.md
           fi
+
+  # Portable Linux x86-64 tarball. Runs AFTER build-windows (which creates the
+  # GitHub release) and uploads its tarballs to the same tag.
+  #
+  # Runner is ubuntu-24.04 (NOT ubuntu-latest / 22.04): the released binary's
+  # glibc/libstdc++ floor is set by ort's WebGPU prebuilt (a static
+  # libonnxruntime built against glibc >= 2.38 / GCC 13+), which 22.04 cannot
+  # link or run. So 24.04 is the build AND runtime floor for GPU parity. See
+  # docs/MILESTONE-linux-support.md.
+  build-linux:
+    needs: build-windows
+    runs-on: ubuntu-24.04
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      tag: ${{ needs.build-windows.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-windows.outputs.tag }}
+          # Kokoro ONNX model + voicepacks + Whisper model are Git-LFS blobs.
+          lfs: true
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+          # Tauri v2 (webkit2gtk-4.1 + libsoup3 + gtk3 + appindicator), audio
+          # (ALSA for cpal/rodio), the espeak-ng-sys/whisper-rs bindgen +
+          # cmake/clang toolchain, Vulkan (whisper stt-vulkan) and libssl-dev
+          # (build-time only: ort-sys' downloader uses ureq -> native-tls ->
+          # openssl on Linux; it does NOT link into the shipped binary).
+          # espeak-ng-data supplies the compiled phoneme tables build.rs bundles
+          # (espeak-rs-sys builds only the lib on Linux, not the data).
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev build-essential pkg-config file \
+            libasound2-dev cmake clang libclang-dev llvm \
+            libvulkan-dev glslang-tools spirv-tools mesa-vulkan-drivers \
+            libssl-dev espeak-ng-data unzip
+
+      - name: Install recent Vulkan headers + glslc (LunarG SDK repo)
+        shell: bash
+        run: |
+          set -e
+          # Ubuntu 24.04's Vulkan headers/glslc are too old for whisper.cpp's
+          # ggml-vulkan (needs VK_EXT_layer_settings / cooperative-matrix KHR /
+          # etc.), and Ubuntu ships no `glslc` at all. The LunarG apt repo
+          # provides both. (Linux analog of the Windows job's Vulkan SDK install.)
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update -qq
+          sudo apt-get install -y vulkan-headers libvulkan-dev shaderc
+          glslc --version | head -1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm deps
+        run: npm install --no-audit --no-fund
+
+      - name: Tauri build (release, GPU parity)
+        shell: bash
+        env:
+          # ort's WebGPU EP (Dawn->Vulkan on Linux) + whisper.cpp's Vulkan
+          # backend — the portable, vendor-agnostic GPU path (falls back to CPU
+          # when no usable GPU). Mirrors the Windows job's stt-vulkan,tts-webgpu.
+          FEATURES: stt-vulkan,tts-webgpu
+        run: |
+          set -e
+          # bindgen (whisper-rs-sys, espeak-rs-sys) needs libclang; find it
+          # regardless of the runner's LLVM version.
+          export LIBCLANG_PATH="$(dirname "$(find /usr/lib/llvm-* -name libclang.so 2>/dev/null | sort | tail -1)")"
+          echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+          npm run tauri build -- --no-bundle --features "$FEATURES"
+
+      - name: Stage portable layouts (full + no-models)
+        shell: bash
+        run: |
+          set -e
+          rel="src-tauri/target/release"
+          stageFull="cimp-portable-linux-x64-$tag"
+          stageSlim="cimp-portable-linux-x64-$tag-no-models"
+
+          # --- Full variant --------------------------------------------------
+          mkdir -p "$stageFull/bin" "$stageFull/models/voices"
+
+          cp "$rel/cimp" "$stageFull/bin/"
+
+          # ort's WebGPU runtime dylib (Dawn). REQUIRED — without it the WebGPU
+          # EP can't init and TTS silently falls back to CPU. The binary carries
+          # an $ORIGIN rpath (build.rs) so it's found next to cimp. Deref the
+          # symlink ort leaves in target/release. Fail the build if missing.
+          if [ -f "$rel/libwebgpu_dawn.so" ]; then
+            cp -L "$rel/libwebgpu_dawn.so" "$stageFull/bin/"
+          else
+            echo "::error::libwebgpu_dawn.so missing from build output"; exit 1
+          fi
+
+          # Compiled espeak-ng phoneme data (build.rs copies it next to the
+          # binary from the system espeak-ng-data pkg). Bundling makes the OOV
+          # fallback work without the user apt-installing anything.
+          if [ -d "$rel/espeak-ng-data" ]; then
+            cp -r "$rel/espeak-ng-data" "$stageFull/bin/"
+          else
+            echo "::warning::espeak-ng-data not next to binary; OOV fallback unavailable"
+          fi
+
+          # Prompt-detection patterns (full zip only, like Windows).
+          cp scripts/patterns.default.json "$stageFull/bin/patterns.json"
+
+          # UI themes + terminal palettes.
+          cp -r themes "$stageFull/bin/themes"
+          cp -r palettes "$stageFull/bin/palettes"
+
+          # Kokoro model + all voicepacks + Whisper STT model (Git LFS).
+          cp models/kokoro-v1.0.onnx "$stageFull/models/"
+          cp models/voices/*.bin "$stageFull/models/voices/"
+          if [ -f models/ggml-small.bin ]; then
+            cp models/ggml-small.bin "$stageFull/models/"
+          else
+            echo "::warning::models/ggml-small.bin absent; full tarball ships without the STT model"
+          fi
+
+          # Avatar videos + sprite sets (discoverable on-disk copies).
+          cp -r avatars "$stageFull/avatars"
+          cp -r sprites "$stageFull/sprites"
+
+          cp LICENSE NOTICE "$stageFull/"
+          cp scripts/portable-readme-linux.txt "$stageFull/README.txt"
+
+          # --- Slim variant (no models/avatars/sprites, keep binary+libs) ----
+          mkdir -p "$stageSlim/bin"
+          cp "$rel/cimp" "$stageSlim/bin/"
+          cp -L "$rel/libwebgpu_dawn.so" "$stageSlim/bin/"
+          [ -d "$rel/espeak-ng-data" ] && cp -r "$rel/espeak-ng-data" "$stageSlim/bin/"
+          cp -r themes "$stageSlim/bin/themes"
+          cp -r palettes "$stageSlim/bin/palettes"
+          cp LICENSE NOTICE "$stageSlim/"
+          cp scripts/portable-readme-linux.txt "$stageSlim/README.txt"
+
+      - name: Stage bundled tools into ebin (both variants)
+        shell: bash
+        env:
+          BROOT_VERSION: '1.57.0'      # Canop/broot — MIT
+          RUSTNET_VERSION: '1.4.0'     # domcyrus/rustnet — Apache-2.0
+        run: |
+          set -e
+          stageFull="cimp-portable-linux-x64-$tag"
+          stageSlim="cimp-portable-linux-x64-$tag-no-models"
+          work="$RUNNER_TEMP/ebin"
+          mkdir -p "$work" "$stageFull/ebin" "$stageSlim/ebin"
+
+          # broot — its release zip bundles every platform; pick the static
+          # musl Linux build.
+          curl -L --fail -o "$work/broot.zip" \
+            "https://github.com/Canop/broot/releases/download/v$BROOT_VERSION/broot_$BROOT_VERSION.zip"
+          unzip -q -o "$work/broot.zip" -d "$work/broot"
+          broot_bin="$(find "$work/broot" -type f -name broot -path '*x86_64-unknown-linux-musl*' | head -1)"
+          [ -n "$broot_bin" ] || { echo "::error::linux broot not found in archive"; exit 1; }
+          install -m755 "$broot_bin" "$stageFull/ebin/broot"
+          install -m755 "$broot_bin" "$stageSlim/ebin/broot"
+
+          # rustnet — static musl tarball. (Packet capture needs
+          # `setcap cap_net_raw+ep ./ebin/rustnet` on the user's machine; see
+          # README.txt.)
+          curl -L --fail -o "$work/rustnet.tgz" \
+            "https://github.com/domcyrus/rustnet/releases/download/v$RUSTNET_VERSION/rustnet-v$RUSTNET_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          tar -xzf "$work/rustnet.tgz" -C "$work"
+          rustnet_bin="$(find "$work" -type f -name rustnet | head -1)"
+          [ -n "$rustnet_bin" ] || { echo "::error::rustnet binary not found in archive"; exit 1; }
+          install -m755 "$rustnet_bin" "$stageFull/ebin/rustnet"
+          install -m755 "$rustnet_bin" "$stageSlim/ebin/rustnet"
+
+      - name: Tar both variants
+        id: tar
+        shell: bash
+        run: |
+          set -e
+          stageFull="cimp-portable-linux-x64-$tag"
+          stageSlim="cimp-portable-linux-x64-$tag-no-models"
+          tar -czf "$stageFull.tar.gz" "$stageFull"
+          tar -czf "$stageSlim.tar.gz" "$stageSlim"
+          shaFull=$(sha256sum "$stageFull.tar.gz" | cut -d' ' -f1)
+          shaSlim=$(sha256sum "$stageSlim.tar.gz" | cut -d' ' -f1)
+          echo "full=$stageFull.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "slim=$stageSlim.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "tarball SHA-256 (full):  $shaFull"
+          echo "tarball SHA-256 (slim):  $shaSlim"
+
+      - name: Upload Linux tarballs to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -e
+          gh release upload "$tag" \
+            "${{ steps.tar.outputs.full }}" "${{ steps.tar.outputs.slim }}" --clobber

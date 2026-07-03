@@ -307,6 +307,15 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Windows 11 Snap Layouts for the custom TuiTitleBar maximize button
+        // (id "snap-max-btn"). No-op on Linux/macOS and pre-Win11, so it's
+        // registered unconditionally. The frontend attaches/detaches the
+        // overlay per-window as the title bar mounts (see TuiTitleBar.svelte).
+        .plugin(
+            tauri_plugin_snap_layout::init()
+                .button_id("snap-max-btn")
+                .build(),
+        )
         .manage(state)
         .setup(move |app| {
             // Recover a poisoned guard rather than `.ok()` skipping it: silently

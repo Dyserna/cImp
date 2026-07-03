@@ -2,6 +2,29 @@
 
 > **Release tag:** TBD by the user at ship time (the V-series numbering is independent of the git tag). This milestone is **cross-cutting** rather than a new feature pillar: it adds a second target OS to an app that has shipped Windows-only since V1. It supersedes the standing "Linux validation deferred" decision — Windows remains the primary target, but Linux becomes a supported, CI-built second target.
 
+## Spike results (2026-07-04) — GPU parity BUILDS + RUNS on Ubuntu 24.04
+
+The Phase A spike is done (in WSL2). **cImp builds with full GPU parity
+(`stt-vulkan,tts-webgpu`) and launches/runs on Ubuntu 24.04.** Both original
+unknowns resolved: ort *does* ship a Linux WebGPU prebuilt, and the app starts +
+renders under WSLg (webkit2gtk input fidelity still pending native-laptop
+sign-off — see `docs/LINUX-VALIDATION.md`).
+
+**Key change: distro floor is Ubuntu 24.04, not 22.04.** ort's WebGPU prebuilt
+(static `libonnxruntime`) requires **glibc ≥ 2.38 + libstdc++ GCC 13/14**, which
+22.04 can't link/run. Since ort is the only TTS runtime, the whole build+runtime
+floor is 24.04. User accepted the 24.04 floor. Everywhere below that says "22.04"
+now reads **24.04**.
+
+Six build gaps found + fixed (all captured in `docs/MAINTENANCE.md` → *Linux
+build*): `openssl-sys`→`libssl-dev` (build-only); `glslc`+recent Vulkan headers→
+LunarG apt repo; libclang→`LIBCLANG_PATH`; espeak data→system pkg + `build.rs`
+fallback; app icon→added `icons/icon.png`; `libwebgpu_dawn.so` discovery→
+`$ORIGIN` rpath in `build.rs`. Only two Rust source changes (both in `build.rs`);
+no `cfg` blockers (the audit held). CI: `release.yml` gained a `build-linux` job
+(`ubuntu-24.04`) producing full + slim `.tar.gz`. **Remaining:** native-laptop
+validation (Phase 4 runbook) and the docs polish below.
+
 ## Purpose
 
 Make cImp build, run, and ship on Linux (x86-64, targeting Ubuntu 22.04+/Debian-based first) as a portable tarball, with the same core capabilities as the Windows build: multi-tab PTY terminals, the fullscreen AI TUI tabs, TTS (Kokoro), STT (Whisper), the code graph, and the local offload stack.

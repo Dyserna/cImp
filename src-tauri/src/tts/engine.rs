@@ -14,6 +14,7 @@ use ort::execution_providers::WebGPUExecutionProvider;
 use ort::execution_providers::CUDAExecutionProvider;
 
 use crate::error::{AppError, AppResult};
+use crate::settings::ProcessingDevice;
 use crate::tts::phonemize::Phonemizer;
 use crate::tts::voice::VoicePack;
 
@@ -68,7 +69,7 @@ pub struct TtsEngine {
 }
 
 impl TtsEngine {
-    pub fn new(model_path: &Path, voice_path: &Path) -> AppResult<Self> {
+    pub fn new(model_path: &Path, voice_path: &Path, device: ProcessingDevice) -> AppResult<Self> {
         if !model_path.exists() {
             return Err(AppError::ModelNotFound(model_path.display().to_string()));
         }
@@ -78,7 +79,7 @@ impl TtsEngine {
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| AppError::Tts(format!("opt level: {e}")))?;
 
-        let bound_ep = Self::register_execution_provider(&mut builder)?;
+        let bound_ep = Self::register_execution_provider(&mut builder, device)?;
 
         let session = builder
             .commit_from_file(model_path)
@@ -99,17 +100,21 @@ impl TtsEngine {
     }
 
     /// Register the execution provider and return its label. When a GPU backend
-    /// is compiled in (`tts-webgpu` / `tts-cuda`), the GPU is the default and we
-    /// fall back to CPU automatically if its registration fails (no usable GPU,
-    /// driver issue, …) — so the same binary runs everywhere, mirroring
-    /// `stt/engine.rs`. `CIMP_GPU=cpu` forces CPU. Built with no GPU feature,
-    /// this is always CPU.
+    /// is compiled in (`tts-webgpu` / `tts-cuda`), the `device` setting selects
+    /// GPU vs CPU: `Gpu` registers the GPU EP and falls back to CPU
+    /// automatically if its registration fails (no usable GPU, driver issue, …)
+    /// — so the same binary runs everywhere, mirroring `stt/engine.rs`; `Cpu`
+    /// forces CPU. The `device` setting is authoritative (the old `CIMP_GPU`
+    /// env override is gone). Built with no GPU feature, this is always CPU.
     ///
     /// NB: a successful GPU registration means the EP is *active*, not that
     /// every op runs on the GPU — the WebGPU EP can place unsupported ops on CPU.
     #[cfg(any(feature = "tts-webgpu", feature = "tts-cuda"))]
-    fn register_execution_provider(builder: &mut SessionBuilder) -> AppResult<&'static str> {
-        if std::env::var("CIMP_GPU").as_deref() == Ok("cpu") {
+    fn register_execution_provider(
+        builder: &mut SessionBuilder,
+        device: ProcessingDevice,
+    ) -> AppResult<&'static str> {
+        if device == ProcessingDevice::Cpu {
             Self::register_cpu(builder)?;
             return Ok("CPU (forced)");
         }
@@ -124,7 +129,10 @@ impl TtsEngine {
     }
 
     #[cfg(not(any(feature = "tts-webgpu", feature = "tts-cuda")))]
-    fn register_execution_provider(builder: &mut SessionBuilder) -> AppResult<&'static str> {
+    fn register_execution_provider(
+        builder: &mut SessionBuilder,
+        _device: ProcessingDevice,
+    ) -> AppResult<&'static str> {
         Self::register_cpu(builder)?;
         Ok("CPU")
     }
@@ -221,7 +229,7 @@ mod tests {
     /// and, on a GPU build, pulls the GPU.
     ///
     /// Run:        `cargo test --bin cimp [--features tts-webgpu] -- --ignored --nocapture synthesizes`
-    /// CPU baseline: prefix with `CIMP_GPU=cpu`.
+    /// CPU baseline: pass `ProcessingDevice::Cpu` below.
     #[test]
     #[ignore]
     fn synthesizes() {
@@ -247,7 +255,8 @@ mod tests {
 
         // The bound EP is logged by `TtsEngine::new` ("TTS engine ready
         // bound=…"); the tracing subscriber above surfaces it under --nocapture.
-        let mut engine = TtsEngine::new(&model, &voice).expect("engine init");
+        let mut engine =
+            TtsEngine::new(&model, &voice, ProcessingDevice::Gpu).expect("engine init");
 
         let text = "Hello world. This is a text to speech test.";
         // First synth pays one-time shader compilation on GPU backends; the

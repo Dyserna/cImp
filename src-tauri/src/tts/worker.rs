@@ -40,11 +40,17 @@ pub fn spawn_tts_worker(
         // load/unload edge logic lives in exactly one place.
         let mut engine: Option<TtsEngine> = None;
         let mut tts_enabled = false;
+        // Track the device the loaded engine was built on so a live change to
+        // `tts.device` (GPU ↔ CPU) triggers a reload. Seeded from the current
+        // setting so the initial `apply_settings` load doesn't self-trigger a
+        // redundant reload.
+        let mut tts_device = settings.current().tts.device;
         {
             let cur = settings.current();
             apply_settings(
                 &mut engine,
                 &mut tts_enabled,
+                &mut tts_device,
                 &cur,
                 &state_signals,
                 &active,
@@ -61,6 +67,7 @@ pub fn spawn_tts_worker(
                             apply_settings(
                                 &mut engine,
                                 &mut tts_enabled,
+                                &mut tts_device,
                                 &s,
                                 &state_signals,
                                 &active,
@@ -295,16 +302,22 @@ pub fn spawn_tts_worker(
 /// - `tts.enabled` false→true loads the Kokoro model; true→false drops it
 ///   (unloading the ONNX session). `was_enabled` tracks the prior state so the
 ///   load/unload happens only on the edge.
+/// - `tts.device` GPU↔CPU while enabled reloads the model on the newly-selected
+///   device (dropping the old session first, freeing that device's memory).
+///   `cur_device` tracks the loaded engine's device so the reload fires only on
+///   the edge.
 /// - while enabled, `speed`/`voice` changes apply to the next synthesis with no
 ///   engine restart.
 async fn apply_settings(
     engine: &mut Option<TtsEngine>,
     was_enabled: &mut bool,
+    cur_device: &mut crate::settings::ProcessingDevice,
     s: &Settings,
     state_signals: &mpsc::Sender<StateSignal>,
     active: &ActiveTab,
 ) {
     let now_enabled = s.tts.enabled;
+    let device = s.tts.device;
     if now_enabled && !*was_enabled {
         if engine.is_none() {
             *engine = load_engine(s, state_signals, active).await;
@@ -313,8 +326,15 @@ async fn apply_settings(
         if engine.take().is_some() {
             info!("tts: disabled; Kokoro model unloaded");
         }
+    } else if now_enabled && device != *cur_device && engine.is_some() {
+        // Device changed while enabled: drop the old session before building
+        // the new one so the old device's memory is freed first, then reload.
+        info!(?device, "tts: device changed; reloading Kokoro model");
+        *engine = None;
+        *engine = load_engine(s, state_signals, active).await;
     }
     *was_enabled = now_enabled;
+    *cur_device = device;
 
     if let Some(engine) = engine.as_mut() {
         engine.set_speed(s.tts.speed);
@@ -358,7 +378,9 @@ async fn load_engine(
         }
     };
     let speed = s.tts.speed;
-    let built = tokio::task::spawn_blocking(move || TtsEngine::new(&model_path, &voice_path)).await;
+    let device = s.tts.device;
+    let built =
+        tokio::task::spawn_blocking(move || TtsEngine::new(&model_path, &voice_path, device)).await;
     let result = match built {
         Ok(r) => r,
         Err(e) => {

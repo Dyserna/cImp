@@ -325,10 +325,12 @@ interaction*).
 
 - **OS:** Windows 10/11 (primary). Linux is feasible but not part of the
   validation matrix — see `docs/completedMilestones/MILESTONE-V1-08-polish.md`.
-- **GPU:** optional. The app defaults to CPU inference (Kokoro is small
-  enough for near-real-time CPU). NVIDIA CUDA 12.x can be opted into via
-  `setx CIMP_GPU cuda` and a restart — see `docs/MAINTENANCE.md` for the
-  current GPU support matrix and Blackwell caveat.
+- **GPU:** optional. The released build uses the GPU by default (Kokoro on
+  WebGPU, Whisper on Vulkan) and falls back to CPU automatically when none is
+  usable. You can pick GPU or CPU per feature at runtime — *Settings → Audio →
+  TTS → Process on* and *Settings → Speech-to-text → Process on* — with no
+  restart. See `docs/MAINTENANCE.md` for the GPU support matrix and Blackwell
+  caveat.
 - **Claude Code:** the `claude` binary must be on `PATH` for the Claude and
   Claude (local) tabs. cImp spawns it as a subprocess.
 - **OpenCode (optional):** the `opencode` binary must be on `PATH` (or in
@@ -411,8 +413,8 @@ found" on first use and logs the expected path.
 same time**: it's built with whisper.cpp's Vulkan backend, so it automatically
 uses any GPU (NVIDIA, AMD, or Intel) and falls back to CPU on machines without
 one — the only requirement is `vulkan-1.dll`, which ships with Windows. Nothing
-to install. (`CIMP_GPU=cpu` forces CPU; a short utterance on `small` is
-~1–3 s on CPU, well under a second on a GPU.)
+to install. (Pick GPU or CPU in *Settings → Speech-to-text → Process on*; a
+short utterance on `small` is ~1–3 s on CPU, well under a second on a GPU.)
 
 Building from source, the **default is CPU-only** (no GPU SDK needed). To build
 the GPU variant locally, compile `--features stt-vulkan` from a VS x64 Native
@@ -735,8 +737,8 @@ are needed, since the per-state behaviour comes from the manifest.
   Until you fix it you can simply use the subscription Claude tab, which is
   unaffected.
 - **CUDA EP errors per segment (silent output).** You're on a GPU not yet
-  covered by the bundled ORT prebuilt (Blackwell / RTX 5090). Unset
-  `CIMP_GPU` to fall back to CPU. See `docs/MAINTENANCE.md`.
+  covered by the bundled ORT prebuilt (Blackwell / RTX 5090). Switch
+  *Settings → Audio → TTS → Process on* to **CPU**. See `docs/MAINTENANCE.md`.
 - **Avatar doesn't move.** Confirm `Settings → Avatar → Visible` is on
   and the per-state image paths point to readable files (or are blank to use
   the bundled defaults). In *Animated sprites* mode, confirm the chosen

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.2] — 2026-07-03
+
+Runtime GPU/CPU selection for TTS and STT, reusable offload backend templates,
+and an at-a-glance tools reference in the Code Graph and Offload Server tabs.
+
+### Added
+
+- **GPU/CPU device selector for TTS and STT.** *Settings → Audio → TTS* and
+  *Settings → Speech-to-text* each gained a **Process on** dropdown (GPU / CPU).
+  Switching it reloads only that model on the newly-selected device — no app
+  restart. **GPU** prefers the compiled GPU backend and auto-falls-back to CPU
+  if none is usable; **CPU** forces CPU. On a CPU-only build both run on CPU.
+- **Saveable offload backend templates.** Local backends can save/load/delete
+  named `llama-server` command templates (a global library); Remote backends
+  get named base-URL + auth-token endpoint templates. The Pool editor layout
+  was reflowed — inline *Start-on-launch*, Start/Stop/Reset at the card bottom,
+  a word-wrapped multi-row *Server command* field, and *Test offload* moved to
+  the section bottom.
+- **Collapsible Tools reference** in the Code Graph and Offload Server tabs. A
+  shared component lists the tools each feature exposes — the `graph_*` MCP
+  tools for Code Graph, and `offload_task` plus the worker's native
+  `read_file` / `code_search` / `run_command` for the Offload Server — each with
+  a one-line description and an example prompt.
+
+### Changed
+
+- **The TTS/STT device is now a setting, not the `CIMP_GPU` env var.** The new
+  per-feature **Process on** selector is authoritative; `CIMP_GPU=cpu` is no
+  longer consulted for device selection (the setting supersedes it). Existing
+  settings files without the field load as **GPU**, preserving the historical
+  "prefer GPU, fall back to CPU" behavior — no migration needed.
+
 ## [0.32.0] — 2026-07-01
 
 The per-project code knowledge graph now understands ~29 languages through a

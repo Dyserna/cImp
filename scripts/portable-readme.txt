@@ -143,17 +143,18 @@ into that folder; it appears in Settings -> TTS -> Voice on next launch
 (or the next time the dropdown is opened, depending on the build).
 
 
-Optional: GPU acceleration
---------------------------
+GPU acceleration
+----------------
 
-CPU is the default and works near-real-time for Kokoro. Opt into NVIDIA
-CUDA with:
+This build is GPU-accelerated out of the box (Kokoro TTS on WebGPU,
+Whisper STT on Vulkan) and falls back to CPU automatically on machines
+without a usable GPU. Nothing to install.
 
-    setx CIMP_GPU cuda
-
-then restart cImp. Requires CUDA 12.x runtime + cuDNN 9 installed
-separately. Known broken on Blackwell (RTX 5090); see docs/MAINTENANCE.md
-in the repo for the GPU support matrix.
+To force CPU (or switch back to GPU) for either feature, use the
+"Process on" dropdown in Settings -> Audio -> TTS and Settings ->
+Speech-to-text. The change takes effect immediately -- no restart.
+See docs/MAINTENANCE.md in the repo for the GPU support matrix and the
+Blackwell (RTX 5090) caveat.
 
 
 Updating

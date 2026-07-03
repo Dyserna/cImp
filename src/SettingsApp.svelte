@@ -16,6 +16,7 @@
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
+    ProcessingDevice,
     Settings,
     ShellTabConfig,
     TabConfig,
@@ -43,6 +44,8 @@
     BackendTier,
     CommandPolicy,
     McpServerConfig,
+    ServerCommandTemplate,
+    RemoteBackendTemplate,
   } from './lib/settings/types';
   import { LOCAL_DATA_TOOLS } from './lib/settings/types';
   import type { AiTabId } from './lib/tabs/types';
@@ -246,6 +249,109 @@
   function updateBackend(i: number, fn: (b: OffloadBackend) => void): void {
     patch((s) => {
       fn(s.offload.backends[i]);
+    });
+  }
+  // ── Backend templates (global libraries) ───────────────────────────────
+  // Save/Load/Delete controls under a backend field manage a global template
+  // library shared across backends and restarts: Local backends use
+  // `offload.server_command_templates` (name + command); Remote backends use
+  // `offload.remote_backend_templates` (name + base URL + auth token). Only one
+  // popup is open at a time; `templatePopup` records which backend (by index)
+  // opened it and which mode it's in — the backend's own kind decides which
+  // library the popup acts on.
+  let templatePopup = $state<{ i: number; mode: 'save' | 'load' | 'delete' } | null>(null);
+  let newTemplateName = $state('');
+  let templateError = $state<string | null>(null);
+
+  function openTemplatePopup(i: number, mode: 'save' | 'load' | 'delete'): void {
+    // A second click on the same button closes the popup (toggle).
+    if (templatePopup && templatePopup.i === i && templatePopup.mode === mode) {
+      closeTemplatePopup();
+      return;
+    }
+    templatePopup = { i, mode };
+    newTemplateName = '';
+    templateError = null;
+  }
+  function closeTemplatePopup(): void {
+    templatePopup = null;
+    newTemplateName = '';
+    templateError = null;
+  }
+  // Validate the pending template name against an existing library; returns the
+  // trimmed name or null (and sets `templateError`) when invalid.
+  function validateTemplateName(existing: string[]): string | null {
+    const name = newTemplateName.trim();
+    if (!name) {
+      templateError = 'Name required.';
+      return null;
+    }
+    if (existing.includes(name)) {
+      templateError = `A template named "${name}" already exists.`;
+      return null;
+    }
+    return name;
+  }
+  // Local backend (server command) ───────────────────────────────
+  function commitSaveLocalTemplate(i: number): void {
+    if (!snapshot) return;
+    const name = validateTemplateName(
+      snapshot.offload.server_command_templates.map((t) => t.name),
+    );
+    if (!name) return;
+    const backend = snapshot.offload.backends[i];
+    const command = backend?.kind.type === 'local' ? backend.kind.server_command : '';
+    patch((s) => {
+      s.offload.server_command_templates = [
+        ...s.offload.server_command_templates,
+        { name, command },
+      ];
+    });
+    closeTemplatePopup();
+  }
+  function loadLocalTemplate(i: number, tpl: ServerCommandTemplate): void {
+    updateBackend(i, (b) => {
+      if (b.kind.type === 'local') b.kind.server_command = tpl.command;
+    });
+    closeTemplatePopup();
+  }
+  function deleteLocalTemplate(name: string): void {
+    patch((s) => {
+      s.offload.server_command_templates =
+        s.offload.server_command_templates.filter((t) => t.name !== name);
+    });
+  }
+  // Remote backend (base URL + auth token) ───────────────────────
+  function commitSaveRemoteTemplate(i: number): void {
+    if (!snapshot) return;
+    const name = validateTemplateName(
+      snapshot.offload.remote_backend_templates.map((t) => t.name),
+    );
+    if (!name) return;
+    const backend = snapshot.offload.backends[i];
+    const base_url = backend?.kind.type === 'remote' ? backend.kind.base_url : '';
+    const auth_token = backend?.kind.type === 'remote' ? backend.kind.auth_token : '';
+    patch((s) => {
+      s.offload.remote_backend_templates = [
+        ...s.offload.remote_backend_templates,
+        { name, base_url, auth_token },
+      ];
+    });
+    closeTemplatePopup();
+  }
+  function loadRemoteTemplate(i: number, tpl: RemoteBackendTemplate): void {
+    updateBackend(i, (b) => {
+      if (b.kind.type === 'remote') {
+        b.kind.base_url = tpl.base_url;
+        b.kind.auth_token = tpl.auth_token;
+      }
+    });
+    closeTemplatePopup();
+  }
+  function deleteRemoteTemplate(name: string): void {
+    patch((s) => {
+      s.offload.remote_backend_templates =
+        s.offload.remote_backend_templates.filter((t) => t.name !== name);
     });
   }
   // ── Command security policies (Tools tab) ──────────────────────────────
@@ -978,6 +1084,23 @@
             loaded but silence playback, use <em>Mute</em> instead.)
           </small>
           <label>
+            <span>Process on</span>
+            <select
+              value={snapshot.tts.device}
+              disabled={!snapshot.tts.enabled}
+              onchange={(e) => patch((s) => (s.tts.device = (e.currentTarget as HTMLSelectElement).value as ProcessingDevice))}
+            >
+              <option value="gpu">GPU (fall back to CPU)</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
+          <small class="hint">
+            Where Kokoro runs. <strong>GPU</strong> uses the graphics card and
+            automatically falls back to CPU if none is available;
+            <strong>CPU</strong> forces CPU. Switching reloads the model on the
+            new device — no restart needed.
+          </small>
+          <label>
             <span>Voice</span>
             <select
               value={snapshot.tts.voice}
@@ -1278,6 +1401,22 @@
               reloads the engine on your next recording.
             </small>
           {/if}
+
+          <label>
+            <span>Process on</span>
+            <select
+              value={snapshot.stt.device}
+              onchange={(e) => patch((s) => (s.stt.device = (e.currentTarget as HTMLSelectElement).value as ProcessingDevice))}
+            >
+              <option value="gpu">GPU (fall back to CPU)</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
+          <small class="hint">
+            Where Whisper runs. <strong>GPU</strong> uses the graphics card and
+            automatically falls back to CPU if none is available;
+            <strong>CPU</strong> forces CPU. Takes effect on your next recording.
+          </small>
 
           <label>
             <span>Input device</span>
@@ -2605,11 +2744,6 @@
             />
             <span>Enable offload</span>
           </label>
-          <small class="hint">
-            When on, cImp injects the <code>offload_task</code> tool into
-            Claude tabs (re-launch a tab to pick it up). Configure your
-            local/remote models in the <strong>Backend pool</strong> below.
-          </small>
           <label class="checkbox">
             <input
               type="checkbox"
@@ -2620,28 +2754,7 @@
             <span>Inject offload guidance into the system prompt</span>
           </label>
 
-          <label>
-            <span>Test offload</span>
-            <input
-              type="text"
-              bind:value={offloadTestInput}
-              placeholder="Leave empty for a canned reachability check, or type a task…"
-            />
-            <div class="button-row">
-              <button type="button" disabled={offloadBusy} onclick={runOffloadTest}>
-                Run test
-              </button>
-            </div>
-            {#if offloadTestResult}
-              <pre class="offload-test-result">{offloadTestResult}</pre>
-            {/if}
-          </label>
-          <small class="hint">
-            Watch the local model load + server logs live in the read-only
-            <strong>Offload Server</strong> tab (appears when offload is
-            enabled).
-          </small>
-
+          <hr class="card-divider lg" />
           <div class="sub-tabs" role="tablist" aria-label="Offload sub-sections">
             <button
               type="button"
@@ -2706,6 +2819,19 @@
                   />
                   <span>enabled</span>
                 </label>
+                {#if backend.kind.type === 'local'}
+                  <label class="checkbox inline">
+                    <input
+                      type="checkbox"
+                      checked={backend.kind.autostart}
+                      onchange={(e) =>
+                        updateBackend(i, (b) => {
+                          if (b.kind.type === 'local') b.kind.autostart = (e.currentTarget as HTMLInputElement).checked;
+                        })}
+                    />
+                    <span>Start on launch</span>
+                  </label>
+                {/if}
                 <button type="button" class="secondary danger" onclick={() => removeBackend(i)}>Remove</button>
               </div>
 
@@ -2719,35 +2845,99 @@
               {/if}
 
               {#if backend.kind.type === 'local'}
+                <hr class="card-divider lg" />
                 <label>
                   <span>Server command</span>
-                  <input
-                    type="text"
+                  <textarea
+                    class="server-command"
+                    rows="6"
+                    wrap="soft"
                     value={backend.kind.server_command}
                     oninput={(e) =>
                       updateBackend(i, (b) => {
-                        if (b.kind.type === 'local') b.kind.server_command = (e.currentTarget as HTMLInputElement).value;
+                        if (b.kind.type === 'local') b.kind.server_command = (e.currentTarget as HTMLTextAreaElement).value;
                       })}
                     placeholder="llama-server --model … --port 8080 --jinja -ngl 99 --ctx-size 150000"
-                  />
+                  ></textarea>
                 </label>
-                <label class="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={backend.kind.autostart}
-                    onchange={(e) =>
-                      updateBackend(i, (b) => {
-                        if (b.kind.type === 'local') b.kind.autostart = (e.currentTarget as HTMLInputElement).checked;
-                      })}
-                  />
-                  <span>Start on launch</span>
-                </label>
-                <div class="button-row">
-                  <button type="button" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStart(backend.name))}>Start</button>
-                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStop(backend.name))}>Stop</button>
-                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendRestart(backend.name))}>Reset</button>
+                <div class="button-row template-actions">
+                  <button
+                    type="button"
+                    class="secondary"
+                    class:active={templatePopup?.i === i && templatePopup?.mode === 'save'}
+                    onclick={() => openTemplatePopup(i, 'save')}
+                  >Save</button>
+                  <button
+                    type="button"
+                    class="secondary"
+                    class:active={templatePopup?.i === i && templatePopup?.mode === 'load'}
+                    onclick={() => openTemplatePopup(i, 'load')}
+                  >Load</button>
+                  <button
+                    type="button"
+                    class="secondary"
+                    class:active={templatePopup?.i === i && templatePopup?.mode === 'delete'}
+                    onclick={() => openTemplatePopup(i, 'delete')}
+                  >Delete</button>
                 </div>
+
+                {#if templatePopup?.i === i}
+                  {@const templates = snapshot.offload.server_command_templates}
+                  <div class="template-popup" role="group">
+                    {#if templatePopup.mode === 'save'}
+                      <div class="template-save">
+                        <input
+                          type="text"
+                          placeholder="Template name"
+                          bind:value={newTemplateName}
+                          onkeydown={(e) => {
+                            if (e.key === 'Enter') commitSaveLocalTemplate(i);
+                            if (e.key === 'Escape') closeTemplatePopup();
+                          }}
+                        />
+                        <button type="button" onclick={() => commitSaveLocalTemplate(i)}>Save</button>
+                        <button type="button" class="secondary" onclick={closeTemplatePopup}>Cancel</button>
+                      </div>
+                      {#if templateError}
+                        <small class="error">{templateError}</small>
+                      {/if}
+                    {:else if templatePopup.mode === 'load'}
+                      {#if templates.length === 0}
+                        <small class="hint">No saved commands yet.</small>
+                      {:else}
+                        <ul class="template-list">
+                          {#each templates as t (t.name)}
+                            <li>
+                              <span class="template-name" title={t.command}>{t.name}</span>
+                              <button type="button" onclick={() => loadLocalTemplate(i, t)}>Load</button>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                      <div class="button-row">
+                        <button type="button" class="secondary" onclick={closeTemplatePopup}>Cancel</button>
+                      </div>
+                    {:else if templatePopup.mode === 'delete'}
+                      {#if templates.length === 0}
+                        <small class="hint">No saved commands yet.</small>
+                      {:else}
+                        <ul class="template-list">
+                          {#each templates as t (t.name)}
+                            <li>
+                              <span class="template-name" title={t.command}>{t.name}</span>
+                              <button type="button" class="danger" onclick={() => deleteLocalTemplate(t.name)}>Delete</button>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                      <div class="button-row">
+                        <button type="button" class="secondary" onclick={closeTemplatePopup}>Cancel</button>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
               {:else if backend.kind.type === 'remote'}
+                <hr class="card-divider lg" />
                 <label>
                   <span>Base URL</span>
                   <input
@@ -2772,6 +2962,86 @@
                     placeholder="Bearer token for cloud APIs"
                   />
                 </label>
+                <div class="button-row template-actions">
+                  <button
+                    type="button"
+                    class="secondary"
+                    class:active={templatePopup?.i === i && templatePopup?.mode === 'save'}
+                    onclick={() => openTemplatePopup(i, 'save')}
+                  >Save</button>
+                  <button
+                    type="button"
+                    class="secondary"
+                    class:active={templatePopup?.i === i && templatePopup?.mode === 'load'}
+                    onclick={() => openTemplatePopup(i, 'load')}
+                  >Load</button>
+                  <button
+                    type="button"
+                    class="secondary"
+                    class:active={templatePopup?.i === i && templatePopup?.mode === 'delete'}
+                    onclick={() => openTemplatePopup(i, 'delete')}
+                  >Delete</button>
+                </div>
+
+                {#if templatePopup?.i === i}
+                  {@const templates = snapshot.offload.remote_backend_templates}
+                  <div class="template-popup" role="group">
+                    {#if templatePopup.mode === 'save'}
+                      <div class="template-save">
+                        <input
+                          type="text"
+                          placeholder="Template name"
+                          bind:value={newTemplateName}
+                          onkeydown={(e) => {
+                            if (e.key === 'Enter') commitSaveRemoteTemplate(i);
+                            if (e.key === 'Escape') closeTemplatePopup();
+                          }}
+                        />
+                        <button type="button" onclick={() => commitSaveRemoteTemplate(i)}>Save</button>
+                        <button type="button" class="secondary" onclick={closeTemplatePopup}>Cancel</button>
+                      </div>
+                      {#if templateError}
+                        <small class="error">{templateError}</small>
+                      {/if}
+                      <small class="hint">Saves the base URL and auth token above.</small>
+                    {:else if templatePopup.mode === 'load'}
+                      {#if templates.length === 0}
+                        <small class="hint">No saved endpoints yet.</small>
+                      {:else}
+                        <ul class="template-list">
+                          {#each templates as t (t.name)}
+                            <li>
+                              <span class="template-name" title={t.base_url}>{t.name}</span>
+                              <span class="template-sub">{t.base_url}</span>
+                              <button type="button" onclick={() => loadRemoteTemplate(i, t)}>Load</button>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                      <div class="button-row">
+                        <button type="button" class="secondary" onclick={closeTemplatePopup}>Cancel</button>
+                      </div>
+                    {:else if templatePopup.mode === 'delete'}
+                      {#if templates.length === 0}
+                        <small class="hint">No saved endpoints yet.</small>
+                      {:else}
+                        <ul class="template-list">
+                          {#each templates as t (t.name)}
+                            <li>
+                              <span class="template-name" title={t.base_url}>{t.name}</span>
+                              <span class="template-sub">{t.base_url}</span>
+                              <button type="button" class="danger" onclick={() => deleteRemoteTemplate(t.name)}>Delete</button>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                      <div class="button-row">
+                        <button type="button" class="secondary" onclick={closeTemplatePopup}>Cancel</button>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+                <hr class="card-divider lg" />
                 <label class="checkbox">
                   <input
                     type="checkbox"
@@ -2816,6 +3086,7 @@
                 </label>
               {/if}
 
+              <hr class="card-divider lg" />
               <label>
                 <span>Tool scope</span>
                 <select
@@ -2834,6 +3105,15 @@
                   never leave the machine. Widen a cloud backend only with intent.
                 </small>
               </label>
+
+              {#if backend.kind.type === 'local'}
+                <hr class="card-divider" />
+                <div class="button-row">
+                  <button type="button" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStart(backend.name))}>Start</button>
+                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStop(backend.name))}>Stop</button>
+                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendRestart(backend.name))}>Reset</button>
+                </div>
+              {/if}
             </div>
           {/each}
 
@@ -2842,17 +3122,7 @@
             <button type="button" onclick={addRemoteBackend}>+ Remote backend</button>
           </div>
 
-          {#if serviceStatus}
-            <div class="offload-status warm-pool">
-              <span class="offload-status-label">Warm pool:</span>
-              <span>
-                {serviceStatus.global_in_flight} / {serviceStatus.global_cap} offloads in flight
-                (global, across all Claude tabs){#if serviceStatus.queue_depth > 0}, {serviceStatus.queue_depth}
-                  queued{/if}
-              </span>
-            </div>
-          {/if}
-
+          <hr class="card-divider lg" />
           <h3>Limits</h3>
           <label>
             <span>Working-budget high-water (%)</span>
@@ -3126,6 +3396,29 @@
             <button type="button" onclick={addCommandPolicy}>Add command policy</button>
           </div>
           {/if}
+
+          <hr class="card-divider lg" />
+          <label>
+            <span>Test offload</span>
+            <input
+              type="text"
+              bind:value={offloadTestInput}
+              placeholder="Leave empty for a canned reachability check, or type a task…"
+            />
+            <div class="button-row">
+              <button type="button" disabled={offloadBusy} onclick={runOffloadTest}>
+                Run test
+              </button>
+            </div>
+            {#if offloadTestResult}
+              <pre class="offload-test-result">{offloadTestResult}</pre>
+            {/if}
+          </label>
+          <small class="hint">
+            Watch the local model load + server logs live in the read-only
+            <strong>Offload Server</strong> tab (appears when offload is
+            enabled).
+          </small>
         </section>
       {:else if activeSection === 'mcp'}
         <section>
@@ -3633,10 +3926,7 @@
     font-weight: 600;
     color: var(--text-secondary);
   }
-  /* V8-03 warm-pool readout + per-MCP-server health */
-  .warm-pool {
-    color: var(--text-secondary);
-  }
+  /* Per-MCP-server health readout */
   .status-error {
     color: var(--danger, #d08770);
     font-weight: 600;
@@ -3784,6 +4074,18 @@
     flex-wrap: wrap;
     margin-bottom: 0.3rem;
   }
+  /* Blank vertical spacer used to space out the offload backend editor
+     (above Server command, Tool scope, and the Start/Stop/Reset row). No
+     rule line — just breathing room. */
+  .card-divider {
+    border: none;
+    margin: 0;
+    height: 0.9rem;
+  }
+  /* Wider gap above the Server command and Tool scope groups. */
+  .card-divider.lg {
+    height: 1.8rem;
+  }
   .backend-name {
     flex: 1 1 8rem;
     min-width: 6rem;
@@ -3808,6 +4110,74 @@
   .badge.warn {
     color: #d08770;
     border-color: #d08770;
+  }
+  /* Multiline, word-wrapping Server command field so every argument of a long
+     llama-server invocation stays visible without horizontal scrolling. */
+  textarea.server-command {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 7.8rem;
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .template-actions {
+    margin-top: 0.35rem;
+  }
+  .template-actions button.active {
+    border-color: var(--accent, #d08770);
+    color: var(--accent, #d08770);
+  }
+  .template-popup {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md, 6px);
+    padding: 0.5rem 0.6rem;
+    margin: 0.4rem 0 0.2rem;
+    background: var(--surface-1, var(--surface-sunken));
+  }
+  .template-save {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .template-save input[type='text'] {
+    flex: 1 1 10rem;
+    min-width: 8rem;
+  }
+  .template-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 var(--space-2);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .template-list li {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+  }
+  .template-list .template-name {
+    flex: 0 1 auto;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Dimmed secondary line (e.g. a remote endpoint's base URL) that fills the
+     remaining row width and truncates before the trailing action button. */
+  .template-list .template-sub {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: var(--font-size-xs);
+    opacity: 0.6;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   /* Two-column layout: fixed sidebar on the left, scrollable content on
      the right. The settings page lives inside #app, which app.css pins to

@@ -68,10 +68,18 @@ export interface AvatarSettings {
   waveform: WaveformSettings;
 }
 
+/// Where a TTS/STT model runs. `gpu` prefers the compiled GPU backend and
+/// auto-falls-back to CPU if none is usable; `cpu` forces CPU. Switching it
+/// live reloads only that model (no restart). Mirrors the Rust
+/// `ProcessingDevice` enum.
+export type ProcessingDevice = 'gpu' | 'cpu';
+
 export interface TtsSettings {
   /// Master enable for TTS. When false the Kokoro model is unloaded and no
   /// synthesis runs; distinct from `mute` (which keeps the model loaded).
   enabled: boolean;
+  /// GPU vs CPU for Kokoro synthesis. Changing it reloads the model live.
+  device: ProcessingDevice;
   voice: string;
   speed: number;
   volume: number;
@@ -90,6 +98,9 @@ export type SttButtonMode = 'toggle' | 'hold';
 export interface SttSettings {
   /// Master enable for the whole STT feature (record button + PTT).
   enabled: boolean;
+  /// GPU vs CPU for Whisper transcription. Changing it reloads the model on
+  /// the next recording / preload.
+  device: ProcessingDevice;
   /// GGML model filename under `models/` (e.g. "ggml-small.bin").
   model_file: string;
   /// Whisper language hint. "auto" = detect; "en", "he", … force a language.
@@ -720,6 +731,24 @@ export interface CommandPolicy {
   env: CommandEnvVar[];
 }
 
+/// A named, reusable `llama-server` launch command saved globally and pasted
+/// back into a Local backend's `Server command` field via the Pool editor's
+/// Save/Load/Delete controls (mirror of Rust `ServerCommandTemplate`).
+export interface ServerCommandTemplate {
+  name: string;
+  command: string;
+}
+
+/// A named, reusable Remote-backend endpoint (base URL + auth token) saved
+/// globally and pasted back into a Remote backend's fields via the same
+/// Save/Load/Delete controls (mirror of Rust `RemoteBackendTemplate`). The
+/// `auth_token` is stored cleartext on disk, like the backend's own token.
+export interface RemoteBackendTemplate {
+  name: string;
+  base_url: string;
+  auth_token: string;
+}
+
 export interface OffloadSettings {
   enabled: boolean;
   autostart: boolean;
@@ -733,6 +762,11 @@ export interface OffloadSettings {
   command_policies: CommandPolicy[];
   mcp_servers: McpServerConfig[];
   backends: OffloadBackend[];
+  /// Saved, reusable server-command templates (see `ServerCommandTemplate`).
+  /// A convenience library only — nothing reads these at runtime.
+  server_command_templates: ServerCommandTemplate[];
+  /// Saved, reusable Remote-backend endpoints (see `RemoteBackendTemplate`).
+  remote_backend_templates: RemoteBackendTemplate[];
   budget_high_water_pct: number;
   per_tool_result_token_cap: number;
   max_steps: number;
@@ -779,6 +813,7 @@ export function defaultSettings(): Settings {
     schema_version: CURRENT_SCHEMA_VERSION,
     tts: {
       enabled: true,
+      device: 'gpu',
       voice: 'af_heart',
       speed: 1.0,
       volume: 1.0,
@@ -798,6 +833,7 @@ export function defaultSettings(): Settings {
     },
     stt: {
       enabled: true,
+      device: 'gpu',
       model_file: 'ggml-small.bin',
       language: 'auto',
       input_device: '',
@@ -1026,6 +1062,8 @@ export function defaultSettings(): Settings {
       ],
       mcp_servers: [],
       backends: [],
+      server_command_templates: [],
+      remote_backend_templates: [],
       budget_high_water_pct: 80,
       per_tool_result_token_cap: 8000,
       max_steps: 16,

@@ -20,6 +20,23 @@
     type GraphStatus,
   } from './graph';
   import { listenManaged } from './listenManaged';
+  import ToolsReference from './ToolsReference.svelte';
+
+  // Reference list of the graph_* MCP tools this feature exposes to Claude (and
+  // the offload worker) while the graph is enabled. Mirrors the descriptions in
+  // `src-tauri/src/graph/mcp.rs::tool_specs`; kept here as static docs.
+  const GRAPH_TOOLS = [
+    { name: 'graph_find_symbol', desc: 'Where a symbol (function/struct/trait/…) is defined — file, line, signature.', example: 'Where is GraphService defined?' },
+    { name: 'graph_callers', desc: 'Which functions call the given symbol (its call sites). Impact analysis.', example: 'What calls graphRebuild?' },
+    { name: 'graph_callees', desc: 'Which symbols are called by the given symbol.', example: 'What does handle_call call?' },
+    { name: 'graph_references', desc: 'Every reference (use site) of a name — file, line, column.', example: 'Find all references to ToolDef.' },
+    { name: 'graph_imports', desc: 'The modules/paths a file imports.', example: 'What does src/offload/mcp.rs import?' },
+    { name: 'graph_outline', desc: 'Every definition in a file, in source order (a structural outline).', example: 'Outline BackendDashboardCard.svelte.' },
+    { name: 'graph_transitive', desc: 'Transitive call chain for a symbol — everything it reaches (callees) or that reaches it (callers).', example: 'What does runOffloadTest transitively call?' },
+    { name: 'graph_search_docs', desc: 'Keyword search over docs and doc-comments; returns matching snippets.', example: "Search the docs for 'warm pool'." },
+    { name: 'graph_struct_search', desc: 'Find code by AST shape via a tree-sitter query (not text).', example: 'Find every .unwrap() in the Rust code.' },
+    { name: 'graph_semantic_docs', desc: 'Meaning-based (embedding) search over docs — only when Semantic search is enabled.', example: 'Find docs about how offload timeouts are handled.' },
+  ];
 
   let roots = $state<GraphStatus[]>([]);
   let paused = $state<boolean>(false);
@@ -233,6 +250,12 @@
       {/if}
     </div>
   </section>
+
+  <ToolsReference
+    title="Graph tools"
+    tools={GRAPH_TOOLS}
+    note="MCP tools exposed to Claude (and the offload worker) while the graph is enabled. Ask in natural language — Claude picks the tool."
+  />
 </div>
 
 <style>

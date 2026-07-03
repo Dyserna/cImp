@@ -123,7 +123,8 @@ portable binary that uses any vendor's GPU and falls back to CPU.
   CUDA DLLs, no redistributables, no SDK. `ort`'s `download-binaries` static-links
   core ONNX Runtime into `cimp.exe`, so there is usually no `onnxruntime.dll`.
 - **GPU by default with CPU fallback** (`tts/engine.rs` registers WebGPU then
-  falls back; `CIMP_GPU=cpu` forces CPU) — same model as STT. Validated ~5×
+  falls back; the `tts.device` setting selects GPU vs CPU at runtime) — same
+  model as STT. Validated ~5×
   faster than CPU and correct on Kokoro, including the `ConvTranspose` that broke
   the DirectML EP. See `docs/features/FEATURE-tts-webgpu.md`.
 - **No extra build toolchain.** Unlike `stt-vulkan`, the WebGPU EP is a prebuilt
@@ -155,8 +156,9 @@ built with whisper.cpp's **Vulkan** backend (`--features stt-vulkan`):
   GPU-related runtime dependency is `vulkan-1.dll` — a Windows system component
   present on every Win10+ machine. So one binary: uses any vendor's GPU
   (NVIDIA/AMD/Intel) when present, falls back to CPU automatically when not
-  (`stt/engine.rs` tries GPU then CPU; `CIMP_GPU=cpu` forces CPU). **Nothing
-  GPU-specific is bundled** — no CUDA DLLs, no redistributables.
+  (`stt/engine.rs` tries GPU then CPU; the `stt.device` setting selects GPU vs
+  CPU at runtime). **Nothing GPU-specific is bundled** — no CUDA DLLs, no
+  redistributables.
 - **The default feature set is CPU-only**, so routine local builds stay light;
   the GPU build is explicit (`--features stt-vulkan`). CI builds the release
   that way — see `release.yml`'s MSVC-dev-env + Vulkan-SDK steps and

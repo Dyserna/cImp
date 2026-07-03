@@ -58,10 +58,10 @@ pub(crate) fn spawn_stt_worker(
                         // cold load. Best-effort — a missing model just logs and
                         // is retried (and reported) on the first real recording.
                         let cfg = settings.current().stt;
-                        if engine.as_ref().map(|e| e.model_file() != cfg.model_file).unwrap_or(true) {
-                            match load_engine(&cfg.model_file) {
+                        if engine.as_ref().map(|e| needs_reload(e, &cfg)).unwrap_or(true) {
+                            match load_engine(&cfg.model_file, cfg.device) {
                                 Ok(e) => {
-                                    info!(target: "stt", model = %cfg.model_file, "Whisper model preloaded");
+                                    info!(target: "stt", model = %cfg.model_file, device = ?cfg.device, "Whisper model preloaded");
                                     engine = Some(e);
                                 }
                                 Err(e) => {
@@ -82,9 +82,9 @@ pub(crate) fn spawn_stt_worker(
                     continue;
                 }
 
-                // (Re)load the engine if absent or the model changed.
-                if engine.as_ref().map(|e| e.model_file() != cfg.model_file).unwrap_or(true) {
-                    match load_engine(&cfg.model_file) {
+                // (Re)load the engine if absent or the model / device changed.
+                if engine.as_ref().map(|e| needs_reload(e, &cfg)).unwrap_or(true) {
+                    match load_engine(&cfg.model_file, cfg.device) {
                         Ok(e) => engine = Some(e),
                         Err(crate::error::AppError::ModelNotFound(_)) => {
                             crate::stt::report_missing_model_files(&cfg.model_file);
@@ -129,13 +129,23 @@ pub(crate) fn spawn_stt_worker(
         .expect("spawn stt worker thread");
 }
 
-fn load_engine(model_file: &str) -> crate::error::AppResult<SttEngine> {
+/// True when the loaded engine no longer matches the current settings — a
+/// different model file OR a different device (GPU↔CPU). Either triggers a
+/// rebuild of the `WhisperContext` on the next recording / preload.
+fn needs_reload(engine: &SttEngine, cfg: &crate::settings::SttSettings) -> bool {
+    engine.model_file() != cfg.model_file || engine.device() != cfg.device
+}
+
+fn load_engine(
+    model_file: &str,
+    device: crate::settings::ProcessingDevice,
+) -> crate::error::AppResult<SttEngine> {
     // Route whisper/ggml C-side logging through Rust (off raw stdout/stderr).
     // Installed here, on the first engine load (a recording), so the GPU
     // backend init it triggers never runs during app startup. Idempotent.
     whisper_rs::install_logging_hooks();
     let path = crate::stt::default_model_path(model_file)?;
-    SttEngine::new(&path, model_file.to_string())
+    SttEngine::new(&path, model_file.to_string(), device)
 }
 
 fn emit_transcript(app: &AppHandle, text: &str) {

@@ -660,7 +660,7 @@ pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Settings> {
 
 /// Per-AI-tab default config. Used by the Settings window's "Reset to
 /// default" buttons so the frontend doesn't have to mirror Rust-side
-/// constants (notably `RUNTIME_SYSTEM_PROMPT` for Claude's TTS instructions).
+/// tab defaults.
 ///
 /// Only AI tabs have a meaningful "default" in v1.2 — Shell tab defaults
 /// depend on the host platform's auto-detected shell, and "reset" on a

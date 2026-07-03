@@ -43,8 +43,7 @@ export async function requestTabRestart(tab: TabId): Promise<void> {
 
 /// Per-AI-tab default config from the backend. Used by the Settings
 /// window's "Reset to default" buttons to match the Rust-side defaults
-/// exactly (notably the embedded RUNTIME_SYSTEM_PROMPT for Claude's TTS
-/// instructions). Returns an error from the backend for non-AI ids.
+/// exactly. Returns an error from the backend for non-AI ids.
 export async function aiToolTabDefaults(tab: TabId): Promise<AiToolTabConfig> {
   return invoke('ai_tool_tab_defaults', { tab });
 }

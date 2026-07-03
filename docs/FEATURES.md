@@ -95,9 +95,9 @@ dependency/component breadth) — this is the *capability* breadth.
 
 ## Settings & Config
 - Portable global `settings.json` next to the exe; per-folder `.cimp.custom.config.json` overlay (auto-deleted when empty)
-- Per-tab settings: command, CLI flags, TTS injection prompt, notification text, appearance
+- Per-tab settings: command, CLI flags, TTS speak toggle, notification text, appearance
 - Migration system with timestamped backups + per-key load validation
-- Per-tab instructions injection on launch (Claude `--append-system-prompt`, OpenCode instructions file)
+- Capability guidance injected on launch when relevant — offload + code-graph tool hints (Claude `--append-system-prompt`, OpenCode instructions file)
 
 ## Notifications, Shortcuts & Status Bar
 - Tab-state announcements (idle / awaiting-permission / question / error; shells: error / exited)

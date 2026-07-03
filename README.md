@@ -649,8 +649,7 @@ Open with `Ctrl+,` or the cog button on the avatar.
   and rotate per state; the image/video and transition options don't apply.
   See *Animated sprite avatars* below.
 - **Waveform:** color, line width, glow, opacity.
-- **Display:** terminal font family + size, toggle to render TTS markup
-  verbatim in the terminal (debug aid).
+- **Display:** terminal font family + size.
 - **Appearance:** UI chrome theme — two ratatui-style variants ship,
   **TUI Orange** (Gruvbox surfaces + Claude Code's accent orange) and
   **TUI Grey** (OpenCode's cool light-grey accent); new installs default to

@@ -725,7 +725,7 @@ fn migrate_v1_to_v1_2(value: &mut Value, default_shell: &ShellSpec) {
     let claude_v1_1 = json!({
         "command": "claude",
         "extra_cli_flags": old_args,
-        "tts_injection": { "enabled": true, "instructions": crate::tts::RUNTIME_SYSTEM_PROMPT },
+        "tts_injection": { "enabled": true },
         "notifications": {
             "idle": "Claude is idle",
             "awaiting_permission": "Claude is awaiting permission",
@@ -1036,27 +1036,15 @@ fn migrate_v1_7_to_v1_8(value: &mut Value) {
                 obj.insert("args".to_string(), Value::Array(Vec::new()));
                 obj.insert("use_local_provider".to_string(), Value::Bool(true));
                 // Aider's default had tts_injection.enabled=false; the
-                // rewritten tab is Claude, which does honor TTS injection.
-                // Ensure the object exists before enabling — otherwise an aider
-                // tab serialized without a `tts_injection` field would skip the
-                // enable entirely, leaving the rewritten Claude (local) tab with
-                // TTS injection off.
+                // rewritten tab is Claude, which speaks. Ensure the object
+                // exists before enabling — otherwise an aider tab serialized
+                // without a `tts_injection` field would skip the enable
+                // entirely, leaving the rewritten Claude (local) tab silent.
                 let tts_entry = obj
                     .entry("tts_injection".to_string())
                     .or_insert_with(|| json!({}));
                 if let Some(tts) = tts_entry.as_object_mut() {
                     tts.insert("enabled".to_string(), Value::Bool(true));
-                    let needs_default = tts
-                        .get("instructions")
-                        .and_then(Value::as_str)
-                        .map(str::is_empty)
-                        .unwrap_or(true);
-                    if needs_default {
-                        tts.insert(
-                            "instructions".to_string(),
-                            Value::String(crate::tts::RUNTIME_SYSTEM_PROMPT.to_string()),
-                        );
-                    }
                 }
                 // Notification strings — replace any "Aider …" text with
                 // the matching "Claude (local) …" text. If the user
@@ -1651,24 +1639,12 @@ fn migrate_v18_to_v19(value: &mut Value) {
                 obj.insert("name".to_string(), Value::String("OpenCode".to_string()));
             }
 
-            // OpenCode can speak (instructions file): enable TTS injection and
-            // seed the runtime prompt when empty. Ensure the object exists.
+            // OpenCode can speak: enable TTS. Ensure the object exists.
             let tts_entry = obj
                 .entry("tts_injection".to_string())
                 .or_insert_with(|| json!({}));
             if let Some(tts) = tts_entry.as_object_mut() {
                 tts.insert("enabled".to_string(), Value::Bool(true));
-                let needs_default = tts
-                    .get("instructions")
-                    .and_then(Value::as_str)
-                    .map(str::is_empty)
-                    .unwrap_or(true);
-                if needs_default {
-                    tts.insert(
-                        "instructions".to_string(),
-                        Value::String(crate::tts::RUNTIME_SYSTEM_PROMPT.to_string()),
-                    );
-                }
             }
 
             // Rewrite canonical "Aider …" / "Aider (local) …" notification text
@@ -2942,13 +2918,9 @@ mod tests {
         assert_eq!(rewritten.get("command").unwrap(), "claude");
         assert!(rewritten.get("args").unwrap().as_array().unwrap().is_empty());
         assert_eq!(rewritten.get("use_local_provider").unwrap(), true);
-        // tts_injection re-enabled with default instructions.
+        // tts_injection re-enabled (V20: plain speak gate, no instructions).
         let tts = rewritten.get("tts_injection").unwrap();
         assert_eq!(tts.get("enabled").unwrap(), true);
-        assert!(
-            tts.get("instructions").unwrap().as_str().unwrap().len() > 10,
-            "tts_injection.instructions should have been seeded with the runtime prompt"
-        );
         // Canonical aider notifications rewritten to claude-local.
         let n = rewritten.get("notifications").unwrap();
         assert_eq!(n.get("idle").unwrap(), "Claude (local) is idle");

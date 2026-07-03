@@ -87,6 +87,12 @@ export default defineConfig(async () => ({
     }),
   ],
   clearScreen: false,
+  // The snap-layout plugin injects window.__SNAP_LAYOUT_*__ globals its JS
+  // wrapper depends on; excluding it from Vite's dep pre-bundling avoids a
+  // stale cached copy where __SNAP_BUTTON_ID__ is undefined (per plugin docs).
+  optimizeDeps: {
+    exclude: ['tauri-plugin-snap-layout'],
+  },
   server: {
     port: 1420,
     strictPort: true,

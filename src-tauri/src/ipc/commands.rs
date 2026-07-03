@@ -700,9 +700,9 @@ pub async fn settings_update(
     // live materialize/remove after the mutate. The integrity pass that
     // normally owns those tabs only runs at load, so without this a freshly
     // enabled feature's tab wouldn't appear until the next launch.
-    let (was_graph, was_offload, was_stt) = {
+    let (was_graph, was_offload, was_stt, was_stt_device) = {
         let old = state.settings.current();
-        (old.graph.enabled, old.offload.enabled, old.stt.enabled)
+        (old.graph.enabled, old.offload.enabled, old.stt.enabled, old.stt.device)
     };
 
     // The Settings window holds a full snapshot and replaces wholesale, but it
@@ -722,7 +722,12 @@ pub async fn settings_update(
     });
 
     // On an `stt.enabled` edge, load or unload the Whisper model so the toggle
-    // actually frees/reclaims memory (not just hides the record button).
+    // actually frees/reclaims memory (not just hides the record button). When
+    // the feature stays enabled but the device (GPU↔CPU) changed, preload
+    // reloads the model on the new device — `needs_reload` in the worker
+    // detects the device mismatch and rebuilds the context, freeing the old
+    // device's memory. (Unlike TTS, the STT worker isn't a settings subscriber;
+    // it's driven by these control messages, so the reload must be nudged here.)
     let now = state.settings.current();
     if now.stt.enabled != was_stt {
         if now.stt.enabled {
@@ -730,6 +735,8 @@ pub async fn settings_update(
         } else {
             state.stt.unload();
         }
+    } else if now.stt.enabled && now.stt.device != was_stt_device {
+        state.stt.preload();
     }
 
     // On an actual enable/disable edge, mirror the change into the runtime so

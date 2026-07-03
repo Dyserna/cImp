@@ -68,10 +68,18 @@ export interface AvatarSettings {
   waveform: WaveformSettings;
 }
 
+/// Where a TTS/STT model runs. `gpu` prefers the compiled GPU backend and
+/// auto-falls-back to CPU if none is usable; `cpu` forces CPU. Switching it
+/// live reloads only that model (no restart). Mirrors the Rust
+/// `ProcessingDevice` enum.
+export type ProcessingDevice = 'gpu' | 'cpu';
+
 export interface TtsSettings {
   /// Master enable for TTS. When false the Kokoro model is unloaded and no
   /// synthesis runs; distinct from `mute` (which keeps the model loaded).
   enabled: boolean;
+  /// GPU vs CPU for Kokoro synthesis. Changing it reloads the model live.
+  device: ProcessingDevice;
   voice: string;
   speed: number;
   volume: number;
@@ -90,6 +98,9 @@ export type SttButtonMode = 'toggle' | 'hold';
 export interface SttSettings {
   /// Master enable for the whole STT feature (record button + PTT).
   enabled: boolean;
+  /// GPU vs CPU for Whisper transcription. Changing it reloads the model on
+  /// the next recording / preload.
+  device: ProcessingDevice;
   /// GGML model filename under `models/` (e.g. "ggml-small.bin").
   model_file: string;
   /// Whisper language hint. "auto" = detect; "en", "he", … force a language.
@@ -802,6 +813,7 @@ export function defaultSettings(): Settings {
     schema_version: CURRENT_SCHEMA_VERSION,
     tts: {
       enabled: true,
+      device: 'gpu',
       voice: 'af_heart',
       speed: 1.0,
       volume: 1.0,
@@ -821,6 +833,7 @@ export function defaultSettings(): Settings {
     },
     stt: {
       enabled: true,
+      device: 'gpu',
       model_file: 'ggml-small.bin',
       language: 'auto',
       input_device: '',

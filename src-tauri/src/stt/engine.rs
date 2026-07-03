@@ -4,20 +4,21 @@
 //! decoder state; the heavyweight `WhisperContext` (the loaded model) is
 //! reused across calls and only rebuilt when the user picks a different model.
 //!
-//! GPU handling differs from `tts/engine.rs` (which is opt-in via
-//! `CIMP_GPU=cuda`). whisper.cpp's GPU backend is a *compile-time* feature —
-//! `stt-vulkan` (default, portable, any GPU vendor) or the optional
-//! `stt-cuda` (NVIDIA-only). When a GPU backend is compiled in, STT uses the
-//! GPU **by default** and falls back to CPU automatically if GPU init fails or
-//! no GPU is present — so the same Vulkan binary runs on any machine, GPU or
-//! not. `CIMP_GPU=cpu` forces CPU. Built `--no-default-features`, there is no
-//! GPU backend and STT always runs on CPU.
+//! whisper.cpp's GPU backend is a *compile-time* feature — `stt-vulkan`
+//! (default, portable, any GPU vendor) or the optional `stt-cuda`
+//! (NVIDIA-only). When a GPU backend is compiled in, the `stt.device` setting
+//! selects GPU vs CPU: `Gpu` uses the GPU and falls back to CPU automatically
+//! if GPU init fails or no GPU is present — so the same Vulkan binary runs on
+//! any machine, GPU or not; `Cpu` forces CPU. The setting is authoritative
+//! (the old `CIMP_GPU` env override is gone). Built `--no-default-features`,
+//! there is no GPU backend and STT always runs on CPU.
 
 use std::path::Path;
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::error::{AppError, AppResult};
+use crate::settings::ProcessingDevice;
 
 /// Whisper's required input sample rate. Capture resamples to this before
 /// handing samples to [`SttEngine::transcribe`].
@@ -39,30 +40,36 @@ pub struct SttEngine {
     /// "ggml-small.bin"). The worker compares it against the current
     /// setting to decide whether a reload is needed.
     model_file: String,
+    /// The device this context was requested on (`stt.device`). The worker
+    /// compares it against the current setting to decide whether a reload is
+    /// needed on a live GPU↔CPU switch. NB: this is the *requested* device;
+    /// with `Gpu`, GPU init can still fall back to CPU internally.
+    device: ProcessingDevice,
 }
 
 impl SttEngine {
     /// Load a GGML Whisper model. `model_file` is the bare filename used
-    /// for the reload check; `model_path` is the resolved absolute path.
-    pub fn new(model_path: &Path, model_file: String) -> AppResult<Self> {
+    /// for the reload check; `model_path` is the resolved absolute path;
+    /// `device` selects GPU vs CPU (`Gpu` falls back to CPU if unavailable).
+    pub fn new(model_path: &Path, model_file: String, device: ProcessingDevice) -> AppResult<Self> {
         if !model_path.exists() {
             return Err(AppError::ModelNotFound(model_path.display().to_string()));
         }
 
-        // GPU is the default whenever a GPU backend is compiled in (default
-        // `stt-vulkan`, or the optional `stt-cuda`). `CIMP_GPU=cpu` forces
-        // CPU. On a GPU init failure — including no GPU present on the machine
-        // — we retry on CPU automatically, which is what makes the Vulkan build
+        // GPU is used when a GPU backend is compiled in (default `stt-vulkan`,
+        // or the optional `stt-cuda`) AND the `stt.device` setting is `Gpu`.
+        // On a GPU init failure — including no GPU present on the machine — we
+        // retry on CPU automatically, which is what makes the Vulkan build
         // portable: the binary launches everywhere and silently uses the CPU
         // when there's no usable GPU.
-        let force_cpu = std::env::var("CIMP_GPU").as_deref() == Ok("cpu");
+        let force_cpu = device == ProcessingDevice::Cpu;
         let gpu_compiled = cfg!(any(feature = "stt-vulkan", feature = "stt-cuda"));
 
         if gpu_compiled && !force_cpu {
             match Self::load_ctx(model_path, true) {
                 Ok(ctx) => {
                     tracing::info!(target: "stt", model = %model_file, backend = GPU_BACKEND, "STT engine ready");
-                    return Ok(Self { ctx, model_file });
+                    return Ok(Self { ctx, model_file, device });
                 }
                 Err(e) => {
                     tracing::warn!(target: "stt", error = %e, "STT GPU init failed; falling back to CPU");
@@ -77,7 +84,7 @@ impl SttEngine {
             "CPU"
         };
         tracing::info!(target: "stt", model = %model_file, backend, "STT engine ready");
-        Ok(Self { ctx, model_file })
+        Ok(Self { ctx, model_file, device })
     }
 
     fn load_ctx(model_path: &Path, use_gpu: bool) -> AppResult<WhisperContext> {
@@ -89,6 +96,12 @@ impl SttEngine {
 
     pub fn model_file(&self) -> &str {
         &self.model_file
+    }
+
+    /// The device this engine was built for. Compared against `stt.device` by
+    /// the worker to trigger a reload on a live GPU↔CPU switch.
+    pub fn device(&self) -> ProcessingDevice {
+        self.device
     }
 
     /// Transcribe 16 kHz mono f32 samples. `language` is "auto" (detect) or a

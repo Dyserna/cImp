@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **GPU/CPU device selector for TTS and STT.** *Settings → Audio → TTS* and
+  *Settings → Speech-to-text* each gained a **Process on** dropdown (GPU / CPU).
+  Switching it reloads only that model on the newly-selected device — no app
+  restart. **GPU** prefers the compiled GPU backend and auto-falls-back to CPU
+  if none is usable; **CPU** forces CPU. On a CPU-only build both run on CPU.
+
+### Changed
+
+- **The TTS/STT device is now a setting, not the `CIMP_GPU` env var.** The new
+  per-feature **Process on** selector is authoritative; `CIMP_GPU=cpu` is no
+  longer consulted for device selection (the setting supersedes it). Existing
+  settings files without the field load as **GPU**, preserving the historical
+  "prefer GPU, fall back to CPU" behavior — no migration needed.
+
 ## [0.32.0] — 2026-07-01
 
 The per-project code knowledge graph now understands ~29 languages through a

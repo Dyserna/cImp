@@ -16,6 +16,7 @@
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
+    ProcessingDevice,
     Settings,
     ShellTabConfig,
     TabConfig,
@@ -1083,6 +1084,23 @@
             loaded but silence playback, use <em>Mute</em> instead.)
           </small>
           <label>
+            <span>Process on</span>
+            <select
+              value={snapshot.tts.device}
+              disabled={!snapshot.tts.enabled}
+              onchange={(e) => patch((s) => (s.tts.device = (e.currentTarget as HTMLSelectElement).value as ProcessingDevice))}
+            >
+              <option value="gpu">GPU (fall back to CPU)</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
+          <small class="hint">
+            Where Kokoro runs. <strong>GPU</strong> uses the graphics card and
+            automatically falls back to CPU if none is available;
+            <strong>CPU</strong> forces CPU. Switching reloads the model on the
+            new device — no restart needed.
+          </small>
+          <label>
             <span>Voice</span>
             <select
               value={snapshot.tts.voice}
@@ -1383,6 +1401,22 @@
               reloads the engine on your next recording.
             </small>
           {/if}
+
+          <label>
+            <span>Process on</span>
+            <select
+              value={snapshot.stt.device}
+              onchange={(e) => patch((s) => (s.stt.device = (e.currentTarget as HTMLSelectElement).value as ProcessingDevice))}
+            >
+              <option value="gpu">GPU (fall back to CPU)</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
+          <small class="hint">
+            Where Whisper runs. <strong>GPU</strong> uses the graphics card and
+            automatically falls back to CPU if none is available;
+            <strong>CPU</strong> forces CPU. Takes effect on your next recording.
+          </small>
 
           <label>
             <span>Input device</span>

@@ -1672,6 +1672,21 @@ pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
 
 // --- Other settings sub-structs (unchanged from v2) -------------------------
 
+/// Where a TTS/STT model runs. `Gpu` prefers the compiled GPU backend and
+/// **auto-falls-back to CPU** if no usable GPU is present (so it's a safe
+/// default everywhere); `Cpu` forces CPU. Runtime-switchable per feature —
+/// changing it reloads only that model, no app restart. On a CPU-only build
+/// (no GPU Cargo feature) both values run on CPU. This setting is
+/// authoritative: it supersedes the legacy `CIMP_GPU` env var, which is no
+/// longer consulted for device selection.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessingDevice {
+    #[default]
+    Gpu,
+    Cpu,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct TtsSettings {
@@ -1682,6 +1697,10 @@ pub struct TtsSettings {
     /// struct-level `#[serde(default)]` — files predating the field load as
     /// `true`.
     pub enabled: bool,
+    /// GPU vs CPU for Kokoro synthesis. Changing it live reloads the model on
+    /// the newly-selected device (no restart). Additive/back-compat via the
+    /// struct-level `#[serde(default)]` — older files load as `Gpu`.
+    pub device: ProcessingDevice,
     pub voice: String,
     pub speed: f32,
     pub volume: f32,
@@ -1698,6 +1717,7 @@ impl Default for TtsSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            device: ProcessingDevice::Gpu,
             voice: "af_heart".to_string(),
             speed: 1.0,
             volume: 1.0,
@@ -1717,6 +1737,11 @@ impl Default for TtsSettings {
 pub struct SttSettings {
     /// Master enable for the whole STT feature (record button + PTT).
     pub enabled: bool,
+    /// GPU vs CPU for Whisper transcription. Changing it live reloads the
+    /// model on the newly-selected device (on the next recording / preload).
+    /// Additive/back-compat via the struct-level `#[serde(default)]` — older
+    /// files load as `Gpu`.
+    pub device: ProcessingDevice,
     /// GGML model filename under `models/` (e.g. "ggml-small.bin").
     pub model_file: String,
     /// Whisper language hint. "auto" = detect; "en", "he", … force a language.
@@ -1741,6 +1766,7 @@ impl Default for SttSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            device: ProcessingDevice::Gpu,
             model_file: "ggml-small.bin".to_string(),
             language: "auto".to_string(),
             input_device: String::new(),
@@ -2721,11 +2747,34 @@ mod tests {
         let v = serde_json::to_value(&s).unwrap();
         let back: SttSettings = serde_json::from_value(v).unwrap();
         assert!(back.enabled);
+        assert_eq!(back.device, ProcessingDevice::Gpu);
         assert_eq!(back.model_file, "ggml-small.bin");
         assert_eq!(back.language, "auto");
         assert!(back.input_device.is_empty());
         assert_eq!(back.button_mode, SttButtonMode::Toggle);
         assert!(!back.translate_to_english);
+    }
+
+    #[test]
+    fn processing_device_serializes_snake_case() {
+        // The wire form must be lowercase to match the frontend union type
+        // `'gpu' | 'cpu'`.
+        assert_eq!(serde_json::to_value(ProcessingDevice::Gpu).unwrap(), json!("gpu"));
+        assert_eq!(serde_json::to_value(ProcessingDevice::Cpu).unwrap(), json!("cpu"));
+    }
+
+    #[test]
+    fn tts_stt_without_device_field_default_to_gpu() {
+        // Pre-existing settings files predate the `device` field; the additive
+        // struct-level `#[serde(default)]` must load them as GPU (preserving the
+        // historical "prefer GPU, fall back to CPU" behavior) — no migration.
+        let tts: TtsSettings =
+            serde_json::from_value(json!({ "enabled": true, "voice": "af_heart" })).unwrap();
+        assert_eq!(tts.device, ProcessingDevice::Gpu);
+        let stt: SttSettings =
+            serde_json::from_value(json!({ "enabled": true, "model_file": "ggml-small.bin" }))
+                .unwrap();
+        assert_eq!(stt.device, ProcessingDevice::Gpu);
     }
 
     #[test]

@@ -42,7 +42,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Speed and volume controls
 - Speak-selection gesture (`Ctrl`+right-click)
 - WebGPU GPU backend (shipped, vendor-agnostic) with automatic CPU fallback; optional CUDA (not shipped)
-- `CIMP_GPU=cpu` forces CPU
+- GPU/CPU selectable at runtime in *Settings → Audio* ("Process on"); switching reloads the model, no restart (supersedes the old `CIMP_GPU` env var)
 
 ## Speech-to-Text (Dictation)
 - Offline dictation via whisper.cpp (MIT), selectable GGML models (default `small`)

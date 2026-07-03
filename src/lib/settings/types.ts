@@ -720,6 +720,24 @@ export interface CommandPolicy {
   env: CommandEnvVar[];
 }
 
+/// A named, reusable `llama-server` launch command saved globally and pasted
+/// back into a Local backend's `Server command` field via the Pool editor's
+/// Save/Load/Delete controls (mirror of Rust `ServerCommandTemplate`).
+export interface ServerCommandTemplate {
+  name: string;
+  command: string;
+}
+
+/// A named, reusable Remote-backend endpoint (base URL + auth token) saved
+/// globally and pasted back into a Remote backend's fields via the same
+/// Save/Load/Delete controls (mirror of Rust `RemoteBackendTemplate`). The
+/// `auth_token` is stored cleartext on disk, like the backend's own token.
+export interface RemoteBackendTemplate {
+  name: string;
+  base_url: string;
+  auth_token: string;
+}
+
 export interface OffloadSettings {
   enabled: boolean;
   autostart: boolean;
@@ -733,6 +751,11 @@ export interface OffloadSettings {
   command_policies: CommandPolicy[];
   mcp_servers: McpServerConfig[];
   backends: OffloadBackend[];
+  /// Saved, reusable server-command templates (see `ServerCommandTemplate`).
+  /// A convenience library only — nothing reads these at runtime.
+  server_command_templates: ServerCommandTemplate[];
+  /// Saved, reusable Remote-backend endpoints (see `RemoteBackendTemplate`).
+  remote_backend_templates: RemoteBackendTemplate[];
   budget_high_water_pct: number;
   per_tool_result_token_cap: number;
   max_steps: number;
@@ -1026,6 +1049,8 @@ export function defaultSettings(): Settings {
       ],
       mcp_servers: [],
       backends: [],
+      server_command_templates: [],
+      remote_backend_templates: [],
       budget_high_water_pct: 80,
       per_tool_result_token_cap: 8000,
       max_steps: 16,

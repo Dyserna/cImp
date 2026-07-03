@@ -1,9 +1,26 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    set_linux_origin_rpath();
     copy_espeak_data();
     copy_theming_assets();
     tauri_build::build()
+}
+
+/// On Linux the release bundles `libwebgpu_dawn.so` (ort's WebGPU execution
+/// provider) next to the binary, in the portable layout's `bin/`. Windows
+/// searches the executable's own directory for DLLs automatically, but the ELF
+/// loader does not — without help it only searches `LD_LIBRARY_PATH` and the
+/// system paths, so a portable `cimp` would fail to start with
+/// "libwebgpu_dawn.so: cannot open shared object file". Add an `$ORIGIN` rpath
+/// so the loader looks next to the binary, making the bundled dylib resolvable
+/// with no launcher script or env var. Target-gated via `CARGO_CFG_TARGET_OS`
+/// (set by cargo for the *target*, correct under cross-compilation too); a
+/// no-op on Windows/macOS.
+fn set_linux_origin_rpath() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
+    }
 }
 
 /// Copy the repo-root `themes/`, `palettes/`, and `ebin/` folders next to the
@@ -42,10 +59,18 @@ fn copy_theming_assets() {
     }
 }
 
-/// Copy espeak-ng-data/ (built by espeak-rs-sys's cmake step) next to the
-/// final binary. espeak-ng's runtime auto-discovery walks the exe's parent
-/// dir for an `espeak-ng-data/` folder, so this is what makes the fallback
-/// work without setting any env var at runtime.
+/// Copy espeak-ng-data/ (the compiled phoneme tables) next to the final binary.
+/// espeak-ng's runtime auto-discovery walks the exe's parent dir for an
+/// `espeak-ng-data/` folder, so this is what makes the OOV fallback work
+/// without setting any env var at runtime.
+///
+/// Source differs by platform: on Windows, espeak-rs-sys's cmake step compiles
+/// and installs the data to `out/share/espeak-ng-data`. On Linux the crate
+/// builds only the library and does NOT compile the data, so we fall back to
+/// the system `espeak-ng-data` package (Debian/Ubuntu: `/usr/lib/<triple>/
+/// espeak-ng-data`). espeak is only the OOV fallback behind misaki's pure-Rust
+/// G2P, so a missing data dir degrades that fallback rather than breaking TTS —
+/// off Windows we warn instead of failing the build.
 fn copy_espeak_data() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     // OUT_DIR = target/{profile}/build/cimp-{hash}/out
@@ -56,13 +81,45 @@ fn copy_espeak_data() {
         .and_then(|p| p.parent())
         .expect("OUT_DIR has unexpected shape");
     let profile_dir = build_root.parent().expect("no profile dir");
-
-    let src = find_espeak_data(build_root)
-        .expect("espeak-rs-sys did not produce espeak-ng-data; rebuild that crate");
     let dst = profile_dir.join("espeak-ng-data");
 
-    println!("cargo:rerun-if-changed={}", src.display());
-    copy_dir_all(&src, &dst).expect("failed to copy espeak-ng-data");
+    match find_espeak_data(build_root).or_else(find_system_espeak_data) {
+        Some(src) => {
+            println!("cargo:rerun-if-changed={}", src.display());
+            copy_dir_all(&src, &dst).expect("failed to copy espeak-ng-data");
+        }
+        None if cfg!(windows) => {
+            panic!("espeak-rs-sys did not produce espeak-ng-data; rebuild that crate");
+        }
+        None => {
+            println!(
+                "cargo:warning=espeak-ng-data not found (neither espeak-rs-sys output nor a \
+                 system install); espeak OOV fallback will be unavailable. Install the \
+                 `espeak-ng-data` package to bundle it."
+            );
+        }
+    }
+}
+
+/// Locate a system-installed, compiled `espeak-ng-data` (identified by the
+/// presence of `phontab`). Used on Linux, where espeak-rs-sys ships only the
+/// source data, not the compiled tables. The candidate paths cover
+/// Debian/Ubuntu multiarch and the common install prefixes; on Windows none
+/// exist so this returns `None` and the caller's own logic applies.
+fn find_system_espeak_data() -> Option<PathBuf> {
+    for cand in [
+        "/usr/lib/x86_64-linux-gnu/espeak-ng-data",
+        "/usr/lib/aarch64-linux-gnu/espeak-ng-data",
+        "/usr/share/espeak-ng-data",
+        "/usr/lib/espeak-ng-data",
+        "/usr/local/share/espeak-ng-data",
+    ] {
+        let pb = PathBuf::from(cand);
+        if pb.join("phontab").is_file() {
+            return Some(pb);
+        }
+    }
+    None
 }
 
 /// Walk `target/{profile}/build/espeak-rs-sys-*/out/share/espeak-ng-data` and

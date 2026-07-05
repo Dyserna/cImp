@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.2] — 2026-07-06
+
+### Added
+
+- **Interactive language buttons in the Code Graph tab.** The read-only
+  per-language file-count list is now a grid of colour-outlined buttons that
+  classify every language present in the project: **green** = indexed,
+  **yellow** = supported by the engine but not indexed (click to add — it's
+  indexed and, when semantic search is on, embedded), **red** = unsupported
+  (informational). Clicking a green button removes that language from the index
+  (dropping its rows) and turns it yellow. Red buttons use curated display names
+  for well-known unsupported programming languages (Zig, Lua, Elixir, F#,
+  Fortran, Solidity, …); data/config/unknown files fold into a single "Other"
+  bucket. Backed by a new project language *census* that walks the tree with the
+  same ignore rules as a rebuild but without the allowlist filter, so it sees
+  languages the indexed store never records.
+
 ## [0.34.1] — 2026-07-06
 
 ### Added

@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod layout;
+pub mod note;
 pub mod state;
 pub mod tab_lifecycle;
 pub mod windows;

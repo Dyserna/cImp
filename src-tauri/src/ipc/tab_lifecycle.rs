@@ -1032,6 +1032,106 @@ pub async fn open_tool_tab(
     Ok(tab)
 }
 
+/// The reserved id of the singleton Note tab. It's an ordinary Shell-kind tab
+/// on the backend (so it needs no dedicated `TabId` variant and is freely
+/// closable), but it runs no PTY: the frontend keys off this id to render the
+/// `NoteView` editor instead of an xterm (see `tabs/types.ts` `isNoteTab`).
+pub const NOTE_TAB_ID: &str = "note";
+
+/// Open the Note scratchpad tab (bottom-bar button). Singleton: if the tab is
+/// already open it's simply re-activated; otherwise a fresh closable Shell tab
+/// with the reserved [`NOTE_TAB_ID`] id is created, persisted, and activated —
+/// the same persist → register → `TabAdded` → activate flow as `open_tool_tab`,
+/// minus a spawn command (the tab has no PTY). The backing note file
+/// (`.cimp/cimp.note.txt`) is created up front so the button "opens an existing
+/// note or creates one"; `read_note` reads it once the frontend mounts.
+#[tauri::command]
+pub async fn open_note_tab(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TabId, TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
+    let tab = TabId::Shell(NOTE_TAB_ID.to_string());
+
+    // Create `.cimp/cimp.note.txt` (and `.cimp/`) if missing. Non-fatal: the
+    // tab still opens on failure and `read_note` retries the create.
+    if let Err(e) = crate::ipc::note::ensure_note_file(&state.launch.cwd) {
+        warn!(error = %e, "open_note_tab: ensure note file failed; opening tab anyway");
+    }
+
+    // Singleton: re-activate an already-open note tab instead of duplicating.
+    {
+        let mut registry = state.tabs.lock().await;
+        if registry.has_tab(&tab) {
+            if let Err(e) = registry.activate(tab.clone()).await {
+                warn!(error = %e, "open_note_tab: activate existing failed");
+            }
+            let _ = app;
+            return Ok(tab);
+        }
+    }
+
+    let name = "Note".to_string();
+
+    // Persist BEFORE registering, guarding against a stale duplicate entry.
+    {
+        let entry = TabConfig::Shell(ShellTabSettings {
+            id: NOTE_TAB_ID.to_string(),
+            builtin: false,
+            name: name.clone(),
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            env: HashMap::new(),
+            notifications: ShellNotificationConfig::default(),
+            theme_override: None,
+            background_override: None,
+        });
+        state.settings.mutate(move |snap| {
+            if !snap.tabs.iter().any(|t| t.id() == NOTE_TAB_ID) {
+                snap.tabs.push(entry);
+            }
+        });
+    }
+
+    let position = {
+        let mut registry = state.tabs.lock().await;
+        registry.insert_user_tab(tab.clone(), name.clone())
+    };
+
+    if let Err(e) = state
+        .state_signals
+        .send(StateSignal::TabAdded {
+            meta: TabMeta {
+                id: tab.clone(),
+                kind: TabKind::Shell,
+                name,
+            },
+            position,
+        })
+        .await
+    {
+        warn!(error = %e, "open_note_tab: state-signal channel closed");
+        // Roll back the committed settings + registry entries (see open_tool_tab).
+        state
+            .settings
+            .mutate(|snap| snap.tabs.retain(|t| t.id() != NOTE_TAB_ID));
+        state.tabs.lock().await.remove_tab(&tab).await;
+        return Err(TabLifecycleError::internal("state signal channel closed"));
+    }
+
+    {
+        let mut registry = state.tabs.lock().await;
+        if let Err(e) = registry.activate(tab.clone()).await {
+            warn!(error = %e, "open_note_tab: activate failed");
+        }
+    }
+
+    let _ = app; // reserved for future per-window emits
+    info!(?tab, "note tab opened");
+    Ok(tab)
+}
+
 async fn add_ai_builtin_tab(
     state: &State<'_, AppState>,
     id: AiTabId,

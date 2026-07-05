@@ -55,9 +55,10 @@ use crate::ipc::commands::{
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
 };
+use crate::ipc::note::{read_note, write_note};
 use crate::ipc::tab_lifecycle::{
     close_tab, create_ai_tab, create_shell_tab, default_shell_spec, get_shell_tab_config,
-    open_tool_tab, reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
+    open_note_tab, open_tool_tab, reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
@@ -590,6 +591,9 @@ fn main() {
             get_shell_tab_config,
             set_enabled_ai_tabs,
             open_tool_tab,
+            open_note_tab,
+            read_note,
+            write_note,
             set_window_square_corners,
             save_layout,
             save_layout_preset,

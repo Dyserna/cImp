@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Note tab — a per-project scratchpad.** A new 📝 button in the bottom bar's
+  broot/rustnet group opens a singleton Note tab: a rudimentary plain-text
+  editor (old-Notepad style) for jotting commands and ideas. Its content lives
+  in `<launch_cwd>/.cimp/cimp.note.txt` (alongside the settings overlay and
+  code-graph store) and autosaves — debounced ~800 ms after the last keystroke,
+  on a 5 s safety timer, and on tab/app close. Pressing the button opens the
+  existing note or creates one; the tab is closable and re-opens to the same
+  file. No schema bump (the tab persists as an ordinary Shell-kind entry).
+
 ### Changed
 
 - **Per-folder settings overlay moved into the project's `.cimp` dir.** The

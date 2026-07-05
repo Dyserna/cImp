@@ -3126,11 +3126,6 @@
               {#if backend.kind.type === 'local'}
                 <hr class="card-divider" />
                 <div class="button-row">
-                  <button type="button" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStart(backend.name))}>Start</button>
-                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStop(backend.name))}>Stop</button>
-                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendRestart(backend.name))}>Reset</button>
-                </div>
-                <div class="button-row">
                   <button
                     type="button"
                     class="secondary"
@@ -3148,7 +3143,7 @@
                     <span>Auto-sync while offload enabled</span>
                   </label>
                 </div>
-                <small class="hint">
+                <small class="hint opencode-desc">
                   Registers this server as OpenCode's <code>local-llama</code>
                   provider (base URL + model read from the command above) and
                   selects it as the default model, so a freshly opened OpenCode
@@ -3160,6 +3155,11 @@
                 {#if opencodeProviderMsg && opencodeProviderMsg.i === i}
                   <small class={opencodeProviderMsg.ok ? 'hint' : 'error'}>{opencodeProviderMsg.text}</small>
                 {/if}
+                <div class="button-row offload-lifecycle-row">
+                  <button type="button" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStart(backend.name))}>Start</button>
+                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStop(backend.name))}>Stop</button>
+                  <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendRestart(backend.name))}>Reset</button>
+                </div>
               {/if}
             </div>
           {/each}
@@ -3962,6 +3962,18 @@
     gap: 0.5rem;
     margin-top: 0.4rem;
     flex-wrap: wrap;
+  }
+  /* Offload local-backend card: 1 blank line between the OpenCode buttons
+     (Add to OpenCode / Auto-sync) and their description. Overrides the
+     default `small.hint` negative top margin. */
+  small.hint.opencode-desc {
+    margin-top: 1.5rem;
+  }
+  /* …and 2 blank lines between that description and the Start/Stop/Reset
+     lifecycle row, which now sits at the bottom of the card. Overrides the
+     default `.button-row` top margin. */
+  .button-row.offload-lifecycle-row {
+    margin-top: 3rem;
   }
   .offload-status {
     display: flex;

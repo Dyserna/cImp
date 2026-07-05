@@ -9,7 +9,7 @@
 //!
 //! Persistence is layered: a global baseline lives at `<exe-dir>/settings.json`
 //! and the saver writes a diff against that baseline to the launch-dir
-//! overlay file (`.cimp.custom.config.json`). The handle keeps the global
+//! overlay file (`.cimp/config.json`). The handle keeps the global
 //! snapshot resolved at startup so `set()` can compute diffs without
 //! re-reading from disk; the launch_cwd is captured in `main` and threaded
 //! through `init`.

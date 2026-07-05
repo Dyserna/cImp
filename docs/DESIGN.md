@@ -545,7 +545,7 @@ Behavior is straightforward bindings: mute toggles `tts.mute`, announcements tog
 Two JSON files participate, both under `src-tauri/src/settings/`:
 
 - **Global baseline** — `<exe-dir>/settings.json`. Portable; written once on first launch when missing and rewritten only on migration / integrity repair. Hand-edit to change defaults.
-- **Per-folder custom overlay** — `<launch_cwd>/.cimp.custom.config.json`. Partial JSON object containing only the keys that differ from the global baseline. Created automatically the first time the user customizes anything from a given working directory, deleted automatically when the diff is empty. Layered on top of global at load via deep-merge.
+- **Per-folder custom overlay** — `<launch_cwd>/.cimp/config.json`, inside the project's `.cimp` data dir (the same folder that holds the code-graph `graph.db`). Partial JSON object containing only the keys that differ from the global baseline. Created automatically the first time the user customizes anything from a given working directory, deleted automatically when the diff is empty. Layered on top of global at load via deep-merge. A pre-consolidation overlay at the old loose path `<launch_cwd>/.cimp.custom.config.json` is migrated into `.cimp/` on the next launch.
 
 This replaces an earlier design that wrote a single file under `dirs::config_dir().join("cImp")`. The portable + overlay model lets the user (a) carry the binary as a self-contained portable directory, and (b) keep per-project customizations alongside the project rather than in OS-global config.
 
@@ -641,7 +641,7 @@ Cloud backends are gated behind an explicit data-egress consent toggle and badge
 
 ## Settings Schema
 
-The on-disk JSON shape, current as of v1.9. The example below shows the fully-resolved global file; the per-folder overlay (`.cimp.custom.config.json`) is a partial subset of the same shape.
+The on-disk JSON shape, current as of v1.9. The example below shows the fully-resolved global file; the per-folder overlay (`.cimp/config.json`) is a partial subset of the same shape.
 
 ```json
 {
@@ -892,7 +892,7 @@ The full set is in the settings schema above. Behavior of `switch_to_tab_N` is b
 Settings paths on every platform:
 
 - Global baseline: `<exe-dir>/settings.json`
-- Per-folder overlay: `<launch_cwd>/.cimp.custom.config.json`
+- Per-folder overlay: `<launch_cwd>/.cimp/config.json` (migrated from the legacy loose `<launch_cwd>/.cimp.custom.config.json` on first launch)
 
 These replace the OS-config-dir paths used in earlier versions. The portable design means cImp can be packaged as a self-contained directory, and per-project tweaks live alongside the project rather than in OS-global config.
 

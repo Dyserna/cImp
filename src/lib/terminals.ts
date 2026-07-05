@@ -69,7 +69,7 @@ import { setTerminalFocuser } from './terminalFocus';
 import { perTabClosedState } from './avatarState';
 import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
-import { isShellTab, isOffloadTab, isGraphMonitorTab, type TabId } from './tabs/types';
+import { isShellTab, isOffloadTab, isGraphMonitorTab, isNoteTab, type TabId } from './tabs/types';
 
 const OFFSCREEN_ID = 'terminal-offscreen';
 
@@ -496,8 +496,9 @@ export function createTerminal(
 ): void {
   if (entries.has(tabId)) return;
   // V8-03/V9-01: the Offload Server and Code Graph monitor tabs render Svelte
-  // dashboards instead of an xterm — no terminal entry for either.
-  if (isOffloadTab(tabId) || isGraphMonitorTab(tabId)) return;
+  // dashboards instead of an xterm — no terminal entry for either. The Note
+  // tab likewise renders a Svelte editor (NoteView) with no PTY.
+  if (isOffloadTab(tabId) || isGraphMonitorTab(tabId) || isNoteTab(tabId)) return;
 
   const offscreen = ensureOffscreen();
 

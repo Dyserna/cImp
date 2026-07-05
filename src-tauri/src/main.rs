@@ -39,6 +39,7 @@ use crate::ipc::commands::{
     get_system_stats, graph_history, graph_rebuild, graph_rebuild_embeddings,
     graph_set_watch_paused, graph_status, graph_test_embedder, list_tabs,
     list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
+    offload_derive_opencode_provider,
     offload_server_log, offload_server_metrics, offload_server_restart, offload_server_start,
     offload_server_stop,
     offload_service_status,
@@ -54,9 +55,10 @@ use crate::ipc::commands::{
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
 };
+use crate::ipc::note::{read_note, write_note};
 use crate::ipc::tab_lifecycle::{
     close_tab, create_ai_tab, create_shell_tab, default_shell_spec, get_shell_tab_config,
-    open_tool_tab, reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
+    open_note_tab, open_tool_tab, reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
@@ -589,6 +591,9 @@ fn main() {
             get_shell_tab_config,
             set_enabled_ai_tabs,
             open_tool_tab,
+            open_note_tab,
+            read_note,
+            write_note,
             set_window_square_corners,
             save_layout,
             save_layout_preset,
@@ -605,6 +610,7 @@ fn main() {
             offload_backend_stop,
             offload_backend_restart,
             offload_test,
+            offload_derive_opencode_provider,
             offload_service_status,
             offload_reload_mcp,
             offload_server_log,

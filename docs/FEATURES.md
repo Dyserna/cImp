@@ -94,7 +94,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Configurable terminal font family and size
 
 ## Settings & Config
-- Portable global `settings.json` next to the exe; per-folder `.cimp.custom.config.json` overlay (auto-deleted when empty)
+- Portable global `settings.json` next to the exe; per-folder `.cimp/config.json` overlay inside the project's `.cimp` data dir (auto-deleted when empty)
 - Per-tab settings: command, CLI flags, TTS speak toggle, notification text, appearance
 - Migration system with timestamped backups + per-key load validation
 - Capability guidance injected on launch when relevant — offload + code-graph tool hints (Claude `--append-system-prompt`, OpenCode instructions file)

@@ -31,17 +31,28 @@ export function isGraphMonitorTab(id: TabId): boolean {
   return id === GRAPH_MONITOR_TAB_ID;
 }
 
+/// The reserved id of the singleton Note scratchpad tab. Shell-kind on the
+/// backend (an ordinary closable tab), but the frontend keys off this id to
+/// render the `NoteView` editor with no PTY — like the Offload/Graph tabs, its
+/// behavior is decided by the id, not the kind.
+export const NOTE_TAB_ID = 'note';
+
+/// True for the Note scratchpad tab.
+export function isNoteTab(id: TabId): boolean {
+  return id === NOTE_TAB_ID;
+}
+
 /// Type guard for shell tabs — every non-AI-builtin ID is a shell, EXCEPT the
-/// Offload Server and Code Graph monitor tabs, which are read-only and
-/// app-rendered (they must not get the shell closed-overlay / restart /
-/// keystroke behaviors).
+/// Offload Server, Code Graph monitor, and Note tabs, which are app-rendered
+/// (they must not get the shell closed-overlay / restart / keystroke behaviors).
 export function isShellTab(id: TabId): boolean {
   return (
     id !== 'claude' &&
     id !== 'claude-local' &&
     id !== 'opencode' &&
     id !== OFFLOAD_SERVER_TAB_ID &&
-    id !== GRAPH_MONITOR_TAB_ID
+    id !== GRAPH_MONITOR_TAB_ID &&
+    id !== NOTE_TAB_ID
   );
 }
 

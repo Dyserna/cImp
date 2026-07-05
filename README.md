@@ -153,7 +153,7 @@ Common alternatives, paste into Configure → command + arguments:
 - **My settings.json got corrupted.** Each migration writes a backup
   alongside the source file (e.g. `settings.json.v<n>.bak.<ts>`). For other
   corruption, delete the global `<exe-dir>/settings.json` (and the per-folder
-  `.cimp.custom.config.json` overlay if present) and the app writes fresh
+  `.cimp/config.json` overlay if present) and the app writes fresh
   defaults on next launch.
 
 ## Multi-pane Layout
@@ -285,7 +285,7 @@ Environment*.
 - Anthropic-server features (prompt caching, extended thinking, vision)
   are unavailable on local models.
 - The auth token sits cleartext in `<exe-dir>/settings.json` (or the
-  per-folder `.cimp.custom.config.json` overlay) — fine for local
+  per-folder `.cimp/config.json` overlay) — fine for local
   dummies; don't put a real Anthropic API key there.
 
 ## How TTS works
@@ -604,9 +604,12 @@ into four sub-sections: **Claude**, **Claude (local)**, **OpenCode**, and
 
 Settings are persisted to two files: a **portable global baseline** at
 `<exe-dir>/settings.json`, and a **per-folder overlay** at
-`<launch_cwd>/.cimp.custom.config.json` containing only the keys that
+`<launch_cwd>/.cimp/config.json` (inside the project's `.cimp` data dir,
+alongside the code-graph `graph.db`) containing only the keys that
 differ from the baseline. Saves are debounced (500 ms) and the overlay
-file is deleted automatically when the diff is empty.
+file is deleted automatically when the diff is empty. An older loose
+`.cimp.custom.config.json` from a previous version is moved into `.cimp/`
+on the next launch.
 
 ## Running
 

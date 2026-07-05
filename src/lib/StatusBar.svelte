@@ -11,6 +11,7 @@
   import StatusBarArrangement from './status/StatusBarArrangement.svelte';
   import SelectionTtsControls from './status/SelectionTtsControls.svelte';
   import ToolLaunchButton from './status/ToolLaunchButton.svelte';
+  import NoteButton from './status/NoteButton.svelte';
   import { settings } from './settings/store';
 </script>
 
@@ -20,6 +21,7 @@
     <span class="sep" aria-hidden="true"></span>
     <ToolLaunchButton tool="broot" glyph="🌳" label="New broot tab" />
     <ToolLaunchButton tool="rustnet" glyph="🌐" label="New rustnet tab" />
+    <NoteButton />
     {#if $settings.stt.enabled}
       <span class="sep" aria-hidden="true"></span>
       <RecordButton />

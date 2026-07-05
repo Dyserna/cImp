@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-07-06
+
+A per-project Note scratchpad, one-click OpenCode wiring for local offload
+backends, and consolidation of cImp's per-project files under the `.cimp` dir.
+
+### Added
+
+- **Note tab — a per-project scratchpad.** A new 📝 button in the bottom bar's
+  broot/rustnet group opens a singleton Note tab: a rudimentary plain-text
+  editor (old-Notepad style) for jotting commands and ideas. Its content lives
+  in `<launch_cwd>/.cimp/cimp.note.txt` (alongside the settings overlay and
+  code-graph store) and autosaves — debounced ~800 ms after the last keystroke,
+  on a 5 s safety timer, and on tab/app close. Pressing the button opens the
+  existing note or creates one; the tab is closable and re-opens to the same
+  file. No schema bump (the tab persists as an ordinary Shell-kind entry).
+
+- **One-click OpenCode provider registration for local offload backends.** The
+  Offload settings' local-backend card gains an **Add to OpenCode** button (plus
+  an *Auto-sync while offload enabled* toggle) that registers the running
+  llama-server as OpenCode's `local-llama` provider — base URL and model read
+  from the backend command — and selects it as the default model, so a freshly
+  opened OpenCode tab is ready to use. Auto-sync re-derives it from the primary
+  local backend at launch and on save while offload stays enabled.
+
+### Changed
+
+- **Per-folder settings overlay moved into the project's `.cimp` dir.** The
+  per-launch-directory overlay is now `<launch_cwd>/.cimp/config.json` (inside
+  the same `.cimp` folder that already holds the code-graph `graph.db`), instead
+  of the loose `<launch_cwd>/.cimp.custom.config.json`. This consolidates all
+  cImp-specific per-project files under one directory. An existing loose overlay
+  is migrated into `.cimp/` automatically on the next launch (best-effort move;
+  the old file is still read in place if the move can't happen, so no
+  customization is lost). No schema bump.
+
+- **Offload local-backend card layout.** The OpenCode provider controls now sit
+  above the Start/Stop/Reset lifecycle row (moved to the bottom of the card),
+  with clearer spacing between the two groups.
+
 ## [0.33.0] — 2026-07-04
 
 Linux support: cImp now builds, runs, and ships on Linux (x86-64, Ubuntu 24.04+)

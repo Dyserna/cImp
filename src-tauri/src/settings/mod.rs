@@ -6,8 +6,9 @@
 //! slider drag doesn't write the file on every frame.
 //!
 //! Storage is layered: the global baseline lives at `<exe-dir>/settings.json`
-//! and a per-launch-directory overlay (`.cimp.custom.config.json`) records
-//! only the fields that differ from global. See `persistence` for details.
+//! and a per-launch-directory overlay (`.cimp/config.json`, inside the
+//! project's `.cimp` data dir) records only the fields that differ from
+//! global. See `persistence` for details.
 
 mod broadcaster;
 mod migration;

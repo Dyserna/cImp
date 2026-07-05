@@ -310,6 +310,24 @@ export async function openToolTab(tool: ToolKind): Promise<TabId> {
   return invoke<TabId>('open_tool_tab', { tool });
 }
 
+/// Open the Note scratchpad tab (bottom-bar button). Singleton: re-activates
+/// the tab if it's already open, otherwise creates it (and its backing
+/// `.cimp/cimp.note.txt` file) and activates it. Returns the note tab id.
+export async function openNoteTab(): Promise<TabId> {
+  return invoke<TabId>('open_note_tab');
+}
+
+/// Load the note's text, creating an empty `.cimp/cimp.note.txt` on first open.
+export async function readNote(): Promise<string> {
+  return invoke<string>('read_note');
+}
+
+/// Persist the note's text (atomic write into `.cimp/cimp.note.txt`). Called by
+/// the NoteView autosave (debounced on edit, on a 5s timer, and on close).
+export async function writeNote(content: string): Promise<void> {
+  await invoke('write_note', { content });
+}
+
 /// Open `<portable-root>/logs/content/` in the OS file manager. Backend
 /// creates the folder first if it doesn't exist.
 export async function contentOpenFolder(): Promise<void> {

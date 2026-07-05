@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Per-folder settings overlay moved into the project's `.cimp` dir.** The
+  per-launch-directory overlay is now `<launch_cwd>/.cimp/config.json` (inside
+  the same `.cimp` folder that already holds the code-graph `graph.db`), instead
+  of the loose `<launch_cwd>/.cimp.custom.config.json`. This consolidates all
+  cImp-specific per-project files under one directory. An existing loose overlay
+  is migrated into `.cimp/` automatically on the next launch (best-effort move;
+  the old file is still read in place if the move can't happen, so no
+  customization is lost). No schema bump.
+
 ## [0.33.0] — 2026-07-04
 
 Linux support: cImp now builds, runs, and ships on Linux (x86-64, Ubuntu 24.04+)

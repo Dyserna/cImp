@@ -28,8 +28,8 @@ Add `bin/` to PATH; run `cimp` from any terminal. No installer, no
 registry entries, no admin rights. Everything cImp writes lives inside
 the unzip folder: `settings.json` and `scrollback/` next to the exe in
 `bin/`; logs under `<portable-root>/logs/` (sibling of `bin/`).
-Per-launch-directory overlays (`.cimp.custom.config.json`) go in
-whatever working directory the user starts cImp from.
+Per-launch-directory overlays (`.cimp/config.json`, inside the `.cimp`
+data dir) go in whatever working directory the user starts cImp from.
 
 The Rust runtime resolves the model dir as `<exe-dir>/../models/` (see
 `model_dir()` in `src-tauri/src/tts/mod.rs`) — that's the only location
@@ -172,7 +172,7 @@ built with whisper.cpp's **Vulkan** backend (`--features stt-vulkan`):
 
 Currently manual: download the next release zip, unzip over the existing
 folder. The `settings.json` next to the exe and any per-folder
-`.cimp.custom.config.json` overlays are not in the zip and stay where
+`.cimp/config.json` overlays are not in the zip and stay where
 they are across updates.
 
 Tauri ships a built-in updater that polls a JSON manifest, downloads, and

@@ -163,7 +163,7 @@ Updating
 Download the next release zip and unzip over the top of this folder.
 The zip ships the exe, DLLs, models, docs, and a default
 bin\patterns.json — your existing settings.json (next to the exe) and
-any per-folder .cimp.custom.config.json overlays are not in the zip and
+any per-folder .cimp\config.json overlays are not in the zip and
 stay where they are.
 
 Note: the full zip DOES contain bin\patterns.json, so unzipping it over
@@ -184,8 +184,8 @@ Uninstall
      models, the global settings.json, scrollback files, and logs —
      everything cImp writes lives inside this folder.)
   2. Remove the PATH entry you added.
-  3. Optionally delete `.cimp.custom.config.json` from any folder you
-     used to start cImp to drop those per-folder overlays.
+  3. Optionally delete the `.cimp\` folder from any folder you used to
+     start cImp to drop those per-folder overlays (and the code graph).
 
 
 Troubleshooting

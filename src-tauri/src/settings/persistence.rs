@@ -5,10 +5,14 @@
 //!   * **Global** (`<exe-dir>/settings.json`) — portable baseline. Written
 //!     once on first launch when missing; never rewritten through normal
 //!     edits afterwards. Hand-edit to change defaults.
-//!   * **Custom overlay** (`<launch_cwd>/.cimp.custom.config.json`) — per
-//!     launch-directory delta layered on top of global. Created the first
-//!     time a user customizes anything from a given working directory and
-//!     deleted automatically when the diff is empty.
+//!   * **Custom overlay** (`<launch_cwd>/.cimp/config.json`) — per
+//!     launch-directory delta layered on top of global, kept inside the
+//!     project's `.cimp` data dir alongside the code-graph `graph.db`.
+//!     Created the first time a user customizes anything from a given
+//!     working directory and deleted automatically when the diff is empty.
+//!     A pre-consolidation overlay at the old loose path
+//!     (`<launch_cwd>/.cimp.custom.config.json`) is migrated into `.cimp/`
+//!     on the next launch (see `migrate_legacy_overlay`).
 //!
 //! On-disk format for both files is the same JSON object shape (matching
 //! `Settings`). The custom file is allowed to be a *partial* object — any
@@ -48,7 +52,17 @@ use crate::settings::schema::{
 use crate::shell::ShellSpec;
 
 const GLOBAL_FILE_NAME: &str = "settings.json";
-const CUSTOM_FILE_NAME: &str = ".cimp.custom.config.json";
+/// The per-project cImp data directory. Holds the per-folder settings overlay
+/// (`config.json`) and the code-graph store (`graph.db`); the home for any
+/// future cImp-specific per-project file. Kept as a literal here rather than
+/// tied to `graph.db_subdir`: the overlay determines where the overlay is read
+/// from, so its location can't depend on a value that lives *inside* it.
+const CIMP_DIR_NAME: &str = ".cimp";
+/// Per-folder overlay filename, inside `<launch_cwd>/.cimp/`.
+const CUSTOM_FILE_NAME: &str = "config.json";
+/// Pre-consolidation overlay filename — a loose file in `launch_cwd`, migrated
+/// into `.cimp/` on load.
+const LEGACY_CUSTOM_FILE_NAME: &str = ".cimp.custom.config.json";
 
 /// `<exe-dir>/settings.json` — the portable baseline. Falls back to the
 /// current working directory if `current_exe()` is unavailable, which
@@ -63,9 +77,71 @@ pub fn global_path() -> AppResult<PathBuf> {
     Ok(dir.join(GLOBAL_FILE_NAME))
 }
 
-/// `<launch_cwd>/.cimp.custom.config.json` — the per-folder overlay.
+/// `<launch_cwd>/.cimp/config.json` — the per-folder overlay, inside the
+/// project's `.cimp` data dir (alongside `graph.db`).
 pub fn custom_path(launch_cwd: &Path) -> PathBuf {
-    launch_cwd.join(CUSTOM_FILE_NAME)
+    launch_cwd.join(CIMP_DIR_NAME).join(CUSTOM_FILE_NAME)
+}
+
+/// `<launch_cwd>/.cimp.custom.config.json` — the pre-consolidation loose
+/// overlay path. Read as a fallback and migrated into `.cimp/` on load.
+fn legacy_custom_path(launch_cwd: &Path) -> PathBuf {
+    launch_cwd.join(LEGACY_CUSTOM_FILE_NAME)
+}
+
+/// Path to *read* the overlay from: the canonical `.cimp/config.json` if it
+/// exists, else the legacy loose file if that exists, else the canonical path
+/// (the absent case). The side-effectful [`load`] first calls
+/// [`migrate_legacy_overlay`] to physically move a legacy file into `.cimp/`;
+/// this resolver is the read-only fallback that keeps a customization readable
+/// even when that move can't happen (read-only child, or a failed rename).
+fn overlay_read_path(launch_cwd: &Path) -> PathBuf {
+    let canonical = custom_path(launch_cwd);
+    if canonical.exists() {
+        return canonical;
+    }
+    let legacy = legacy_custom_path(launch_cwd);
+    if legacy.exists() {
+        return legacy;
+    }
+    canonical
+}
+
+/// Best-effort move of a pre-consolidation loose overlay into `.cimp/`. No-op
+/// when the canonical file already exists or no legacy file is present. A
+/// failed move leaves the legacy file untouched — [`overlay_read_path`] still
+/// finds it, so no customization is lost and the migration simply retries on
+/// the next launch. Only the side-effectful [`load`] calls this; the read-only
+/// child path never moves the user's files.
+fn migrate_legacy_overlay(launch_cwd: &Path) {
+    let canonical = custom_path(launch_cwd);
+    let legacy = legacy_custom_path(launch_cwd);
+    if canonical.exists() || !legacy.exists() {
+        return;
+    }
+    if let Some(parent) = canonical.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::warn!(
+                error = %e,
+                dir = %parent.display(),
+                "settings: create .cimp dir for overlay migration failed; reading legacy overlay in place"
+            );
+            return;
+        }
+    }
+    match fs::rename(&legacy, &canonical) {
+        Ok(()) => tracing::info!(
+            from = %legacy.display(),
+            to = %canonical.display(),
+            "settings: migrated per-folder overlay into .cimp/"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            from = %legacy.display(),
+            to = %canonical.display(),
+            "settings: overlay migration move failed; reading legacy in place, will retry next launch"
+        ),
+    }
 }
 
 /// Bundle returned from `load`: the resolved settings plus a snapshot of
@@ -101,8 +177,11 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     //    growth). Missing fields are handled correctly downstream anyway:
     //    deep-merge fills from the (already-migrated) global, and serde
     //    `#[serde(default)]` covers the rest.
-    let custom_path = custom_path(launch_cwd);
-    let overlay_value = read_overlay(&custom_path, true);
+    //    First fold any pre-consolidation loose overlay into `.cimp/`, then
+    //    read from the resolved location (canonical `.cimp/config.json`, or the
+    //    legacy file if the move couldn't happen).
+    migrate_legacy_overlay(launch_cwd);
+    let overlay_value = read_overlay(&overlay_read_path(launch_cwd), true);
 
     // 3. Merge the (now both-current-shape) global + overlay.
     let mut merged = match serde_json::to_value(&global) {
@@ -198,7 +277,7 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         Some(v) => v,
         None => return Settings::default(),
     };
-    if let Some(overlay) = read_overlay(&custom_path(launch_cwd), false) {
+    if let Some(overlay) = read_overlay(&overlay_read_path(launch_cwd), false) {
         deep_merge(&mut merged, overlay);
     }
     serde_json::from_value(merged).unwrap_or_default()
@@ -1691,7 +1770,8 @@ mod tests {
         let dir = std::env::temp_dir()
             .join(format!("cimp_test_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
-        let overlay = dir.join(CUSTOM_FILE_NAME);
+        // The overlay now lives inside the project's `.cimp/` dir.
+        let overlay = custom_path(&dir);
 
         // Customized: should write a non-empty overlay.
         let mut customized = global.clone();
@@ -1705,6 +1785,74 @@ mod tests {
         // Reverted to identical: should remove the overlay.
         save(&global, &dir, &global).unwrap();
         assert!(!overlay.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_writes_overlay_inside_cimp_dir() {
+        // The per-folder overlay must land at `<cwd>/.cimp/config.json`, not
+        // the pre-consolidation loose `<cwd>/.cimp.custom.config.json`.
+        let _shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+
+        let dir = std::env::temp_dir().join(format!("cimp_loc_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut customized = global.clone();
+        customized.ui.theme = "future-light".to_string();
+        save(&customized, &dir, &global).unwrap();
+
+        assert!(dir.join(".cimp").join("config.json").exists());
+        assert!(!dir.join(".cimp.custom.config.json").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_legacy_overlay_moves_loose_file_into_cimp_dir() {
+        let dir = std::env::temp_dir().join(format!("cimp_mig_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Seed a pre-consolidation loose overlay.
+        let legacy = dir.join(".cimp.custom.config.json");
+        fs::write(&legacy, r#"{"ui":{"theme":"future-light"}}"#).unwrap();
+
+        migrate_legacy_overlay(&dir);
+
+        let canonical = dir.join(".cimp").join("config.json");
+        assert!(canonical.exists(), "legacy overlay should be moved into .cimp/");
+        assert!(!legacy.exists(), "legacy overlay should be gone after the move");
+        assert_eq!(
+            fs::read_to_string(&canonical).unwrap(),
+            r#"{"ui":{"theme":"future-light"}}"#
+        );
+        // The resolver now points at the canonical file.
+        assert_eq!(overlay_read_path(&dir), canonical);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_legacy_overlay_noop_when_canonical_exists() {
+        // A newer canonical overlay wins; the legacy loose file is left as-is
+        // (never overwrites the canonical, never silently reappears).
+        let dir = std::env::temp_dir().join(format!("cimp_mig2_{}", uuid::Uuid::new_v4()));
+        let cimp = dir.join(".cimp");
+        fs::create_dir_all(&cimp).unwrap();
+        fs::write(cimp.join("config.json"), r#"{"ui":{"theme":"canonical"}}"#).unwrap();
+        let legacy = dir.join(".cimp.custom.config.json");
+        fs::write(&legacy, r#"{"ui":{"theme":"legacy"}}"#).unwrap();
+
+        migrate_legacy_overlay(&dir);
+
+        assert!(legacy.exists(), "legacy untouched when canonical present");
+        assert_eq!(
+            fs::read_to_string(cimp.join("config.json")).unwrap(),
+            r#"{"ui":{"theme":"canonical"}}"#
+        );
+        assert_eq!(overlay_read_path(&dir), cimp.join("config.json"));
 
         let _ = fs::remove_dir_all(&dir);
     }

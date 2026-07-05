@@ -39,7 +39,7 @@ How to use (updating an existing install)
 
 Your settings file (settings.json next to cimp.exe), your edited
 prompt-detection patterns (bin\patterns.json), and any per-folder
-overlay files (.cimp.custom.config.json) are not affected — the zip
+overlay files (.cimp\config.json) are not affected — the zip
 never touches them.
 
 

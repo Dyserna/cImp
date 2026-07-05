@@ -32,8 +32,11 @@ Thumbs.db
 **/.claude/settings.local.json
 **/.claude/scheduled_tasks.lock
 
-# CIMP local custom config (per-machine layout / session / avatar /
-# TTS state; the app writes these alongside the regular config).
+# CIMP local custom config (per-machine layout / session / avatar / TTS
+# state). The active overlay now lives at `.cimp/config.json` and is covered
+# by the `**/.cimp/` rule below; these entries ignore the pre-consolidation
+# loose overlay (migrated into `.cimp/` on next launch) and stale pre-rebrand
+# names. Never commit any of them.
 **/.cimp.custom.config.json
 # Stale pre-rebrand local custom configs (old `ccimp`/`cctts` names); never commit.
 **/.ccimp.custom.config.json

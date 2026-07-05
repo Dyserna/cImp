@@ -9,7 +9,7 @@ This file scopes the work to move secrets out of the plaintext settings JSON and
 `claude_local.auth_token` lives in:
 
 - `<exe-dir>/settings.json` (portable global baseline)
-- `<launch_cwd>/.cimp.custom.config.json` (per-folder overlay)
+- `<launch_cwd>/.cimp/config.json` (per-folder overlay, inside the `.cimp` data dir)
 
 Per-tab `env` entries (`AiToolTabConfig.env`, `ShellTabConfig.env`) can also carry credentials — anything the user typed into the *Environment* table in **Configure tab → Environment**. Those values may include real `ANTHROPIC_API_KEY`, OAuth bearer tokens, AWS keys, Slack webhooks, etc.
 

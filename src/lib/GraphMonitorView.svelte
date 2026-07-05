@@ -14,10 +14,13 @@
     graphSetWatchPaused,
     graphTestEmbedder,
     graphHistory,
+    graphLanguageCensus,
+    graphSetLanguageEnabled,
     onGraphStatus,
     type EmbedderProbe,
     type GraphCall,
     type GraphStatus,
+    type LangCensus,
   } from './graph';
   import { listenManaged } from './listenManaged';
   import ToolsReference from './ToolsReference.svelte';
@@ -45,6 +48,67 @@
   let probing = $state<boolean>(false);
   let history = $state<GraphCall[]>([]);
   let poll: ReturnType<typeof setInterval> | null = null;
+
+  // Per-root language census (all languages present on disk, classified
+  // green/yellow/red). Walking the tree is comparatively expensive, so it's
+  // refreshed only on open, when a root first appears, after a build finishes,
+  // and right after a toggle — never on the 2s status poll.
+  let census = $state<Record<string, LangCensus[]>>({});
+  // Key of the language whose add/remove is in flight (disables the whole grid
+  // so a double-click can't race two rebuilds).
+  let langBusy = $state<string | null>(null);
+  // Tracks each root's previous `building` flag so we can refetch the census
+  // exactly on the building→done edge (new file counts land after a rebuild).
+  let wasBuilding: Record<string, boolean> = {};
+
+  function langColor(e: LangCensus): 'green' | 'yellow' | 'red' {
+    if (!e.supported) return 'red';
+    return e.enabled ? 'green' : 'yellow';
+  }
+
+  function langTitle(e: LangCensus): string {
+    if (!e.supported) return `${e.label}: not supported by the code graph`;
+    return e.enabled
+      ? `${e.label}: indexed — click to remove it from the graph`
+      : `${e.label}: supported — click to add it to the graph`;
+  }
+
+  // Fetch the census for roots that just appeared or just finished building.
+  // Called at the tail of every `refresh()`; the edge checks keep it from
+  // walking the tree on every poll tick.
+  async function maybeRefreshCensus(): Promise<void> {
+    for (const r of roots) {
+      const finished = wasBuilding[r.root] && !r.building;
+      const missing = !(r.root in census);
+      if (missing || finished) {
+        try {
+          census[r.root] = await graphLanguageCensus(r.root);
+        } catch (e) {
+          console.warn('graph_language_census failed', e);
+        }
+      }
+      wasBuilding[r.root] = r.building;
+    }
+  }
+
+  async function toggleLang(root: string, entry: LangCensus): Promise<void> {
+    // Red (unsupported) chips are informational; ignore clicks. Serialize
+    // toggles so two rebuilds can't stack.
+    if (!entry.supported || langBusy !== null) return;
+    langBusy = entry.key;
+    try {
+      await graphSetLanguageEnabled(entry.key, !entry.enabled, root);
+      // Settings are mutated synchronously in the command, so the census now
+      // reflects the new enabled state — the button flips colour immediately,
+      // ahead of the rebuild that indexes the files.
+      census[root] = await graphLanguageCensus(root);
+      await refresh(); // surface the building badge the rebuild just set
+    } catch (e) {
+      console.error('graph_set_language_enabled failed', e);
+    } finally {
+      langBusy = null;
+    }
+  }
 
   function fmtTime(ms: number): string {
     return ms ? new Date(ms).toLocaleTimeString() : '—';
@@ -74,6 +138,9 @@
     } catch {
       /* ignore — history is best-effort */
     }
+    // Refresh the per-root language census only on a root's appear/build-done
+    // edge (cheap on a steady poll, fresh counts right after a rebuild).
+    await maybeRefreshCensus();
   }
 
   async function testEmbedder(): Promise<void> {
@@ -185,13 +252,25 @@
           <div><span class="num">{r.files_indexed}</span><span class="lbl">last scan</span></div>
         </div>
 
-        {#if r.langs && r.langs.length > 0}
-          <div class="langs" title="Indexed files per language">
-            {#each r.langs as l (l.lang)}
-              <span class="lang-cell">
-                <span class="lang-name" title={l.lang}>{l.lang}</span>
+        {#if census[r.root] && census[r.root].length > 0}
+          <div class="lang-legend">
+            <span><span class="dot green"></span>indexed</span>
+            <span><span class="dot yellow"></span>available — click to add</span>
+            <span><span class="dot red"></span>unsupported</span>
+          </div>
+          <div class="langs">
+            {#each census[r.root] as l (l.key)}
+              <button
+                type="button"
+                class="lang-btn {langColor(l)}"
+                class:busy={langBusy === l.key}
+                disabled={!l.supported || langBusy !== null || r.building}
+                title={langTitle(l)}
+                onclick={() => toggleLang(r.root, l)}
+              >
+                <span class="lang-name">{l.label}</span>
                 <span class="lang-n">{l.files}</span>
-              </span>
+              </button>
             {/each}
           </div>
         {/if}
@@ -386,39 +465,113 @@
     font-size: 11px;
     opacity: 0.6;
   }
-  /* Per-language file counts. A grid of auto-filled columns: each cell is a
-     single line ("lang  N"); the column count grows/shrinks with the tab
-     width, so more languages pack horizontally and vertical growth is
-     minimized. */
+  /* Language buttons. A grid of auto-filled columns: each cell is a single
+     line ("Lang  N") with a colour-coded outline — green = indexed, yellow =
+     supported-but-off (click to add), red = unsupported. The column count
+     grows/shrinks with the tab width so languages pack horizontally. */
+  .lang-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin: 2px 0 8px;
+    font-size: 10.5px;
+    opacity: 0.7;
+  }
+  .lang-legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .lang-legend .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    border: 1.5px solid;
+    display: inline-block;
+  }
+  .lang-legend .dot.green {
+    border-color: #2e7d32;
+  }
+  .lang-legend .dot.yellow {
+    border-color: #b26a00;
+  }
+  .lang-legend .dot.red {
+    border-color: #b3261e;
+  }
   .langs {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
-    gap: 2px 10px;
+    gap: 6px 8px;
     margin: 0 0 10px;
   }
-  .lang-cell {
+  .lang-btn {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
     gap: 6px;
     min-width: 0;
-    padding: 1px 6px;
-    border-radius: 4px;
-    background: rgba(255, 255, 255, 0.03);
+    padding: 3px 8px;
+    border-radius: 5px;
+    border: 1.5px solid var(--border, #444);
+    background: transparent;
+    color: inherit;
     font-size: 11px;
     line-height: 1.5;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    transition:
+      background 0.12s ease,
+      filter 0.12s ease,
+      opacity 0.12s ease;
   }
-  .lang-name {
+  .lang-btn .lang-name {
     overflow: hidden;
     text-overflow: ellipsis;
-    opacity: 0.8;
   }
-  .lang-n {
+  .lang-btn .lang-n {
     flex: 0 0 auto;
     font-weight: 600;
-    opacity: 0.95;
+  }
+  .lang-btn.green {
+    border-color: #2e7d32;
+    color: #b8e6bb;
+  }
+  .lang-btn.yellow {
+    border-color: #b26a00;
+    color: #f0c674;
+  }
+  .lang-btn.red {
+    border-color: #b3261e;
+    color: #ffb4ab;
+    cursor: default;
+  }
+  .lang-btn.green:hover:not(:disabled),
+  .lang-btn.yellow:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.06);
+    filter: brightness(1.12);
+  }
+  .lang-btn:focus-visible {
+    outline: 2px solid var(--accent, #3b6ea5);
+    outline-offset: 1px;
+  }
+  /* Only the toggleable (green/yellow) chips dim while disabled; red is purely
+     informational so it stays at full readability. */
+  .lang-btn.green:disabled,
+  .lang-btn.yellow:disabled {
+    opacity: 0.5;
+  }
+  .lang-btn.busy {
+    animation: lang-pulse 1s ease-in-out infinite;
+  }
+  @keyframes lang-pulse {
+    0%,
+    100% {
+      opacity: 0.5;
+    }
+    50% {
+      opacity: 0.85;
+    }
   }
   .section-label {
     font-size: 11px;

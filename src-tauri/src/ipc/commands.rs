@@ -992,6 +992,57 @@ pub async fn graph_set_watch_paused(
     Ok(service.set_watch_paused(paused))
 }
 
+/// V9-02: the project's language census for the Code Graph tab's language
+/// buttons — every language present on disk with its file count and
+/// green/yellow/red classification (indexed / supported-but-off / unsupported).
+/// `root` defaults to the launch directory. Walks the tree fresh each call, so
+/// the frontend calls it on tab open and after a rebuild, not on a poll.
+#[tauri::command]
+pub async fn graph_language_census(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<Vec<crate::graph::LangCensus>> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    Ok(service.language_census(&root))
+}
+
+/// V9-02: add or remove a language from the code graph's index set. Adds/removes
+/// the tag in `GraphSettings.languages` (persisted), then kicks a full rebuild
+/// so the change takes effect — indexing new files (and embedding them when
+/// semantic search is on) or dropping the removed language's rows. Rejects
+/// unsupported tags. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_set_language_enabled(
+    state: State<'_, AppState>,
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    lang: String,
+    enabled: bool,
+    root: Option<String>,
+) -> AppResult<()> {
+    let tag = lang.trim().to_ascii_lowercase();
+    if crate::graph::Lang::from_tag(&tag) == crate::graph::Lang::Other {
+        return Err(AppError::Settings(format!("unsupported graph language: {lang}")));
+    }
+    state.settings.mutate(move |cur| {
+        let langs = &mut cur.graph.languages;
+        let present = langs.iter().any(|l| l == &tag);
+        if enabled && !present {
+            langs.push(tag);
+        } else if !enabled {
+            langs.retain(|l| l != &tag);
+        }
+    });
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    service.spawn_rebuild(root);
+    Ok(())
+}
+
 /// Open `<portable-root>/logs/content/` in the host file manager. Creates the
 /// folder first if it doesn't exist so the call doesn't 404 on a clean
 /// install. Windows uses `explorer.exe`; macOS `open`; Linux

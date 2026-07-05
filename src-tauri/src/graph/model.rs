@@ -174,6 +174,89 @@ impl Lang {
             Lang::Other => "other",
         }
     }
+
+    /// Human-facing display name (proper casing/punctuation) for the language
+    /// buttons in the Code Graph tab. Distinct from [`Self::tag`], which is the
+    /// stable lowercase storage/config key.
+    pub fn label(self) -> &'static str {
+        match self {
+            Lang::Rust => "Rust",
+            Lang::TypeScript => "TypeScript",
+            Lang::JavaScript => "JavaScript",
+            Lang::Python => "Python",
+            Lang::Markdown => "Markdown",
+            Lang::Go => "Go",
+            Lang::Java => "Java",
+            Lang::C => "C",
+            Lang::Cpp => "C++",
+            Lang::CSharp => "C#",
+            Lang::Php => "PHP",
+            Lang::Bash => "Bash",
+            Lang::Scala => "Scala",
+            Lang::Ocaml => "OCaml",
+            Lang::Ruby => "Ruby",
+            Lang::Haskell => "Haskell",
+            Lang::Html => "HTML",
+            Lang::Css => "CSS",
+            Lang::Json => "JSON",
+            Lang::Kotlin => "Kotlin",
+            Lang::Swift => "Swift",
+            Lang::Sql => "SQL",
+            Lang::Yaml => "YAML",
+            Lang::Xml => "XML",
+            Lang::Erlang => "Erlang",
+            Lang::R => "R",
+            Lang::Perl => "Perl",
+            Lang::Ada => "Ada",
+            Lang::Asm => "Assembly",
+            Lang::Other => "Other",
+        }
+    }
+}
+
+/// Display name for a well-known **programming language** that cImp's graph
+/// engine does *not* support, keyed by file extension. Returns `(slug, label)`
+/// for the Code Graph tab's red buttons; `None` for data/config/markup/unknown
+/// files, which fold into the tab's single "Other" bucket. Only genuine
+/// programming languages are named here on purpose — everything else stays
+/// "Other" rather than sprouting a chip per stray extension.
+pub fn unsupported_lang_name(path: &Path) -> Option<(&'static str, &'static str)> {
+    let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    let named = match ext.as_str() {
+        "lua" => ("lua", "Lua"),
+        "zig" => ("zig", "Zig"),
+        "ex" | "exs" => ("elixir", "Elixir"),
+        "dart" => ("dart", "Dart"),
+        "jl" => ("julia", "Julia"),
+        "clj" | "cljs" | "cljc" => ("clojure", "Clojure"),
+        "nim" | "nims" => ("nim", "Nim"),
+        "cr" => ("crystal", "Crystal"),
+        "groovy" | "gradle" => ("groovy", "Groovy"),
+        "vala" => ("vala", "Vala"),
+        "fs" | "fsx" | "fsi" => ("fsharp", "F#"),
+        "vb" => ("vbnet", "Visual Basic"),
+        "mm" => ("objcpp", "Objective-C++"),
+        "f" | "for" | "f90" | "f95" | "f03" | "f08" => ("fortran", "Fortran"),
+        "cob" | "cbl" => ("cobol", "COBOL"),
+        "pas" => ("pascal", "Pascal"),
+        "rkt" => ("racket", "Racket"),
+        "lisp" | "lsp" => ("lisp", "Lisp"),
+        "el" => ("elisp", "Emacs Lisp"),
+        "elm" => ("elm", "Elm"),
+        "hx" => ("haxe", "Haxe"),
+        "d" => ("d", "D"),
+        "vhd" | "vhdl" => ("vhdl", "VHDL"),
+        "tcl" => ("tcl", "Tcl"),
+        "sol" => ("solidity", "Solidity"),
+        "ps1" | "psm1" | "psd1" => ("powershell", "PowerShell"),
+        "bat" | "cmd" => ("batch", "Batch"),
+        "coffee" => ("coffeescript", "CoffeeScript"),
+        "re" => ("reason", "Reason"),
+        "res" => ("rescript", "ReScript"),
+        "purs" => ("purescript", "PureScript"),
+        _ => return None,
+    };
+    Some(named)
 }
 
 /// The kind of a definition. Broad enough to cover the MVP languages; the
@@ -380,5 +463,30 @@ mod tests {
         }
         assert_eq!(Lang::Rust.tag(), "rust");
         assert_eq!(EdgeKind::Call.tag(), "call");
+    }
+
+    #[test]
+    fn labels_are_human_readable_and_tags_round_trip() {
+        assert_eq!(Lang::Cpp.label(), "C++");
+        assert_eq!(Lang::CSharp.label(), "C#");
+        assert_eq!(Lang::Asm.label(), "Assembly");
+        // Every supported tag must round-trip tag → from_tag → same variant, so
+        // the census can rebuild a Lang from a stored tag to get its label.
+        for l in [Lang::Rust, Lang::TypeScript, Lang::Cpp, Lang::CSharp, Lang::Ada] {
+            assert_eq!(Lang::from_tag(l.tag()).label(), l.label());
+        }
+    }
+
+    #[test]
+    fn unsupported_lang_name_maps_known_and_ignores_the_rest() {
+        assert_eq!(unsupported_lang_name(&PathBuf::from("a/b.zig")), Some(("zig", "Zig")));
+        assert_eq!(unsupported_lang_name(&PathBuf::from("m.exs")), Some(("elixir", "Elixir")));
+        assert_eq!(unsupported_lang_name(&PathBuf::from("a.fsx")), Some(("fsharp", "F#")));
+        // Data/config/unknown extensions are NOT named — they fold into "other".
+        assert_eq!(unsupported_lang_name(&PathBuf::from("data.bin")), None);
+        assert_eq!(unsupported_lang_name(&PathBuf::from("noext")), None);
+        // A supported language's extension is never a "red" name (it's a Lang,
+        // handled by the census before the unsupported map is consulted).
+        assert_eq!(unsupported_lang_name(&PathBuf::from("main.rs")), None);
     }
 }

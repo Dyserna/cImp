@@ -37,4 +37,4 @@ pub use mcp::{
     GraphToolSpec,
 };
 pub use model::*;
-pub use service::{EmbedderProbe, GraphService, GraphStatus};
+pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus};

@@ -61,6 +61,36 @@ export function graphSetWatchPaused(paused: boolean): Promise<boolean> {
   return invoke<boolean>('graph_set_watch_paused', { paused });
 }
 
+/// Mirror of Rust `graph::LangCensus` — one language present in the project.
+/// `supported && enabled` = green (indexed); `supported && !enabled` = yellow
+/// (indexable but off); `!supported` = red (known-unsupported language, or the
+/// `"other"` catch-all bucket).
+export interface LangCensus {
+  key: string;
+  label: string;
+  files: number;
+  supported: boolean;
+  enabled: boolean;
+}
+
+/// The project's language census for the Code Graph tab's language buttons.
+/// Walks the tree fresh, so call it on tab open and after a rebuild — not on a
+/// tight poll. `root` defaults (backend side) to the launch directory.
+export function graphLanguageCensus(root?: string): Promise<LangCensus[]> {
+  return invoke<LangCensus[]>('graph_language_census', { root: root ?? null });
+}
+
+/// Add (`enabled=true`) or remove (`false`) a language from the graph's index
+/// set, then kick a rebuild so it's indexed/embedded (or its rows dropped).
+/// Only supported language tags are accepted. `root` defaults to the launch dir.
+export function graphSetLanguageEnabled(
+  lang: string,
+  enabled: boolean,
+  root?: string,
+): Promise<void> {
+  return invoke<void>('graph_set_language_enabled', { lang, enabled, root: root ?? null });
+}
+
 /// Result of an on-demand embedder reachability probe. Mirror of Rust
 /// `graph::EmbedderProbe`.
 export interface EmbedderProbe {

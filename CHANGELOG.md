@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-07-06
+
+A per-project Note scratchpad, one-click OpenCode wiring for local offload
+backends, and consolidation of cImp's per-project files under the `.cimp` dir.
+
 ### Added
 
 - **Note tab — a per-project scratchpad.** A new 📝 button in the bottom bar's
@@ -18,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing note or creates one; the tab is closable and re-opens to the same
   file. No schema bump (the tab persists as an ordinary Shell-kind entry).
 
+- **One-click OpenCode provider registration for local offload backends.** The
+  Offload settings' local-backend card gains an **Add to OpenCode** button (plus
+  an *Auto-sync while offload enabled* toggle) that registers the running
+  llama-server as OpenCode's `local-llama` provider — base URL and model read
+  from the backend command — and selects it as the default model, so a freshly
+  opened OpenCode tab is ready to use. Auto-sync re-derives it from the primary
+  local backend at launch and on save while offload stays enabled.
+
 ### Changed
 
 - **Per-folder settings overlay moved into the project's `.cimp` dir.** The
@@ -28,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is migrated into `.cimp/` automatically on the next launch (best-effort move;
   the old file is still read in place if the move can't happen, so no
   customization is lost). No schema bump.
+
+- **Offload local-backend card layout.** The OpenCode provider controls now sit
+  above the Start/Stop/Reset lifecycle row (moved to the bottom of the card),
+  with clearer spacing between the two groups.
 
 ## [0.33.0] — 2026-07-04
 

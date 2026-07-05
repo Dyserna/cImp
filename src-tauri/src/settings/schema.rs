@@ -755,6 +755,26 @@ pub struct OffloadSettings {
     /// a clear "queue full" error once `n` are already waiting and every slot
     /// is busy — backpressure that fails fast instead of stacking long waits.
     pub max_queue_depth: Option<u32>,
+    /// The OpenCode `local-llama` custom provider, derived from a Local
+    /// backend's `server_command` via the Offload settings "Add to OpenCode"
+    /// button (or kept in sync when [`opencode_provider_auto`] is on). When
+    /// `Some`, `build_opencode_config` injects a `provider.local-llama` block +
+    /// selects it as the default `model`, so a freshly opened OpenCode tab
+    /// talks to the local `llama-server` out of the box. `None` = never
+    /// registered. Additive `#[serde(default)]`.
+    ///
+    /// [`opencode_provider_auto`]: Self::opencode_provider_auto
+    pub opencode_provider: Option<OpencodeLocalProvider>,
+    /// When `true` AND the local offload server is [`enabled`], keep
+    /// [`opencode_provider`] in step with the primary Local backend's command:
+    /// re-derived at each OpenCode launch and re-persisted on a settings save
+    /// whenever the command changed. When the local server is disabled this
+    /// does nothing (the last snapshot, if any, stands). Off = the provider is
+    /// a manual snapshot the button wrote once.
+    ///
+    /// [`enabled`]: Self::enabled
+    /// [`opencode_provider`]: Self::opencode_provider
+    pub opencode_provider_auto: bool,
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -782,8 +802,37 @@ impl std::fmt::Debug for OffloadSettings {
             .field("offload_timeout_secs", &self.offload_timeout_secs)
             .field("global_concurrency", &self.global_concurrency)
             .field("max_queue_depth", &self.max_queue_depth)
+            // No secrets beyond the (already-cleartext) `--api-key` the user
+            // themselves put in the server command; `OpencodeLocalProvider`
+            // derives Debug.
+            .field("opencode_provider", &self.opencode_provider)
+            .field("opencode_provider_auto", &self.opencode_provider_auto)
             .finish()
     }
+}
+
+/// A derived OpenCode custom-provider entry — always registered under the id
+/// `local-llama` — pointing at the local `llama-server`'s OpenAI-compatible
+/// endpoint. Built from a Local backend's `server_command` (see
+/// [`crate::offload::server::derive_opencode_provider`]) and injected into the
+/// session config OpenCode receives via `OPENCODE_CONFIG_CONTENT`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct OpencodeLocalProvider {
+    /// OpenAI-compatible base URL, ending in `/v1`
+    /// (e.g. `http://127.0.0.1:8080/v1`). Host + port come from `--host`
+    /// (default `127.0.0.1`) and `--port` in the command.
+    pub base_url: String,
+    /// Model id OpenCode sends in the completion request and selects as the
+    /// default (`local-llama/<model>`). `--alias`/`-a` if present, else the
+    /// `--model`/`-m` file basename (directory + `.gguf` stripped).
+    pub model: String,
+    /// API key from `--api-key` in the command, if any. `llama-server` ignores
+    /// auth unless it was launched with a key, so this is usually empty.
+    pub api_key: String,
+    /// The `server_command` this snapshot was derived from. Lets the auto-sync
+    /// re-derive only when the command actually changed.
+    pub source_command: String,
 }
 
 impl Default for OffloadSettings {
@@ -807,6 +856,8 @@ impl Default for OffloadSettings {
             offload_timeout_secs: 300,
             global_concurrency: None,
             max_queue_depth: None,
+            opencode_provider: None,
+            opencode_provider_auto: false,
         }
     }
 }
@@ -1378,6 +1429,65 @@ impl OffloadSettings {
             tier: BackendTier::Quality,
             tool_scope: ToolScope::All,
         }]
+    }
+
+    /// The `server_command` of the primary Local backend the OpenCode
+    /// `local-llama` provider tracks: the first enabled Local backend with a
+    /// non-blank command (from [`effective_backends`], so a legacy single-local
+    /// config resolves too). `None` when there's no usable Local command.
+    ///
+    /// [`effective_backends`]: Self::effective_backends
+    pub fn primary_local_command(&self) -> Option<String> {
+        self.effective_backends().into_iter().find_map(|b| match b.kind {
+            OffloadBackendKind::Local { server_command, .. }
+                if b.enabled && !server_command.trim().is_empty() =>
+            {
+                Some(server_command)
+            }
+            _ => None,
+        })
+    }
+
+    /// The effective `local-llama` provider to inject into an OpenCode session,
+    /// or `None` to inject nothing. When auto-sync is on and the local server
+    /// is enabled, re-derive from the current primary Local command so edits
+    /// take effect at launch without re-clicking the button; if that command is
+    /// missing/incomplete, fall back to the last persisted snapshot. Otherwise
+    /// use the stored snapshot as-is.
+    pub fn resolve_opencode_provider(&self) -> Option<OpencodeLocalProvider> {
+        if self.opencode_provider_auto && self.enabled {
+            if let Some(cmd) = self.primary_local_command() {
+                if let Ok(p) = crate::offload::server::derive_opencode_provider(&cmd) {
+                    return Some(p);
+                }
+            }
+        }
+        self.opencode_provider.clone()
+    }
+
+    /// Re-sync the persisted `local-llama` snapshot on a settings save. No-op
+    /// unless auto-sync is on AND the local server is enabled (per the auto
+    /// contract: disabled ⇒ do nothing). Re-derives only when the primary Local
+    /// command differs from the snapshot's `source_command`, so unrelated saves
+    /// don't churn. A derive failure (missing `--port`/model) leaves the prior
+    /// snapshot untouched rather than clearing it.
+    pub fn sync_opencode_provider_on_save(&mut self) {
+        if !(self.opencode_provider_auto && self.enabled) {
+            return;
+        }
+        let Some(cmd) = self.primary_local_command() else {
+            return;
+        };
+        let unchanged = self
+            .opencode_provider
+            .as_ref()
+            .is_some_and(|p| p.source_command == cmd);
+        if unchanged {
+            return;
+        }
+        if let Ok(p) = crate::offload::server::derive_opencode_provider(&cmd) {
+            self.opencode_provider = Some(p);
+        }
     }
 
     /// Whether at least one MCP server is exposed to Claude Code.
@@ -2642,6 +2752,61 @@ impl Default for ProcessingSettings {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    fn local_backend(cmd: &str) -> OffloadBackend {
+        OffloadBackend {
+            name: "local".to_string(),
+            enabled: true,
+            kind: OffloadBackendKind::Local {
+                server_command: cmd.to_string(),
+                autostart: false,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sync_provider_noop_when_auto_off_or_server_disabled() {
+        // Auto off ⇒ untouched even with offload enabled.
+        let mut o = OffloadSettings {
+            enabled: true,
+            opencode_provider_auto: false,
+            backends: vec![local_backend("llama-server -a m --port 8080")],
+            ..Default::default()
+        };
+        o.sync_opencode_provider_on_save();
+        assert!(o.opencode_provider.is_none(), "auto off ⇒ no sync");
+
+        // Auto on but server disabled ⇒ do nothing (the auto contract).
+        o.opencode_provider_auto = true;
+        o.enabled = false;
+        o.sync_opencode_provider_on_save();
+        assert!(o.opencode_provider.is_none(), "disabled server ⇒ no sync");
+    }
+
+    #[test]
+    fn sync_provider_derives_when_enabled_and_rederives_on_change() {
+        let mut o = OffloadSettings {
+            enabled: true,
+            opencode_provider_auto: true,
+            backends: vec![local_backend("llama-server -a first --port 8080")],
+            ..Default::default()
+        };
+        o.sync_opencode_provider_on_save();
+        assert_eq!(o.opencode_provider.as_ref().unwrap().model, "first");
+
+        // Same command again ⇒ unchanged snapshot (source_command matches).
+        let snap = o.opencode_provider.clone();
+        o.sync_opencode_provider_on_save();
+        assert_eq!(o.opencode_provider, snap, "no change ⇒ no churn");
+
+        // Command edited ⇒ re-derived.
+        o.backends = vec![local_backend("llama-server -a second --port 9099")];
+        o.sync_opencode_provider_on_save();
+        let p = o.opencode_provider.as_ref().unwrap();
+        assert_eq!(p.model, "second");
+        assert_eq!(p.base_url, "http://127.0.0.1:9099/v1");
+    }
 
     #[test]
     fn ai_tab_id_serde_wire_format_matches_tab_ids() {

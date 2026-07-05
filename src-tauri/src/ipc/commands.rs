@@ -719,6 +719,10 @@ pub async fn settings_update(
         // Keep the reserved feature tabs (Offload Server / Code Graph monitor)
         // present-iff-enabled in the persisted list.
         crate::settings::reconcile_reserved_tabs(cur);
+        // V21: when OpenCode local-llama auto-sync is on and the local server is
+        // enabled, re-derive the provider snapshot if the primary Local command
+        // changed (no-op otherwise), so the OpenCode tab tracks command edits.
+        cur.offload.sync_opencode_provider_on_save();
     });
 
     // On an `stt.enabled` edge, load or unload the Whisper model so the toggle
@@ -858,6 +862,18 @@ pub async fn offload_test(
         .inner()
         .run_task(task, crate::offload::agent::ThinkingMode::Auto)
         .await
+}
+
+/// V21: derive the OpenCode `local-llama` provider from a Local backend's
+/// server command (the Settings "Add to OpenCode" button). Pure — parses and
+/// validates only; the frontend persists the returned snapshot via
+/// `settings_update`. On a missing `--port` or model flag it errors with a
+/// message naming exactly what's absent, which the button surfaces verbatim.
+#[tauri::command]
+pub async fn offload_derive_opencode_provider(
+    server_command: String,
+) -> AppResult<crate::settings::OpencodeLocalProvider> {
+    crate::offload::server::derive_opencode_provider(&server_command)
 }
 
 /// V8-03: aggregate offload-service status — the honest global in-flight

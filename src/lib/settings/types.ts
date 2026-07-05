@@ -780,6 +780,29 @@ export interface OffloadSettings {
   /// = unbounded blocking queue; a number fast-rejects once that many are
   /// already waiting on busy slots.
   max_queue_depth: number | null;
+  /// V21: the OpenCode `local-llama` custom provider, derived from a Local
+  /// backend's server command via the Offload "Add to OpenCode" button (or
+  /// auto-sync). When set, the OpenCode tab gets a `provider.local-llama` block
+  /// + this as its default model. `null` = never registered.
+  opencode_provider: OpencodeLocalProvider | null;
+  /// V21: when true AND the local offload server is enabled, keep
+  /// `opencode_provider` in sync with the primary Local backend's command
+  /// (re-derived at launch + on save when it changed). Disabled server ⇒
+  /// no-op.
+  opencode_provider_auto: boolean;
+}
+
+/// V21: a derived OpenCode custom-provider entry (always id `local-llama`)
+/// pointing at the local `llama-server` (mirror of Rust `OpencodeLocalProvider`).
+export interface OpencodeLocalProvider {
+  /// OpenAI-compatible base URL, ending in `/v1`.
+  base_url: string;
+  /// Model id OpenCode requests + selects as default (`local-llama/<model>`).
+  model: string;
+  /// Optional `--api-key` from the command; usually empty.
+  api_key: string;
+  /// The server command this was derived from (drives auto-sync change checks).
+  source_command: string;
 }
 
 /// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
@@ -1071,6 +1094,8 @@ export function defaultSettings(): Settings {
       offload_timeout_secs: 300,
       global_concurrency: null,
       max_queue_depth: null,
+      opencode_provider: null,
+      opencode_provider_auto: false,
     },
     graph: {
       enabled: false,

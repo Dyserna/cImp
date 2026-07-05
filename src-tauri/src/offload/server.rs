@@ -21,7 +21,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use crate::error::{AppError, AppResult};
-use crate::settings::{BackendTier, ToolScope};
+use crate::settings::{BackendTier, OpencodeLocalProvider, ToolScope};
 
 use super::Backend;
 
@@ -137,6 +137,102 @@ impl ServerCommand {
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
     }
+}
+
+/// Derive the OpenCode `local-llama` provider from a Local backend's
+/// `server_command`. Requires an explicit `--port` and a model identifier
+/// (`--alias`/`-a`, else the `--model`/`-m` file basename); the host defaults
+/// to `127.0.0.1`. On a missing required flag, returns a self-contained error
+/// naming exactly what's absent so the Settings button can surface it verbatim.
+pub fn derive_opencode_provider(command: &str) -> AppResult<OpencodeLocalProvider> {
+    let tokens = shlex::split(command)
+        .ok_or_else(|| AppError::Offload("server command has unbalanced quotes".into()))?;
+    let mut it = tokens.into_iter();
+    let _program = it
+        .next()
+        .ok_or_else(|| AppError::Offload("server command is empty".into()))?;
+    let args: Vec<String> = it.collect();
+
+    let mut host = DEFAULT_HOST.to_string();
+    let mut port: Option<u16> = None;
+    let mut alias: Option<String> = None;
+    let mut model_path: Option<String> = None;
+    let mut api_key = String::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let (key, inline) = split_flag(&args[i]);
+        match key {
+            "--host" => {
+                if let Some(v) = flag_value(inline, &args, &mut i) {
+                    host = normalize_host(&v);
+                }
+            }
+            "--port" => {
+                if let Some(v) = flag_value(inline, &args, &mut i) {
+                    if let Ok(p) = v.parse::<u16>() {
+                        port = Some(p);
+                    }
+                }
+            }
+            "-a" | "--alias" => {
+                if let Some(v) = flag_value(inline, &args, &mut i) {
+                    if !v.trim().is_empty() {
+                        alias = Some(v.trim().to_string());
+                    }
+                }
+            }
+            "-m" | "--model" => {
+                if let Some(v) = flag_value(inline, &args, &mut i) {
+                    if !v.trim().is_empty() {
+                        model_path = Some(v);
+                    }
+                }
+            }
+            "--api-key" | "--api_key" => {
+                if let Some(v) = flag_value(inline, &args, &mut i) {
+                    api_key = v;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let model = alias.or_else(|| model_path.as_deref().map(model_id_from_path));
+
+    // Collect every missing required param so the error names them all at once.
+    let mut missing: Vec<&str> = Vec::new();
+    if port.is_none() {
+        missing.push("--port");
+    }
+    if model.is_none() {
+        missing.push("a model (--model/-m or --alias/-a)");
+    }
+    if !missing.is_empty() {
+        return Err(AppError::Offload(format!(
+            "can't register the OpenCode local-llama provider: the server command is missing {}.",
+            missing.join(" and ")
+        )));
+    }
+
+    Ok(OpencodeLocalProvider {
+        base_url: format!("http://{host}:{}/v1", port.expect("port present")),
+        model: model.expect("model present"),
+        api_key,
+        source_command: command.to_string(),
+    })
+}
+
+/// The OpenCode model id for a `--model` path: the file name with any leading
+/// directory and a trailing `.gguf` removed
+/// (`…/Qwen3.6-35B-A3B-Q4.gguf` → `Qwen3.6-35B-A3B-Q4`).
+fn model_id_from_path(path: &str) -> String {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    base.strip_suffix(".gguf")
+        .or_else(|| base.strip_suffix(".GGUF"))
+        .unwrap_or(base)
+        .to_string()
 }
 
 /// The single Local backend: a supervised `llama-server`.
@@ -501,5 +597,42 @@ mod tests {
         // 40000 * 80% = 32000.
         s.n_ctx.store(40_000, Ordering::Relaxed);
         assert_eq!(s.per_slot_budget(80), Some(32_000));
+    }
+
+    #[test]
+    fn derive_provider_model_from_path_basename() {
+        let p = derive_opencode_provider(
+            "llama-server --model C:/models/Qwen3.6-35B-A3B-Q4.gguf --port 8080 --jinja",
+        )
+        .unwrap();
+        assert_eq!(p.base_url, "http://127.0.0.1:8080/v1");
+        assert_eq!(p.model, "Qwen3.6-35B-A3B-Q4");
+        assert!(p.api_key.is_empty());
+    }
+
+    #[test]
+    fn derive_provider_alias_wins_over_model_and_reads_host_apikey() {
+        let p = derive_opencode_provider(
+            "llama-server -m /m/q4.gguf -a my-alias --host 0.0.0.0 --port 9001 --api-key sk-x",
+        )
+        .unwrap();
+        // alias beats the file basename; bind-all host normalized to loopback.
+        assert_eq!(p.model, "my-alias");
+        assert_eq!(p.base_url, "http://127.0.0.1:9001/v1");
+        assert_eq!(p.api_key, "sk-x");
+    }
+
+    #[test]
+    fn derive_provider_missing_port_errors_naming_it() {
+        let err = derive_opencode_provider("llama-server -a m").unwrap_err().to_string();
+        assert!(err.contains("--port"), "got: {err}");
+        assert!(!err.contains("model"), "port-only miss shouldn't name model: {err}");
+    }
+
+    #[test]
+    fn derive_provider_missing_both_names_both() {
+        let err = derive_opencode_provider("llama-server --jinja").unwrap_err().to_string();
+        assert!(err.contains("--port"), "got: {err}");
+        assert!(err.contains("--model/-m or --alias/-a"), "got: {err}");
     }
 }

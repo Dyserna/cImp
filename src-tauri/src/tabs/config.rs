@@ -366,8 +366,10 @@ fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
 ///   any guidance applies. The file content is written on the launch path; here
 ///   we only reference its (deterministic) path.
 ///
-/// No `provider` block: OpenCode manages its own providers/credentials (global
-/// config, switchable in-session), so cimp never injects one.
+/// - `provider.local-llama` + a default `model` → injected only when the user
+///   has registered the local `llama-server` as an OpenCode provider (Offload
+///   settings "Add to OpenCode", or auto-sync). Otherwise omitted, leaving
+///   provider/model selection entirely to OpenCode's own global config.
 ///
 /// Additive by default — cimp does not set `OPENCODE_DISABLE_PROJECT_CONFIG`,
 /// so a user's project config still merges underneath. Pure: no filesystem I/O.
@@ -409,10 +411,48 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
         );
     }
 
-    // V19: no `provider` block. The single OpenCode tab uses OpenCode's own
-    // provider config + credentials (global `~/.config/opencode` + `auth.json`,
-    // switchable in-session), so cimp injects only the mcp + instructions and
-    // leaves provider/model selection entirely to OpenCode.
+    // V21: inject the `local-llama` custom provider + select it as the default
+    // `model` when one has been registered (Offload settings "Add to OpenCode",
+    // or kept in sync by auto-sync). The OpenCode tab still uses OpenCode's own
+    // global providers for everything else; this only adds the local
+    // `llama-server`'s OpenAI-compatible endpoint and points `model` at it so a
+    // freshly opened tab is ready to work. `None` ⇒ no `provider`/`model` keys,
+    // exactly as before (default install / never registered).
+    if let Some(provider) = settings.offload.resolve_opencode_provider() {
+        if !provider.base_url.is_empty() && !provider.model.is_empty() {
+            let mut options = serde_json::Map::new();
+            options.insert(
+                "baseURL".to_string(),
+                serde_json::Value::String(provider.base_url),
+            );
+            if !provider.api_key.is_empty() {
+                options.insert(
+                    "apiKey".to_string(),
+                    serde_json::Value::String(provider.api_key),
+                );
+            }
+            let mut models = serde_json::Map::new();
+            models.insert(
+                provider.model.clone(),
+                serde_json::json!({ "name": provider.model.clone() }),
+            );
+            config.insert(
+                "provider".to_string(),
+                serde_json::json!({
+                    "local-llama": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "Local Llama (cImp offload)",
+                        "options": serde_json::Value::Object(options),
+                        "models": serde_json::Value::Object(models),
+                    }
+                }),
+            );
+            config.insert(
+                "model".to_string(),
+                serde_json::Value::String(format!("local-llama/{}", provider.model)),
+            );
+        }
+    }
     serde_json::Value::Object(config)
 }
 
@@ -788,15 +828,60 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_never_injects_provider() {
-        // The single OpenCode tab manages its own providers; cimp never
-        // injects a `provider`/`model` block, even with use_local_provider set.
+    fn opencode_config_no_provider_when_unregistered() {
+        // With no `local-llama` registered, cimp injects no `provider`/`model`
+        // block — regardless of the per-tab `use_local_provider` flag (which
+        // drives Claude's env synthesis, not OpenCode's config).
         let settings = Settings::default();
         let mut cfg = opencode_cfg();
         cfg.use_local_provider = true;
         let config = build_opencode_config(&cfg, &settings);
-        assert!(config.get("provider").is_none(), "opencode gets no provider block");
+        assert!(config.get("provider").is_none(), "no registration ⇒ no provider block");
         assert!(config.get("model").is_none());
+    }
+
+    #[test]
+    fn opencode_config_injects_registered_local_provider() {
+        // A registered snapshot ⇒ a `provider.local-llama` block pointing at the
+        // local endpoint + `model` selecting it, so the tab is ready on open.
+        let mut settings = Settings::default();
+        settings.offload.opencode_provider = Some(crate::settings::OpencodeLocalProvider {
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            model: "Qwen3-Q4".to_string(),
+            api_key: String::new(),
+            source_command: "llama-server -m Qwen3-Q4.gguf --port 8080".to_string(),
+        });
+        let config = build_opencode_config(&opencode_cfg(), &settings);
+        let prov = &config["provider"]["local-llama"];
+        assert_eq!(prov["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(prov["options"]["baseURL"], "http://127.0.0.1:8080/v1");
+        assert!(prov["models"]["Qwen3-Q4"].is_object(), "model listed in provider");
+        assert_eq!(config["model"], "local-llama/Qwen3-Q4");
+        assert!(
+            prov["options"].get("apiKey").is_none(),
+            "no apiKey key when the command carried none",
+        );
+    }
+
+    #[test]
+    fn opencode_config_auto_derives_provider_from_backend() {
+        // Auto-sync on + offload enabled ⇒ derive the provider live from the
+        // primary Local backend's command, even with no stored snapshot.
+        let mut settings = Settings::default();
+        settings.offload.enabled = true;
+        settings.offload.opencode_provider_auto = true;
+        settings.offload.backends = vec![crate::settings::OffloadBackend {
+            name: "local".to_string(),
+            enabled: true,
+            kind: crate::settings::OffloadBackendKind::Local {
+                server_command: "llama-server -a my-model --port 9001 --jinja".to_string(),
+                autostart: false,
+            },
+            ..Default::default()
+        }];
+        let config = build_opencode_config(&opencode_cfg(), &settings);
+        assert_eq!(config["provider"]["local-llama"]["options"]["baseURL"], "http://127.0.0.1:9001/v1");
+        assert_eq!(config["model"], "local-llama/my-model");
     }
 
     #[test]

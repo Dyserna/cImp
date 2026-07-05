@@ -26,6 +26,7 @@
   import { listSttModels, listInputDevices } from './lib/stt';
   import {
     offloadTest,
+    offloadDeriveOpencodeProvider,
     offloadStatuses,
     offloadBackendStart,
     offloadBackendStop,
@@ -158,6 +159,32 @@
       offloadTestResult = `Error: ${e}`;
     } finally {
       offloadBusy = false;
+    }
+  }
+
+  // V21: register the given Local backend as the OpenCode `local-llama`
+  // provider. Derives base URL + model from its server command in Rust (which
+  // errors, naming the missing --port/model flag, when the command is
+  // incomplete), then persists the snapshot and selects it as the default
+  // model so the OpenCode tab is ready to use. Overrides any existing
+  // registration. `opencodeProviderMsg` reports success/failure inline.
+  let opencodeProviderMsg = $state<{ i: number; text: string; ok: boolean } | null>(null);
+  async function registerOpencodeProvider(i: number): Promise<void> {
+    const backend = snapshot?.offload.backends[i];
+    if (!backend || backend.kind.type !== 'local') return;
+    opencodeProviderMsg = null;
+    try {
+      const provider = await offloadDeriveOpencodeProvider(backend.kind.server_command);
+      patch((s) => {
+        s.offload.opencode_provider = provider;
+      });
+      opencodeProviderMsg = {
+        i,
+        ok: true,
+        text: `Registered local-llama → ${provider.model} at ${provider.base_url}. OpenCode tabs will use it by default.`,
+      };
+    } catch (e) {
+      opencodeProviderMsg = { i, ok: false, text: `${e}` };
     }
   }
 
@@ -3103,6 +3130,36 @@
                   <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStop(backend.name))}>Stop</button>
                   <button type="button" class="secondary" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendRestart(backend.name))}>Reset</button>
                 </div>
+                <div class="button-row">
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => registerOpencodeProvider(i)}
+                  >Add to OpenCode</button>
+                  <label class="checkbox inline">
+                    <input
+                      type="checkbox"
+                      checked={snapshot.offload.opencode_provider_auto}
+                      onchange={(e) =>
+                        patch((s) => {
+                          s.offload.opencode_provider_auto = (e.currentTarget as HTMLInputElement).checked;
+                        })}
+                    />
+                    <span>Auto-sync while offload enabled</span>
+                  </label>
+                </div>
+                <small class="hint">
+                  Registers this server as OpenCode's <code>local-llama</code>
+                  provider (base URL + model read from the command above) and
+                  selects it as the default model, so a freshly opened OpenCode
+                  tab is ready to work. Overrides any existing
+                  <code>local-llama</code>. Auto-sync re-derives it from the
+                  primary local backend at launch and on save, but only while the
+                  offload server is enabled.
+                </small>
+                {#if opencodeProviderMsg && opencodeProviderMsg.i === i}
+                  <small class={opencodeProviderMsg.ok ? 'hint' : 'error'}>{opencodeProviderMsg.text}</small>
+                {/if}
               {/if}
             </div>
           {/each}

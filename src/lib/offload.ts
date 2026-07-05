@@ -5,6 +5,7 @@
 import { writable, type Writable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { OpencodeLocalProvider } from './settings/types';
 
 /// Mirror of Rust `OffloadState` (serde tag = "state").
 export type OffloadState =
@@ -126,6 +127,16 @@ export function describeBackendStatus(s: BackendStatus): string {
 /// Run a canned (or custom) offload task and return the synthesized answer.
 export async function offloadTest(instructions: string): Promise<string> {
   return invoke('offload_test', { instructions });
+}
+
+/// V21: derive the OpenCode `local-llama` provider from a Local backend's
+/// server command (the Settings "Add to OpenCode" button). Rejects with a
+/// message naming the missing `--port`/model flag when the command is
+/// incomplete; the caller persists the resolved snapshot via `settings_update`.
+export async function offloadDeriveOpencodeProvider(
+  serverCommand: string,
+): Promise<OpencodeLocalProvider> {
+  return invoke('offload_derive_opencode_provider', { serverCommand });
 }
 
 /// V8-03: per-MCP-server health row (mirror of Rust `McpServerHealth`).

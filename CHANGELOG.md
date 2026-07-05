@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.1] — 2026-07-06
+
+### Added
+
+- **Start/Stop/Reset for the local offload server in the Offload Server tab.**
+  The Local section now shows a Start/Stop/Reset button row at the top (below
+  the "Local" heading, above the status card), so the local llama-server can be
+  controlled straight from the tab without opening Settings. Mirrors the
+  per-backend lifecycle controls in Settings → Offload.
+
 ## [0.34.0] — 2026-07-06
 
 A per-project Note scratchpad, one-click OpenCode wiring for local offload

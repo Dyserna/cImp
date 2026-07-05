@@ -332,6 +332,16 @@ impl GraphService {
             .collect()
     }
 
+    /// The project's language census for `root` — every language present on
+    /// disk with its file count and green/yellow/red classification (drives the
+    /// Code Graph tab's language buttons). Walks the tree fresh each call, so
+    /// callers should invoke it on tab open and after a rebuild, not on a tight
+    /// poll.
+    pub fn language_census(&self, root: &Path) -> Vec<LangCensus> {
+        let snap = self.settings.current().graph;
+        language_census(root, &snap, &self.db_subdir())
+    }
+
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns
     /// immediately; progress lands on the `graph-status` event and via
     /// [`status`](Self::status). A no-op (logged) when a build for this root is
@@ -808,36 +818,7 @@ fn build_tree(
     let max_bytes = snap.max_file_bytes.max(1);
 
     let mut indexed: u64 = 0;
-    let mut wb = WalkBuilder::new(root);
-    wb.hidden(false) // index dotfiles like `.github/*.md`; the db dir is filtered below
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true);
-    // Honor the user's extra ignore globs (additive to `.gitignore`). An
-    // `Override` whose patterns are *ignore* globs needs each prefixed with
-    // `!` (overrides are whitelists; a leading `!` flips one to a blacklist).
-    if !snap.ignore.is_empty() {
-        let mut ob = ignore::overrides::OverrideBuilder::new(root);
-        for pat in &snap.ignore {
-            let pat = pat.trim();
-            if pat.is_empty() {
-                continue;
-            }
-            let rule = if let Some(stripped) = pat.strip_prefix('!') {
-                stripped.to_string() // already a re-include
-            } else {
-                format!("!{pat}") // ignore this glob
-            };
-            let _ = ob.add(&rule);
-        }
-        if let Ok(ov) = ob.build() {
-            wb.overrides(ov);
-        }
-    }
-    let walker = wb.build();
-
-    for entry in walker {
+    for entry in build_walker(root, snap) {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -891,6 +872,152 @@ fn build_tree(
     let _ = idx.prune_orphan_vectors();
 
     Ok((indexed, idx.stats()?))
+}
+
+/// The shared tree walker for a rebuild and the language census, so the two
+/// agree exactly on what counts as "in the project" (gitignore + global +
+/// exclude + parents, dotfiles included, plus the user's extra `ignore` globs).
+/// The db-subdir and per-file size/language filtering are applied by callers.
+fn build_walker(root: &Path, snap: &GraphSettings) -> ignore::Walk {
+    let mut wb = WalkBuilder::new(root);
+    wb.hidden(false) // index dotfiles like `.github/*.md`; the db dir is filtered by callers
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true);
+    // Honor the user's extra ignore globs (additive to `.gitignore`). An
+    // `Override` whose patterns are *ignore* globs needs each prefixed with
+    // `!` (overrides are whitelists; a leading `!` flips one to a blacklist).
+    if !snap.ignore.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        for pat in &snap.ignore {
+            let pat = pat.trim();
+            if pat.is_empty() {
+                continue;
+            }
+            let rule = if let Some(stripped) = pat.strip_prefix('!') {
+                stripped.to_string() // already a re-include
+            } else {
+                format!("!{pat}") // ignore this glob
+            };
+            let _ = ob.add(&rule);
+        }
+        if let Ok(ov) = ob.build() {
+            wb.overrides(ov);
+        }
+    }
+    wb.build()
+}
+
+/// One row of the project **language census**: a language present on disk, how
+/// many files it has, and how the graph relates to it. Drives the Code Graph
+/// tab's green/yellow/red language buttons.
+///
+/// - `supported && enabled` → green (indexed by the graph).
+/// - `supported && !enabled` → yellow (the engine can index it, but it isn't in
+///   `GraphSettings.languages`).
+/// - `!supported` → red (a known-but-unsupported programming language, or the
+///   catch-all "other" bucket).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LangCensus {
+    /// Stable key: a supported [`Lang`] tag (`"rust"`), a known-unsupported
+    /// programming-language slug (`"zig"`), or `"other"` for the catch-all.
+    pub key: String,
+    /// Human display label (`"Rust"`, `"Zig"`, `"Other"`).
+    pub label: String,
+    /// Number of files of this language found in the project tree.
+    pub files: u64,
+    /// The graph engine can index this language (a concrete `Lang` variant).
+    pub supported: bool,
+    /// The language's tag is currently in `GraphSettings.languages`.
+    pub enabled: bool,
+}
+
+/// Group-and-files sort rank for the census: green (0) → yellow (1) → red-known
+/// (2) → the "other" bucket (3, always last).
+fn census_rank(e: &LangCensus) -> u8 {
+    if e.key == "other" {
+        3
+    } else if !e.supported {
+        2
+    } else if e.enabled {
+        0
+    } else {
+        1
+    }
+}
+
+/// Walk `root` and tally every source file by detected language, *without* the
+/// `languages` allowlist filter — so the result includes supported-but-not-
+/// indexed languages (yellow) and unsupported ones (red), which the indexed
+/// `file` relation never records. Reuses [`build_walker`] so the file set
+/// matches a rebuild's exactly. Best-effort and non-fatal: unreadable entries
+/// are skipped, never surfaced as errors.
+fn language_census(root: &Path, snap: &GraphSettings, db_subdir: &str) -> Vec<LangCensus> {
+    use std::collections::BTreeMap;
+
+    let mut supported: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut known: BTreeMap<&'static str, (&'static str, u64)> = BTreeMap::new();
+    let mut other: u64 = 0;
+
+    for entry in build_walker(root, snap) {
+        let Ok(entry) = entry else { continue };
+        if entry.file_type().map(|t| !t.is_file()).unwrap_or(true) {
+            continue;
+        }
+        let path = entry.path();
+        // Never count our own store directory.
+        if path.components().any(|c| c.as_os_str() == db_subdir) {
+            continue;
+        }
+        let lang = Lang::from_path(path);
+        if lang != Lang::Other {
+            *supported.entry(lang.tag()).or_default() += 1;
+        } else if let Some((slug, label)) = super::model::unsupported_lang_name(path) {
+            let e = known.entry(slug).or_insert((label, 0));
+            e.1 += 1;
+        } else {
+            other += 1;
+        }
+    }
+
+    let langs = &snap.languages;
+    let mut out: Vec<LangCensus> = Vec::new();
+    for (tag, files) in supported {
+        out.push(LangCensus {
+            key: tag.to_string(),
+            label: Lang::from_tag(tag).label().to_string(),
+            files,
+            supported: true,
+            enabled: langs.iter().any(|l| l == tag),
+        });
+    }
+    for (slug, (label, files)) in known {
+        out.push(LangCensus {
+            key: slug.to_string(),
+            label: label.to_string(),
+            files,
+            supported: false,
+            enabled: false,
+        });
+    }
+    if other > 0 {
+        out.push(LangCensus {
+            key: "other".to_string(),
+            label: "Other".to_string(),
+            files: other,
+            supported: false,
+            enabled: false,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        census_rank(a)
+            .cmp(&census_rank(b))
+            .then_with(|| b.files.cmp(&a.files))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    out
 }
 
 /// Project-relative path with forward slashes, matching what the parser stores
@@ -1001,6 +1128,49 @@ mod tests {
         assert!(idx.find_symbol("gamma").unwrap().is_empty());
 
         drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The language census sees every language on disk (not just indexed ones)
+    /// and classifies each: a supported+allowlisted lang is green (enabled), a
+    /// supported-but-not-allowlisted lang is yellow, a known-but-unsupported
+    /// programming language is a named red chip, and anything else folds into
+    /// the single "other" bucket.
+    #[test]
+    fn language_census_classifies_green_yellow_red_and_other() {
+        let dir = std::env::temp_dir().join(format!("ckg-census-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap(); // rust → green
+        std::fs::write(dir.join("page.html"), "<h1>hi</h1>\n").unwrap(); // html → yellow (off by default)
+        std::fs::write(dir.join("main.zig"), "pub fn main() void {}\n").unwrap(); // zig → red (named)
+        std::fs::write(dir.join("data.bin"), "\0\0\0").unwrap(); // unknown → other
+        std::fs::write(dir.join("notes.unknownext"), "x\n").unwrap(); // unknown → other
+
+        let snap = GraphSettings::default(); // rust on, html off
+        let census = language_census(&dir, &snap, ".ckg-test");
+
+        let get = |key: &str| census.iter().find(|e| e.key == key).cloned();
+
+        let rust = get("rust").expect("rust present");
+        assert!(rust.supported && rust.enabled, "rust green: {rust:?}");
+        assert_eq!(rust.files, 1);
+        assert_eq!(rust.label, "Rust");
+
+        let html = get("html").expect("html present");
+        assert!(html.supported && !html.enabled, "html yellow: {html:?}");
+
+        let zig = get("zig").expect("zig present");
+        assert!(!zig.supported && !zig.enabled, "zig red: {zig:?}");
+        assert_eq!(zig.label, "Zig");
+
+        let other = get("other").expect("other bucket present");
+        assert!(!other.supported, "other red: {other:?}");
+        assert_eq!(other.files, 2, "bin + unknownext fold into other");
+
+        // Green sorts ahead of the "other" bucket, which is always last.
+        assert_eq!(census.first().map(|e| e.key.as_str()), Some("rust"));
+        assert_eq!(census.last().map(|e| e.key.as_str()), Some("other"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -109,7 +109,7 @@ export function graphTestEmbedder(): Promise<EmbedderProbe> {
 /// One recorded graph tool call. Mirror of Rust `graph::GraphCall`.
 export interface GraphCall {
   ts_ms: number;
-  source: 'claude' | 'offload';
+  source: 'claude' | 'opencode' | 'offload';
   tool: string;
   target: string;
   chars: number;

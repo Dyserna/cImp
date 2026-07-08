@@ -1002,6 +1002,9 @@
   .hsrc.claude {
     color: #58a6ff;
   }
+  .hsrc.opencode {
+    color: #d2a8ff;
+  }
   .hsrc.offload {
     color: #3fb950;
   }

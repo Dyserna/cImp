@@ -190,13 +190,14 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if name.starts_with("graph_") {
-                // Warm path: let the app's single index serve it (no second
-                // cross-process DB open; lets the app record it for the monitor).
+            if name.starts_with("graph_") || name.starts_with("context_") {
+                // Graph + session-memory tools. Warm path: let the app's single
+                // index serve it (no second cross-process DB open; lets the app
+                // record it for the monitor and scope memory to this consumer).
                 // Fall back to a direct read-only open when the app isn't up.
                 match proxy_graph(&params).await {
                     Some(r) => r,
-                    None => crate::graph::handle_mcp_call(&params).await,
+                    None => crate::graph::handle_mcp_call(&params, consumer()).await,
                 }
             } else if name == "offload_batch" {
                 handle_batch_tool(params).await
@@ -723,7 +724,7 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
         .timeout(Duration::from_secs(30))
         .build()
         .ok()?;
-    let body = json!({ "cwd": cwd, "name": name, "args": args });
+    let body = json!({ "cwd": cwd, "name": name, "args": args, "consumer": consumer() });
     let resp = client
         .post(format!("{base}/graph_run"))
         .bearer_auth(&token)

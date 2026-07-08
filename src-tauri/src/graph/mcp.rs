@@ -189,10 +189,33 @@ pub fn tools() -> Vec<Value> {
         .collect()
 }
 
-/// Dispatch a `graph_*` MCP tool call. Returns a JSON-RPC `tools/call` result;
-/// a missing index or bad args come back as a (non-protocol) tool error so Opus
-/// can read and adapt. Unknown tool names are a protocol error.
-pub async fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
+/// The activity/memory **source** string for a consumer name — the value
+/// carried through the activity ring and used to scope the `context_*` memory
+/// tools to the calling agent. `"opencode"` stays itself; anything else
+/// (Claude, or unset) is `"claude"`.
+pub fn source_for_consumer(consumer: &str) -> &'static str {
+    if consumer.eq_ignore_ascii_case("opencode") {
+        "opencode"
+    } else {
+        "claude"
+    }
+}
+
+/// Map an activity source to the memory agent the `context_*` tools scope to:
+/// a tab agent (`claude`/`opencode`) filters to its own sessions; the offload
+/// worker (`offload`) has no tab session, so it reads the project-wide latest.
+fn mem_agent(source: &str) -> Option<&str> {
+    match source {
+        "offload" => None,
+        other => Some(other),
+    }
+}
+
+/// Dispatch a `graph_*` / `context_*` MCP tool call for the given `consumer`
+/// (`"claude"` / `"opencode"`). Returns a JSON-RPC `tools/call` result; a
+/// missing index or bad args come back as a (non-protocol) tool error so the
+/// agent can read and adapt. Unknown tool names are a protocol error.
+pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
@@ -205,7 +228,8 @@ pub async fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
         Err(msg) => return Ok(tool_error(&msg)),
     };
 
-    let result = dispatch_recorded(&root, &idx, &settings, "claude", name, &args).await;
+    let source = source_for_consumer(consumer);
+    let result = dispatch_recorded(&root, &idx, &settings, source, name, &args).await;
 
     match result {
         Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
@@ -214,11 +238,12 @@ pub async fn handle_call(params: &Value) -> Result<Value, (i64, String)> {
     }
 }
 
-/// Execute one resolved `graph_*` tool against an open index — dispatching to
-/// the semantic / structural / plain path — and record it in the activity ring
-/// for the monitor tab. `source` is `"claude"` (cloud) or `"offload"` (local
-/// worker). Shared by the cloud (warm + fallback) and worker paths so each call
-/// is captured exactly once.
+/// Execute one resolved `graph_*` / `context_*` tool against an open index —
+/// dispatching to the semantic / structural / plain path — and record it in the
+/// activity ring for the monitor tab. `source` is `"claude"` / `"opencode"`
+/// (a tab agent) or `"offload"` (the local worker); it drives both the ring's
+/// source badge and the `context_*` tools' per-agent session scoping. Shared by
+/// the cloud (warm + fallback) and worker paths so each call is captured once.
 pub(crate) async fn dispatch_recorded(
     root: &Path,
     idx: &GraphIndex,
@@ -235,7 +260,7 @@ pub(crate) async fn dispatch_recorded(
     } else if name == "graph_struct_search" {
         run_struct_search(root, idx, args, max_rows, max_snippet)
     } else {
-        run_tool(idx, name, args, max_rows, max_snippet)
+        run_tool(idx, name, args, max_rows, max_snippet, mem_agent(source))
     };
     super::activity::record(super::activity::GraphCall {
         ts_ms: started,
@@ -270,6 +295,10 @@ pub fn run_tool(
     args: &Value,
     max_rows: usize,
     max_snippet: usize,
+    // The calling agent for the `context_*` memory tools, so they scope to the
+    // caller's own session (`Some("claude")`/`Some("opencode")`), or `None` for
+    // the project-wide most-recent session (the offload worker's sub-tasks).
+    agent: Option<&str>,
 ) -> Result<String, String> {
     let arg = |key: &str| -> String {
         args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
@@ -344,7 +373,7 @@ pub fn run_tool(
             .map(|v| fmt_cycles(&v, max_rows))
             .map_err(|e| e.to_string()),
         "context_recall" => {
-            let Some(sid) = idx.mem_current_session().map_err(|e| e.to_string())? else {
+            let Some(sid) = idx.mem_current_session_for(agent).map_err(|e| e.to_string())? else {
                 return Ok("No session activity recorded yet.".to_string());
             };
             idx.mem_working_set(&sid, max_rows)
@@ -352,7 +381,7 @@ pub fn run_tool(
                 .map_err(|e| e.to_string())
         }
         "context_notes" => {
-            let sid = idx.mem_current_session().map_err(|e| e.to_string())?.unwrap_or_default();
+            let sid = idx.mem_current_session_for(agent).map_err(|e| e.to_string())?.unwrap_or_default();
             idx.mem_notes(&sid)
                 .map(|v| fmt_notes(&v, max_rows))
                 .map_err(|e| e.to_string())
@@ -360,7 +389,7 @@ pub fn run_tool(
         "context_note" => {
             let text = req("text")?;
             let pin = args.get("pin").and_then(|v| v.as_bool()).unwrap_or(false);
-            let sid = idx.mem_current_session().map_err(|e| e.to_string())?.unwrap_or_default();
+            let sid = idx.mem_current_session_for(agent).map_err(|e| e.to_string())?.unwrap_or_default();
             let note_id = uuid::Uuid::new_v4().to_string();
             let ts = super::activity::now_ms() as i64;
             idx.mem_add_note(&note_id, &sid, &text, ts, pin)

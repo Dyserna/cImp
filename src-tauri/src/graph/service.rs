@@ -285,13 +285,17 @@ impl GraphService {
         cwd: &Path,
         name: &str,
         args: &serde_json::Value,
+        consumer: &str,
     ) -> Result<String, String> {
         let settings = self.settings.current();
         let sub = settings.graph.effective_db_subdir();
         let root = super::mcp::find_graph_root(cwd, &sub)
             .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
         let idx = self.index_for(&root).map_err(|e| e.to_string())?;
-        super::mcp::dispatch_recorded(&root, &idx, &settings, "claude", name, args).await
+        // The consumer selects the activity source + the memory tools' agent
+        // scope, so an OpenCode tab's graph/context calls don't read as Claude's.
+        let source = super::mcp::source_for_consumer(consumer);
+        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args).await
     }
 
     /// The configured per-project db subdirectory (default `.cimp`).

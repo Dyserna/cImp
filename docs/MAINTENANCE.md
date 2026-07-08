@@ -467,6 +467,44 @@ session id = the `<id>.jsonl` stem), wired through `OobContext.mem` from
 comes from the injection plugin's `tool.execute.after` hook POSTing to
 `/memory/event`. `graph::classify_tool` maps tool names → `(kind, arg)` for both.
 
+**Memory-tool session scoping — per-agent (partial), pending a Claude Code
+feature.** The `context_recall` / `context_note` / `context_notes` MCP tools have
+no session argument (Claude Code does not pass session identity into an MCP
+server's tool-call context — see below), so they resolve a session from
+`graph.db` by recency. To keep a **Claude** tab and an **OpenCode** tab on the
+same project from reading/writing each other's session, the resolution is scoped
+to the *calling agent*: the MCP child's `--consumer` (claude/opencode) flows
+`offload/mcp.rs::proxy_graph` → `/graph_run` (`GraphRunBody.consumer`) →
+`run_graph_tool` → `dispatch_recorded` `source` → `mem_agent(source)` →
+`GraphIndex::mem_current_session_for(Some(agent))` (and the app-down fallback
+`handle_call(params, consumer)` does the same). `source` is also the activity
+ring's badge, so OpenCode's graph/context calls now read as `opencode`, not
+`claude` (frontend `GraphCall.source` union + `.hsrc.opencode`).
+
+*Residual limitation (periodically re-check):* two tabs of the **same** agent
+(e.g. two Claude tabs) on one project still share the same agent scope, so a
+`context_note` from one can attach to the other's session, and `context_recall`
+can return the other's working set. Full per-tab isolation needs a session
+identifier available *inside the MCP tool call* so the tool knows which of
+several same-agent sessions is calling.
+
+- **What's missing:** Claude Code exposes a session id to **hooks** (the
+  `UserPromptSubmit` payload carries `session_id` — that's how the transcript tap
+  and `cimp --context-hook` get it) but **not** to the MCP servers it launches:
+  the `cimp --offload-mcp` child is spawned per Claude session yet receives no
+  session UUID (no arg, no env var, and no field on the JSON-RPC `tools/call`
+  params). So the child literally cannot tell which session is invoking a tool.
+- **What to watch for** (any of these closes the gap): a session id / session
+  metadata field on the MCP `tools/call` request; a per-session env var set on
+  the MCP server process at spawn (like the hook `session_id`); or an MCP
+  "elicitation"/context mechanism that carries session identity. Check the MCP
+  server docs + the Claude Code hooks/MCP release notes.
+- **When it lands:** thread that id into `dispatch_recorded` alongside `source`,
+  add `mem_event`/`session` writes keyed by it, and switch the tools from
+  `mem_current_session_for(agent)` to an exact session lookup. The recording side
+  already stores a real per-session id (`session.session_id`), so only the read
+  path's "which session am I" resolution needs to change.
+
 **Context injection** (opt-in, `graph.context_injection`). `graph/context.rs`
 ranks files (symbol/reference/doc hits + session working set) and budget-packs
 outline digests — synchronous, no per-prompt embedding. Claude injects via a

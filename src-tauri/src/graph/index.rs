@@ -1164,14 +1164,32 @@ impl GraphIndex {
         })
     }
 
-    /// The session with the most recent activity (what `context_recall` scopes
-    /// to), or `None` when the project has no memory yet.
+    /// The session with the most recent activity (across all agents), or `None`.
     pub fn mem_current_session(&self) -> AppResult<Option<String>> {
-        let rows = self.run(
-            "?[session_id, last_ms] := *session{session_id, last_ms}\n:order -last_ms\n:limit 1",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        self.mem_current_session_for(None)
+    }
+
+    /// The most-recently-active session id, optionally filtered to one `agent`
+    /// (`"claude"` / `"opencode"`). Filtering lets the memory tools scope to the
+    /// **calling** agent so a Claude tab and an OpenCode tab on the same project
+    /// don't read or write each other's session. `None` = across all agents.
+    pub fn mem_current_session_for(&self, agent: Option<&str>) -> AppResult<Option<String>> {
+        let rows = match agent {
+            Some(a) => {
+                let mut p = BTreeMap::new();
+                p.insert("agent".to_string(), DataValue::Str(a.into()));
+                self.run(
+                    "?[session_id, last_ms] := *session{session_id, agent, last_ms}, agent == $agent\n:order -last_ms\n:limit 1",
+                    p,
+                    ScriptMutability::Immutable,
+                )?
+            }
+            None => self.run(
+                "?[session_id, last_ms] := *session{session_id, last_ms}\n:order -last_ms\n:limit 1",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )?,
+        };
         Ok(rows.rows.first().map(|r| cell_str(r, 0)))
     }
 
@@ -2173,6 +2191,28 @@ pub struct Point { x: i32 }
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].session_id, "s2"); // newest first
         assert!(sessions.iter().find(|s| s.session_id == "s1").unwrap().events >= 3);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_current_session_scopes_by_agent() {
+        let dir = std::env::temp_dir().join(format!("ckg-agent-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // A Claude session (older) and an OpenCode session (more recent) on the
+        // same project.
+        idx.record_mem_event("c1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("o1", "opencode", "read", "b.rs", None, None, 200, None).unwrap();
+
+        // Unscoped picks the globally most recent (OpenCode's).
+        assert_eq!(idx.mem_current_session().unwrap().as_deref(), Some("o1"));
+        // Agent-scoped resolves each agent's own session — no cross-talk, even
+        // though the OpenCode session is newer.
+        assert_eq!(idx.mem_current_session_for(Some("claude")).unwrap().as_deref(), Some("c1"));
+        assert_eq!(idx.mem_current_session_for(Some("opencode")).unwrap().as_deref(), Some("o1"));
+        // An agent with no sessions yet resolves to None.
+        assert_eq!(idx.mem_current_session_for(Some("nobody")).unwrap(), None);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

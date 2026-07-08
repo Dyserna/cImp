@@ -499,11 +499,16 @@ struct GraphRunBody {
     /// from it (same ancestor-walk the MCP child uses).
     #[serde(default)]
     cwd: Option<String>,
-    /// The `graph_*` tool name.
+    /// The `graph_*` / `context_*` tool name.
     name: String,
     /// The tool arguments.
     #[serde(default)]
     args: Value,
+    /// The requesting consumer (`"claude"` / `"opencode"`); selects the activity
+    /// source and the `context_*` tools' per-agent session scope. Defaults to
+    /// Claude when absent.
+    #[serde(default)]
+    consumer: Option<String>,
 }
 
 /// A `POST /mcp/call` request body (a Claude-exposed MCP tool invocation).
@@ -551,7 +556,8 @@ async fn handle_graph_run(
         .cwd
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let r = match graph.run_graph_tool(&cwd, &body.name, &body.args).await {
+    let consumer = body.consumer.as_deref().unwrap_or("claude");
+    let r = match graph.run_graph_tool(&cwd, &body.name, &body.args, consumer).await {
         Ok(text) => RunResult {
             ok: true,
             text: Some(text),

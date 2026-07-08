@@ -23,10 +23,12 @@
 //! starts when the AI tab spawns and stops when the tab's process exits.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::graph::GraphService;
 use crate::settings::{SettingsHandle, TabConfig};
 use crate::state::{StateSignal, TabId};
 use crate::tts::TtsRequest;
@@ -56,6 +58,10 @@ pub struct OobContext {
     pub state_signals: tokio::sync::mpsc::Sender<StateSignal>,
     pub settings: SettingsHandle,
     pub cancel: CancellationToken,
+    /// V10: the warm graph service, so the Claude transcript tap can record
+    /// session/action memory in-process. `None` when the graph feature isn't
+    /// wired (tests, or a build without a GraphService in managed state).
+    pub mem: Option<Arc<GraphService>>,
 }
 
 /// Spawn the adapter described by `spec`, tied to `ctx.cancel`. Non-blocking:
@@ -124,5 +130,26 @@ impl OobContext {
     /// edge-triggered and best-effort, matching the PTY processor's `try_send`).
     pub fn signal(&self, sig: StateSignal) {
         let _ = self.state_signals.try_send(sig);
+    }
+
+    /// V10: record one session/action memory event via the graph service. A
+    /// no-op when memory isn't wired (`mem` is `None`) or the graph is disabled
+    /// (the service gates internally). Best-effort — never blocks or errors the
+    /// tap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mem(
+        &self,
+        root: &std::path::Path,
+        session_id: &str,
+        agent: &str,
+        kind: &str,
+        path: &str,
+        symbol: Option<&str>,
+        line: Option<u32>,
+        detail: Option<&str>,
+    ) {
+        if let Some(mem) = self.mem.as_ref() {
+            mem.record_mem_event(root, session_id, agent, kind, path, symbol, line, detail);
+        }
     }
 }

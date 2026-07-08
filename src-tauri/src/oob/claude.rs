@@ -88,7 +88,16 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
         }
 
         if let Some(path) = cur.clone() {
-            offset = drain_new_lines(&path, offset, &mut seen, &mut agents, &ctx).await;
+            // The transcript filename stem is the Claude session id — the memory
+            // scope key. `<id>.jsonl` → `<id>`.
+            let session_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            offset =
+                drain_new_lines(&path, offset, &mut seen, &mut agents, &project_dir, &session_id, &ctx)
+                    .await;
         }
 
         tokio::select! {
@@ -100,11 +109,14 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
 
 /// Read complete new lines from `path` starting at `offset`, speaking assistant
 /// text, and return the new offset (advanced only past whole lines).
+#[allow(clippy::too_many_arguments)]
 async fn drain_new_lines(
     path: &Path,
     mut offset: u64,
     seen: &mut HashSet<String>,
     agents: &mut HashSet<String>,
+    project_dir: &Path,
+    session_id: &str,
     ctx: &OobContext,
 ) -> u64 {
     use std::io::{Read, Seek, SeekFrom};
@@ -141,6 +153,7 @@ async fn drain_new_lines(
         }
         if let Ok(obj) = serde_json::from_str::<Value>(line) {
             update_agents(&obj, agents, ctx);
+            record_tool_events(&obj, project_dir, session_id, ctx);
             for (key, text) in assistant_texts(&obj) {
                 if seen.insert(key) {
                     trace!(tab = ?ctx.tab, "Claude OOB: speaking assistant block");
@@ -275,6 +288,52 @@ fn update_agents(obj: &Value, agents: &mut HashSet<String>, ctx: &OobContext) {
     }
 }
 
+/// V10: record file/query memory events from an assistant line's `tool_use`
+/// blocks. Maps Claude's tool names → a memory `kind` + target
+/// ([`crate::graph::classify_tool`]); tools not in that map (Task, TodoWrite,
+/// our own `mcp__cimp-offload__*`) are ignored. Sidechain (sub-agent) lines are
+/// skipped so an agent's internal reads don't pollute the parent session. A
+/// no-op when memory isn't wired.
+fn record_tool_events(obj: &Value, project_dir: &Path, session_id: &str, ctx: &OobContext) {
+    if ctx.mem.is_none() {
+        return;
+    }
+    if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+    if obj.get("type").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    let Some(parts) = message_parts(obj) else { return };
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let Some(name) = part.get("name").and_then(Value::as_str) else { continue };
+        let Some((kind, arg)) = crate::graph::classify_tool(name) else { continue };
+        let input = part.get("input");
+        let get = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
+        let (path, detail) = match arg {
+            crate::graph::MemArg::Path => (get("file_path").unwrap_or("").to_string(), None),
+            crate::graph::MemArg::Pattern => (
+                get("pattern").or_else(|| get("path")).unwrap_or("").to_string(),
+                None,
+            ),
+            crate::graph::MemArg::Command => (
+                String::new(),
+                get("command").map(|c| c.chars().take(200).collect::<String>()),
+            ),
+        };
+        // A read/edit/grep with no target carries nothing worth recording.
+        if matches!(arg, crate::graph::MemArg::Path | crate::graph::MemArg::Pattern)
+            && path.is_empty()
+        {
+            continue;
+        }
+        ctx.record_mem(project_dir, session_id, "claude", kind, &path, None, None, detail.as_deref());
+    }
+}
+
 /// `~/.claude/projects/<slug>/` for `project_dir`. `None` if no home dir.
 fn project_root(project_dir: &Path) -> Option<PathBuf> {
     let home = home_dir()?;
@@ -379,6 +438,7 @@ mod tests {
             state_signals: sig_tx,
             settings,
             cancel: CancellationToken::new(),
+            mem: None,
         };
         (ctx, sig_rx)
     }

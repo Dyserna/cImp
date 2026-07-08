@@ -31,6 +31,7 @@ use crate::settings::{GraphSettings, SettingsHandle};
 
 use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
+use super::memory::{MemNote, MemorySnapshot, WorkingSetEntry};
 use super::model::Lang;
 use super::parse_file;
 
@@ -355,6 +356,124 @@ impl GraphService {
     pub fn import_cycles(&self, root: &Path) -> AppResult<Vec<Vec<String>>> {
         let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
         self.index_for(root)?.import_cycles(max)
+    }
+
+    // ── V10 session / action memory ──────────────────────────────────────
+
+    /// Record one memory event for `root`'s current-project graph. A no-op when
+    /// the graph is disabled. Best-effort — a store error is logged, never
+    /// propagated (memory must never break the agent's turn). Called in-process
+    /// from the Claude transcript tap and via the `/memory/event` loopback route.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mem_event(
+        &self,
+        root: &Path,
+        session_id: &str,
+        agent: &str,
+        kind: &str,
+        path: &str,
+        symbol: Option<&str>,
+        line: Option<u32>,
+        detail: Option<&str>,
+    ) {
+        if !self.settings.current().graph.enabled {
+            return;
+        }
+        // Store paths project-relative with `/` separators so memory paths match
+        // the graph's stored file paths (agents send absolute or `\`-separated
+        // paths). A pattern/command that isn't under root passes through.
+        let rel = relativize_path(root, path);
+        let ts = super::activity::now_ms() as i64;
+        match self.index_for(root) {
+            Ok(idx) => {
+                if let Err(e) =
+                    idx.record_mem_event(session_id, agent, kind, &rel, symbol, line, ts, detail)
+                {
+                    debug!(error = %e, "graph: record_mem_event failed");
+                }
+            }
+            Err(e) => debug!(error = %e, "graph: record_mem_event open failed"),
+        }
+    }
+
+    /// The current (most-recently-active) session id for `root`, or `None`.
+    pub fn current_session(&self, root: &Path) -> Option<String> {
+        self.index_for(root).ok().and_then(|idx| idx.mem_current_session().ok().flatten())
+    }
+
+    /// Ranked working set for a session (default: the current session).
+    pub fn mem_working_set(
+        &self,
+        root: &Path,
+        session_id: Option<&str>,
+        max: usize,
+    ) -> Vec<WorkingSetEntry> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        let sid = match session_id {
+            Some(s) => s.to_string(),
+            None => match idx.mem_current_session().ok().flatten() {
+                Some(s) => s,
+                None => return Vec::new(),
+            },
+        };
+        idx.mem_working_set(&sid, max).unwrap_or_default()
+    }
+
+    /// Record a note; returns its generated id.
+    pub fn mem_add_note(
+        &self,
+        root: &Path,
+        session_id: &str,
+        text: &str,
+        pin: bool,
+    ) -> AppResult<String> {
+        let idx = self.index_for(root)?;
+        let note_id = uuid::Uuid::new_v4().to_string();
+        let ts = super::activity::now_ms() as i64;
+        idx.mem_add_note(&note_id, session_id, text, ts, pin)?;
+        Ok(note_id)
+    }
+
+    /// Pin/unpin a note.
+    pub fn mem_set_note_pinned(&self, root: &Path, note_id: &str, pin: bool) -> AppResult<()> {
+        self.index_for(root)?.mem_set_note_pinned(note_id, pin)
+    }
+
+    /// A session's notes plus every pinned note (default: the current session).
+    pub fn mem_notes(&self, root: &Path, session_id: Option<&str>) -> Vec<MemNote> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        let sid = match session_id {
+            Some(s) => s.to_string(),
+            // No explicit session → use current, or "" (pinned notes still match).
+            None => idx.mem_current_session().ok().flatten().unwrap_or_default(),
+        };
+        idx.mem_notes(&sid).unwrap_or_default()
+    }
+
+    /// The full memory readout for `root` (drives the Memory UI section).
+    pub fn memory_snapshot(&self, root: &Path) -> MemorySnapshot {
+        let Ok(idx) = self.index_for(root) else {
+            return MemorySnapshot {
+                current_session: None,
+                working_set: Vec::new(),
+                notes: Vec::new(),
+                sessions: Vec::new(),
+            };
+        };
+        let current = idx.mem_current_session().ok().flatten();
+        let working_set = current
+            .as_deref()
+            .map(|s| idx.mem_working_set(s, 50).unwrap_or_default())
+            .unwrap_or_default();
+        // With a current session, notes = its notes + pinned; without, just pinned.
+        let notes = idx.mem_notes(current.as_deref().unwrap_or("")).unwrap_or_default();
+        let sessions = idx.mem_sessions().unwrap_or_default();
+        MemorySnapshot { current_session: current, working_set, notes, sessions }
+    }
+
+    /// Clear one session's memory (`Some`) or the whole project's (`None`).
+    pub fn mem_clear(&self, root: &Path, session_id: Option<&str>) -> AppResult<()> {
+        self.index_for(root)?.mem_clear(session_id)
     }
 
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns
@@ -815,6 +934,18 @@ impl GraphService {
         self.watchers.lock().unwrap().clear();
         self.indices.lock().unwrap().clear();
     }
+}
+
+/// Make `path` project-relative to `root` with `/` separators when it lives
+/// under `root`; otherwise return it with separators normalized. Empty in →
+/// empty out. Keeps memory paths aligned with the graph's stored file paths.
+fn relativize_path(root: &Path, path: &str) -> String {
+    if path.trim().is_empty() {
+        return String::new();
+    }
+    let p = Path::new(path);
+    let rel = p.strip_prefix(root).unwrap_or(p);
+    rel.to_string_lossy().replace('\\', "/")
 }
 
 /// Reset `idx` and re-index every supported file under `root`, honoring

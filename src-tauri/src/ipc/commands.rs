@@ -1032,6 +1032,53 @@ pub async fn graph_cycles(
     service.import_cycles(&root)
 }
 
+/// V10 (Memory): the project's session/action memory — current session, its
+/// working set, notes (pinned + current-session), and the recent-sessions list.
+/// `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_memory(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<crate::graph::MemorySnapshot> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    Ok(service.memory_snapshot(&root))
+}
+
+/// V10 (Memory): clear one session's memory (`session` = its id) or the whole
+/// project's memory (`session` omitted). `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_memory_clear(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    session: Option<String>,
+) -> AppResult<()> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    let session = session.filter(|s| !s.trim().is_empty());
+    service.mem_clear(&root, session.as_deref())
+}
+
+/// V10 (Memory): pin/unpin a note (pinned notes survive session eviction and
+/// show project-wide). `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_note_set_pinned(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    note_id: String,
+    pinned: bool,
+) -> AppResult<()> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    service.mem_set_note_pinned(&root, &note_id, pinned)
+}
+
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
 /// = file changes are ignored until resumed (a manual rebuild still works).
 #[tauri::command]

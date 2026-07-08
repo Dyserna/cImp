@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use super::index::{DocHit, GraphIndex, RefHit, SymbolHit};
+use super::memory::{MemNote, WorkingSetEntry};
 
 /// One graph tool's identity, description, and JSON-Schema parameters — the
 /// shared definition both surfaces render into their own shape.
@@ -135,6 +136,33 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
                 modules that don't resolve to an indexed file are ignored. Takes no arguments.",
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
         },
+        GraphToolSpec {
+            name: "context_recall",
+            description: "Recall what THIS session has been working on — the ranked working set of \
+                files it read/edited/queried, with the symbols touched. Use at the start of a \
+                follow-up task to reload your working context. Takes no arguments.",
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        GraphToolSpec {
+            name: "context_note",
+            description: "Remember a non-obvious decision or fact for this project's session memory \
+                (e.g. 'we chose FNV hashing because …'). Set pin=true to keep it project-wide across \
+                sessions.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The decision/fact to remember." },
+                    "pin": { "type": "boolean", "description": "Keep across sessions (project-wide). Default false." }
+                },
+                "required": ["text"]
+            }),
+        },
+        GraphToolSpec {
+            name: "context_notes",
+            description: "List this session's remembered notes plus every pinned note for the \
+                project (pinned first, newest first). Takes no arguments.",
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
     ]
 }
 
@@ -227,6 +255,7 @@ fn arg_summary(name: &str, args: &Value) -> String {
     let key = match name {
         "graph_imports" | "graph_outline" => "file",
         "graph_search_docs" | "graph_semantic_docs" | "graph_struct_search" => "query",
+        "context_note" => "text",
         _ => "name",
     };
     args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
@@ -314,6 +343,30 @@ pub fn run_tool(
             .import_cycles(max_rows)
             .map(|v| fmt_cycles(&v, max_rows))
             .map_err(|e| e.to_string()),
+        "context_recall" => {
+            let Some(sid) = idx.mem_current_session().map_err(|e| e.to_string())? else {
+                return Ok("No session activity recorded yet.".to_string());
+            };
+            idx.mem_working_set(&sid, max_rows)
+                .map(|v| fmt_working_set(&v, max_rows))
+                .map_err(|e| e.to_string())
+        }
+        "context_notes" => {
+            let sid = idx.mem_current_session().map_err(|e| e.to_string())?.unwrap_or_default();
+            idx.mem_notes(&sid)
+                .map(|v| fmt_notes(&v, max_rows))
+                .map_err(|e| e.to_string())
+        }
+        "context_note" => {
+            let text = req("text")?;
+            let pin = args.get("pin").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sid = idx.mem_current_session().map_err(|e| e.to_string())?.unwrap_or_default();
+            let note_id = uuid::Uuid::new_v4().to_string();
+            let ts = super::activity::now_ms() as i64;
+            idx.mem_add_note(&note_id, &sid, &text, ts, pin)
+                .map(|_| format!("Noted{}.", if pin { " (pinned, kept across sessions)" } else { "" }))
+                .map_err(|e| e.to_string())
+        }
         // Sync path / no-embedder fallback for semantic search: degrade to
         // labelled full-text. The embedder-backed ranking is applied in the
         // async wrappers ([`handle_call`] / [`offload_query`]).
@@ -476,6 +529,43 @@ fn fmt_cycles(cycles: &[Vec<String>], max_rows: usize) -> String {
         .collect();
     if cycles.len() > max_rows {
         lines.push(format!("… (+{} more)", cycles.len() - max_rows));
+    }
+    lines.join("\n")
+}
+
+fn fmt_working_set(ws: &[WorkingSetEntry], max_rows: usize) -> String {
+    if ws.is_empty() {
+        return "No files touched in this session yet.".to_string();
+    }
+    let mut lines: Vec<String> = ws
+        .iter()
+        .take(max_rows)
+        .map(|e| {
+            let syms = if e.top_symbols.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", e.top_symbols.join(", "))
+            };
+            format!("{} — {}× (last {}){}", e.path, e.touches, e.last_kind, syms)
+        })
+        .collect();
+    if ws.len() > max_rows {
+        lines.push(format!("… (+{} more)", ws.len() - max_rows));
+    }
+    format!("Current session working set (most active first):\n{}", lines.join("\n"))
+}
+
+fn fmt_notes(notes: &[MemNote], max_rows: usize) -> String {
+    if notes.is_empty() {
+        return "No notes recorded for this session.".to_string();
+    }
+    let mut lines: Vec<String> = notes
+        .iter()
+        .take(max_rows)
+        .map(|n| format!("{}{}", if n.pinned { "📌 " } else { "• " }, n.text))
+        .collect();
+    if notes.len() > max_rows {
+        lines.push(format!("… (+{} more)", notes.len() - max_rows));
     }
     lines.join("\n")
 }

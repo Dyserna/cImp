@@ -23,6 +23,7 @@ mod builder;
 mod embed;
 mod index;
 mod mcp;
+mod memory;
 mod model;
 mod schema;
 mod service;
@@ -32,6 +33,7 @@ mod watcher;
 pub use activity::{snapshot as graph_history, GraphCall};
 pub use builder::parse_file;
 pub use index::{GraphIndex, GraphStats, SymbolHit};
+pub use memory::{classify_tool, MemArg, MemNote, MemorySnapshot, SessionInfo, WorkingSetEntry};
 pub use mcp::{
     handle_call as handle_mcp_call, offload_query, semantic_spec, tool_specs, tools as mcp_tools,
     GraphToolSpec,

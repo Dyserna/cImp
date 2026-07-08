@@ -6,13 +6,16 @@
 //! The query API broadens in Phase B; this stage proves the round trip
 //! (parse → store → `find_symbol`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use cozo::{DataValue, DbInstance, MultiTransaction, Num, ScriptMutability};
 
 use crate::error::{AppError, AppResult};
 
+use super::memory::{
+    MemNote, SessionInfo, WorkingSetEntry, MAX_EVENTS_PER_SESSION, MAX_SESSIONS_PER_ROOT,
+};
 use super::model::{FileGraph, Lang};
 use super::schema::{GRAPH_SCHEMA_VERSION, RELATIONS};
 
@@ -81,6 +84,7 @@ impl GraphIndex {
         let index = GraphIndex { db };
         index.ensure_schema()?;
         index.migrate_schema()?;
+        index.ensure_memory_relations()?;
         Ok(index)
     }
 
@@ -945,6 +949,390 @@ reach[x, y] := reach[x, z], calls[z, y]
     }
 }
 
+// ── V10 session / action memory ──────────────────────────────────────────
+//
+// Stored in the same `graph.db` but in relations ensured OUTSIDE `RELATIONS`,
+// so a full index `reset()` (rebuild) never wipes memory. Memory is runtime
+// event data, not derived from source.
+impl GraphIndex {
+    /// Ensure the memory relations exist. Idempotent; called at every open.
+    pub fn ensure_memory_relations(&self) -> AppResult<()> {
+        let existing = self.existing_relations()?;
+        let defs: &[(&str, &str)] = &[
+            (
+                "session",
+                ":create session {session_id: String => agent: String, started_ms: Int, last_ms: Int}",
+            ),
+            (
+                "mem_event",
+                ":create mem_event {session_id: String, seq: Int => \
+                    kind: String, path: String, symbol: String?, line: Int?, ts_ms: Int, detail: String?}",
+            ),
+            (
+                "mem_note",
+                ":create mem_note {note_id: String => session_id: String, text: String, ts_ms: Int, pinned: Bool}",
+            ),
+        ];
+        for (name, create) in defs {
+            if !existing.contains(*name) {
+                self.run_mut(create, BTreeMap::new())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Append one memory event for `session_id`, upserting the session's
+    /// last-seen time and pruning old events / evicting old sessions — all in a
+    /// single write transaction so the monotonic `seq` allocation is race-free.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mem_event(
+        &self,
+        session_id: &str,
+        agent: &str,
+        kind: &str,
+        path: &str,
+        symbol: Option<&str>,
+        line: Option<u32>,
+        ts_ms: i64,
+        detail: Option<&str>,
+    ) -> AppResult<()> {
+        let sid = session_id.to_string();
+        let agent = agent.to_string();
+        let kind = kind.to_string();
+        let path = path.to_string();
+        let symbol = symbol.map(|s| s.to_string());
+        let detail = detail.map(|s| s.to_string());
+        self.with_write_txn(move |tx| {
+            let mut p = BTreeMap::new();
+            p.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
+
+            // Next per-session seq — monotonic even after a prune: max(seq)+1.
+            // Aggregations must live in the rule head in CozoScript.
+            let rows = tx_run(
+                tx,
+                "?[count(seq), max(seq)] := *mem_event{session_id, seq}, session_id == $sid",
+                p.clone(),
+            )?;
+            let (cnt, mx) = rows
+                .rows
+                .first()
+                .map(|r| (cell_i64(r, 0), cell_i64(r, 1)))
+                .unwrap_or((0, 0));
+            let seq = if cnt == 0 { 0 } else { mx + 1 };
+
+            // Upsert the session: keep its started_ms, bump last_ms to now.
+            let existing = tx_run(
+                tx,
+                "?[started_ms] := *session{session_id, started_ms}, session_id == $sid",
+                p.clone(),
+            )?;
+            let started = existing.rows.first().map(|r| cell_i64(r, 0)).unwrap_or(ts_ms);
+            let mut ps = BTreeMap::new();
+            ps.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
+            ps.insert("agent".to_string(), DataValue::Str(agent.as_str().into()));
+            ps.insert("st".to_string(), DataValue::Num(Num::Int(started)));
+            ps.insert("last".to_string(), DataValue::Num(Num::Int(ts_ms)));
+            tx_run(
+                tx,
+                "?[session_id, agent, started_ms, last_ms] <- [[$sid, $agent, $st, $last]]\n\
+                 :put session {session_id => agent, started_ms, last_ms}",
+                ps,
+            )?;
+
+            // Insert the event.
+            let row = DataValue::List(vec![
+                DataValue::Str(sid.as_str().into()),
+                DataValue::Num(Num::Int(seq)),
+                DataValue::Str(kind.as_str().into()),
+                DataValue::Str(path.as_str().into()),
+                symbol.as_deref().map(|s| DataValue::Str(s.into())).unwrap_or(DataValue::Null),
+                line.map(|l| DataValue::Num(Num::Int(l as i64))).unwrap_or(DataValue::Null),
+                DataValue::Num(Num::Int(ts_ms)),
+                detail.as_deref().map(|s| DataValue::Str(s.into())).unwrap_or(DataValue::Null),
+            ]);
+            tx_put(
+                tx,
+                "?[session_id, seq, kind, path, symbol, line, ts_ms, detail] <- $rows\n\
+                 :put mem_event {session_id, seq => kind, path, symbol, line, ts_ms, detail}",
+                vec![row],
+            )?;
+
+            // Ring-prune this session's oldest events beyond the cap.
+            let cutoff = seq - MAX_EVENTS_PER_SESSION;
+            if cutoff >= 0 {
+                let mut pc = BTreeMap::new();
+                pc.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
+                pc.insert("cut".to_string(), DataValue::Num(Num::Int(cutoff)));
+                tx_run(
+                    tx,
+                    "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid, seq <= $cut\n:rm mem_event {session_id, seq}",
+                    pc,
+                )?;
+            }
+
+            // Evict sessions beyond the per-root cap (cascade events + unpinned
+            // notes; pinned notes survive).
+            prune_sessions_in_tx(tx)?;
+            Ok(())
+        })
+    }
+
+    /// The session with the most recent activity (what `context_recall` scopes
+    /// to), or `None` when the project has no memory yet.
+    pub fn mem_current_session(&self) -> AppResult<Option<String>> {
+        let rows = self.run(
+            "?[session_id, last_ms] := *session{session_id, last_ms}\n:order -last_ms\n:limit 1",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_str(r, 0)))
+    }
+
+    /// The ranked working set for `session_id`: files aggregated from its events,
+    /// scored `frequency × kind_weight` with recency as the tiebreak, newest and
+    /// most-edited first. Bounded to `max` entries.
+    pub fn mem_working_set(&self, session_id: &str, max: usize) -> AppResult<Vec<WorkingSetEntry>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[path, kind, symbol, ts_ms, seq] := \
+                *mem_event{session_id, seq, kind, path, symbol, ts_ms}, session_id == $sid",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+
+        struct Agg {
+            touches: u32,
+            last_kind: String,
+            last_ms: i64,
+            last_seq: i64,
+            symbols: Vec<(i64, String)>,
+        }
+        let mut map: HashMap<String, Agg> = HashMap::new();
+        for r in &rows.rows {
+            let path = cell_str(r, 0);
+            if path.is_empty() {
+                continue;
+            }
+            let kind = cell_str(r, 1);
+            let symbol = cell_str(r, 2);
+            let ts = cell_i64(r, 3);
+            let seq = cell_i64(r, 4);
+            let e = map.entry(path).or_insert(Agg {
+                touches: 0,
+                last_kind: String::new(),
+                last_ms: 0,
+                last_seq: -1,
+                symbols: Vec::new(),
+            });
+            e.touches += 1;
+            if seq > e.last_seq {
+                e.last_seq = seq;
+                e.last_kind = kind;
+                e.last_ms = ts;
+            }
+            if !symbol.is_empty() {
+                e.symbols.push((seq, symbol));
+            }
+        }
+
+        let mut entries: Vec<(f64, WorkingSetEntry)> = map
+            .into_iter()
+            .map(|(path, a)| {
+                // Distinct symbols, most recent (highest seq) first, bounded.
+                let mut syms = a.symbols;
+                syms.sort_by(|x, y| y.0.cmp(&x.0));
+                let mut seen = HashSet::new();
+                let top: Vec<String> = syms
+                    .into_iter()
+                    .filter(|(_, s)| seen.insert(s.clone()))
+                    .map(|(_, s)| s)
+                    .take(5)
+                    .collect();
+                let score = a.touches as f64 * kind_weight(&a.last_kind);
+                (
+                    score,
+                    WorkingSetEntry {
+                        path,
+                        touches: a.touches,
+                        last_kind: a.last_kind,
+                        last_ms: a.last_ms,
+                        top_symbols: top,
+                    },
+                )
+            })
+            .collect();
+        // Score desc, then recency desc as the tiebreak.
+        entries.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.1.last_ms.cmp(&a.1.last_ms))
+        });
+        Ok(entries.into_iter().take(max).map(|(_, e)| e).collect())
+    }
+
+    /// Record a note (a decision/fact) for a session.
+    pub fn mem_add_note(
+        &self,
+        note_id: &str,
+        session_id: &str,
+        text: &str,
+        ts_ms: i64,
+        pinned: bool,
+    ) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("nid".to_string(), DataValue::Str(note_id.into()));
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        p.insert("text".to_string(), DataValue::Str(text.into()));
+        p.insert("ts".to_string(), DataValue::Num(Num::Int(ts_ms)));
+        p.insert("pin".to_string(), DataValue::Bool(pinned));
+        self.run_mut(
+            "?[note_id, session_id, text, ts_ms, pinned] <- [[$nid, $sid, $text, $ts, $pin]]\n\
+             :put mem_note {note_id => session_id, text, ts_ms, pinned}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// Set/clear the pinned flag on a note.
+    pub fn mem_set_note_pinned(&self, note_id: &str, pinned: bool) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("nid".to_string(), DataValue::Str(note_id.into()));
+        p.insert("pin".to_string(), DataValue::Bool(pinned));
+        // Read-modify-write to keep the other columns intact.
+        let rows = self.run(
+            "?[session_id, text, ts_ms] := *mem_note{note_id, session_id, text, ts_ms}, note_id == $nid",
+            p.clone(),
+            ScriptMutability::Immutable,
+        )?;
+        let Some(r) = rows.rows.first() else { return Ok(()) };
+        p.insert("sid".to_string(), DataValue::Str(cell_str(r, 0).as_str().into()));
+        p.insert("text".to_string(), DataValue::Str(cell_str(r, 1).as_str().into()));
+        p.insert("ts".to_string(), DataValue::Num(Num::Int(cell_i64(r, 2))));
+        self.run_mut(
+            "?[note_id, session_id, text, ts_ms, pinned] <- [[$nid, $sid, $text, $ts, $pin]]\n\
+             :put mem_note {note_id => session_id, text, ts_ms, pinned}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// A session's notes plus every pinned note in the project, pinned first
+    /// then newest.
+    pub fn mem_notes(&self, session_id: &str) -> AppResult<Vec<MemNote>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[note_id, session_id, text, ts_ms, pinned] := \
+                *mem_note{note_id, session_id, text, ts_ms, pinned}, \
+                (session_id == $sid or pinned == true)",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut notes: Vec<MemNote> = rows
+            .rows
+            .iter()
+            .map(|r| MemNote {
+                note_id: cell_str(r, 0),
+                session_id: cell_str(r, 1),
+                text: cell_str(r, 2),
+                ts_ms: cell_i64(r, 3),
+                pinned: cell_bool(r, 4),
+            })
+            .collect();
+        notes.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.ts_ms.cmp(&a.ts_ms)));
+        Ok(notes)
+    }
+
+    /// All known sessions with their event counts, newest activity first.
+    pub fn mem_sessions(&self) -> AppResult<Vec<SessionInfo>> {
+        let srows = self.run(
+            "?[session_id, agent, started_ms, last_ms] := \
+                *session{session_id, agent, started_ms, last_ms}\n:order -last_ms",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let crows = self.run(
+            "?[session_id, count(seq)] := *mem_event{session_id, seq}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        for r in &crows.rows {
+            counts.insert(cell_str(r, 0), cell_i64(r, 1) as u32);
+        }
+        Ok(srows
+            .rows
+            .iter()
+            .map(|r| {
+                let sid = cell_str(r, 0);
+                let events = counts.get(&sid).copied().unwrap_or(0);
+                SessionInfo {
+                    session_id: sid,
+                    agent: cell_str(r, 1),
+                    started_ms: cell_i64(r, 2),
+                    last_ms: cell_i64(r, 3),
+                    events,
+                }
+            })
+            .collect())
+    }
+
+    /// Clear memory: one session (events + notes + session row) when `session_id`
+    /// is `Some`, or the whole project's memory when `None`.
+    pub fn mem_clear(&self, session_id: Option<&str>) -> AppResult<()> {
+        self.with_write_txn(|tx| {
+            match session_id {
+                Some(sid) => {
+                    let mut p = BTreeMap::new();
+                    p.insert("sid".to_string(), DataValue::Str(sid.into()));
+                    tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
+                    tx_run(tx, "?[note_id] := *mem_note{note_id, session_id}, session_id == $sid\n:rm mem_note {note_id}", p.clone())?;
+                    tx_run(tx, "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}", p)?;
+                }
+                None => {
+                    tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}\n:rm mem_event {session_id, seq}", BTreeMap::new())?;
+                    tx_run(tx, "?[note_id] := *mem_note{note_id}\n:rm mem_note {note_id}", BTreeMap::new())?;
+                    tx_run(tx, "?[session_id] := *session{session_id}\n:rm session {session_id}", BTreeMap::new())?;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Kind weight for working-set scoring: an edit outranks a query outranks a read.
+fn kind_weight(kind: &str) -> f64 {
+    match kind {
+        "edit" => 3.0,
+        "query" => 2.0,
+        _ => 1.0,
+    }
+}
+
+/// Evict sessions beyond [`MAX_SESSIONS_PER_ROOT`] (oldest `last_ms` first),
+/// cascading each evicted session's events and **unpinned** notes; its pinned
+/// notes and their rows survive project-wide.
+fn prune_sessions_in_tx(tx: &MultiTransaction) -> AppResult<()> {
+    let rows = tx_run(
+        tx,
+        "?[session_id, last_ms] := *session{session_id, last_ms}\n:order -last_ms",
+        BTreeMap::new(),
+    )?;
+    let ids: Vec<String> = rows.rows.iter().map(|r| cell_str(r, 0)).collect();
+    if ids.len() <= MAX_SESSIONS_PER_ROOT {
+        return Ok(());
+    }
+    for sid in &ids[MAX_SESSIONS_PER_ROOT..] {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
+        tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
+        tx_run(tx, "?[note_id] := *mem_note{note_id, session_id, pinned}, session_id == $sid, pinned == false\n:rm mem_note {note_id}", p.clone())?;
+        tx_run(tx, "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}", p)?;
+    }
+    Ok(())
+}
+
 /// Run one script inside a multi-transaction, mapping cozo errors to [`AppError`].
 fn tx_run(
     tx: &MultiTransaction,
@@ -1054,6 +1442,10 @@ fn cell_str(row: &[DataValue], i: usize) -> String {
 
 fn cell_i64(row: &[DataValue], i: usize) -> i64 {
     row.get(i).map(dv_i64).unwrap_or(0)
+}
+
+fn cell_bool(row: &[DataValue], i: usize) -> bool {
+    matches!(row.get(i), Some(DataValue::Bool(true)))
 }
 
 fn dv_f64(v: &DataValue) -> f64 {
@@ -1618,6 +2010,49 @@ pub struct Point { x: i32 }
         idx.index_file_graph(&parse_file("src/c.ts", "import fs from 'node:fs';\n", Lang::TypeScript))
             .expect("c");
         assert!(idx.import_cycles(50).expect("cycles2").is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_events_notes_and_ranking() {
+        let dir = std::env::temp_dir().join(format!("ckg-mem-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        // Session s1: read a.rs (t=100), then edit b.rs twice (t=200,300).
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s1", "claude", "edit", "b.rs", Some("foo"), Some(3), 200, None).unwrap();
+        idx.record_mem_event("s1", "claude", "edit", "b.rs", Some("bar"), Some(9), 300, None).unwrap();
+
+        assert_eq!(idx.mem_current_session().unwrap().as_deref(), Some("s1"));
+
+        let ws = idx.mem_working_set("s1", 10).unwrap();
+        assert_eq!(ws.len(), 2);
+        // b.rs (2 edits, weight 3) outranks a.rs (1 read, weight 1).
+        assert_eq!(ws[0].path, "b.rs");
+        assert_eq!(ws[0].touches, 2);
+        assert_eq!(ws[0].last_kind, "edit");
+        // Most-recent symbol first, deduped.
+        assert_eq!(ws[0].top_symbols, vec!["bar".to_string(), "foo".to_string()]);
+        assert_eq!(ws[1].path, "a.rs");
+
+        // A later session s2 becomes current.
+        idx.record_mem_event("s2", "opencode", "read", "c.rs", None, None, 400, None).unwrap();
+        assert_eq!(idx.mem_current_session().unwrap().as_deref(), Some("s2"));
+
+        // Notes: a pinned note is visible from any session; unpinned only its own.
+        let n1 = "note-1";
+        idx.mem_add_note(n1, "s1", "use FNV hashing", 250, true).unwrap();
+        idx.mem_add_note("note-2", "s1", "s1-only detail", 260, false).unwrap();
+        let s2_notes = idx.mem_notes("s2").unwrap();
+        assert!(s2_notes.iter().any(|n| n.note_id == n1), "pinned note crosses sessions");
+        assert!(!s2_notes.iter().any(|n| n.note_id == "note-2"), "unpinned note stays in its session");
+
+        let sessions = idx.mem_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "s2"); // newest first
+        assert!(sessions.iter().find(|s| s.session_id == "s1").unwrap().events >= 3);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

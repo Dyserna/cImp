@@ -150,3 +150,56 @@ export function graphDeadExports(root?: string): Promise<DeadExportRow[]> {
 export function graphCycles(root?: string): Promise<string[][]> {
   return invoke<string[][]>('graph_cycles', { root: root ?? null });
 }
+
+/// V10 (Memory): one file in a session's working set. Mirror of Rust
+/// `graph::memory::WorkingSetEntry`.
+export interface WorkingSetEntry {
+  path: string;
+  touches: number;
+  last_kind: string;
+  last_ms: number;
+  top_symbols: string[];
+}
+
+/// A remembered note. Mirror of Rust `graph::memory::MemNote`.
+export interface MemNote {
+  note_id: string;
+  session_id: string;
+  text: string;
+  ts_ms: number;
+  pinned: boolean;
+}
+
+/// A session summary row. Mirror of Rust `graph::memory::SessionInfo`.
+export interface SessionInfo {
+  session_id: string;
+  agent: string;
+  started_ms: number;
+  last_ms: number;
+  events: number;
+}
+
+/// The project's full memory readout. Mirror of Rust
+/// `graph::memory::MemorySnapshot`.
+export interface MemorySnapshot {
+  current_session: string | null;
+  working_set: WorkingSetEntry[];
+  notes: MemNote[];
+  sessions: SessionInfo[];
+}
+
+/// The project's session/action memory. `root` defaults to the launch directory.
+export function graphMemory(root?: string): Promise<MemorySnapshot> {
+  return invoke<MemorySnapshot>('graph_memory', { root: root ?? null });
+}
+
+/// Clear one session's memory (`session` = its id) or the whole project's
+/// (`session` omitted).
+export function graphMemoryClear(session?: string, root?: string): Promise<void> {
+  return invoke<void>('graph_memory_clear', { root: root ?? null, session: session ?? null });
+}
+
+/// Pin/unpin a note (pinned notes survive session eviction, show project-wide).
+export function graphNoteSetPinned(noteId: string, pinned: boolean, root?: string): Promise<void> {
+  return invoke<void>('graph_note_set_pinned', { root: root ?? null, noteId, pinned });
+}

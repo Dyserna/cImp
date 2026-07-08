@@ -18,12 +18,16 @@
     graphSetLanguageEnabled,
     graphDeadExports,
     graphCycles,
+    graphMemory,
+    graphMemoryClear,
+    graphNoteSetPinned,
     onGraphStatus,
     type EmbedderProbe,
     type GraphCall,
     type GraphStatus,
     type LangCensus,
     type DeadExportRow,
+    type MemorySnapshot,
   } from './graph';
   import { listenManaged } from './listenManaged';
   import ToolsReference from './ToolsReference.svelte';
@@ -75,6 +79,44 @@
     } finally {
       analysisBusy = null;
     }
+  }
+
+  // Memory (Phase C): per-project session/action memory. Fetched while the
+  // Memory section is open (via refresh()'s poll) and on demand.
+  let memory = $state<MemorySnapshot | null>(null);
+
+  async function refreshMemory(): Promise<void> {
+    try {
+      memory = await graphMemory();
+    } catch (e) {
+      console.warn('graph_memory failed', e);
+    }
+  }
+
+  async function togglePin(noteId: string, pinned: boolean): Promise<void> {
+    try {
+      await graphNoteSetPinned(noteId, pinned);
+      await refreshMemory();
+    } catch (e) {
+      console.error('graph_note_set_pinned failed', e);
+    }
+  }
+
+  async function clearMemory(session?: string): Promise<void> {
+    const msg = session
+      ? 'Clear this session’s memory?'
+      : 'Clear ALL memory for this project?';
+    if (!confirm(msg)) return;
+    try {
+      await graphMemoryClear(session);
+      await refreshMemory();
+    } catch (e) {
+      console.error('graph_memory_clear failed', e);
+    }
+  }
+
+  function fmtKind(k: string): string {
+    return k === 'edit' ? '✎ edit' : k === 'query' ? '⌕ query' : '👁 read';
   }
 
   // V10: the tab now hosts five sections. Index/Activity carry the V9 content;
@@ -190,6 +232,10 @@
     // Refresh the per-root language census only on a root's appear/build-done
     // edge (cheap on a steady poll, fresh counts right after a rebuild).
     await maybeRefreshCensus();
+    // Memory is only fetched while its section is visible (opens the warm index).
+    if (section === 'memory') {
+      await refreshMemory();
+    }
   }
 
   async function testEmbedder(): Promise<void> {
@@ -278,7 +324,10 @@
         type="button"
         class="seg"
         class:active={section === s.id}
-        onclick={() => (section = s.id)}
+        onclick={() => {
+          section = s.id;
+          if (s.id === 'memory') refreshMemory();
+        }}
       >{s.label}</button>
     {/each}
   </nav>
@@ -397,9 +446,75 @@
     </div>
   </section>
   {:else if section === 'memory'}
-    <p class="placeholder">
-      Session memory (what each agent read, edited, and decided) lands here.
-    </p>
+    {#if !memory || (memory.working_set.length === 0 && memory.notes.length === 0 && memory.sessions.length === 0)}
+      <p class="placeholder">
+        No session memory yet. As Claude reads, edits, and queries files (with the
+        graph enabled), its working set and notes appear here.
+      </p>
+    {:else}
+      <section class="card">
+        <div class="history-head">
+          Working set
+          <span class="muted">
+            {#if memory.current_session}(current session){/if}
+          </span>
+          <button class="mini danger" onclick={() => clearMemory(memory?.current_session ?? undefined)}>
+            Clear session
+          </button>
+        </div>
+        {#if memory.working_set.length === 0}
+          <p class="placeholder">Nothing touched in this session yet.</p>
+        {:else}
+          <div class="rows">
+            {#each memory.working_set as w (w.path)}
+              <div class="arow ws">
+                <span class="aname" title={w.top_symbols.join(', ')}>{w.path}</span>
+                <span class="akind">{fmtKind(w.last_kind)}</span>
+                <span class="aloc">{w.touches}×{w.top_symbols.length ? ' · ' + w.top_symbols.slice(0, 3).join(', ') : ''}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </section>
+
+      <section class="card">
+        <div class="history-head">Notes <span class="muted">({memory.notes.length})</span></div>
+        {#if memory.notes.length === 0}
+          <p class="placeholder">No notes. Ask Claude to <code>context_note</code> a decision.</p>
+        {:else}
+          <div class="rows">
+            {#each memory.notes as n (n.note_id)}
+              <div class="arow note">
+                <button
+                  class="pin"
+                  class:pinned={n.pinned}
+                  title={n.pinned ? 'Unpin' : 'Pin (keep across sessions)'}
+                  onclick={() => togglePin(n.note_id, !n.pinned)}
+                >{n.pinned ? '📌' : '📍'}</button>
+                <span class="ntext">{n.text}</span>
+                <span class="aloc">{fmtTime(n.ts_ms)}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </section>
+
+      <section class="card">
+        <div class="history-head">
+          Recent sessions <span class="muted">({memory.sessions.length})</span>
+          <button class="mini danger" onclick={() => clearMemory()}>Clear all</button>
+        </div>
+        <div class="rows">
+          {#each memory.sessions as s (s.session_id)}
+            <div class="arow sess" class:current={s.session_id === memory.current_session}>
+              <span class="aname" title={s.session_id}>{s.agent}</span>
+              <span class="akind">{s.events} events</span>
+              <span class="aloc">{fmtTime(s.last_ms)}</span>
+            </div>
+          {/each}
+        </div>
+      </section>
+    {/if}
   {:else if section === 'context'}
     <p class="placeholder">
       Automatic context injection — what cImp prepends to each prompt — is configured here.
@@ -877,5 +992,53 @@
     opacity: 0.8;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .arow.note,
+  .arow.sess,
+  .arow.ws {
+    grid-template-columns: 1fr auto auto;
+    white-space: normal;
+  }
+  .arow.note {
+    grid-template-columns: auto 1fr auto;
+  }
+  .arow.sess.current .aname {
+    color: var(--accent, #3b6ea5);
+    font-weight: 700;
+  }
+  .ntext {
+    font-size: 12px;
+    word-break: break-word;
+  }
+  .pin {
+    background: transparent;
+    border: none;
+    padding: 0 4px 0 0;
+    cursor: pointer;
+    font-size: 12px;
+    opacity: 0.55;
+  }
+  .pin.pinned {
+    opacity: 1;
+  }
+  .history-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .history-head .muted {
+    margin-right: auto;
+  }
+  button.mini {
+    padding: 2px 8px;
+    font-size: 11px;
+  }
+  button.mini.danger {
+    background: transparent;
+    border-color: #b3261e;
+    color: #ffb4ab;
+  }
+  button.mini.danger:hover {
+    background: rgba(179, 38, 30, 0.15);
   }
 </style>

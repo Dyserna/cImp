@@ -288,6 +288,7 @@ mod tests {
             state_signals: sig_tx,
             settings,
             cancel: CancellationToken::new(),
+            mem: None,
         };
         (ctx, tts_rx, sig_rx)
     }

@@ -203,3 +203,19 @@ export function graphMemoryClear(session?: string, root?: string): Promise<void>
 export function graphNoteSetPinned(noteId: string, pinned: boolean, root?: string): Promise<void> {
   return invoke<void>('graph_note_set_pinned', { root: root ?? null, noteId, pinned });
 }
+
+/// V10 (Context): the result of a context retrieval. Mirror of Rust
+/// `graph::context::RetrieveResult`.
+export interface RetrieveResult {
+  context_md: string;
+  files_used: string[];
+  chars: number;
+  tokens_est: number;
+}
+
+/// Preview what context injection WOULD prepend for `prompt` (bypasses the
+/// injection toggle, so it works while injection is off). `root` defaults to the
+/// launch directory.
+export function graphContextPreview(prompt: string, root?: string): Promise<RetrieveResult> {
+  return invoke<RetrieveResult>('graph_context_preview', { root: root ?? null, prompt });
+}

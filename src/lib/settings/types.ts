@@ -624,6 +624,12 @@ export interface GraphSettings {
   embedding_dims: number;
   embed_code_bodies: boolean;
   embedding_batch: number;
+  // V10 context injection.
+  context_injection: boolean;
+  context_per_file_chars: number;
+  context_turn_budget_chars: number;
+  context_include_session: boolean;
+  context_min_score: number;
 }
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
@@ -1119,6 +1125,11 @@ export function defaultSettings(): Settings {
       embedding_dims: 0,
       embed_code_bodies: false,
       embedding_batch: 32,
+      context_injection: false,
+      context_per_file_chars: 800,
+      context_turn_budget_chars: 6_000,
+      context_include_session: true,
+      context_min_score: 3,
     },
     enabled_ai_tabs: ['claude'],
     logging: {

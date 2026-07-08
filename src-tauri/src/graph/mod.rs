@@ -20,6 +20,7 @@
 
 mod activity;
 mod builder;
+mod context;
 mod embed;
 mod index;
 mod mcp;
@@ -32,6 +33,7 @@ mod watcher;
 
 pub use activity::{snapshot as graph_history, GraphCall};
 pub use builder::parse_file;
+pub use context::RetrieveResult;
 pub use index::{GraphIndex, GraphStats, SymbolHit};
 pub use memory::{classify_tool, MemArg, MemNote, MemorySnapshot, SessionInfo, WorkingSetEntry};
 pub use mcp::{

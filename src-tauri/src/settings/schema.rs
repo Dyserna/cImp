@@ -920,6 +920,22 @@ pub struct GraphSettings {
     pub embed_code_bodies: bool,
     /// Number of chunks per `/v1/embeddings` request (amortizes round-trips).
     pub embedding_batch: usize,
+
+    // --- Context injection (V10 Phase D) ---
+    /// Automatically prepend a budget-bounded digest of the most relevant files
+    /// to each user prompt (Claude via a UserPromptSubmit hook, OpenCode via a
+    /// plugin). Off by default — it changes what the agent sees.
+    pub context_injection: bool,
+    /// Max characters of digest emitted per file (outline + best snippet).
+    pub context_per_file_chars: u32,
+    /// Total character budget for one turn's injected context across all files.
+    pub context_turn_budget_chars: u32,
+    /// Fold the current session's working set (Phase C memory) into the ranking
+    /// so session-hot files rank first.
+    pub context_include_session: bool,
+    /// Minimum top-file relevance score below which nothing is injected (so
+    /// meta/"hi" prompts inject nothing).
+    pub context_min_score: u32,
 }
 
 impl GraphSettings {
@@ -965,6 +981,11 @@ impl Default for GraphSettings {
             embedding_dims: 0,
             embed_code_bodies: false,
             embedding_batch: 32,
+            context_injection: false,
+            context_per_file_chars: 800,
+            context_turn_budget_chars: 6_000,
+            context_include_session: true,
+            context_min_score: 3,
         }
     }
 }

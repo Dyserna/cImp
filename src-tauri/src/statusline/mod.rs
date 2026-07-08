@@ -47,6 +47,14 @@ pub fn launch_command() -> Option<String> {
     Some(format!("{} --statusline", shell_safe_path(&exe)))
 }
 
+/// V10: the `command` string for the Claude `UserPromptSubmit` context hook —
+/// `<this-exe> --context-hook`, shell-safe like [`launch_command`]. `None` when
+/// `current_exe()` can't be resolved (caller skips the injection).
+pub fn context_hook_command() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    Some(format!("{} --context-hook", shell_safe_path(&exe)))
+}
+
 /// Render an executable path so it survives whichever shell Claude Code
 /// uses to run the status line command. Forward slashes always (Git Bash
 /// strips unquoted backslashes); space-free unquoted when possible so the

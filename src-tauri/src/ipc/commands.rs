@@ -1079,6 +1079,23 @@ pub async fn graph_note_set_pinned(
     service.mem_set_note_pinned(&root, &note_id, pinned)
 }
 
+/// V10 (Context): preview what context injection WOULD prepend for `prompt`,
+/// bypassing the `context_injection` toggle (so the user can tune before
+/// enabling). Requires the graph to be enabled. `root` defaults to the launch
+/// directory; no `session_id` (the preview isn't tied to a live session).
+#[tauri::command]
+pub async fn graph_context_preview(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    prompt: String,
+    root: Option<String>,
+) -> AppResult<crate::graph::RetrieveResult> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    Ok(service.retrieve_context(&root, &prompt, None))
+}
+
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
 /// = file changes are ignored until resumed (a manual rebuild still works).
 #[tauri::command]

@@ -21,6 +21,7 @@
     graphMemory,
     graphMemoryClear,
     graphNoteSetPinned,
+    graphContextPreview,
     onGraphStatus,
     type EmbedderProbe,
     type GraphCall,
@@ -28,6 +29,7 @@
     type LangCensus,
     type DeadExportRow,
     type MemorySnapshot,
+    type RetrieveResult,
   } from './graph';
   import { listenManaged } from './listenManaged';
   import ToolsReference from './ToolsReference.svelte';
@@ -117,6 +119,24 @@
 
   function fmtKind(k: string): string {
     return k === 'edit' ? '✎ edit' : k === 'query' ? '⌕ query' : '👁 read';
+  }
+
+  // Context (Phase D): a preview surface to see what injection would prepend.
+  let previewPrompt = $state('');
+  let preview = $state<RetrieveResult | null>(null);
+  let previewBusy = $state(false);
+
+  async function runPreview(): Promise<void> {
+    if (!previewPrompt.trim()) return;
+    previewBusy = true;
+    try {
+      preview = await graphContextPreview(previewPrompt);
+    } catch (e) {
+      console.error('graph_context_preview failed', e);
+      preview = null;
+    } finally {
+      previewBusy = false;
+    }
   }
 
   // V10: the tab now hosts five sections. Index/Activity carry the V9 content;
@@ -516,9 +536,44 @@
       </section>
     {/if}
   {:else if section === 'context'}
-    <p class="placeholder">
-      Automatic context injection — what cImp prepends to each prompt — is configured here.
-    </p>
+    <div class="context-sec">
+      <p class="caveat">
+        When enabled (Settings → Code Intelligence → Context injection), cImp
+        prepends a budget-bounded digest of the most relevant files to each
+        prompt — for Claude via a <code>UserPromptSubmit</code> hook, for OpenCode
+        via a generated plugin. Preview below shows what <em>would</em> be injected
+        for a prompt, regardless of the toggle.
+      </p>
+
+      <section class="card">
+        <div class="history-head">Preview injection</div>
+        <div class="preview-in">
+          <input
+            type="text"
+            placeholder="Type a prompt to see what would be injected…"
+            bind:value={previewPrompt}
+            onkeydown={(e) => e.key === 'Enter' && runPreview()}
+          />
+          <button onclick={runPreview} disabled={previewBusy || !previewPrompt.trim()}>
+            {previewBusy ? 'Ranking…' : 'Preview'}
+          </button>
+        </div>
+
+        {#if preview}
+          {#if preview.chars === 0}
+            <p class="placeholder">
+              Nothing would be injected — no file cleared the relevance threshold.
+            </p>
+          {:else}
+            <p class="preview-meta">
+              {preview.files_used.length} file{preview.files_used.length === 1 ? '' : 's'} ·
+              {preview.chars} chars · ~{preview.tokens_est} tokens injected
+            </p>
+            <pre class="preview-md">{preview.context_md}</pre>
+          {/if}
+        {/if}
+      </section>
+    </div>
   {:else if section === 'analyses'}
     <div class="analyses">
       <div class="actions">
@@ -1040,5 +1095,39 @@
   }
   button.mini.danger:hover {
     background: rgba(179, 38, 30, 0.15);
+  }
+  .preview-in {
+    display: flex;
+    gap: 8px;
+    margin: 6px 0 10px;
+  }
+  .preview-in input {
+    flex: 1;
+    min-width: 0;
+    padding: 5px 8px;
+    border-radius: 5px;
+    border: 1px solid var(--border, #444);
+    background: var(--panel, #1e1e1e);
+    color: var(--text, #ddd);
+    font-size: 12px;
+  }
+  .preview-meta {
+    font-size: 11px;
+    opacity: 0.75;
+    margin: 4px 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .preview-md {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border, #333);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 11.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 320px;
+    overflow-y: auto;
+    margin: 4px 0 0;
   }
 </style>

@@ -343,6 +343,8 @@ async fn handle_conn(
     match (req.method.as_str(), route) {
         ("POST", "/run") => handle_run(&mut stream, &service, &req).await,
         ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
+        ("POST", "/context/retrieve") => handle_context_retrieve(&mut stream, &app, &req).await,
+        ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
         ("GET", "/describe") => {
@@ -563,6 +565,116 @@ async fn handle_graph_run(
     };
     // 200 even on a tool-level error: the child renders `error` as a tool result.
     write_json(stream, 200, &r).await
+}
+
+/// A `POST /context/retrieve` request body (from the Claude UserPromptSubmit
+/// hook or the OpenCode injection plugin).
+#[derive(Deserialize)]
+struct ContextRetrieveBody {
+    /// The calling session's working directory; the project root is resolved
+    /// from it (defaults to `.`).
+    #[serde(default)]
+    cwd: Option<String>,
+    /// The user's prompt to rank context against.
+    prompt: String,
+    /// The agent session id (scopes the working-set boost); optional.
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// `POST /context/retrieve`: rank files for the prompt and return the injectable
+/// digest as `{ ok, text }`. Gated on `context_injection` — returns empty text
+/// (never blocks a turn) when injection is off or nothing clears the threshold.
+async fn handle_context_retrieve(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: ContextRetrieveBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let empty = serde_json::json!({ "ok": true, "text": "", "files": [], "tokens_est": 0 });
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &empty).await;
+    };
+    let graph = graph.inner().clone();
+    // The injection toggle is enforced here (the service's retrieve does not) so
+    // the preview surface can reuse the same core while injection is off.
+    if !graph.context_injection_enabled() {
+        return write_json(stream, 200, &empty).await;
+    }
+    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let r = graph.retrieve_context(&cwd, &body.prompt, body.session_id.as_deref());
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({ "ok": true, "text": r.context_md, "files": r.files_used, "tokens_est": r.tokens_est }),
+    )
+    .await
+}
+
+/// A `POST /memory/event` request body (the OpenCode plugin's tool hook — the
+/// only memory ingress for OpenCode, whose OOB SSE stream carries no tool
+/// events). Claude records in-process via the transcript tap instead.
+#[derive(Deserialize)]
+struct MemoryEventBody {
+    #[serde(default)]
+    cwd: Option<String>,
+    session_id: String,
+    #[serde(default)]
+    agent: Option<String>,
+    tool: String,
+    #[serde(default)]
+    args: Value,
+}
+
+/// `POST /memory/event`: classify an agent tool call and record it as a memory
+/// event. Best-effort — an unclassifiable tool or a missing graph service is a
+/// silent no-op (200), never an error the plugin has to handle.
+async fn handle_memory_event(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: MemoryEventBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let ok = serde_json::json!({ "ok": true });
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &ok).await;
+    };
+    let graph = graph.inner().clone();
+    if let Some((kind, arg)) = crate::graph::classify_tool(&body.tool) {
+        let get = |k: &str| body.args.get(k).and_then(Value::as_str);
+        let (path, detail) = match arg {
+            crate::graph::MemArg::Path => (get("file_path").or_else(|| get("filePath")).or_else(|| get("path")).unwrap_or("").to_string(), None),
+            crate::graph::MemArg::Pattern => (get("pattern").or_else(|| get("path")).or_else(|| get("query")).unwrap_or("").to_string(), None),
+            crate::graph::MemArg::Command => (String::new(), get("command").map(|c| c.chars().take(200).collect::<String>())),
+        };
+        let recordable = !matches!(arg, crate::graph::MemArg::Path | crate::graph::MemArg::Pattern) || !path.is_empty();
+        if recordable {
+            let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+            let agent = body.agent.as_deref().unwrap_or("opencode");
+            graph.record_mem_event(&cwd, &body.session_id, agent, kind, &path, None, None, detail.as_deref());
+        }
+    }
+    write_json(stream, 200, &ok).await
 }
 
 /// `POST /mcp/list`: the proxied MCP tool descriptors for the requesting

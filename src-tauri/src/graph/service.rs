@@ -476,6 +476,51 @@ impl GraphService {
         self.index_for(root)?.mem_clear(session_id)
     }
 
+    // ── V10 context injection ────────────────────────────────────────────
+
+    /// Rank files for `prompt` and build the injectable digest for `root`.
+    /// Requires the graph to be enabled but **not** the injection toggle — the
+    /// toggle is enforced by the caller (the `/context/retrieve` route), so the
+    /// preview surface can show what *would* be injected while it's off. Returns
+    /// an empty result when the graph is off or nothing clears the threshold.
+    pub fn retrieve_context(
+        &self,
+        root: &Path,
+        prompt: &str,
+        session_id: Option<&str>,
+    ) -> super::context::RetrieveResult {
+        let g = self.settings.current().graph;
+        if !g.enabled {
+            return super::context::RetrieveResult::default();
+        }
+        let Ok(idx) = self.index_for(root) else {
+            return super::context::RetrieveResult::default();
+        };
+        let session_files: Vec<(String, f64)> = if g.context_include_session {
+            self.mem_working_set(root, session_id, 30)
+                .into_iter()
+                .map(|e| (e.path, super::context::session_weight(&e.last_kind)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        super::context::build_context(
+            &idx,
+            prompt,
+            &session_files,
+            g.context_per_file_chars as usize,
+            g.context_turn_budget_chars as usize,
+            g.context_min_score as f64,
+        )
+    }
+
+    /// Whether context injection is currently enabled (graph + toggle). The
+    /// injection routes gate on this; the preview path does not.
+    pub fn context_injection_enabled(&self) -> bool {
+        let g = self.settings.current().graph;
+        g.enabled && g.context_injection
+    }
+
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns
     /// immediately; progress lands on the `graph-status` event and via
     /// [`status`](Self::status). A no-op (logged) when a build for this root is

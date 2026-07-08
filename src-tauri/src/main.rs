@@ -2,6 +2,7 @@
 
 mod audio;
 mod content;
+mod context_hook;
 mod error;
 mod graph;
 mod ipc;
@@ -37,7 +38,7 @@ use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
     get_system_stats, graph_cycles, graph_dead_exports, graph_history, graph_language_census,
-    graph_memory, graph_memory_clear, graph_note_set_pinned, graph_rebuild,
+    graph_context_preview, graph_memory, graph_memory_clear, graph_note_set_pinned, graph_rebuild,
     graph_rebuild_embeddings, graph_set_language_enabled, graph_set_watch_paused,
     graph_status, graph_test_embedder, list_tabs,
     list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
@@ -81,6 +82,15 @@ fn main() {
     // console allocation is suppressed.
     if std::env::args().skip(1).any(|a| a == "--statusline") {
         statusline::run();
+        return;
+    }
+
+    // V10 context-injection hook: Claude Code invokes `cimp --context-hook` as a
+    // UserPromptSubmit hook, pipes the hook JSON to our stdin, and reads the
+    // `additionalContext` to prepend from our stdout. Handled here before any
+    // Tauri init so it stays GUI-free and fast; on any error it prints nothing.
+    if std::env::args().skip(1).any(|a| a == "--context-hook") {
+        context_hook::run();
         return;
     }
 
@@ -630,6 +640,7 @@ fn main() {
             graph_memory,
             graph_memory_clear,
             graph_note_set_pinned,
+            graph_context_preview,
             theming::themes_list,
             theming::palettes_list,
         ])

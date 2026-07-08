@@ -3580,7 +3580,7 @@
         </section>
       {:else if activeSection === 'graph'}
         <section>
-          <h2>Code knowledge graph</h2>
+          <h2>Code Intelligence</h2>
           <small class="hint top">
             Build a per-project graph of your code and docs (symbols, calls,
             imports, doc-comments), stored at
@@ -3760,6 +3760,92 @@
                 Use <strong>Rebuild embeddings</strong> on the Code Graph tab
                 after a silent model swap behind the same name.
               </small>
+            {/if}
+
+            <h3>Context injection</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.context_injection}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.context_injection = (e.currentTarget as HTMLInputElement).checked),
+                  )}
+              />
+              <span>Auto-inject relevant file digests into each prompt</span>
+            </label>
+            <small class="hint">
+              Prepends a budget-bounded digest of the most relevant files to each
+              prompt (Claude via a <code>UserPromptSubmit</code> hook, OpenCode via
+              a generated <code>.opencode/plugin</code>). Off by default — it
+              changes what the agent sees. Re-launch a tab to pick it up. Tune and
+              preview it on the <strong>Context</strong> section of the Code
+              Intelligence tab.
+            </small>
+            {#if snapshot.graph.context_injection}
+              <label>
+                <span>Per-file budget (chars)</span>
+                <input
+                  type="number"
+                  min="100"
+                  value={snapshot.graph.context_per_file_chars}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.context_per_file_chars = Math.max(
+                          100,
+                          Number((e.currentTarget as HTMLInputElement).value) || 800,
+                        )),
+                    )}
+                />
+              </label>
+              <label>
+                <span>Per-turn budget (chars)</span>
+                <input
+                  type="number"
+                  min="500"
+                  value={snapshot.graph.context_turn_budget_chars}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.context_turn_budget_chars = Math.max(
+                          500,
+                          Number((e.currentTarget as HTMLInputElement).value) || 6000,
+                        )),
+                    )}
+                />
+              </label>
+              <label>
+                <span>Min relevance score (skip below)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.context_min_score}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.context_min_score = Math.max(
+                          0,
+                          Number((e.currentTarget as HTMLInputElement).value) || 3,
+                        )),
+                    )}
+                />
+              </label>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.context_include_session}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.context_include_session = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Rank session-hot files first (from Memory)</span>
+              </label>
             {/if}
 
             <h3>Offload worker access</h3>

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod compact_hook;
 mod content;
 mod context_hook;
 mod error;
@@ -13,6 +14,7 @@ mod offload;
 mod process_guard;
 mod processing;
 mod pty;
+mod read_hook;
 mod settings;
 mod shell;
 mod state;
@@ -91,6 +93,27 @@ fn main() {
     // Tauri init so it stays GUI-free and fast; on any error it prints nothing.
     if std::env::args().skip(1).any(|a| a == "--context-hook") {
         context_hook::run();
+        return;
+    }
+
+    // V11 Phase D context-compaction hook: Claude Code invokes
+    // `cimp --precompact-hook` as a `PreCompact` hook. It POSTs to the app's
+    // loopback `/context/compaction` (which clears dedup + marks the session
+    // post-compaction, and returns a working-set/notes block to survive the
+    // summary). GUI-free and fast like the other shims; prints nothing on error.
+    if std::env::args().skip(1).any(|a| a == "--precompact-hook") {
+        compact_hook::run();
+        return;
+    }
+
+    // V11 Phase E read advisor: Claude Code invokes `cimp --read-hook` as a
+    // `PreToolUse` (matcher `Read`) hook. It asks the app's loopback
+    // `/context/should_read` whether the file was already read unchanged this
+    // session; on a "remind" it denies the Read with the file's outline/body as
+    // the reason. GUI-free like the other shims; prints nothing (⇒ read proceeds)
+    // on any error, so it never wrongly blocks a read.
+    if std::env::args().skip(1).any(|a| a == "--read-hook") {
+        read_hook::run();
         return;
     }
 

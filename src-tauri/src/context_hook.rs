@@ -42,7 +42,6 @@ pub fn run() {
         .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
         .unwrap_or_default();
 
-    let Some(disc) = crate::offload::loopback::read_discovery() else { return };
     let body = serde_json::json!({
         "cwd": cwd,
         "prompt": prompt,
@@ -50,7 +49,7 @@ pub fn run() {
     })
     .to_string();
 
-    let Some(text) = post_context(disc.port, &disc.token, &body) else { return };
+    let Some(text) = post_loopback("/context/retrieve", &body) else { return };
     if text.trim().is_empty() {
         return;
     }
@@ -64,14 +63,23 @@ pub fn run() {
     let _ = writeln!(std::io::stdout(), "{out}");
 }
 
-/// Minimal blocking HTTP/1.1 POST to the loopback; returns the response's `text`
-/// field, or `None` on any error/timeout.
-fn post_context(port: u16, token: &str, body: &str) -> Option<String> {
+/// Discover the running app and POST `body` to a loopback `path`, returning the
+/// response's `text` field, or `None` on any error/timeout/miss. Shared by the
+/// V11 `--precompact-hook` / `--read-hook` shims so the framing (Bearer auth,
+/// Content-Length, `Connection: close`, 2xx-only, short timeout) lives once.
+pub(crate) fn post_loopback(path: &str, body: &str) -> Option<String> {
+    let disc = crate::offload::loopback::read_discovery()?;
+    post_context(disc.port, &disc.token, path, body)
+}
+
+/// Minimal blocking HTTP/1.1 POST to a loopback route; returns the response's
+/// `text` field, or `None` on any error/timeout.
+fn post_context(port: u16, token: &str, path: &str, body: &str) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(TIMEOUT)).ok()?;
     let req = format!(
-        "POST /context/retrieve HTTP/1.1\r\n\
+        "POST {path} HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
          Authorization: Bearer {token}\r\n\
          Content-Type: application/json\r\n\

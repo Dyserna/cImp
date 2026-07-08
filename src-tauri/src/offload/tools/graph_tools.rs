@@ -23,8 +23,12 @@ pub fn defs() -> Vec<ToolDef> {
     // Advertise semantic search to the worker only when it's enabled (it
     // degrades to full-text at runtime if the embedder is down).
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if crate::settings::load_readonly(&cwd).graph.semantic_search {
+    let g = crate::settings::load_readonly(&cwd).graph;
+    if g.semantic_search {
         specs.push(crate::graph::semantic_spec());
+    }
+    if g.embed_code_bodies {
+        specs.push(crate::graph::semantic_code_spec());
     }
     specs
         .into_iter()

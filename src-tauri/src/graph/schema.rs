@@ -7,7 +7,12 @@
 /// On open, a `graph.db` stamped with an older version is `reset()` and fully
 /// rebuilt from source — cheap, since every row is re-derivable. V9 == 1;
 /// V10 adds `symbol.visibility` and the memory relations.
-pub const GRAPH_SCHEMA_VERSION: i64 = 2;
+/// V11–V14 == 3: `symbol.is_test` (the sole column change) forces one rebuild;
+/// every other new relation in this roadmap (`injected`, `digest`,
+/// `code_chunk`/`code_vec`, `commit_touch`, `project_fact`, `session_distilled`,
+/// `usage_stat`) is additive create-if-missing and needs no bump. The bump is
+/// front-loaded here so the whole V11→V14 roadmap costs users a single rebuild.
+pub const GRAPH_SCHEMA_VERSION: i64 = 3;
 
 /// `(name, create-script)` for every stored relation. Order matters only in
 /// that all are ensured before any write.
@@ -21,7 +26,7 @@ pub const RELATIONS: &[(&str, &str)] = &[
         ":create symbol {id: String => \
             name: String, kind: String, file: String, \
             start_line: Int, end_line: Int, signature: String, doc: String?, \
-            visibility: String}",
+            visibility: String, is_test: Bool}",
     ),
     (
         "ref",
@@ -34,5 +39,9 @@ pub const RELATIONS: &[(&str, &str)] = &[
     (
         "doc_chunk",
         ":create doc_chunk {id: String => source_path: String, anchor: String, text: String}",
+    ),
+    (
+        "code_chunk",
+        ":create code_chunk {id: String => file: String, text: String}",
     ),
 ];

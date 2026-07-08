@@ -563,6 +563,69 @@ impl OffloadSupervisor {
         let cancel = tokio_util::sync::CancellationToken::new();
         super::agent::run(server.client(), &cfg, &router, task, deadline, None, &cancel).await
     }
+
+    /// V11 Phase F — a single plain completion against a ready **local** backend:
+    /// no agent loop, no tools, and **never** a remote/cloud backend (project
+    /// source stays on the machine). Used by internal callers like the context
+    /// digest generator. Errors if no local backend is ready. Local-only holds by
+    /// construction — `running` only ever contains local servers; remote backends
+    /// live on a separate path and never appear here.
+    pub async fn run_internal(
+        &self,
+        prompt: String,
+        max_tokens: u32,
+        timeout: Duration,
+    ) -> AppResult<String> {
+        let server = {
+            let guard = self.running.lock().await;
+            guard
+                .values()
+                .find(|r| r.server.is_ready())
+                .map(|r| r.server.clone())
+                .ok_or_else(|| {
+                    AppError::OffloadNotReady("no local backend is running/ready".into())
+                })?
+        };
+        let _permit = server.acquire_slot(timeout).await?;
+
+        // A plain, non-streaming completion — no tools, thinking suppressed.
+        let req = super::openai::ChatRequest {
+            messages: vec![super::openai::ChatMessage::user(prompt)],
+            tools: Vec::new(),
+            tool_choice: None,
+            model: None,
+            temperature: Some(0.2),
+            chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": false })),
+            stream: Some(false),
+            stream_options: None,
+            max_tokens: Some(max_tokens),
+        };
+        let url = format!("{}/v1/chat/completions", server.base_url());
+        let resp = server
+            .client()
+            .post(&url)
+            .json(&req)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| AppError::Offload(format!("internal completion request failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(AppError::Offload(format!(
+                "internal completion returned HTTP {}",
+                resp.status()
+            )));
+        }
+        let body: super::openai::ChatResponse = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Offload(format!("internal completion decode failed: {e}")))?;
+        let content = body
+            .choices
+            .first()
+            .and_then(|c| c.message.content.clone())
+            .unwrap_or_default();
+        Ok(super::openai::strip_think(&content))
+    }
 }
 
 /// Coarse tool-scope summary for the status row (mirrors the MCP-side

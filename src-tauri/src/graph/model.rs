@@ -416,6 +416,18 @@ pub struct DocChunk {
     pub text: String,
 }
 
+/// A chunk of a symbol's own source (signature + doc + body), embedded for
+/// semantic **code** search (V11 Phase G) — the `DocChunk` twin, but over a
+/// definition's implementation rather than prose. `id` is the owning symbol's
+/// id, so `code_vec.chunk_id` joins straight back to `symbol` with no extra
+/// join table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeChunk {
+    pub id: String,
+    pub file: String,
+    pub text: String,
+}
+
 /// Everything extracted from a single file in one parse. This is the unit the
 /// builder produces and the index writes transactionally (delete-then-insert
 /// by `path`), so a re-index of one file never touches another's rows.
@@ -429,6 +441,7 @@ pub struct FileGraph {
     pub references: Vec<Reference>,
     pub edges: Vec<Edge>,
     pub docs: Vec<DocChunk>,
+    pub code_chunks: Vec<CodeChunk>,
 }
 
 /// Build a stable symbol id from its file, name, and start line. Stable across

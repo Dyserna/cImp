@@ -344,6 +344,8 @@ async fn handle_conn(
         ("POST", "/run") => handle_run(&mut stream, &service, &req).await,
         ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
         ("POST", "/context/retrieve") => handle_context_retrieve(&mut stream, &app, &req).await,
+        ("POST", "/context/compaction") => handle_context_compaction(&mut stream, &app, &req).await,
+        ("POST", "/context/should_read") => handle_should_read(&mut stream, &app, &req).await,
         ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
@@ -619,12 +621,112 @@ async fn handle_context_retrieve(
     }
     let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let r = graph.retrieve_context(&cwd, &body.prompt, body.session_id.as_deref());
+    // V11 Phase B: prepend the once-per-session project map. Done here (the real
+    // injection path), not in `retrieve_context`, so the preview surface — which
+    // also calls `retrieve_context` — never consumes the once-per-session flag.
+    let mut text = r.context_md;
+    if let Some(map) = graph.session_greeting(&cwd, body.session_id.as_deref()) {
+        text = if text.is_empty() { map } else { format!("{map}\n\n{text}") };
+    }
+    let tokens_est = text.chars().count() / 4;
     write_json(
         stream,
         200,
-        &serde_json::json!({ "ok": true, "text": r.context_md, "files": r.files_used, "tokens_est": r.tokens_est }),
+        &serde_json::json!({ "ok": true, "text": text, "files": r.files_used, "tokens_est": tokens_est }),
     )
     .await
+}
+
+/// A `POST /context/compaction` request body (the Claude `PreCompact` shim).
+#[derive(Deserialize)]
+struct ContextCompactionBody {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    /// `"manual"` / `"auto"`; recorded, not currently branched on.
+    #[serde(default)]
+    #[allow(dead_code)]
+    trigger: Option<String>,
+}
+
+/// `POST /context/compaction` (V11 Phase D): always runs the session's
+/// compaction side effects (clear injection dedup, mark post-compaction) and
+/// returns a compact working-set/notes block as `{ ok, text }` to carry through
+/// the summary. Never blocks — an empty block is returned as empty text.
+async fn handle_context_compaction(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: ContextCompactionBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let empty = serde_json::json!({ "ok": true, "text": "" });
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &empty).await;
+    };
+    let graph = graph.inner().clone();
+    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let block = graph.compaction_context(&cwd, body.session_id.as_deref());
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({ "ok": true, "text": block.unwrap_or_default() }),
+    )
+    .await
+}
+
+/// A `POST /context/should_read` request body (the Claude `PreToolUse` Read
+/// advisor shim).
+#[derive(Deserialize)]
+struct ShouldReadBody {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    file_path: String,
+    /// 1-based read offset, when the agent asked for a windowed read.
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+/// `POST /context/should_read` (V11 Phase E): the read-advisor verdict for a
+/// `Read`. Returns `{ ok, verdict: "pass" }` to let the read through, or
+/// `{ ok, verdict: "remind", text }` to deny-with-content. Fails open to `pass`
+/// on any missing state — the advisor must never block a legitimate read.
+async fn handle_should_read(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
+    let pass = serde_json::json!({ "ok": true, "verdict": "pass" });
+    let body: ShouldReadBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &pass).await;
+    };
+    let graph = graph.inner().clone();
+    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    match graph.should_read(&cwd, body.session_id.as_deref(), &body.file_path, body.offset) {
+        Some(text) => {
+            write_json(stream, 200, &serde_json::json!({ "ok": true, "verdict": "remind", "text": text })).await
+        }
+        None => write_json(stream, 200, &pass).await,
+    }
 }
 
 /// A `POST /memory/event` request body (the OpenCode plugin's tool hook — the

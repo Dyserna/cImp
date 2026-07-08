@@ -613,6 +613,8 @@ export interface GraphSettings {
   watch_debounce_ms: number;
   max_rows_per_query: number;
   max_snippet_bytes: number;
+  /// Hard cap on the body bytes returned by `graph_snippet` (V11 Phase A).
+  max_body_bytes: number;
   db_subdir: string;
   /// Let the offload worker query the graph when running on a *remote*
   /// backend (LAN or cloud). The local worker always has access; a remote
@@ -624,12 +626,27 @@ export interface GraphSettings {
   embedding_dims: number;
   embed_code_bodies: boolean;
   embedding_batch: number;
+  /// Project-wide cap on `code_chunk` rows kept by a full rebuild (V11 Phase G).
+  semantic_code_max_chunks: number;
   // V10 context injection.
   context_injection: boolean;
   context_per_file_chars: number;
   context_turn_budget_chars: number;
   context_include_session: boolean;
   context_min_score: number;
+  // V11 Phase B: repo map (session-start orientation).
+  repo_map_budget_chars: number;
+  repo_map_on_session_start: boolean;
+  // V11 Phase C: injection dedup TTL in turns (0 disables).
+  context_dedup_ttl_turns: number;
+  // V11 Phase D: feed the compactor the working set + pinned notes.
+  compaction_context: boolean;
+  // V11 Phase E: redundant-read advisor (opt-in).
+  read_advisor: boolean;
+  read_advisor_min_lines: number;
+  read_advisor_mode: string;
+  // V11 Phase F: local-model context digests (local-only).
+  context_llm_digests: boolean;
 }
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
@@ -1117,6 +1134,7 @@ export function defaultSettings(): Settings {
       watch_debounce_ms: 300,
       max_rows_per_query: 100,
       max_snippet_bytes: 2_000,
+      max_body_bytes: 16_384,
       db_subdir: '.cimp',
       allow_remote_worker_access: false,
       semantic_search: false,
@@ -1125,11 +1143,20 @@ export function defaultSettings(): Settings {
       embedding_dims: 0,
       embed_code_bodies: false,
       embedding_batch: 32,
+      semantic_code_max_chunks: 20_000,
       context_injection: false,
       context_per_file_chars: 800,
       context_turn_budget_chars: 6_000,
       context_include_session: true,
       context_min_score: 3,
+      repo_map_budget_chars: 4_000,
+      repo_map_on_session_start: false,
+      context_dedup_ttl_turns: 10,
+      compaction_context: true,
+      read_advisor: false,
+      read_advisor_min_lines: 300,
+      read_advisor_mode: 'advise',
+      context_llm_digests: false,
     },
     enabled_ai_tabs: ['claude'],
     logging: {

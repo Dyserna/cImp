@@ -15,7 +15,7 @@
 //! once on startup for the launch root when the feature is enabled, and again
 //! whenever the `graph_rebuild` IPC is invoked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -84,6 +84,12 @@ pub struct GraphStatus {
     pub embed_total: u64,
     /// Chunks still awaiting a current-epoch vector.
     pub embed_pending: u64,
+    /// V11 Phase G: code-body vectors stored for the current epoch.
+    pub code_embedded: u64,
+    /// V11 Phase G: total code chunks (the code-embedding denominator).
+    pub code_embed_total: u64,
+    /// V11 Phase F: cached local-model context digests.
+    pub digests: u64,
     /// Last embedder error, if any.
     pub embed_error: Option<String>,
 }
@@ -108,6 +114,9 @@ impl GraphStatus {
             embedded: 0,
             embed_total: 0,
             embed_pending: 0,
+            code_embedded: 0,
+            code_embed_total: 0,
+            digests: 0,
             embed_error: None,
         }
     }
@@ -152,6 +161,39 @@ pub struct GraphService {
     /// `again` records that a request arrived while a backfill was running, so
     /// the in-flight task does one more pass and no late chunk is missed.
     backfill: StdMutex<HashMap<PathBuf, BackfillFlag>>,
+    /// V11 Phase B: session ids that have already received the once-per-session
+    /// project-map greeting. In-memory only — a restart re-greets each session
+    /// once, which is acceptable (and self-corrects). A session is recorded here
+    /// only after a non-empty map actually renders, so an early prompt (before
+    /// the graph has call edges) retries on the next turn.
+    greeted: StdMutex<HashSet<String>>,
+    /// V11 Phase C: per-session injection dedup state. In-memory (a restart just
+    /// re-injects fresh, which is safe). Keyed by session id; the preview path
+    /// (session id `None`) never touches it.
+    injected: StdMutex<HashMap<String, InjectState>>,
+    /// V11 Phase D/E: session ids that just went through a compaction. Set by the
+    /// `/context/compaction` route; consumed by the read advisor (Phase E), which
+    /// passes every read until each file is re-read once after a compaction (the
+    /// agent genuinely lost the content the summary dropped).
+    post_compaction: StdMutex<HashSet<String>>,
+    /// V11 Phase E: `(session_id, rel_path)` pairs the read advisor has already
+    /// reminded about — one reminder per file per session, so an agent that reads
+    /// again after a reminder (it knows better than our heuristic) always passes.
+    reminded: StdMutex<HashSet<(String, String)>>,
+    /// V11 Phase F: `(file, content_hash)` digest jobs currently in flight, so a
+    /// cache miss never spawns a duplicate local-model job for the same content.
+    /// Also caps concurrent jobs (demand-driven + slot-gated by the supervisor).
+    digest_inflight: StdMutex<HashSet<(String, String)>>,
+}
+
+/// Per-session record of what context has been injected, for dedup (V11 Phase C).
+#[derive(Default)]
+struct InjectState {
+    /// Monotonic retrieve counter for this session (the dedup TTL clock).
+    turn: u32,
+    /// `path → (content_hash_at_injection, turn_injected)` for files injected in
+    /// full, so an unchanged re-candidate can be demoted to a one-line reminder.
+    files: HashMap<String, (String, u32)>,
 }
 
 /// Per-root backfill liveness for the single-flight guard in [`spawn_backfill`].
@@ -200,6 +242,11 @@ impl GraphService {
             write_lock: StdMutex::new(()),
             paused: AtomicBool::new(false),
             backfill: StdMutex::new(HashMap::new()),
+            greeted: StdMutex::new(HashSet::new()),
+            injected: StdMutex::new(HashMap::new()),
+            post_compaction: StdMutex::new(HashSet::new()),
+            reminded: StdMutex::new(HashSet::new()),
+            digest_inflight: StdMutex::new(HashSet::new()),
         })
     }
 
@@ -216,7 +263,8 @@ impl GraphService {
     /// path for a silent model swap behind the same name. No-op when semantic
     /// search is off.
     pub fn spawn_rebuild_embeddings(self: &Arc<Self>, root: PathBuf) {
-        if !self.settings.current().graph.semantic_search {
+        let snap = self.settings.current().graph;
+        if !snap.semantic_search {
             return;
         }
         if let Ok(idx) = self.index_for(&root) {
@@ -234,6 +282,22 @@ impl GraphService {
                     s.embed_error = Some(format!("failed to clear vectors: {e}"));
                 });
                 return;
+            }
+            // V11 Phase G: also drop code vectors when code embedding is on, so
+            // "Rebuild embeddings" re-embeds both stores together rather than
+            // leaving stale code vectors behind under a fresh doc epoch.
+            if snap.embed_code_bodies {
+                let cleared_code = {
+                    let _w = self.write_lock.lock().unwrap();
+                    idx.clear_code_vectors()
+                };
+                if let Err(e) = cleared_code {
+                    self.patch_status(&root, |s| {
+                        s.embed_state = "error".into();
+                        s.embed_error = Some(format!("failed to clear code vectors: {e}"));
+                    });
+                    return;
+                }
             }
         }
         self.spawn_backfill(root);
@@ -464,6 +528,30 @@ impl GraphService {
 
     /// Clear one session's memory (`Some`) or the whole project's (`None`).
     pub fn mem_clear(&self, root: &Path, session_id: Option<&str>) -> AppResult<()> {
+        // V11 Phase B/C: also drop the in-memory greeting + injection-dedup state
+        // for the cleared scope so a cleared session re-greets and re-injects.
+        if let Ok(mut map) = self.injected.lock() {
+            match session_id {
+                Some(s) => {
+                    map.remove(s);
+                }
+                None => map.clear(),
+            }
+        }
+        if let Ok(mut set) = self.greeted.lock() {
+            match session_id {
+                Some(s) => {
+                    set.remove(s);
+                }
+                None => set.clear(),
+            }
+        }
+        if let Ok(mut set) = self.reminded.lock() {
+            match session_id {
+                Some(s) => set.retain(|(sid, _)| sid != s),
+                None => set.clear(),
+            }
+        }
         self.index_for(root)?.mem_clear(session_id)
     }
 
@@ -495,14 +583,266 @@ impl GraphService {
         } else {
             Vec::new()
         };
-        super::context::build_context(
+
+        // V11 Phase E: a new prompt ends the post-compaction recovery window —
+        // the agent has re-read what it needed, so the advisor resumes next turn.
+        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            if let Ok(mut s) = self.post_compaction.lock() {
+                s.remove(sid);
+            }
+        }
+
+        // V11 Phase C: injection dedup, only when scoped to a session (the
+        // preview passes `None` and so never dedups or mutates injected state).
+        let ttl = g.context_dedup_ttl_turns;
+        let sid = session_id.filter(|s| !s.is_empty());
+        let (snapshot, current_turn) = match sid {
+            Some(s) => {
+                let mut map = self.injected.lock().unwrap();
+                let st = map.entry(s.to_string()).or_default();
+                st.turn = st.turn.saturating_add(1);
+                (st.files.clone(), st.turn)
+            }
+            None => (HashMap::new(), 0),
+        };
+
+        let result = super::context::build_context(
             &idx,
             prompt,
             &session_files,
             g.context_per_file_chars as usize,
             g.context_turn_budget_chars as usize,
             g.context_min_score as f64,
-        )
+            &snapshot,
+            current_turn,
+            ttl,
+            g.context_llm_digests,
+        );
+
+        // Record the files injected in full so the next turn can dedup them.
+        if let Some(s) = sid {
+            if ttl > 0 {
+                let mut map = self.injected.lock().unwrap();
+                let st = map.entry(s.to_string()).or_default();
+                for f in &result.files_used {
+                    if let Ok(Some(h)) = idx.stored_file_hash(f) {
+                        st.files.insert(f.clone(), (h, current_turn));
+                    }
+                }
+            }
+        }
+
+        // V11 Phase F: schedule background local-model digests for no-outline
+        // files that ranked in but had no cached digest (docs/configs/scripts).
+        if g.context_llm_digests {
+            for (file, hash) in &result.digest_misses {
+                self.enqueue_digest(root, file, hash);
+            }
+        }
+        result
+    }
+
+    /// V11 Phase F — kick off a background local-model digest for `(file,
+    /// content_hash)` unless one is already in flight, or the in-flight fleet is
+    /// at its cap (bounded, demand-driven). The heavy work is slot-gated by the
+    /// offload supervisor, so this never floods the local backend. Injection
+    /// never waits on it — a miss uses the V10 fallback and the digest lands next
+    /// time. Requires the app to be running on the tokio runtime (it always is
+    /// when this is reached — via the loopback/IPC async handlers).
+    fn enqueue_digest(&self, root: &Path, file: &str, content_hash: &str) {
+        const MAX_INFLIGHT: usize = 32;
+        let key = (file.to_string(), content_hash.to_string());
+        {
+            let mut inflight = match self.digest_inflight.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if inflight.len() >= MAX_INFLIGHT || !inflight.insert(key.clone()) {
+                return;
+            }
+        }
+        let Some(me) = self.app.try_state::<Arc<GraphService>>() else {
+            let _ = self.digest_inflight.lock().map(|mut g| g.remove(&key));
+            return;
+        };
+        let me = me.inner().clone();
+        let root = root.to_path_buf();
+        tokio::spawn(async move {
+            me.compute_and_cache_digest(&root, &key.0, &key.1).await;
+            let _ = me.digest_inflight.lock().map(|mut g| g.remove(&key));
+        });
+    }
+
+    /// Compute one digest via the **local-only** offload path and cache it.
+    /// Silent on any failure (no local backend, read error, bad output) — the
+    /// fallback digest keeps working and the item is simply not cached.
+    async fn compute_and_cache_digest(&self, root: &Path, file: &str, content_hash: &str) {
+        let Some(sup) = self.app.try_state::<Arc<crate::offload::OffloadSupervisor>>() else {
+            return;
+        };
+        let sup = sup.inner().clone();
+        let Ok(content) = std::fs::read_to_string(root.join(file)) else {
+            return;
+        };
+        // Only the first 4 KiB drives the digest — enough for a doc/config head.
+        let head: String = content.chars().take(4096).collect();
+        let prompt = format!(
+            "Summarize this file for a code-assistant context block in at most 3 short lines. \
+             No preamble, no code fences.\n\n{head}"
+        );
+        let text = match sup
+            .run_internal(prompt, 128, std::time::Duration::from_secs(20))
+            .await
+        {
+            Ok(t) => t.trim().to_string(),
+            Err(_) => return,
+        };
+        // Validate: non-empty and not oversized (a runaway generation).
+        if text.is_empty() || text.chars().count() > 400 {
+            return;
+        }
+        if let Ok(idx) = self.index_for(root) {
+            let _ = idx.put_digest(file, content_hash, &text, super::activity::now_ms() as i64);
+        }
+    }
+
+    /// V11 Phase B — the once-per-session project-map greeting for `root`, or
+    /// `None` when it's disabled, already delivered this session, or empty.
+    /// Called **only** from the real injection path (the `/context/retrieve`
+    /// route), never the preview, so the preview can't consume the once-flag. A
+    /// session is marked greeted only after a non-empty map renders, so an early
+    /// prompt (before the graph has call edges) simply retries next turn.
+    pub fn session_greeting(&self, root: &Path, session_id: Option<&str>) -> Option<String> {
+        let g = self.settings.current().graph;
+        if !g.enabled || !g.context_injection || !g.repo_map_on_session_start {
+            return None;
+        }
+        let sid = session_id.filter(|s| !s.is_empty())?;
+        if self.greeted.lock().ok()?.contains(sid) {
+            return None;
+        }
+        let idx = self.index_for(root).ok()?;
+        let session_files: Vec<(String, f64)> = self
+            .mem_working_set(root, session_id, 30)
+            .into_iter()
+            .map(|e| (e.path, super::context::session_weight(&e.last_kind)))
+            .collect();
+        let map = super::context::repo_map(&idx, g.repo_map_budget_chars as usize, &session_files);
+        if map.is_empty() {
+            return None;
+        }
+        // Mark greeted (a rare concurrent double-render is harmless).
+        self.greeted.lock().ok()?.insert(sid.to_string());
+        Some(map)
+    }
+
+    /// V11 Phase D — handle a compaction for `root`/`session_id`. **Side effects
+    /// run unconditionally** (even when the block is gated off): clear the
+    /// session's injection-dedup state so the next turn re-injects fresh, and
+    /// mark the session post-compaction so the read advisor (Phase E) stops
+    /// suppressing reads until each file is re-read. Returns the working-set +
+    /// notes block to carry through the summary, or `None` when the block is
+    /// disabled or empty.
+    pub fn compaction_context(&self, root: &Path, session_id: Option<&str>) -> Option<String> {
+        let g = self.settings.current().graph;
+        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            if let Ok(mut m) = self.injected.lock() {
+                m.remove(sid);
+            }
+            if let Ok(mut s) = self.post_compaction.lock() {
+                s.insert(sid.to_string());
+            }
+        }
+        // The block itself is gated (side effects above already ran).
+        if !g.enabled || !g.context_injection || !g.compaction_context {
+            return None;
+        }
+        let idx = self.index_for(root).ok()?;
+        let block = super::context::compaction_block(&idx, session_id);
+        if block.is_empty() {
+            None
+        } else {
+            Some(block)
+        }
+    }
+
+    /// V11 Phase E — whether `session_id` is flagged post-compaction (the read
+    /// advisor passes reads while this holds). Cleared on the next prompt's
+    /// `retrieve_context`, so the recovery window is "until the next user turn".
+    pub fn is_post_compaction(&self, session_id: &str) -> bool {
+        self.post_compaction.lock().map(|s| s.contains(session_id)).unwrap_or(false)
+    }
+
+    /// V11 Phase E — the read advisor's verdict for a `Read` of `file_path`:
+    /// `Some(reminder_text)` to deny-with-content, or `None` to let the read
+    /// proceed. Passes (in order) when: the advisor is off; there's no session;
+    /// the session is recovering from a compaction; the file was already reminded
+    /// once this session; the file was never seen this session; it changed since
+    /// last seen; or it's smaller than the min-lines floor. The reminder always
+    /// carries usable content (outline, plus the body in substitute mode).
+    pub fn should_read(
+        &self,
+        root: &Path,
+        session_id: Option<&str>,
+        file_path: &str,
+        offset: Option<u32>,
+    ) -> Option<String> {
+        let g = self.settings.current().graph;
+        if !g.enabled || !g.read_advisor {
+            return None;
+        }
+        let sid = session_id.filter(|s| !s.is_empty())?;
+        // Recovering from a compaction ⇒ pass everything (content was lost).
+        if self.is_post_compaction(sid) {
+            return None;
+        }
+        let rel = relativize_path(root, file_path);
+        if rel.is_empty() {
+            return None;
+        }
+        // One reminder per file per session — a second read always passes.
+        let key = (sid.to_string(), rel.clone());
+        if self.reminded.lock().ok()?.contains(&key) {
+            return None;
+        }
+        let idx = self.index_for(root).ok()?;
+        // Never seen this file this session ⇒ pass.
+        let last_seen = idx.mem_file_last_event_ms(sid, &rel).ok().flatten()?;
+
+        let abs = root.join(&rel);
+        let meta = std::fs::metadata(&abs).ok()?;
+        // Changed since last seen ⇒ pass (let the agent read the new content).
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if mtime_ms > last_seen {
+            return None;
+        }
+        // Small files are cheap to re-read ⇒ pass.
+        let content = std::fs::read_to_string(&abs).ok()?;
+        if (content.lines().count() as u32) < g.read_advisor_min_lines {
+            return None;
+        }
+
+        // Remind. Build usable content, record the reminder, and log it.
+        let substitute = g.read_advisor_mode.eq_ignore_ascii_case("substitute");
+        let text = super::context::read_advice(&idx, root, &rel, offset, substitute, g.max_body_bytes as usize);
+        self.reminded.lock().ok()?.insert(key);
+        // Activity: the `chars` slot carries the estimated tokens the reminder
+        // displaced (file bytes / 4), labeled by the `read_advisor`/`remind` tags.
+        super::activity::record(super::activity::GraphCall {
+            ts_ms: super::activity::now_ms(),
+            source: "read_advisor".to_string(),
+            tool: "remind".to_string(),
+            target: rel,
+            chars: (content.len() / 4),
+            ms: 0,
+            ok: true,
+        });
+        Some(text)
     }
 
     /// Whether context injection is currently enabled (graph + toggle). The
@@ -698,6 +1038,8 @@ impl GraphService {
         if changed > 0 {
             // Drop vectors for chunks this batch deleted or re-anchored.
             let _ = idx.prune_orphan_vectors();
+            let _ = idx.prune_orphan_code_vectors();
+            let _ = idx.prune_orphan_digests();
         }
         drop(_w);
 
@@ -920,6 +1262,92 @@ impl GraphService {
             }
         }
 
+        // V11 Phase G: also embed pending symbol bodies for semantic *code*
+        // search, sharing this pass's embedder/dim/epoch. Docs run first
+        // (cheaper, and doc search stays useful even with code embedding off);
+        // code chunks are typically far more numerous, so they ride the same
+        // backfill but strictly after. Gated on its own setting — off by
+        // default, since it multiplies the vector count.
+        if snap.embed_code_bodies {
+            {
+                let idx = idx.clone();
+                let model = snap.embedding_model.clone();
+                let epoch = epoch.clone();
+                if let Err(e) = self
+                    .locked_write(move || idx.ensure_code_vector_store(dim, &model, &epoch))
+                    .await
+                {
+                    self.patch_status(root, |s| {
+                        s.embed_state = "error".into();
+                        s.embed_error = Some(e.to_string());
+                    });
+                    return;
+                }
+            }
+            loop {
+                let pending = match idx.pending_code_chunks(&epoch, batch) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.patch_status(root, |s| {
+                            s.embed_state = "error".into();
+                            s.embed_error = Some(e.to_string());
+                        });
+                        return;
+                    }
+                };
+                if pending.is_empty() {
+                    break;
+                }
+                let texts: Vec<String> = pending.iter().map(|(_, _, t)| t.clone()).collect();
+                match embedder.embed(&texts).await {
+                    Ok(vectors) if vectors.len() == pending.len() => {
+                        let rows: Vec<(String, String, Vec<f32>)> = pending
+                            .into_iter()
+                            .zip(vectors)
+                            .map(|((id, hash, _), v)| (id, hash, v))
+                            .collect();
+                        let put = {
+                            let idx = idx.clone();
+                            let epoch = epoch.clone();
+                            self.locked_write(move || idx.put_code_vectors(&epoch, &rows))
+                                .await
+                        };
+                        if let Err(e) = put {
+                            self.patch_status(root, |s| {
+                                s.embed_state = "error".into();
+                                s.embed_error = Some(e.to_string());
+                            });
+                            return;
+                        }
+                    }
+                    Ok(_) => {
+                        self.patch_status(root, |s| {
+                            s.embed_state = "degraded".into();
+                            s.embedder_ready = false;
+                            s.embed_error = Some("code embedding count mismatch".into());
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        // Endpoint went away mid-backfill — degrade, keep what we have.
+                        self.patch_status(root, |s| {
+                            s.embed_state = "degraded".into();
+                            s.embedder_ready = false;
+                            s.embed_error = Some(e);
+                        });
+                        return;
+                    }
+                }
+            }
+            {
+                let idx = idx.clone();
+                self.locked_write(move || {
+                    let _ = idx.prune_orphan_code_vectors();
+                })
+                .await;
+            }
+        }
+
         // A rebuild can delete doc chunks while an embed request is in flight
         // (the write lock is released across the await). Drop any vectors that
         // no longer have a chunk so coverage stays accurate.
@@ -941,10 +1369,17 @@ impl GraphService {
     /// Recompute `(embedded, total, pending)` for the status from the store.
     fn refresh_embed_coverage(&self, root: &Path, idx: &GraphIndex, epoch: &str, ready: bool) {
         let (embedded, total) = idx.embedding_coverage(epoch).unwrap_or((0, 0));
+        // V11 Phase G/F: code-embedding coverage + cached-digest count for the
+        // Index/Context readouts (both are cheap DB counts).
+        let (code_embedded, code_total) = idx.code_embedding_coverage(epoch).unwrap_or((0, 0));
+        let digests = idx.digest_count().unwrap_or(0);
         self.patch_status(root, |s| {
             s.embedded = embedded;
             s.embed_total = total;
             s.embed_pending = total.saturating_sub(embedded);
+            s.code_embedded = code_embedded;
+            s.code_embed_total = code_total;
+            s.digests = digests;
             s.embedder_ready = ready;
         });
     }
@@ -996,6 +1431,12 @@ fn build_tree(
     idx.reset()?;
 
     let max_bytes = snap.max_file_bytes.max(1);
+    // V11 Phase G: a simple project-wide count cap on `code_chunk` rows
+    // (order-dependent on the walk order, which is acceptable for V1 — see
+    // `GraphSettings::semantic_code_max_chunks`). Only enforced on a full
+    // rebuild; the incremental watcher path doesn't re-check the running
+    // total against the rest of the project.
+    let mut code_chunk_budget = snap.semantic_code_max_chunks as usize;
 
     let mut indexed: u64 = 0;
     for entry in build_walker(root, snap) {
@@ -1038,7 +1479,11 @@ fn build_tree(
         };
 
         let rel = rel_path(root, path);
-        let fg = parse_file(&rel, &src, lang);
+        let mut fg = parse_file(&rel, &src, lang);
+        if fg.code_chunks.len() > code_chunk_budget {
+            fg.code_chunks.truncate(code_chunk_budget);
+        }
+        code_chunk_budget = code_chunk_budget.saturating_sub(fg.code_chunks.len());
         if let Err(e) = idx.index_file_graph(&fg) {
             warn!(file = %rel, error = %e, "graph: index_file_graph failed (skipped)");
             continue;
@@ -1050,6 +1495,9 @@ fn build_tree(
     // needlessly re-embedded), so vectors for files that vanished since the
     // last build are now orphans — drop them before reporting stats.
     let _ = idx.prune_orphan_vectors();
+    let _ = idx.prune_orphan_code_vectors();
+    // V11 Phase F: likewise drop cached digests for files that vanished.
+    let _ = idx.prune_orphan_digests();
 
     Ok((indexed, idx.stats()?))
 }
@@ -1398,6 +1846,39 @@ mod tests {
         snap_off.index_docs = false;
         build_tree(&idx, &dir, &snap_off, sub).expect("rebuild2");
         assert!(idx.search_docs("frobnicator", 10, 200).unwrap().is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_code_max_chunks_caps_total_across_a_rebuild() {
+        // Two files, each with one chunk-eligible function. A budget of 1
+        // must cap the project-wide `code_chunk` total at 1, regardless of
+        // which file the walk visits first.
+        let dir = std::env::temp_dir().join(format!("ckg-codecap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "pub fn alpha(a: i32, b: i32) -> i32 {\n    let c = a + b;\n    c\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/b.rs"),
+            "pub fn beta(a: i32, b: i32) -> i32 {\n    let c = a * b;\n    c\n}\n",
+        )
+        .unwrap();
+
+        let sub = ".ckg-test";
+        let mut snap = GraphSettings::default();
+        snap.semantic_code_max_chunks = 1;
+        let idx = GraphIndex::open(&dir, sub).expect("open");
+        build_tree(&idx, &dir, &snap, sub).expect("rebuild");
+
+        // `total` from `code_embedding_coverage` is epoch-independent (a plain
+        // `count(*code_chunk{id})`), so any epoch string works here.
+        let (_, total) = idx.code_embedding_coverage("any").expect("coverage");
+        assert_eq!(total, 1, "the project-wide cap trims to the configured budget");
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

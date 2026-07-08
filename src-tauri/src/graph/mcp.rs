@@ -83,6 +83,39 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
             &[("file", "Project-relative file path (as indexed).")],
         ),
         GraphToolSpec {
+            name: "graph_repo_map",
+            description: "A budget-bounded map of the project's most call-central files with their \
+                top exported signatures — a fast way to orient at the start of a task without \
+                exploring. Session-hot files are lifted up the ranking. Optional `budget_chars` \
+                overrides the configured size.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "budget_chars": { "type": "integer", "description": "Character budget for the map (default from settings)." }
+                },
+                "required": []
+            }),
+        },
+        GraphToolSpec {
+            name: "graph_snippet",
+            description: "Fetch just a DEFINITION'S BODY instead of reading the whole file — the \
+                token-cheap way to see one function/type in a large file. Give `symbol` (a name; \
+                an ambiguous name returns a disambiguation list, not a body) OR `file`+`line` \
+                (returns the smallest definition whose span encloses that line). Optional \
+                `context_lines` adds N lines above and below. Prefer this (often after \
+                `graph_outline`) over Read for a single definition.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string", "description": "Symbol name to fetch the body of." },
+                    "file": { "type": "string", "description": "Project-relative file path (use with `line`)." },
+                    "line": { "type": "integer", "description": "1-based line inside the wanted definition (use with `file`)." },
+                    "context_lines": { "type": "integer", "description": "Extra source lines above and below the span (default 0)." }
+                },
+                "required": []
+            }),
+        },
+        GraphToolSpec {
             name: "graph_transitive",
             description: "Transitive call chain for a symbol. direction 'callees' (default) returns \
                 everything it transitively calls; 'callers' returns everything that transitively calls it.",
@@ -177,6 +210,9 @@ pub fn tools() -> Vec<Value> {
     if settings.graph.semantic_search {
         specs.push(semantic_spec());
     }
+    if settings.graph.embed_code_bodies {
+        specs.push(semantic_code_spec());
+    }
     specs
         .into_iter()
         .map(|s| {
@@ -257,8 +293,21 @@ pub(crate) async fn dispatch_recorded(
     let result = if name == "graph_semantic_docs" {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         semantic_query(idx, settings, query, max_rows, max_snippet).await
+    } else if name == "graph_semantic_code" {
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let k = args
+            .get("k")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(max_rows)
+            .clamp(1, max_rows.max(1));
+        semantic_code_query(idx, settings, query, k).await
     } else if name == "graph_struct_search" {
         run_struct_search(root, idx, args, max_rows, max_snippet)
+    } else if name == "graph_snippet" {
+        run_snippet(root, idx, args, max_rows, settings.graph.max_body_bytes as usize)
+    } else if name == "graph_repo_map" {
+        run_repo_map(idx, settings, args, mem_agent(source))
     } else {
         run_tool(idx, name, args, max_rows, max_snippet, mem_agent(source))
     };
@@ -277,9 +326,17 @@ pub(crate) async fn dispatch_recorded(
 /// The primary argument of a graph tool (symbol / file / query) for the
 /// history's at-a-glance column.
 fn arg_summary(name: &str, args: &Value) -> String {
+    // graph_snippet has no single primary key — prefer the symbol, else file.
+    if name == "graph_snippet" {
+        let sym = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+        if !sym.is_empty() {
+            return sym.to_string();
+        }
+        return args.get("file").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    }
     let key = match name {
         "graph_imports" | "graph_outline" => "file",
-        "graph_search_docs" | "graph_semantic_docs" | "graph_struct_search" => "query",
+        "graph_search_docs" | "graph_semantic_docs" | "graph_semantic_code" | "graph_struct_search" => "query",
         "context_note" => "text",
         _ => "name",
     };
@@ -406,6 +463,16 @@ pub fn run_tool(
                 format!("(full-text fallback — semantic embedder unavailable)\n{body}")
             })
             .map_err(|e| e.to_string()),
+        // No text-search relation backs `code_chunk` the way `doc_chunk` backs
+        // `graph_semantic_docs`, so there's no full-text fallback here — just a
+        // clear degrade pointing at the structural alternatives. (Unreachable
+        // through `dispatch_recorded`, which special-cases this name for the
+        // embedder-backed async path; kept for direct `run_tool` callers.)
+        "graph_semantic_code" => Ok(
+            "(semantic code search unavailable — no embedder configured/reachable; \
+             try `graph_find_symbol` or `graph_struct_search` instead)"
+                .to_string(),
+        ),
         other => Err(format!("unknown graph tool: {other}")),
     }
 }
@@ -421,6 +488,30 @@ pub fn semantic_spec() -> GraphToolSpec {
         parameters: json!({
             "type": "object",
             "properties": { "query": { "type": "string", "description": "A natural-language description of what you're looking for." } },
+            "required": ["query"]
+        }),
+    }
+}
+
+/// The semantic-code-search tool spec, advertised only when `embed_code_bodies`
+/// is enabled. Unlike [`semantic_spec`], there's no full-text fallback at
+/// runtime — `code_chunk` isn't a keyword-searchable relation the way
+/// `doc_chunk` is — so a miss degrades to a clear "unavailable" message
+/// pointing at `graph_find_symbol`/`graph_struct_search`.
+pub fn semantic_code_spec() -> GraphToolSpec {
+    GraphToolSpec {
+        name: "graph_semantic_code",
+        description: "Semantic (meaning-based) search over indexed symbol BODIES (functions, \
+            methods, structs, classes, ...) — finds relevant code even when it doesn't share \
+            keywords with the query. Returns file:line, kind, signature, and a distance score for \
+            each hit — never the body text. Chain into `graph_snippet` to fetch the actual code. \
+            Optional `k` caps the result count.",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "A natural-language description of the code you're looking for." },
+                "k": { "type": "integer", "description": "Max results (default from settings)." }
+            },
             "required": ["query"]
         }),
     }
@@ -475,6 +566,60 @@ async fn semantic_query(
         }
         // No vectors matched yet (mid-backfill) or a query error → full-text.
         _ => fallback(idx),
+    }
+}
+
+/// Embedder-backed semantic **code** search, degrading to a clear
+/// "unavailable" message on any miss (feature off, no embedder configured/
+/// reachable, no code vectors yet, or a dim mismatch after a model change) —
+/// there's no full-text fallback for code chunks, so this can't silently
+/// re-run as a keyword search the way [`semantic_query`] does.
+async fn semantic_code_query(
+    idx: &GraphIndex,
+    settings: &crate::settings::Settings,
+    query: &str,
+    k: usize,
+) -> Result<String, String> {
+    let unavailable = || {
+        Ok("(semantic code search unavailable — try `graph_find_symbol` or `graph_struct_search` instead)"
+            .to_string())
+    };
+    let g = &settings.graph;
+    if !g.embed_code_bodies {
+        return unavailable();
+    }
+    let epoch = match idx.current_code_epoch() {
+        Ok(Some(e)) => e,
+        _ => return unavailable(),
+    };
+    let Some(embedder) = super::embed::Embedder::new(&g.embedding_endpoint, &g.embedding_model)
+    else {
+        return unavailable();
+    };
+    let qv = match embedder.embed_one(query).await {
+        Ok(v) => v,
+        Err(_) => return unavailable(),
+    };
+    match idx.semantic_code_search(&qv, &epoch, k) {
+        Ok(hits) if !hits.is_empty() => {
+            // `dist` is a cosine DISTANCE (lower = more similar), matching the
+            // doc-search convention. No body text — chain into `graph_snippet`.
+            let mut lines: Vec<String> = hits
+                .iter()
+                .take(k)
+                .map(|(s, dist)| {
+                    format!("{}:{} · {} · {} · distance {:.3}", s.file, s.start_line, s.kind, s.signature, dist)
+                })
+                .collect();
+            if hits.len() > k {
+                lines.push(format!("… (+{} more)", hits.len() - k));
+            }
+            let body = lines.join("\n");
+            Ok(format!(
+                "(semantic code — nearest first; lower distance = more similar; use `graph_snippet` for the body)\n{body}"
+            ))
+        }
+        _ => unavailable(),
     }
 }
 
@@ -748,6 +893,176 @@ fn open_project_index_confined(
     Ok((resolved, idx))
 }
 
+/// Execute `graph_snippet`: resolve a definition (by `symbol`, or by
+/// `file`+`line`) and return its source body sliced from disk with a compact
+/// header. Reads the file at call time — spans can drift a few lines between
+/// watcher debounces, so a possibly-stale span is flagged by comparing the
+/// stored content hash against the current one. Bounded by `max_body_bytes`.
+fn run_snippet(
+    root: &Path,
+    idx: &GraphIndex,
+    args: &Value,
+    max_rows: usize,
+    max_body_bytes: usize,
+) -> Result<String, String> {
+    let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let file_arg = args.get("file").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let context_lines = args
+        .get("context_lines")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(200) as usize;
+
+    // Resolve the target definition.
+    let hit = if !symbol.is_empty() {
+        let hits = idx.find_symbol(symbol).map_err(|e| e.to_string())?;
+        match hits.len() {
+            0 => return Ok(format!("No symbol named `{symbol}` is defined in this project.")),
+            1 => hits.into_iter().next().unwrap(),
+            // Ambiguous — return the disambiguation list, never a body.
+            _ => {
+                return Ok(format!(
+                    "`{symbol}` is defined in {} places — pass `file`+`line` (or a more specific name) to pick one:\n{}",
+                    hits.len(),
+                    fmt_symbols(&hits, max_rows)
+                ))
+            }
+        }
+    } else if !file_arg.is_empty() {
+        let line = match args.get("line").and_then(|v| v.as_u64()) {
+            Some(l) if l >= 1 => l as u32,
+            _ => return Err("graph_snippet with `file` also needs a 1-based `line`".into()),
+        };
+        match idx.symbol_at(file_arg, line).map_err(|e| e.to_string())? {
+            Some(h) => h,
+            None => {
+                return Ok(format!(
+                    "No indexed definition encloses {file_arg}:{line} (it may be an import/blank region). \
+                     Use Read with offset/limit for exact text."
+                ))
+            }
+        }
+    } else {
+        return Err("graph_snippet needs either `symbol`, or `file` + `line`".into());
+    };
+
+    // Read the file from disk, confined to the project root.
+    let abs = confine_to_root(root, &hit.file)?;
+    let content = std::fs::read_to_string(&abs).map_err(|e| format!("cannot read {}: {e}", hit.file))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+
+    // Whole-file span (top-level scripts): don't dump the file — outline + hint.
+    // Require the span to reach the last line (`>= total`), not merely near it,
+    // so an ordinary function that happens to end a line before EOF isn't
+    // mistaken for a whole-file symbol.
+    let whole_file = hit.start_line <= 1 && (hit.end_line as usize) >= total && total > 3;
+    if whole_file {
+        let outline = idx.outline(&hit.file).map_err(|e| e.to_string())?;
+        return Ok(format!(
+            "{} — {} spans the whole file ({} lines); here's its outline. Use Read with offset/limit for the body:\n{}",
+            hit.file,
+            hit.name,
+            total,
+            fmt_symbols(&outline, max_rows)
+        ));
+    }
+
+    // Slice [start_line, end_line] ± context_lines (1-based → 0-based indices).
+    let first = (hit.start_line as usize).saturating_sub(1).saturating_sub(context_lines);
+    let last = ((hit.end_line as usize) + context_lines).min(total); // exclusive
+    let slice = if first < last { lines[first..last].join("\n") } else { String::new() };
+    let (body, truncated) = cap_bytes(&slice, max_body_bytes);
+
+    // Staleness: on-disk content hash vs the stored one.
+    let stale = matches!(
+        idx.stored_file_hash(&hit.file).map_err(|e| e.to_string())?,
+        Some(stored) if stored != super::model::fnv1a_hex(&content)
+    );
+
+    let callers = idx.callers_count(&hit.name).unwrap_or(0);
+    let header = format!(
+        "{}:{}-{} · {} · {} · {} callers",
+        hit.file, hit.start_line, hit.end_line, hit.kind, hit.visibility, callers
+    );
+    let mut out = String::new();
+    if stale {
+        out.push_str("note: file changed after the last index pass; the span may have drifted\n");
+    }
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&body);
+    if truncated {
+        out.push_str(&format!("\n… [truncated at {max_body_bytes} bytes]"));
+    }
+    Ok(out)
+}
+
+/// Execute `graph_repo_map`: render the project orientation map, folding in the
+/// caller's session working set when the call can be scoped to a session.
+fn run_repo_map(
+    idx: &GraphIndex,
+    settings: &crate::settings::Settings,
+    args: &Value,
+    agent: Option<&str>,
+) -> Result<String, String> {
+    let budget = args
+        .get("budget_chars")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(settings.graph.repo_map_budget_chars as usize);
+    let boost = repo_map_session_boost(idx, agent);
+    let map = super::context::repo_map(idx, budget, &boost);
+    if map.is_empty() {
+        Ok("No project map yet — the graph has no call edges to rank files by.".to_string())
+    } else {
+        Ok(map)
+    }
+}
+
+/// The caller's session working set as `(path, weight)` for repo-map ranking,
+/// or empty when there's no scoped session (the offload worker) or no activity.
+fn repo_map_session_boost(idx: &GraphIndex, agent: Option<&str>) -> Vec<(String, f64)> {
+    let Ok(Some(sid)) = idx.mem_current_session_for(agent) else {
+        return Vec::new();
+    };
+    let Ok(ws) = idx.mem_working_set(&sid, 20) else {
+        return Vec::new();
+    };
+    ws.iter()
+        .map(|e| (e.path.clone(), super::context::session_weight(&e.last_kind)))
+        .collect()
+}
+
+/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary.
+/// Returns `(text, truncated)`.
+fn cap_bytes(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
+}
+
+/// Resolve a project-relative indexed path to an absolute file inside `root`,
+/// refusing anything that escapes it. Indexed paths are already project-relative
+/// and trusted, but `graph_snippet` reads arbitrary disk, so this is defense in
+/// depth (same posture as the `read_file` native tool's confinement).
+fn confine_to_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let canon_root = root.canonicalize().map_err(|e| format!("cannot resolve project root: {e}"))?;
+    let canon = canon_root
+        .join(rel)
+        .canonicalize()
+        .map_err(|_| format!("{rel} not found on disk"))?;
+    if !canon.starts_with(&canon_root) {
+        return Err(format!("refusing to read {rel} — outside the project root"));
+    }
+    Ok(canon)
+}
+
 /// Walk up from `start` looking for an ancestor containing `<sub>/graph.db`.
 pub(crate) fn find_graph_root(start: &Path, sub: &str) -> Option<PathBuf> {
     for dir in start.ancestors() {
@@ -756,4 +1071,86 @@ pub(crate) fn find_graph_root(start: &Path, sub: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use super::{cap_bytes, run_snippet, GraphIndex};
+    use crate::graph::{parse_file, Lang};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    const SRC: &str = "pub fn alpha() -> i32 {\n    let x = 1;\n    x + 1\n}\npub fn beta() -> i32 { alpha() }\n";
+
+    /// Build a temp project on disk (real source files) + its graph index.
+    fn setup(tag: &str, files: &[(&str, &str)]) -> (PathBuf, GraphIndex) {
+        let dir = std::env::temp_dir().join(format!("snip-{tag}-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        for (rel, src) in files {
+            let abs = dir.join(rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, src).unwrap();
+            idx.index_file_graph(&parse_file(rel, src, Lang::Rust)).expect("index");
+        }
+        (dir, idx)
+    }
+
+    #[test]
+    fn by_symbol_returns_body_not_whole_file() {
+        let (dir, idx) = setup("body", &[("src/geo.rs", SRC)]);
+        let out = run_snippet(&dir, &idx, &json!({ "symbol": "alpha" }), 50, 16_384).unwrap();
+        assert!(out.contains("src/geo.rs:"), "header present: {out}");
+        assert!(out.contains("let x = 1;"), "body present: {out}");
+        assert!(!out.contains("fn beta"), "did not dump the rest of the file: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguous_name_lists_without_a_body() {
+        let (dir, idx) = setup(
+            "amb",
+            &[("src/a.rs", "pub fn dup() -> i32 { 1 }\n"), ("src/b.rs", "pub fn dup() -> i32 { 2 }\n")],
+        );
+        let out = run_snippet(&dir, &idx, &json!({ "symbol": "dup" }), 50, 16_384).unwrap();
+        assert!(out.contains("defined in 2 places"), "disambiguation: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_line_resolves_enclosing_symbol() {
+        let (dir, idx) = setup("fl", &[("src/geo.rs", SRC)]);
+        // Line 2 sits inside alpha's body.
+        let out = run_snippet(&dir, &idx, &json!({ "file": "src/geo.rs", "line": 2 }), 50, 16_384).unwrap();
+        assert!(out.contains("let x = 1;"), "resolved alpha's body: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn byte_cap_truncates() {
+        let (dir, idx) = setup("cap", &[("src/geo.rs", SRC)]);
+        let out = run_snippet(&dir, &idx, &json!({ "symbol": "alpha" }), 50, 8).unwrap();
+        assert!(out.contains("[truncated at 8 bytes]"), "truncated: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_symbol_reports_clearly() {
+        let (dir, idx) = setup("miss", &[("src/geo.rs", SRC)]);
+        let out = run_snippet(&dir, &idx, &json!({ "symbol": "nope" }), 50, 16_384).unwrap();
+        assert!(out.contains("No symbol named"), "{out}");
+        // No args at all is an error, not a body.
+        assert!(run_snippet(&dir, &idx, &json!({}), 50, 16_384).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cap_bytes_respects_char_boundary() {
+        // 'h' = 1 byte, 'é' = 2 bytes; a 2-byte cap must not split 'é'.
+        let (s, truncated) = cap_bytes("héllo", 2);
+        assert!(truncated);
+        assert_eq!(s, "h");
+        let (s2, t2) = cap_bytes("abc", 10);
+        assert!(!t2);
+        assert_eq!(s2, "abc");
+    }
 }

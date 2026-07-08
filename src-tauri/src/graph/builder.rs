@@ -11,12 +11,21 @@
 use tree_sitter::{Node, Parser};
 
 use super::model::{
-    doc_chunk_id, fnv1a_hex, symbol_doc_chunk_id, symbol_id, DocChunk, Edge, EdgeKind, FileGraph,
-    Lang, Reference, Symbol, SymbolKind, Visibility,
+    doc_chunk_id, fnv1a_hex, symbol_doc_chunk_id, symbol_id, CodeChunk, DocChunk, Edge, EdgeKind,
+    FileGraph, Lang, Reference, Symbol, SymbolKind, Visibility,
 };
 
 /// Max characters kept for a symbol's one-line signature.
 const MAX_SIGNATURE: usize = 200;
+
+/// Minimum span (inclusive line count) for a symbol to earn a semantic code
+/// chunk (V11 Phase G) — a one- or two-line definition is already fully
+/// captured by its `signature`, so chunking it would just duplicate that row.
+const MIN_CODE_CHUNK_LINES: u32 = 3;
+
+/// Max characters kept in a code chunk's embedded text (signature + doc +
+/// body), mirroring [`MAX_SIGNATURE`]'s role for the one-line signature.
+const MAX_CODE_CHUNK_CHARS: usize = 1024;
 
 /// Parse one file's source into a [`FileGraph`]. `path` is the project-relative
 /// path stored on every row; `lang` selects the grammar.
@@ -729,6 +738,26 @@ pub(crate) fn emit_symbol(
     if let Some(p) = parent {
         fg.edges.push(Edge { kind: EdgeKind::Contains, src: p.to_string(), dst: id.clone() });
     }
+    // V11 Phase G: a semantic *code* chunk for this symbol (signature + doc +
+    // body), keyed by the symbol's own id. Uses `doc.as_deref()` rather than
+    // consuming `doc` — the doc-chunk block below still needs it. Only
+    // "shaped" definitions worth embedding, and only spans long enough that
+    // the signature alone (already in `symbol.signature`) wouldn't capture
+    // the interesting part.
+    if is_code_chunk_kind(skind) && end.saturating_sub(start) + 1 >= MIN_CODE_CHUNK_LINES {
+        let mut text = signature_of(src, node);
+        text.push('\n');
+        if let Some(d) = doc.as_deref() {
+            text.push_str(d);
+            text.push('\n');
+        }
+        text.push_str(&node_text(src, node));
+        fg.code_chunks.push(CodeChunk {
+            id: id.clone(),
+            file: file.to_string(),
+            text: truncate_code_chunk(&text, MAX_CODE_CHUNK_CHARS),
+        });
+    }
     if let Some(text) = doc {
         // Disambiguate the storage key by start line so two same-named defs in
         // one file don't collide and overwrite each other's doc chunk.
@@ -742,6 +771,32 @@ pub(crate) fn emit_symbol(
         fg.edges.push(Edge { kind: EdgeKind::Documents, src: cid, dst: id.clone() });
     }
     id
+}
+
+/// Symbol kinds "shaped" enough to earn a semantic code chunk — a bare
+/// `const`/`static`/`field`/`variant`/`module`/`macro`/`impl` is already fully
+/// covered by its one-line signature, so chunking it would just be noise.
+fn is_code_chunk_kind(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Struct
+            | SymbolKind::Class
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Interface
+            | SymbolKind::TypeAlias
+    )
+}
+
+/// Truncate `s` to at most `n` characters (char-boundary safe — see
+/// [`signature_of`]'s note on why a byte-offset truncate can panic here).
+fn truncate_code_chunk(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => s[..idx].to_string(),
+        None => s.to_string(),
+    }
 }
 
 fn take_doc(pending: &mut Vec<String>) -> Option<String> {

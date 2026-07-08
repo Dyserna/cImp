@@ -35,6 +35,10 @@ export interface GraphStatus {
   embedded: number;
   embed_total: number;
   embed_pending: number;
+  // V11 Phase G/F: code-embedding coverage + cached-digest count.
+  code_embedded: number;
+  code_embed_total: number;
+  digests: number;
   embed_error: string | null;
 }
 

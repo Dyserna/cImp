@@ -31,6 +31,10 @@ pub struct SymbolHit {
     pub signature: String,
     /// Stored visibility tag (`public`/`private`/`crate`/`unknown`).
     pub visibility: String,
+    /// Last source line of the definition's span. Projected as the 8th column
+    /// (after `visibility`); queries that don't select it fall back to
+    /// `start_line` (a single-line span). Feeds `graph_snippet` (V11 Phase A).
+    pub end_line: u32,
 }
 
 /// One reference (use site) returned by `references`.
@@ -246,10 +250,11 @@ impl GraphIndex {
             .collect())
     }
 
-    /// Delete every row belonging to `file` (symbols, refs, doc-chunks, the
-    /// `file` row, and edges keyed by the file-embedded id prefix `<file>#…` or
-    /// `src == file` for imports). Used both by the per-file replace in
-    /// [`index_file_graph`] and by the watcher when a file is deleted.
+    /// Delete every row belonging to `file` (symbols, refs, doc-chunks,
+    /// code-chunks, the `file` row, and edges keyed by the file-embedded id
+    /// prefix `<file>#…` or `src == file` for imports). Used both by the
+    /// per-file replace in [`index_file_graph`] and by the watcher when a file
+    /// is deleted.
     pub fn remove_file(&self, file: &str) -> AppResult<()> {
         self.with_write_txn(|tx| remove_file_in_tx(tx, file))
     }
@@ -285,6 +290,9 @@ impl GraphIndex {
                         .map(|d| DataValue::Str(d.into()))
                         .unwrap_or(DataValue::Null),
                     DataValue::Str(s.visibility.tag().into()),
+                    // `is_test` provisioned in the v3 (V11–V14) bump; V12 Phase C
+                    // replaces this literal with the walker-detected value.
+                    DataValue::Bool(false),
                 ])
             })
             .collect();
@@ -319,6 +327,18 @@ impl GraphIndex {
             })
             .collect();
 
+        let code_chunk_rows = fg
+            .code_chunks
+            .iter()
+            .map(|c| {
+                DataValue::List(vec![
+                    DataValue::Str(c.id.as_str().into()),
+                    DataValue::Str(c.file.as_str().into()),
+                    DataValue::Str(c.text.as_str().into()),
+                ])
+            })
+            .collect();
+
         let edge_rows = fg
             .edges
             .iter()
@@ -343,8 +363,8 @@ impl GraphIndex {
             )?;
             tx_put(
                 tx,
-                "?[id, name, kind, file, start_line, end_line, signature, doc, visibility] <- $rows\n\
-                 :put symbol {id => name, kind, file, start_line, end_line, signature, doc, visibility}",
+                "?[id, name, kind, file, start_line, end_line, signature, doc, visibility, is_test] <- $rows\n\
+                 :put symbol {id => name, kind, file, start_line, end_line, signature, doc, visibility, is_test}",
                 symbol_rows,
             )?;
             tx_put(
@@ -356,6 +376,11 @@ impl GraphIndex {
                 tx,
                 "?[id, source_path, anchor, text] <- $rows\n:put doc_chunk {id => source_path, anchor, text}",
                 doc_rows,
+            )?;
+            tx_put(
+                tx,
+                "?[id, file, text] <- $rows\n:put code_chunk {id => file, text}",
+                code_chunk_rows,
             )?;
             tx_put(
                 tx,
@@ -393,8 +418,8 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            "?[id, name, kind, file, start_line, signature, visibility] := \
-                *symbol{id, name, kind, file, start_line, signature, visibility}, name == $name",
+            "?[id, name, kind, file, start_line, signature, visibility, end_line] := \
+                *symbol{id, name, kind, file, start_line, signature, visibility, end_line}, name == $name",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -407,9 +432,9 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            r#"?[sid, sname, skind, file, start_line, signature, visibility] :=
+            r#"?[sid, sname, skind, file, start_line, signature, visibility, end_line] :=
                 *edge{kind: ek, src: sid, dst: dn}, ek == "call", dn == $name,
-                *symbol{id: sid, name: sname, kind: skind, file, start_line, signature, visibility}
+                *symbol{id: sid, name: sname, kind: skind, file, start_line, signature, visibility, end_line}
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
@@ -422,10 +447,10 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            r#"?[id2, nm, skind, file, start_line, signature, visibility] :=
+            r#"?[id2, nm, skind, file, start_line, signature, visibility, end_line] :=
                 *symbol{id: cid, name: cn}, cn == $name,
                 *edge{kind: ek, src: cid, dst: dn}, ek == "call",
-                *symbol{id: id2, name: nm, kind: skind, file, start_line, signature, visibility}, nm == dn
+                *symbol{id: id2, name: nm, kind: skind, file, start_line, signature, visibility, end_line}, nm == dn
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
@@ -504,8 +529,8 @@ impl GraphIndex {
         // unreferenced) is naturally small, so an unbounded query is cheap.
         let rows = self.run(
             r#"call_dst[dst] := *edge{kind: k, src, dst}, k == "call"
-?[id, name, kind, file, start_line, signature, visibility] :=
-    *symbol{id, name, kind, file, start_line, signature, visibility},
+?[id, name, kind, file, start_line, signature, visibility, end_line] :=
+    *symbol{id, name, kind, file, start_line, signature, visibility, end_line},
     visibility == "public",
     not *ref{name: name},
     not call_dst[name],
@@ -588,14 +613,85 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("file".to_string(), DataValue::Str(file.into()));
         let rows = self.run(
-            "?[id, name, kind, file, start_line, signature, visibility] := \
-                *symbol{id, name, kind, file, start_line, signature, visibility}, file == $file",
+            "?[id, name, kind, file, start_line, signature, visibility, end_line] := \
+                *symbol{id, name, kind, file, start_line, signature, visibility, end_line}, file == $file",
             p,
             ScriptMutability::Immutable,
         )?;
         let mut syms = rows_to_symbols(&rows);
         syms.sort_by_key(|s| s.start_line);
         Ok(syms)
+    }
+
+    /// The smallest symbol whose span encloses `line` (1-based) in `file`. Used
+    /// by `graph_snippet`'s `file`+`line` mode. `None` when no indexed symbol
+    /// contains the line (e.g. a top-of-file import region or a blank line).
+    pub fn symbol_at(&self, file: &str, line: u32) -> AppResult<Option<SymbolHit>> {
+        let mut p = BTreeMap::new();
+        p.insert("file".to_string(), DataValue::Str(file.into()));
+        p.insert("line".to_string(), DataValue::Num(Num::Int(line as i64)));
+        let rows = self.run(
+            "?[id, name, kind, file, start_line, signature, visibility, end_line] := \
+                *symbol{id, name, kind, file, start_line, signature, visibility, end_line}, \
+                file == $file, start_line <= $line, end_line >= $line",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut syms = rows_to_symbols(&rows);
+        // Smallest enclosing span wins — the most specific definition (a method
+        // inside an impl inside a module resolves to the method).
+        syms.sort_by_key(|s| s.end_line.saturating_sub(s.start_line));
+        Ok(syms.into_iter().next())
+    }
+
+    /// Number of distinct callers of a symbol name — a cheap orientation figure
+    /// for the `graph_snippet` header. The `edge` relation stores `(kind, src,
+    /// dst)` as a set, so with `kind`/`dst` fixed this counts distinct caller
+    /// ids. Name-keyed like the other call queries (approximate by convention).
+    pub fn callers_count(&self, name: &str) -> AppResult<u64> {
+        let mut p = BTreeMap::new();
+        p.insert("name".to_string(), DataValue::Str(name.into()));
+        let rows = self.run(
+            r#"?[count(src)] := *edge{kind: k, src, dst}, k == "call", dst == $name"#,
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64)
+    }
+
+    /// The stored content hash for an indexed file, or `None` if not indexed.
+    /// `graph_snippet` compares it against the on-disk content hash to flag a
+    /// span as possibly stale (file edited since the last index pass).
+    pub fn stored_file_hash(&self, file: &str) -> AppResult<Option<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("file".to_string(), DataValue::Str(file.into()));
+        let rows = self.run(
+            "?[hash] := *file{path, hash}, path == $file",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_str(r, 0)))
+    }
+
+    /// Files ranked by inbound-call centrality (how many call sites target a
+    /// symbol defined in the file), most-central first, capped at `max`. Feeds
+    /// the V11 Phase B project map. Name-keyed like the other call queries, so a
+    /// file defining a very common name ranks high — an orientation signal, not
+    /// a precise metric.
+    pub fn file_centrality(&self, max: usize) -> AppResult<Vec<(String, u64)>> {
+        let rows = self.run(
+            r#"?[file, count(src)] := *edge{kind: k, src, dst}, k == "call", *symbol{name: dst, file}"#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut v: Vec<(String, u64)> = rows
+            .rows
+            .iter()
+            .map(|r| (cell_str(r, 0), cell_i64(r, 1) as u64))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(max);
+        Ok(v)
     }
 
     /// Transitive call-chain names. `forward = true` returns everything `name`
@@ -787,6 +883,72 @@ reach[x, y] := reach[x, z], calls[z, y]
         Ok(n)
     }
 
+    /// V11 Phase F — a cached local-model digest for `(file, content_hash)`, or
+    /// `None` on a miss (stale hash / never computed).
+    pub fn get_digest(&self, file: &str, content_hash: &str) -> AppResult<Option<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("file".to_string(), DataValue::Str(file.into()));
+        p.insert("hash".to_string(), DataValue::Str(content_hash.into()));
+        let rows = self.run(
+            "?[text] := *digest{file, content_hash, text}, file == $file, content_hash == $hash",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_str(r, 0)))
+    }
+
+    /// Upsert a computed digest for `(file, content_hash)`.
+    pub fn put_digest(&self, file: &str, content_hash: &str, text: &str, ts_ms: i64) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("file".to_string(), DataValue::Str(file.into()));
+        p.insert("hash".to_string(), DataValue::Str(content_hash.into()));
+        p.insert("text".to_string(), DataValue::Str(text.into()));
+        p.insert("ts".to_string(), DataValue::Num(Num::Int(ts_ms)));
+        self.run_mut(
+            "?[file, content_hash, text, ts_ms] <- [[$file, $hash, $text, $ts]]\n\
+             :put digest {file, content_hash => text, ts_ms}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// Number of cached digests, for the Context section's coverage readout.
+    pub fn digest_count(&self) -> AppResult<u64> {
+        if !self.existing_relations()?.contains("digest") {
+            return Ok(0);
+        }
+        let rows = self.run(
+            "?[count(file)] := *digest{file, content_hash}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64)
+    }
+
+    /// Drop cached digests whose file is no longer indexed (mirrors the doc_vec
+    /// orphan sweep).
+    pub fn prune_orphan_digests(&self) -> AppResult<u64> {
+        if !self.existing_relations()?.contains("digest") {
+            return Ok(0);
+        }
+        let n = {
+            let rows = self.run(
+                "?[count(file)] := *digest{file, content_hash}, not *file{path: file}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )?;
+            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+        };
+        if n > 0 {
+            self.run_mut(
+                "?[file, content_hash] := *digest{file, content_hash}, not *file{path: file}\n\
+                 :rm digest {file, content_hash}",
+                BTreeMap::new(),
+            )?;
+        }
+        Ok(n)
+    }
+
     fn ensure_meta_relation(&self) -> AppResult<()> {
         if !self.existing_relations()?.contains("embed_meta") {
             self.run_mut(
@@ -972,6 +1134,288 @@ reach[x, y] := reach[x, z], calls[z, y]
         Ok((embedded, total))
     }
 
+    // ── Semantic *code* search (V11 Phase G) ──────────────────────────────
+    //
+    // The `code_chunk`/`code_vec` pair is the near-exact twin of `doc_chunk`/
+    // `doc_vec` above, over symbol bodies instead of prose. It keeps its own
+    // `code_embed_meta` singleton (rather than sharing `embed_meta`) so a dim
+    // change is detected independently of whichever store `ensure_*` runs
+    // first — sharing one singleton would have the second call see the first
+    // call's just-written new dim and wrongly conclude nothing changed.
+
+    /// Ensure the `code_vec` relation + HNSW index exist sized for `dim`, and
+    /// stamp `model`/`dim`/`epoch` into the `code_embed_meta` singleton.
+    /// Mirrors [`Self::ensure_vector_store`]. Returns `true` on a dim change
+    /// (old code vectors dropped — a full code re-embed is due).
+    pub fn ensure_code_vector_store(&self, dim: usize, model: &str, epoch: &str) -> AppResult<bool> {
+        self.ensure_code_meta_relation()?;
+        let existing_dim = self.stored_code_dim()?;
+        let mut reset = false;
+        let have_code_vec = self.existing_relations()?.contains("code_vec");
+
+        if !have_code_vec || existing_dim != Some(dim) {
+            if have_code_vec {
+                self.drop_code_vector_store()?;
+                reset = true;
+            }
+            self.run_mut(
+                &format!("?[chunk_id, epoch, hash, vec] <- []\n:create code_vec {{chunk_id: String, epoch: String => hash: String, vec: <F32; {dim}>}}"),
+                BTreeMap::new(),
+            )?;
+            self.run_mut(
+                &format!(
+                    "::hnsw create code_vec:vec_idx {{dim: {dim}, m: 16, dtype: F32, fields: [vec], distance: Cosine, ef_construction: 50}}"
+                ),
+                BTreeMap::new(),
+            )?;
+        }
+
+        let mut p = BTreeMap::new();
+        p.insert("model".to_string(), DataValue::Str(model.into()));
+        p.insert("dim".to_string(), int(dim as u32));
+        p.insert("epoch".to_string(), DataValue::Str(epoch.into()));
+        self.run_mut(
+            "?[id, model, dim, epoch] <- [['1', $model, $dim, $epoch]]\n:put code_embed_meta {id => model, dim, epoch}",
+            p,
+        )?;
+        Ok(reset)
+    }
+
+    /// Drop the `code_vec` store, forcing the next backfill to re-embed every
+    /// code chunk from scratch. Mirrors [`Self::clear_vectors`]. No-op if
+    /// there's no store.
+    pub fn clear_code_vectors(&self) -> AppResult<()> {
+        if self.existing_relations()?.contains("code_vec") {
+            self.drop_code_vector_store()?;
+        }
+        Ok(())
+    }
+
+    /// Remove the `code_vec` relation, dropping its HNSW index first. Mirrors
+    /// [`Self::drop_vector_store`].
+    fn drop_code_vector_store(&self) -> AppResult<()> {
+        let _ = self.run_mut("::index drop code_vec:vec_idx", BTreeMap::new());
+        self.run_mut("::remove code_vec", BTreeMap::new())?;
+        Ok(())
+    }
+
+    /// Delete code vectors whose `code_chunk` no longer exists — chunks
+    /// dropped by a file delete/rename or a symbol that shrank below the
+    /// chunking threshold. Mirrors [`Self::prune_orphan_vectors`]. Returns the
+    /// number of orphans removed.
+    pub fn prune_orphan_code_vectors(&self) -> AppResult<u64> {
+        if !self.existing_relations()?.contains("code_vec") {
+            return Ok(0);
+        }
+        let n = {
+            let rows = self.run(
+                "?[count(chunk_id)] := *code_vec{chunk_id, epoch}, not *code_chunk{id: chunk_id}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )?;
+            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+        };
+        if n > 0 {
+            self.run_mut(
+                "?[chunk_id, epoch] := *code_vec{chunk_id, epoch}, not *code_chunk{id: chunk_id}\n\
+                 :rm code_vec {chunk_id, epoch}",
+                BTreeMap::new(),
+            )?;
+        }
+        Ok(n)
+    }
+
+    fn ensure_code_meta_relation(&self) -> AppResult<()> {
+        if !self.existing_relations()?.contains("code_embed_meta") {
+            self.run_mut(
+                "?[id, model, dim, epoch] <- []\n:create code_embed_meta {id: String => model: String, dim: Int, epoch: String}",
+                BTreeMap::new(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn stored_code_dim(&self) -> AppResult<Option<usize>> {
+        if !self.existing_relations()?.contains("code_embed_meta") {
+            return Ok(None);
+        }
+        let rows = self.run(
+            "?[dim] := *code_embed_meta{dim}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_i64(r, 0) as usize))
+    }
+
+    /// The current code-embedding epoch fingerprint, or `None` if never embedded.
+    pub fn current_code_epoch(&self) -> AppResult<Option<String>> {
+        if !self.existing_relations()?.contains("code_embed_meta") {
+            return Ok(None);
+        }
+        let rows = self.run(
+            "?[epoch] := *code_embed_meta{epoch}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_str(r, 0)))
+    }
+
+    /// Store `(chunk_id, embedding)` rows for the current code `epoch`,
+    /// stamping each with its chunk's content hash. Mirrors
+    /// [`Self::put_doc_vectors`].
+    pub fn put_code_vectors(
+        &self,
+        epoch: &str,
+        items: &[(String, String, Vec<f32>)], // (chunk_id, text_hash, vector)
+    ) -> AppResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<DataValue> = items
+            .iter()
+            .map(|(id, hash, vec)| {
+                let v = DataValue::List(
+                    vec.iter()
+                        .map(|f| DataValue::Num(Num::Float(*f as f64)))
+                        .collect(),
+                );
+                DataValue::List(vec![
+                    DataValue::Str(id.as_str().into()),
+                    DataValue::Str(epoch.into()),
+                    DataValue::Str(hash.as_str().into()),
+                    v,
+                ])
+            })
+            .collect();
+        self.put(
+            "?[chunk_id, epoch, hash, vec] <- $rows\n:put code_vec {chunk_id, epoch => hash, vec}",
+            rows,
+        )
+    }
+
+    /// Code chunks lacking a current-epoch vector whose hash matches their
+    /// text — i.e. new or changed symbol bodies that need (re-)embedding.
+    /// Mirrors [`Self::chunks_needing_vectors`]. Bounded by `limit`. Returns
+    /// `(chunk_id, text_hash, text)`.
+    pub fn pending_code_chunks(
+        &self,
+        epoch: &str,
+        limit: usize,
+    ) -> AppResult<Vec<(String, String, String)>> {
+        let mut embedded: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if self.existing_relations()?.contains("code_vec") {
+            let mut p = BTreeMap::new();
+            p.insert("epoch".to_string(), DataValue::Str(epoch.into()));
+            let rows = self.run(
+                "?[chunk_id, hash] := *code_vec{chunk_id, epoch, hash}, epoch == $epoch",
+                p,
+                ScriptMutability::Immutable,
+            )?;
+            for r in &rows.rows {
+                embedded.insert(cell_str(r, 0), cell_str(r, 1));
+            }
+        }
+        let rows = self.run(
+            "?[id, text] := *code_chunk{id, text}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut out = Vec::new();
+        for r in &rows.rows {
+            let id = cell_str(r, 0);
+            let text = cell_str(r, 1);
+            let hash = text_hash(&text);
+            if embedded.get(&id) != Some(&hash) {
+                out.push((id, hash, text));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// k-NN semantic **code** search: nearest current-epoch code-chunk
+    /// vectors to `query_vec`, joined back to the defining symbol (a code
+    /// chunk's id IS its symbol's id, so this is a direct join — no separate
+    /// text lookup). Returns `(SymbolHit, distance)` ascending by distance;
+    /// deliberately carries no body text — callers chain into `graph_snippet`
+    /// for that. Empty when there's no vector store/epoch.
+    pub fn semantic_code_search(
+        &self,
+        query_vec: &[f32],
+        epoch: &str,
+        k: usize,
+    ) -> AppResult<Vec<(SymbolHit, f32)>> {
+        if !self.existing_relations()?.contains("code_vec") {
+            return Ok(Vec::new());
+        }
+        let mut p = BTreeMap::new();
+        p.insert(
+            "q".to_string(),
+            DataValue::List(
+                query_vec
+                    .iter()
+                    .map(|f| DataValue::Num(Num::Float(*f as f64)))
+                    .collect(),
+            ),
+        );
+        p.insert("epoch".to_string(), DataValue::Str(epoch.into()));
+        p.insert("k".to_string(), int(k as u32));
+        p.insert("ef".to_string(), int((k * 10).max(50) as u32));
+        let rows = self.run(
+            r#"sem[chunk_id, dist] := ~code_vec:vec_idx{chunk_id, epoch | query: q, k: $k, ef: $ef, bind_distance: dist, filter: epoch == $epoch}, q = vec($q)
+?[cid, name, kind, file, start_line, signature, visibility, end_line, dist] := sem[cid, dist], *symbol{id: cid, name, kind, file, start_line, end_line, signature, visibility}
+:order dist
+:limit $k"#,
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| {
+                let hit = SymbolHit {
+                    id: cell_str(r, 0),
+                    name: cell_str(r, 1),
+                    kind: cell_str(r, 2),
+                    file: cell_str(r, 3),
+                    start_line: cell_i64(r, 4) as u32,
+                    signature: cell_str(r, 5),
+                    visibility: cell_str(r, 6),
+                    end_line: cell_i64(r, 7) as u32,
+                };
+                (hit, cell_f64(r, 8) as f32)
+            })
+            .collect())
+    }
+
+    /// `(embedded_current_epoch, total_code_chunks)` for the coverage readout.
+    pub fn code_embedding_coverage(&self, epoch: &str) -> AppResult<(u64, u64)> {
+        let total = {
+            let rows = self.run(
+                "?[count(id)] := *code_chunk{id}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )?;
+            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+        };
+        let embedded = if self.existing_relations()?.contains("code_vec") {
+            let mut p = BTreeMap::new();
+            p.insert("epoch".to_string(), DataValue::Str(epoch.into()));
+            let rows = self.run(
+                "?[count(chunk_id)] := *code_vec{chunk_id, epoch}, epoch == $epoch",
+                p,
+                ScriptMutability::Immutable,
+            )?;
+            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+        } else {
+            0
+        };
+        Ok((embedded, total))
+    }
+
     /// Row counts for the status surface.
     pub fn stats(&self) -> AppResult<GraphStats> {
         let count = |rel: &str| -> AppResult<u64> {
@@ -1058,6 +1502,13 @@ impl GraphIndex {
             (
                 "mem_note",
                 ":create mem_note {note_id: String => session_id: String, text: String, ts_ms: Int, pinned: Bool}",
+            ),
+            // V11 Phase F: cached local-model digests, keyed by file + content
+            // hash so a stale entry is simply ignored. Additive (survives a
+            // graph rebuild — recomputing digests costs local GPU time).
+            (
+                "digest",
+                ":create digest {file: String, content_hash: String => text: String, ts_ms: Int}",
             ),
         ];
         for (name, create) in defs {
@@ -1191,6 +1642,21 @@ impl GraphIndex {
             )?,
         };
         Ok(rows.rows.first().map(|r| cell_str(r, 0)))
+    }
+
+    /// The most recent event timestamp (ms) for `path` in `session_id`, or
+    /// `None` if this session never touched that file. Feeds the V11 read
+    /// advisor's "already seen this file" check. `path` is project-relative.
+    pub fn mem_file_last_event_ms(&self, session_id: &str, path: &str) -> AppResult<Option<i64>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        p.insert("path".to_string(), DataValue::Str(path.into()));
+        let rows = self.run(
+            "?[ts_ms] := *mem_event{session_id, path, ts_ms}, session_id == $sid, path == $path",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.iter().map(|r| cell_i64(r, 0)).max())
     }
 
     /// The ranked working set for `session_id`: files aggregated from its events,
@@ -1457,9 +1923,10 @@ fn tx_put(tx: &MultiTransaction, script: &str, rows: Vec<DataValue>) -> AppResul
 }
 
 /// Delete every row belonging to `file` within an open transaction (symbols,
-/// refs, doc-chunks, the `file` row, edges keyed by the file id-prefix or
-/// `src == file`, plus inbound call edges to names this file uniquely defined).
-/// The transaction makes this atomic with the re-insert in [`GraphIndex::index_file_graph`].
+/// refs, doc-chunks, code-chunks, the `file` row, edges keyed by the file
+/// id-prefix or `src == file`, plus inbound call edges to names this file
+/// uniquely defined). The transaction makes this atomic with the re-insert in
+/// [`GraphIndex::index_file_graph`].
 fn remove_file_in_tx(tx: &MultiTransaction, file: &str) -> AppResult<()> {
     let prefix = format!("{file}#");
     let mut p = BTreeMap::new();
@@ -1487,6 +1954,11 @@ fn remove_file_in_tx(tx: &MultiTransaction, file: &str) -> AppResult<()> {
     tx_run(
         tx,
         "?[id] := *doc_chunk{id, source_path}, source_path == $file\n:rm doc_chunk {id}",
+        p.clone(),
+    )?;
+    tx_run(
+        tx,
+        "?[id] := *code_chunk{id, file}, file == $file\n:rm code_chunk {id}",
         p.clone(),
     )?;
     tx_run(
@@ -1573,19 +2045,24 @@ fn text_hash(s: &str) -> String {
 }
 
 /// Map query rows shaped `[id, name, kind, file, start_line, signature,
-/// visibility]` to [`SymbolHit`]s. Queries that don't project `visibility`
-/// (7th column absent) get `"unknown"`.
+/// visibility, end_line]` to [`SymbolHit`]s. Queries that don't project
+/// `visibility` (7th column absent) get `"unknown"`; those that don't project
+/// `end_line` (8th column absent) fall back to `start_line`.
 fn rows_to_symbols(rows: &cozo::NamedRows) -> Vec<SymbolHit> {
     rows.rows
         .iter()
-        .map(|r| SymbolHit {
-            id: cell_str(r, 0),
-            name: cell_str(r, 1),
-            kind: cell_str(r, 2),
-            file: cell_str(r, 3),
-            start_line: cell_i64(r, 4) as u32,
-            signature: cell_str(r, 5),
-            visibility: if r.len() > 6 { cell_str(r, 6) } else { "unknown".to_string() },
+        .map(|r| {
+            let start_line = cell_i64(r, 4) as u32;
+            SymbolHit {
+                id: cell_str(r, 0),
+                name: cell_str(r, 1),
+                kind: cell_str(r, 2),
+                file: cell_str(r, 3),
+                start_line,
+                signature: cell_str(r, 5),
+                visibility: if r.len() > 6 { cell_str(r, 6) } else { "unknown".to_string() },
+                end_line: if r.len() > 7 { cell_i64(r, 7) as u32 } else { start_line },
+            }
         })
         .collect()
 }
@@ -1850,10 +2327,48 @@ pub struct Point { x: i32 }
         idx.index_file_graph(&fg).expect("reindex");
         assert_eq!(idx.find_symbol("add").expect("find2").len(), 1);
 
+        // V11 Phase A: end_line is projected and covers the body.
+        assert!(hits[0].end_line >= hits[0].start_line);
+        // symbol_at resolves the smallest enclosing definition for a body line.
+        let at = idx.symbol_at("src/geo.rs", hits[0].start_line).expect("symbol_at");
+        assert_eq!(at.as_ref().map(|s| s.name.as_str()), Some("add"));
+        // The blank first line encloses no definition.
+        assert!(idx.symbol_at("src/geo.rs", 1).expect("symbol_at blank").is_none());
+        // callers_count: add calls helper → helper has ≥1 caller; add has none.
+        assert!(idx.callers_count("helper").expect("cc helper") >= 1);
+        assert_eq!(idx.callers_count("add").expect("cc add"), 0);
+        // stored_file_hash returns the indexed content hash.
+        assert_eq!(idx.stored_file_hash("src/geo.rs").expect("hash"), Some(fg.hash.clone()));
+
         let stats = idx.stats().expect("stats");
         assert_eq!(stats.files, 1);
         assert!(stats.symbols >= 3);
         assert!(stats.edges >= 1);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn digest_cache_roundtrip_and_orphan_prune() {
+        let dir = std::env::temp_dir().join(format!("ckg-digest-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/a.rs", "pub fn f() {}\n", Lang::Rust))
+            .expect("index");
+
+        // Miss, then hit; a different hash is a miss (stale content).
+        assert!(idx.get_digest("src/a.rs", "h1").unwrap().is_none());
+        idx.put_digest("src/a.rs", "h1", "a three line digest", 100).unwrap();
+        assert_eq!(idx.get_digest("src/a.rs", "h1").unwrap().as_deref(), Some("a three line digest"));
+        assert!(idx.get_digest("src/a.rs", "h2").unwrap().is_none());
+        assert_eq!(idx.digest_count().unwrap(), 1);
+
+        // A digest for a file no longer indexed is pruned; the live one stays.
+        idx.put_digest("gone.rs", "hx", "orphan", 100).unwrap();
+        assert_eq!(idx.digest_count().unwrap(), 2);
+        assert_eq!(idx.prune_orphan_digests().unwrap(), 1);
+        assert_eq!(idx.digest_count().unwrap(), 1);
+        assert!(idx.get_digest("gone.rs", "hx").unwrap().is_none());
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2052,6 +2567,104 @@ pub struct Point { x: i32 }
         idx.put_doc_vectors(epoch, &vecs).expect("put");
         assert_eq!(idx.prune_orphan_vectors().unwrap(), 0, "nothing orphaned");
         assert!(idx.chunks_needing_vectors(epoch, 100).unwrap().is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn code_chunk_emission_respects_kind_and_size_filters() {
+        // const → not a "shaped" kind, never chunked. short() → a shaped kind
+        // but a 1-line span, below the 3-line floor. long_fn → shaped + a
+        // 4-line span, so it earns a chunk whose text carries the body.
+        let src = "pub const N: i32 = 1;\n\
+                   pub fn short() { 1 }\n\
+                   pub fn long_fn(a: i32, b: i32) -> i32 {\n    let c = a + b;\n    c * 2\n}\n";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let ids: Vec<&str> = fg.code_chunks.iter().map(|c| c.id.as_str()).collect();
+        assert!(!ids.iter().any(|i| i.contains("N@")), "const not chunked: {ids:?}");
+        assert!(!ids.iter().any(|i| i.contains("short@")), "1-line fn not chunked: {ids:?}");
+        let chunk = fg
+            .code_chunks
+            .iter()
+            .find(|c| c.id.contains("long_fn@"))
+            .expect("long_fn chunked");
+        assert_eq!(chunk.file, "src/a.rs");
+        assert!(chunk.text.contains("let c = a + b"), "body present: {}", chunk.text);
+    }
+
+    #[test]
+    fn semantic_code_vector_store_roundtrip() {
+        // Exercises the code_vec HNSW path end-to-end with deterministic
+        // vectors (no embedding endpoint needed) — the code twin of
+        // `semantic_vector_store_roundtrip`.
+        let dir = std::env::temp_dir().join(format!("ckg-codevec-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        let src = "pub fn add_numbers(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    sum\n}\n\
+                   pub fn multiply_numbers(a: i32, b: i32) -> i32 {\n    let prod = a * b;\n    prod\n}\n";
+        idx.index_file_graph(&parse_file("src/math.rs", src, Lang::Rust))
+            .expect("index");
+
+        let epoch = "code-epoch";
+        let reset = idx.ensure_code_vector_store(3, "fake-model", epoch).expect("ensure");
+        assert!(!reset, "fresh store isn't a reset");
+
+        let need = idx.pending_code_chunks(epoch, 100).expect("need");
+        assert_eq!(need.len(), 2);
+
+        // Deterministic 3-d vectors: "add_numbers" near [1,0,0], the other near [0,1,0].
+        let vecs: Vec<(String, String, Vec<f32>)> = need
+            .iter()
+            .map(|(id, hash, text)| {
+                let v = if text.contains("add_numbers") {
+                    vec![1.0, 0.0, 0.0]
+                } else {
+                    vec![0.0, 1.0, 0.0]
+                };
+                (id.clone(), hash.clone(), v)
+            })
+            .collect();
+        idx.put_code_vectors(epoch, &vecs).expect("put vecs");
+
+        assert_eq!(idx.code_embedding_coverage(epoch).expect("cov"), (2, 2));
+        assert!(idx.pending_code_chunks(epoch, 100).expect("need2").is_empty());
+
+        let hits = idx
+            .semantic_code_search(&[0.9, 0.1, 0.0], epoch, 2)
+            .expect("search");
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0.name, "add_numbers");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_orphan_code_vectors_drops_deleted_chunks() {
+        let dir = std::env::temp_dir().join(format!("ckg-codeprune-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        let src = "pub fn add_numbers(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    sum\n}\n";
+        idx.index_file_graph(&parse_file("src/math.rs", src, Lang::Rust))
+            .expect("index");
+
+        let epoch = "e";
+        idx.ensure_code_vector_store(3, "m", epoch).expect("ensure");
+        let need = idx.pending_code_chunks(epoch, 100).expect("need");
+        assert_eq!(need.len(), 1);
+        let vecs: Vec<(String, String, Vec<f32>)> = need
+            .iter()
+            .map(|(id, h, _)| (id.clone(), h.clone(), vec![1.0, 0.0, 0.0]))
+            .collect();
+        idx.put_code_vectors(epoch, &vecs).expect("put");
+        assert_eq!(idx.code_embedding_coverage(epoch).unwrap(), (1, 1));
+
+        // Delete the file's chunks: code_chunk rows go, code_vec rows orphan.
+        idx.remove_file("src/math.rs").expect("remove");
+        assert_eq!(idx.code_embedding_coverage(epoch).unwrap(), (1, 0));
+
+        assert_eq!(idx.prune_orphan_code_vectors().unwrap(), 1);
+        assert_eq!(idx.code_embedding_coverage(epoch).unwrap(), (0, 0));
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

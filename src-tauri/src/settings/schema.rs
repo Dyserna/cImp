@@ -892,6 +892,10 @@ pub struct GraphSettings {
     pub max_rows_per_query: u32,
     /// Hard cap on the snippet bytes attached to each result row.
     pub max_snippet_bytes: u32,
+    /// Hard cap on the body bytes returned by `graph_snippet` (V11 Phase A).
+    /// Larger than `max_snippet_bytes` because whole definition bodies are
+    /// bigger than the one-line snippets attached to result rows.
+    pub max_body_bytes: u32,
     /// Per-project subdirectory holding `graph.db`. Recommended git-ignored.
     pub db_subdir: String,
     /// Let the **offload worker** query the graph when it's running on a
@@ -917,9 +921,15 @@ pub struct GraphSettings {
     pub embedding_dims: u32,
     /// Also embed full symbol bodies (not just docs + signatures) for
     /// semantic *code* search. Off by default — multiplies vector count.
+    /// Doubles as the enable switch for the `graph_semantic_code` tool and its
+    /// backfill pass.
     pub embed_code_bodies: bool,
     /// Number of chunks per `/v1/embeddings` request (amortizes round-trips).
     pub embedding_batch: usize,
+    /// Project-wide cap on how many `code_chunk` rows a full rebuild keeps
+    /// (a simple count cap for V1 — see `build_tree`). Bounds DB size and
+    /// embedding cost on very large repos.
+    pub semantic_code_max_chunks: u32,
 
     // --- Context injection (V10 Phase D) ---
     /// Automatically prepend a budget-bounded digest of the most relevant files
@@ -936,6 +946,45 @@ pub struct GraphSettings {
     /// Minimum top-file relevance score below which nothing is injected (so
     /// meta/"hi" prompts inject nothing).
     pub context_min_score: u32,
+
+    // --- V11 Phase B: repo map (session-start orientation) ---
+    /// Character budget for the once-per-session project map (`graph_repo_map`
+    /// tool, and the session-start injection when enabled).
+    pub repo_map_budget_chars: u32,
+    /// Prepend the project map to the first injected turn of each new session.
+    /// Rides the `context_injection` master toggle AND this flag. Off by default.
+    pub repo_map_on_session_start: bool,
+
+    // --- V11 Phase C: injection dedup ---
+    /// How many turns a dedup suppression lasts: a file injected in full is
+    /// demoted to a one-line "unchanged" reminder on later turns until it changes
+    /// or this many turns pass. `0` disables dedup (every turn re-injects).
+    pub context_dedup_ttl_turns: u32,
+
+    // --- V11 Phase D: compaction survival (Claude PreCompact) ---
+    /// Feed the compactor the session's working set + pinned notes so they
+    /// survive the summary (and clear dedup / mark post-compaction). Costs a few
+    /// hundred chars once per compaction; still master-gated by `context_injection`.
+    pub compaction_context: bool,
+
+    // --- V11 Phase E: redundant-read advisor (opt-in; logic in Phase E) ---
+    /// Intercept a `Read` of a file already read unchanged this session and
+    /// answer with a cheap reminder (outline digest) instead of re-reading it.
+    /// Strictly opt-in — it changes the agent's tool behaviour. Default off.
+    pub read_advisor: bool,
+    /// Files with fewer than this many lines always pass the advisor (a small
+    /// file is cheap to re-read; the reminder isn't worth it).
+    pub read_advisor_min_lines: u32,
+    /// `"advise"` (remind with the outline) or `"substitute"` (also include the
+    /// most relevant symbol body). Default `"advise"`.
+    pub read_advisor_mode: String,
+
+    // --- V11 Phase F: local-model context digests ---
+    /// For files with no useful outline (docs/configs/long scripts), have the
+    /// **local** offload backend write a 3-line semantic digest, cached in
+    /// `graph.db`. Off by default; needs a ready local offload backend. Never
+    /// leaves the machine (local-only path).
+    pub context_llm_digests: bool,
 }
 
 impl GraphSettings {
@@ -973,6 +1022,7 @@ impl Default for GraphSettings {
             watch_debounce_ms: 300,
             max_rows_per_query: 100,
             max_snippet_bytes: 2_000,
+            max_body_bytes: 16_384,
             db_subdir: ".cimp".to_string(),
             allow_remote_worker_access: false,
             semantic_search: false,
@@ -981,11 +1031,20 @@ impl Default for GraphSettings {
             embedding_dims: 0,
             embed_code_bodies: false,
             embedding_batch: 32,
+            semantic_code_max_chunks: 20_000,
             context_injection: false,
             context_per_file_chars: 800,
             context_turn_budget_chars: 6_000,
             context_include_session: true,
             context_min_score: 3,
+            repo_map_budget_chars: 4_000,
+            repo_map_on_session_start: false,
+            context_dedup_ttl_turns: 10,
+            compaction_context: true,
+            read_advisor: false,
+            read_advisor_min_lines: 300,
+            read_advisor_mode: "advise".to_string(),
+            context_llm_digests: false,
         }
     }
 }

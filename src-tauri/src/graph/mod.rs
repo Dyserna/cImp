@@ -37,8 +37,8 @@ pub use context::RetrieveResult;
 pub use index::{GraphIndex, GraphStats, SymbolHit};
 pub use memory::{classify_tool, MemArg, MemorySnapshot};
 pub use mcp::{
-    handle_call as handle_mcp_call, offload_query, semantic_spec, tool_specs, tools as mcp_tools,
-    GraphToolSpec,
+    handle_call as handle_mcp_call, offload_query, semantic_code_spec, semantic_spec, tool_specs,
+    tools as mcp_tools, GraphToolSpec,
 };
 pub use model::*;
 pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus};

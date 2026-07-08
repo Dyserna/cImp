@@ -210,16 +210,46 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
                 );
             }
         }
-        if settings.graph.enabled && settings.graph.context_injection {
-            if let Some(command) = crate::statusline::context_hook_command() {
-                overlay.insert(
-                    "hooks".to_string(),
-                    serde_json::json!({
-                        "UserPromptSubmit": [ { "hooks": [
+        // Accumulate Claude hook entries (UserPromptSubmit context injection,
+        // V11 PreCompact compaction survival, V11 PreToolUse read advisor) into
+        // one `hooks` object — each entry is installed only when its gate is on.
+        {
+            let mut hooks = serde_json::Map::new();
+            if settings.graph.enabled && settings.graph.context_injection {
+                if let Some(command) = crate::statusline::context_hook_command() {
+                    hooks.insert(
+                        "UserPromptSubmit".to_string(),
+                        serde_json::json!([ { "hooks": [
                             { "type": "command", "command": command, "timeout": 5 }
-                        ] } ]
-                    }),
-                );
+                        ] } ]),
+                    );
+                }
+                // V11 Phase D: PreCompact — carry the working set through a compaction.
+                if settings.graph.compaction_context {
+                    if let Some(command) = crate::statusline::hook_command("--precompact-hook") {
+                        hooks.insert(
+                            "PreCompact".to_string(),
+                            serde_json::json!([ { "hooks": [
+                                { "type": "command", "command": command, "timeout": 5 }
+                            ] } ]),
+                        );
+                    }
+                }
+            }
+            // V11 Phase E: PreToolUse read advisor (opt-in; independent of the
+            // injection toggle, but still needs the graph). Matches only `Read`.
+            if settings.graph.enabled && settings.graph.read_advisor {
+                if let Some(command) = crate::statusline::hook_command("--read-hook") {
+                    hooks.insert(
+                        "PreToolUse".to_string(),
+                        serde_json::json!([ { "matcher": "Read", "hooks": [
+                            { "type": "command", "command": command, "timeout": 5 }
+                        ] } ]),
+                    );
+                }
+            }
+            if !hooks.is_empty() {
+                overlay.insert("hooks".to_string(), serde_json::Value::Object(hooks));
             }
         }
         if !overlay.is_empty() {
@@ -303,7 +333,9 @@ window. Keep work that needs your full reasoning or the conversation's context h
 const GRAPH_GUIDANCE: &str = "This project has a code knowledge graph (from the cimp-offload MCP \
 server). Prefer the `graph_*` tools over grep for code-structure questions: `graph_find_symbol` \
 (where a symbol is defined), `graph_callers`/`graph_callees` (call relationships), \
-`graph_references`, `graph_imports`, `graph_outline` (a file's definitions), `graph_transitive` \
+`graph_references`, `graph_imports`, `graph_outline` (a file's definitions), `graph_snippet` \
+(fetch just one definition's body instead of reading the whole file — for files over ~300 lines \
+prefer `graph_outline` → `graph_snippet` over a full Read), `graph_transitive` \
 (transitive call chains), `graph_search_docs` (documentation/doc-comments), and \
 `graph_struct_search` (find code by AST shape via a tree-sitter query — e.g. every `.unwrap()` or \
 every function with a given parameter pattern — when text search can't express the structure). They \

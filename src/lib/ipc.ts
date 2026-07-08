@@ -106,14 +106,18 @@ export interface UsageSnapshot {
 }
 
 /// Outcome of a usage fetch:
-///   - `snapshot` set → success.
-///   - `rate_limited` → 429 (transient); keep showing last-good/placeholder and
-///     retry after `retry_after_secs` (or the caller's cooldown).
-///   - all empty → unavailable (not logged in / network error).
+///   - `snapshot` set, `stale` false → fresh success.
+///   - `snapshot` set, `stale` true → last-good served during a 429 / transient
+///     failure; render it but signal it may be out of date.
+///   - `rate_limited` → 429; retry after `retry_after_secs` (or the caller's
+///     cooldown), keeping whatever snapshot came back on screen.
+///   - all empty → unavailable (not logged in) or a cold rate-limit with no
+///     cached snapshot yet.
 export interface UsageResult {
   snapshot: UsageSnapshot | null;
   rate_limited: boolean;
   retry_after_secs: number | null;
+  stale: boolean;
 }
 
 /// Fetch the current Claude Code usage. See `UsageResult` for the outcomes.

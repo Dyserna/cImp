@@ -27,7 +27,7 @@
 //!     returns a non-200 and we return `None` so the UI hides the widget.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -65,8 +65,9 @@ pub struct UsageWindow {
 
 /// The session (5h) and weekly (7d) windows the UI renders. Re-serialized to
 /// the frontend; the other fields the endpoint returns (`seven_day_sonnet`,
-/// `extra_usage`, …) are intentionally dropped.
-#[derive(Serialize, Clone, Debug)]
+/// `extra_usage`, …) are intentionally dropped. `Deserialize` is derived too
+/// so a last-good snapshot can be re-hydrated from the on-disk cache.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UsageSnapshot {
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
@@ -78,13 +79,21 @@ pub struct UsageSnapshot {
 /// data). `Default` is the unavailable state.
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct UsageResult {
-    /// Present on a successful (200) fetch.
+    /// The snapshot to render. On a 200 it's the freshly fetched one; on a
+    /// 429 / transient failure it's the persisted last-good snapshot (with
+    /// `stale` set) so the widget keeps showing real numbers instead of
+    /// reverting to placeholders. `None` only when we've never had a good
+    /// read (cold start) or the user is logged out.
     pub snapshot: Option<UsageSnapshot>,
     /// True when the endpoint returned 429 Too Many Requests.
     pub rate_limited: bool,
     /// Parsed `Retry-After` (whole seconds) from a 429, when the server sent
     /// the delta-seconds form. `None` → caller uses its own cooldown.
     pub retry_after_secs: Option<u64>,
+    /// True when `snapshot` is the cached last-good rather than a fresh read —
+    /// the endpoint was rate-limited or transiently unavailable. The UI dims
+    /// the numbers to signal they may be out of date.
+    pub stale: bool,
 }
 
 /// Raw shape of the endpoint response — only the two fields we consume.
@@ -96,6 +105,73 @@ struct UsageResponse {
     five_hour: Option<UsageWindow>,
     #[serde(default)]
     seven_day: Option<UsageWindow>,
+}
+
+// ---- last-good snapshot cache -------------------------------------------
+//
+// The usage endpoint is aggressively rate-limited (a small burst budget, then
+// 429 with a multi-minute `Retry-After`). Without a fallback the widget shows
+// bare placeholders whenever a poll is throttled — and a cold start that keeps
+// losing the burst budget never escapes that state. We therefore keep the last
+// successful snapshot both in memory and on disk (`<exe-dir>/usage-cache.json`)
+// so a restart shows real (stale) numbers immediately, and serve it — flagged
+// stale — on any non-200 that isn't a clean logged-out.
+
+/// `<exe-dir>/usage-cache.json` — sits next to the portable `settings.json`.
+/// `None` when `current_exe()` can't be resolved (the cache is then skipped).
+fn cache_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("usage-cache.json"))
+}
+
+/// Process-wide last-good snapshot, lazily hydrated from disk on first access.
+fn cache_slot() -> &'static Mutex<Option<UsageSnapshot>> {
+    static CACHE: OnceLock<Mutex<Option<UsageSnapshot>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(load_cache_from_disk()))
+}
+
+/// Read the persisted snapshot from disk. `None` on any failure (absent file,
+/// malformed JSON) — the cache simply starts empty.
+fn load_cache_from_disk() -> Option<UsageSnapshot> {
+    let path = cache_path()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Return a clone of the cached last-good snapshot, if any (hydrating from disk
+/// on first call). The lock is only poisoned if a holder panicked while writing;
+/// we recover the guard rather than propagate, since a stale read is harmless.
+fn cached_snapshot() -> Option<UsageSnapshot> {
+    cache_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Store a freshly fetched snapshot as the new last-good, in memory and on
+/// disk. Disk write failures are logged but never surfaced — the in-memory
+/// copy still serves this session.
+fn store_snapshot(snapshot: &UsageSnapshot) {
+    *cache_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot.clone());
+    if let (Some(path), Ok(json)) = (cache_path(), serde_json::to_string(snapshot)) {
+        if let Err(e) = std::fs::write(&path, json) {
+            debug!(error = %e, "usage: failed to persist last-good snapshot");
+        }
+    }
+}
+
+/// Build the "serve the cached snapshot, flagged stale" result for a 429 /
+/// transient failure. When there's no cache yet (cold start), `snapshot` is
+/// `None` and `stale` is false — the widget falls back to placeholders.
+fn stale_result(rate_limited: bool, retry_after_secs: Option<u64>) -> UsageResult {
+    let snapshot = cached_snapshot();
+    let stale = snapshot.is_some();
+    UsageResult {
+        snapshot,
+        rate_limited,
+        retry_after_secs,
+        stale,
+    }
 }
 
 /// Credentials file path: `<home>/.claude/.credentials.json`. Resolves the
@@ -163,8 +239,9 @@ pub async fn fetch_usage() -> UsageResult {
     {
         Ok(r) => r,
         Err(e) => {
+            // Transient network/transport error — keep the last-good on screen.
             debug!(error = %e, "usage: request failed");
-            return UsageResult::default();
+            return stale_result(false, None);
         }
     };
 
@@ -178,17 +255,16 @@ pub async fn fetch_usage() -> UsageResult {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok());
         debug!(?retry_after_secs, "usage: 429 rate limited");
-        return UsageResult {
-            snapshot: None,
-            rate_limited: true,
-            retry_after_secs,
-        };
+        // Serve the last-good snapshot (flagged stale) so the widget keeps
+        // showing real numbers through the cooldown instead of placeholders.
+        return stale_result(true, retry_after_secs);
     }
 
     if !status.is_success() {
-        // 401 = logged out / stale token; anything else = endpoint hiccup.
+        // 401 = stale token (Claude Code refreshes it), anything else = endpoint
+        // hiccup — both transient, so keep the last-good on screen.
         debug!(%status, "usage: non-success response");
-        return UsageResult::default();
+        return stale_result(false, None);
     }
 
     match resp.json::<UsageResponse>().await {
@@ -198,18 +274,23 @@ pub async fn fetch_usage() -> UsageResult {
                 seven_day = parsed.seven_day.as_ref().map(|w| w.utilization),
                 "usage: fetched"
             );
+            let snapshot = UsageSnapshot {
+                five_hour: parsed.five_hour,
+                seven_day: parsed.seven_day,
+            };
+            // Persist as the new last-good for future 429s / restarts.
+            store_snapshot(&snapshot);
             UsageResult {
-                snapshot: Some(UsageSnapshot {
-                    five_hour: parsed.five_hour,
-                    seven_day: parsed.seven_day,
-                }),
+                snapshot: Some(snapshot),
                 rate_limited: false,
                 retry_after_secs: None,
+                stale: false,
             }
         }
         Err(e) => {
+            // Unexpected shape — treat as a transient hiccup and keep last-good.
             warn!(error = %e, "usage: response parse failed");
-            UsageResult::default()
+            stale_result(false, None)
         }
     }
 }

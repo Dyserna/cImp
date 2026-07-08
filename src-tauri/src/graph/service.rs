@@ -31,7 +31,7 @@ use crate::settings::{GraphSettings, SettingsHandle};
 
 use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
-use super::memory::{MemNote, MemorySnapshot, WorkingSetEntry};
+use super::memory::{MemorySnapshot, WorkingSetEntry};
 use super::model::Lang;
 use super::parse_file;
 
@@ -396,11 +396,6 @@ impl GraphService {
         }
     }
 
-    /// The current (most-recently-active) session id for `root`, or `None`.
-    pub fn current_session(&self, root: &Path) -> Option<String> {
-        self.index_for(root).ok().and_then(|idx| idx.mem_current_session().ok().flatten())
-    }
-
     /// Ranked working set for a session (default: the current session).
     pub fn mem_working_set(
         &self,
@@ -419,35 +414,9 @@ impl GraphService {
         idx.mem_working_set(&sid, max).unwrap_or_default()
     }
 
-    /// Record a note; returns its generated id.
-    pub fn mem_add_note(
-        &self,
-        root: &Path,
-        session_id: &str,
-        text: &str,
-        pin: bool,
-    ) -> AppResult<String> {
-        let idx = self.index_for(root)?;
-        let note_id = uuid::Uuid::new_v4().to_string();
-        let ts = super::activity::now_ms() as i64;
-        idx.mem_add_note(&note_id, session_id, text, ts, pin)?;
-        Ok(note_id)
-    }
-
     /// Pin/unpin a note.
     pub fn mem_set_note_pinned(&self, root: &Path, note_id: &str, pin: bool) -> AppResult<()> {
         self.index_for(root)?.mem_set_note_pinned(note_id, pin)
-    }
-
-    /// A session's notes plus every pinned note (default: the current session).
-    pub fn mem_notes(&self, root: &Path, session_id: Option<&str>) -> Vec<MemNote> {
-        let Ok(idx) = self.index_for(root) else { return Vec::new() };
-        let sid = match session_id {
-            Some(s) => s.to_string(),
-            // No explicit session → use current, or "" (pinned notes still match).
-            None => idx.mem_current_session().ok().flatten().unwrap_or_default(),
-        };
-        idx.mem_notes(&sid).unwrap_or_default()
     }
 
     /// The full memory readout for `root` (drives the Memory UI section).

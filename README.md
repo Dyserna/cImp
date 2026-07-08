@@ -558,7 +558,7 @@ global concurrency, or live health. Changes to a server's config take effect whe
 the app next warms the pool; toggling **Enable offload** itself takes effect on
 the next app launch.
 
-## Code knowledge graph
+## Code Intelligence (code knowledge graph)
 
 cImp builds a per-project **code + docs knowledge graph** (CozoDB + tree-sitter
 over `.cimp/graph.db`) that Opus and offload workers can query through MCP tools —
@@ -571,8 +571,24 @@ tree-sitter `tags.scm` engine); HTML, CSS, JSON, YAML, XML, and assembly are
 struct-searchable; Markdown feeds docs — with symbol/call/import edges,
 transitive reachability, full-text and
 (optionally) embedding-based semantic doc search, and a filesystem watcher for
-incremental re-index. A reserved **Code Graph** monitor tab shows build status,
+incremental re-index. A reserved **Code Intelligence** tab shows build status,
 node/edge counts, embedder health, and recent-query history.
+
+Beyond structural search, Code Intelligence adds three capabilities (**Memory**,
+**Context**, and **Analyses** sections of the same tab):
+
+- **Session memory** — a per-project, rolling record of what each agent session
+  read/edited/queried, plus notes the agent chooses to remember. Exposed as
+  `context_recall`, `context_note` (pin to keep it across sessions), and
+  `context_notes`. Stored in `graph.db` and preserved across index rebuilds.
+- **Automatic context injection** (opt-in, off by default) — ranks the files
+  most relevant to each prompt and prepends a budget-bounded digest before the
+  agent runs (Claude via a `UserPromptSubmit` hook, OpenCode via a generated
+  `.opencode/plugin`). Session-hot files rank first; a live preview and per-file
+  / per-turn budgets are in the tab and Settings.
+- **Packaged analyses** — on-demand **dead exports** (candidate unused public
+  symbols) and **import cycles**, also as the `graph_dead_exports` /
+  `graph_cycles` tools.
 
 ## Configuring Tabs
 

@@ -63,7 +63,13 @@ mod tests {
             assert_eq!(def.function.parameters, spec.parameters);
         }
         for def in &defs {
-            assert!(def.function.name.starts_with("graph_"));
+            // V10 adds the `context_*` memory tools to the shared spec set
+            // alongside the `graph_*` tools.
+            assert!(
+                def.function.name.starts_with("graph_") || def.function.name.starts_with("context_"),
+                "unexpected tool name `{}`",
+                def.function.name
+            );
         }
     }
 }

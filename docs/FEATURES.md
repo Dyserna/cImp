@@ -85,7 +85,14 @@ dependency/component breadth) — this is the *capability* breadth.
 - Markdown/doc-comment parsing + full-text search; semantic search via Qwen3-Embedding + HNSW
 - Structural AST pattern search; FS watcher for incremental re-index
 - MCP graph tools: `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`, `graph_struct_search`
-- Reserved Code Graph monitor tab: build status, node/edge counts, embedder health, unified recent-calls history
+- Symbol visibility bit (Rust `pub`/`pub(crate)`, JS/TS `export`, Python `_` convention, Go capitalization)
+- Reserved **Code Intelligence** tab (renamed from Code Graph): five sections — Index / Activity / Memory / Context / Analyses
+
+## Code Intelligence — Context Engine (V10)
+- Session/action memory: per-project record of files each session read/edited/queried + agent notes; `context_recall` / `context_note` (pinnable) / `context_notes`; survives index rebuilds; Memory tab section (working set, notes, sessions, clear)
+- Automatic context injection (opt-in): ranks prompt-relevant files and prepends a budget-bounded outline digest — Claude via a `UserPromptSubmit` hook, OpenCode via a generated dependency-free `.opencode/plugin`; session-hot files first; live preview + per-file/per-turn budgets + min-score gate
+- Packaged analyses: dead exports (candidate unused public symbols) + import cycles; `graph_dead_exports` / `graph_cycles` tools + Analyses tab section
+- Local loopback surfaces: `POST /context/retrieve`, `POST /memory/event` (same authenticated-localhost trust model as `/graph_run`)
 
 ## Theming & Appearance
 - 12 bundled terminal palettes + custom 22-color ANSI palette editor; per-tab palette override

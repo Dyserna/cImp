@@ -440,6 +440,47 @@ a `tags.scm` whose `@definition.<kind>` capture sits on the actual construct nod
 (not an enclosing scope) works with no engine changes. Capture suffixes map to
 `SymbolKind` in `kind_from_suffix`.
 
+## Code Intelligence — Context Engine (V10)
+
+The "Code Graph" tab is renamed **Code Intelligence** (internal tab id
+`graph-monitor` and the `graph` settings key are unchanged) and its view
+(`src/lib/CodeIntelligenceView.svelte`) routes five sections: Index / Activity /
+Memory / Context / Analyses.
+
+**Schema versioning & migration.** `graph/schema.rs::GRAPH_SCHEMA_VERSION` stamps
+the derived-relation shape. On open, `GraphIndex::migrate_schema` compares it
+against a `schema_meta` singleton (which is **not** in `RELATIONS`, so it survives
+`reset()`); a mismatch drops+recreates the derived relations, and the service's
+normal rebuild repopulates them from source. This runs once, transparently, on
+the first launch after an upgrade — bump `GRAPH_SCHEMA_VERSION` whenever a
+`RELATIONS` column changes.
+
+**Memory relations are rebuild-safe.** `session` / `mem_event` / `mem_note` are
+ensured by `ensure_memory_relations` **outside** `RELATIONS`, because a full
+index rebuild calls `reset()` (drops every `RELATIONS` relation) and memory is
+runtime event data, not derived from source — it must survive a rebuild.
+
+**Memory event sources are per-agent.** Claude records in-process via the
+transcript tap (`oob/claude.rs::record_tool_events`, beside `update_agents`;
+session id = the `<id>.jsonl` stem), wired through `OobContext.mem` from
+`pty/manager.rs`. OpenCode's OOB SSE stream has no tool events, so its memory
+comes from the injection plugin's `tool.execute.after` hook POSTing to
+`/memory/event`. `graph::classify_tool` maps tool names → `(kind, arg)` for both.
+
+**Context injection** (opt-in, `graph.context_injection`). `graph/context.rs`
+ranks files (symbol/reference/doc hits + session working set) and budget-packs
+outline digests — synchronous, no per-prompt embedding. Claude injects via a
+`UserPromptSubmit` hook (`cimp --context-hook`, `context_hook.rs`) added to the
+`--settings` overlay; OpenCode via a generated dependency-free plugin
+(`tabs/config.rs::write_opencode_plugin` → `<project>/.opencode/plugin/cimp-inject.js`,
+baking in the loopback port+token per launch; `.opencode/` is added to
+`.git/info/exclude`). **Never launch OpenCode with `--pure`** — it disables all
+external plugins.
+
+**New local loopback routes** (`offload/loopback.rs`), same authenticated-
+localhost trust model as `/graph_run`: `POST /context/retrieve` (gated on
+`context_injection`) and `POST /memory/event` (OpenCode's memory ingress).
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

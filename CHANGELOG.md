@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] — 2026-07-08
+
+### Added
+
+- **Code Intelligence (V10 Context Engine).** The read-only "Code Graph" tab is
+  renamed **Code Intelligence** and gains four capabilities beyond structural
+  search, folded into a five-section view (Index / Activity / Memory / Context /
+  Analyses):
+  - **Session memory.** cImp keeps a per-project, rolling record of what each
+    agent session reads, edits, and queries (from Claude's transcript in-process
+    and OpenCode's tool hooks), plus free-text notes the agent chooses to
+    remember. New MCP tools `context_recall` (reload this session's working
+    set), `context_note` (remember a decision; pin to keep it across sessions),
+    and `context_notes`. The Memory section shows the working set, notes (with
+    pin/unpin), and recent sessions, with per-session and project-wide clear.
+    Memory is stored in `graph.db` in relations that survive a full index
+    rebuild.
+  - **Automatic context injection** (opt-in, off by default). When enabled, cImp
+    ranks the files most relevant to each prompt and prepends a budget-bounded
+    digest (an outline of the top files' signatures, not their full contents) —
+    for **Claude** via a `UserPromptSubmit` hook, for **OpenCode** via a
+    generated dependency-free `.opencode/plugin`. Session-hot files (from
+    memory) rank first. The Context section has a live **preview** so you can
+    see exactly what a prompt would inject, and per-file / per-turn character
+    budgets and a relevance threshold in Settings.
+  - **Packaged analyses.** On-demand **dead exports** (candidate unused public
+    symbols — honestly labelled as candidates, since dynamic dispatch / external
+    APIs / macros produce false positives) and **import cycles** (loops of files
+    that import one another), as the Analyses section and the `graph_dead_exports`
+    / `graph_cycles` MCP tools.
+- **Symbol visibility.** The graph now records each definition's visibility
+  (Rust `pub`/`pub(crate)`, JS/TS `export`, Python underscore convention, Go
+  capitalization), which powers accurate dead-export detection.
+
+### Changed
+
+- The graph store schema is versioned; on first launch after upgrading, an older
+  `graph.db` is transparently rebuilt from source to pick up the new columns and
+  memory relations (cheap — every row is re-derivable).
+- Two new local loopback surfaces (`POST /context/retrieve`, `POST /memory/event`)
+  join `/graph_run` under the same authenticated-localhost trust model.
+
 ## [0.34.2] — 2026-07-06
 
 ### Added

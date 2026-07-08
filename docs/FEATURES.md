@@ -90,8 +90,11 @@ dependency/component breadth) — this is the *capability* breadth.
 
 ## Code Intelligence — Context Engine (V10)
 - Session/action memory: per-project record of files each session read/edited/queried + agent notes; `context_recall` / `context_note` (pinnable) / `context_notes`; survives index rebuilds; Memory tab section (working set, notes, sessions, clear)
+- Per-agent memory scoping: a Claude tab and an OpenCode tab on the same project keep separate sessions, so recall/notes don't cross between them
 - Automatic context injection (opt-in): ranks prompt-relevant files and prepends a budget-bounded outline digest — Claude via a `UserPromptSubmit` hook, OpenCode via a generated dependency-free `.opencode/plugin`; session-hot files first; live preview + per-file/per-turn budgets + min-score gate
-- Packaged analyses: dead exports (candidate unused public symbols) + import cycles; `graph_dead_exports` / `graph_cycles` tools + Analyses tab section
+- Packaged analyses: dead exports (candidate unused public symbols) + import cycles; `graph_dead_exports` / `graph_cycles` tools + Analyses tab section; UI states which languages each analysis covers (dead exports: Rust/JS/TS/Python/Go; cycles: JS/TS/Python/Rust)
+- Activity history distinguishes the caller (claude / opencode / offload) per graph & memory tool call
+- Stale-schema safety: an older `graph.db` is transparently rebuilt on the app side; read-only consumers (MCP child, offload worker) are told to rebuild rather than served an emptied index
 - Local loopback surfaces: `POST /context/retrieve`, `POST /memory/event` (same authenticated-localhost trust model as `/graph_run`)
 
 ## Theming & Appearance

@@ -581,6 +581,9 @@ Beyond structural search, Code Intelligence adds three capabilities (**Memory**,
   read/edited/queried, plus notes the agent chooses to remember. Exposed as
   `context_recall`, `context_note` (pin to keep it across sessions), and
   `context_notes`. Stored in `graph.db` and preserved across index rebuilds.
+  Scoped per agent, so a Claude tab and an OpenCode tab on the same project keep
+  separate sessions. The **Activity** section labels each graph/memory tool call
+  with its caller (claude / opencode / offload).
 - **Automatic context injection** (opt-in, off by default) — ranks the files
   most relevant to each prompt and prepends a budget-bounded digest before the
   agent runs (Claude via a `UserPromptSubmit` hook, OpenCode via a generated
@@ -588,7 +591,9 @@ Beyond structural search, Code Intelligence adds three capabilities (**Memory**,
   / per-turn budgets are in the tab and Settings.
 - **Packaged analyses** — on-demand **dead exports** (candidate unused public
   symbols) and **import cycles**, also as the `graph_dead_exports` /
-  `graph_cycles` tools.
+  `graph_cycles` tools. Each states which languages it covers (dead exports:
+  Rust, JS/TS, Python, Go; cycles: JS/TS, Python, Rust), so an empty result on
+  another language reads as "not checked," not "clean."
 
 ## Configuring Tabs
 

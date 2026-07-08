@@ -1,0 +1,196 @@
+# V14 — Workflow & Visibility (token X-ray · preview tab · prompt library)
+
+**Status:** SPEC (written 2026-07-08). Not yet coded.
+**Builds on:** V20 OOB transcript tail (`src-tauri/src/oob/` — the JSONL stream
+already carries per-message `usage`), the Offload Server dashboard tab pattern,
+the compose overlay, the reserved-tab pattern, V10 Context section's
+tokens-injected counter.
+
+## Why
+
+Three quality-of-life features that round out the agentic workflow. They share
+one theme — **see what's happening, and feed the loop faster**:
+
+1. **Token/cost X-ray** — V10/V11 add knobs (budgets, dedup, digests) whose
+   entire point is token savings, but nothing today shows where a session's
+   tokens actually go. You can't tune budgets you can't see.
+2. **Preview tab + images into compose** — for web-dev vibe coding the missing
+   verify loop is *seeing the app*. And even outside web dev, pasting a
+   screenshot into the compose overlay is table stakes for a 2026 agent
+   frontend.
+3. **Prompt library** — the same prompts get retyped daily; templates with
+   variables are trivial to build on the compose overlay and pay off
+   immediately.
+
+---
+
+## Feature 1 — Token/cost X-ray
+
+### Goal
+Per-tab / per-session / per-project token accounting, broken down by *what
+consumed them* — turns, tool results, injected context — plus the offload
+local-vs-cloud split. Honest measurement (from transcript `usage` fields where
+present, labeled estimates elsewhere), no fabricated "savings %".
+
+### Data source (no new interception)
+- The OOB tail already parses every transcript JSONL line for TTS and memory.
+  Extend the tap to also extract, per assistant message: `usage`
+  (`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
+  `cache_creation_input_tokens`) and, per `tool_result`, the result size
+  (chars → estimated tokens, labeled est.). Claude transcripts carry `usage`
+  verbatim; OpenCode's `/event` stream is checked for an equivalent
+  (spike — if absent, OpenCode rows show est.-only).
+- Aggregate in a new `usage_stat` relation in the per-project `graph.db`
+  (session_id, turn, tokens by class, top tool consumers), ring-bounded like
+  `mem_event`.
+- Join with what cImp already knows: tokens injected per turn (V10 counter),
+  dedup-suppressed chars (V11), `offload_task` calls that ran locally (the
+  offload metrics already exist in the dashboard).
+
+### UI — new **Usage** section in the Code Intelligence tab
+(It's session/project analytics over the same stores — it belongs with
+Activity/Memory/Context, not in a new tab.)
+- **This session:** stacked per-turn bars — input / cache-read / output /
+  est. tool-result share; a "top consumers" table (tool name × est. tokens),
+  which is the actionable view ("Read of `foo.rs` cost 18k twice").
+- **Project totals:** per-session rows with totals + cache-hit ratio; the
+  offload split ("N tasks served locally").
+- **Effectiveness panel:** injected vs. suppressed-by-dedup vs. read-advisor
+  displacement (V11 Activity events) — measured chars, est. tokens, honest
+  labels.
+- Status-bar: the existing usage meter is *rate-limit* oriented; add an
+  optional per-session token counter to its popover, not a new widget.
+
+### Edge cases
+- Estimates are estimates: every derived number carries the `est.` label in
+  the UI; only transcript `usage` fields are shown as exact.
+- Cost-in-currency is out of scope (subscription plans make $/token
+  meaningless for most users); tokens only.
+
+---
+
+## Feature 2 — Localhost preview tab + images into compose
+
+### Goal
+Close the visual verify loop: an embedded browser tab pointed at the dev
+server, one click from "what the agent just built" to "screenshot in the
+agent's context". Plus the standalone half everyone needs anyway: image paste
+into the compose overlay.
+
+### Feature 2a — image paste/drop into compose (ships first, independently)
+- Paste (`Ctrl+V` with image clipboard content) or drag-drop an image file
+  onto the compose overlay → saved to a session-scoped temp dir
+  (`%TEMP%/cimp-attach/<session>/n.png`) → a chip appears above the textarea;
+  on submit, the file path(s) are appended to the message text (Claude Code
+  and OpenCode both accept local image paths in prompts).
+- Uses the existing Tauri clipboard plugin (the WebView2
+  `navigator.clipboard` denial is a known gotcha — same workaround as the
+  AI-tab clipboard work).
+- Cleanup: temp dir pruned on app exit + age-capped.
+
+### Feature 2b — preview tab
+- New user-creatable tab type **Preview** (`+` menu): a Tauri WRY child
+  webview navigated to a user-entered URL (default `http://localhost:<port>`,
+  remembered per project in the `.cimp/config.json` overlay). Toolbar: URL
+  bar, back/reload, device-width presets (mobile/tablet/desktop), and
+  **Snapshot → compose**.
+- **Snapshot → compose:** capture the webview (Tauri window/webview capture
+  API — D0 spike below) to PNG in the attach temp dir, open the compose
+  overlay with the image chip pre-attached, targeted at the focused AI tab.
+  One click from pixels to prompt.
+- Auto-reload option: reload on graph-watcher quiet periods (the "agent
+  finished an edit burst" signal, debounced ~1 s) so the preview tracks the
+  agent's work without manual refreshes.
+- **Not** a general browser: no tab history UI, no profiles, external links
+  open in the system browser. Navigation is restricted to
+  localhost/127.0.0.1/LAN-private hosts by default (`preview_allow_remote`
+  opt-in for staging URLs) — this is a *preview* surface, and the restriction
+  also keeps the embedded webview from becoming a general (and
+  prompt-injectable) browsing surface next to agent tabs.
+
+### D0 spike (gates 2b)
+Verify in Tauri 2.x on WebView2: (1) a child-webview per tab coexists with
+the xterm panes and the portal/drag system (reuse the AI-tab child-webview
+learnings if any apply), (2) programmatic capture of *that* webview's
+viewport is available (WebView2 `CapturePreviewAsync` exists; confirm wry
+exposes it or add a small windows-rs call), (3) focus/keyboard isolation.
+Linux parity (webkit2gtk capture) checked but not blocking — Windows-first
+like the rest of the app.
+
+### Edge cases
+- Dev server down: standard "connection refused" page with a retry — never an
+  error dialog loop.
+- HiDPI capture scaling: snapshot at CSS-pixel scale so screenshots aren't
+  4× the needed size (token cost of images is real).
+
+---
+
+## Feature 3 — Prompt library
+
+### Goal
+Saved, parameterized prompt templates, insertable from the compose overlay.
+Trivial cost, daily-use win.
+
+### Design
+- **Storage:** global list in `settings.json` + per-project additions in the
+  `.cimp/config.json` overlay (project templates shadow global ones by name —
+  same precedence rule as every other overlaid setting).
+  ```
+  prompt_templates: [ { name, body, scope: "global"|"project" } ]
+  ```
+- **Variables:** `{selection}` (current terminal selection of the focused
+  pane), `{file}` (prompted on insert), `{clipboard}`, plus free-form
+  `{placeholder}` names — unresolved placeholders become tab-stops the user
+  fills in the textarea (first placeholder selected on insert).
+- **Invocation:** in the compose overlay, `/` at the start of an empty
+  textarea opens a fuzzy-filter popover (↑↓ + Enter), mirroring the CLI
+  slash-command idiom; also a small 📋 button for discoverability. A
+  rebindable shortcut opens compose *with* the picker open.
+- **Management:** Settings → Compose section: list, add/edit/delete, scope
+  toggle, import/export as JSON (team sharing via a committed
+  `.cimp/config.json` works out of the box because of the overlay).
+- Ship 4–5 starter templates (review-this-diff, write-tests-for, explain,
+  commit-message) — deletable, clearly marked as examples.
+
+### Edge cases
+- Name collisions between global and project scope: project wins, Settings
+  shows the shadowed global entry greyed with a note.
+- `/` conflicts with typing a literal slash-command for the AI tab: the picker
+  only triggers on *empty* textarea + `/`, and `Esc`/continuing-to-type
+  dismisses it into literal text — the agent's own slash commands still work
+  unimpeded.
+
+---
+
+## Phasing
+
+| Phase | Scope | Notes |
+|---|---|---|
+| **A. Prompt library** | Schema + overlay precedence + picker UI + starter set | Smallest; ships alone |
+| **B. Image paste/drop** | Clipboard/drop handling + attach chips + temp-dir lifecycle | Independent of preview |
+| **C. Usage tap + store** | Extend OOB tap for `usage` + `usage_stat` relation + OpenCode `/event` spike | Backend half of X-ray |
+| **D. Usage UI** | Usage section in Code Intelligence + status-bar popover counter | Depends on C |
+| **E0. Preview spike** | Child webview + capture + focus isolation on WebView2 | Gates F |
+| **F. Preview tab** | Tab type (schema bump) + toolbar + snapshot→compose + auto-reload | Depends on B (attach path) + E0 |
+| **G. Docs/tests** | README/FEATURES/MAINTENANCE, settings UI, unit+integration | Per repo convention |
+
+Suggested order **A → B → C → D → E0 → F → G** — but A, B, and C+D are three
+independently shippable slices; the preview tab is the only gated one.
+
+## Decisions — OPEN
+
+1. **Usage section placement** — proposed: inside Code Intelligence (6th
+   section) rather than a new tab. Confirm the tab isn't getting crowded
+   (Index/Activity/Memory/Context/Analyses/Usage).
+2. **Preview tab type** — user-creatable tab type (schema bump) vs. reserved
+   single tab. Proposed: user-creatable (people run several dev servers), which
+   costs a migration like any tab-type addition.
+3. **Image attach format** — append path text (simple, matches Claude CLI
+   semantics today) vs. structured attachment per agent. Proposed: path text
+   for V1, verified against both agents in a quick harness.
+
+## Cost note
+
+All four features are mechanical UI + plumbing work (Sonnet/Haiku fan-out);
+the E0 webview-capture spike is the one part worth Opus attention — per the
+standing agent-cost guidance.

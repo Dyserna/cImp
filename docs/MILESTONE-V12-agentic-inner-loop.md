@@ -239,6 +239,11 @@ one appended line in the V11 repo map when counts grew. Removes the
 - **Never block the turn:** the hook has a tight timeout; a slow check parks
   its report per session and the next `/context/retrieve` (or the next
   post-edit call) drains it.
+- **Two harnesses, one project:** check runs are single-flight per project —
+  a Claude tab and an OpenCode tab editing concurrently share one run's
+  result instead of spawning duplicate builds — while diagnostic baselines
+  stay per-session, so each agent is told only what *it* hasn't seen.
+  (Sessions are per-agent per V10 scoping, so the baselines can't cross.)
 
 ---
 

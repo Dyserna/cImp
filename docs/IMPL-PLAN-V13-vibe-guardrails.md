@@ -207,9 +207,14 @@ checkpoint — N files"); never block a prompt or the UI thread. Log
 - **Prompt tap:** `handle_context_retrieve` (`offload/loopback.rs:591`) and
   the OpenCode `chat.message` plugin already receive every prompt when the
   respective hook is installed. Add a call-out to
-  `workbench::on_prompt(root, prompt_head)` from the retrieve handler
+  `workbench::on_prompt(root, agent, prompt_head)` from the retrieve handler
   (before the injection gate — checkpointing must fire even when injection
-  yields nothing). Hook install condition (`tabs/config.rs:199`) widens to
+  yields nothing). The retrieve body gains an optional `agent` field set by
+  each shim (`"claude"` from `--context-hook`, `"opencode"` from the plugin;
+  absent ⇒ `unknown`) — stored in the checkpoint metadata and rendered in
+  the Timeline's agent column, and shown in the restore confirmation's
+  interleaving note ("N checkpoints from the other agent sit after this
+  point"). Hook install condition (`tabs/config.rs:199`) widens to
   `context_injection || workbench.checkpoints` — and the retrieve handler's
   *injection* gate stays on `context_injection` alone. ⚠ This implements
   milestone Decision 4's proposal; if a separate `hooks_enabled` umbrella is

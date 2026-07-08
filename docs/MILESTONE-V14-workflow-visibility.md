@@ -106,6 +106,11 @@ proposals don't re-fire until the underlying rate changes materially.
 ### Edge cases
 - **Cold start:** rules need a minimum sample (≥ 5 sessions / ≥ 200
   injections) before proposing; below that the card says it's collecting.
+- **Mixed harnesses:** OpenCode sessions may be est-only (no exact `usage` —
+  Feature 1's C3 spike). Token-based rules aggregate over exact-usage
+  sessions only, rather than blending estimates into measured rates;
+  behavior-based rules (injected-then-never-touched, remind-then-reread) use
+  all sessions since their signals don't depend on token counts.
 - Rules are versioned in code and listed in the card's tooltip — inspectable,
   not magic.
 

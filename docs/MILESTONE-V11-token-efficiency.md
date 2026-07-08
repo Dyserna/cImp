@@ -25,6 +25,19 @@ offload pool gives us a free local model for compression. All opt-in knobs
 default consistent with V10's posture (tools on when graph is on; *behavioral*
 hooks opt-in, default off).
 
+**Two-harness posture (Claude Code + OpenCode).** Every feature serves both
+agent harnesses unless stated: the tools ride the shared MCP surface, and
+dedup / digests / repo-map greeting live server-side in `/context/retrieve`,
+which the Claude hook and the OpenCode plugin both call. Isolation is
+inherited from V10's per-agent session scoping: all new per-session state
+(`injected`, the post-compaction flag, remind-once, the repo-map greeting) is
+keyed by `session_id`, and a Claude tab and an OpenCode tab on the same
+project hold distinct sessions — two harnesses working different tasks never
+cross-contaminate each other's dedup, reminders, or recaps. The two
+acknowledged asymmetries: Feature 4 (PreCompact is Claude-only — OpenCode has
+no compaction hook) and Feature 5 (Claude-first; OpenCode gated on the
+before-hook spike).
+
 ---
 
 ## Feature 1 — `graph_snippet` (symbol-body fetch)
@@ -63,7 +76,9 @@ in the OpenCode instructions file.
 ## Feature 2 — `graph_repo_map` (session-start orientation map)
 
 ### Goal
-Aider's headline token trick, done with a real graph: a **once-per-session**,
+The repo-map trick popularized by the external `aider` CLI (cited as prior
+art only — cImp's aider tab was removed in V1.4-07; the two harnesses here
+are Claude Code and OpenCode), done with a real graph: a **once-per-session**,
 budget-bounded skeleton of the project's most central symbols, so the agent
 starts oriented and burns fewer explore-turns. Distinct from V10 per-prompt
 injection: this is *orientation*, that is *relevance*.

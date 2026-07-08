@@ -311,6 +311,11 @@ print the returned block per the F0 contract (empty ⇒ print nothing).
   check; diff `DiagGroup` keys against the session's previous report
   (in-memory baseline per session); render only new/worsened groups
   (Phase A format), cap ~1.5k chars.
+- **Single-flight per project:** a `Mutex`-guarded in-flight map keyed by
+  root — concurrent sessions (a Claude tab + an OpenCode tab editing the
+  same project) await the same run and each diff its result against their
+  *own* baseline; no duplicate builds. Baselines are per `session_id`, which
+  is per-agent (V10 scoping), so agents never see each other's "new".
 - **Auto-impact:** map the edited file through `impact::changed_symbols`'s
   span-overlap; any symbol with inbound count (V11-A1 `callers_count`) ≥
   `auto_impact_min_dependents` ⇒ append the two-line blast-radius note.

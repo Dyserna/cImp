@@ -155,6 +155,10 @@ Also add `turns: Int` default 0 to the `session` relation (retrieve-call
 counter) — or store the counter in the in-memory session map if touching the
 V10 relation is noisier; **decide at implementation, prefer the relation**
 (survives restarts, and eviction cascades already exist for sessions).
+`session_id` inherits V10's per-agent scoping (Claude transcript stem vs
+OpenCode plugin `sessionID`) — concurrent Claude + OpenCode tabs on one
+project hold disjoint dedup/remind/greeting state by construction; no extra
+keying is needed.
 
 **C2. Retrieve integration** (`graph/context.rs::retrieve`):
 - Increment the session's `turn` on every call.

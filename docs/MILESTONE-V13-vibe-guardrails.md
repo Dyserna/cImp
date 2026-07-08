@@ -72,7 +72,8 @@ the mess.
 
 ### UI — new **Timeline** section (in a new reserved tab, see Feature 2)
 - Vertical list: timestamp · trigger (prompt text / activity / manual) · files
-  changed vs previous · agent tab that was focused.
+  changed vs previous · triggering agent (claude / opencode / —, recorded
+  from the prompt-tap request, not inferred from focus).
 - Row actions: **Diff vs now** (opens Feature 2's viewer) · **Restore**.
 
 ### Checkpoint health — regression detection (soft-dep on V12 `run_check`)
@@ -91,6 +92,17 @@ is validated on a big repo), `checkpoint_max`, `checkpoint_max_age_days`,
 `checkpoint_burst_files` / `_window_s`.
 
 ### Edge cases
+- **Two agents, one tree (the isolation caveat):** checkpoints are
+  working-tree-global — a Claude tab and an OpenCode tab on the same project
+  interleave on one timeline, and a restore rolls back *both* agents' work.
+  Mitigations: every checkpoint records its triggering agent so the timeline
+  is attributable; the restore confirmation shows the interleaving ("2
+  opencode-triggered checkpoints sit after this point"); and the doc/UI state
+  plainly that for genuinely parallel different-task work the isolation
+  mechanism is Feature 3 (one worktree per task), not per-agent checkpoints.
+  Per-agent checkpoint *filtering* of a shared tree is deliberately not
+  offered — a shared working tree has one true state, and pretending
+  otherwise invites restoring to a state that never existed.
 - Non-git projects: shadow repo works anyway (it's self-contained) — this makes
   checkpoints valuable even *before* the user runs `git init`.
 - Huge repos: first snapshot is the expensive one; run it on a background

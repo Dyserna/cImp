@@ -216,6 +216,9 @@ session": `injected` (V11-C) ⋈ `mem_event` (V10) per session. Add small
 aggregates: `injection_follow_rate(root)`, `advisor_reread_rate(root)` (from
 the V11-E Activity events), plus sample counts. Each degrades to `None` when
 its source feature never ran — a rule without its signal simply doesn't fire.
+Signals carry a per-session `est_only` partition (from C3): token-based
+aggregates cover exact-usage sessions only; behavior-based aggregates
+(follow/reread rates) cover all sessions.
 
 **D2.2 Rules** (`src-tauri/src/advisor.rs`, new):
 ```rust

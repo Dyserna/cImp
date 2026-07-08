@@ -275,19 +275,30 @@ Otherwise remind: `text` = outline digest (reuse the Phase A formatting) +
 limit}) if you need exact text."` Record an Activity event
 (`kind: "remind"`, detail = est. displaced tokens = file_bytes/4).
 
+**E3b. Substitute mode:** `read_advisor_mode: "advise" | "substitute"`
+(default advise). In substitute mode the remind `text` additionally carries
+the most relevant symbol body: when the hook JSON shows a targeted read
+(`offset`/`limit` in `tool_input`) use `symbol_at` on that range; otherwise
+pack the file's top-centrality public symbols (Phase B1's `file_centrality`
+signal at symbol granularity) up to `max_body_bytes / 2`, via the Phase A
+slicing helper. The escape-hatch line and the remind-once rule (E3) are
+unchanged — substitution can never lock the agent out of exact text.
+
 **E4. OpenCode** ⚠: extend the plugin writer (`tabs/config.rs:395-460`) with a
 `tool.execute.before` handler **only if** a mini-spike shows a before-hook can
 short-circuit the tool with substitute output in the pinned OpenCode version;
 otherwise skip — Claude-only, documented.
 
 **E5. Settings:** `read_advisor: bool` (false),
-`read_advisor_min_lines: u32` (300). Overlay installs the `PreToolUse` hook
+`read_advisor_min_lines: u32` (300), `read_advisor_mode: String`
+(`"advise"`). Overlay installs the `PreToolUse` hook
 only when `read_advisor` is on (keep the hook out of the settings JSON
 otherwise — zero overhead for non-users).
 
 **E6. Tests:** verdict matrix (unread/changed/small/post-compaction/second-ask
-⇒ pass; read-unchanged-large ⇒ remind once); Activity event recorded; route
-honors master toggles.
+⇒ pass; read-unchanged-large ⇒ remind once); substitute mode includes a body
+and respects the byte cap; Activity event recorded; route honors master
+toggles.
 
 ---
 
@@ -405,8 +416,8 @@ fixture pattern); coverage counts; orphan sweep.
 **New settings** (`GraphSettings`): `max_body_bytes`,
 `repo_map_budget_chars`, `repo_map_on_session_start`,
 `context_dedup_ttl_turns`, `compaction_context`, `read_advisor`,
-`read_advisor_min_lines`, `context_llm_digests`, `semantic_code`,
-`semantic_code_max_chunks`.
+`read_advisor_min_lines`, `read_advisor_mode`, `context_llm_digests`,
+`semantic_code`, `semantic_code_max_chunks`.
 
 **Schema (one bump, v3):** relations `injected`, `digest`, `code_chunk`,
 `code_vec` (+ HNSW); `session.turns` counter; `SymbolHit.end_line`.

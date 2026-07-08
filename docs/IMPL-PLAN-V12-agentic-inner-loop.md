@@ -6,7 +6,8 @@ cloud tabs only in V1, not the offload worker's native set; impact depth 3;
 distillation default off) — sections marked ⚠ change if a decision flips.
 
 Phases: **A** (`run_check`) → **B** (`graph_impact`) → **C** (test mapping) →
-**D** (git-aware context) → **E** (distillation) → **F** (docs/tests/release).
+**D** (git-aware context) → **E** (distillation) → **F** (proactive
+automation) → **G** (docs/tests/release).
 
 Grounding anchors (verified against current `develop`, post-V10):
 - Tools plumbing: `graph/mcp.rs` (`tool_specs`, `dispatch_recorded`,
@@ -284,7 +285,72 @@ without error.
 
 ---
 
-## Phase F — Docs, settings polish, tests, release
+## Phase F — Proactive automation
+
+**F0. Contract spike:** extend the V11 D0 capture harness to `PostToolUse`
+(matcher `Edit|Write|MultiEdit`): record the stdin JSON shape and verify
+which stdout field reaches the model as additional context. One harness run
+covers `PreCompact` (V11) + `PostToolUse`; findings recorded in both
+milestone docs. If nothing reaches the model, 6a/6b re-scope to
+parked-block-only delivery (F2's drain path) — degraded but not cancelled.
+
+**F1. Shim** (`src-tauri/src/postedit_hook.rs`, `cimp --postedit-hook`,
+registered in `main.rs` beside `--context-hook`): stdin JSON (`tool_name`,
+`tool_input.file_path`, session id, cwd) → POST `/context/post_edit` →
+print the returned block per the F0 contract (empty ⇒ print nothing).
+~300 ms client timeout, exit 0 always.
+
+**F2. Route + logic** (`offload/loopback.rs` route + new
+`src-tauri/src/checks/auto.rs`):
+- **Debounce** per session (`auto_check_debounce_s`): edits inside the window
+  coalesce; calls inside the window return empty fast; the first call after
+  the window closes gets the result. A check slower than the hook budget
+  parks its report in a per-session **pending block** drained by the next
+  `/context/retrieve` or post-edit call — a turn is never blocked.
+- **Run + diff:** `checks::run(root, def, changed_only=true)` per configured
+  check; diff `DiagGroup` keys against the session's previous report
+  (in-memory baseline per session); render only new/worsened groups
+  (Phase A format), cap ~1.5k chars.
+- **Auto-impact:** map the edited file through `impact::changed_symbols`'s
+  span-overlap; any symbol with inbound count (V11-A1 `callers_count`) ≥
+  `auto_impact_min_dependents` ⇒ append the two-line blast-radius note.
+- Record an Activity event per injection (`kind: "auto_check"`, detail =
+  group count) — the graduation evidence for milestone Decision 4.
+
+**F3. Hook install** (`tabs/config.rs`): `PostToolUse` entry in the settings
+overlay when `auto_check` is on. OpenCode: the plugin's existing
+`tool.execute.after` handler additionally POSTs edit-class tools to
+`/context/post_edit`; whether its return can carry context is spiked —
+if not, OpenCode relies on the parked-block drain (already built).
+
+**F4. Analyses trigger** (`graph/service.rs`): at the end of each completed
+index pass (same spot as the V11-B3 repo-map cache invalidation), when
+`analyses_auto`: run `dead_exports` + `import_cycles` bounded, store
+`(dead_count, cycle_count)` in the `meta` relation, emit a `graph-analyses`
+event when they changed. `CodeIntelligenceView` badges the Analyses section
+control + the individual buttons ("+3 since last pass"). The V11-B2 repo-map
+renderer appends one line when counts grew (reads the meta row).
+
+**F5. Fact promotion** (`tabs/config.rs`): when `promote_pinned_facts`, the
+guidance builder appends a marked `## cImp project facts` block of pinned
+`project_fact` rows (cap 1500 chars, newest-pinned first) to the Claude
+`--append-system-prompt` payload and the OpenCode instructions file at
+launch. Launch-time only; the Facts UI notes "applies next launch".
+
+**F6. Settings:** `auto_check: bool` (false), `auto_check_debounce_s: u32`
+(5), `auto_impact_min_dependents: u32` (10), `analyses_auto: bool` (true),
+`promote_pinned_facts: bool` (false). UI: first three under the Checks
+settings section, `analyses_auto` under Code Intelligence, promotion under
+the Memory subsection.
+
+**F7. Tests:** debounce coalescing (three rapid edits → one check run);
+new-vs-baseline diffing (identical second run → empty); impact threshold;
+parked-block drain via retrieve; analyses event fires only on count change;
+promotion block formatting + cap + pinned-only selection.
+
+---
+
+## Phase G — Docs, settings polish, tests, release
 
 - README / `docs/FEATURES.md`: `run_check` (+ config example), impact/tests
   tools, `graph_recent_changes`, project facts. `docs/MAINTENANCE.md`: the
@@ -302,20 +368,26 @@ without error.
 **New MCP tools** (4): `run_check`, `graph_impact`, `graph_tests_for`,
 `graph_recent_changes`.
 
-**New settings:** root-level `checks: Vec<CheckDef>`; `GraphSettings`:
-`memory_distillation`. (Impact depth is a tool arg, not a setting.)
+**New settings:** root-level `checks: Vec<CheckDef>`, `auto_check`,
+`auto_check_debounce_s`, `auto_impact_min_dependents`; `GraphSettings`:
+`memory_distillation`, `analyses_auto`, `promote_pinned_facts`. (Impact
+depth is a tool arg, not a setting.)
 
 **Schema (coordinated bump):** `symbol.is_test`; relations `commit_touch`,
 `project_fact`; `session.distilled`.
 
-**New Rust files:** `checks/mod.rs`, `checks/parsers.rs`,
-`graph/impact.rs`, `graph/gitmeta.rs`.
+**New Rust files:** `checks/mod.rs`, `checks/parsers.rs`, `checks/auto.rs`,
+`graph/impact.rs`, `graph/gitmeta.rs`, `postedit_hook.rs`.
+
+**New loopback route:** `POST /context/post_edit`. **New CLI subcommand:**
+`cimp --postedit-hook`.
 
 **New IPC:** `graph_impact`, `graph_facts`, `graph_fact_update`,
 `graph_fact_add`.
 
-**Frontend:** Analyses third button (impact); Memory Facts list; Checks
-settings table; `ToolsReference` entries.
+**Frontend:** Analyses third button (impact) + auto-run badges; Memory Facts
+list (+ promotion note); Checks settings table (+ auto-check fields);
+`ToolsReference` entries.
 
 **External process use (all spawned `git`/checker, console-suppressed,
 user-configured commands only):** `git diff/status/log/rev-parse`, the

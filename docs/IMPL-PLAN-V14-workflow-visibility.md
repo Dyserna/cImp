@@ -7,8 +7,9 @@ Code Intelligence section; Preview is a user-creatable tab type; image attach
 flips.
 
 Phases: **A** (prompt library) → **B** (image paste/drop) → **C** (usage tap +
-store) → **D** (usage UI) → **E0** (preview spike) → **F** (preview tab) →
-**G** (docs/tests/release). A, B, C+D are independently shippable slices.
+store) → **D** (usage UI) → **D2** (tuning advisor) → **E0** (preview spike) →
+**F** (preview tab) → **G** (docs/tests/release). A, B, C+D+D2 are
+independently shippable slices.
 
 Grounding anchors (verified against current `develop`, post-V10):
 - OOB tap: `src-tauri/src/oob/` — Claude transcript JSONL drain in
@@ -207,6 +208,46 @@ snapshot assembly with graph-off and est-only paths.
 
 ---
 
+## Phase D2 — Budget-tuning advisor
+
+**D2.1 Signals** (`graph/index.rs` + `graph/service.rs`): one join the X-ray
+doesn't ship by default — "was an injected file subsequently touched this
+session": `injected` (V11-C) ⋈ `mem_event` (V10) per session. Add small
+aggregates: `injection_follow_rate(root)`, `advisor_reread_rate(root)` (from
+the V11-E Activity events), plus sample counts. Each degrades to `None` when
+its source feature never ran — a rule without its signal simply doesn't fire.
+
+**D2.2 Rules** (`src-tauri/src/advisor.rs`, new):
+```rust
+pub struct Signals { /* the D2.1 aggregates + current GraphSettings */ }
+pub struct Proposal { pub setting: String, pub current: String,
+                      pub proposed: String, pub rationale: String,
+                      pub rule_id: &'static str }
+pub fn evaluate(sig: &Signals) -> Vec<Proposal>;   // static rule list, each with min_samples
+```
+V1 rules per the milestone: min-score raise, advisor min-lines raise,
+turn-budget lower. Dismissals persisted in settings
+(`advisor_dismissed: Vec<DismissedRule { rule_id, signature }>`) keyed by a
+coarse signature of the triggering rate (e.g. the rate bucketed to 10%) so a
+materially changed rate re-fires the proposal.
+
+**D2.3 IPC + apply path** (`ipc/commands.rs`):
+`graph_usage_advice(root?) -> Vec<Proposal>` (runs `evaluate` over fresh
+signals), `advisor_dismiss { rule_id, signature }`. **No bespoke apply IPC:**
+the Apply button writes through the existing settings-update path the
+Settings window uses — visible immediately, undoable, migration-safe.
+
+**D2.4 UI** (Usage section, top card): proposals with Apply/Dismiss;
+collecting-state below `min_samples`; a tooltip listing rule ids +
+thresholds. Optional narrative line via `run_internal` when a local backend
+is ready (skipped silently otherwise; numbers never come from the model).
+
+**D2.5 Tests:** each rule's threshold + min-sample gate; missing-signal rules
+don't fire; dismissal signature semantics (same bucket suppressed, changed
+bucket re-fires); proposal → settings round-trip.
+
+---
+
 ## Phase E0 — Preview spike (gates F)
 
 Empirical, on Windows/WebView2 first (Linux webkit2gtk noted, non-blocking):
@@ -286,18 +327,19 @@ covered by the E0 spike + manual passes (same posture as the TUI work).
 **New tab kind:** `'preview'` (+ settings migration). No new reserved tabs.
 
 **New settings:** `prompt_templates`, `templates_seeded`,
-`preview_allow_remote` (root); per-tab preview fields (`url`,
-`device_width`, `auto_reload`); overlay keys `prompt_templates` (project
-scope), `preview_last_url`.
+`preview_allow_remote`, `advisor_dismissed` (root); per-tab preview fields
+(`url`, `device_width`, `auto_reload`); overlay keys `prompt_templates`
+(project scope), `preview_last_url`.
 
 **Schema (coordinated bump):** `usage_stat` relation.
 
 **New IPC:** `compose_templates`, `compose_attach_image`, `graph_usage`,
+`graph_usage_advice`, `advisor_dismiss`,
 `preview_open/navigate/reload/set_rect/capture/close`,
 `workbench`-independent (no V13 dependency except the optional `fs-batch`
 subscription).
 
-**New Rust files:** `attach.rs`, `preview/mod.rs`.
+**New Rust files:** `attach.rs`, `preview/mod.rs`, `advisor.rs`.
 
 **New frontend files:** `lib/TemplatePicker.svelte`, `lib/PreviewToolbar.svelte`,
 `lib/compose/templates.ts`; touches: `ComposeOverlay.svelte`,

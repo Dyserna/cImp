@@ -75,6 +75,16 @@ the mess.
   changed vs previous · agent tab that was focused.
 - Row actions: **Diff vs now** (opens Feature 2's viewer) · **Restore**.
 
+### Checkpoint health — regression detection (soft-dep on V12 `run_check`)
+When V12's checks are configured, each checkpoint stores the latest
+diagnostic summary (per-check error counts) alongside its metadata, captured
+whenever a check runs (tool-invoked or V12 auto-check). The Timeline renders
+the trend, and when the current count is meaningfully worse than a recent
+checkpoint's ("3 failures at checkpoint 4 → 17 now") a banner offers
+one-click **Diff vs that checkpoint** — detection and suggestion only,
+**never** auto-restore. Without V12 or configured checks the column simply
+doesn't render.
+
 ### Settings
 `checkpoints: bool` (default off in V1 — flip to on once the shadow-repo cost
 is validated on a big repo), `checkpoint_max`, `checkpoint_max_age_days`,
@@ -150,6 +160,12 @@ branch, spawn an AI tab in it, and merge back (or discard) from the UI.
   does *not* attempt conflict resolution UI; the user gets a shell one click
   away), **Discard** (remove worktree + delete branch, double-confirm), and
   **Open shell here**.
+- **Merge readiness (soft-dep on V12 `run_check`):** when checks are
+  configured, each worktree row shows a pass/fail chip from the latest
+  `changed_only` check run in that worktree — on demand via a row button, or
+  refreshed automatically after edit bursts there when V12's `auto_check` is
+  on. The Merge action highlights when green. Advisory only — a merge is
+  never triggered automatically.
 - **Lifecycle:** closing the tab does **not** remove the worktree (work
   survives); the Worktrees list shows orphaned ones (no live tab) for cleanup.
   `git worktree prune` on app start.
@@ -174,7 +190,9 @@ branch, spawn an AI tab in it, and merge back (or discard) from the UI.
 | **E. Docs/tests** | README/FEATURES/MAINTENANCE, settings UI, unit+integration | Per repo convention |
 
 Suggested order **A → B → C → D → E**. B alone (live diff) is a complete,
-shippable release if C/D slip.
+shippable release if C/D slip. Checkpoint health (in C) and the
+merge-readiness chip (in D) are **soft dependencies on V12 Phase A**
+(`run_check`) — they ship dark and light up when checks are configured.
 
 ## Decisions — OPEN
 

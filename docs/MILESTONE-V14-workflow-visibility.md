@@ -1,4 +1,4 @@
-# V14 — Workflow & Visibility (token X-ray · preview tab · prompt library)
+# V14 — Workflow & Visibility (token X-ray · tuning advisor · preview tab · prompt library)
 
 **Status:** SPEC (written 2026-07-08). Not yet coded.
 **Builds on:** V20 OOB transcript tail (`src-tauri/src/oob/` — the JSONL stream
@@ -8,17 +8,21 @@ tokens-injected counter.
 
 ## Why
 
-Three quality-of-life features that round out the agentic workflow. They share
+Four quality-of-life features that round out the agentic workflow. They share
 one theme — **see what's happening, and feed the loop faster**:
 
 1. **Token/cost X-ray** — V10/V11 add knobs (budgets, dedup, digests) whose
    entire point is token savings, but nothing today shows where a session's
    tokens actually go. You can't tune budgets you can't see.
-2. **Preview tab + images into compose** — for web-dev vibe coding the missing
+2. **Budget-tuning advisor** — and once you *can* see, the tuning itself
+   shouldn't be homework: the X-ray data drives measured, propose-and-confirm
+   suggestions for the V10/V11 knobs, turning the dashboard from a report
+   into a controller.
+3. **Preview tab + images into compose** — for web-dev vibe coding the missing
    verify loop is *seeing the app*. And even outside web dev, pasting a
    screenshot into the compose overlay is table stakes for a 2026 agent
    frontend.
-3. **Prompt library** — the same prompts get retyped daily; templates with
+4. **Prompt library** — the same prompts get retyped daily; templates with
    variables are trivial to build on the compose overlay and pay off
    immediately.
 
@@ -66,6 +70,44 @@ Activity/Memory/Context, not in a new tab.)
   the UI; only transcript `usage` fields are shown as exact.
 - Cost-in-currency is out of scope (subscription plans make $/token
   meaningless for most users); tokens only.
+
+---
+
+## Feature 1b — Budget-tuning advisor (closing the loop)
+
+### Goal
+The X-ray collects exactly the data the V10/V11 knobs need for tuning, but
+sliders leave the tuning to the user. The advisor proposes measured changes —
+**propose-and-confirm, never silent self-modification** (a setting that
+changes itself erodes the trust the honest-accounting posture builds).
+
+### Design
+- **Deterministic heuristics, not a black box:** rules computed in Rust over
+  `usage_stat` + the V10/V11 effectiveness stores. V1 rules:
+  - injected files that were never subsequently read/edited in-session at a
+    high rate ⇒ propose raising `context_min_score`;
+  - read-advisor reminders followed by an immediate full re-read at a high
+    rate ⇒ propose raising `read_advisor_min_lines` (the reminders fire on
+    files the agent genuinely needs whole);
+  - injected-but-unread rate high *while* budgets are maxed ⇒ propose
+    lowering `context_turn_budget_chars`.
+  Only rules with a clear causal story ship; no speculative correlations.
+- Each proposal carries: the setting, current → proposed value, the measured
+  rationale, and an **Apply** button that writes through the normal settings
+  path (visible in Settings, undoable, migration-safe).
+- Optional local-model narrative (V11's `run_internal`) phrasing a summary;
+  the *numbers* always come from the heuristics.
+
+### UI
+An **Advisor** card at the top of the Usage section: current proposals with
+Apply/Dismiss (or "no changes suggested — data looks healthy"). Dismissed
+proposals don't re-fire until the underlying rate changes materially.
+
+### Edge cases
+- **Cold start:** rules need a minimum sample (≥ 5 sessions / ≥ 200
+  injections) before proposing; below that the card says it's collecting.
+- Rules are versioned in code and listed in the card's tooltip — inspectable,
+  not magic.
 
 ---
 
@@ -170,12 +212,14 @@ Trivial cost, daily-use win.
 | **B. Image paste/drop** | Clipboard/drop handling + attach chips + temp-dir lifecycle | Independent of preview |
 | **C. Usage tap + store** | Extend OOB tap for `usage` + `usage_stat` relation + OpenCode `/event` spike | Backend half of X-ray |
 | **D. Usage UI** | Usage section in Code Intelligence + status-bar popover counter | Depends on C |
+| **D2. Tuning advisor** | Heuristic rules + proposals IPC + Advisor card + apply-through-settings | Depends on C/D; richest with the V11 counters |
 | **E0. Preview spike** | Child webview + capture + focus isolation on WebView2 | Gates F |
 | **F. Preview tab** | Tab type (schema bump) + toolbar + snapshot→compose + auto-reload | Depends on B (attach path) + E0 |
 | **G. Docs/tests** | README/FEATURES/MAINTENANCE, settings UI, unit+integration | Per repo convention |
 
-Suggested order **A → B → C → D → E0 → F → G** — but A, B, and C+D are three
-independently shippable slices; the preview tab is the only gated one.
+Suggested order **A → B → C → D → D2 → E0 → F → G** — but A, B, and C+D+D2
+are three independently shippable slices; the preview tab is the only gated
+one.
 
 ## Decisions — OPEN
 

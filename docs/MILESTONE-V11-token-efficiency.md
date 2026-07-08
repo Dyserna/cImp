@@ -183,8 +183,19 @@ opt-in, default off.**
   "before" hook can veto/replace the tool result in the shipped OpenCode; if
   not, Claude-only, same degradation posture as Feature 4.
 
+### Escalation — substitute mode (second tier, after advise proves out)
+In `advise` mode the remind points at the outline; in `substitute` mode it
+*answers* the read: outline **plus** the graph-relevant symbol body (the
+Feature 1 slicing), so the whole-file tokens die even when the agent never
+learns `graph_snippet` exists. Same hook, same route — the difference is pure
+policy. Graduation rule: enable per project only once Activity logs show
+advise-mode reminders are rarely followed by an immediate full re-read (the
+signal that the reminder alone was sufficient). The escape hatch is
+unconditional in both modes: a second Read of the same file always passes.
+
 ### Settings
-`read_advisor: bool` (default false), `read_advisor_min_lines: u32` (default 300).
+`read_advisor: bool` (default false), `read_advisor_min_lines: u32` (default
+300), `read_advisor_mode: advise | substitute` (default `advise`).
 
 ### UI
 Activity section logs `remind` events (file, tokens of the Read it displaced,
@@ -258,7 +269,7 @@ expensive step in this milestone), `semantic_code_max_chunks: u32`.
 | **C. Injection dedup** | `injected` table + retrieve changes + Context-panel badges | Small; pairs with D |
 | **D0. PreCompact spike** | Verify hook output contract w/ capture harness | Gates D; V10-spike method |
 | **D. Compaction survival** | `/context/compaction` route + `--precompact-hook` shim + overlay | Clears dedup table |
-| **E. Read advisor** | `/context/should_read` + `PreToolUse` shim + OpenCode before-hook spike | Depends on D; opt-in |
+| **E. Read advisor** | `/context/should_read` + `PreToolUse` shim + OpenCode before-hook spike | Depends on D; opt-in; `substitute` mode ships in the same phase, default `advise` |
 | **F. LLM digests** | `run_internal` local-only path + digest cache + queue | Independent of D/E |
 | **G. Code embeddings** | `code_chunk` extraction + `graph_semantic_code` + gating | Heaviest; last |
 | **H. Docs/tests** | README/FEATURES/MAINTENANCE, settings UI, unit+integration | Per repo convention |
@@ -273,7 +284,9 @@ hook-behavior half; F/G are independent tails.
    OpenCode degradation (unlike V10 injection, these hook agent-internal events
    OpenCode may not expose). Confirm before Phase D.
 2. **Read-advisor default** — proposed off. Could default on once field data
-   (Activity logs) shows the reminder is never harmful.
+   (Activity logs) shows the reminder is never harmful; `substitute` mode
+   graduates per project on the same evidence (reminders rarely followed by
+   an immediate full re-read).
 3. **`max_body_bytes` for snippets** — 16 KiB proposed; tune against real
    symbol-size distribution once Phase A lands.
 

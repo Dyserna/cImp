@@ -229,7 +229,19 @@ lists the files (from a dry-run diff) + a "delete files created since"
 checkbox (default unchecked); `workbench_checkpoint_now`. Rows: time ·
 trigger icon · label (prompt head) · files-changed count.
 
-**C5. Tests** (tempdir integration, skip without git): snapshot/restore
+**C5. Checkpoint health (soft-dep V12-A):** checkpoint metadata (the same
+store as label/trigger — the `cp-<seq>` tag message or the meta sidecar,
+per the C1 retention decision) gains an optional
+`check_summary: {check_name: error_count}` captured from the most recent
+`CheckReport` per configured check — the checks module emits a small
+broadcast after every run (auto or tool-invoked) that the workbench service
+subscribes to. Timeline renders an errors column + a CSS-bar trend; a
+regression banner appears when current errors materially exceed a checkpoint
+within the retention window (V1 rule: ≥ 2× and ≥ +5), offering "Diff vs
+cp-N". No checks configured ⇒ column absent. Tests: summary attach on
+snapshot; banner threshold; absence path.
+
+**C6. Tests** (tempdir integration, skip without git): snapshot/restore
 round-trip byte-faithful (CRLF file included); restore keeps new files by
 default and deletes with the flag; pre-restore snapshot exists; empty
 work-tree change ⇒ snapshot dedupes; gc respects pinned retention counts;
@@ -278,6 +290,12 @@ tab-schema field this milestone adds (rides the §0.4 migration).
   `git diff <base>...cimp/<slug>`) · **Merge** · **Discard**
   (double-confirm) · **Open shell here** (existing shell-tab creation with
   cwd).
+- **Merge-readiness chip (soft-dep V12-A):** a per-row "Run checks" action
+  executes the configured checks with cwd = the worktree (reuses
+  `checks::run`; `changed_only` vs the recorded base branch); the chip caches
+  pass/fail + age. When V12 `auto_check` is on, fs-batch paths under
+  `.cimp/worktrees/<slug>` refresh it automatically. The Merge button gains a
+  green highlight on pass — advisory only, never auto-merge.
 - Closing the tab leaves the worktree; the section lists orphans for cleanup;
   `prune` runs at app start.
 
@@ -325,6 +343,10 @@ touches: `Pane.svelte`, `tabs/types.ts`, `StatusBar.svelte`,
 `offload/loopback.rs` (`on_prompt` call-out), `tabs/config.rs` (hook install
 condition), `pty/manager.rs` (cwd override), `state/manager.rs` /
 `tabs/registry.rs` (reserved tab).
+
+**Soft dependencies on V12 Phase A:** checkpoint health (C5) and the
+merge-readiness chip (D3) consume `checks::run` + its result broadcast when
+present; both ship dark without it.
 
 **No new MCP tools, no graph-schema change, no new C dependencies** —
 everything is spawned `git` + existing plumbing.

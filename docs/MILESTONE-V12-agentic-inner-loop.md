@@ -1,4 +1,4 @@
-# V12 — Agentic Inner Loop (impact · tests · diagnostics · durable memory)
+# V12 — Agentic Inner Loop (impact · tests · diagnostics · durable memory · proactive automation)
 
 **Status:** SPEC (written 2026-07-08). Not yet coded.
 **Builds on:** V9-01/-02 graph (`graph_transitive`, extraction walkers), V10
@@ -21,6 +21,10 @@ tighter and better-aimed:
   with it. A distillation pass promotes them to project facts.
 - Commit history is the densest free documentation a repo has; the ranker
   ignores it today.
+- And the meta-gap: every tool above is **agent-pull** — it only saves tokens
+  if the model chooses to call it, and guidance nudges decay after
+  compaction. Feature 6 converts the highest-value pulls into harness-driven
+  hooks, so the loop tightens even when the model never asks.
 
 All local, all per-project, same `.cimp/` posture as V9/V10.
 
@@ -169,12 +173,72 @@ difference from GrapeRoot — and the local model does it for free.
   (a fact mentioning `foo.rs` boosts that file).
 - **UI:** Memory section gains a **Facts** list: pin / edit / delete / add
   manually (facts are user-legible state, not a black box).
+- **Promotion (fully automatic recall):** `context_recall` is still
+  agent-pull. Opt-in `promote_pinned_facts: bool` (default false): **pinned**
+  facts — and only pinned, the human-curated tier — are appended to the
+  launch-time guidance payload (Claude `--append-system-prompt`, OpenCode
+  instructions file) inside a clearly marked `cImp project facts` block,
+  capped ~1500 chars. Durable knowledge then arrives with zero tool calls.
+  Launch-time only; facts pinned mid-session apply on the next launch, and
+  the Facts UI says so.
 
 ### Edge cases
 - Distillation quality is model-dependent: facts carry their source session id,
   are individually deletable, and the whole feature sits behind
   `memory_distillation: bool` (default false until the prompt is tuned on real
   sessions).
+
+---
+
+## Feature 6 — Proactive automation (the harness acts, unasked)
+
+### Goal
+Convert this milestone's agent-pull tools into automatic behavior at the
+three moments the agent most needs them and least asks: after an edit, after
+a *risky* edit, and after a rebuild. All reuse the V10/V11
+shim → loopback pattern; the behavior hooks are opt-in, default off — same
+posture as V11's read advisor.
+
+### 6a — Auto-check after edits
+A `PostToolUse` hook (matcher `Edit|Write|MultiEdit`) POSTs to a new loopback
+route `POST /context/post_edit`. The app debounces (agent edits arrive in
+bursts), runs the configured checks with `changed_only`, diffs the diagnostic
+groups against the session's previous run, and returns **only new/worsened**
+diagnostics as additional context (bounded, in Feature 1's structured
+format). The agent learns it broke something in the same turn, in ~1k tokens,
+instead of three turns later via a raw build dump. Nothing new ⇒ inject
+nothing.
+
+### 6b — Auto-impact on risky edits
+Same hook, same route: when the edited span maps to a symbol whose inbound
+edge count ≥ `auto_impact_min_dependents`, append a two-line blast-radius
+note ("14 dependents across 6 files; 3 tests cover this — `graph_impact` /
+`graph_tests_for` for the list"). The moments the agent most needs impact
+analysis are exactly the moments it doesn't think to ask.
+
+### 6c — Analyses on a trigger
+Dead exports and cycles (V10) are human-pull buttons today. Run both after
+each completed index pass (cheap on the warm index), store the counts, and
+badge the Analyses section when they change ("+3 import cycles"); optionally
+one appended line in the V11 repo map when counts grew. Removes the
+"never clicked it" failure mode; the on-demand buttons stay.
+
+### Settings
+`auto_check: bool` (default false), `auto_check_debounce_s: u32` (default 5),
+`auto_impact_min_dependents: u32` (default 10), `analyses_auto: bool`
+(default true — read-only, cheap, feeds only a badge).
+
+### Edge cases
+- **Hook contract:** `PostToolUse` additional-context delivery is verified by
+  the same capture-harness method as V11's D0 spike (one harness run covers
+  `PreCompact` + `PostToolUse`).
+- **OpenCode:** the plugin's `tool.execute.after` is already wired for memory
+  events; whether its return can carry context back to the model is spiked,
+  not assumed — if it can't, parked results drain via the retrieve path
+  below.
+- **Never block the turn:** the hook has a tight timeout; a slow check parks
+  its report per session and the next `/context/retrieve` (or the next
+  post-edit call) drains it.
 
 ---
 
@@ -186,10 +250,13 @@ difference from GrapeRoot — and the local model does it for free.
 | **B. `graph_impact`** | Diff→symbol mapping + reverse-transitive query + tool + Analyses button | Pure graph work |
 | **C. Test mapping** | `is_test` bit (schema bump + re-index) + queries + tools + impact integration | Cross-language surface like V10-B1 |
 | **D. Git-aware context** | `commit_touch` relation + ranking term + trailer + `graph_recent_changes` | Small; independent |
-| **E. Distillation** | `project_fact` relation + distiller job + recall/retrieve integration + Facts UI | Depends on V11-F (`run_internal`); last |
-| **F. Docs/tests** | README/FEATURES/MAINTENANCE, settings UI, guidance addenda, unit+integration | Per repo convention |
+| **E. Distillation** | `project_fact` relation + distiller job + recall/retrieve integration + Facts UI | Depends on V11-F (`run_internal`) |
+| **F. Proactive automation** | `PostToolUse` spike + `/context/post_edit` + auto-check/auto-impact + analyses trigger + fact promotion | Depends on A (checks), B (impact), E (facts); hooks opt-in |
+| **G. Docs/tests** | README/FEATURES/MAINTENANCE, settings UI, guidance addenda, unit+integration | Per repo convention |
 
-Suggested order **A → B → C → D → E → F**. A alone is a worthwhile release.
+Suggested order **A → B → C → D → E → F → G**. A alone is a worthwhile
+release; F is where the milestone stops depending on the model's tool-calling
+discipline.
 
 ## Decisions — OPEN
 
@@ -199,6 +266,9 @@ Suggested order **A → B → C → D → E → F**. A alone is a worthwhile rel
 2. **Impact default depth** — proposed 3. Tune on this repo's graph once B lands.
 3. **Distillation default** — off until prompt quality is validated; revisit
    after ~2 weeks of real sessions.
+4. **`auto_check` default** — proposed off (a behavior hook, like the V11
+   read advisor). Graduation evidence: Activity logs showing auto-check
+   injections were followed by a fix in the same turn at a high rate.
 
 ## Cost note
 

@@ -98,7 +98,7 @@ pub fn build_context(
     // Score every candidate file.
     let mut score: HashMap<String, f64> = HashMap::new();
     for term in &terms {
-        // Definitions: strong signal.
+        // Definitions: strong signal. Indexed point lookup by name.
         if let Ok(hits) = idx.find_symbol(term) {
             for h in hits.iter().take(20) {
                 *score.entry(h.file.clone()).or_default() += 3.0;
@@ -110,11 +110,11 @@ pub fn build_context(
                 *score.entry(r.file.clone()).or_default() += 1.0;
             }
         }
-        // Docs mentioning the term.
-        if let Ok(docs) = idx.search_docs(term, 20, 80) {
-            for d in docs {
-                *score.entry(d.source_path).or_default() += 2.0;
-            }
+    }
+    // Docs: ONE scan of doc_chunk for all terms (not one full scan per term).
+    if let Ok(doc_hits) = idx.doc_source_hits(&terms) {
+        for (path, hits) in doc_hits {
+            *score.entry(path).or_default() += 2.0 * hits as f64;
         }
     }
     // Session recency boost.

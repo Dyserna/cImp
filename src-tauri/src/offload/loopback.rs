@@ -663,11 +663,20 @@ async fn handle_memory_event(
     if let Some((kind, arg)) = crate::graph::classify_tool(&body.tool) {
         let get = |k: &str| body.args.get(k).and_then(Value::as_str);
         let (path, detail) = match arg {
-            crate::graph::MemArg::Path => (get("file_path").or_else(|| get("filePath")).or_else(|| get("path")).unwrap_or("").to_string(), None),
+            crate::graph::MemArg::Path => (
+                get("file_path").or_else(|| get("filePath")).or_else(|| get("notebook_path")).or_else(|| get("path")).unwrap_or("").to_string(),
+                None,
+            ),
             crate::graph::MemArg::Pattern => (get("pattern").or_else(|| get("path")).or_else(|| get("query")).unwrap_or("").to_string(), None),
             crate::graph::MemArg::Command => (String::new(), get("command").map(|c| c.chars().take(200).collect::<String>())),
         };
-        let recordable = !matches!(arg, crate::graph::MemArg::Path | crate::graph::MemArg::Pattern) || !path.is_empty();
+        // Skip an event with no usable target: an empty path (Path/Pattern) or a
+        // Command whose `command` arg was absent (detail is None) — recording it
+        // would just evict useful events from the ring.
+        let recordable = match arg {
+            crate::graph::MemArg::Command => detail.is_some(),
+            _ => !path.is_empty(),
+        };
         if recordable {
             let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
             let agent = body.agent.as_deref().unwrap_or("opencode");

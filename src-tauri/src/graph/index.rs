@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cozo::{DataValue, DbInstance, MultiTransaction, Num, ScriptMutability};
 
@@ -70,27 +71,57 @@ pub struct GraphStats {
 
 pub struct GraphIndex {
     db: DbInstance,
+    /// Set true when [`Self::open`] had to `reset()` a stale-schema store. The
+    /// service reads it **once** (via [`Self::take_schema_reset`]) to trigger a
+    /// repopulating rebuild, so a migrated (emptied) store never lingers empty.
+    schema_reset: AtomicBool,
 }
 
 impl GraphIndex {
-    /// Open (creating if needed) the graph store for `root`, ensuring the
-    /// schema. `db_subdir` is the per-project home (default `.cimp`).
-    pub fn open(root: &Path, db_subdir: &str) -> AppResult<GraphIndex> {
+    /// Open the SQLite-backed store for `root` (creating the dir/db if needed)
+    /// without touching the schema.
+    fn open_db(root: &Path, db_subdir: &str) -> AppResult<GraphIndex> {
         let dir = root.join(db_subdir);
         std::fs::create_dir_all(&dir).map_err(AppError::Io)?;
         let db_path = dir.join("graph.db");
         let db = DbInstance::new("sqlite", db_path.to_string_lossy().as_ref(), Default::default())
             .map_err(|e| AppError::Graph(format!("open {}: {e}", db_path.display())))?;
-        let index = GraphIndex { db };
+        Ok(GraphIndex { db, schema_reset: AtomicBool::new(false) })
+    }
+
+    /// Open (creating if needed) the graph store for `root`, ensuring the schema.
+    /// This is the **writable / service** path: a store stamped with an older
+    /// [`GRAPH_SCHEMA_VERSION`] is `reset()` to the current shape (CozoDB has no
+    /// cheap `ALTER`, and every derived row is re-buildable from source) and
+    /// flagged so the service re-indexes it. `db_subdir` is the per-project home
+    /// (default `.cimp`).
+    pub fn open(root: &Path, db_subdir: &str) -> AppResult<GraphIndex> {
+        let index = Self::open_db(root, db_subdir)?;
         index.ensure_schema()?;
-        index.migrate_schema()?;
         index.ensure_memory_relations()?;
+        index.ensure_schema_meta()?;
+        if index.stored_schema_version()? != Some(GRAPH_SCHEMA_VERSION) {
+            // A pre-V10 store has no `schema_meta` at all, so its version reads as
+            // `None` — same as a brand-new empty store. Distinguish them by data:
+            // only a *populated* store that predates the schema needs a rebuild
+            // after the reset (flag it); a fresh/empty store is filled by the
+            // normal enable/index flow, so a stray touch of it isn't auto-indexed.
+            let had_data = index.count_files()? > 0;
+            index.reset()?;
+            index.write_schema_version(GRAPH_SCHEMA_VERSION)?;
+            if had_data {
+                index.schema_reset.store(true, Ordering::Relaxed);
+            }
+        }
         Ok(index)
     }
 
-    /// Open an **existing** graph store, erroring if it hasn't been built yet.
-    /// Used by read-only consumers (the MCP child) that must not create an
-    /// empty db for an unindexed project.
+    /// Open an **existing** graph store read-only, erroring if it hasn't been
+    /// built yet OR if its schema predates [`GRAPH_SCHEMA_VERSION`]. Used by
+    /// read-only consumers (the MCP child, the offload worker) that must never
+    /// create-or-wipe a store: a stale store is left intact and surfaced as
+    /// [`AppError::GraphNotReady`] so the app (which owns the rebuild) can
+    /// migrate it, instead of silently serving an emptied/mis-shaped index.
     pub fn open_existing(root: &Path, db_subdir: &str) -> AppResult<GraphIndex> {
         let db_path = root.join(db_subdir).join("graph.db");
         if !db_path.exists() {
@@ -99,7 +130,36 @@ impl GraphIndex {
                 db_path.display()
             )));
         }
-        Self::open(root, db_subdir)
+        let index = Self::open_db(root, db_subdir)?;
+        // Create-if-missing only (never resets); memory relations are additive.
+        index.ensure_schema()?;
+        index.ensure_memory_relations()?;
+        index.ensure_schema_meta()?;
+        if index.stored_schema_version()? != Some(GRAPH_SCHEMA_VERSION) {
+            return Err(AppError::GraphNotReady(format!(
+                "the code graph for {} is from an older cImp version — open the project in cImp to rebuild it",
+                root.display()
+            )));
+        }
+        Ok(index)
+    }
+
+    /// Take (and clear) the "stale schema was reset on open" flag. Returns `true`
+    /// exactly once after a migrating open, so the service triggers one rebuild.
+    pub fn take_schema_reset(&self) -> bool {
+        self.schema_reset.swap(false, Ordering::Relaxed)
+    }
+
+    /// Number of indexed files — used to tell a populated (needs-rebuild-after-
+    /// migration) store from a fresh/empty one. The `file` relation's shape is
+    /// stable across schema versions, so this is safe to read on a stale store.
+    fn count_files(&self) -> AppResult<u64> {
+        let rows = self.run(
+            "?[count(path)] := *file{path}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64)
     }
 
     /// Drop every relation and recreate the schema empty. Used by a **full
@@ -123,23 +183,6 @@ impl GraphIndex {
             if !existing.contains(*name) {
                 self.run_mut(create, BTreeMap::new())?;
             }
-        }
-        Ok(())
-    }
-
-    /// Detect a stale on-disk schema generation and, if found, drop+recreate the
-    /// derived relations at the current [`GRAPH_SCHEMA_VERSION`] shape. CozoDB
-    /// has no cheap `ALTER` and every graph row is re-derivable from source, so
-    /// a `reset()` *is* the migration — a re-index (spawned by the service on
-    /// launch/watch) repopulates the emptied relations with the new columns. The
-    /// version lives in a dedicated `schema_meta` singleton that is **not** part
-    /// of [`RELATIONS`], so `reset()` preserves it. A fresh store starts at
-    /// `None` and is stamped on first open (one cheap recreate).
-    fn migrate_schema(&self) -> AppResult<()> {
-        self.ensure_schema_meta()?;
-        if self.stored_schema_version()? != Some(GRAPH_SCHEMA_VERSION) {
-            self.reset()?;
-            self.write_schema_version(GRAPH_SCHEMA_VERSION)?;
         }
         Ok(())
     }
@@ -439,13 +482,26 @@ impl GraphIndex {
 
     /// **Candidate** dead exports: public symbols with no reference use-site and
     /// no inbound call edge (by name or id), minus a small entrypoint allowlist
-    /// (`main`, `test_*`, common trait/convention method names). These are
-    /// *candidates* — a symbol reached only through dynamic dispatch, an external
-    /// consumer, a macro, or reflection has no static edge and will appear here
-    /// as a false positive. The caller/UI must state that caveat.
+    /// (`main`, `test_*`, common trait/convention method names). Bounded to `max`.
+    ///
+    /// These are *candidates*, in two directions:
+    /// - **False positives** — a symbol reached only through dynamic dispatch, an
+    ///   external consumer, a macro, or reflection has no static edge and appears
+    ///   here anyway.
+    /// - **False negatives** — reference/call matching is by *name* (the graph is
+    ///   name-keyed, references aren't fully id-resolved), so a genuinely-dead
+    ///   symbol that shares its name with a used symbol elsewhere is masked. This
+    ///   errs toward under-reporting on purpose (never flag live code).
+    ///
+    /// The caller/UI must state both caveats. Only languages that record real
+    /// visibility (Rust/JS/TS/Python/Go) contribute; others are `unknown` and so
+    /// never `"public"`.
     pub fn dead_exports(&self, max: usize) -> AppResult<Vec<SymbolHit>> {
-        let mut p = BTreeMap::new();
-        p.insert("max".to_string(), int(max as u32));
+        // No DB-side `:limit` — the entrypoint allowlist is applied in Rust after
+        // the query, so limiting first would let conventionally-named public
+        // symbols (new/default/fmt/…) consume the budget and then get stripped,
+        // yielding far fewer than `max` (or zero). The candidate set (public AND
+        // unreferenced) is naturally small, so an unbounded query is cheap.
         let rows = self.run(
             r#"call_dst[dst] := *edge{kind: k, src, dst}, k == "call"
 ?[id, name, kind, file, start_line, signature, visibility] :=
@@ -453,14 +509,14 @@ impl GraphIndex {
     visibility == "public",
     not *ref{name: name},
     not call_dst[name],
-    not call_dst[id]
-:limit $max"#,
-            p,
+    not call_dst[id]"#,
+            BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
         let mut syms = rows_to_symbols(&rows);
         syms.retain(|s| !is_entrypoint_name(&s.name));
         syms.sort_by(|a, b| a.file.cmp(&b.file).then(a.start_line.cmp(&b.start_line)));
+        syms.truncate(max);
         Ok(syms)
     }
 
@@ -596,6 +652,37 @@ reach[x, y] := reach[x, z], calls[z, y]
             }
         }
         Ok(hits)
+    }
+
+    /// Count, per source file, how many of `terms` appear in its doc chunks —
+    /// in a **single** scan of `doc_chunk` (each chunk lower-cased once). Used by
+    /// context ranking on the per-prompt hot path, where calling `search_docs`
+    /// once per term would re-scan and re-lowercase the whole table N times.
+    /// `terms` are matched case-insensitively; empty terms are ignored.
+    pub fn doc_source_hits(&self, terms: &[String]) -> AppResult<HashMap<String, u32>> {
+        let needles: Vec<String> = terms
+            .iter()
+            .map(|t| t.to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let mut out: HashMap<String, u32> = HashMap::new();
+        if needles.is_empty() {
+            return Ok(out);
+        }
+        let rows = self.run(
+            "?[source_path, anchor, text] := *doc_chunk{source_path, anchor, text}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        for r in &rows.rows {
+            let source_path = cell_str(r, 0);
+            let hay = format!("{} {}", cell_str(r, 1), cell_str(r, 2)).to_lowercase();
+            let hits = needles.iter().filter(|n| hay.contains(n.as_str())).count() as u32;
+            if hits > 0 {
+                *out.entry(source_path).or_default() += hits;
+            }
+        }
+        Ok(out)
     }
 
     // ── Semantic search (Phase G): vector store + epoch + k-NN ───────────
@@ -1949,6 +2036,39 @@ pub struct Point { x: i32 }
         assert!(idx.chunks_needing_vectors(epoch, 100).unwrap().is_empty());
 
         drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_schema_is_refused_by_open_existing_and_migrated_by_open() {
+        let dir = std::env::temp_dir().join(format!("ckg-migr-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/a.rs", "pub fn f() {}\n", Lang::Rust))
+            .expect("index");
+        assert!(!idx.find_symbol("f").unwrap().is_empty());
+        // Simulate an older on-disk schema generation.
+        idx.write_schema_version(1).expect("downgrade");
+        drop(idx);
+
+        // Read-only consumers must REFUSE a stale store (not silently wipe it).
+        let refused = GraphIndex::open_existing(&dir, ".ckg");
+        assert!(
+            matches!(refused, Err(AppError::GraphNotReady(_))),
+            "open_existing must refuse a stale store with GraphNotReady"
+        );
+        // The data is still intact (open_existing didn't reset it).
+        {
+            let peek = GraphIndex::open_db(&dir, ".ckg").expect("peek");
+            assert!(!peek.find_symbol("f").unwrap().is_empty(), "open_existing must not wipe");
+        }
+
+        // The writable path migrates: resets (empties) + flags exactly once.
+        let idx2 = GraphIndex::open(&dir, ".ckg").expect("reopen");
+        assert!(idx2.take_schema_reset(), "migration flags a rebuild");
+        assert!(!idx2.take_schema_reset(), "flag is one-shot");
+        assert!(idx2.find_symbol("f").unwrap().is_empty(), "stale rows were reset");
+
+        drop(idx2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

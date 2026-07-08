@@ -3823,13 +3823,12 @@
                   min="0"
                   value={snapshot.graph.context_min_score}
                   onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.context_min_score = Math.max(
-                          0,
-                          Number((e.currentTarget as HTMLInputElement).value) || 3,
-                        )),
-                    )}
+                    patch((s) => {
+                      // 0 is a valid value (no threshold), so keep it — a bare
+                      // `|| 3` would treat the falsy 0 as "unset" and revert it.
+                      const n = Number((e.currentTarget as HTMLInputElement).value);
+                      s.graph.context_min_score = Number.isFinite(n) ? Math.max(0, n) : 3;
+                    })}
                 />
               </label>
               <label class="checkbox">

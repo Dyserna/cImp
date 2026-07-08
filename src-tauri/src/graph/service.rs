@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use ignore::gitignore::Gitignore;
 use ignore::WalkBuilder;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, info, warn};
 
 use crate::error::AppResult;
@@ -309,12 +309,27 @@ impl GraphService {
     /// the open is cheap.
     fn index_for(&self, root: &Path) -> AppResult<Arc<GraphIndex>> {
         let root = root.to_path_buf();
-        let mut guard = self.indices.lock().unwrap();
-        if let Some(idx) = guard.get(&root).cloned() {
-            return Ok(idx);
+        let (idx, migrated) = {
+            let mut guard = self.indices.lock().unwrap();
+            if let Some(idx) = guard.get(&root).cloned() {
+                return Ok(idx);
+            }
+            let idx = Arc::new(GraphIndex::open(&root, &self.db_subdir())?);
+            // Read (once) whether this open had to reset a stale-schema store.
+            let migrated = idx.take_schema_reset();
+            guard.insert(root.clone(), idx.clone());
+            (idx, migrated)
+        }; // release the indices lock before spawning a rebuild
+
+        if migrated {
+            // A pre-upgrade store was emptied to fix its shape. Repopulate it now
+            // (via the managed service Arc) so a non-launch root touched only by a
+            // query or the memory tap doesn't stay silently empty.
+            if let Some(svc) = self.app.try_state::<Arc<GraphService>>() {
+                tracing::info!(root = %root.display(), "graph: schema migrated — rebuilding");
+                svc.inner().clone().spawn_rebuild(root);
+            }
         }
-        let idx = Arc::new(GraphIndex::open(&root, &self.db_subdir())?);
-        guard.insert(root, idx.clone());
         Ok(idx)
     }
 
@@ -404,7 +419,10 @@ impl GraphService {
         max: usize,
     ) -> Vec<WorkingSetEntry> {
         let Ok(idx) = self.index_for(root) else { return Vec::new() };
-        let sid = match session_id {
+        // Treat an empty session id as "unspecified" so a hook/plugin that sends
+        // "" (rather than omitting the field) still falls back to the current
+        // session instead of querying a session literally named "".
+        let sid = match session_id.filter(|s| !s.is_empty()) {
             Some(s) => s.to_string(),
             None => match idx.mem_current_session().ok().flatten() {
                 Some(s) => s,
@@ -950,16 +968,14 @@ impl GraphService {
     }
 }
 
-/// Make `path` project-relative to `root` with `/` separators when it lives
-/// under `root`; otherwise return it with separators normalized. Empty in →
-/// empty out. Keeps memory paths aligned with the graph's stored file paths.
+/// Make a `&str` `path` project-relative to `root` with `/` separators (empty in
+/// → empty out). Delegates to [`rel_path`] so memory-event paths and the
+/// indexer's stored file paths are relativized identically.
 fn relativize_path(root: &Path, path: &str) -> String {
     if path.trim().is_empty() {
         return String::new();
     }
-    let p = Path::new(path);
-    let rel = p.strip_prefix(root).unwrap_or(p);
-    rel.to_string_lossy().replace('\\', "/")
+    rel_path(root, Path::new(path))
 }
 
 /// Reset `idx` and re-index every supported file under `root`, honoring
@@ -1181,11 +1197,30 @@ fn language_census(root: &Path, snap: &GraphSettings, db_subdir: &str) -> Vec<La
 }
 
 /// Project-relative path with forward slashes, matching what the parser stores
-/// and the MCP tools query against. Falls back to the file name if `path`
-/// isn't under `root` (shouldn't happen for a walk rooted at `root`).
+/// and the MCP tools query against. The fs walk always strips cleanly; the
+/// case-insensitive fallback exists for agent-supplied absolute paths (memory
+/// events) that on Windows can differ from `root` only in drive/dir case — the
+/// tail keeps its original casing, which matches the indexed file. Returns the
+/// forward-slashed path unchanged when it isn't under `root`.
 fn rel_path(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
+    // Fast, exact path (always taken by the indexer's own walk).
+    if let Ok(rel) = path.strip_prefix(root) {
+        return rel.to_string_lossy().replace('\\', "/");
+    }
+    // Case-insensitive root-prefix strip.
+    let path_s = path.to_string_lossy().replace('\\', "/");
+    let root_s = root.to_string_lossy().replace('\\', "/");
+    let root_trim = root_s.trim_end_matches('/');
+    let rl = root_trim.len();
+    if !root_trim.is_empty()
+        && path_s.len() > rl
+        && path_s.is_char_boundary(rl)
+        && path_s.as_bytes()[rl] == b'/'
+        && path_s[..rl].eq_ignore_ascii_case(root_trim)
+    {
+        return path_s[rl + 1..].to_string();
+    }
+    path_s
 }
 
 /// The embedding "epoch" fingerprint — a vector is only comparable to others

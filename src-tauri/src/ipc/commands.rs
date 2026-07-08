@@ -920,6 +920,16 @@ pub async fn offload_server_metrics(
     Ok(service.server_metrics())
 }
 
+/// Resolve an optional `root` IPC argument to a project directory: the given
+/// path when non-blank, else the app's launch directory. Shared by the graph
+/// commands so the fallback lives in one place.
+fn resolve_graph_root(root: Option<String>) -> AppResult<std::path::PathBuf> {
+    match root {
+        Some(r) if !r.trim().is_empty() => Ok(std::path::PathBuf::from(r)),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}"))),
+    }
+}
+
 /// V9-01: known per-root code-graph status (idle/building/ready/error + row
 /// counts). The initial fill for the graph status surface; live transitions
 /// arrive via the `graph-status` event. Empty before the first build.
@@ -957,10 +967,7 @@ pub async fn graph_rebuild_embeddings(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<()> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     service.spawn_rebuild_embeddings(root);
     Ok(())
 }
@@ -1001,10 +1008,7 @@ pub async fn graph_dead_exports(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<Vec<DeadExportRow>> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     let hits = service.dead_exports(&root)?;
     Ok(hits
         .into_iter()
@@ -1025,10 +1029,7 @@ pub async fn graph_cycles(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<Vec<Vec<String>>> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     service.import_cycles(&root)
 }
 
@@ -1040,10 +1041,7 @@ pub async fn graph_memory(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<crate::graph::MemorySnapshot> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     Ok(service.memory_snapshot(&root))
 }
 
@@ -1055,10 +1053,7 @@ pub async fn graph_memory_clear(
     root: Option<String>,
     session: Option<String>,
 ) -> AppResult<()> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     let session = session.filter(|s| !s.trim().is_empty());
     service.mem_clear(&root, session.as_deref())
 }
@@ -1072,10 +1067,7 @@ pub async fn graph_note_set_pinned(
     note_id: String,
     pinned: bool,
 ) -> AppResult<()> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     service.mem_set_note_pinned(&root, &note_id, pinned)
 }
 
@@ -1089,10 +1081,7 @@ pub async fn graph_context_preview(
     prompt: String,
     root: Option<String>,
 ) -> AppResult<crate::graph::RetrieveResult> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     Ok(service.retrieve_context(&root, &prompt, None))
 }
 
@@ -1116,10 +1105,7 @@ pub async fn graph_language_census(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<Vec<crate::graph::LangCensus>> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     Ok(service.language_census(&root))
 }
 
@@ -1149,10 +1135,7 @@ pub async fn graph_set_language_enabled(
             langs.retain(|l| l != &tag);
         }
     });
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     service.spawn_rebuild(root);
     Ok(())
 }

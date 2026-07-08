@@ -84,6 +84,12 @@ fn post_context(port: u16, token: &str, body: &str) -> Option<String> {
     // Best-effort read; the read timeout caps it even if the peer lingers.
     let _ = stream.read_to_end(&mut resp);
     let resp = String::from_utf8_lossy(&resp);
+    // Only parse a 2xx body — a 401 (bad token) or 4xx/5xx carries a non-JSON or
+    // error body we must not treat as injectable context.
+    let status_line = resp.lines().next().unwrap_or("");
+    if !status_line.split(' ').nth(1).is_some_and(|c| c.starts_with('2')) {
+        return None;
+    }
     let start = resp.find("\r\n\r\n")? + 4;
     let json: serde_json::Value = serde_json::from_str(resp[start..].trim()).ok()?;
     json.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())

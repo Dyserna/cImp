@@ -481,7 +481,11 @@
           <span class="muted">
             {#if memory.current_session}(current session){/if}
           </span>
-          <button class="mini danger" onclick={() => clearMemory(memory?.current_session ?? undefined)}>
+          <button
+            class="mini danger"
+            disabled={!memory.current_session}
+            onclick={() => memory?.current_session && clearMemory(memory.current_session)}
+          >
             Clear session
           </button>
         </div>
@@ -600,7 +604,10 @@
           <p class="caveat">
             Candidates only — a symbol reached via dynamic dispatch, an external
             consumer, a macro, or reflection has no static edge and can appear
-            here as a false positive.
+            here as a false positive; conversely a dead symbol sharing its name
+            with a used one is missed. Detection covers languages with visibility
+            info: <strong>Rust, JavaScript/TypeScript, Python, Go</strong> (other
+            languages report nothing here yet).
           </p>
           {#if deadExports.length === 0}
             <p class="placeholder">No candidate dead exports.</p>
@@ -623,6 +630,11 @@
           <div class="history-head">
             Import cycles <span class="muted">({cycles.length})</span>
           </div>
+          <p class="caveat">
+            Import resolution covers <strong>JavaScript/TypeScript, Python,
+            Rust</strong>; other languages aren't analyzed for cycles yet, so an
+            empty result for them means "not checked," not "cycle-free."
+          </p>
           {#if cycles.length === 0}
             <p class="placeholder">No import cycles found.</p>
           {:else}

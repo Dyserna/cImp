@@ -314,7 +314,12 @@ fn record_tool_events(obj: &Value, project_dir: &Path, session_id: &str, ctx: &O
         let input = part.get("input");
         let get = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
         let (path, detail) = match arg {
-            crate::graph::MemArg::Path => (get("file_path").unwrap_or("").to_string(), None),
+            // Read/Edit key the target as `file_path`; NotebookRead/NotebookEdit
+            // key it as `notebook_path`.
+            crate::graph::MemArg::Path => (
+                get("file_path").or_else(|| get("notebook_path")).unwrap_or("").to_string(),
+                None,
+            ),
             crate::graph::MemArg::Pattern => (
                 get("pattern").or_else(|| get("path")).unwrap_or("").to_string(),
                 None,

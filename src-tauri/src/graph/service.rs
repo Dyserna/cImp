@@ -30,7 +30,7 @@ use crate::error::AppResult;
 use crate::settings::{GraphSettings, SettingsHandle};
 
 use super::embed::Embedder;
-use super::index::{GraphIndex, GraphStats, LangCount};
+use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
 use super::model::Lang;
 use super::parse_file;
 
@@ -340,6 +340,21 @@ impl GraphService {
     pub fn language_census(&self, root: &Path) -> Vec<LangCensus> {
         let snap = self.settings.current().graph;
         language_census(root, &snap, &self.db_subdir())
+    }
+
+    /// V10: candidate dead exports for `root` — public symbols with no reference
+    /// and no inbound call edge. Opens the warm index; bounded by
+    /// `max_rows_per_query`. Candidates only (see [`GraphIndex::dead_exports`]).
+    pub fn dead_exports(&self, root: &Path) -> AppResult<Vec<SymbolHit>> {
+        let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
+        self.index_for(root)?.dead_exports(max)
+    }
+
+    /// V10: import cycles between files under `root` (each a loop of ≥ 2 files).
+    /// Opens the warm index; bounded by `max_rows_per_query`.
+    pub fn import_cycles(&self, root: &Path) -> AppResult<Vec<Vec<String>>> {
+        let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
+        self.index_for(root)?.import_cycles(max)
     }
 
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns

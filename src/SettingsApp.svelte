@@ -570,7 +570,7 @@
     { id: 'tabs', label: 'Tabs' },
     { id: 'offload', label: 'Offload task tools' },
     { id: 'mcp', label: 'MCP servers' },
-    { id: 'graph', label: 'Code graph' },
+    { id: 'graph', label: 'Code Intelligence' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];

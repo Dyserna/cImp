@@ -24,7 +24,7 @@
   import TabErrorOverlay from './TabErrorOverlay.svelte';
   import ClosedShellOverlay from './ClosedShellOverlay.svelte';
   import OffloadServerView from './OffloadServerView.svelte';
-  import GraphMonitorView from './GraphMonitorView.svelte';
+  import CodeIntelligenceView from './CodeIntelligenceView.svelte';
   import NoteView from './NoteView.svelte';
   import { isShellTab, isOffloadTab, isGraphMonitorTab, isNoteTab, type TabId } from './tabs/types';
   import { tabs } from './tabs/store';
@@ -160,7 +160,7 @@
       {#if isOffloadTab(pane.active_tab_id)}
         <OffloadServerView />
       {:else if isGraphMonitorTab(pane.active_tab_id)}
-        <GraphMonitorView />
+        <CodeIntelligenceView />
       {:else if isNoteTab(pane.active_tab_id)}
         <NoteView />
       {:else}

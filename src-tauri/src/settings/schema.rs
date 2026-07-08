@@ -1741,7 +1741,7 @@ pub fn default_graph_monitor_tab() -> TabConfig {
     TabConfig::Shell(ShellTabConfig {
         id: GRAPH_MONITOR_TAB_ID.to_string(),
         builtin: true,
-        name: "Code Graph".to_string(),
+        name: "Code Intelligence".to_string(),
         command: String::new(),
         args: Vec::new(),
         cwd: None,

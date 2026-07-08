@@ -781,11 +781,21 @@ fn reconcile_graph_monitor_tab(settings: &mut Settings) -> bool {
     if settings.graph.enabled {
         match present {
             Some(i) => {
+                // Keep the reserved tab's builtin flag and display name in sync
+                // with the current default. The V10 rename (Code Graph → Code
+                // Intelligence) reaches existing installs through here, since the
+                // tab is already persisted and never re-materialized.
+                let mut changed = false;
                 if !settings.tabs[i].builtin() {
                     settings.tabs[i].set_builtin(true);
-                    return true;
+                    changed = true;
                 }
-                false
+                let want_name = default_graph_monitor_tab().name().to_string();
+                if settings.tabs[i].name() != want_name {
+                    settings.tabs[i].set_name(want_name);
+                    changed = true;
+                }
+                changed
             }
             None => {
                 let pos = graph_monitor_insert_position(&settings.tabs);

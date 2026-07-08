@@ -12,7 +12,7 @@ use tree_sitter::{Node, Parser};
 
 use super::model::{
     doc_chunk_id, fnv1a_hex, symbol_doc_chunk_id, symbol_id, DocChunk, Edge, EdgeKind, FileGraph,
-    Lang, Reference, Symbol, SymbolKind,
+    Lang, Reference, Symbol, SymbolKind, Visibility,
 };
 
 /// Max characters kept for a symbol's one-line signature.
@@ -262,7 +262,8 @@ fn walk_items(
 
         if let Some((name, skind)) = def_name_kind(src, child, in_impl) {
             let doc = take_doc(&mut pending_doc);
-            let id = emit_symbol(src, file, child, &name, skind, parent, doc, fg);
+            let vis = rust_visibility(child);
+            let id = emit_symbol(src, file, child, &name, skind, parent, doc, vis, fg);
 
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                 collect_calls_in(src, file, child, &id, CallSyntax::Rust, fg);
@@ -313,6 +314,25 @@ fn def_name_kind(src: &str, node: Node, in_impl: bool) -> Option<(String, Symbol
         _ => return None,
     };
     Some((name, sk))
+}
+
+/// Rust visibility of a definition node from its `visibility_modifier` child:
+/// `pub` → Public, `pub(crate)`/`pub(super)`/`pub(in …)` → Crate, absent →
+/// Private. The modifier is a direct child of the item node when present.
+fn rust_visibility(node: Node) -> Visibility {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            // A bare `pub` has no named children; `pub(crate)`/`pub(super)`/
+            // `pub(in path)` add a restriction, which we fold into Crate.
+            return if child.named_child_count() > 0 {
+                Visibility::Crate
+            } else {
+                Visibility::Public
+            };
+        }
+    }
+    Visibility::Private
 }
 
 /// Synthesize a readable name for an `impl` block: `impl Foo` or
@@ -646,9 +666,15 @@ fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
             child
         };
 
+        // A declaration wrapped in `export …` (or `export default …`) is public;
+        // a bare top-level declaration is module-private. Methods nested in a
+        // class stay Private (reachable via their class, never a dead export).
+        let exported = kind == "export_statement";
+        let vis = if exported { Visibility::Public } else { Visibility::Private };
+
         if let Some((name, skind)) = js_def_name_kind(src, def_node, in_class) {
             let doc = take_doc(&mut pending_doc);
-            let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, fg);
+            let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, fg);
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                 collect_calls_in(src, file, def_node, &id, CallSyntax::Js, fg);
             }
@@ -658,7 +684,7 @@ fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
         } else if matches!(def_node.kind(), "lexical_declaration" | "variable_declaration") {
             // `const foo = () => {…}` / `const bar = function(){}` → a function.
             let doc = take_doc(&mut pending_doc);
-            emit_js_var_functions(src, file, def_node, parent, doc, fg);
+            emit_js_var_functions(src, file, def_node, parent, doc, vis, fg);
             pending_doc.clear();
         } else if kind == "import_statement" {
             if let Some(srcpath) = js_import_source(src, child) {
@@ -683,6 +709,7 @@ pub(crate) fn emit_symbol(
     skind: SymbolKind,
     parent: Option<&str>,
     doc: Option<String>,
+    vis: Visibility,
     fg: &mut FileGraph,
 ) -> String {
     let start = node.start_position().row as u32 + 1;
@@ -697,6 +724,7 @@ pub(crate) fn emit_symbol(
         end_line: end,
         signature: signature_of(src, node),
         doc: doc.clone(),
+        visibility: vis,
     });
     if let Some(p) = parent {
         fg.edges.push(Edge { kind: EdgeKind::Contains, src: p.to_string(), dst: id.clone() });
@@ -749,6 +777,7 @@ fn emit_js_var_functions(
     decl: Node,
     parent: Option<&str>,
     doc: Option<String>,
+    vis: Visibility,
     fg: &mut FileGraph,
 ) {
     let mut cursor = decl.walk();
@@ -764,7 +793,7 @@ fn emit_js_var_functions(
         let Some(name) = d.child_by_field_name("name").map(|n| node_text(src, n)) else { continue };
         // Only the first declarator gets the leading doc-comment.
         let this_doc = if first { doc.clone() } else { None };
-        let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, fg);
+        let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, vis, fg);
         collect_calls_in(src, file, value, &id, CallSyntax::Js, fg);
         first = false;
     }
@@ -861,7 +890,8 @@ fn walk_py(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
                     SymbolKind::Function
                 };
                 let doc = py_docstring(src, def_node);
-                let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, fg);
+                let vis = py_visibility(&name);
+                let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, fg);
                 if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                     collect_calls_in(src, file, def_node, &id, CallSyntax::Python, fg);
                 }
@@ -875,6 +905,18 @@ fn walk_py(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
             }
             _ => walk_py(src, file, def_node, parent, in_class, fg),
         }
+    }
+}
+
+/// Python visibility by name convention: a single leading underscore (but not a
+/// dunder like `__init__`) marks a module-private/"internal" name; everything
+/// else is treated as public. `__all__` membership is out of scope for the MVP.
+fn py_visibility(name: &str) -> Visibility {
+    let is_dunder = name.starts_with("__") && name.ends_with("__");
+    if name.starts_with('_') && !is_dunder {
+        Visibility::Private
+    } else {
+        Visibility::Public
     }
 }
 
@@ -975,6 +1017,39 @@ mod tests {
             .filter(|s| s.kind == kind)
             .map(|s| s.name.clone())
             .collect()
+    }
+
+    fn vis_of(fg: &FileGraph, name: &str) -> Visibility {
+        fg.symbols.iter().find(|s| s.name == name).unwrap().visibility
+    }
+
+    #[test]
+    fn rust_visibility_classified() {
+        let src = "pub fn a() {}\nfn b() {}\npub(crate) fn c() {}\npub(super) fn d() {}\n";
+        let fg = parse_file("src/v.rs", src, Lang::Rust);
+        assert_eq!(vis_of(&fg, "a"), Visibility::Public);
+        assert_eq!(vis_of(&fg, "b"), Visibility::Private);
+        assert_eq!(vis_of(&fg, "c"), Visibility::Crate);
+        assert_eq!(vis_of(&fg, "d"), Visibility::Crate);
+    }
+
+    #[test]
+    fn js_export_visibility_classified() {
+        let src = "export function pub_fn() {}\nfunction priv_fn() {}\nexport const arrow = () => {};\nconst hidden = () => {};\n";
+        let fg = parse_file("src/v.ts", src, Lang::TypeScript);
+        assert_eq!(vis_of(&fg, "pub_fn"), Visibility::Public);
+        assert_eq!(vis_of(&fg, "priv_fn"), Visibility::Private);
+        assert_eq!(vis_of(&fg, "arrow"), Visibility::Public);
+        assert_eq!(vis_of(&fg, "hidden"), Visibility::Private);
+    }
+
+    #[test]
+    fn python_underscore_visibility_classified() {
+        let src = "def public_fn():\n    pass\ndef _helper():\n    pass\ndef __dunder__():\n    pass\n";
+        let fg = parse_file("src/v.py", src, Lang::Python);
+        assert_eq!(vis_of(&fg, "public_fn"), Visibility::Public);
+        assert_eq!(vis_of(&fg, "_helper"), Visibility::Private);
+        assert_eq!(vis_of(&fg, "__dunder__"), Visibility::Public);
     }
 
     const SRC: &str = r#"

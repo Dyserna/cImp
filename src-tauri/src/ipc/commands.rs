@@ -982,6 +982,56 @@ pub async fn graph_history() -> AppResult<Vec<crate::graph::GraphCall>> {
     Ok(crate::graph::graph_history())
 }
 
+/// V10: one candidate dead export (unused public symbol) for the Analyses tab.
+#[derive(serde::Serialize)]
+pub struct DeadExportRow {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+    pub signature: String,
+}
+
+/// V10 (Analyses): candidate unused public symbols — public/exported defs with
+/// no reference and no inbound call edge. Candidates only; the UI states the
+/// false-positive caveat (dynamic dispatch, external API, macros/reflection).
+/// `root` defaults to the launch directory. On-demand (no background schedule).
+#[tauri::command]
+pub async fn graph_dead_exports(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<Vec<DeadExportRow>> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    let hits = service.dead_exports(&root)?;
+    Ok(hits
+        .into_iter()
+        .map(|s| DeadExportRow {
+            name: s.name,
+            kind: s.kind,
+            file: s.file,
+            line: s.start_line,
+            signature: s.signature,
+        })
+        .collect())
+}
+
+/// V10 (Analyses): import cycles between files (each a loop of ≥ 2 files that
+/// transitively import one another). `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_cycles(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<Vec<Vec<String>>> {
+    let root = match root {
+        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+    };
+    service.import_cycles(&root)
+}
+
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
 /// = file changes are ignored until resumed (a manual rebuild still works).
 #[tauri::command]

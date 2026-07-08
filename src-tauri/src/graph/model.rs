@@ -259,6 +259,43 @@ pub fn unsupported_lang_name(path: &Path) -> Option<(&'static str, &'static str)
     Some(named)
 }
 
+/// Whether a definition is visible outside its own module/file. Feeds
+/// `dead_exports` (only genuinely public, unused symbols are candidates) and the
+/// context ranker. `Unknown` is the honest default for languages whose walker
+/// can't yet tell — it's treated as "don't claim it's dead", never as public.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Private,
+    /// Rust `pub(crate)`/`pub(super)`/`pub(in …)` — visible within the crate but
+    /// not the public API.
+    Crate,
+    Unknown,
+}
+
+impl Visibility {
+    /// Stable lowercase tag stored in the `symbol.visibility` column.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+            Visibility::Crate => "crate",
+            Visibility::Unknown => "unknown",
+        }
+    }
+
+    /// Inverse of [`Self::tag`] — resolve a stored tag back to a `Visibility`
+    /// (`Unknown` for anything unrecognized).
+    pub fn from_tag(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "public" => Visibility::Public,
+            "private" => Visibility::Private,
+            "crate" => Visibility::Crate,
+            _ => Visibility::Unknown,
+        }
+    }
+}
+
 /// The kind of a definition. Broad enough to cover the MVP languages; the
 /// parser maps each grammar's node kinds onto these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,6 +379,9 @@ pub struct Symbol {
     pub signature: String,
     /// Associated doc-comment text, if any.
     pub doc: Option<String>,
+    /// Whether the definition is externally visible (drives dead-export
+    /// detection). `Unknown` for languages whose walker can't tell yet.
+    pub visibility: Visibility,
 }
 
 /// A reference (use site) of a name. `resolved_id` is `Some` when the parser

@@ -36,8 +36,8 @@ use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::ipc::commands::{
     acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
-    get_system_stats, graph_history, graph_language_census, graph_rebuild,
-    graph_rebuild_embeddings, graph_set_language_enabled, graph_set_watch_paused,
+    get_system_stats, graph_cycles, graph_dead_exports, graph_history, graph_language_census,
+    graph_rebuild, graph_rebuild_embeddings, graph_set_language_enabled, graph_set_watch_paused,
     graph_status, graph_test_embedder, list_tabs,
     list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
     offload_derive_opencode_provider,
@@ -624,6 +624,8 @@ fn main() {
             graph_set_language_enabled,
             graph_test_embedder,
             graph_history,
+            graph_dead_exports,
+            graph_cycles,
             theming::themes_list,
             theming::palettes_list,
         ])

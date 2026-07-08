@@ -17,10 +17,11 @@
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::graph::builder::{emit_symbol, language_for};
-use crate::graph::model::{symbol_id, Edge, EdgeKind, FileGraph, Lang, Reference, SymbolKind};
+use crate::graph::model::{symbol_id, Edge, EdgeKind, FileGraph, Lang, Reference, SymbolKind, Visibility};
 
 /// A grammar + its vendored tags query.
 pub(crate) struct TagSpec {
+    pub lang: Lang,
     pub language: tree_sitter::Language,
     pub tags_query: &'static str,
 }
@@ -52,7 +53,22 @@ pub(crate) fn tag_spec(lang: Lang) -> Option<TagSpec> {
         _ => return None,
     };
     let language = language_for(lang)?;
-    Some(TagSpec { language, tags_query })
+    Some(TagSpec { lang, language, tags_query })
+}
+
+/// Best-effort visibility for a generic-tags language. Only Go is decidable
+/// cheaply from the name (exported iff the identifier starts uppercase); the
+/// other grammars need modifier inspection we don't do yet, so they stay
+/// `Unknown` — honest, and keeps them out of `dead_exports` rather than guessing.
+fn tags_visibility(lang: Lang, name: &str) -> Visibility {
+    match lang {
+        Lang::Go => match name.chars().next() {
+            Some(c) if c.is_uppercase() => Visibility::Public,
+            Some(_) => Visibility::Private,
+            None => Visibility::Unknown,
+        },
+        _ => Visibility::Unknown,
+    }
 }
 
 /// Map a `@definition.<suffix>` capture suffix to a [`SymbolKind`].
@@ -178,7 +194,8 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
             continue;
         }
         let parent_id = parent.map(|p| ids[p].as_str());
-        emit_symbol(src, file, d.node, &d.name, d.kind, parent_id, None, fg);
+        let vis = tags_visibility(spec.lang, &d.name);
+        emit_symbol(src, file, d.node, &d.name, d.kind, parent_id, None, vis, fg);
     }
 
     // Record every call as a reference (so `find references` sees it), then add

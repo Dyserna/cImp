@@ -127,3 +127,26 @@ export function graphHistory(): Promise<GraphCall[]> {
 export function onGraphStatus(cb: (status: GraphStatus) => void): Promise<UnlistenFn> {
   return listen<GraphStatus>('graph-status', (e) => cb(e.payload));
 }
+
+/// V10 (Analyses): one candidate dead export. Mirror of Rust `DeadExportRow`.
+export interface DeadExportRow {
+  name: string;
+  kind: string;
+  file: string;
+  line: number;
+  signature: string;
+}
+
+/// Candidate unused public symbols (public/exported defs with no reference and
+/// no inbound call edge). Candidates only — dynamic dispatch, an external API,
+/// macros, or reflection can produce false positives. `root` defaults to the
+/// launch directory. On-demand (no polling).
+export function graphDeadExports(root?: string): Promise<DeadExportRow[]> {
+  return invoke<DeadExportRow[]>('graph_dead_exports', { root: root ?? null });
+}
+
+/// Import cycles between files — each entry is a loop of two or more files that
+/// transitively import one another. `root` defaults to the launch directory.
+export function graphCycles(root?: string): Promise<string[][]> {
+  return invoke<string[][]>('graph_cycles', { root: root ?? null });
+}

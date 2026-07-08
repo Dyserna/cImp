@@ -120,6 +120,21 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
                 "required": ["query", "lang"]
             }),
         },
+        GraphToolSpec {
+            name: "graph_dead_exports",
+            description: "List CANDIDATE unused public symbols — public/exported definitions with \
+                no reference and no inbound call edge anywhere in the project. Candidates only: a \
+                symbol reached via dynamic dispatch, an external consumer, a macro, or reflection \
+                has no static edge and may appear here as a false positive. Takes no arguments.",
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        GraphToolSpec {
+            name: "graph_cycles",
+            description: "List import cycles between files (each a loop of two or more files that \
+                transitively import one another). Uses best-effort per-language import resolution; \
+                modules that don't resolve to an indexed file are ignored. Takes no arguments.",
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
     ]
 }
 
@@ -291,6 +306,14 @@ pub fn run_tool(
             .search_docs(&req("query")?, max_rows, max_snippet)
             .map(|v| fmt_docs(&v, max_rows))
             .map_err(|e| e.to_string()),
+        "graph_dead_exports" => idx
+            .dead_exports(max_rows)
+            .map(|v| fmt_dead_exports(&v, max_rows))
+            .map_err(|e| e.to_string()),
+        "graph_cycles" => idx
+            .import_cycles(max_rows)
+            .map(|v| fmt_cycles(&v, max_rows))
+            .map_err(|e| e.to_string()),
         // Sync path / no-embedder fallback for semantic search: degrade to
         // labelled full-text. The embedder-backed ranking is applied in the
         // async wrappers ([`handle_call`] / [`offload_query`]).
@@ -414,6 +437,45 @@ fn fmt_symbols(syms: &[SymbolHit], max_rows: usize) -> String {
         .collect();
     if syms.len() > max_rows {
         lines.push(format!("… (+{} more)", syms.len() - max_rows));
+    }
+    lines.join("\n")
+}
+
+fn fmt_dead_exports(syms: &[SymbolHit], max_rows: usize) -> String {
+    if syms.is_empty() {
+        return "No candidate dead exports found.".to_string();
+    }
+    let mut lines: Vec<String> = syms
+        .iter()
+        .take(max_rows)
+        .map(|s| format!("{} ({}) — {}:{}", s.name, s.kind, s.file, s.start_line))
+        .collect();
+    if syms.len() > max_rows {
+        lines.push(format!("… (+{} more)", syms.len() - max_rows));
+    }
+    format!(
+        "Candidate unused public symbols (may include false positives — dynamic dispatch, external API, macros/reflection):\n{}",
+        lines.join("\n")
+    )
+}
+
+fn fmt_cycles(cycles: &[Vec<String>], max_rows: usize) -> String {
+    if cycles.is_empty() {
+        return "No import cycles found.".to_string();
+    }
+    let mut lines: Vec<String> = cycles
+        .iter()
+        .take(max_rows)
+        .map(|c| {
+            let mut s = c.join(" → ");
+            if let Some(first) = c.first() {
+                s.push_str(&format!(" → {first}"));
+            }
+            s
+        })
+        .collect();
+    if cycles.len() > max_rows {
+        lines.push(format!("… (+{} more)", cycles.len() - max_rows));
     }
     lines.join("\n")
 }

@@ -16,11 +16,14 @@
     graphHistory,
     graphLanguageCensus,
     graphSetLanguageEnabled,
+    graphDeadExports,
+    graphCycles,
     onGraphStatus,
     type EmbedderProbe,
     type GraphCall,
     type GraphStatus,
     type LangCensus,
+    type DeadExportRow,
   } from './graph';
   import { listenManaged } from './listenManaged';
   import ToolsReference from './ToolsReference.svelte';
@@ -39,7 +42,53 @@
     { name: 'graph_search_docs', desc: 'Keyword search over docs and doc-comments; returns matching snippets.', example: "Search the docs for 'warm pool'." },
     { name: 'graph_struct_search', desc: 'Find code by AST shape via a tree-sitter query (not text).', example: 'Find every .unwrap() in the Rust code.' },
     { name: 'graph_semantic_docs', desc: 'Meaning-based (embedding) search over docs — only when Semantic search is enabled.', example: 'Find docs about how offload timeouts are handled.' },
+    { name: 'graph_dead_exports', desc: 'Candidate unused public symbols (no reference, no inbound call). Candidates only — may include false positives.', example: 'List candidate dead exports.' },
+    { name: 'graph_cycles', desc: 'Import cycles between files (loops of files that import one another).', example: 'Are there any import cycles?' },
   ];
+
+  // Analyses (Phase B2): on-demand dead-export + import-cycle results. Run only
+  // when the user clicks — walking the graph is comparatively expensive.
+  let deadExports = $state<DeadExportRow[] | null>(null);
+  let cycles = $state<string[][] | null>(null);
+  let analysisBusy = $state<'dead' | 'cycles' | null>(null);
+  let analysisError = $state<string | null>(null);
+
+  async function runDeadExports(): Promise<void> {
+    analysisBusy = 'dead';
+    analysisError = null;
+    try {
+      deadExports = await graphDeadExports();
+    } catch (e) {
+      analysisError = String(e);
+    } finally {
+      analysisBusy = null;
+    }
+  }
+
+  async function runCycles(): Promise<void> {
+    analysisBusy = 'cycles';
+    analysisError = null;
+    try {
+      cycles = await graphCycles();
+    } catch (e) {
+      analysisError = String(e);
+    } finally {
+      analysisBusy = null;
+    }
+  }
+
+  // V10: the tab now hosts five sections. Index/Activity carry the V9 content;
+  // Memory/Context/Analyses are filled by later V10 phases. The internal tab id
+  // (`graph-monitor`) is unchanged — this is purely the in-view section router.
+  type Section = 'index' | 'activity' | 'memory' | 'context' | 'analyses';
+  const SECTIONS: { id: Section; label: string }[] = [
+    { id: 'index', label: 'Index' },
+    { id: 'activity', label: 'Activity' },
+    { id: 'memory', label: 'Memory' },
+    { id: 'context', label: 'Context' },
+    { id: 'analyses', label: 'Analyses' },
+  ];
+  let section = $state<Section>('index');
 
   let roots = $state<GraphStatus[]>([]);
   let paused = $state<boolean>(false);
@@ -210,7 +259,7 @@
 
 <div class="graph-monitor">
   <header>
-    <h2>Code Graph</h2>
+    <h2>Code Intelligence</h2>
     <div class="actions">
       <button onclick={doRebuild} disabled={busy}>Rebuild index</button>
       <button onclick={doRebuildEmbeddings} disabled={busy}>Rebuild embeddings</button>
@@ -223,6 +272,18 @@
     </div>
   </header>
 
+  <nav class="sections">
+    {#each SECTIONS as s (s.id)}
+      <button
+        type="button"
+        class="seg"
+        class:active={section === s.id}
+        onclick={() => (section = s.id)}
+      >{s.label}</button>
+    {/each}
+  </nav>
+
+  {#if section === 'index'}
   {#if probe}
     <p class="probe {probe.ok ? 'ok' : 'err'}">
       <span class="probe-dot"></span>
@@ -307,6 +368,12 @@
     {/each}
   {/if}
 
+  <ToolsReference
+    title="Graph tools"
+    tools={GRAPH_TOOLS}
+    note="MCP tools exposed to Claude (and the offload worker) while the graph is enabled. Ask in natural language — Claude picks the tool."
+  />
+  {:else if section === 'activity'}
   <section class="card history">
     <div class="history-head">Recent calls <span class="muted">(newest first)</span></div>
     <div class="history-body">
@@ -329,12 +396,75 @@
       {/if}
     </div>
   </section>
+  {:else if section === 'memory'}
+    <p class="placeholder">
+      Session memory (what each agent read, edited, and decided) lands here.
+    </p>
+  {:else if section === 'context'}
+    <p class="placeholder">
+      Automatic context injection — what cImp prepends to each prompt — is configured here.
+    </p>
+  {:else if section === 'analyses'}
+    <div class="analyses">
+      <div class="actions">
+        <button onclick={runDeadExports} disabled={analysisBusy !== null}>
+          {analysisBusy === 'dead' ? 'Scanning…' : 'Find dead exports'}
+        </button>
+        <button onclick={runCycles} disabled={analysisBusy !== null}>
+          {analysisBusy === 'cycles' ? 'Scanning…' : 'Find import cycles'}
+        </button>
+      </div>
 
-  <ToolsReference
-    title="Graph tools"
-    tools={GRAPH_TOOLS}
-    note="MCP tools exposed to Claude (and the offload worker) while the graph is enabled. Ask in natural language — Claude picks the tool."
-  />
+      {#if analysisError}
+        <p class="error">{analysisError}</p>
+      {/if}
+
+      {#if deadExports !== null}
+        <section class="card">
+          <div class="history-head">
+            Dead exports <span class="muted">({deadExports.length})</span>
+          </div>
+          <p class="caveat">
+            Candidates only — a symbol reached via dynamic dispatch, an external
+            consumer, a macro, or reflection has no static edge and can appear
+            here as a false positive.
+          </p>
+          {#if deadExports.length === 0}
+            <p class="placeholder">No candidate dead exports.</p>
+          {:else}
+            <div class="rows">
+              {#each deadExports as d (d.file + ':' + d.line)}
+                <div class="arow">
+                  <span class="aname">{d.name}</span>
+                  <span class="akind">{d.kind}</span>
+                  <span class="aloc" title={d.signature}>{d.file}:{d.line}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </section>
+      {/if}
+
+      {#if cycles !== null}
+        <section class="card">
+          <div class="history-head">
+            Import cycles <span class="muted">({cycles.length})</span>
+          </div>
+          {#if cycles.length === 0}
+            <p class="placeholder">No import cycles found.</p>
+          {:else}
+            <div class="rows">
+              {#each cycles as c, i (i)}
+                <div class="arow cycle">
+                  {c.join(' → ')} → {c[0]}
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </section>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -384,6 +514,40 @@
   }
   .empty {
     opacity: 0.7;
+  }
+  .placeholder {
+    opacity: 0.6;
+    font-style: italic;
+    padding: 8px 2px;
+  }
+  /* Segmented section nav under the header. */
+  nav.sections {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid var(--border, #333);
+    padding-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .seg {
+    padding: 4px 12px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text, #ddd);
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0.7;
+  }
+  .seg:hover {
+    background: rgba(255, 255, 255, 0.06);
+    opacity: 1;
+  }
+  .seg.active {
+    background: var(--accent, #3b6ea5);
+    color: #fff;
+    opacity: 1;
+    border-color: var(--accent, #3b6ea5);
   }
   .probe {
     display: flex;
@@ -667,5 +831,51 @@
   .muted {
     opacity: 0.6;
     font-weight: 400;
+  }
+  .analyses .actions {
+    margin-bottom: 12px;
+  }
+  .caveat {
+    font-size: 11px;
+    opacity: 0.65;
+    margin: 2px 0 8px;
+    line-height: 1.4;
+  }
+  .rows {
+    display: flex;
+    flex-direction: column;
+  }
+  .arow {
+    display: grid;
+    grid-template-columns: 1fr 6rem 2fr;
+    gap: 8px;
+    align-items: baseline;
+    padding: 3px 4px;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .arow.cycle {
+    display: block;
+    font-family: monospace;
+    font-size: 11.5px;
+    white-space: normal;
+    word-break: break-all;
+  }
+  .aname {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .akind {
+    opacity: 0.7;
+    font-size: 11px;
+  }
+  .aloc {
+    font-family: monospace;
+    font-size: 11px;
+    opacity: 0.8;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 </style>

@@ -13,8 +13,8 @@ use cozo::{DataValue, DbInstance, MultiTransaction, Num, ScriptMutability};
 
 use crate::error::{AppError, AppResult};
 
-use super::model::FileGraph;
-use super::schema::RELATIONS;
+use super::model::{FileGraph, Lang};
+use super::schema::{GRAPH_SCHEMA_VERSION, RELATIONS};
 
 /// One symbol returned by a lookup query.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +25,8 @@ pub struct SymbolHit {
     pub file: String,
     pub start_line: u32,
     pub signature: String,
+    /// Stored visibility tag (`public`/`private`/`crate`/`unknown`).
+    pub visibility: String,
 }
 
 /// One reference (use site) returned by `references`.
@@ -78,6 +80,7 @@ impl GraphIndex {
             .map_err(|e| AppError::Graph(format!("open {}: {e}", db_path.display())))?;
         let index = GraphIndex { db };
         index.ensure_schema()?;
+        index.migrate_schema()?;
         Ok(index)
     }
 
@@ -117,6 +120,57 @@ impl GraphIndex {
                 self.run_mut(create, BTreeMap::new())?;
             }
         }
+        Ok(())
+    }
+
+    /// Detect a stale on-disk schema generation and, if found, drop+recreate the
+    /// derived relations at the current [`GRAPH_SCHEMA_VERSION`] shape. CozoDB
+    /// has no cheap `ALTER` and every graph row is re-derivable from source, so
+    /// a `reset()` *is* the migration — a re-index (spawned by the service on
+    /// launch/watch) repopulates the emptied relations with the new columns. The
+    /// version lives in a dedicated `schema_meta` singleton that is **not** part
+    /// of [`RELATIONS`], so `reset()` preserves it. A fresh store starts at
+    /// `None` and is stamped on first open (one cheap recreate).
+    fn migrate_schema(&self) -> AppResult<()> {
+        self.ensure_schema_meta()?;
+        if self.stored_schema_version()? != Some(GRAPH_SCHEMA_VERSION) {
+            self.reset()?;
+            self.write_schema_version(GRAPH_SCHEMA_VERSION)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_schema_meta(&self) -> AppResult<()> {
+        if !self.existing_relations()?.contains("schema_meta") {
+            self.run_mut(
+                "?[key, value] <- []\n:create schema_meta {key: String => value: Int}",
+                BTreeMap::new(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn stored_schema_version(&self) -> AppResult<Option<i64>> {
+        if !self.existing_relations()?.contains("schema_meta") {
+            return Ok(None);
+        }
+        let mut p = BTreeMap::new();
+        p.insert("key".to_string(), DataValue::Str("schema_version".into()));
+        let rows = self.run(
+            "?[value] := *schema_meta{key, value}, key == $key",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_i64(r, 0)))
+    }
+
+    fn write_schema_version(&self, v: i64) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("v".to_string(), DataValue::Num(Num::Int(v)));
+        self.run_mut(
+            "?[key, value] <- [['schema_version', $v]]\n:put schema_meta {key => value}",
+            p,
+        )?;
         Ok(())
     }
 
@@ -183,6 +237,7 @@ impl GraphIndex {
                         .as_deref()
                         .map(|d| DataValue::Str(d.into()))
                         .unwrap_or(DataValue::Null),
+                    DataValue::Str(s.visibility.tag().into()),
                 ])
             })
             .collect();
@@ -241,8 +296,8 @@ impl GraphIndex {
             )?;
             tx_put(
                 tx,
-                "?[id, name, kind, file, start_line, end_line, signature, doc] <- $rows\n\
-                 :put symbol {id => name, kind, file, start_line, end_line, signature, doc}",
+                "?[id, name, kind, file, start_line, end_line, signature, doc, visibility] <- $rows\n\
+                 :put symbol {id => name, kind, file, start_line, end_line, signature, doc, visibility}",
                 symbol_rows,
             )?;
             tx_put(
@@ -291,23 +346,12 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            "?[id, name, kind, file, start_line, signature] := \
-                *symbol{id, name, kind, file, start_line, signature}, name == $name",
+            "?[id, name, kind, file, start_line, signature, visibility] := \
+                *symbol{id, name, kind, file, start_line, signature, visibility}, name == $name",
             p,
             ScriptMutability::Immutable,
         )?;
-        Ok(rows
-            .rows
-            .iter()
-            .map(|r| SymbolHit {
-                id: cell_str(r, 0),
-                name: cell_str(r, 1),
-                kind: cell_str(r, 2),
-                file: cell_str(r, 3),
-                start_line: cell_i64(r, 4) as u32,
-                signature: cell_str(r, 5),
-            })
-            .collect())
+        Ok(rows_to_symbols(&rows))
     }
 
     /// Symbols that call `name` (callers). Joins call edges (whose `dst` is the
@@ -316,9 +360,9 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            r#"?[sid, sname, skind, file, start_line, signature] :=
+            r#"?[sid, sname, skind, file, start_line, signature, visibility] :=
                 *edge{kind: ek, src: sid, dst: dn}, ek == "call", dn == $name,
-                *symbol{id: sid, name: sname, kind: skind, file, start_line, signature}
+                *symbol{id: sid, name: sname, kind: skind, file, start_line, signature, visibility}
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
@@ -331,10 +375,10 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            r#"?[id2, nm, skind, file, start_line, signature] :=
+            r#"?[id2, nm, skind, file, start_line, signature, visibility] :=
                 *symbol{id: cid, name: cn}, cn == $name,
                 *edge{kind: ek, src: cid, dst: dn}, ek == "call",
-                *symbol{id: id2, name: nm, kind: skind, file, start_line, signature}, nm == dn
+                *symbol{id: id2, name: nm, kind: skind, file, start_line, signature, visibility}, nm == dn
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
@@ -389,13 +433,103 @@ impl GraphIndex {
         Ok(rows.rows.iter().map(|r| cell_str(r, 0)).collect())
     }
 
+    /// **Candidate** dead exports: public symbols with no reference use-site and
+    /// no inbound call edge (by name or id), minus a small entrypoint allowlist
+    /// (`main`, `test_*`, common trait/convention method names). These are
+    /// *candidates* — a symbol reached only through dynamic dispatch, an external
+    /// consumer, a macro, or reflection has no static edge and will appear here
+    /// as a false positive. The caller/UI must state that caveat.
+    pub fn dead_exports(&self, max: usize) -> AppResult<Vec<SymbolHit>> {
+        let mut p = BTreeMap::new();
+        p.insert("max".to_string(), int(max as u32));
+        let rows = self.run(
+            r#"call_dst[dst] := *edge{kind: k, src, dst}, k == "call"
+?[id, name, kind, file, start_line, signature, visibility] :=
+    *symbol{id, name, kind, file, start_line, signature, visibility},
+    visibility == "public",
+    not *ref{name: name},
+    not call_dst[name],
+    not call_dst[id]
+:limit $max"#,
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut syms = rows_to_symbols(&rows);
+        syms.retain(|s| !is_entrypoint_name(&s.name));
+        syms.sort_by(|a, b| a.file.cmp(&b.file).then(a.start_line.cmp(&b.start_line)));
+        Ok(syms)
+    }
+
+    /// Import cycles between files (each a loop of ≥ 2 files). Import edges store
+    /// a raw module string as `dst`, so this resolves each `(file, module)` to a
+    /// concrete file with a best-effort per-language resolver, builds the
+    /// file→file import graph, and returns its strongly-connected components of
+    /// size ≥ 2 (a self-import is ignored). Modules that don't resolve to a known
+    /// indexed file are dropped — languages without a resolver simply never
+    /// report cycles, which is honest rather than wrong.
+    pub fn import_cycles(&self, max: usize) -> AppResult<Vec<Vec<String>>> {
+        // file → lang tag, so the resolver can pick per-language rules.
+        let file_rows = self.run(
+            "?[path, lang] := *file{path, lang}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut lang_of: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut known: HashSet<String> = HashSet::new();
+        for r in &file_rows.rows {
+            let path = cell_str(r, 0);
+            known.insert(path.clone());
+            lang_of.insert(path, cell_str(r, 1));
+        }
+
+        // Every import edge (src file → raw module string).
+        let import_rows = self.run(
+            r#"?[src, dst] := *edge{kind: k, src, dst}, k == "import""#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        // Resolve each to a file→file adjacency (indices into `files`).
+        let files: Vec<String> = known.iter().cloned().collect();
+        let idx_of: std::collections::HashMap<&str, usize> =
+            files.iter().enumerate().map(|(i, f)| (f.as_str(), i)).collect();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); files.len()];
+        for r in &import_rows.rows {
+            let src = cell_str(r, 0);
+            let module = cell_str(r, 1);
+            let Some(&si) = idx_of.get(src.as_str()) else { continue };
+            let lang = Lang::from_tag(lang_of.get(&src).map(|s| s.as_str()).unwrap_or(""));
+            if let Some(target) = resolve_import(lang, &src, &module, &known) {
+                if let Some(&ti) = idx_of.get(target.as_str()) {
+                    if ti != si {
+                        adj[si].push(ti);
+                    }
+                }
+            }
+        }
+
+        let mut cycles = tarjan_sccs(&adj)
+            .into_iter()
+            .filter(|scc| scc.len() >= 2)
+            .map(|scc| scc.into_iter().map(|i| files[i].clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        // Stable order (biggest cycles first, then lexicographic) and bound.
+        for c in cycles.iter_mut() {
+            c.sort();
+        }
+        cycles.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        cycles.truncate(max);
+        Ok(cycles)
+    }
+
     /// Every definition in `file`, ordered by start line.
     pub fn outline(&self, file: &str) -> AppResult<Vec<SymbolHit>> {
         let mut p = BTreeMap::new();
         p.insert("file".to_string(), DataValue::Str(file.into()));
         let rows = self.run(
-            "?[id, name, kind, file, start_line, signature] := \
-                *symbol{id, name, kind, file, start_line, signature}, file == $file",
+            "?[id, name, kind, file, start_line, signature, visibility] := \
+                *symbol{id, name, kind, file, start_line, signature, visibility}, file == $file",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -941,8 +1075,9 @@ fn text_hash(s: &str) -> String {
     super::model::fnv1a_hex(s)
 }
 
-/// Map query rows shaped `[id, name, kind, file, start_line, signature]` to
-/// [`SymbolHit`]s.
+/// Map query rows shaped `[id, name, kind, file, start_line, signature,
+/// visibility]` to [`SymbolHit`]s. Queries that don't project `visibility`
+/// (7th column absent) get `"unknown"`.
 fn rows_to_symbols(rows: &cozo::NamedRows) -> Vec<SymbolHit> {
     rows.rows
         .iter()
@@ -953,8 +1088,225 @@ fn rows_to_symbols(rows: &cozo::NamedRows) -> Vec<SymbolHit> {
             file: cell_str(r, 3),
             start_line: cell_i64(r, 4) as u32,
             signature: cell_str(r, 5),
+            visibility: if r.len() > 6 { cell_str(r, 6) } else { "unknown".to_string() },
         })
         .collect()
+}
+
+/// Whether `name` is a conventional entrypoint / trait-method that's routinely
+/// "unreferenced by name" yet not actually dead — kept out of `dead_exports` to
+/// cut the obvious false positives. Deliberately small and conservative.
+fn is_entrypoint_name(name: &str) -> bool {
+    if name == "main" || name.starts_with("test_") {
+        return true;
+    }
+    matches!(
+        name,
+        "new"
+            | "default"
+            | "from"
+            | "into"
+            | "fmt"
+            | "drop"
+            | "clone"
+            | "eq"
+            | "ne"
+            | "hash"
+            | "cmp"
+            | "partial_cmp"
+            | "deref"
+            | "as_ref"
+            | "serialize"
+            | "deserialize"
+    )
+}
+
+/// Best-effort resolution of an import's raw module string to a concrete indexed
+/// file, per language. Returns `None` (dropped by the cycle detector) for
+/// external/unresolvable modules or languages without a resolver. Paths are
+/// project-relative with `/` separators (as stored on graph rows).
+fn resolve_import(lang: Lang, from_file: &str, module: &str, known: &HashSet<String>) -> Option<String> {
+    match lang {
+        Lang::TypeScript | Lang::JavaScript => resolve_relative_js(from_file, module, known),
+        Lang::Python => resolve_python(from_file, module, known),
+        Lang::Rust => resolve_rust(module, known),
+        _ => None,
+    }
+}
+
+/// The directory portion of a project-relative file path (`""` for a top-level
+/// file), split into components.
+fn dir_parts(file: &str) -> Vec<String> {
+    let mut parts: Vec<String> = file.split('/').map(|s| s.to_string()).collect();
+    parts.pop(); // drop the file name
+    parts
+}
+
+/// Normalize a component list, resolving `.` and `..` in place. Leading `..`
+/// that escape the root are kept (they simply won't match a known file).
+fn normalize(parts: Vec<String>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for p in parts {
+        match p.as_str() {
+            "" | "." => {}
+            ".." => {
+                if out.last().map(|s| s != "..").unwrap_or(false) {
+                    out.pop();
+                } else {
+                    out.push(p);
+                }
+            }
+            _ => out.push(p),
+        }
+    }
+    out.join("/")
+}
+
+/// JS/TS relative import (`./x`, `../x`): resolve against the importer's dir and
+/// try the usual extension/`index` candidates. Bare specifiers (node_modules)
+/// return `None`.
+fn resolve_relative_js(from_file: &str, module: &str, known: &HashSet<String>) -> Option<String> {
+    if !module.starts_with('.') {
+        return None;
+    }
+    let mut base = dir_parts(from_file);
+    base.extend(module.split('/').map(|s| s.to_string()));
+    let stem = normalize(base);
+    const EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
+    // Exact path first (module already had an extension), then <stem>.<ext>, then
+    // <stem>/index.<ext>.
+    if known.contains(&stem) {
+        return Some(stem);
+    }
+    for ext in EXTS {
+        let cand = format!("{stem}.{ext}");
+        if known.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    for ext in EXTS {
+        let cand = format!("{stem}/index.{ext}");
+        if known.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Python import resolution. Absolute dotted (`a.b.c`) → `a/b/c.py` or
+/// `a/b/c/__init__.py`. Relative (`.mod`, `..pkg.mod`) resolves the leading dots
+/// against the importer's package directory.
+fn resolve_python(from_file: &str, module: &str, known: &HashSet<String>) -> Option<String> {
+    let leading_dots = module.chars().take_while(|c| *c == '.').count();
+    let rest = &module[leading_dots..];
+    let rest_parts: Vec<String> = if rest.is_empty() {
+        Vec::new()
+    } else {
+        rest.split('.').map(|s| s.to_string()).collect()
+    };
+    let mut base: Vec<String> = if leading_dots == 0 {
+        Vec::new()
+    } else {
+        // One dot = the importer's own package dir; each extra dot goes up one.
+        let mut d = dir_parts(from_file);
+        for _ in 0..leading_dots.saturating_sub(1) {
+            d.pop();
+        }
+        d
+    };
+    base.extend(rest_parts);
+    let stem = normalize(base);
+    if stem.is_empty() {
+        return None;
+    }
+    for cand in [format!("{stem}.py"), format!("{stem}/__init__.py")] {
+        if known.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Rust import resolution for in-crate paths only. `crate::a::b` → `src/a/b.rs`
+/// or `src/a/b/mod.rs`. External crates (`std::`, `serde::`, …) and `super`/
+/// `self`-relative paths return `None` (dropped).
+fn resolve_rust(module: &str, known: &HashSet<String>) -> Option<String> {
+    let rest = module.strip_prefix("crate::")?;
+    let segs: Vec<&str> = rest.split("::").collect();
+    if segs.is_empty() {
+        return None;
+    }
+    // Drop a trailing item that's likely a symbol, then a leaf module — try both
+    // the full path as a module and one segment shorter.
+    for take in [segs.len(), segs.len().saturating_sub(1)] {
+        if take == 0 {
+            continue;
+        }
+        let joined = segs[..take].join("/");
+        for cand in [format!("src/{joined}.rs"), format!("src/{joined}/mod.rs")] {
+            if known.contains(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Strongly-connected components of a directed graph given as an adjacency list
+/// (Tarjan's algorithm, iterative to avoid deep recursion on large graphs).
+fn tarjan_sccs(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = adj.len();
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+    let mut next_index = 0usize;
+
+    // Explicit DFS stack of (node, next-child-cursor).
+    let mut call: Vec<(usize, usize)> = Vec::new();
+    for start in 0..n {
+        if index[start] != usize::MAX {
+            continue;
+        }
+        call.push((start, 0));
+        while let Some(&(v, ci)) = call.last() {
+            if ci == 0 {
+                index[v] = next_index;
+                low[v] = next_index;
+                next_index += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            if ci < adj[v].len() {
+                let w = adj[v][ci];
+                call.last_mut().unwrap().1 += 1;
+                if index[w] == usize::MAX {
+                    call.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+            } else {
+                if low[v] == index[v] {
+                    let mut comp = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on_stack[w] = false;
+                        comp.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    sccs.push(comp);
+                }
+                call.pop();
+                if let Some(&(parent, _)) = call.last() {
+                    low[parent] = low[parent].min(low[v]);
+                }
+            }
+        }
+    }
+    sccs
 }
 
 /// Truncate a string to at most `n` characters (on a char boundary), adding an
@@ -1203,6 +1555,69 @@ pub struct Point { x: i32 }
         idx.put_doc_vectors(epoch, &vecs).expect("put");
         assert_eq!(idx.prune_orphan_vectors().unwrap(), 0, "nothing orphaned");
         assert!(idx.chunks_needing_vectors(epoch, 100).unwrap().is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dead_exports_flags_only_unused_public_symbols() {
+        let dir = std::env::temp_dir().join(format!("ckg-dead-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // used_pub is called by driver; unused_pub is not; priv_fn is private.
+        let src = "pub fn used_pub() {}\n\
+                   pub fn unused_pub() {}\n\
+                   fn priv_fn() {}\n\
+                   pub fn driver() { used_pub() }\n";
+        idx.index_file_graph(&parse_file("src/a.rs", src, Lang::Rust))
+            .expect("index");
+
+        let dead = idx.dead_exports(100).expect("dead");
+        let names: Vec<&str> = dead.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"unused_pub"), "unused public fn is a candidate");
+        assert!(!names.contains(&"used_pub"), "a called fn is not dead");
+        assert!(!names.contains(&"priv_fn"), "a private fn is never a dead export");
+        // driver() is public + unused, but it *does* reference used_pub, so it's
+        // not itself referenced — it should appear (honest candidate).
+        assert!(names.contains(&"driver"));
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_cycles_finds_a_two_file_loop() {
+        let dir = std::env::temp_dir().join(format!("ckg-cyc-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // a.ts imports ./b, b.ts imports ./a → a 2-file cycle.
+        idx.index_file_graph(&parse_file("src/a.ts", "import { x } from './b';\nexport const y = 1;\n", Lang::TypeScript))
+            .expect("a");
+        idx.index_file_graph(&parse_file("src/b.ts", "import { y } from './a';\nexport const x = 1;\n", Lang::TypeScript))
+            .expect("b");
+
+        let cycles = idx.import_cycles(50).expect("cycles");
+        assert_eq!(cycles.len(), 1, "exactly one cycle");
+        let mut c = cycles[0].clone();
+        c.sort();
+        assert_eq!(c, vec!["src/a.ts".to_string(), "src/b.ts".to_string()]);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_cycles_none_for_acyclic_graph() {
+        let dir = std::env::temp_dir().join(format!("ckg-acyc-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/a.ts", "import { x } from './b';\n", Lang::TypeScript))
+            .expect("a");
+        idx.index_file_graph(&parse_file("src/b.ts", "export const x = 1;\n", Lang::TypeScript))
+            .expect("b");
+        assert!(idx.import_cycles(50).expect("cycles").is_empty());
+        // An unresolvable/external import must not crash.
+        idx.index_file_graph(&parse_file("src/c.ts", "import fs from 'node:fs';\n", Lang::TypeScript))
+            .expect("c");
+        assert!(idx.import_cycles(50).expect("cycles2").is_empty());
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

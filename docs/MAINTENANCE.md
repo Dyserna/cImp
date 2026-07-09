@@ -624,6 +624,95 @@ without deduping, so a callee name defined N times in one file inflated that
 file's centrality by N×. Fixed in `graph/index.rs::file_centrality`, with a
 regression test alongside it.
 
+## Code Intelligence — Agentic Inner Loop (V12)
+
+**No schema bump — every V12 store is additive, create-if-missing.**
+`symbol.is_test` (Phase C) is the one column that would normally force a
+version bump, but it rode V11's v2 → v3 bump for free (the column already
+existed, unused, in that migration — see the V11 section above), so
+`GRAPH_SCHEMA_VERSION` stays at 3 for all of V12. Every other new store is a
+plain relation created on first use, the same pattern V10/V11 used for
+`session`/`digest`/`code_chunk`: `commit_touch` (Phase D, file churn),
+`project_fact` (Phase E, durable facts), `session_distilled` (Phase E, an
+idempotency marker per session id), and `meta` (Phase F, a small generic
+key/value store backing the analyses-auto trigger's last-seen counts). An
+older `graph.db` opens against these with zero migration step — they simply
+don't exist until the first write.
+
+**A fourth Claude hook shim joins the V11 three, sharing the same POST
+helper.** `postedit_hook.rs`'s `cimp --postedit-hook` (`PostToolUse`, matcher
+`Edit|Write|MultiEdit` → `POST /context/post_edit`) reuses `context_hook.rs`'s
+`post_loopback(path, body)` exactly like `compact_hook.rs` and `read_hook.rs`
+do — same Bearer auth, `Content-Length`, ~600 ms timeout, fail-open-on-any-error
+posture. `tabs/config.rs` adds the hook to the Claude settings overlay
+whenever `context_injection && auto_check`, independent of the other three
+context-hook toggles.
+
+**`TODO(spike F0)` — a third unverified hook output contract, same posture as
+V11's D0/E1.** Which JSON field of a `PostToolUse` hook's stdout actually
+reaches the model as additional context is unconfirmed against the pinned
+Claude Code build (`postedit_hook.rs`'s module doc). We emit the documented
+`hookSpecificOutput.additionalContext` shape, mirroring `UserPromptSubmit`/
+`PreCompact`. Degrades safely either way: the server-side effects (debounce
+clock, baseline update, parked-block bookkeeping) run regardless of whether
+Claude reads the field, and a parked block still drains via the next
+`/context/retrieve` call (`GraphService::drain_auto_check`) — worst case the
+block just arrives a turn later instead of inline. `auto_check` defaults off,
+so nothing is affected until this is confirmed and a project opts in.
+
+**The `checks/` module is a new dependency surface: parser fixtures need
+upkeep alongside the tools they parse.** `checks::parsers` has one parser per
+shipped `ParserKind` (`cargo-json`, `tsc`, `eslint-json`, `pytest`,
+`generic-gcc`); each is regex/JSON-shape coupled to that tool's *current*
+output format. A `cargo`/`tsc`/`eslint`/`pytest` release that changes its
+diagnostic JSON shape or line format silently degrades `run_check` to
+zero/garbage groups rather than erroring loudly — there's no schema
+validation against the real tool, only the fixtures in `checks/parsers.rs`'s
+test module. Re-run those fixtures (and add a new one from a real tool
+invocation) whenever bumping a toolchain this repo's own `checks:` config
+points at, and periodically spot-check the parser against that tool's latest
+`--help`/changelog for output-format notes.
+
+**`graph_impact` / `is_test` / `graph_tests_for` are all approximate by the
+same name-keyed-call-graph limitation `graph_references` already documents.**
+None of these resolve dynamic dispatch, trait objects, higher-order callbacks,
+or reflection-based test discovery — they walk the same reverse/forward
+`calls` edges the rest of the graph does, which are name-keyed, not
+type-checked. `graph_impact`'s dependent tree and `graph_tests_for`'s test
+list are both labeled candidates in their tool descriptions (`graph/mcp.rs`),
+same honesty convention as dead exports: an empty result reads as "found
+none", not "verified none exist." Test detection itself (`graph/builder.rs`'s
+`is_test` walkers) has no bit at all for languages without a bespoke walker or
+a path-convention fallback — again accurate-but-incomplete rather than wrong,
+matching V10's `visibility` precedent.
+
+**The 4-agent code-review pass (`fix(V12)`, commit `aa120c3`) is worth reading
+directly** — it caught several correctness bugs that would otherwise degrade
+silently: `git status --porcelain` collapsing a brand-new untracked directory
+into one `?? dir/` line (both `graph_impact` and `changed_only` now use
+`-z --untracked-files=all` and NUL-split, shared between `graph::impact` and
+`checks::gitls`); a `changed_only` site filter that could drop a just-edited
+file's occurrence when a diagnostic already had ≥5 sites elsewhere (fixed by
+filtering the *uncapped* site list before `cap_sites` truncates — see
+`checks::mod::run`'s doc comment); a check that fails to spawn previously
+vanished from the report indistinguishably from "ran clean" (now surfaced as
+`"⚠ check `<name>` did not run: <err>"`, `checks::auto::spawn_failure_line`);
+`is_cfg_test` missing `cfg(any(test, …))`/`cfg(all(test, …))`; a
+`DistillGuard` in-flight-session-id guard preventing two concurrent
+distillation sweeps (a full rebuild and a watcher-batch reindex can both pick
+up the same idle session) from double-distilling it into duplicate facts; the
+project-fact ranking boost requiring a whole-word, ≥4-char, non-generic-stem
+match (the initial version was a raw substring match, so `mod`/`index`/
+`context` spuriously boosted unrelated files); and `parse_unified_diff` only
+treating a `+++ ` line as a new file header when it immediately follows a
+`--- ` line (otherwise an added line whose *content* starts with `++` can be
+misread as a header). The same pass also de-duplicated the two modules' git
+spawn helper into `graph::gitcmd::run_git` (shared by `graph::impact` and
+`graph::gitmeta`; `checks::gitls` keeps its own async twin on purpose — see
+that module's doc comment) and bounded `graph_recent_changes` at the Datalog
+level (`:order -last_ts :limit`) instead of scanning the whole `commit_touch`
+relation per retrieve.
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

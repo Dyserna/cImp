@@ -564,7 +564,8 @@ cImp builds a per-project **code + docs knowledge graph** (CozoDB + tree-sitter
 over `.cimp/graph.db`) that Opus and offload workers can query through MCP tools —
 `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`,
 `graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`,
-`graph_struct_search`, `graph_snippet`, and `graph_repo_map` (plus
+`graph_struct_search`, `graph_snippet`, `graph_repo_map`, `graph_impact`,
+`graph_tests_for`, `graph_recent_changes`, and `run_check` (plus
 `graph_semantic_docs` / `graph_semantic_code` when semantic search is on). It
 covers **20+ languages** — Rust, TypeScript/JavaScript,
 Python, Go, Java, C, C++, C#, PHP, Bash, Scala, OCaml, Ruby, Haskell, Kotlin,
@@ -609,6 +610,21 @@ re-read of an unchanged file, always with usable content (outline, or outline
 + body) in its place; files with no useful outline get a cached local-model
 digest (never leaves the machine); and `graph_semantic_code` adds
 symbol-level semantic search alongside the existing doc search.
+
+**Agentic Inner Loop (V12)** tightens the edit → check → fix loop, including
+without the model asking: `run_check` runs a project's configured
+build/lint/test commands (`.cimp/config.json`'s `checks` list) and returns
+deduplicated, structured diagnostics instead of a raw dump; `graph_impact`
+gives the blast radius of the working-tree diff (or explicit symbols) as
+transitive dependents, with a matching Analyses button; test↔symbol mapping
+(`graph_tests_for`) finds the candidate tests a change would exercise; git
+commit history boosts recently-churned files in injection ranking and adds a
+`last change: "…" (3d ago)` trailer (`graph_recent_changes` surfaces it
+directly); opt-in memory distillation turns a session's working set into
+durable, pinnable **project facts** via the local-only offload path before it
+evicts; and opt-in proactive automation (a Claude `PostToolUse` hook) injects
+only new/worsened diagnostics right after an edit, plus a blast-radius note on
+risky changes — all off by default, same posture as the V11 read advisor.
 
 ## Configuring Tabs
 

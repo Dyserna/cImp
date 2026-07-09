@@ -62,6 +62,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     coverage (`code: N/M chunks`) and cached digest count (`N context digests
     cached`) alongside the existing doc-embedding readout.
 
+- **Agentic Inner Loop (V12).** Builds on V11's token efficiency to tighten
+  the agent's edit → check → fix loop and make it work even when the model
+  never asks:
+  - **`run_check`** — one tool that runs the project's configured checker
+    commands and returns deduplicated, structured diagnostics (grouped by
+    severity + code + normalized message, up to 5 sample sites each) instead
+    of a raw dump; a 400-error `tsc` run becomes ~30 rows. Configured
+    per-project via a new root-level `checks: [{ name, cmd, parser,
+    timeout_secs }]` list (rides the `.cimp/config.json` overlay). Shipped
+    parsers: `cargo-json`, `tsc`, `eslint-json`, `pytest`, and `generic-gcc`
+    (the `file:line:col` fallback). `changed_only: true` filters diagnostics
+    to files touched since HEAD. Same security posture as `run_command` — a
+    model-supplied `name` only *selects* among the project's configured
+    checks, never a raw command. Doesn't require the code graph; exposed to
+    both cloud tabs (MCP) and the offload worker's native tool set.
+  - **`graph_impact`** — blast-radius analysis for the working-tree diff (or
+    an explicit `symbols` list): maps changed line ranges to indexed symbols,
+    then returns their transitive dependents (name-keyed, approximate — same
+    honesty convention as `graph_references`) with depth, a file-level
+    rollup, and changed-but-unindexed files called out separately. Also a new
+    Analyses-section button ("Impact of working-tree changes"). `include_tests:
+    true` appends the affected tests to the report.
+  - **Test↔symbol mapping.** `symbol.is_test` is now populated per language —
+    Rust `#[test]`/`#[tokio::test]`/`rstest` plus `#[cfg(test)]` modules
+    (including `cfg(any(test))`/`cfg(all(test))`), JS/TS `*.test.*` /
+    `*.spec.*` / `__tests__`, Python `test_*` in `test_*.py` / `tests/`, and
+    generic path-convention heuristics elsewhere. New tool
+    `graph_tests_for { symbol | file }` returns the transitive callers of the
+    root filtered to test definitions — candidates, not guarantees (dynamic
+    dispatch caveat, same posture as dead exports).
+  - **Git-aware context.** A new `commit_touch` relation (file → last commit
+    timestamp/subject/90-day touch count, collected from `git log
+    --since=90.days`) boosts recently-churned files in `/context/retrieve`
+    ranking (+3 within 7 days, +1 within 30) and adds a `last change: "…"
+    (3d ago)` trailer to injected digests and `graph_find_symbol` rows. New
+    tool `graph_recent_changes { days?, path_prefix? }`. Not a git repo →
+    the feature is simply absent, everything else unaffected.
+  - **Memory distillation.** An idle-session sweep (session quiet > 24h)
+    sends its working set + notes to the **local-only** offload path (never
+    remote/cloud) to extract at most 3 non-obvious, durable `project_fact`
+    rows, capped at 100 live facts (oldest unpinned archived first). Facts
+    surface in `context_recall`, boost `/context/retrieve` ranking when a
+    fact mentions a candidate file's stem (whole-word match, generic stems
+    excluded), and get a Memory-section **Facts** list (pin/edit/delete/add).
+    Off by default (`memory_distillation`; needs a ready local backend). New
+    opt-in `promote_pinned_facts` appends only pinned facts to the
+    launch-time guidance payload, so durable knowledge can arrive with zero
+    tool calls.
+  - **Proactive automation** (opt-in, off by default — same posture as V11's
+    read advisor). A new Claude `PostToolUse` hook on `Edit`/`Write`/
+    `MultiEdit` (`cimp --postedit-hook` → `POST /context/post_edit`) debounces
+    a session's edit bursts (`auto_check_debounce_s`, default 5s), runs the
+    configured checks `changed_only`, and injects only diagnostics that are
+    new or worsened since the session's last run — plus a two-line
+    blast-radius note when the edited symbol has at least
+    `auto_impact_min_dependents` (default 10) dependents. Check runs are
+    single-flight per project root, so a Claude tab and an OpenCode tab
+    editing concurrently share one run instead of duplicating a build; each
+    session still sees only what *it* hasn't seen. Dead-exports/import-cycles
+    now also re-run after every completed index pass (`analyses_auto`,
+    default **on** — read-only, badges the Analyses section on change).
+
 ### Changed
 
 - The graph store schema bumps to v3 (`symbol.is_test`, provisioned for a
@@ -72,6 +134,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Two new loopback routes join `/context/retrieve` under the same
   authenticated-localhost trust model: `POST /context/compaction` and
   `POST /context/should_read`.
+- V12 adds one more loopback route the same way: `POST /context/post_edit`.
+  V12's schema footprint is entirely additive on top of V11's v3 bump — no
+  further version bump (`commit_touch`, `project_fact`, `session_distilled`,
+  `meta` are all create-if-missing).
 
 ## [0.35.0] — 2026-07-08
 

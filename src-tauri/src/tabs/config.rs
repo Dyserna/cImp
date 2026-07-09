@@ -410,7 +410,11 @@ prefer `graph_outline` → `graph_snippet` over a full Read), `graph_transitive`
 every function with a given parameter pattern — when text search can't express the structure). They \
 return precise, token-bounded results from an index, so they're cheaper and more exact than text \
 search for 'where is X defined', 'who calls X', and impact analysis. `graph_dead_exports` lists \
-candidate unused public symbols and `graph_cycles` lists import cycles. This project also has \
+candidate unused public symbols and `graph_cycles` lists import cycles. For the edit→check→fix \
+loop: before changing shared code run `graph_impact` (what your working-tree diff could break) and \
+`graph_tests_for` (which tests cover a symbol); after edits run `run_check {changed_only:true}` for \
+deduplicated diagnostics instead of a raw build dump; `graph_recent_changes` shows what's been \
+churning lately. This project also has \
 session memory: call `context_recall` at the start of a follow-up task to reload what this session \
 has been working on, and `context_note` to record a non-obvious decision (pin=true to keep it \
 across sessions) so it survives into later sessions.";

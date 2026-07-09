@@ -14,8 +14,11 @@
 //!
 //! [`diff`] is filled in by Phase B (unified-diff parsing + the live diff
 //! pane's `summary`/`diff_file`, called from this module's
-//! `diff_summary`/`diff_file`/`send_hunk`/`revert_hunk`); `shadow`/`worktree`
-//! remain near-empty placeholders for Phases C/D.
+//! `diff_summary`/`diff_file`/`send_hunk`/`revert_hunk`); [`shadow`] by Phase
+//! C (the checkpoint shadow repo, called from `on_prompt`/`checkpoint_now`/
+//! `checkpoints`/`checkpoint_diff`/`restore`); [`worktree`] by Phase D (the
+//! worktree manager, called from `worktrees`/`worktree_create`/
+//! `worktree_merge`/`worktree_discard`/`worktree_run_checks` below).
 
 pub mod diff;
 pub mod git;
@@ -33,7 +36,7 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::error::{AppError, AppResult};
-use crate::settings::SettingsHandle;
+use crate::settings::{SettingsHandle, TabConfig};
 
 /// Tauri event name for the frontend's fs-batch subscription (§0.3). Payload
 /// is [`FsBatch`]. Emitted only while `settings.workbench.enabled` — see
@@ -81,6 +84,12 @@ pub struct WorkbenchService {
     /// changed paths seen since the window last reset. Keyed by project root
     /// since multiple projects can be open in different tabs at once.
     burst_state: Mutex<HashMap<PathBuf, BurstState>>,
+    /// Phase D D3: the merge-readiness chip's last "Run checks" result per
+    /// `(root, slug)`, so the Worktrees table can show a cached pass/fail +
+    /// age without re-running every configured check on every render — only
+    /// [`worktree_run_checks`](Self::worktree_run_checks) (an explicit row
+    /// button, or a future auto-check hook) refreshes an entry.
+    worktree_check_cache: Mutex<HashMap<(PathBuf, String), WorktreeCheckStatus>>,
 }
 
 /// One project root's rolling burst-trigger accumulator (see
@@ -99,6 +108,30 @@ struct BurstState {
 pub struct WorkbenchStatus {
     pub git_available: bool,
     pub is_repo: bool,
+}
+
+/// Phase D D3: the merge-readiness chip's cached result for one worktree —
+/// `pass` gates the Merge button's green highlight (advisory only; a merge is
+/// never auto-triggered by this). `checked_at_unix` lets the frontend show an
+/// age ("checked 4m ago") and decide whether to suggest a re-run.
+///
+/// **Known rough edge** (soft-dep V12 Phase A, called out by the milestone as
+/// acceptable to ship with — see `IMPL-PLAN-V13-vibe-guardrails.md` §D3):
+/// `checks::run`'s `changed_only` flag filters diagnostics to files touched
+/// since the CWD's own `HEAD` (uncommitted/staged changes). In a worktree
+/// where everything is already committed (the normal case right before a
+/// merge), that filter would see nothing at all — it has no concept of "vs
+/// the base branch this worktree was cut from". So this runs every
+/// configured check UNFILTERED (`changed_only: false`) with `cwd` = the
+/// worktree, which is still a meaningful "does this worktree pass its own
+/// checks" signal, just not scoped to only the worktree's own diff the way a
+/// `changed_only vs base` mode would be. Promoting `checks::run` to accept an
+/// explicit base ref is a clean follow-on, not attempted here.
+#[derive(Clone, Debug, Serialize)]
+pub struct WorktreeCheckStatus {
+    pub pass: bool,
+    pub checked_at_unix: u64,
+    pub reports: Vec<crate::checks::CheckReport>,
 }
 
 impl WorkbenchService {
@@ -123,6 +156,7 @@ impl WorkbenchService {
             fs_batch_tx,
             checkpoint_last: Mutex::new(None),
             burst_state: Mutex::new(HashMap::new()),
+            worktree_check_cache: Mutex::new(HashMap::new()),
         });
         svc.clone().spawn_burst_trigger();
         svc
@@ -399,6 +433,125 @@ impl WorkbenchService {
         hunk_hash: &str,
     ) -> AppResult<diff::FileDiff> {
         revert_hunk(root, path, hunk_index, hunk_hash).await
+    }
+
+    /// Phase D `workbench_worktrees`: every cImp-managed worktree of `root`'s
+    /// repo. `has_live_tab` isn't known to [`worktree::list`] itself (it has
+    /// no `Settings` access) — filled in here by checking whether any
+    /// configured AI tab's `cwd` points at exactly that worktree's path. D3's
+    /// "New tab in worktree" flow always sets an AI tab's `cwd` to the fresh
+    /// worktree's path, so this is an exact match, not a heuristic.
+    pub async fn worktrees(&self, root: &Path) -> AppResult<Vec<worktree::WorktreeInfo>> {
+        let mut infos = worktree::list(root).await?;
+        if infos.is_empty() {
+            return Ok(infos);
+        }
+        let live_paths: HashSet<String> = self
+            .settings
+            .current()
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                TabConfig::AiTool(cfg) => cfg.cwd.as_ref(),
+                TabConfig::Shell(_) => None,
+            })
+            .map(|p| p.display().to_string().replace('\\', "/"))
+            .collect();
+        for info in &mut infos {
+            info.has_live_tab = live_paths.contains(&info.path);
+        }
+        Ok(infos)
+    }
+
+    /// Phase D D3's per-row **Diff** action: worktree `slug` vs. the base
+    /// branch it was cut from, via [`worktree::diff_against_base`]. Read-only
+    /// (a diff between two commits, not the working tree) — no revert action
+    /// applies here.
+    pub async fn worktree_diff(&self, root: &Path, slug: &str) -> AppResult<Vec<diff::FileDiff>> {
+        worktree::diff_against_base(root, slug).await
+    }
+
+    /// Phase D `workbench_worktree_create`. Thin pass-through to
+    /// [`worktree::create`] — see that function's doc comment for the full
+    /// precondition sequence (nested-repo refusal, detached-HEAD refusal,
+    /// duplicate-slug refusal).
+    pub async fn worktree_create(&self, root: &Path, slug: &str) -> AppResult<PathBuf> {
+        worktree::create(root, slug).await
+    }
+
+    /// Phase D `workbench_worktree_merge`. **Safety-critical** — see
+    /// `worktree::merge`'s doc comment: this either fully merges or leaves
+    /// the main tree exactly as it was; there is no partial/half-merged
+    /// outcome from this call.
+    pub async fn worktree_merge(&self, root: &Path, slug: &str) -> AppResult<worktree::MergeReport> {
+        worktree::merge(root, slug).await
+    }
+
+    /// Phase D `workbench_worktree_discard`. Double-confirmation is the
+    /// frontend's job (D3); this is the unconditional action once confirmed.
+    /// Also drops any cached check status for `slug` so a later re-creation
+    /// under the same name doesn't show a stale chip.
+    pub async fn worktree_discard(&self, root: &Path, slug: &str) -> AppResult<()> {
+        worktree::discard(root, slug).await?;
+        self.worktree_check_cache.lock().unwrap().remove(&(root.to_path_buf(), slug.to_string()));
+        Ok(())
+    }
+
+    /// Phase D `worktree::prune`, called once at app start (see `main.rs`)
+    /// for `root` = the launch directory. Best-effort by design — logged, not
+    /// propagated, since a prune failure (or `root` not being a repo at all)
+    /// should never affect app startup.
+    pub async fn worktree_prune_at_startup(&self, root: &Path) {
+        if let Err(e) = worktree::prune(root).await {
+            warn!(root = %root.display(), error = %e, "workbench: worktree prune at startup failed");
+        }
+    }
+
+    /// Phase D D3 merge-readiness chip: run every configured check
+    /// (`settings.checks`) with `cwd` = worktree `slug`'s directory, cache
+    /// the aggregate pass/fail (no `error`-severity diagnostic groups in any
+    /// report = pass), and return it. See [`WorktreeCheckStatus`]'s doc
+    /// comment for the `changed_only` rough edge this accepts for V1.
+    /// `pass` is `true` (vacuously) when no checks are configured at all —
+    /// the frontend is expected to render "no checks configured" rather than
+    /// a green chip in that case, using `reports.is_empty()` to tell the two
+    /// apart.
+    pub async fn worktree_run_checks(&self, root: &Path, slug: &str) -> AppResult<WorktreeCheckStatus> {
+        let wt_path = worktree::resolve_path(root, slug)?;
+        let checks = self.settings.current().checks.clone();
+        let mut reports = Vec::with_capacity(checks.len());
+        let mut pass = true;
+        for def in &checks {
+            match crate::checks::run(&wt_path, def, false).await {
+                Ok(report) => {
+                    if report.groups.iter().any(|g| g.severity == crate::checks::Severity::Error) {
+                        pass = false;
+                    }
+                    reports.push(report);
+                }
+                Err(e) => {
+                    warn!(root = %root.display(), slug, check = %def.name, error = %e, "workbench: worktree check run failed");
+                    pass = false;
+                }
+            }
+        }
+        let checked_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let status = WorktreeCheckStatus { pass, checked_at_unix, reports };
+        self.worktree_check_cache
+            .lock()
+            .unwrap()
+            .insert((root.to_path_buf(), slug.to_string()), status.clone());
+        Ok(status)
+    }
+
+    /// The merge-readiness chip's last cached result for `slug`, if any
+    /// check has ever been run for it this session — `None` renders as
+    /// "not checked yet" rather than a stale/default value.
+    pub fn worktree_check_status(&self, root: &Path, slug: &str) -> Option<WorktreeCheckStatus> {
+        self.worktree_check_cache.lock().unwrap().get(&(root.to_path_buf(), slug.to_string())).cloned()
     }
 }
 

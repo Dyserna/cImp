@@ -46,6 +46,7 @@
     onConfigure,
     onRestart,
     onClose,
+    onNewWorktreeTab,
     onDismiss,
   }: {
     x: number;
@@ -67,6 +68,10 @@
     onConfigure?: () => void;
     onRestart?: () => void;
     onClose?: () => void;
+    /// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — offered
+    /// for any AI-tool tab (builtin or already-duplicated), same
+    /// availability rule as `onConfigure`.
+    onNewWorktreeTab?: () => void;
     onDismiss: () => void;
   } = $props();
 
@@ -208,6 +213,11 @@
     {#if !tab.builtin || tab.kind === 'ai-tool'}
       <button type="button" class="entry" role="menuitem" onclick={fire(onConfigure)}>
         Configure…
+      </button>
+    {/if}
+    {#if tab.kind === 'ai-tool' && onNewWorktreeTab}
+      <button type="button" class="entry" role="menuitem" onclick={fire(onNewWorktreeTab)}>
+        New tab in worktree…
       </button>
     {/if}
     {#if !tab.builtin}

@@ -1361,6 +1361,104 @@ pub async fn workbench_restore(
     service.restore(&root, &id, delete_new).await
 }
 
+/// V13 Phase D: every cImp-managed worktree of `root`'s repo — slug, branch,
+/// base branch, ahead/behind vs that base, and whether an AI tab is
+/// currently pointed at it. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn workbench_worktrees(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+) -> AppResult<Vec<crate::workbench::worktree::WorktreeInfo>> {
+    let root = resolve_workbench_root(root)?;
+    service.worktrees(&root).await
+}
+
+/// V13 Phase D D3: worktree `slug` vs. the base branch it was cut from
+/// (`git diff <base>...cimp/<slug>`), parsed the same way `workbench_diff_file`
+/// is. Read-only — there is no revert action on this diff.
+#[tauri::command]
+pub async fn workbench_worktree_diff(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
+    let root = resolve_workbench_root(root)?;
+    service.worktree_diff(&root, &slug).await
+}
+
+/// V13 Phase D: create a bare worktree (no tab) for `slug` — the Worktrees
+/// section's own "create" affordance. Returns the new worktree's absolute
+/// path. See `workbench::worktree::create`'s doc comment for the full
+/// precondition sequence (nested-repo refusal, detached-HEAD refusal,
+/// duplicate-slug refusal) that surfaces as a typed error here.
+#[tauri::command]
+pub async fn workbench_worktree_create(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<String> {
+    let root = resolve_workbench_root(root)?;
+    let path = service.worktree_create(&root, &slug).await?;
+    Ok(path.display().to_string())
+}
+
+/// V13 Phase D: merge worktree `slug`'s branch back into the branch it was
+/// cut from. **Safety-critical** — see `workbench::worktree::merge`'s doc
+/// comment: on ANY failure past the preconditions (most notably a merge
+/// conflict), the merge is aborted before this returns, so the main working
+/// tree is either fully merged or completely untouched — never half-merged.
+#[tauri::command]
+pub async fn workbench_worktree_merge(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<crate::workbench::worktree::MergeReport> {
+    let root = resolve_workbench_root(root)?;
+    service.worktree_merge(&root, &slug).await
+}
+
+/// V13 Phase D: remove worktree `slug`'s directory and delete its branch.
+/// **Double-confirmation is the frontend's job** — this call performs the
+/// removal unconditionally once invoked, and only ever acts on a
+/// cImp-created worktree (refuses a `slug` with no meta sidecar).
+#[tauri::command]
+pub async fn workbench_worktree_discard(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<()> {
+    let root = resolve_workbench_root(root)?;
+    service.worktree_discard(&root, &slug).await
+}
+
+/// V13 Phase D D3 (soft-dep V12 Phase A `checks::run`): the merge-readiness
+/// chip's "Run checks" action — runs every configured check with `cwd` = the
+/// worktree, caches the aggregate pass/fail, and returns it. See
+/// `WorktreeCheckStatus`'s doc comment for the `changed_only` rough edge this
+/// accepts for V1.
+#[tauri::command]
+pub async fn workbench_worktree_run_checks(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<crate::workbench::WorktreeCheckStatus> {
+    let root = resolve_workbench_root(root)?;
+    service.worktree_run_checks(&root, &slug).await
+}
+
+/// V13 Phase D D3: the merge-readiness chip's last cached result for `slug`,
+/// if any check has been run this session — `null` on the wire means "not
+/// checked yet", not a failure.
+#[tauri::command]
+pub fn workbench_worktree_check_status(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<Option<crate::workbench::WorktreeCheckStatus>> {
+    let root = resolve_workbench_root(root)?;
+    Ok(service.worktree_check_status(&root, &slug))
+}
+
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
 /// = file changes are ignored until resumed (a manual rebuild still works).
 #[tauri::command]

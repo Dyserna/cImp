@@ -2092,6 +2092,17 @@ fn build_tree(
 /// agree exactly on what counts as "in the project" (gitignore + global +
 /// exclude + parents, dotfiles included, plus the user's extra `ignore` globs).
 /// The db-subdir and per-file size/language filtering are applied by callers.
+///
+/// V13 Phase D: the `<db_subdir>/` override below (default `.cimp/`) is
+/// unconditional — not gated on the user's own `.gitignore` containing it —
+/// so this walker never DESCENDS into it at all, rather than relying on
+/// callers' post-hoc `path.components().any(|c| c.as_os_str() == db_subdir)`
+/// filter alone. That filter is still correct (and kept, as defense in
+/// depth), but a project that hasn't gitignored `.cimp/` would otherwise have
+/// this walker step through the shadow checkpoint repo's whole object store
+/// AND every worktree's full checkout under `.cimp/worktrees/<slug>/` on
+/// every rebuild — the worktree case in particular can be as large as the
+/// project itself, multiplied per open worktree.
 fn build_walker(root: &Path, snap: &GraphSettings) -> ignore::Walk {
     let mut wb = WalkBuilder::new(root);
     wb.hidden(false) // index dotfiles like `.github/*.md`; the db dir is filtered by callers
@@ -2099,26 +2110,26 @@ fn build_walker(root: &Path, snap: &GraphSettings) -> ignore::Walk {
         .git_global(true)
         .git_exclude(true)
         .parents(true);
-    // Honor the user's extra ignore globs (additive to `.gitignore`). An
-    // `Override` whose patterns are *ignore* globs needs each prefixed with
-    // `!` (overrides are whitelists; a leading `!` flips one to a blacklist).
-    if !snap.ignore.is_empty() {
-        let mut ob = ignore::overrides::OverrideBuilder::new(root);
-        for pat in &snap.ignore {
-            let pat = pat.trim();
-            if pat.is_empty() {
-                continue;
-            }
-            let rule = if let Some(stripped) = pat.strip_prefix('!') {
-                stripped.to_string() // already a re-include
-            } else {
-                format!("!{pat}") // ignore this glob
-            };
-            let _ = ob.add(&rule);
+    // Honor the user's extra ignore globs (additive to `.gitignore`), plus
+    // the always-on `<db_subdir>/` exclusion above. An `Override` whose
+    // patterns are *ignore* globs needs each prefixed with `!` (overrides are
+    // whitelists; a leading `!` flips one to a blacklist).
+    let mut ob = ignore::overrides::OverrideBuilder::new(root);
+    let _ = ob.add(&format!("!{}/", snap.effective_db_subdir()));
+    for pat in &snap.ignore {
+        let pat = pat.trim();
+        if pat.is_empty() {
+            continue;
         }
-        if let Ok(ov) = ob.build() {
-            wb.overrides(ov);
-        }
+        let rule = if let Some(stripped) = pat.strip_prefix('!') {
+            stripped.to_string() // already a re-include
+        } else {
+            format!("!{pat}") // ignore this glob
+        };
+        let _ = ob.add(&rule);
+    }
+    if let Ok(ov) = ob.build() {
+        wb.overrides(ov);
     }
     wb.build()
 }

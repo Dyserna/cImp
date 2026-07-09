@@ -174,6 +174,19 @@
       </small>
     </label>
 
+    {#if settings.cwd}
+      <label class="field">
+        <span>Working directory</span>
+        <input type="text" value={settings.cwd} readonly />
+        <small class="hint">
+          Read-only. This tab was spawned into a cImp-managed git worktree
+          (V13 Phase D's "New tab in worktree…") — it always runs here, not
+          the project root. Manage the worktree itself (diff / merge /
+          discard) from the Workbench tab's Worktrees section.
+        </small>
+      </label>
+    {/if}
+
     <label class="field">
       <span>
         Persistent CLI args

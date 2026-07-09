@@ -369,6 +369,115 @@ pub async fn create_ai_tab(
     Ok(tab)
 }
 
+/// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — the worktree
+/// counterpart of [`create_ai_tab`]. Creates a fresh cImp worktree (branch
+/// `cimp/<slug>` under `<root>/.cimp/worktrees/<slug>`, refused per
+/// `workbench::worktree::create`'s preconditions: nested repo, detached
+/// `HEAD`, duplicate slug), then duplicates `template`'s AI config exactly
+/// like the plain "+" duplicate — except the new tab's `cwd` is set to the
+/// worktree's path (D2: threaded through `build_ai_tool_spec` /
+/// `pty::manager` exactly the way a Shell tab's `cwd` already is) and its
+/// display name is prefixed `⑂ <slug>` so it reads as worktree-scoped at a
+/// glance. `root` defaults to the launch directory, like every other
+/// Workbench IPC command.
+///
+/// If the worktree is created but tab registration then fails (the
+/// state-signal-channel-closed case `create_ai_tab` also guards), the
+/// worktree is intentionally left in place rather than auto-discarded —
+/// `discard` is a double-confirmed, branch-deleting action the milestone
+/// reserves for an explicit user click; an orphaned (no-live-tab) worktree
+/// just shows up in the Worktrees section for manual cleanup, exactly like
+/// one whose tab was later closed.
+#[tauri::command]
+pub async fn create_ai_tab_in_worktree(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    workbench: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    template: TabId,
+    root: Option<String>,
+    slug: String,
+) -> Result<TabId, TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
+
+    let root_path = match root.as_deref().map(str::trim) {
+        Some(r) if !r.is_empty() => PathBuf::from(r),
+        _ => state.launch.cwd.clone(),
+    };
+
+    let wt_path = workbench
+        .worktree_create(&root_path, &slug)
+        .await
+        .map_err(|e| TabLifecycleError::internal(format!("create worktree: {e}")))?;
+
+    // Clone the template's AI config, same rule as `create_ai_tab`: the
+    // worktree-tab affordance only appears on AI tabs, so a missing entry or
+    // a Shell template is a malformed request. Unlike `create_ai_tab`, a
+    // failure past this point does NOT roll back the worktree — see this
+    // function's doc comment.
+    let mut cfg = {
+        let snap = state.settings.current();
+        let entry = snap.find_tab(template.as_str()).ok_or_else(|| {
+            TabLifecycleError::TabNotFound {
+                tab: template.as_str().to_string(),
+            }
+        })?;
+        match entry {
+            TabConfig::AiTool(ai) => ai.clone(),
+            TabConfig::Shell(_) => return Err(TabLifecycleError::WrongKind),
+        }
+    };
+
+    let tab = TabId::Ai(format!("ai-{}", Uuid::new_v4()));
+    let base_name = format!("⑂ {slug}: {}", cfg.name);
+    let name = unique_tab_name(&state.settings.current(), &base_name);
+    cfg.id = tab.as_str().to_string();
+    cfg.builtin = false;
+    cfg.name = name.clone();
+    cfg.cwd = Some(wt_path);
+
+    let tab_meta = TabMeta {
+        id: tab.clone(),
+        kind: TabKind::AiTool,
+        name: name.clone(),
+    };
+
+    // Persist BEFORE registering — same ordering rationale as `create_ai_tab`.
+    state.settings.mutate(move |snap| {
+        snap.tabs.push(TabConfig::AiTool(cfg));
+    });
+
+    let position = {
+        let mut registry = state.tabs.lock().await;
+        registry.insert_user_tab(tab.clone(), name.clone())
+    };
+
+    if let Err(e) = state
+        .state_signals
+        .send(StateSignal::TabAdded {
+            meta: tab_meta,
+            position,
+        })
+        .await
+    {
+        warn!(error = %e, "create_ai_tab_in_worktree: state-signal channel closed");
+        let id = tab.as_str().to_string();
+        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
+        state.tabs.lock().await.remove_tab(&tab).await;
+        return Err(TabLifecycleError::internal("state signal channel closed"));
+    }
+
+    {
+        let mut registry = state.tabs.lock().await;
+        if let Err(e) = registry.activate(tab.clone()).await {
+            warn!(error = %e, "create_ai_tab_in_worktree: activate failed");
+        }
+    }
+
+    let _ = app; // reserved for future per-window emits
+    info!(?tab, ?template, %slug, "ai tab created in worktree");
+    Ok(tab)
+}
+
 /// Close a Shell tab (including the default `shell-default-1`). The AI
 /// builtins (Claude / Claude-local) reject with `BuiltinNotClosable`. The
 /// PTY is killed, the registry entry dropped, the settings entry removed,

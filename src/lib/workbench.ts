@@ -1,6 +1,6 @@
-// V13 Phase A/B — frontend IPC wrapper for the Workbench tab. Diff (Phase B)
-// lives here alongside the Phase A top-of-view status; checkpoints (Phase C)
-// and worktrees (Phase D) add their own wrappers as they land.
+// V13 Phase A/B/C/D — frontend IPC wrapper for the Workbench tab. Diff
+// (Phase B) lives here alongside the Phase A top-of-view status; checkpoints
+// (Phase C) and worktrees (Phase D) add their own sections below.
 
 import { invoke } from '@tauri-apps/api/core';
 import { writable } from 'svelte/store';
@@ -173,4 +173,114 @@ export function workbenchRestore(id: string, deleteNew: boolean, root?: string):
 export const workbenchCheckpointsVersion = writable<number>(0);
 export function bumpWorkbenchCheckpointsVersion(): void {
   workbenchCheckpointsVersion.update((n) => n + 1);
+}
+
+// ── Phase D: worktree manager ───────────────────────────────────────────
+
+/// Mirror of Rust `workbench::worktree::WorktreeInfo` — one Worktrees-table
+/// row.
+export interface WorktreeInfo {
+  slug: string;
+  path: string;
+  branch: string;
+  base: string;
+  ahead: number;
+  behind: number;
+  has_live_tab: boolean;
+}
+
+/// Mirror of Rust `workbench::worktree::MergeReport`.
+export interface MergeReport {
+  fast_forward: boolean;
+  commit: string;
+}
+
+/// Mirror of Rust `checks::Severity`.
+export type CheckSeverity = 'error' | 'warning' | 'note';
+
+/// Mirror of Rust `checks::DiagGroup`.
+export interface DiagGroup {
+  key: string;
+  severity: CheckSeverity;
+  message: string;
+  count: number;
+  sites: [string, number][];
+}
+
+/// Mirror of Rust `checks::CheckReport`.
+export interface CheckReport {
+  name: string;
+  exit_code: number | null;
+  duration_ms: number;
+  timed_out: boolean;
+  groups: DiagGroup[];
+}
+
+/// Mirror of Rust `workbench::WorktreeCheckStatus` — the merge-readiness
+/// chip's cached result. `reports.length === 0` with no checks configured at
+/// all should render as "no checks configured", not a green chip, even
+/// though `pass` is vacuously `true` in that case.
+export interface WorktreeCheckStatus {
+  pass: boolean;
+  checked_at_unix: number;
+  reports: CheckReport[];
+}
+
+/// Every cImp-managed worktree of `root`'s repo (empty when `root` isn't a
+/// git repo, or has none).
+export function workbenchWorktrees(root?: string): Promise<WorktreeInfo[]> {
+  return invoke<WorktreeInfo[]>('workbench_worktrees', { root: root ?? null });
+}
+
+/// The Diff row action: worktree `slug` vs. the base branch it was cut
+/// from, parsed the same way `workbenchDiffFile` is. Read-only — there is
+/// no revert action on this diff (it's a diff between two commits, not the
+/// working tree).
+export function workbenchWorktreeDiff(slug: string, root?: string): Promise<FileDiff[]> {
+  return invoke<FileDiff[]>('workbench_worktree_diff', { root: root ?? null, slug });
+}
+
+/// Create a bare worktree (no tab) for `slug` — used by the Worktrees
+/// section's own "create" affordance, distinct from the tab-bar's "New tab
+/// in worktree…" flow (`createAiTabInWorktree` in `ipc.ts`), which creates
+/// one AND spawns a tab into it in one step.
+export function workbenchWorktreeCreate(slug: string, root?: string): Promise<string> {
+  return invoke<string>('workbench_worktree_create', { root: root ?? null, slug });
+}
+
+/// Merge worktree `slug`'s branch back into the branch it was cut from. Runs
+/// entirely in the main working tree; **never** leaves it half-merged — a
+/// conflict aborts the merge and rejects with a plain-string error before
+/// anything is left in a partial state (see the backend's
+/// `workbench::worktree::merge` doc comment).
+export function workbenchWorktreeMerge(slug: string, root?: string): Promise<MergeReport> {
+  return invoke<MergeReport>('workbench_worktree_merge', { root: root ?? null, slug });
+}
+
+/// Remove worktree `slug`'s directory AND delete its branch. Double
+/// confirmation is this dialog's job, not the backend's — call only after
+/// the user has explicitly confirmed.
+export function workbenchWorktreeDiscard(slug: string, root?: string): Promise<void> {
+  return invoke('workbench_worktree_discard', { root: root ?? null, slug });
+}
+
+/// The merge-readiness chip's "Run checks" action: runs every configured
+/// check with `cwd` = the worktree, caches the aggregate pass/fail
+/// server-side, and returns it.
+export function workbenchWorktreeRunChecks(slug: string, root?: string): Promise<WorktreeCheckStatus> {
+  return invoke<WorktreeCheckStatus>('workbench_worktree_run_checks', { root: root ?? null, slug });
+}
+
+/// The merge-readiness chip's last cached result, if any — `null` means "not
+/// checked yet this session" (render as such, not as a failure).
+export function workbenchWorktreeCheckStatus(slug: string, root?: string): Promise<WorktreeCheckStatus | null> {
+  return invoke<WorktreeCheckStatus | null>('workbench_worktree_check_status', { root: root ?? null, slug });
+}
+
+/// Bumped after a successful create/merge/discard so the Worktrees section
+/// refetches without a direct reference to whichever dialog/action triggered
+/// it — same pattern as `workbenchCheckpointsVersion`.
+export const workbenchWorktreesVersion = writable<number>(0);
+export function bumpWorkbenchWorktreesVersion(): void {
+  workbenchWorktreesVersion.update((n) => n + 1);
 }

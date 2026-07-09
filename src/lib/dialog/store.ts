@@ -6,6 +6,7 @@
 
 import { writable, type Writable } from 'svelte/store';
 import type { TabId } from '../tabs/types';
+import type { PaneId } from '../layout/types';
 
 export type DialogState =
   | { kind: 'none' }
@@ -13,7 +14,8 @@ export type DialogState =
   | { kind: 'configure-tab'; tab: TabId }
   | { kind: 'save-layout' }
   | { kind: 'manage-presets' }
-  | { kind: 'restore-checkpoint'; id: string; root?: string };
+  | { kind: 'restore-checkpoint'; id: string; root?: string }
+  | { kind: 'new-worktree-tab'; template: TabId; paneId: PaneId };
 
 export const dialogState: Writable<DialogState> = writable({ kind: 'none' });
 
@@ -45,6 +47,14 @@ export function openManagePresetsDialog(): void {
 /// which checkpoint and (optionally) which project root.
 export function openRestoreCheckpointDialog(id: string, root?: string): void {
   dialogState.set({ kind: 'restore-checkpoint', id, root });
+}
+
+/// V13 Phase D D3: opened from a builtin AI tab's context menu — "New
+/// <Claude|OpenCode> tab in worktree…". `template` is the AI tab whose
+/// config the new tab clones; `paneId` is where the frontend routes the new
+/// tab once spawned (mirrors the plain "+" duplicate's `requestTabIntoPane`).
+export function openNewWorktreeTabDialog(template: TabId, paneId: PaneId): void {
+  dialogState.set({ kind: 'new-worktree-tab', template, paneId });
 }
 
 export function closeDialog(): void {

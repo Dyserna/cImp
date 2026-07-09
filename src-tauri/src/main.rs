@@ -62,15 +62,18 @@ use crate::ipc::commands::{
     tab_activate, tts_speak, tts_set_paused, tts_speak_selection, tts_stop, tts_test,
     workbench_checkpoint_diff, workbench_checkpoint_now, workbench_checkpoints, workbench_diff_file,
     workbench_diff_summary, workbench_restore, workbench_revert_hunk, workbench_send_hunk,
-    workbench_status,
+    workbench_status, workbench_worktree_check_status, workbench_worktree_create,
+    workbench_worktree_diff, workbench_worktree_discard, workbench_worktree_merge,
+    workbench_worktree_run_checks, workbench_worktrees,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
 };
 use crate::ipc::note::{read_note, write_note};
 use crate::ipc::tab_lifecycle::{
-    close_tab, create_ai_tab, create_shell_tab, default_shell_spec, get_shell_tab_config,
-    open_note_tab, open_tool_tab, reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
+    close_tab, create_ai_tab, create_ai_tab_in_worktree, create_shell_tab, default_shell_spec,
+    get_shell_tab_config, open_note_tab, open_tool_tab, reconfigure_shell_tab, rename_tab,
+    set_enabled_ai_tabs,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
@@ -534,6 +537,16 @@ fn main() {
                     app.handle().clone(),
                     settings_for_workbench.clone(),
                 );
+                // V13 Phase D D3: reconcile git's worktree bookkeeping once at
+                // startup (a worktree directory the user deleted out-of-band
+                // since the last run). Best-effort/fire-and-forget — see
+                // `worktree_prune_at_startup`'s doc comment; never blocks launch.
+                if let Ok(root) = std::env::current_dir() {
+                    let svc = workbench_service.clone();
+                    tauri::async_runtime::spawn(async move {
+                        svc.worktree_prune_at_startup(&root).await;
+                    });
+                }
                 app.manage(workbench_service);
             }
 
@@ -653,6 +666,7 @@ fn main() {
             set_active_tab,
             create_shell_tab,
             create_ai_tab,
+            create_ai_tab_in_worktree,
             close_tab,
             rename_tab,
             reconfigure_shell_tab,
@@ -711,6 +725,13 @@ fn main() {
             workbench_checkpoint_diff,
             workbench_checkpoint_now,
             workbench_restore,
+            workbench_worktrees,
+            workbench_worktree_create,
+            workbench_worktree_diff,
+            workbench_worktree_merge,
+            workbench_worktree_discard,
+            workbench_worktree_run_checks,
+            workbench_worktree_check_status,
             theming::themes_list,
             theming::palettes_list,
         ])

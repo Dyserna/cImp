@@ -14,6 +14,7 @@
   import { settings } from './settings/store';
   import DiffView from './DiffView.svelte';
   import TimelineView from './TimelineView.svelte';
+  import WorktreesView from './WorktreesView.svelte';
 
   type Section = 'diff' | 'timeline' | 'worktrees';
   const SECTIONS: { id: Section; label: string }[] = [
@@ -99,11 +100,11 @@
       <TimelineView />
     {/if}
   {:else if section === 'worktrees'}
-    <p class="placeholder">
-      Worktree manager — coming in Phase D. Once shipped, this section lets
-      you spin up an isolated worktree + branch for a parallel agent task,
-      then merge or discard it from here.
-    </p>
+    {#if statusError || (needsGit && gitBannerText)}
+      <!-- The banner above already explains what's missing. -->
+    {:else}
+      <WorktreesView />
+    {/if}
   {/if}
 </div>
 
@@ -173,11 +174,5 @@
     background: rgba(179, 38, 30, 0.18);
     border-color: #b3261e;
     color: #ffb4ab;
-  }
-  .placeholder {
-    opacity: 0.65;
-    font-style: italic;
-    line-height: 1.5;
-    max-width: 60ch;
   }
 </style>

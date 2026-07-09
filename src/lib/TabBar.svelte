@@ -15,7 +15,7 @@
     renameTab as renameTabIpc,
     restartShellTab,
   } from './ipc';
-  import { openConfigureTabDialog, openNewShellTabDialog } from './dialog/store';
+  import { openConfigureTabDialog, openNewShellTabDialog, openNewWorktreeTabDialog } from './dialog/store';
   import { openSettingsWindowToTab } from './settings/ipc';
   import { isShellTab, type TabId } from './tabs/types';
   import { tabMeta } from './tabs/store';
@@ -276,6 +276,7 @@
       : undefined}
     onRestart={t ? () => onRestartTab(t.id) : undefined}
     onClose={t ? () => onCloseTab(t.id) : undefined}
+    onNewWorktreeTab={t && !isShell ? () => openNewWorktreeTabDialog(t.id, pane.id) : undefined}
     onDismiss={dismissMenu}
   />
 {/if}

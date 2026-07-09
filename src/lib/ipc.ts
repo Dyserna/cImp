@@ -244,6 +244,21 @@ export async function createAiTab(template: TabId): Promise<TabId> {
   return invoke<TabId>('create_ai_tab', { template });
 }
 
+/// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — creates a
+/// fresh cImp worktree (`.cimp/worktrees/<slug>`, branch `cimp/<slug>` cut
+/// from `HEAD`) then spawns a duplicate of `template`'s config with `cwd`
+/// pointed at it. Throws the same `TabLifecycleError` shape as
+/// `createAiTab` on a tab-registration failure; a worktree-creation failure
+/// (nested repo, detached HEAD, duplicate slug, ...) throws a plain string
+/// (the backend's `AppError::Workbench` message).
+export async function createAiTabInWorktree(
+  template: TabId,
+  slug: string,
+  root?: string,
+): Promise<TabId> {
+  return invoke<TabId>('create_ai_tab_in_worktree', { template, slug, root: root ?? null });
+}
+
 export async function closeTab(tab: TabId): Promise<void> {
   await invoke('close_tab', { tab });
 }

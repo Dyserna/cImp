@@ -554,6 +554,17 @@ pub struct AiToolTabConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    /// `None` (the default for every builtin and every plain "+"-duplicated
+    /// tab) ⇒ spawn with the app's launch directory, same as always. V13
+    /// Phase D's "New tab in worktree…" flow
+    /// (`ipc::tab_lifecycle::create_ai_tab_in_worktree`) is the one place
+    /// that sets this — to the freshly created worktree's path — so the tab
+    /// runs isolated from the main working tree. This field already existed
+    /// (mirroring `ShellTabConfig::cwd`, wired into `build_ai_tool_spec`
+    /// since V3) but was never set by any flow until Phase D; there is no
+    /// user-facing "set a custom cwd" affordance for AI tabs, so a non-`None`
+    /// value always means "this tab lives in a cImp-managed worktree" — shown
+    /// read-only where the tab's Configure surface displays it.
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub tts_injection: TtsInjection,

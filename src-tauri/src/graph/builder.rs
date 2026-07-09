@@ -738,15 +738,15 @@ pub(crate) fn emit_symbol(
     if let Some(p) = parent {
         fg.edges.push(Edge { kind: EdgeKind::Contains, src: p.to_string(), dst: id.clone() });
     }
-    // V11 Phase G: a semantic *code* chunk for this symbol (signature + doc +
-    // body), keyed by the symbol's own id. Uses `doc.as_deref()` rather than
-    // consuming `doc` — the doc-chunk block below still needs it. Only
-    // "shaped" definitions worth embedding, and only spans long enough that
-    // the signature alone (already in `symbol.signature`) wouldn't capture
-    // the interesting part.
+    // V11 Phase G: a semantic *code* chunk for this symbol (doc + body), keyed by
+    // the symbol's own id. The node text already begins with the signature line,
+    // so it is NOT prepended separately (doing so would burn the truncation
+    // budget on a duplicate). Uses `doc.as_deref()` rather than consuming `doc` —
+    // the doc-chunk block below still needs it. Only "shaped" definitions worth
+    // embedding, and only spans long enough that the one-line signature alone
+    // wouldn't capture the interesting part.
     if is_code_chunk_kind(skind) && end.saturating_sub(start) + 1 >= MIN_CODE_CHUNK_LINES {
-        let mut text = signature_of(src, node);
-        text.push('\n');
+        let mut text = String::new();
         if let Some(d) = doc.as_deref() {
             text.push_str(d);
             text.push('\n');

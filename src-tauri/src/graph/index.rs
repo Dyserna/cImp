@@ -679,16 +679,21 @@ impl GraphIndex {
     /// file defining a very common name ranks high — an orientation signal, not
     /// a precise metric.
     pub fn file_centrality(&self, max: usize) -> AppResult<Vec<(String, u64)>> {
+        // Project DISTINCT (file, src, dst) then count in Rust. A `count(src)`
+        // aggregate over the join would multiply a single call edge by the number
+        // of same-named symbols in the target file (e.g. `A::new` + `B::new` in
+        // one file both match `dst == "new"`), inflating that file's centrality.
+        // The distinct projection collapses those duplicate matches to one row.
         let rows = self.run(
-            r#"?[file, count(src)] := *edge{kind: k, src, dst}, k == "call", *symbol{name: dst, file}"#,
+            r#"?[file, src, dst] := *edge{kind: k, src, dst}, k == "call", *symbol{name: dst, file}"#,
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
-        let mut v: Vec<(String, u64)> = rows
-            .rows
-            .iter()
-            .map(|r| (cell_str(r, 0), cell_i64(r, 1) as u64))
-            .collect();
+        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for r in &rows.rows {
+            *counts.entry(cell_str(r, 0)).or_default() += 1;
+        }
+        let mut v: Vec<(String, u64)> = counts.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         v.truncate(max);
         Ok(v)
@@ -2369,6 +2374,26 @@ pub struct Point { x: i32 }
         assert_eq!(idx.prune_orphan_digests().unwrap(), 1);
         assert_eq!(idx.digest_count().unwrap(), 1);
         assert!(idx.get_digest("gone.rs", "hx").unwrap().is_none());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_centrality_counts_distinct_edges_not_join_cardinality() {
+        let dir = std::env::temp_dir().join(format!("ckg-cent-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // `run` is defined twice in one file; a single inbound call must count
+        // ONCE for that file, not once per matching definition (the old
+        // count-over-join bug double-counted files with recurring method names).
+        idx.index_file_graph(&parse_file("src/dup.rs", "pub fn run() {}\npub fn run() {}\n", Lang::Rust))
+            .expect("index dup");
+        idx.index_file_graph(&parse_file("src/caller.rs", "pub fn c() { run() }\n", Lang::Rust))
+            .expect("index caller");
+
+        let central = idx.file_centrality(10).expect("centrality");
+        let dup = central.iter().find(|(f, _)| f == "src/dup.rs").map(|(_, c)| *c).unwrap_or(0);
+        assert_eq!(dup, 1, "one call edge counts once despite two same-named defs");
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

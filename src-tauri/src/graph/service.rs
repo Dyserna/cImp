@@ -180,10 +180,28 @@ pub struct GraphService {
     /// reminded about — one reminder per file per session, so an agent that reads
     /// again after a reminder (it knows better than our heuristic) always passes.
     reminded: StdMutex<HashSet<(String, String)>>,
-    /// V11 Phase F: `(file, content_hash)` digest jobs currently in flight, so a
-    /// cache miss never spawns a duplicate local-model job for the same content.
-    /// Also caps concurrent jobs (demand-driven + slot-gated by the supervisor).
-    digest_inflight: StdMutex<HashSet<(String, String)>>,
+    /// V11 Phase F: `(root, file, content_hash)` digest jobs currently in flight,
+    /// so a cache miss never spawns a duplicate local-model job for the same
+    /// content. Keyed by root too, since one service manages multiple projects
+    /// and an identical (path, hash) can occur in two of them. Also caps
+    /// concurrent jobs (demand-driven + slot-gated by the supervisor).
+    digest_inflight: StdMutex<HashSet<(PathBuf, String, String)>>,
+}
+
+/// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
+/// panic in the spawned digest task can't leak the key and permanently shrink
+/// the in-flight budget — mirrors [`BackfillGuard`]'s cleanup discipline.
+struct InflightGuard {
+    svc: Arc<GraphService>,
+    key: (PathBuf, String, String),
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.svc.digest_inflight.lock() {
+            g.remove(&self.key);
+        }
+    }
 }
 
 /// Per-session record of what context has been injected, for dedup (V11 Phase C).
@@ -528,8 +546,13 @@ impl GraphService {
 
     /// Clear one session's memory (`Some`) or the whole project's (`None`).
     pub fn mem_clear(&self, root: &Path, session_id: Option<&str>) -> AppResult<()> {
-        // V11 Phase B/C: also drop the in-memory greeting + injection-dedup state
-        // for the cleared scope so a cleared session re-greets and re-injects.
+        // Clear the persisted memory FIRST — it's the fallible part. Only on
+        // success drop the in-memory greeting/dedup/reminder bookkeeping, so a
+        // failed clear doesn't leave the two out of sync (in-memory wiped while
+        // the DB session is intact).
+        self.index_for(root)?.mem_clear(session_id)?;
+        // V11 Phase B/C/E: drop the in-memory greeting + injection-dedup +
+        // read-advisor state for the cleared scope so it re-greets/re-injects.
         if let Ok(mut map) = self.injected.lock() {
             match session_id {
                 Some(s) => {
@@ -552,7 +575,7 @@ impl GraphService {
                 None => set.clear(),
             }
         }
-        self.index_for(root)?.mem_clear(session_id)
+        Ok(())
     }
 
     // ── V10 context injection ────────────────────────────────────────────
@@ -599,6 +622,13 @@ impl GraphService {
         let (snapshot, current_turn) = match sid {
             Some(s) => {
                 let mut map = self.injected.lock().unwrap();
+                // Bound the per-session dedup state: nothing prunes it when a
+                // session simply ends, so cap it (clearing is safe — it just
+                // re-injects once). The greeted/reminded sets hold only small
+                // strings and aren't worth a cap.
+                if map.len() > 1024 && !map.contains_key(s) {
+                    map.clear();
+                }
                 let st = map.entry(s.to_string()).or_default();
                 st.turn = st.turn.saturating_add(1);
                 (st.files.clone(), st.turn)
@@ -626,7 +656,15 @@ impl GraphService {
                 let st = map.entry(s.to_string()).or_default();
                 for f in &result.files_used {
                     if let Ok(Some(h)) = idx.stored_file_hash(f) {
-                        st.files.insert(f.clone(), (h, current_turn));
+                        // Only overwrite if this turn is at least as new as the
+                        // recorded one, so an interleaved earlier retrieve can't
+                        // clobber a newer turn's record with a stale hash.
+                        match st.files.get(f) {
+                            Some((_, prev_turn)) if *prev_turn > current_turn => {}
+                            _ => {
+                                st.files.insert(f.clone(), (h, current_turn));
+                            }
+                        }
                     }
                 }
             }
@@ -651,7 +689,7 @@ impl GraphService {
     /// when this is reached — via the loopback/IPC async handlers).
     fn enqueue_digest(&self, root: &Path, file: &str, content_hash: &str) {
         const MAX_INFLIGHT: usize = 32;
-        let key = (file.to_string(), content_hash.to_string());
+        let key = (root.to_path_buf(), file.to_string(), content_hash.to_string());
         {
             let mut inflight = match self.digest_inflight.lock() {
                 Ok(g) => g,
@@ -666,10 +704,10 @@ impl GraphService {
             return;
         };
         let me = me.inner().clone();
-        let root = root.to_path_buf();
         tokio::spawn(async move {
-            me.compute_and_cache_digest(&root, &key.0, &key.1).await;
-            let _ = me.digest_inflight.lock().map(|mut g| g.remove(&key));
+            // Guard removes the key on Drop — even if the compute panics.
+            let _guard = InflightGuard { svc: me.clone(), key: key.clone() };
+            me.compute_and_cache_digest(&key.0, &key.1, &key.2).await;
         });
     }
 
@@ -806,23 +844,20 @@ impl GraphService {
             return None;
         }
         let idx = self.index_for(root).ok()?;
-        // Never seen this file this session ⇒ pass.
-        let last_seen = idx.mem_file_last_event_ms(sid, &rel).ok().flatten()?;
+        // Never seen this file this session ⇒ pass (the `?` returns on `None`).
+        idx.mem_file_last_event_ms(sid, &rel).ok().flatten()?;
 
         let abs = root.join(&rel);
-        let meta = std::fs::metadata(&abs).ok()?;
-        // Changed since last seen ⇒ pass (let the agent read the new content).
-        let mtime_ms = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        if mtime_ms > last_seen {
-            return None;
+        let content = std::fs::read_to_string(&abs).ok()?;
+        // Changed since it was indexed ⇒ pass. Compared by content hash (like
+        // `graph_snippet`'s staleness check) rather than mtime-vs-event-time,
+        // which a filesystem clock skew (network shares, WSL2 bind-mounts) could
+        // make wrong. Not indexed ⇒ pass.
+        match idx.stored_file_hash(&rel).ok().flatten() {
+            Some(indexed) if indexed == super::model::fnv1a_hex(&content) => {}
+            _ => return None,
         }
         // Small files are cheap to re-read ⇒ pass.
-        let content = std::fs::read_to_string(&abs).ok()?;
         if (content.lines().count() as u32) < g.read_advisor_min_lines {
             return None;
         }
@@ -831,14 +866,15 @@ impl GraphService {
         let substitute = g.read_advisor_mode.eq_ignore_ascii_case("substitute");
         let text = super::context::read_advice(&idx, root, &rel, offset, substitute, g.max_body_bytes as usize);
         self.reminded.lock().ok()?.insert(key);
-        // Activity: the `chars` slot carries the estimated tokens the reminder
-        // displaced (file bytes / 4), labeled by the `read_advisor`/`remind` tags.
+        // Activity: `chars` is the reminder's actual size (what we returned),
+        // consistent with every other graph tool's honest response-size figure —
+        // not a fabricated token estimate.
         super::activity::record(super::activity::GraphCall {
             ts_ms: super::activity::now_ms(),
             source: "read_advisor".to_string(),
             tool: "remind".to_string(),
             target: rel,
-            chars: (content.len() / 4),
+            chars: text.chars().count(),
             ms: 0,
             ok: true,
         });

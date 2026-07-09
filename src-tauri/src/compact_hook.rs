@@ -31,8 +31,8 @@ pub fn run() {
         Err(_) => return,
     };
     let session_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
-    // "manual" (a `/compact`) or "auto" (context-window pressure); passed through
-    // for the record, not currently branched on.
+    // "manual" (a `/compact`) or "auto" (context-window pressure); forwarded to
+    // the route but not currently acted on (it's ignored server-side today).
     let trigger = v.get("trigger").and_then(|s| s.as_str()).unwrap_or("");
     let cwd = v
         .get("cwd")

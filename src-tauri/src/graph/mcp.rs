@@ -210,7 +210,10 @@ pub fn tools() -> Vec<Value> {
     if settings.graph.semantic_search {
         specs.push(semantic_spec());
     }
-    if settings.graph.embed_code_bodies {
+    // Code semantic search needs the embedder too: the code-embedding backfill
+    // only runs when `semantic_search` is on, so advertising the tool on
+    // `embed_code_bodies` alone would offer a tool that can never return results.
+    if settings.graph.semantic_search && settings.graph.embed_code_bodies {
         specs.push(semantic_code_spec());
     }
     specs

@@ -164,7 +164,14 @@ pub fn build_context(
     let mut digest_misses: Vec<(String, String)> = Vec::new();
     let mut budget = turn_budget_chars;
     for (file, _s) in ranked {
-        if used.len() >= 12 {
+        // Hard cap on total emitted lines (full digests + reminders) so a broad
+        // prompt on a big project can't produce an enormous block.
+        if used.len() + reminders.len() >= 24 {
+            break;
+        }
+        // Once the full-digest cap is hit and there's no room even for a cheap
+        // reminder, there's nothing left to add — stop scanning.
+        if used.len() >= 12 && budget < 80 {
             break;
         }
         // V11 Phase C: was this file already injected this session, and is it
@@ -201,8 +208,10 @@ pub fn build_context(
             continue;
         }
 
-        if budget < 80 {
-            break;
+        // A non-suppressed file needs a full digest; skip it (but keep scanning
+        // for more reminders) once the full-digest cap or budget is exhausted.
+        if used.len() >= 12 || budget < 80 {
+            continue;
         }
         let mut digest = file_digest(idx, &file, per_file_chars.min(budget));
         if digest.is_empty() && llm_digests {

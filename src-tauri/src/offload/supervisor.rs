@@ -589,6 +589,10 @@ impl OffloadSupervisor {
         let _permit = server.acquire_slot(timeout).await?;
 
         // A plain, non-streaming completion — no tools, thinking suppressed.
+        // Non-streaming forgoes the disconnect-abort that streaming gives on a
+        // client timeout, so a timed-out call may leave the backend generating up
+        // to `max_tokens` more; acceptable here because callers pass a small cap
+        // (digests use 128) and the work is opt-in, best-effort background jobs.
         let req = super::openai::ChatRequest {
             messages: vec![super::openai::ChatMessage::user(prompt)],
             tools: Vec::new(),

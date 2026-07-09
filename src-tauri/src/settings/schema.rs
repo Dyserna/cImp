@@ -921,8 +921,9 @@ pub struct GraphSettings {
     pub embedding_dims: u32,
     /// Also embed full symbol bodies (not just docs + signatures) for
     /// semantic *code* search. Off by default — multiplies vector count.
-    /// Doubles as the enable switch for the `graph_semantic_code` tool and its
-    /// backfill pass.
+    /// Requires `semantic_search` on (it shares the embedder + backfill pass);
+    /// with `semantic_search` on, this enables the `graph_semantic_code` tool and
+    /// its code-embedding pass.
     pub embed_code_bodies: bool,
     /// Number of chunks per `/v1/embeddings` request (amortizes round-trips).
     pub embedding_batch: usize,

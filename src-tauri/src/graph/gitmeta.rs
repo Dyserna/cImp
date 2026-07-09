@@ -151,7 +151,16 @@ pub fn collect_for(root: &Path, files: &[String]) -> AppResult<Vec<FileChurn>> {
         // output). The sole caller already passes repo-relative paths; this
         // keeps that a local guarantee rather than an unstated precondition.
         let file = normalize_path(file);
-        let Ok(text) = run_git(root, &["log", "-1", "--format=%ct%x09%s", "--", &file]) else {
+        // `--literal-pathspecs` (a global git flag, so it precedes `log`):
+        // everything after `--` is a pathspec with fnmatch glob semantics by
+        // default, so a filename with metacharacters — e.g. a Next.js/
+        // SvelteKit route file literally named `[id].tsx` — would match the
+        // one-char class `[id]` (a sibling `i.tsx`'s history!) instead of
+        // itself. The full `collect` pass uses no pathspec and is unaffected.
+        let Ok(text) = run_git(
+            root,
+            &["--literal-pathspecs", "log", "-1", "--format=%ct%x09%s", "--", &file],
+        ) else {
             continue;
         };
         let text = text.trim();
@@ -407,6 +416,37 @@ mod tests {
         // A file with no history at all is silently skipped, not an error.
         let none = collect_for(&dir, &["never-committed.rs".to_string()]).expect("collect_for");
         assert!(none.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: without `--literal-pathspecs`, the pathspec `[id].tsx` is
+    /// parsed as the one-char glob class `[id]` + `.tsx`, so `git log -1 --
+    /// pages/[id].tsx` returns a sibling `i.tsx`'s history (or nothing) —
+    /// wrong churn for every Next.js/SvelteKit-style bracketed route file.
+    #[test]
+    fn collect_for_treats_bracketed_filenames_literally() {
+        let dir = std::env::temp_dir().join(format!("gitmeta-glob-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("pages")).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+
+        // The glob-decoy sibling first, in its own commit: `[id]` matches `i`.
+        std::fs::write(dir.join("pages/i.tsx"), "export default 1\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "feat: i sibling"]);
+        std::fs::write(dir.join("pages/[id].tsx"), "export default 2\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "feat: id route"]);
+
+        let churn = collect_for(&dir, &["pages/[id].tsx".to_string()]).expect("collect_for");
+        assert_eq!(churn.len(), 1, "{churn:?}");
+        assert_eq!(churn[0].file, "pages/[id].tsx");
+        assert_eq!(
+            churn[0].last_subject, "feat: id route",
+            "the bracketed file's OWN commit, not the glob-matched sibling's"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

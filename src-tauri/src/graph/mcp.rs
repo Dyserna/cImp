@@ -1456,9 +1456,15 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
         })?),
         None => None,
     };
-    let dependents = idx
-        .dependents_transitive(&root_names, depth, max_rows, min_confidence)
+    // Ask for one row beyond the cap: `dependents_transitive` truncates
+    // internally (it never returns more than the max it's given), so an
+    // overshoot row is the only way to distinguish "exactly max_rows
+    // dependents" from "capped — the true blast radius is larger".
+    let mut dependents = idx
+        .dependents_transitive(&root_names, depth, max_rows.saturating_add(1), min_confidence)
         .map_err(|e| e.to_string())?;
+    let capped = dependents.len() > max_rows;
+    dependents.truncate(max_rows);
 
     let mut out = String::new();
     if !changed_syms.is_empty() {
@@ -1489,8 +1495,10 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
                 )
             })
             .collect();
-        if dependents.len() > max_rows {
-            lines.push(format!("… (+{} more)", dependents.len() - max_rows));
+        if capped {
+            lines.push(format!(
+                "… (capped at {max_rows} — the true blast radius is larger)"
+            ));
         }
         out.push_str(&lines.join("\n"));
         let files: std::collections::BTreeSet<&str> =
@@ -1506,15 +1514,17 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
             }
         }
         out.push_str(&format!(
-            "\n\n{} dependent{} ({} extracted, {} inferred, {} ambiguous) across {} file{} \
+            "\n\n{}{} dependent{} ({} extracted, {} inferred, {} ambiguous) across {}{} file{} \
              (approximate — call edges are name-keyed, not id-resolved).",
             dependents.len(),
-            if dependents.len() == 1 { "" } else { "s" },
+            if capped { "+" } else { "" },
+            if dependents.len() == 1 && !capped { "" } else { "s" },
             ex,
             inf,
             amb,
             files.len(),
-            if files.len() == 1 { "" } else { "s" }
+            if capped { "+" } else { "" },
+            if files.len() == 1 && !capped { "" } else { "s" }
         ));
     }
 
@@ -2032,6 +2042,20 @@ mod impact_tool_tests {
         let out = run_impact(&dir, &idx, &json!({ "symbols": "a", "depth": 1 }), 50).expect("run_impact");
         assert!(out.contains("· b · depth 1"), "{out}");
         assert!(!out.contains("· c ·"), "depth=1 must not reach c: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: `dependents_transitive` caps its result internally, so the
+    /// old `len() > max_rows` overflow check was dead code and a truncated
+    /// blast radius read as exhaustive — the exact under-estimation the tool
+    /// exists to prevent. A capped result must say so.
+    #[test]
+    fn impact_flags_truncation_at_max_rows() {
+        let (dir, idx) = setup("cap");
+        // The chain has 2 dependents (b, c); a cap of 1 must be flagged.
+        let out = run_impact(&dir, &idx, &json!({ "symbols": "a" }), 1).expect("run_impact");
+        assert!(out.contains("capped at 1 — the true blast radius is larger"), "{out}");
+        assert!(out.contains("1+ dependents"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

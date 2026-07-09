@@ -1446,11 +1446,31 @@ reach[x] := reach[z], calls[x, z]"#
         )?;
         let mut sym_file: HashMap<String, String> = HashMap::new(); // id → file
         let mut name_files: HashMap<String, Vec<String>> = HashMap::new(); // name → files
+        // name → (id, kind, file, start_line) of its FIRST definition, ordered
+        // like `find_symbol` (file, start_line, id) — the god-node loop below
+        // resolves representatives from this already-loaded table instead of
+        // issuing one `find_symbol` DB query per candidate name.
+        let mut first_def: HashMap<String, (String, String, String, i64)> = HashMap::new();
         for r in &sym_rows.rows {
             let id = cell_str(r, 0);
             let name = cell_str(r, 1);
+            let kind = cell_str(r, 2);
             let file = cell_str(r, 3);
-            sym_file.insert(id, file.clone());
+            let start_line = cell_i64(r, 4);
+            sym_file.insert(id.clone(), file.clone());
+            match first_def.entry(name.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let (cid, _, cfile, cline) = e.get();
+                    if (file.as_str(), start_line, id.as_str())
+                        < (cfile.as_str(), *cline, cid.as_str())
+                    {
+                        e.insert((id, kind, file.clone(), start_line));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((id, kind, file.clone(), start_line));
+                }
+            }
             name_files.entry(name).or_default().push(file);
         }
 
@@ -1646,13 +1666,15 @@ reach[x] := reach[z], calls[x, z]"#
         let mut sym_deg: Vec<(String, u64)> = inbound_calls.into_iter().collect();
         sym_deg.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         for (name, deg) in sym_deg.iter().take(max_rows) {
-            // Represent by the first definition of the name.
-            if let Some(sym) = self.find_symbol(name)?.into_iter().next() {
+            // Represent by the first definition of the name; a callee name
+            // with no definition (external/stdlib) is skipped, exactly like
+            // the `find_symbol`-was-empty case this replaces.
+            if let Some((id, kind, file, _)) = first_def.get(name) {
                 god.push(GodNode {
-                    id: sym.id,
+                    id: id.clone(),
                     label: name.clone(),
-                    file: sym.file,
-                    kind: sym.kind,
+                    file: file.clone(),
+                    kind: kind.clone(),
                     degree: *deg,
                 });
             }
@@ -1715,8 +1737,11 @@ reach[x] := reach[z], calls[x, z]"#
         }
 
         // Subsystem coloring: the longest subsystem name (a dir prefix) that
-        // prefixes a file. Cheap reuse of the architecture pass's named buckets.
-        let arch = self.architecture(64, 1, 512).unwrap_or_default();
+        // prefixes a file. Cheap reuse of the architecture pass's named
+        // buckets — `max_rows = 0` because only `subsystems` is consumed, so
+        // the god-node and surprising-edge computations (including the
+        // file-centrality scan) are skipped entirely.
+        let arch = self.architecture(64, 1, 0).unwrap_or_default();
         let sub_names: Vec<String> = arch.subsystems.iter().map(|s| s.name.clone()).collect();
         let subsystem_of = |file: &str| -> String {
             sub_names

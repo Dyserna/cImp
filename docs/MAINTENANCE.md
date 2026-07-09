@@ -713,6 +713,115 @@ that module's doc comment) and bounded `graph_recent_changes` at the Datalog
 level (`:order -last_ts :limit`) instead of scanning the whole `commit_touch`
 relation per retrieve.
 
+## Workbench — Vibe-Coding Guardrails (V13)
+
+**No graph-schema change, no new MCP tool.** The whole feature is a reserved
+app-rendered tab (`TabId::Workbench`, same pattern as Code Intelligence)
+backed by spawned `git` (diff parsing, worktrees) and a self-contained
+`.cimp/shadow.git` store (checkpoints) — `GRAPH_SCHEMA_VERSION` stays at 3.
+Diff/worktree operations need `git` on `PATH`; checkpoints work in a project
+with no `.git` at all (the shadow repo is self-contained), which is
+deliberate — it's what makes checkpoints useful *before* `git init`.
+
+**Shadow-repo trust model — one audited chokepoint.** `workbench::git::GitCtx`
+(`git.rs`) has three optional fields mapping 1:1 onto `GIT_DIR` /
+`GIT_WORK_TREE` / `GIT_INDEX_FILE`; `run`/`run_with_stdin` always **set or
+remove** all three explicitly before spawning `git` — never leaving one
+inherited from the parent process's environment — which is the actual safety
+property (a spawned `git` child could otherwise silently inherit a stray
+`GIT_DIR` and operate on the wrong repo). `GitCtx::discover` (all `None`)
+targets the user's own repo; `GitCtx::shadow(root)` points `GIT_DIR` at
+`.cimp/shadow.git`, `GIT_WORK_TREE` at the project root (shared with the
+user's tree — checkpoints see real on-disk content), and `GIT_INDEX_FILE` at
+the shadow repo's own index so staging for a snapshot never touches the
+user's index. Every shadow git call in `shadow.rs`, `diff.rs` (the
+non-git/checkpoint-diff fallback), and `worktree.rs` routes through this one
+constructor pair — there is no second way to spawn a shadow `git` process.
+Regression-tested directly (`git.rs`'s unit tests assert the exact env-var
+overrides for both `discover` and `shadow`, plus that `discover`'s overrides
+are all `None`).
+
+**Checkpoints are orphan commits, deduped by tree sha, not by a "did
+anything change" flag.** `shadow::snapshot` always runs `stage_and_write_tree`
+first (needed to see untracked files even for the dry-run dedup check), then
+compares the freshly-computed tree sha against the latest `cp-<seq>` tag's
+`<tag>^{tree}` — equal shas skip the commit. This replaced an earlier
+`changed_since_index`-based dedup guard (removed in the V13 code-review pass)
+that could wrongly report "unchanged" against a stale index; tree-sha
+comparison sidesteps the whole index-staleness question. Each checkpoint is a
+parentless `commit-tree` (`git commit-tree` with no `-p`) tagged `cp-<seq>` —
+no branch ever advances in the shadow repo, so `git status` inside it
+permanently reads "unborn HEAD vs a fully-staged index"; that's expected, not
+a bug. `next_seq`/`latest_checkpoint_tag` both derive from a `tag -l cp-*`
+scan rather than a counter file, so they can't drift out of sync with what
+tags actually exist.
+
+**Restore-safety invariants are the one place in this milestone worth
+double-checking on every touch.** `shadow::restore` (`shadow.rs`) always: (A)
+takes a `Trigger::PreRestore` snapshot of the current state *before* touching
+anything, so every restore is itself undoable; (B) re-creates files present
+at the target but deleted since; (C) computes `created_since` (files present
+in the pre-restore state but absent from the target) and leaves them alone
+**unless** the caller passes `delete_new: true` (default `false` at every call
+site — untracked new work survives a restore by default); (D) only deletes
+`created_since` paths when `delete_new` is explicit. `restore_round_trip_is_
+byte_faithful_including_crlf` and `restore_keeps_new_files_by_default_
+deletes_only_with_delete_new` in `shadow.rs`'s test module are the direct
+regression coverage; re-run both after touching this function. The user's own
+`.git` is never opened by `restore` — it operates entirely through the
+`GitCtx::shadow` context above.
+
+**Per-hunk revert reconstructs a single-hunk patch and applies it with `git
+apply --reverse --unidiff-zero -`** (`diff.rs::revert_hunk`/
+`build_hunk_patch`) — never a partial apply; a failure (stale `hunk_hash`,
+mid-merge/-rebase `readonly` guard, or `git apply` itself rejecting the patch)
+leaves the file untouched. `hunk_hash` is recomputed from the hunk's own
+content each time a diff is built, so a hunk that shifted or changed since the
+UI last saw it fails the hash check rather than reverting the wrong lines. A
+checkpoint (when checkpoints are on) is taken before the `git apply` call,
+matching Feature 1's restore-is-always-undoable posture. `is_special_state`
+checks for `MERGE_HEAD`/`REBASE_HEAD` and flips the whole diff summary
+`readonly` — no hunk reverts while the index is mid-merge/-rebase.
+
+**The `fs-batch` event is a new, shared primitive — not workbench-private.**
+`WorkbenchService::publish_fs_batch` (`mod.rs`) broadcasts a capped path list
+on the `fs-batch` Tauri event whenever the graph watcher's own debounce thread
+hands over a batch; both the Diff pane (`workbenchDiff.ts`, 500 ms debounce +
+5 s poll fallback that skips itself while the watcher is on) and the burst
+checkpoint trigger (`handle_fs_batch_for_burst`) subscribe to the same
+broadcast channel, so a project with `graph.enabled` off still gets live diff
+refresh and burst checkpoints — the watcher requirement is soft, not hard.
+
+**Merge never leaves a half-merged main tree — verified, not just attempted.**
+`worktree::merge` refuses up front on a dirty main tree or a main branch that
+doesn't match the worktree's recorded base; on a `git merge` conflict it runs
+`git merge --abort` and, critically, checks *that* command's own exit status
+(a V13 code-review fix) — if the abort itself fails, the error message says so
+explicitly ("main working tree may be left half-merged... resolve manually")
+rather than claiming a clean abort it can't confirm. `discard` only removes
+worktrees whose `.cimp/worktrees/<slug>.meta.json` sidecar cImp itself wrote,
+double-confirmed in the UI. `merge_conflict_aborts_cleanly_and_leaves_main_
+tree_untouched` in `worktree.rs`'s test module asserts `MERGE_HEAD` absence,
+unchanged `HEAD`, and a clean `git status` after an aborted merge — the
+regression coverage for the "never half-merged" guarantee.
+
+**The 3-agent code-review pass (`fix(V13)`, commit `010a14e`) is worth reading
+directly** — same posture as V12's, and it caught one **critical data-loss
+bug**: `diff_vs_now`'s `git add -A` used to leave the shared shadow index
+matching disk, so `restore`'s own pre-restore safety snapshot (Invariant C,
+above) could dedup against a now-*stale* tree sha and skip taking a real
+undo point — a restore could then destroy uncommitted edits with nothing to
+recover them from. Fixed by giving `diff_vs_now` its own scratch index (zero
+side effect on the dedup-relevant index state); regression test
+`restore_after_a_dry_run_diff_preserves_uncommitted_edits`, verified
+fail-without/pass-with. The same pass added the `git merge --abort`
+exit-status check described above, fixed a `parse_unified` panic on an empty
+hunk-body line, moved the checkpoint min-gap gate from global to per-root
+(it was swallowing other projects' checkpoints), excluded
+checkout-untouched paths from `RestoreReport.changed`, and wired the
+non-git-project diff pane (`DiffSource::Shadow` — diff vs the latest
+checkpoint) that Feature 2's design called for but Phase B initially missed.
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

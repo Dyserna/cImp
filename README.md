@@ -626,6 +626,19 @@ evicts; and opt-in proactive automation (a Claude `PostToolUse` hook) injects
 only new/worsened diagnostics right after an edit, plus a blast-radius note on
 risky changes — all off by default, same posture as the V11 read advisor.
 
+## Workbench (V13 — vibe-coding guardrails)
+
+A reserved **Workbench** tab (on by default) makes it safe to let agents run
+loose across the whole working tree. **Diff** shows the working-tree diff vs
+`HEAD` live as agents edit, with per-hunk revert/copy/send-to-agent and a
+status-bar `±N` badge. **Timeline** is an opt-in shadow-git checkpoint
+history (triggered per prompt, on a file-activity burst, or manually) that
+never touches the user's own `.git` — restore always snapshots the current
+state first, so it's itself undoable. **Worktrees** turns "isolated task" into
+one click: create a `git worktree` + branch, spawn an AI tab in it, then merge
+back or discard from the UI, with a merge that refuses to leave a half-merged
+main tree on conflict.
+
 ## Configuring Tabs
 
 Per-tab subprocess configuration lives under **Settings → Tabs**, split

@@ -124,6 +124,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     now also re-run after every completed index pass (`analyses_auto`,
     default **on** — read-only, badges the Analyses section on change).
 
+- **Vibe-Coding Guardrails (V13).** A new reserved **Workbench** tab (default
+  **on**) makes it safe to let agents loose across the whole working tree —
+  live diff, undo-anything checkpoints, and isolated worktrees, all local and
+  git-native:
+  - **Live diff pane.** The working-tree diff vs `HEAD` (spawned `git`,
+    parsed unified diff), re-diffed on the same `fs-batch` event the graph
+    watcher already emits (debounced 500 ms, plus a 5 s poll fallback when
+    the watcher itself is off). Virtualized file list, unified/side-by-side
+    toggle, intra-line word-diff. Per-hunk **Revert** (`git apply --reverse`;
+    refuses mid-merge/-rebase and on a stale `hunk_hash` if the file changed
+    since the hunk was computed), **Copy**, and **Send to agent** (drops the
+    hunk as a fenced block + `file:line` header into the compose overlay,
+    targeted at the focused AI tab). A status-bar `±N` badge click-opens the
+    tab. Non-git projects with checkpoints on diff against the latest
+    checkpoint instead.
+  - **Cross-agent checkpoints** (off by default). Automatic working-tree
+    snapshots into a separate `.cimp/shadow.git` store that never touches the
+    user's own `.git` — no stash entries, refs, or reflog noise, enforced by
+    a `GitCtx` that always sets *or* removes `GIT_DIR`/`GIT_WORK_TREE`/
+    `GIT_INDEX_FILE` before spawning a shadow `git`. Each snapshot is an
+    orphan commit tagged `cp-<seq>`, deduplicated by tree sha so a quiet
+    period doesn't spam near-identical commits. Triggers: per user prompt
+    (tapped from the same POST the injection shim already uses, recording
+    the triggering agent), a debounced file-activity burst (covers shell-tab
+    edits), and a manual "Checkpoint now". A new **Timeline** section (in the
+    Workbench tab) lists snapshots with trigger/agent/files-changed and
+    offers **Diff vs now** / **Restore**. Restore always snapshots the
+    current state first (a "pre-restore" checkpoint, so restore is itself
+    undoable), re-creates files deleted since, and deletes files created
+    since only with an explicit opt-in checkbox (default off — untracked new
+    work is kept unless asked). Works even before `git init`. New settings
+    `workbench.checkpoints` (default off), `checkpoint_max` (100),
+    `checkpoint_max_age_days` (7), `checkpoint_burst_files` (5) /
+    `_burst_window_s` (60), `checkpoint_min_gap_s` (120).
+  - **Worktree manager.** "New Claude/OpenCode tab in worktree…" runs `git
+    worktree add .cimp/worktrees/<slug> -b cimp/<slug>` and spawns the AI tab
+    with `cwd` set to the new worktree (tab title gets a `⑂ slug` marker). A
+    **Worktrees** section lists every worktree with ahead/behind counts,
+    **Diff vs base** (reuses the diff viewer), **Merge** (fast-forward or
+    merge commit; requires a clean main tree on the worktree's base branch;
+    on conflict runs `git merge --abort` and reports failure rather than
+    ever leaving a half-merged tree), **Discard** (double-confirmed, only
+    for cImp-created worktrees), and **Open shell here**. A merge-readiness
+    chip (soft-dep on V12 `run_check`) shows the latest `changed_only` check
+    result per worktree — advisory only, never gates the Merge button.
+    `git worktree prune` runs on app start.
+
 ### Changed
 
 - The graph store schema bumps to v3 (`symbol.is_test`, provisioned for a
@@ -138,6 +185,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   V12's schema footprint is entirely additive on top of V11's v3 bump — no
   further version bump (`commit_touch`, `project_fact`, `session_distilled`,
   `meta` are all create-if-missing).
+- V13 touches neither the graph schema nor MCP tool set — the Workbench is a
+  reserved app-rendered tab (like Code Intelligence) backed entirely by
+  spawned `git` and its own `.cimp/shadow.git` store.
 
 ## [0.35.0] — 2026-07-08
 

@@ -1164,6 +1164,9 @@ pub struct DependentRow {
     pub line: u32,
     pub depth: u32,
     pub approx: bool,
+    /// V15 Feature 3: weakest edge confidence along the discovery chain
+    /// (`extracted`/`inferred`/`ambiguous`).
+    pub confidence: String,
 }
 
 /// V12 Phase B (Analyses): the working-tree diff's blast radius — the
@@ -1204,6 +1207,7 @@ pub async fn graph_impact(
                 line: d.symbol.start_line,
                 depth: d.depth,
                 approx: d.approx,
+                confidence: d.confidence.tag().to_string(),
             })
             .collect(),
         unindexed: report.unindexed,
@@ -1354,6 +1358,55 @@ pub async fn graph_architecture(
                 from_subsystem: e.from_subsystem,
                 to_subsystem: e.to_subsystem,
             })
+            .collect(),
+    })
+}
+
+// ── V15 Feature 4: Graph View snapshot ───────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct VizNodeRow {
+    pub id: String,
+    pub label: String,
+    pub file: String,
+    pub kind: String,
+    pub degree: u64,
+    pub subsystem: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct VizEdgeRow {
+    pub src: String,
+    pub dst: String,
+    pub kind: String,
+    pub confidence: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct VizGraphResult {
+    pub nodes: Vec<VizNodeRow>,
+    pub edges: Vec<VizEdgeRow>,
+}
+
+/// V15 Feature 4 (Graph View): a bounded {nodes, edges} subgraph for the live
+/// visualization tab. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_viz_snapshot(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<VizGraphResult> {
+    let root = resolve_graph_root(root)?;
+    let g = service.viz_snapshot(&root)?;
+    Ok(VizGraphResult {
+        nodes: g
+            .nodes
+            .into_iter()
+            .map(|n| VizNodeRow { id: n.id, label: n.label, file: n.file, kind: n.kind, degree: n.degree, subsystem: n.subsystem })
+            .collect(),
+        edges: g
+            .edges
+            .into_iter()
+            .map(|e| VizEdgeRow { src: e.src, dst: e.dst, kind: e.kind, confidence: e.confidence })
             .collect(),
     })
 }

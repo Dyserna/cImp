@@ -593,6 +593,13 @@ impl GraphService {
         )
     }
 
+    /// V15 Feature 4: a bounded subgraph for the Graph View tab. Opens the warm
+    /// index; capped at `graph_viz_max_nodes`.
+    pub fn viz_snapshot(&self, root: &Path) -> AppResult<super::index::VizGraph> {
+        let max = self.settings.current().graph.graph_viz_max_nodes.max(1) as usize;
+        self.index_for(root)?.viz_snapshot(max)
+    }
+
     // ── V10 session / action memory ──────────────────────────────────────
 
     /// Record one memory event for `root`'s current-project graph. A no-op when

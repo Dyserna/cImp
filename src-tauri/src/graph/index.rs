@@ -139,6 +139,39 @@ pub struct ArchReport {
     pub surprising: Vec<SurprisingEdge>,
 }
 
+/// One node in the Graph View snapshot (V15 Feature 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VizNode {
+    pub id: String,
+    pub label: String,
+    pub file: String,
+    /// Symbol kind tag, or `"file"`.
+    pub kind: String,
+    /// Incident-edge count (node size in the view).
+    pub degree: u64,
+    /// Derived subsystem name (node color), or empty when uncommunitied.
+    pub subsystem: String,
+}
+
+/// One edge in the Graph View snapshot (V15 Feature 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VizEdge {
+    pub src: String,
+    pub dst: String,
+    /// Edge kind tag (`call`/`import`/`contains`) — edge color.
+    pub kind: String,
+    /// Confidence tag (`extracted`/`inferred`/`ambiguous`) — edge dash pattern.
+    pub confidence: String,
+}
+
+/// A bounded subgraph for the Graph View tab (V15 Feature 4): the top-degree
+/// hubs and the edges among them, never the whole graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VizGraph {
+    pub nodes: Vec<VizNode>,
+    pub edges: Vec<VizEdge>,
+}
+
 /// A traced shortest path between two entities (V15 Feature 1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathHit {
@@ -1560,6 +1593,137 @@ reach[x] := reach[z], calls[x, z]"#
         god.truncate(max_rows);
 
         Ok(ArchReport { god_nodes: god, subsystems, surprising })
+    }
+
+    /// V15 Feature 4: a bounded subgraph for the Graph View tab — the top
+    /// `max_nodes` highest-degree nodes and the resolved edges among them (never
+    /// the whole graph). Nodes carry a subsystem label (color) and degree (size);
+    /// edges carry kind (color) and confidence (dash). Offline, read-only.
+    pub fn viz_snapshot(&self, max_nodes: usize) -> AppResult<VizGraph> {
+        let max_nodes = max_nodes.max(1);
+
+        // Node metadata (symbols + files).
+        let sym_rows = self.run(
+            "?[id, name, kind, file] := *symbol{id, name, kind, file}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut meta: HashMap<String, VizNode> = HashMap::new();
+        let mut name_to_ids: HashMap<String, Vec<String>> = HashMap::new();
+        for r in &sym_rows.rows {
+            let id = cell_str(r, 0);
+            let name = cell_str(r, 1);
+            name_to_ids.entry(name.clone()).or_default().push(id.clone());
+            meta.insert(
+                id.clone(),
+                VizNode { id, label: name, file: cell_str(r, 3), kind: cell_str(r, 2), degree: 0, subsystem: String::new() },
+            );
+        }
+        let file_rows = self.run(
+            "?[path, lang] := *file{path, lang}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut file_lang: HashMap<String, String> = HashMap::new();
+        let mut known_files: HashSet<String> = HashSet::new();
+        for r in &file_rows.rows {
+            let path = cell_str(r, 0);
+            file_lang.insert(path.clone(), cell_str(r, 1));
+            let id = format!("file:{path}");
+            meta.insert(
+                id.clone(),
+                VizNode { id, label: path.clone(), file: path.clone(), kind: "file".to_string(), degree: 0, subsystem: String::new() },
+            );
+            known_files.insert(path);
+        }
+
+        // Subsystem coloring: the longest subsystem name (a dir prefix) that
+        // prefixes a file. Cheap reuse of the architecture pass's named buckets.
+        let arch = self.architecture(64, 1, 512).unwrap_or_default();
+        let sub_names: Vec<String> = arch.subsystems.iter().map(|s| s.name.clone()).collect();
+        let subsystem_of = |file: &str| -> String {
+            sub_names
+                .iter()
+                .filter(|n| file.starts_with(n.as_str()))
+                .max_by_key(|n| n.len())
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let multi = self.multi_candidate_names()?;
+        let mut edges: Vec<VizEdge> = Vec::new();
+        let mut seen: HashSet<(String, String, &'static str)> = HashSet::new();
+        let mut push_edge = |edges: &mut Vec<VizEdge>, seen: &mut HashSet<(String, String, &'static str)>, meta: &mut HashMap<String, VizNode>, a: &str, b: &str, kind: &'static str, conf: Confidence| {
+            if a == b || !meta.contains_key(a) || !meta.contains_key(b) {
+                return;
+            }
+            if !seen.insert((a.to_string(), b.to_string(), kind)) {
+                return;
+            }
+            if let Some(n) = meta.get_mut(a) { n.degree += 1; }
+            if let Some(n) = meta.get_mut(b) { n.degree += 1; }
+            edges.push(VizEdge { src: a.to_string(), dst: b.to_string(), kind: kind.to_string(), confidence: conf.tag().to_string() });
+        };
+
+        // Call edges (name-resolved).
+        let call_rows = self.run(
+            r#"?[src, dst, conf] := *edge{kind: k, src, dst, confidence: conf}, k == "call""#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        for r in &call_rows.rows {
+            let src = cell_str(r, 0);
+            let dst = cell_str(r, 1);
+            let conf = if multi.contains(&dst) { Confidence::Ambiguous } else { Confidence::from_tag(&cell_str(r, 2)) };
+            if let Some(ids) = name_to_ids.get(&dst) {
+                let ids = ids.clone();
+                for callee in ids {
+                    push_edge(&mut edges, &mut seen, &mut meta, &src, &callee, "call", conf);
+                }
+            }
+        }
+        // Contains edges (stored + synthesized file→symbol).
+        let contains_rows = self.run(
+            r#"?[src, dst] := *edge{kind: k, src, dst}, k == "contains""#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        for r in &contains_rows.rows {
+            let (src, dst) = (cell_str(r, 0), cell_str(r, 1));
+            push_edge(&mut edges, &mut seen, &mut meta, &src, &dst, "contains", Confidence::Extracted);
+        }
+        for r in &sym_rows.rows {
+            let id = cell_str(r, 0);
+            let fnode = format!("file:{}", cell_str(r, 3));
+            push_edge(&mut edges, &mut seen, &mut meta, &fnode, &id, "contains", Confidence::Extracted);
+        }
+        // Import edges (resolved file→file).
+        let import_rows = self.run(
+            r#"?[src, dst, conf] := *edge{kind: k, src, dst, confidence: conf}, k == "import""#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        for r in &import_rows.rows {
+            let from_file = cell_str(r, 0);
+            let module = cell_str(r, 1);
+            let lang = Lang::from_tag(file_lang.get(&from_file).map(|s| s.as_str()).unwrap_or(""));
+            if let Some(target) = resolve_import(lang, &from_file, &module, &known_files) {
+                let conf = Confidence::from_tag(&cell_str(r, 2));
+                push_edge(&mut edges, &mut seen, &mut meta, &format!("file:{from_file}"), &format!("file:{target}"), "import", conf);
+            }
+        }
+
+        // Keep the top `max_nodes` by degree (ties by id for determinism).
+        let mut nodes: Vec<VizNode> = meta.into_values().filter(|n| n.degree > 0).collect();
+        nodes.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.id.cmp(&b.id)));
+        nodes.truncate(max_nodes);
+        for n in &mut nodes {
+            n.subsystem = subsystem_of(&n.file);
+        }
+        let kept: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        edges.retain(|e| kept.contains(&e.src) && kept.contains(&e.dst));
+
+        Ok(VizGraph { nodes, edges })
     }
 
     /// V12 Phase C: the **candidate** tests that (transitively) depend on one

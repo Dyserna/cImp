@@ -469,6 +469,26 @@ impl GraphService {
         self.index_for(root)?.import_cycles(max)
     }
 
+    /// V12 Phase B (Analyses): working-tree impact — symbols changed since
+    /// `HEAD` plus their transitive dependents. Diff mode only (the
+    /// `symbols`-scoped mode is MCP-tool only, where an agent picks explicit
+    /// roots — see `graph::mcp::run_impact`). Opens the warm index; bounded
+    /// by `max_rows_per_query`; the default depth (3) matches the tool's.
+    pub fn impact(&self, root: &Path) -> AppResult<super::impact::ImpactReport> {
+        let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
+        let idx = self.index_for(root)?;
+        let set = super::impact::changed_symbols(root, &idx)?;
+        let mut names: Vec<String> = set.changed.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        let dependents = if names.is_empty() {
+            Vec::new()
+        } else {
+            idx.dependents_transitive(&names, 3, max)?
+        };
+        Ok(super::impact::ImpactReport { changed: set.changed, dependents, unindexed: set.unindexed })
+    }
+
     // ── V10 session / action memory ──────────────────────────────────────
 
     /// Record one memory event for `root`'s current-project graph. A no-op when

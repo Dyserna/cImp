@@ -18,6 +18,7 @@
     graphSetLanguageEnabled,
     graphDeadExports,
     graphCycles,
+    graphImpact,
     graphMemory,
     graphMemoryClear,
     graphNoteSetPinned,
@@ -28,6 +29,7 @@
     type GraphStatus,
     type LangCensus,
     type DeadExportRow,
+    type ImpactResult,
     type MemorySnapshot,
     type RetrieveResult,
   } from './graph';
@@ -53,6 +55,7 @@
     { name: 'graph_semantic_code', desc: 'Meaning-based (embedding) search over symbol bodies — only when "Embed code bodies" is enabled. Returns file:line/kind/signature/distance, never the body; pair with graph_snippet.', example: 'Find code that retries a failed network request.' },
     { name: 'graph_dead_exports', desc: 'Candidate unused public symbols (no reference, no inbound call). Candidates only — may include false positives.', example: 'List candidate dead exports.' },
     { name: 'graph_cycles', desc: 'Import cycles between files (loops of files that import one another).', example: 'Are there any import cycles?' },
+    { name: 'graph_impact', desc: 'Blast radius: what could this change break? Defaults to the working-tree diff vs HEAD; pass symbols to analyze specific names instead. Results are approximate (name-keyed).', example: 'What would break if I change GraphIndex::dependents_transitive?' },
     { name: 'context_recall', desc: "Recall this session's working set — the files it read/edited/queried and the symbols touched.", example: 'What has this session been working on?' },
     { name: 'context_note', desc: 'Remember a non-obvious decision/fact for this project (pin to keep it across sessions).', example: 'Note: we chose FNV hashing for stability.' },
     { name: 'context_notes', desc: "List this session's notes plus every pinned note for the project.", example: 'Show my remembered notes.' },
@@ -62,7 +65,8 @@
   // when the user clicks — walking the graph is comparatively expensive.
   let deadExports = $state<DeadExportRow[] | null>(null);
   let cycles = $state<string[][] | null>(null);
-  let analysisBusy = $state<'dead' | 'cycles' | null>(null);
+  let impact = $state<ImpactResult | null>(null);
+  let analysisBusy = $state<'dead' | 'cycles' | 'impact' | null>(null);
   let analysisError = $state<string | null>(null);
 
   async function runDeadExports(): Promise<void> {
@@ -82,6 +86,18 @@
     analysisError = null;
     try {
       cycles = await graphCycles();
+    } catch (e) {
+      analysisError = String(e);
+    } finally {
+      analysisBusy = null;
+    }
+  }
+
+  async function runImpact(): Promise<void> {
+    analysisBusy = 'impact';
+    analysisError = null;
+    try {
+      impact = await graphImpact();
     } catch (e) {
       analysisError = String(e);
     } finally {
@@ -597,6 +613,9 @@
         <button onclick={runCycles} disabled={analysisBusy !== null}>
           {analysisBusy === 'cycles' ? 'Scanning…' : 'Find import cycles'}
         </button>
+        <button onclick={runImpact} disabled={analysisBusy !== null}>
+          {analysisBusy === 'impact' ? 'Scanning…' : 'Impact of working-tree changes'}
+        </button>
       </div>
 
       {#if analysisError}
@@ -652,6 +671,54 @@
                 </div>
               {/each}
             </div>
+          {/if}
+        </section>
+      {/if}
+
+      {#if impact !== null}
+        <section class="card">
+          <div class="history-head">
+            Impact of working-tree changes
+            <span class="muted">({impact.changed.length} changed, {impact.dependents.length} dependent{impact.dependents.length === 1 ? '' : 's'})</span>
+          </div>
+          <p class="caveat">
+            Approximate (name-keyed) — call edges aren't id-resolved, so this
+            can both miss dynamic-dispatch callers and, more rarely, match a
+            same-named symbol elsewhere. Diff vs <code>HEAD</code>; requires a
+            git repository.
+          </p>
+          {#if impact.changed.length === 0}
+            <p class="placeholder">No changes detected (working tree matches HEAD).</p>
+          {:else}
+            <div class="rows">
+              {#each impact.changed as s (s.file + ':' + s.line)}
+                <div class="arow">
+                  <span class="aname">{s.name}</span>
+                  <span class="akind">{s.kind}</span>
+                  <span class="aloc">{s.file}:{s.line}</span>
+                </div>
+              {/each}
+            </div>
+            {#if impact.dependents.length === 0}
+              <p class="placeholder">No dependents found (nothing in the index transitively calls the changed symbol(s)).</p>
+            {:else}
+              <div class="history-head">Dependents</div>
+              <div class="rows">
+                {#each impact.dependents as d, i (d.file + ':' + d.line + ':' + i)}
+                  <div class="arow dep">
+                    <span class="aname">{d.approx ? '~' : ''}{d.name}</span>
+                    <span class="akind">{d.kind}</span>
+                    <span class="aloc">{d.file}:{d.line}</span>
+                    <span class="muted">depth {d.depth}</span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          {/if}
+          {#if impact.unindexed.length > 0}
+            <p class="caveat">
+              Changed but not indexed ({impact.unindexed.length}): {impact.unindexed.join(', ')}
+            </p>
           {/if}
         </section>
       {/if}
@@ -1056,6 +1123,9 @@
     font-size: 11.5px;
     white-space: normal;
     word-break: break-all;
+  }
+  .arow.dep {
+    grid-template-columns: 1fr 6rem 2fr auto;
   }
   .aname {
     font-weight: 600;

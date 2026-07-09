@@ -155,6 +155,43 @@ export function graphCycles(root?: string): Promise<string[][]> {
   return invoke<string[][]>('graph_cycles', { root: root ?? null });
 }
 
+/// V12 Phase B (Analyses): one symbol changed since HEAD. Mirror of Rust
+/// `ChangedSymbolRow`.
+export interface ChangedSymbolRow {
+  name: string;
+  kind: string;
+  file: string;
+  line: number;
+}
+
+/// V12 Phase B (Analyses): one transitive dependent of a changed symbol.
+/// Mirror of Rust `DependentRow`. `approx` is always true today — the call
+/// graph is name-keyed, not id-resolved (same honesty convention as
+/// `graph_references`).
+export interface DependentRow {
+  name: string;
+  kind: string;
+  file: string;
+  line: number;
+  depth: number;
+  approx: boolean;
+}
+
+/// V12 Phase B (Analyses): the working-tree diff's blast radius. Mirror of
+/// Rust `ImpactResult`.
+export interface ImpactResult {
+  changed: ChangedSymbolRow[];
+  dependents: DependentRow[];
+  unindexed: string[];
+}
+
+/// "What does my current working-tree change affect?" — diff mode only (vs
+/// HEAD). `root` defaults to the launch directory. Rejects with a
+/// "not a git repository" message when `root` isn't a git repo.
+export function graphImpact(root?: string): Promise<ImpactResult> {
+  return invoke<ImpactResult>('graph_impact', { root: root ?? null });
+}
+
 /// V10 (Memory): one file in a session's working set. Mirror of Rust
 /// `graph::memory::WorkingSetEntry`.
 export interface WorkingSetEntry {

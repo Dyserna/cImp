@@ -74,6 +74,13 @@ pub enum AppError {
     /// tool layer; a bad/absent checker binary reads as this, not a panic.
     #[error("check error: {0}")]
     Checks(String),
+
+    /// V12 Phase B: `graph_impact`'s default (diff-vs-HEAD) mode needs a git
+    /// repository at the project root. Kept distinct from [`AppError::Graph`]
+    /// so the tool/UI layer can render a specific "requires git" hint instead
+    /// of a generic index error.
+    #[error("not a git repository: {0}")]
+    NotAGitRepo(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

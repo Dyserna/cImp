@@ -37,6 +37,22 @@ pub struct SymbolHit {
     pub end_line: u32,
 }
 
+/// V12 Phase B: one symbol found to (transitively) depend on a changed root
+/// — it calls the root, directly or through a chain of other callers.
+/// Returned by [`GraphIndex::dependents_transitive`], the engine behind
+/// `graph_impact`'s blast-radius output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependentHit {
+    pub symbol: SymbolHit,
+    /// Hops from the nearest root (1 = a direct caller of a root).
+    pub depth: u32,
+    /// Name-only (unresolved) call-edge derivation — same honesty flag
+    /// `graph_references` uses. Always `true`: the graph's call edges are
+    /// name-keyed (`dst` is a callee NAME, not a resolved symbol id), so
+    /// every dependents hit is approximate by construction.
+    pub approx: bool,
+}
+
 /// One reference (use site) returned by `references`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefHit {
@@ -720,6 +736,82 @@ reach[x, y] := reach[x, z], calls[z, y]
         );
         let rows = self.run(&script, p, ScriptMutability::Immutable)?;
         Ok(rows.rows.iter().map(|r| cell_str(r, 0)).collect())
+    }
+
+    /// V12 Phase B: everything that (transitively) calls one of `roots`, up to
+    /// `depth` hops — the "blast radius" behind `graph_impact`. A plain Rust
+    /// BFS over a reverse name-level call adjacency built from a single scan
+    /// of the `edge`/`symbol` relations, rather than recursive Datalog with a
+    /// depth counter threaded through it: easier to cap, dedupe by minimum
+    /// depth, and test. `depth` is clamped to `1..=6`; results are capped at
+    /// `max`, sorted by `(depth, name)`. `roots` themselves are never reported
+    /// (their callers are found directly since every root seeds the BFS's
+    /// first frontier, so nothing is lost by not also re-expanding through a
+    /// root discovered as someone else's caller). Empty `roots` → empty
+    /// result, no query run.
+    pub fn dependents_transitive(
+        &self,
+        roots: &[String],
+        depth: u32,
+        max: usize,
+    ) -> AppResult<Vec<DependentHit>> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let depth = depth.clamp(1, 6);
+
+        // One scan of every name-level call edge: (caller name, callee name).
+        let rows = self.run(
+            r#"?[caller, callee] := *symbol{id: cid, name: caller}, *edge{kind: ek, src: cid, dst: callee}, ek == "call""#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        // Reverse adjacency: callee name -> distinct caller names.
+        let mut rev: HashMap<String, HashSet<String>> = HashMap::new();
+        for r in &rows.rows {
+            let caller = cell_str(r, 0);
+            let callee = cell_str(r, 1);
+            rev.entry(callee).or_default().insert(caller);
+        }
+
+        let root_set: HashSet<&str> = roots.iter().map(|s| s.as_str()).collect();
+        let mut min_depth: HashMap<String, u32> = HashMap::new();
+        let mut frontier: HashSet<String> = roots.iter().cloned().collect();
+        for d in 1..=depth {
+            let mut next_frontier: HashSet<String> = HashSet::new();
+            for name in &frontier {
+                let Some(callers) = rev.get(name) else { continue };
+                for caller in callers {
+                    if root_set.contains(caller.as_str()) {
+                        continue;
+                    }
+                    // First discovery wins the depth — BFS order guarantees
+                    // that's always the minimum.
+                    if !min_depth.contains_key(caller) {
+                        min_depth.insert(caller.clone(), d);
+                        next_frontier.insert(caller.clone());
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        let mut names: Vec<(String, u32)> = min_depth.into_iter().collect();
+        names.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut hits: Vec<DependentHit> = Vec::new();
+        for (name, d) in names {
+            for symbol in self.find_symbol(&name)? {
+                hits.push(DependentHit { symbol, depth: d, approx: true });
+                if hits.len() >= max {
+                    return Ok(hits);
+                }
+            }
+        }
+        Ok(hits)
     }
 
     /// Full-text-ish documentation search. MVP: a case-insensitive substring
@@ -2429,6 +2521,75 @@ pub struct Point { x: i32 }
         // doc search finds the "Adds two numbers." chunk.
         let docs = idx.search_docs("numbers", 10, 200).expect("docs");
         assert!(docs.iter().any(|d| d.anchor == "add"));
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dependents_transitive_finds_callers_at_min_depth() {
+        // c() calls b(), b() calls a(). Changing a() should surface b() at
+        // depth 1 and c() at depth 2 — the fixture from the IMPL-PLAN.
+        let dir = std::env::temp_dir().join(format!("ckg-dep-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file(
+            "src/chain.rs",
+            "pub fn a() {}\npub fn b() { a() }\npub fn c() { b() }\n",
+            Lang::Rust,
+        ))
+        .expect("index");
+
+        let hits = idx.dependents_transitive(&["a".to_string()], 3, 100).expect("dependents");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        let b = hits.iter().find(|h| h.symbol.name == "b").expect("b present");
+        let c = hits.iter().find(|h| h.symbol.name == "c").expect("c present");
+        assert_eq!(b.depth, 1);
+        assert_eq!(c.depth, 2);
+        assert!(b.approx && c.approx, "every hit is approximate by construction");
+        // Sorted by (depth, name): b (depth 1) before c (depth 2).
+        assert_eq!(hits[0].symbol.name, "b");
+        assert_eq!(hits[1].symbol.name, "c");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dependents_transitive_respects_depth_cap_and_max_and_roots() {
+        let dir = std::env::temp_dir().join(format!("ckg-depcap-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file(
+            "src/chain.rs",
+            "pub fn a() {}\npub fn b() { a() }\npub fn c() { b() }\n",
+            Lang::Rust,
+        ))
+        .expect("index");
+
+        // depth=1 only reaches b, not c.
+        let capped = idx.dependents_transitive(&["a".to_string()], 1, 100).expect("dependents");
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].symbol.name, "b");
+
+        // max=1 truncates even though depth would reach both.
+        let truncated = idx.dependents_transitive(&["a".to_string()], 6, 1).expect("dependents");
+        assert_eq!(truncated.len(), 1);
+
+        // A depth passed as 0 (or absurdly high) is clamped into 1..=6, not
+        // rejected — 0 still finds the direct caller.
+        let clamped = idx.dependents_transitive(&["a".to_string()], 0, 100).expect("dependents");
+        assert_eq!(clamped.len(), 1);
+        assert_eq!(clamped[0].symbol.name, "b");
+
+        // Empty roots is an empty result, not a query error.
+        assert!(idx.dependents_transitive(&[], 3, 100).expect("dependents").is_empty());
+
+        // A root that's also a caller of another root doesn't get reported as
+        // its own dependent.
+        let both_roots = idx
+            .dependents_transitive(&["a".to_string(), "b".to_string()], 3, 100)
+            .expect("dependents");
+        assert!(!both_roots.iter().any(|h| h.symbol.name == "a" || h.symbol.name == "b"));
+        assert!(both_roots.iter().any(|h| h.symbol.name == "c"));
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

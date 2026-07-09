@@ -1033,6 +1033,71 @@ pub async fn graph_cycles(
     service.import_cycles(&root)
 }
 
+/// V12 Phase B (Analyses): one symbol changed since `HEAD` (the working-tree
+/// diff's root set).
+#[derive(serde::Serialize)]
+pub struct ChangedSymbolRow {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+}
+
+/// V12 Phase B (Analyses): one transitive dependent of a changed symbol.
+#[derive(serde::Serialize)]
+pub struct DependentRow {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+    pub depth: u32,
+    pub approx: bool,
+}
+
+/// V12 Phase B (Analyses): the working-tree diff's blast radius — the
+/// changed symbols, their transitive dependents, and any changed files the
+/// graph doesn't index (docs/configs/etc.).
+#[derive(serde::Serialize)]
+pub struct ImpactResult {
+    pub changed: Vec<ChangedSymbolRow>,
+    pub dependents: Vec<DependentRow>,
+    pub unindexed: Vec<String>,
+}
+
+/// V12 Phase B (Analyses): "what does my current working-tree change
+/// affect?" — diff mode only (the `symbols`-scoped mode is MCP-tool only,
+/// where an agent supplies explicit roots). `root` defaults to the launch
+/// directory. Errors with a "requires git" message when `root` isn't a git
+/// repository (see `AppError::NotAGitRepo`).
+#[tauri::command]
+pub async fn graph_impact(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<ImpactResult> {
+    let root = resolve_graph_root(root)?;
+    let report = service.impact(&root)?;
+    Ok(ImpactResult {
+        changed: report
+            .changed
+            .into_iter()
+            .map(|s| ChangedSymbolRow { name: s.name, kind: s.kind, file: s.file, line: s.start_line })
+            .collect(),
+        dependents: report
+            .dependents
+            .into_iter()
+            .map(|d| DependentRow {
+                name: d.symbol.name,
+                kind: d.symbol.kind,
+                file: d.symbol.file,
+                line: d.symbol.start_line,
+                depth: d.depth,
+                approx: d.approx,
+            })
+            .collect(),
+        unindexed: report.unindexed,
+    })
+}
+
 /// V10 (Memory): the project's session/action memory — current session, its
 /// working set, notes (pinned + current-session), and the recent-sessions list.
 /// `root` defaults to the launch directory.

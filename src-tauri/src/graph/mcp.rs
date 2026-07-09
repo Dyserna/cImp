@@ -155,6 +155,25 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
             }),
         },
         GraphToolSpec {
+            name: "graph_impact",
+            description: "Blast-radius / impact analysis: what could this change break? With no \
+                `symbols`, analyzes the CURRENT WORKING-TREE DIFF vs HEAD — maps changed line \
+                ranges to indexed symbols, then finds everything that transitively calls them (their \
+                dependents), up to `depth` hops. Pass `symbols` (comma/space-separated names) to \
+                analyze specific symbols instead of the diff. Results are name-keyed and therefore \
+                APPROXIMATE, same honesty convention as `graph_references`. The default diff mode \
+                requires a git repository.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "symbols": { "type": "string", "description": "Comma/space-separated symbol names to use as roots instead of the working-tree diff." },
+                    "depth": { "type": "integer", "description": "Max hops to traverse from a changed symbol (default 3, clamped 1-6)." },
+                    "include_tests": { "type": "boolean", "description": "Reserved for a future release (test↔symbol mapping); currently a no-op." }
+                },
+                "required": []
+            }),
+        },
+        GraphToolSpec {
             name: "graph_dead_exports",
             description: "List CANDIDATE unused public symbols — public/exported definitions with \
                 no reference and no inbound call edge anywhere in the project. Candidates only: a \
@@ -331,6 +350,8 @@ pub(crate) async fn dispatch_recorded(
         run_snippet(root, idx, args, max_rows, settings.graph.max_body_bytes as usize)
     } else if name == "graph_repo_map" {
         run_repo_map(idx, settings, args, mem_agent(source))
+    } else if name == "graph_impact" {
+        run_impact(root, idx, args, max_rows)
     } else {
         run_tool(idx, name, args, max_rows, max_snippet, mem_agent(source))
     };
@@ -361,6 +382,7 @@ fn arg_summary(name: &str, args: &Value) -> String {
         "graph_imports" | "graph_outline" => "file",
         "graph_search_docs" | "graph_semantic_docs" | "graph_semantic_code" | "graph_struct_search" => "query",
         "context_note" => "text",
+        "graph_impact" => "symbols",
         _ => "name",
     };
     args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
@@ -1160,6 +1182,107 @@ fn run_repo_map(
     }
 }
 
+/// Execute `graph_impact` (V12 Phase B): resolve the roots — either the
+/// `symbols` argument (comma/space-separated names) or, by default, the
+/// working-tree diff vs `HEAD` mapped through symbol spans
+/// ([`super::impact::changed_symbols`]) — then find their transitive
+/// dependents and render a compact report: the changed/root symbols, the
+/// flattened dependent list (`~` marks every hit as approximate — the call
+/// graph is name-keyed, never id-resolved), a file-level rollup, and any
+/// changed-but-unindexed files. `include_tests` is accepted but currently a
+/// no-op (Phase C wires it to an affected-tests block).
+fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> Result<String, String> {
+    let depth = args
+        .get("depth")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(3)
+        .clamp(1, 6);
+    let symbols_arg = args.get("symbols").and_then(|v| v.as_str()).unwrap_or("").trim();
+
+    let (root_names, changed_syms, unindexed): (Vec<String>, Vec<SymbolHit>, Vec<String>) =
+        if !symbols_arg.is_empty() {
+            let names: Vec<String> = symbols_arg
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (names, Vec::new(), Vec::new())
+        } else {
+            let set = super::impact::changed_symbols(root, idx).map_err(|e| e.to_string())?;
+            let mut names: Vec<String> = set.changed.iter().map(|s| s.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            (names, set.changed, set.unindexed)
+        };
+
+    if root_names.is_empty() {
+        return Ok(if unindexed.is_empty() {
+            "No changes detected (working tree matches HEAD).".to_string()
+        } else {
+            format!(
+                "No indexed symbols changed. Changed but not indexed ({}): {}",
+                unindexed.len(),
+                unindexed.join(", ")
+            )
+        });
+    }
+
+    let dependents = idx.dependents_transitive(&root_names, depth, max_rows).map_err(|e| e.to_string())?;
+
+    let mut out = String::new();
+    if !changed_syms.is_empty() {
+        let list: Vec<String> = changed_syms
+            .iter()
+            .map(|s| format!("{} ({}:{})", s.name, s.file, s.start_line))
+            .collect();
+        out.push_str(&format!("Changed symbols ({}): {}\n\n", changed_syms.len(), list.join(", ")));
+    } else {
+        out.push_str(&format!("Roots: {}\n\n", root_names.join(", ")));
+    }
+
+    if dependents.is_empty() {
+        out.push_str("No dependents found (nothing in the index transitively calls the changed symbol(s)).");
+    } else {
+        let mut lines: Vec<String> = dependents
+            .iter()
+            .take(max_rows)
+            .map(|d| {
+                format!(
+                    "{}{}:{} · {} · depth {}",
+                    if d.approx { "~" } else { "" },
+                    d.symbol.file,
+                    d.symbol.start_line,
+                    d.symbol.name,
+                    d.depth
+                )
+            })
+            .collect();
+        if dependents.len() > max_rows {
+            lines.push(format!("… (+{} more)", dependents.len() - max_rows));
+        }
+        out.push_str(&lines.join("\n"));
+        let files: std::collections::BTreeSet<&str> =
+            dependents.iter().map(|d| d.symbol.file.as_str()).collect();
+        out.push_str(&format!(
+            "\n\n{} file{} depend on your change (approximate — call edges are name-keyed, not id-resolved).",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    if !unindexed.is_empty() {
+        out.push_str(&format!(
+            "\n\nChanged but not indexed ({}): {}",
+            unindexed.len(),
+            unindexed.join(", ")
+        ));
+    }
+
+    let _ = args.get("include_tests"); // accepted, no-op until Phase C
+    Ok(out)
+}
+
 /// The caller's session working set as `(path, weight)` for repo-map ranking,
 /// or empty when there's no scoped session (the offload worker) or no activity.
 fn repo_map_session_boost(idx: &GraphIndex, agent: Option<&str>) -> Vec<(String, f64)> {
@@ -1393,5 +1516,92 @@ mod snippet_tests {
         let (s2, t2) = cap_bytes("abc", 10);
         assert!(!t2);
         assert_eq!(s2, "abc");
+    }
+}
+
+#[cfg(test)]
+mod impact_tool_tests {
+    use super::{run_impact, GraphIndex};
+    use crate::graph::{parse_file, Lang};
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::process::Command as StdCommand;
+
+    /// A throwaway git repo with `src/chain.rs` committed (`c` calls `b` calls
+    /// `a`) plus its graph index — the fixture both the symbols-arg and
+    /// diff-mode tests build on.
+    fn setup(tag: &str) -> (PathBuf, GraphIndex) {
+        let dir = std::env::temp_dir().join(format!("impact-tool-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let git = |args: &[&str]| {
+            let out = StdCommand::new("git").args(args).current_dir(&dir).output().expect("git");
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        // Ignore the graph store's own db dir (mirrors the real `.cimp/`
+        // gitignore rule) so it doesn't show up as an untracked "change".
+        std::fs::write(dir.join(".gitignore"), ".ckg/\n").unwrap();
+        let src = "pub fn a() {}\npub fn b() { a() }\npub fn c() { b() }\n";
+        std::fs::write(dir.join("src/chain.rs"), src).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust)).expect("index");
+        (dir, idx)
+    }
+
+    #[test]
+    fn symbols_arg_reports_dependents_with_tilde() {
+        let (dir, idx) = setup("symbols");
+        let out = run_impact(&dir, &idx, &json!({ "symbols": "a" }), 50).expect("run_impact");
+        assert!(out.contains("Roots: a"), "{out}");
+        assert!(out.contains("~src/chain.rs:2 · b · depth 1"), "{out}");
+        assert!(out.contains("~src/chain.rs:3 · c · depth 2"), "{out}");
+        assert!(out.contains("2 files depend on your change") || out.contains("1 file depend"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbols_arg_respects_depth() {
+        let (dir, idx) = setup("depth");
+        let out = run_impact(&dir, &idx, &json!({ "symbols": "a", "depth": 1 }), 50).expect("run_impact");
+        assert!(out.contains("· b · depth 1"), "{out}");
+        assert!(!out.contains("· c ·"), "depth=1 must not reach c: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_mode_maps_the_edit_to_its_symbol() {
+        let (dir, idx) = setup("diff");
+        // Edit a()'s body — still empty braces content-wise but touches its line.
+        std::fs::write(dir.join("src/chain.rs"), "pub fn a() { /* changed */ }\npub fn b() { a() }\npub fn c() { b() }\n").unwrap();
+
+        let out = run_impact(&dir, &idx, &json!({}), 50).expect("run_impact");
+        assert!(out.contains("Changed symbols"), "{out}");
+        assert!(out.contains("a ("), "{out}");
+        assert!(out.contains("· b · depth 1"), "{out}");
+        assert!(out.contains("· c · depth 2"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_mode_no_git_repo_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("impact-tool-norepo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        let err = run_impact(&dir, &idx, &json!({}), 50).expect_err("not a git repo");
+        assert!(err.contains("not a git repository") || err.to_lowercase().contains("git"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_changes_no_symbols_reports_clean_tree() {
+        let (dir, idx) = setup("clean");
+        let out = run_impact(&dir, &idx, &json!({}), 50).expect("run_impact");
+        assert!(out.contains("No changes detected"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Token Efficiency (V11 Context Engine II).** Builds on V10's memory/injection
+  core to cut the token cost of a real agentic session: fetching one function
+  instead of a whole file, orienting once instead of exploring, and not
+  re-sending what the agent already has.
+  - **`graph_snippet`** — fetch a single definition's *body* (by symbol, or by
+    `file`+`line`) instead of reading the whole file. Ambiguous symbol names
+    return a disambiguation list rather than a body; a symbol spanning the
+    whole file (a top-level script) falls back to its outline + a "use Read
+    with offset/limit" hint. Byte-capped by a new `max_body_bytes` setting
+    (default 16 KiB) and flagged `stale` when the on-disk content hash no
+    longer matches what was indexed.
+  - **`graph_repo_map`** — a budget-bounded map of the project's most
+    call-central files with their top exported signatures, for orienting at
+    the start of a task without exploring. Session-hot files rank higher.
+    Agent-pullable any time, and (opt-in) auto-injected once per session on
+    the first prompt when `repo_map_on_session_start` is on. New settings
+    `repo_map_budget_chars` (default 4000) and `repo_map_on_session_start`
+    (default off).
+  - **Injection dedup.** A file injected in full is demoted to a one-line
+    "unchanged" reminder on later turns until it changes or a TTL elapses
+    (`(updated)` tag when it does change). New setting
+    `context_dedup_ttl_turns` (default 10 turns; `0` disables dedup).
+  - **Compaction survival.** A new Claude `PreCompact` hook
+    (`cimp --precompact-hook` → `POST /context/compaction`) feeds the
+    compactor the session's ranked working set and pinned notes so they
+    survive the summary, and clears the session's dedup state so the next
+    turn re-injects fresh. New setting `compaction_context` (default **on**,
+    nested under context injection).
+  - **Redundant-read advisor** (opt-in, off by default). A new Claude
+    `PreToolUse` hook on `Read` (`cimp --read-hook` →
+    `POST /context/should_read`) intercepts a re-`Read` of a file already read
+    unchanged this session and denies it with the file's outline (`advise`
+    mode) or outline + the most relevant symbol body (`substitute` mode) as
+    the reason — always usable content, never a bare refusal. One reminder per
+    file per session; everything passes through unchanged right after a
+    compaction (the agent may have genuinely lost the content). New settings
+    `read_advisor` (default off), `read_advisor_min_lines` (default 300),
+    `read_advisor_mode` (`advise` | `substitute`, default `advise`).
+  - **Local-model context digests.** For files with no useful outline (docs,
+    configs, long scripts), the **local** offload backend writes a cached
+    ≤3-line digest instead of falling back to a raw content snippet — never
+    routed off-box. New setting `context_llm_digests` (default off; needs a
+    ready local offload backend).
+  - **Code embeddings + `graph_semantic_code`.** Symbol-level semantic code
+    search, mirroring the existing doc-embedding pipeline. Returns
+    `file:line · kind · signature · distance` — never bodies — meant to chain
+    into `graph_snippet`. Enabled by `embed_code_bodies`, which requires
+    `semantic_search` (they share the embedder and backfill pass). New setting
+    `semantic_code_max_chunks` (default 20 000).
+  - The Code Intelligence tab's Index card now shows cached code-embedding
+    coverage (`code: N/M chunks`) and cached digest count (`N context digests
+    cached`) alongside the existing doc-embedding readout.
+
+### Changed
+
+- The graph store schema bumps to v3 (`symbol.is_test`, provisioned for a
+  later milestone — the only column change); an older `graph.db` is
+  transparently rebuilt on first launch, same as the V10 migration. Every
+  other new relation this adds (`digest`, `code_chunk`, `code_vec`) is
+  additive and created on demand — no separate migration.
+- Two new loopback routes join `/context/retrieve` under the same
+  authenticated-localhost trust model: `POST /context/compaction` and
+  `POST /context/should_read`.
+
 ## [0.35.0] — 2026-07-08
 
 ### Added

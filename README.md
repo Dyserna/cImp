@@ -563,8 +563,10 @@ the next app launch.
 cImp builds a per-project **code + docs knowledge graph** (CozoDB + tree-sitter
 over `.cimp/graph.db`) that Opus and offload workers can query through MCP tools —
 `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`,
-`graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`, and
-`graph_struct_search`. It covers **20+ languages** — Rust, TypeScript/JavaScript,
+`graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`,
+`graph_struct_search`, `graph_snippet`, and `graph_repo_map` (plus
+`graph_semantic_docs` / `graph_semantic_code` when semantic search is on). It
+covers **20+ languages** — Rust, TypeScript/JavaScript,
 Python, Go, Java, C, C++, C#, PHP, Bash, Scala, OCaml, Ruby, Haskell, Kotlin,
 Swift, SQL, Erlang, R, Perl, and Ada get full symbol/call graphs (via a generic
 tree-sitter `tags.scm` engine); HTML, CSS, JSON, YAML, XML, and assembly are
@@ -594,6 +596,19 @@ Beyond structural search, Code Intelligence adds three capabilities (**Memory**,
   `graph_cycles` tools. Each states which languages it covers (dead exports:
   Rust, JS/TS, Python, Go; cycles: JS/TS, Python, Rust), so an empty result on
   another language reads as "not checked," not "clean."
+
+**Token efficiency (V11)** cuts what those capabilities cost to use:
+`graph_snippet` fetches one definition's body instead of a whole file;
+`graph_repo_map` gives a budget-bounded, centrality-ranked project map for
+orienting without exploring, agent-pullable any time and (opt-in)
+auto-injected once per session; injection **dedup** demotes an unchanged
+re-candidate to a one-line reminder instead of re-sending its digest; a Claude
+`PreCompact` hook carries the session's working set and pinned notes through a
+compaction; an opt-in Claude `PreToolUse` hook on `Read` can deny a redundant
+re-read of an unchanged file, always with usable content (outline, or outline
++ body) in its place; files with no useful outline get a cached local-model
+digest (never leaves the machine); and `graph_semantic_code` adds
+symbol-level semantic search alongside the existing doc search.
 
 ## Configuring Tabs
 

@@ -97,6 +97,16 @@ dependency/component breadth) — this is the *capability* breadth.
 - Stale-schema safety: an older `graph.db` is transparently rebuilt on the app side; read-only consumers (MCP child, offload worker) are told to rebuild rather than served an emptied index
 - Local loopback surfaces: `POST /context/retrieve`, `POST /memory/event` (same authenticated-localhost trust model as `/graph_run`)
 
+## Code Intelligence — Token Efficiency (V11)
+- `graph_snippet`: fetch one definition's body (by symbol, or `file`+`line`) instead of reading the whole file; ambiguous names return a disambiguation list, whole-file symbols fall back to an outline hint; byte-capped (`max_body_bytes`, default 16 KiB) and flagged `stale` when the on-disk hash has drifted from the index
+- `graph_repo_map`: a budget-bounded (`repo_map_budget_chars`) map of the project's most call-central files and their top exported signatures, for orienting without exploring; session-hot files rank higher; agent-pullable any time, plus an opt-in once-per-session injection on a session's first prompt (`repo_map_on_session_start`)
+- Injection dedup: a file already injected in full is demoted to a one-line "unchanged" reminder on later turns until it changes (`(updated)` tag) or `context_dedup_ttl_turns` (default 10) elapses; per-session, in-memory
+- Compaction survival: a Claude `PreCompact` hook (`cimp --precompact-hook` → `POST /context/compaction`) feeds the compactor the session's ranked working set + pinned notes and clears the dedup state so the next turn re-injects fresh (`compaction_context`, default on)
+- Redundant-read advisor (opt-in, off by default): a Claude `PreToolUse` hook on `Read` (`cimp --read-hook` → `POST /context/should_read`) denies a re-read of an unchanged file with its outline (`advise`) or outline + relevant symbol body (`substitute`) as the reason — never a bare refusal; one reminder per file per session; passes everything right after a compaction (`read_advisor` / `read_advisor_min_lines` / `read_advisor_mode`)
+- Local-model context digests: for files with no useful outline (docs/configs/long scripts), the local offload backend caches a ≤3-line digest (never routed off-box); `context_llm_digests`, needs a ready local backend
+- Code embeddings + `graph_semantic_code`: symbol-level semantic code search mirroring the doc-embedding pipeline, returning `file:line · kind · signature · distance` (never bodies) to chain into `graph_snippet`; gated on `embed_code_bodies` **and** `semantic_search` (shared embedder); `semantic_code_max_chunks` caps the backfill
+- Index card shows cached code-embedding coverage (`code: N/M chunks`) and cached digest count (`N context digests cached`)
+
 ## Theming & Appearance
 - 12 bundled terminal palettes + custom 22-color ANSI palette editor; per-tab palette override
 - UI theme selector: TUI Orange (default) + TUI Grey, ratatui-style; external theme/palette files

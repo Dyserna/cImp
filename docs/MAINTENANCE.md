@@ -519,6 +519,111 @@ external plugins.
 localhost trust model as `/graph_run`: `POST /context/retrieve` (gated on
 `context_injection`) and `POST /memory/event` (OpenCode's memory ingress).
 
+## Code Intelligence — Token Efficiency (V11)
+
+**Schema bump to v3 — one rebuild for the whole V11–V14 roadmap.**
+`graph/schema.rs::GRAPH_SCHEMA_VERSION` moved 2 → 3 for a single column change:
+`symbol.is_test` (provisioned for a later milestone, unused by anything in
+V11). That's the *only* `RELATIONS` shape change, so it's the only thing that
+forces the migrate-on-open rebuild described in the V10 section above. Every
+other new store this milestone adds is **additive, create-if-missing, and
+needs no version bump**: `code_chunk` (added to `RELATIONS` directly — the
+code-embedding source text) plus `digest` and `code_vec`, both ensured lazily
+the first time they're needed (`GraphIndex::put_digest` /
+`ensure_code_vector_store`), the same pattern V10 used for `session` /
+`mem_event` / `mem_note`. **`injected` (the Phase C dedup state) is *not* a
+relation** — it's an in-memory `HashMap<session_id, InjectState>` on
+`GraphService` (`graph/service.rs`), so it never survives a restart and needs
+no schema entry; a restart just re-injects fresh on the next turn, which is
+the intended fail-safe.
+
+**Three Claude hook shims, one shared POST helper.** `context_hook.rs`'s
+`post_loopback(path, body)` (Bearer auth, `Content-Length`, `Connection:
+close`, 2xx-only, ~600 ms timeout) is now used by all three CLI subcommands
+wired in `main.rs`:
+
+| Subcommand | Hook event | Route | Module |
+|---|---|---|---|
+| `cimp --context-hook` | `UserPromptSubmit` | `POST /context/retrieve` | `context_hook.rs` (V10) |
+| `cimp --precompact-hook` | `PreCompact` | `POST /context/compaction` | `compact_hook.rs` (V11 Phase D) |
+| `cimp --read-hook` | `PreToolUse` (matcher `Read`) | `POST /context/should_read` | `read_hook.rs` (V11 Phase E) |
+
+All three are dependency-light, synchronous, and fail open (print nothing,
+exit 0) on any error — a hook must never block or perturb the agent's turn.
+`tabs/config.rs` adds the `PreCompact` hook to the Claude settings overlay
+whenever `context_injection && compaction_context`, and the `PreToolUse` hook
+whenever `context_injection && read_advisor` (independent toggles — a project
+can run compaction survival without the read advisor).
+
+**Compaction route's side effects are unconditional.** `GraphService::
+compaction_context` (`graph/service.rs`) always clears the session's
+`injected` dedup map and marks it `post_compaction` — even when
+`compaction_context` is off or the rendered block is empty — because those
+two effects are what keep Phase C (dedup) and Phase E (read advisor) correct
+across a compaction regardless of whether the block itself is gated on. Only
+the returned working-set/notes text is gated.
+
+**`TODO(spike)` — two hook output contracts are unverified against the pinned
+Claude Code build:**
+- **D0 (`compact_hook.rs`):** which JSON field of a `PreCompact` hook's stdout
+  actually reaches the *compaction prompt* (we emit the documented
+  `hookSpecificOutput.additionalContext` shape, mirroring the
+  `UserPromptSubmit` hook, but this hasn't been confirmed hands-on the way the
+  V10 OpenCode injection spike was). The server-side effects (dedup clear,
+  post-compaction flag) are correct **regardless** of whether Claude reads
+  this field, so the feature degrades safely either way — worst case the
+  block just doesn't reach the model.
+- **E1 (`read_hook.rs`):** whether a `PreToolUse` deny's
+  `permissionDecisionReason` is surfaced **to the model** (not just the user)
+  on the pinned Claude Code version. If it isn't, the read advisor can't
+  substitute usable content on a deny and the milestone spec says to cancel
+  the feature rather than ship a bare refusal — `read_advisor` defaults off,
+  so nothing is affected until this is confirmed and the setting is turned on
+  per project.
+
+**Read advisor staleness check uses content hash, not mtime.** `should_read`
+(`graph/service.rs`) compares the current file's FNV hash against the indexed
+`file.hash` — the same check `graph_snippet`'s `stale` flag uses — rather than
+comparing a stored mtime against the memory event's timestamp. A code-review
+fix (see the `fix(V11)` commit): mtime comparison is vulnerable to filesystem
+clock skew on network shares / WSL2 bind-mounts, which could wrongly suppress
+a real edit and hand the agent stale content.
+
+**Digest jobs are demand-driven, slot-gated, and local-only.**
+`context_llm_digests` only digests files that actually ranked into an
+injection and have no outline (docs/configs/long scripts) — not the whole
+repo. `GraphService::enqueue_digest` single-flights by `(root, file,
+content_hash)` (an `InflightGuard` removes the key on `Drop`, so a panicked
+digest task can't permanently leak a slot) and caps concurrent jobs at 32.
+The compute itself goes through `OffloadSupervisor::run_internal` — a
+non-streaming, tools-off, thinking-suppressed completion that **only
+considers backends already running locally** (`self.running`, not the full
+pool/router), so a digest can never route to a remote or cloud backend
+regardless of `allow_remote_worker_access`. Injection never blocks on this: a
+cache miss falls back to the V10 outline/empty digest and the result lands in
+`graph.db`'s `digest` relation for the next retrieve.
+
+**Code-embedding backfill rides the doc-embedding pass, strictly after it.**
+`embed_backfill` (`graph/service.rs`) embeds `doc_chunk`s first (cheaper, and
+doc search stays useful even with code embedding off), then — only when
+`embed_code_bodies` is on — embeds pending `code_chunk`s into `code_vec` under
+the same epoch/dim/model. `graph_semantic_code` is advertised (`graph/mcp.rs
+tools()`) only when **both** `semantic_search` and `embed_code_bodies` are on
+(a code-review fix — the backfill that actually populates `code_vec` only
+runs when `semantic_search` is on, so gating the tool on `embed_code_bodies`
+alone would advertise a tool that could never return results). No full-text
+fallback exists for code chunks the way `graph_search_docs` backs
+`graph_semantic_docs` — a miss degrades to a clear "unavailable, try
+`graph_find_symbol`/`graph_struct_search`" message instead of silently
+re-running as a keyword search.
+
+**`file_centrality` counts distinct inbound edges, not join rows** (a
+code-review fix). `graph_repo_map`'s ranking signal is inbound call-edge
+count per file; the initial implementation joined `edge` against `symbol`
+without deduping, so a callee name defined N times in one file inflated that
+file's centrality by N×. Fixed in `graph/index.rs::file_centrality`, with a
+regression test alongside it.
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

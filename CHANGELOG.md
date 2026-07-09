@@ -171,6 +171,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     result per worktree — advisory only, never gates the Merge button.
     `git worktree prune` runs on app start.
 
+- **Workflow & Visibility (V14).** Four quality-of-life features sharing one
+  theme — see what's happening, and feed the loop faster:
+  - **Prompt library.** Saved, parameterized compose templates: a global list
+    in `settings.json` plus per-project entries in the `.cimp/config.json`
+    overlay, project entries shadowing a same-named global one by name.
+    Variables `{selection}` (the focused pane's terminal selection) and
+    `{clipboard}` resolve immediately on insert; any other `{name}` stays a
+    literal tab-stop, first one auto-selected. In the compose overlay, `/` at
+    the start of an empty textarea (or a 📋 button) opens a fuzzy-filter
+    picker (↑↓/Enter, `Esc` or continued typing dismisses it into literal
+    text — the agent's own slash commands are unaffected); a rebindable
+    shortcut (default `Alt+/`) opens compose with the picker already up.
+    Managed under *Settings → Compose* — global templates get full
+    add/edit/delete; project templates are a read-only list edited via the
+    overlay file, so a committed `.cimp/config.json` shares a team's
+    templates with no separate export step. Ships 4 starters
+    (`review-this-diff`, `write-tests-for`, `explain-selection`,
+    `commit-message`), deletable.
+  - **Image paste/drop into compose.** Paste an image (Tauri clipboard
+    plugin — the WebView2 `navigator.clipboard` denial doesn't apply here) or
+    drag-drop image files onto the compose overlay → a chip appears above the
+    textarea; on submit, the local path(s) are appended to the message text
+    (both Claude Code and OpenCode accept local image paths in prompts).
+    Pasted images are written to a per-launch temp dir
+    (`%TEMP%/cimp-attach/<launch-id>/n.png`); dropped files are referenced in
+    place, not copied. The temp dir is age-pruned (>3 days) at startup and
+    again on graceful exit.
+  - **Token/cost X-ray.** A new **Usage** section (6th, after Analyses) in
+    the Code Intelligence tab: per-turn stacked bars (input / cache-read /
+    output / est. tool-result), a top-consumers table (tool × est. tokens), a
+    per-session table with totals and cache-hit ratio, and an effectiveness
+    panel (chars injected / suppressed-by-dedup / displaced-by-read-advisor).
+    Honest measurement throughout — token counts read straight from a
+    transcript's own `usage` block are exact; anything derived from
+    character counts is labeled `est.`, and there's no fabricated savings %.
+    Sourced by extending the existing OOB Claude transcript tap to also
+    record `usage` and tool-result sizes into a new `usage_stat` relation
+    (additive, no schema bump); OpenCode's `/event` stream carries no
+    token/usage fields on the pinned version, so every OpenCode session
+    reports `est_only`. A new status-bar session-tokens line surfaces the
+    running total.
+  - **Budget-tuning advisor.** An **Advisor** card atop the Usage section
+    proposes measured changes to the V10/V11 knobs — propose-and-confirm,
+    never silent self-modification. Three deterministic Rust rules, each
+    gated on a minimum sample size (≥5 sessions, plus a per-rule
+    injection/reminder/turn floor): injected files rarely touched again ⇒
+    propose raising `context_min_score` (capped at a ceiling so repeated
+    applies can't silently kill injection); read-advisor reminders usually
+    followed by a full re-read anyway ⇒ propose raising
+    `read_advisor_min_lines`; a high unused-injection rate while turns are
+    budget-maxed ⇒ propose lowering `context_turn_budget_chars` (only ever
+    proposed when it's a real reduction). Each proposal carries the measured
+    rationale and an Apply button that writes through the normal settings
+    path; Dismiss is remembered per rule at a 10%-bucketed rate, so it
+    re-fires only once the underlying rate shifts to a different bucket.
+    Rules are versioned (`rule_id` strings) and listed in the card's
+    tooltip.
+  - **Localhost preview tab.** A new user-creatable **Preview** tab: an
+    embedded WebView2 child webview (Tauri's multi-webview API) pointed at a
+    dev-server URL, with a URL bar, back/reload, device-width presets
+    (mobile/tablet/desktop), and **Snapshot → compose** (captures the
+    webview's current viewport straight to a PNG in the compose attach dir
+    and opens the overlay with it pre-attached). Auto-reload fires on a quiet
+    period (~1s) after the shared `fs-batch` file-activity event. Navigation
+    is restricted to `localhost`/loopback/RFC-1918-private hosts unless
+    `preview_allow_remote` is on; any `target="_blank"`/`window.open()`
+    always leaves the tab for the system browser rather than opening a
+    second preview pane. Not a general browser — no history UI, no
+    profiles.
+
 ### Changed
 
 - The graph store schema bumps to v3 (`symbol.is_test`, provisioned for a
@@ -188,6 +258,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - V13 touches neither the graph schema nor MCP tool set — the Workbench is a
   reserved app-rendered tab (like Code Intelligence) backed entirely by
   spawned `git` and its own `.cimp/shadow.git` store.
+- V14 adds the new `usage_stat` relation additively — no graph schema bump
+  (still v3). The **settings** schema bumps 20 → 21 for the new Preview tab
+  kind (`TabConfig::Preview`) and the `preview_allow_remote` /
+  `preview_last_url` / `prompt_templates` / `templates_seeded` /
+  `advisor_dismissed` fields; the migration is a no-op data transform (every
+  new field is `#[serde(default)]`/`Option`), so an older `settings.json`
+  round-trips additively.
 
 ## [0.35.0] — 2026-07-08
 

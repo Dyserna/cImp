@@ -639,6 +639,21 @@ one click: create a `git worktree` + branch, spawn an AI tab in it, then merge
 back or discard from the UI, with a merge that refuses to leave a half-merged
 main tree on conflict.
 
+## Workflow & Visibility (V14)
+
+Four smaller additions that round out the day-to-day workflow. A **prompt
+library** (*Settings → Compose*) saves parameterized templates — global plus
+per-project, with `{selection}`/`{clipboard}` variables and free-form
+`{placeholder}` tab-stops — insertable by typing `/` in an empty compose
+textarea. The compose overlay accepts **pasted or dropped images**, appending
+their local path(s) to the message on submit. A new **Usage** section in
+Code Intelligence gives an honest token/cost X-ray (exact where the
+transcript says so, `est.` everywhere else) with a **budget-tuning advisor**
+that proposes — never silently applies — changes to the context-injection
+knobs above, based on measured usage. And a new **Preview** tab embeds a
+localhost/LAN-only dev-server webview with **Snapshot → compose**, turning
+"see what the agent built" into one click.
+
 ## Configuring Tabs
 
 Per-tab subprocess configuration lives under **Settings → Tabs**, split

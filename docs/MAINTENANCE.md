@@ -822,6 +822,160 @@ checkout-untouched paths from `RestoreReport.changed`, and wired the
 non-git-project diff pane (`DiffSource::Shadow` — diff vs the latest
 checkpoint) that Feature 2's design called for but Phase B initially missed.
 
+## Workflow & Visibility (V14)
+
+**Two different schema numbers move this milestone — don't conflate them.**
+The **graph** schema stays at `GRAPH_SCHEMA_VERSION = 3` (`graph/schema.rs`):
+the new `usage_stat` relation (`graph/index.rs`) is additive/create-if-missing,
+the same pattern every V10–V13 store used. The **settings** schema, by
+contrast, bumps `CURRENT_SCHEMA_VERSION` 20 → 21 (`settings/schema.rs`) — the
+first schema move this file's V10–V13 sections haven't had to talk about,
+because it's the first milestone in the series to add a new *tab kind*
+(`TabConfig::Preview`) rather than a graph-side capability. The migration
+step itself (`settings/migration.rs`'s `migrate_v20_to_v21`) is a pure
+version-stamp, no data transform: every new field this milestone adds
+(`preview_last_url`, `preview_allow_remote`, `prompt_templates`,
+`templates_seeded`, `advisor_dismissed`) is `#[serde(default)]`/`Option`, so
+an older `settings.json` round-trips through it with nothing to migrate.
+
+**Usage/X-ray is the fifth hook-free area in Code Intelligence.** Of the tab's
+six sections (Index / Activity / Memory / Context / Analyses / Usage), only
+**Context** needs a Claude hook (the four shims tabulated in the V11 section
+below: `UserPromptSubmit`, `PreCompact`, `PreToolUse`, `PostToolUse`) — Index,
+Activity, Memory, Analyses, and now **Usage** all ride existing plumbing with
+no hook of their own. The usage tap extends the OOB Claude-transcript reader
+that already exists for TTS and memory (`oob/claude.rs::record_usage`, called
+from the same `drain_new_lines` loop as `record_tool_events`): `parse_usage_line`
+pulls `message.usage.{input_tokens,output_tokens,cache_read_input_tokens,
+cache_creation_input_tokens}` keyed by `message.id` (an UPSERT-by-`msg_id`,
+so a later line with firmed-up numbers overwrites an earlier zeroed one
+in place), and `extract_tool_results` sums `tool_result` content chars,
+attributed to a tool name via a small per-session `tool_use_id → name` ring.
+Unlike `record_tool_events`, this tap does **not** skip sidechain (sub-agent)
+lines — sub-agent token spend counts toward the parent session's totals.
+
+**OpenCode usage is `est_only` — `TODO(spike C3)`, resolved as "absent."**
+`oob/opencode.rs`'s module doc records the spike outcome directly: OpenCode's
+`/event` SSE stream's `message.updated.properties.info` object was captured
+exhaustively and carries only `{id, role, time}` — no token/usage fields on
+the pinned OpenCode version — so this file adds no usage tap at all. The
+actual OpenCode-side usage recording happens where OpenCode's memory events
+already land, `offload/loopback.rs::handle_memory_event` (`POST
+/memory/event`), which estimates chars from a tool call's *input* args (the
+same blind spot the memory tap already had — tool output isn't visible
+there either) and records a `ToolResult` usage event from that estimate.
+`GraphIndex::usage_all_sessions` derives `est_only` structurally
+(`session.agent != "claude"`), not from a separately tracked flag, so it can
+never drift out of sync with which agent actually produced a session. Revisit
+if a future OpenCode release adds real token fields to `message.updated`;
+`opencode.rs`'s doc comment names the exact field path to re-check.
+
+**`TODO(spike E0)` — WebView2 child-webview capture compiles clean but has
+never run against a live instance.** The Preview tab's capture path
+(`preview/capture.rs`) reaches `ICoreWebView2::CapturePreview` through
+`Webview::with_webview` → `PlatformWebview::controller()`, verified to
+type-match this crate's own `webview2-com = "0.38"` dependency (pinned to the
+same 0.38.2 wry 0.55 resolves to transitively, confirmed via `Cargo.lock` —
+no COM-GUID-compatible-but-distinct-type risk) — and it compiled cleanly on
+the first attempt against the exact pinned dependency graph. What's still
+unverified, because no live app was available to drive it from: whether the
+captured PNG is actually pixel-correct (right viewport bounds, true
+CSS-pixel — not HiDPI-inflated — scale, correct timing relative to paint);
+z-order/coexistence with the xterm panes during an actual tab drag; and
+focus/keyboard isolation in practice (no hold-Alt-bypass-equivalent was
+added, on the assumption — not the measurement — that WebView2 child
+webviews don't fight the host window's accelerator table the way the AI-tab
+PTY mouse capture did). See the `TODO(spike E0)` comments in both
+`preview/mod.rs` and `preview/capture.rs` for the exact call sites; do a live
+pass before relying on Snapshot → compose for anything precision-sensitive.
+
+**The embedded-webview path is a new, Windows-only native dependency
+surface.** `tauri = { version = "2", features = ["protocol-asset",
+"unstable"] }` — `unstable` gates `Window::add_child`, the multi-webview API
+the Preview tab is built on (a Tauri naming quirk, not a claim about API
+risk: it's the documented, doctested multi-webview shape). Capture adds
+`webview2-com = "0.38"` and `windows = { version = "0.61", features =
+["Win32_System_Com", "Win32_UI_Shell"] }`, both pinned to match what wry
+0.55 already resolves to. All three are load-bearing only on Windows —
+`preview/capture.rs`'s `#[cfg(not(windows))]` stub always returns a clear
+"only implemented on Windows today" error rather than attempting webkit2gtk
+capture, matching the milestone's non-blocking allowance for Linux.
+
+**Preview nav-policy security model — two independent allowlists, one
+documented gap.** `preview::is_allowed_preview_host` (pure, unit-tested)
+gates which **hosts** the embedded webview may navigate to directly:
+`localhost` (name) or a loopback/RFC-1918-private IP literal
+(`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `::1`)
+unless `preview_allow_remote` is on, checked via `url::Host` (not string
+matching, so `http://localhost@evil.com`-style userinfo tricks resolve to
+the real host). Separately, `preview::is_externally_openable` gates which
+**schemes** may ever reach the OS system-opener (`tauri_plugin_opener`) —
+`http`/`https` only; this is the Follina-style RCE-vector fix from the
+`fix(V14)` review pass (below). **KNOWN LIMITATION** (documented directly
+in `preview/mod.rs`'s module doc, `// KNOWN LIMITATION` comment): both
+policies apply only to the **main frame** — wry exposes no
+subframe-navigation hook, so a policy-allowed page (a legitimate localhost
+dev server) that embeds `<iframe src="https://some-remote-host">` can load
+that remote content inside the Preview tab without either check ever
+running. Accepted for a localhost dev-preview surface (the threat model is
+"don't let the tab casually reach hosts you didn't ask for," not "sandbox
+untrusted third-party content") — revisit if wry grows subframe-navigation
+events, or by reaching `CoreWebView2Frame::NavigationStarting` directly if
+this ever needs to be airtight.
+
+**The `fix(V14)` review pass (commit `820319e`) is worth reading directly** —
+same posture as V12's and V13's, three agents, one HIGH-severity data-loss
+bug and one HIGH-severity RCE-vector bug:
+- **`settings_update` template-clobber (HIGH, data loss).** The generic
+  settings-save IPC used to do a near-wholesale overwrite of the persisted
+  `Settings` (preserving only `layout`/`session` from live state before
+  applying an incoming snapshot). `prompt_templates`/`templates_seeded` are
+  written **out-of-band** by the dedicated `compose_templates_global_set` IPC
+  (straight read-modify-write against the physical global `settings.json` —
+  see the Prompt Library note in `FEATURES.md`/`CHANGELOG.md`), so a Settings
+  window snapshot taken before a template edit could roll that edit right
+  back the next time *any* unrelated setting saved. Fixed by
+  `apply_incoming_settings` also preserving `prompt_templates`/
+  `templates_seeded` from live state, same as `layout`/`session`; regression
+  test simulates a stale/empty incoming snapshot and asserts templates
+  survive.
+- **`open_external` scheme allowlist (HIGH, RCE vector).** Before this fix, a
+  Preview tab's rejected-navigation path and `on_new_window` handler forwarded
+  *any* URL straight to `tauri_plugin_opener::open_url`, which ultimately
+  calls OS shell APIs — a `file:`, `data:`, or (the Follina-class case) a
+  registered custom protocol handler like `ms-msdt:` had no meaningful "host"
+  for `is_allowed_preview_host` to reject, so it sailed through untouched to
+  the OS. Fixed by `is_externally_openable`, gating `open_external` to
+  `http`/`https` only — see the security-model note above.
+- **`attach.rs` TOCTOU (correctness).** `save_png`/`reserve_path` used to pick
+  the next `n.png` index (a `read_dir` scan) and then create the file as two
+  separate steps; two genuinely concurrent writers (a clipboard paste racing
+  a Preview snapshot, both allocating from the same session's attach dir)
+  could observe the same "next index" and collide, silently dropping one
+  image. Fixed with a process-wide `ATTACH_ALLOC_LOCK` mutex serializing
+  index-pick-and-create in a shared `allocate_and_write` helper, plus
+  `OpenOptions::create_new` (O_EXCL-equivalent) with retry-on-collision as a
+  second line of defense; regression test spawns two barriered threads and
+  asserts both payloads land intact in distinct files.
+- **Advisor proposal bounds (correctness).** `RULE_MIN_SCORE` gained a
+  `MIN_SCORE_CEILING` (12) so repeated applies of "raise `context_min_score`"
+  can't climb the floor high enough to silently turn off injection
+  altogether; `RULE_TURN_BUDGET` now only proposes when its formula computes
+  a genuine reduction (`proposed < current`) — the previous `.max(1_000)`
+  floor could otherwise propose *raising* (or no-op'ing) an already-small
+  budget, directly contradicting a rule whose entire premise is "lower the
+  budget." Both guarded by dedicated tests in `advisor.rs`.
+- The same pass also fixed a webview-leak (a Preview child webview is now
+  destroyed by the backend's own `close_tab` and drained on app exit, not
+  solely by the frontend's `onDestroy`, which a renderer crash or HMR reload
+  could skip), added a 5s timeout to `capture_to_png` (a concurrent tab-close
+  could otherwise hang the capture's completion callback forever) with
+  stray-0-byte-file cleanup on any failure path, scoped `effectiveness_totals`
+  to the calling project root's own sessions (it was previously summing
+  process-wide, misattributing another project's chars in a multi-project
+  session), and fixed a `PreviewToolbar` Back-button history bug (a
+  non-pure history model that could oscillate between two entries).
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

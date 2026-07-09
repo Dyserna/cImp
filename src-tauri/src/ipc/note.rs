@@ -53,7 +53,13 @@ pub fn ensure_note_file(launch_cwd: &Path) -> AppResult<PathBuf> {
 #[tauri::command]
 pub async fn read_note(state: State<'_, AppState>) -> AppResult<String> {
     let path = ensure_note_file(&state.launch.cwd)?;
-    std::fs::read_to_string(&path).map_err(AppError::Io)
+    // Read bytes and lossily decode: the note is advertised as freely
+    // hand-editable, so a stray non-UTF-8 byte (from an external editor or
+    // tool) must degrade to a replacement char rather than making
+    // `read_to_string` fail and lock the note out of the tab entirely.
+    std::fs::read(&path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .map_err(AppError::Io)
 }
 
 /// Persist the note's text, replacing the file's contents atomically. The

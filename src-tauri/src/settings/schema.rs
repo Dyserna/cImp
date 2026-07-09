@@ -39,6 +39,16 @@ pub const OFFLOAD_SERVER_TAB_ID: &str = "offload-server";
 /// like the Offload Server tab). Unlike the other reserved tabs it is
 /// app-rendered, not PTY-backed.
 pub const GRAPH_MONITOR_TAB_ID: &str = "graph-monitor";
+/// V13 Phase A: reserved id of the read-only, app-rendered Workbench tab
+/// (live diff / checkpoint timeline / worktrees). Materialized iff
+/// `workbench.enabled` (reconciled by the integrity check, exactly like the
+/// Code Graph monitor tab). App-rendered like the graph monitor — no PTY.
+pub const WORKBENCH_TAB_ID: &str = "workbench-1";
+/// V15 Feature 4: reserved id of the read-only, app-rendered Graph View tab
+/// (live 2D/3D force-graph of the code graph). Materialized iff
+/// `graph.graph_viz` (reconciled by the integrity check, exactly like the Code
+/// Graph monitor tab). App-rendered like the monitor — no PTY.
+pub const GRAPH_VIEW_TAB_ID: &str = "graph-view";
 /// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
 /// longer a persistent builtin — it (like rustnet) launches on demand from
 /// the bottom-bar tool buttons into ordinary closable Shell tabs (uuid ids).
@@ -54,7 +64,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 20;
+pub const CURRENT_SCHEMA_VERSION: u8 = 21;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -157,6 +167,22 @@ pub struct Settings {
     /// offload worker (native). Off by default. Additive — old settings
     /// files load with the feature disabled.
     pub graph: GraphSettings,
+    /// V13 Phase A: the Workbench feature — live diff pane, checkpoints (a
+    /// shadow git repo), and a worktree manager, hosted in one reserved tab.
+    /// The master `enabled` flag defaults `true` (the tab itself is cheap;
+    /// each sub-feature gates itself, and checkpoints stay off by default —
+    /// see `WorkbenchSettings`). Additive — old settings files load with the
+    /// tab present but checkpoints off.
+    pub workbench: WorkbenchSettings,
+    /// V12 Phase A: project checker commands (`cargo check`, `tsc`, `eslint`,
+    /// `pytest`, …) the `run_check` MCP tool can run. Lives at the root, not
+    /// inside `GraphSettings` — it's project tooling, independent of the code
+    /// graph (`run_check` is advertised whenever this is non-empty, whether or
+    /// not `graph.enabled`). Empty by default; rides the `.cimp/config.json`
+    /// overlay, which is where users actually set it. A model-supplied
+    /// `run_check` tool call only *selects* a `CheckDef` by name — the command
+    /// itself is never model-supplied.
+    pub checks: Vec<crate::checks::CheckDef>,
     /// Which AI-tool tabs are enabled. Each id in this list corresponds
     /// to one of the four reserved AI builtins (`claude`, `claude-local`,
     /// `aider`, `aider-local`). Adding an id opens that tab; removing
@@ -170,6 +196,46 @@ pub struct Settings {
     /// rolling files into `<portable-root>/logs/`; the level field drives
     /// the EnvFilter via a reload handle so changes apply live.
     pub logging: LoggingSettings,
+    /// V14 Phase A: the global-scope prompt-template library. Populated with
+    /// [`starter_prompt_templates`] once (see `templates_seeded`), then
+    /// entirely user-owned. Read/written through dedicated `compose_templates_*`
+    /// IPC that targets the physical global `settings.json` directly (NOT the
+    /// normal per-project overlay diff every other field goes through) — see
+    /// `settings::persistence::{read,write}_global_prompt_templates` — so the
+    /// library really is global regardless of which project cImp is launched
+    /// from. Project-scope additions live separately, in the `.cimp/config.json`
+    /// overlay's own `prompt_templates` array (see [`PromptTemplate`]'s doc
+    /// comment); this field is NOT merged with those.
+    pub prompt_templates: Vec<PromptTemplate>,
+    /// One-shot gate for the starter-template seed: `false` until the first
+    /// load seeds [`starter_prompt_templates`] into `prompt_templates` and
+    /// flips this to `true`. Deliberately independent of
+    /// `CURRENT_SCHEMA_VERSION` — a user who deletes all 4 starters must not
+    /// have them reappear on a future migration.
+    pub templates_seeded: bool,
+    /// V14 Phase D2: budget-tuning advisor proposals the user has dismissed.
+    /// Each entry suppresses ONE rule at ONE coarse (10%-bucketed) rate —
+    /// see `advisor::Proposal::signature`'s doc comment — so a materially
+    /// changed rate re-fires the proposal even though the same `rule_id`
+    /// still matches. Additive `#[serde(default)]`; empty on a fresh install.
+    pub advisor_dismissed: Vec<DismissedRule>,
+    /// V14 Phase F: the last URL entered into any Preview tab, remembered so
+    /// the next "New Preview tab" starts from where the user left off rather
+    /// than the hardcoded fallback (`preview::DEFAULT_PREVIEW_URL`). A plain
+    /// scalar field (unlike `prompt_templates`) — it merges correctly through
+    /// the ordinary per-project `.cimp/config.json` overlay diff (a later
+    /// scalar write simply overwrites the earlier one; no array-replace pitfall
+    /// applies), so a project remembers its own dev-server URL without any
+    /// bespoke read/write path. `None` until the first Preview tab is created
+    /// or navigated.
+    pub preview_last_url: Option<String>,
+    /// V14 Phase F: global gate on the Preview tab's navigation policy — when
+    /// `false` (the default), `preview::is_allowed_preview_host` only allows
+    /// localhost/127.0.0.1/RFC-1918 hosts; navigation to anything else opens
+    /// in the system browser instead. Opt-in per the milestone's design: a
+    /// Preview tab is a dev-server surface, not a general (and
+    /// prompt-injectable) browsing pane beside the agent tabs.
+    pub preview_allow_remote: bool,
 }
 
 impl Default for Settings {
@@ -197,10 +263,29 @@ impl Default for Settings {
             external_tools: ExternalToolsSettings::default(),
             offload: OffloadSettings::default(),
             graph: GraphSettings::default(),
+            workbench: WorkbenchSettings::default(),
+            checks: Vec::new(),
             enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
+            prompt_templates: Vec::new(),
+            templates_seeded: false,
+            advisor_dismissed: Vec::new(),
+            preview_last_url: None,
+            preview_allow_remote: false,
         }
     }
+}
+
+/// V14 Phase D2: one dismissed advisor proposal. `rule_id` mirrors
+/// `advisor::Proposal::rule_id` (a versioned string constant, e.g.
+/// `"advisor.raise_context_min_score.v1"`); `signature` is the coarse
+/// (10%-bucketed) rate that triggered the dismissed proposal. Equality on
+/// BOTH fields is what "suppressed" means — see `advisor::evaluate`.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct DismissedRule {
+    pub rule_id: String,
+    pub signature: String,
 }
 
 /// Logging configuration. The file path is fixed at
@@ -475,15 +560,18 @@ where
 }
 
 /// Discriminated tab config. The `kind` field is the JSON discriminator
-/// (`"ai_tool"` or `"shell"`), produced by serde's internally-tagged
-/// representation. Each variant carries the fields specific to its kind —
-/// AI tabs have `tts_injection` and three notification slots; Shell tabs
-/// have two notification slots and no TTS hook.
+/// (`"ai_tool"`, `"shell"`, or — V14 Phase F — `"preview"`), produced by
+/// serde's internally-tagged representation. Each variant carries the fields
+/// specific to its kind — AI tabs have `tts_injection` and three notification
+/// slots; Shell tabs have two notification slots and no TTS hook; Preview
+/// tabs have neither (no PTY at all — `url`/`device_width`/`auto_reload`
+/// drive an embedded child webview instead, see `crate::preview`).
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TabConfig {
     AiTool(AiToolTabConfig),
     Shell(ShellTabConfig),
+    Preview(PreviewTabConfig),
 }
 
 impl TabConfig {
@@ -491,6 +579,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => &c.id,
             TabConfig::Shell(c) => &c.id,
+            TabConfig::Preview(c) => &c.id,
         }
     }
 
@@ -498,6 +587,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => &c.name,
             TabConfig::Shell(c) => &c.name,
+            TabConfig::Preview(c) => &c.name,
         }
     }
 
@@ -505,6 +595,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => c.name = name,
             TabConfig::Shell(c) => c.name = name,
+            TabConfig::Preview(c) => c.name = name,
         }
     }
 
@@ -512,6 +603,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => c.builtin,
             TabConfig::Shell(c) => c.builtin,
+            TabConfig::Preview(c) => c.builtin,
         }
     }
 
@@ -519,6 +611,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => c.builtin = value,
             TabConfig::Shell(c) => c.builtin = value,
+            TabConfig::Preview(c) => c.builtin = value,
         }
     }
 }
@@ -531,6 +624,17 @@ pub struct AiToolTabConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    /// `None` (the default for every builtin and every plain "+"-duplicated
+    /// tab) ⇒ spawn with the app's launch directory, same as always. V13
+    /// Phase D's "New tab in worktree…" flow
+    /// (`ipc::tab_lifecycle::create_ai_tab_in_worktree`) is the one place
+    /// that sets this — to the freshly created worktree's path — so the tab
+    /// runs isolated from the main working tree. This field already existed
+    /// (mirroring `ShellTabConfig::cwd`, wired into `build_ai_tool_spec`
+    /// since V3) but was never set by any flow until Phase D; there is no
+    /// user-facing "set a custom cwd" affordance for AI tabs, so a non-`None`
+    /// value always means "this tab lives in a cImp-managed worktree" — shown
+    /// read-only where the tab's Configure surface displays it.
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub tts_injection: TtsInjection,
@@ -579,6 +683,33 @@ pub struct ShellTabConfig {
     pub background_override: Option<BackgroundOverride>,
 }
 
+/// V14 Phase F: a user-created Preview tab — an embedded, localhost-scoped
+/// child webview, not a subprocess. No `command`/`args`/`cwd`/`env`/PTY
+/// fields at all (unlike `AiToolTabConfig`/`ShellTabConfig`) since there is
+/// nothing to spawn; `crate::preview` manages the child webview keyed by
+/// tab id, reading `url`/`device_width`/`auto_reload` from here.
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct PreviewTabConfig {
+    pub id: String,
+    /// Always `false` in practice — Preview has no reserved/builtin instance
+    /// (every one is user-created via the `+` menu), but the field exists so
+    /// `TabConfig`'s shared accessors (`builtin()`/`set_builtin()`) stay
+    /// uniform across variants.
+    pub builtin: bool,
+    pub name: String,
+    pub url: String,
+    /// `None` ⇒ the toolbar's "Desktop" preset (fill the available rect, no
+    /// letterboxing). `Some(w)` ⇒ letterbox to a fixed CSS-pixel width (the
+    /// mobile/tablet presets) — see `preview::policy` for the shared
+    /// device-preset table for the rect math.
+    pub device_width: Option<u32>,
+    /// Reload after a ~1s quiet period following a `fs-batch` event (V13),
+    /// while the tab is visible. Off by default — a dev server's own HMR
+    /// usually already handles this, so auto-reload is an opt-in belt for
+    /// setups without it.
+    pub auto_reload: bool,
+}
 
 /// V1.4-07: local-LLM provider configuration. When an AI tab has
 /// `use_local_provider: true`, the launch flow composes env vars from
@@ -892,6 +1023,10 @@ pub struct GraphSettings {
     pub max_rows_per_query: u32,
     /// Hard cap on the snippet bytes attached to each result row.
     pub max_snippet_bytes: u32,
+    /// Hard cap on the body bytes returned by `graph_snippet` (V11 Phase A).
+    /// Larger than `max_snippet_bytes` because whole definition bodies are
+    /// bigger than the one-line snippets attached to result rows.
+    pub max_body_bytes: u32,
     /// Per-project subdirectory holding `graph.db`. Recommended git-ignored.
     pub db_subdir: String,
     /// Let the **offload worker** query the graph when it's running on a
@@ -917,9 +1052,125 @@ pub struct GraphSettings {
     pub embedding_dims: u32,
     /// Also embed full symbol bodies (not just docs + signatures) for
     /// semantic *code* search. Off by default — multiplies vector count.
+    /// Requires `semantic_search` on (it shares the embedder + backfill pass);
+    /// with `semantic_search` on, this enables the `graph_semantic_code` tool and
+    /// its code-embedding pass.
     pub embed_code_bodies: bool,
     /// Number of chunks per `/v1/embeddings` request (amortizes round-trips).
     pub embedding_batch: usize,
+    /// Project-wide cap on how many `code_chunk` rows a full rebuild keeps
+    /// (a simple count cap for V1 — see `build_tree`). Bounds DB size and
+    /// embedding cost on very large repos.
+    pub semantic_code_max_chunks: u32,
+
+    // --- Context injection (V10 Phase D) ---
+    /// Automatically prepend a budget-bounded digest of the most relevant files
+    /// to each user prompt (Claude via a UserPromptSubmit hook, OpenCode via a
+    /// plugin). Off by default — it changes what the agent sees.
+    pub context_injection: bool,
+    /// Max characters of digest emitted per file (outline + best snippet).
+    pub context_per_file_chars: u32,
+    /// Total character budget for one turn's injected context across all files.
+    pub context_turn_budget_chars: u32,
+    /// Fold the current session's working set (Phase C memory) into the ranking
+    /// so session-hot files rank first.
+    pub context_include_session: bool,
+    /// Minimum top-file relevance score below which nothing is injected (so
+    /// meta/"hi" prompts inject nothing).
+    pub context_min_score: u32,
+
+    // --- V11 Phase B: repo map (session-start orientation) ---
+    /// Character budget for the once-per-session project map (`graph_repo_map`
+    /// tool, and the session-start injection when enabled).
+    pub repo_map_budget_chars: u32,
+    /// Prepend the project map to the first injected turn of each new session.
+    /// Rides the `context_injection` master toggle AND this flag. Off by default.
+    pub repo_map_on_session_start: bool,
+
+    // --- V11 Phase C: injection dedup ---
+    /// How many turns a dedup suppression lasts: a file injected in full is
+    /// demoted to a one-line "unchanged" reminder on later turns until it changes
+    /// or this many turns pass. `0` disables dedup (every turn re-injects).
+    pub context_dedup_ttl_turns: u32,
+
+    // --- V11 Phase D: compaction survival (Claude PreCompact) ---
+    /// Feed the compactor the session's working set + pinned notes so they
+    /// survive the summary (and clear dedup / mark post-compaction). Costs a few
+    /// hundred chars once per compaction; still master-gated by `context_injection`.
+    pub compaction_context: bool,
+
+    // --- V11 Phase E: redundant-read advisor (opt-in; logic in Phase E) ---
+    /// Intercept a `Read` of a file already read unchanged this session and
+    /// answer with a cheap reminder (outline digest) instead of re-reading it.
+    /// Strictly opt-in — it changes the agent's tool behaviour. Default off.
+    pub read_advisor: bool,
+    /// Files with fewer than this many lines always pass the advisor (a small
+    /// file is cheap to re-read; the reminder isn't worth it).
+    pub read_advisor_min_lines: u32,
+    /// `"advise"` (remind with the outline) or `"substitute"` (also include the
+    /// most relevant symbol body). Default `"advise"`.
+    pub read_advisor_mode: String,
+
+    // --- V11 Phase F: local-model context digests ---
+    /// For files with no useful outline (docs/configs/long scripts), have the
+    /// **local** offload backend write a 3-line semantic digest, cached in
+    /// `graph.db`. Off by default; needs a ready local offload backend. Never
+    /// leaves the machine (local-only path).
+    pub context_llm_digests: bool,
+
+    // --- V12 Phase E: memory distillation (durable project facts) ---
+    /// Distill an idle session's working set + notes into at most 3 durable
+    /// `project_fact` rows via the **local-only** offload path before/instead
+    /// of letting that knowledge evaporate with the session. Off by default —
+    /// needs a ready local offload backend and the prompt is model-dependent
+    /// (milestone Decision 3: revisit after real-session validation).
+    pub memory_distillation: bool,
+    /// Append **pinned** project facts (only pinned — the human-curated tier)
+    /// to the launch-time guidance payload (Claude `--append-system-prompt`,
+    /// OpenCode's instructions file), so durable knowledge arrives with zero
+    /// tool calls. Off by default. Launch-time only: a fact pinned mid-session
+    /// applies on the tab's next launch.
+    pub promote_pinned_facts: bool,
+
+    // --- V12 Phase F: proactive automation ---
+    /// Auto-run the project's configured checks after an edit (`PostToolUse`
+    /// hook → `/context/post_edit`) and inject only NEW/worsened diagnostics
+    /// as additional context — the agent learns it broke something in the
+    /// same turn instead of three turns later. Strictly opt-in — it's a
+    /// behavior hook, same posture as `read_advisor`. Off by default; needs
+    /// `checks` non-empty to do anything.
+    pub auto_check: bool,
+    /// Debounce window (seconds): edits inside this window since the last
+    /// triggered run are coalesced (no new run); the run then covers
+    /// everything the burst touched, since checks run against the file system
+    /// state, not a specific edit.
+    pub auto_check_debounce_s: u32,
+    /// Minimum DIRECT inbound call count (`graph_callers`'s count) an edited
+    /// file's symbol must have before the same hook appends a two-line
+    /// blast-radius note (6b) — the moments an agent most needs impact
+    /// analysis are exactly the moments it doesn't think to ask for it.
+    pub auto_impact_min_dependents: u32,
+    /// Re-run `dead_exports`/`import_cycles` after every completed index pass
+    /// (bounded, read-only on the warm index — cheap) and badge the Analyses
+    /// section when the counts changed. On by default — unlike the other
+    /// Phase F toggles this doesn't change agent behavior, only a UI badge.
+    pub analyses_auto: bool,
+    /// V15 Feature 1: hop bound for `graph_path` shortest-path tracing — how far
+    /// the BFS explores before giving up. Clamped 1–32 at the tool boundary.
+    pub path_max_hops: u32,
+    /// V15 Feature 2: max subsystems (file communities) `graph_architecture`
+    /// reports, biggest first.
+    pub arch_max_communities: u32,
+    /// V15 Feature 2: ignore communities smaller than this in the architecture
+    /// report (singletons/pairs are noise, not subsystems).
+    pub arch_min_community_size: u32,
+    /// V15 Feature 4 (STRETCH): master toggle for the reserved **Graph View**
+    /// tab (2D/3D live force-graph). Off by default — it's the human-facing
+    /// visual, not on any agent path.
+    pub graph_viz: bool,
+    /// V15 Feature 4: cap on the rendered subgraph node count so large repos
+    /// stay smooth (the view is bounded orientation, never the whole graph).
+    pub graph_viz_max_nodes: u32,
 }
 
 impl GraphSettings {
@@ -957,6 +1208,7 @@ impl Default for GraphSettings {
             watch_debounce_ms: 300,
             max_rows_per_query: 100,
             max_snippet_bytes: 2_000,
+            max_body_bytes: 16_384,
             db_subdir: ".cimp".to_string(),
             allow_remote_worker_access: false,
             semantic_search: false,
@@ -965,6 +1217,84 @@ impl Default for GraphSettings {
             embedding_dims: 0,
             embed_code_bodies: false,
             embedding_batch: 32,
+            semantic_code_max_chunks: 20_000,
+            context_injection: false,
+            context_per_file_chars: 800,
+            context_turn_budget_chars: 6_000,
+            context_include_session: true,
+            context_min_score: 3,
+            repo_map_budget_chars: 4_000,
+            repo_map_on_session_start: false,
+            context_dedup_ttl_turns: 10,
+            compaction_context: true,
+            read_advisor: false,
+            read_advisor_min_lines: 300,
+            read_advisor_mode: "advise".to_string(),
+            context_llm_digests: false,
+            memory_distillation: false,
+            promote_pinned_facts: false,
+            auto_check: false,
+            auto_check_debounce_s: 5,
+            auto_impact_min_dependents: 10,
+            analyses_auto: true,
+            path_max_hops: 8,
+            arch_max_communities: 12,
+            arch_min_community_size: 3,
+            graph_viz: false,
+            graph_viz_max_nodes: 1500,
+        }
+    }
+}
+
+/// V13 §0.4: the Workbench feature's settings. `enabled` is the master
+/// switch for the tab itself (default **on** — the tab is cheap and each
+/// section gates its own behavior); `checkpoints` is the shadow-repo
+/// snapshot feature (default **off** in V1 — proposed on-by-default once the
+/// shadow-repo cost is validated on a large real repo, per the milestone's
+/// open decision 2). The five `checkpoint_*` fields tune retention (`_max`,
+/// `_max_age_days`) and the debounced burst trigger (`_burst_files`,
+/// `_burst_window_s`, `_min_gap_s`) that Phase C's fallback-to-activity
+/// snapshot trigger reads.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(default)]
+pub struct WorkbenchSettings {
+    /// Master switch: the reserved Workbench tab exists. Off = no tab, no
+    /// fs-batch event/broadcast, no checkpoint scheduling.
+    pub enabled: bool,
+    /// Automatic checkpoint snapshots (Phase C's shadow git repo). Off by
+    /// default in V1 — the tab's Diff/Worktrees sections work without it;
+    /// Timeline needs this on.
+    pub checkpoints: bool,
+    /// Ring-buffer cap: the shadow repo keeps at most this many checkpoints
+    /// (oldest pruned first by `shadow::gc`, subject to `checkpoint_max_age_days`).
+    pub checkpoint_max: u32,
+    /// Age cap in days: checkpoints older than this are pruned regardless of
+    /// how far under `checkpoint_max` the ring is.
+    pub checkpoint_max_age_days: u32,
+    /// Burst trigger: at least this many distinct changed paths within
+    /// `checkpoint_burst_window_s` (and at least `checkpoint_min_gap_s` since
+    /// the last snapshot) fires an "activity" checkpoint — the fallback that
+    /// covers shell-tab edits and any flow that doesn't go through the
+    /// prompt-tap trigger.
+    pub checkpoint_burst_files: u32,
+    /// Time window (seconds) the burst-file count above is measured over.
+    pub checkpoint_burst_window_s: u32,
+    /// Minimum seconds between any two automatic snapshots (prompt-tap OR
+    /// burst), so a rapid-fire prompt sequence or a noisy save loop can't
+    /// spam the shadow repo with near-duplicate commits.
+    pub checkpoint_min_gap_s: u32,
+}
+
+impl Default for WorkbenchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            checkpoints: false,
+            checkpoint_max: 100,
+            checkpoint_max_age_days: 7,
+            checkpoint_burst_files: 5,
+            checkpoint_burst_window_s: 60,
+            checkpoint_min_gap_s: 120,
         }
     }
 }
@@ -1741,7 +2071,43 @@ pub fn default_graph_monitor_tab() -> TabConfig {
     TabConfig::Shell(ShellTabConfig {
         id: GRAPH_MONITOR_TAB_ID.to_string(),
         builtin: true,
-        name: "Code Graph".to_string(),
+        name: "Code Intelligence".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
+}
+
+/// V13 Phase A: the reserved, non-closable Workbench tab. Same shape as the
+/// Code Graph monitor tab — Shell-kind with no command (app-rendered, no
+/// PTY). Materialized/removed by the integrity check per `workbench.enabled`.
+pub fn default_workbench_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: WORKBENCH_TAB_ID.to_string(),
+        builtin: true,
+        name: "Workbench".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
+}
+
+/// V15 Feature 4: the reserved, non-closable Graph View tab. Same shape as the
+/// Code Graph monitor tab — Shell-kind with no command (app-rendered, no PTY).
+/// Materialized/removed by the integrity check per `graph.graph_viz`.
+pub fn default_graph_view_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: GRAPH_VIEW_TAB_ID.to_string(),
+        builtin: true,
+        name: "Graph View".to_string(),
         command: String::new(),
         args: Vec::new(),
         cwd: None,
@@ -2636,10 +3002,101 @@ impl Default for ComposeSettings {
     }
 }
 
+/// V14 Phase A: one saved prompt-library entry. `body` may contain the two
+/// immediately-resolvable variables `{selection}` / `{clipboard}` (substituted
+/// by the frontend on insert — see `lib/compose/templates.ts`) plus any
+/// number of free-form `{name}` placeholders, which stay literal as tab-stops
+/// the user fills in. Lives at `Settings::prompt_templates` (global scope);
+/// project-scope entries of the same shape live in the `.cimp/config.json`
+/// overlay's own `prompt_templates` array, read directly by the
+/// `compose_templates` resolver IPC rather than through the normal
+/// deep-merged `Settings` (see `settings::persistence::read_project_prompt_templates`
+/// — the merge would otherwise wholesale-replace the global list instead of
+/// shadowing it by name).
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct PromptTemplate {
+    pub name: String,
+    pub body: String,
+}
+
+/// The 4 starter templates seeded into the global list exactly once (guarded
+/// by `Settings::templates_seeded`, not `CURRENT_SCHEMA_VERSION` — a user who
+/// deletes all 4 must not have them reappear on a later migration). Clearly
+/// example-flavored bodies; deletable like anything else in the list.
+pub fn starter_prompt_templates() -> Vec<PromptTemplate> {
+    vec![
+        PromptTemplate {
+            name: "review-this-diff".to_string(),
+            body: "Review the following diff for correctness, style, and missed edge cases:\n\n{selection}".to_string(),
+        },
+        PromptTemplate {
+            name: "write-tests-for".to_string(),
+            body: "Write tests covering {selection}. Include the obvious edge cases.".to_string(),
+        },
+        PromptTemplate {
+            name: "explain-selection".to_string(),
+            body: "Explain what this does and why:\n\n{selection}".to_string(),
+        },
+        PromptTemplate {
+            name: "commit-message".to_string(),
+            body: "Write a concise, conventional commit message for:\n\n{selection}".to_string(),
+        },
+    ]
+}
+
+/// A template resolved by name across the two scopes — what the compose
+/// overlay's `/` picker actually renders. `scope` is `"global"` or
+/// `"project"`, surfaced in the UI so a shadowed global entry can be shown
+/// greyed with a note.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct ResolvedTemplate {
+    pub name: String,
+    pub body: String,
+    pub scope: String,
+}
+
+/// Merge global + project template lists by name: a project entry shadows a
+/// same-named global one (matching every other overlay's precedence rule),
+/// and any project-only entry is appended after the (filtered) global list.
+/// Pure and file-I/O-free so the shadowing rule is unit-testable without
+/// touching disk; `ipc::commands::compose_templates` is the thin I/O wrapper
+/// that feeds it the two raw lists (see the `PromptTemplate` doc comment for
+/// why those are read directly rather than through the merged `Settings`).
+pub fn resolve_prompt_templates(
+    global: Vec<PromptTemplate>,
+    project: Vec<PromptTemplate>,
+) -> Vec<ResolvedTemplate> {
+    let project_names: std::collections::HashSet<&str> =
+        project.iter().map(|t| t.name.as_str()).collect();
+    let mut out: Vec<ResolvedTemplate> = global
+        .into_iter()
+        .filter(|t| !project_names.contains(t.name.as_str()))
+        .map(|t| ResolvedTemplate {
+            name: t.name,
+            body: t.body,
+            scope: "global".to_string(),
+        })
+        .collect();
+    out.extend(project.into_iter().map(|t| ResolvedTemplate {
+        name: t.name,
+        body: t.body,
+        scope: "project".to_string(),
+    }));
+    out
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct ShortcutSettings {
     pub open_compose: Option<String>,
+    /// V14 Phase A: open compose (like `open_compose`) AND immediately open
+    /// the prompt-template picker popover — the discoverable keyboard path
+    /// alongside the 📋 button beside the compose textarea. Default
+    /// `Alt+/` (mirrors `open_compose`'s `Alt+Enter` and the picker's own
+    /// `/` trigger); NOT a `Ctrl+Shift+…` chord — see the V6-01 note above
+    /// on `push_to_talk`'s bare-`Ctrl+Shift` collision.
+    pub open_compose_picker: Option<String>,
     pub submit_compose: Option<String>,
     pub cancel_compose: Option<String>,
     pub open_settings: Option<String>,
@@ -2689,6 +3146,7 @@ impl Default for ShortcutSettings {
             // chord doesn't visibly arm/abort when these fire. New installs
             // get these defaults; existing settings files keep their bindings.
             open_compose: Some("Alt+Enter".to_string()),
+            open_compose_picker: Some("Alt+/".to_string()),
             // V6-01: Enter submits (one-handed send for dictation); Alt+Enter
             // (and Shift+Enter) insert a newline — see ComposeOverlay.svelte.
             submit_compose: Some("Enter".to_string()),
@@ -3064,5 +3522,65 @@ mod tests {
         assert_eq!(parsed.name, preset.name);
         assert_eq!(parsed.config.image, preset.config.image);
         assert_eq!(parsed.config.blur, preset.config.blur);
+    }
+
+    // --- V14 Phase A: prompt library -----------------------------------
+
+    #[test]
+    fn starter_prompt_templates_has_the_four_named_entries() {
+        let templates = starter_prompt_templates();
+        let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "review-this-diff",
+                "write-tests-for",
+                "explain-selection",
+                "commit-message",
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_templates_project_shadows_global_by_name() {
+        let global = vec![
+            PromptTemplate { name: "a".to_string(), body: "global-a".to_string() },
+            PromptTemplate { name: "b".to_string(), body: "global-b".to_string() },
+        ];
+        let project = vec![
+            // Shadows global "a" — project body wins, global "a" is dropped.
+            PromptTemplate { name: "a".to_string(), body: "project-a".to_string() },
+            // Project-only entry, appended after the (filtered) global list.
+            PromptTemplate { name: "c".to_string(), body: "project-c".to_string() },
+        ];
+        let resolved = resolve_prompt_templates(global, project);
+        assert_eq!(resolved.len(), 3, "shadowed global \"a\" must not appear twice");
+
+        let a = resolved.iter().find(|t| t.name == "a").unwrap();
+        assert_eq!(a.body, "project-a");
+        assert_eq!(a.scope, "project");
+
+        let b = resolved.iter().find(|t| t.name == "b").unwrap();
+        assert_eq!(b.body, "global-b");
+        assert_eq!(b.scope, "global");
+
+        let c = resolved.iter().find(|t| t.name == "c").unwrap();
+        assert_eq!(c.body, "project-c");
+        assert_eq!(c.scope, "project");
+    }
+
+    #[test]
+    fn resolve_prompt_templates_empty_project_passes_global_through() {
+        let global = vec![PromptTemplate { name: "a".to_string(), body: "x".to_string() }];
+        let resolved = resolve_prompt_templates(global, Vec::new());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].scope, "global");
+    }
+
+    #[test]
+    fn settings_default_starts_unseeded_with_no_templates() {
+        let s = Settings::default();
+        assert!(!s.templates_seeded);
+        assert!(s.prompt_templates.is_empty());
     }
 }

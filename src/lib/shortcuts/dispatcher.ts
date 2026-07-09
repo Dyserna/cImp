@@ -12,6 +12,9 @@ import type { ShortcutSettings } from '../settings/types';
 
 export type ShortcutAction =
   | 'open_compose'
+  /// V14 Phase A: open compose AND open the prompt-template picker popover
+  /// in one keystroke (the 📋 button's keyboard equivalent).
+  | 'open_compose_picker'
   | 'submit_compose'
   | 'cancel_compose'
   | 'open_settings'
@@ -67,6 +70,7 @@ let suppressed = false;
 export function configureShortcuts(s: ShortcutSettings, h: ShortcutHandlers): void {
   predicates = {
     open_compose: parseShortcut(s.open_compose),
+    open_compose_picker: parseShortcut(s.open_compose_picker),
     submit_compose: parseShortcut(s.submit_compose),
     cancel_compose: parseShortcut(s.cancel_compose),
     open_settings: parseShortcut(s.open_settings),

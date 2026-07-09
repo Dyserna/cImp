@@ -558,21 +558,101 @@ global concurrency, or live health. Changes to a server's config take effect whe
 the app next warms the pool; toggling **Enable offload** itself takes effect on
 the next app launch.
 
-## Code knowledge graph
+## Code Intelligence (code knowledge graph)
 
 cImp builds a per-project **code + docs knowledge graph** (CozoDB + tree-sitter
 over `.cimp/graph.db`) that Opus and offload workers can query through MCP tools —
 `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`,
-`graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`, and
-`graph_struct_search`. It covers **20+ languages** — Rust, TypeScript/JavaScript,
+`graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`,
+`graph_struct_search`, `graph_snippet`, `graph_repo_map`, `graph_impact`,
+`graph_tests_for`, `graph_recent_changes`, and `run_check` (plus
+`graph_semantic_docs` / `graph_semantic_code` when semantic search is on). It
+covers **20+ languages** — Rust, TypeScript/JavaScript,
 Python, Go, Java, C, C++, C#, PHP, Bash, Scala, OCaml, Ruby, Haskell, Kotlin,
 Swift, SQL, Erlang, R, Perl, and Ada get full symbol/call graphs (via a generic
 tree-sitter `tags.scm` engine); HTML, CSS, JSON, YAML, XML, and assembly are
 struct-searchable; Markdown feeds docs — with symbol/call/import edges,
 transitive reachability, full-text and
 (optionally) embedding-based semantic doc search, and a filesystem watcher for
-incremental re-index. A reserved **Code Graph** monitor tab shows build status,
+incremental re-index. A reserved **Code Intelligence** tab shows build status,
 node/edge counts, embedder health, and recent-query history.
+
+Beyond structural search, Code Intelligence adds three capabilities (**Memory**,
+**Context**, and **Analyses** sections of the same tab):
+
+- **Session memory** — a per-project, rolling record of what each agent session
+  read/edited/queried, plus notes the agent chooses to remember. Exposed as
+  `context_recall`, `context_note` (pin to keep it across sessions), and
+  `context_notes`. Stored in `graph.db` and preserved across index rebuilds.
+  Scoped per agent, so a Claude tab and an OpenCode tab on the same project keep
+  separate sessions. The **Activity** section labels each graph/memory tool call
+  with its caller (claude / opencode / offload).
+- **Automatic context injection** (opt-in, off by default) — ranks the files
+  most relevant to each prompt and prepends a budget-bounded digest before the
+  agent runs (Claude via a `UserPromptSubmit` hook, OpenCode via a generated
+  `.opencode/plugin`). Session-hot files rank first; a live preview and per-file
+  / per-turn budgets are in the tab and Settings.
+- **Packaged analyses** — on-demand **dead exports** (candidate unused public
+  symbols) and **import cycles**, also as the `graph_dead_exports` /
+  `graph_cycles` tools. Each states which languages it covers (dead exports:
+  Rust, JS/TS, Python, Go; cycles: JS/TS, Python, Rust), so an empty result on
+  another language reads as "not checked," not "clean."
+
+**Token efficiency (V11)** cuts what those capabilities cost to use:
+`graph_snippet` fetches one definition's body instead of a whole file;
+`graph_repo_map` gives a budget-bounded, centrality-ranked project map for
+orienting without exploring, agent-pullable any time and (opt-in)
+auto-injected once per session; injection **dedup** demotes an unchanged
+re-candidate to a one-line reminder instead of re-sending its digest; a Claude
+`PreCompact` hook carries the session's working set and pinned notes through a
+compaction; an opt-in Claude `PreToolUse` hook on `Read` can deny a redundant
+re-read of an unchanged file, always with usable content (outline, or outline
++ body) in its place; files with no useful outline get a cached local-model
+digest (never leaves the machine); and `graph_semantic_code` adds
+symbol-level semantic search alongside the existing doc search.
+
+**Agentic Inner Loop (V12)** tightens the edit → check → fix loop, including
+without the model asking: `run_check` runs a project's configured
+build/lint/test commands (`.cimp/config.json`'s `checks` list) and returns
+deduplicated, structured diagnostics instead of a raw dump; `graph_impact`
+gives the blast radius of the working-tree diff (or explicit symbols) as
+transitive dependents, with a matching Analyses button; test↔symbol mapping
+(`graph_tests_for`) finds the candidate tests a change would exercise; git
+commit history boosts recently-churned files in injection ranking and adds a
+`last change: "…" (3d ago)` trailer (`graph_recent_changes` surfaces it
+directly); opt-in memory distillation turns a session's working set into
+durable, pinnable **project facts** via the local-only offload path before it
+evicts; and opt-in proactive automation (a Claude `PostToolUse` hook) injects
+only new/worsened diagnostics right after an edit, plus a blast-radius note on
+risky changes — all off by default, same posture as the V11 read advisor.
+
+## Workbench (V13 — vibe-coding guardrails)
+
+A reserved **Workbench** tab (on by default) makes it safe to let agents run
+loose across the whole working tree. **Diff** shows the working-tree diff vs
+`HEAD` live as agents edit, with per-hunk revert/copy/send-to-agent and a
+status-bar `±N` badge. **Timeline** is an opt-in shadow-git checkpoint
+history (triggered per prompt, on a file-activity burst, or manually) that
+never touches the user's own `.git` — restore always snapshots the current
+state first, so it's itself undoable. **Worktrees** turns "isolated task" into
+one click: create a `git worktree` + branch, spawn an AI tab in it, then merge
+back or discard from the UI, with a merge that refuses to leave a half-merged
+main tree on conflict.
+
+## Workflow & Visibility (V14)
+
+Four smaller additions that round out the day-to-day workflow. A **prompt
+library** (*Settings → Compose*) saves parameterized templates — global plus
+per-project, with `{selection}`/`{clipboard}` variables and free-form
+`{placeholder}` tab-stops — insertable by typing `/` in an empty compose
+textarea. The compose overlay accepts **pasted or dropped images**, appending
+their local path(s) to the message on submit. A new **Usage** section in
+Code Intelligence gives an honest token/cost X-ray (exact where the
+transcript says so, `est.` everywhere else) with a **budget-tuning advisor**
+that proposes — never silently applies — changes to the context-injection
+knobs above, based on measured usage. And a new **Preview** tab embeds a
+localhost/LAN-only dev-server webview with **Snapshot → compose**, turning
+"see what the agent built" into one click.
 
 ## Configuring Tabs
 

@@ -68,6 +68,51 @@ pub enum AppError {
     /// query, embedding). Carries human-readable context for the IPC layer.
     #[error("graph error: {0}")]
     Graph(String),
+
+    /// V12 Phase A: a `run_check` structured-diagnostics run failed (spawn,
+    /// I/O, or shell resolution). Carries human-readable context for the
+    /// tool layer; a bad/absent checker binary reads as this, not a panic.
+    #[error("check error: {0}")]
+    Checks(String),
+
+    /// V12 Phase B: `graph_impact`'s default (diff-vs-HEAD) mode needs a git
+    /// repository at the project root. Kept distinct from [`AppError::Graph`]
+    /// so the tool/UI layer can render a specific "requires git" hint instead
+    /// of a generic index error.
+    #[error("not a git repository: {0}")]
+    NotAGitRepo(String),
+
+    /// V13 §0.2: the Workbench git harness (`workbench::git::run`) couldn't
+    /// find a `git` executable on PATH. Kept as one typed variant (distinct
+    /// from the generic [`AppError::CommandNotFound`]) so every Workbench UI
+    /// surface — diff pane, checkpoints, worktrees — renders the exact same
+    /// "install git" guidance instead of each inventing its own message.
+    #[error("git is not available: {0}")]
+    GitUnavailable(String),
+
+    /// V13: a generic Workbench failure (spawn I/O, timeout, unexpected `git`
+    /// output shape) that isn't the specific "git missing" case above. Mirrors
+    /// [`AppError::Graph`]/[`AppError::Checks`]'s per-module catch-all.
+    #[error("workbench error: {0}")]
+    Workbench(String),
+
+    /// V13 Phase D `worktree::merge` (FIX 2 / V13 code review): a `git merge
+    /// --abort` issued after a failed `git merge` itself ALSO failed. Kept
+    /// distinct from [`AppError::Workbench`] so the UI can render a sharp
+    /// warning — the main tree may be left half-merged (`MERGE_HEAD` still
+    /// set, a partial checkout on disk) and needs MANUAL resolution (e.g. a
+    /// user-run `git merge --abort`), rather than the reassuring-but-false
+    /// "merge was aborted, main tree unchanged" message the plain conflict
+    /// path reports when the abort actually succeeds.
+    #[error("worktree merge left the main tree in an unclear state: {0}")]
+    WorktreeMergeUnclean(String),
+
+    /// V14 Phase F: Preview tab errors — an unknown/already-closed tab id, a
+    /// navigation target rejected by `preview::is_allowed_preview_host`, or a
+    /// capture failure (including "not supported on this platform" outside
+    /// Windows).
+    #[error("preview error: {0}")]
+    Preview(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

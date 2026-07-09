@@ -343,6 +343,11 @@ async fn handle_conn(
     match (req.method.as_str(), route) {
         ("POST", "/run") => handle_run(&mut stream, &service, &req).await,
         ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
+        ("POST", "/context/retrieve") => handle_context_retrieve(&mut stream, &app, &req).await,
+        ("POST", "/context/compaction") => handle_context_compaction(&mut stream, &app, &req).await,
+        ("POST", "/context/should_read") => handle_should_read(&mut stream, &app, &req).await,
+        ("POST", "/context/post_edit") => handle_post_edit(&mut stream, &app, &req).await,
+        ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
         ("GET", "/describe") => {
@@ -497,11 +502,16 @@ struct GraphRunBody {
     /// from it (same ancestor-walk the MCP child uses).
     #[serde(default)]
     cwd: Option<String>,
-    /// The `graph_*` tool name.
+    /// The `graph_*` / `context_*` tool name.
     name: String,
     /// The tool arguments.
     #[serde(default)]
     args: Value,
+    /// The requesting consumer (`"claude"` / `"opencode"`); selects the activity
+    /// source and the `context_*` tools' per-agent session scope. Defaults to
+    /// Claude when absent.
+    #[serde(default)]
+    consumer: Option<String>,
 }
 
 /// A `POST /mcp/call` request body (a Claude-exposed MCP tool invocation).
@@ -549,7 +559,8 @@ async fn handle_graph_run(
         .cwd
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let r = match graph.run_graph_tool(&cwd, &body.name, &body.args).await {
+    let consumer = body.consumer.as_deref().unwrap_or("claude");
+    let r = match graph.run_graph_tool(&cwd, &body.name, &body.args, consumer).await {
         Ok(text) => RunResult {
             ok: true,
             text: Some(text),
@@ -563,6 +574,337 @@ async fn handle_graph_run(
     };
     // 200 even on a tool-level error: the child renders `error` as a tool result.
     write_json(stream, 200, &r).await
+}
+
+/// A `POST /context/retrieve` request body (from the Claude UserPromptSubmit
+/// hook or the OpenCode injection plugin).
+#[derive(Deserialize)]
+struct ContextRetrieveBody {
+    /// The calling session's working directory; the project root is resolved
+    /// from it (defaults to `.`).
+    #[serde(default)]
+    cwd: Option<String>,
+    /// The user's prompt to rank context against.
+    prompt: String,
+    /// The agent session id (scopes the working-set boost); optional.
+    #[serde(default)]
+    session_id: Option<String>,
+    /// V13 Phase C: which agent shim is calling — `"claude"` (set by
+    /// `context_hook.rs`) or `"opencode"` (set by the generated plugin);
+    /// absent/`None` for an unrecognized caller. Recorded on the checkpoint
+    /// it triggers (see [`WorkbenchService::on_prompt`](crate::workbench::WorkbenchService::on_prompt)),
+    /// not otherwise used by context retrieval itself.
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+/// `POST /context/retrieve`: rank files for the prompt and return the injectable
+/// digest as `{ ok, text }`. Gated on `context_injection` — returns empty text
+/// (never blocks a turn) when injection is off or nothing clears the threshold.
+async fn handle_context_retrieve(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: ContextRetrieveBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let cwd = body.cwd.clone().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+
+    // V13 Phase C: fire the prompt-tap checkpoint trigger for EVERY prompt
+    // that reaches this route, BEFORE the `context_injection` gate below —
+    // checkpointing must fire even when injection is off or yields nothing
+    // (Decision 4: decoupled from the injection toggle, reusing its
+    // transport). Fire-and-forget: `on_prompt`'s own min-gap check is cheap
+    // and the real snapshot work runs on a background task inside it, so
+    // this never delays the turn waiting on a `git` round trip.
+    // FIX 8 (V13 code review): only spawn the task at all when checkpoints
+    // are actually on — `on_prompt`/`maybe_snapshot` already no-op when
+    // they're off, but that check used to happen AFTER a task was already
+    // spawned for every single prompt, which is needless per-prompt work
+    // (a task spawn plus a settings read) for a feature the user has
+    // disabled.
+    if let Some(workbench) = app.try_state::<Arc<crate::workbench::WorkbenchService>>() {
+        let workbench = workbench.inner().clone();
+        if workbench.checkpoints_enabled() {
+            let root = cwd.clone();
+            let agent = body.agent.clone();
+            let prompt_head: String = body.prompt.chars().take(80).collect();
+            tauri::async_runtime::spawn(async move {
+                workbench.on_prompt(&root, agent, &prompt_head).await;
+            });
+        }
+    }
+
+    let empty = serde_json::json!({ "ok": true, "text": "", "files": [], "tokens_est": 0 });
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &empty).await;
+    };
+    let graph = graph.inner().clone();
+    // The injection toggle is enforced here (the service's retrieve does not) so
+    // the preview surface can reuse the same core while injection is off.
+    if !graph.context_injection_enabled() {
+        return write_json(stream, 200, &empty).await;
+    }
+    let r = graph.retrieve_context(&cwd, &body.prompt, body.session_id.as_deref());
+    // V11 Phase B: prepend the once-per-session project map. Done here (the real
+    // injection path), not in `retrieve_context`, so the preview surface — which
+    // also calls `retrieve_context` — never consumes the once-per-session flag.
+    let mut text = r.context_md;
+    if let Some(map) = graph.session_greeting(&cwd, body.session_id.as_deref()) {
+        text = if text.is_empty() { map } else { format!("{map}\n\n{text}") };
+    }
+    // V12 Phase F: drain any auto-check block a slow post-edit run parked for
+    // this session (see `GraphService::post_edit`'s budget/park path) — a
+    // turn is never blocked waiting for a check, but its result still reaches
+    // the model on the very next opportunity.
+    if let Some(pending) = graph.drain_auto_check(body.session_id.as_deref()) {
+        text = if text.is_empty() { pending } else { format!("{text}\n\n{pending}") };
+    }
+    // Same char→token estimate as the retrieval core (shared divisor so the two
+    // can't drift). Estimated from the FULL injected text (digest + greeting +
+    // drained auto-check), not just the digest.
+    let tokens_est = crate::graph::est_tokens(text.chars().count());
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({ "ok": true, "text": text, "files": r.files_used, "tokens_est": tokens_est }),
+    )
+    .await
+}
+
+/// A `POST /context/compaction` request body (the Claude `PreCompact` shim).
+#[derive(Deserialize)]
+struct ContextCompactionBody {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    /// `"manual"` / `"auto"`; recorded, not currently branched on.
+    #[serde(default)]
+    #[allow(dead_code)]
+    trigger: Option<String>,
+}
+
+/// `POST /context/compaction` (V11 Phase D): always runs the session's
+/// compaction side effects (clear injection dedup, mark post-compaction) and
+/// returns a compact working-set/notes block as `{ ok, text }` to carry through
+/// the summary. Never blocks — an empty block is returned as empty text.
+async fn handle_context_compaction(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: ContextCompactionBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let empty = serde_json::json!({ "ok": true, "text": "" });
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &empty).await;
+    };
+    let graph = graph.inner().clone();
+    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let block = graph.compaction_context(&cwd, body.session_id.as_deref());
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({ "ok": true, "text": block.unwrap_or_default() }),
+    )
+    .await
+}
+
+/// A `POST /context/should_read` request body (the Claude `PreToolUse` Read
+/// advisor shim).
+#[derive(Deserialize)]
+struct ShouldReadBody {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    file_path: String,
+    /// 1-based read offset, when the agent asked for a windowed read.
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+/// `POST /context/should_read` (V11 Phase E): the read-advisor verdict for a
+/// `Read`. Returns `{ ok, verdict: "pass" }` to let the read through, or
+/// `{ ok, verdict: "remind", text }` to deny-with-content. Fails open to `pass`
+/// on any missing state — the advisor must never block a legitimate read.
+async fn handle_should_read(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
+    let pass = serde_json::json!({ "ok": true, "verdict": "pass" });
+    let body: ShouldReadBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &pass).await;
+    };
+    let graph = graph.inner().clone();
+    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    match graph.should_read(&cwd, body.session_id.as_deref(), &body.file_path, body.offset) {
+        Some(text) => {
+            write_json(stream, 200, &serde_json::json!({ "ok": true, "verdict": "remind", "text": text })).await
+        }
+        None => write_json(stream, 200, &pass).await,
+    }
+}
+
+/// A `POST /context/post_edit` request body (the Claude `PostToolUse` shim, or
+/// the OpenCode plugin's `tool.execute.after` hook).
+#[derive(Deserialize)]
+struct ContextPostEditBody {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    file_path: String,
+    /// Recorded for symmetry with the shim's payload; not currently branched
+    /// on (the matcher/plugin already scope this to edit-class tools).
+    #[serde(default)]
+    #[allow(dead_code)]
+    tool_name: Option<String>,
+}
+
+/// `POST /context/post_edit` (V12 Phase F): debounce this session's edits, run
+/// the project's configured checks single-flight per root, diff against the
+/// session's own baseline, and return only NEW/worsened diagnostics (plus an
+/// optional auto-impact note) as `{ ok, text }`. Fails open to empty text on
+/// any missing state — the hook must never block or perturb an edit.
+async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
+    let empty = serde_json::json!({ "ok": true, "text": "" });
+    let body: ContextPostEditBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &empty).await;
+    };
+    let graph = graph.inner().clone();
+    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let text = graph
+        .post_edit(&cwd, body.session_id.as_deref(), &body.file_path)
+        .await
+        .unwrap_or_default();
+    write_json(stream, 200, &serde_json::json!({ "ok": true, "text": text })).await
+}
+
+/// A `POST /memory/event` request body (the OpenCode plugin's tool hook — the
+/// only memory ingress for OpenCode, whose OOB SSE stream carries no tool
+/// events, AND — V14 Phase C — the only *usage* ingress for OpenCode, for the
+/// same reason). Claude records both in-process via the transcript tap instead.
+#[derive(Deserialize)]
+struct MemoryEventBody {
+    #[serde(default)]
+    cwd: Option<String>,
+    session_id: String,
+    #[serde(default)]
+    agent: Option<String>,
+    tool: String,
+    #[serde(default)]
+    args: Value,
+}
+
+/// `POST /memory/event`: classify an agent tool call and record it as a memory
+/// event, AND (V14 Phase C) record its estimated usage. Best-effort — an
+/// unclassifiable tool or a missing graph service is a silent no-op (200 with
+/// memory recording skipped; usage recording no-ops internally the same way),
+/// never an error the plugin has to handle.
+async fn handle_memory_event(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: MemoryEventBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let ok = serde_json::json!({ "ok": true });
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &ok).await;
+    };
+    let graph = graph.inner().clone();
+    let cwd = body.cwd.as_deref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let agent = body.agent.as_deref().unwrap_or("opencode");
+
+    if let Some((kind, arg)) = crate::graph::classify_tool(&body.tool) {
+        let get = |k: &str| body.args.get(k).and_then(Value::as_str);
+        let (path, detail) = match arg {
+            crate::graph::MemArg::Path => (
+                get("file_path").or_else(|| get("filePath")).or_else(|| get("notebook_path")).or_else(|| get("path")).unwrap_or("").to_string(),
+                None,
+            ),
+            crate::graph::MemArg::Pattern => (get("pattern").or_else(|| get("path")).or_else(|| get("query")).unwrap_or("").to_string(), None),
+            crate::graph::MemArg::Command => (String::new(), get("command").map(|c| c.chars().take(200).collect::<String>())),
+        };
+        // Skip an event with no usable target: an empty path (Path/Pattern) or a
+        // Command whose `command` arg was absent (detail is None) — recording it
+        // would just evict useful events from the ring.
+        let recordable = match arg {
+            crate::graph::MemArg::Command => detail.is_some(),
+            _ => !path.is_empty(),
+        };
+        if recordable {
+            graph.record_mem_event(&cwd, &body.session_id, agent, kind, &path, None, None, detail.as_deref());
+        }
+    }
+
+    // V14 Phase C: OpenCode's usage tap (see the C3 spike note atop
+    // `oob/opencode.rs` — its SSE stream carries no usage fields, so this
+    // hook, which already fires after every tool call, is the only place
+    // that can record OpenCode usage). Unlike the memory recording above,
+    // this runs for EVERY tool call, not just ones `classify_tool` maps to a
+    // filesystem/query target — usage wants the full picture. `chars` is
+    // estimated from the tool's serialized INPUT args (its actual output
+    // isn't visible to this hook), which is exactly why OpenCode sessions
+    // report `est_only` in the X-ray.
+    let chars = serde_json::to_string(&body.args).map(|s| s.chars().count()).unwrap_or(0) as u32;
+    graph.record_usage(
+        &cwd,
+        &body.session_id,
+        agent,
+        crate::graph::UsageEvent::ToolResult { tool: Some(body.tool.clone()), chars },
+    );
+
+    write_json(stream, 200, &ok).await
 }
 
 /// `POST /mcp/list`: the proxied MCP tool descriptors for the requesting

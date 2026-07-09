@@ -35,6 +35,10 @@ export interface GraphStatus {
   embedded: number;
   embed_total: number;
   embed_pending: number;
+  // V11 Phase G/F: code-embedding coverage + cached-digest count.
+  code_embedded: number;
+  code_embed_total: number;
+  digests: number;
   embed_error: string | null;
 }
 
@@ -109,7 +113,7 @@ export function graphTestEmbedder(): Promise<EmbedderProbe> {
 /// One recorded graph tool call. Mirror of Rust `graph::GraphCall`.
 export interface GraphCall {
   ts_ms: number;
-  source: 'claude' | 'offload';
+  source: 'claude' | 'opencode' | 'offload';
   tool: string;
   target: string;
   chars: number;
@@ -126,4 +130,415 @@ export function graphHistory(): Promise<GraphCall[]> {
 /// time). Returns an unlisten fn.
 export function onGraphStatus(cb: (status: GraphStatus) => void): Promise<UnlistenFn> {
   return listen<GraphStatus>('graph-status', (e) => cb(e.payload));
+}
+
+/// V12 Phase F (6c): the analyses-auto trigger's live counts, emitted only
+/// when they changed since the last completed index pass.
+export interface GraphAnalyses {
+  root: string;
+  dead_exports: number;
+  import_cycles: number;
+}
+
+/// Subscribe to `graph-analyses` (fires only on a count change, per-root).
+/// Drives the Analyses section's "+N since last pass" badges.
+export function onGraphAnalyses(cb: (a: GraphAnalyses) => void): Promise<UnlistenFn> {
+  return listen<GraphAnalyses>('graph-analyses', (e) => cb(e.payload));
+}
+
+/// V10 (Analyses): one candidate dead export. Mirror of Rust `DeadExportRow`.
+export interface DeadExportRow {
+  name: string;
+  kind: string;
+  file: string;
+  line: number;
+  signature: string;
+}
+
+/// Candidate unused public symbols (public/exported defs with no reference and
+/// no inbound call edge). Candidates only — dynamic dispatch, an external API,
+/// macros, or reflection can produce false positives. `root` defaults to the
+/// launch directory. On-demand (no polling).
+export function graphDeadExports(root?: string): Promise<DeadExportRow[]> {
+  return invoke<DeadExportRow[]>('graph_dead_exports', { root: root ?? null });
+}
+
+/// Import cycles between files — each entry is a loop of two or more files that
+/// transitively import one another. `root` defaults to the launch directory.
+export function graphCycles(root?: string): Promise<string[][]> {
+  return invoke<string[][]>('graph_cycles', { root: root ?? null });
+}
+
+/// V12 Phase B (Analyses): one symbol changed since HEAD. Mirror of Rust
+/// `ChangedSymbolRow`.
+export interface ChangedSymbolRow {
+  name: string;
+  kind: string;
+  file: string;
+  line: number;
+}
+
+/// V12 Phase B (Analyses): one transitive dependent of a changed symbol.
+/// Mirror of Rust `DependentRow`. `approx` is always true today — the call
+/// graph is name-keyed, not id-resolved (same honesty convention as
+/// `graph_references`).
+export interface DependentRow {
+  name: string;
+  kind: string;
+  file: string;
+  line: number;
+  depth: number;
+  approx: boolean;
+  /// V15 Feature 3: weakest edge confidence along the discovery chain
+  /// (`extracted` | `inferred` | `ambiguous`).
+  confidence: string;
+}
+
+/// V12 Phase B (Analyses): the working-tree diff's blast radius. Mirror of
+/// Rust `ImpactResult`.
+export interface ImpactResult {
+  changed: ChangedSymbolRow[];
+  dependents: DependentRow[];
+  unindexed: string[];
+}
+
+/// "What does my current working-tree change affect?" — diff mode only (vs
+/// HEAD). `root` defaults to the launch directory. Rejects with a
+/// "not a git repository" message when `root` isn't a git repo.
+export function graphImpact(root?: string): Promise<ImpactResult> {
+  return invoke<ImpactResult>('graph_impact', { root: root ?? null });
+}
+
+/// V10 (Memory): one file in a session's working set. Mirror of Rust
+/// `graph::memory::WorkingSetEntry`.
+export interface WorkingSetEntry {
+  path: string;
+  touches: number;
+  last_kind: string;
+  last_ms: number;
+  top_symbols: string[];
+}
+
+/// A remembered note. Mirror of Rust `graph::memory::MemNote`.
+export interface MemNote {
+  note_id: string;
+  session_id: string;
+  text: string;
+  ts_ms: number;
+  pinned: boolean;
+}
+
+/// A session summary row. Mirror of Rust `graph::memory::SessionInfo`.
+export interface SessionInfo {
+  session_id: string;
+  agent: string;
+  started_ms: number;
+  last_ms: number;
+  events: number;
+}
+
+/// The project's full memory readout. Mirror of Rust
+/// `graph::memory::MemorySnapshot`.
+export interface MemorySnapshot {
+  current_session: string | null;
+  working_set: WorkingSetEntry[];
+  notes: MemNote[];
+  sessions: SessionInfo[];
+}
+
+/// The project's session/action memory. `root` defaults to the launch directory.
+export function graphMemory(root?: string): Promise<MemorySnapshot> {
+  return invoke<MemorySnapshot>('graph_memory', { root: root ?? null });
+}
+
+// ── V15 Feature 1: path tracing ──────────────────────────────────────────
+
+/// One node on a traced path. Mirror of Rust `PathNodeRow`. `edge_to_next` /
+/// `confidence` describe the edge leaving this node toward the next; both are
+/// null on the final node. `line` is 0 for a file node (`kind === 'file'`).
+export interface PathNodeRow {
+  id: string;
+  label: string;
+  file: string;
+  line: number;
+  kind: string;
+  edge_to_next: string | null;
+  confidence: string | null;
+}
+
+/// The result of a `graph_path` trace. Mirror of Rust `PathResult`.
+export interface PathResult {
+  found: boolean;
+  nodes: PathNodeRow[];
+  hops: number;
+  equal_alternatives: number;
+}
+
+/// V15 Feature 1: trace the shortest path between two entities (`from`/`to` are
+/// a symbol name, `file:line`, or file path). `kinds` restricts the edge types
+/// traversed (subset of `call`/`import`/`contains`; default all). `symmetric`
+/// walks edges undirected. `root` defaults to the launch directory.
+export function graphPath(
+  from: string,
+  to: string,
+  opts?: { kinds?: string[]; symmetric?: boolean; root?: string },
+): Promise<PathResult> {
+  return invoke<PathResult>('graph_path', {
+    root: opts?.root ?? null,
+    from,
+    to,
+    kinds: opts?.kinds ?? null,
+    symmetric: opts?.symmetric ?? null,
+  });
+}
+
+// ── V15 Feature 2: architecture overview ─────────────────────────────────
+
+/// A hub in the architecture overview. Mirror of Rust `GodNodeRow`.
+export interface GodNodeRow {
+  id: string;
+  label: string;
+  file: string;
+  kind: string;
+  degree: number;
+}
+
+/// A subsystem (file community). Mirror of Rust `SubsystemRow`. `files` is a
+/// bounded sample of members; `name` is the derived common-prefix label.
+export interface SubsystemRow {
+  name: string;
+  size: number;
+  files: string[];
+  hub: string;
+}
+
+/// An edge crossing subsystem boundaries. Mirror of Rust `SurprisingRow`.
+export interface SurprisingRow {
+  from: string;
+  to: string;
+  kind: string;
+  from_subsystem: string;
+  to_subsystem: string;
+}
+
+/// The architecture overview. Mirror of Rust `ArchResult`.
+export interface ArchResult {
+  god_nodes: GodNodeRow[];
+  subsystems: SubsystemRow[];
+  surprising: SurprisingRow[];
+}
+
+/// V15 Feature 2: the system-shape overview (god nodes, subsystems, surprising
+/// edges). Heuristic clustering — advisory, not authoritative. `root` defaults
+/// to the launch directory.
+export function graphArchitecture(root?: string): Promise<ArchResult> {
+  return invoke<ArchResult>('graph_architecture', { root: root ?? null });
+}
+
+// ── V15 Feature 4: Graph View snapshot ───────────────────────────────────
+
+/// One node in the Graph View snapshot. Mirror of Rust `VizNodeRow`.
+/// `degree` = node size; `subsystem` = node color; `kind === 'file'` for files.
+export interface VizNodeRow {
+  id: string;
+  label: string;
+  file: string;
+  kind: string;
+  degree: number;
+  subsystem: string;
+}
+
+/// One edge in the Graph View snapshot. Mirror of Rust `VizEdgeRow`.
+/// `kind` = edge color (call/import/contains); `confidence` = dash pattern.
+export interface VizEdgeRow {
+  src: string;
+  dst: string;
+  kind: string;
+  confidence: string;
+}
+
+/// A bounded {nodes, edges} subgraph for the Graph View tab. Mirror of Rust
+/// `VizGraphResult`.
+export interface VizGraphResult {
+  nodes: VizNodeRow[];
+  edges: VizEdgeRow[];
+}
+
+/// V15 Feature 4: fetch the bounded subgraph for the Graph View tab (top-degree
+/// hubs + edges among them, capped at `graph_viz_max_nodes`). `root` defaults
+/// to the launch directory.
+export function graphVizSnapshot(root?: string): Promise<VizGraphResult> {
+  return invoke<VizGraphResult>('graph_viz_snapshot', { root: root ?? null });
+}
+
+/// Clear one session's memory (`session` = its id) or the whole project's
+/// (`session` omitted).
+export function graphMemoryClear(session?: string, root?: string): Promise<void> {
+  return invoke<void>('graph_memory_clear', { root: root ?? null, session: session ?? null });
+}
+
+/// Pin/unpin a note (pinned notes survive session eviction, show project-wide).
+export function graphNoteSetPinned(noteId: string, pinned: boolean, root?: string): Promise<void> {
+  return invoke<void>('graph_note_set_pinned', { root: root ?? null, noteId, pinned });
+}
+
+/// V10 (Context): the result of a context retrieval. Mirror of Rust
+/// `graph::context::RetrieveResult`.
+export interface RetrieveResult {
+  context_md: string;
+  files_used: string[];
+  chars: number;
+  tokens_est: number;
+}
+
+/// Preview what context injection WOULD prepend for `prompt` (bypasses the
+/// injection toggle, so it works while injection is off). `root` defaults to the
+/// launch directory.
+export function graphContextPreview(prompt: string, root?: string): Promise<RetrieveResult> {
+  return invoke<RetrieveResult>('graph_context_preview', { root: root ?? null, prompt });
+}
+
+/// V12 Phase E (Memory): a durable project fact. Mirror of Rust
+/// `graph::memory::ProjectFact`.
+export interface ProjectFact {
+  fact_id: string;
+  text: string;
+  /// The session that produced this fact, or `"manual"` for a UI-added fact.
+  source_session: string;
+  ts_ms: number;
+  pinned: boolean;
+  archived: boolean;
+}
+
+/// The project's live (non-archived) durable facts, pinned first then newest.
+/// `root` defaults to the launch directory.
+export function graphFacts(root?: string): Promise<ProjectFact[]> {
+  return invoke<ProjectFact[]>('graph_facts', { root: root ?? null });
+}
+
+/// Pin / unpin / archive / delete one project fact. `root` defaults to the
+/// launch directory.
+export function graphFactUpdate(
+  id: string,
+  action: 'pin' | 'unpin' | 'archive' | 'delete',
+  root?: string,
+): Promise<void> {
+  return invoke<void>('graph_fact_update', { root: root ?? null, id, action });
+}
+
+/// Manually add a project fact from the Facts UI's "add fact" input.
+/// `root` defaults to the launch directory.
+export function graphFactAdd(text: string, pin?: boolean, root?: string): Promise<void> {
+  return invoke<void>('graph_fact_add', { root: root ?? null, text, pin: pin ?? null });
+}
+
+// ── V14 Phase D/D2: Usage section (token X-ray) + budget-tuning advisor ───
+
+/// One tool's ranked contribution to a session (the Usage section's "top
+/// consumers" table). Mirror of Rust `graph::ToolUsage`. `est_tokens` is a
+/// `chars / 4` estimate — always render it labeled `est.`; `calls` is exact.
+export interface ToolUsage {
+  tool: string;
+  est_tokens: number;
+  calls: number;
+}
+
+/// One turn's token breakdown. Mirror of Rust `graph::memory::TurnUsage`
+/// (V14 Phase C/D). `tool_chars` is the estimated tool-result characters
+/// that arrived just before this turn — divide by 4 for the "est. tool"
+/// stacked-bar segment.
+export interface TurnUsage {
+  msg_id: string;
+  model: string | null;
+  in_tok: number;
+  out_tok: number;
+  cache_read: number;
+  cache_make: number;
+  tool_chars: number;
+  ts_ms: number;
+}
+
+/// Summed token totals across a session's turns. Mirror of Rust
+/// `graph::memory::UsageTotals`.
+export interface UsageTotals {
+  in_tok: number;
+  out_tok: number;
+  cache_read: number;
+  cache_make: number;
+}
+
+/// The current (most-recently-active) session's usage readout. Mirror of
+/// Rust `graph::memory::SessionUsage`.
+export interface SessionUsage {
+  session_id: string;
+  turns: TurnUsage[];
+  totals: UsageTotals;
+  top_tools: ToolUsage[];
+}
+
+/// One project session's totals row (Sessions table). Mirror of Rust
+/// `graph::memory::SessionUsageRow`.
+export interface SessionUsageRow {
+  session_id: string;
+  agent: string;
+  totals: UsageTotals;
+  tool_chars: number;
+  cache_hit_ratio: number;
+  /// True when this session has no exact `usage` data (currently every
+  /// non-Claude agent) — the table's "est" badge.
+  est_only: boolean;
+}
+
+/// The Effectiveness panel's three measured counters — all exact chars, no
+/// fabricated savings figure. Mirror of Rust `graph::memory::Effectiveness`.
+export interface Effectiveness {
+  injected_chars: number;
+  deduped_chars: number;
+  advisor_displaced_chars: number;
+}
+
+/// The Usage section's full payload. Mirror of Rust `graph::UsageSnapshot`.
+export interface UsageSnapshot {
+  current: SessionUsage | null;
+  sessions: SessionUsageRow[];
+  effectiveness: Effectiveness;
+  offload_local_tasks: number;
+}
+
+/// The Usage section's token X-ray for `root` (defaults to the launch
+/// directory).
+export function graphUsage(root?: string): Promise<UsageSnapshot> {
+  return invoke<UsageSnapshot>('graph_usage', { root: root ?? null });
+}
+
+/// One budget-tuning proposal. Mirror of Rust `advisor::Proposal`.
+/// `signature` is opaque to the UI — pass it straight through to
+/// `advisorDismiss` unchanged.
+export interface AdvisorProposal {
+  setting: string;
+  current: string;
+  proposed: string;
+  rationale: string;
+  rule_id: string;
+  signature: string;
+}
+
+/// Mirror of Rust `ipc::commands::AdvisorSnapshot`. `collecting` distinguishes
+/// "not enough data yet" from "checked, all healthy" (an empty `proposals`
+/// with `collecting: false`).
+export interface AdvisorSnapshot {
+  proposals: AdvisorProposal[];
+  collecting: boolean;
+}
+
+/// The budget-tuning advisor's current proposals for `root` (defaults to the
+/// launch directory).
+export function graphUsageAdvice(root?: string): Promise<AdvisorSnapshot> {
+  return invoke<AdvisorSnapshot>('graph_usage_advice', { root: root ?? null });
+}
+
+/// Dismiss one proposal (`ruleId` + its `signature`, both echoed verbatim
+/// from the `AdvisorProposal` the user clicked Dismiss on).
+export function advisorDismiss(ruleId: string, signature: string): Promise<void> {
+  return invoke<void>('advisor_dismiss', { ruleId, signature });
 }

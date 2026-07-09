@@ -16,6 +16,27 @@
 //! it finishes — including messages between tool calls. The same stream drives
 //! the avatar Thinking/Idle state (V20 Phase E folds in here since it shares the
 //! connection).
+//!
+//! ## V14 Phase C spike (C3): no usage/token fields on this stream
+//! `message.updated`'s `properties.info` object was captured exhaustively
+//! live in spike 0a (the vocabulary above is the complete shape observed) and
+//! carries only `{id, role, time}` — no `tokens`/`usage`/cost fields on the
+//! pinned OpenCode version. So unlike Claude's transcript (which embeds exact
+//! `usage` on every assistant message), OpenCode gives this SSE consumer
+//! nothing to build an exact token count from, and this file adds no usage
+//! tap. Per the milestone's "absent ⇒ tool_result-class events only" fallback,
+//! the actual OpenCode usage tap lives at `offload::loopback::handle_memory_event`
+//! (`POST /memory/event`) instead — already the sole memory ingress for
+//! OpenCode (see that function's doc comment) and the only place that has
+//! both a `cwd`/session AND a tool name to record against; this SSE consumer
+//! has neither. It estimates chars from the tool's INPUT args (its output
+//! isn't visible to that hook either), which is why every OpenCode session
+//! reports `est_only: true` in [`crate::graph::GraphIndex::usage_all_sessions`]
+//! (derived from `session.agent != "claude"`, not a separately tracked flag).
+//! TODO(spike C3): re-check `message.updated`'s `info` shape against a newer
+//! pinned OpenCode release — if a future version adds token/usage fields
+//! there, wire a `record_usage` call into this file's `Tracker` directly
+//! (it would need a `root`/session context this struct doesn't carry today).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -288,6 +309,7 @@ mod tests {
             state_signals: sig_tx,
             settings,
             cancel: CancellationToken::new(),
+            mem: None,
         };
         (ctx, tts_rx, sig_rx)
     }

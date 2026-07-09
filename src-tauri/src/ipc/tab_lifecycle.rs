@@ -268,6 +268,109 @@ pub async fn create_shell_tab(
     Ok(tab)
 }
 
+/// Create a new user-managed Preview tab (the "+"-adjacent "New Preview tab"
+/// affordance — V14 Phase F). Unlike `create_shell_tab`/`create_ai_tab`
+/// there is no command/binary/cwd/env to validate — a Preview tab has no
+/// PTY at all, just a `url`/`device_width`/`auto_reload` triple the backend
+/// child webview (`crate::preview`) reads. An empty `url` falls back to
+/// `Settings::preview_last_url` (the last URL used by any Preview tab in
+/// this project), then `preview::DEFAULT_PREVIEW_URL`.
+#[tauri::command]
+pub async fn create_preview_tab(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<TabId, TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
+
+    let snap = state.settings.current();
+    let resolved_url = {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            snap.preview_last_url
+                .clone()
+                .unwrap_or_else(|| crate::preview::DEFAULT_PREVIEW_URL.to_string())
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let name = unique_preview_tab_name(&snap);
+
+    let tab = TabId::Preview(format!("preview-{}", Uuid::new_v4()));
+    let tab_meta = TabMeta {
+        id: tab.clone(),
+        kind: TabKind::Preview,
+        name: name.clone(),
+    };
+
+    // Persist BEFORE registering — same ordering rationale as
+    // `create_shell_tab`/`create_ai_tab` (though Preview tabs never call
+    // `pty_start`, keeping the ordering uniform avoids a special case here).
+    {
+        let entry = crate::settings::PreviewTabConfig {
+            id: tab.as_str().to_string(),
+            builtin: false,
+            name: name.clone(),
+            url: resolved_url.clone(),
+            device_width: None,
+            auto_reload: false,
+        };
+        state.settings.mutate(move |s| {
+            s.tabs.push(TabConfig::Preview(entry.clone()));
+            s.preview_last_url = Some(resolved_url.clone());
+        });
+    }
+
+    let position = {
+        let mut registry = state.tabs.lock().await;
+        registry.insert_user_tab(tab.clone(), name.clone())
+    };
+
+    if let Err(e) = state
+        .state_signals
+        .send(StateSignal::TabAdded {
+            meta: tab_meta,
+            position,
+        })
+        .await
+    {
+        warn!(error = %e, "create_preview_tab: state-signal channel closed");
+        let id = tab.as_str().to_string();
+        state.settings.mutate(move |s| s.tabs.retain(|t| t.id() != id));
+        state.tabs.lock().await.remove_tab(&tab).await;
+        return Err(TabLifecycleError::internal("state signal channel closed"));
+    }
+
+    {
+        let mut registry = state.tabs.lock().await;
+        if let Err(e) = registry.activate(tab.clone()).await {
+            warn!(error = %e, "create_preview_tab: activate failed");
+        }
+    }
+
+    info!(?tab, "preview tab created");
+    Ok(tab)
+}
+
+/// "Preview" if untaken, else the lowest-free-integer-suffixed "Preview N"
+/// (N ≥ 2) — unlike [`unique_tab_name`] (which always suffixes, because its
+/// caller's `base` is an existing template's name), a Preview tab has no
+/// pre-existing instance to collide with, so the FIRST one is plain
+/// "Preview".
+fn unique_preview_tab_name(settings: &Settings) -> String {
+    let taken: std::collections::HashSet<&str> =
+        settings.tabs.iter().map(|t| t.name()).collect();
+    if !taken.contains("Preview") {
+        return "Preview".to_string();
+    }
+    for n in 2..1000 {
+        let candidate = format!("Preview {n}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    format!("Preview {}", Uuid::new_v4())
+}
+
 /// Pick a unique display name for a spawned duplicate by suffixing the
 /// template's name with the lowest free integer ≥ 2 (e.g. "Claude" →
 /// "Claude 2", "Claude 3"). Falls back to a uuid suffix in the
@@ -312,7 +415,7 @@ pub async fn create_ai_tab(
         })?;
         match entry {
             TabConfig::AiTool(ai) => ai.clone(),
-            TabConfig::Shell(_) => return Err(TabLifecycleError::WrongKind),
+            TabConfig::Shell(_) | TabConfig::Preview(_) => return Err(TabLifecycleError::WrongKind),
         }
     };
 
@@ -369,6 +472,116 @@ pub async fn create_ai_tab(
     Ok(tab)
 }
 
+/// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — the worktree
+/// counterpart of [`create_ai_tab`]. Creates a fresh cImp worktree (branch
+/// `cimp/<slug>` under `<root>/.cimp/worktrees/<slug>`, refused per
+/// `workbench::worktree::create`'s preconditions: nested repo, detached
+/// `HEAD`, duplicate slug), then duplicates `template`'s AI config exactly
+/// like the plain "+" duplicate — except the new tab's `cwd` is set to the
+/// worktree's path (D2: threaded through `build_ai_tool_spec` /
+/// `pty::manager` exactly the way a Shell tab's `cwd` already is) and its
+/// display name is prefixed `⑂ <slug>` so it reads as worktree-scoped at a
+/// glance. `root` defaults to the launch directory, like every other
+/// Workbench IPC command.
+///
+/// If the worktree is created but tab registration then fails (the
+/// state-signal-channel-closed case `create_ai_tab` also guards), the
+/// worktree is intentionally left in place rather than auto-discarded —
+/// `discard` is a double-confirmed, branch-deleting action the milestone
+/// reserves for an explicit user click; an orphaned (no-live-tab) worktree
+/// just shows up in the Worktrees section for manual cleanup, exactly like
+/// one whose tab was later closed.
+#[tauri::command]
+pub async fn create_ai_tab_in_worktree(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    workbench: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    template: TabId,
+    root: Option<String>,
+    slug: String,
+) -> Result<TabId, TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
+
+    let root_path = match root.as_deref().map(str::trim) {
+        Some(r) if !r.is_empty() => PathBuf::from(r),
+        _ => state.launch.cwd.clone(),
+    };
+
+    // Validate the template BEFORE creating the worktree. Same rule as
+    // `create_ai_tab`: the worktree-tab affordance only appears on AI tabs, so
+    // a missing entry or a Shell template is a malformed request. This read has
+    // no side effects, so doing it first means an invalid template can't orphan
+    // a freshly-created branch + worktree dir on disk. (Failures *past* the
+    // `worktree_create` below still don't roll back — see the doc comment.)
+    let mut cfg = {
+        let snap = state.settings.current();
+        let entry = snap.find_tab(template.as_str()).ok_or_else(|| {
+            TabLifecycleError::TabNotFound {
+                tab: template.as_str().to_string(),
+            }
+        })?;
+        match entry {
+            TabConfig::AiTool(ai) => ai.clone(),
+            TabConfig::Shell(_) | TabConfig::Preview(_) => return Err(TabLifecycleError::WrongKind),
+        }
+    };
+
+    let wt_path = workbench
+        .worktree_create(&root_path, &slug)
+        .await
+        .map_err(|e| TabLifecycleError::internal(format!("create worktree: {e}")))?;
+
+    let tab = TabId::Ai(format!("ai-{}", Uuid::new_v4()));
+    let base_name = format!("⑂ {slug}: {}", cfg.name);
+    let name = unique_tab_name(&state.settings.current(), &base_name);
+    cfg.id = tab.as_str().to_string();
+    cfg.builtin = false;
+    cfg.name = name.clone();
+    cfg.cwd = Some(wt_path);
+
+    let tab_meta = TabMeta {
+        id: tab.clone(),
+        kind: TabKind::AiTool,
+        name: name.clone(),
+    };
+
+    // Persist BEFORE registering — same ordering rationale as `create_ai_tab`.
+    state.settings.mutate(move |snap| {
+        snap.tabs.push(TabConfig::AiTool(cfg));
+    });
+
+    let position = {
+        let mut registry = state.tabs.lock().await;
+        registry.insert_user_tab(tab.clone(), name.clone())
+    };
+
+    if let Err(e) = state
+        .state_signals
+        .send(StateSignal::TabAdded {
+            meta: tab_meta,
+            position,
+        })
+        .await
+    {
+        warn!(error = %e, "create_ai_tab_in_worktree: state-signal channel closed");
+        let id = tab.as_str().to_string();
+        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
+        state.tabs.lock().await.remove_tab(&tab).await;
+        return Err(TabLifecycleError::internal("state signal channel closed"));
+    }
+
+    {
+        let mut registry = state.tabs.lock().await;
+        if let Err(e) = registry.activate(tab.clone()).await {
+            warn!(error = %e, "create_ai_tab_in_worktree: activate failed");
+        }
+    }
+
+    let _ = app; // reserved for future per-window emits
+    info!(?tab, ?template, %slug, "ai tab created in worktree");
+    Ok(tab)
+}
+
 /// Close a Shell tab (including the default `shell-default-1`). The AI
 /// builtins (Claude / Claude-local) reject with `BuiltinNotClosable`. The
 /// PTY is killed, the registry entry dropped, the settings entry removed,
@@ -376,14 +589,16 @@ pub async fn create_ai_tab(
 #[tauri::command]
 pub async fn close_tab(
     state: State<'_, AppState>,
+    preview_registry: State<'_, crate::preview::PreviewRegistry>,
     tab: TabId,
 ) -> Result<(), TabLifecycleError> {
     let _serializer = state.lifecycle_serializer.lock().await;
     // V8-03: the Offload Server tab is never closable (removed only by
     // disabling offload). V9-01: the Code Graph monitor tab likewise (removed
-    // only by disabling the graph). Guard explicitly so a hand-edit that clears
-    // the `builtin` flag still can't close them.
-    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor) {
+    // only by disabling the graph). V13 Phase A: the Workbench tab likewise
+    // (removed only by disabling workbench). Guard explicitly so a hand-edit
+    // that clears the `builtin` flag still can't close them.
+    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor | TabId::Workbench) {
         return Err(TabLifecycleError::BuiltinNotClosable);
     }
     {
@@ -433,6 +648,18 @@ pub async fn close_tab(
         return Err(TabLifecycleError::TabNotFound {
             tab: tab.as_str().to_string(),
         });
+    }
+
+    // V14 code-review fix (webview leak): proactively destroy a closed
+    // Preview tab's child webview from the backend, rather than relying
+    // solely on `PreviewToolbar.svelte`'s `onDestroy` — a renderer crash,
+    // an HMR reload, or a thrown exception could skip that path entirely
+    // and leak the webview for the rest of the process's life.
+    // `destroy_if_open` is idempotent, so this is safe even if the
+    // frontend's own cleanup also runs (whichever gets there first wins;
+    // the other is a no-op).
+    if tab.kind() == TabKind::Preview {
+        crate::preview::destroy_if_open(&preview_registry, tab.as_str());
     }
 
     // V1.4-04 D.6: drop any persisted scrollback file for the closed
@@ -648,7 +875,9 @@ pub async fn reconfigure_shell_tab(
             })
         }
         Some(TabConfig::Shell(_)) => {}
-        Some(TabConfig::AiTool(_)) => return Err(TabLifecycleError::WrongKind),
+        Some(TabConfig::AiTool(_)) | Some(TabConfig::Preview(_)) => {
+            return Err(TabLifecycleError::WrongKind)
+        }
     }
     let new_command = validated.command.to_string_lossy().into_owned();
     let new_name = validated.name.clone();
@@ -1209,6 +1438,13 @@ async fn remove_ai_builtin_tab(
 
     if let Err(e) = crate::pty::scrollback::delete(&tab) {
         warn!(?tab, error = %e, "set_enabled_ai_tabs: scrollback delete failed");
+    }
+
+    // Drop the tab's typed-input echo buffer, mirroring `close_tab` — without
+    // this, disabling an AI tab via the Settings checkbox leaves its
+    // `user_input_buf` entry behind.
+    if let Ok(mut buf) = state.user_input_buf.lock() {
+        buf.remove(&tab);
     }
 
     state.settings.mutate(|snap| {

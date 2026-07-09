@@ -41,6 +41,14 @@ pub fn build_launch_spec(
 
     match entry {
         TabConfig::AiTool(cfg) => build_ai_tool_spec(tab, cfg, settings, launch_cwd, invocation_args),
+        // V14 Phase F: Preview tabs are an embedded child webview, not a
+        // subprocess — the frontend never calls `pty_start` for one (see
+        // `TabKind::Preview`'s doc comment), so this arm should be
+        // unreachable in practice; it exists only so the match stays
+        // exhaustive and a stray call fails cleanly instead of panicking.
+        TabConfig::Preview(_) => Err(AppError::Pty(format!(
+            "tab {id} is a Preview tab — it has no PTY to launch"
+        ))),
         TabConfig::Shell(cfg) => {
             // The detection module verified the default Shell-1 binary;
             // user-supplied paths from the New Shell Tab dialog are
@@ -86,6 +94,10 @@ fn build_ai_tool_spec(
     // the pure `compose_ai_env` path so the config builder stays test-safe.
     if command_is(&cfg.command, "opencode") {
         write_opencode_instructions(cfg, settings);
+        // V10: drop the dependency-free injection/memory plugin into the
+        // project's `.opencode/plugin/`, baking in the current loopback port +
+        // token. Uses `working_dir` (the project root the TUI opens).
+        write_opencode_plugin(&working_dir, settings);
     }
     // V20: resolve the out-of-band TTS source. For OpenCode this also injects
     // the `--port`/`--hostname` the fullscreen TUI hosts its event server on
@@ -190,13 +202,90 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         args.push(addendum);
     }
 
-    if settings.statusline.enabled {
-        if let Some(command) = crate::statusline::launch_command() {
-            let overlay = serde_json::json!({
-                "statusLine": { "type": "command", "command": command }
-            });
+    // A single `--settings` overlay carrying every session-scoped Claude Code
+    // setting cImp injects: the `statusLine` renderer (gated on
+    // `statusline.enabled`) and the V10 `UserPromptSubmit` context-injection
+    // hook (gated on `graph.enabled && graph.context_injection`). Merged into
+    // one object so we never rely on Claude concatenating repeated `--settings`,
+    // and it layers over the user's own settings without touching `~/.claude`.
+    {
+        let mut overlay = serde_json::Map::new();
+        if settings.statusline.enabled {
+            if let Some(command) = crate::statusline::launch_command() {
+                overlay.insert(
+                    "statusLine".to_string(),
+                    serde_json::json!({ "type": "command", "command": command }),
+                );
+            }
+        }
+        // Accumulate Claude hook entries (UserPromptSubmit context injection,
+        // V11 PreCompact compaction survival, V11 PreToolUse read advisor) into
+        // one `hooks` object — each entry is installed only when its gate is on.
+        {
+            let mut hooks = serde_json::Map::new();
+            // V13 Phase C: widened from `context_injection` alone so the
+            // prompt-tap checkpoint trigger (`workbench::on_prompt`, called
+            // from the `/context/retrieve` handler BEFORE its own injection
+            // gate) still runs when the user wants checkpoints but has
+            // injection off — the milestone's Decision 4. The retrieve
+            // handler's own *injection* gate is unaffected by this; it stays
+            // on `context_injection` alone.
+            if settings.graph.enabled && (settings.graph.context_injection || settings.workbench.checkpoints) {
+                if let Some(command) = crate::statusline::context_hook_command() {
+                    hooks.insert(
+                        "UserPromptSubmit".to_string(),
+                        serde_json::json!([ { "hooks": [
+                            { "type": "command", "command": command, "timeout": 5 }
+                        ] } ]),
+                    );
+                }
+            }
+            // V11 Phase D: PreCompact — carry the working set through a
+            // compaction. Kept on its own narrower condition (still requires
+            // injection, unlike the widened UserPromptSubmit hook above) —
+            // compaction survival is meaningless without injection to feed.
+            if settings.graph.enabled && settings.graph.context_injection && settings.graph.compaction_context {
+                if let Some(command) = crate::statusline::hook_command("--precompact-hook") {
+                    hooks.insert(
+                        "PreCompact".to_string(),
+                        serde_json::json!([ { "hooks": [
+                            { "type": "command", "command": command, "timeout": 5 }
+                        ] } ]),
+                    );
+                }
+            }
+            // V11 Phase E: PreToolUse read advisor (opt-in; independent of the
+            // injection toggle, but still needs the graph). Matches only `Read`.
+            if settings.graph.enabled && settings.graph.read_advisor {
+                if let Some(command) = crate::statusline::hook_command("--read-hook") {
+                    hooks.insert(
+                        "PreToolUse".to_string(),
+                        serde_json::json!([ { "matcher": "Read", "hooks": [
+                            { "type": "command", "command": command, "timeout": 5 }
+                        ] } ]),
+                    );
+                }
+            }
+            // V12 Phase F (6a/6b): PostToolUse auto-check after an edit — opt-in
+            // (behavior hook), needs the graph AND at least one configured check
+            // (nothing to run otherwise). Matches the edit-class tools.
+            if settings.graph.enabled && settings.graph.auto_check && !settings.checks.is_empty() {
+                if let Some(command) = crate::statusline::hook_command("--postedit-hook") {
+                    hooks.insert(
+                        "PostToolUse".to_string(),
+                        serde_json::json!([ { "matcher": "Edit|Write|MultiEdit", "hooks": [
+                            { "type": "command", "command": command, "timeout": 5 }
+                        ] } ]),
+                    );
+                }
+            }
+            if !hooks.is_empty() {
+                overlay.insert("hooks".to_string(), serde_json::Value::Object(hooks));
+            }
+        }
+        if !overlay.is_empty() {
             args.push("--settings".to_string());
-            args.push(overlay.to_string());
+            args.push(serde_json::Value::Object(overlay).to_string());
         }
     }
 
@@ -240,7 +329,11 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
 /// assistant prose directly. The per-tab `tts_injection.enabled` flag is now
 /// the "speak this tab" gate read by the out-of-band sources, not a prompt
 /// injection toggle (the former free-text `instructions` field is gone).
-fn compose_capability_guidance(_cfg: &AiToolTabConfig, settings: &Settings) -> String {
+///
+/// V12 Phase E: when `graph.promote_pinned_facts` is on, a marked
+/// `## cImp project facts` block of PINNED facts is appended last (see
+/// [`fact_promotion_block`]) — launch-time only, best-effort.
+fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> String {
     let mut addendum = String::new();
     if settings.offload.enabled && settings.offload.inject_guidance {
         if !addendum.is_empty() {
@@ -257,7 +350,59 @@ fn compose_capability_guidance(_cfg: &AiToolTabConfig, settings: &Settings) -> S
             addendum.push_str(GRAPH_SEMANTIC_GUIDANCE);
         }
     }
+    if settings.graph.enabled && settings.graph.promote_pinned_facts {
+        // `cfg.cwd` is the tab's configured project root; when unset the real
+        // launch falls back to the launch directory (`std::env::current_dir()`
+        // at the time `main` computed `launch_cwd` — see `main.rs`), which is
+        // the same value this fallback reproduces without threading a root
+        // parameter through every caller (most of which have no reason to
+        // otherwise take one, and are exercised by many existing tests).
+        let root = cfg
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        if let Some(block) = fact_promotion_block(&root, settings) {
+            if !addendum.is_empty() {
+                addendum.push_str("\n\n");
+            }
+            addendum.push_str(&block);
+        }
+    }
     addendum
+}
+
+/// V12 Phase E: the `## cImp project facts` launch-time addendum — PINNED
+/// facts only, newest-pinned first, capped ~1500 chars. `None` when the graph
+/// hasn't been built at `root` yet, has no pinned facts, or can't be opened —
+/// best-effort, same posture as this module's other launch-time I/O (e.g.
+/// [`write_opencode_instructions`]).
+fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
+    const CAP_CHARS: usize = 1500;
+    let sub = settings.graph.effective_db_subdir();
+    let idx = crate::graph::GraphIndex::open_existing(root, &sub).ok()?;
+    let mut pinned: Vec<_> = idx
+        .list_project_facts(false, 200)
+        .ok()?
+        .into_iter()
+        .filter(|f| f.pinned)
+        .collect();
+    if pinned.is_empty() {
+        return None;
+    }
+    // `list_project_facts` already returns pinned-first/newest, but the
+    // pinned-only filter above could in principle be fed a differently-sorted
+    // source later — sort explicitly here so "newest-pinned first" holds
+    // regardless.
+    pinned.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+    let mut out = String::from("## cImp project facts\n");
+    for f in &pinned {
+        let line = format!("- {}\n", f.text);
+        if out.len() + line.len() > CAP_CHARS {
+            break;
+        }
+        out.push_str(&line);
+    }
+    Some(out)
 }
 
 /// V8-01: the system-prompt addendum telling Opus *when* to reach for
@@ -275,12 +420,22 @@ window. Keep work that needs your full reasoning or the conversation's context h
 const GRAPH_GUIDANCE: &str = "This project has a code knowledge graph (from the cimp-offload MCP \
 server). Prefer the `graph_*` tools over grep for code-structure questions: `graph_find_symbol` \
 (where a symbol is defined), `graph_callers`/`graph_callees` (call relationships), \
-`graph_references`, `graph_imports`, `graph_outline` (a file's definitions), `graph_transitive` \
+`graph_references`, `graph_imports`, `graph_outline` (a file's definitions), `graph_snippet` \
+(fetch just one definition's body instead of reading the whole file — for files over ~300 lines \
+prefer `graph_outline` → `graph_snippet` over a full Read), `graph_transitive` \
 (transitive call chains), `graph_search_docs` (documentation/doc-comments), and \
 `graph_struct_search` (find code by AST shape via a tree-sitter query — e.g. every `.unwrap()` or \
 every function with a given parameter pattern — when text search can't express the structure). They \
 return precise, token-bounded results from an index, so they're cheaper and more exact than text \
-search for 'where is X defined', 'who calls X', and impact analysis.";
+search for 'where is X defined', 'who calls X', and impact analysis. `graph_dead_exports` lists \
+candidate unused public symbols and `graph_cycles` lists import cycles. For the edit→check→fix \
+loop: before changing shared code run `graph_impact` (what your working-tree diff could break) and \
+`graph_tests_for` (which tests cover a symbol); after edits run `run_check {changed_only:true}` for \
+deduplicated diagnostics instead of a raw build dump; `graph_recent_changes` shows what's been \
+churning lately. This project also has \
+session memory: call `context_recall` at the start of a follow-up task to reload what this session \
+has been working on, and `context_note` to record a non-obvious decision (pin=true to keep it \
+across sessions) so it survives into later sessions.";
 
 /// V9-01: appended after [`GRAPH_GUIDANCE`] only when semantic search is on
 /// (the `graph_semantic_docs` tool is advertised to Opus only then).
@@ -352,6 +507,148 @@ fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
         }
     }
     let _ = std::fs::write(&path, text);
+}
+
+/// V10: write (or remove) the OpenCode injection/memory plugin in the project's
+/// `.opencode/plugin/cimp-inject.js`. The plugin is dependency-free (node
+/// builtins + global `fetch`, so OpenCode does not run a launch-time
+/// `bun install`) and bakes in the current loopback port + token — regenerated
+/// each launch since the token rotates per app run (idempotent overwrite). It
+/// serves two hooks:
+///   * `chat.message` → POST the prompt to `/context/retrieve` and append the
+///     digest **in place** on the existing text part (schema-safe; verified in
+///     the D0 spike), gated by the baked-in inject flag; and
+///   * `tool.execute.after` → POST to `/memory/event` (the sole memory ingress
+///     for OpenCode, whose OOB SSE stream carries no tool events).
+///
+/// Removed when the graph is off (nothing to inject or record). Also adds
+/// `.opencode/` to the project's `.git/info/exclude` so the generated plugin and
+/// OpenCode's own `.opencode/.gitignore` don't dirty `git status`.
+fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
+    let plugin_path = working_dir
+        .join(".opencode")
+        .join("plugin")
+        .join("cimp-inject.js");
+
+    // No graph → nothing to inject or record; clean up a stale plugin.
+    if !settings.graph.enabled {
+        let _ = std::fs::remove_file(&plugin_path);
+        return;
+    }
+    // Need the loopback endpoint to reach the app; without it, skip (and clean).
+    let Some(disc) = crate::offload::loopback::read_discovery() else {
+        let _ = std::fs::remove_file(&plugin_path);
+        return;
+    };
+
+    let inject_enabled = settings.graph.context_injection;
+    // V12 Phase F (6a/6b): same gate as the Claude PostToolUse hook — auto-check
+    // needs the graph AND at least one configured check.
+    let auto_check_enabled = settings.graph.auto_check && !settings.checks.is_empty();
+    let js = opencode_plugin_source(disc.port, &disc.token, inject_enabled, auto_check_enabled);
+
+    if let Some(dir) = plugin_path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::write(&plugin_path, js);
+    git_exclude_opencode(working_dir);
+}
+
+/// The dependency-free OpenCode plugin source, with the loopback port + token
+/// and the inject/auto-check flags baked in.
+fn opencode_plugin_source(port: u16, token: &str, inject_enabled: bool, auto_check_enabled: bool) -> String {
+    format!(
+        r#"// Generated by cImp (V10 Code Intelligence). Do not edit — regenerated each launch.
+const CIMP_LOOPBACK = "http://127.0.0.1:{port}";
+const CIMP_TOKEN = "{token}";
+const CIMP_INJECT_ENABLED = {inject};
+const CIMP_AUTO_CHECK_ENABLED = {auto_check};
+const CIMP_EDIT_TOOLS = new Set(["edit", "write", "patch"]);
+
+export default async (input) => ({{
+  // V13 Phase C: this POST always fires (not gated on CIMP_INJECT_ENABLED)
+  // so the app-side prompt-tap checkpoint trigger sees every prompt even
+  // when injection is off — only APPLYING the returned text to the draft is
+  // gated. Mirrors the Claude `--context-hook` shim, which always POSTs too.
+  "chat.message": async (inp, out) => {{
+    const p = out.parts.find((x) => x.type === "text");
+    if (!p || !p.text) return;
+    try {{
+      const r = await fetch(CIMP_LOOPBACK + "/context/retrieve", {{
+        method: "POST",
+        headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
+        body: JSON.stringify({{ cwd: input.directory, prompt: p.text, session_id: inp.sessionID, agent: "opencode" }}),
+        signal: AbortSignal.timeout(600),
+      }});
+      const j = await r.json();
+      if (CIMP_INJECT_ENABLED && j && j.ok && j.text) p.text += "\n\n" + j.text;
+    }} catch (_e) {{}}
+  }},
+  "tool.execute.after": async (inp) => {{
+    try {{
+      await fetch(CIMP_LOOPBACK + "/memory/event", {{
+        method: "POST",
+        headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
+        body: JSON.stringify({{
+          cwd: input.directory,
+          session_id: inp.sessionID,
+          agent: "opencode",
+          tool: inp.tool,
+          args: inp.args,
+        }}),
+        signal: AbortSignal.timeout(600),
+      }});
+    }} catch (_e) {{}}
+    // V12 Phase F (6a/6b): best-effort, fire-and-forget — OpenCode's hook
+    // return value isn't verified to carry context back to the model (the F0
+    // spike scope), so this doesn't await/use the response; the server-side
+    // debounce/diff/park still runs, and a parked block reaches the model via
+    // the next `chat.message` retrieve above.
+    if (CIMP_AUTO_CHECK_ENABLED && CIMP_EDIT_TOOLS.has(inp.tool)) {{
+      const filePath = (inp.args && (inp.args.filePath || inp.args.path)) || "";
+      fetch(CIMP_LOOPBACK + "/context/post_edit", {{
+        method: "POST",
+        headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
+        body: JSON.stringify({{
+          cwd: input.directory,
+          session_id: inp.sessionID,
+          file_path: filePath,
+          tool_name: inp.tool,
+        }}),
+        signal: AbortSignal.timeout(600),
+      }}).catch((_e) => {{}});
+    }}
+  }},
+}});
+"#,
+        port = port,
+        token = token,
+        inject = if inject_enabled { "true" } else { "false" },
+        auto_check = if auto_check_enabled { "true" } else { "false" },
+    )
+}
+
+/// Best-effort: add `.opencode/` to `<project>/.git/info/exclude` so the
+/// generated plugin (and OpenCode's own `.opencode/.gitignore`) don't show up in
+/// `git status`. No-op when there's no `.git` dir or the line is already present.
+fn git_exclude_opencode(working_dir: &Path) {
+    let info_dir = working_dir.join(".git").join("info");
+    if !info_dir.is_dir() {
+        return; // not a git repo (or a worktree/submodule shape we won't touch)
+    }
+    let exclude = info_dir.join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == ".opencode/") {
+        return;
+    }
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(".opencode/\n");
+    let _ = std::fs::write(&exclude, next);
 }
 
 /// V19: synthesize OpenCode's session-scoped config — the JSON document that
@@ -583,6 +880,159 @@ mod tests {
         settings.statusline.enabled = false;
         let args = build_pre_args(&claude_cfg(), &settings);
         assert!(settings_overlay(&args).is_none());
+    }
+
+    #[test]
+    fn context_hook_overlay_injected_when_injection_on() {
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.context_injection = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        let overlay = settings_overlay(&args).expect("overlay present");
+        let cmd = overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("hook command is a string");
+        assert!(cmd.ends_with(" --context-hook"), "got: {cmd}");
+        assert!(!cmd.contains('\\'), "path must be forward-slashed: {cmd}");
+    }
+
+    #[test]
+    fn no_context_hook_when_injection_off() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = false;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        // Graph on but injection off + statusline off + checkpoints off →
+        // no --settings overlay.
+        assert!(settings_overlay(&args).is_none());
+    }
+
+    /// V13 Phase C: the UserPromptSubmit hook (the prompt-tap checkpoint
+    /// trigger's transport) must still install when `workbench.checkpoints`
+    /// is on, even with context injection off — the milestone's Decision 4.
+    #[test]
+    fn context_hook_overlay_installed_when_checkpoints_on_even_if_injection_off() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = false;
+        settings.workbench.checkpoints = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        let overlay = settings_overlay(&args).expect("overlay present");
+        let cmd = overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("hook command is a string");
+        assert!(cmd.ends_with(" --context-hook"), "got: {cmd}");
+        // PreCompact stays off — it's still gated on context_injection alone.
+        assert!(overlay["hooks"].get("PreCompact").is_none());
+    }
+
+    /// Checkpoints alone (graph off) must NOT install the hook — the
+    /// milestone's widened condition still requires `graph.enabled` (the
+    /// hook's own gate prefix is unchanged, only the injection/checkpoints
+    /// half was widened).
+    #[test]
+    fn no_context_hook_when_checkpoints_on_but_graph_disabled() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = false;
+        settings.workbench.checkpoints = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        assert!(settings_overlay(&args).is_none());
+    }
+
+    #[test]
+    fn postedit_hook_installed_when_auto_check_on_with_checks_configured() {
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.auto_check = true;
+        settings.checks = vec![crate::checks::CheckDef {
+            name: "cargo".to_string(),
+            cmd: "cargo check".to_string(),
+            ..Default::default()
+        }];
+        let args = build_pre_args(&claude_cfg(), &settings);
+        let overlay = settings_overlay(&args).expect("overlay present");
+        let hook = &overlay["hooks"]["PostToolUse"][0];
+        assert_eq!(hook["matcher"], "Edit|Write|MultiEdit");
+        let cmd = hook["hooks"][0]["command"].as_str().expect("hook command is a string");
+        assert!(cmd.ends_with(" --postedit-hook"), "got: {cmd}");
+    }
+
+    #[test]
+    fn no_postedit_hook_when_auto_check_off_or_no_checks_configured() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = true;
+        settings.graph.auto_check = false;
+        settings.checks = vec![crate::checks::CheckDef::default()];
+        let args = build_pre_args(&claude_cfg(), &settings);
+        // auto_check off → no --settings overlay at all (nothing else is on).
+        assert!(settings_overlay(&args).is_none());
+
+        let mut settings2 = Settings::default();
+        settings2.statusline.enabled = false;
+        settings2.graph.enabled = true;
+        settings2.graph.auto_check = true;
+        settings2.checks = Vec::new();
+        let args2 = build_pre_args(&claude_cfg(), &settings2);
+        assert!(settings_overlay(&args2).is_none());
+    }
+
+    #[test]
+    fn statusline_and_context_hook_share_one_overlay() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = true;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        // Exactly one `--settings` flag carrying both keys.
+        assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
+        let overlay = settings_overlay(&args).expect("overlay present");
+        assert!(overlay.get("statusLine").is_some());
+        assert!(overlay.get("hooks").is_some());
+    }
+
+    #[test]
+    fn opencode_plugin_source_bakes_endpoint_and_flag() {
+        let js = opencode_plugin_source(54321, "deadbeef00", true, true);
+        assert!(js.contains("127.0.0.1:54321"));
+        assert!(js.contains("deadbeef00"));
+        assert!(js.contains("CIMP_INJECT_ENABLED = true"));
+        assert!(js.contains("CIMP_AUTO_CHECK_ENABLED = true"));
+        assert!(js.contains("/context/retrieve"));
+        assert!(js.contains("/memory/event"));
+        assert!(js.contains("/context/post_edit"));
+        assert!(js.contains("chat.message"));
+        assert!(js.contains("tool.execute.after"));
+        let off = opencode_plugin_source(1, "x", false, false);
+        assert!(off.contains("CIMP_INJECT_ENABLED = false"));
+        assert!(off.contains("CIMP_AUTO_CHECK_ENABLED = false"));
+    }
+
+    /// V13 Phase C: the `/context/retrieve` POST inside `chat.message` must
+    /// NOT be gated behind an early `if (!CIMP_INJECT_ENABLED) return`
+    /// (unlike the applying-the-text step) — the prompt-tap checkpoint
+    /// trigger needs every prompt to reach the app even when injection is
+    /// off. Also carries `agent: "opencode"` so the checkpoint it fires is
+    /// attributable.
+    #[test]
+    fn opencode_chat_message_posts_retrieve_even_when_injection_disabled() {
+        let js = opencode_plugin_source(1, "x", false, false);
+        assert!(js.contains(r#"agent: "opencode""#), "missing agent field: {js}");
+        // The fetch call must appear BEFORE any inject-gated early return —
+        // i.e. there is no `if (!CIMP_INJECT_ENABLED) return;` guarding the
+        // `chat.message` handler's body ahead of the fetch.
+        let chat_message_start = js.find("\"chat.message\"").expect("chat.message handler present");
+        let fetch_pos = js[chat_message_start..].find("fetch(CIMP_LOOPBACK").expect("fetch call present");
+        let between = &js[chat_message_start..chat_message_start + fetch_pos];
+        assert!(
+            !between.contains("if (!CIMP_INJECT_ENABLED) return"),
+            "the retrieve POST must not be gated on CIMP_INJECT_ENABLED: {between}"
+        );
+        // The gate DOES still apply to actually using the response text.
+        assert!(js.contains("CIMP_INJECT_ENABLED && j && j.ok && j.text"));
     }
 
     #[test]
@@ -927,5 +1377,80 @@ mod tests {
             Some("1"),
             "an explicit per-tab value must pass through the env merge",
         );
+    }
+
+    // ── V12 Phase E: fact promotion block ─────────────────────────────────
+
+    #[test]
+    fn fact_promotion_block_is_pinned_only_newest_first() {
+        let dir = std::env::temp_dir().join(format!("cimp-facts-{}", uuid::Uuid::new_v4()));
+        {
+            let idx = crate::graph::GraphIndex::open(&dir, ".cimp").expect("open");
+            idx.add_project_fact("f-old-pinned", "oldest pinned fact", "s1", 100, true)
+                .unwrap();
+            idx.add_project_fact("f-new-pinned", "newest pinned fact", "s1", 200, true)
+                .unwrap();
+            idx.add_project_fact("f-unpinned", "an unpinned fact must not appear", "s1", 300, false)
+                .unwrap();
+            // Dropped here, before reopening read-only below.
+        }
+
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.promote_pinned_facts = true;
+
+        let block = fact_promotion_block(&dir, &settings).expect("block present");
+        assert!(block.starts_with("## cImp project facts\n"), "{block}");
+        assert!(block.contains("newest pinned fact"), "{block}");
+        assert!(block.contains("oldest pinned fact"), "{block}");
+        assert!(!block.contains("must not appear"), "unpinned facts must not be promoted: {block}");
+
+        let pos_new = block.find("newest pinned fact").unwrap();
+        let pos_old = block.find("oldest pinned fact").unwrap();
+        assert!(pos_new < pos_old, "newest-pinned must come first: {block}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fact_promotion_block_caps_length() {
+        let dir = std::env::temp_dir().join(format!("cimp-facts-cap-{}", uuid::Uuid::new_v4()));
+        {
+            let idx = crate::graph::GraphIndex::open(&dir, ".cimp").expect("open");
+            // Enough ~100-char pinned facts to blow well past the 1500-char cap.
+            for i in 0..40 {
+                let text = format!("pinned fact number {i} with some padding text to reach length ##########");
+                idx.add_project_fact(&format!("f{i}"), &text, "s1", i as i64, true).unwrap();
+            }
+        }
+
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.promote_pinned_facts = true;
+
+        let block = fact_promotion_block(&dir, &settings).expect("block present");
+        assert!(block.len() <= 1500 + 200, "block should stay near the cap: {} chars", block.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fact_promotion_block_none_without_pinned_facts_or_graph() {
+        let dir = std::env::temp_dir().join(format!("cimp-facts-none-{}", uuid::Uuid::new_v4()));
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.promote_pinned_facts = true;
+
+        // No graph ever built at this root — best-effort `None`, no panic.
+        assert!(fact_promotion_block(&dir, &settings).is_none());
+
+        {
+            let idx = crate::graph::GraphIndex::open(&dir, ".cimp").expect("open");
+            idx.add_project_fact("f1", "an unpinned fact", "s1", 1, false).unwrap();
+        }
+        // A built graph with only unpinned facts is still `None`.
+        assert!(fact_promotion_block(&dir, &settings).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

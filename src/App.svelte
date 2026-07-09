@@ -13,6 +13,8 @@
   import ConfigureTabDialog from './lib/dialog/ConfigureTabDialog.svelte';
   import SaveLayoutDialog from './lib/dialog/SaveLayoutDialog.svelte';
   import ManagePresetsDialog from './lib/dialog/ManagePresetsDialog.svelte';
+  import RestoreCheckpointDialog from './lib/dialog/RestoreCheckpointDialog.svelte';
+  import NewWorktreeTabDialog from './lib/dialog/NewWorktreeTabDialog.svelte';
   import Toast from './lib/Toast.svelte';
   import DragGhost from './lib/dnd/DragGhost.svelte';
   import DropZoneOverlay from './lib/dnd/DropZoneOverlay.svelte';
@@ -57,6 +59,7 @@
     composeFocused,
     composeContent,
     openCompose,
+    openComposeWithPicker,
     closeCompose,
     submitCompose,
   } from './lib/composeState';
@@ -230,6 +233,11 @@
             handler: openCompose,
             active: () => !get(composeOpen),
           },
+          // V14 Phase A: opens compose AND the template picker in one
+          // keystroke. No `active` guard needed — unlike `open_compose`
+          // (whose default Alt+Enter doubles as the textarea's newline
+          // key), this binding has no in-sheet meaning to fall back to.
+          open_compose_picker: openComposeWithPicker,
           submit_compose: {
             handler: () => {
               void submitCompose();
@@ -451,6 +459,8 @@
   <ConfigureTabDialog />
   <SaveLayoutDialog />
   <ManagePresetsDialog />
+  <RestoreCheckpointDialog />
+  <NewWorktreeTabDialog />
   <Toast />
 </main>
 

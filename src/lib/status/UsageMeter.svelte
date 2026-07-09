@@ -12,21 +12,38 @@
   import { settings } from '../settings/store';
   import {
     getClaudeUsage,
+    onUsageSessionTokens,
     type UsageResult,
     type UsageSnapshot,
+    type SessionTokensEvent,
   } from '../ipc';
+  import { listenManaged } from '../listenManaged';
 
   // Floor on the poll cadence so a hand-edited tiny interval can't hammer the
   // undocumented endpoint.
   const MIN_POLL_SECS = 15;
-  // Cooldown after a 429 when the server didn't send a usable Retry-After.
-  const RATE_LIMIT_COOLDOWN_MS = 2 * 60_000;
+  // On a 429, wait this many normal intervals before the next poll (so a 60s
+  // cadence backs off to 300s), then a success snaps straight back to normal.
+  // The endpoint is aggressively rate-limited, so a single 429 means "ease off
+  // briefly" rather than "keep hammering at the configured rate".
+  const RATE_LIMIT_BACKOFF = 5;
 
   let snapshot = $state<UsageSnapshot | null>(null);
   // True when the last fetch was a 429. Keeps the widget visible (with stale /
   // placeholder data) during a rate-limit instead of hiding it.
   let rateLimited = $state(false);
+  // True when `snapshot` is the backend's cached last-good rather than a fresh
+  // read (429 / transient failure). Dims the numbers to signal they may be old.
+  let stale = $state(false);
   let now = $state(Date.now());
+
+  // V14 Phase D3: current session's running token totals (token X-ray),
+  // pushed by a debounced backend event rather than polled — a separate
+  // feature (graph.enabled) from the rate-limit quota above, so it's shown
+  // independent of that toggle. `null` until the first event arrives (e.g.
+  // the graph is off, or nothing has been recorded yet this session).
+  let sessionTokens = $state<SessionTokensEvent | null>(null);
+  listenManaged(() => onUsageSessionTokens((e) => (sessionTokens = e)));
 
   const usage = $derived($settings.usage);
   // The Claude Code usage quota only makes sense when the subscription Claude
@@ -64,17 +81,22 @@
     }
   }
 
-  // Poll loop. Three outcomes:
-  //   - success → show the snapshot, clear rate-limit, poll again at pollMs.
-  //   - 429 → keep the widget visible (last-good or placeholder), and wait the
-  //     server's Retry-After (or a fixed cooldown) before retrying. This is not
-  //     an error backoff — we honor the server's cadence, not exponential.
-  //   - unavailable (no token / network) → keep last-good if any, else the
-  //     widget hides; retry with exponential backoff.
+  // Poll loop. The backend now returns its cached last-good snapshot (flagged
+  // `stale`) on a 429 / transient failure, so we adopt whatever snapshot comes
+  // back and only fall back to placeholders on a truly cold rate-limit.
+  //   - fresh success → show snapshot, clear stale/rate-limit, poll at pollMs.
+  //   - 429 → adopt the (stale) snapshot if present; back off to pollMs ×
+  //     RATE_LIMIT_BACKOFF (never sooner than the server's Retry-After), then a
+  //     later success resumes the normal cadence.
+  //   - unavailable / not logged in (snapshot null, not rate-limited) → clear
+  //     the snapshot so the widget hides; poll at the normal cadence so it
+  //     reappears within one interval after the user logs in.
+  //   - thrown transport / IPC error → keep last-good, back off exponentially.
   $effect(() => {
     if (!enabled) {
       snapshot = null;
       rateLimited = false;
+      stale = false;
       return;
     }
     let cancelled = false;
@@ -84,31 +106,31 @@
       const result = await fetchOnce();
       if (cancelled) return;
       let delay: number;
-      if (result && result.snapshot) {
-        snapshot = result.snapshot;
-        rateLimited = false;
-        failures = 0;
-        delay = pollMs;
-      } else if (result && result.rate_limited) {
-        rateLimited = true; // keep last-good snapshot on screen
-        failures = 0;
-        const ra = result.retry_after_secs ?? 0;
-        delay = ra > 0 ? Math.max(pollMs, ra * 1000) : RATE_LIMIT_COOLDOWN_MS;
-      } else if (result) {
-        // Structured 'unavailable / not logged in' (snapshot null, not rate
-        // limited). This is a stable steady state, not a transient transport
-        // error — poll at the normal fixed cadence so the widget appears within
-        // one interval after the user logs in, rather than ramping the failure
-        // backoff up to MAX_BACKOFF_MS (~5 min).
-        rateLimited = false;
-        failures = 0;
-        delay = pollMs;
-      } else {
-        // result === null: a thrown transport / IPC error. Back off
-        // exponentially.
-        rateLimited = false;
+      if (!result) {
+        // A thrown transport / IPC error. Keep last-good on screen; back off.
         failures += 1;
         delay = Math.min(pollMs * 2 ** Math.min(failures, 5), MAX_BACKOFF_MS);
+      } else {
+        failures = 0;
+        // Adopt any snapshot the backend returned — fresh (200) or the cached
+        // last-good it serves (flagged stale) during a rate-limit / hiccup.
+        if (result.snapshot) {
+          snapshot = result.snapshot;
+        } else if (!result.rate_limited) {
+          // Genuine 'unavailable / not logged in' with no cache — hide.
+          snapshot = null;
+        }
+        stale = result.stale;
+        rateLimited = result.rate_limited;
+        if (result.rate_limited) {
+          // Back off to 5× the normal cadence, but never retry before the
+          // server's stated Retry-After — that guarantees recovery even when a
+          // short configured interval × 5 is still inside the cooldown.
+          const ra = (result.retry_after_secs ?? 0) * 1000;
+          delay = Math.max(pollMs * RATE_LIMIT_BACKOFF, ra);
+        } else {
+          delay = pollMs;
+        }
       }
       timer = setTimeout(tick, delay);
     };
@@ -194,7 +216,12 @@
 {#if enabled && visible}
   <div
     class="usage-meter"
-    title={rateLimited && !snapshot ? 'Claude Code usage — rate limited, retrying…' : 'Claude Code usage'}
+    class:stale={stale && !!snapshot}
+    title={rateLimited && !snapshot
+      ? 'Claude Code usage — rate limited, retrying…'
+      : stale
+        ? 'Claude Code usage — last known (rate limited, refreshing…)'
+        : 'Claude Code usage'}
   >
     <!-- label column: name + duration in their own tracks so (5h)/(7d)
          line up across the two rows. -->
@@ -250,6 +277,20 @@
   </div>
 {/if}
 
+{#if sessionTokens}
+  <!-- V14 Phase D3: session tokens line — deliberately its own small element
+       rather than folded into the quota widget's markup above, so it still
+       shows when the quota tracker itself is disabled/hidden (they're
+       independent features: `usage.enabled` vs. `graph.enabled`). -->
+  <div
+    class="session-tokens"
+    title="Current session token usage (token X-ray) — see Code Intelligence → Usage for the full breakdown."
+  >
+    <span class="name">session tokens</span>
+    <span class="vals">{sessionTokens.in_tok.toLocaleString()} in / {sessionTokens.out_tok.toLocaleString()} out</span>
+  </div>
+{/if}
+
 <style>
   /* A flex row of stacked columns (label, bar, %, countdown, clock) with
      short dividers between groups. Each column is a 2-row grid: the 5h
@@ -263,6 +304,11 @@
     color: var(--text-secondary);
     white-space: nowrap;
     user-select: none;
+  }
+  /* Cached last-good numbers shown during a rate-limit / hiccup: dimmed so
+     they read as "may be out of date" without hiding the data. */
+  .usage-meter.stale {
+    opacity: 0.55;
   }
   .ug {
     display: grid;
@@ -330,5 +376,25 @@
   }
   .clk {
     color: var(--text-secondary);
+  }
+
+  /* V14 Phase D3: session tokens line. */
+  .session-tokens {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    font-size: 11px;
+    line-height: 1;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    user-select: none;
+  }
+  .session-tokens .name {
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .session-tokens .vals {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
   }
 </style>

@@ -57,6 +57,10 @@ fn allowed_for(kind: &TabKind, event: NotificationEvent) -> bool {
         (TabKind::Shell, NotificationEvent::Idle) => false,
         (TabKind::Shell, NotificationEvent::AwaitingPermission) => false,
         (TabKind::Shell, NotificationEvent::AwaitingQuestion) => false,
+        // V14 Phase F: Preview tabs run no subprocess and speak no output —
+        // none of these edges are reachable for one, but the allowlist stays
+        // explicit (like every other kind here) rather than falling through.
+        (TabKind::Preview, _) => false,
     }
 }
 
@@ -546,6 +550,10 @@ fn notification_text(
         (TabConfig::Shell(_), NotificationEvent::Idle)
         | (TabConfig::Shell(_), NotificationEvent::AwaitingPermission)
         | (TabConfig::Shell(_), NotificationEvent::AwaitingQuestion) => return String::new(),
+        // V14 Phase F: Preview tabs never reach `allowed_for` with a `true`
+        // result (see its `(TabKind::Preview, _) => false` arm), so this
+        // function is never called for one in practice — defensive empty.
+        (TabConfig::Preview(_), _) => return String::new(),
     };
 
     if !slot.enabled {

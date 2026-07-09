@@ -74,7 +74,16 @@ pub async fn pty_start(
     // stalls every other registry-touching command (pty_write, pty_resize,
     // tab_activate, …) behind disk latency / AV scans. Re-acquire only for the
     // seed, which does touch the registry.
-    let restored = crate::pty::scrollback::read(&tab);
+    // `scrollback::read` is a synchronous `fs::read` of the whole file; run it
+    // on the blocking pool so a large scrollback under slow / AV-scanned disk
+    // doesn't stall other IPC futures on this tokio worker (mirrors
+    // `get_system_stats`). Re-acquire the registry lock only for the seed.
+    let restored = {
+        let tab_for_read = tab.clone();
+        tauri::async_runtime::spawn_blocking(move || crate::pty::scrollback::read(&tab_for_read))
+            .await
+            .map_err(|e| AppError::Pty(format!("scrollback read join: {e}")))?
+    };
     if let Some(bytes) = &restored {
         let registry = state.tabs.lock().await;
         match registry.seed_scrollback(&tab, bytes).await {
@@ -164,8 +173,10 @@ pub async fn pty_write(
 ) -> AppResult<()> {
     // V8-03: the Offload Server tab is read-only — it has no PTY of its own
     // (its content is the live llama-server output stream), so swallow any
-    // write. Defense-in-depth behind the frontend's read-only guard.
-    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor) {
+    // write. Defense-in-depth behind the frontend's read-only guard. Same for
+    // the V9-01 Code Graph monitor and V13 Workbench tabs — both app-rendered
+    // with no PTY.
+    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor | TabId::Workbench) {
         return Ok(());
     }
     // Pre-register any TTS markers in the user's input so they don't fire
@@ -210,10 +221,14 @@ pub async fn pty_write(
     let registry = state.tabs.lock().await;
 
     let existing = {
+        // The counter is only the idle-Listening heuristic; a poisoned lock
+        // must NOT gate input delivery, or a prior panic would silently drop
+        // all keystrokes for the rest of the session. Recover the inner value
+        // (matches the poison-recovery pattern used in `tts_stop`/`mutate`).
         let map = state
             .input_lengths
             .read()
-            .map_err(|e| AppError::Pty(format!("input_lengths poisoned: {e}")))?;
+            .unwrap_or_else(|e| e.into_inner());
         map.get(&tab).cloned()
     };
     let len_counter = match existing {
@@ -229,7 +244,7 @@ pub async fn pty_write(
             let mut map = state
                 .input_lengths
                 .write()
-                .map_err(|e| AppError::Pty(format!("input_lengths poisoned: {e}")))?;
+                .unwrap_or_else(|e| e.into_inner());
             map.entry(tab.clone())
                 .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)))
                 .clone()
@@ -597,6 +612,71 @@ pub async fn compose_content_changed(
     Ok(())
 }
 
+/// V14 Phase A: the compose overlay's `/` picker data source. Resolves the
+/// global prompt-template library (from the physical global `settings.json`)
+/// against `root`'s project-scope additions (its `.cimp/config.json`
+/// overlay's own `prompt_templates` array) by name — a project entry
+/// shadows a same-named global one. Deliberately reads both scopes directly
+/// off disk rather than through the merged `Settings` the rest of the app
+/// uses; see `PromptTemplate`'s doc comment for why the normal deep-merge
+/// would silently replace the global list instead of shadowing it.
+/// `root` defaults to the launch directory, mirroring `graph_rebuild`.
+#[tauri::command]
+pub async fn compose_templates(root: Option<String>) -> AppResult<Vec<crate::settings::ResolvedTemplate>> {
+    let root = resolve_graph_root(root)?;
+    let global = crate::settings::read_global_prompt_templates();
+    let project = crate::settings::read_project_prompt_templates(&root);
+    Ok(crate::settings::resolve_prompt_templates(global, project))
+}
+
+/// V14 Phase A: the Settings window's Compose section reads the raw global
+/// list (unshadowed — a template currently shadowed by a project override
+/// still needs to be editable here) directly from the physical global file.
+#[tauri::command]
+pub async fn compose_templates_global_get() -> AppResult<Vec<crate::settings::PromptTemplate>> {
+    Ok(crate::settings::read_global_prompt_templates())
+}
+
+/// V14 Phase A: the Settings window's Compose section save. Writes straight
+/// to the physical global `settings.json` — NOT through `settings_update`'s
+/// normal per-project overlay diff — so the library really is global
+/// regardless of which project this cImp session was launched from. See
+/// `settings::persistence::write_global_prompt_templates`'s doc comment.
+#[tauri::command]
+pub async fn compose_templates_global_set(
+    templates: Vec<crate::settings::PromptTemplate>,
+) -> AppResult<()> {
+    crate::settings::write_global_prompt_templates(templates)
+}
+
+/// V14 Phase A: read-only project-scope listing for the Settings window's
+/// Compose section (edited by hand in `.cimp/config.json`, not from
+/// Settings — matching the milestone's scope rule). `root` defaults to the
+/// launch directory.
+#[tauri::command]
+pub async fn compose_templates_project_get(
+    root: Option<String>,
+) -> AppResult<Vec<crate::settings::PromptTemplate>> {
+    let root = resolve_graph_root(root)?;
+    Ok(crate::settings::read_project_prompt_templates(&root))
+}
+
+/// V14 Phase B: writes a pasted clipboard image (already re-encoded to PNG
+/// bytes on the frontend — see `lib/compose/attachments.ts`'s
+/// `readClipboardImagePng`, which reads via the Tauri clipboard plugin's
+/// image API rather than the WebView2-denied `navigator.clipboard`) to this
+/// app run's session-scoped attach dir and returns the absolute saved path.
+/// The frontend renders that path as a chip and, on submit, appends it to
+/// the message text (`compose/attachments.ts`'s `appendAttachments`).
+/// Dropped image *files* (`tauri://drag-drop`) skip this command entirely —
+/// they're referenced in place, never copied here.
+#[tauri::command]
+pub async fn compose_attach_image(state: State<'_, AppState>, bytes: Vec<u8>) -> AppResult<String> {
+    let session = state.launch.launch_id.clone();
+    let path = crate::attach::save_png(&session, &bytes)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 pub async fn acknowledge_error(state: State<'_, AppState>, tab: TabId) -> AppResult<()> {
     let _ = state
@@ -680,10 +760,34 @@ pub async fn ai_tool_tab_defaults(tab: TabId) -> AppResult<AiToolTabConfig> {
     };
     match config {
         TabConfig::AiTool(c) => Ok(c),
-        TabConfig::Shell(_) => Err(AppError::Pty(
-            "ai_tool_tab_defaults: reserved id resolved to a shell config".into(),
+        TabConfig::Shell(_) | TabConfig::Preview(_) => Err(AppError::Pty(
+            "ai_tool_tab_defaults: reserved id resolved to a non-AI-tool config".into(),
         )),
     }
+}
+
+/// The body of `settings_update`'s read-modify-write, factored out so it can
+/// be exercised directly in a unit test without a full Tauri `AppState`
+/// harness (`SettingsHandle::mutate` requires the closure to run under its
+/// own lock; this is the pure logic that closure runs).
+///
+/// `incoming` is the Settings-window's full snapshot; `cur` is the live
+/// in-memory state. See the call site in `settings_update` for why
+/// `layout`/`session`/`prompt_templates`/`templates_seeded` are preserved
+/// from `cur` rather than taken from `incoming`.
+fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
+    incoming.layout = cur.layout.clone();
+    incoming.session = cur.session.clone();
+    incoming.prompt_templates = cur.prompt_templates.clone();
+    incoming.templates_seeded = cur.templates_seeded;
+    *cur = incoming;
+    // Keep the reserved feature tabs (Offload Server / Code Graph monitor /
+    // Workbench) present-iff-enabled in the persisted list.
+    crate::settings::reconcile_reserved_tabs(cur);
+    // V21: when OpenCode local-llama auto-sync is on and the local server is
+    // enabled, re-derive the provider snapshot if the primary Local command
+    // changed (no-op otherwise), so the OpenCode tab tracks command edits.
+    cur.offload.sync_opencode_provider_on_save();
 }
 
 #[tauri::command]
@@ -700,9 +804,15 @@ pub async fn settings_update(
     // live materialize/remove after the mutate. The integrity pass that
     // normally owns those tabs only runs at load, so without this a freshly
     // enabled feature's tab wouldn't appear until the next launch.
-    let (was_graph, was_offload, was_stt, was_stt_device) = {
+    let (was_graph, was_offload, was_workbench, was_stt, was_stt_device) = {
         let old = state.settings.current();
-        (old.graph.enabled, old.offload.enabled, old.stt.enabled, old.stt.device)
+        (
+            old.graph.enabled,
+            old.offload.enabled,
+            old.workbench.enabled,
+            old.stt.enabled,
+            old.stt.device,
+        )
     };
 
     // The Settings window holds a full snapshot and replaces wholesale, but it
@@ -712,18 +822,21 @@ pub async fn settings_update(
     // layout the user just dragged or the active-tab the main window just set.
     // `tabs` IS legitimately edited here (TabBar reorder, ConfigureTabDialog,
     // reset-to-defaults), so it is taken from the incoming struct.
-    state.settings.mutate(move |cur| {
-        settings.layout = cur.layout.clone();
-        settings.session = cur.session.clone();
-        *cur = settings;
-        // Keep the reserved feature tabs (Offload Server / Code Graph monitor)
-        // present-iff-enabled in the persisted list.
-        crate::settings::reconcile_reserved_tabs(cur);
-        // V21: when OpenCode local-llama auto-sync is on and the local server is
-        // enabled, re-derive the provider snapshot if the primary Local command
-        // changed (no-op otherwise), so the OpenCode tab tracks command edits.
-        cur.offload.sync_opencode_provider_on_save();
-    });
+    //
+    // V14 code-review fix (HIGH, data loss): `prompt_templates` +
+    // `templates_seeded` are ALSO out-of-band fields — they're written only
+    // by `compose_templates_global_set` -> `write_global_prompt_templates`,
+    // straight to the physical global `settings.json`, bypassing this
+    // `SettingsHandle` entirely (see that command's doc comment). The
+    // Settings window's generic snapshot can easily be stale for these two
+    // fields (e.g. fetched before a Compose-section edit), and without this
+    // preservation a completely unrelated save (theme, a toggle, ...) would
+    // stomp the live in-memory copy with that stale value, which a later
+    // read (or a diff-and-persist elsewhere) could then present as the
+    // template library having reverted or lost entries. Preserve both here,
+    // exactly like `layout`/`session`, so the dedicated compose IPC stays
+    // the only writer of the template library.
+    state.settings.mutate(move |cur| apply_incoming_settings(cur, settings));
 
     // On an `stt.enabled` edge, load or unload the Whisper model so the toggle
     // actually frees/reclaims memory (not just hides the record button). When
@@ -745,7 +858,10 @@ pub async fn settings_update(
 
     // On an actual enable/disable edge, mirror the change into the runtime so
     // the reserved tab appears/disappears live (tab bar + pane placement).
-    if now.graph.enabled != was_graph || now.offload.enabled != was_offload {
+    if now.graph.enabled != was_graph
+        || now.offload.enabled != was_offload
+        || now.workbench.enabled != was_workbench
+    {
         // Serialize against create/close_tab while we touch the registry.
         let _serializer = state.lifecycle_serializer.lock().await;
         if now.graph.enabled != was_graph {
@@ -761,6 +877,15 @@ pub async fn settings_update(
                 state.inner(),
                 TabId::OffloadServer,
                 now.offload.enabled,
+            )
+            .await;
+        }
+        // V13 Phase A: mirror the Workbench tab live too.
+        if now.workbench.enabled != was_workbench {
+            super::tab_lifecycle::sync_reserved_feature_tab(
+                state.inner(),
+                TabId::Workbench,
+                now.workbench.enabled,
             )
             .await;
         }
@@ -920,6 +1045,16 @@ pub async fn offload_server_metrics(
     Ok(service.server_metrics())
 }
 
+/// Resolve an optional `root` IPC argument to a project directory: the given
+/// path when non-blank, else the app's launch directory. Shared by the graph
+/// commands so the fallback lives in one place.
+fn resolve_graph_root(root: Option<String>) -> AppResult<std::path::PathBuf> {
+    match root {
+        Some(r) if !r.trim().is_empty() => Ok(std::path::PathBuf::from(r)),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}"))),
+    }
+}
+
 /// V9-01: known per-root code-graph status (idle/building/ready/error + row
 /// counts). The initial fill for the graph status surface; live transitions
 /// arrive via the `graph-status` event. Empty before the first build.
@@ -957,10 +1092,7 @@ pub async fn graph_rebuild_embeddings(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<()> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     service.spawn_rebuild_embeddings(root);
     Ok(())
 }
@@ -980,6 +1112,792 @@ pub async fn graph_test_embedder(
 #[tauri::command]
 pub async fn graph_history() -> AppResult<Vec<crate::graph::GraphCall>> {
     Ok(crate::graph::graph_history())
+}
+
+/// V10: one candidate dead export (unused public symbol) for the Analyses tab.
+#[derive(serde::Serialize)]
+pub struct DeadExportRow {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+    pub signature: String,
+}
+
+/// V10 (Analyses): candidate unused public symbols — public/exported defs with
+/// no reference and no inbound call edge. Candidates only; the UI states the
+/// false-positive caveat (dynamic dispatch, external API, macros/reflection).
+/// `root` defaults to the launch directory. On-demand (no background schedule).
+#[tauri::command]
+pub async fn graph_dead_exports(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<Vec<DeadExportRow>> {
+    let root = resolve_graph_root(root)?;
+    let hits = service.dead_exports(&root)?;
+    Ok(hits
+        .into_iter()
+        .map(|s| DeadExportRow {
+            name: s.name,
+            kind: s.kind,
+            file: s.file,
+            line: s.start_line,
+            signature: s.signature,
+        })
+        .collect())
+}
+
+/// V10 (Analyses): import cycles between files (each a loop of ≥ 2 files that
+/// transitively import one another). `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_cycles(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<Vec<Vec<String>>> {
+    let root = resolve_graph_root(root)?;
+    service.import_cycles(&root)
+}
+
+/// V12 Phase B (Analyses): one symbol changed since `HEAD` (the working-tree
+/// diff's root set).
+#[derive(serde::Serialize)]
+pub struct ChangedSymbolRow {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+}
+
+/// V12 Phase B (Analyses): one transitive dependent of a changed symbol.
+#[derive(serde::Serialize)]
+pub struct DependentRow {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+    pub depth: u32,
+    pub approx: bool,
+    /// V15 Feature 3: weakest edge confidence along the discovery chain
+    /// (`extracted`/`inferred`/`ambiguous`).
+    pub confidence: String,
+}
+
+/// V12 Phase B (Analyses): the working-tree diff's blast radius — the
+/// changed symbols, their transitive dependents, and any changed files the
+/// graph doesn't index (docs/configs/etc.).
+#[derive(serde::Serialize)]
+pub struct ImpactResult {
+    pub changed: Vec<ChangedSymbolRow>,
+    pub dependents: Vec<DependentRow>,
+    pub unindexed: Vec<String>,
+}
+
+/// V12 Phase B (Analyses): "what does my current working-tree change
+/// affect?" — diff mode only (the `symbols`-scoped mode is MCP-tool only,
+/// where an agent supplies explicit roots). `root` defaults to the launch
+/// directory. Errors with a "requires git" message when `root` isn't a git
+/// repository (see `AppError::NotAGitRepo`).
+#[tauri::command]
+pub async fn graph_impact(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<ImpactResult> {
+    let root = resolve_graph_root(root)?;
+    let report = service.impact(&root)?;
+    Ok(ImpactResult {
+        changed: report
+            .changed
+            .into_iter()
+            .map(|s| ChangedSymbolRow { name: s.name, kind: s.kind, file: s.file, line: s.start_line })
+            .collect(),
+        dependents: report
+            .dependents
+            .into_iter()
+            .map(|d| DependentRow {
+                name: d.symbol.name,
+                kind: d.symbol.kind,
+                file: d.symbol.file,
+                line: d.symbol.start_line,
+                depth: d.depth,
+                approx: d.approx,
+                confidence: d.confidence.tag().to_string(),
+            })
+            .collect(),
+        unindexed: report.unindexed,
+    })
+}
+
+// ── V15 Feature 1: path tracing ──────────────────────────────────────────
+
+/// One node on a traced path, serialized for the Code Intelligence tab.
+#[derive(serde::Serialize)]
+pub struct PathNodeRow {
+    pub id: String,
+    pub label: String,
+    pub file: String,
+    pub line: u32,
+    pub kind: String,
+    pub edge_to_next: Option<String>,
+    pub confidence: Option<String>,
+}
+
+/// The result of a `graph_path` trace. `found=false` means no path within the
+/// hop bound (or an unresolvable endpoint).
+#[derive(serde::Serialize)]
+pub struct PathResult {
+    pub found: bool,
+    pub nodes: Vec<PathNodeRow>,
+    pub hops: usize,
+    pub equal_alternatives: u64,
+}
+
+fn parse_path_kinds(kinds: Option<Vec<String>>) -> Vec<crate::graph::EdgeKind> {
+    use crate::graph::EdgeKind;
+    let all = || vec![EdgeKind::Call, EdgeKind::Import, EdgeKind::Contains];
+    let Some(ks) = kinds else { return all() };
+    let mut out = Vec::new();
+    for k in ks {
+        match k.trim().to_ascii_lowercase().as_str() {
+            "call" => out.push(EdgeKind::Call),
+            "import" => out.push(EdgeKind::Import),
+            "contains" => out.push(EdgeKind::Contains),
+            _ => {}
+        }
+    }
+    if out.is_empty() { all() } else { out }
+}
+
+/// V15 Feature 1 (Architecture): trace the shortest path between two entities
+/// through the call/import/containment graph. `root` defaults to the launch
+/// directory.
+#[tauri::command]
+pub async fn graph_path(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    from: String,
+    to: String,
+    kinds: Option<Vec<String>>,
+    symmetric: Option<bool>,
+) -> AppResult<PathResult> {
+    let root = resolve_graph_root(root)?;
+    let kinds = parse_path_kinds(kinds);
+    let hit = service.shortest_path(&root, from.trim(), to.trim(), &kinds, symmetric.unwrap_or(false))?;
+    Ok(match hit {
+        Some(h) => PathResult {
+            found: true,
+            nodes: h
+                .nodes
+                .into_iter()
+                .map(|n| PathNodeRow {
+                    id: n.id,
+                    label: n.label,
+                    file: n.file,
+                    line: n.line,
+                    kind: n.kind,
+                    edge_to_next: n.edge_to_next,
+                    confidence: n.confidence.map(|c| c.tag().to_string()),
+                })
+                .collect(),
+            hops: h.hops,
+            equal_alternatives: h.equal_alternatives,
+        },
+        None => PathResult { found: false, nodes: Vec::new(), hops: 0, equal_alternatives: 0 },
+    })
+}
+
+// ── V15 Feature 2: architecture overview ─────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct GodNodeRow {
+    pub id: String,
+    pub label: String,
+    pub file: String,
+    pub kind: String,
+    pub degree: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct SubsystemRow {
+    pub name: String,
+    pub size: usize,
+    pub files: Vec<String>,
+    pub hub: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct SurprisingRow {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub from_subsystem: String,
+    pub to_subsystem: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ArchResult {
+    pub god_nodes: Vec<GodNodeRow>,
+    pub subsystems: Vec<SubsystemRow>,
+    pub surprising: Vec<SurprisingRow>,
+}
+
+/// V15 Feature 2 (Architecture): the system-shape overview — god nodes,
+/// subsystems, and surprising cross-subsystem edges. `root` defaults to the
+/// launch directory.
+#[tauri::command]
+pub async fn graph_architecture(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<ArchResult> {
+    let root = resolve_graph_root(root)?;
+    let r = service.architecture(&root)?;
+    Ok(ArchResult {
+        god_nodes: r
+            .god_nodes
+            .into_iter()
+            .map(|g| GodNodeRow { id: g.id, label: g.label, file: g.file, kind: g.kind, degree: g.degree })
+            .collect(),
+        subsystems: r
+            .subsystems
+            .into_iter()
+            .map(|s| SubsystemRow { name: s.name, size: s.size, files: s.files, hub: s.hub })
+            .collect(),
+        surprising: r
+            .surprising
+            .into_iter()
+            .map(|e| SurprisingRow {
+                from: e.from,
+                to: e.to,
+                kind: e.kind,
+                from_subsystem: e.from_subsystem,
+                to_subsystem: e.to_subsystem,
+            })
+            .collect(),
+    })
+}
+
+// ── V15 Feature 4: Graph View snapshot ───────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct VizNodeRow {
+    pub id: String,
+    pub label: String,
+    pub file: String,
+    pub kind: String,
+    pub degree: u64,
+    pub subsystem: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct VizEdgeRow {
+    pub src: String,
+    pub dst: String,
+    pub kind: String,
+    pub confidence: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct VizGraphResult {
+    pub nodes: Vec<VizNodeRow>,
+    pub edges: Vec<VizEdgeRow>,
+}
+
+/// V15 Feature 4 (Graph View): a bounded {nodes, edges} subgraph for the live
+/// visualization tab. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_viz_snapshot(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<VizGraphResult> {
+    let root = resolve_graph_root(root)?;
+    let g = service.viz_snapshot(&root)?;
+    Ok(VizGraphResult {
+        nodes: g
+            .nodes
+            .into_iter()
+            .map(|n| VizNodeRow { id: n.id, label: n.label, file: n.file, kind: n.kind, degree: n.degree, subsystem: n.subsystem })
+            .collect(),
+        edges: g
+            .edges
+            .into_iter()
+            .map(|e| VizEdgeRow { src: e.src, dst: e.dst, kind: e.kind, confidence: e.confidence })
+            .collect(),
+    })
+}
+
+/// V10 (Memory): the project's session/action memory — current session, its
+/// working set, notes (pinned + current-session), and the recent-sessions list.
+/// `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_memory(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<crate::graph::MemorySnapshot> {
+    let root = resolve_graph_root(root)?;
+    Ok(service.memory_snapshot(&root))
+}
+
+/// V10 (Memory): clear one session's memory (`session` = its id) or the whole
+/// project's memory (`session` omitted). `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_memory_clear(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    session: Option<String>,
+) -> AppResult<()> {
+    let root = resolve_graph_root(root)?;
+    let session = session.filter(|s| !s.trim().is_empty());
+    service.mem_clear(&root, session.as_deref())
+}
+
+/// V10 (Memory): pin/unpin a note (pinned notes survive session eviction and
+/// show project-wide). `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_note_set_pinned(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    note_id: String,
+    pinned: bool,
+) -> AppResult<()> {
+    let root = resolve_graph_root(root)?;
+    service.mem_set_note_pinned(&root, &note_id, pinned)
+}
+
+/// V12 Phase E (Memory): the project's durable facts (pinned first, then
+/// newest), excluding archived ones. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_facts(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<Vec<crate::graph::ProjectFact>> {
+    let root = resolve_graph_root(root)?;
+    Ok(service.list_project_facts(&root, false, 200))
+}
+
+/// V12 Phase E (Memory): pin / unpin / archive / delete one project fact.
+/// `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_fact_update(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    id: String,
+    action: String,
+) -> AppResult<()> {
+    let root = resolve_graph_root(root)?;
+    match action.as_str() {
+        "pin" => service.set_fact_pinned(&root, &id, true),
+        "unpin" => service.set_fact_pinned(&root, &id, false),
+        "archive" => service.set_fact_archived(&root, &id, true),
+        "delete" => service.delete_fact(&root, &id),
+        other => Err(crate::error::AppError::Graph(format!(
+            "unknown fact action: {other} (expected pin|unpin|archive|delete)"
+        ))),
+    }
+}
+
+/// V12 Phase E (Memory): manually add a project fact from the Facts UI's "add
+/// fact" input (recorded with `source_session = "manual"`). `root` defaults
+/// to the launch directory.
+#[tauri::command]
+pub async fn graph_fact_add(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    text: String,
+    pin: Option<bool>,
+) -> AppResult<()> {
+    let root = resolve_graph_root(root)?;
+    service.add_project_fact_manual(&root, &text, pin.unwrap_or(false))
+}
+
+/// V10 (Context): preview what context injection WOULD prepend for `prompt`,
+/// bypassing the `context_injection` toggle (so the user can tune before
+/// enabling). Requires the graph to be enabled. `root` defaults to the launch
+/// directory; no `session_id` (the preview isn't tied to a live session).
+#[tauri::command]
+pub async fn graph_context_preview(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    prompt: String,
+    root: Option<String>,
+) -> AppResult<crate::graph::RetrieveResult> {
+    let root = resolve_graph_root(root)?;
+    Ok(service.retrieve_context(&root, &prompt, None))
+}
+
+// ── V14 Phase D/D2: Usage section (token X-ray) + budget-tuning advisor ───
+
+/// V14 Phase D: the Usage section's full payload for `root` — the current
+/// session's per-turn series + top-tools ranking, every known session's
+/// totals row, and the effectiveness counters. `root` defaults to the launch
+/// directory.
+#[tauri::command]
+pub async fn graph_usage(
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    offload: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
+    root: Option<String>,
+) -> AppResult<crate::graph::UsageSnapshot> {
+    let root = resolve_graph_root(root)?;
+    let mut snap = graph.usage_snapshot(&root);
+    // Offload local-task count: completed runs (not still `"running"`) on
+    // `local` backends only — "N tasks served locally" per the milestone's
+    // Effectiveness panel, distinct from a run still in flight. GraphService
+    // has no dependency on OffloadService, so this is filled in here rather
+    // than inside `usage_snapshot`.
+    snap.offload_local_tasks = offload
+        .server_metrics()
+        .into_iter()
+        .filter(|b| b.kind == "local")
+        .flat_map(|b| b.metrics.runs)
+        .filter(|r| r.outcome != "running")
+        .count() as u64;
+    Ok(snap)
+}
+
+/// V14 Phase D2: the `graph_usage_advice` response. Wraps `advisor::evaluate`'s
+/// `Vec<Proposal>` with a `collecting` flag — NOT part of the milestone's
+/// literal `Vec<Proposal>` pseudocode, added because the Advisor card (D2.4)
+/// needs to distinguish "no data yet" from "checked, all healthy", and a
+/// bare `Vec<Proposal>` can't carry that distinction on its own.
+#[derive(serde::Serialize)]
+pub struct AdvisorSnapshot {
+    pub proposals: Vec<crate::advisor::Proposal>,
+    pub collecting: bool,
+}
+
+/// V14 Phase D2: the budget-tuning advisor's current proposals for `root`.
+/// Assembled fresh on every call from `GraphService`'s D2.1 signal getters —
+/// cheap (bounded Datalog queries + a small in-memory scan), no caching
+/// needed. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_usage_advice(
+    state: State<'_, AppState>,
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<AdvisorSnapshot> {
+    let root = resolve_graph_root(root)?;
+    let settings = state.settings.current();
+
+    let (injection_follow_rate, injection_follow_samples) = match graph.injection_follow_rate(&root)
+    {
+        Some((r, n)) => (Some(r), n),
+        None => (None, 0),
+    };
+    let (budget_maxed_rate, budget_maxed_samples) = match graph.budget_maxed_rate(&root) {
+        Some((r, n)) => (Some(r), n),
+        None => (None, 0),
+    };
+    let (advisor_reread_rate, advisor_reread_samples) = match graph.advisor_reread_rate(&root) {
+        Some((r, n)) => (Some(r), n),
+        None => (None, 0),
+    };
+    let session_count = graph.advisor_session_count(&root);
+
+    let sig = crate::advisor::Signals {
+        injection_follow_rate,
+        injection_follow_samples,
+        advisor_reread_rate,
+        advisor_reread_samples,
+        budget_maxed_rate,
+        budget_maxed_samples,
+        session_count,
+        graph: settings.graph.clone(),
+        dismissed: settings.advisor_dismissed.clone(),
+    };
+    let proposals = crate::advisor::evaluate(&sig);
+    // "Collecting" = nothing has cleared the cold-start floor yet: not
+    // enough sessions, OR neither of the two independent sample counts
+    // (injections / reminders) has cleared its own rule's floor. Distinct
+    // from "cleared the floor, rates are just healthy" (empty proposals,
+    // `collecting = false`).
+    let collecting = session_count < crate::advisor::MIN_SESSIONS
+        || (injection_follow_samples < crate::advisor::MIN_INJECTIONS
+            && advisor_reread_samples < crate::advisor::MIN_REMINDS);
+    Ok(AdvisorSnapshot { proposals, collecting })
+}
+
+/// V14 Phase D2: dismiss one advisor proposal (`rule_id` + its coarse rate
+/// `signature`, both echoed from the `Proposal` the user clicked Dismiss
+/// on). Persisted in `Settings.advisor_dismissed`; a materially changed rate
+/// (a different signature bucket) re-fires the proposal even for the same
+/// `rule_id`. Idempotent — dismissing the same pair twice is a no-op.
+#[tauri::command]
+pub async fn advisor_dismiss(
+    state: State<'_, AppState>,
+    rule_id: String,
+    signature: String,
+) -> AppResult<()> {
+    state.settings.mutate(move |cur| {
+        let already = cur
+            .advisor_dismissed
+            .iter()
+            .any(|d| d.rule_id == rule_id && d.signature == signature);
+        if !already {
+            cur.advisor_dismissed.push(crate::settings::DismissedRule { rule_id, signature });
+        }
+    });
+    Ok(())
+}
+
+/// V13 Phase A: resolve an optional `root` IPC argument to a project
+/// directory, falling back to the app's launch directory. Small, deliberate
+/// duplicate of `resolve_graph_root` (see the rationale in
+/// `checks/gitls.rs`'s doc comment for the sibling `run_git` split) — kept
+/// separate so `workbench` doesn't couple its root-resolution to `graph`'s.
+fn resolve_workbench_root(root: Option<String>) -> AppResult<std::path::PathBuf> {
+    match root {
+        Some(r) if !r.trim().is_empty() => {
+            let path = std::path::PathBuf::from(r);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                // Absolutize a relative root here at the IPC boundary: the
+                // workbench layer joins sub-paths onto it AND hands it to
+                // spawned `git` as `current_dir`, and git resolves argument
+                // paths relative to that same cwd — a relative root would
+                // double up (`root/root/.cimp/…`).
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(path))
+                    .map_err(|e| AppError::Settings(format!("cwd: {e}")))
+            }
+        }
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}"))),
+    }
+}
+
+/// V13 Phase A: the Workbench tab's top-of-view banner data — is `git` on
+/// PATH at all, and is `root` inside a working tree. `root` defaults to the
+/// launch directory. Cheap: `git_available` is a PATH lookup, `is_repo` a
+/// cached `rev-parse` probe (see `workbench::git::is_repo`).
+#[tauri::command]
+pub async fn workbench_status(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+) -> AppResult<crate::workbench::WorkbenchStatus> {
+    let root = resolve_workbench_root(root)?;
+    Ok(service.status(&root).await)
+}
+
+/// V13 Phase B: the Diff section's file list — status/binary/too_large per
+/// file plus the readonly (mid-merge/-rebase) and source (git vs. — until
+/// Phase C — nothing) flags. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn workbench_diff_summary(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+) -> AppResult<crate::workbench::diff::DiffSummary> {
+    let root = resolve_workbench_root(root)?;
+    service.diff_summary(&root).await
+}
+
+/// V13 Phase B: one file's full parsed diff (hunks + lines), fetched only
+/// when the frontend expands that file's row (the file list itself is
+/// virtualized around this — see `workbench_diff_summary`).
+#[tauri::command]
+pub async fn workbench_diff_file(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    path: String,
+) -> AppResult<crate::workbench::diff::FileDiff> {
+    let root = resolve_workbench_root(root)?;
+    service.diff_file(&root, &path).await
+}
+
+/// V13 Phase B B2: revert one hunk. `hunk_hash` must match the hash of the
+/// hunk currently at `hunk_index` in the file's diff (`workbench::diff::hunk_hash`)
+/// — a mismatch means the file changed since the frontend last fetched it
+/// (an agent edit raced the diff view) and the revert is refused rather than
+/// applied against stale content. Also refused while the repo is
+/// mid-merge/-rebase. Returns the file's fresh diff after a successful
+/// revert.
+#[tauri::command]
+pub async fn workbench_revert_hunk(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    path: String,
+    hunk_index: usize,
+    hunk_hash: String,
+) -> AppResult<crate::workbench::diff::FileDiff> {
+    let root = resolve_workbench_root(root)?;
+    service.revert_hunk(&root, &path, hunk_index, &hunk_hash).await
+}
+
+/// V13 Phase B: format one hunk as a fenced code block + `path:line` header
+/// for the compose overlay's "Send to agent" hunk action. Returns plain text
+/// the frontend appends to the compose draft — the submit path is unchanged.
+#[tauri::command]
+pub async fn workbench_send_hunk(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    path: String,
+    hunk_index: usize,
+) -> AppResult<String> {
+    let root = resolve_workbench_root(root)?;
+    service.send_hunk(&root, &path, hunk_index).await
+}
+
+/// V13 Phase C: the Timeline section's row list — every checkpoint currently
+/// retained in the shadow repo, oldest first. Empty (not an error) when
+/// checkpoints have never run for `root`. `root` defaults to the launch
+/// directory.
+#[tauri::command]
+pub async fn workbench_checkpoints(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+) -> AppResult<Vec<crate::workbench::shadow::Checkpoint>> {
+    let root = resolve_workbench_root(root)?;
+    service.checkpoints(&root).await
+}
+
+/// V13 Phase C: checkpoint `id` vs. the CURRENT working tree, parsed the same
+/// way `workbench_diff_file` is — powers both the Timeline's "Diff vs now"
+/// viewer and the restore confirmation dialog's dry-run file list (the same
+/// call backs both UI surfaces; the frontend just renders it read-only for
+/// the confirmation case, since these files describe the CHECKPOINT, not a
+/// revertable live hunk).
+#[tauri::command]
+pub async fn workbench_checkpoint_diff(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    id: String,
+) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
+    let root = resolve_workbench_root(root)?;
+    service.checkpoint_diff(&root, &id).await
+}
+
+/// V13 Phase C: the manual "Checkpoint now" action. `label` defaults to
+/// "manual checkpoint" when omitted. Unlike the automatic triggers this is
+/// NOT throttled by `checkpoint_min_gap_s` — an explicit click always
+/// produces a real checkpoint (or dedupes against an unchanged tree, per
+/// `shadow::snapshot`'s own contract) rather than being silently dropped.
+#[tauri::command]
+pub async fn workbench_checkpoint_now(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    label: Option<String>,
+) -> AppResult<crate::workbench::shadow::CheckpointId> {
+    let root = resolve_workbench_root(root)?;
+    service.checkpoint_now(&root, label).await
+}
+
+/// V13 Phase C: restore the working tree to checkpoint `id`.
+/// **Safety-critical**: `delete_new` MUST default to `false` on the frontend
+/// (the confirmation dialog's "delete files created since" checkbox starts
+/// unchecked) — see `shadow::restore`'s doc comment for the invariants this
+/// upholds (a pre-restore checkpoint is always taken first; the user's own
+/// `.git`, if any, is never touched). Returns the full changed/created/
+/// deleted file lists for the UI's post-restore report.
+#[tauri::command]
+pub async fn workbench_restore(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    id: String,
+    delete_new: bool,
+) -> AppResult<crate::workbench::shadow::RestoreReport> {
+    let root = resolve_workbench_root(root)?;
+    service.restore(&root, &id, delete_new).await
+}
+
+/// V13 Phase D: every cImp-managed worktree of `root`'s repo — slug, branch,
+/// base branch, ahead/behind vs that base, and whether an AI tab is
+/// currently pointed at it. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn workbench_worktrees(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+) -> AppResult<Vec<crate::workbench::worktree::WorktreeInfo>> {
+    let root = resolve_workbench_root(root)?;
+    service.worktrees(&root).await
+}
+
+/// V13 Phase D D3: worktree `slug` vs. the base branch it was cut from
+/// (`git diff <base>...cimp/<slug>`), parsed the same way `workbench_diff_file`
+/// is. Read-only — there is no revert action on this diff.
+#[tauri::command]
+pub async fn workbench_worktree_diff(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
+    let root = resolve_workbench_root(root)?;
+    service.worktree_diff(&root, &slug).await
+}
+
+/// V13 Phase D: create a bare worktree (no tab) for `slug` — the Worktrees
+/// section's own "create" affordance. Returns the new worktree's absolute
+/// path. See `workbench::worktree::create`'s doc comment for the full
+/// precondition sequence (nested-repo refusal, detached-HEAD refusal,
+/// duplicate-slug refusal) that surfaces as a typed error here.
+#[tauri::command]
+pub async fn workbench_worktree_create(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    state: State<'_, AppState>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<String> {
+    // Same serializer `create_ai_tab_in_worktree` holds: two concurrent
+    // creates for one slug could otherwise both pass `worktree::create`'s
+    // existence check before either runs `git worktree add` (git's own
+    // locking makes the loser fail, but with an opaque "branch already
+    // exists" instead of the typed duplicate-slug error).
+    let _serializer = state.lifecycle_serializer.lock().await;
+    let root = resolve_workbench_root(root)?;
+    let path = service.worktree_create(&root, &slug).await?;
+    Ok(path.display().to_string())
+}
+
+/// V13 Phase D: merge worktree `slug`'s branch back into the branch it was
+/// cut from. **Safety-critical** — see `workbench::worktree::merge`'s doc
+/// comment: on ANY failure past the preconditions (most notably a merge
+/// conflict), the merge is aborted before this returns, so the main working
+/// tree is either fully merged or completely untouched — never half-merged.
+#[tauri::command]
+pub async fn workbench_worktree_merge(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<crate::workbench::worktree::MergeReport> {
+    let root = resolve_workbench_root(root)?;
+    service.worktree_merge(&root, &slug).await
+}
+
+/// V13 Phase D: remove worktree `slug`'s directory and delete its branch.
+/// **Double-confirmation is the frontend's job** — this call performs the
+/// removal unconditionally once invoked, and only ever acts on a
+/// cImp-created worktree (refuses a `slug` with no meta sidecar).
+#[tauri::command]
+pub async fn workbench_worktree_discard(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<()> {
+    let root = resolve_workbench_root(root)?;
+    service.worktree_discard(&root, &slug).await
+}
+
+/// V13 Phase D D3 (soft-dep V12 Phase A `checks::run`): the merge-readiness
+/// chip's "Run checks" action — runs every configured check with `cwd` = the
+/// worktree, caches the aggregate pass/fail, and returns it. See
+/// `WorktreeCheckStatus`'s doc comment for the `changed_only` rough edge this
+/// accepts for V1.
+#[tauri::command]
+pub async fn workbench_worktree_run_checks(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<crate::workbench::WorktreeCheckStatus> {
+    let root = resolve_workbench_root(root)?;
+    service.worktree_run_checks(&root, &slug).await
+}
+
+/// V13 Phase D D3: the merge-readiness chip's last cached result for `slug`,
+/// if any check has been run this session — `null` on the wire means "not
+/// checked yet", not a failure.
+#[tauri::command]
+pub fn workbench_worktree_check_status(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    slug: String,
+) -> AppResult<Option<crate::workbench::WorktreeCheckStatus>> {
+    let root = resolve_workbench_root(root)?;
+    Ok(service.worktree_check_status(&root, &slug))
 }
 
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
@@ -1002,10 +1920,7 @@ pub async fn graph_language_census(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<Vec<crate::graph::LangCensus>> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     Ok(service.language_census(&root))
 }
 
@@ -1026,19 +1941,22 @@ pub async fn graph_set_language_enabled(
     if crate::graph::Lang::from_tag(&tag) == crate::graph::Lang::Other {
         return Err(AppError::Settings(format!("unsupported graph language: {lang}")));
     }
+    // Skip the mutate + full rebuild when the desired state already holds
+    // (re-enabling an already-present language, or disabling an absent one).
+    // A redundant rebuild re-indexes/re-embeds the whole project for nothing.
+    let already = state.settings.current().graph.languages.iter().any(|l| l == &tag);
+    if enabled == already {
+        return Ok(());
+    }
     state.settings.mutate(move |cur| {
         let langs = &mut cur.graph.languages;
-        let present = langs.iter().any(|l| l == &tag);
-        if enabled && !present {
+        if enabled {
             langs.push(tag);
-        } else if !enabled {
+        } else {
             langs.retain(|l| l != &tag);
         }
     });
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
+    let root = resolve_graph_root(root)?;
     service.spawn_rebuild(root);
     Ok(())
 }
@@ -1246,6 +2164,47 @@ pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::is_automatic_terminal_response as auto_reply;
+    use super::apply_incoming_settings;
+    use crate::settings::{PromptTemplate, Settings};
+
+    // V14 code-review FIX 1 (HIGH, data loss): `prompt_templates` /
+    // `templates_seeded` are written out-of-band by
+    // `compose_templates_global_set` (straight to the physical global
+    // `settings.json`, bypassing `SettingsHandle`), so the live in-memory
+    // copy can legitimately hold templates the Settings window's generic
+    // snapshot doesn't know about. Simulate that: `cur` already has
+    // templates (as if the dedicated compose path had just run), the
+    // incoming snapshot is stale/empty, and applying it must NOT clobber
+    // the live templates or the seeded flag.
+    #[test]
+    fn settings_update_preserves_out_of_band_prompt_templates() {
+        let mut cur = Settings::default();
+        cur.prompt_templates = vec![
+            PromptTemplate { name: "review-this-diff".to_string(), body: "R".to_string() },
+            PromptTemplate { name: "my-new-template".to_string(), body: "N".to_string() },
+        ];
+        cur.templates_seeded = true;
+
+        // The incoming snapshot represents an unrelated Settings-window save
+        // (e.g. a theme flip) whose local copy of the template library is
+        // stale/empty because it was fetched before the compose-section edit.
+        let mut incoming = Settings::default();
+        incoming.ui.theme = "future-light".to_string();
+        assert!(incoming.prompt_templates.is_empty());
+        assert!(!incoming.templates_seeded);
+
+        apply_incoming_settings(&mut cur, incoming);
+
+        // The unrelated field DID apply...
+        assert_eq!(cur.ui.theme, "future-light");
+        // ...but the out-of-band template library and its seeded flag must
+        // be exactly as they were live, not reverted/deleted by the stale
+        // incoming snapshot.
+        assert_eq!(cur.prompt_templates.len(), 2);
+        assert_eq!(cur.prompt_templates[0].name, "review-this-diff");
+        assert_eq!(cur.prompt_templates[1].name, "my-new-template");
+        assert!(cur.templates_seeded);
+    }
 
     #[test]
     fn focus_events_are_auto() {

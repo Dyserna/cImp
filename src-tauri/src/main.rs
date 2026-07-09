@@ -1,7 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod advisor;
+mod attach;
 mod audio;
+mod checks;
+mod compact_hook;
 mod content;
+mod context_hook;
 mod error;
 mod graph;
 mod ipc;
@@ -9,9 +14,12 @@ mod logging;
 mod notifications;
 mod oob;
 mod offload;
+mod postedit_hook;
+mod preview;
 mod process_guard;
 mod processing;
 mod pty;
+mod read_hook;
 mod settings;
 mod shell;
 mod state;
@@ -22,6 +30,7 @@ mod theming;
 mod tabs;
 mod tts;
 mod usage;
+mod workbench;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -34,11 +43,18 @@ use tracing::{info, warn};
 
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::ipc::commands::{
-    acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
+    acknowledge_error, advisor_dismiss, ai_tool_tab_defaults, close_settings_window,
+    compose_attach_image,
+    compose_content_changed,
+    compose_templates, compose_templates_global_get, compose_templates_global_set,
+    compose_templates_project_get,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
-    get_system_stats, graph_history, graph_language_census, graph_rebuild,
+    get_system_stats, graph_cycles, graph_dead_exports, graph_fact_add, graph_fact_update, graph_facts,
+    graph_history, graph_impact, graph_path, graph_architecture, graph_viz_snapshot,
+    graph_language_census,
+    graph_context_preview, graph_memory, graph_memory_clear, graph_note_set_pinned, graph_rebuild,
     graph_rebuild_embeddings, graph_set_language_enabled, graph_set_watch_paused,
-    graph_status, graph_test_embedder, list_tabs,
+    graph_status, graph_test_embedder, graph_usage, graph_usage_advice, list_tabs,
     list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
     offload_derive_opencode_provider,
     offload_server_log, offload_server_metrics, offload_server_restart, offload_server_start,
@@ -52,14 +68,20 @@ use crate::ipc::commands::{
     restart_shell_tab, set_active_tab, set_window_square_corners, settings_get, settings_update,
     stt_cancel, stt_list_input_devices, stt_list_models, stt_start_recording, stt_stop_recording,
     tab_activate, tts_speak, tts_set_paused, tts_speak_selection, tts_stop, tts_test,
+    workbench_checkpoint_diff, workbench_checkpoint_now, workbench_checkpoints, workbench_diff_file,
+    workbench_diff_summary, workbench_restore, workbench_revert_hunk, workbench_send_hunk,
+    workbench_status, workbench_worktree_check_status, workbench_worktree_create,
+    workbench_worktree_diff, workbench_worktree_discard, workbench_worktree_merge,
+    workbench_worktree_run_checks, workbench_worktrees,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
 };
 use crate::ipc::note::{read_note, write_note};
 use crate::ipc::tab_lifecycle::{
-    close_tab, create_ai_tab, create_shell_tab, default_shell_spec, get_shell_tab_config,
-    open_note_tab, open_tool_tab, reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
+    close_tab, create_ai_tab, create_ai_tab_in_worktree, create_preview_tab, create_shell_tab,
+    default_shell_spec, get_shell_tab_config, open_note_tab, open_tool_tab,
+    reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
@@ -68,6 +90,10 @@ use crate::settings::{
 };
 use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::stt::SttHandle;
+use crate::preview::{
+    preview_capture, preview_close, preview_hide, preview_navigate, preview_open,
+    preview_reload, preview_set_rect, preview_show, preview_update_config,
+};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
 
@@ -80,6 +106,48 @@ fn main() {
     // console allocation is suppressed.
     if std::env::args().skip(1).any(|a| a == "--statusline") {
         statusline::run();
+        return;
+    }
+
+    // V10 context-injection hook: Claude Code invokes `cimp --context-hook` as a
+    // UserPromptSubmit hook, pipes the hook JSON to our stdin, and reads the
+    // `additionalContext` to prepend from our stdout. Handled here before any
+    // Tauri init so it stays GUI-free and fast; on any error it prints nothing.
+    if std::env::args().skip(1).any(|a| a == "--context-hook") {
+        context_hook::run();
+        return;
+    }
+
+    // V11 Phase D context-compaction hook: Claude Code invokes
+    // `cimp --precompact-hook` as a `PreCompact` hook. It POSTs to the app's
+    // loopback `/context/compaction` (which clears dedup + marks the session
+    // post-compaction, and returns a working-set/notes block to survive the
+    // summary). GUI-free and fast like the other shims; prints nothing on error.
+    if std::env::args().skip(1).any(|a| a == "--precompact-hook") {
+        compact_hook::run();
+        return;
+    }
+
+    // V11 Phase E read advisor: Claude Code invokes `cimp --read-hook` as a
+    // `PreToolUse` (matcher `Read`) hook. It asks the app's loopback
+    // `/context/should_read` whether the file was already read unchanged this
+    // session; on a "remind" it denies the Read with the file's outline/body as
+    // the reason. GUI-free like the other shims; prints nothing (⇒ read proceeds)
+    // on any error, so it never wrongly blocks a read.
+    if std::env::args().skip(1).any(|a| a == "--read-hook") {
+        read_hook::run();
+        return;
+    }
+
+    // V12 Phase F: Claude Code invokes `cimp --postedit-hook` as a
+    // `PostToolUse` (matcher `Edit|Write|MultiEdit`) hook right after an edit
+    // completes. It POSTs to the app's loopback `/context/post_edit` (which
+    // debounces, runs the project's configured checks, and diffs against the
+    // session's baseline) and prints only NEW/worsened diagnostics as
+    // additional context. GUI-free like the other shims; prints nothing on
+    // any error, so it never blocks or perturbs an edit.
+    if std::env::args().skip(1).any(|a| a == "--postedit-hook") {
+        postedit_hook::run();
         return;
     }
 
@@ -108,6 +176,10 @@ fn main() {
 
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
+    // V14 Phase B: one id per app run, scoping the compose overlay's
+    // image-attachment temp dir (`attach::attach_dir`). See
+    // `LaunchContext::launch_id`'s doc comment.
+    let launch_id = uuid::Uuid::new_v4().to_string();
 
     // Window title reflects the project the user launched from. If the
     // launch cwd is anywhere inside a git working copy, the title uses
@@ -156,6 +228,12 @@ fn main() {
         content::set_enabled(snap.logging.content_capture.enabled);
         content::run_cleanup(snap.logging.content_capture.retention);
     }
+
+    // V14 Phase B: sweep compose-attach directories orphaned by a previous
+    // run that crashed or was killed before its own exit-time prune (below,
+    // in the `CloseRequested` handler) ran. Fixed 3-day age cap — not a
+    // user setting, this is opportunistic disk hygiene, not a feature.
+    attach::prune(3);
 
     // TTS / audio pipeline. Failures are non-fatal — the app launches with
     // TTS silent and a warning logged. Init is deferred to the Tauri `setup`
@@ -272,6 +350,7 @@ fn main() {
         launch: LaunchContext {
             cwd: launch_cwd,
             extra_args,
+            launch_id,
         },
         tts_segments: tts_tx,
         speak_session: speak_session.clone(),
@@ -307,9 +386,14 @@ fn main() {
     let settings_for_stt = settings_handle.clone();
     let settings_for_offload = settings_handle.clone();
     let settings_for_graph = settings_handle.clone();
+    let settings_for_workbench = settings_handle.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // V14 Phase F: "open in the system browser" for Preview-tab links that
+        // fall outside the localhost/RFC-1918 navigation policy (or a denied
+        // `window.open`) — see `preview::open_external`.
+        .plugin(tauri_plugin_opener::init())
         // Windows 11 Snap Layouts for the custom TuiTitleBar maximize button
         // (id "snap-max-btn"). No-op on Linux/macOS and pre-Win11, so it's
         // registered unconditionally. The frontend attaches/detaches the
@@ -320,6 +404,11 @@ fn main() {
                 .build(),
         )
         .manage(state)
+        // V14 Phase F: one child webview per open Preview tab, keyed by tab
+        // id — needs no AppHandle to construct (unlike WorkbenchService/
+        // GraphService below), so it's managed right away rather than from
+        // inside `.setup()`.
+        .manage(preview::PreviewRegistry::default())
         .setup(move |app| {
             // Recover a poisoned guard rather than `.ok()` skipping it: silently
             // not spawning the state manager would leave the whole avatar /
@@ -469,6 +558,30 @@ fn main() {
                 }
             }
 
+            // V13 Phase A: the Workbench service (fs-batch broadcast today;
+            // checkpoint scheduling and worktree bookkeeping in later phases).
+            // Managed unconditionally, before the graph service below, since
+            // `GraphService::reindex_paths` looks it up via `AppHandle::state`
+            // on every watcher batch — construct it first so that lookup never
+            // races an empty state table during startup.
+            {
+                let workbench_service = crate::workbench::WorkbenchService::new(
+                    app.handle().clone(),
+                    settings_for_workbench.clone(),
+                );
+                // V13 Phase D D3: reconcile git's worktree bookkeeping once at
+                // startup (a worktree directory the user deleted out-of-band
+                // since the last run). Best-effort/fire-and-forget — see
+                // `worktree_prune_at_startup`'s doc comment; never blocks launch.
+                if let Ok(root) = std::env::current_dir() {
+                    let svc = workbench_service.clone();
+                    tauri::async_runtime::spawn(async move {
+                        svc.worktree_prune_at_startup(&root).await;
+                    });
+                }
+                app.manage(workbench_service);
+            }
+
             // V9-01 code knowledge graph: the app-owned graph service that
             // builds `<root>/<db_subdir>/graph.db` so the `graph_*` MCP tools
             // have data to read. Managed unconditionally (the IPC reaches it
@@ -580,11 +693,27 @@ fn main() {
             request_tab_restart,
             restart_shell_tab,
             compose_content_changed,
+            compose_templates,
+            compose_templates_global_get,
+            compose_templates_global_set,
+            compose_templates_project_get,
+            compose_attach_image,
             acknowledge_error,
             tab_activate,
             set_active_tab,
             create_shell_tab,
             create_ai_tab,
+            create_ai_tab_in_worktree,
+            create_preview_tab,
+            preview_open,
+            preview_navigate,
+            preview_reload,
+            preview_set_rect,
+            preview_hide,
+            preview_show,
+            preview_close,
+            preview_capture,
+            preview_update_config,
             close_tab,
             rename_tab,
             reconfigure_shell_tab,
@@ -624,6 +753,38 @@ fn main() {
             graph_set_language_enabled,
             graph_test_embedder,
             graph_history,
+            graph_dead_exports,
+            graph_cycles,
+            graph_impact,
+            graph_path,
+            graph_architecture,
+            graph_viz_snapshot,
+            graph_memory,
+            graph_memory_clear,
+            graph_note_set_pinned,
+            graph_facts,
+            graph_fact_update,
+            graph_fact_add,
+            graph_context_preview,
+            graph_usage,
+            graph_usage_advice,
+            advisor_dismiss,
+            workbench_status,
+            workbench_diff_summary,
+            workbench_diff_file,
+            workbench_revert_hunk,
+            workbench_send_hunk,
+            workbench_checkpoints,
+            workbench_checkpoint_diff,
+            workbench_checkpoint_now,
+            workbench_restore,
+            workbench_worktrees,
+            workbench_worktree_create,
+            workbench_worktree_diff,
+            workbench_worktree_merge,
+            workbench_worktree_discard,
+            workbench_worktree_run_checks,
+            workbench_worktree_check_status,
             theming::themes_list,
             theming::palettes_list,
         ])
@@ -692,6 +853,20 @@ fn main() {
                     // connections close on drop).
                     app.state::<std::sync::Arc<crate::graph::GraphService>>()
                         .shutdown();
+                    // V14 Phase B: best-effort compose-attach cleanup. Same
+                    // 3-day age cap as the startup sweep — a clean exit
+                    // doesn't guarantee THIS run's own directory is empty
+                    // (an attached image may still be sitting in a draft the
+                    // user never submitted), so this only ever catches
+                    // directories already past the age cap, same as startup.
+                    attach::prune(3);
+                    // V14 code-review fix (webview leak): best-effort drain of
+                    // every still-open Preview child webview. Each one is
+                    // otherwise destroyed only by its own tab's close (or the
+                    // frontend's `onDestroy`), so a Preview tab left open at
+                    // quit time would leave its child webview attached through
+                    // the rest of this teardown; catch it here too.
+                    preview::close_all(&app.state::<preview::PreviewRegistry>());
                     // Closing the main window also closes the settings window
                     // if it's open — otherwise it would keep the process alive
                     // with no main window. Destroy it before the main window.
@@ -806,6 +981,7 @@ fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
             let kind = match cfg {
                 TabConfig::AiTool(_) => TabKind::AiTool,
                 TabConfig::Shell(_) => TabKind::Shell,
+                TabConfig::Preview(_) => TabKind::Preview,
             };
             TabMeta {
                 id: tab_id,

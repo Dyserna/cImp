@@ -20,9 +20,14 @@
 
 mod activity;
 mod builder;
+mod context;
 mod embed;
+mod gitcmd;
+mod gitmeta;
+mod impact;
 mod index;
 mod mcp;
+mod memory;
 mod model;
 mod schema;
 mod service;
@@ -31,10 +36,20 @@ mod watcher;
 
 pub use activity::{snapshot as graph_history, GraphCall};
 pub use builder::parse_file;
+pub use context::{est_tokens, RetrieveResult};
 pub use index::{GraphIndex, GraphStats, SymbolHit};
+pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent};
+// V14 Phase D: only `UsageSnapshot` itself is named by qualified path outside
+// this module (the `graph_usage` IPC handler's return type). Its nested
+// field types (`Effectiveness`/`SessionUsage`/`SessionUsageRow`/`ToolUsage`/
+// `TurnUsage`/`UsageTotals`) are used structurally, never referenced by their
+// own `crate::graph::…` path — same posture as `MemorySnapshot`'s own nested
+// `WorkingSetEntry`/`MemNote`/`SessionInfo`, which aren't re-exported here
+// either.
+pub use memory::UsageSnapshot;
 pub use mcp::{
-    handle_call as handle_mcp_call, offload_query, semantic_spec, tool_specs, tools as mcp_tools,
-    GraphToolSpec,
+    handle_call as handle_mcp_call, offload_query, semantic_code_spec, semantic_spec, tool_specs,
+    tools as mcp_tools, GraphToolSpec,
 };
 pub use model::*;
 pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus};

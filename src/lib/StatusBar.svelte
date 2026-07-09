@@ -12,6 +12,7 @@
   import SelectionTtsControls from './status/SelectionTtsControls.svelte';
   import ToolLaunchButton from './status/ToolLaunchButton.svelte';
   import NoteButton from './status/NoteButton.svelte';
+  import WorkbenchDiffBadge from './status/WorkbenchDiffBadge.svelte';
   import { settings } from './settings/store';
 </script>
 
@@ -22,6 +23,7 @@
     <ToolLaunchButton tool="broot" glyph="🌳" label="New broot tab" />
     <ToolLaunchButton tool="rustnet" glyph="🌐" label="New rustnet tab" />
     <NoteButton />
+    <WorkbenchDiffBadge />
     {#if $settings.stt.enabled}
       <span class="sep" aria-hidden="true"></span>
       <RecordButton />

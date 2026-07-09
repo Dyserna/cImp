@@ -106,19 +106,43 @@ export interface UsageSnapshot {
 }
 
 /// Outcome of a usage fetch:
-///   - `snapshot` set → success.
-///   - `rate_limited` → 429 (transient); keep showing last-good/placeholder and
-///     retry after `retry_after_secs` (or the caller's cooldown).
-///   - all empty → unavailable (not logged in / network error).
+///   - `snapshot` set, `stale` false → fresh success.
+///   - `snapshot` set, `stale` true → last-good served during a 429 / transient
+///     failure; render it but signal it may be out of date.
+///   - `rate_limited` → 429; retry after `retry_after_secs` (or the caller's
+///     cooldown), keeping whatever snapshot came back on screen.
+///   - all empty → unavailable (not logged in) or a cold rate-limit with no
+///     cached snapshot yet.
 export interface UsageResult {
   snapshot: UsageSnapshot | null;
   rate_limited: boolean;
   retry_after_secs: number | null;
+  stale: boolean;
 }
 
 /// Fetch the current Claude Code usage. See `UsageResult` for the outcomes.
 export async function getClaudeUsage(): Promise<UsageResult> {
   return invoke<UsageResult>('get_claude_usage');
+}
+
+/// V14 Phase D3: the current session's running token totals, emitted
+/// (debounced ~2s) by the backend's `record_usage` tap whenever a Claude
+/// transcript line firms up a message's `usage` block. Feeds the status-bar
+/// usage-meter's "session tokens" line. Distinct from `UsageSnapshot` above
+/// (that's the Claude Code rate-limit quota; this is a live token count for
+/// the V14 token X-ray — see `graph.ts`'s own, differently-named,
+/// `UsageSnapshot` for the full Usage-section payload).
+export interface SessionTokensEvent {
+  session_id: string;
+  in_tok: number;
+  out_tok: number;
+}
+
+/// Subscribe to `usage-session-tokens`. Returns an unlisten fn.
+export function onUsageSessionTokens(
+  cb: (e: SessionTokensEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<SessionTokensEvent>('usage-session-tokens', (e) => cb(e.payload));
 }
 
 /// NVIDIA GPU stats (null when no NVIDIA GPU / NVML).
@@ -240,6 +264,21 @@ export async function createAiTab(template: TabId): Promise<TabId> {
   return invoke<TabId>('create_ai_tab', { template });
 }
 
+/// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — creates a
+/// fresh cImp worktree (`.cimp/worktrees/<slug>`, branch `cimp/<slug>` cut
+/// from `HEAD`) then spawns a duplicate of `template`'s config with `cwd`
+/// pointed at it. Throws the same `TabLifecycleError` shape as
+/// `createAiTab` on a tab-registration failure; a worktree-creation failure
+/// (nested repo, detached HEAD, duplicate slug, ...) throws a plain string
+/// (the backend's `AppError::Workbench` message).
+export async function createAiTabInWorktree(
+  template: TabId,
+  slug: string,
+  root?: string,
+): Promise<TabId> {
+  return invoke<TabId>('create_ai_tab_in_worktree', { template, slug, root: root ?? null });
+}
+
 export async function closeTab(tab: TabId): Promise<void> {
   await invoke('close_tab', { tab });
 }
@@ -326,6 +365,92 @@ export async function readNote(): Promise<string> {
 /// the NoteView autosave (debounced on edit, on a 5s timer, and on close).
 export async function writeNote(content: string): Promise<void> {
   await invoke('write_note', { content });
+}
+
+// ── V14 Phase F: Preview tab ─────────────────────────────────────────────
+
+/// Create a new user-managed Preview tab (the toolbar's "New Preview tab"
+/// affordance). An empty `url` falls back to `Settings.preview_last_url`,
+/// then `lib/preview/policy.ts`'s `DEFAULT_PREVIEW_URL`, on the backend.
+export async function createPreviewTab(url: string): Promise<TabId> {
+  return invoke<TabId>('create_preview_tab', { url });
+}
+
+/// Open (or replace, if already open) the child webview for `tab`'s
+/// Preview pane at `url`, positioned at `rect` (logical/CSS pixels, relative
+/// to the main window's content area). Called once from the pane body's
+/// `onMount`. Rejects `url` against the live navigation policy before ever
+/// touching a webview — throws (surfaces as a toast) if it does, having
+/// already opened the URL in the system browser as a courtesy.
+export async function previewOpen(
+  tab: TabId,
+  url: string,
+  rect: { x: number; y: number; width: number; height: number },
+): Promise<void> {
+  await invoke('preview_open', { tabId: tab, url, ...rect });
+}
+
+/// Navigate an already-open Preview tab to a new URL (the toolbar's URL
+/// bar). Same policy check as `previewOpen`.
+export async function previewNavigate(tab: TabId, url: string): Promise<void> {
+  await invoke('preview_navigate', { tabId: tab, url });
+}
+
+/// Reload the Preview tab's current page (toolbar reload button + Phase F4
+/// auto-reload).
+export async function previewReload(tab: TabId): Promise<void> {
+  await invoke('preview_reload', { tabId: tab });
+}
+
+/// Reposition/resize an open Preview tab's webview — called on every pane
+/// layout change (the `ResizeObserver` on the measured body div, and the
+/// device-preset letterbox rect from `computePreviewRect`).
+export async function previewSetRect(
+  tab: TabId,
+  rect: { x: number; y: number; width: number; height: number },
+): Promise<void> {
+  await invoke('preview_set_rect', { tabId: tab, ...rect });
+}
+
+/// Hide (not destroy) a Preview tab's webview on tab-switch-away.
+export async function previewHide(tab: TabId): Promise<void> {
+  await invoke('preview_hide', { tabId: tab });
+}
+
+/// Show a previously-hidden Preview tab's webview on tab-switch-back.
+export async function previewShow(tab: TabId): Promise<void> {
+  await invoke('preview_show', { tabId: tab });
+}
+
+/// Destroy a Preview tab's webview on tab close (the pane body's
+/// `onDestroy`). A missing/already-closed tab id is a no-op on the backend.
+export async function previewClose(tab: TabId): Promise<void> {
+  await invoke('preview_close', { tabId: tab });
+}
+
+/// Snapshot the Preview tab's current viewport to a PNG in the Phase-B
+/// attach dir. Returns the saved path — the toolbar's Snapshot button then
+/// pushes it onto `composeAttachments` and opens the compose overlay, same
+/// as a pasted clipboard image.
+export async function previewCapture(tab: TabId): Promise<string> {
+  return invoke<string>('preview_capture', { tabId: tab });
+}
+
+/// Persist the toolbar's live `url`/`deviceWidth`/`autoReload` back onto the
+/// tab's settings entry (so a restart reopens with the same state) and
+/// remember `url` as the project's `preview_last_url`.
+export async function previewUpdateConfig(
+  tab: TabId,
+  url: string,
+  deviceWidth: number | null,
+  autoReload: boolean,
+): Promise<void> {
+  await invoke('preview_update_config', {
+    tabId: tab,
+    url,
+    deviceWidth,
+    autoReload,
+  });
 }
 
 /// Open `<portable-root>/logs/content/` in the OS file manager. Backend

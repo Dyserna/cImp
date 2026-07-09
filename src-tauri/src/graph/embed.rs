@@ -18,6 +18,13 @@ pub struct Embedder {
     client: reqwest::Client,
     endpoint: String,
     model: String,
+    /// The dimension the vector store was sized to, once known. `embed`
+    /// rejects any response whose vectors don't match it — so a remote
+    /// `llama-server` silently restarted with a different-dimension model
+    /// can't feed wrong-length vectors into a store built for the old size
+    /// (which later panics or produces NaN scores in the HNSW k-NN). `None`
+    /// during the initial `probe_dim` (when the dimension isn't known yet).
+    expected_dim: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -50,7 +57,15 @@ impl Embedder {
             client: shared_client(),
             endpoint: normalize_endpoint(endpoint),
             model: model.trim().to_string(),
+            expected_dim: None,
         })
+    }
+
+    /// Pin the dimension every subsequent `embed`/`embed_one` must return —
+    /// the size the vector store was built for. Call once the store dimension
+    /// is resolved (configured or probed) and before persisting any vectors.
+    pub fn expect_dim(&mut self, dim: usize) {
+        self.expected_dim = Some(dim);
     }
 
     /// Embed a batch of texts, preserving order. `Err` on any transport/decode
@@ -97,6 +112,17 @@ impl Embedder {
                 "embeddings dimension mismatch: expected {dim}, got {}",
                 bad.embedding.len()
             ));
+        }
+        // Guard against the store's dimension too: a server restarted with a
+        // different-dimension model returns internally-consistent vectors that
+        // would still corrupt a store built for the old size.
+        if let Some(want) = self.expected_dim {
+            if dim != want {
+                return Err(format!(
+                    "embeddings dimension changed: store expects {want}, endpoint returned {dim} \
+                     (embedding model likely changed — rebuild the vector store)"
+                ));
+            }
         }
         Ok(ordered_embeddings(body.data))
     }
@@ -163,7 +189,10 @@ fn shared_client() -> reqwest::Client {
 /// Append `/v1/embeddings` unless the user already pointed at a full path.
 fn normalize_endpoint(endpoint: &str) -> String {
     let trimmed = endpoint.trim_end_matches('/');
-    if trimmed.contains("/embeddings") {
+    // Match the `/embeddings` path SEGMENT, not a substring — so a host path
+    // like `.../embeddingsvc` isn't mistaken for a complete endpoint (which
+    // would skip appending `/v1/embeddings` and POST to the wrong path).
+    if trimmed.ends_with("/embeddings") || trimmed.contains("/embeddings/") {
         trimmed.to_string()
     } else if trimmed.ends_with("/v1") {
         format!("{trimmed}/embeddings")
@@ -184,6 +213,12 @@ mod tests {
         assert_eq!(
             normalize_endpoint("http://h:8081/v1/embeddings"),
             "http://h:8081/v1/embeddings"
+        );
+        // A path that merely *contains* "embeddings" is not a complete endpoint:
+        // the `/v1/embeddings` suffix must still be appended.
+        assert_eq!(
+            normalize_endpoint("http://h:8081/embeddingsvc"),
+            "http://h:8081/embeddingsvc/v1/embeddings"
         );
     }
 

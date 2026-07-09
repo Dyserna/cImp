@@ -211,6 +211,9 @@ export interface ComposeSettings {
 
 export interface ShortcutSettings {
   open_compose: string | null;
+  /// V14 Phase A: open compose AND immediately open the prompt-template
+  /// picker popover. Default `Alt+/`.
+  open_compose_picker: string | null;
   submit_compose: string | null;
   cancel_compose: string | null;
   open_settings: string | null;
@@ -320,7 +323,38 @@ export interface ShellTabConfig {
   background_override: BackgroundOverrideWire | null;
 }
 
-export type TabConfig = AiToolTabConfig | ShellTabConfig;
+/// V14 Phase F: a user-created Preview tab — an embedded, localhost-scoped
+/// child webview, not a subprocess. No `command`/`args`/`cwd`/`env`/PTY
+/// fields (unlike the two configs above) since there's nothing to spawn.
+export interface PreviewTabConfig {
+  kind: 'preview';
+  id: string;
+  builtin: boolean;
+  name: string;
+  url: string;
+  /// `null` ⇒ the "Desktop" preset (fill the pane, no letterboxing).
+  /// Non-null ⇒ letterbox to a fixed CSS-pixel width (mobile/tablet
+  /// presets) — see `lib/preview/policy.ts`'s device-preset table.
+  device_width: number | null;
+  auto_reload: boolean;
+}
+
+export type TabConfig = AiToolTabConfig | ShellTabConfig | PreviewTabConfig;
+
+/// V14 Phase F: `PreviewTabConfig` has neither `theme_override` nor
+/// `background_override` — it has no terminal to theme at all (no PTY, no
+/// xterm). Call sites that read/write those two fields off a `TabConfig`
+/// looked up by id (`ConfigureTabDialog.svelte`, `SettingsApp.svelte`,
+/// `terminals.ts`) narrow through this helper so they type-check against
+/// the now-3-member union. In practice a Preview tab never reaches any of
+/// them (it offers no "Configure…" — see `TabContextMenu.svelte` — and gets
+/// no terminal entry — see `terminals.ts`'s `createTerminal` guard), so this
+/// is a type-level narrowing, not a runtime behavior change.
+export type ThemedTabConfig = AiToolTabConfig | ShellTabConfig;
+
+export function asThemedTabConfig(t: TabConfig | undefined): ThemedTabConfig | undefined {
+  return t && t.kind !== 'preview' ? t : undefined;
+}
 
 export interface SessionState {
   active_tab_id: string | null;
@@ -508,7 +542,7 @@ export interface LayoutPreset {
 /// `src-tauri/src/settings/schema.rs`. Bumped on every backend migration
 /// step. Frontend doesn't read it for any logic — it round-trips as a
 /// bare integer through the IPC bridge.
-export const CURRENT_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = 21;
 
 export interface Settings {
   /// On-disk schema version. The backend stamps `CURRENT_SCHEMA_VERSION`
@@ -559,6 +593,14 @@ export interface Settings {
   offload: OffloadSettings;
   /// V9-01: per-project code knowledge graph config. Off by default.
   graph: GraphSettings;
+  /// V13 Phase A: the Workbench feature (live diff / checkpoints /
+  /// worktrees). The tab itself defaults on; checkpoints default off.
+  workbench: WorkbenchSettings;
+  /// V12 Phase A: project checker commands the `run_check` MCP tool can run
+  /// (mirror of Rust `Vec<CheckDef>`). Lives at the root, not inside
+  /// `GraphSettings` — independent of the code graph. Empty by default; set
+  /// via the `.cimp/config.json` overlay.
+  checks: CheckDef[];
   /// Which AI-tool tabs are enabled. The checkbox group in
   /// Settings → Tabs is the canonical way to flip this; the backend's
   /// `set_enabled_ai_tabs` IPC opens / closes the corresponding AI
@@ -570,6 +612,51 @@ export interface Settings {
   /// File-logger configuration. The backend writes daily rolling log
   /// files into `<portable-root>/logs/`; this field drives the live filter.
   logging: LoggingSettings;
+  /// V14 Phase A: the global-scope prompt-template library. Read/written
+  /// through the dedicated `compose_templates_global_*` IPC (which targets
+  /// the physical global `settings.json` directly), NOT through the normal
+  /// `settingsUpdate` round-trip — see `lib/compose/templates.ts`. Kept here
+  /// mainly for schema/round-trip fidelity with the backend struct.
+  prompt_templates: PromptTemplate[];
+  /// One-shot starter-seed gate; `true` once the backend has seeded the 4
+  /// starter templates. See the Rust field's doc comment.
+  templates_seeded: boolean;
+  /// V14 Phase D2: budget-tuning advisor proposals the user has dismissed.
+  /// See `DismissedRule`'s doc comment for the (rule_id, signature) matching
+  /// semantics.
+  advisor_dismissed: DismissedRule[];
+  /// V14 Phase F: the last URL entered into any Preview tab in this project
+  /// — a fresh "New Preview tab" starts here (falling back to
+  /// `lib/preview/policy.ts`'s `DEFAULT_PREVIEW_URL` when `null`). Round-trips
+  /// through the ordinary per-project `.cimp/config.json` overlay diff (a
+  /// plain scalar, unlike `prompt_templates` — no bespoke read/write path
+  /// needed).
+  preview_last_url: string | null;
+  /// V14 Phase F: global gate on the Preview tab's navigation policy. `false`
+  /// (default) restricts navigation to localhost/127.0.0.1/RFC-1918 hosts;
+  /// see `lib/preview/policy.ts`'s `isAllowedPreviewHost` (frontend mirror of
+  /// the Rust `preview::is_allowed_preview_host`, used for the toolbar's own
+  /// pre-flight check before even calling the backend).
+  preview_allow_remote: boolean;
+}
+
+/// V14 Phase D2: one dismissed advisor proposal. Mirror of Rust
+/// `settings::DismissedRule`. `rule_id` is a versioned rule constant (e.g.
+/// `"advisor.raise_context_min_score.v1"`); `signature` is the coarse
+/// (10%-bucketed) rate that triggered the dismissed proposal — a materially
+/// changed rate (different bucket) re-fires the proposal even for the same
+/// `rule_id`.
+export interface DismissedRule {
+  rule_id: string;
+  signature: string;
+}
+
+/// V14 Phase A: one saved prompt-library entry (global or project scope —
+/// scope is not part of the stored shape, only of the resolved picker view,
+/// see `ResolvedTemplate` in `lib/compose/templates.ts`).
+export interface PromptTemplate {
+  name: string;
+  body: string;
 }
 
 /// One of the four reserved AI-tool tab ids. Wire format mirrors the
@@ -600,6 +687,20 @@ export interface LoggingSettings {
   content_capture: ContentCaptureSettings;
 }
 
+/// Which built-in parser decodes a check's output (mirror of Rust
+/// `ParserKind`). Wire format is kebab-case.
+export type ParserKind = 'cargo-json' | 'tsc' | 'eslint-json' | 'pytest' | 'generic-gcc';
+
+/// One configured project check the `run_check` MCP tool can run (mirror of
+/// Rust `CheckDef`). `cmd` is the full shell command line (cwd = project
+/// root); `name` is what a model-supplied `run_check` tool call selects by.
+export interface CheckDef {
+  name: string;
+  cmd: string;
+  parser: ParserKind;
+  timeout_secs: number;
+}
+
 /// V9-01: per-project code-knowledge-graph config. Mirror of Rust
 /// `GraphSettings`. Only `enabled` and `allow_remote_worker_access` are
 /// surfaced in the UI today; the rest carry defaults until the full
@@ -613,6 +714,8 @@ export interface GraphSettings {
   watch_debounce_ms: number;
   max_rows_per_query: number;
   max_snippet_bytes: number;
+  /// Hard cap on the body bytes returned by `graph_snippet` (V11 Phase A).
+  max_body_bytes: number;
   db_subdir: string;
   /// Let the offload worker query the graph when running on a *remote*
   /// backend (LAN or cloud). The local worker always has access; a remote
@@ -624,6 +727,68 @@ export interface GraphSettings {
   embedding_dims: number;
   embed_code_bodies: boolean;
   embedding_batch: number;
+  /// Project-wide cap on `code_chunk` rows kept by a full rebuild (V11 Phase G).
+  semantic_code_max_chunks: number;
+  // V10 context injection.
+  context_injection: boolean;
+  context_per_file_chars: number;
+  context_turn_budget_chars: number;
+  context_include_session: boolean;
+  context_min_score: number;
+  // V11 Phase B: repo map (session-start orientation).
+  repo_map_budget_chars: number;
+  repo_map_on_session_start: boolean;
+  // V11 Phase C: injection dedup TTL in turns (0 disables).
+  context_dedup_ttl_turns: number;
+  // V11 Phase D: feed the compactor the working set + pinned notes.
+  compaction_context: boolean;
+  // V11 Phase E: redundant-read advisor (opt-in).
+  read_advisor: boolean;
+  read_advisor_min_lines: number;
+  read_advisor_mode: string;
+  // V11 Phase F: local-model context digests (local-only).
+  context_llm_digests: boolean;
+  // V12 Phase E: memory distillation (durable project facts, local-only).
+  memory_distillation: boolean;
+  // V12 Phase E: promote PINNED facts into launch-time guidance.
+  promote_pinned_facts: boolean;
+  // V12 Phase F: proactive automation.
+  /// Auto-run configured checks after an edit (`PostToolUse` hook) and inject
+  /// only NEW/worsened diagnostics. Opt-in; needs `checks` non-empty.
+  auto_check: boolean;
+  /// Debounce window (seconds) coalescing a burst of edits into one run.
+  auto_check_debounce_s: number;
+  /// Minimum direct inbound call count before the auto-impact note appends.
+  auto_impact_min_dependents: number;
+  /// Re-run dead-exports/import-cycles after each index pass and badge the
+  /// Analyses section when the counts changed. On by default (read-only).
+  analyses_auto: boolean;
+  /// V15 Feature 1: hop bound for `graph_path` shortest-path tracing (1–32).
+  path_max_hops: number;
+  /// V15 Feature 2: max subsystems `graph_architecture` reports.
+  arch_max_communities: number;
+  /// V15 Feature 2: ignore communities smaller than this in the report.
+  arch_min_community_size: number;
+  /// V15 Feature 4 (STRETCH): master toggle for the reserved Graph View tab.
+  graph_viz: boolean;
+  /// V15 Feature 4: cap on the rendered subgraph node count.
+  graph_viz_max_nodes: number;
+}
+
+/// V13 §0.4: the Workbench feature's settings. Mirror of Rust
+/// `WorkbenchSettings`. `enabled` is the master switch for the reserved tab
+/// itself (default true — the tab is cheap; each section gates its own
+/// behavior); `checkpoints` is the shadow-repo snapshot feature (default
+/// false in V1). The five `checkpoint_*` fields tune retention and the
+/// debounced burst trigger.
+export interface WorkbenchSettings {
+  enabled: boolean;
+  checkpoints: boolean;
+  checkpoint_max: number;
+  checkpoint_max_age_days: number;
+  checkpoint_burst_files: number;
+  checkpoint_burst_window_s: number;
+  checkpoint_min_gap_s: number;
 }
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
@@ -926,6 +1091,7 @@ export function defaultSettings(): Settings {
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {
       open_compose: 'Alt+Enter',
+      open_compose_picker: 'Alt+/',
       submit_compose: 'Enter',
       cancel_compose: 'Escape',
       open_settings: 'Ctrl+,',
@@ -1111,6 +1277,7 @@ export function defaultSettings(): Settings {
       watch_debounce_ms: 300,
       max_rows_per_query: 100,
       max_snippet_bytes: 2_000,
+      max_body_bytes: 16_384,
       db_subdir: '.cimp',
       allow_remote_worker_access: false,
       semantic_search: false,
@@ -1119,12 +1286,52 @@ export function defaultSettings(): Settings {
       embedding_dims: 0,
       embed_code_bodies: false,
       embedding_batch: 32,
+      semantic_code_max_chunks: 20_000,
+      context_injection: false,
+      context_per_file_chars: 800,
+      context_turn_budget_chars: 6_000,
+      context_include_session: true,
+      context_min_score: 3,
+      repo_map_budget_chars: 4_000,
+      repo_map_on_session_start: false,
+      context_dedup_ttl_turns: 10,
+      compaction_context: true,
+      read_advisor: false,
+      read_advisor_min_lines: 300,
+      read_advisor_mode: 'advise',
+      context_llm_digests: false,
+      memory_distillation: false,
+      promote_pinned_facts: false,
+      auto_check: false,
+      auto_check_debounce_s: 5,
+      auto_impact_min_dependents: 10,
+      analyses_auto: true,
+      path_max_hops: 8,
+      arch_max_communities: 12,
+      arch_min_community_size: 3,
+      graph_viz: false,
+      graph_viz_max_nodes: 1500,
     },
+    workbench: {
+      enabled: true,
+      checkpoints: false,
+      checkpoint_max: 100,
+      checkpoint_max_age_days: 7,
+      checkpoint_burst_files: 5,
+      checkpoint_burst_window_s: 60,
+      checkpoint_min_gap_s: 120,
+    },
+    checks: [],
     enabled_ai_tabs: ['claude'],
     logging: {
       level: 'info',
       retention: 'weekly',
       content_capture: { enabled: false, retention: 'weekly' },
     },
+    prompt_templates: [],
+    templates_seeded: false,
+    advisor_dismissed: [],
+    preview_last_url: null,
+    preview_allow_remote: false,
   };
 }

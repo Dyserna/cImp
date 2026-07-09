@@ -186,6 +186,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v1.17", detect: looks_v1_17, transform: migrate_v1_17_to_v1_18_step },
     MigrationStep { from_version: "v18", detect: looks_v18, transform: migrate_v18_to_v19_step },
     MigrationStep { from_version: "v19", detect: looks_v19, transform: migrate_v19_to_v20_step },
+    MigrationStep { from_version: "v20", detect: looks_v20, transform: migrate_v20_to_v21_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -1768,6 +1769,37 @@ fn migrate_v19_to_v20(value: &mut Value) {
     );
 }
 
+fn looks_v20(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 20)
+}
+
+fn migrate_v20_to_v21_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v20_to_v21(value)
+}
+
+/// V20 → V21: V14 Phase F preview tab support.
+///
+/// No data transform needed — `preview_last_url` / `preview_allow_remote`
+/// are new `Settings` root fields and `TabConfig::Preview` is a new
+/// internally-tagged tab-config variant; all additive with
+/// `#[serde(default)]`, so an existing v20 file (with zero Preview tabs and
+/// no knowledge of the new root fields) round-trips unchanged. This step
+/// exists purely to advance the version marker so the migration cascade's
+/// fixpoint guard (`migrate_if_needed`) doesn't flag a v20 file as
+/// under-migrated.
+fn migrate_v20_to_v21(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(21u8)),
+    );
+}
+
 /// Walk layout-tree-shaped JSON inside the settings root and rewrite any
 /// `aider` / `aider-local` tab-id reference to `opencode`, de-duplicating the
 /// `opencode` entries each `tab_ids` array then collapses to. Covers
@@ -2134,6 +2166,45 @@ mod tests {
     }
 
     #[test]
+    fn looks_v20_detects_v20_and_not_others() {
+        assert!(looks_v20(&json!({ "schema_version": 20 })));
+        assert!(!looks_v20(&json!({ "schema_version": 19 })));
+        assert!(!looks_v20(&json!({ "schema_version": 21 })));
+        assert!(!looks_v20(&json!({})));
+    }
+
+    /// V14 Phase F: a v20 file — including one with existing (non-Preview)
+    /// tabs — round-trips through the v20→v21 step with everything but the
+    /// version marker untouched; the new root fields simply aren't present
+    /// (they'll deserialize to their `#[serde(default)]` values).
+    #[test]
+    fn v20_to_v21_is_additive_only() {
+        let mut v = json!({
+            "schema_version": 20,
+            "tabs": [{ "id": "claude", "kind": "ai_tool", "command": "claude" }],
+            "behavior": { "copy_on_select": true }
+        });
+        let before_tabs = v["tabs"].clone();
+        migrate_v20_to_v21(&mut v);
+
+        assert_eq!(v["schema_version"], json!(21));
+        assert_eq!(v["tabs"], before_tabs);
+        assert_eq!(v["behavior"]["copy_on_select"], json!(true));
+        assert!(!looks_v20(&v));
+        assert!(v.get("preview_last_url").is_none());
+        assert!(v.get("preview_allow_remote").is_none());
+    }
+
+    #[test]
+    fn v20_to_v21_is_idempotent() {
+        let mut v = json!({ "schema_version": 20, "tabs": [] });
+        migrate_v20_to_v21(&mut v);
+        let once = v.clone();
+        migrate_v20_to_v21(&mut v);
+        assert_eq!(v, once);
+    }
+
+    #[test]
     fn v1_1_to_v1_2_collapses_extra_flags_into_args() {
         let mut v: Value = serde_json::from_str(
             r#"{
@@ -2220,7 +2291,7 @@ mod tests {
         // the whole cascade and write a fresh `.v1.2.bak` on every launch.
         let v: Value = serde_json::from_str(
             r#"{
-                "schema_version": 20,
+                "schema_version": 21,
                 "tabs": [
                     { "kind": "ai_tool", "id": "claude", "name": "Claude" }
                 ]

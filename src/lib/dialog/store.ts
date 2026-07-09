@@ -6,13 +6,16 @@
 
 import { writable, type Writable } from 'svelte/store';
 import type { TabId } from '../tabs/types';
+import type { PaneId } from '../layout/types';
 
 export type DialogState =
   | { kind: 'none' }
   | { kind: 'new-shell-tab' }
   | { kind: 'configure-tab'; tab: TabId }
   | { kind: 'save-layout' }
-  | { kind: 'manage-presets' };
+  | { kind: 'manage-presets' }
+  | { kind: 'restore-checkpoint'; id: string; root?: string }
+  | { kind: 'new-worktree-tab'; template: TabId; paneId: PaneId };
 
 export const dialogState: Writable<DialogState> = writable({ kind: 'none' });
 
@@ -36,6 +39,22 @@ export function openSaveLayoutDialog(): void {
 /// store; no payload needed.
 export function openManagePresetsDialog(): void {
   dialogState.set({ kind: 'manage-presets' });
+}
+
+/// V13 Phase C: opened from the Timeline section's "Restore" row action.
+/// The dialog itself fetches the dry-run diff (`workbench_checkpoint_diff`)
+/// on open to list the affected files — no diff payload needed here, just
+/// which checkpoint and (optionally) which project root.
+export function openRestoreCheckpointDialog(id: string, root?: string): void {
+  dialogState.set({ kind: 'restore-checkpoint', id, root });
+}
+
+/// V13 Phase D D3: opened from a builtin AI tab's context menu — "New
+/// <Claude|OpenCode> tab in worktree…". `template` is the AI tab whose
+/// config the new tab clones; `paneId` is where the frontend routes the new
+/// tab once spawned (mirrors the plain "+" duplicate's `requestTabIntoPane`).
+export function openNewWorktreeTabDialog(template: TabId, paneId: PaneId): void {
+  dialogState.set({ kind: 'new-worktree-tab', template, paneId });
 }
 
 export function closeDialog(): void {

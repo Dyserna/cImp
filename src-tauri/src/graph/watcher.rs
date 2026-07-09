@@ -12,7 +12,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,10 +31,46 @@ pub fn start(
     root: PathBuf,
     debounce: Duration,
 ) -> notify::Result<notify::RecommendedWatcher> {
-    let (tx, rx) = channel::<notify::Result<notify::Event>>();
-    let mut watcher = notify::recommended_watcher(move |res| {
-        // A send error just means the debounce thread has exited; drop it.
-        let _ = tx.send(res);
+    // F16: BOUNDED channel so a flood of fs events (a git checkout, a build, a
+    // formatter) can't grow the queue without limit while a slow re-index holds
+    // the debounce thread below. Pure-access and all-`.git` events — the dominant
+    // flood source (a checkout/gc churns thousands of unindexable `.git` objects)
+    // — are dropped in the callback so they never consume capacity. On a genuine
+    // overflow we drop the event but flag it, and the debounce thread recovers
+    // correctness with a full (idempotent) rebuild rather than a silently-missed
+    // change.
+    const CHANNEL_CAP: usize = 4096;
+    let (tx, rx) = sync_channel::<notify::Result<notify::Event>>(CHANNEL_CAP);
+    let overflow = Arc::new(AtomicBool::new(false));
+    let cb_overflow = overflow.clone();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(ev) = &res {
+            // Drop events that can never change indexed content, at the source.
+            if matches!(ev.kind, EventKind::Access(_)) {
+                return;
+            }
+            // Drop events whose every path lies inside a high-churn build/VCS
+            // directory that's never indexed. Filtering HERE (not only later in
+            // `reindex_paths`, which respects gitignore) keeps a `cargo build`
+            // or `npm install` writing thousands of files from flooding the
+            // bounded channel and forcing back-to-back full rebuilds mid-build.
+            const SKIP_DIRS: [&str; 3] = [".git", "target", "node_modules"];
+            if !ev.paths.is_empty()
+                && ev.paths.iter().all(|p| {
+                    p.components()
+                        .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_str().unwrap_or("")))
+                })
+            {
+                return;
+            }
+        }
+        match tx.try_send(res) {
+            Ok(()) => {}
+            // Full: record it so the debounce thread does a full rebuild.
+            Err(TrySendError::Full(_)) => cb_overflow.store(true, Ordering::Relaxed),
+            // Disconnected: the debounce thread has exited; drop it.
+            Err(TrySendError::Disconnected(_)) => {}
+        }
     })?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
@@ -78,7 +115,13 @@ pub fn start(
                     }
                 }
 
-                if !paths.is_empty() {
+                // If the channel overflowed while we were busy, some events were
+                // dropped — recover with a full (idempotent) rebuild rather than
+                // risk a silently stale index. The rebuild covers everything, so
+                // the incremental batch is redundant this round.
+                if overflow.swap(false, Ordering::Relaxed) {
+                    service.spawn_rebuild(root.clone());
+                } else if !paths.is_empty() {
                     service.reindex_paths(&root, paths.into_iter().collect());
                 }
             }

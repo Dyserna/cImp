@@ -5,7 +5,360 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.40.0] — 2026-07-10
+
+### Added
+
+- **Code Graph Parity (V15).** Closes four code-only gaps benchmarked against
+  Graphify, all on top of the existing per-project graph — no multimodal
+  ingestion, no external services, everything local.
+  - **Edge confidence** — every call/reference/edge is now tagged
+    `extracted` (same-file / structural — the parser is certain), `inferred`
+    (a single cross-file name-keyed guess), or `ambiguous` (the name resolves
+    to more than one definition). Surfaced as badges on `graph_callers`,
+    `graph_callees`, `graph_references`, and `graph_impact` (which gains a
+    confidence split summary and an optional `min_confidence` filter), so the
+    agent can tell a certain caller from a probable one. Always on — a
+    correctness property, not a toggle. Forces one graph rebuild
+    (`GRAPH_SCHEMA_VERSION` 3 → 4).
+  - **`graph_path`** — trace the shortest path between two entities ("how does
+    X reach Y?") across call/import/containment edges, each hop labelled with
+    its edge kind and confidence. Directed by default; `symmetric` for a plain
+    "are these related at all?" walk; `kinds` restricts edge types; bounded by
+    the new `path_max_hops` setting (default 8).
+  - **`graph_architecture`** — a once-per-project orientation map: **god nodes**
+    (highest-degree hubs), **subsystems** (deterministic label-propagation file
+    communities, named by common path prefix), and **surprising connections**
+    (edges crossing subsystem boundaries — candidate accidental coupling).
+    Topology only, no LLM/embeddings. New settings `arch_max_communities`
+    (default 12) and `arch_min_community_size` (default 3).
+  - **Graph View tab (stretch)** — an opt-in reserved tab that draws a bounded
+    subgraph as a live 2D/3D force graph (node color = subsystem, size =
+    degree; edge color = kind, dash = confidence) and pulses nodes as agents
+    read/edit/query the codebase. Off by default (`graph_viz`), capped at
+    `graph_viz_max_nodes` (default 1500).
+  - Both new tools are exposed to the cloud Claude session and the local
+    offload worker, and mirrored as `graph_path` / `graph_architecture` /
+    `graph_viz_snapshot` Tauri commands for the Code Intelligence tab's new
+    **Trace path** and **Architecture** sections.
+
+- **Token Efficiency (V11 Context Engine II).** Builds on V10's memory/injection
+  core to cut the token cost of a real agentic session: fetching one function
+  instead of a whole file, orienting once instead of exploring, and not
+  re-sending what the agent already has.
+  - **`graph_snippet`** — fetch a single definition's *body* (by symbol, or by
+    `file`+`line`) instead of reading the whole file. Ambiguous symbol names
+    return a disambiguation list rather than a body; a symbol spanning the
+    whole file (a top-level script) falls back to its outline + a "use Read
+    with offset/limit" hint. Byte-capped by a new `max_body_bytes` setting
+    (default 16 KiB) and flagged `stale` when the on-disk content hash no
+    longer matches what was indexed.
+  - **`graph_repo_map`** — a budget-bounded map of the project's most
+    call-central files with their top exported signatures, for orienting at
+    the start of a task without exploring. Session-hot files rank higher.
+    Agent-pullable any time, and (opt-in) auto-injected once per session on
+    the first prompt when `repo_map_on_session_start` is on. New settings
+    `repo_map_budget_chars` (default 4000) and `repo_map_on_session_start`
+    (default off).
+  - **Injection dedup.** A file injected in full is demoted to a one-line
+    "unchanged" reminder on later turns until it changes or a TTL elapses
+    (`(updated)` tag when it does change). New setting
+    `context_dedup_ttl_turns` (default 10 turns; `0` disables dedup).
+  - **Compaction survival.** A new Claude `PreCompact` hook
+    (`cimp --precompact-hook` → `POST /context/compaction`) feeds the
+    compactor the session's ranked working set and pinned notes so they
+    survive the summary, and clears the session's dedup state so the next
+    turn re-injects fresh. New setting `compaction_context` (default **on**,
+    nested under context injection).
+  - **Redundant-read advisor** (opt-in, off by default). A new Claude
+    `PreToolUse` hook on `Read` (`cimp --read-hook` →
+    `POST /context/should_read`) intercepts a re-`Read` of a file already read
+    unchanged this session and denies it with the file's outline (`advise`
+    mode) or outline + the most relevant symbol body (`substitute` mode) as
+    the reason — always usable content, never a bare refusal. One reminder per
+    file per session; everything passes through unchanged right after a
+    compaction (the agent may have genuinely lost the content). New settings
+    `read_advisor` (default off), `read_advisor_min_lines` (default 300),
+    `read_advisor_mode` (`advise` | `substitute`, default `advise`).
+  - **Local-model context digests.** For files with no useful outline (docs,
+    configs, long scripts), the **local** offload backend writes a cached
+    ≤3-line digest instead of falling back to a raw content snippet — never
+    routed off-box. New setting `context_llm_digests` (default off; needs a
+    ready local offload backend).
+  - **Code embeddings + `graph_semantic_code`.** Symbol-level semantic code
+    search, mirroring the existing doc-embedding pipeline. Returns
+    `file:line · kind · signature · distance` — never bodies — meant to chain
+    into `graph_snippet`. Enabled by `embed_code_bodies`, which requires
+    `semantic_search` (they share the embedder and backfill pass). New setting
+    `semantic_code_max_chunks` (default 20 000).
+  - The Code Intelligence tab's Index card now shows cached code-embedding
+    coverage (`code: N/M chunks`) and cached digest count (`N context digests
+    cached`) alongside the existing doc-embedding readout.
+
+- **Agentic Inner Loop (V12).** Builds on V11's token efficiency to tighten
+  the agent's edit → check → fix loop and make it work even when the model
+  never asks:
+  - **`run_check`** — one tool that runs the project's configured checker
+    commands and returns deduplicated, structured diagnostics (grouped by
+    severity + code + normalized message, up to 5 sample sites each) instead
+    of a raw dump; a 400-error `tsc` run becomes ~30 rows. Configured
+    per-project via a new root-level `checks: [{ name, cmd, parser,
+    timeout_secs }]` list (rides the `.cimp/config.json` overlay). Shipped
+    parsers: `cargo-json`, `tsc`, `eslint-json`, `pytest`, and `generic-gcc`
+    (the `file:line:col` fallback). `changed_only: true` filters diagnostics
+    to files touched since HEAD. Same security posture as `run_command` — a
+    model-supplied `name` only *selects* among the project's configured
+    checks, never a raw command. Doesn't require the code graph; exposed to
+    both cloud tabs (MCP) and the offload worker's native tool set.
+  - **`graph_impact`** — blast-radius analysis for the working-tree diff (or
+    an explicit `symbols` list): maps changed line ranges to indexed symbols,
+    then returns their transitive dependents (name-keyed, approximate — same
+    honesty convention as `graph_references`) with depth, a file-level
+    rollup, and changed-but-unindexed files called out separately. Also a new
+    Analyses-section button ("Impact of working-tree changes"). `include_tests:
+    true` appends the affected tests to the report.
+  - **Test↔symbol mapping.** `symbol.is_test` is now populated per language —
+    Rust `#[test]`/`#[tokio::test]`/`rstest` plus `#[cfg(test)]` modules
+    (including `cfg(any(test))`/`cfg(all(test))`), JS/TS `*.test.*` /
+    `*.spec.*` / `__tests__`, Python `test_*` in `test_*.py` / `tests/`, and
+    generic path-convention heuristics elsewhere. New tool
+    `graph_tests_for { symbol | file }` returns the transitive callers of the
+    root filtered to test definitions — candidates, not guarantees (dynamic
+    dispatch caveat, same posture as dead exports).
+  - **Git-aware context.** A new `commit_touch` relation (file → last commit
+    timestamp/subject/90-day touch count, collected from `git log
+    --since=90.days`) boosts recently-churned files in `/context/retrieve`
+    ranking (+3 within 7 days, +1 within 30) and adds a `last change: "…"
+    (3d ago)` trailer to injected digests and `graph_find_symbol` rows. New
+    tool `graph_recent_changes { days?, path_prefix? }`. Not a git repo →
+    the feature is simply absent, everything else unaffected.
+  - **Memory distillation.** An idle-session sweep (session quiet > 24h)
+    sends its working set + notes to the **local-only** offload path (never
+    remote/cloud) to extract at most 3 non-obvious, durable `project_fact`
+    rows, capped at 100 live facts (oldest unpinned archived first). Facts
+    surface in `context_recall`, boost `/context/retrieve` ranking when a
+    fact mentions a candidate file's stem (whole-word match, generic stems
+    excluded), and get a Memory-section **Facts** list (pin/edit/delete/add).
+    Off by default (`memory_distillation`; needs a ready local backend). New
+    opt-in `promote_pinned_facts` appends only pinned facts to the
+    launch-time guidance payload, so durable knowledge can arrive with zero
+    tool calls.
+  - **Proactive automation** (opt-in, off by default — same posture as V11's
+    read advisor). A new Claude `PostToolUse` hook on `Edit`/`Write`/
+    `MultiEdit` (`cimp --postedit-hook` → `POST /context/post_edit`) debounces
+    a session's edit bursts (`auto_check_debounce_s`, default 5s), runs the
+    configured checks `changed_only`, and injects only diagnostics that are
+    new or worsened since the session's last run — plus a two-line
+    blast-radius note when the edited symbol has at least
+    `auto_impact_min_dependents` (default 10) dependents. Check runs are
+    single-flight per project root, so a Claude tab and an OpenCode tab
+    editing concurrently share one run instead of duplicating a build; each
+    session still sees only what *it* hasn't seen. Dead-exports/import-cycles
+    now also re-run after every completed index pass (`analyses_auto`,
+    default **on** — read-only, badges the Analyses section on change).
+
+- **Vibe-Coding Guardrails (V13).** A new reserved **Workbench** tab (default
+  **on**) makes it safe to let agents loose across the whole working tree —
+  live diff, undo-anything checkpoints, and isolated worktrees, all local and
+  git-native:
+  - **Live diff pane.** The working-tree diff vs `HEAD` (spawned `git`,
+    parsed unified diff), re-diffed on the same `fs-batch` event the graph
+    watcher already emits (debounced 500 ms, plus a 5 s poll fallback when
+    the watcher itself is off). Virtualized file list, unified/side-by-side
+    toggle, intra-line word-diff. Per-hunk **Revert** (`git apply --reverse`;
+    refuses mid-merge/-rebase and on a stale `hunk_hash` if the file changed
+    since the hunk was computed), **Copy**, and **Send to agent** (drops the
+    hunk as a fenced block + `file:line` header into the compose overlay,
+    targeted at the focused AI tab). A status-bar `±N` badge click-opens the
+    tab. Non-git projects with checkpoints on diff against the latest
+    checkpoint instead.
+  - **Cross-agent checkpoints** (off by default). Automatic working-tree
+    snapshots into a separate `.cimp/shadow.git` store that never touches the
+    user's own `.git` — no stash entries, refs, or reflog noise, enforced by
+    a `GitCtx` that always sets *or* removes `GIT_DIR`/`GIT_WORK_TREE`/
+    `GIT_INDEX_FILE` before spawning a shadow `git`. Each snapshot is an
+    orphan commit tagged `cp-<seq>`, deduplicated by tree sha so a quiet
+    period doesn't spam near-identical commits. Triggers: per user prompt
+    (tapped from the same POST the injection shim already uses, recording
+    the triggering agent), a debounced file-activity burst (covers shell-tab
+    edits), and a manual "Checkpoint now". A new **Timeline** section (in the
+    Workbench tab) lists snapshots with trigger/agent/files-changed and
+    offers **Diff vs now** / **Restore**. Restore always snapshots the
+    current state first (a "pre-restore" checkpoint, so restore is itself
+    undoable), re-creates files deleted since, and deletes files created
+    since only with an explicit opt-in checkbox (default off — untracked new
+    work is kept unless asked). Works even before `git init`. New settings
+    `workbench.checkpoints` (default off), `checkpoint_max` (100),
+    `checkpoint_max_age_days` (7), `checkpoint_burst_files` (5) /
+    `_burst_window_s` (60), `checkpoint_min_gap_s` (120).
+  - **Worktree manager.** "New Claude/OpenCode tab in worktree…" runs `git
+    worktree add .cimp/worktrees/<slug> -b cimp/<slug>` and spawns the AI tab
+    with `cwd` set to the new worktree (tab title gets a `⑂ slug` marker). A
+    **Worktrees** section lists every worktree with ahead/behind counts,
+    **Diff vs base** (reuses the diff viewer), **Merge** (fast-forward or
+    merge commit; requires a clean main tree on the worktree's base branch;
+    on conflict runs `git merge --abort` and reports failure rather than
+    ever leaving a half-merged tree), **Discard** (double-confirmed, only
+    for cImp-created worktrees), and **Open shell here**. A merge-readiness
+    chip (soft-dep on V12 `run_check`) shows the latest `changed_only` check
+    result per worktree — advisory only, never gates the Merge button.
+    `git worktree prune` runs on app start.
+
+- **Workflow & Visibility (V14).** Four quality-of-life features sharing one
+  theme — see what's happening, and feed the loop faster:
+  - **Prompt library.** Saved, parameterized compose templates: a global list
+    in `settings.json` plus per-project entries in the `.cimp/config.json`
+    overlay, project entries shadowing a same-named global one by name.
+    Variables `{selection}` (the focused pane's terminal selection) and
+    `{clipboard}` resolve immediately on insert; any other `{name}` stays a
+    literal tab-stop, first one auto-selected. In the compose overlay, `/` at
+    the start of an empty textarea (or a 📋 button) opens a fuzzy-filter
+    picker (↑↓/Enter, `Esc` or continued typing dismisses it into literal
+    text — the agent's own slash commands are unaffected); a rebindable
+    shortcut (default `Alt+/`) opens compose with the picker already up.
+    Managed under *Settings → Compose* — global templates get full
+    add/edit/delete; project templates are a read-only list edited via the
+    overlay file, so a committed `.cimp/config.json` shares a team's
+    templates with no separate export step. Ships 4 starters
+    (`review-this-diff`, `write-tests-for`, `explain-selection`,
+    `commit-message`), deletable.
+  - **Image paste/drop into compose.** Paste an image (Tauri clipboard
+    plugin — the WebView2 `navigator.clipboard` denial doesn't apply here) or
+    drag-drop image files onto the compose overlay → a chip appears above the
+    textarea; on submit, the local path(s) are appended to the message text
+    (both Claude Code and OpenCode accept local image paths in prompts).
+    Pasted images are written to a per-launch temp dir
+    (`%TEMP%/cimp-attach/<launch-id>/n.png`); dropped files are referenced in
+    place, not copied. The temp dir is age-pruned (>3 days) at startup and
+    again on graceful exit.
+  - **Token/cost X-ray.** A new **Usage** section (6th, after Analyses) in
+    the Code Intelligence tab: per-turn stacked bars (input / cache-read /
+    output / est. tool-result), a top-consumers table (tool × est. tokens), a
+    per-session table with totals and cache-hit ratio, and an effectiveness
+    panel (chars injected / suppressed-by-dedup / displaced-by-read-advisor).
+    Honest measurement throughout — token counts read straight from a
+    transcript's own `usage` block are exact; anything derived from
+    character counts is labeled `est.`, and there's no fabricated savings %.
+    Sourced by extending the existing OOB Claude transcript tap to also
+    record `usage` and tool-result sizes into a new `usage_stat` relation
+    (additive, no schema bump); OpenCode's `/event` stream carries no
+    token/usage fields on the pinned version, so every OpenCode session
+    reports `est_only`. A new status-bar session-tokens line surfaces the
+    running total.
+  - **Budget-tuning advisor.** An **Advisor** card atop the Usage section
+    proposes measured changes to the V10/V11 knobs — propose-and-confirm,
+    never silent self-modification. Three deterministic Rust rules, each
+    gated on a minimum sample size (≥5 sessions, plus a per-rule
+    injection/reminder/turn floor): injected files rarely touched again ⇒
+    propose raising `context_min_score` (capped at a ceiling so repeated
+    applies can't silently kill injection); read-advisor reminders usually
+    followed by a full re-read anyway ⇒ propose raising
+    `read_advisor_min_lines`; a high unused-injection rate while turns are
+    budget-maxed ⇒ propose lowering `context_turn_budget_chars` (only ever
+    proposed when it's a real reduction). Each proposal carries the measured
+    rationale and an Apply button that writes through the normal settings
+    path; Dismiss is remembered per rule at a 10%-bucketed rate, so it
+    re-fires only once the underlying rate shifts to a different bucket.
+    Rules are versioned (`rule_id` strings) and listed in the card's
+    tooltip.
+  - **Localhost preview tab.** A new user-creatable **Preview** tab: an
+    embedded WebView2 child webview (Tauri's multi-webview API) pointed at a
+    dev-server URL, with a URL bar, back/reload, device-width presets
+    (mobile/tablet/desktop), and **Snapshot → compose** (captures the
+    webview's current viewport straight to a PNG in the compose attach dir
+    and opens the overlay with it pre-attached). Auto-reload fires on a quiet
+    period (~1s) after the shared `fs-batch` file-activity event. Navigation
+    is restricted to `localhost`/loopback/RFC-1918-private hosts unless
+    `preview_allow_remote` is on; any `target="_blank"`/`window.open()`
+    always leaves the tab for the system browser rather than opening a
+    second preview pane. Not a general browser — no history UI, no
+    profiles.
+
+### Changed
+
+- The graph store schema bumps to v3 (`symbol.is_test`, provisioned for a
+  later milestone — the only column change); an older `graph.db` is
+  transparently rebuilt on first launch, same as the V10 migration. Every
+  other new relation this adds (`digest`, `code_chunk`, `code_vec`) is
+  additive and created on demand — no separate migration.
+- Two new loopback routes join `/context/retrieve` under the same
+  authenticated-localhost trust model: `POST /context/compaction` and
+  `POST /context/should_read`.
+- V12 adds one more loopback route the same way: `POST /context/post_edit`.
+  V12's schema footprint is entirely additive on top of V11's v3 bump — no
+  further version bump (`commit_touch`, `project_fact`, `session_distilled`,
+  `meta` are all create-if-missing).
+- V13 touches neither the graph schema nor MCP tool set — the Workbench is a
+  reserved app-rendered tab (like Code Intelligence) backed entirely by
+  spawned `git` and its own `.cimp/shadow.git` store.
+- V14 adds the new `usage_stat` relation additively — no graph schema bump
+  (still v3). The **settings** schema bumps 20 → 21 for the new Preview tab
+  kind (`TabConfig::Preview`) and the `preview_allow_remote` /
+  `preview_last_url` / `prompt_templates` / `templates_seeded` /
+  `advisor_dismissed` fields; the migration is a no-op data transform (every
+  new field is `#[serde(default)]`/`Option`), so an older `settings.json`
+  round-trips additively.
+
+### Fixed
+
+- **Workbench module hardening** (multi-agent code review of the whole
+  module). Highlights: automatic prompt/burst checkpoints were silently
+  broken on Windows (git rejects the `\\?\` canonicalized root the
+  triggers passed — verbatim prefixes are now stripped at the spawn
+  boundary); several Workbench views mutated plain `Set`/`Map` state that
+  Svelte 5 doesn't proxy, leaving the worktree diff panel / check chips /
+  checkpoint-diff expansion visually dead (now `SvelteSet`/`SvelteMap`);
+  reverting an untracked file's hunk deleted the file with no confirmation
+  (now always confirms in explicit delete terms). Also: merges are no
+  longer refused over untracked files, discard refuses while an AI tab
+  lives in the worktree, failed worktree/shell creates no longer leak a
+  queued pane placement, per-file diff fetches guard against out-of-order
+  responses, non-UTF-8 filenames survive restore on Linux, `LC_ALL=C` is
+  pinned on spawned git, the shadow repo pins `core.hooksPath` and skips
+  redundant re-init per checkpoint, and the diff parser prefers explicit
+  header paths over the `diff --git` split.
+
+## [0.35.0] — 2026-07-08
+
+### Added
+
+- **Code Intelligence (V10 Context Engine).** The read-only "Code Graph" tab is
+  renamed **Code Intelligence** and gains four capabilities beyond structural
+  search, folded into a five-section view (Index / Activity / Memory / Context /
+  Analyses):
+  - **Session memory.** cImp keeps a per-project, rolling record of what each
+    agent session reads, edits, and queries (from Claude's transcript in-process
+    and OpenCode's tool hooks), plus free-text notes the agent chooses to
+    remember. New MCP tools `context_recall` (reload this session's working
+    set), `context_note` (remember a decision; pin to keep it across sessions),
+    and `context_notes`. The Memory section shows the working set, notes (with
+    pin/unpin), and recent sessions, with per-session and project-wide clear.
+    Memory is stored in `graph.db` in relations that survive a full index
+    rebuild.
+  - **Automatic context injection** (opt-in, off by default). When enabled, cImp
+    ranks the files most relevant to each prompt and prepends a budget-bounded
+    digest (an outline of the top files' signatures, not their full contents) —
+    for **Claude** via a `UserPromptSubmit` hook, for **OpenCode** via a
+    generated dependency-free `.opencode/plugin`. Session-hot files (from
+    memory) rank first. The Context section has a live **preview** so you can
+    see exactly what a prompt would inject, and per-file / per-turn character
+    budgets and a relevance threshold in Settings.
+  - **Packaged analyses.** On-demand **dead exports** (candidate unused public
+    symbols — honestly labelled as candidates, since dynamic dispatch / external
+    APIs / macros produce false positives) and **import cycles** (loops of files
+    that import one another), as the Analyses section and the `graph_dead_exports`
+    / `graph_cycles` MCP tools.
+- **Symbol visibility.** The graph now records each definition's visibility
+  (Rust `pub`/`pub(crate)`, JS/TS `export`, Python underscore convention, Go
+  capitalization), which powers accurate dead-export detection.
+
+### Changed
+
+- The graph store schema is versioned; on first launch after upgrading, an older
+  `graph.db` is transparently rebuilt from source to pick up the new columns and
+  memory relations (cheap — every row is re-derivable).
+- Two new local loopback surfaces (`POST /context/retrieve`, `POST /memory/event`)
+  join `/graph_run` under the same authenticated-localhost trust model.
 
 ## [0.34.2] — 2026-07-06
 

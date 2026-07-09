@@ -21,7 +21,13 @@
     ShellTabConfig,
     TabConfig,
   } from './lib/settings/types';
-  import { defaultSettings, findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
+  import {
+    asThemedTabConfig,
+    defaultSettings,
+    findTab,
+    findTabIndex,
+    toPresetConfig,
+  } from './lib/settings/types';
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
   import { listSttModels, listInputDevices } from './lib/stt';
   import {
@@ -47,7 +53,13 @@
     McpServerConfig,
     ServerCommandTemplate,
     RemoteBackendTemplate,
+    PromptTemplate,
   } from './lib/settings/types';
+  import {
+    composeTemplatesGlobalGet,
+    composeTemplatesGlobalSet,
+    composeTemplatesProjectGet,
+  } from './lib/compose/templates';
   import { LOCAL_DATA_TOOLS } from './lib/settings/types';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
@@ -147,6 +159,61 @@
       console.error('graph rebuild failed', e);
     } finally {
       graphBusy = false;
+    }
+  }
+
+  // V14 Phase A: prompt-library "Compose" section. Global templates are
+  // edited here and saved through the dedicated global-only IPC (NOT
+  // `patch`/`applySettings` — see `compose_templates_global_set`'s doc
+  // comment); project templates are a read-only listing (they live in this
+  // project's `.cimp/config.json`, edited by hand).
+  let globalTemplates = $state<PromptTemplate[]>([]);
+  let projectTemplates = $state<PromptTemplate[]>([]);
+  let composeTemplatesLoading = $state(true);
+  let composeTemplatesDirty = $state(false);
+  let composeTemplatesError = $state<string | null>(null);
+
+  async function loadComposeTemplates(): Promise<void> {
+    composeTemplatesLoading = true;
+    composeTemplatesError = null;
+    try {
+      const [g, p] = await Promise.all([
+        composeTemplatesGlobalGet(),
+        composeTemplatesProjectGet(),
+      ]);
+      globalTemplates = g;
+      projectTemplates = p;
+      composeTemplatesDirty = false;
+    } catch (e) {
+      composeTemplatesError = `${e}`;
+    } finally {
+      composeTemplatesLoading = false;
+    }
+  }
+
+  function addGlobalTemplate(): void {
+    globalTemplates = [...globalTemplates, { name: `template-${globalTemplates.length + 1}`, body: '' }];
+    composeTemplatesDirty = true;
+  }
+  function renameGlobalTemplate(i: number, name: string): void {
+    globalTemplates = globalTemplates.map((t, idx) => (idx === i ? { ...t, name } : t));
+    composeTemplatesDirty = true;
+  }
+  function editGlobalTemplateBody(i: number, body: string): void {
+    globalTemplates = globalTemplates.map((t, idx) => (idx === i ? { ...t, body } : t));
+    composeTemplatesDirty = true;
+  }
+  function deleteGlobalTemplate(i: number): void {
+    globalTemplates = globalTemplates.filter((_, idx) => idx !== i);
+    composeTemplatesDirty = true;
+  }
+  async function saveGlobalTemplates(): Promise<void> {
+    composeTemplatesError = null;
+    try {
+      await composeTemplatesGlobalSet(globalTemplates);
+      composeTemplatesDirty = false;
+    } catch (e) {
+      composeTemplatesError = `${e}`;
     }
   }
 
@@ -554,9 +621,11 @@
     | 'bottom-bar'
     | 'tabs'
     | 'shortcuts'
+    | 'compose'
     | 'offload'
     | 'mcp'
     | 'graph'
+    | 'workbench'
     | 'advanced'
     | 'about';
   let activeSection = $state<SectionId>('theme');
@@ -564,13 +633,15 @@
     { id: 'theme', label: 'Appearance' },
     { id: 'avatar', label: 'Avatar' },
     { id: 'shortcuts', label: 'Keyboard controls' },
+    { id: 'compose', label: 'Compose' },
     { id: 'bottom-bar', label: 'Bottom bar' },
     { id: 'audio', label: 'Text-to-speech' },
     { id: 'stt', label: 'Speech-to-text' },
     { id: 'tabs', label: 'Tabs' },
     { id: 'offload', label: 'Offload task tools' },
     { id: 'mcp', label: 'MCP servers' },
-    { id: 'graph', label: 'Code graph' },
+    { id: 'graph', label: 'Code Intelligence' },
+    { id: 'workbench', label: 'Workbench' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
@@ -665,6 +736,7 @@
     listInputDevices()
       .then((d) => (inputDevices = d))
       .catch((e) => console.warn('stt_list_input_devices failed', e));
+    void loadComposeTemplates();
     for (const t of AI_TABS) {
       aiToolTabDefaults(t)
         .then((d) => {
@@ -922,7 +994,7 @@
   );
   const activeTab = $derived(
     activeTabId && snapshot
-      ? snapshot.tabs.find((t) => t.id === activeTabId) ?? null
+      ? asThemedTabConfig(snapshot.tabs.find((t) => t.id === activeTabId)) ?? null
       : null,
   );
   const activeTabHasOverrides = $derived(
@@ -958,7 +1030,7 @@
     patch((s) => {
       const id = s.session.active_tab_id ?? s.tabs[0]?.id;
       if (!id) return;
-      const src = s.tabs.find((t) => t.id === id);
+      const src = asThemedTabConfig(s.tabs.find((t) => t.id === id));
       if (!src) return;
       if (src.theme_override) {
         s.terminal.theme = src.theme_override;
@@ -972,7 +1044,9 @@
           ...src.background_override,
         };
       }
+      // Preview tabs carry neither field — nothing to clear on them.
       for (const t of s.tabs) {
+        if (t.kind === 'preview') continue;
         t.theme_override = null;
         t.background_override = null;
       }
@@ -2666,6 +2740,15 @@
             />
           </label>
           <label>
+            <span>Open compose with template picker</span>
+            <ShortcutCapture
+              bind:value={
+                () => snapshot!.shortcuts.open_compose_picker,
+                (v) => patch((s) => (s.shortcuts.open_compose_picker = v))
+              }
+            />
+          </label>
+          <label>
             <span>Submit compose</span>
             <ShortcutCapture
               bind:value={
@@ -2739,6 +2822,94 @@
             equivalent of Ctrl+right-click. Shows a "No text selected" notice
             when nothing is selected.
           </small>
+        </section>
+      {:else if activeSection === 'compose'}
+        <section>
+          <h2>Compose</h2>
+          <small class="hint top">
+            Saved prompt templates, insertable from the compose overlay's
+            <code>/</code> picker (type <code>/</code> on an empty line, or
+            click the 📋 button beside the textarea). Variables:
+            <code>{'{selection}'}</code> (the focused pane's terminal
+            selection) and <code>{'{clipboard}'}</code> (the system
+            clipboard) are filled in immediately; any other
+            <code>{'{name}'}</code> becomes a tab-stop you Tab between and
+            overtype after inserting.
+          </small>
+
+          <h3>Global templates</h3>
+          <small class="hint">
+            Available from every project. Saved directly to the global
+            settings file, not this project's overlay.
+          </small>
+          {#if composeTemplatesLoading}
+            <small class="hint">Loading…</small>
+          {:else}
+            {#if globalTemplates.length === 0}
+              <small class="hint">No templates yet — add one below.</small>
+            {:else}
+              <ul class="template-list compose-template-list">
+                {#each globalTemplates as t, i (i)}
+                  <li class="compose-template-row">
+                    <input
+                      type="text"
+                      class="compose-template-name"
+                      placeholder="name"
+                      value={t.name}
+                      oninput={(e) =>
+                        renameGlobalTemplate(i, (e.currentTarget as HTMLInputElement).value)}
+                    />
+                    <textarea
+                      class="compose-template-body"
+                      placeholder={'Template body — use {selection}, {clipboard}, or {any-name} for tab-stops'}
+                      rows="2"
+                      value={t.body}
+                      oninput={(e) =>
+                        editGlobalTemplateBody(i, (e.currentTarget as HTMLTextAreaElement).value)}
+                    ></textarea>
+                    <button type="button" class="danger" onclick={() => deleteGlobalTemplate(i)}
+                      >Delete</button
+                    >
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+            <div class="button-row">
+              <button type="button" onclick={addGlobalTemplate}>Add template</button>
+              <button
+                type="button"
+                disabled={!composeTemplatesDirty}
+                onclick={() => void saveGlobalTemplates()}
+                >Save</button
+              >
+              {#if composeTemplatesDirty}
+                <small class="hint">Unsaved changes</small>
+              {/if}
+            </div>
+            {#if composeTemplatesError}
+              <small class="error">{composeTemplatesError}</small>
+            {/if}
+          {/if}
+
+          <h3>Project templates</h3>
+          <small class="hint">
+            Read-only here — project-scope templates live in this project's
+            <code>.cimp/config.json</code> (a top-level
+            <code>prompt_templates</code> array), edited by hand or committed
+            for team sharing. A project template shadows a global one of the
+            same name.
+          </small>
+          {#if projectTemplates.length === 0}
+            <small class="hint">None for this project.</small>
+          {:else}
+            <ul class="template-list">
+              {#each projectTemplates as t (t.name)}
+                <li>
+                  <span class="template-name" title={t.body}>{t.name}</span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </section>
       {:else if activeSection === 'offload'}
         <section>
@@ -3580,7 +3751,7 @@
         </section>
       {:else if activeSection === 'graph'}
         <section>
-          <h2>Code knowledge graph</h2>
+          <h2>Code Intelligence</h2>
           <small class="hint top">
             Build a per-project graph of your code and docs (symbols, calls,
             imports, doc-comments), stored at
@@ -3762,6 +3933,180 @@
               </small>
             {/if}
 
+            <h3>Context injection</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.context_injection}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.context_injection = (e.currentTarget as HTMLInputElement).checked),
+                  )}
+              />
+              <span>Auto-inject relevant file digests into each prompt</span>
+            </label>
+            <small class="hint">
+              Prepends a budget-bounded digest of the most relevant files to each
+              prompt (Claude via a <code>UserPromptSubmit</code> hook, OpenCode via
+              a generated <code>.opencode/plugin</code>). Off by default — it
+              changes what the agent sees. Re-launch a tab to pick it up. Tune and
+              preview it on the <strong>Context</strong> section of the Code
+              Intelligence tab.
+            </small>
+            {#if snapshot.graph.context_injection}
+              <label>
+                <span>Per-file budget (chars)</span>
+                <input
+                  type="number"
+                  min="100"
+                  value={snapshot.graph.context_per_file_chars}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.context_per_file_chars = Math.max(
+                          100,
+                          Number((e.currentTarget as HTMLInputElement).value) || 800,
+                        )),
+                    )}
+                />
+              </label>
+              <label>
+                <span>Per-turn budget (chars)</span>
+                <input
+                  type="number"
+                  min="500"
+                  value={snapshot.graph.context_turn_budget_chars}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.context_turn_budget_chars = Math.max(
+                          500,
+                          Number((e.currentTarget as HTMLInputElement).value) || 6000,
+                        )),
+                    )}
+                />
+              </label>
+              <label>
+                <span>Min relevance score (skip below)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.context_min_score}
+                  onchange={(e) =>
+                    patch((s) => {
+                      // 0 is a valid value (no threshold), so keep it — a bare
+                      // `|| 3` would treat the falsy 0 as "unset" and revert it.
+                      const n = Number((e.currentTarget as HTMLInputElement).value);
+                      s.graph.context_min_score = Number.isFinite(n) ? Math.max(0, n) : 3;
+                    })}
+                />
+              </label>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.context_include_session}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.context_include_session = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Rank session-hot files first (from Memory)</span>
+              </label>
+            {/if}
+
+            <h3>Architecture &amp; path tracing</h3>
+            <small class="hint">
+              Tune V15's code-intelligence features: <code>graph_path</code>
+              (shortest-path tracing), <code>graph_architecture</code> (god
+              nodes, subsystems, surprising edges), and the live Graph View tab.
+              Edge confidence (extracted/inferred/ambiguous) is always on.
+            </small>
+            <label>
+              <span>Path tracing max hops (1–32)</span>
+              <input
+                type="number"
+                min="1"
+                max="32"
+                value={snapshot.graph.path_max_hops}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.path_max_hops = Math.min(
+                        32,
+                        Math.max(1, Number((e.currentTarget as HTMLInputElement).value) || 8),
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Max subsystems reported</span>
+              <input
+                type="number"
+                min="1"
+                value={snapshot.graph.arch_max_communities}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.arch_max_communities = Math.max(
+                        1,
+                        Number((e.currentTarget as HTMLInputElement).value) || 12,
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Minimum subsystem size</span>
+              <input
+                type="number"
+                min="1"
+                value={snapshot.graph.arch_min_community_size}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.arch_min_community_size = Math.max(
+                        1,
+                        Number((e.currentTarget as HTMLInputElement).value) || 3,
+                      )),
+                  )}
+              />
+            </label>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.graph_viz}
+                onchange={(e) =>
+                  patch((s) => (s.graph.graph_viz = (e.currentTarget as HTMLInputElement).checked))}
+              />
+              <span>Show the <strong>Graph View</strong> tab (live 2D/3D force graph)</span>
+            </label>
+            <small class="hint">
+              A dedicated tab that draws the code graph and pulses nodes as agents
+              read/edit/query the codebase. Off by default — it's a human-facing
+              visual, not on any agent path.
+            </small>
+            {#if snapshot.graph.graph_viz}
+              <label>
+                <span>Max rendered nodes</span>
+                <input
+                  type="number"
+                  min="50"
+                  value={snapshot.graph.graph_viz_max_nodes}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.graph_viz_max_nodes = Math.max(
+                          50,
+                          Number((e.currentTarget as HTMLInputElement).value) || 1500,
+                        )),
+                    )}
+                />
+              </label>
+            {/if}
+
             <h3>Offload worker access</h3>
             <label class="checkbox">
               <input
@@ -3787,6 +4132,139 @@
               setting.
             </small>
           {/if}
+        </section>
+      {:else if activeSection === 'workbench'}
+        <section>
+          <h2>Workbench</h2>
+          <small class="hint top">
+            Vibe-coding guardrails: a live diff pane, automatic checkpoints
+            (a separate shadow git repo — your own <code>.git</code> is never
+            touched), and a worktree manager for running parallel agents
+            safely. The tab is cheap to keep around; checkpoints are a
+            heavier, opt-in feature below.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.workbench.enabled}
+              onchange={(e) =>
+                patch(
+                  (s) => (s.workbench.enabled = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Show the Workbench tab</span>
+          </label>
+
+          <h3>Checkpoints</h3>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.workbench.checkpoints}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoints = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Enable automatic checkpoints</span>
+          </label>
+          <small class="hint">
+            Off by default in V1 — Diff and Worktrees work without it. When
+            on, cImp periodically snapshots your working tree into a separate
+            shadow git repo (your own <code>.git</code> is never touched).
+            Enable this to start capturing checkpoints; restore one from the
+            Workbench tab's Timeline section.
+          </small>
+          <label>
+            <span>Max checkpoints kept</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_max}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_max = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 100,
+                    )),
+                )}
+            />
+          </label>
+          <label>
+            <span>Max checkpoint age (days)</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_max_age_days}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_max_age_days = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 7,
+                    )),
+                )}
+            />
+          </label>
+          <small class="hint">
+            The burst trigger fires an "activity" checkpoint when a shell tab
+            or other non-hooked flow touches several files at once — the
+            fallback that covers what the per-prompt trigger can't see.
+          </small>
+          <label>
+            <span>Burst trigger: files changed</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_burst_files}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_burst_files = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 5,
+                    )),
+                )}
+            />
+          </label>
+          <label>
+            <span>Burst trigger: time window (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_burst_window_s}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_burst_window_s = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 60,
+                    )),
+                )}
+            />
+          </label>
+          <label>
+            <span>Minimum gap between snapshots (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_min_gap_s}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_min_gap_s = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 120,
+                    )),
+                )}
+            />
+          </label>
         </section>
       {:else if activeSection === 'advanced'}
         <section>
@@ -4237,6 +4715,27 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* V14 Phase A: Compose section's global-template editor rows — a name
+     field, a growable body textarea, and a delete button. Unlike the
+     read-only `.template-list` rows above, each entry here is directly
+     editable. */
+  .compose-template-list {
+    gap: var(--space-3);
+  }
+  .compose-template-row {
+    align-items: flex-start !important;
+  }
+  .compose-template-name {
+    flex: 0 0 10rem;
+  }
+  .compose-template-body {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-family: inherit;
+    font-size: var(--font-size-sm, 13px);
+    resize: vertical;
+    padding: 6px 8px;
   }
   /* Two-column layout: fixed sidebar on the left, scrollable content on
      the right. The settings page lives inside #app, which app.css pins to

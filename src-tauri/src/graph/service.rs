@@ -15,28 +15,43 @@
 //! once on startup for the launch root when the feature is enabled, and again
 //! whenever the `graph_rebuild` IPC is invoked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ignore::gitignore::Gitignore;
 use ignore::WalkBuilder;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, info, warn};
 
 use crate::error::AppResult;
 use crate::settings::{GraphSettings, SettingsHandle};
 
 use super::embed::Embedder;
-use super::index::{GraphIndex, GraphStats, LangCount};
+use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
+use super::memory::{
+    Effectiveness, MemorySnapshot, ProjectFact, SessionUsage, SessionUsageRow, ToolUsage,
+    TurnUsage, UsageEvent, UsageSnapshot, UsageTotals, WorkingSetEntry,
+};
 use super::model::Lang;
 use super::parse_file;
 
 /// Bumped if the embedding schema/layout changes in a way that invalidates
 /// stored vectors. Part of the epoch fingerprint alongside model + dim.
 const EMBED_SCHEMA: &str = "v1";
+
+/// V12 Phase E: the distiller's fixed extraction instruction, prepended to a
+/// session's working set + notes before the local-only completion. Verbatim
+/// per the milestone spec — do not paraphrase (the validator downstream
+/// assumes this exact output contract: 1-3 lines, no numbering, no preamble).
+const DISTILL_PROMPT_INSTRUCTION: &str = "You are distilling a coding session's memory into \
+durable project facts. From the working set and notes below, extract AT MOST 3 non-obvious, \
+durable facts a future coding session on THIS project would need. Skip anything derivable from \
+the code itself (structure, naming, what a function does). Prefer decisions, constraints, \
+gotchas, and their rationale. Output one fact per line, each <=200 chars, plain text, no \
+numbering, no preamble, no blank lines.";
 
 /// Tauri event carrying a [`GraphStatus`] snapshot whenever a root's build
 /// state changes (queued → building → ready/error). The Phase-I monitor tab
@@ -83,6 +98,12 @@ pub struct GraphStatus {
     pub embed_total: u64,
     /// Chunks still awaiting a current-epoch vector.
     pub embed_pending: u64,
+    /// V11 Phase G: code-body vectors stored for the current epoch.
+    pub code_embedded: u64,
+    /// V11 Phase G: total code chunks (the code-embedding denominator).
+    pub code_embed_total: u64,
+    /// V11 Phase F: cached local-model context digests.
+    pub digests: u64,
     /// Last embedder error, if any.
     pub embed_error: Option<String>,
 }
@@ -107,6 +128,9 @@ impl GraphStatus {
             embedded: 0,
             embed_total: 0,
             embed_pending: 0,
+            code_embedded: 0,
+            code_embed_total: 0,
+            digests: 0,
             embed_error: None,
         }
     }
@@ -151,6 +175,115 @@ pub struct GraphService {
     /// `again` records that a request arrived while a backfill was running, so
     /// the in-flight task does one more pass and no late chunk is missed.
     backfill: StdMutex<HashMap<PathBuf, BackfillFlag>>,
+    /// V11 Phase B: session ids that have already received the once-per-session
+    /// project-map greeting. In-memory only — a restart re-greets each session
+    /// once, which is acceptable (and self-corrects). A session is recorded here
+    /// only after a non-empty map actually renders, so an early prompt (before
+    /// the graph has call edges) retries on the next turn.
+    greeted: StdMutex<HashSet<String>>,
+    /// V11 Phase C: per-session injection dedup state. In-memory (a restart just
+    /// re-injects fresh, which is safe). Keyed by session id; the preview path
+    /// (session id `None`) never touches it.
+    injected: StdMutex<HashMap<String, InjectState>>,
+    /// V11 Phase D/E: session ids that just went through a compaction. Set by the
+    /// `/context/compaction` route; consumed by the read advisor (Phase E), which
+    /// passes every read until each file is re-read once after a compaction (the
+    /// agent genuinely lost the content the summary dropped).
+    post_compaction: StdMutex<HashSet<String>>,
+    /// V11 Phase E: `(session_id, rel_path)` pairs the read advisor has already
+    /// reminded about — one reminder per file per session, so an agent that reads
+    /// again after a reminder (it knows better than our heuristic) always passes.
+    reminded: StdMutex<HashSet<(String, String)>>,
+    /// V11 Phase E / F4-fix: the content hash the read advisor last observed on
+    /// disk for a `(session_id, rel_path)` — i.e. what the agent actually read
+    /// last time. The staleness check compares against THIS, not the index hash:
+    /// once the watcher re-indexes an edited file the index hash matches the new
+    /// content, but the agent's context still holds the version it read before
+    /// the edit, so comparing to the index would wrongly suppress the re-read it
+    /// genuinely needs. In-memory (a restart just allows a fresh read); capped.
+    read_seen: StdMutex<HashMap<(String, String), String>>,
+    /// V11 Phase F: `(root, file, content_hash)` digest jobs currently in flight,
+    /// so a cache miss never spawns a duplicate local-model job for the same
+    /// content. Keyed by root too, since one service manages multiple projects
+    /// and an identical (path, hash) can occur in two of them. Also caps
+    /// concurrent jobs (demand-driven + slot-gated by the supervisor).
+    digest_inflight: StdMutex<HashSet<(PathBuf, String, String)>>,
+    /// V12 Phase F: per-session auto-check debounce/baseline/pending state
+    /// (`/context/post_edit`). Keyed by session id — never by root, so two
+    /// agents editing the same project each get their own "what's new" view
+    /// (V10 session scoping).
+    auto_check_sessions: StdMutex<HashMap<String, crate::checks::auto::AutoCheckState>>,
+    /// V12 Phase F: the single-flight check runner shared by every session —
+    /// see `checks::auto::RootRunner`'s doc comment.
+    auto_check_runner: crate::checks::auto::RootRunner,
+    /// V12 review: session ids currently being distilled by [`GraphService::distill_session`],
+    /// so two sweeps that both select the same idle-undistilled session (the
+    /// rebuild sweep and the watcher-batch sweep can race onto the same
+    /// candidate across the ~30s `run_internal` await) don't both distill it —
+    /// same single-flight shape as `digest_inflight`/[`InflightGuard`].
+    distilling: StdMutex<HashSet<String>>,
+    /// V14 Phase D3: last time [`Self::record_usage`] emitted the
+    /// `usage-session-tokens` status-bar event, per session id — debounces a
+    /// fast-streaming transcript's repeated `Turn` upserts to at most one
+    /// emit every couple of seconds per session.
+    usage_emit_debounce: StdMutex<HashMap<String, Instant>>,
+}
+
+/// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
+/// panic in the spawned digest task can't leak the key and permanently shrink
+/// the in-flight budget — mirrors [`BackfillGuard`]'s cleanup discipline.
+struct InflightGuard {
+    svc: Arc<GraphService>,
+    key: (PathBuf, String, String),
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.svc.digest_inflight.lock() {
+            g.remove(&self.key);
+        }
+    }
+}
+
+/// RAII removal of a `distilling` in-flight session id (V12 review). Runs on
+/// `Drop` so an early `return` (validation failure, offload error, ...) or a
+/// future panic in [`GraphService::distill_session`] still frees the session
+/// for a later sweep — mirrors [`InflightGuard`]'s cleanup discipline.
+struct DistillGuard<'a> {
+    svc: &'a GraphService,
+    session_id: String,
+}
+
+impl Drop for DistillGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.svc.distilling.lock() {
+            g.remove(&self.session_id);
+        }
+    }
+}
+
+/// Per-session record of what context has been injected, for dedup (V11 Phase C).
+#[derive(Default)]
+struct InjectState {
+    /// Monotonic retrieve counter for this session (the dedup TTL clock).
+    turn: u32,
+    /// `path → (content_hash_at_injection, turn_injected)` for files injected in
+    /// full, so an unchanged re-candidate can be demoted to a one-line reminder.
+    files: HashMap<String, (String, u32)>,
+    /// V14 Phase D: cumulative chars of full digests injected this session —
+    /// feeds the Usage section's Effectiveness panel (`injected_chars`) via
+    /// [`GraphService::effectiveness_totals`]. Honest measured accounting
+    /// (summed straight from `RetrieveResult::chars`), not a token estimate.
+    injected_chars: u64,
+    /// V14 Phase D: cumulative chars suppressed by dedup this session (V11-C
+    /// `RetrieveResult::deduped_chars`) — feeds `deduped_chars`.
+    deduped_chars: u64,
+    /// V14 Phase D2: retrieval turns observed this session, and (`turns_maxed`)
+    /// how many of them injected at least 90% of `context_turn_budget_chars`
+    /// — the advisor's "budget maxed" signal (rule 3, paired with
+    /// [`GraphService::injection_follow_rate`]).
+    turns_seen: u32,
+    turns_maxed: u32,
 }
 
 /// Per-root backfill liveness for the single-flight guard in [`spawn_backfill`].
@@ -199,6 +332,16 @@ impl GraphService {
             write_lock: StdMutex::new(()),
             paused: AtomicBool::new(false),
             backfill: StdMutex::new(HashMap::new()),
+            greeted: StdMutex::new(HashSet::new()),
+            injected: StdMutex::new(HashMap::new()),
+            post_compaction: StdMutex::new(HashSet::new()),
+            reminded: StdMutex::new(HashSet::new()),
+            read_seen: StdMutex::new(HashMap::new()),
+            digest_inflight: StdMutex::new(HashSet::new()),
+            auto_check_sessions: StdMutex::new(HashMap::new()),
+            auto_check_runner: crate::checks::auto::RootRunner::new(),
+            distilling: StdMutex::new(HashSet::new()),
+            usage_emit_debounce: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -215,12 +358,13 @@ impl GraphService {
     /// path for a silent model swap behind the same name. No-op when semantic
     /// search is off.
     pub fn spawn_rebuild_embeddings(self: &Arc<Self>, root: PathBuf) {
-        if !self.settings.current().graph.semantic_search {
+        let snap = self.settings.current().graph;
+        if !snap.semantic_search {
             return;
         }
         if let Ok(idx) = self.index_for(&root) {
             let cleared = {
-                let _w = self.write_lock.lock().unwrap();
+                let _w = self.write_guard();
                 idx.clear_vectors()
             };
             // Don't silently no-op: if the clear failed (e.g. the store was
@@ -233,6 +377,22 @@ impl GraphService {
                     s.embed_error = Some(format!("failed to clear vectors: {e}"));
                 });
                 return;
+            }
+            // V11 Phase G: also drop code vectors when code embedding is on, so
+            // "Rebuild embeddings" re-embeds both stores together rather than
+            // leaving stale code vectors behind under a fresh doc epoch.
+            if snap.embed_code_bodies {
+                let cleared_code = {
+                    let _w = self.write_guard();
+                    idx.clear_code_vectors()
+                };
+                if let Err(e) = cleared_code {
+                    self.patch_status(&root, |s| {
+                        s.embed_state = "error".into();
+                        s.embed_error = Some(format!("failed to clear code vectors: {e}"));
+                    });
+                    return;
+                }
             }
         }
         self.spawn_backfill(root);
@@ -284,13 +444,27 @@ impl GraphService {
         cwd: &Path,
         name: &str,
         args: &serde_json::Value,
+        consumer: &str,
     ) -> Result<String, String> {
         let settings = self.settings.current();
         let sub = settings.graph.effective_db_subdir();
+        // The consumer selects the activity source + the memory tools' agent
+        // scope, so an OpenCode tab's graph/context calls don't read as Claude's.
+        let source = super::mcp::source_for_consumer(consumer);
+
+        // `run_check` (V12 Phase A) needs a project root but not a built code
+        // graph — resolve root the same way graph tools do when a graph.db
+        // exists, else fall back to `cwd` itself, and skip opening an index
+        // entirely (same rationale as `mcp::handle_call`'s special case).
+        if name == "run_check" {
+            let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
+            return super::mcp::run_check_tool(&root, &settings, source, args).await;
+        }
+
         let root = super::mcp::find_graph_root(cwd, &sub)
             .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
         let idx = self.index_for(&root).map_err(|e| e.to_string())?;
-        super::mcp::dispatch_recorded(&root, &idx, &settings, "claude", name, args).await
+        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args).await
     }
 
     /// The configured per-project db subdirectory (default `.cimp`).
@@ -308,12 +482,27 @@ impl GraphService {
     /// the open is cheap.
     fn index_for(&self, root: &Path) -> AppResult<Arc<GraphIndex>> {
         let root = root.to_path_buf();
-        let mut guard = self.indices.lock().unwrap();
-        if let Some(idx) = guard.get(&root).cloned() {
-            return Ok(idx);
+        let (idx, migrated) = {
+            let mut guard = self.indices.lock().unwrap();
+            if let Some(idx) = guard.get(&root).cloned() {
+                return Ok(idx);
+            }
+            let idx = Arc::new(GraphIndex::open(&root, &self.db_subdir())?);
+            // Read (once) whether this open had to reset a stale-schema store.
+            let migrated = idx.take_schema_reset();
+            guard.insert(root.clone(), idx.clone());
+            (idx, migrated)
+        }; // release the indices lock before spawning a rebuild
+
+        if migrated {
+            // A pre-upgrade store was emptied to fix its shape. Repopulate it now
+            // (via the managed service Arc) so a non-launch root touched only by a
+            // query or the memory tap doesn't stay silently empty.
+            if let Some(svc) = self.app.try_state::<Arc<GraphService>>() {
+                tracing::info!(root = %root.display(), "graph: schema migrated — rebuilding");
+                svc.inner().clone().spawn_rebuild(root);
+            }
         }
-        let idx = Arc::new(GraphIndex::open(&root, &self.db_subdir())?);
-        guard.insert(root, idx.clone());
         Ok(idx)
     }
 
@@ -342,12 +531,1298 @@ impl GraphService {
         language_census(root, &snap, &self.db_subdir())
     }
 
+    /// V10: candidate dead exports for `root` — public symbols with no reference
+    /// and no inbound call edge. Opens the warm index; bounded by
+    /// `max_rows_per_query`. Candidates only (see [`GraphIndex::dead_exports`]).
+    pub fn dead_exports(&self, root: &Path) -> AppResult<Vec<SymbolHit>> {
+        let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
+        self.index_for(root)?.dead_exports(max)
+    }
+
+    /// V10: import cycles between files under `root` (each a loop of ≥ 2 files).
+    /// Opens the warm index; bounded by `max_rows_per_query`.
+    pub fn import_cycles(&self, root: &Path) -> AppResult<Vec<Vec<String>>> {
+        let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
+        self.index_for(root)?.import_cycles(max)
+    }
+
+    /// V12 Phase B (Analyses): working-tree impact — symbols changed since
+    /// `HEAD` plus their transitive dependents. Diff mode only (the
+    /// `symbols`-scoped mode is MCP-tool only, where an agent picks explicit
+    /// roots — see `graph::mcp::run_impact`). Opens the warm index; bounded
+    /// by `max_rows_per_query`; the default depth (3) matches the tool's.
+    pub fn impact(&self, root: &Path) -> AppResult<super::impact::ImpactReport> {
+        let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
+        let idx = self.index_for(root)?;
+        let set = super::impact::changed_symbols(root, &idx)?;
+        let mut names: Vec<String> = set.changed.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        let dependents = if names.is_empty() {
+            Vec::new()
+        } else {
+            idx.dependents_transitive(&names, 3, max, None)?
+        };
+        Ok(super::impact::ImpactReport { changed: set.changed, dependents, unindexed: set.unindexed })
+    }
+
+    /// V15 Feature 1: the shortest path between two entities across the code
+    /// edge kinds. Opens the warm index; `max_hops` from `path_max_hops`
+    /// (clamped 1–32). `None` when unresolvable or no path within the bound.
+    pub fn shortest_path(
+        &self,
+        root: &Path,
+        from: &str,
+        to: &str,
+        kinds: &[super::model::EdgeKind],
+        symmetric: bool,
+    ) -> AppResult<Option<super::index::PathHit>> {
+        let hops = (self.settings.current().graph.path_max_hops.max(1) as usize).min(32);
+        self.index_for(root)?.shortest_path(from, to, kinds, hops, symmetric)
+    }
+
+    /// V15 Feature 2: the architecture overview (god nodes, subsystems,
+    /// surprising edges). Opens the warm index; bounded by the arch settings.
+    pub fn architecture(&self, root: &Path) -> AppResult<super::index::ArchReport> {
+        let g = self.settings.current().graph;
+        let max = g.max_rows_per_query.max(1) as usize;
+        self.index_for(root)?.architecture(
+            g.arch_max_communities as usize,
+            g.arch_min_community_size as usize,
+            max,
+        )
+    }
+
+    /// V15 Feature 4: a bounded subgraph for the Graph View tab. Opens the warm
+    /// index; capped at `graph_viz_max_nodes`.
+    pub fn viz_snapshot(&self, root: &Path) -> AppResult<super::index::VizGraph> {
+        let max = self.settings.current().graph.graph_viz_max_nodes.max(1) as usize;
+        self.index_for(root)?.viz_snapshot(max)
+    }
+
+    // ── V10 session / action memory ──────────────────────────────────────
+
+    /// Record one memory event for `root`'s current-project graph. A no-op when
+    /// the graph is disabled. Best-effort — a store error is logged, never
+    /// propagated (memory must never break the agent's turn). Called in-process
+    /// from the Claude transcript tap and via the `/memory/event` loopback route.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mem_event(
+        &self,
+        root: &Path,
+        session_id: &str,
+        agent: &str,
+        kind: &str,
+        path: &str,
+        symbol: Option<&str>,
+        line: Option<u32>,
+        detail: Option<&str>,
+    ) {
+        if !self.settings.current().graph.enabled {
+            return;
+        }
+        // Store paths project-relative with `/` separators so memory paths match
+        // the graph's stored file paths (agents send absolute or `\`-separated
+        // paths). A pattern/command that isn't under root passes through.
+        let rel = relativize_path(root, path);
+        let ts = super::activity::now_ms() as i64;
+        match self.index_for(root) {
+            Ok(idx) => {
+                if let Err(e) =
+                    idx.record_mem_event(session_id, agent, kind, &rel, symbol, line, ts, detail)
+                {
+                    debug!(error = %e, "graph: record_mem_event failed");
+                }
+            }
+            Err(e) => debug!(error = %e, "graph: record_mem_event open failed"),
+        }
+    }
+
+    // ── V14 Phase C: usage / cost accounting ──────────────────────────────
+
+    /// Record one usage/cost event for `root`'s current-project graph. A
+    /// no-op when the graph is disabled — usage rides `graph.db`, so without
+    /// it the token X-ray is simply unavailable (same posture as memory).
+    /// Best-effort: a store error is logged, never propagated. Called
+    /// in-process from the Claude transcript tap and via the `/memory/event`
+    /// loopback route (OpenCode's usage tap — see the C3 spike note atop
+    /// `oob/opencode.rs`).
+    pub fn record_usage(&self, root: &Path, session_id: &str, agent: &str, event: UsageEvent) {
+        if !self.settings.current().graph.enabled {
+            return;
+        }
+        let ts = super::activity::now_ms() as i64;
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: record_usage_event open failed");
+                return;
+            }
+        };
+        if let Err(e) = idx.record_usage_event(session_id, agent, &event, ts) {
+            debug!(error = %e, "graph: record_usage_event failed");
+            return;
+        }
+        // V14 Phase D3: debounced session-tokens event for the status bar's
+        // usage-meter popover. Only a `Turn` row carries tokens (a
+        // `ToolResult` carries chars), and a streamed transcript upserts the
+        // same `Turn` many times as `usage` firms up — the debounce keeps
+        // that from spamming the frontend.
+        if matches!(event, UsageEvent::Turn { .. }) {
+            self.maybe_emit_session_tokens(session_id, &idx);
+        }
+    }
+
+    /// See [`Self::record_usage`]'s Phase D3 note. Best-effort: an emit
+    /// failure (no window yet, etc.) is silently dropped, same posture as
+    /// every other `self.app.emit` call in this module.
+    fn maybe_emit_session_tokens(&self, session_id: &str, idx: &GraphIndex) {
+        const DEBOUNCE: Duration = Duration::from_secs(2);
+        {
+            let mut m = self.usage_emit_debounce.lock().unwrap();
+            let now = Instant::now();
+            if let Some(last) = m.get(session_id) {
+                if now.duration_since(*last) < DEBOUNCE {
+                    return;
+                }
+            }
+            // F12: bound the map — nothing prunes it when a session ends, so it
+            // grew one entry per session id for the process lifetime. Clearing is
+            // safe (a dropped entry just allows one immediate emit).
+            if m.len() > 1024 && !m.contains_key(session_id) {
+                m.clear();
+            }
+            m.insert(session_id.to_string(), now);
+        }
+        if let Ok(totals) = idx.usage_session_totals(session_id) {
+            let _ = self.app.emit(
+                "usage-session-tokens",
+                &serde_json::json!({
+                    "session_id": session_id,
+                    "in_tok": totals.in_tok,
+                    "out_tok": totals.out_tok,
+                }),
+            );
+        }
+    }
+
+    /// Summed token totals for `session_id` ("turn" rows only). Empty
+    /// defaults on any store error (graph disabled, session unknown, etc.).
+    pub fn usage_session_totals(&self, root: &Path, session_id: &str) -> UsageTotals {
+        let Ok(idx) = self.index_for(root) else { return UsageTotals::default() };
+        idx.usage_session_totals(session_id).unwrap_or_default()
+    }
+
+    /// Per-turn token/tool-char series for `session_id`, oldest → newest.
+    pub fn usage_turn_series(&self, root: &Path, session_id: &str) -> Vec<TurnUsage> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.usage_turn_series(session_id).unwrap_or_default()
+    }
+
+    /// Per-session usage totals + cache-hit ratio + `est_only` for every
+    /// known session under `root` (drives the Usage section's project
+    /// totals table).
+    pub fn usage_all_sessions(&self, root: &Path) -> Vec<SessionUsageRow> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.usage_all_sessions().unwrap_or_default()
+    }
+
+    /// V14 Phase D: per-tool ranking (est. tokens + call count) for
+    /// `session_id`, descending.
+    pub fn usage_tool_ranking(&self, root: &Path, session_id: &str) -> Vec<ToolUsage> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.usage_tool_ranking(session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(tool, chars, calls)| ToolUsage { tool, est_tokens: chars / 4, calls })
+            .collect()
+    }
+
+    /// V14 Phase D: the Usage section's on-demand payload for `root` — the
+    /// current session's per-turn series + top-tools ranking, every known
+    /// session's totals row, and the effectiveness counters.
+    /// `offload_local_tasks` is left at `0` — the `graph_usage` IPC handler
+    /// fills it in from the (separate) `OffloadService`, which this module
+    /// has no dependency on.
+    pub fn usage_snapshot(&self, root: &Path) -> UsageSnapshot {
+        let effectiveness = self.effectiveness_totals(root);
+        let Ok(idx) = self.index_for(root) else {
+            return UsageSnapshot {
+                current: None,
+                sessions: Vec::new(),
+                effectiveness,
+                offload_local_tasks: 0,
+            };
+        };
+        // Reuses the per-root wrapper methods above (not `idx` directly) so
+        // this is the one place that consumes them — same "one caller,
+        // exercised for real" posture the rest of the service follows.
+        let current = idx.mem_current_session().ok().flatten().map(|sid| {
+            SessionUsage {
+                turns: self.usage_turn_series(root, &sid),
+                totals: self.usage_session_totals(root, &sid),
+                top_tools: self.usage_tool_ranking(root, &sid),
+                session_id: sid,
+            }
+        });
+        let sessions = self.usage_all_sessions(root);
+        UsageSnapshot { current, sessions, effectiveness, offload_local_tasks: 0 }
+    }
+
+    /// V14 Phase D: sum of the honest injected/deduped-char counters
+    /// accumulated in the in-memory injection-dedup state (V11-C), across
+    /// every session currently resident there, plus the read-advisor's
+    /// displaced chars (V11-E Activity events — see [`Effectiveness`]'s doc
+    /// comment for why this reads the Activity ring rather than
+    /// `usage_stat`). Process-wide and non-durable, like `injected` itself —
+    /// a restart loses the running total; good enough for an honest
+    /// "since-restart" readout, not a permanent ledger.
+    ///
+    /// V14 code-review fix (FIX 7): `injected`/`deduped` are now scoped to
+    /// `root`'s own sessions (`idx.mem_sessions()`), same as
+    /// [`Self::injection_follow_rate`]/[`Self::budget_maxed_rate`] —
+    /// previously this summed the WHOLE process-wide `injected` map, so a
+    /// multi-project cImp session would attribute every OTHER project's
+    /// injected/deduped chars to whichever root happened to call
+    /// `usage_snapshot`.
+    ///
+    /// note: `advisor_displaced_chars` is NOT root-scoped — the Activity
+    /// ring (`super::activity::snapshot`) is a single process-wide buffer
+    /// with no root/session key to filter on, unlike `injected`. Left as a
+    /// process-wide estimate; the UI already labels this figure `est.`.
+    fn effectiveness_totals(&self, root: &Path) -> Effectiveness {
+        let advisor_displaced_chars: u64 = super::activity::snapshot()
+            .iter()
+            .filter(|c| c.source == "read_advisor" && c.tool == "remind")
+            .map(|c| c.chars as u64)
+            .sum();
+        let root_sessions: HashSet<String> = self
+            .index_for(root)
+            .ok()
+            .and_then(|idx| idx.mem_sessions().ok())
+            .map(|sessions| sessions.into_iter().map(|s| s.session_id).collect())
+            .unwrap_or_default();
+        let map = self.injected.lock().unwrap();
+        let (injected_chars, deduped_chars) = map
+            .iter()
+            .filter(|(sid, _)| root_sessions.contains(sid.as_str()))
+            .fold((0u64, 0u64), |(i, d), (_, st)| (i + st.injected_chars, d + st.deduped_chars));
+        Effectiveness { injected_chars, deduped_chars, advisor_displaced_chars }
+    }
+
+    /// V14 Phase D2: fraction of files injected in full this project (across
+    /// every session currently resident in the in-memory dedup state —
+    /// V11-C) that were LATER read or edited in that same session (V10
+    /// `mem_event`), plus the sample count (distinct injected-file
+    /// instances) it's based on. Sessions in the in-memory map that don't
+    /// belong to `root` (their id doesn't appear in `root`'s own
+    /// `mem_sessions`) are excluded — the map itself isn't root-scoped, only
+    /// keyed by session id. `None` when nothing has been injected for this
+    /// root yet (context injection never fired, or the graph is off).
+    pub fn injection_follow_rate(&self, root: &Path) -> Option<(f64, u64)> {
+        let idx = self.index_for(root).ok()?;
+        let root_sessions: HashSet<String> =
+            idx.mem_sessions().ok()?.into_iter().map(|s| s.session_id).collect();
+        // Snapshot (session, injected paths) under the lock, then release it
+        // before the per-session DB round trips — holding `injected` across
+        // `mem_touched_paths` serializes all injection-map access behind SQLite
+        // lookups on the hot injection path.
+        let snapshot: Vec<(String, Vec<String>)> = {
+            let map = self.injected.lock().unwrap();
+            map.iter()
+                .filter(|(sid, _)| root_sessions.contains(sid.as_str()))
+                .map(|(sid, st)| (sid.clone(), st.files.keys().cloned().collect()))
+                .collect()
+        };
+        let mut total = 0u64;
+        let mut followed = 0u64;
+        for (sid, paths) in snapshot {
+            let touched = idx.mem_touched_paths(&sid).unwrap_or_default();
+            for path in paths {
+                total += 1;
+                if touched.contains(&path) {
+                    followed += 1;
+                }
+            }
+        }
+        if total == 0 { None } else { Some((followed as f64 / total as f64, total)) }
+    }
+
+    /// V14 Phase D2: fraction of retrieval turns whose injected digest filled
+    /// at least 90% of `context_turn_budget_chars` — the advisor's "the
+    /// budget is maxed out" signal (rule 3's second half). Sample count =
+    /// turns observed; same root-session scoping as
+    /// [`Self::injection_follow_rate`].
+    pub fn budget_maxed_rate(&self, root: &Path) -> Option<(f64, u64)> {
+        let idx = self.index_for(root).ok()?;
+        let root_sessions: HashSet<String> =
+            idx.mem_sessions().ok()?.into_iter().map(|s| s.session_id).collect();
+        let map = self.injected.lock().unwrap();
+        let mut seen = 0u64;
+        let mut maxed = 0u64;
+        for (sid, st) in map.iter() {
+            if !root_sessions.contains(sid) {
+                continue;
+            }
+            seen += st.turns_seen as u64;
+            maxed += st.turns_maxed as u64;
+        }
+        if seen == 0 { None } else { Some((maxed as f64 / seen as f64, seen)) }
+    }
+
+    /// V14 Phase D2: wraps [`GraphIndex::advisor_reread_rate`] — this query
+    /// is already fully root+session scoped (it reads `mem_event` from
+    /// `root`'s own index), unlike the two signals above.
+    pub fn advisor_reread_rate(&self, root: &Path) -> Option<(f64, u64)> {
+        self.index_for(root).ok()?.advisor_reread_rate().ok().flatten()
+    }
+
+    /// V14 Phase D2: how many distinct sessions this root's memory knows
+    /// about — the advisor's "≥5 sessions" half of the cold-start floor.
+    pub fn advisor_session_count(&self, root: &Path) -> u64 {
+        let Ok(idx) = self.index_for(root) else { return 0 };
+        idx.mem_sessions().map(|v| v.len() as u64).unwrap_or(0)
+    }
+
+    /// Ranked working set for a session (default: the current session).
+    pub fn mem_working_set(
+        &self,
+        root: &Path,
+        session_id: Option<&str>,
+        max: usize,
+    ) -> Vec<WorkingSetEntry> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        // Treat an empty session id as "unspecified" so a hook/plugin that sends
+        // "" (rather than omitting the field) still falls back to the current
+        // session instead of querying a session literally named "".
+        let sid = match session_id.filter(|s| !s.is_empty()) {
+            Some(s) => s.to_string(),
+            None => match idx.mem_current_session().ok().flatten() {
+                Some(s) => s,
+                None => return Vec::new(),
+            },
+        };
+        idx.mem_working_set(&sid, max).unwrap_or_default()
+    }
+
+    /// Pin/unpin a note.
+    pub fn mem_set_note_pinned(&self, root: &Path, note_id: &str, pin: bool) -> AppResult<()> {
+        self.index_for(root)?.mem_set_note_pinned(note_id, pin)
+    }
+
+    /// The full memory readout for `root` (drives the Memory UI section).
+    pub fn memory_snapshot(&self, root: &Path) -> MemorySnapshot {
+        let Ok(idx) = self.index_for(root) else {
+            return MemorySnapshot {
+                current_session: None,
+                working_set: Vec::new(),
+                notes: Vec::new(),
+                sessions: Vec::new(),
+            };
+        };
+        let current = idx.mem_current_session().ok().flatten();
+        let working_set = current
+            .as_deref()
+            .map(|s| idx.mem_working_set(s, 50).unwrap_or_default())
+            .unwrap_or_default();
+        // With a current session, notes = its notes + pinned; without, just pinned.
+        let notes = idx.mem_notes(current.as_deref().unwrap_or("")).unwrap_or_default();
+        let sessions = idx.mem_sessions().unwrap_or_default();
+        MemorySnapshot { current_session: current, working_set, notes, sessions }
+    }
+
+    /// Clear one session's memory (`Some`) or the whole project's (`None`).
+    pub fn mem_clear(&self, root: &Path, session_id: Option<&str>) -> AppResult<()> {
+        // Clear the persisted memory FIRST — it's the fallible part. Only on
+        // success drop the in-memory greeting/dedup/reminder bookkeeping, so a
+        // failed clear doesn't leave the two out of sync (in-memory wiped while
+        // the DB session is intact).
+        self.index_for(root)?.mem_clear(session_id)?;
+        // V11 Phase B/C/E: drop the in-memory greeting + injection-dedup +
+        // read-advisor state for the cleared scope so it re-greets/re-injects.
+        if let Ok(mut map) = self.injected.lock() {
+            match session_id {
+                Some(s) => {
+                    map.remove(s);
+                }
+                None => map.clear(),
+            }
+        }
+        if let Ok(mut set) = self.greeted.lock() {
+            match session_id {
+                Some(s) => {
+                    set.remove(s);
+                }
+                None => set.clear(),
+            }
+        }
+        if let Ok(mut set) = self.reminded.lock() {
+            match session_id {
+                Some(s) => set.retain(|(sid, _)| sid != s),
+                None => set.clear(),
+            }
+        }
+        if let Ok(mut seen) = self.read_seen.lock() {
+            match session_id {
+                Some(s) => seen.retain(|(sid, _), _| sid != s),
+                None => seen.clear(),
+            }
+        }
+        // V12 review: `auto_check_sessions` (debounce/baseline/pending state
+        // for `/context/post_edit`) grows per session and was never evicted —
+        // clear the same scope here too, mirroring `injected`/`greeted`/`reminded`.
+        if let Ok(mut sessions) = self.auto_check_sessions.lock() {
+            match session_id {
+                Some(s) => {
+                    sessions.remove(s);
+                }
+                None => sessions.clear(),
+            }
+        }
+        // F14: also drop the post-compaction flag. Left set, `should_read`
+        // short-circuits to "pass every read" for the cleared session until the
+        // next `retrieve_context` happens to clear it — silently disabling the
+        // read advisor for that session in the interim.
+        if let Ok(mut set) = self.post_compaction.lock() {
+            match session_id {
+                Some(s) => {
+                    set.remove(s);
+                }
+                None => set.clear(),
+            }
+        }
+        // F12: and the usage-emit debounce timestamps, which nothing else prunes.
+        if let Ok(mut m) = self.usage_emit_debounce.lock() {
+            match session_id {
+                Some(s) => {
+                    m.remove(s);
+                }
+                None => m.clear(),
+            }
+        }
+        Ok(())
+    }
+
+    // ── V12 Phase E: project facts (memory distillation) ─────────────────
+
+    /// Live (non-archived) project facts for `root`'s Facts UI list — pinned
+    /// first, then newest. `root` defaults handled by the caller (IPC).
+    pub fn list_project_facts(&self, root: &Path, include_archived: bool, max: usize) -> Vec<ProjectFact> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.list_project_facts(include_archived, max).unwrap_or_default()
+    }
+
+    /// Pin/unpin a fact.
+    pub fn set_fact_pinned(&self, root: &Path, fact_id: &str, pinned: bool) -> AppResult<()> {
+        self.index_for(root)?.set_fact_pinned(fact_id, pinned)
+    }
+
+    /// Archive a fact (excludes it from the cap, `context_recall`, and
+    /// promotion, but keeps the row).
+    pub fn set_fact_archived(&self, root: &Path, fact_id: &str, archived: bool) -> AppResult<()> {
+        self.index_for(root)?.set_fact_archived(fact_id, archived)
+    }
+
+    /// Permanently delete a fact.
+    pub fn delete_fact(&self, root: &Path, fact_id: &str) -> AppResult<()> {
+        self.index_for(root)?.delete_fact(fact_id)
+    }
+
+    /// Manually add a fact from the Facts UI's "add fact" input. Recorded
+    /// with `source_session = "manual"` so the UI can distinguish it from a
+    /// distiller-produced fact (whose source session is a real session id).
+    pub fn add_project_fact_manual(&self, root: &Path, text: &str, pin: bool) -> AppResult<()> {
+        let idx = self.index_for(root)?;
+        let fact_id = uuid::Uuid::new_v4().to_string();
+        let ts = super::activity::now_ms() as i64;
+        idx.add_project_fact(&fact_id, text, "manual", ts, pin)
+    }
+
+    /// Idle-sweep candidates older than this go through the distiller.
+    const DISTILL_IDLE_MS: i64 = 24 * 60 * 60 * 1000;
+
+    /// V12 Phase E: opportunistically distill any session idle more than 24h
+    /// that hasn't been distilled yet. There's no dedicated periodic timer in
+    /// this service, so this piggybacks on the two places the store is
+    /// touched by normal activity anyway — a completed full rebuild and an
+    /// applied watcher batch (see call sites) — which keeps distillation
+    /// roughly in step with the project without a separate clock. Cheap when
+    /// there's nothing to do: one small query, no spawn.
+    pub fn spawn_distillation_sweep(self: &Arc<Self>, root: PathBuf) {
+        if !self.settings.current().graph.memory_distillation {
+            return;
+        }
+        let Ok(idx) = self.index_for(&root) else { return };
+        let cutoff = super::activity::now_ms() as i64 - Self::DISTILL_IDLE_MS;
+        let Ok(candidates) = idx.sessions_idle_undistilled(cutoff) else { return };
+        if candidates.is_empty() {
+            return;
+        }
+        let this = self.clone();
+        tauri::async_runtime::spawn(async move {
+            for sid in candidates {
+                this.distill_session(&root, &sid).await;
+            }
+        });
+    }
+
+    /// V12 Phase E: distill one session's working set + notes into at most 3
+    /// durable project facts via the **local-only** offload path
+    /// (`OffloadSupervisor::run_internal`, V11 Phase F — never remote/cloud),
+    /// then mark the session distilled either way. Gated on
+    /// `memory_distillation` + a ready local backend — no ready backend
+    /// leaves the session undistilled (V10's "evict undistilled" fallback
+    /// still applies; the sweep will retry it next pass). A validation
+    /// failure on the model's output DOES mark the session distilled — the
+    /// "never retry-loop a bad generation" posture from the milestone spec.
+    async fn distill_session(&self, root: &Path, session_id: &str) {
+        if !self.settings.current().graph.memory_distillation {
+            return;
+        }
+        let Some(sup) = self.app.try_state::<Arc<crate::offload::OffloadSupervisor>>() else {
+            return;
+        };
+        let sup = sup.inner().clone();
+
+        // Single-flight guard: `is_session_distilled` (below) and
+        // `mark_session_distilled` (at the end) are check-then-act across a
+        // ~30s `.await`, and two sweeps (the rebuild sweep and a watcher-batch
+        // sweep) can both select the same idle-undistilled session in that
+        // window. Claim the session id here; a second concurrent call for the
+        // same id bails out immediately. `_guard` releases it on every exit
+        // path below, including the early returns.
+        {
+            let mut inflight = self.distilling.lock().unwrap();
+            if !inflight.insert(session_id.to_string()) {
+                return;
+            }
+        }
+        let _guard = DistillGuard { svc: self, session_id: session_id.to_string() };
+
+        let Ok(idx) = self.index_for(root) else { return };
+        // Idempotency guard: `spawn_distillation_sweep`'s candidate query
+        // already filters to undistilled sessions, but this also protects a
+        // future direct caller (e.g. an eviction-time trigger) from
+        // re-distilling a session two triggers raced onto.
+        if idx.is_session_distilled(session_id).unwrap_or(false) {
+            return;
+        }
+
+        let working_set = idx.mem_working_set(session_id, 10).unwrap_or_default();
+        let notes = idx.mem_notes(session_id).unwrap_or_default();
+        let ts = super::activity::now_ms() as i64;
+        if working_set.is_empty() && notes.is_empty() {
+            // Nothing to distill — mark it done so the sweep doesn't keep
+            // re-selecting an empty session on every future pass.
+            let _ = idx.mark_session_distilled(session_id, ts);
+            return;
+        }
+
+        let mut body = String::new();
+        for e in &working_set {
+            body.push_str(&format!("- {} ({}x, last {})\n", e.path, e.touches, e.last_kind));
+        }
+        for n in &notes {
+            body.push_str(&format!("- note: {}\n", n.text));
+        }
+        let prompt = format!("{DISTILL_PROMPT_INSTRUCTION}\n\n{body}");
+
+        let text = match sup
+            .run_internal(prompt, 256, std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(t) => t,
+            // No ready local backend (or the call otherwise failed) — leave
+            // undistilled, per V10 semantics; retried by a later sweep.
+            Err(_) => return,
+        };
+        match super::memory::parse_distilled_facts(&text) {
+            Some(facts) => {
+                for f in facts {
+                    let fact_id = uuid::Uuid::new_v4().to_string();
+                    if let Err(e) = idx.add_project_fact(&fact_id, &f, session_id, ts, false) {
+                        debug!(error = %e, "graph: add_project_fact failed");
+                    }
+                }
+            }
+            None => {
+                debug!(session_id, "graph: distiller output failed validation, skipping insert");
+            }
+        }
+        let _ = idx.mark_session_distilled(session_id, ts);
+    }
+
+    // ── V10 context injection ────────────────────────────────────────────
+
+    /// Rank files for `prompt` and build the injectable digest for `root`.
+    /// Requires the graph to be enabled but **not** the injection toggle — the
+    /// toggle is enforced by the caller (the `/context/retrieve` route), so the
+    /// preview surface can show what *would* be injected while it's off. Returns
+    /// an empty result when the graph is off or nothing clears the threshold.
+    pub fn retrieve_context(
+        &self,
+        root: &Path,
+        prompt: &str,
+        session_id: Option<&str>,
+    ) -> super::context::RetrieveResult {
+        let g = self.settings.current().graph;
+        if !g.enabled {
+            return super::context::RetrieveResult::default();
+        }
+        let Ok(idx) = self.index_for(root) else {
+            return super::context::RetrieveResult::default();
+        };
+        let session_files: Vec<(String, f64)> = if g.context_include_session {
+            self.mem_working_set(root, session_id, 30)
+                .into_iter()
+                .map(|e| (e.path, super::context::session_weight(&e.last_kind)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // V11 Phase E: a new prompt ends the post-compaction recovery window —
+        // the agent has re-read what it needed, so the advisor resumes next turn.
+        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            if let Ok(mut s) = self.post_compaction.lock() {
+                s.remove(sid);
+            }
+        }
+
+        // V11 Phase C: injection dedup, only when scoped to a session (the
+        // preview passes `None` and so never dedups or mutates injected state).
+        let ttl = g.context_dedup_ttl_turns;
+        let sid = session_id.filter(|s| !s.is_empty());
+        let (snapshot, current_turn) = match sid {
+            Some(s) => {
+                let mut map = self.injected.lock().unwrap();
+                // Bound the per-session dedup state: nothing prunes it when a
+                // session simply ends, so cap it (clearing is safe — it just
+                // re-injects once). The greeted/reminded/read_seen sets are
+                // likewise capped at their own insert sites (F13).
+                if map.len() > 1024 && !map.contains_key(s) {
+                    map.clear();
+                }
+                let st = map.entry(s.to_string()).or_default();
+                st.turn = st.turn.saturating_add(1);
+                (st.files.clone(), st.turn)
+            }
+            None => (HashMap::new(), 0),
+        };
+
+        let result = super::context::build_context(
+            &idx,
+            prompt,
+            &session_files,
+            g.context_per_file_chars as usize,
+            g.context_turn_budget_chars as usize,
+            g.context_min_score as f64,
+            &snapshot,
+            current_turn,
+            ttl,
+            g.context_llm_digests,
+        );
+
+        // V14 Phase D/D2: honest-accounting counters for the Usage section's
+        // Effectiveness panel (injected/deduped chars) and the D2 advisor's
+        // budget-maxed signal. Tracked unconditionally — independent of the
+        // `ttl > 0` gate below, which only governs the files_used tracking
+        // used for dedup demotion.
+        if let Some(s) = sid {
+            let mut map = self.injected.lock().unwrap();
+            let st = map.entry(s.to_string()).or_default();
+            st.injected_chars += result.chars as u64;
+            st.deduped_chars += result.deduped_chars as u64;
+            st.turns_seen = st.turns_seen.saturating_add(1);
+            let budget = g.context_turn_budget_chars as u64;
+            // "Maxed" = this turn's injected chars reached ≥90% of the
+            // budget — a proxy for "the budget is the binding constraint",
+            // not "we injected literally everything that ranked in".
+            if budget > 0 && (result.chars as u64) * 10 >= budget * 9 {
+                st.turns_maxed = st.turns_maxed.saturating_add(1);
+            }
+        }
+
+        // Record the files injected in full so the next turn can dedup them.
+        if let Some(s) = sid {
+            if ttl > 0 {
+                // Resolve each file's current hash BEFORE taking the lock, so
+                // the injection map isn't held across per-file SQLite lookups
+                // on this hot path.
+                let hashes: Vec<(String, String)> = result
+                    .files_used
+                    .iter()
+                    .filter_map(|f| match idx.stored_file_hash(f) {
+                        Ok(Some(h)) => Some((f.clone(), h)),
+                        _ => None,
+                    })
+                    .collect();
+                let mut map = self.injected.lock().unwrap();
+                let st = map.entry(s.to_string()).or_default();
+                for (f, h) in hashes {
+                    // Only overwrite if this turn is at least as new as the
+                    // recorded one, so an interleaved earlier retrieve can't
+                    // clobber a newer turn's record with a stale hash.
+                    match st.files.get(&f) {
+                        Some((_, prev_turn)) if *prev_turn > current_turn => {}
+                        _ => {
+                            st.files.insert(f, (h, current_turn));
+                        }
+                    }
+                }
+            }
+        }
+
+        // V11 Phase F: schedule background local-model digests for no-outline
+        // files that ranked in but had no cached digest (docs/configs/scripts).
+        if g.context_llm_digests {
+            for (file, hash) in &result.digest_misses {
+                self.enqueue_digest(root, file, hash);
+            }
+        }
+        result
+    }
+
+    /// V11 Phase F — kick off a background local-model digest for `(file,
+    /// content_hash)` unless one is already in flight, or the in-flight fleet is
+    /// at its cap (bounded, demand-driven). The heavy work is slot-gated by the
+    /// offload supervisor, so this never floods the local backend. Injection
+    /// never waits on it — a miss uses the V10 fallback and the digest lands next
+    /// time. Requires the app to be running on the tokio runtime (it always is
+    /// when this is reached — via the loopback/IPC async handlers).
+    fn enqueue_digest(&self, root: &Path, file: &str, content_hash: &str) {
+        const MAX_INFLIGHT: usize = 32;
+        let key = (root.to_path_buf(), file.to_string(), content_hash.to_string());
+        {
+            let mut inflight = match self.digest_inflight.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if inflight.len() >= MAX_INFLIGHT || !inflight.insert(key.clone()) {
+                return;
+            }
+        }
+        let Some(me) = self.app.try_state::<Arc<GraphService>>() else {
+            let _ = self.digest_inflight.lock().map(|mut g| g.remove(&key));
+            return;
+        };
+        let me = me.inner().clone();
+        tokio::spawn(async move {
+            // Guard removes the key on Drop — even if the compute panics.
+            let _guard = InflightGuard { svc: me.clone(), key: key.clone() };
+            me.compute_and_cache_digest(&key.0, &key.1, &key.2).await;
+        });
+    }
+
+    /// Compute one digest via the **local-only** offload path and cache it.
+    /// Silent on any failure (no local backend, read error, bad output) — the
+    /// fallback digest keeps working and the item is simply not cached.
+    async fn compute_and_cache_digest(&self, root: &Path, file: &str, content_hash: &str) {
+        let Some(sup) = self.app.try_state::<Arc<crate::offload::OffloadSupervisor>>() else {
+            return;
+        };
+        let sup = sup.inner().clone();
+        // Read off the async worker — file I/O would otherwise block a tokio
+        // thread for the duration.
+        let path = root.join(file);
+        let content = match tokio::task::spawn_blocking(move || std::fs::read_to_string(path)).await {
+            Ok(Ok(c)) => c,
+            _ => return,
+        };
+        // Only the first 4 KiB drives the digest — enough for a doc/config head.
+        let head: String = content.chars().take(4096).collect();
+        let prompt = format!(
+            "Summarize this file for a code-assistant context block in at most 3 short lines. \
+             No preamble, no code fences.\n\n{head}"
+        );
+        let text = match sup
+            .run_internal(prompt, 128, std::time::Duration::from_secs(20))
+            .await
+        {
+            Ok(t) => t.trim().to_string(),
+            Err(_) => return,
+        };
+        // Validate: non-empty and not oversized (a runaway generation).
+        if text.is_empty() || text.chars().count() > 400 {
+            return;
+        }
+        if let Ok(idx) = self.index_for(root) {
+            // The SQLite write is synchronous — run it on a blocking thread so
+            // it doesn't stall an async worker.
+            let file = file.to_string();
+            let content_hash = content_hash.to_string();
+            let ts = super::activity::now_ms() as i64;
+            let _ = tokio::task::spawn_blocking(move || {
+                idx.put_digest(&file, &content_hash, &text, ts)
+            })
+            .await;
+        }
+    }
+
+    /// V11 Phase B — the once-per-session project-map greeting for `root`, or
+    /// `None` when it's disabled, already delivered this session, or empty.
+    /// Called **only** from the real injection path (the `/context/retrieve`
+    /// route), never the preview, so the preview can't consume the once-flag. A
+    /// session is marked greeted only after a non-empty map renders, so an early
+    /// prompt (before the graph has call edges) simply retries next turn.
+    pub fn session_greeting(&self, root: &Path, session_id: Option<&str>) -> Option<String> {
+        let g = self.settings.current().graph;
+        if !g.enabled || !g.context_injection || !g.repo_map_on_session_start {
+            return None;
+        }
+        let sid = session_id.filter(|s| !s.is_empty())?;
+        if self.greeted.lock().ok()?.contains(sid) {
+            return None;
+        }
+        let idx = self.index_for(root).ok()?;
+        let session_files: Vec<(String, f64)> = self
+            .mem_working_set(root, session_id, 30)
+            .into_iter()
+            .map(|e| (e.path, super::context::session_weight(&e.last_kind)))
+            .collect();
+        let map = super::context::repo_map(&idx, g.repo_map_budget_chars as usize, &session_files);
+        if map.is_empty() {
+            return None;
+        }
+        // Mark greeted (a rare concurrent double-render is harmless). F13: cap
+        // the set — nothing prunes it when a session ends, so it grew one entry
+        // per greeted session for the process lifetime.
+        {
+            let mut set = self.greeted.lock().ok()?;
+            if set.len() > 1024 && !set.contains(sid) {
+                set.clear();
+            }
+            set.insert(sid.to_string());
+        }
+        Some(map)
+    }
+
+    /// V11 Phase D — handle a compaction for `root`/`session_id`. **Side effects
+    /// run unconditionally** (even when the block is gated off): clear the
+    /// session's injection-dedup state so the next turn re-injects fresh, and
+    /// mark the session post-compaction so the read advisor (Phase E) stops
+    /// suppressing reads until each file is re-read. Returns the working-set +
+    /// notes block to carry through the summary, or `None` when the block is
+    /// disabled or empty.
+    pub fn compaction_context(&self, root: &Path, session_id: Option<&str>) -> Option<String> {
+        let g = self.settings.current().graph;
+        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            if let Ok(mut m) = self.injected.lock() {
+                m.remove(sid);
+            }
+            if let Ok(mut s) = self.post_compaction.lock() {
+                s.insert(sid.to_string());
+            }
+        }
+        // The block itself is gated (side effects above already ran).
+        if !g.enabled || !g.context_injection || !g.compaction_context {
+            return None;
+        }
+        let idx = self.index_for(root).ok()?;
+        let block = super::context::compaction_block(&idx, session_id);
+        if block.is_empty() {
+            None
+        } else {
+            Some(block)
+        }
+    }
+
+    /// V11 Phase E — whether `session_id` is flagged post-compaction (the read
+    /// advisor passes reads while this holds). Cleared on the next prompt's
+    /// `retrieve_context`, so the recovery window is "until the next user turn".
+    pub fn is_post_compaction(&self, session_id: &str) -> bool {
+        self.post_compaction.lock().map(|s| s.contains(session_id)).unwrap_or(false)
+    }
+
+    /// V11 Phase E — the read advisor's verdict for a `Read` of `file_path`:
+    /// `Some(reminder_text)` to deny-with-content, or `None` to let the read
+    /// proceed. Passes (in order) when: the advisor is off; there's no session;
+    /// the session is recovering from a compaction; the file was already reminded
+    /// once this session; the file was never seen this session; it changed since
+    /// last seen; or it's smaller than the min-lines floor. The reminder always
+    /// carries usable content (outline, plus the body in substitute mode).
+    pub fn should_read(
+        &self,
+        root: &Path,
+        session_id: Option<&str>,
+        file_path: &str,
+        offset: Option<u32>,
+    ) -> Option<String> {
+        let g = self.settings.current().graph;
+        if !g.enabled || !g.read_advisor {
+            return None;
+        }
+        let sid = session_id.filter(|s| !s.is_empty())?;
+        // Recovering from a compaction ⇒ pass everything (content was lost).
+        if self.is_post_compaction(sid) {
+            return None;
+        }
+        let rel = relativize_path(root, file_path);
+        if rel.is_empty() {
+            return None;
+        }
+        // One reminder per file per session — a second read always passes.
+        let key = (sid.to_string(), rel.clone());
+        if self.reminded.lock().ok()?.contains(&key) {
+            return None;
+        }
+        let idx = self.index_for(root).ok()?;
+
+        let abs = root.join(&rel);
+        let content = std::fs::read_to_string(&abs).ok()?;
+        let cur_hash = super::model::fnv1a_hex(&content);
+        // Compare against what the agent ACTUALLY read last time, not the index
+        // hash. Comparing to the index is wrong: once the watcher re-indexes an
+        // edited file, the index hash equals the NEW content, yet the agent's
+        // context still holds the version it read before the edit — so an
+        // index-hash match would wrongly suppress the re-read it genuinely needs.
+        // A file not yet read this session, or one whose content differs from the
+        // last read we observed, passes (and records the new hash) — content
+        // hash rather than mtime, so a filesystem clock skew (network shares,
+        // WSL2 bind-mounts) can't make it wrong.
+        {
+            let mut seen = self.read_seen.lock().ok()?;
+            match seen.get(&key) {
+                Some(prev) if *prev == cur_hash => {}
+                _ => {
+                    // Bound the map: nothing prunes it when a session ends
+                    // (clearing is safe — it just allows a fresh read once).
+                    if seen.len() > 1024 && !seen.contains_key(&key) {
+                        seen.clear();
+                    }
+                    seen.insert(key.clone(), cur_hash);
+                    return None;
+                }
+            }
+        }
+        // Small files are cheap to re-read ⇒ pass.
+        if (content.lines().count() as u32) < g.read_advisor_min_lines {
+            return None;
+        }
+
+        // Remind. Build usable content, record the reminder, and log it.
+        let substitute = g.read_advisor_mode.eq_ignore_ascii_case("substitute");
+        let text = super::context::read_advice(&idx, root, &rel, offset, substitute, g.max_body_bytes as usize);
+        // F13: cap the set — one entry per (session, file), never pruned on
+        // session end (clearing is safe: a dropped key just allows one re-remind).
+        {
+            let mut set = self.reminded.lock().ok()?;
+            if set.len() > 4096 && !set.contains(&key) {
+                set.clear();
+            }
+            set.insert(key);
+        }
+        let ts = super::activity::now_ms() as i64;
+        // V14 Phase D2: also persist a root+session-scoped `mem_event{kind:
+        // "remind"}` row — distinct from the process-wide Activity event
+        // below — so `GraphIndex::advisor_reread_rate` can precisely check
+        // whether the agent re-read this exact file afterward. Reuses the
+        // session's real agent when known: reaching this branch means the agent
+        // has already read this file at least once this session (`read_seen`
+        // held its prior hash), and each executed read records a session event,
+        // so the session row normally exists — `"claude"` is a safe default if
+        // the lookup somehow misses rather than fabricating a tag.
+        let agent = idx.session_agent(sid).ok().flatten().unwrap_or_else(|| "claude".to_string());
+        let _ = idx.record_mem_event(sid, &agent, "remind", &rel, None, None, ts, None);
+        // Activity: `chars` is the reminder's actual size (what we returned),
+        // consistent with every other graph tool's honest response-size figure —
+        // not a fabricated token estimate.
+        super::activity::record(super::activity::GraphCall {
+            ts_ms: ts as u64,
+            source: "read_advisor".to_string(),
+            tool: "remind".to_string(),
+            target: rel,
+            chars: text.chars().count(),
+            ms: 0,
+            ok: true,
+        });
+        Some(text)
+    }
+
+    /// Whether context injection is currently enabled (graph + toggle). The
+    /// injection routes gate on this; the preview path does not.
+    pub fn context_injection_enabled(&self) -> bool {
+        let g = self.settings.current().graph;
+        g.enabled && g.context_injection
+    }
+
+    // ── V12 Phase F: proactive automation (`/context/post_edit`) ─────────
+
+    /// The client-facing budget for one `post_edit` call: run(s) that finish
+    /// within this window return their result immediately; a slower run keeps
+    /// going in the background and its result is PARKED for the next
+    /// `post_edit`/`/context/retrieve` call to drain (see
+    /// [`Self::drain_auto_check`]). Generous relative to the hook shim's own
+    /// ~600 ms socket timeout would allow, but the shim's timeout is the real
+    /// backstop — this just avoids obviously wasting the budget on a run that
+    /// was never going to make it (most real checkers take seconds).
+    const POST_EDIT_BUDGET_MS: u64 = 800;
+
+    /// V12 Phase F (6a/6b) — the `/context/post_edit` route's core. Debounces
+    /// this session's edits (`auto_check_debounce_s`), runs the project's
+    /// configured checks single-flight per root, diffs the result against the
+    /// session's OWN baseline (never another session's — V10 scoping), and
+    /// appends an auto-impact blast-radius note when the edited file's
+    /// symbols are heavily depended on. Fail-open/non-blocking throughout:
+    /// disabled settings, no checks configured, a missing session id, or a
+    /// slow run all yield `None` now (a slow run's result is parked instead —
+    /// drained by the next call).
+    pub async fn post_edit(
+        self: &Arc<Self>,
+        root: &Path,
+        session_id: Option<&str>,
+        file_path: &str,
+    ) -> Option<String> {
+        let settings = self.settings.current();
+        if !settings.graph.enabled || !settings.graph.auto_check || settings.checks.is_empty() {
+            return None;
+        }
+        let sid = session_id.filter(|s| !s.is_empty())?.to_string();
+        let debounce = Duration::from_secs(settings.graph.auto_check_debounce_s.max(1) as u64);
+
+        let run_now = {
+            let mut sessions = self.auto_check_sessions.lock().unwrap();
+            // Bound the per-session auto-check state the same way `injected`
+            // is bounded: nothing evicts it when a session simply ends
+            // (`mem_clear` only covers an explicit clear), so cap it —
+            // clearing is safe, it just re-runs the debounce/baseline fresh.
+            if sessions.len() > 1024 && !sessions.contains_key(&sid) {
+                sessions.clear();
+            }
+            let st = sessions.entry(sid.clone()).or_default();
+            crate::checks::auto::should_run(st, Instant::now(), debounce)
+        };
+        if !run_now {
+            return self.drain_auto_check(Some(&sid));
+        }
+
+        let root_buf = root.to_path_buf();
+        let defs = settings.checks.clone();
+        let this = self.clone();
+        let mut handle =
+            tokio::spawn(async move { this.auto_check_runner.run(&root_buf, &defs).await });
+
+        tokio::select! {
+            res = &mut handle => {
+                let (reports, check_errors) = res.unwrap_or_default();
+                self.finish_post_edit(&sid, root, file_path, reports, check_errors, false)
+            }
+            _ = tokio::time::sleep(Duration::from_millis(Self::POST_EDIT_BUDGET_MS)) => {
+                // Slow: let the run keep going in the background and park its
+                // (diffed) result for the next call to pick up. The turn is
+                // never blocked on it.
+                let this2 = self.clone();
+                let sid2 = sid.clone();
+                let root2 = root.to_path_buf();
+                let file2 = file_path.to_string();
+                tokio::spawn(async move {
+                    // Bound the parked run: a check command that hangs (waiting
+                    // on a lock, reading stdin) must not live forever, or the
+                    // single-flight `RootRunner` coalesces every later post_edit
+                    // onto the stuck task and auto-check is silently wedged for
+                    // this root. On timeout, abort so the root isn't pinned.
+                    const PARKED_MAX_MS: u64 = 60_000;
+                    match tokio::time::timeout(
+                        Duration::from_millis(PARKED_MAX_MS),
+                        &mut handle,
+                    )
+                    .await
+                    {
+                        Ok(Ok((reports, check_errors))) => {
+                            this2.finish_post_edit(&sid2, &root2, &file2, reports, check_errors, true);
+                        }
+                        Ok(Err(_join_err)) => {}
+                        Err(_elapsed) => handle.abort(),
+                    }
+                });
+                None
+            }
+        }
+    }
+
+    /// Diff `reports` against `sid`'s baseline (updating it to the fresh
+    /// result regardless of what's surfaced), append `check_errors` (any
+    /// configured check that failed to spawn/run — V12 review: these must
+    /// stay visible, never silently vanish and read as "ran clean"), append
+    /// the auto-impact note, record one Activity event per non-empty
+    /// injection, and either return the block (`park = false`, the fast path)
+    /// or stash it in the session's `pending` slot (`park = true`, drained by
+    /// the next call).
+    fn finish_post_edit(
+        self: &Arc<Self>,
+        sid: &str,
+        root: &Path,
+        file_path: &str,
+        reports: Vec<crate::checks::CheckReport>,
+        check_errors: Vec<String>,
+        park: bool,
+    ) -> Option<String> {
+        let cap_chars = 1500usize;
+        let mut per_check: Vec<(String, Vec<crate::checks::DiagGroup>)> = Vec::new();
+        {
+            let mut sessions = self.auto_check_sessions.lock().unwrap();
+            let st = sessions.entry(sid.to_string()).or_default();
+            for report in &reports {
+                let baseline = st.baseline.entry(report.name.clone()).or_default();
+                let new_groups: Vec<crate::checks::DiagGroup> =
+                    crate::checks::auto::diff_groups(baseline, &report.groups)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                per_check.push((report.name.clone(), new_groups));
+            }
+            // Update the baseline to this run's full result regardless of what
+            // was surfaced — the session has now effectively "seen" it.
+            for report in &reports {
+                st.baseline
+                    .insert(report.name.clone(), crate::checks::auto::to_baseline(&report.groups));
+            }
+        }
+        let per_check_refs: Vec<(&str, Vec<&crate::checks::DiagGroup>)> = per_check
+            .iter()
+            .map(|(name, groups)| (name.as_str(), groups.iter().collect()))
+            .collect();
+        let mut block = crate::checks::auto::format_diff_block(&per_check_refs, cap_chars);
+
+        // V12 review: a check that failed to spawn/run must stay visible —
+        // never let it silently vanish and read as "everything's clean" just
+        // because there was nothing else to report.
+        if !check_errors.is_empty() {
+            if !block.is_empty() {
+                block.push('\n');
+            }
+            block.push_str(&check_errors.join("\n"));
+        }
+
+        if let Some(note) = self.auto_impact_note(root, file_path) {
+            if block.is_empty() {
+                block = note;
+            } else {
+                block.push('\n');
+                block.push_str(&note);
+            }
+        }
+
+        if block.is_empty() {
+            return None;
+        }
+
+        // Activity: one event per injection — the graduation evidence for
+        // milestone Decision 4 (whether auto-check injections correlate with
+        // a same-turn fix).
+        super::activity::record(super::activity::GraphCall {
+            ts_ms: super::activity::now_ms(),
+            source: "auto_check".to_string(),
+            tool: "auto_check".to_string(),
+            target: file_path.to_string(),
+            chars: block.chars().count(),
+            ms: 0,
+            ok: true,
+        });
+
+        if park {
+            let mut sessions = self.auto_check_sessions.lock().unwrap();
+            sessions.entry(sid.to_string()).or_default().pending = Some(block);
+            None
+        } else {
+            Some(block)
+        }
+    }
+
+    /// V12 Phase F (6b) — the auto-impact blast-radius note for an edit to
+    /// `file_path`: every symbol the edited file DEFINES (its outline) whose
+    /// direct inbound call count (`callers_count`) meets
+    /// `auto_impact_min_dependents` gates the note; the note's own numbers are
+    /// the wider transitive dependents/files/tests counts. `None` when the
+    /// graph is unavailable, the file isn't indexed, or nothing meets the
+    /// threshold.
+    fn auto_impact_note(&self, root: &Path, file_path: &str) -> Option<String> {
+        let g = self.settings.current().graph;
+        let idx = self.index_for(root).ok()?;
+        let rel = relativize_path(root, file_path);
+        if rel.is_empty() {
+            return None;
+        }
+        let outline = idx.outline(&rel).ok()?;
+        if outline.is_empty() {
+            return None;
+        }
+        let min_dependents = g.auto_impact_min_dependents as u64;
+        let mut max_callers: u64 = 0;
+        let mut names: Vec<String> = Vec::new();
+        for s in &outline {
+            let callers = idx.callers_count(&s.name).unwrap_or(0);
+            max_callers = max_callers.max(callers);
+            if callers >= min_dependents {
+                names.push(s.name.clone());
+            }
+        }
+        if names.is_empty() {
+            return None;
+        }
+        names.sort();
+        names.dedup();
+        let max = g.max_rows_per_query.max(1) as usize;
+        let dependents = idx.dependents_transitive(&names, 3, max, None).ok()?;
+        let files: HashSet<&str> = dependents.iter().map(|d| d.symbol.file.as_str()).collect();
+        let tests = idx.tests_for(&names, 3, max).unwrap_or_default();
+        crate::checks::auto::impact_note(max_callers, dependents.len(), files.len(), tests.len(), min_dependents)
+    }
+
+    /// Drain (take) `session_id`'s parked auto-check block, if any — called
+    /// from `post_edit` (a coalesced call) and from `/context/retrieve` so a
+    /// slow check's result is never lost, only delayed. `None` for an unknown
+    /// session id or an empty session id.
+    pub fn drain_auto_check(&self, session_id: Option<&str>) -> Option<String> {
+        let sid = session_id.filter(|s| !s.is_empty())?;
+        self.auto_check_sessions
+            .lock()
+            .unwrap()
+            .get_mut(sid)
+            .and_then(|st| st.pending.take())
+    }
+
+    // ── V12 Phase F (6c): analyses-auto trigger ───────────────────────────
+
+    /// Run `dead_exports` + `import_cycles` for `root` (bounded, read-only on
+    /// the warm index — cheap) and emit `graph-analyses` when the counts
+    /// changed since the last completed pass. Called at the end of every
+    /// completed index pass ([`Self::spawn_rebuild`]'s success handler and
+    /// [`Self::reindex_paths`]'s "changed > 0" branch), same spot as the
+    /// distillation sweep. No-op when `analyses_auto` is off.
+    fn run_analyses_trigger(&self, root: &Path) {
+        if !self.settings.current().graph.analyses_auto {
+            return;
+        }
+        let Ok(idx) = self.index_for(root) else { return };
+        let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
+        let dead = idx.dead_exports(max).map(|v| v.len()).unwrap_or(0);
+        let cycles = idx.import_cycles(max).map(|v| v.len()).unwrap_or(0);
+        const KEY: &str = "analyses_counts";
+        let prev = idx.get_meta(KEY).ok().flatten();
+        let cur = format!("{dead},{cycles}");
+        if analyses_changed(prev.as_deref(), &cur) {
+            let _ = idx.put_meta(KEY, &cur);
+            let payload = serde_json::json!({
+                "root": root.display().to_string(),
+                "dead_exports": dead,
+                "import_cycles": cycles,
+            });
+            let _ = self.app.emit("graph-analyses", &payload);
+        }
+    }
+
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns
     /// immediately; progress lands on the `graph-status` event and via
     /// [`status`](Self::status). A no-op (logged) when a build for this root is
     /// already in flight.
     pub fn spawn_rebuild(self: &Arc<Self>, root: PathBuf) {
-        {
+        // Build the status under the lock but emit AFTER dropping it: `emit`
+        // dispatches synchronously on this thread, and a same-thread listener
+        // that read `self.statuses()` during delivery would re-lock the
+        // non-reentrant `status` mutex and self-deadlock (the discipline
+        // `patch_status` already follows).
+        let building = {
             let mut guard = self.status.lock().unwrap();
             if let Some(s) = guard.get(&root) {
                 if s.building {
@@ -364,8 +1839,9 @@ impl GraphService {
             building.last_error = None;
             guard.insert(root.clone(), building.clone());
             building.watch_paused = self.paused.load(Ordering::Relaxed);
-            let _ = self.app.emit(GRAPH_STATUS_EVENT, &building);
-        }
+            building
+        };
+        let _ = self.app.emit(GRAPH_STATUS_EVENT, &building);
 
         let this = self.clone();
         let thread_root = root.clone();
@@ -396,6 +1872,15 @@ impl GraphService {
                         // Phase G: embed any new/changed doc chunks (no-op when
                         // semantic search is off).
                         this.spawn_backfill(root.clone());
+                        // V12 Phase E: opportunistic idle-session distillation
+                        // sweep (no-op when the setting is off or nothing's idle).
+                        this.spawn_distillation_sweep(root.clone());
+                        // V12 Phase F (6c): re-check dead-exports/import-cycles
+                        // counts and badge the Analyses UI when they changed
+                        // (no-op when `analyses_auto` is off). Cheap, read-only
+                        // on the just-built index; runs inline on this worker
+                        // thread like the status bookkeeping above.
+                        this.run_analyses_trigger(&root);
                     }
                     Err(e) => {
                         warn!(root = %root.display(), error = %e, "graph: rebuild failed");
@@ -431,7 +1916,7 @@ impl GraphService {
         let idx = self.index_for(root)?;
         // Hold the store-write lock across the whole rebuild so a concurrent
         // watcher batch can't write into the store mid-`reset()`.
-        let _w = self.write_lock.lock().unwrap();
+        let _w = self.write_guard();
         let (indexed, stats) = build_tree(&idx, root, &snap, &self.db_subdir())?;
 
         // Record the visited-file count alongside the authoritative row counts.
@@ -467,6 +1952,20 @@ impl GraphService {
     /// created/modified files, drop rows for deleted ones, then refresh the
     /// status counts. Called from the watcher thread.
     pub fn reindex_paths(self: &Arc<Self>, root: &Path, paths: Vec<PathBuf>) {
+        // V13 §0.3: fan this coalesced batch out to Workbench consumers
+        // (fs-batch Tauri event for the frontend + an internal broadcast for
+        // backend subscribers) BEFORE any graph-specific filtering below — a
+        // batch of paths the graph itself ignores (unsupported extension,
+        // gitignored, graph disabled) can still be exactly what the diff pane
+        // or a future checkpoint burst trigger cares about. Reached via
+        // `AppHandle::state` rather than a constructor dependency so `graph`
+        // and `workbench` don't need to know about each other's lifecycle;
+        // `WorkbenchService` self-gates on `workbench.enabled`, so this is a
+        // cheap no-op when the feature is off.
+        if let Some(workbench) = self.app.try_state::<Arc<crate::workbench::WorkbenchService>>() {
+            workbench.publish_fs_batch(root, &paths);
+        }
+
         let snap = self.settings.current().graph;
         if !snap.enabled || self.paused.load(Ordering::Relaxed) {
             return;
@@ -482,28 +1981,73 @@ impl GraphService {
         let max_bytes = snap.max_file_bytes.max(1);
         let gi = build_gitignore(root, &paths);
 
-        let _w = self.write_lock.lock().unwrap();
+        let _w = self.write_guard();
         let mut changed = 0u64;
+        // V12 Phase D: rel paths touched this batch (indexed OR removed), fed
+        // to `gitmeta::collect_for` below for an incremental churn refresh —
+        // a small, bounded set since watcher batches are debounced and small.
+        let mut touched_rels: Vec<String> = Vec::new();
         for path in paths {
             // Never touch our own store directory.
             if path.components().any(|c| c.as_os_str() == sub.as_str()) {
                 continue;
             }
-            // Only files with a configured language matter (this also filters
-            // out directory events, whose path has no indexable extension).
+            let rel = rel_path(root, &path);
+
+            // A path that EXISTS as a directory was just created or renamed/
+            // moved in. Windows reports an atomic directory rename as one
+            // dir-level OLD/NEW pair — the children are never re-reported —
+            // so without walking here the moved subtree stays missing from
+            // the graph until an unrelated full rebuild (the old-name side is
+            // handled by the removal branch below). Walk it with the same
+            // tree walker as a full rebuild and index every eligible file.
+            // A stored-hash check skips unchanged children, so a redundant
+            // dir event costs one read+hash per child, not a re-parse.
+            if path.is_dir() {
+                match index_dir_tree(&idx, root, &path, &snap, &sub, max_bytes) {
+                    DirWalk::Indexed { indexed, rels } => {
+                        changed += indexed;
+                        touched_rels.extend(rels);
+                    }
+                    // Too big for the incremental path: a full rebuild does
+                    // the same per-file work on its own thread with progress
+                    // reporting and single-flight guarding, rather than
+                    // pinning the watcher thread for an unbounded stretch.
+                    // It covers this whole batch, so stop processing it.
+                    DirWalk::TooBig => {
+                        debug!(root = %root.display(), dir = %rel,
+                            "graph: moved-in directory exceeds incremental walk cap; full rebuild");
+                        drop(_w);
+                        self.spawn_rebuild(root.to_path_buf());
+                        return;
+                    }
+                }
+                continue;
+            }
+
+            // Deletions/moves-away are handled BEFORE the `lang_for` gate: a
+            // removed path may be a directory (rename or `rm -r`), which has no
+            // indexable extension and would otherwise be dropped by that gate,
+            // leaking every child file's rows until a full rebuild. Drop the
+            // exact file if it was indexed AND everything indexed beneath it.
+            if !path.is_file() {
+                let was_indexed = idx.stored_file_hash(&rel).ok().flatten().is_some();
+                if was_indexed {
+                    let _ = idx.remove_file(&rel);
+                }
+                let removed_under = idx.remove_files_under(&rel).unwrap_or(0);
+                if was_indexed || removed_under > 0 {
+                    changed += 1;
+                    touched_rels.push(rel);
+                }
+                continue;
+            }
+
+            // Only files with a configured language matter.
             let Some(lang) = lang_for(&path, &snap.languages) else {
                 continue;
             };
             if lang == Lang::Markdown && !snap.index_docs {
-                continue;
-            }
-            let rel = rel_path(root, &path);
-
-            if !path.is_file() {
-                // Deleted/moved-away — drop its rows (no-op if never indexed).
-                if idx.remove_file(&rel).is_ok() {
-                    changed += 1;
-                }
                 continue;
             }
             // Respect gitignore so editing a build artifact doesn't churn.
@@ -521,13 +2065,25 @@ impl GraphService {
             };
             let fg = parse_file(&rel, &src, lang);
             match idx.index_file_graph(&fg) {
-                Ok(()) => changed += 1,
+                Ok(()) => {
+                    changed += 1;
+                    touched_rels.push(rel);
+                }
                 Err(e) => debug!(file = %rel, error = %e, "graph: incremental index failed"),
             }
         }
         if changed > 0 {
             // Drop vectors for chunks this batch deleted or re-anchored.
             let _ = idx.prune_orphan_vectors();
+            let _ = idx.prune_orphan_code_vectors();
+            let _ = idx.prune_orphan_digests();
+            // V12 Phase D: incremental churn refresh for just the touched
+            // files — one small `git log -1` spawn per path, cheap at
+            // watcher-batch scale. No-ops (empty result, no error) outside a
+            // git repo.
+            if let Ok(churn) = super::gitmeta::collect_for(root, &touched_rels) {
+                let _ = idx.put_commit_touches(&churn);
+            }
         }
         drop(_w);
 
@@ -549,6 +2105,12 @@ impl GraphService {
             debug!(root = %root.display(), changed, "graph: incremental re-index applied");
             // Phase G: embed the new/changed doc chunks (no-op when off).
             self.spawn_backfill(root.to_path_buf());
+            // V12 Phase E: opportunistic idle-session distillation sweep
+            // (no-op when the setting is off or nothing's idle).
+            self.spawn_distillation_sweep(root.to_path_buf());
+            // V12 Phase F (6c): same analyses-auto trigger as a full rebuild —
+            // cheap on the just-updated index, already on the watcher thread.
+            self.run_analyses_trigger(root);
         }
     }
 
@@ -600,6 +2162,16 @@ impl GraphService {
         });
     }
 
+    /// Acquire the rebuild-serialization lock, tolerating a poisoned mutex (F9).
+    /// `write_lock` guards nothing but `()` — it only serializes writers — so a
+    /// panic in a prior holder (e.g. tree-sitter choking on pathological input
+    /// mid-rebuild) leaves no corrupt state, and must NOT permanently wedge every
+    /// future rebuild/backfill with a poison cascade through each `.unwrap()`.
+    /// Recovering the guard from the poison error keeps writers serialized.
+    fn write_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Run a store mutation under `write_lock` on a blocking thread, returning
     /// its result. An `async` caller must use this instead of locking
     /// `write_lock` directly: a full rebuild can hold the lock for many seconds,
@@ -613,7 +2185,7 @@ impl GraphService {
     {
         let this = self.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let _w = this.write_lock.lock().unwrap();
+            let _w = this.write_guard();
             f()
         })
         .await
@@ -634,7 +2206,7 @@ impl GraphService {
             s.semantic_enabled = true;
             s.embedder_configured = configured;
         });
-        let Some(embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model) else {
+        let Some(mut embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model) else {
             self.patch_status(root, |s| {
                 s.embed_state = "degraded".into();
                 s.embedder_ready = false;
@@ -659,6 +2231,9 @@ impl GraphService {
                 }
             }
         };
+        // Pin the store dimension so a later model swap on the endpoint can't
+        // feed wrong-length vectors into a store sized to `dim`.
+        embedder.expect_dim(dim);
 
         let idx = match self.index_for(root) {
             Ok(i) => i,
@@ -750,6 +2325,92 @@ impl GraphService {
             }
         }
 
+        // V11 Phase G: also embed pending symbol bodies for semantic *code*
+        // search, sharing this pass's embedder/dim/epoch. Docs run first
+        // (cheaper, and doc search stays useful even with code embedding off);
+        // code chunks are typically far more numerous, so they ride the same
+        // backfill but strictly after. Gated on its own setting — off by
+        // default, since it multiplies the vector count.
+        if snap.embed_code_bodies {
+            {
+                let idx = idx.clone();
+                let model = snap.embedding_model.clone();
+                let epoch = epoch.clone();
+                if let Err(e) = self
+                    .locked_write(move || idx.ensure_code_vector_store(dim, &model, &epoch))
+                    .await
+                {
+                    self.patch_status(root, |s| {
+                        s.embed_state = "error".into();
+                        s.embed_error = Some(e.to_string());
+                    });
+                    return;
+                }
+            }
+            loop {
+                let pending = match idx.pending_code_chunks(&epoch, batch) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.patch_status(root, |s| {
+                            s.embed_state = "error".into();
+                            s.embed_error = Some(e.to_string());
+                        });
+                        return;
+                    }
+                };
+                if pending.is_empty() {
+                    break;
+                }
+                let texts: Vec<String> = pending.iter().map(|(_, _, t)| t.clone()).collect();
+                match embedder.embed(&texts).await {
+                    Ok(vectors) if vectors.len() == pending.len() => {
+                        let rows: Vec<(String, String, Vec<f32>)> = pending
+                            .into_iter()
+                            .zip(vectors)
+                            .map(|((id, hash, _), v)| (id, hash, v))
+                            .collect();
+                        let put = {
+                            let idx = idx.clone();
+                            let epoch = epoch.clone();
+                            self.locked_write(move || idx.put_code_vectors(&epoch, &rows))
+                                .await
+                        };
+                        if let Err(e) = put {
+                            self.patch_status(root, |s| {
+                                s.embed_state = "error".into();
+                                s.embed_error = Some(e.to_string());
+                            });
+                            return;
+                        }
+                    }
+                    Ok(_) => {
+                        self.patch_status(root, |s| {
+                            s.embed_state = "degraded".into();
+                            s.embedder_ready = false;
+                            s.embed_error = Some("code embedding count mismatch".into());
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        // Endpoint went away mid-backfill — degrade, keep what we have.
+                        self.patch_status(root, |s| {
+                            s.embed_state = "degraded".into();
+                            s.embedder_ready = false;
+                            s.embed_error = Some(e);
+                        });
+                        return;
+                    }
+                }
+            }
+            {
+                let idx = idx.clone();
+                self.locked_write(move || {
+                    let _ = idx.prune_orphan_code_vectors();
+                })
+                .await;
+            }
+        }
+
         // A rebuild can delete doc chunks while an embed request is in flight
         // (the write lock is released across the await). Drop any vectors that
         // no longer have a chunk so coverage stays accurate.
@@ -771,10 +2432,17 @@ impl GraphService {
     /// Recompute `(embedded, total, pending)` for the status from the store.
     fn refresh_embed_coverage(&self, root: &Path, idx: &GraphIndex, epoch: &str, ready: bool) {
         let (embedded, total) = idx.embedding_coverage(epoch).unwrap_or((0, 0));
+        // V11 Phase G/F: code-embedding coverage + cached-digest count for the
+        // Index/Context readouts (both are cheap DB counts).
+        let (code_embedded, code_total) = idx.code_embedding_coverage(epoch).unwrap_or((0, 0));
+        let digests = idx.digest_count().unwrap_or(0);
         self.patch_status(root, |s| {
             s.embedded = embedded;
             s.embed_total = total;
             s.embed_pending = total.saturating_sub(embedded);
+            s.code_embedded = code_embedded;
+            s.code_embed_total = code_total;
+            s.digests = digests;
             s.embedder_ready = ready;
         });
     }
@@ -802,6 +2470,26 @@ impl GraphService {
     }
 }
 
+/// V12 Phase F (6c): pure gate for [`GraphService::run_analyses_trigger`] —
+/// whether the freshly computed counts (`cur`, the `"{dead},{cycles}"` string)
+/// differ from what was last stored (`prev`). Factored out so "the event
+/// fires only when counts changed" is testable without a `GraphIndex`/
+/// `AppHandle`. `None` (nothing stored yet) always counts as a change — the
+/// first successful pass this project has ever run IS new information.
+fn analyses_changed(prev: Option<&str>, cur: &str) -> bool {
+    prev != Some(cur)
+}
+
+/// Make a `&str` `path` project-relative to `root` with `/` separators (empty in
+/// → empty out). Delegates to [`rel_path`] so memory-event paths and the
+/// indexer's stored file paths are relativized identically.
+fn relativize_path(root: &Path, path: &str) -> String {
+    if path.trim().is_empty() {
+        return String::new();
+    }
+    rel_path(root, Path::new(path))
+}
+
 /// Reset `idx` and re-index every supported file under `root`, honoring
 /// gitignore (+ global/exclude) and the configured language/size filters.
 /// Returns `(files_visited, final_stats)`. Free function (no `self`) so the
@@ -816,6 +2504,12 @@ fn build_tree(
     idx.reset()?;
 
     let max_bytes = snap.max_file_bytes.max(1);
+    // V11 Phase G: a simple project-wide count cap on `code_chunk` rows
+    // (order-dependent on the walk order, which is acceptable for V1 — see
+    // `GraphSettings::semantic_code_max_chunks`). Only enforced on a full
+    // rebuild; the incremental watcher path doesn't re-check the running
+    // total against the rest of the project.
+    let mut code_chunk_budget = snap.semantic_code_max_chunks as usize;
 
     let mut indexed: u64 = 0;
     for entry in build_walker(root, snap) {
@@ -858,7 +2552,11 @@ fn build_tree(
         };
 
         let rel = rel_path(root, path);
-        let fg = parse_file(&rel, &src, lang);
+        let mut fg = parse_file(&rel, &src, lang);
+        if fg.code_chunks.len() > code_chunk_budget {
+            fg.code_chunks.truncate(code_chunk_budget);
+        }
+        code_chunk_budget = code_chunk_budget.saturating_sub(fg.code_chunks.len());
         if let Err(e) = idx.index_file_graph(&fg) {
             warn!(file = %rel, error = %e, "graph: index_file_graph failed (skipped)");
             continue;
@@ -870,6 +2568,19 @@ fn build_tree(
     // needlessly re-embedded), so vectors for files that vanished since the
     // last build are now orphans — drop them before reporting stats.
     let _ = idx.prune_orphan_vectors();
+    let _ = idx.prune_orphan_code_vectors();
+    // V11 Phase F: likewise drop cached digests for files that vanished.
+    let _ = idx.prune_orphan_digests();
+
+    // V12 Phase D: refresh git churn metadata for the ranking boost + digest
+    // trailers. `commit_touch` is additive (outside `RELATIONS`, ensured by
+    // `ensure_memory_relations`), so it survives the `reset()` above and just
+    // gets repopulated here every full pass. `collect` itself degrades to an
+    // empty vec (never an error) when `root` isn't a git repo, so this is
+    // always safe to call — a non-git project just gets no churn boost.
+    if let Ok(churn) = super::gitmeta::collect(root) {
+        let _ = idx.put_commit_touches(&churn);
+    }
 
     Ok((indexed, idx.stats()?))
 }
@@ -878,6 +2589,17 @@ fn build_tree(
 /// agree exactly on what counts as "in the project" (gitignore + global +
 /// exclude + parents, dotfiles included, plus the user's extra `ignore` globs).
 /// The db-subdir and per-file size/language filtering are applied by callers.
+///
+/// V13 Phase D: the `<db_subdir>/` override below (default `.cimp/`) is
+/// unconditional — not gated on the user's own `.gitignore` containing it —
+/// so this walker never DESCENDS into it at all, rather than relying on
+/// callers' post-hoc `path.components().any(|c| c.as_os_str() == db_subdir)`
+/// filter alone. That filter is still correct (and kept, as defense in
+/// depth), but a project that hasn't gitignored `.cimp/` would otherwise have
+/// this walker step through the shadow checkpoint repo's whole object store
+/// AND every worktree's full checkout under `.cimp/worktrees/<slug>/` on
+/// every rebuild — the worktree case in particular can be as large as the
+/// project itself, multiplied per open worktree.
 fn build_walker(root: &Path, snap: &GraphSettings) -> ignore::Walk {
     let mut wb = WalkBuilder::new(root);
     wb.hidden(false) // index dotfiles like `.github/*.md`; the db dir is filtered by callers
@@ -885,28 +2607,106 @@ fn build_walker(root: &Path, snap: &GraphSettings) -> ignore::Walk {
         .git_global(true)
         .git_exclude(true)
         .parents(true);
-    // Honor the user's extra ignore globs (additive to `.gitignore`). An
-    // `Override` whose patterns are *ignore* globs needs each prefixed with
-    // `!` (overrides are whitelists; a leading `!` flips one to a blacklist).
-    if !snap.ignore.is_empty() {
-        let mut ob = ignore::overrides::OverrideBuilder::new(root);
-        for pat in &snap.ignore {
-            let pat = pat.trim();
-            if pat.is_empty() {
-                continue;
-            }
-            let rule = if let Some(stripped) = pat.strip_prefix('!') {
-                stripped.to_string() // already a re-include
-            } else {
-                format!("!{pat}") // ignore this glob
-            };
-            let _ = ob.add(&rule);
+    // Honor the user's extra ignore globs (additive to `.gitignore`), plus
+    // the always-on `<db_subdir>/` exclusion above. An `Override` whose
+    // patterns are *ignore* globs needs each prefixed with `!` (overrides are
+    // whitelists; a leading `!` flips one to a blacklist).
+    let mut ob = ignore::overrides::OverrideBuilder::new(root);
+    let _ = ob.add(&format!("!{}/", snap.effective_db_subdir()));
+    for pat in &snap.ignore {
+        let pat = pat.trim();
+        if pat.is_empty() {
+            continue;
         }
-        if let Ok(ov) = ob.build() {
-            wb.overrides(ov);
-        }
+        let rule = if let Some(stripped) = pat.strip_prefix('!') {
+            stripped.to_string() // already a re-include
+        } else {
+            format!("!{pat}") // ignore this glob
+        };
+        let _ = ob.add(&rule);
+    }
+    if let Ok(ov) = ob.build() {
+        wb.overrides(ov);
     }
     wb.build()
+}
+
+/// Outcome of [`index_dir_tree`] for one moved-in/created directory.
+enum DirWalk {
+    /// Walked and indexed inline: how many files changed, and their rel paths
+    /// (for the caller's incremental churn refresh).
+    Indexed { indexed: u64, rels: Vec<String> },
+    /// The subtree holds more eligible files than the incremental cap; the
+    /// caller should fall back to a full rebuild.
+    TooBig,
+}
+
+/// Index every eligible file under `dir` (a directory that just appeared in a
+/// watcher batch). Windows reports an atomic directory rename as one
+/// dir-level OLD/NEW event pair — the children are never re-reported — so
+/// without this walk a renamed/moved-in subtree would stay missing from the
+/// graph until an unrelated full rebuild. Uses the same tree walker as a full
+/// rebuild (gitignore + user ignore globs + db-subdir exclusion), the same
+/// language/size gates as the per-file incremental path, and skips children
+/// whose stored content hash already matches (e.g. their own file events
+/// landed in the same batch), so a redundant directory event costs one
+/// read+hash per child, not a re-parse.
+fn index_dir_tree(
+    idx: &GraphIndex,
+    root: &Path,
+    dir: &Path,
+    snap: &GraphSettings,
+    sub: &str,
+    max_bytes: u64,
+) -> DirWalk {
+    const MAX_DIR_WALK: usize = 4096;
+    let mut eligible = 0usize;
+    let mut indexed = 0u64;
+    let mut rels: Vec<String> = Vec::new();
+    for entry in build_walker(dir, snap) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let child = entry.into_path();
+        if child.components().any(|c| c.as_os_str() == sub) {
+            continue;
+        }
+        let Some(lang) = lang_for(&child, &snap.languages) else {
+            continue;
+        };
+        if lang == Lang::Markdown && !snap.index_docs {
+            continue;
+        }
+        match std::fs::metadata(&child) {
+            Ok(m) if m.len() > max_bytes => continue,
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        eligible += 1;
+        if eligible > MAX_DIR_WALK {
+            return DirWalk::TooBig;
+        }
+        let src = match std::fs::read_to_string(&child) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let rel = rel_path(root, &child);
+        if idx.stored_file_hash(&rel).ok().flatten().as_deref()
+            == Some(super::model::fnv1a_hex(&src).as_str())
+        {
+            continue;
+        }
+        let fg = parse_file(&rel, &src, lang);
+        match idx.index_file_graph(&fg) {
+            Ok(()) => {
+                indexed += 1;
+                rels.push(rel);
+            }
+            Err(e) => debug!(file = %rel, error = %e, "graph: incremental index failed"),
+        }
+    }
+    DirWalk::Indexed { indexed, rels }
 }
 
 /// One row of the project **language census**: a language present on disk, how
@@ -1021,11 +2821,30 @@ fn language_census(root: &Path, snap: &GraphSettings, db_subdir: &str) -> Vec<La
 }
 
 /// Project-relative path with forward slashes, matching what the parser stores
-/// and the MCP tools query against. Falls back to the file name if `path`
-/// isn't under `root` (shouldn't happen for a walk rooted at `root`).
+/// and the MCP tools query against. The fs walk always strips cleanly; the
+/// case-insensitive fallback exists for agent-supplied absolute paths (memory
+/// events) that on Windows can differ from `root` only in drive/dir case — the
+/// tail keeps its original casing, which matches the indexed file. Returns the
+/// forward-slashed path unchanged when it isn't under `root`.
 fn rel_path(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
+    // Fast, exact path (always taken by the indexer's own walk).
+    if let Ok(rel) = path.strip_prefix(root) {
+        return rel.to_string_lossy().replace('\\', "/");
+    }
+    // Case-insensitive root-prefix strip.
+    let path_s = path.to_string_lossy().replace('\\', "/");
+    let root_s = root.to_string_lossy().replace('\\', "/");
+    let root_trim = root_s.trim_end_matches('/');
+    let rl = root_trim.len();
+    if !root_trim.is_empty()
+        && path_s.len() > rl
+        && path_s.is_char_boundary(rl)
+        && path_s.as_bytes()[rl] == b'/'
+        && path_s[..rl].eq_ignore_ascii_case(root_trim)
+    {
+        return path_s[rl + 1..].to_string();
+    }
+    path_s
 }
 
 /// The embedding "epoch" fingerprint — a vector is only comparable to others
@@ -1131,6 +2950,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression for the directory-rename staleness bug: a moved-in directory
+    /// arrives from the watcher as a single dir-level path (Windows never
+    /// re-reports the children), and used to be a silent no-op — the subtree
+    /// stayed missing until an unrelated full rebuild. `index_dir_tree` must
+    /// walk and index it, and a second pass must skip unchanged children.
+    #[test]
+    fn moved_in_directory_is_walked_and_indexed() {
+        let dir = std::env::temp_dir().join(format!("ckg-mvdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let sub = ".ckg-test";
+        let snap = GraphSettings::default();
+        let idx = GraphIndex::open(&dir, sub).expect("open");
+        build_tree(&idx, &dir, &snap, sub).expect("initial build");
+        assert!(!idx.find_symbol("alpha").unwrap().is_empty());
+
+        // Simulate `mv src srcnew`: the watcher batch carries only the two
+        // directory paths — the removal branch drops the old side...
+        std::fs::rename(dir.join("src"), dir.join("srcnew")).unwrap();
+        idx.remove_files_under("src").expect("remove old side");
+        assert!(idx.find_symbol("alpha").unwrap().is_empty());
+
+        // ...and the walk must index the new side.
+        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX) {
+            DirWalk::Indexed { indexed, rels } => {
+                assert_eq!(indexed, 1, "one child file indexed");
+                assert_eq!(rels, vec!["srcnew/lib.rs".to_string()]);
+            }
+            DirWalk::TooBig => panic!("one file is not too big"),
+        }
+        let hits = idx.find_symbol("alpha").unwrap();
+        assert!(
+            hits.iter().any(|s| s.file == "srcnew/lib.rs"),
+            "alpha lives under the new directory: {hits:?}"
+        );
+
+        // Idempotence: unchanged children are hash-skipped on a repeat event.
+        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX) {
+            DirWalk::Indexed { indexed, .. } => assert_eq!(indexed, 0, "nothing re-indexed"),
+            DirWalk::TooBig => panic!("one file is not too big"),
+        }
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The language census sees every language on disk (not just indexed ones)
     /// and classifies each: a supported+allowlisted lang is green (enabled), a
     /// supported-but-not-allowlisted lang is yellow, a known-but-unsupported
@@ -1205,6 +3071,39 @@ mod tests {
     }
 
     #[test]
+    fn semantic_code_max_chunks_caps_total_across_a_rebuild() {
+        // Two files, each with one chunk-eligible function. A budget of 1
+        // must cap the project-wide `code_chunk` total at 1, regardless of
+        // which file the walk visits first.
+        let dir = std::env::temp_dir().join(format!("ckg-codecap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "pub fn alpha(a: i32, b: i32) -> i32 {\n    let c = a + b;\n    c\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/b.rs"),
+            "pub fn beta(a: i32, b: i32) -> i32 {\n    let c = a * b;\n    c\n}\n",
+        )
+        .unwrap();
+
+        let sub = ".ckg-test";
+        let mut snap = GraphSettings::default();
+        snap.semantic_code_max_chunks = 1;
+        let idx = GraphIndex::open(&dir, sub).expect("open");
+        build_tree(&idx, &dir, &snap, sub).expect("rebuild");
+
+        // `total` from `code_embedding_coverage` is epoch-independent (a plain
+        // `count(*code_chunk{id})`), so any epoch string works here.
+        let (_, total) = idx.code_embedding_coverage("any").expect("coverage");
+        assert_eq!(total, 1, "the project-wide cap trims to the configured budget");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn lang_for_honors_configured_languages() {
         use std::path::PathBuf;
         let all = GraphSettings::default().languages;
@@ -1215,5 +3114,17 @@ mod tests {
         let only_rust = vec!["rust".to_string()];
         assert_eq!(lang_for(&PathBuf::from("a.py"), &only_rust), None);
         assert_eq!(lang_for(&PathBuf::from("a.rs"), &only_rust), Some(Lang::Rust));
+    }
+
+    /// V12 Phase F (6c): the `graph-analyses` event only fires when the
+    /// dead-exports/import-cycles counts actually changed since the last
+    /// stored pass — first-ever pass (`None` stored) counts as a change, an
+    /// identical repeat does not, and any different count does.
+    #[test]
+    fn analyses_changed_only_on_first_seen_or_different_counts() {
+        assert!(analyses_changed(None, "3,1"), "first pass is always new information");
+        assert!(!analyses_changed(Some("3,1"), "3,1"), "identical counts: no event");
+        assert!(analyses_changed(Some("3,1"), "4,1"), "dead-export count grew");
+        assert!(analyses_changed(Some("3,1"), "3,0"), "cycle count shrank — still a change");
     }
 }

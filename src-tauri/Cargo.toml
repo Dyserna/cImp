@@ -1,6 +1,6 @@
 [package]
 name = "cimp"
-version = "0.34.2"
+version = "0.40.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
@@ -53,7 +53,10 @@ tts-cuda = ["ort/cuda"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset"] }
+# V14 Phase F: `unstable` gates `Window::add_child` (the multi-webview API
+# the Preview tab's embedded child webview is built on) — Tauri's own name
+# for the feature, not a claim about our usage of it.
+tauri = { version = "2", features = ["protocol-asset", "unstable"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 # Windows 11 Snap Layouts on our custom (frameless) title bar: injects a
@@ -68,6 +71,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-ut
 tokio-util = { version = "0.7", features = ["rt"] }
 portable-pty = "0.8"
 thiserror = "1"
+# V12 Phase A: `run_check` diagnostic parsers (tsc / generic gcc-style
+# `file:line:col: level: message`). Pure Rust, no C deps.
+regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
@@ -163,6 +169,20 @@ ignore = "0.4"
 # filtering are done in `graph::watcher`.
 notify = "6"
 
+# V14 Phase F (Preview tab): official Tauri plugin for "open this URL/path in
+# the user's default browser/file manager" — used for external links clicked
+# inside a Preview tab's embedded webview (denied `on_new_window`/off-policy
+# `on_navigation` targets) and the fallback "open in system browser" button.
+# Pulls in the cross-platform `open` crate; its Linux xdg-open path drags in
+# `zbus`/`async-*` but those are only compiled for `cfg(target_os = "linux")`
+# inside `open`, so the Windows build gains nothing from them.
+tauri-plugin-opener = "2"
+# V14 Phase F: parses/classifies Preview-tab navigation targets
+# (`preview::is_allowed_preview_host`). Already resolved in Cargo.lock as a
+# transitive dependency (reqwest/tauri), so depending on it directly adds no
+# new entries to the tree.
+url = "2"
+
 # Windows-only: registry probe for Git Bash auto-detection in shell::detect.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
@@ -175,6 +195,31 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+# V14 Phase F (Preview tab, `preview::capture`): the single COM call this
+# module needs — `ICoreWebView2::CapturePreview` — isn't exposed by wry, so
+# `preview::capture` reaches through `Webview::with_webview`'s
+# `PlatformWebview::controller()` (an `ICoreWebView2Controller` from THIS
+# crate) to get there. Pinned to "0.38" — the exact version wry 0.55
+# transitively resolves to (see Cargo.lock) — so the type wry hands back and
+# the type this crate casts against are the SAME nominal type, not just
+# COM-GUID-compatible; a version drift here would fail to compile, not
+# silently misbehave.
+webview2-com = "0.38"
+# The ergonomic `windows` crate (distinct from `windows-sys` above, which has
+# no COM/interface support) for the few Win32 APIs `preview::capture` calls
+# directly: `SHCreateStreamOnFileW` (a FILE-BACKED `IStream`, so
+# `CapturePreview`'s PNG output lands on disk with no manual byte-copying)
+# and the `STGM_*` open-mode flags. Pinned to "0.61" to match what
+# `webview2-com` 0.38.2 itself depends on (see its Cargo.toml), keeping
+# `IStream`/`PCWSTR`/etc. type-identical between the two crates.
+windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell"] }
+
+[dev-dependencies]
+# V14 Phase B: backdating a directory's mtime in `attach::tests` (to exercise
+# `attach::prune`'s age cutoff). Already resolved in Cargo.lock as a
+# transitive dependency of another crate; pinning it directly here adds no
+# new entries to the dependency tree.
+filetime = "0.2"
 
 [profile.release]
 codegen-units = 1

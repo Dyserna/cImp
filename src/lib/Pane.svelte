@@ -24,9 +24,20 @@
   import TabErrorOverlay from './TabErrorOverlay.svelte';
   import ClosedShellOverlay from './ClosedShellOverlay.svelte';
   import OffloadServerView from './OffloadServerView.svelte';
-  import GraphMonitorView from './GraphMonitorView.svelte';
+  import CodeIntelligenceView from './CodeIntelligenceView.svelte';
   import NoteView from './NoteView.svelte';
-  import { isShellTab, isOffloadTab, isGraphMonitorTab, isNoteTab, type TabId } from './tabs/types';
+  import WorkbenchView from './WorkbenchView.svelte';
+  import GraphView from './GraphView.svelte';
+  import PreviewToolbar from './PreviewToolbar.svelte';
+  import {
+    isShellTab,
+    isOffloadTab,
+    isGraphMonitorTab,
+    isNoteTab,
+    isWorkbenchTab,
+    isGraphViewTab,
+    type TabId,
+  } from './tabs/types';
   import { tabs } from './tabs/store';
   import type { LayoutNode, PaneNode } from './layout/types';
 
@@ -160,9 +171,17 @@
       {#if isOffloadTab(pane.active_tab_id)}
         <OffloadServerView />
       {:else if isGraphMonitorTab(pane.active_tab_id)}
-        <GraphMonitorView />
+        <CodeIntelligenceView />
       {:else if isNoteTab(pane.active_tab_id)}
         <NoteView />
+      {:else if isWorkbenchTab(pane.active_tab_id)}
+        <WorkbenchView />
+      {:else if isGraphViewTab(pane.active_tab_id)}
+        <GraphView />
+      {:else if $tabs.find((m) => m.id === pane.active_tab_id)?.kind === 'preview'}
+        {#key pane.active_tab_id}
+          <PreviewToolbar tabId={pane.active_tab_id} />
+        {/key}
       {:else}
         <TabErrorOverlay tabId={pane.active_tab_id} onretry={handleRetry} />
         {#if isShellTab(pane.active_tab_id)}

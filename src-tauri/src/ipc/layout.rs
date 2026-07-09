@@ -118,14 +118,25 @@ pub async fn rename_layout_preset(
     drop(snap);
     // Perform the rename atomically, re-checking under the held lock so a
     // concurrent rename/delete can't be clobbered or produce a duplicate name.
-    state.settings.mutate(move |snap| {
+    // Track whether the rename actually applied: if a concurrent op created
+    // `new_trimmed` or removed `old_name` between our pre-check and the lock,
+    // the closure no-ops — surface that as an error instead of a false `Ok`
+    // that leaves the caller's UI believing the rename succeeded.
+    let renamed = std::cell::Cell::new(false);
+    state.settings.mutate(|snap| {
         if snap.layout_presets.iter().any(|p| p.name == new_trimmed) {
             return;
         }
         if let Some(target) = snap.layout_presets.iter_mut().find(|p| p.name == old_name) {
-            target.name = new_trimmed;
+            target.name = new_trimmed.clone();
+            renamed.set(true);
         }
     });
+    if !renamed.get() {
+        return Err(AppError::Settings(format!(
+            "rename_layout_preset: '{old_name}' → '{new_trimmed}' did not apply (a concurrent change intervened)"
+        )));
+    }
     Ok(())
 }
 

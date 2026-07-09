@@ -46,6 +46,8 @@
     onConfigure,
     onRestart,
     onClose,
+    onNewWorktreeTab,
+    onNewPreviewTab,
     onDismiss,
   }: {
     x: number;
@@ -59,7 +61,11 @@
     /// (Claude / Claude-local) where the parent routes Configure to
     /// the Settings window. Builtin shell tabs continue to hide it
     /// because their ConfigureTabDialog rejects builtin-shell edits.
-    tab: { id: TabId; builtin: boolean; kind: 'shell' | 'ai-tool'; canRestart: boolean } | null;
+    /// V14 Phase F: `'preview'` never shows "Configure…" or "New tab in
+    /// worktree…" — a Preview tab's own toolbar (URL bar/device presets/
+    /// auto-reload) IS its configuration surface, and worktrees are an
+    /// AI-tab-only concept.
+    tab: { id: TabId; builtin: boolean; kind: 'shell' | 'ai-tool' | 'preview'; canRestart: boolean } | null;
     /// Tab actions. Required when `tab` is non-null; ignored otherwise.
     /// Optional in the type to make the bar-background callsite
     /// boilerplate-free.
@@ -67,6 +73,16 @@
     onConfigure?: () => void;
     onRestart?: () => void;
     onClose?: () => void;
+    /// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — offered
+    /// for any AI-tool tab (builtin or already-duplicated), same
+    /// availability rule as `onConfigure`.
+    onNewWorktreeTab?: () => void;
+    /// V14 Phase F: "New Preview tab" — a pane action (like Split/Close
+    /// pane below), not gated on which tab was right-clicked (or offered
+    /// even with no tab at all, on a bar-background right-click), since a
+    /// Preview tab isn't tied to any existing tab the way a worktree
+    /// duplicate is.
+    onNewPreviewTab?: () => void;
     onDismiss: () => void;
   } = $props();
 
@@ -205,9 +221,14 @@
     <button type="button" class="entry" role="menuitem" onclick={fire(onRename)}>
       Rename
     </button>
-    {#if !tab.builtin || tab.kind === 'ai-tool'}
+    {#if tab.kind !== 'preview' && (!tab.builtin || tab.kind === 'ai-tool')}
       <button type="button" class="entry" role="menuitem" onclick={fire(onConfigure)}>
         Configure…
+      </button>
+    {/if}
+    {#if tab.kind === 'ai-tool' && onNewWorktreeTab}
+      <button type="button" class="entry" role="menuitem" onclick={fire(onNewWorktreeTab)}>
+        New tab in worktree…
       </button>
     {/if}
     {#if !tab.builtin}
@@ -239,6 +260,11 @@
   >
     Split vertically
   </button>
+  {#if onNewPreviewTab}
+    <button type="button" class="entry" role="menuitem" onclick={fire(onNewPreviewTab)}>
+      New Preview tab
+    </button>
+  {/if}
   <div class="separator"></div>
   <button
     type="button"

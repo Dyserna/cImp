@@ -440,6 +440,588 @@ a `tags.scm` whose `@definition.<kind>` capture sits on the actual construct nod
 (not an enclosing scope) works with no engine changes. Capture suffixes map to
 `SymbolKind` in `kind_from_suffix`.
 
+## Code Intelligence — Context Engine (V10)
+
+The "Code Graph" tab is renamed **Code Intelligence** (internal tab id
+`graph-monitor` and the `graph` settings key are unchanged) and its view
+(`src/lib/CodeIntelligenceView.svelte`) routes five sections: Index / Activity /
+Memory / Context / Analyses.
+
+**Schema versioning & migration.** `graph/schema.rs::GRAPH_SCHEMA_VERSION` stamps
+the derived-relation shape. On open, `GraphIndex::migrate_schema` compares it
+against a `schema_meta` singleton (which is **not** in `RELATIONS`, so it survives
+`reset()`); a mismatch drops+recreates the derived relations, and the service's
+normal rebuild repopulates them from source. This runs once, transparently, on
+the first launch after an upgrade — bump `GRAPH_SCHEMA_VERSION` whenever a
+`RELATIONS` column changes.
+
+**Memory relations are rebuild-safe.** `session` / `mem_event` / `mem_note` are
+ensured by `ensure_memory_relations` **outside** `RELATIONS`, because a full
+index rebuild calls `reset()` (drops every `RELATIONS` relation) and memory is
+runtime event data, not derived from source — it must survive a rebuild.
+
+**Memory event sources are per-agent.** Claude records in-process via the
+transcript tap (`oob/claude.rs::record_tool_events`, beside `update_agents`;
+session id = the `<id>.jsonl` stem), wired through `OobContext.mem` from
+`pty/manager.rs`. OpenCode's OOB SSE stream has no tool events, so its memory
+comes from the injection plugin's `tool.execute.after` hook POSTing to
+`/memory/event`. `graph::classify_tool` maps tool names → `(kind, arg)` for both.
+
+**Memory-tool session scoping — per-agent (partial), pending a Claude Code
+feature.** The `context_recall` / `context_note` / `context_notes` MCP tools have
+no session argument (Claude Code does not pass session identity into an MCP
+server's tool-call context — see below), so they resolve a session from
+`graph.db` by recency. To keep a **Claude** tab and an **OpenCode** tab on the
+same project from reading/writing each other's session, the resolution is scoped
+to the *calling agent*: the MCP child's `--consumer` (claude/opencode) flows
+`offload/mcp.rs::proxy_graph` → `/graph_run` (`GraphRunBody.consumer`) →
+`run_graph_tool` → `dispatch_recorded` `source` → `mem_agent(source)` →
+`GraphIndex::mem_current_session_for(Some(agent))` (and the app-down fallback
+`handle_call(params, consumer)` does the same). `source` is also the activity
+ring's badge, so OpenCode's graph/context calls now read as `opencode`, not
+`claude` (frontend `GraphCall.source` union + `.hsrc.opencode`).
+
+*Residual limitation (periodically re-check):* two tabs of the **same** agent
+(e.g. two Claude tabs) on one project still share the same agent scope, so a
+`context_note` from one can attach to the other's session, and `context_recall`
+can return the other's working set. Full per-tab isolation needs a session
+identifier available *inside the MCP tool call* so the tool knows which of
+several same-agent sessions is calling.
+
+- **What's missing:** Claude Code exposes a session id to **hooks** (the
+  `UserPromptSubmit` payload carries `session_id` — that's how the transcript tap
+  and `cimp --context-hook` get it) but **not** to the MCP servers it launches:
+  the `cimp --offload-mcp` child is spawned per Claude session yet receives no
+  session UUID (no arg, no env var, and no field on the JSON-RPC `tools/call`
+  params). So the child literally cannot tell which session is invoking a tool.
+- **What to watch for** (any of these closes the gap): a session id / session
+  metadata field on the MCP `tools/call` request; a per-session env var set on
+  the MCP server process at spawn (like the hook `session_id`); or an MCP
+  "elicitation"/context mechanism that carries session identity. Check the MCP
+  server docs + the Claude Code hooks/MCP release notes.
+- **When it lands:** thread that id into `dispatch_recorded` alongside `source`,
+  add `mem_event`/`session` writes keyed by it, and switch the tools from
+  `mem_current_session_for(agent)` to an exact session lookup. The recording side
+  already stores a real per-session id (`session.session_id`), so only the read
+  path's "which session am I" resolution needs to change.
+
+**Context injection** (opt-in, `graph.context_injection`). `graph/context.rs`
+ranks files (symbol/reference/doc hits + session working set) and budget-packs
+outline digests — synchronous, no per-prompt embedding. Claude injects via a
+`UserPromptSubmit` hook (`cimp --context-hook`, `context_hook.rs`) added to the
+`--settings` overlay; OpenCode via a generated dependency-free plugin
+(`tabs/config.rs::write_opencode_plugin` → `<project>/.opencode/plugin/cimp-inject.js`,
+baking in the loopback port+token per launch; `.opencode/` is added to
+`.git/info/exclude`). **Never launch OpenCode with `--pure`** — it disables all
+external plugins.
+
+**New local loopback routes** (`offload/loopback.rs`), same authenticated-
+localhost trust model as `/graph_run`: `POST /context/retrieve` (gated on
+`context_injection`) and `POST /memory/event` (OpenCode's memory ingress).
+
+## Code Intelligence — Token Efficiency (V11)
+
+**Schema bump to v3 — one rebuild for the whole V11–V14 roadmap.**
+`graph/schema.rs::GRAPH_SCHEMA_VERSION` moved 2 → 3 for a single column change:
+`symbol.is_test` (provisioned for a later milestone, unused by anything in
+V11). That's the *only* `RELATIONS` shape change, so it's the only thing that
+forces the migrate-on-open rebuild described in the V10 section above. Every
+other new store this milestone adds is **additive, create-if-missing, and
+needs no version bump**: `code_chunk` (added to `RELATIONS` directly — the
+code-embedding source text) plus `digest` and `code_vec`, both ensured lazily
+the first time they're needed (`GraphIndex::put_digest` /
+`ensure_code_vector_store`), the same pattern V10 used for `session` /
+`mem_event` / `mem_note`. **`injected` (the Phase C dedup state) is *not* a
+relation** — it's an in-memory `HashMap<session_id, InjectState>` on
+`GraphService` (`graph/service.rs`), so it never survives a restart and needs
+no schema entry; a restart just re-injects fresh on the next turn, which is
+the intended fail-safe.
+
+**Three Claude hook shims, one shared POST helper.** `context_hook.rs`'s
+`post_loopback(path, body)` (Bearer auth, `Content-Length`, `Connection:
+close`, 2xx-only, ~600 ms timeout) is now used by all three CLI subcommands
+wired in `main.rs`:
+
+| Subcommand | Hook event | Route | Module |
+|---|---|---|---|
+| `cimp --context-hook` | `UserPromptSubmit` | `POST /context/retrieve` | `context_hook.rs` (V10) |
+| `cimp --precompact-hook` | `PreCompact` | `POST /context/compaction` | `compact_hook.rs` (V11 Phase D) |
+| `cimp --read-hook` | `PreToolUse` (matcher `Read`) | `POST /context/should_read` | `read_hook.rs` (V11 Phase E) |
+
+All three are dependency-light, synchronous, and fail open (print nothing,
+exit 0) on any error — a hook must never block or perturb the agent's turn.
+`tabs/config.rs` adds the `PreCompact` hook to the Claude settings overlay
+whenever `context_injection && compaction_context`, and the `PreToolUse` hook
+whenever `context_injection && read_advisor` (independent toggles — a project
+can run compaction survival without the read advisor).
+
+**Compaction route's side effects are unconditional.** `GraphService::
+compaction_context` (`graph/service.rs`) always clears the session's
+`injected` dedup map and marks it `post_compaction` — even when
+`compaction_context` is off or the rendered block is empty — because those
+two effects are what keep Phase C (dedup) and Phase E (read advisor) correct
+across a compaction regardless of whether the block itself is gated on. Only
+the returned working-set/notes text is gated.
+
+**`TODO(spike)` — two hook output contracts are unverified against the pinned
+Claude Code build:**
+- **D0 (`compact_hook.rs`):** which JSON field of a `PreCompact` hook's stdout
+  actually reaches the *compaction prompt* (we emit the documented
+  `hookSpecificOutput.additionalContext` shape, mirroring the
+  `UserPromptSubmit` hook, but this hasn't been confirmed hands-on the way the
+  V10 OpenCode injection spike was). The server-side effects (dedup clear,
+  post-compaction flag) are correct **regardless** of whether Claude reads
+  this field, so the feature degrades safely either way — worst case the
+  block just doesn't reach the model.
+- **E1 (`read_hook.rs`):** whether a `PreToolUse` deny's
+  `permissionDecisionReason` is surfaced **to the model** (not just the user)
+  on the pinned Claude Code version. If it isn't, the read advisor can't
+  substitute usable content on a deny and the milestone spec says to cancel
+  the feature rather than ship a bare refusal — `read_advisor` defaults off,
+  so nothing is affected until this is confirmed and the setting is turned on
+  per project.
+
+**Read advisor staleness check uses content hash, not mtime.** `should_read`
+(`graph/service.rs`) compares the current file's FNV hash against the indexed
+`file.hash` — the same check `graph_snippet`'s `stale` flag uses — rather than
+comparing a stored mtime against the memory event's timestamp. A code-review
+fix (see the `fix(V11)` commit): mtime comparison is vulnerable to filesystem
+clock skew on network shares / WSL2 bind-mounts, which could wrongly suppress
+a real edit and hand the agent stale content.
+
+**Digest jobs are demand-driven, slot-gated, and local-only.**
+`context_llm_digests` only digests files that actually ranked into an
+injection and have no outline (docs/configs/long scripts) — not the whole
+repo. `GraphService::enqueue_digest` single-flights by `(root, file,
+content_hash)` (an `InflightGuard` removes the key on `Drop`, so a panicked
+digest task can't permanently leak a slot) and caps concurrent jobs at 32.
+The compute itself goes through `OffloadSupervisor::run_internal` — a
+non-streaming, tools-off, thinking-suppressed completion that **only
+considers backends already running locally** (`self.running`, not the full
+pool/router), so a digest can never route to a remote or cloud backend
+regardless of `allow_remote_worker_access`. Injection never blocks on this: a
+cache miss falls back to the V10 outline/empty digest and the result lands in
+`graph.db`'s `digest` relation for the next retrieve.
+
+**Code-embedding backfill rides the doc-embedding pass, strictly after it.**
+`embed_backfill` (`graph/service.rs`) embeds `doc_chunk`s first (cheaper, and
+doc search stays useful even with code embedding off), then — only when
+`embed_code_bodies` is on — embeds pending `code_chunk`s into `code_vec` under
+the same epoch/dim/model. `graph_semantic_code` is advertised (`graph/mcp.rs
+tools()`) only when **both** `semantic_search` and `embed_code_bodies` are on
+(a code-review fix — the backfill that actually populates `code_vec` only
+runs when `semantic_search` is on, so gating the tool on `embed_code_bodies`
+alone would advertise a tool that could never return results). No full-text
+fallback exists for code chunks the way `graph_search_docs` backs
+`graph_semantic_docs` — a miss degrades to a clear "unavailable, try
+`graph_find_symbol`/`graph_struct_search`" message instead of silently
+re-running as a keyword search.
+
+**`file_centrality` counts distinct inbound edges, not join rows** (a
+code-review fix). `graph_repo_map`'s ranking signal is inbound call-edge
+count per file; the initial implementation joined `edge` against `symbol`
+without deduping, so a callee name defined N times in one file inflated that
+file's centrality by N×. Fixed in `graph/index.rs::file_centrality`, with a
+regression test alongside it.
+
+## Code Intelligence — Agentic Inner Loop (V12)
+
+**No schema bump — every V12 store is additive, create-if-missing.**
+`symbol.is_test` (Phase C) is the one column that would normally force a
+version bump, but it rode V11's v2 → v3 bump for free (the column already
+existed, unused, in that migration — see the V11 section above), so
+`GRAPH_SCHEMA_VERSION` stays at 3 for all of V12. Every other new store is a
+plain relation created on first use, the same pattern V10/V11 used for
+`session`/`digest`/`code_chunk`: `commit_touch` (Phase D, file churn),
+`project_fact` (Phase E, durable facts), `session_distilled` (Phase E, an
+idempotency marker per session id), and `meta` (Phase F, a small generic
+key/value store backing the analyses-auto trigger's last-seen counts). An
+older `graph.db` opens against these with zero migration step — they simply
+don't exist until the first write.
+
+**A fourth Claude hook shim joins the V11 three, sharing the same POST
+helper.** `postedit_hook.rs`'s `cimp --postedit-hook` (`PostToolUse`, matcher
+`Edit|Write|MultiEdit` → `POST /context/post_edit`) reuses `context_hook.rs`'s
+`post_loopback(path, body)` exactly like `compact_hook.rs` and `read_hook.rs`
+do — same Bearer auth, `Content-Length`, ~600 ms timeout, fail-open-on-any-error
+posture. `tabs/config.rs` adds the hook to the Claude settings overlay
+whenever `context_injection && auto_check`, independent of the other three
+context-hook toggles.
+
+**`TODO(spike F0)` — a third unverified hook output contract, same posture as
+V11's D0/E1.** Which JSON field of a `PostToolUse` hook's stdout actually
+reaches the model as additional context is unconfirmed against the pinned
+Claude Code build (`postedit_hook.rs`'s module doc). We emit the documented
+`hookSpecificOutput.additionalContext` shape, mirroring `UserPromptSubmit`/
+`PreCompact`. Degrades safely either way: the server-side effects (debounce
+clock, baseline update, parked-block bookkeeping) run regardless of whether
+Claude reads the field, and a parked block still drains via the next
+`/context/retrieve` call (`GraphService::drain_auto_check`) — worst case the
+block just arrives a turn later instead of inline. `auto_check` defaults off,
+so nothing is affected until this is confirmed and a project opts in.
+
+**The `checks/` module is a new dependency surface: parser fixtures need
+upkeep alongside the tools they parse.** `checks::parsers` has one parser per
+shipped `ParserKind` (`cargo-json`, `tsc`, `eslint-json`, `pytest`,
+`generic-gcc`); each is regex/JSON-shape coupled to that tool's *current*
+output format. A `cargo`/`tsc`/`eslint`/`pytest` release that changes its
+diagnostic JSON shape or line format silently degrades `run_check` to
+zero/garbage groups rather than erroring loudly — there's no schema
+validation against the real tool, only the fixtures in `checks/parsers.rs`'s
+test module. Re-run those fixtures (and add a new one from a real tool
+invocation) whenever bumping a toolchain this repo's own `checks:` config
+points at, and periodically spot-check the parser against that tool's latest
+`--help`/changelog for output-format notes.
+
+**`graph_impact` / `is_test` / `graph_tests_for` are all approximate by the
+same name-keyed-call-graph limitation `graph_references` already documents.**
+None of these resolve dynamic dispatch, trait objects, higher-order callbacks,
+or reflection-based test discovery — they walk the same reverse/forward
+`calls` edges the rest of the graph does, which are name-keyed, not
+type-checked. `graph_impact`'s dependent tree and `graph_tests_for`'s test
+list are both labeled candidates in their tool descriptions (`graph/mcp.rs`),
+same honesty convention as dead exports: an empty result reads as "found
+none", not "verified none exist." Test detection itself (`graph/builder.rs`'s
+`is_test` walkers) has no bit at all for languages without a bespoke walker or
+a path-convention fallback — again accurate-but-incomplete rather than wrong,
+matching V10's `visibility` precedent.
+
+**The 4-agent code-review pass (`fix(V12)`, commit `aa120c3`) is worth reading
+directly** — it caught several correctness bugs that would otherwise degrade
+silently: `git status --porcelain` collapsing a brand-new untracked directory
+into one `?? dir/` line (both `graph_impact` and `changed_only` now use
+`-z --untracked-files=all` and NUL-split, shared between `graph::impact` and
+`checks::gitls`); a `changed_only` site filter that could drop a just-edited
+file's occurrence when a diagnostic already had ≥5 sites elsewhere (fixed by
+filtering the *uncapped* site list before `cap_sites` truncates — see
+`checks::mod::run`'s doc comment); a check that fails to spawn previously
+vanished from the report indistinguishably from "ran clean" (now surfaced as
+`"⚠ check `<name>` did not run: <err>"`, `checks::auto::spawn_failure_line`);
+`is_cfg_test` missing `cfg(any(test, …))`/`cfg(all(test, …))`; a
+`DistillGuard` in-flight-session-id guard preventing two concurrent
+distillation sweeps (a full rebuild and a watcher-batch reindex can both pick
+up the same idle session) from double-distilling it into duplicate facts; the
+project-fact ranking boost requiring a whole-word, ≥4-char, non-generic-stem
+match (the initial version was a raw substring match, so `mod`/`index`/
+`context` spuriously boosted unrelated files); and `parse_unified_diff` only
+treating a `+++ ` line as a new file header when it immediately follows a
+`--- ` line (otherwise an added line whose *content* starts with `++` can be
+misread as a header). The same pass also de-duplicated the two modules' git
+spawn helper into `graph::gitcmd::run_git` (shared by `graph::impact` and
+`graph::gitmeta`; `checks::gitls` keeps its own async twin on purpose — see
+that module's doc comment) and bounded `graph_recent_changes` at the Datalog
+level (`:order -last_ts :limit`) instead of scanning the whole `commit_touch`
+relation per retrieve.
+
+## Workbench — Vibe-Coding Guardrails (V13)
+
+**No graph-schema change, no new MCP tool.** The whole feature is a reserved
+app-rendered tab (`TabId::Workbench`, same pattern as Code Intelligence)
+backed by spawned `git` (diff parsing, worktrees) and a self-contained
+`.cimp/shadow.git` store (checkpoints) — `GRAPH_SCHEMA_VERSION` stays at 3.
+Diff/worktree operations need `git` on `PATH`; checkpoints work in a project
+with no `.git` at all (the shadow repo is self-contained), which is
+deliberate — it's what makes checkpoints useful *before* `git init`.
+
+**Shadow-repo trust model — one audited chokepoint.** `workbench::git::GitCtx`
+(`git.rs`) has three optional fields mapping 1:1 onto `GIT_DIR` /
+`GIT_WORK_TREE` / `GIT_INDEX_FILE`; `run`/`run_with_stdin` always **set or
+remove** all three explicitly before spawning `git` — never leaving one
+inherited from the parent process's environment — which is the actual safety
+property (a spawned `git` child could otherwise silently inherit a stray
+`GIT_DIR` and operate on the wrong repo). `GitCtx::discover` (all `None`)
+targets the user's own repo; `GitCtx::shadow(root)` points `GIT_DIR` at
+`.cimp/shadow.git`, `GIT_WORK_TREE` at the project root (shared with the
+user's tree — checkpoints see real on-disk content), and `GIT_INDEX_FILE` at
+the shadow repo's own index so staging for a snapshot never touches the
+user's index. Every shadow git call in `shadow.rs`, `diff.rs` (the
+non-git/checkpoint-diff fallback), and `worktree.rs` routes through this one
+constructor pair — there is no second way to spawn a shadow `git` process.
+Regression-tested directly (`git.rs`'s unit tests assert the exact env-var
+overrides for both `discover` and `shadow`, plus that `discover`'s overrides
+are all `None`).
+
+**Checkpoints are orphan commits, deduped by tree sha, not by a "did
+anything change" flag.** `shadow::snapshot` always runs `stage_and_write_tree`
+first (needed to see untracked files even for the dry-run dedup check), then
+compares the freshly-computed tree sha against the latest `cp-<seq>` tag's
+`<tag>^{tree}` — equal shas skip the commit. This replaced an earlier
+`changed_since_index`-based dedup guard (removed in the V13 code-review pass)
+that could wrongly report "unchanged" against a stale index; tree-sha
+comparison sidesteps the whole index-staleness question. Each checkpoint is a
+parentless `commit-tree` (`git commit-tree` with no `-p`) tagged `cp-<seq>` —
+no branch ever advances in the shadow repo, so `git status` inside it
+permanently reads "unborn HEAD vs a fully-staged index"; that's expected, not
+a bug. `next_seq`/`latest_checkpoint_tag` both derive from a `tag -l cp-*`
+scan rather than a counter file, so they can't drift out of sync with what
+tags actually exist.
+
+**Restore-safety invariants are the one place in this milestone worth
+double-checking on every touch.** `shadow::restore` (`shadow.rs`) always: (A)
+takes a `Trigger::PreRestore` snapshot of the current state *before* touching
+anything, so every restore is itself undoable; (B) re-creates files present
+at the target but deleted since; (C) computes `created_since` (files present
+in the pre-restore state but absent from the target) and leaves them alone
+**unless** the caller passes `delete_new: true` (default `false` at every call
+site — untracked new work survives a restore by default); (D) only deletes
+`created_since` paths when `delete_new` is explicit. `restore_round_trip_is_
+byte_faithful_including_crlf` and `restore_keeps_new_files_by_default_
+deletes_only_with_delete_new` in `shadow.rs`'s test module are the direct
+regression coverage; re-run both after touching this function. The user's own
+`.git` is never opened by `restore` — it operates entirely through the
+`GitCtx::shadow` context above.
+
+**Per-hunk revert reconstructs a single-hunk patch and applies it with `git
+apply --reverse --unidiff-zero -`** (`diff.rs::revert_hunk`/
+`build_hunk_patch`) — never a partial apply; a failure (stale `hunk_hash`,
+mid-merge/-rebase `readonly` guard, or `git apply` itself rejecting the patch)
+leaves the file untouched. `hunk_hash` is recomputed from the hunk's own
+content each time a diff is built, so a hunk that shifted or changed since the
+UI last saw it fails the hash check rather than reverting the wrong lines. A
+checkpoint (when checkpoints are on) is taken before the `git apply` call,
+matching Feature 1's restore-is-always-undoable posture. `is_special_state`
+checks for `MERGE_HEAD`/`REBASE_HEAD` and flips the whole diff summary
+`readonly` — no hunk reverts while the index is mid-merge/-rebase.
+
+**The `fs-batch` event is a new, shared primitive — not workbench-private.**
+`WorkbenchService::publish_fs_batch` (`mod.rs`) broadcasts a capped path list
+on the `fs-batch` Tauri event whenever the graph watcher's own debounce thread
+hands over a batch; both the Diff pane (`workbenchDiff.ts`, 500 ms debounce +
+5 s poll fallback that skips itself while the watcher is on) and the burst
+checkpoint trigger (`handle_fs_batch_for_burst`) subscribe to the same
+broadcast channel, so a project with `graph.enabled` off still gets live diff
+refresh and burst checkpoints — the watcher requirement is soft, not hard.
+
+**Merge never leaves a half-merged main tree — verified, not just attempted.**
+`worktree::merge` refuses up front on a dirty main tree or a main branch that
+doesn't match the worktree's recorded base; on a `git merge` conflict it runs
+`git merge --abort` and, critically, checks *that* command's own exit status
+(a V13 code-review fix) — if the abort itself fails, the error message says so
+explicitly ("main working tree may be left half-merged... resolve manually")
+rather than claiming a clean abort it can't confirm. `discard` only removes
+worktrees whose `.cimp/worktrees/<slug>.meta.json` sidecar cImp itself wrote,
+double-confirmed in the UI. `merge_conflict_aborts_cleanly_and_leaves_main_
+tree_untouched` in `worktree.rs`'s test module asserts `MERGE_HEAD` absence,
+unchanged `HEAD`, and a clean `git status` after an aborted merge — the
+regression coverage for the "never half-merged" guarantee.
+
+**The 3-agent code-review pass (`fix(V13)`, commit `010a14e`) is worth reading
+directly** — same posture as V12's, and it caught one **critical data-loss
+bug**: `diff_vs_now`'s `git add -A` used to leave the shared shadow index
+matching disk, so `restore`'s own pre-restore safety snapshot (Invariant C,
+above) could dedup against a now-*stale* tree sha and skip taking a real
+undo point — a restore could then destroy uncommitted edits with nothing to
+recover them from. Fixed by giving `diff_vs_now` its own scratch index (zero
+side effect on the dedup-relevant index state); regression test
+`restore_after_a_dry_run_diff_preserves_uncommitted_edits`, verified
+fail-without/pass-with. The same pass added the `git merge --abort`
+exit-status check described above, fixed a `parse_unified` panic on an empty
+hunk-body line, moved the checkpoint min-gap gate from global to per-root
+(it was swallowing other projects' checkpoints), excluded
+checkout-untouched paths from `RestoreReport.changed`, and wired the
+non-git-project diff pane (`DiffSource::Shadow` — diff vs the latest
+checkpoint) that Feature 2's design called for but Phase B initially missed.
+
+## Workflow & Visibility (V14)
+
+**Two different schema numbers move this milestone — don't conflate them.**
+The **graph** schema stays at `GRAPH_SCHEMA_VERSION = 3` (`graph/schema.rs`):
+the new `usage_stat` relation (`graph/index.rs`) is additive/create-if-missing,
+the same pattern every V10–V13 store used. The **settings** schema, by
+contrast, bumps `CURRENT_SCHEMA_VERSION` 20 → 21 (`settings/schema.rs`) — the
+first schema move this file's V10–V13 sections haven't had to talk about,
+because it's the first milestone in the series to add a new *tab kind*
+(`TabConfig::Preview`) rather than a graph-side capability. The migration
+step itself (`settings/migration.rs`'s `migrate_v20_to_v21`) is a pure
+version-stamp, no data transform: every new field this milestone adds
+(`preview_last_url`, `preview_allow_remote`, `prompt_templates`,
+`templates_seeded`, `advisor_dismissed`) is `#[serde(default)]`/`Option`, so
+an older `settings.json` round-trips through it with nothing to migrate.
+
+**Usage/X-ray is the fifth hook-free area in Code Intelligence.** Of the tab's
+six sections (Index / Activity / Memory / Context / Analyses / Usage), only
+**Context** needs a Claude hook (the four shims tabulated in the V11 section
+below: `UserPromptSubmit`, `PreCompact`, `PreToolUse`, `PostToolUse`) — Index,
+Activity, Memory, Analyses, and now **Usage** all ride existing plumbing with
+no hook of their own. The usage tap extends the OOB Claude-transcript reader
+that already exists for TTS and memory (`oob/claude.rs::record_usage`, called
+from the same `drain_new_lines` loop as `record_tool_events`): `parse_usage_line`
+pulls `message.usage.{input_tokens,output_tokens,cache_read_input_tokens,
+cache_creation_input_tokens}` keyed by `message.id` (an UPSERT-by-`msg_id`,
+so a later line with firmed-up numbers overwrites an earlier zeroed one
+in place), and `extract_tool_results` sums `tool_result` content chars,
+attributed to a tool name via a small per-session `tool_use_id → name` ring.
+Unlike `record_tool_events`, this tap does **not** skip sidechain (sub-agent)
+lines — sub-agent token spend counts toward the parent session's totals.
+
+**OpenCode usage is `est_only` — `TODO(spike C3)`, resolved as "absent."**
+`oob/opencode.rs`'s module doc records the spike outcome directly: OpenCode's
+`/event` SSE stream's `message.updated.properties.info` object was captured
+exhaustively and carries only `{id, role, time}` — no token/usage fields on
+the pinned OpenCode version — so this file adds no usage tap at all. The
+actual OpenCode-side usage recording happens where OpenCode's memory events
+already land, `offload/loopback.rs::handle_memory_event` (`POST
+/memory/event`), which estimates chars from a tool call's *input* args (the
+same blind spot the memory tap already had — tool output isn't visible
+there either) and records a `ToolResult` usage event from that estimate.
+`GraphIndex::usage_all_sessions` derives `est_only` structurally
+(`session.agent != "claude"`), not from a separately tracked flag, so it can
+never drift out of sync with which agent actually produced a session. Revisit
+if a future OpenCode release adds real token fields to `message.updated`;
+`opencode.rs`'s doc comment names the exact field path to re-check.
+
+**`TODO(spike E0)` — WebView2 child-webview capture compiles clean but has
+never run against a live instance.** The Preview tab's capture path
+(`preview/capture.rs`) reaches `ICoreWebView2::CapturePreview` through
+`Webview::with_webview` → `PlatformWebview::controller()`, verified to
+type-match this crate's own `webview2-com = "0.38"` dependency (pinned to the
+same 0.38.2 wry 0.55 resolves to transitively, confirmed via `Cargo.lock` —
+no COM-GUID-compatible-but-distinct-type risk) — and it compiled cleanly on
+the first attempt against the exact pinned dependency graph. What's still
+unverified, because no live app was available to drive it from: whether the
+captured PNG is actually pixel-correct (right viewport bounds, true
+CSS-pixel — not HiDPI-inflated — scale, correct timing relative to paint);
+z-order/coexistence with the xterm panes during an actual tab drag; and
+focus/keyboard isolation in practice (no hold-Alt-bypass-equivalent was
+added, on the assumption — not the measurement — that WebView2 child
+webviews don't fight the host window's accelerator table the way the AI-tab
+PTY mouse capture did). See the `TODO(spike E0)` comments in both
+`preview/mod.rs` and `preview/capture.rs` for the exact call sites; do a live
+pass before relying on Snapshot → compose for anything precision-sensitive.
+
+**The embedded-webview path is a new, Windows-only native dependency
+surface.** `tauri = { version = "2", features = ["protocol-asset",
+"unstable"] }` — `unstable` gates `Window::add_child`, the multi-webview API
+the Preview tab is built on (a Tauri naming quirk, not a claim about API
+risk: it's the documented, doctested multi-webview shape). Capture adds
+`webview2-com = "0.38"` and `windows = { version = "0.61", features =
+["Win32_System_Com", "Win32_UI_Shell"] }`, both pinned to match what wry
+0.55 already resolves to. All three are load-bearing only on Windows —
+`preview/capture.rs`'s `#[cfg(not(windows))]` stub always returns a clear
+"only implemented on Windows today" error rather than attempting webkit2gtk
+capture, matching the milestone's non-blocking allowance for Linux.
+
+**Preview nav-policy security model — two independent allowlists, one
+documented gap.** `preview::is_allowed_preview_host` (pure, unit-tested)
+gates which **hosts** the embedded webview may navigate to directly:
+`localhost` (name) or a loopback/RFC-1918-private IP literal
+(`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `::1`)
+unless `preview_allow_remote` is on, checked via `url::Host` (not string
+matching, so `http://localhost@evil.com`-style userinfo tricks resolve to
+the real host). Separately, `preview::is_externally_openable` gates which
+**schemes** may ever reach the OS system-opener (`tauri_plugin_opener`) —
+`http`/`https` only; this is the Follina-style RCE-vector fix from the
+`fix(V14)` review pass (below). **KNOWN LIMITATION** (documented directly
+in `preview/mod.rs`'s module doc, `// KNOWN LIMITATION` comment): both
+policies apply only to the **main frame** — wry exposes no
+subframe-navigation hook, so a policy-allowed page (a legitimate localhost
+dev server) that embeds `<iframe src="https://some-remote-host">` can load
+that remote content inside the Preview tab without either check ever
+running. Accepted for a localhost dev-preview surface (the threat model is
+"don't let the tab casually reach hosts you didn't ask for," not "sandbox
+untrusted third-party content") — revisit if wry grows subframe-navigation
+events, or by reaching `CoreWebView2Frame::NavigationStarting` directly if
+this ever needs to be airtight.
+
+**The `fix(V14)` review pass (commit `820319e`) is worth reading directly** —
+same posture as V12's and V13's, three agents, one HIGH-severity data-loss
+bug and one HIGH-severity RCE-vector bug:
+- **`settings_update` template-clobber (HIGH, data loss).** The generic
+  settings-save IPC used to do a near-wholesale overwrite of the persisted
+  `Settings` (preserving only `layout`/`session` from live state before
+  applying an incoming snapshot). `prompt_templates`/`templates_seeded` are
+  written **out-of-band** by the dedicated `compose_templates_global_set` IPC
+  (straight read-modify-write against the physical global `settings.json` —
+  see the Prompt Library note in `FEATURES.md`/`CHANGELOG.md`), so a Settings
+  window snapshot taken before a template edit could roll that edit right
+  back the next time *any* unrelated setting saved. Fixed by
+  `apply_incoming_settings` also preserving `prompt_templates`/
+  `templates_seeded` from live state, same as `layout`/`session`; regression
+  test simulates a stale/empty incoming snapshot and asserts templates
+  survive.
+- **`open_external` scheme allowlist (HIGH, RCE vector).** Before this fix, a
+  Preview tab's rejected-navigation path and `on_new_window` handler forwarded
+  *any* URL straight to `tauri_plugin_opener::open_url`, which ultimately
+  calls OS shell APIs — a `file:`, `data:`, or (the Follina-class case) a
+  registered custom protocol handler like `ms-msdt:` had no meaningful "host"
+  for `is_allowed_preview_host` to reject, so it sailed through untouched to
+  the OS. Fixed by `is_externally_openable`, gating `open_external` to
+  `http`/`https` only — see the security-model note above.
+- **`attach.rs` TOCTOU (correctness).** `save_png`/`reserve_path` used to pick
+  the next `n.png` index (a `read_dir` scan) and then create the file as two
+  separate steps; two genuinely concurrent writers (a clipboard paste racing
+  a Preview snapshot, both allocating from the same session's attach dir)
+  could observe the same "next index" and collide, silently dropping one
+  image. Fixed with a process-wide `ATTACH_ALLOC_LOCK` mutex serializing
+  index-pick-and-create in a shared `allocate_and_write` helper, plus
+  `OpenOptions::create_new` (O_EXCL-equivalent) with retry-on-collision as a
+  second line of defense; regression test spawns two barriered threads and
+  asserts both payloads land intact in distinct files.
+- **Advisor proposal bounds (correctness).** `RULE_MIN_SCORE` gained a
+  `MIN_SCORE_CEILING` (12) so repeated applies of "raise `context_min_score`"
+  can't climb the floor high enough to silently turn off injection
+  altogether; `RULE_TURN_BUDGET` now only proposes when its formula computes
+  a genuine reduction (`proposed < current`) — the previous `.max(1_000)`
+  floor could otherwise propose *raising* (or no-op'ing) an already-small
+  budget, directly contradicting a rule whose entire premise is "lower the
+  budget." Both guarded by dedicated tests in `advisor.rs`.
+- The same pass also fixed a webview-leak (a Preview child webview is now
+  destroyed by the backend's own `close_tab` and drained on app exit, not
+  solely by the frontend's `onDestroy`, which a renderer crash or HMR reload
+  could skip), added a 5s timeout to `capture_to_png` (a concurrent tab-close
+  could otherwise hang the capture's completion callback forever) with
+  stray-0-byte-file cleanup on any failure path, scoped `effectiveness_totals`
+  to the calling project root's own sessions (it was previously summing
+  process-wide, misattributing another project's chars in a multi-project
+  session), and fixed a `PreviewToolbar` Back-button history bug (a
+  non-pure history model that could oscillate between two entries).
+
+## Code Graph Parity (V15)
+
+**The graph schema moves 3 → 4 — the first graph-side bump since V11.** V15
+Feature 3 adds a `confidence` value column to two relations (`ref` and `edge`,
+`graph/schema.rs`), which is a *shape* change CozoDB can't `ALTER`, so it trips
+the existing reset-migration: on first launch after upgrade an old `graph.db`
+is `reset()` and fully re-derived from source (every row is re-derivable, so no
+data is lost). Both columns carry a `default 'inferred'` so a partially-written
+row is never silently `Extracted`. If you add another graph relation column,
+bump the version again and note it here.
+
+**Confidence is a two-layer computation — don't look for `Ambiguous` at parse
+time.** The bespoke walkers and the tags engine only ever stamp `Extracted`
+(same-file target, or a structural/import/doc edge) or `Inferred` (cross-file,
+name-keyed) — that's all a single-file parse can honestly know
+(`FileGraph::classify_confidence`, `graph/model.rs`). `Ambiguous` is applied at
+**query time**, the only place a name's global candidate count is visible:
+`callers`/`references` downgrade to `Ambiguous` when `symbol_count(name) > 1`;
+`callees` when a callee name resolved to more than one row; `dependents_transitive`
+and `shortest_path` fold it in via `multi_candidate_names()` and carry the
+*weakest* link along a chain (`Confidence::weaker`). If you add a new
+name-keyed consumer, apply the same override or it will over-claim certainty.
+
+**`graph_path` and `graph_architecture` are idx-only, settings-aware tools.**
+They're special-cased in `graph/mcp.rs::dispatch_recorded` (like `graph_impact`)
+so they can read `path_max_hops` / `arch_*` from settings — they do *not* fall
+through to `run_tool` (which has no settings handle). Both build their adjacency
+in Rust from a handful of relation scans (the `transitive`/`dependents_transitive`
+pattern), not Datalog recursion. Architecture clustering is deterministic label
+propagation (id-sorted, bounded iters) — approximate and honestly labelled
+"heuristic"; there is **no** warm-index cache in V1 (computed on demand each
+call), so if a large repo makes it slow, add caching keyed off the index epoch.
+
+**The Graph View tab is a fourth reserved app-rendered tab (`TabId::GraphView`).**
+It follows the Code Graph monitor pattern exactly — Shell-kind id, no PTY,
+rendered by `Pane.svelte` (`isGraphViewTab`), materialized/removed by
+`reconcile_graph_view_tab` per `graph.graph_viz` (default off). The visualization
+is a **self-contained** Canvas 2D force graph in `src/lib/GraphView.svelte` — no
+three.js / d3 dependency was added, keeping the bundle lean and offline. Live
+activity is a 1.5 s poll of `graphHistory()` (there's no push event for
+individual tool calls), matching `GraphCall.target` to rendered nodes; a real
+traversed-edge highlight isn't reconstructable because `GraphCall` carries only
+a single `target` string, so callers/callees calls approximate it via the node's
+incident call edges. If a tool-call push event is ever added, switch the poll
+to it.
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

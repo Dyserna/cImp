@@ -43,11 +43,12 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
-    default_ai_tab, default_graph_monitor_tab, default_offload_server_tab, default_shell_1_tab,
-    AiTabId, LayoutNodePersisted, Settings, TabConfig,
+    default_ai_tab, default_graph_monitor_tab, default_graph_view_tab, default_offload_server_tab,
+    default_shell_1_tab, default_workbench_tab, starter_prompt_templates,
+    AiTabId, LayoutNodePersisted, PromptTemplate, Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
-    GRAPH_MONITOR_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
-    SHELL_DEFAULT_TAB_ID,
+    GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
+    SHELL_DEFAULT_TAB_ID, WORKBENCH_TAB_ID,
 };
 use crate::shell::ShellSpec;
 
@@ -283,6 +284,88 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
     serde_json::from_value(merged).unwrap_or_default()
 }
 
+/// V14 Phase A: global scope of the prompt-template library, read directly
+/// from the physical global file (`<exe-dir>/settings.json`) — NOT from the
+/// live merged `Settings`, which (if the active project's overlay happens to
+/// carry its own `prompt_templates` key) would already show the OVERLAY's
+/// array in that field per the deep-merge's array-replace-wholesale rule.
+/// Reading the true global file directly is what makes "global" actually
+/// mean "every project", independent of which one cImp is launched from.
+/// Missing/corrupt file → empty (never errors; a fresh install with no
+/// global file yet has no templates to show).
+pub fn read_global_prompt_templates() -> Vec<PromptTemplate> {
+    match global_path() {
+        Ok(p) => read_prompt_templates_from(&p),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn read_prompt_templates_from(path: &Path) -> Vec<PromptTemplate> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
+        .map(|s| s.prompt_templates)
+        .unwrap_or_default()
+}
+
+/// V14 Phase A: write the prompt-template library straight to the physical
+/// global file, bypassing the normal per-project overlay diff every other
+/// Settings-window edit goes through (`settings_update` → `SettingsHandle`'s
+/// debounced saver, which diffs against the pristine global snapshot and
+/// writes into whichever project's `.cimp/config.json` is active). Without
+/// this bypass, editing the "global" library from a Settings window opened
+/// inside a customized project would silently land in that project's
+/// overlay instead — defeating the whole global/project split this feature
+/// promises. Read-modify-write: every other field in the on-disk global
+/// file is preserved untouched.
+pub fn write_global_prompt_templates(templates: Vec<PromptTemplate>) -> AppResult<()> {
+    let path = global_path()?;
+    write_prompt_templates_to(&path, templates)
+}
+
+fn write_prompt_templates_to(path: &Path, templates: Vec<PromptTemplate>) -> AppResult<()> {
+    let mut settings: Settings = if path.exists() {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    } else {
+        Settings::default()
+    };
+    settings.prompt_templates = templates;
+    // An explicit Settings-window save always counts as "seeded" — it must
+    // never be clobbered by the one-time starter injection on a later load.
+    settings.templates_seeded = true;
+    save_to(path, &settings)
+}
+
+/// V14 Phase A: project scope of the prompt-template library, read directly
+/// from the raw overlay JSON at `root` (its own `prompt_templates` key) —
+/// bypassing the typed, deep-merged `Settings` for exactly the same reason
+/// [`read_global_prompt_templates`] bypasses it. Missing overlay, missing
+/// key, or a malformed array all degrade to empty rather than erroring —
+/// project templates are a nice-to-have, not load-bearing for the app to
+/// start.
+pub fn read_project_prompt_templates(root: &Path) -> Vec<PromptTemplate> {
+    let path = overlay_read_path(root);
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("prompt_templates")
+        .and_then(|v| serde_json::from_value::<Vec<PromptTemplate>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
 /// Read the global file. Writes seeded defaults when absent. On parse
 /// failure quarantines the file and returns defaults. Runs migration on
 /// the global file in place — backup goes next to the global path itself,
@@ -343,7 +426,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
         }
     };
 
-    let typed: Settings = match serde_json::from_value(value) {
+    let mut typed: Settings = match serde_json::from_value(value) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -358,14 +441,22 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
         }
     };
 
-    if migrated {
-        // Persist the migrated shape back to disk so future launches don't
-        // re-migrate. Atomic write inside save_to keeps this safe under
-        // crash.
+    // V14 Phase A: seed the starter prompt-template library exactly once,
+    // directly against the physical global file — this is the ONE place
+    // that runs (unlike `integrity_check`, which also runs against the
+    // per-project merged `Settings` and wouldn't reliably flush a fresh
+    // seed to disk when a project overlay is active; see the function's
+    // own doc comment).
+    let seeded = seed_prompt_templates_if_needed(&mut typed);
+
+    if migrated || seeded {
+        // Persist the migrated/seeded shape back to disk so future launches
+        // don't re-migrate or re-seed. Atomic write inside save_to keeps
+        // this safe under crash.
         if let Err(e) = save_to(&path, &typed) {
-            tracing::warn!(error = %e, path = %path.display(), "settings: post-migration global save failed");
+            tracing::warn!(error = %e, path = %path.display(), "settings: post-migration/seed global save failed");
         } else {
-            tracing::info!(path = %path.display(), "settings: global migrated and rewritten");
+            tracing::info!(path = %path.display(), migrated, seeded, "settings: global migrated/seeded and rewritten");
         }
     } else {
         tracing::info!(path = %path.display(), "settings: global loaded");
@@ -544,7 +635,23 @@ fn seeded_defaults(default_shell: &ShellSpec) -> Settings {
     // V16: broot is no longer auto-seeded. It (and rustnet) launch on demand
     // from the bottom-bar tool buttons into ordinary closable Shell tabs.
     apply_portable_avatar_paths(&mut s);
+    // V14 Phase A: fresh installs get the 4 starter prompt templates.
+    seed_prompt_templates_if_needed(&mut s);
     s
+}
+
+/// V14 Phase A: seed [`starter_prompt_templates`] into `prompt_templates`
+/// exactly once, gated on `templates_seeded` rather than the schema version
+/// (see that field's doc comment). Returns `true` when it actually seeded
+/// (i.e. this was the first load), so callers know whether the physical
+/// global file needs rewriting. Idempotent — a second call is a no-op.
+fn seed_prompt_templates_if_needed(s: &mut Settings) -> bool {
+    if s.templates_seeded {
+        return false;
+    }
+    s.prompt_templates = starter_prompt_templates();
+    s.templates_seeded = true;
+    true
 }
 
 /// `<exe-dir>/../avatars/` — the portable avatar folder shipped in the
@@ -781,11 +888,21 @@ fn reconcile_graph_monitor_tab(settings: &mut Settings) -> bool {
     if settings.graph.enabled {
         match present {
             Some(i) => {
+                // Keep the reserved tab's builtin flag and display name in sync
+                // with the current default. The V10 rename (Code Graph → Code
+                // Intelligence) reaches existing installs through here, since the
+                // tab is already persisted and never re-materialized.
+                let mut changed = false;
                 if !settings.tabs[i].builtin() {
                     settings.tabs[i].set_builtin(true);
-                    return true;
+                    changed = true;
                 }
-                false
+                let want_name = default_graph_monitor_tab().name().to_string();
+                if settings.tabs[i].name() != want_name {
+                    settings.tabs[i].set_name(want_name);
+                    changed = true;
+                }
+                changed
             }
             None => {
                 let pos = graph_monitor_insert_position(&settings.tabs);
@@ -803,14 +920,50 @@ fn reconcile_graph_monitor_tab(settings: &mut Settings) -> bool {
     }
 }
 
+/// V13 Phase A: keep the read-only Workbench tab present iff
+/// `workbench.enabled` — mirrors [`reconcile_graph_monitor_tab`]. `enabled`
+/// defaults `true`, so this materializes the tab for existing users on their
+/// first load after upgrading (the same self-healing mechanism that
+/// introduced the Code Graph monitor tab — no explicit schema migration
+/// needed since `WorkbenchSettings` round-trips via `#[serde(default)]`).
+/// Returns `true` if tabs changed.
+fn reconcile_workbench_tab(settings: &mut Settings) -> bool {
+    let present = settings.tabs.iter().position(|t| t.id() == WORKBENCH_TAB_ID);
+    if settings.workbench.enabled {
+        match present {
+            Some(i) => {
+                if !settings.tabs[i].builtin() {
+                    settings.tabs[i].set_builtin(true);
+                    return true;
+                }
+                false
+            }
+            None => {
+                let pos = workbench_insert_position(&settings.tabs);
+                settings.tabs.insert(pos, default_workbench_tab());
+                tracing::info!("integrity: materialized Workbench tab (workbench enabled)");
+                true
+            }
+        }
+    } else if let Some(i) = present {
+        settings.tabs.remove(i);
+        tracing::info!("integrity: removed Workbench tab (workbench disabled)");
+        true
+    } else {
+        false
+    }
+}
+
 /// Re-run the reserved feature-tab reconciles (Offload Server + Code Graph
-/// monitor) so the persisted tab list matches the current enable flags. The
-/// full [`integrity_check`] only runs at load-from-disk; the live
+/// monitor + Workbench) so the persisted tab list matches the current enable
+/// flags. The full [`integrity_check`] only runs at load-from-disk; the live
 /// settings-update path calls this so toggling a feature materializes/removes
 /// its reserved tab immediately. Returns `true` if `settings.tabs` changed.
 pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
     let mut changed = reconcile_offload_server_tab(settings);
     changed |= reconcile_graph_monitor_tab(settings);
+    changed |= reconcile_workbench_tab(settings);
+    changed |= reconcile_graph_view_tab(settings);
     changed
 }
 
@@ -820,6 +973,81 @@ fn graph_monitor_insert_position(tabs: &[TabConfig]) -> usize {
     let mut pos = 0usize;
     for (idx, tab) in tabs.iter().enumerate() {
         if AiTabId::from_id(tab.id()).is_some() || tab.id() == OFFLOAD_SERVER_TAB_ID {
+            pos = idx + 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// Insert position for the Workbench tab: after the leading AI builtins AND
+/// the Offload Server + Code Graph monitor tabs (if present), ahead of user
+/// shells — the same "reserved feature tabs stay contiguous, leftmost" rule
+/// as the other two.
+fn workbench_insert_position(tabs: &[TabConfig]) -> usize {
+    let mut pos = 0usize;
+    for (idx, tab) in tabs.iter().enumerate() {
+        if AiTabId::from_id(tab.id()).is_some()
+            || tab.id() == OFFLOAD_SERVER_TAB_ID
+            || tab.id() == GRAPH_MONITOR_TAB_ID
+        {
+            pos = idx + 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// V15 Feature 4: keep the read-only Graph View tab present iff
+/// `graph.graph_viz` — mirrors [`reconcile_graph_monitor_tab`]. Off by default,
+/// so the tab only appears once the user opts into the visualization. Returns
+/// `true` if tabs changed.
+fn reconcile_graph_view_tab(settings: &mut Settings) -> bool {
+    let present = settings.tabs.iter().position(|t| t.id() == GRAPH_VIEW_TAB_ID);
+    if settings.graph.graph_viz {
+        match present {
+            Some(i) => {
+                let mut changed = false;
+                if !settings.tabs[i].builtin() {
+                    settings.tabs[i].set_builtin(true);
+                    changed = true;
+                }
+                let want_name = default_graph_view_tab().name().to_string();
+                if settings.tabs[i].name() != want_name {
+                    settings.tabs[i].set_name(want_name);
+                    changed = true;
+                }
+                changed
+            }
+            None => {
+                let pos = graph_view_insert_position(&settings.tabs);
+                settings.tabs.insert(pos, default_graph_view_tab());
+                tracing::info!("integrity: materialized Graph View tab (graph_viz enabled)");
+                true
+            }
+        }
+    } else if let Some(i) = present {
+        settings.tabs.remove(i);
+        tracing::info!("integrity: removed Graph View tab (graph_viz disabled)");
+        true
+    } else {
+        false
+    }
+}
+
+/// Insert position for the Graph View tab: after the leading AI builtins AND
+/// the Offload Server + Code Graph monitor + Workbench tabs (if present), ahead
+/// of user shells — same "reserved feature tabs stay contiguous, leftmost" rule.
+fn graph_view_insert_position(tabs: &[TabConfig]) -> usize {
+    let mut pos = 0usize;
+    for (idx, tab) in tabs.iter().enumerate() {
+        if AiTabId::from_id(tab.id()).is_some()
+            || tab.id() == OFFLOAD_SERVER_TAB_ID
+            || tab.id() == GRAPH_MONITOR_TAB_ID
+            || tab.id() == WORKBENCH_TAB_ID
+        {
             pos = idx + 1;
         } else {
             break;
@@ -966,6 +1194,20 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         changed = true;
     }
 
+    // 4d. V13 Phase A: materialize the read-only Workbench tab while
+    //     `workbench.enabled` (default true), remove it otherwise. Same
+    //     ordering rationale as 4b/4c; sits after the Code Graph monitor tab.
+    if reconcile_workbench_tab(settings) {
+        changed = true;
+    }
+
+    // 4e. V15 Feature 4: materialize the read-only Graph View tab while
+    //     `graph.graph_viz` (default false), remove it otherwise. Same ordering
+    //     rationale as 4b–4d; sits after the Workbench tab.
+    if reconcile_graph_view_tab(settings) {
+        changed = true;
+    }
+
     // 5. Backend layout sanity. The frontend owns the deep integrity
     //    walk (orphan placement, empty-pane collapse) — it has the tree
     //    helpers. The backend's job here is just to keep the file
@@ -1064,6 +1306,7 @@ mod tests {
         // mustn't re-seed claude-local. The closable shell-default-1
         // ships via `seeded_defaults`, not the integrity check.
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
         assert!(changed);
@@ -1075,6 +1318,7 @@ mod tests {
     #[test]
     fn integrity_seeds_both_when_enabled_ai_tabs_is_both_claudes() {
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
@@ -1087,6 +1331,7 @@ mod tests {
     #[test]
     fn integrity_seeds_only_claude_local_when_setting_is_claude_local_only() {
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![AiTabId::ClaudeLocal];
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
@@ -1099,6 +1344,7 @@ mod tests {
     fn integrity_backfills_default_question_slot_on_upgraded_ai_tab() {
         use crate::settings::schema::{NotificationSlot, TabConfig};
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![AiTabId::Claude];
         integrity_check(&mut s); // seed the claude tab
 
@@ -1126,6 +1372,7 @@ mod tests {
     fn integrity_does_not_clobber_user_customized_question_slot() {
         use crate::settings::schema::{NotificationSlot, TabConfig};
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![AiTabId::Claude];
         integrity_check(&mut s);
 
@@ -1152,6 +1399,7 @@ mod tests {
     #[test]
     fn integrity_seeds_opencode_at_canonical_position() {
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
             AiTabId::ClaudeLocal,
@@ -1167,6 +1415,7 @@ mod tests {
     #[test]
     fn integrity_no_offload_tab_when_disabled() {
         let mut s = Settings::default(); // offload disabled by default
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         integrity_check(&mut s);
         assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
     }
@@ -1174,6 +1423,7 @@ mod tests {
     #[test]
     fn integrity_materializes_offload_tab_after_ai_builtins() {
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         s.offload.enabled = true;
         integrity_check(&mut s);
@@ -1188,6 +1438,7 @@ mod tests {
     #[test]
     fn integrity_removes_offload_tab_when_disabled() {
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.offload.enabled = true;
         integrity_check(&mut s);
         assert!(s.tabs.iter().any(|t| t.id() == OFFLOAD_SERVER_TAB_ID));
@@ -1201,6 +1452,7 @@ mod tests {
     #[test]
     fn reconcile_reserved_tabs_materializes_and_removes_both_live() {
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.offload.enabled = true;
         s.graph.enabled = true;
         // The live toggle path uses reconcile_reserved_tabs (not the full
@@ -1219,11 +1471,70 @@ mod tests {
     }
 
     #[test]
+    fn integrity_materializes_workbench_tab_by_default() {
+        // `workbench.enabled` defaults true, so a fresh install's tab list
+        // includes the Workbench tab without anyone touching the flag.
+        let mut s = Settings::default();
+        integrity_check(&mut s);
+        assert!(s.tabs.iter().any(|t| t.id() == WORKBENCH_TAB_ID));
+        let entry = s.tabs.iter().find(|t| t.id() == WORKBENCH_TAB_ID).unwrap();
+        assert!(entry.builtin());
+    }
+
+    #[test]
+    fn integrity_removes_workbench_tab_when_disabled() {
+        let mut s = Settings::default();
+        integrity_check(&mut s);
+        assert!(s.tabs.iter().any(|t| t.id() == WORKBENCH_TAB_ID));
+        s.workbench.enabled = false;
+        let changed = integrity_check(&mut s);
+        assert!(changed);
+        assert!(s.tabs.iter().all(|t| t.id() != WORKBENCH_TAB_ID));
+    }
+
+    #[test]
+    fn workbench_tab_lands_after_graph_monitor_tab() {
+        // Ordering: AI builtins, then Offload Server, then Code Graph
+        // monitor, then Workbench, then user shells — mirrors the other two
+        // reserved feature tabs' contiguous-leftmost placement.
+        let mut s = Settings::default();
+        s.offload.enabled = true;
+        s.graph.enabled = true;
+        integrity_check(&mut s);
+        let offload_pos = s.tabs.iter().position(|t| t.id() == OFFLOAD_SERVER_TAB_ID).unwrap();
+        let graph_pos = s.tabs.iter().position(|t| t.id() == GRAPH_MONITOR_TAB_ID).unwrap();
+        let workbench_pos = s.tabs.iter().position(|t| t.id() == WORKBENCH_TAB_ID).unwrap();
+        assert!(offload_pos < graph_pos);
+        assert!(graph_pos < workbench_pos);
+    }
+
+    #[test]
+    fn reconcile_reserved_tabs_covers_workbench_live_toggle() {
+        // Start from an already-materialized tab (as a loaded settings file
+        // would have, `workbench.enabled` defaulting true) and disable live.
+        let mut s = Settings::default();
+        integrity_check(&mut s);
+        assert!(s.tabs.iter().any(|t| t.id() == WORKBENCH_TAB_ID));
+
+        s.workbench.enabled = false;
+        assert!(reconcile_reserved_tabs(&mut s));
+        assert!(s.tabs.iter().all(|t| t.id() != WORKBENCH_TAB_ID));
+        // Idempotent while it stays disabled.
+        assert!(!reconcile_reserved_tabs(&mut s));
+
+        // Re-enabling live materializes it again.
+        s.workbench.enabled = true;
+        assert!(reconcile_reserved_tabs(&mut s));
+        assert!(s.tabs.iter().any(|t| t.id() == WORKBENCH_TAB_ID));
+    }
+
+    #[test]
     fn integrity_inserts_opencode_between_claude_local_and_user_shell() {
         // User has [claude, claude-local, shell-foo] and now enables
         // opencode. The new tab should land at index 2 (after claude-local,
         // before the shell), not at the end.
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
             AiTabId::ClaudeLocal,
@@ -1258,6 +1569,7 @@ mod tests {
         // Loading a file where the setting and tabs disagree (e.g. a
         // hand-edit, or post-migration drift) reconciles to the setting.
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         let _shell = fake_default_shell();
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         integrity_check(&mut s);
@@ -1276,6 +1588,7 @@ mod tests {
         // integrity forces it back to [claude] so the user always boots
         // with at least one AI tab.
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = Vec::new();
         let changed = integrity_check(&mut s);
         assert!(changed);
@@ -1289,6 +1602,7 @@ mod tests {
         // Closing shell-default-1 must persist across launches: the
         // integrity check should leave it absent.
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         assert!(s
@@ -1303,6 +1617,7 @@ mod tests {
         // Loading those files must demote the entry so the close button
         // works.
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a legacy-shaped shell-default-1 with builtin: true.
@@ -1333,6 +1648,7 @@ mod tests {
     #[test]
     fn integrity_forces_builtin_true_on_ai_builtins() {
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Tamper: flip claude's builtin to false.
@@ -1347,6 +1663,7 @@ mod tests {
     #[test]
     fn integrity_preserves_user_tabs() {
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a user shell tab.
@@ -1384,6 +1701,7 @@ mod tests {
     fn v1_2_round_trip() {
         let _shell = fake_default_shell();
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         integrity_check(&mut s);
         let text = serde_json::to_string(&s).unwrap();
@@ -1399,6 +1717,7 @@ mod tests {
         // subscription Claude tab into local-LLM mode (or vice versa).
         // Enable both so the check has both AI tabs to validate.
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         let _shell = fake_default_shell();
         integrity_check(&mut s);
@@ -1424,6 +1743,7 @@ mod tests {
     #[test]
     fn integrity_corrects_use_local_provider_on_opencode() {
         let mut s = Settings::default();
+        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
         s.enabled_ai_tabs = vec![AiTabId::OpenCode];
         integrity_check(&mut s);
         // Tamper: opencode → local (it has no local variant; canonical is false).
@@ -1853,6 +2173,111 @@ mod tests {
             r#"{"ui":{"theme":"canonical"}}"#
         );
         assert_eq!(overlay_read_path(&dir), cimp.join("config.json"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- V14 Phase A: prompt library persistence ------------------------
+
+    #[test]
+    fn seed_prompt_templates_if_needed_seeds_once() {
+        let mut s = Settings::default();
+        assert!(!s.templates_seeded);
+        assert!(s.prompt_templates.is_empty());
+
+        let seeded_first = seed_prompt_templates_if_needed(&mut s);
+        assert!(seeded_first);
+        assert!(s.templates_seeded);
+        assert_eq!(s.prompt_templates.len(), 4);
+
+        // A deletion the user made must stick: a second call is a no-op even
+        // though the list is now empty again.
+        s.prompt_templates.clear();
+        let seeded_second = seed_prompt_templates_if_needed(&mut s);
+        assert!(!seeded_second, "seeding must not re-fire once templates_seeded is true");
+        assert!(s.prompt_templates.is_empty(), "deleted starters must stay deleted");
+    }
+
+    #[test]
+    fn write_then_read_global_prompt_templates_round_trips() {
+        let dir = std::env::temp_dir().join(format!("cimp_tpl_global_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let templates = vec![
+            PromptTemplate { name: "a".to_string(), body: "body-a".to_string() },
+            PromptTemplate { name: "b".to_string(), body: "body-b".to_string() },
+        ];
+        write_prompt_templates_to(&path, templates.clone()).unwrap();
+
+        let read_back = read_prompt_templates_from(&path);
+        assert_eq!(read_back, templates);
+
+        // templates_seeded is forced true by an explicit write, so a later
+        // seed-if-needed pass is a no-op (a user-authored list is never
+        // clobbered by the starter set).
+        let mut settings: Settings =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(settings.templates_seeded);
+        assert!(!seed_prompt_templates_if_needed(&mut settings));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_global_prompt_templates_preserves_other_fields() {
+        let dir = std::env::temp_dir().join(format!("cimp_tpl_preserve_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut initial = Settings::default();
+        initial.ui.theme = "future-light".to_string();
+        save_to(&path, &initial).unwrap();
+
+        write_prompt_templates_to(
+            &path,
+            vec![PromptTemplate { name: "a".to_string(), body: "x".to_string() }],
+        )
+        .unwrap();
+
+        let after: Settings = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after.ui.theme, "future-light", "unrelated field must survive the R-M-W");
+        assert_eq!(after.prompt_templates.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_project_prompt_templates_reads_the_overlays_own_array() {
+        let dir = std::env::temp_dir().join(format!("cimp_tpl_project_{}", uuid::Uuid::new_v4()));
+        let cimp = dir.join(".cimp");
+        fs::create_dir_all(&cimp).unwrap();
+        fs::write(
+            cimp.join("config.json"),
+            r#"{"prompt_templates":[{"name":"p1","body":"project body"}]}"#,
+        )
+        .unwrap();
+
+        let templates = read_project_prompt_templates(&dir);
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, "p1");
+        assert_eq!(templates[0].body, "project body");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_project_prompt_templates_empty_when_overlay_absent_or_key_missing() {
+        let dir = std::env::temp_dir().join(format!("cimp_tpl_project_absent_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        // No overlay file at all.
+        assert!(read_project_prompt_templates(&dir).is_empty());
+
+        // Overlay exists but carries no `prompt_templates` key.
+        let cimp = dir.join(".cimp");
+        fs::create_dir_all(&cimp).unwrap();
+        fs::write(cimp.join("config.json"), r#"{"ui":{"theme":"x"}}"#).unwrap();
+        assert!(read_project_prompt_templates(&dir).is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -69,7 +69,15 @@ import { setTerminalFocuser } from './terminalFocus';
 import { perTabClosedState } from './avatarState';
 import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
-import { isShellTab, isOffloadTab, isGraphMonitorTab, isNoteTab, type TabId } from './tabs/types';
+import {
+  isShellTab,
+  isOffloadTab,
+  isGraphMonitorTab,
+  isNoteTab,
+  isPreviewTabId,
+  isWorkbenchTab,
+  type TabId,
+} from './tabs/types';
 
 const OFFSCREEN_ID = 'terminal-offscreen';
 
@@ -497,8 +505,17 @@ export function createTerminal(
   if (entries.has(tabId)) return;
   // V8-03/V9-01: the Offload Server and Code Graph monitor tabs render Svelte
   // dashboards instead of an xterm — no terminal entry for either. The Note
-  // tab likewise renders a Svelte editor (NoteView) with no PTY.
-  if (isOffloadTab(tabId) || isGraphMonitorTab(tabId) || isNoteTab(tabId)) return;
+  // tab likewise renders a Svelte editor (NoteView), and V13's Workbench tab
+  // a sectioned dashboard (WorkbenchView) — neither has a PTY. V14 Phase F:
+  // Preview tabs are an embedded child webview, not a PTY, either.
+  if (
+    isOffloadTab(tabId) ||
+    isGraphMonitorTab(tabId) ||
+    isNoteTab(tabId) ||
+    isWorkbenchTab(tabId) ||
+    isPreviewTabId(tabId)
+  )
+    return;
 
   const offscreen = ensureOffscreen();
 
@@ -506,7 +523,15 @@ export function createTerminal(
   // not be in `settings.tabs` yet during the snapshot/event race at
   // startup; in that case we fall back to global settings alone.
   const initialSettings = get(settingsStore);
-  const initialTab = initialSettings.tabs.find((t) => t.id === tabId);
+  const initialTabRaw = initialSettings.tabs.find((t) => t.id === tabId);
+  // V14 Phase F: `PreviewTabConfig` has neither `theme_override` nor
+  // `background_override` (no terminal to theme) — narrowed out here so
+  // `effectiveTheme`/`effectiveBackgroundMode`'s structural param types are
+  // satisfied. Unreachable in practice (the guard above already returns
+  // before a Preview tab ever gets here), but the type-level exclusion
+  // documents why AiTool/Shell are the only kinds these resolvers see.
+  const initialTab =
+    initialTabRaw && initialTabRaw.kind !== 'preview' ? initialTabRaw : undefined;
   const baseTheme = initialTab
     ? effectiveTheme(initialTab, initialSettings.terminal.theme)
     : themeFromSetting(initialSettings.terminal.theme);
@@ -645,7 +670,9 @@ export function createTerminal(
       firstAppearance = false;
       return;
     }
-    const tab = s.tabs.find((t) => t.id === tabId);
+    const tabRaw = s.tabs.find((t) => t.id === tabId);
+    // See the matching narrowing comment in `createTerminal` above.
+    const tab = tabRaw && tabRaw.kind !== 'preview' ? tabRaw : undefined;
     const baseTheme = tab
       ? effectiveTheme(tab, s.terminal.theme)
       : themeFromSetting(s.terminal.theme);
@@ -992,6 +1019,15 @@ export function focusTerminalFor(tabId: TabId): void {
   const entry = entries.get(tabId);
   if (!entry) return;
   entry.term.focus();
+}
+
+/// The live xterm instance for `tabId`, if the registry is tracking one.
+/// Backs V14 Phase A template variable substitution (`{selection}`), which
+/// needs the FOCUSED pane's terminal specifically — unlike
+/// `terminalWithSelection` below, which scans every terminal for one that
+/// merely happens to have a non-empty selection.
+export function getTerminal(tabId: TabId): Terminal | undefined {
+  return entries.get(tabId)?.term;
 }
 
 /// The terminal that currently holds a non-empty selection, if any. Backs the

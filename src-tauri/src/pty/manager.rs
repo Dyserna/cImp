@@ -209,6 +209,11 @@ impl PtyManager {
         // V20: build the out-of-band TTS source context before the senders are
         // moved into the processor/waiter. The source rides `cancel`, so it
         // starts now and dies when the tab's PTY does.
+        // V10: the warm graph service, so the Claude transcript tap can record
+        // session/action memory in-process. Absent in headless/test builds.
+        let mem = app
+            .try_state::<Arc<crate::graph::GraphService>>()
+            .map(|s| s.inner().clone());
         let oob_ctx = spec.oob.clone().map(|oob_spec| {
             (
                 oob_spec,
@@ -218,6 +223,7 @@ impl PtyManager {
                     state_signals: state_signals.clone(),
                     settings: settings.clone(),
                     cancel: cancel.clone(),
+                    mem: mem.clone(),
                 },
             )
         });

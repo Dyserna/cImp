@@ -16,11 +16,12 @@
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
-use crate::graph::builder::{emit_symbol, language_for};
-use crate::graph::model::{symbol_id, Edge, EdgeKind, FileGraph, Lang, Reference, SymbolKind};
+use crate::graph::builder::{char_col, emit_symbol, language_for};
+use crate::graph::model::{symbol_id, Confidence, Edge, EdgeKind, FileGraph, Lang, Reference, SymbolKind, Visibility};
 
 /// A grammar + its vendored tags query.
 pub(crate) struct TagSpec {
+    pub lang: Lang,
     pub language: tree_sitter::Language,
     pub tags_query: &'static str,
 }
@@ -52,7 +53,49 @@ pub(crate) fn tag_spec(lang: Lang) -> Option<TagSpec> {
         _ => return None,
     };
     let language = language_for(lang)?;
-    Some(TagSpec { language, tags_query })
+    Some(TagSpec { lang, language, tags_query })
+}
+
+/// V12 Phase C **fallback** test detection for the generic tags engine: no
+/// vendored `tags.scm` currently ships a `@definition.test` capture, so every
+/// generic-tags language falls back to a path heuristic. The conventions are
+/// scoped per language rather than applied globally — the `spec/` segment is
+/// **Ruby-specific** (RSpec), and applying it language-agnostically wrongly
+/// tagged every symbol in an unrelated `spec/` directory (OpenAPI / protocol
+/// specs are common in Go/Kotlin/Swift/… projects). Kept broad: Go's `_test.go`
+/// filename suffix, and the widely shared `tests/` directory layout. Applied to
+/// Function/Method definitions only. A project that follows no convention simply
+/// never sets the bit — accurate, not wrong, the same posture as
+/// [`tags_visibility`]'s `Unknown`.
+fn tags_is_test_path(lang: Lang, file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    if name.ends_with("_test.go") {
+        return true;
+    }
+    let has_seg = |seg: &str| lower.split('/').any(|s| s == seg);
+    match lang {
+        // RSpec's `spec/` and minitest's `test/`, both Ruby conventions.
+        Lang::Ruby => has_seg("tests") || has_seg("spec") || has_seg("test"),
+        // `tests/` is the cross-language test-dir convention; `spec/` is NOT
+        // applied here (it is not a test directory outside Ruby).
+        _ => has_seg("tests"),
+    }
+}
+
+/// Best-effort visibility for a generic-tags language. Only Go is decidable
+/// cheaply from the name (exported iff the identifier starts uppercase); the
+/// other grammars need modifier inspection we don't do yet, so they stay
+/// `Unknown` — honest, and keeps them out of `dead_exports` rather than guessing.
+fn tags_visibility(lang: Lang, name: &str) -> Visibility {
+    match lang {
+        Lang::Go => match name.chars().next() {
+            Some(c) if c.is_uppercase() => Visibility::Public,
+            Some(_) => Visibility::Private,
+            None => Visibility::Unknown,
+        },
+        _ => Visibility::Unknown,
+    }
 }
 
 /// Map a `@definition.<suffix>` capture suffix to a [`SymbolKind`].
@@ -125,7 +168,7 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
     while let Some(m) = it.next() {
         let mut def: Option<(Node, SymbolKind)> = None;
         let mut name_node: Option<Node> = None;
-        let mut is_call = false;
+        let mut call_node: Option<Node> = None;
         for cap in m.captures {
             let cname = names[cap.index as usize];
             if let Some(suffix) = cname.strip_prefix("definition.") {
@@ -133,31 +176,44 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
             } else if cname == "name" {
                 name_node = Some(cap.node);
             } else if cname == "reference.call" {
-                is_call = true;
+                call_node = Some(cap.node);
             }
         }
-        match (def, name_node) {
-            (Some((dn, kind)), Some(nn)) => {
-                let name = node_text(src, nn);
-                let name = name.trim();
-                if !name.is_empty() {
-                    defs.push(Def { node: dn, name: name.to_string(), kind });
+        match def {
+            Some((dn, kind)) => {
+                if let Some(nn) = name_node {
+                    let name = node_text(src, nn);
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        defs.push(Def { node: dn, name: name.to_string(), kind });
+                    }
                 }
             }
-            (None, Some(nn)) if is_call => {
-                let name = node_text(src, nn);
-                let name = name.trim();
-                if !name.is_empty() {
-                    let p = nn.start_position();
-                    calls.push(CallRef {
-                        name: name.to_string(),
-                        byte: nn.start_byte(),
-                        line: p.row as u32 + 1,
-                        col: p.column as u32 + 1,
-                    });
+            // A call: prefer an explicit `@name`, but fall back to the
+            // `@reference.call` node itself — many vendored queries tag the
+            // callee identifier directly (e.g. `(identifier) @reference.call`)
+            // with no inner `@name`, and those calls were previously dropped.
+            None => {
+                if let Some(nn) = name_node.or(call_node) {
+                    // Leading identifier of the captured node, so a whole-`(call)`
+                    // capture yields `foo` rather than `foo(a, b)`.
+                    let raw = node_text(src, nn);
+                    let name = raw
+                        .split(|c: char| c == '(' || c.is_whitespace())
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if !name.is_empty() && call_node.is_some() {
+                        calls.push(CallRef {
+                            name: name.to_string(),
+                            byte: nn.start_byte(),
+                            line: nn.start_position().row as u32 + 1,
+                            // F26: character column, not tree-sitter's byte offset.
+                            col: char_col(src, nn),
+                        });
+                    }
                 }
             }
-            _ => {}
         }
     }
 
@@ -178,7 +234,10 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
             continue;
         }
         let parent_id = parent.map(|p| ids[p].as_str());
-        emit_symbol(src, file, d.node, &d.name, d.kind, parent_id, None, fg);
+        let vis = tags_visibility(spec.lang, &d.name);
+        let is_test =
+            matches!(d.kind, SymbolKind::Function | SymbolKind::Method) && tags_is_test_path(spec.lang, file);
+        emit_symbol(src, file, d.node, &d.name, d.kind, parent_id, None, vis, is_test, fg);
     }
 
     // Record every call as a reference (so `find references` sees it), then add
@@ -192,16 +251,14 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
             line: c.line,
             col: c.col,
             resolved_id: None,
+            // Upgraded to Extracted for same-file targets by `classify_confidence`.
+            confidence: Confidence::Inferred,
         });
         let caller = smallest_container(&spans, c.byte, c.byte + 1, None, |j| {
             matches!(defs[j].kind, SymbolKind::Function | SymbolKind::Method)
         });
         if let Some(j) = caller {
-            fg.edges.push(Edge {
-                kind: EdgeKind::Call,
-                src: ids[j].clone(),
-                dst: c.name.clone(),
-            });
+            fg.edges.push(Edge::new(EdgeKind::Call, ids[j].clone(), c.name.clone()));
         }
     }
 }
@@ -372,6 +429,22 @@ class Calculator {
         assert!(names_of(&fg, SymbolKind::Class).contains(&"Calculator".to_string()));
         assert!(names_of(&fg, SymbolKind::Method).contains(&"add".to_string()));
         assert!(call_targets(&fg).contains(&"compute".to_string()));
+    }
+
+    #[test]
+    fn test_path_heuristic_scopes_spec_to_ruby() {
+        // F3: `spec/` is RSpec-only — it must not tag non-Ruby files (OpenAPI /
+        // protocol `spec/` dirs are common in Go/Swift/Kotlin projects).
+        assert!(!tags_is_test_path(Lang::Go, "api/spec/openapi.go"));
+        assert!(!tags_is_test_path(Lang::Swift, "sources/spec/model.swift"));
+        assert!(tags_is_test_path(Lang::Ruby, "spec/models/user_spec.rb"));
+        // `tests/` is the shared cross-language convention.
+        assert!(tags_is_test_path(Lang::Java, "tests/footest.java"));
+        assert!(tags_is_test_path(Lang::Go, "tests/integration.go"));
+        // Go's own `_test.go` suffix works anywhere.
+        assert!(tags_is_test_path(Lang::Go, "pkg/foo_test.go"));
+        // A plain source file is not a test.
+        assert!(!tags_is_test_path(Lang::Go, "pkg/foo.go"));
     }
 }
 

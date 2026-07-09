@@ -11,12 +11,21 @@
 use tree_sitter::{Node, Parser};
 
 use super::model::{
-    doc_chunk_id, fnv1a_hex, symbol_doc_chunk_id, symbol_id, DocChunk, Edge, EdgeKind, FileGraph,
-    Lang, Reference, Symbol, SymbolKind,
+    doc_chunk_id, fnv1a_hex, symbol_doc_chunk_id, symbol_id, CodeChunk, Confidence, DocChunk, Edge,
+    EdgeKind, FileGraph, Lang, Reference, Symbol, SymbolKind, Visibility,
 };
 
 /// Max characters kept for a symbol's one-line signature.
 const MAX_SIGNATURE: usize = 200;
+
+/// Minimum span (inclusive line count) for a symbol to earn a semantic code
+/// chunk (V11 Phase G) — a one- or two-line definition is already fully
+/// captured by its `signature`, so chunking it would just duplicate that row.
+const MIN_CODE_CHUNK_LINES: u32 = 3;
+
+/// Max characters kept in a code chunk's embedded text (signature + doc +
+/// body), mirroring [`MAX_SIGNATURE`]'s role for the one-line signature.
+const MAX_CODE_CHUNK_CHARS: usize = 1024;
 
 /// Parse one file's source into a [`FileGraph`]. `path` is the project-relative
 /// path stored on every row; `lang` selects the grammar.
@@ -63,7 +72,30 @@ pub fn parse_file(path: &str, src: &str, lang: Lang) -> FileGraph {
         Lang::Other => {}
     }
 
+    // V15 Feature 3: now that the whole file is parsed, upgrade same-file
+    // call/reference confidence from `Inferred` to `Extracted`. Single place,
+    // walk-order-independent, covers both the bespoke walkers and the tags engine.
+    fg.classify_confidence();
+    dedup_graph(&mut fg);
     fg
+}
+
+/// Collapse duplicate edges and reference sites a single file can emit — e.g. a
+/// function that calls `log()` 200 times (200 identical `Call` edges), or a
+/// repeated `use foo::bar;` — so downstream fan-out / impact / confidence
+/// counts aren't inflated by the same relationship recorded many times. Edges
+/// are keyed by `(kind, src, dst)`; references by `(name, line, col)` so that
+/// distinct call sites on different lines (genuinely distinct use sites) are
+/// kept while a site captured twice by overlapping logic is collapsed. Runs
+/// once here so it covers every language (the bespoke walkers and the tags
+/// engine alike).
+fn dedup_graph(fg: &mut FileGraph) {
+    let mut seen_edges: std::collections::HashSet<(&'static str, String, String)> =
+        std::collections::HashSet::new();
+    fg.edges.retain(|e| seen_edges.insert((e.kind.tag(), e.src.clone(), e.dst.clone())));
+    let mut seen_refs: std::collections::HashSet<(String, u32, u32)> =
+        std::collections::HashSet::new();
+    fg.references.retain(|r| seen_refs.insert((r.name.clone(), r.line, r.col)));
 }
 
 /// Chunk a Markdown file into `doc_chunk`s by heading section, so
@@ -225,22 +257,42 @@ fn parse_rust(src: &str, file: &str, fg: &mut FileGraph) {
     let Some(tree) = parser.parse(src, None) else {
         return;
     };
-    walk_items(src, file, tree.root_node(), None, false, fg);
+    walk_items(src, file, tree.root_node(), 0, None, false, false, fg);
 }
 
 /// Recurse over a node's named children, emitting definitions (with
 /// containment + doc edges), import edges, and call references. `parent` is the
 /// enclosing symbol id (for `Contains`); `in_impl` makes functions count as
-/// methods.
+/// methods; `in_test_mod` is true once the walk has descended into a
+/// `#[cfg(test)] mod` — every fn/method found from there down is a test (V12
+/// Phase C), regardless of its own attributes.
+/// Recursion-depth cap shared by every tree walker (`walk_items`,
+/// `collect_calls_in`, `collect_rust_macro_calls`, `walk_js`, `walk_py`).
+/// tree-sitter imposes no nesting limit, so a machine-generated or adversarial
+/// file (e.g. one 60k-deep nested call expression) could otherwise recurse the
+/// native stack to an uncatchable abort. Real source nests far shallower than
+/// this; hitting the cap simply stops descending that subtree and yields
+/// whatever parsed above it — matching the module's "never panic" contract.
+const MAX_WALK_DEPTH: u32 = 512;
+
 fn walk_items(
     src: &str,
     file: &str,
     node: Node,
+    depth: u32,
     parent: Option<&str>,
     in_impl: bool,
+    in_test_mod: bool,
     fg: &mut FileGraph,
 ) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let mut pending_doc: Vec<String> = Vec::new();
+    // Attribute text accumulated since the last def/doc reset, so a def can be
+    // checked for a preceding `#[test]`/`#[tokio::test]`/`#[rstest]` the same
+    // way `pending_doc` accumulates doc-comments.
+    let mut pending_attrs: Vec<String> = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let kind = child.kind();
@@ -256,35 +308,137 @@ fn walk_items(
                 }
                 continue;
             }
-            "attribute_item" | "inner_attribute_item" => continue,
+            "attribute_item" | "inner_attribute_item" => {
+                pending_attrs.push(node_text(src, child));
+                continue;
+            }
             _ => {}
         }
 
         if let Some((name, skind)) = def_name_kind(src, child, in_impl) {
             let doc = take_doc(&mut pending_doc);
-            let id = emit_symbol(src, file, child, &name, skind, parent, doc, fg);
+            let vis = rust_visibility(child);
+            let is_test = in_test_mod
+                || (matches!(skind, SymbolKind::Function | SymbolKind::Method)
+                    && pending_attrs.iter().any(|a| is_test_attribute(a)));
+            let id = emit_symbol(src, file, child, &name, skind, parent, doc, vis, is_test, fg);
 
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
-                collect_calls_in(src, file, child, &id, CallSyntax::Rust, fg);
+                collect_calls_in(src, file, child, depth + 1, &id, CallSyntax::Rust, fg);
             }
             let child_in_impl = matches!(kind, "impl_item" | "trait_item");
-            walk_items(src, file, child, Some(&id), child_in_impl, fg);
+            // A `#[cfg(test)] mod` marks everything nested in it as tests, all
+            // the way down (a plain `fn` inside needs no `#[test]` of its own).
+            let child_in_test_mod = in_test_mod
+                || (kind == "mod_item" && pending_attrs.iter().any(|a| is_cfg_test_attribute(a)));
+            walk_items(src, file, child, depth + 1, Some(&id), child_in_impl, child_in_test_mod, fg);
             pending_doc.clear();
+            pending_attrs.clear();
         } else if kind == "use_declaration" {
-            if let Some(path) = import_path(src, child) {
-                fg.edges.push(Edge {
-                    kind: EdgeKind::Import,
-                    src: file.to_string(),
-                    dst: path,
-                });
+            // One edge per imported module path — a grouped/aliased/glob `use`
+            // (`use a::{b, c};`, `use a::b as c;`, `use a::*;`) expands to the
+            // individual, resolvable module paths rather than a single literal
+            // edge that never matches anything.
+            if let Some(arg) = child.child_by_field_name("argument") {
+                let mut paths = Vec::new();
+                collect_use_paths(src, arg, "", &mut paths);
+                for path in paths {
+                    fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), path));
+                }
             }
             pending_doc.clear();
+            pending_attrs.clear();
         } else {
             // Descend for nested items (module bodies, impl bodies, etc.).
-            walk_items(src, file, child, parent, in_impl, fg);
+            walk_items(src, file, child, depth + 1, parent, in_impl, in_test_mod, fg);
             pending_doc.clear();
+            pending_attrs.clear();
         }
     }
+}
+
+/// Whether an accumulated `#[...]`/`#![...]` attribute's text is `#[test]`,
+/// `#[tokio::test]`, `#[async_std::test]`, `#[rstest]`, `#[rstest::rstest]`, or
+/// similar (`test`/`rstest` as the leading path segment, or the path's last
+/// segment). Matches on text rather than a re-parse of the attribute's inner
+/// tree — the accepted spellings are simple enough that string matching is
+/// both simpler and cheaper than a second grammar walk.
+fn is_test_attribute(attr_text: &str) -> bool {
+    let inner = attr_text
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches('!')
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    // Drop any `(...)`/`= ...` args, keep the leading path (`tokio::test(...)` -> `tokio::test`).
+    let path = inner.split(['(', '=']).next().unwrap_or(inner).trim();
+    if is_test_path(path) {
+        return true;
+    }
+    // F28: `#[cfg_attr(<pred>, test)]` conditionally applies `test` (or `rstest`).
+    // The predicate is the FIRST arg; the applied attributes follow the first
+    // top-level comma. Only those count — a bare `test` in the predicate (e.g.
+    // `cfg_attr(all(test), Serialize)`) must NOT match.
+    if path == "cfg_attr" {
+        if let Some(args) = inner
+            .strip_prefix("cfg_attr")
+            .map(str::trim)
+            .and_then(|s| s.strip_prefix('('))
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let mut depth = 0i32;
+            let mut top_comma = None;
+            for (i, c) in args.char_indices() {
+                match c {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    ',' if depth == 0 => {
+                        top_comma = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(i) = top_comma {
+                return args[i + 1..].split(',').any(|attr| {
+                    is_test_path(attr.trim().split(['(', '=']).next().unwrap_or("").trim())
+                });
+            }
+        }
+    }
+    false
+}
+
+/// Whether an attribute path (leading segment already isolated) is a test
+/// marker: `test`/`rstest`, or `*::test`/`*::rstest` (`tokio::test`, …).
+fn is_test_path(path: &str) -> bool {
+    matches!(path, "test" | "rstest") || path.ends_with("::test") || path.ends_with("::rstest")
+}
+
+/// Whether an accumulated attribute's text is a `cfg(...)` whose predicate
+/// list includes a bare `test` — marks a `mod` block whose entire contents
+/// are test-only. Matches the literal `cfg(test)` as well as `test` nested
+/// inside `all(...)`/`any(...)` (`cfg(all(test, feature = "x"))`,
+/// `cfg(any(test, feature = "x"))`, `cfg(test, feature = "x")`) — broadened
+/// (V12 review) past a plain `cfg(test)` substring match, which missed every
+/// combinator form. Strips the `#[...]`/`#![...]` wrapper, requires the
+/// remainder to start with `cfg(`, then tokenizes on `(`/`)`/`,` and looks
+/// for a bare `test` token — so `cfg(test_utils)` (a longer identifier, not
+/// the `test` predicate) does NOT match.
+fn is_cfg_test_attribute(attr_text: &str) -> bool {
+    let inner = attr_text
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches('!')
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    let compact: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(rest) = compact.strip_prefix("cfg(") else { return false };
+    rest.split(['(', ')', ',']).any(|tok| tok == "test")
 }
 
 /// If `node` is a Rust definition, return its name + kind.
@@ -313,6 +467,25 @@ fn def_name_kind(src: &str, node: Node, in_impl: bool) -> Option<(String, Symbol
         _ => return None,
     };
     Some((name, sk))
+}
+
+/// Rust visibility of a definition node from its `visibility_modifier` child:
+/// `pub` → Public, `pub(crate)`/`pub(super)`/`pub(in …)` → Crate, absent →
+/// Private. The modifier is a direct child of the item node when present.
+fn rust_visibility(node: Node) -> Visibility {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            // A bare `pub` has no named children; `pub(crate)`/`pub(super)`/
+            // `pub(in path)` add a restriction, which we fold into Crate.
+            return if child.named_child_count() > 0 {
+                Visibility::Crate
+            } else {
+                Visibility::Public
+            };
+        }
+    }
+    Visibility::Private
 }
 
 /// Synthesize a readable name for an `impl` block: `impl Foo` or
@@ -357,27 +530,35 @@ impl CallSyntax {
         }
     }
 
-    /// Whether `kind` opens a nested scope whose calls belong to *it*, not the
-    /// current symbol — the walk must not descend into these (each gets its own
-    /// `collect_calls_in` from the item walk).
-    fn is_nested_scope(self, kind: &str) -> bool {
+    /// Whether `node` opens a nested scope that gets its OWN `collect_calls_in`
+    /// pass, so this walk must NOT descend into it (descending would attribute
+    /// its calls to the enclosing symbol as well — a double count).
+    ///
+    /// The scopes with their own pass are the NAMED definitions (collected by the
+    /// item walk) and — in JS — a function/arrow *expression* that is the value of
+    /// a `const/let f = …` declarator (collected by [`emit_js_var_functions`]).
+    /// Everything else function-shaped — Rust `closure_expression`, Python
+    /// `lambda`, and JS inline callbacks / IIFEs / object-property arrows — has NO
+    /// own pass, so we DO descend and fold its calls into the enclosing symbol.
+    /// Before this, calls made inside an anonymous closure vanished from the graph
+    /// entirely (attributed to no symbol at all).
+    fn is_nested_scope(self, node: Node) -> bool {
+        let kind = node.kind();
         match self {
-            CallSyntax::Rust => matches!(
-                kind,
-                "function_item" | "closure_expression" | "function_signature_item"
-            ),
-            CallSyntax::Js => matches!(
-                kind,
-                "function_declaration"
-                    | "generator_function_declaration"
-                    | "function"
-                    | "generator_function"
-                    | "arrow_function"
-                    | "method_definition"
-            ),
-            CallSyntax::Python => {
-                matches!(kind, "function_definition" | "class_definition" | "lambda")
-            }
+            CallSyntax::Rust => matches!(kind, "function_item" | "function_signature_item"),
+            CallSyntax::Js => match kind {
+                "function_declaration" | "generator_function_declaration" | "method_definition" => {
+                    true
+                }
+                // A function/arrow *expression* only has its own pass when it is a
+                // declarator value (`const f = () => …`); an inline callback,
+                // IIFE, or object-property arrow does not, so descend into it.
+                "arrow_function" | "function" | "function_expression" | "generator_function" => {
+                    node.parent().map(|p| p.kind()) == Some("variable_declarator")
+                }
+                _ => false,
+            },
+            CallSyntax::Python => matches!(kind, "function_definition" | "class_definition"),
         }
     }
 }
@@ -390,31 +571,105 @@ fn collect_calls_in(
     src: &str,
     file: &str,
     node: Node,
+    depth: u32,
     from_id: &str,
     syntax: CallSyntax,
     fg: &mut FileGraph,
 ) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == syntax.call_kind() {
             if let Some(callee) = syntax.callee_name(src, child) {
-                let pos = child.start_position();
-                fg.references.push(Reference {
-                    name: callee.clone(),
-                    file: file.to_string(),
-                    line: pos.row as u32 + 1,
-                    col: pos.column as u32 + 1,
-                    resolved_id: None,
-                });
-                fg.edges.push(Edge {
-                    kind: EdgeKind::Call,
-                    src: from_id.to_string(),
-                    dst: callee,
-                });
+                push_call(src, file, child, &callee, from_id, fg);
             }
         }
-        if !syntax.is_nested_scope(child.kind()) {
-            collect_calls_in(src, file, child, from_id, syntax, fg);
+        // Rust macros wrap their args in an opaque `token_tree`; recover the
+        // function calls written inside them (see [`collect_rust_macro_calls`]).
+        if matches!(syntax, CallSyntax::Rust) && child.kind() == "macro_invocation" {
+            let mut mc = child.walk();
+            for gc in child.named_children(&mut mc) {
+                if gc.kind() == "token_tree" {
+                    collect_rust_macro_calls(src, file, gc, depth + 1, from_id, fg);
+                }
+            }
+        }
+        if !syntax.is_nested_scope(child) {
+            collect_calls_in(src, file, child, depth + 1, from_id, syntax, fg);
+        }
+    }
+}
+
+/// Push one `Call` reference + edge for `callee`, located at `at`'s start.
+fn push_call(src: &str, file: &str, at: Node, callee: &str, from_id: &str, fg: &mut FileGraph) {
+    fg.references.push(Reference {
+        name: callee.to_string(),
+        file: file.to_string(),
+        line: at.start_position().row as u32 + 1,
+        col: char_col(src, at),
+        resolved_id: None,
+        // Inferred by default; `FileGraph::classify_confidence` upgrades it to
+        // Extracted if `callee` is defined in this same file.
+        confidence: Confidence::Inferred,
+    });
+    fg.edges.push(Edge::new(EdgeKind::Call, from_id.to_string(), callee.to_string()));
+}
+
+/// The 1-based **character** column of `node`'s start. F26: tree-sitter's
+/// `Point.column` is a BYTE offset within the line, so on a line containing
+/// multi-byte characters before the token (a non-ASCII comment/string, or an
+/// identifier like `café_fn`) it overshoots the real column an editor reports;
+/// counting chars from the line start fixes it. `line` (the row) is unaffected.
+pub(crate) fn char_col(src: &str, node: Node) -> u32 {
+    let start = node.start_byte();
+    let line_start = src.get(..start).and_then(|s| s.rfind('\n')).map(|i| i + 1).unwrap_or(0);
+    src.get(line_start..start).map(|s| s.chars().count() as u32).unwrap_or(0) + 1
+}
+
+/// Rust macros (`println!`, `assert_eq!`, `vec!`, `tokio::select!`, …) wrap their
+/// arguments in a `token_tree` whose contents tree-sitter does NOT parse into
+/// `call_expression` nodes — they are raw tokens, so every function call written
+/// inside a macro is otherwise absent from the call graph. This recovers the
+/// common call shapes heuristically: a bare `identifier` immediately followed by
+/// a parenthesized `token_tree`, with no gap between them, is a call to that
+/// identifier (`foo(x)`, `path::foo(x)` via the final segment, `recv.method(x)`
+/// via the method name — the preceding `.`/`::` tokens are anonymous and ignored).
+/// The zero-gap adjacency check excludes a nested macro invocation `inner!(…)`
+/// (a `!` sits between the name and its tree) and generic turbofish calls, both
+/// of which would otherwise be mis-attributed. Recurses into nested token trees.
+fn collect_rust_macro_calls(src: &str, file: &str, tree: Node, depth: u32, from_id: &str, fg: &mut FileGraph) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
+    let mut cursor = tree.walk();
+    let children: Vec<Node> = tree.named_children(&mut cursor).collect();
+    for (i, child) in children.iter().enumerate() {
+        match child.kind() {
+            "identifier" => {
+                if let Some(next) = children.get(i + 1) {
+                    if next.kind() == "token_tree"
+                        && next.start_byte() == child.end_byte()
+                        && node_text(src, *next).starts_with('(')
+                    {
+                        let callee = node_text(src, *child).trim().to_string();
+                        // Inside a macro's opaque token tree, an `Ident(...)` is
+                        // as likely an enum-variant / tuple-struct *pattern* or
+                        // constructor (`Some(v)`, `Ok(_)`, `Foo(1)`) as a real
+                        // call. Rust functions are snake_case, so a PascalCase
+                        // initial marks the common false positives — skip them
+                        // (real snake_case calls like `foo()`/`bar()` are kept).
+                        let is_ctor_like =
+                            callee.chars().find(|c| c.is_alphabetic()).is_some_and(char::is_uppercase);
+                        if !callee.is_empty() && !is_ctor_like {
+                            push_call(src, file, *child, &callee, from_id, fg);
+                        }
+                    }
+                }
+            }
+            "token_tree" => collect_rust_macro_calls(src, file, *child, depth + 1, from_id, fg),
+            _ => {}
         }
     }
 }
@@ -439,7 +694,11 @@ fn callee_name(src: &str, call: Node) -> Option<String> {
             .child_by_field_name("function")
             .map(|n| node_text(src, n))
             .unwrap_or_else(|| node_text(src, f)),
-        _ => first_line(&node_text(src, f)),
+        // F25: an unhandled callee shape (`(make_fn())()`, `arr[i]()`, an IIFE,
+        // a subscript call) has no clean identifier — drop the edge rather than
+        // recording the whole sub-expression's first line as a bogus,
+        // un-resolvable "symbol" name that pollutes ref/edge resolution.
+        _ => return None,
     };
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -449,9 +708,71 @@ fn callee_name(src: &str, call: Node) -> Option<String> {
     }
 }
 
-/// The full `use` path text, minus the `use ` prefix and trailing `;`.
-fn import_path(src: &str, node: Node) -> Option<String> {
-    node.child_by_field_name("argument").map(|n| node_text(src, n))
+/// Expand a `use` tree (the `argument` of a `use_declaration`) into the
+/// individual module paths it imports, joining each to the accumulated
+/// `prefix`. Handles the shapes that a single-string capture flattened into an
+/// unresolvable edge:
+/// - `a::b`            → `["a::b"]`
+/// - `a::b as c`       → `["a::b"]`      (the alias is dropped)
+/// - `a::{b, c::d}`    → `["a::b", "a::c::d"]`
+/// - `a::{self, b}`    → `["a", "a::b"]` (`self` is the module itself)
+/// - `a::*`            → `["a"]`         (the glob target is the module)
+fn collect_use_paths(src: &str, node: Node, prefix: &str, out: &mut Vec<String>) {
+    match node.kind() {
+        // `path as alias` — keep the path, drop the alias half.
+        "use_as_clause" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                collect_use_paths(src, path, prefix, out);
+            }
+        }
+        // `path::{ ... }` — the path extends the prefix for every list item.
+        "scoped_use_list" => {
+            let new_prefix = node
+                .child_by_field_name("path")
+                .map(|p| join_mod(prefix, node_text(src, p).trim()))
+                .unwrap_or_else(|| prefix.to_string());
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_use_paths(src, list, &new_prefix, out);
+            }
+        }
+        // `{ a, b, ... }` — each child is its own use tree under `prefix`.
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_use_paths(src, child, prefix, out);
+            }
+        }
+        // `path::*` — record the module itself (the glob never resolves to a
+        // single name). The path is the wildcard's only named child.
+        "use_wildcard" => match node.named_child(0) {
+            Some(inner) => collect_use_paths(src, inner, prefix, out),
+            None if !prefix.is_empty() => out.push(prefix.to_string()),
+            None => {}
+        },
+        // Leaf: identifier / scoped_identifier / crate / super / self / etc.
+        _ => {
+            let seg = node_text(src, node);
+            let seg = seg.trim();
+            if seg == "self" {
+                // `use a::{self}` → the module `a`.
+                if !prefix.is_empty() {
+                    out.push(prefix.to_string());
+                }
+            } else if !seg.is_empty() {
+                out.push(join_mod(prefix, seg));
+            }
+        }
+    }
+}
+
+/// Join a module path segment to a `::`-separated prefix (`""` prefix → the
+/// segment alone).
+fn join_mod(prefix: &str, seg: &str) -> String {
+    if prefix.is_empty() {
+        seg.to_string()
+    } else {
+        format!("{prefix}::{seg}")
+    }
 }
 
 /// A one-line signature: the node's first line, trimmed and length-capped.
@@ -618,13 +939,40 @@ fn parse_js_ts(src: &str, file: &str, lang: Lang, fg: &mut FileGraph) {
     let Some(tree) = parser.parse(src, None) else {
         return;
     };
-    walk_js(src, file, tree.root_node(), None, false, fg);
+    let file_is_test = js_is_test_file(file);
+    walk_js(src, file, tree.root_node(), 0, None, false, file_is_test, fg);
+}
+
+/// Whether `file`'s path marks every definition in it as a test, by the common
+/// JS/TS convention: a `*.test.*`/`*.spec.*` filename, or any `__tests__/`
+/// path segment. No per-definition signal (`test()`/`it()`/`describe()`
+/// callbacks aren't synthesized as symbols by this walker — see
+/// [`js_def_name_kind`]/[`emit_js_var_functions`]), so the file-level rule is
+/// the whole story for JS/TS (V12 Phase C).
+fn js_is_test_file(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    name.contains(".test.") || name.contains(".spec.") || lower.split('/').any(|seg| seg == "__tests__")
 }
 
 /// Recursive JS/TS item walk: declarations (functions, classes, methods,
 /// interfaces, enums, type aliases, arrow-fn consts), import edges, call
-/// references, JSDoc, and class→method containment.
-fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bool, fg: &mut FileGraph) {
+/// references, JSDoc, and class→method containment. `file_is_test` (V12 Phase
+/// C) marks every emitted definition as a test when the file itself is a test
+/// file (see [`js_is_test_file`]).
+fn walk_js(
+    src: &str,
+    file: &str,
+    node: Node,
+    depth: u32,
+    parent: Option<&str>,
+    in_class: bool,
+    file_is_test: bool,
+    fg: &mut FileGraph,
+) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let mut pending_doc: Vec<String> = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -646,35 +994,42 @@ fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
             child
         };
 
+        // A declaration wrapped in `export …` (or `export default …`) is public;
+        // a bare top-level declaration is module-private. Methods nested in a
+        // class stay Private (reachable via their class, never a dead export).
+        let exported = kind == "export_statement";
+        let vis = if exported { Visibility::Public } else { Visibility::Private };
+
         if let Some((name, skind)) = js_def_name_kind(src, def_node, in_class) {
             let doc = take_doc(&mut pending_doc);
-            let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, fg);
+            let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, file_is_test, fg);
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
-                collect_calls_in(src, file, def_node, &id, CallSyntax::Js, fg);
+                collect_calls_in(src, file, def_node, depth + 1, &id, CallSyntax::Js, fg);
             }
             let child_in_class = matches!(def_node.kind(), "class_declaration" | "abstract_class_declaration");
-            walk_js(src, file, def_node, Some(&id), child_in_class, fg);
+            walk_js(src, file, def_node, depth + 1, Some(&id), child_in_class, file_is_test, fg);
             pending_doc.clear();
         } else if matches!(def_node.kind(), "lexical_declaration" | "variable_declaration") {
             // `const foo = () => {…}` / `const bar = function(){}` → a function.
             let doc = take_doc(&mut pending_doc);
-            emit_js_var_functions(src, file, def_node, parent, doc, fg);
+            emit_js_var_functions(src, file, def_node, depth + 1, parent, doc, vis, file_is_test, fg);
             pending_doc.clear();
         } else if kind == "import_statement" {
             if let Some(srcpath) = js_import_source(src, child) {
-                fg.edges.push(Edge { kind: EdgeKind::Import, src: file.to_string(), dst: srcpath });
+                fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), srcpath));
             }
             pending_doc.clear();
         } else {
             // Descend into wrappers (export of a name list, statement blocks,
             // class bodies, namespaces) keeping the enclosing symbol/parent.
-            walk_js(src, file, def_node, parent, in_class, fg);
+            walk_js(src, file, def_node, depth + 1, parent, in_class, file_is_test, fg);
             pending_doc.clear();
         }
     }
 }
 
 /// Emit one symbol (+ containment + doc edges) and return its id.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_symbol(
     src: &str,
     file: &str,
@@ -683,6 +1038,8 @@ pub(crate) fn emit_symbol(
     skind: SymbolKind,
     parent: Option<&str>,
     doc: Option<String>,
+    vis: Visibility,
+    is_test: bool,
     fg: &mut FileGraph,
 ) -> String {
     let start = node.start_position().row as u32 + 1;
@@ -697,9 +1054,31 @@ pub(crate) fn emit_symbol(
         end_line: end,
         signature: signature_of(src, node),
         doc: doc.clone(),
+        visibility: vis,
+        is_test,
     });
     if let Some(p) = parent {
-        fg.edges.push(Edge { kind: EdgeKind::Contains, src: p.to_string(), dst: id.clone() });
+        fg.edges.push(Edge::new(EdgeKind::Contains, p.to_string(), id.clone()));
+    }
+    // V11 Phase G: a semantic *code* chunk for this symbol (doc + body), keyed by
+    // the symbol's own id. The node text already begins with the signature line,
+    // so it is NOT prepended separately (doing so would burn the truncation
+    // budget on a duplicate). Uses `doc.as_deref()` rather than consuming `doc` —
+    // the doc-chunk block below still needs it. Only "shaped" definitions worth
+    // embedding, and only spans long enough that the one-line signature alone
+    // wouldn't capture the interesting part.
+    if is_code_chunk_kind(skind) && end.saturating_sub(start) + 1 >= MIN_CODE_CHUNK_LINES {
+        let mut text = String::new();
+        if let Some(d) = doc.as_deref() {
+            text.push_str(d);
+            text.push('\n');
+        }
+        text.push_str(&node_text(src, node));
+        fg.code_chunks.push(CodeChunk {
+            id: id.clone(),
+            file: file.to_string(),
+            text: truncate_code_chunk(&text, MAX_CODE_CHUNK_CHARS),
+        });
     }
     if let Some(text) = doc {
         // Disambiguate the storage key by start line so two same-named defs in
@@ -711,9 +1090,35 @@ pub(crate) fn emit_symbol(
             anchor: name.to_string(),
             text,
         });
-        fg.edges.push(Edge { kind: EdgeKind::Documents, src: cid, dst: id.clone() });
+        fg.edges.push(Edge::new(EdgeKind::Documents, cid, id.clone()));
     }
     id
+}
+
+/// Symbol kinds "shaped" enough to earn a semantic code chunk — a bare
+/// `const`/`static`/`field`/`variant`/`module`/`macro`/`impl` is already fully
+/// covered by its one-line signature, so chunking it would just be noise.
+fn is_code_chunk_kind(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Struct
+            | SymbolKind::Class
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Interface
+            | SymbolKind::TypeAlias
+    )
+}
+
+/// Truncate `s` to at most `n` characters (char-boundary safe — see
+/// [`signature_of`]'s note on why a byte-offset truncate can panic here).
+fn truncate_code_chunk(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => s[..idx].to_string(),
+        None => s.to_string(),
+    }
 }
 
 fn take_doc(pending: &mut Vec<String>) -> Option<String> {
@@ -743,12 +1148,16 @@ fn js_def_name_kind(src: &str, node: Node, in_class: bool) -> Option<(String, Sy
 
 /// Emit `Function` symbols for `const f = () => …` / `= function(){}` inside a
 /// `lexical_declaration`/`variable_declaration`.
+#[allow(clippy::too_many_arguments)]
 fn emit_js_var_functions(
     src: &str,
     file: &str,
     decl: Node,
+    depth: u32,
     parent: Option<&str>,
     doc: Option<String>,
+    vis: Visibility,
+    file_is_test: bool,
     fg: &mut FileGraph,
 ) {
     let mut cursor = decl.walk();
@@ -764,8 +1173,8 @@ fn emit_js_var_functions(
         let Some(name) = d.child_by_field_name("name").map(|n| node_text(src, n)) else { continue };
         // Only the first declarator gets the leading doc-comment.
         let this_doc = if first { doc.clone() } else { None };
-        let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, fg);
-        collect_calls_in(src, file, value, &id, CallSyntax::Js, fg);
+        let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, vis, file_is_test, fg);
+        collect_calls_in(src, file, value, depth + 1, &id, CallSyntax::Js, fg);
         first = false;
     }
 }
@@ -780,7 +1189,11 @@ fn js_callee_name(src: &str, call: Node) -> Option<String> {
             .child_by_field_name("property")
             .map(|n| node_text(src, n))
             .unwrap_or_else(|| node_text(src, f)),
-        _ => first_line(&node_text(src, f)),
+        // F25: an unhandled callee shape (`(make_fn())()`, `arr[i]()`, an IIFE,
+        // a subscript call) has no clean identifier — drop the edge rather than
+        // recording the whole sub-expression's first line as a bogus,
+        // un-resolvable "symbol" name that pollutes ref/edge resolution.
+        _ => return None,
     };
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -833,12 +1246,40 @@ fn parse_python(src: &str, file: &str, fg: &mut FileGraph) {
     let Some(tree) = parser.parse(src, None) else {
         return;
     };
-    walk_py(src, file, tree.root_node(), None, false, fg);
+    let file_is_test_path = py_is_test_file(file);
+    walk_py(src, file, tree.root_node(), 0, None, false, file_is_test_path, fg);
+}
+
+/// Whether `file`'s path matches the pytest test-file convention:
+/// `test_*.py` / `*_test.py`, or any `tests/` path segment. Combined with a
+/// `test_`-prefixed `def` name at the call site (V12 Phase C) — the file
+/// match alone isn't enough (a `tests/conftest.py` helper isn't a test).
+fn py_is_test_file(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    (name.starts_with("test_") && name.ends_with(".py"))
+        || name.ends_with("_test.py")
+        || lower.split('/').any(|seg| seg == "tests")
 }
 
 /// Recursive Python walk: `def`/`class` definitions (incl. `@decorated`),
 /// docstrings, import edges, call references, class→method containment.
-fn walk_py(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bool, fg: &mut FileGraph) {
+/// `file_is_test_path` (V12 Phase C) is the file-path half of the pytest
+/// test-detection rule (see [`py_is_test_file`]); combined with a
+/// `test_`-prefixed name at the definition site.
+fn walk_py(
+    src: &str,
+    file: &str,
+    node: Node,
+    depth: u32,
+    parent: Option<&str>,
+    in_class: bool,
+    file_is_test_path: bool,
+    fg: &mut FileGraph,
+) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let kind = child.kind();
@@ -861,20 +1302,36 @@ fn walk_py(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
                     SymbolKind::Function
                 };
                 let doc = py_docstring(src, def_node);
-                let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, fg);
+                let vis = py_visibility(&name);
+                let is_test = file_is_test_path
+                    && matches!(skind, SymbolKind::Function | SymbolKind::Method)
+                    && name.starts_with("test_");
+                let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, is_test, fg);
                 if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
-                    collect_calls_in(src, file, def_node, &id, CallSyntax::Python, fg);
+                    collect_calls_in(src, file, def_node, depth + 1, &id, CallSyntax::Python, fg);
                 }
                 let child_in_class = def_node.kind() == "class_definition";
-                walk_py(src, file, def_node, Some(&id), child_in_class, fg);
+                walk_py(src, file, def_node, depth + 1, Some(&id), child_in_class, file_is_test_path, fg);
             }
             "import_statement" | "import_from_statement" => {
                 for m in py_import_modules(src, def_node) {
-                    fg.edges.push(Edge { kind: EdgeKind::Import, src: file.to_string(), dst: m });
+                    fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), m));
                 }
             }
-            _ => walk_py(src, file, def_node, parent, in_class, fg),
+            _ => walk_py(src, file, def_node, depth + 1, parent, in_class, file_is_test_path, fg),
         }
+    }
+}
+
+/// Python visibility by name convention: a single leading underscore (but not a
+/// dunder like `__init__`) marks a module-private/"internal" name; everything
+/// else is treated as public. `__all__` membership is out of scope for the MVP.
+fn py_visibility(name: &str) -> Visibility {
+    let is_dunder = name.starts_with("__") && name.ends_with("__");
+    if name.starts_with('_') && !is_dunder {
+        Visibility::Private
+    } else {
+        Visibility::Public
     }
 }
 
@@ -929,7 +1386,11 @@ fn py_callee_name(src: &str, call: Node) -> Option<String> {
             .child_by_field_name("attribute")
             .map(|n| node_text(src, n))
             .unwrap_or_else(|| node_text(src, f)),
-        _ => first_line(&node_text(src, f)),
+        // F25: an unhandled callee shape (`(make_fn())()`, `arr[i]()`, an IIFE,
+        // a subscript call) has no clean identifier — drop the edge rather than
+        // recording the whole sub-expression's first line as a bogus,
+        // un-resolvable "symbol" name that pollutes ref/edge resolution.
+        _ => return None,
     };
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -975,6 +1436,163 @@ mod tests {
             .filter(|s| s.kind == kind)
             .map(|s| s.name.clone())
             .collect()
+    }
+
+    fn vis_of(fg: &FileGraph, name: &str) -> Visibility {
+        fg.symbols.iter().find(|s| s.name == name).unwrap().visibility
+    }
+
+    fn is_test_of(fg: &FileGraph, name: &str) -> bool {
+        fg.symbols.iter().find(|s| s.name == name).unwrap().is_test
+    }
+
+    #[test]
+    fn rust_visibility_classified() {
+        let src = "pub fn a() {}\nfn b() {}\npub(crate) fn c() {}\npub(super) fn d() {}\n";
+        let fg = parse_file("src/v.rs", src, Lang::Rust);
+        assert_eq!(vis_of(&fg, "a"), Visibility::Public);
+        assert_eq!(vis_of(&fg, "b"), Visibility::Private);
+        assert_eq!(vis_of(&fg, "c"), Visibility::Crate);
+        assert_eq!(vis_of(&fg, "d"), Visibility::Crate);
+    }
+
+    #[test]
+    fn js_export_visibility_classified() {
+        let src = "export function pub_fn() {}\nfunction priv_fn() {}\nexport const arrow = () => {};\nconst hidden = () => {};\n";
+        let fg = parse_file("src/v.ts", src, Lang::TypeScript);
+        assert_eq!(vis_of(&fg, "pub_fn"), Visibility::Public);
+        assert_eq!(vis_of(&fg, "priv_fn"), Visibility::Private);
+        assert_eq!(vis_of(&fg, "arrow"), Visibility::Public);
+        assert_eq!(vis_of(&fg, "hidden"), Visibility::Private);
+    }
+
+    #[test]
+    fn python_underscore_visibility_classified() {
+        let src = "def public_fn():\n    pass\ndef _helper():\n    pass\ndef __dunder__():\n    pass\n";
+        let fg = parse_file("src/v.py", src, Lang::Python);
+        assert_eq!(vis_of(&fg, "public_fn"), Visibility::Public);
+        assert_eq!(vis_of(&fg, "_helper"), Visibility::Private);
+        assert_eq!(vis_of(&fg, "__dunder__"), Visibility::Public);
+    }
+
+    // ── V12 Phase C: is_test detection ──────────────────────────────────
+
+    #[test]
+    fn rust_attribute_test_detected() {
+        let src = "#[test]\nfn a_test() {}\n#[tokio::test]\nasync fn tokio_test() {}\n#[rstest]\nfn an_rstest() {}\nfn plain() {}\n";
+        let fg = parse_file("src/t.rs", src, Lang::Rust);
+        assert!(is_test_of(&fg, "a_test"));
+        assert!(is_test_of(&fg, "tokio_test"));
+        assert!(is_test_of(&fg, "an_rstest"));
+        assert!(!is_test_of(&fg, "plain"));
+    }
+
+    #[test]
+    fn is_test_attribute_handles_cfg_attr() {
+        // F28: a conditional `#[cfg_attr(<pred>, test)]` applies `test`.
+        assert!(is_test_attribute("#[cfg_attr(feature = \"integration\", test)]"));
+        assert!(is_test_attribute("#[cfg_attr(unix, tokio::test)]"));
+        // A bare `test` in the PREDICATE (not the applied attr) must not match.
+        assert!(!is_test_attribute("#[cfg_attr(all(test), Serialize)]"));
+        assert!(!is_test_attribute("#[cfg_attr(feature = \"x\", derive(Debug))]"));
+        // Plain forms still work.
+        assert!(is_test_attribute("#[test]"));
+        assert!(is_test_attribute("#[tokio::test]"));
+        assert!(!is_test_attribute("#[derive(Debug)]"));
+    }
+
+    #[test]
+    fn rust_cfg_test_mod_marks_every_fn_inside() {
+        // A plain fn (no #[test] of its own) inside a #[cfg(test)] mod is still
+        // a test — the mod-level cfg attribute is the signal.
+        let src = "fn outer() {}\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n    #[test]\n    fn it_works() {}\n}\n";
+        let fg = parse_file("src/t.rs", src, Lang::Rust);
+        assert!(!is_test_of(&fg, "outer"));
+        assert!(is_test_of(&fg, "helper"), "plain fn inside #[cfg(test)] mod is a test");
+        assert!(is_test_of(&fg, "it_works"));
+    }
+
+    #[test]
+    fn rust_cfg_any_test_mod_marks_every_fn_inside() {
+        // `#[cfg(any(test, feature = "x"))]` is a common combinator form —
+        // the plain `cfg(test)` substring check used to miss it entirely
+        // (V12 review).
+        let src = "fn outer() {}\n#[cfg(any(test, feature = \"x\"))]\nmod tests {\n    fn helper() {}\n}\n";
+        let fg = parse_file("src/t.rs", src, Lang::Rust);
+        assert!(!is_test_of(&fg, "outer"));
+        assert!(is_test_of(&fg, "helper"), "plain fn inside #[cfg(any(test, ...))] mod is a test");
+    }
+
+    #[test]
+    fn rust_cfg_test_utils_mod_is_not_a_cfg_test_mod() {
+        // `test_utils` is a longer identifier, not the bare `test` predicate —
+        // must NOT be mistaken for a `#[cfg(test)]` mod.
+        let src = "#[cfg(test_utils)]\nmod helpers {\n    fn helper() {}\n}\n";
+        let fg = parse_file("src/t.rs", src, Lang::Rust);
+        assert!(!is_test_of(&fg, "helper"));
+    }
+
+    #[test]
+    fn js_test_file_marks_every_function_as_test() {
+        let src = "export function checkThing() { return 1; }\nfunction helper() { return 2; }\n";
+        let fg = parse_file("src/thing.test.ts", src, Lang::TypeScript);
+        assert!(is_test_of(&fg, "checkThing"));
+        assert!(is_test_of(&fg, "helper"));
+
+        // The same source in a non-test file gets no test bit.
+        let fg2 = parse_file("src/thing.ts", src, Lang::TypeScript);
+        assert!(!is_test_of(&fg2, "checkThing"));
+    }
+
+    #[test]
+    fn js_spec_and_dunder_tests_dir_marks_test_file() {
+        let src = "function checkThing() { return 1; }\n";
+        assert!(is_test_of(&parse_file("src/thing.spec.js", src, Lang::JavaScript), "checkThing"));
+        assert!(is_test_of(&parse_file("__tests__/thing.js", src, Lang::JavaScript), "checkThing"));
+    }
+
+    #[test]
+    fn python_test_prefixed_def_in_test_file_detected() {
+        let src = "def test_add():\n    pass\ndef helper():\n    pass\n";
+        let fg = parse_file("tests/test_math.py", src, Lang::Python);
+        assert!(is_test_of(&fg, "test_add"));
+        // Not test_-prefixed, even in a test file: not a test.
+        assert!(!is_test_of(&fg, "helper"));
+    }
+
+    #[test]
+    fn python_test_prefixed_def_outside_test_path_not_detected() {
+        // `test_`-prefixed name alone isn't enough — the file must also match
+        // the pytest convention (name or `tests/` path).
+        let src = "def test_add():\n    pass\n";
+        let fg = parse_file("src/math.py", src, Lang::Python);
+        assert!(!is_test_of(&fg, "test_add"));
+    }
+
+    #[test]
+    fn python_underscore_suffix_test_file_detected() {
+        let src = "def test_sub():\n    pass\n";
+        let fg = parse_file("math_test.py", src, Lang::Python);
+        assert!(is_test_of(&fg, "test_sub"));
+    }
+
+    #[test]
+    fn generic_tags_engine_path_fallback_detects_go_test_file() {
+        let src = "package main\n\nfunc TestAdd(t *T) {\n    helper()\n}\n\nfunc helper() {}\n";
+        let fg = parse_file("pkg/math_test.go", src, Lang::Go);
+        assert!(is_test_of(&fg, "TestAdd"));
+        assert!(is_test_of(&fg, "helper"), "every fn in a _test.go file is a candidate test");
+
+        // The same source in a non-test-named Go file gets no test bit.
+        let fg2 = parse_file("pkg/math.go", src, Lang::Go);
+        assert!(!is_test_of(&fg2, "TestAdd"));
+    }
+
+    #[test]
+    fn generic_tags_engine_tests_dir_fallback() {
+        let src = "class Greeter\n  def greet(name)\n    name\n  end\nend\n";
+        let fg = parse_file("spec/greeter_spec.rb", src, Lang::Ruby);
+        assert!(is_test_of(&fg, "greet"));
     }
 
     const SRC: &str = r#"
@@ -1238,6 +1856,149 @@ class Point:
         assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Import && e.dst == "pkg.sub"));
         let origin = fg.symbols.iter().find(|s| s.name == "origin").unwrap();
         assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == origin.id && e.dst == "getcwd"));
+    }
+
+    #[test]
+    fn calls_inside_rust_closures_attributed_to_enclosing_fn() {
+        // F1: a call inside an anonymous closure must fold into the enclosing
+        // symbol, not vanish (the closure is never emitted as its own symbol).
+        let src = "fn outer() {\n    let v = [1];\n    v.iter().for_each(|x| { helper(x); });\n}\nfn helper(x: &i32) {}\n";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        assert!(
+            fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "helper"),
+            "call inside closure should attribute to the enclosing fn"
+        );
+    }
+
+    #[test]
+    fn calls_inside_python_lambda_attributed_to_enclosing_fn() {
+        // F1 (Python): a call inside a lambda folds into the enclosing def.
+        let src = "def outer():\n    return list(map(lambda x: helper(x), [1, 2]))\n\ndef helper(x):\n    return x\n";
+        let fg = parse_file("src/a.py", src, Lang::Python);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        assert!(
+            fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "helper"),
+            "call inside lambda should attribute to the enclosing def"
+        );
+    }
+
+    #[test]
+    fn calls_inside_js_inline_callback_attributed_to_enclosing_fn() {
+        // F1 (JS): an inline arrow callback is not its own symbol, so its calls
+        // fold into the enclosing function; a `const f = () => …` still gets its
+        // own attribution (no double count).
+        let src = "function outer() {\n  [1].forEach((x) => { helper(x); });\n}\nfunction helper(x) {}\n";
+        let fg = parse_file("src/a.js", src, Lang::JavaScript);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        assert!(
+            fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "helper"),
+            "call inside inline arrow should attribute to the enclosing fn"
+        );
+    }
+
+    #[test]
+    fn calls_inside_rust_macros_extracted() {
+        // F2: calls written inside macro token-trees must appear in the graph,
+        // and the macro names themselves must not be recorded as calls.
+        let src = "fn outer() {\n    println!(\"{}\", compute());\n    assert_eq!(f(), g());\n}\nfn compute() -> i32 { 0 }\nfn f() -> i32 { 0 }\nfn g() -> i32 { 0 }\n";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        for callee in ["compute", "f", "g"] {
+            assert!(
+                fg.edges
+                    .iter()
+                    .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == callee),
+                "macro-internal call `{callee}` should be extracted"
+            );
+        }
+        assert!(
+            !fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Call && (e.dst == "println" || e.dst == "assert_eq")),
+            "macro names must not be recorded as calls"
+        );
+    }
+
+    #[test]
+    fn grouped_aliased_glob_use_expands_to_individual_import_edges() {
+        let src = "\
+use std::collections::{HashMap, HashSet};
+use std::io::Write as _W;
+use crate::foo::*;
+use serde::{self, Serialize};
+fn a() {}
+";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let imports: Vec<&str> = fg
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Import)
+            .map(|e| e.dst.as_str())
+            .collect();
+        // Grouped `use` → one edge per module (not one literal `{…}` string).
+        assert!(imports.contains(&"std::collections::HashMap"), "{imports:?}");
+        assert!(imports.contains(&"std::collections::HashSet"), "{imports:?}");
+        // Aliased `use` → the path, with the alias dropped.
+        assert!(imports.contains(&"std::io::Write"), "{imports:?}");
+        assert!(!imports.iter().any(|p| p.contains(" as ")), "alias must be dropped: {imports:?}");
+        // Glob `use` → the module itself, no trailing `*`.
+        assert!(imports.contains(&"crate::foo"), "{imports:?}");
+        assert!(!imports.iter().any(|p| p.contains('*')), "no glob star: {imports:?}");
+        // `self` in a group → the module itself.
+        assert!(imports.contains(&"serde"), "{imports:?}");
+        assert!(imports.contains(&"serde::Serialize"), "{imports:?}");
+        // Nothing left unexpanded.
+        assert!(!imports.iter().any(|p| p.contains('{')), "no unexpanded group: {imports:?}");
+    }
+
+    #[test]
+    fn macro_pattern_constructors_not_recorded_as_calls() {
+        // Inside macros, PascalCase variant/tuple-struct patterns & constructors
+        // must NOT become call edges, but real snake_case calls still must.
+        let src = "\
+fn outer() {
+    assert!(matches!(opt, Some(_)));
+    assert!(matches!(res, Ok(_)));
+    let _ = vec![Foo(1), Bar(2)];
+    println!(\"{}\", compute());
+}
+fn compute() -> i32 { 0 }
+";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        assert!(
+            fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "compute"),
+            "real snake_case call must still be recovered"
+        );
+        for bogus in ["Some", "Ok", "Foo", "Bar"] {
+            assert!(
+                !fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.dst == bogus),
+                "PascalCase `{bogus}` (a pattern/constructor) must not be a call edge"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_calls_dedup_to_one_edge_but_keep_distinct_sites() {
+        let src = "fn a() { log(); log(); log(); }\nfn log() {}\n";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let a = fg.symbols.iter().find(|s| s.name == "a").unwrap();
+        let log_edges = fg
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Call && e.src == a.id && e.dst == "log")
+            .count();
+        assert_eq!(log_edges, 1, "three calls to log() collapse to one Call edge");
+        // The three distinct call sites (different columns) remain as references.
+        let log_refs = fg.references.iter().filter(|r| r.name == "log").count();
+        assert_eq!(log_refs, 3, "distinct call sites stay as distinct references");
     }
 
     #[test]

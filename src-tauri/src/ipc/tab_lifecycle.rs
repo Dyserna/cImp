@@ -507,16 +507,12 @@ pub async fn create_ai_tab_in_worktree(
         _ => state.launch.cwd.clone(),
     };
 
-    let wt_path = workbench
-        .worktree_create(&root_path, &slug)
-        .await
-        .map_err(|e| TabLifecycleError::internal(format!("create worktree: {e}")))?;
-
-    // Clone the template's AI config, same rule as `create_ai_tab`: the
-    // worktree-tab affordance only appears on AI tabs, so a missing entry or
-    // a Shell template is a malformed request. Unlike `create_ai_tab`, a
-    // failure past this point does NOT roll back the worktree — see this
-    // function's doc comment.
+    // Validate the template BEFORE creating the worktree. Same rule as
+    // `create_ai_tab`: the worktree-tab affordance only appears on AI tabs, so
+    // a missing entry or a Shell template is a malformed request. This read has
+    // no side effects, so doing it first means an invalid template can't orphan
+    // a freshly-created branch + worktree dir on disk. (Failures *past* the
+    // `worktree_create` below still don't roll back — see the doc comment.)
     let mut cfg = {
         let snap = state.settings.current();
         let entry = snap.find_tab(template.as_str()).ok_or_else(|| {
@@ -529,6 +525,11 @@ pub async fn create_ai_tab_in_worktree(
             TabConfig::Shell(_) | TabConfig::Preview(_) => return Err(TabLifecycleError::WrongKind),
         }
     };
+
+    let wt_path = workbench
+        .worktree_create(&root_path, &slug)
+        .await
+        .map_err(|e| TabLifecycleError::internal(format!("create worktree: {e}")))?;
 
     let tab = TabId::Ai(format!("ai-{}", Uuid::new_v4()));
     let base_name = format!("⑂ {slug}: {}", cfg.name);

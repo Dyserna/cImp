@@ -212,10 +212,14 @@ pub async fn pty_write(
     let registry = state.tabs.lock().await;
 
     let existing = {
+        // The counter is only the idle-Listening heuristic; a poisoned lock
+        // must NOT gate input delivery, or a prior panic would silently drop
+        // all keystrokes for the rest of the session. Recover the inner value
+        // (matches the poison-recovery pattern used in `tts_stop`/`mutate`).
         let map = state
             .input_lengths
             .read()
-            .map_err(|e| AppError::Pty(format!("input_lengths poisoned: {e}")))?;
+            .unwrap_or_else(|e| e.into_inner());
         map.get(&tab).cloned()
     };
     let len_counter = match existing {
@@ -231,7 +235,7 @@ pub async fn pty_write(
             let mut map = state
                 .input_lengths
                 .write()
-                .map_err(|e| AppError::Pty(format!("input_lengths poisoned: {e}")))?;
+                .unwrap_or_else(|e| e.into_inner());
             map.entry(tab.clone())
                 .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)))
                 .clone()

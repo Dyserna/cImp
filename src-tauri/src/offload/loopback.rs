@@ -346,6 +346,7 @@ async fn handle_conn(
         ("POST", "/context/retrieve") => handle_context_retrieve(&mut stream, &app, &req).await,
         ("POST", "/context/compaction") => handle_context_compaction(&mut stream, &app, &req).await,
         ("POST", "/context/should_read") => handle_should_read(&mut stream, &app, &req).await,
+        ("POST", "/context/post_edit") => handle_post_edit(&mut stream, &app, &req).await,
         ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
@@ -628,6 +629,13 @@ async fn handle_context_retrieve(
     if let Some(map) = graph.session_greeting(&cwd, body.session_id.as_deref()) {
         text = if text.is_empty() { map } else { format!("{map}\n\n{text}") };
     }
+    // V12 Phase F: drain any auto-check block a slow post-edit run parked for
+    // this session (see `GraphService::post_edit`'s budget/park path) — a
+    // turn is never blocked waiting for a check, but its result still reaches
+    // the model on the very next opportunity.
+    if let Some(pending) = graph.drain_auto_check(body.session_id.as_deref()) {
+        text = if text.is_empty() { pending } else { format!("{text}\n\n{pending}") };
+    }
     let tokens_est = text.chars().count() / 4;
     write_json(
         stream,
@@ -727,6 +735,53 @@ async fn handle_should_read(stream: &mut TcpStream, app: &AppHandle, req: &Reque
         }
         None => write_json(stream, 200, &pass).await,
     }
+}
+
+/// A `POST /context/post_edit` request body (the Claude `PostToolUse` shim, or
+/// the OpenCode plugin's `tool.execute.after` hook).
+#[derive(Deserialize)]
+struct ContextPostEditBody {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    file_path: String,
+    /// Recorded for symmetry with the shim's payload; not currently branched
+    /// on (the matcher/plugin already scope this to edit-class tools).
+    #[serde(default)]
+    #[allow(dead_code)]
+    tool_name: Option<String>,
+}
+
+/// `POST /context/post_edit` (V12 Phase F): debounce this session's edits, run
+/// the project's configured checks single-flight per root, diff against the
+/// session's own baseline, and return only NEW/worsened diagnostics (plus an
+/// optional auto-impact note) as `{ ok, text }`. Fails open to empty text on
+/// any missing state — the hook must never block or perturb an edit.
+async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
+    let empty = serde_json::json!({ "ok": true, "text": "" });
+    let body: ContextPostEditBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return write_json(stream, 200, &empty).await;
+    };
+    let graph = graph.inner().clone();
+    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let text = graph
+        .post_edit(&cwd, body.session_id.as_deref(), &body.file_path)
+        .await
+        .unwrap_or_default();
+    write_json(stream, 200, &serde_json::json!({ "ok": true, "text": text })).await
 }
 
 /// A `POST /memory/event` request body (the OpenCode plugin's tool hook — the

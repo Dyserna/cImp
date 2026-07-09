@@ -670,6 +670,17 @@ export interface GraphSettings {
   memory_distillation: boolean;
   // V12 Phase E: promote PINNED facts into launch-time guidance.
   promote_pinned_facts: boolean;
+  // V12 Phase F: proactive automation.
+  /// Auto-run configured checks after an edit (`PostToolUse` hook) and inject
+  /// only NEW/worsened diagnostics. Opt-in; needs `checks` non-empty.
+  auto_check: boolean;
+  /// Debounce window (seconds) coalescing a burst of edits into one run.
+  auto_check_debounce_s: number;
+  /// Minimum direct inbound call count before the auto-impact note appends.
+  auto_impact_min_dependents: number;
+  /// Re-run dead-exports/import-cycles after each index pass and badge the
+  /// Analyses section when the counts changed. On by default (read-only).
+  analyses_auto: boolean;
 }
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
@@ -1182,6 +1193,10 @@ export function defaultSettings(): Settings {
       context_llm_digests: false,
       memory_distillation: false,
       promote_pinned_facts: false,
+      auto_check: false,
+      auto_check_debounce_s: 5,
+      auto_impact_min_dependents: 10,
+      analyses_auto: true,
     },
     checks: [],
     enabled_ai_tabs: ['claude'],

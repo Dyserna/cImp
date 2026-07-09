@@ -10,8 +10,9 @@
 /// V11–V14 == 3: `symbol.is_test` (the sole column change) forces one rebuild;
 /// every other new relation in this roadmap (`injected`, `digest`,
 /// `code_chunk`/`code_vec`, `commit_touch`, `project_fact`, `session_distilled`,
-/// `usage_stat`) is additive create-if-missing and needs no bump. The bump is
-/// front-loaded here so the whole V11→V14 roadmap costs users a single rebuild.
+/// `meta`, `usage_stat`) is additive create-if-missing and needs no bump. The
+/// bump is front-loaded here so the whole V11→V14 roadmap costs users a
+/// single rebuild.
 pub const GRAPH_SCHEMA_VERSION: i64 = 3;
 
 /// `(name, create-script)` for every stored relation. Order matters only in

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ignore::gitignore::Gitignore;
 use ignore::WalkBuilder;
@@ -197,6 +197,14 @@ pub struct GraphService {
     /// and an identical (path, hash) can occur in two of them. Also caps
     /// concurrent jobs (demand-driven + slot-gated by the supervisor).
     digest_inflight: StdMutex<HashSet<(PathBuf, String, String)>>,
+    /// V12 Phase F: per-session auto-check debounce/baseline/pending state
+    /// (`/context/post_edit`). Keyed by session id — never by root, so two
+    /// agents editing the same project each get their own "what's new" view
+    /// (V10 session scoping).
+    auto_check_sessions: StdMutex<HashMap<String, crate::checks::auto::AutoCheckState>>,
+    /// V12 Phase F: the single-flight check runner shared by every session —
+    /// see `checks::auto::RootRunner`'s doc comment.
+    auto_check_runner: crate::checks::auto::RootRunner,
 }
 
 /// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
@@ -276,6 +284,8 @@ impl GraphService {
             post_compaction: StdMutex::new(HashSet::new()),
             reminded: StdMutex::new(HashSet::new()),
             digest_inflight: StdMutex::new(HashSet::new()),
+            auto_check_sessions: StdMutex::new(HashMap::new()),
+            auto_check_runner: crate::checks::auto::RootRunner::new(),
         })
     }
 
@@ -1062,6 +1072,236 @@ impl GraphService {
         g.enabled && g.context_injection
     }
 
+    // ── V12 Phase F: proactive automation (`/context/post_edit`) ─────────
+
+    /// The client-facing budget for one `post_edit` call: run(s) that finish
+    /// within this window return their result immediately; a slower run keeps
+    /// going in the background and its result is PARKED for the next
+    /// `post_edit`/`/context/retrieve` call to drain (see
+    /// [`Self::drain_auto_check`]). Generous relative to the hook shim's own
+    /// ~600 ms socket timeout would allow, but the shim's timeout is the real
+    /// backstop — this just avoids obviously wasting the budget on a run that
+    /// was never going to make it (most real checkers take seconds).
+    const POST_EDIT_BUDGET_MS: u64 = 800;
+
+    /// V12 Phase F (6a/6b) — the `/context/post_edit` route's core. Debounces
+    /// this session's edits (`auto_check_debounce_s`), runs the project's
+    /// configured checks single-flight per root, diffs the result against the
+    /// session's OWN baseline (never another session's — V10 scoping), and
+    /// appends an auto-impact blast-radius note when the edited file's
+    /// symbols are heavily depended on. Fail-open/non-blocking throughout:
+    /// disabled settings, no checks configured, a missing session id, or a
+    /// slow run all yield `None` now (a slow run's result is parked instead —
+    /// drained by the next call).
+    pub async fn post_edit(
+        self: &Arc<Self>,
+        root: &Path,
+        session_id: Option<&str>,
+        file_path: &str,
+    ) -> Option<String> {
+        let settings = self.settings.current();
+        if !settings.graph.enabled || !settings.graph.auto_check || settings.checks.is_empty() {
+            return None;
+        }
+        let sid = session_id.filter(|s| !s.is_empty())?.to_string();
+        let debounce = Duration::from_secs(settings.graph.auto_check_debounce_s.max(1) as u64);
+
+        let run_now = {
+            let mut sessions = self.auto_check_sessions.lock().unwrap();
+            let st = sessions.entry(sid.clone()).or_default();
+            crate::checks::auto::should_run(st, Instant::now(), debounce)
+        };
+        if !run_now {
+            return self.drain_auto_check(Some(&sid));
+        }
+
+        let root_buf = root.to_path_buf();
+        let defs = settings.checks.clone();
+        let this = self.clone();
+        let mut handle =
+            tokio::spawn(async move { this.auto_check_runner.run(&root_buf, &defs).await });
+
+        tokio::select! {
+            res = &mut handle => {
+                let reports = res.unwrap_or_default();
+                self.finish_post_edit(&sid, root, file_path, reports, false)
+            }
+            _ = tokio::time::sleep(Duration::from_millis(Self::POST_EDIT_BUDGET_MS)) => {
+                // Slow: let the run keep going in the background and park its
+                // (diffed) result for the next call to pick up. The turn is
+                // never blocked on it.
+                let this2 = self.clone();
+                let sid2 = sid.clone();
+                let root2 = root.to_path_buf();
+                let file2 = file_path.to_string();
+                tokio::spawn(async move {
+                    if let Ok(reports) = handle.await {
+                        this2.finish_post_edit(&sid2, &root2, &file2, reports, true);
+                    }
+                });
+                None
+            }
+        }
+    }
+
+    /// Diff `reports` against `sid`'s baseline (updating it to the fresh
+    /// result regardless of what's surfaced), append the auto-impact note,
+    /// record one Activity event per non-empty injection, and either return
+    /// the block (`park = false`, the fast path) or stash it in the session's
+    /// `pending` slot (`park = true`, drained by the next call).
+    fn finish_post_edit(
+        self: &Arc<Self>,
+        sid: &str,
+        root: &Path,
+        file_path: &str,
+        reports: Vec<crate::checks::CheckReport>,
+        park: bool,
+    ) -> Option<String> {
+        let cap_chars = 1500usize;
+        let mut per_check: Vec<(String, Vec<crate::checks::DiagGroup>)> = Vec::new();
+        {
+            let mut sessions = self.auto_check_sessions.lock().unwrap();
+            let st = sessions.entry(sid.to_string()).or_default();
+            for report in &reports {
+                let baseline = st.baseline.entry(report.name.clone()).or_default();
+                let new_groups: Vec<crate::checks::DiagGroup> =
+                    crate::checks::auto::diff_groups(baseline, &report.groups)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                per_check.push((report.name.clone(), new_groups));
+            }
+            // Update the baseline to this run's full result regardless of what
+            // was surfaced — the session has now effectively "seen" it.
+            for report in &reports {
+                st.baseline
+                    .insert(report.name.clone(), crate::checks::auto::to_baseline(&report.groups));
+            }
+        }
+        let per_check_refs: Vec<(&str, Vec<&crate::checks::DiagGroup>)> = per_check
+            .iter()
+            .map(|(name, groups)| (name.as_str(), groups.iter().collect()))
+            .collect();
+        let mut block = crate::checks::auto::format_diff_block(&per_check_refs, cap_chars);
+
+        if let Some(note) = self.auto_impact_note(root, file_path) {
+            if block.is_empty() {
+                block = note;
+            } else {
+                block.push('\n');
+                block.push_str(&note);
+            }
+        }
+
+        if block.is_empty() {
+            return None;
+        }
+
+        // Activity: one event per injection — the graduation evidence for
+        // milestone Decision 4 (whether auto-check injections correlate with
+        // a same-turn fix).
+        super::activity::record(super::activity::GraphCall {
+            ts_ms: super::activity::now_ms(),
+            source: "auto_check".to_string(),
+            tool: "auto_check".to_string(),
+            target: file_path.to_string(),
+            chars: block.chars().count(),
+            ms: 0,
+            ok: true,
+        });
+
+        if park {
+            let mut sessions = self.auto_check_sessions.lock().unwrap();
+            sessions.entry(sid.to_string()).or_default().pending = Some(block);
+            None
+        } else {
+            Some(block)
+        }
+    }
+
+    /// V12 Phase F (6b) — the auto-impact blast-radius note for an edit to
+    /// `file_path`: every symbol the edited file DEFINES (its outline) whose
+    /// direct inbound call count (`callers_count`) meets
+    /// `auto_impact_min_dependents` gates the note; the note's own numbers are
+    /// the wider transitive dependents/files/tests counts. `None` when the
+    /// graph is unavailable, the file isn't indexed, or nothing meets the
+    /// threshold.
+    fn auto_impact_note(&self, root: &Path, file_path: &str) -> Option<String> {
+        let g = self.settings.current().graph;
+        let idx = self.index_for(root).ok()?;
+        let rel = relativize_path(root, file_path);
+        if rel.is_empty() {
+            return None;
+        }
+        let outline = idx.outline(&rel).ok()?;
+        if outline.is_empty() {
+            return None;
+        }
+        let min_dependents = g.auto_impact_min_dependents as u64;
+        let mut max_callers: u64 = 0;
+        let mut names: Vec<String> = Vec::new();
+        for s in &outline {
+            let callers = idx.callers_count(&s.name).unwrap_or(0);
+            max_callers = max_callers.max(callers);
+            if callers >= min_dependents {
+                names.push(s.name.clone());
+            }
+        }
+        if names.is_empty() {
+            return None;
+        }
+        names.sort();
+        names.dedup();
+        let max = g.max_rows_per_query.max(1) as usize;
+        let dependents = idx.dependents_transitive(&names, 3, max).ok()?;
+        let files: HashSet<&str> = dependents.iter().map(|d| d.symbol.file.as_str()).collect();
+        let tests = idx.tests_for(&names, 3, max).unwrap_or_default();
+        crate::checks::auto::impact_note(max_callers, dependents.len(), files.len(), tests.len(), min_dependents)
+    }
+
+    /// Drain (take) `session_id`'s parked auto-check block, if any — called
+    /// from `post_edit` (a coalesced call) and from `/context/retrieve` so a
+    /// slow check's result is never lost, only delayed. `None` for an unknown
+    /// session id or an empty session id.
+    pub fn drain_auto_check(&self, session_id: Option<&str>) -> Option<String> {
+        let sid = session_id.filter(|s| !s.is_empty())?;
+        self.auto_check_sessions
+            .lock()
+            .unwrap()
+            .get_mut(sid)
+            .and_then(|st| st.pending.take())
+    }
+
+    // ── V12 Phase F (6c): analyses-auto trigger ───────────────────────────
+
+    /// Run `dead_exports` + `import_cycles` for `root` (bounded, read-only on
+    /// the warm index — cheap) and emit `graph-analyses` when the counts
+    /// changed since the last completed pass. Called at the end of every
+    /// completed index pass ([`Self::spawn_rebuild`]'s success handler and
+    /// [`Self::reindex_paths`]'s "changed > 0" branch), same spot as the
+    /// distillation sweep. No-op when `analyses_auto` is off.
+    fn run_analyses_trigger(&self, root: &Path) {
+        if !self.settings.current().graph.analyses_auto {
+            return;
+        }
+        let Ok(idx) = self.index_for(root) else { return };
+        let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
+        let dead = idx.dead_exports(max).map(|v| v.len()).unwrap_or(0);
+        let cycles = idx.import_cycles(max).map(|v| v.len()).unwrap_or(0);
+        const KEY: &str = "analyses_counts";
+        let prev = idx.get_meta(KEY).ok().flatten();
+        let cur = format!("{dead},{cycles}");
+        if analyses_changed(prev.as_deref(), &cur) {
+            let _ = idx.put_meta(KEY, &cur);
+            let payload = serde_json::json!({
+                "root": root.display().to_string(),
+                "dead_exports": dead,
+                "import_cycles": cycles,
+            });
+            let _ = self.app.emit("graph-analyses", &payload);
+        }
+    }
+
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns
     /// immediately; progress lands on the `graph-status` event and via
     /// [`status`](Self::status). A no-op (logged) when a build for this root is
@@ -1119,6 +1359,12 @@ impl GraphService {
                         // V12 Phase E: opportunistic idle-session distillation
                         // sweep (no-op when the setting is off or nothing's idle).
                         this.spawn_distillation_sweep(root.clone());
+                        // V12 Phase F (6c): re-check dead-exports/import-cycles
+                        // counts and badge the Analyses UI when they changed
+                        // (no-op when `analyses_auto` is off). Cheap, read-only
+                        // on the just-built index; runs inline on this worker
+                        // thread like the status bookkeeping above.
+                        this.run_analyses_trigger(&root);
                     }
                     Err(e) => {
                         warn!(root = %root.display(), error = %e, "graph: rebuild failed");
@@ -1292,6 +1538,9 @@ impl GraphService {
             // V12 Phase E: opportunistic idle-session distillation sweep
             // (no-op when the setting is off or nothing's idle).
             self.spawn_distillation_sweep(root.to_path_buf());
+            // V12 Phase F (6c): same analyses-auto trigger as a full rebuild —
+            // cheap on the just-updated index, already on the watcher thread.
+            self.run_analyses_trigger(root);
         }
     }
 
@@ -1636,6 +1885,16 @@ impl GraphService {
         self.watchers.lock().unwrap().clear();
         self.indices.lock().unwrap().clear();
     }
+}
+
+/// V12 Phase F (6c): pure gate for [`GraphService::run_analyses_trigger`] —
+/// whether the freshly computed counts (`cur`, the `"{dead},{cycles}"` string)
+/// differ from what was last stored (`prev`). Factored out so "the event
+/// fires only when counts changed" is testable without a `GraphIndex`/
+/// `AppHandle`. `None` (nothing stored yet) always counts as a change — the
+/// first successful pass this project has ever run IS new information.
+fn analyses_changed(prev: Option<&str>, cur: &str) -> bool {
+    prev != Some(cur)
 }
 
 /// Make a `&str` `path` project-relative to `root` with `/` separators (empty in
@@ -2136,5 +2395,17 @@ mod tests {
         let only_rust = vec!["rust".to_string()];
         assert_eq!(lang_for(&PathBuf::from("a.py"), &only_rust), None);
         assert_eq!(lang_for(&PathBuf::from("a.rs"), &only_rust), Some(Lang::Rust));
+    }
+
+    /// V12 Phase F (6c): the `graph-analyses` event only fires when the
+    /// dead-exports/import-cycles counts actually changed since the last
+    /// stored pass — first-ever pass (`None` stored) counts as a change, an
+    /// identical repeat does not, and any different count does.
+    #[test]
+    fn analyses_changed_only_on_first_seen_or_different_counts() {
+        assert!(analyses_changed(None, "3,1"), "first pass is always new information");
+        assert!(!analyses_changed(Some("3,1"), "3,1"), "identical counts: no event");
+        assert!(analyses_changed(Some("3,1"), "4,1"), "dead-export count grew");
+        assert!(analyses_changed(Some("3,1"), "3,0"), "cycle count shrank — still a change");
     }
 }

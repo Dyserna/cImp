@@ -12,6 +12,7 @@ mod logging;
 mod notifications;
 mod oob;
 mod offload;
+mod postedit_hook;
 mod process_guard;
 mod processing;
 mod pty;
@@ -116,6 +117,18 @@ fn main() {
     // on any error, so it never wrongly blocks a read.
     if std::env::args().skip(1).any(|a| a == "--read-hook") {
         read_hook::run();
+        return;
+    }
+
+    // V12 Phase F: Claude Code invokes `cimp --postedit-hook` as a
+    // `PostToolUse` (matcher `Edit|Write|MultiEdit`) hook right after an edit
+    // completes. It POSTs to the app's loopback `/context/post_edit` (which
+    // debounces, runs the project's configured checks, and diffs against the
+    // session's baseline) and prints only NEW/worsened diagnostics as
+    // additional context. GUI-free like the other shims; prints nothing on
+    // any error, so it never blocks or perturbs an edit.
+    if std::env::args().skip(1).any(|a| a == "--postedit-hook") {
+        postedit_hook::run();
         return;
     }
 

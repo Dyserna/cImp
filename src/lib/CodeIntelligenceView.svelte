@@ -27,6 +27,7 @@
     graphFactAdd,
     graphContextPreview,
     onGraphStatus,
+    onGraphAnalyses,
     type EmbedderProbe,
     type GraphCall,
     type GraphStatus,
@@ -125,11 +126,33 @@
   let analysisBusy = $state<'dead' | 'cycles' | 'impact' | null>(null);
   let analysisError = $state<string | null>(null);
 
+  // V12 Phase F (6c): live counts from the `graph-analyses` event (the
+  // analyses-auto trigger) vs. the counts the user last actually VIEWED
+  // (`analysesAck*`) — the difference badges the section tab + buttons
+  // ("+N since last pass"). The first event this session seeds the ack
+  // baseline too, so a project with a long-standing backlog doesn't flash a
+  // huge badge the moment the tab opens — only genuine growth counts.
+  let analysesLive = $state<{ dead: number; cycles: number } | null>(null);
+  let analysesAckDead = $state<number | null>(null);
+  let analysesAckCycles = $state<number | null>(null);
+  let deadBadge = $derived(
+    analysesLive && analysesAckDead !== null && analysesLive.dead > analysesAckDead
+      ? analysesLive.dead - analysesAckDead
+      : null,
+  );
+  let cyclesBadge = $derived(
+    analysesLive && analysesAckCycles !== null && analysesLive.cycles > analysesAckCycles
+      ? analysesLive.cycles - analysesAckCycles
+      : null,
+  );
+  let analysesBadgeTotal = $derived((deadBadge ?? 0) + (cyclesBadge ?? 0));
+
   async function runDeadExports(): Promise<void> {
     analysisBusy = 'dead';
     analysisError = null;
     try {
       deadExports = await graphDeadExports();
+      analysesAckDead = analysesLive?.dead ?? deadExports.length;
     } catch (e) {
       analysisError = String(e);
     } finally {
@@ -142,6 +165,7 @@
     analysisError = null;
     try {
       cycles = await graphCycles();
+      analysesAckCycles = analysesLive?.cycles ?? cycles.length;
     } catch (e) {
       analysisError = String(e);
     } finally {
@@ -351,6 +375,14 @@
   // Registered at component init (not in the async onMount) so its teardown is
   // armed before any await — avoids the unmount-during-await listener leak.
   listenManaged(() => onGraphStatus(upsert));
+  // V12 Phase F (6c): analyses-auto trigger badges (see the state block above).
+  listenManaged(() =>
+    onGraphAnalyses((a) => {
+      if (analysesAckDead === null) analysesAckDead = a.dead_exports;
+      if (analysesAckCycles === null) analysesAckCycles = a.import_cycles;
+      analysesLive = { dead: a.dead_exports, cycles: a.import_cycles };
+    }),
+  );
 
   onMount(async () => {
     await refresh();
@@ -430,7 +462,7 @@
             refreshFacts();
           }
         }}
-      >{s.label}</button>
+      >{s.label}{#if s.id === 'analyses' && analysesBadgeTotal > 0}<span class="badge" title="New since last pass">+{analysesBadgeTotal}</span>{/if}</button>
     {/each}
   </nav>
 
@@ -712,10 +744,10 @@
     <div class="analyses">
       <div class="actions">
         <button onclick={runDeadExports} disabled={analysisBusy !== null}>
-          {analysisBusy === 'dead' ? 'Scanning…' : 'Find dead exports'}
+          {analysisBusy === 'dead' ? 'Scanning…' : 'Find dead exports'}{#if deadBadge}<span class="badge" title="New since last pass">+{deadBadge}</span>{/if}
         </button>
         <button onclick={runCycles} disabled={analysisBusy !== null}>
-          {analysisBusy === 'cycles' ? 'Scanning…' : 'Find import cycles'}
+          {analysisBusy === 'cycles' ? 'Scanning…' : 'Find import cycles'}{#if cyclesBadge}<span class="badge" title="New since last pass">+{cyclesBadge}</span>{/if}
         </button>
         <button onclick={runImpact} disabled={analysisBusy !== null}>
           {analysisBusy === 'impact' ? 'Scanning…' : 'Impact of working-tree changes'}
@@ -911,6 +943,20 @@
     color: #fff;
     opacity: 1;
     border-color: var(--accent, #3b6ea5);
+  }
+  /* V12 Phase F (6c): "+N since last pass" badge on the Analyses tab + its
+     buttons — a small pill, never wraps, doesn't disturb button sizing. */
+  .badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: 999px;
+    background: var(--warn, #c9820a);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 16px;
+    vertical-align: middle;
   }
   .probe {
     display: flex;

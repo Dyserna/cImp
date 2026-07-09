@@ -132,6 +132,20 @@ export function onGraphStatus(cb: (status: GraphStatus) => void): Promise<Unlist
   return listen<GraphStatus>('graph-status', (e) => cb(e.payload));
 }
 
+/// V12 Phase F (6c): the analyses-auto trigger's live counts, emitted only
+/// when they changed since the last completed index pass.
+export interface GraphAnalyses {
+  root: string;
+  dead_exports: number;
+  import_cycles: number;
+}
+
+/// Subscribe to `graph-analyses` (fires only on a count change, per-root).
+/// Drives the Analyses section's "+N since last pass" badges.
+export function onGraphAnalyses(cb: (a: GraphAnalyses) => void): Promise<UnlistenFn> {
+  return listen<GraphAnalyses>('graph-analyses', (e) => cb(e.payload));
+}
+
 /// V10 (Analyses): one candidate dead export. Mirror of Rust `DeadExportRow`.
 export interface DeadExportRow {
   name: string;

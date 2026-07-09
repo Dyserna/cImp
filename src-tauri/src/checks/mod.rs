@@ -13,6 +13,7 @@
 //! root and a [`CheckDef`], nothing graph-shaped. The `graph::mcp` tool
 //! surface just happens to be where cloud-agent tools live in this codebase.
 
+pub mod auto;
 pub mod gitls;
 pub mod parsers;
 

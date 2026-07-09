@@ -1010,6 +1010,30 @@ pub struct GraphSettings {
     /// tool calls. Off by default. Launch-time only: a fact pinned mid-session
     /// applies on the tab's next launch.
     pub promote_pinned_facts: bool,
+
+    // --- V12 Phase F: proactive automation ---
+    /// Auto-run the project's configured checks after an edit (`PostToolUse`
+    /// hook → `/context/post_edit`) and inject only NEW/worsened diagnostics
+    /// as additional context — the agent learns it broke something in the
+    /// same turn instead of three turns later. Strictly opt-in — it's a
+    /// behavior hook, same posture as `read_advisor`. Off by default; needs
+    /// `checks` non-empty to do anything.
+    pub auto_check: bool,
+    /// Debounce window (seconds): edits inside this window since the last
+    /// triggered run are coalesced (no new run); the run then covers
+    /// everything the burst touched, since checks run against the file system
+    /// state, not a specific edit.
+    pub auto_check_debounce_s: u32,
+    /// Minimum DIRECT inbound call count (`graph_callers`'s count) an edited
+    /// file's symbol must have before the same hook appends a two-line
+    /// blast-radius note (6b) — the moments an agent most needs impact
+    /// analysis are exactly the moments it doesn't think to ask for it.
+    pub auto_impact_min_dependents: u32,
+    /// Re-run `dead_exports`/`import_cycles` after every completed index pass
+    /// (bounded, read-only on the warm index — cheap) and badge the Analyses
+    /// section when the counts changed. On by default — unlike the other
+    /// Phase F toggles this doesn't change agent behavior, only a UI badge.
+    pub analyses_auto: bool,
 }
 
 impl GraphSettings {
@@ -1072,6 +1096,10 @@ impl Default for GraphSettings {
             context_llm_digests: false,
             memory_distillation: false,
             promote_pinned_facts: false,
+            auto_check: false,
+            auto_check_debounce_s: 5,
+            auto_impact_min_dependents: 10,
+            analyses_auto: true,
         }
     }
 }

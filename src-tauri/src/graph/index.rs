@@ -1660,6 +1660,12 @@ impl GraphIndex {
                 "session_distilled",
                 ":create session_distilled {session_id: String => distilled: Bool, ts_ms: Int}",
             ),
+            // V12 Phase F: a small generic key/value store — see `get_meta`/
+            // `put_meta` below. Additive, survives a graph rebuild.
+            (
+                "meta",
+                ":create meta {key: String => value: String}",
+            ),
         ];
         for (name, create) in defs {
             if !existing.contains(*name) {
@@ -2324,6 +2330,42 @@ impl GraphIndex {
         });
         out.truncate(max);
         Ok(out)
+    }
+
+    // ── V12 Phase F: small key/value store (`meta`) ──────────────────────
+    //
+    // Currently used only for the analyses-auto trigger's last-emitted counts
+    // (`analyses_counts`, see `GraphService::run_analyses_trigger`) so a
+    // rebuild only emits `graph-analyses` when the numbers actually changed —
+    // generic rather than a bespoke relation since a future feature needing
+    // one small persisted value can reuse it instead of adding another
+    // `:create`.
+
+    /// Read one `meta` key. `None` if unset (or the relation doesn't exist
+    /// yet — defensive, `ensure_memory_relations` always creates it on open).
+    pub fn get_meta(&self, key: &str) -> AppResult<Option<String>> {
+        if !self.existing_relations()?.contains("meta") {
+            return Ok(None);
+        }
+        let mut p = BTreeMap::new();
+        p.insert("key".to_string(), DataValue::Str(key.into()));
+        let rows = self.run(
+            "?[value] := *meta{key: k, value}, k == $key",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_str(r, 0)))
+    }
+
+    /// Upsert one `meta` key.
+    pub fn put_meta(&self, key: &str, value: &str) -> AppResult<()> {
+        self.put(
+            "?[key, value] <- $rows\n:put meta {key => value}",
+            vec![DataValue::List(vec![
+                DataValue::Str(key.into()),
+                DataValue::Str(value.into()),
+            ])],
+        )
     }
 }
 

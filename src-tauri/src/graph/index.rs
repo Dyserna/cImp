@@ -2280,10 +2280,13 @@ impl GraphIndex {
 
     /// Churn-ranked files touched within the last `days`, optionally filtered
     /// to a `path_prefix`, most-touched first (ties broken by most-recent) —
-    /// the engine behind `graph_recent_changes`. `commit_touch` is file-level
-    /// and expected to be small (one row per ever-touched file, not per
-    /// commit), so this scans it whole and filters/sorts in Rust rather than
-    /// pushing the "within N days" comparison into Datalog.
+    /// the engine behind `graph_recent_changes`. `commit_touch` is expected to
+    /// be small (one row per ever-touched file, not per commit) but is
+    /// unbounded in principle over a project's lifetime; the query itself is
+    /// bounded (`:order -last_ts :limit $max`, so it never scans/returns the
+    /// whole relation) rather than fetching everything and bounding only in
+    /// Rust. The `days`/`path_prefix` filtering and the final touches-first
+    /// sort still happen in Rust, over just the `max` newest-touched rows.
     pub fn recent_changes(
         &self,
         days: u32,
@@ -2293,10 +2296,14 @@ impl GraphIndex {
         if !self.existing_relations()?.contains("commit_touch") {
             return Ok(Vec::new());
         }
+        let mut p = BTreeMap::new();
+        p.insert("max".to_string(), int(max.max(1).min(u32::MAX as usize) as u32));
         let rows = self.run(
             "?[file, last_ts, last_subject, touches_90d] := \
-                *commit_touch{file, last_ts, last_subject, touches_90d}",
-            BTreeMap::new(),
+                *commit_touch{file, last_ts, last_subject, touches_90d}\n\
+             :order -last_ts\n\
+             :limit $max",
+            p,
             ScriptMutability::Immutable,
         )?;
         let cutoff = crate::graph::gitmeta::now_ts() - (days as i64) * 86_400;

@@ -704,7 +704,10 @@ async fn run_check_inner(root: &Path, settings: &crate::settings::Settings, args
     crate::checks::run(root, def, changed_only)
         .await
         .map(|report| fmt_check_report(&report, max_rows))
-        .map_err(|e| format!("run_check `{}` failed: {e}", def.name))
+        // V12 review: a check that fails to spawn/run must read as visibly
+        // broken, not silently absent — same wording as the auto-check
+        // aggregation path (`checks::auto::spawn_failure_line`).
+        .map_err(|e| crate::checks::auto::spawn_failure_line(&def.name, &e.to_string()))
 }
 
 /// Render a [`crate::checks::CheckReport`] compactly: a header line (exit

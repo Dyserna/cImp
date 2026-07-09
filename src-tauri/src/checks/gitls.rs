@@ -6,6 +6,15 @@
 //! is the same shape Phase B (`graph_impact`) will want for its diff→symbol
 //! mapping — promote to a shared module then if warranted, rather than
 //! guessing the abstraction now.
+//!
+//! Both spawns pass `-z`: without it, `git status --porcelain` collapses a
+//! wholly-untracked new directory into a single `?? dir/` entry (hiding the
+//! individual files inside it) and C-quotes any non-ASCII/special path
+//! (`"weird\\303\\251.rs"`). `-z` reports every untracked FILE on its own
+//! NUL-terminated record with no quoting at all (`--untracked-files=all`
+//! forces the per-file expansion; `-z` alone would still collapse the
+//! directory). Paths are therefore NUL-split below, never newline-split, and
+//! never quote-stripped.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -14,25 +23,29 @@ use std::process::Stdio;
 use crate::error::{AppError, AppResult};
 
 /// The union of files touched in `root`'s working tree since `HEAD`: tracked
-/// changes (`git diff --name-only HEAD`) plus untracked files (`git status
-/// --porcelain`'s `??` entries). Paths are project-relative, forward-slash
-/// normalized (git's own convention). `Err` when `root` isn't a git repo (or
-/// `git` isn't on PATH, or has no commits yet) — callers decide how to
-/// degrade; `checks::run` treats it as "don't filter".
+/// changes (`git diff --name-only -z HEAD`) plus untracked files (`git status
+/// --porcelain -z --untracked-files=all`'s `??` entries). Paths are
+/// project-relative, forward-slash normalized (git's own convention). `Err`
+/// when `root` isn't a git repo (or `git` isn't on PATH, or has no commits
+/// yet) — callers decide how to degrade; `checks::run` treats it as "don't
+/// filter".
 pub async fn changed_files(root: &Path) -> AppResult<HashSet<String>> {
     let mut set: HashSet<String> = HashSet::new();
-    for line in run_git(root, &["diff", "--name-only", "HEAD"]).await?.lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            set.insert(line.replace('\\', "/"));
+    let diff_out = run_git(root, &["diff", "--name-only", "-z", "HEAD"]).await?;
+    for part in diff_out.split('\0') {
+        if !part.is_empty() {
+            set.insert(part.replace('\\', "/"));
         }
     }
-    for line in run_git(root, &["status", "--porcelain"]).await?.lines() {
+    let status_out =
+        run_git(root, &["status", "--porcelain", "-z", "--untracked-files=all"]).await?;
+    for part in status_out.split('\0') {
         // Porcelain format: a 2-char status code, a space, then the path.
         // `??` marks untracked; everything else (tracked modifications) is
-        // already covered by the `diff` pass above.
-        if let Some(rest) = line.strip_prefix("?? ") {
-            set.insert(rest.trim().replace('\\', "/"));
+        // already covered by the `diff` pass above. With `-z` there's no
+        // trailing newline/quoting to trim off the path.
+        if let Some(rest) = part.strip_prefix("?? ") {
+            set.insert(rest.replace('\\', "/"));
         }
     }
     Ok(set)
@@ -101,6 +114,36 @@ mod tests {
         let changed = changed_files(&dir).await.expect("changed_files");
         assert!(changed.contains("tracked.rs"), "{changed:?}");
         assert!(changed.contains("untracked.rs"), "{changed:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wholly-untracked new directory must be seen as its individual files,
+    /// not collapsed to one `?? dir/` entry (the bug `-z
+    /// --untracked-files=all` fixes).
+    #[tokio::test]
+    async fn untracked_new_directory_lists_individual_files() {
+        let dir = std::env::temp_dir().join(format!("checks-gitls-newdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("newmod")).unwrap();
+        let git = |args: &[&str]| {
+            let out = StdCommand::new("git").args(args).current_dir(&dir).output().expect("git");
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("committed.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "committed.rs"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        // A brand-new, wholly-untracked directory with two files.
+        std::fs::write(dir.join("newmod").join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("newmod").join("b.rs"), "fn b() {}\n").unwrap();
+
+        let changed = changed_files(&dir).await.expect("changed_files");
+        assert!(!changed.contains("newmod/"), "{changed:?}");
+        assert!(changed.contains("newmod/a.rs"), "{changed:?}");
+        assert!(changed.contains("newmod/b.rs"), "{changed:?}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

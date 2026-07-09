@@ -142,6 +142,16 @@ pub fn impact_note(
     ))
 }
 
+/// Render a check's spawn/run failure as a visible one-line note (V12 review
+/// — a check that fails to spawn/run must never be indistinguishable from a
+/// clean run by simply vanishing from the result). Shared wording between
+/// [`RootRunner::run`]'s auto-check aggregation and the `run_check` tool's own
+/// error formatting (`graph::mcp::run_check_inner`), so the model reads the
+/// same shape whichever path surfaced it.
+pub fn spawn_failure_line(name: &str, err: &str) -> String {
+    format!("⚠ check `{name}` did not run: {err}")
+}
+
 /// Single-flight per-root check runner (V12 F2): concurrent callers for the
 /// SAME root share one run's result instead of each spawning the configured
 /// checks — a Claude tab and an OpenCode tab editing the same project at the
@@ -155,7 +165,7 @@ pub fn impact_note(
 #[derive(Default)]
 pub struct RootRunner {
     locks: StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
-    last: StdMutex<HashMap<PathBuf, (Instant, Vec<CheckReport>)>>,
+    last: StdMutex<HashMap<PathBuf, (Instant, Vec<CheckReport>, Vec<String>)>>,
 }
 
 impl RootRunner {
@@ -165,9 +175,13 @@ impl RootRunner {
 
     /// Run every configured check for `root` with `changed_only = true`
     /// (single-flight per root; see the struct doc). A check that fails to
-    /// spawn/run is simply omitted from the result — best-effort, so one bad
-    /// `CheckDef` doesn't blank out the rest.
-    pub async fn run(&self, root: &Path, defs: &[CheckDef]) -> Vec<CheckReport> {
+    /// spawn/run is dropped from the `Vec<CheckReport>` (one bad `CheckDef`
+    /// doesn't blank out the rest) but is NOT silently discarded — its
+    /// name/error lands in the returned `Vec<String>` (already formatted as
+    /// `"⚠ check \`<name>\` did not run: <err>"`), so a misconfigured check
+    /// reads as visibly broken rather than indistinguishable from "ran clean"
+    /// (V12 review — a spawn failure must never look green).
+    pub async fn run(&self, root: &Path, defs: &[CheckDef]) -> (Vec<CheckReport>, Vec<String>) {
         let lock = {
             let mut locks = self.locks.lock().unwrap();
             locks
@@ -177,22 +191,24 @@ impl RootRunner {
         };
         let waited_since = Instant::now();
         let _guard = lock.lock().await;
-        if let Some((ts, reports)) = self.last.lock().unwrap().get(root) {
+        if let Some((ts, reports, errors)) = self.last.lock().unwrap().get(root) {
             if *ts >= waited_since {
-                return reports.clone();
+                return (reports.clone(), errors.clone());
             }
         }
         let mut reports = Vec::with_capacity(defs.len());
+        let mut errors = Vec::new();
         for def in defs {
-            if let Ok(r) = run(root, def, true).await {
-                reports.push(r);
+            match run(root, def, true).await {
+                Ok(r) => reports.push(r),
+                Err(e) => errors.push(spawn_failure_line(&def.name, &e.to_string())),
             }
         }
         self.last
             .lock()
             .unwrap()
-            .insert(root.to_path_buf(), (Instant::now(), reports.clone()));
-        reports
+            .insert(root.to_path_buf(), (Instant::now(), reports.clone(), errors.clone()));
+        (reports, errors)
     }
 }
 
@@ -361,7 +377,21 @@ mod tests {
         let h2 = tokio::spawn(async move { r2.run(&root2, &defs2).await });
 
         let (res1, res2) = tokio::join!(h1, h2);
-        assert!(res1.unwrap().is_empty());
-        assert!(res2.unwrap().is_empty());
+        let (reports1, errors1) = res1.unwrap();
+        let (reports2, errors2) = res2.unwrap();
+        assert!(reports1.is_empty());
+        assert!(errors1.is_empty());
+        assert!(reports2.is_empty());
+        assert!(errors2.is_empty());
+    }
+
+    // ── spawn-failure visibility (V12 review) ───────────────────────────
+
+    #[test]
+    fn spawn_failure_line_is_visible_and_names_the_check() {
+        let line = spawn_failure_line("broken", "failed to spawn check `bogus`: not found");
+        assert!(line.starts_with("⚠ check"), "{line}");
+        assert!(line.contains("broken"), "{line}");
+        assert!(line.contains("not found"), "{line}");
     }
 }

@@ -89,6 +89,40 @@ pub fn session_weight(last_kind: &str) -> f64 {
     }
 }
 
+/// V12 review: the fact-boost false-match fix. `fact_text.contains(stem)`
+/// (the original implementation) spuriously fires whenever a candidate
+/// file's bare stem happens to be a substring of ordinary prose in a fact —
+/// e.g. a fact mentioning "in this context" boosting `context.rs`, or "the
+/// index page" boosting `index.rs`. `true` iff `stem` appears as a
+/// WHOLE WORD in `fact` — bounded by a non-alphanumeric/non-underscore
+/// character (or string start/end) on both sides, so `retry_backoff` matches
+/// "the retry_backoff logic is fragile" but not a longer identifier like
+/// `retry_backoff_v2`. Case-sensitive: file stems and the identifiers a fact
+/// names are both written in this codebase's own snake_case convention.
+fn fact_mentions_stem(fact: &str, stem: &str) -> bool {
+    if stem.is_empty() {
+        return false;
+    }
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+    fact.match_indices(stem).any(|(idx, matched)| {
+        let before_ok = fact[..idx].chars().next_back().map(|c| !is_word_char(c)).unwrap_or(true);
+        let end = idx + matched.len();
+        let after_ok = fact[end..].chars().next().map(|c| !is_word_char(c)).unwrap_or(true);
+        before_ok && after_ok
+    })
+}
+
+/// Generic module/file-organization stems that are also common in ordinary
+/// prose — so common that even a whole-word match (see
+/// [`fact_mentions_stem`]) isn't a reliable "this fact is about that file"
+/// signal. These are exactly the stems the V12 review flagged as spuriously
+/// matching (`mod.rs`, `lib.rs`, `index.rs`, `context.rs`, `service.rs`,
+/// `config.rs`) — excluded outright rather than relying on length alone,
+/// since several of them are already ≥ 4 characters.
+fn is_generic_stem(stem: &str) -> bool {
+    matches!(stem, "mod" | "lib" | "index" | "context" | "service" | "config")
+}
+
 /// Rank files for `prompt` and build the injectable digest. `session_files` is
 /// the current session's working set as `(project_relative_path, weight)` (empty
 /// when session inclusion is off). Budgets and the min-score gate come from
@@ -191,7 +225,10 @@ pub fn build_context(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
-            if !stem.is_empty() && facts.iter().any(|f| f.contains(stem)) {
+            if stem.chars().count() >= 4
+                && !is_generic_stem(stem)
+                && facts.iter().any(|f| fact_mentions_stem(f, stem))
+            {
                 *s += 2.0;
             }
         }
@@ -599,6 +636,47 @@ mod tests {
         assert!(extract_terms("  ??  ").is_empty());
     }
 
+    /// Mirrors the fact-boost gate in [`build_context`] (length ≥ 4, not a
+    /// generic stem, whole-word match) without needing a full graph index.
+    fn boosts(fact: &str, stem: &str) -> bool {
+        stem.chars().count() >= 4 && !is_generic_stem(stem) && fact_mentions_stem(fact, stem)
+    }
+
+    #[test]
+    fn fact_boost_rejects_generic_stem_but_accepts_distinctive_whole_word() {
+        // "context" is a whole-word match but a known generic/common stem —
+        // the boost must not fire for it (the V12 review's own example).
+        assert!(
+            !boosts("we chose FNV hashing in this context", "context"),
+            "a common word must not boost context.rs"
+        );
+        // A distinctive whole-word identifier should boost.
+        assert!(
+            boosts("the retry_backoff logic is fragile", "retry_backoff"),
+            "a distinctive whole-word identifier should boost retry_backoff.rs"
+        );
+    }
+
+    #[test]
+    fn fact_mentions_stem_is_whole_word_only() {
+        // Substring inside a longer identifier: no match.
+        assert!(!fact_mentions_stem("see retry_backoff_v2 for details", "retry_backoff"));
+        // Exact whole-word occurrence: matches.
+        assert!(fact_mentions_stem("see retry_backoff for details", "retry_backoff"));
+        // At string start/end (no surrounding non-word char needed there).
+        assert!(fact_mentions_stem("retry_backoff is fragile", "retry_backoff"));
+        assert!(fact_mentions_stem("fragile: retry_backoff", "retry_backoff"));
+    }
+
+    #[test]
+    fn is_generic_stem_covers_the_known_false_positives() {
+        for s in ["mod", "lib", "index", "context", "service", "config"] {
+            assert!(is_generic_stem(s), "{s} should be excluded");
+        }
+        assert!(!is_generic_stem("retry_backoff"));
+        assert!(!is_generic_stem("widget"));
+    }
+
     #[test]
     fn build_context_ranks_and_gates() {
         use crate::graph::{parse_file, Lang};
@@ -671,19 +749,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ckg-fact-boost-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // Two files, each defining a same-named symbol — identical base
-        // term-match score, same as the churn-boost test's fixture.
-        idx.index_file_graph(&parse_file("src/hot.rs", "pub fn widget() {}\n", Lang::Rust))
-            .expect("index hot");
+        // term-match score, same as the churn-boost test's fixture. Stems
+        // are ≥ 4 chars and not in the generic-stem denylist (V12 review's
+        // fact-boost false-positive fix) so the boost actually applies.
+        idx.index_file_graph(&parse_file("src/hotpath.rs", "pub fn widget() {}\n", Lang::Rust))
+            .expect("index hotpath");
         idx.index_file_graph(&parse_file("src/cold.rs", "pub fn widget() {}\n", Lang::Rust))
             .expect("index cold");
 
-        // A fact naming "hot" (hot.rs's stem) should boost only that file.
-        idx.add_project_fact("f1", "hot handles the retry-cache gotcha", "s1", 1, false)
+        // A fact naming "hotpath" (hotpath.rs's stem) should boost only that file.
+        idx.add_project_fact("f1", "hotpath handles the retry-cache gotcha", "s1", 1, false)
             .expect("add fact");
 
         let no_dedup = HashMap::new();
         let r = build_context(&idx, "widget", &[], 800, 6000, 0.5, &no_dedup, 0, 0, false);
-        let pos_hot = r.files_used.iter().position(|f| f == "src/hot.rs");
+        let pos_hot = r.files_used.iter().position(|f| f == "src/hotpath.rs");
         let pos_cold = r.files_used.iter().position(|f| f == "src/cold.rs");
         assert!(pos_hot.is_some() && pos_cold.is_some(), "{:?}", r.files_used);
         assert!(pos_hot < pos_cold, "the fact-mentioned file should rank first: {:?}", r.files_used);

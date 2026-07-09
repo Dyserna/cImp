@@ -337,10 +337,28 @@ fn is_test_attribute(attr_text: &str) -> bool {
     matches!(path, "test" | "rstest") || path.ends_with("::test") || path.ends_with("::rstest")
 }
 
-/// Whether an accumulated attribute's text is (or contains) `cfg(test)` —
-/// marks a `mod` block whose entire contents are test-only.
+/// Whether an accumulated attribute's text is a `cfg(...)` whose predicate
+/// list includes a bare `test` — marks a `mod` block whose entire contents
+/// are test-only. Matches the literal `cfg(test)` as well as `test` nested
+/// inside `all(...)`/`any(...)` (`cfg(all(test, feature = "x"))`,
+/// `cfg(any(test, feature = "x"))`, `cfg(test, feature = "x")`) — broadened
+/// (V12 review) past a plain `cfg(test)` substring match, which missed every
+/// combinator form. Strips the `#[...]`/`#![...]` wrapper, requires the
+/// remainder to start with `cfg(`, then tokenizes on `(`/`)`/`,` and looks
+/// for a bare `test` token — so `cfg(test_utils)` (a longer identifier, not
+/// the `test` predicate) does NOT match.
 fn is_cfg_test_attribute(attr_text: &str) -> bool {
-    attr_text.chars().filter(|c| !c.is_whitespace()).collect::<String>().contains("cfg(test)")
+    let inner = attr_text
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches('!')
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    let compact: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(rest) = compact.strip_prefix("cfg(") else { return false };
+    rest.split(['(', ')', ',']).any(|tok| tok == "test")
 }
 
 /// If `node` is a Rust definition, return its name + kind.
@@ -1233,6 +1251,26 @@ mod tests {
         assert!(!is_test_of(&fg, "outer"));
         assert!(is_test_of(&fg, "helper"), "plain fn inside #[cfg(test)] mod is a test");
         assert!(is_test_of(&fg, "it_works"));
+    }
+
+    #[test]
+    fn rust_cfg_any_test_mod_marks_every_fn_inside() {
+        // `#[cfg(any(test, feature = "x"))]` is a common combinator form —
+        // the plain `cfg(test)` substring check used to miss it entirely
+        // (V12 review).
+        let src = "fn outer() {}\n#[cfg(any(test, feature = \"x\"))]\nmod tests {\n    fn helper() {}\n}\n";
+        let fg = parse_file("src/t.rs", src, Lang::Rust);
+        assert!(!is_test_of(&fg, "outer"));
+        assert!(is_test_of(&fg, "helper"), "plain fn inside #[cfg(any(test, ...))] mod is a test");
+    }
+
+    #[test]
+    fn rust_cfg_test_utils_mod_is_not_a_cfg_test_mod() {
+        // `test_utils` is a longer identifier, not the bare `test` predicate —
+        // must NOT be mistaken for a `#[cfg(test)]` mod.
+        let src = "#[cfg(test_utils)]\nmod helpers {\n    fn helper() {}\n}\n";
+        let fg = parse_file("src/t.rs", src, Lang::Rust);
+        assert!(!is_test_of(&fg, "helper"));
     }
 
     #[test]

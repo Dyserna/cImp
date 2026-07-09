@@ -22,6 +22,7 @@ mod activity;
 mod builder;
 mod context;
 mod embed;
+mod gitcmd;
 mod gitmeta;
 mod impact;
 mod index;

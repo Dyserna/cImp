@@ -13,10 +13,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use crate::error::{AppError, AppResult};
 
+use super::gitcmd::run_git;
 use super::index::{DependentHit, GraphIndex, SymbolHit};
 
 /// One (new-side) changed line range within a file, 1-based inclusive.
@@ -78,11 +78,17 @@ pub fn changed_symbols(root: &Path, index: &GraphIndex) -> AppResult<ChangedSet>
         parse_unified_diff(&diff, &mut ranges);
     }
 
+    // `-z --untracked-files=all`: without it, `git status --porcelain`
+    // collapses a wholly-untracked new directory into one `?? dir/` entry
+    // (hiding the individual files a diff-blast-radius scan needs to see)
+    // and C-quotes non-ASCII/special paths. `-z` NUL-terminates each record
+    // with no quoting, so we split on `\0`, not lines, and never strip
+    // quotes — same fix as `checks::gitls::changed_files`.
     let mut whole_file: BTreeSet<String> = BTreeSet::new();
-    if let Ok(status) = run_git(root, &["status", "--porcelain"]) {
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("?? ") {
-                whole_file.insert(rest.trim().replace('\\', "/"));
+    if let Ok(status) = run_git(root, &["status", "--porcelain", "-z", "--untracked-files=all"]) {
+        for part in status.split('\0') {
+            if let Some(rest) = part.strip_prefix("?? ") {
+                whole_file.insert(rest.replace('\\', "/"));
             }
         }
     }
@@ -131,11 +137,25 @@ pub fn changed_symbols(root: &Path, index: &GraphIndex) -> AppResult<ChangedSet>
 /// is likewise skipped: nothing left to map to a symbol.
 fn parse_unified_diff(diff: &str, out: &mut HashMap<String, Vec<LineRange>>) {
     let mut current: Option<String> = None;
+    // Whether the immediately preceding line was a `--- ` (old-file) header —
+    // a `+++ ` line only starts a new file's new-side path when it follows
+    // one, guarding against a content line that happens to start with `++ `
+    // (e.g. a diff of a diff, or generated output) being misread as a file
+    // header.
+    let mut prev_was_old_header = false;
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            current = parse_diff_new_path(rest);
+        if line.starts_with("--- ") {
+            prev_was_old_header = true;
             continue;
         }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            if prev_was_old_header {
+                current = parse_diff_new_path(rest);
+            }
+            prev_was_old_header = false;
+            continue;
+        }
+        prev_was_old_header = false;
         if let Some(rest) = line.strip_prefix("@@ ") {
             let Some(file) = current.as_ref() else { continue };
             if let Some((start, len)) = parse_hunk_new_range(rest) {
@@ -175,37 +195,6 @@ fn parse_hunk_new_range(rest: &str) -> Option<(u32, u32)> {
         None => 1,
     };
     Some((start, len))
-}
-
-/// Run `git <args>` with cwd = `root`, console-suppressed on Windows (the
-/// `CREATE_NO_WINDOW` convention shared by `checks::gitls`, `offload`'s
-/// spawned processes, and `run_command`), returning captured stdout. `Err`
-/// on a non-zero exit (not a repo, no `git` on PATH, no `HEAD` yet, ...) —
-/// callers decide how to degrade.
-fn run_git(root: &Path, args: &[&str]) -> AppResult<String> {
-    let program = crate::pty::resolve_command("git")?;
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let output = cmd
-        .output()
-        .map_err(|e| AppError::Graph(format!("git {}: {e}", args.join(" "))))?;
-    if !output.status.success() {
-        return Err(AppError::Graph(format!(
-            "git {} exited with {:?}",
-            args.join(" "),
-            output.status.code()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]
@@ -265,6 +254,31 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(!out.contains_key("src/b.rs"));
         // c.rs: deleted file (+++ /dev/null) contributes nothing.
         assert!(!out.contains_key("src/c.rs"));
+    }
+
+    #[test]
+    fn parse_unified_diff_ignores_a_content_line_that_looks_like_a_file_header() {
+        // An added line whose own content starts with `++` renders in the
+        // diff as a `+++ ...` line (git's own leading `+` plus the content's
+        // `++`) — without a preceding `--- ` line, this must NOT be misread
+        // as a new file header that clobbers `current`.
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,0 +2,2 @@
++++ looks like a header but isn't
++real content
+@@ -10,0 +12,1 @@
++more content
+";
+        let mut out: HashMap<String, Vec<LineRange>> = HashMap::new();
+        parse_unified_diff(diff, &mut out);
+        // Both hunks still map to src/a.rs — `current` was never clobbered.
+        assert_eq!(
+            out.get("src/a.rs"),
+            Some(&vec![LineRange { start: 2, end: 3 }, LineRange { start: 12, end: 12 }])
+        );
     }
 
     // ── git plumbing + changed_symbols ─────────────────────────────────
@@ -338,6 +352,27 @@ diff --git a/src/c.rs b/src/c.rs
         let set = changed_symbols(&dir, &idx).expect("changed_symbols");
         assert!(set.changed.iter().any(|s| s.name == "n"), "{:?}", set.changed);
         assert!(set.unindexed.iter().any(|f| f == "NOTES.md"), "{:?}", set.unindexed);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_symbols_untracked_new_directory_sees_individual_files() {
+        // A brand-new, wholly-untracked directory with two Rust files must be
+        // seen as two individual changed files, not collapsed into a single
+        // `?? newmod/` porcelain entry that `changed_symbols` can't map to
+        // anything (the `-z --untracked-files=all` fix).
+        let (dir, idx) = setup("newdir", "pub fn a() {}\n");
+        std::fs::create_dir_all(dir.join("src/newmod")).unwrap();
+        std::fs::write(dir.join("src/newmod/x.rs"), "pub fn x() {}\n").unwrap();
+        std::fs::write(dir.join("src/newmod/y.rs"), "pub fn y() {}\n").unwrap();
+        idx.index_file_graph(&parse_file("src/newmod/x.rs", "pub fn x() {}\n", Lang::Rust)).expect("index x");
+        idx.index_file_graph(&parse_file("src/newmod/y.rs", "pub fn y() {}\n", Lang::Rust)).expect("index y");
+
+        let set = changed_symbols(&dir, &idx).expect("changed_symbols");
+        assert!(set.changed.iter().any(|s| s.name == "x"), "{:?}", set.changed);
+        assert!(set.changed.iter().any(|s| s.name == "y"), "{:?}", set.changed);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

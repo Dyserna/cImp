@@ -205,6 +205,12 @@ pub struct GraphService {
     /// V12 Phase F: the single-flight check runner shared by every session —
     /// see `checks::auto::RootRunner`'s doc comment.
     auto_check_runner: crate::checks::auto::RootRunner,
+    /// V12 review: session ids currently being distilled by [`GraphService::distill_session`],
+    /// so two sweeps that both select the same idle-undistilled session (the
+    /// rebuild sweep and the watcher-batch sweep can race onto the same
+    /// candidate across the ~30s `run_internal` await) don't both distill it —
+    /// same single-flight shape as `digest_inflight`/[`InflightGuard`].
+    distilling: StdMutex<HashSet<String>>,
 }
 
 /// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
@@ -219,6 +225,23 @@ impl Drop for InflightGuard {
     fn drop(&mut self) {
         if let Ok(mut g) = self.svc.digest_inflight.lock() {
             g.remove(&self.key);
+        }
+    }
+}
+
+/// RAII removal of a `distilling` in-flight session id (V12 review). Runs on
+/// `Drop` so an early `return` (validation failure, offload error, ...) or a
+/// future panic in [`GraphService::distill_session`] still frees the session
+/// for a later sweep — mirrors [`InflightGuard`]'s cleanup discipline.
+struct DistillGuard<'a> {
+    svc: &'a GraphService,
+    session_id: String,
+}
+
+impl Drop for DistillGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.svc.distilling.lock() {
+            g.remove(&self.session_id);
         }
     }
 }
@@ -286,6 +309,7 @@ impl GraphService {
             digest_inflight: StdMutex::new(HashSet::new()),
             auto_check_sessions: StdMutex::new(HashMap::new()),
             auto_check_runner: crate::checks::auto::RootRunner::new(),
+            distilling: StdMutex::new(HashSet::new()),
         })
     }
 
@@ -626,6 +650,17 @@ impl GraphService {
                 None => set.clear(),
             }
         }
+        // V12 review: `auto_check_sessions` (debounce/baseline/pending state
+        // for `/context/post_edit`) grows per session and was never evicted —
+        // clear the same scope here too, mirroring `injected`/`greeted`/`reminded`.
+        if let Ok(mut sessions) = self.auto_check_sessions.lock() {
+            match session_id {
+                Some(s) => {
+                    sessions.remove(s);
+                }
+                None => sessions.clear(),
+            }
+        }
         Ok(())
     }
 
@@ -709,6 +744,22 @@ impl GraphService {
             return;
         };
         let sup = sup.inner().clone();
+
+        // Single-flight guard: `is_session_distilled` (below) and
+        // `mark_session_distilled` (at the end) are check-then-act across a
+        // ~30s `.await`, and two sweeps (the rebuild sweep and a watcher-batch
+        // sweep) can both select the same idle-undistilled session in that
+        // window. Claim the session id here; a second concurrent call for the
+        // same id bails out immediately. `_guard` releases it on every exit
+        // path below, including the early returns.
+        {
+            let mut inflight = self.distilling.lock().unwrap();
+            if !inflight.insert(session_id.to_string()) {
+                return;
+            }
+        }
+        let _guard = DistillGuard { svc: self, session_id: session_id.to_string() };
+
         let Ok(idx) = self.index_for(root) else { return };
         // Idempotency guard: `spawn_distillation_sweep`'s candidate query
         // already filters to undistilled sessions, but this also protects a
@@ -1108,6 +1159,13 @@ impl GraphService {
 
         let run_now = {
             let mut sessions = self.auto_check_sessions.lock().unwrap();
+            // Bound the per-session auto-check state the same way `injected`
+            // is bounded: nothing evicts it when a session simply ends
+            // (`mem_clear` only covers an explicit clear), so cap it —
+            // clearing is safe, it just re-runs the debounce/baseline fresh.
+            if sessions.len() > 1024 && !sessions.contains_key(&sid) {
+                sessions.clear();
+            }
             let st = sessions.entry(sid.clone()).or_default();
             crate::checks::auto::should_run(st, Instant::now(), debounce)
         };
@@ -1123,8 +1181,8 @@ impl GraphService {
 
         tokio::select! {
             res = &mut handle => {
-                let reports = res.unwrap_or_default();
-                self.finish_post_edit(&sid, root, file_path, reports, false)
+                let (reports, check_errors) = res.unwrap_or_default();
+                self.finish_post_edit(&sid, root, file_path, reports, check_errors, false)
             }
             _ = tokio::time::sleep(Duration::from_millis(Self::POST_EDIT_BUDGET_MS)) => {
                 // Slow: let the run keep going in the background and park its
@@ -1135,8 +1193,8 @@ impl GraphService {
                 let root2 = root.to_path_buf();
                 let file2 = file_path.to_string();
                 tokio::spawn(async move {
-                    if let Ok(reports) = handle.await {
-                        this2.finish_post_edit(&sid2, &root2, &file2, reports, true);
+                    if let Ok((reports, check_errors)) = handle.await {
+                        this2.finish_post_edit(&sid2, &root2, &file2, reports, check_errors, true);
                     }
                 });
                 None
@@ -1145,16 +1203,20 @@ impl GraphService {
     }
 
     /// Diff `reports` against `sid`'s baseline (updating it to the fresh
-    /// result regardless of what's surfaced), append the auto-impact note,
-    /// record one Activity event per non-empty injection, and either return
-    /// the block (`park = false`, the fast path) or stash it in the session's
-    /// `pending` slot (`park = true`, drained by the next call).
+    /// result regardless of what's surfaced), append `check_errors` (any
+    /// configured check that failed to spawn/run — V12 review: these must
+    /// stay visible, never silently vanish and read as "ran clean"), append
+    /// the auto-impact note, record one Activity event per non-empty
+    /// injection, and either return the block (`park = false`, the fast path)
+    /// or stash it in the session's `pending` slot (`park = true`, drained by
+    /// the next call).
     fn finish_post_edit(
         self: &Arc<Self>,
         sid: &str,
         root: &Path,
         file_path: &str,
         reports: Vec<crate::checks::CheckReport>,
+        check_errors: Vec<String>,
         park: bool,
     ) -> Option<String> {
         let cap_chars = 1500usize;
@@ -1183,6 +1245,16 @@ impl GraphService {
             .map(|(name, groups)| (name.as_str(), groups.iter().collect()))
             .collect();
         let mut block = crate::checks::auto::format_diff_block(&per_check_refs, cap_chars);
+
+        // V12 review: a check that failed to spawn/run must stay visible —
+        // never let it silently vanish and read as "everything's clean" just
+        // because there was nothing else to report.
+        if !check_errors.is_empty() {
+            if !block.is_empty() {
+                block.push('\n');
+            }
+            block.push_str(&check_errors.join("\n"));
+        }
 
         if let Some(note) = self.auto_impact_note(root, file_path) {
             if block.is_empty() {

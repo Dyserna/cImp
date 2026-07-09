@@ -17,7 +17,7 @@ pub mod auto;
 pub mod gitls;
 pub mod parsers;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -156,13 +156,26 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
     let duration_ms = started.elapsed().as_millis() as u64;
 
     let diags = parsers::parse(def.parser, &stdout, &stderr);
+    // `group` keeps every site (uncapped) so the `changed_only` filter below
+    // sees the FULL occurrence list, not just the first `MAX_SITES` in source
+    // order — a diagnostic already firing in ≥ `MAX_SITES` other files must
+    // still be recognized as touching a just-edited file even when that
+    // file's occurrence would otherwise fall past the cap. Sites are capped
+    // to `MAX_SITES` only after that filter runs, below.
     let mut groups = group(diags);
 
-    if changed_only {
-        if let Ok(changed) = gitls::changed_files(root).await {
-            groups.retain(|g| g.sites.iter().any(|(f, _)| changed.contains(&normalize_rel(root, f))));
-        }
+    let changed = if changed_only {
         // Git failure degrades to unfiltered — see the doc comment above.
+        gitls::changed_files(root).await.ok()
+    } else {
+        None
+    };
+
+    if let Some(changed) = &changed {
+        groups.retain(|g| g.sites.iter().any(|(f, _)| changed.contains(&normalize_rel(root, f))));
+    }
+    for g in &mut groups {
+        cap_sites(&mut g.sites, root, changed.as_ref());
     }
 
     Ok(CheckReport {
@@ -175,9 +188,11 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
 }
 
 /// Group raw diagnostics by `(severity, code, normalized message)`, folding
-/// the code into the group's display message and capping `sites` at
-/// [`MAX_SITES`]. Preserves first-seen order (not sorted) so the model reads
-/// the checker's own ordering (usually source order).
+/// the code into the group's display message. `sites` is kept UNCAPPED here —
+/// deliberately, so [`run`]'s `changed_only` filter can see every occurrence
+/// before [`cap_sites`] trims for display (see [`run`]'s doc comment on the
+/// V12 review's 5-site-cap fix). Preserves first-seen order (not sorted) so
+/// the model reads the checker's own ordering (usually source order).
 fn group(diags: Vec<Diag>) -> Vec<DiagGroup> {
     let mut order: Vec<String> = Vec::new();
     let mut map: HashMap<String, DiagGroup> = HashMap::new();
@@ -197,11 +212,26 @@ fn group(diags: Vec<Diag>) -> Vec<DiagGroup> {
         }
         let entry = map.get_mut(&key).expect("just inserted");
         entry.count += 1;
-        if entry.sites.len() < MAX_SITES {
-            entry.sites.push((d.file.clone(), d.line));
-        }
+        entry.sites.push((d.file.clone(), d.line));
     }
     order.into_iter().filter_map(|k| map.remove(&k)).collect()
+}
+
+/// Cap `sites` to [`MAX_SITES`] for display. When `changed` is `Some` (the
+/// `changed_only` path), a site whose file is in the changed set sorts first
+/// — via a stable sort, so relative order within each partition (changed vs.
+/// not) is preserved — so a new occurrence in the just-edited file is never
+/// pushed out by ≥ `MAX_SITES` older occurrences elsewhere. `changed == None`
+/// (the unfiltered path, or a degraded git failure) leaves the original
+/// source-order truncation unchanged.
+fn cap_sites(sites: &mut Vec<(String, u32)>, root: &Path, changed: Option<&HashSet<String>>) {
+    if sites.len() <= MAX_SITES {
+        return;
+    }
+    if let Some(changed) = changed {
+        sites.sort_by_key(|(f, _)| if changed.contains(&normalize_rel(root, f)) { 0 } else { 1 });
+    }
+    sites.truncate(MAX_SITES);
 }
 
 /// Replace every `'…'` / `` `…` `` quoted span in `msg` with a placeholder, so
@@ -378,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn group_dedups_and_caps_sites() {
+    fn group_dedups_but_leaves_sites_uncapped() {
         let mut diags = Vec::new();
         for i in 0..8 {
             diags.push(diag(Severity::Error, Some("E0425"), &format!("cannot find value `v{i}` in this scope"), &format!("src/f{i}.rs"), 1));
@@ -390,8 +420,42 @@ mod tests {
         assert_eq!(groups.len(), 2, "the 8 E0425s collapse to one group, the warning is separate: {groups:?}");
         let e0425 = groups.iter().find(|g| g.message.starts_with("E0425")).expect("E0425 group");
         assert_eq!(e0425.count, 8);
-        assert_eq!(e0425.sites.len(), MAX_SITES, "sites capped at {MAX_SITES}");
+        // `group` no longer caps — that's `cap_sites`'s job now, run after
+        // the `changed_only` filter (see `run`'s doc comment).
+        assert_eq!(e0425.sites.len(), 8, "group() itself leaves sites uncapped: {e0425:?}");
         assert_eq!(e0425.message, "E0425: cannot find value ‹…› in this scope");
+    }
+
+    #[test]
+    fn cap_sites_plain_truncates_in_source_order() {
+        let dir = std::env::temp_dir().join(format!("checks-capsites-{}", uuid::Uuid::new_v4()));
+        let mut sites: Vec<(String, u32)> =
+            (0..8).map(|i| (format!("src/f{i}.rs"), 1)).collect();
+        cap_sites(&mut sites, &dir, None);
+        assert_eq!(sites.len(), MAX_SITES);
+        assert_eq!(sites, vec![
+            ("src/f0.rs".to_string(), 1),
+            ("src/f1.rs".to_string(), 1),
+            ("src/f2.rs".to_string(), 1),
+            ("src/f3.rs".to_string(), 1),
+            ("src/f4.rs".to_string(), 1),
+        ]);
+    }
+
+    #[test]
+    fn cap_sites_prefers_a_changed_file_site_past_the_cap() {
+        // 6 sites, none of the first 5 (source order) is the changed file —
+        // it's the 6th. A naive source-order truncation would drop it; the
+        // changed-file site must still show up among the capped 5.
+        let dir = std::env::temp_dir().join(format!("checks-capsites-changed-{}", uuid::Uuid::new_v4()));
+        let mut sites: Vec<(String, u32)> = (0..6).map(|i| (format!("src/f{i}.rs"), 1)).collect();
+        let mut changed = HashSet::new();
+        changed.insert("src/f5.rs".to_string());
+
+        cap_sites(&mut sites, &dir, Some(&changed));
+
+        assert_eq!(sites.len(), MAX_SITES);
+        assert!(sites.iter().any(|(f, _)| f == "src/f5.rs"), "{sites:?}");
     }
 
     #[test]

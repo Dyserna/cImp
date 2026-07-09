@@ -10,18 +10,23 @@
 //! absent, same convention as `graph::impact`'s diff mode uses for its own
 //! (harder) failure case.
 //!
-//! Deliberately synchronous, mirroring `graph::impact`'s `run_git` — both
-//! spawns are called from sync contexts (the rebuild thread, the watcher
-//! thread), never the async runtime.
+//! Deliberately synchronous — both spawns (here and in `graph::impact`, which
+//! shares this module's [`super::gitcmd::run_git`] helper) are called from
+//! sync contexts (the rebuild thread, the watcher thread), never the async
+//! runtime.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use crate::error::AppResult;
 
+use super::gitcmd::run_git;
+
 /// Record separator between commits in [`collect`]'s `git log` format string
-/// — a control byte that can never appear in a commit subject.
+/// — a control byte vanishingly unlikely to appear in a real commit subject
+/// (git doesn't strictly forbid `\x01` in a message). If a malformed subject
+/// ever does contain one, [`parse_log_output`] simply drops that record —
+/// no need for a stricter guarantee than "safe, not silently wrong".
 const RECORD_SEP: char = '\x01';
 
 /// One file's git churn, as stored in the `commit_touch` relation.
@@ -217,36 +222,6 @@ fn normalize_path(p: &str) -> String {
 /// rev-parse --is-inside-work-tree`, same convention as `graph::impact`).
 fn is_git_repo(root: &Path) -> bool {
     run_git(root, &["rev-parse", "--is-inside-work-tree"]).is_ok()
-}
-
-/// Run `git <args>` with cwd = `root`, console-suppressed on Windows (the
-/// `CREATE_NO_WINDOW` convention shared by `graph::impact::run_git` and
-/// `checks::gitls::run_git`), returning captured stdout. `Err` on a non-zero
-/// exit (not a repo, no `git` on PATH, no commits, ...) — callers degrade.
-fn run_git(root: &Path, args: &[&str]) -> AppResult<String> {
-    let program = crate::pty::resolve_command("git")?;
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let output = cmd
-        .output()
-        .map_err(|e| crate::error::AppError::Graph(format!("git {}: {e}", args.join(" "))))?;
-    if !output.status.success() {
-        return Err(crate::error::AppError::Graph(format!(
-            "git {} exited with {:?}",
-            args.join(" "),
-            output.status.code()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]

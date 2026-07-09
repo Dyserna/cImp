@@ -31,7 +31,10 @@ use crate::settings::{GraphSettings, SettingsHandle};
 
 use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
-use super::memory::{MemorySnapshot, ProjectFact, WorkingSetEntry};
+use super::memory::{
+    MemorySnapshot, ProjectFact, SessionUsageRow, TurnUsage, UsageEvent, UsageTotals,
+    WorkingSetEntry,
+};
 use super::model::Lang;
 use super::parse_file;
 
@@ -570,6 +573,65 @@ impl GraphService {
             }
             Err(e) => debug!(error = %e, "graph: record_mem_event open failed"),
         }
+    }
+
+    // ── V14 Phase C: usage / cost accounting ──────────────────────────────
+
+    /// Record one usage/cost event for `root`'s current-project graph. A
+    /// no-op when the graph is disabled — usage rides `graph.db`, so without
+    /// it the token X-ray is simply unavailable (same posture as memory).
+    /// Best-effort: a store error is logged, never propagated. Called
+    /// in-process from the Claude transcript tap and via the `/memory/event`
+    /// loopback route (OpenCode's usage tap — see the C3 spike note atop
+    /// `oob/opencode.rs`).
+    pub fn record_usage(&self, root: &Path, session_id: &str, agent: &str, event: UsageEvent) {
+        if !self.settings.current().graph.enabled {
+            return;
+        }
+        let ts = super::activity::now_ms() as i64;
+        match self.index_for(root) {
+            Ok(idx) => {
+                if let Err(e) = idx.record_usage_event(session_id, agent, &event, ts) {
+                    debug!(error = %e, "graph: record_usage_event failed");
+                }
+            }
+            Err(e) => debug!(error = %e, "graph: record_usage_event open failed"),
+        }
+    }
+
+    /// Summed token totals for `session_id` ("turn" rows only). Empty
+    /// defaults on any store error (graph disabled, session unknown, etc.).
+    // V14 Phase C: query built now, wired into IPC by Phase D — unused until
+    // then (same posture as the `SessionUsageRow`/`TurnUsage`/`UsageTotals`
+    // re-exports in `graph/mod.rs`).
+    #[allow(dead_code)]
+    pub fn usage_session_totals(&self, root: &Path, session_id: &str) -> UsageTotals {
+        let Ok(idx) = self.index_for(root) else { return UsageTotals::default() };
+        idx.usage_session_totals(session_id).unwrap_or_default()
+    }
+
+    /// Estimated tool-result chars for `session_id`, grouped by tool name,
+    /// descending.
+    #[allow(dead_code)] // V14 Phase C: wired into IPC by Phase D.
+    pub fn usage_per_tool(&self, root: &Path, session_id: &str) -> Vec<(String, u64)> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.usage_per_tool(session_id).unwrap_or_default()
+    }
+
+    /// Per-turn token/tool-char series for `session_id`, oldest → newest.
+    #[allow(dead_code)] // V14 Phase C: wired into IPC by Phase D.
+    pub fn usage_turn_series(&self, root: &Path, session_id: &str) -> Vec<TurnUsage> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.usage_turn_series(session_id).unwrap_or_default()
+    }
+
+    /// Per-session usage totals + cache-hit ratio + `est_only` for every
+    /// known session under `root` (drives the Usage section's project
+    /// totals table — Phase D).
+    #[allow(dead_code)] // V14 Phase C: wired into IPC by Phase D.
+    pub fn usage_all_sessions(&self, root: &Path) -> Vec<SessionUsageRow> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.usage_all_sessions().unwrap_or_default()
     }
 
     /// Ranked working set for a session (default: the current session).

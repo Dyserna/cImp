@@ -15,8 +15,9 @@ use cozo::{DataValue, DbInstance, MultiTransaction, Num, ScriptMutability};
 use crate::error::{AppError, AppResult};
 
 use super::memory::{
-    MemNote, ProjectFact, SessionInfo, WorkingSetEntry, MAX_EVENTS_PER_SESSION,
-    MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT,
+    MemNote, ProjectFact, SessionInfo, SessionUsageRow, TurnUsage, UsageEvent, UsageTotals,
+    WorkingSetEntry, MAX_EVENTS_PER_SESSION, MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT,
+    MAX_USAGE_PER_SESSION,
 };
 use super::model::{FileGraph, Lang};
 use super::schema::{GRAPH_SCHEMA_VERSION, RELATIONS};
@@ -1666,6 +1667,18 @@ impl GraphIndex {
                 "meta",
                 ":create meta {key: String => value: String}",
             ),
+            // V14 Phase C: token/cost accounting ring (the X-ray backend).
+            // Additive, survives a graph rebuild, ring-bounded + evicted with
+            // its session exactly like `mem_event` (see `record_usage_event`
+            // and `prune_sessions_in_tx`). NOT part of a schema-version bump
+            // — same posture as every other memory relation in this list.
+            (
+                "usage_stat",
+                ":create usage_stat {session_id: String, seq: Int => \
+                    kind: String, model: String?, msg_id: String?, \
+                    in_tok: Int, out_tok: Int, cache_read: Int, cache_make: Int, \
+                    tool: String?, chars: Int, ts_ms: Int}",
+            ),
         ];
         for (name, create) in defs {
             if !existing.contains(*name) {
@@ -1769,6 +1782,267 @@ impl GraphIndex {
             prune_sessions_in_tx(tx)?;
             Ok(())
         })
+    }
+
+    // ── V14 Phase C: usage / cost accounting ──────────────────────────────
+
+    /// Append one usage event for `session_id`: upserts the session's
+    /// last-seen time (same shape as `record_mem_event` — usage rows are
+    /// often the FIRST activity a chat-only turn ever produces, so this tap
+    /// must be able to create the `session` row on its own, not just piggy-
+    /// back on a tool call). A `Turn` event is UPSERTED in place when a row
+    /// for its `msg_id` already exists (a streamed message's `usage` block
+    /// firming up across updates); every other write appends a new row.
+    /// Ring-prunes beyond [`MAX_USAGE_PER_SESSION`], then evicts old sessions
+    /// via the same cascade `record_mem_event` uses — all in one write
+    /// transaction so the monotonic `seq` allocation is race-free.
+    pub fn record_usage_event(
+        &self,
+        session_id: &str,
+        agent: &str,
+        event: &UsageEvent,
+        ts_ms: i64,
+    ) -> AppResult<()> {
+        let sid = session_id.to_string();
+        let agent = agent.to_string();
+        let event = event.clone();
+        self.with_write_txn(move |tx| {
+            let mut p = BTreeMap::new();
+            p.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
+
+            // Upsert the session (identical shape to `record_mem_event`).
+            let existing = tx_run(
+                tx,
+                "?[started_ms] := *session{session_id, started_ms}, session_id == $sid",
+                p.clone(),
+            )?;
+            let started = existing.rows.first().map(|r| cell_i64(r, 0)).unwrap_or(ts_ms);
+            let mut ps = BTreeMap::new();
+            ps.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
+            ps.insert("agent".to_string(), DataValue::Str(agent.as_str().into()));
+            ps.insert("st".to_string(), DataValue::Num(Num::Int(started)));
+            ps.insert("last".to_string(), DataValue::Num(Num::Int(ts_ms)));
+            tx_run(
+                tx,
+                "?[session_id, agent, started_ms, last_ms] <- [[$sid, $agent, $st, $last]]\n\
+                 :put session {session_id => agent, started_ms, last_ms}",
+                ps,
+            )?;
+
+            // A "turn" event upserts by msg_id: look for an existing row's
+            // seq first so we overwrite in place rather than append.
+            let existing_seq = if let UsageEvent::Turn { msg_id, .. } = &event {
+                let mut pm = p.clone();
+                pm.insert("mid".to_string(), DataValue::Str(msg_id.as_str().into()));
+                let rows = tx_run(
+                    tx,
+                    "?[seq] := *usage_stat{session_id, seq, kind, msg_id}, \
+                        session_id == $sid, kind == \"turn\", msg_id == $mid\n:limit 1",
+                    pm,
+                )?;
+                rows.rows.first().map(|r| cell_i64(r, 0))
+            } else {
+                None
+            };
+
+            let seq = match existing_seq {
+                Some(s) => s,
+                None => {
+                    let rows = tx_run(
+                        tx,
+                        "?[count(seq), max(seq)] := *usage_stat{session_id, seq}, session_id == $sid",
+                        p.clone(),
+                    )?;
+                    let (cnt, mx) =
+                        rows.rows.first().map(|r| (cell_i64(r, 0), cell_i64(r, 1))).unwrap_or((0, 0));
+                    if cnt == 0 { 0 } else { mx + 1 }
+                }
+            };
+
+            let (kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars): (
+                &str,
+                Option<String>,
+                Option<String>,
+                i64,
+                i64,
+                i64,
+                i64,
+                Option<String>,
+                i64,
+            ) = match &event {
+                UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make } => (
+                    "turn",
+                    model.clone(),
+                    Some(msg_id.clone()),
+                    *in_tok as i64,
+                    *out_tok as i64,
+                    *cache_read as i64,
+                    *cache_make as i64,
+                    None,
+                    0,
+                ),
+                UsageEvent::ToolResult { tool, chars } => {
+                    ("tool_result", None, None, 0, 0, 0, 0, tool.clone(), *chars as i64)
+                }
+            };
+
+            let row = DataValue::List(vec![
+                DataValue::Str(sid.as_str().into()),
+                DataValue::Num(Num::Int(seq)),
+                DataValue::Str(kind.into()),
+                model.as_deref().map(|s| DataValue::Str(s.into())).unwrap_or(DataValue::Null),
+                msg_id.as_deref().map(|s| DataValue::Str(s.into())).unwrap_or(DataValue::Null),
+                DataValue::Num(Num::Int(in_tok)),
+                DataValue::Num(Num::Int(out_tok)),
+                DataValue::Num(Num::Int(cache_read)),
+                DataValue::Num(Num::Int(cache_make)),
+                tool.as_deref().map(|s| DataValue::Str(s.into())).unwrap_or(DataValue::Null),
+                DataValue::Num(Num::Int(chars)),
+                DataValue::Num(Num::Int(ts_ms)),
+            ]);
+            tx_put(
+                tx,
+                "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms] <- $rows\n\
+                 :put usage_stat {session_id, seq => kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms}",
+                vec![row],
+            )?;
+
+            // Ring-prune this session's oldest usage rows beyond the cap.
+            let cutoff = seq - MAX_USAGE_PER_SESSION;
+            if cutoff >= 0 {
+                let mut pc = BTreeMap::new();
+                pc.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
+                pc.insert("cut".to_string(), DataValue::Num(Num::Int(cutoff)));
+                tx_run(
+                    tx,
+                    "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid, seq <= $cut\n:rm usage_stat {session_id, seq}",
+                    pc,
+                )?;
+            }
+
+            // Evict sessions beyond the per-root cap (cascade events + usage +
+            // unpinned notes; pinned notes survive).
+            prune_sessions_in_tx(tx)?;
+            Ok(())
+        })
+    }
+
+    /// Summed token totals for `session_id` across its "turn" rows
+    /// ("tool_result" rows carry chars, not tokens, so they don't contribute).
+    pub fn usage_session_totals(&self, session_id: &str) -> AppResult<UsageTotals> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        // `seq` MUST stay in the projection even though it's unused below:
+        // CozoScript relations are SETS, so two turns with identical token
+        // counts would otherwise collapse into one row and undercount (the
+        // same reason `mem_working_set` keeps `seq` in its own projection).
+        let rows = self.run(
+            "?[seq, in_tok, out_tok, cache_read, cache_make] := \
+                *usage_stat{session_id, seq, kind, in_tok, out_tok, cache_read, cache_make}, \
+                session_id == $sid, kind == \"turn\"",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut t = UsageTotals::default();
+        for r in &rows.rows {
+            t.in_tok += cell_i64(r, 1).max(0) as u64;
+            t.out_tok += cell_i64(r, 2).max(0) as u64;
+            t.cache_read += cell_i64(r, 3).max(0) as u64;
+            t.cache_make += cell_i64(r, 4).max(0) as u64;
+        }
+        Ok(t)
+    }
+
+    /// Estimated tool-result characters for `session_id`, grouped by tool
+    /// name (`"unknown"` when the id → name join missed — see the claude
+    /// tap's `ToolNameRing`), descending by chars.
+    pub fn usage_per_tool(&self, session_id: &str) -> AppResult<Vec<(String, u64)>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        // Same `seq`-keeps-rows-distinct reasoning as `usage_session_totals`:
+        // without it, two tool results with identical (tool, chars) — e.g.
+        // two 1-char Bash results — would collapse into one row.
+        let rows = self.run(
+            "?[seq, tool, chars] := *usage_stat{session_id, seq, kind, tool, chars}, \
+                session_id == $sid, kind == \"tool_result\"",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut sums: HashMap<String, u64> = HashMap::new();
+        for r in &rows.rows {
+            let tool = cell_str_opt(r, 1).unwrap_or_else(|| "unknown".to_string());
+            *sums.entry(tool).or_insert(0) += cell_i64(r, 2).max(0) as u64;
+        }
+        let mut out: Vec<(String, u64)> = sums.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
+    /// Per-turn token breakdown for `session_id`, ordered oldest → newest.
+    /// Each turn's `tool_chars` is the (estimated) tool-result characters
+    /// that arrived AFTER the previous turn and before this one — i.e. the
+    /// tool output this turn's assistant message actually read as input
+    /// context. Tool-result rows after the LAST turn (mid-turn, the next
+    /// assistant reply hasn't landed yet) aren't attributable to a turn yet
+    /// and are dropped from this series; they still count toward
+    /// `usage_per_tool`'s totals.
+    pub fn usage_turn_series(&self, session_id: &str) -> AppResult<Vec<TurnUsage>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms] := \
+                *usage_stat{session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms}, \
+                session_id == $sid\n:order seq",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut out = Vec::new();
+        let mut pending_tool_chars: u64 = 0;
+        for r in &rows.rows {
+            if cell_str(r, 1) == "tool_result" {
+                pending_tool_chars += cell_i64(r, 9).max(0) as u64;
+                continue;
+            }
+            out.push(TurnUsage {
+                msg_id: cell_str_opt(r, 3).unwrap_or_default(),
+                model: cell_str_opt(r, 2),
+                in_tok: cell_i64(r, 4).max(0) as u64,
+                out_tok: cell_i64(r, 5).max(0) as u64,
+                cache_read: cell_i64(r, 6).max(0) as u64,
+                cache_make: cell_i64(r, 7).max(0) as u64,
+                tool_chars: pending_tool_chars,
+                ts_ms: cell_i64(r, 10),
+            });
+            pending_tool_chars = 0;
+        }
+        Ok(out)
+    }
+
+    /// One row per known session with usage token totals, cache-hit ratio,
+    /// and whether the session is estimate-only (no exact `usage` block —
+    /// currently every non-Claude agent; see the OpenCode C3 spike note atop
+    /// `oob/opencode.rs`). Reuses [`Self::mem_sessions`] for the session list
+    /// so a session with usage but zero classified `mem_event`s still shows.
+    pub fn usage_all_sessions(&self) -> AppResult<Vec<SessionUsageRow>> {
+        let sessions = self.mem_sessions()?;
+        let mut out = Vec::with_capacity(sessions.len());
+        for s in sessions {
+            let totals = self.usage_session_totals(&s.session_id)?;
+            let per_tool = self.usage_per_tool(&s.session_id)?;
+            let tool_chars: u64 = per_tool.iter().map(|(_, c)| *c).sum();
+            let denom = totals.cache_read + totals.in_tok;
+            let cache_hit_ratio =
+                if denom > 0 { totals.cache_read as f64 / denom as f64 } else { 0.0 };
+            out.push(SessionUsageRow {
+                est_only: s.agent != "claude",
+                session_id: s.session_id,
+                agent: s.agent,
+                totals,
+                tool_chars,
+                cache_hit_ratio,
+            });
+        }
+        Ok(out)
     }
 
     /// The session with the most recent activity (across all agents), or `None`.
@@ -2014,11 +2288,13 @@ impl GraphIndex {
                     let mut p = BTreeMap::new();
                     p.insert("sid".to_string(), DataValue::Str(sid.into()));
                     tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
+                    tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
                     tx_run(tx, "?[note_id] := *mem_note{note_id, session_id}, session_id == $sid\n:rm mem_note {note_id}", p.clone())?;
                     tx_run(tx, "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}", p)?;
                 }
                 None => {
                     tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}\n:rm mem_event {session_id, seq}", BTreeMap::new())?;
+                    tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}\n:rm usage_stat {session_id, seq}", BTreeMap::new())?;
                     tx_run(tx, "?[note_id] := *mem_note{note_id}\n:rm mem_note {note_id}", BTreeMap::new())?;
                     tx_run(tx, "?[session_id] := *session{session_id}\n:rm session {session_id}", BTreeMap::new())?;
                 }
@@ -2386,8 +2662,8 @@ fn kind_weight(kind: &str) -> f64 {
 }
 
 /// Evict sessions beyond [`MAX_SESSIONS_PER_ROOT`] (oldest `last_ms` first),
-/// cascading each evicted session's events and **unpinned** notes; its pinned
-/// notes and their rows survive project-wide.
+/// cascading each evicted session's events, usage rows (V14 Phase C), and
+/// **unpinned** notes; its pinned notes and their rows survive project-wide.
 fn prune_sessions_in_tx(tx: &MultiTransaction) -> AppResult<()> {
     let rows = tx_run(
         tx,
@@ -2402,6 +2678,7 @@ fn prune_sessions_in_tx(tx: &MultiTransaction) -> AppResult<()> {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
         tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
+        tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
         tx_run(tx, "?[note_id] := *mem_note{note_id, session_id, pinned}, session_id == $sid, pinned == false\n:rm mem_note {note_id}", p.clone())?;
         tx_run(tx, "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}", p)?;
     }
@@ -2574,6 +2851,17 @@ fn cell_i64(row: &[DataValue], i: usize) -> i64 {
 
 fn cell_bool(row: &[DataValue], i: usize) -> bool {
     matches!(row.get(i), Some(DataValue::Bool(true)))
+}
+
+/// A nullable `String?` column: `None` for a stored `Null`/missing cell
+/// (unlike [`cell_str`], which folds that case into `""`) — needed wherever
+/// absence must stay distinguishable from an empty string (`usage_stat`'s
+/// `model`/`msg_id`/`tool` columns).
+fn cell_str_opt(row: &[DataValue], i: usize) -> Option<String> {
+    match row.get(i) {
+        None | Some(DataValue::Null) => None,
+        Some(v) => Some(dv_string(v)),
+    }
 }
 
 fn dv_f64(v: &DataValue) -> f64 {
@@ -3493,6 +3781,258 @@ pub struct Point { x: i32 }
         // An agent with no sessions yet resolves to None.
         assert_eq!(idx.mem_current_session_for(Some("nobody")).unwrap(), None);
 
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V14 Phase C: usage_stat store ──────────────────────────────────────
+
+    #[test]
+    fn usage_turn_upserts_by_msg_id_instead_of_duplicating() {
+        let dir = std::env::temp_dir().join(format!("ckg-usage-upsert-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        // A partial line (usage not yet firmed up) ...
+        idx.record_usage_event(
+            "s1",
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: "m1".to_string(),
+                model: None,
+                in_tok: 0,
+                out_tok: 0,
+                cache_read: 0,
+                cache_make: 0,
+            },
+            100,
+        )
+        .unwrap();
+        // ... then the SAME message id with the real numbers.
+        idx.record_usage_event(
+            "s1",
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: "m1".to_string(),
+                model: Some("claude-x".to_string()),
+                in_tok: 120,
+                out_tok: 30,
+                cache_read: 40,
+                cache_make: 5,
+            },
+            110,
+        )
+        .unwrap();
+
+        let series = idx.usage_turn_series("s1").unwrap();
+        assert_eq!(series.len(), 1, "same msg_id must upsert in place, not duplicate");
+        assert_eq!(series[0].msg_id, "m1");
+        assert_eq!(series[0].model.as_deref(), Some("claude-x"));
+        assert_eq!(series[0].in_tok, 120);
+        assert_eq!(series[0].out_tok, 30);
+        assert_eq!(series[0].cache_read, 40);
+        assert_eq!(series[0].cache_make, 5);
+
+        let totals = idx.usage_session_totals("s1").unwrap();
+        assert_eq!(totals.in_tok, 120, "totals reflect the upserted (last) value, not both writes summed");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_per_tool_and_turn_series_join_tool_results_to_the_following_turn() {
+        let dir = std::env::temp_dir().join(format!("ckg-usage-join-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        // Turn 1 (the tool-calling message) ...
+        idx.record_usage_event(
+            "s1",
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: "t1".to_string(),
+                model: Some("m".to_string()),
+                in_tok: 10,
+                out_tok: 5,
+                cache_read: 0,
+                cache_make: 0,
+            },
+            100,
+        )
+        .unwrap();
+        // ... then its tool result arrives (chars attributed to the NEXT turn) ...
+        idx.record_usage_event(
+            "s1",
+            "claude",
+            &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 500 },
+            110,
+        )
+        .unwrap();
+        idx.record_usage_event(
+            "s1",
+            "claude",
+            &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 300 },
+            111,
+        )
+        .unwrap();
+        // ... then turn 2 (which "saw" that tool output as its input context).
+        idx.record_usage_event(
+            "s1",
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: "t2".to_string(),
+                model: Some("m".to_string()),
+                in_tok: 800,
+                out_tok: 20,
+                cache_read: 0,
+                cache_make: 0,
+            },
+            120,
+        )
+        .unwrap();
+
+        let per_tool = idx.usage_per_tool("s1").unwrap();
+        assert_eq!(per_tool, vec![("Read".to_string(), 800)]);
+
+        let series = idx.usage_turn_series("s1").unwrap();
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].msg_id, "t1");
+        assert_eq!(series[0].tool_chars, 0, "no tool results before the first turn");
+        assert_eq!(series[1].msg_id, "t2");
+        assert_eq!(series[1].tool_chars, 800, "both Read results attributed to the turn that followed them");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_per_tool_buckets_unjoined_results_as_unknown() {
+        let dir = std::env::temp_dir().join(format!("ckg-usage-unknown-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.record_usage_event("s1", "claude", &UsageEvent::ToolResult { tool: None, chars: 42 }, 100)
+            .unwrap();
+        assert_eq!(idx.usage_per_tool("s1").unwrap(), vec![("unknown".to_string(), 42)]);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_all_sessions_reports_totals_cache_ratio_and_est_only() {
+        let dir = std::env::temp_dir().join(format!("ckg-usage-allsess-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        idx.record_usage_event(
+            "c1",
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: "m1".to_string(),
+                model: None,
+                in_tok: 100,
+                out_tok: 10,
+                cache_read: 50,
+                cache_make: 0,
+            },
+            100,
+        )
+        .unwrap();
+        idx.record_usage_event(
+            "o1",
+            "opencode",
+            &UsageEvent::ToolResult { tool: Some("edit".to_string()), chars: 20 },
+            200,
+        )
+        .unwrap();
+
+        let rows = idx.usage_all_sessions().unwrap();
+        let claude = rows.iter().find(|r| r.session_id == "c1").expect("c1 present");
+        assert!(!claude.est_only, "claude sessions carry exact usage");
+        assert_eq!(claude.totals.in_tok, 100);
+        // cache_read / (cache_read + in_tok) = 50 / 150.
+        assert!((claude.cache_hit_ratio - (50.0 / 150.0)).abs() < 1e-9);
+
+        let opencode = rows.iter().find(|r| r.session_id == "o1").expect("o1 present");
+        assert!(opencode.est_only, "opencode sessions have no exact usage — always est-only");
+        assert_eq!(opencode.totals.in_tok, 0, "a tool_result-only session has zero token totals");
+        assert_eq!(opencode.tool_chars, 20);
+        assert_eq!(opencode.cache_hit_ratio, 0.0, "no denominator ⇒ 0.0, not NaN");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_ring_prunes_beyond_the_per_session_cap() {
+        let dir = std::env::temp_dir().join(format!("ckg-usage-ring-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        let total = MAX_USAGE_PER_SESSION + 5;
+        for i in 0..total {
+            idx.record_usage_event(
+                "s1",
+                "claude",
+                &UsageEvent::ToolResult { tool: Some("Bash".to_string()), chars: 1 },
+                100 + i,
+            )
+            .unwrap();
+        }
+        let per_tool = idx.usage_per_tool("s1").unwrap();
+        let (_, chars) = per_tool.into_iter().find(|(t, _)| t == "Bash").expect("Bash present");
+        assert_eq!(
+            chars, MAX_USAGE_PER_SESSION as u64,
+            "the ring keeps exactly the cap's worth of rows (1 char each), not `total`"
+        );
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_stat_is_evicted_with_its_session() {
+        let dir = std::env::temp_dir().join(format!("ckg-usage-evict-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        // One usage row for a session that will be evicted (session s0), then
+        // MAX_SESSIONS_PER_ROOT newer sessions push it out.
+        idx.record_usage_event(
+            "s0",
+            "claude",
+            &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 99 },
+            0,
+        )
+        .unwrap();
+        for i in 0..MAX_SESSIONS_PER_ROOT {
+            let sid = format!("s{}", i + 1);
+            idx.record_usage_event(
+                &sid,
+                "claude",
+                &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 1 },
+                1000 + i as i64,
+            )
+            .unwrap();
+        }
+
+        assert!(idx.usage_per_tool("s0").unwrap().is_empty(), "s0's usage rows were cascaded away");
+        assert!(
+            !idx.mem_sessions().unwrap().iter().any(|s| s.session_id == "s0"),
+            "s0 itself was evicted"
+        );
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mem_clear_also_drops_usage_stat() {
+        let dir = std::env::temp_dir().join(format!("ckg-usage-clear-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.record_usage_event(
+            "s1",
+            "claude",
+            &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 10 },
+            100,
+        )
+        .unwrap();
+        idx.mem_clear(Some("s1")).unwrap();
+        assert!(idx.usage_per_tool("s1").unwrap().is_empty());
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }

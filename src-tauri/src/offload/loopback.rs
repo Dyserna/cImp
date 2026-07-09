@@ -819,7 +819,8 @@ async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request
 
 /// A `POST /memory/event` request body (the OpenCode plugin's tool hook — the
 /// only memory ingress for OpenCode, whose OOB SSE stream carries no tool
-/// events). Claude records in-process via the transcript tap instead.
+/// events, AND — V14 Phase C — the only *usage* ingress for OpenCode, for the
+/// same reason). Claude records both in-process via the transcript tap instead.
 #[derive(Deserialize)]
 struct MemoryEventBody {
     #[serde(default)]
@@ -833,8 +834,10 @@ struct MemoryEventBody {
 }
 
 /// `POST /memory/event`: classify an agent tool call and record it as a memory
-/// event. Best-effort — an unclassifiable tool or a missing graph service is a
-/// silent no-op (200), never an error the plugin has to handle.
+/// event, AND (V14 Phase C) record its estimated usage. Best-effort — an
+/// unclassifiable tool or a missing graph service is a silent no-op (200 with
+/// memory recording skipped; usage recording no-ops internally the same way),
+/// never an error the plugin has to handle.
 async fn handle_memory_event(
     stream: &mut TcpStream,
     app: &AppHandle,
@@ -856,6 +859,9 @@ async fn handle_memory_event(
         return write_json(stream, 200, &ok).await;
     };
     let graph = graph.inner().clone();
+    let cwd = body.cwd.as_deref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let agent = body.agent.as_deref().unwrap_or("opencode");
+
     if let Some((kind, arg)) = crate::graph::classify_tool(&body.tool) {
         let get = |k: &str| body.args.get(k).and_then(Value::as_str);
         let (path, detail) = match arg {
@@ -874,11 +880,27 @@ async fn handle_memory_event(
             _ => !path.is_empty(),
         };
         if recordable {
-            let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-            let agent = body.agent.as_deref().unwrap_or("opencode");
             graph.record_mem_event(&cwd, &body.session_id, agent, kind, &path, None, None, detail.as_deref());
         }
     }
+
+    // V14 Phase C: OpenCode's usage tap (see the C3 spike note atop
+    // `oob/opencode.rs` — its SSE stream carries no usage fields, so this
+    // hook, which already fires after every tool call, is the only place
+    // that can record OpenCode usage). Unlike the memory recording above,
+    // this runs for EVERY tool call, not just ones `classify_tool` maps to a
+    // filesystem/query target — usage wants the full picture. `chars` is
+    // estimated from the tool's serialized INPUT args (its actual output
+    // isn't visible to this hook), which is exactly why OpenCode sessions
+    // report `est_only` in the X-ray.
+    let chars = serde_json::to_string(&body.args).map(|s| s.chars().count()).unwrap_or(0) as u32;
+    graph.record_usage(
+        &cwd,
+        &body.session_id,
+        agent,
+        crate::graph::UsageEvent::ToolResult { tool: Some(body.tool.clone()), chars },
+    );
+
     write_json(stream, 200, &ok).await
 }
 

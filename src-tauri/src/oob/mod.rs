@@ -152,4 +152,19 @@ impl OobContext {
             mem.record_mem_event(root, session_id, agent, kind, path, symbol, line, detail);
         }
     }
+
+    /// V14 Phase C: record one usage/cost event via the graph service — a
+    /// no-op when memory isn't wired or the graph is disabled (mirrors
+    /// [`Self::record_mem`]). Never blocks or errors the tap.
+    pub fn record_usage(
+        &self,
+        root: &std::path::Path,
+        session_id: &str,
+        agent: &str,
+        event: crate::graph::UsageEvent,
+    ) {
+        if let Some(mem) = self.mem.as_ref() {
+            mem.record_usage(root, session_id, agent, event);
+        }
+    }
 }

@@ -120,6 +120,86 @@ pub fn parse_distilled_facts(raw: &str) -> Option<Vec<String>> {
     Some(lines)
 }
 
+// ── V14 Phase C: usage / cost accounting ──────────────────────────────────
+//
+// A second per-session ring, stored in its own `usage_stat` relation
+// alongside `mem_event` (additive, survives a graph rebuild, evicted with the
+// session — see `GraphIndex::record_usage_event` / `prune_sessions_in_tx`).
+// Two kinds of row: "turn" (one assistant message's token usage, UPSERTED by
+// `msg_id` so a streamed message that firms up its `usage` block updates in
+// place rather than duplicating) and "tool_result" (one resolved tool call,
+// sized in estimated chars — no exact token count exists for tool output).
+
+/// Per-session `usage_stat` ring cap — deeper than [`MAX_EVENTS_PER_SESSION`]
+/// since usage rows are written far more often (every turn AND every tool
+/// result, vs. one `mem_event` per *classified* tool call).
+pub const MAX_USAGE_PER_SESSION: i64 = 2000;
+
+/// One usage/cost event fed to [`super::service::GraphService::record_usage`].
+/// Timestamped internally (same posture as `record_mem_event`'s `ts_ms`
+/// argument — callers don't carry a clock through the tap).
+#[derive(Clone, Debug, PartialEq)]
+pub enum UsageEvent {
+    /// One assistant message's token usage. `msg_id` is the UPSERT key: a
+    /// streamed transcript can carry the same id across multiple lines as its
+    /// `usage` block fills in, and only the last one should survive as a row.
+    Turn {
+        msg_id: String,
+        model: Option<String>,
+        in_tok: u32,
+        out_tok: u32,
+        cache_read: u32,
+        cache_make: u32,
+    },
+    /// One resolved tool call's result size, in characters (estimated tokens
+    /// = chars / 4 is a UI-layer concern, not stored here). `tool` is `None`
+    /// when the id → name join missed (e.g. the ring evicted it).
+    ToolResult { tool: Option<String>, chars: u32 },
+}
+
+/// Summed token totals across a session's "turn" rows ("tool_result" rows
+/// carry chars, not tokens, so they don't contribute).
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct UsageTotals {
+    pub in_tok: u64,
+    pub out_tok: u64,
+    pub cache_read: u64,
+    pub cache_make: u64,
+}
+
+/// One turn's token breakdown, plus the (estimated) tool-result characters
+/// that arrived since the PREVIOUS turn — i.e. the tool output this turn's
+/// assistant message actually read as input context. See
+/// [`super::index::GraphIndex::usage_turn_series`].
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TurnUsage {
+    pub msg_id: String,
+    pub model: Option<String>,
+    pub in_tok: u64,
+    pub out_tok: u64,
+    pub cache_read: u64,
+    pub cache_make: u64,
+    pub tool_chars: u64,
+    pub ts_ms: i64,
+}
+
+/// One session's row for the project-wide usage totals table.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct SessionUsageRow {
+    pub session_id: String,
+    pub agent: String,
+    pub totals: UsageTotals,
+    /// Total estimated tool-result chars for the session (sum of
+    /// `usage_per_tool`'s values).
+    pub tool_chars: u64,
+    /// `cache_read / (cache_read + in_tok)`; `0.0` when there's no
+    /// denominator (no turns recorded yet).
+    pub cache_hit_ratio: f64,
+    /// True when this session has no exact `usage` data — currently every
+    /// non-Claude agent (see the OpenCode C3 spike note atop `oob/opencode.rs`).
+    pub est_only: bool,
+}
+
 /// Map an agent tool name/id to a memory event `kind` + the argument key that
 /// carries the path/target. Shared by the Claude transcript tap and the
 /// OpenCode plugin's `/memory/event` ingress so both classify identically.

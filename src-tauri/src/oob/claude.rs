@@ -11,7 +11,7 @@
 //!
 //! Latency is sub-second in practice (spike 0b), well within TTS comfort.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -43,6 +43,10 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     // (see `update_agents`). Keyed by the `toolu_…` id so out-of-order results
     // and parallel launches are matched exactly.
     let mut agents: HashSet<String> = HashSet::new();
+    // V14 Phase C: tool_use_id -> name, so a later tool_result can be
+    // attributed to the tool that produced it for usage accounting. Same
+    // per-session lifetime as `agents` — cleared on session rotation below.
+    let mut tool_names = ToolNameRing::default();
     let mut cur: Option<PathBuf> = None;
     let mut offset: u64 = 0;
     // The first file we attach to may already hold a long backlog from before
@@ -76,6 +80,9 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                         active: false,
                     });
                 }
+                // The tool-name ring is per-session too: a new file means old
+                // tool_use ids can never see a matching tool_result.
+                tool_names.clear();
             }
             Some(_) => {}
             None => {
@@ -95,9 +102,17 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            offset =
-                drain_new_lines(&path, offset, &mut seen, &mut agents, &project_dir, &session_id, &ctx)
-                    .await;
+            offset = drain_new_lines(
+                &path,
+                offset,
+                &mut seen,
+                &mut agents,
+                &mut tool_names,
+                &project_dir,
+                &session_id,
+                &ctx,
+            )
+            .await;
         }
 
         tokio::select! {
@@ -115,6 +130,7 @@ async fn drain_new_lines(
     mut offset: u64,
     seen: &mut HashSet<String>,
     agents: &mut HashSet<String>,
+    tool_names: &mut ToolNameRing,
     project_dir: &Path,
     session_id: &str,
     ctx: &OobContext,
@@ -154,6 +170,7 @@ async fn drain_new_lines(
         if let Ok(obj) = serde_json::from_str::<Value>(line) {
             update_agents(&obj, agents, ctx);
             record_tool_events(&obj, project_dir, session_id, ctx);
+            record_usage(&obj, tool_names, project_dir, session_id, ctx);
             for (key, text) in assistant_texts(&obj) {
                 if seen.insert(key) {
                     trace!(tab = ?ctx.tab, "Claude OOB: speaking assistant block");
@@ -336,6 +353,159 @@ fn record_tool_events(obj: &Value, project_dir: &Path, session_id: &str, ctx: &O
             continue;
         }
         ctx.record_mem(project_dir, session_id, "claude", kind, &path, None, None, detail.as_deref());
+    }
+}
+
+// ── V14 Phase C: token/cost usage tap ─────────────────────────────────────
+
+/// Small ring of `tool_use_id -> tool name`, populated from every `tool_use`
+/// block (ALL tools, unlike [`record_tool_events`]'s `classify_tool` filter —
+/// usage accounting wants every tool named, not just the memory-worthy ones)
+/// and consulted when the matching `tool_result` arrives so its estimated
+/// chars can be attributed to a tool ("Read of `foo.rs` cost 18k twice" needs
+/// the name). Bounded so a very long session can't grow it unboundedly —
+/// oldest entries are evicted first, same ring posture as `mem_event`'s cap.
+#[derive(Default)]
+struct ToolNameRing {
+    names: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+/// Ring cap — generous relative to how many tool calls a single session
+/// realistically has outstanding at once (this only needs to bridge a
+/// `tool_use` to its own `tool_result`, which normally arrives within the
+/// same or next line).
+const TOOL_NAME_RING_CAP: usize = 512;
+
+impl ToolNameRing {
+    fn insert(&mut self, id: String, name: String) {
+        if !self.names.contains_key(&id) {
+            self.order.push_back(id.clone());
+            while self.order.len() > TOOL_NAME_RING_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.names.remove(&old);
+                }
+            }
+        }
+        self.names.insert(id, name);
+    }
+
+    fn get(&self, id: &str) -> Option<&str> {
+        self.names.get(id).map(String::as_str)
+    }
+
+    /// Drop everything — called on session rotation (a new transcript file
+    /// means old `tool_use` ids can never see a matching `tool_result`).
+    fn clear(&mut self) {
+        self.names.clear();
+        self.order.clear();
+    }
+}
+
+/// Pure: extract a [`crate::graph::UsageEvent::Turn`] from an assistant
+/// transcript line's `message.usage` block. Tolerant of absent fields
+/// (older transcript lines, or a partial line mid-stream before the block
+/// firms up) — missing token counts default to 0, which is exactly right for
+/// the UPSERT-by-`msg_id` semantics in `record_usage_event`: a later line
+/// carrying the SAME `msg_id` with the real numbers overwrites this one in
+/// place rather than leaving a duplicate zero row. `None` for any
+/// non-assistant line or an assistant line with no `message.id`.
+fn parse_usage_line(obj: &Value) -> Option<crate::graph::UsageEvent> {
+    if obj.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = obj.get("message")?;
+    let msg_id = message.get("id").and_then(Value::as_str)?.to_string();
+    let model = message.get("model").and_then(Value::as_str).map(str::to_string);
+    let usage = message.get("usage");
+    let tok = |k: &str| -> u32 { usage.and_then(|u| u.get(k)).and_then(Value::as_u64).unwrap_or(0) as u32 };
+    Some(crate::graph::UsageEvent::Turn {
+        msg_id,
+        model,
+        in_tok: tok("input_tokens"),
+        out_tok: tok("output_tokens"),
+        cache_read: tok("cache_read_input_tokens"),
+        cache_make: tok("cache_creation_input_tokens"),
+    })
+}
+
+/// Pure: `(tool_use_id, chars)` for every `tool_result` content block in a
+/// user-role transcript line (the carrier for one or more parallel tool
+/// results). `chars` is an estimated-token proxy for the result's size — no
+/// exact token count exists for tool output, only for assistant messages.
+fn extract_tool_results(obj: &Value) -> Vec<(String, usize)> {
+    if obj.get("type").and_then(Value::as_str) != Some("user") {
+        return Vec::new();
+    }
+    let Some(parts) = message_parts(obj) else { return Vec::new() };
+    let mut out = Vec::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let Some(id) = part.get("tool_use_id").and_then(Value::as_str) else { continue };
+        let chars = tool_result_chars(part.get("content").unwrap_or(&Value::Null));
+        out.push((id.to_string(), chars));
+    }
+    out
+}
+
+/// Character length of a `tool_result` block's `content`, which is either a
+/// plain string or an array of blocks (`{"type":"text","text":...}` plus
+/// possibly non-text blocks, e.g. images — only text blocks count towards
+/// the char estimate).
+fn tool_result_chars(content: &Value) -> usize {
+    match content {
+        Value::String(s) => s.chars().count(),
+        Value::Array(items) => items
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .map(|t| t.chars().count())
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// V14 Phase C: feed the token/cost X-ray from one transcript line — a `Turn`
+/// event from an assistant message's `usage` block, and a `ToolResult` event
+/// per `tool_result` block in a tool-carrier user line (joined to its tool
+/// name via `tool_names`). A no-op when memory isn't wired (mirrors
+/// `record_tool_events`). Unlike `record_tool_events`, sidechain (sub-agent)
+/// lines are NOT skipped: a sub-agent's tokens are real spend against the
+/// same session and must be counted, even though its file touches aren't
+/// tracked as the parent's working set.
+fn record_usage(obj: &Value, tool_names: &mut ToolNameRing, project_dir: &Path, session_id: &str, ctx: &OobContext) {
+    if ctx.mem.is_none() {
+        return;
+    }
+
+    // Learn tool_use_id -> name for every tool_use block, regardless of
+    // whether `classify_tool` recognizes it.
+    if let Some(parts) = message_parts(obj) {
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("tool_use") {
+                if let (Some(id), Some(name)) =
+                    (part.get("id").and_then(Value::as_str), part.get("name").and_then(Value::as_str))
+                {
+                    tool_names.insert(id.to_string(), name.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(event) = parse_usage_line(obj) {
+        ctx.record_usage(project_dir, session_id, "claude", event);
+    }
+
+    for (tool_use_id, chars) in extract_tool_results(obj) {
+        let tool = tool_names.get(&tool_use_id).map(str::to_string);
+        ctx.record_usage(
+            project_dir,
+            session_id,
+            "claude",
+            crate::graph::UsageEvent::ToolResult { tool, chars: chars as u32 },
+        );
     }
 }
 
@@ -633,5 +803,163 @@ mod tests {
         let prompt = obj(r#"{"type":"user","message":{"content":"hello"}}"#);
         update_agents(&prompt, &mut agents, &ctx);
         assert!(sig.try_recv().is_err());
+    }
+
+    // ── V14 Phase C: usage tap (parse_usage_line / extract_tool_results) ──
+
+    #[test]
+    fn parse_usage_line_extracts_full_usage_block() {
+        let line = obj(
+            r#"{"type":"assistant","message":{"id":"m1","model":"claude-x","usage":{
+                "input_tokens":100,"output_tokens":20,
+                "cache_read_input_tokens":50,"cache_creation_input_tokens":5}}}"#,
+        );
+        let ev = parse_usage_line(&line).expect("assistant line with usage yields an event");
+        match ev {
+            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make } => {
+                assert_eq!(msg_id, "m1");
+                assert_eq!(model.as_deref(), Some("claude-x"));
+                assert_eq!(in_tok, 100);
+                assert_eq!(out_tok, 20);
+                assert_eq!(cache_read, 50);
+                assert_eq!(cache_make, 5);
+            }
+            other => panic!("expected Turn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_usage_line_tolerates_absent_usage() {
+        // Older transcript lines (or a partial line mid-stream) may carry no
+        // `usage` block at all: still a Turn event (so the msg_id UPSERT can
+        // later overwrite it with real numbers), just with zeroed tokens.
+        let line = obj(r#"{"type":"assistant","message":{"id":"m2"}}"#);
+        let ev = parse_usage_line(&line).expect("absent usage still yields an event");
+        match ev {
+            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make } => {
+                assert_eq!(msg_id, "m2");
+                assert_eq!(model, None);
+                assert_eq!((in_tok, out_tok, cache_read, cache_make), (0, 0, 0, 0));
+            }
+            other => panic!("expected Turn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_usage_line_partial_usage_defaults_missing_fields() {
+        // A usage block with only some fields present (a plausible partial
+        // stream update) — present fields are read, absent ones default to 0.
+        let line = obj(
+            r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7}}}"#,
+        );
+        let ev = parse_usage_line(&line).unwrap();
+        match ev {
+            crate::graph::UsageEvent::Turn { in_tok, out_tok, cache_read, cache_make, .. } => {
+                assert_eq!(in_tok, 7);
+                assert_eq!((out_tok, cache_read, cache_make), (0, 0, 0));
+            }
+            other => panic!("expected Turn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_usage_line_none_for_non_assistant() {
+        let line = obj(r#"{"type":"user","message":{"content":"hi"}}"#);
+        assert!(parse_usage_line(&line).is_none());
+    }
+
+    #[test]
+    fn parse_usage_line_none_without_message_id() {
+        let line = obj(r#"{"type":"assistant","message":{"usage":{"input_tokens":1}}}"#);
+        assert!(parse_usage_line(&line).is_none());
+    }
+
+    #[test]
+    fn extract_tool_results_reads_string_content() {
+        let line = obj(
+            r#"{"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"toolu_1","content":"hello world"}
+            ]}}"#,
+        );
+        let got = extract_tool_results(&line);
+        assert_eq!(got, vec![("toolu_1".to_string(), "hello world".chars().count())]);
+    }
+
+    #[test]
+    fn extract_tool_results_sums_text_blocks_and_skips_non_text() {
+        let line = obj(
+            r#"{"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"toolu_2","content":[
+                    {"type":"text","text":"abc"},
+                    {"type":"image","source":{}},
+                    {"type":"text","text":"de"}
+                ]}
+            ]}}"#,
+        );
+        let got = extract_tool_results(&line);
+        assert_eq!(got, vec![("toolu_2".to_string(), 5)], "only the two text blocks (3+2 chars) count");
+    }
+
+    #[test]
+    fn extract_tool_results_handles_multiple_parallel_results() {
+        let line = obj(
+            r#"{"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"toolu_a","content":"aa"},
+                {"type":"tool_result","tool_use_id":"toolu_b","content":"bbbb"}
+            ]}}"#,
+        );
+        let got = extract_tool_results(&line);
+        assert_eq!(got, vec![("toolu_a".to_string(), 2), ("toolu_b".to_string(), 4)]);
+    }
+
+    #[test]
+    fn extract_tool_results_ignores_non_tool_result_and_non_user_lines() {
+        // A real user prompt (text block, not a tool_result carrier).
+        let prompt = obj(r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#);
+        assert!(extract_tool_results(&prompt).is_empty());
+        // An assistant line is never a tool_result carrier.
+        let assistant = obj(r#"{"type":"assistant","message":{"id":"m1","content":[]}}"#);
+        assert!(extract_tool_results(&assistant).is_empty());
+    }
+
+    #[test]
+    fn tool_name_ring_joins_and_evicts_beyond_cap() {
+        let mut ring = ToolNameRing::default();
+        ring.insert("toolu_1".to_string(), "Read".to_string());
+        assert_eq!(ring.get("toolu_1"), Some("Read"));
+        assert_eq!(ring.get("toolu_missing"), None);
+
+        // Insert one more than the cap; the oldest (`toolu_1`) is evicted,
+        // the newest survives.
+        for i in 0..TOOL_NAME_RING_CAP {
+            ring.insert(format!("toolu_gen_{i}"), "Bash".to_string());
+        }
+        assert_eq!(ring.get("toolu_1"), None, "oldest entry evicted beyond the cap");
+        assert_eq!(ring.get(&format!("toolu_gen_{}", TOOL_NAME_RING_CAP - 1)), Some("Bash"));
+    }
+
+    #[test]
+    fn tool_name_ring_clear_drops_everything() {
+        let mut ring = ToolNameRing::default();
+        ring.insert("toolu_1".to_string(), "Read".to_string());
+        ring.clear();
+        assert_eq!(ring.get("toolu_1"), None);
+    }
+
+    #[test]
+    fn record_usage_is_a_noop_without_graph_memory() {
+        // agent_ctx()'s ctx.mem is None; record_usage must not panic, and —
+        // mirroring record_tool_events's early return — must not even touch
+        // the ring, since without memory there's nothing to join it into.
+        let (ctx, _sig) = agent_ctx();
+        let mut ring = ToolNameRing::default();
+        let dir = std::env::temp_dir();
+        let line = obj(
+            r#"{"type":"assistant","message":{"id":"m1","content":[
+                {"type":"tool_use","id":"toolu_1","name":"Read","input":{}}
+            ],"usage":{"input_tokens":10,"output_tokens":2}}}"#,
+        );
+        record_usage(&line, &mut ring, &dir, "s1", &ctx);
+        assert_eq!(ring.get("toolu_1"), None, "mem is None, so the tap is a full no-op");
     }
 }

@@ -261,7 +261,7 @@ export function workbenchWorktreeMerge(slug: string, root?: string): Promise<Mer
 /// confirmation is this dialog's job, not the backend's — call only after
 /// the user has explicitly confirmed.
 export function workbenchWorktreeDiscard(slug: string, root?: string): Promise<void> {
-  return invoke('workbench_worktree_discard', { root: root ?? null, slug });
+  return invoke<void>('workbench_worktree_discard', { root: root ?? null, slug });
 }
 
 /// The merge-readiness chip's "Run checks" action: runs every configured

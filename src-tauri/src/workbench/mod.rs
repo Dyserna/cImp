@@ -212,12 +212,18 @@ impl WorkbenchService {
         if !cfg.workbench.checkpoints {
             return;
         }
-        let root = PathBuf::from(&batch.root);
+        // Normalize the root to a single canonical form: `batch.root` arrives
+        // as a `root.display()` string round-trip, while the prompt-tap path
+        // keys `checkpoint_last` from a raw `&Path`. Without normalizing, the
+        // two representations of the same project become distinct map keys and
+        // the shared `checkpoint_min_gap_s` debounce stops working across the
+        // burst and prompt triggers.
+        let root = git::canonical_path(&PathBuf::from(&batch.root));
         let burst_files = cfg.workbench.checkpoint_burst_files.max(1) as usize;
         let window = Duration::from_secs(cfg.workbench.checkpoint_burst_window_s.max(1) as u64);
 
         let fire = {
-            let mut state = self.burst_state.lock().unwrap();
+            let mut state = self.burst_state.lock().unwrap_or_else(|e| e.into_inner());
             // Opportunistically drop long-idle roots so this map doesn't grow
             // unbounded across a long session touching many projects.
             state.retain(|_, s| s.window_start.elapsed() < Self::BURST_STATE_MAX_AGE);
@@ -265,9 +271,12 @@ impl WorkbenchService {
         }
         let cfg = self.settings.current();
         let min_gap = Duration::from_secs(cfg.workbench.checkpoint_min_gap_s as u64);
-        let root = root.to_path_buf();
+        // Canonicalize so this gate keys on the same form as every other
+        // `checkpoint_last` writer (burst, manual, restore) regardless of how
+        // the caller spelled `root`.
+        let root = git::canonical_path(root);
         {
-            let mut last = self.checkpoint_last.lock().unwrap();
+            let mut last = self.checkpoint_last.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(prev) = last.get(&root) {
                 if prev.elapsed() < min_gap {
                     return;
@@ -327,7 +336,7 @@ impl WorkbenchService {
             cfg.graph.max_file_bytes,
         )
         .await?;
-        self.checkpoint_last.lock().unwrap().insert(root.to_path_buf(), Instant::now());
+        self.checkpoint_last.lock().unwrap_or_else(|e| e.into_inner()).insert(git::canonical_path(root), Instant::now());
         if let Err(e) = shadow::gc(root, cfg.workbench.checkpoint_max, cfg.workbench.checkpoint_max_age_days).await {
             warn!(root = %root.display(), error = %e, "workbench: checkpoint gc failed after manual checkpoint");
         }
@@ -358,7 +367,7 @@ impl WorkbenchService {
     pub async fn restore(&self, root: &Path, id: &str, delete_new: bool) -> AppResult<shadow::RestoreReport> {
         let cfg = self.settings.current();
         let report = shadow::restore(root, id, delete_new, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
-        self.checkpoint_last.lock().unwrap().insert(root.to_path_buf(), Instant::now());
+        self.checkpoint_last.lock().unwrap_or_else(|e| e.into_inner()).insert(git::canonical_path(root), Instant::now());
         Ok(report)
     }
 
@@ -427,7 +436,17 @@ impl WorkbenchService {
         if summary.source.is_some() || !self.checkpoints_enabled() {
             return Ok(summary);
         }
-        let Some(latest) = shadow::list(root).await.unwrap_or_default().into_iter().next_back() else {
+        let latest = match shadow::list(root).await {
+            Ok(list) => list.into_iter().next_back(),
+            Err(e) => {
+                // A broken shadow repo shouldn't crash the diff pane, but it
+                // also shouldn't masquerade as "no checkpoints" — log it so the
+                // failure is diagnosable rather than silent.
+                warn!(root = %root.display(), error = %e, "workbench: shadow checkpoint list failed; falling back to plain summary");
+                None
+            }
+        };
+        let Some(latest) = latest else {
             return Ok(summary);
         };
         let cfg = self.settings.current();
@@ -449,7 +468,14 @@ impl WorkbenchService {
         if git::is_repo(root).await || !self.checkpoints_enabled() {
             return diff::diff_file(root, path).await;
         }
-        let Some(latest) = shadow::list(root).await.unwrap_or_default().into_iter().next_back() else {
+        let latest = match shadow::list(root).await {
+            Ok(list) => list.into_iter().next_back(),
+            Err(e) => {
+                warn!(root = %root.display(), error = %e, "workbench: shadow checkpoint list failed; falling back to plain diff");
+                None
+            }
+        };
+        let Some(latest) = latest else {
             return diff::diff_file(root, path).await;
         };
         let cfg = self.settings.current();
@@ -496,7 +522,13 @@ impl WorkbenchService {
         if infos.is_empty() {
             return Ok(infos);
         }
-        let live_paths: HashSet<String> = self
+        // Canonicalize both the tab cwds and each worktree's path before
+        // comparing: `info.path` is git's resolved worktree path while a tab
+        // `cwd` is stored as-configured, so an exact string compare misses
+        // matches that differ only by drive-letter case, 8.3 short name, or
+        // the `\\?\` prefix — showing a worktree as having no live tab and
+        // prompting a duplicate.
+        let live_paths: HashSet<PathBuf> = self
             .settings
             .current()
             .tabs
@@ -505,10 +537,10 @@ impl WorkbenchService {
                 TabConfig::AiTool(cfg) => cfg.cwd.as_ref(),
                 TabConfig::Shell(_) | TabConfig::Preview(_) => None,
             })
-            .map(|p| p.display().to_string().replace('\\', "/"))
+            .map(|p| git::canonical_path(p))
             .collect();
         for info in &mut infos {
-            info.has_live_tab = live_paths.contains(&info.path);
+            info.has_live_tab = live_paths.contains(&git::canonical_path(Path::new(&info.path)));
         }
         Ok(infos)
     }
@@ -543,7 +575,7 @@ impl WorkbenchService {
     /// under the same name doesn't show a stale chip.
     pub async fn worktree_discard(&self, root: &Path, slug: &str) -> AppResult<()> {
         worktree::discard(root, slug).await?;
-        self.worktree_check_cache.lock().unwrap().remove(&(root.to_path_buf(), slug.to_string()));
+        self.worktree_check_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(&(root.to_path_buf(), slug.to_string()));
         Ok(())
     }
 
@@ -591,7 +623,7 @@ impl WorkbenchService {
             .unwrap_or(0);
         let status = WorktreeCheckStatus { pass, checked_at_unix, reports };
         {
-            let mut cache = self.worktree_check_cache.lock().unwrap();
+            let mut cache = self.worktree_check_cache.lock().unwrap_or_else(|e| e.into_inner());
             // FIX 8: opportunistic age-based eviction — see
             // `WORKTREE_CHECK_CACHE_MAX_AGE_SECS`'s doc comment.
             cache.retain(|_, v| {
@@ -606,7 +638,7 @@ impl WorkbenchService {
     /// check has ever been run for it this session — `None` renders as
     /// "not checked yet" rather than a stale/default value.
     pub fn worktree_check_status(&self, root: &Path, slug: &str) -> Option<WorktreeCheckStatus> {
-        self.worktree_check_cache.lock().unwrap().get(&(root.to_path_buf(), slug.to_string())).cloned()
+        self.worktree_check_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&(root.to_path_buf(), slug.to_string())).cloned()
     }
 }
 
@@ -735,6 +767,100 @@ mod tests {
         assert!(after.hunks.is_empty(), "expected a clean file after revert: {after:?}");
         let content = std::fs::read_to_string(dir.join("f.txt")).unwrap();
         assert_eq!(content, "line1\nline2\nline3\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (H1): a CRLF-terminated file must survive the full revert
+    /// round trip. Before the fix, `parse_unified` split with `str::lines()`
+    /// (which strips `\r`), so `build_hunk_patch` emitted an LF-only patch that
+    /// `git apply --reverse` could not match against the on-disk `\r\n`, and
+    /// every hunk revert on a CRLF file failed. `core.autocrlf=false` (set in
+    /// `setup_repo`) keeps git from rewriting the endings, so the `\r\n` bytes
+    /// reach the parser verbatim.
+    #[tokio::test]
+    async fn revert_hunk_round_trips_a_crlf_file() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = setup_repo("crlf");
+        std::fs::write(dir.join("f.txt"), "line1\r\nline2\r\nline3\r\n").unwrap();
+        git(&dir, &["add", "f.txt"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("f.txt"), "line1\r\nline2-CHANGED\r\nline3\r\n").unwrap();
+
+        let before = diff::diff_file(&dir, "f.txt").await.expect("diff before");
+        assert_eq!(before.hunks.len(), 1);
+        let hash = diff::hunk_hash(&before.hunks[0]);
+
+        let after = revert_hunk(&dir, "f.txt", 0, &hash).await.expect("revert_hunk on CRLF file");
+        assert!(after.hunks.is_empty(), "expected a clean file after revert: {after:?}");
+        // Byte-exact: the CRLF endings must be restored, not silently
+        // normalized to LF.
+        let content = std::fs::read(dir.join("f.txt")).unwrap();
+        assert_eq!(content, b"line1\r\nline2\r\nline3\r\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (H2): a non-ASCII filename must diff and revert. Git's
+    /// default `core.quotePath=true` C-quotes such paths in the `diff --git`
+    /// header (`"caf\303\251.txt"`), which `parse_diff_git_line` could not
+    /// parse — the whole file section was dropped and the diff pane came up
+    /// empty (and un-revertable). `diff_file` now pins `core.quotePath=false`.
+    #[tokio::test]
+    async fn revert_hunk_round_trips_a_non_ascii_filename() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = setup_repo("unicode");
+        let name = "café.txt";
+        std::fs::write(dir.join(name), "a\nb\nc\n").unwrap();
+        git(&dir, &["add", name]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join(name), "a\nB\nc\n").unwrap();
+
+        let before = diff::diff_file(&dir, name).await.expect("diff before");
+        assert_eq!(before.path, name, "path must round-trip unquoted");
+        assert_eq!(before.hunks.len(), 1, "non-ASCII file must produce a hunk, not be dropped");
+        let hash = diff::hunk_hash(&before.hunks[0]);
+
+        let after = revert_hunk(&dir, name, 0, &hash).await.expect("revert_hunk on unicode-named file");
+        assert!(after.hunks.is_empty(), "expected a clean file after revert: {after:?}");
+        let content = std::fs::read_to_string(dir.join(name)).unwrap();
+        assert_eq!(content, "a\nb\nc\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (L5): reverting a hunk that touches the unterminated final
+    /// line of a file must NOT add a trailing newline. Before the fix,
+    /// `build_hunk_patch` dropped the `\ No newline at end of file` marker, so
+    /// the reverse patch didn't match the on-disk (newline-less) last line —
+    /// the revert either failed or silently appended a byte the user never had.
+    #[tokio::test]
+    async fn revert_hunk_preserves_missing_trailing_newline() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = setup_repo("nonewline");
+        std::fs::write(dir.join("f.txt"), "a\nb\nc").unwrap(); // no trailing newline
+        git(&dir, &["add", "f.txt"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("f.txt"), "a\nb\nCHANGED").unwrap(); // still unterminated
+
+        let before = diff::diff_file(&dir, "f.txt").await.expect("diff before");
+        assert_eq!(before.hunks.len(), 1);
+        let hash = diff::hunk_hash(&before.hunks[0]);
+
+        let after = revert_hunk(&dir, "f.txt", 0, &hash).await.expect("revert_hunk on no-newline file");
+        assert!(after.hunks.is_empty(), "expected a clean file after revert: {after:?}");
+        // Byte-exact: the file must NOT have gained a trailing newline.
+        let content = std::fs::read(dir.join("f.txt")).unwrap();
+        assert_eq!(content, b"a\nb\nc");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

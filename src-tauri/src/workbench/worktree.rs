@@ -116,6 +116,20 @@ pub fn sanitize_slug(input: &str) -> AppResult<String> {
             "worktree name can only contain letters, digits, '-', and '_'".to_string(),
         ));
     }
+    // Windows can't create a directory named after a reserved DOS device, so
+    // such a slug would pass every check above only to fail deep inside `git
+    // worktree add` with an opaque OS error. Reject it up front (case-
+    // insensitive) with a clear message. Harmless to enforce on all platforms.
+    const RESERVED: &[&str] = &[
+        "con", "prn", "aux", "nul",
+        "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+        "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    if RESERVED.contains(&s.to_ascii_lowercase().as_str()) {
+        return Err(AppError::Workbench(format!(
+            "'{s}' is a reserved device name on Windows — choose another worktree name"
+        )));
+    }
     Ok(s.to_string())
 }
 
@@ -313,7 +327,16 @@ pub async fn create(root: &Path, slug: &str) -> AppResult<PathBuf> {
         )));
     }
 
-    write_meta(root, &slug, &WorktreeMeta { base })?;
+    if let Err(e) = write_meta(root, &slug, &WorktreeMeta { base }) {
+        // Roll back the worktree + branch we just created. Without the meta
+        // file `list` skips this worktree and `discard` refuses it, so a failed
+        // meta write would otherwise wedge the slug as an orphan only a manual
+        // `git worktree remove` could clear. Best-effort cleanup; the original
+        // write error is what we surface.
+        let _ = git::run(&ctx, &["worktree", "remove", "--force", &path_str], Some(BULK_TIMEOUT)).await;
+        let _ = git::run(&ctx, &["branch", "-D", &branch], None).await;
+        return Err(e);
+    }
     git::invalidate_is_repo_cache(&path);
     Ok(path)
 }
@@ -397,11 +420,16 @@ pub async fn list(root: &Path) -> AppResult<Vec<WorktreeInfo>> {
             out.stderr.trim()
         )));
     }
-    let worktrees_root = root.join(WORKTREES_DIR);
+    // Canonicalize both sides: `git worktree list` reports the resolved real
+    // path (symlink/junction/8.3/`\\?\`-normalized), so comparing it against an
+    // as-passed `root.join(...)` would spuriously drop every cImp worktree when
+    // `root` reached us via a symlink, junction, or short path — making them
+    // invisible and un-mergeable/un-discardable in the UI.
+    let worktrees_root = git::canonical_path(&root.join(WORKTREES_DIR));
     let mut infos = Vec::new();
     for raw in parse_worktree_porcelain(&out.stdout) {
         let Some(parent) = raw.path.parent() else { continue };
-        if parent != worktrees_root {
+        if git::canonical_path(parent) != worktrees_root {
             continue; // not one of ours
         }
         let Some(slug) = raw.path.file_name().and_then(|n| n.to_str()) else { continue };
@@ -485,15 +513,30 @@ pub async fn merge(root: &Path, slug: &str) -> AppResult<MergeReport> {
     let branch = branch_name(&slug);
     let merge_out = git::run(&ctx, &["merge", "--no-edit", &branch], Some(BULK_TIMEOUT)).await?;
     if !merge_out.success() {
-        // Hard safety rule: never CLAIM the tree is clean when it isn't.
-        // `git merge --abort`'s own result must be checked (FIX 2 / V13 code
-        // review) — a failed abort (e.g. it couldn't reset the index, or the
-        // merge never got as far as writing `MERGE_HEAD` and there's nothing
-        // for `--abort` to abort in the first place, which itself makes
-        // `--abort` fail) means the main tree's state is genuinely unknown,
-        // not "aborted and unchanged". Reporting the reassuring message in
-        // that case would tell the user it's safe to keep going when it
-        // might not be.
+        // Did the merge actually start? If there's no `MERGE_HEAD`, git failed
+        // BEFORE touching the tree — a deleted/renamed worktree branch, "not
+        // something we can merge", an unborn base — so the main tree is
+        // unchanged. Report a plain error rather than the alarming
+        // "half-merged" one below: in this case `git merge --abort` legitimately
+        // fails with "no merge to abort", which must NOT be read as a corrupt
+        // tree.
+        let merge_started = matches!(
+            git::run(&ctx, &["rev-parse", "-q", "--verify", "MERGE_HEAD"], None).await,
+            Ok(out) if out.success()
+        );
+        if !merge_started {
+            return Err(AppError::Workbench(format!(
+                "couldn't merge '{branch}' — the merge did not start (the worktree branch may be missing or there is nothing to merge). The main working tree is unchanged. git said: {}",
+                merge_out.stderr.trim().lines().next().unwrap_or(merge_out.stderr.trim())
+            )));
+        }
+        // A merge is genuinely in progress (conflicts). Hard safety rule: never
+        // CLAIM the tree is clean when it isn't. `git merge --abort`'s own
+        // result must be checked (FIX 2 / V13 code review) — a failed abort
+        // (e.g. it couldn't reset the index) means the main tree's state is
+        // genuinely unknown, not "aborted and unchanged". Reporting the
+        // reassuring message in that case would tell the user it's safe to keep
+        // going when it might not be.
         let abort_out = git::run(&ctx, &["merge", "--abort"], None).await;
         let abort_ok = matches!(&abort_out, Ok(out) if out.success());
         if !abort_ok {
@@ -663,6 +706,17 @@ mod tests {
         assert!(sanitize_slug("").is_err());
         assert!(sanitize_slug("   ").is_err());
         assert!(sanitize_slug("-leading-dash").is_err());
+    }
+
+    #[test]
+    fn sanitize_slug_rejects_windows_reserved_names() {
+        for name in ["con", "CON", "nul", "Aux", "prn", "com1", "COM9", "lpt1", "LPT9"] {
+            assert!(sanitize_slug(name).is_err(), "{name} should be rejected as reserved");
+        }
+        // A reserved stem with extra characters is a normal, allowed name.
+        assert!(sanitize_slug("console").is_ok());
+        assert!(sanitize_slug("com10").is_ok());
+        assert!(sanitize_slug("com0").is_ok());
     }
 
     // ── create / list / ahead-behind / meta ─────────────────────────────

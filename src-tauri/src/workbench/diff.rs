@@ -51,9 +51,10 @@ pub enum FileStatus {
 /// One `@@ … @@` hunk. `lines` is the hunk body in order, each entry a
 /// `(marker, text)` pair where `marker` is `' '` (context), `'+'` (added), or
 /// `'-'` (removed) — `text` excludes both the marker and the trailing
-/// newline. A trailing `\ No newline at end of file` marker line is consumed
-/// by the parser but not represented here (V1 doesn't need to round-trip it —
-/// see [`build_hunk_patch`]'s doc comment for the one place that matters).
+/// newline. A `\ No newline at end of file` marker is recorded in
+/// [`no_newline_at`](Self::no_newline_at) so [`build_hunk_patch`] can
+/// reproduce it faithfully (without it, reverting a hunk that touches a file's
+/// unterminated final line would silently add a trailing newline).
 #[derive(Clone, Debug, Serialize, PartialEq, Default)]
 pub struct Hunk {
     /// The raw `@@ -a,b +c,d @@ <context>` header line, kept verbatim for
@@ -66,6 +67,13 @@ pub struct Hunk {
     pub new_start: u32,
     pub new_lines: u32,
     pub lines: Vec<(char, String)>,
+    /// Indices into [`lines`](Self::lines) that were followed by a `\ No
+    /// newline at end of file` marker in the source diff — i.e. lines whose
+    /// content is NOT newline-terminated on disk. Usually empty; at most the
+    /// hunk's final `-` and/or `+` line. [`build_hunk_patch`] re-emits the
+    /// marker after each so a reverse-apply doesn't mutate the file's trailing
+    /// newline.
+    pub no_newline_at: Vec<usize>,
     /// [`hunk_hash`] of this hunk's own content, precomputed once the hunk is
     /// fully built (by [`parse_unified`] / [`synthesize_untracked`]) and
     /// carried over the wire so the frontend has something opaque to echo
@@ -167,7 +175,18 @@ pub struct DiffSummary {
 /// produced here — see [`FileStatus::Untracked`]'s doc comment.
 pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
     let mut files = Vec::new();
-    let mut lines = diff_text.lines().peekable();
+    // Split on `\n` only, preserving any trailing `\r` as part of the line's
+    // content. `str::lines()` strips `\r\n` down to LF, which silently drops
+    // the `\r` from CRLF file content; `build_hunk_patch` would then emit an
+    // LF-only patch that `git apply` can't match against the on-disk `\r\n`,
+    // breaking revert for every CRLF file (common on Windows). Structural
+    // lines from `git` (`diff --git`, `@@ `, `--- `, …) are LF-terminated and
+    // carry no `\r`, so the `starts_with`/`strip_prefix` checks below are
+    // unaffected — only real content lines keep their `\r`.
+    let mut lines = diff_text
+        .split_inclusive('\n')
+        .map(|l| l.strip_suffix('\n').unwrap_or(l))
+        .peekable();
 
     while let Some(line) = lines.next() {
         let Some(rest) = line.strip_prefix("diff --git ") else {
@@ -254,6 +273,12 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
                     break;
                 }
                 if *bl == "\\ No newline at end of file" {
+                    // Applies to the line just pushed — record its index so
+                    // `build_hunk_patch` can reproduce the marker (else a revert
+                    // would silently newline-terminate an unterminated file).
+                    if let Some(last) = hunk.lines.len().checked_sub(1) {
+                        hunk.no_newline_at.push(last);
+                    }
                     lines.next();
                     continue;
                 }
@@ -323,6 +348,7 @@ fn parse_hunk_header(full_line: &str, rest: &str) -> Option<Hunk> {
         new_start,
         new_lines,
         lines: Vec::new(),
+        no_newline_at: Vec::new(),
         // Filled in by the caller once `lines` is populated — see the
         // `hunk.hash = hunk_hash(&hunk)` right before this hunk is pushed.
         hash: String::new(),
@@ -361,6 +387,7 @@ pub fn hunk_hash(hunk: &Hunk) -> String {
     hunk.new_start.hash(&mut hasher);
     hunk.new_lines.hash(&mut hasher);
     hunk.lines.hash(&mut hasher);
+    hunk.no_newline_at.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -374,12 +401,10 @@ pub fn hunk_hash(hunk: &Hunk) -> String {
 /// for a rename — the physical file being patched on disk lives at the new
 /// path; the old name from `FileStatus::Renamed` is display-only.
 ///
-/// Doesn't reproduce a trailing `\ No newline at end of file` marker (the
-/// parser drops it — see [`Hunk`]'s doc comment): reverting a hunk that
-/// touches the very last line of a file with no trailing newline may leave a
-/// stray newline behind. Accepted as a known V1 limitation rather than
-/// threading a per-line "no newline" flag through the whole hunk model for
-/// this one edge case.
+/// Reproduces `\ No newline at end of file` markers from
+/// [`Hunk::no_newline_at`] so reverting a hunk that touches an unterminated
+/// final line doesn't add (or, on reverse-apply, strip) a trailing newline the
+/// user never had.
 pub fn build_hunk_patch(file: &FileDiff, hunk: &Hunk) -> Vec<u8> {
     let (old_side, new_side) = match &file.status {
         FileStatus::Added | FileStatus::Untracked => {
@@ -401,10 +426,15 @@ pub fn build_hunk_patch(file: &FileDiff, hunk: &Hunk) -> Vec<u8> {
         "@@ -{},{} +{},{} @@\n",
         hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
     ));
-    for (marker, text) in &hunk.lines {
+    for (i, (marker, text)) in hunk.lines.iter().enumerate() {
         out.push(*marker);
         out.push_str(text);
         out.push('\n');
+        if hunk.no_newline_at.contains(&i) {
+            // The preceding line has no newline on disk; the marker tells `git
+            // apply` so it doesn't add (or, on reverse, strip) one.
+            out.push_str("\\ No newline at end of file\n");
+        }
     }
     out.into_bytes()
 }
@@ -446,6 +476,11 @@ fn parse_status_z(raw: &str) -> Vec<StatusEntry> {
         }
         let (xy, rest) = rec.split_at(2);
         let path = rest.strip_prefix(' ').unwrap_or(rest).replace('\\', "/");
+        // Guard against a `"XY "` record (no path) slipping through the
+        // `len() < 3` check above as an empty-path entry.
+        if path.is_empty() {
+            continue;
+        }
         let mut chars = xy.chars();
         let x = chars.next().unwrap_or(' ');
         let y = chars.next().unwrap_or(' ');
@@ -454,10 +489,14 @@ fn parse_status_z(raw: &str) -> Vec<StatusEntry> {
         } else if x == 'R' || x == 'C' {
             let from = parts.next().unwrap_or("").replace('\\', "/");
             FileStatus::Renamed { from }
+        } else if x == 'D' || y == 'D' {
+            // Worktree/index deletion takes precedence over `x == 'A'`: an `AD`
+            // record (staged add, then deleted on disk) must report as Deleted,
+            // not Added — the file no longer exists, so classifying it Added
+            // would point `diff_file` at a nonexistent path.
+            FileStatus::Deleted
         } else if x == 'A' {
             FileStatus::Added
-        } else if x == 'D' || y == 'D' {
-            FileStatus::Deleted
         } else {
             FileStatus::Modified
         };
@@ -555,26 +594,36 @@ pub async fn summary(root: &Path) -> AppResult<DiffSummary> {
 
     let readonly = is_special_state(&ctx).await;
 
-    let mut files = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let (added, removed, binary) = match numstat.get(&entry.path) {
-            Some((Some(a), Some(r))) => (*a, *r, false),
-            Some((None, None)) => (0, 0, true), // git's "-\t-" binary marker
-            _ => untracked_line_estimate(root, &entry),
-        };
-        let too_large = std::fs::metadata(root.join(&entry.path))
-            .map(|m| m.len() > MAX_DIFF_FILE_BYTES)
-            .unwrap_or(false);
-        files.push(FileDiffMeta {
-            path: entry.path,
-            status: entry.status,
-            binary,
-            too_large,
-            added: if too_large { 0 } else { added },
-            removed: if too_large { 0 } else { removed },
-        });
-    }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    // The per-entry work below is blocking filesystem I/O (a `stat` per file,
+    // plus an up-to-`MAX_DIFF_FILE_BYTES` read per UNTRACKED file to line-count
+    // it) with no `.await` in the loop — offload the whole batch to a blocking
+    // thread so a slow/large tree can't stall a tokio runtime worker.
+    let root_owned = root.to_path_buf();
+    let files = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (added, removed, binary) = match numstat.get(&entry.path) {
+                Some((Some(a), Some(r))) => (*a, *r, false),
+                Some((None, None)) => (0, 0, true), // git's "-\t-" binary marker
+                _ => untracked_line_estimate(&root_owned, &entry),
+            };
+            let too_large = std::fs::metadata(root_owned.join(&entry.path))
+                .map(|m| m.len() > MAX_DIFF_FILE_BYTES)
+                .unwrap_or(false);
+            files.push(FileDiffMeta {
+                path: entry.path,
+                status: entry.status,
+                binary,
+                too_large,
+                added: if too_large { 0 } else { added },
+                removed: if too_large { 0 } else { removed },
+            });
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files
+    })
+    .await
+    .map_err(|e| AppError::Workbench(format!("diff summary worker panicked: {e}")))?;
 
     Ok(DiffSummary { files, readonly, source: Some(DiffSource::Git) })
 }
@@ -638,10 +687,17 @@ pub async fn diff_file(root: &Path, path: &str) -> AppResult<FileDiff> {
     };
 
     if entry.status == FileStatus::Untracked {
-        return synthesize_untracked(root, path);
+        // `synthesize_untracked` reads the file (up to `MAX_DIFF_FILE_BYTES`)
+        // synchronously — run it off the async runtime.
+        let root = root.to_path_buf();
+        let path = path.to_string();
+        return tokio::task::spawn_blocking(move || synthesize_untracked(&root, &path))
+            .await
+            .map_err(|e| AppError::Workbench(format!("untracked diff worker panicked: {e}")))?;
     }
 
-    let too_large = std::fs::metadata(root.join(path))
+    let too_large = tokio::fs::metadata(root.join(path))
+        .await
         .map(|m| m.len() > MAX_DIFF_FILE_BYTES)
         .unwrap_or(false);
     if too_large {
@@ -653,9 +709,16 @@ pub async fn diff_file(root: &Path, path: &str) -> AppResult<FileDiff> {
         // for `git diff`) has the old content to compare against; `-M` makes
         // that explicit rather than relying on the ambient `diff.renames`
         // config.
-        git::run(&ctx, &["diff", "--no-color", "--unified=3", "-M", "HEAD", "--", from, path], None).await?
+        git::run(&ctx, &[
+            "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-color",
+            "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "-M", "HEAD", "--",
+            from.as_str(), path,
+        ], None).await?
     } else {
-        git::run(&ctx, &["diff", "--no-color", "--unified=3", "HEAD", "--", path], None).await?
+        git::run(&ctx, &[
+            "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-color",
+            "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "HEAD", "--", path,
+        ], None).await?
     };
 
     let mut parsed = parse_unified(&diff_out.stdout);
@@ -692,7 +755,12 @@ fn synthesize_untracked(root: &Path, path: &str) -> AppResult<FileDiff> {
         return Ok(FileDiff { path: path.to_string(), status: FileStatus::Untracked, binary: true, hunks: Vec::new(), too_large: false });
     }
     let text = String::from_utf8_lossy(&bytes);
-    let body: Vec<(char, String)> = text.lines().map(|l| ('+', l.to_string())).collect();
+    // Preserve trailing `\r` (see `parse_unified`): a CRLF untracked file must
+    // round-trip through `build_hunk_patch` as `\r\n` or its revert won't apply.
+    let body: Vec<(char, String)> = text
+        .split_inclusive('\n')
+        .map(|l| ('+', l.strip_suffix('\n').unwrap_or(l).to_string()))
+        .collect();
     if body.is_empty() {
         return Ok(FileDiff { path: path.to_string(), status: FileStatus::Untracked, binary: false, hunks: Vec::new(), too_large: false });
     }
@@ -704,6 +772,7 @@ fn synthesize_untracked(root: &Path, path: &str) -> AppResult<FileDiff> {
         new_start: 1,
         new_lines: n,
         lines: body,
+        no_newline_at: Vec::new(),
         hash: String::new(),
     };
     hunk.hash = hunk_hash(&hunk);
@@ -969,6 +1038,7 @@ diff --git a/a.rs b/a.rs
                 new_start: 1,
                 new_lines: 1,
                 lines: vec![('-', "old".into()), ('+', "new".into())],
+                no_newline_at: Vec::new(),
                 hash: String::new(),
             }],
             too_large: true,
@@ -986,7 +1056,7 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn hunk_hash_changes_when_content_changes_stable_otherwise() {
-        let h1 = Hunk { header: "@@ -1,1 +1,1 @@".into(), old_start: 1, old_lines: 1, new_start: 1, new_lines: 1, lines: vec![('-', "a".into()), ('+', "b".into())], hash: String::new() };
+        let h1 = Hunk { header: "@@ -1,1 +1,1 @@".into(), old_start: 1, old_lines: 1, new_start: 1, new_lines: 1, lines: vec![('-', "a".into()), ('+', "b".into())], no_newline_at: vec![], hash: String::new() };
         let h1_again = h1.clone();
         let mut h2 = h1.clone();
         h2.lines[1] = ('+', "c".into());
@@ -995,9 +1065,60 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
+    fn parse_unified_preserves_trailing_cr_in_content_lines() {
+        // H1: CRLF content reaches the parser as ` line\r` / `-line\r`; the
+        // `\r` must be kept in `Hunk::lines` so `build_hunk_patch` can rebuild
+        // a `\r\n` patch. Structural lines (`@@ `, `--- `, `diff --git`) are
+        // LF-only and must NOT carry a `\r`.
+        let diff = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n context\r\n-old\r\n+new\r\n";
+        let files = parse_unified(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].hunks.len(), 1);
+        assert_eq!(files[0].hunks[0].lines, vec![
+            (' ', "context\r".to_string()),
+            ('-', "old\r".to_string()),
+            ('+', "new\r".to_string()),
+        ]);
+        // The rebuilt patch reproduces the `\r\n` terminators verbatim.
+        let patch = String::from_utf8(build_hunk_patch(&files[0], &files[0].hunks[0])).unwrap();
+        assert!(patch.ends_with(" context\r\n-old\r\n+new\r\n"), "patch: {patch:?}");
+    }
+
+    #[test]
+    fn parse_unified_records_and_rebuilds_no_newline_marker() {
+        // L5: a hunk whose final `-`/`+` lines lack a trailing newline must
+        // record the marker and reproduce it in the rebuilt patch, so a revert
+        // doesn't newline-terminate a file that had no terminator.
+        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n";
+        let files = parse_unified(diff);
+        assert_eq!(files.len(), 1);
+        let hunk = &files[0].hunks[0];
+        // Both body lines (indices 0 and 1) are unterminated.
+        assert_eq!(hunk.no_newline_at, vec![0, 1]);
+        let patch = String::from_utf8(build_hunk_patch(&files[0], hunk)).unwrap();
+        assert!(
+            patch.ends_with("-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"),
+            "patch: {patch:?}"
+        );
+    }
+
+    #[test]
+    fn parse_status_z_add_then_delete_is_deleted_and_empty_path_skipped() {
+        // L7: `AD` (staged add, deleted on disk) must classify as Deleted, not
+        // Added; a pathless 3-byte `"XY "` record must be skipped.
+        let raw = "AD gone.txt\0 M \0 M kept.txt\0";
+        let entries = parse_status_z(raw);
+        assert_eq!(entries.len(), 2, "the empty-path ` M ` record must be dropped");
+        assert_eq!(entries[0].path, "gone.txt");
+        assert_eq!(entries[0].status, FileStatus::Deleted);
+        assert_eq!(entries[1].path, "kept.txt");
+        assert_eq!(entries[1].status, FileStatus::Modified);
+    }
+
+    #[test]
     fn build_hunk_patch_modified_file_shape() {
         let file = FileDiff { path: "f.txt".into(), status: FileStatus::Modified, binary: false, hunks: vec![], too_large: false };
-        let hunk = Hunk { header: "x".into(), old_start: 2, old_lines: 1, new_start: 2, new_lines: 1, lines: vec![('-', "old".into()), ('+', "new".into())], hash: String::new() };
+        let hunk = Hunk { header: "x".into(), old_start: 2, old_lines: 1, new_start: 2, new_lines: 1, lines: vec![('-', "old".into()), ('+', "new".into())], no_newline_at: vec![], hash: String::new() };
         let patch = String::from_utf8(build_hunk_patch(&file, &hunk)).unwrap();
         assert!(patch.starts_with("--- a/f.txt\n+++ b/f.txt\n@@ -2,1 +2,1 @@\n-old\n+new\n"));
     }
@@ -1005,7 +1126,7 @@ diff --git a/a.rs b/a.rs
     #[test]
     fn build_hunk_patch_added_file_routes_old_side_through_dev_null() {
         let file = FileDiff { path: "new.txt".into(), status: FileStatus::Added, binary: false, hunks: vec![], too_large: false };
-        let hunk = Hunk { header: "x".into(), old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec![('+', "hi".into())], hash: String::new() };
+        let hunk = Hunk { header: "x".into(), old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec![('+', "hi".into())], no_newline_at: vec![], hash: String::new() };
         let patch = String::from_utf8(build_hunk_patch(&file, &hunk)).unwrap();
         assert!(patch.starts_with("--- /dev/null\n+++ b/new.txt\n"));
     }

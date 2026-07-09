@@ -28,8 +28,9 @@
 //!     exist in `<id>`'s tree, so untracked new work is left alone unless the
 //!     caller explicitly opts in.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -37,6 +38,31 @@ use serde::Serialize;
 use crate::error::{AppError, AppResult};
 
 use super::git::{self, GitCtx};
+
+/// Per-root serialization for shadow-repo MUTATIONS. `snapshot`/`restore`/`gc`/
+/// `diff_vs_now` all touch the single shared shadow index and the `cp-<seq>`
+/// tag space; run two concurrently on one root and they race — both can
+/// allocate the same `cp-N` (the loser fails "tag already exists", and if that
+/// loser is a restore's pre-restore safety snapshot the whole restore aborts),
+/// or contend on `index.lock`. git's own locking keeps the repo from
+/// corrupting, but turns the collision into a spurious hard failure. Holding
+/// one async lock per root for the duration serializes them cleanly (and closes
+/// the restore snapshot→checkout window against a concurrent snapshot). Keyed
+/// by [`git::canonical_path`] so two spellings of one root share the lock.
+static SHADOW_LOCKS: StdMutex<Option<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    StdMutex::new(None);
+
+/// The per-root shadow lock (created on first use). The registry mutex is held
+/// only long enough to clone the `Arc` — never across the actual git work.
+fn shadow_lock(root: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let key = git::canonical_path(root);
+    let mut guard = SHADOW_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 /// Relative (from the project root) path of the shadow repo's git-dir.
 const SHADOW_GIT_DIR: &str = ".cimp/shadow.git";
@@ -66,6 +92,21 @@ fn shadow_ctx(root: &Path) -> GitCtx {
 
 fn git_dir_of(root: &Path) -> PathBuf {
     root.join(SHADOW_GIT_DIR)
+}
+
+/// RAII cleanup for [`diff_vs_now`]'s scratch index: removes the temp index
+/// file (and any `<index>.lock` git may have left) when it goes out of scope,
+/// on both the success and the error path.
+struct ScratchIndex(PathBuf);
+
+impl Drop for ScratchIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        // git's lock for a custom index file is `<indexfile>.lock` — append the
+        // suffix to the full path (NOT `with_extension`, which would rewrite the
+        // real `index.lock`).
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.lock", self.0.display())));
+    }
 }
 
 /// What fired a checkpoint. `PreRestore` is never chosen by a caller — it's
@@ -252,12 +293,14 @@ async fn stage_and_write_tree(ctx: &GitCtx, root: &Path, max_file_bytes: u64) ->
             })
             .map(|s| s.to_string())
             .collect();
-        if !oversize.is_empty() {
+        // Chunk the unstage so a large oversize set can't build a single
+        // command line past Windows' ~32K argv limit (which would make the
+        // spawn itself fail, silently unstaging nothing). Best-effort either
+        // way: an oversize blob riding along in one snapshot is a size-hygiene
+        // nicety, not a correctness issue.
+        for batch in oversize.chunks(100) {
             let mut args: Vec<&str> = vec!["reset", "-q", "--"];
-            args.extend(oversize.iter().map(String::as_str));
-            // Best-effort: an oversize-unstage failure just means a big blob
-            // rides along in this one snapshot rather than failing the whole
-            // checkpoint over a size-hygiene nicety.
+            args.extend(batch.iter().map(String::as_str));
             let _ = git::run(ctx, &args, None).await;
         }
     }
@@ -323,13 +366,30 @@ async fn changed_since_index(ctx: &GitCtx) -> AppResult<Vec<String>> {
 /// commit-tree` as a multi-KB commit subject.
 fn truncate_label(label: &str) -> String {
     const MAX: usize = 200;
-    let mut chars = label.chars();
+    // Replace control characters BEFORE truncating: a raw newline in a
+    // prompt-derived label makes git store only the first line as the commit
+    // subject (a wrong/short Timeline label), and an embedded `\u{1e}`/`\u{1f}`
+    // record/field separator would fragment the `for-each-ref` record in
+    // [`list`] so the whole checkpoint silently vanishes from the Timeline.
+    let sanitized: String = label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut chars = sanitized.chars();
     let truncated: String = chars.by_ref().take(MAX).collect();
     if chars.next().is_some() {
         format!("{truncated}…")
     } else {
         truncated
     }
+}
+
+/// `true` if `id` is a well-formed checkpoint tag name (`cp-<digits>`). The one
+/// gate every [`resolve_commit`] caller relies on to keep untrusted ids out of
+/// `git rev-parse`'s option/rev grammar.
+fn is_checkpoint_id(id: &str) -> bool {
+    id.strip_prefix("cp-")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Next `cp-<seq>` number: one past the highest existing `cp-*` tag, or `1`
@@ -370,6 +430,14 @@ async fn latest_checkpoint_tag(ctx: &GitCtx) -> AppResult<Option<String>> {
 /// of a raw `git` error surfacing from whichever call happened to choke on
 /// it first.
 async fn resolve_commit(ctx: &GitCtx, id: &str) -> AppResult<String> {
+    // Every checkpoint id this module mints is `cp-<seq>`. Rejecting anything
+    // else up front means a frontend-supplied id can never reach `git rev-parse`
+    // as a leading-dash option or any other injected rev expression — it fails
+    // with the same clean typed error instead. (argv, not a shell, so this was
+    // never code-execution — just defense in depth + a clearer failure.)
+    if !is_checkpoint_id(id) {
+        return Err(AppError::Workbench(format!("unknown checkpoint: {id}")));
+    }
     let spec = format!("{id}^{{commit}}");
     let out = git::run(ctx, &["rev-parse", "-q", "--verify", &spec], None).await?;
     if !out.success() {
@@ -412,6 +480,24 @@ async fn resolve_commit(ctx: &GitCtx, id: &str) -> AppResult<String> {
 /// vs `None` on `latest_checkpoint_tag` makes the trees compare unequal
 /// automatically in that case).
 pub async fn snapshot(
+    root: &Path,
+    label: &str,
+    trigger: Trigger,
+    agent: Option<&str>,
+    extra_ignore: &[String],
+    max_file_bytes: u64,
+) -> AppResult<CheckpointId> {
+    let lock = shadow_lock(root);
+    let _guard = lock.lock().await;
+    snapshot_inner(root, label, trigger, agent, extra_ignore, max_file_bytes).await
+}
+
+/// The body of [`snapshot`], WITHOUT acquiring the per-root shadow lock — so
+/// [`restore`] (which already holds that lock for its whole sequence) can take
+/// its invariant-C pre-restore snapshot without deadlocking on a re-entrant
+/// acquire. Never call this directly from outside the module; go through
+/// [`snapshot`] so the serialization guarantee holds.
+async fn snapshot_inner(
     root: &Path,
     label: &str,
     trigger: Trigger,
@@ -555,14 +641,19 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
 /// observable effect on the shadow repo's persistent index at all, belt and
 /// suspenders.
 pub async fn diff_vs_now(root: &Path, id: &str, extra_ignore: &[String], max_file_bytes: u64) -> AppResult<String> {
+    let lock = shadow_lock(root);
+    let _guard = lock.lock().await;
     ensure(root, extra_ignore).await?;
     let ctx = shadow_ctx(root);
     let target = resolve_commit(&ctx, id).await?;
 
     let scratch_index = git_dir_of(root).join(format!("index.diffnow-{}", uuid::Uuid::new_v4()));
+    // RAII cleanup so the scratch index (and any leftover `.lock`) is removed on
+    // EVERY exit path — a `stage_and_write_tree` error used to `?`-return before
+    // the manual `remove_file`, littering `.cimp/shadow.git/` with dead indexes.
+    let _scratch = ScratchIndex(scratch_index.clone());
     let scratch_ctx = GitCtx { index_file: Some(scratch_index.clone()), ..ctx.clone() };
     let now_tree = stage_and_write_tree(&scratch_ctx, root, max_file_bytes).await?;
-    let _ = std::fs::remove_file(&scratch_index);
 
     let out = git::run(&ctx, &["diff", "--no-color", "--no-renames", "--unified=3", &target, &now_tree], Some(BULK_TIMEOUT)).await?;
     if !out.success() {
@@ -591,11 +682,18 @@ pub async fn restore(
     extra_ignore: &[String],
     max_file_bytes: u64,
 ) -> AppResult<RestoreReport> {
+    // Hold the per-root shadow lock for the WHOLE restore: this both serializes
+    // against concurrent snapshot/gc and keeps a background snapshot from
+    // slipping in between the pre-restore safety snapshot and the checkout.
+    let lock = shadow_lock(root);
+    let _guard = lock.lock().await;
     ensure(root, extra_ignore).await?;
     let ctx = shadow_ctx(root);
     let target = resolve_commit(&ctx, id).await?;
 
-    let pre_restore_id = snapshot(root, "pre-restore", Trigger::PreRestore, None, extra_ignore, max_file_bytes).await?;
+    // `snapshot_inner`, not `snapshot`: we already hold the lock, and the async
+    // mutex is not re-entrant.
+    let pre_restore_id = snapshot_inner(root, "pre-restore", Trigger::PreRestore, None, extra_ignore, max_file_bytes).await?;
     let pre_sha = resolve_commit(&ctx, &pre_restore_id).await?;
 
     let added = git::run(&ctx, &["diff", "--no-renames", "--name-only", "--diff-filter=A", "-z", &target, &pre_sha], None).await?;
@@ -666,6 +764,8 @@ pub async fn gc(root: &Path, max: u32, max_age_days: u32) -> AppResult<()> {
     if !git_dir.join("HEAD").exists() {
         return Ok(());
     }
+    let lock = shadow_lock(root);
+    let _guard = lock.lock().await;
     let ctx = shadow_ctx(root);
     let checkpoints = list(root).await?; // ascending by seq
 
@@ -693,12 +793,18 @@ pub async fn gc(root: &Path, max: u32, max_age_days: u32) -> AppResult<()> {
         return Ok(());
     }
 
+    // Chunk `tag -d` for the same argv-length reason as the oversize unstage
+    // above: age-based deletion can select many tags at once, and unlike that
+    // path this one is not best-effort, so a spawn failure would surface as a
+    // gc error.
     let names: Vec<&str> = to_delete.iter().map(String::as_str).collect();
-    let mut args: Vec<&str> = vec!["tag", "-d"];
-    args.extend(names);
-    let out = git::run(&ctx, &args, None).await?;
-    if !out.success() {
-        return Err(AppError::Workbench(format!("shadow tag -d failed: {}", out.stderr.trim())));
+    for batch in names.chunks(100) {
+        let mut args: Vec<&str> = vec!["tag", "-d"];
+        args.extend(batch.iter().copied());
+        let out = git::run(&ctx, &args, None).await?;
+        if !out.success() {
+            return Err(AppError::Workbench(format!("shadow tag -d failed: {}", out.stderr.trim())));
+        }
     }
     // Best-effort space reclaim: the tags (the part of the retention
     // contract that matters) are already gone even if this fails.
@@ -709,6 +815,26 @@ pub async fn gc(root: &Path, max: u32, max_age_days: u32) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_checkpoint_id_accepts_only_cp_digits() {
+        assert!(is_checkpoint_id("cp-1"));
+        assert!(is_checkpoint_id("cp-9001"));
+        assert!(!is_checkpoint_id("cp-"));
+        assert!(!is_checkpoint_id("cp-1a"));
+        assert!(!is_checkpoint_id("cp-1.2"));
+        assert!(!is_checkpoint_id("-foo")); // leading-dash rev/option injection
+        assert!(!is_checkpoint_id("HEAD"));
+        assert!(!is_checkpoint_id("../etc/passwd"));
+    }
+
+    #[test]
+    fn truncate_label_strips_control_chars() {
+        // Newlines and the \u{1e}/\u{1f} separators `list` parses on must be
+        // neutralized so a checkpoint label can't corrupt or drop its own row.
+        let out = truncate_label("one\ntwo\u{1f}three\u{1e}four\r");
+        assert_eq!(out, "one two three four ");
+    }
 
     fn has_git() -> bool {
         crate::pty::resolve_command("git").is_ok()

@@ -185,23 +185,34 @@ async fn run_inner(
         let mut child = cmd
             .spawn()
             .map_err(|e| AppError::Workbench(format!("spawn git {}: {e}", args.join(" "))))?;
-        if let Some(data) = stdin_data {
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                stdin
-                    .write_all(data)
-                    .await
-                    .map_err(|e| AppError::Workbench(format!("write git {} stdin: {e}", args.join(" "))))?;
-                // Drop here (rather than waiting for `child` to be dropped)
-                // to close the pipe and send EOF — `git apply` on the other
-                // end is reading to EOF before it does anything.
-                drop(stdin);
-            }
-        }
-        child
+        // Drive the stdin write on a separate task so it runs CONCURRENTLY
+        // with `wait_with_output` draining stdout/stderr. Writing all of stdin
+        // *before* reading any output deadlocks when the child fills its
+        // ~64KB stdout/stderr pipe buffer before it has consumed all of stdin:
+        // git blocks writing output while we block writing stdin (a large
+        // `git apply` patch that git rejects early — writing to stderr while
+        // still reading the patch — is exactly this shape). The writer drops
+        // its `stdin` handle on completion, closing the pipe so git sees EOF.
+        // A write error (e.g. `BrokenPipe` when git exits early) is
+        // intentionally ignored: git's own exit code/stderr carries the real
+        // failure, so surfacing the pipe error would just mask it.
+        let writer = stdin_data.and_then(|data| {
+            child.stdin.take().map(|mut stdin| {
+                let data = data.to_vec();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stdin.write_all(&data).await;
+                })
+            })
+        });
+        let output = child
             .wait_with_output()
             .await
-            .map_err(|e| AppError::Workbench(format!("git {}: {e}", args.join(" "))))
+            .map_err(|e| AppError::Workbench(format!("git {}: {e}", args.join(" "))))?;
+        if let Some(writer) = writer {
+            let _ = writer.await;
+        }
+        Ok::<_, AppError>(output)
     };
 
     let output = match timeout(timeout_dur, run_fut).await {
@@ -223,10 +234,25 @@ async fn run_inner(
     })
 }
 
-/// Process-wide cache for [`is_repo`], keyed by canonicalized-ish root path.
-/// A plain `Mutex<HashMap<..>>` is enough — probes are infrequent (once per
-/// diff-pane open/refresh cycle, not per keystroke) and the map stays tiny
-/// (one entry per project root cImp has looked at this session).
+/// Normalize a path into a stable key for comparison and caching that survives
+/// the ways two spellings of the same location differ — symlinks/junctions,
+/// 8.3 short names, drive-letter case, and the `\\?\` verbatim prefix on
+/// Windows; the `/private` vs `/var` symlink on macOS. Canonicalizes when the
+/// path exists on disk, else falls back to the path as given (still a
+/// meaningful key, just not fully normalized). Because both sides of any
+/// comparison run through this same function, the canonicalized form compares
+/// equal regardless of the original spelling.
+pub fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Process-wide cache for [`is_repo`], keyed by [`canonical_path`] of the root
+/// so two spellings of the same project (trailing slash, case, 8.3 short name)
+/// share one entry — and, crucially, so [`invalidate_is_repo_cache`] clears the
+/// same entry a differently-spelled reader would hit. A plain `Mutex<HashMap>`
+/// is enough — probes are infrequent (once per diff-pane open/refresh cycle,
+/// not per keystroke) and the map stays tiny (one entry per project root cImp
+/// has looked at this session).
 static IS_REPO_CACHE: Mutex<Option<HashMap<PathBuf, (bool, Instant)>>> = Mutex::new(None);
 
 /// `true` if `root` is inside a git working tree (`git rev-parse
@@ -237,7 +263,7 @@ static IS_REPO_CACHE: Mutex<Option<HashMap<PathBuf, (bool, Instant)>>> = Mutex::
 /// [`IS_REPO_CACHE_TTL`]; call [`invalidate_is_repo_cache`] after an
 /// operation that could change the answer (e.g. a fresh `git init`).
 pub async fn is_repo(root: &Path) -> bool {
-    let key = root.to_path_buf();
+    let key = canonical_path(root);
     if let Some(cached) = cached_is_repo(&key) {
         return cached;
     }
@@ -272,9 +298,10 @@ fn store_is_repo(root: PathBuf, answer: bool) {
 /// `worktree::create`/`discard` (a linked worktree's directory starts/stops
 /// being a repo) — rather than waiting out the TTL.
 pub fn invalidate_is_repo_cache(root: &Path) {
+    let key = canonical_path(root);
     if let Ok(mut guard) = IS_REPO_CACHE.lock() {
         if let Some(map) = guard.as_mut() {
-            map.remove(root);
+            map.remove(&key);
         }
     }
 }

@@ -30,12 +30,28 @@ let refCount = 0;
 let unlistenFsBatch: UnlistenFn | null = null;
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
+// Monotonic token: bumped on every refresh start AND on teardown. A refresh
+// only writes the stores if its token is still current — so a slow
+// `workbench_diff_summary` that resolves after a newer refresh (or after the
+// watcher was torn down) is discarded instead of clobbering fresher state
+// with stale data (e.g. a post-revert refresh being overwritten by an
+// in-flight fs-batch refresh, showing a phantom un-reverted hunk).
+let refreshSeq = 0;
+// Monotonic token for the fs-batch listener registration. `listen()` resolves
+// asynchronously; if the last consumer releases (or a new session starts)
+// before it resolves, the pending registration must unlisten itself rather
+// than leak a handler for the app's lifetime.
+let listenGen = 0;
 
 async function refresh(): Promise<void> {
+  const mine = ++refreshSeq;
   try {
-    workbenchDiff.set(await workbenchDiffSummary());
+    const summary = await workbenchDiffSummary();
+    if (mine !== refreshSeq) return;
+    workbenchDiff.set(summary);
     workbenchDiffError.set(null);
   } catch (e) {
+    if (mine !== refreshSeq) return;
     workbenchDiffError.set(String(e));
     console.warn('workbench_diff_summary failed:', e);
   }
@@ -55,10 +71,20 @@ function scheduleRefresh(): void {
 export function watchWorkbenchDiff(): () => void {
   refCount += 1;
   if (refCount === 1) {
+    const gen = ++listenGen;
     void refresh();
-    void listen('fs-batch', () => scheduleRefresh()).then((fn) => {
-      unlistenFsBatch = fn;
-    });
+    listen('fs-batch', () => scheduleRefresh())
+      .then((fn) => {
+        // If this session was torn down (or superseded by a newer start)
+        // while `listen()` was still resolving, `gen` no longer matches —
+        // unlisten immediately so the handler doesn't leak.
+        if (gen === listenGen && refCount > 0) {
+          unlistenFsBatch = fn;
+        } else {
+          fn();
+        }
+      })
+      .catch((e) => console.warn('fs-batch listen failed:', e));
     pollTimer = setInterval(() => {
       // fs-batch already covers the "graph watcher running" case; only do
       // the redundant poll-driven refresh when it won't fire on its own.
@@ -72,6 +98,11 @@ export function watchWorkbenchDiff(): () => void {
     released = true;
     refCount = Math.max(0, refCount - 1);
     if (refCount === 0) {
+      // Invalidate any in-flight listen() registration and any in-flight
+      // refresh so neither lands after teardown (leaked handler / stale store
+      // write).
+      listenGen += 1;
+      refreshSeq += 1;
       unlistenFsBatch?.();
       unlistenFsBatch = null;
       if (pollTimer) {
@@ -82,6 +113,10 @@ export function watchWorkbenchDiff(): () => void {
         clearTimeout(debounceTimer);
         debounceTimer = undefined;
       }
+      // Drop the last session's summary/error so a later remount doesn't
+      // briefly render stale state before its first refresh resolves.
+      workbenchDiff.set(null);
+      workbenchDiffError.set(null);
     }
   };
 }

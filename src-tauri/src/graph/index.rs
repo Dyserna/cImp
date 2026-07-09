@@ -232,6 +232,11 @@ pub struct GraphIndex {
 }
 
 impl GraphIndex {
+    /// Hard cap on the number of nodes [`Self::transitive`] returns. Exposed so
+    /// callers can detect when a result hit the cap (len == `TRANSITIVE_LIMIT`)
+    /// and is therefore truncated, rather than presenting it as the exact reach.
+    pub const TRANSITIVE_LIMIT: usize = 1000;
+
     /// Open the SQLite-backed store for `root` (creating the dir/db if needed)
     /// without touching the schema.
     fn open_db(root: &Path, db_subdir: &str) -> AppResult<GraphIndex> {
@@ -328,6 +333,13 @@ impl GraphIndex {
                 self.run_mut(&format!("::remove {name}"), BTreeMap::new())?;
             }
         }
+        // The lazily-created vector stores aren't in RELATIONS, so a bare reset
+        // would leave `doc_vec`/`code_vec` full of orphan vectors after their
+        // `doc_chunk`/`code_chunk` rows were wiped — making `embedding_coverage`
+        // report embedded > total and suppress the backfill that should
+        // re-embed. Drop them too (no-op when absent).
+        self.clear_vectors()?;
+        self.clear_code_vectors()?;
         self.ensure_schema()
     }
 
@@ -407,6 +419,27 @@ impl GraphIndex {
     /// is deleted.
     pub fn remove_file(&self, file: &str) -> AppResult<()> {
         self.with_write_txn(|tx| remove_file_in_tx(tx, file))
+    }
+
+    /// Delete every indexed file whose path lies under directory `dir` (i.e.
+    /// `path` starts with `dir/`), returning the count removed. Used by the
+    /// watcher for directory rename/delete events: such an event carries only
+    /// the directory path (which has no indexable extension), so the per-file
+    /// delete path never fires for its children and their rows would otherwise
+    /// leak until a full rebuild.
+    pub fn remove_files_under(&self, dir: &str) -> AppResult<usize> {
+        let prefix = format!("{}/", dir.trim_end_matches('/'));
+        self.with_write_txn(|tx| {
+            let mut p = BTreeMap::new();
+            p.insert("prefix".to_string(), DataValue::Str(prefix.as_str().into()));
+            let rows = tx_run(tx, "?[path] := *file{path}, starts_with(path, $prefix)", p)?;
+            let files: Vec<String> = rows.rows.iter().map(|r| cell_str(r, 0)).collect();
+            let n = files.len();
+            for f in &files {
+                remove_file_in_tx(tx, f)?;
+            }
+            Ok(n)
+        })
     }
 
     /// Write one file's extracted graph, replacing any prior rows for that
@@ -570,7 +603,8 @@ impl GraphIndex {
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
             "?[id, name, kind, file, start_line, signature, visibility, end_line, is_test] := \
-                *symbol{id, name, kind, file, start_line, signature, visibility, end_line, is_test}, name == $name",
+                *symbol{id, name, kind, file, start_line, signature, visibility, end_line, is_test}, name == $name\n\
+             :order file, start_line, id",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -586,6 +620,7 @@ impl GraphIndex {
             r#"?[sid, sname, skind, file, start_line, signature, visibility, end_line, is_test, conf] :=
                 *edge{kind: ek, src: sid, dst: dn, confidence: conf}, ek == "call", dn == $name,
                 *symbol{id: sid, name: sname, kind: skind, file, start_line, signature, visibility, end_line, is_test}
+            :order file, start_line, sid
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
@@ -611,6 +646,7 @@ impl GraphIndex {
                 *symbol{id: cid, name: cn}, cn == $name,
                 *edge{kind: ek, src: cid, dst: dn, confidence: conf}, ek == "call",
                 *symbol{id: id2, name: nm, kind: skind, file, start_line, signature, visibility, end_line, is_test}, nm == dn
+            :order file, start_line, id2
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
@@ -636,7 +672,7 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            "?[name, file, line, col, conf] := *ref{name, file, line, col, confidence: conf}, name == $name\n:limit 1000",
+            "?[name, file, line, col, conf] := *ref{name, file, line, col, confidence: conf}, name == $name\n:order file, line, col\n:limit 1000",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -678,6 +714,7 @@ impl GraphIndex {
         p.insert("file".to_string(), DataValue::Str(file.into()));
         let rows = self.run(
             r#"?[dst] := *edge{kind: ek, src, dst}, ek == "import", src == $file
+            :order dst
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
@@ -917,6 +954,7 @@ impl GraphIndex {
     pub fn transitive(&self, name: &str, forward: bool) -> AppResult<Vec<String>> {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
+        let limit = Self::TRANSITIVE_LIMIT;
         // F10: SEED the recursion from `$name` rather than materializing the
         // whole-graph closure `reach[x, y]` (every source/target pair) and
         // filtering `x == $name` only at the head — that forced Cozo to compute
@@ -936,7 +974,8 @@ reach[x] := reach[z], calls[x, z]"#
             r#"calls[cn, dn] := *symbol{{id: cid, name: cn}}, *edge{{kind: ek, src: cid, dst: dn}}, ek == "call"
 {rules}
 ?[n] := reach[n]
-:limit 1000"#
+:order n
+:limit {limit}"#
         );
         let rows = self.run(&script, p, ScriptMutability::Immutable)?;
         Ok(rows.rows.iter().map(|r| cell_str(r, 0)).collect())
@@ -953,11 +992,17 @@ reach[x] := reach[z], calls[x, z]"#
     /// first frontier, so nothing is lost by not also re-expanding through a
     /// root discovered as someone else's caller). Empty `roots` → empty
     /// result, no query run.
+    ///
+    /// `min_confidence` filters the blast radius to dependents at least that
+    /// certain. It is applied to the full dependent set *before* the `max`
+    /// cap, so a confidence-filtered result is not silently truncated by the
+    /// cap dropping certain rows in favour of less-certain ones.
     pub fn dependents_transitive(
         &self,
         roots: &[String],
         depth: u32,
         max: usize,
+        min_confidence: Option<Confidence>,
     ) -> AppResult<Vec<DependentHit>> {
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -1006,12 +1051,26 @@ reach[x] := reach[z], calls[x, z]"#
                     if root_set.contains(caller.as_str()) {
                         continue;
                     }
-                    // First discovery (BFS order) wins the min depth; its chain
-                    // confidence is the weakest link from a root to here.
-                    if !best.contains_key(caller) {
-                        let cc = chain_conf.weaker(*ec);
-                        best.insert(caller.clone(), (d, cc));
-                        next_frontier.insert(caller.clone(), cc);
+                    let cc = chain_conf.weaker(*ec);
+                    match best.get(caller) {
+                        // Already discovered at a shallower depth: min depth
+                        // wins; it was expanded there, don't revisit.
+                        Some((bd, _)) if *bd < d => {}
+                        // Reached again at the SAME depth via another path: keep
+                        // the strongest chain confidence. `stronger` is
+                        // commutative, so the result is independent of the
+                        // (randomized) HashMap iteration order — the fix for the
+                        // previous "first path processed wins" non-determinism.
+                        Some((bd, bc)) if *bd == d => {
+                            let merged = bc.stronger(cc);
+                            best.insert(caller.clone(), (d, merged));
+                            next_frontier.insert(caller.clone(), merged);
+                        }
+                        // First discovery: this depth is the min depth.
+                        _ => {
+                            best.insert(caller.clone(), (d, cc));
+                            next_frontier.insert(caller.clone(), cc);
+                        }
                     }
                 }
             }
@@ -1023,6 +1082,12 @@ reach[x] := reach[z], calls[x, z]"#
 
         let mut names: Vec<(String, u32, Confidence)> =
             best.into_iter().map(|(n, (d, c))| (n, d, c)).collect();
+        // Confidence filter runs BEFORE the `max` cap below, so a filtered
+        // blast radius keeps its most-certain rows rather than losing them to
+        // the cap (which is applied during symbol resolution).
+        if let Some(floor) = min_confidence {
+            names.retain(|(_, _, c)| c.rank() >= floor.rank());
+        }
         names.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
         // F15: resolve every dependent name to its symbol(s) in ONE query — a
@@ -1739,7 +1804,7 @@ reach[x] := reach[z], calls[x, z]"#
     /// appear here.
     pub fn tests_for(&self, roots: &[String], depth: u32, max: usize) -> AppResult<Vec<SymbolHit>> {
         Ok(self
-            .dependents_transitive(roots, depth, max)?
+            .dependents_transitive(roots, depth, max, None)?
             .into_iter()
             .filter(|hit| hit.symbol.is_test)
             .map(|hit| hit.symbol)
@@ -4408,7 +4473,7 @@ pub struct Point { x: i32 }
         ))
         .expect("index");
 
-        let hits = idx.dependents_transitive(&["a".to_string()], 3, 100).expect("dependents");
+        let hits = idx.dependents_transitive(&["a".to_string()], 3, 100, None).expect("dependents");
         assert_eq!(hits.len(), 2, "{hits:?}");
         let b = hits.iter().find(|h| h.symbol.name == "b").expect("b present");
         let c = hits.iter().find(|h| h.symbol.name == "c").expect("c present");
@@ -4435,27 +4500,27 @@ pub struct Point { x: i32 }
         .expect("index");
 
         // depth=1 only reaches b, not c.
-        let capped = idx.dependents_transitive(&["a".to_string()], 1, 100).expect("dependents");
+        let capped = idx.dependents_transitive(&["a".to_string()], 1, 100, None).expect("dependents");
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].symbol.name, "b");
 
         // max=1 truncates even though depth would reach both.
-        let truncated = idx.dependents_transitive(&["a".to_string()], 6, 1).expect("dependents");
+        let truncated = idx.dependents_transitive(&["a".to_string()], 6, 1, None).expect("dependents");
         assert_eq!(truncated.len(), 1);
 
         // A depth passed as 0 (or absurdly high) is clamped into 1..=6, not
         // rejected — 0 still finds the direct caller.
-        let clamped = idx.dependents_transitive(&["a".to_string()], 0, 100).expect("dependents");
+        let clamped = idx.dependents_transitive(&["a".to_string()], 0, 100, None).expect("dependents");
         assert_eq!(clamped.len(), 1);
         assert_eq!(clamped[0].symbol.name, "b");
 
         // Empty roots is an empty result, not a query error.
-        assert!(idx.dependents_transitive(&[], 3, 100).expect("dependents").is_empty());
+        assert!(idx.dependents_transitive(&[], 3, 100, None).expect("dependents").is_empty());
 
         // A root that's also a caller of another root doesn't get reported as
         // its own dependent.
         let both_roots = idx
-            .dependents_transitive(&["a".to_string(), "b".to_string()], 3, 100)
+            .dependents_transitive(&["a".to_string(), "b".to_string()], 3, 100, None)
             .expect("dependents");
         assert!(!both_roots.iter().any(|h| h.symbol.name == "a" || h.symbol.name == "b"));
         assert!(both_roots.iter().any(|h| h.symbol.name == "c"));

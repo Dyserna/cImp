@@ -550,7 +550,20 @@ pub fn run_tool(
                 ));
             };
             idx.transitive(&target, forward)
-                .map(|v| fmt_list(&v, max_rows))
+                .map(|v| {
+                    // The traversal is hard-capped; at the cap the true reach is
+                    // larger, so say so rather than letting `fmt_list`'s "+N more"
+                    // imply an exact total.
+                    let capped = v.len() >= GraphIndex::TRANSITIVE_LIMIT;
+                    let mut out = fmt_list(&v, max_rows);
+                    if capped {
+                        out.push_str(&format!(
+                            "\n(closure capped at {} nodes — the true transitive reach is larger)",
+                            GraphIndex::TRANSITIVE_LIMIT
+                        ));
+                    }
+                    out
+                })
                 .map_err(|e| e.to_string())
         }
         "graph_search_docs" => idx
@@ -1288,8 +1301,10 @@ fn run_snippet(
         }
     } else if !file_arg.is_empty() {
         let line = match args.get("line").and_then(|v| v.as_u64()) {
-            Some(l) if l >= 1 => l as u32,
-            _ => return Err("graph_snippet with `file` also needs a 1-based `line`".into()),
+            // Reject out-of-range values rather than letting `as u32` wrap a
+            // huge line number into a valid-but-wrong line (e.g. 4294967298 → 2).
+            Some(l) if l >= 1 && l <= u32::MAX as u64 => l as u32,
+            _ => return Err("graph_snippet with `file` also needs a valid 1-based `line`".into()),
         };
         match idx.symbol_at(file_arg, line).map_err(|e| e.to_string())? {
             Some(h) => h,
@@ -1429,15 +1444,21 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
         });
     }
 
-    let mut dependents = idx.dependents_transitive(&root_names, depth, max_rows).map_err(|e| e.to_string())?;
-
     // V15 Feature 3: optional `min_confidence` (extracted|inferred|ambiguous)
     // reads blast-radius conservatively — keep only dependents at least that
-    // certain. Default: include all.
-    if let Some(min) = args.get("min_confidence").and_then(|v| v.as_str()) {
-        let floor = super::model::Confidence::from_tag(min).rank();
-        dependents.retain(|d| d.confidence.rank() >= floor);
-    }
+    // certain. Default: include all. Passed INTO the traversal so the filter
+    // is applied before the `max_rows` cap (otherwise the cap keeps the first
+    // `max_rows` rows regardless of confidence and the retain silently
+    // under-reports the certain blast radius).
+    let min_confidence = match args.get("min_confidence").and_then(|v| v.as_str()) {
+        Some(s) => Some(super::model::Confidence::parse_tag(s).ok_or_else(|| {
+            format!("invalid min_confidence '{s}' (expected: extracted, inferred, or ambiguous)")
+        })?),
+        None => None,
+    };
+    let dependents = idx
+        .dependents_transitive(&root_names, depth, max_rows, min_confidence)
+        .map_err(|e| e.to_string())?;
 
     let mut out = String::new();
     if !changed_syms.is_empty() {

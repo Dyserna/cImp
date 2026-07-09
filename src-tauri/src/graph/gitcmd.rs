@@ -24,7 +24,13 @@ use crate::error::{AppError, AppResult};
 pub(crate) fn run_git(root: &Path, args: &[&str]) -> AppResult<String> {
     let program = crate::pty::resolve_command("git")?;
     let mut cmd = Command::new(program);
-    cmd.args(args)
+    // `-c core.quotePath=false` disables git's default C-quoting of non-ASCII
+    // path bytes (e.g. `src/café.rs` → `"src/caf\303\251.rs"`), which would
+    // otherwise mangle every non-ASCII path in `--name-only`/diff output and
+    // silently drop its churn/impact metadata. Must precede the subcommand.
+    cmd.arg("-c")
+        .arg("core.quotePath=false")
+        .args(args)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

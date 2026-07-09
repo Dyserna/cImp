@@ -669,7 +669,10 @@ async fn handle_context_retrieve(
     if let Some(pending) = graph.drain_auto_check(body.session_id.as_deref()) {
         text = if text.is_empty() { pending } else { format!("{text}\n\n{pending}") };
     }
-    let tokens_est = text.chars().count() / 4;
+    // Same char→token estimate as the retrieval core (shared divisor so the two
+    // can't drift). Estimated from the FULL injected text (digest + greeting +
+    // drained auto-check), not just the digest.
+    let tokens_est = crate::graph::est_tokens(text.chars().count());
     write_json(
         stream,
         200,

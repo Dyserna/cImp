@@ -408,6 +408,18 @@ impl Confidence {
         }
     }
 
+    /// Strict parse for user/LLM-supplied tags: `None` on anything
+    /// unrecognized so the caller can reject it with a clear error, rather
+    /// than silently coercing (as [`Self::from_tag`] does for stored tags).
+    pub fn parse_tag(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "extracted" => Some(Confidence::Extracted),
+            "inferred" => Some(Confidence::Inferred),
+            "ambiguous" => Some(Confidence::Ambiguous),
+            _ => None,
+        }
+    }
+
     /// Certainty rank, higher = more certain. `Ambiguous` (0) is the weakest,
     /// `Extracted` (2) the strongest. Used to combine confidences along a chain.
     pub fn rank(self) -> u8 {
@@ -557,14 +569,33 @@ impl FileGraph {
     pub fn classify_confidence(&mut self) {
         let local: std::collections::HashSet<&str> =
             self.symbols.iter().map(|s| s.name.as_str()).collect();
+        let local_ids: std::collections::HashSet<&str> =
+            self.symbols.iter().map(|s| s.id.as_str()).collect();
         for e in &mut self.edges {
             if e.kind == EdgeKind::Call && local.contains(e.dst.as_str()) {
                 e.confidence = Confidence::Extracted;
             }
         }
         for r in &mut self.references {
-            if local.contains(r.name.as_str()) {
-                r.confidence = Confidence::Extracted;
+            match &r.resolved_id {
+                // Already bound to a concrete symbol: it's only a certain
+                // same-file target if that symbol lives in THIS file. A
+                // reference stack-graphs resolved to another file must not be
+                // promoted just because a local symbol happens to share its
+                // name — that would defeat the honesty the confidence layer
+                // exists to provide.
+                Some(id) => {
+                    if local_ids.contains(id.as_str()) {
+                        r.confidence = Confidence::Extracted;
+                    }
+                }
+                // Name-only reference: a same-file definition is the one target
+                // the parser can prove locally.
+                None => {
+                    if local.contains(r.name.as_str()) {
+                        r.confidence = Confidence::Extracted;
+                    }
+                }
             }
         }
     }

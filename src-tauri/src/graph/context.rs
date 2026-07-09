@@ -24,8 +24,15 @@ pub struct RetrieveResult {
     /// Files whose full digests were included (project-relative). Dedup-demoted
     /// files (one-line "unchanged" reminders) are **not** listed here.
     pub files_used: Vec<String>,
+    /// Size of `context_md` in **characters** — the unit every budget/setting
+    /// in this module is measured in (`context_turn_budget_chars`,
+    /// `context_per_file_chars`). Compare budgets against THIS, never
+    /// `tokens_est`.
     pub chars: usize,
-    /// Rough token estimate (`chars / 4`) for the UI's honesty readout.
+    /// A rough **token** estimate (`chars / CHARS_PER_TOKEN_EST`) for the UI's
+    /// honesty readout ONLY. It is not a real tokenizer count and must not be
+    /// compared against the `*_chars` budgets (they differ ~4×) — see
+    /// [`est_tokens`].
     pub tokens_est: usize,
     /// V11 Phase C: measured characters of digests suppressed by dedup this turn
     /// (files already injected unchanged). Honest accounting — the actual digest
@@ -36,6 +43,19 @@ pub struct RetrieveResult {
     /// for background digest generation. Internal plumbing, not serialized.
     #[serde(skip)]
     pub digest_misses: Vec<(String, String)>,
+}
+
+/// Rough characters-per-token divisor. This module measures everything in
+/// **characters** (budgets, caps, `RetrieveResult::chars`); a token *estimate*
+/// is only ever a coarse `chars / CHARS_PER_TOKEN_EST` for display. Defined
+/// once so the ratio can't drift between the retrieval core and the loopback
+/// shim, and so the char→token boundary is explicit at every call site.
+pub const CHARS_PER_TOKEN_EST: usize = 4;
+
+/// Coarse token estimate from a character count. For UI/telemetry display only
+/// — NOT a tokenizer count, and never comparable to a `*_chars` budget.
+pub fn est_tokens(chars: usize) -> usize {
+    chars / CHARS_PER_TOKEN_EST
 }
 
 /// Extract candidate search terms from a prompt: identifier-like and path-like
@@ -285,7 +305,13 @@ pub fn build_context(
     let mut reminders: Vec<String> = Vec::new();
     let mut deduped_chars = 0usize;
     let mut digest_misses: Vec<(String, String)> = Vec::new();
-    let mut budget = turn_budget_chars;
+    // The assembled block is prefixed with this header and (optionally) suffixed
+    // with a session-working-set footer; both are charged against the budget
+    // (header reserved here, footer fitted after the loop) so the whole block
+    // honors `turn_budget_chars`. Each pushed line is also charged its joining
+    // newline below.
+    const HEADER: &str = "## Relevant context (cImp)\n";
+    let mut budget = turn_budget_chars.saturating_sub(HEADER.chars().count());
     for (file, _s) in ranked {
         // Hard cap on total emitted lines (full digests + reminders) so a broad
         // prompt on a big project can't produce an enormous block.
@@ -322,7 +348,7 @@ pub fn build_context(
             let saved = file_digest(idx, &file, per_file_chars);
             let prev_turn = prev.map(|(_, t)| *t).unwrap_or(0);
             let line = format!("- `{file}` — injected turn {prev_turn}, unchanged");
-            let cost = line.chars().count();
+            let cost = line.chars().count() + 1; // +1 for the joining newline
             if budget >= cost {
                 budget -= cost;
                 // F27: count the saved chars ONLY when the reminder is actually
@@ -354,8 +380,22 @@ pub fn build_context(
             continue;
         }
         let tag = if changed { " (updated)" } else { "" };
+        // Cap the digest so the WHOLE line fits the remaining budget. The
+        // outline path caps the digest itself but not the `- `…` — `/tag
+        // wrapper (7 chars) or the joining newline, and the `get_digest`
+        // fallback returns an *uncapped* cached digest — without this the last
+        // emitted line can overrun `turn_budget_chars`.
+        let overhead = 7 + file.chars().count() + tag.chars().count() + 1;
+        let room = budget.saturating_sub(overhead);
+        if room == 0 {
+            continue;
+        }
+        if digest.chars().count() > room {
+            digest = digest.chars().take(room.saturating_sub(1)).collect::<String>();
+            digest.push('…');
+        }
         let line = format!("- `{file}` — {digest}{tag}");
-        budget = budget.saturating_sub(line.chars().count());
+        budget = budget.saturating_sub(line.chars().count() + 1); // +1: joining newline
         lines.push(line);
         used.push(file);
     }
@@ -363,11 +403,23 @@ pub fn build_context(
         return RetrieveResult::default();
     }
 
-    let mut md = String::from("## Relevant context (cImp)\n");
+    let mut md = String::from(HEADER);
     lines.extend(reminders);
     md.push_str(&lines.join("\n"));
     if !session_files.is_empty() {
-        let ws: Vec<&str> = session_files.iter().take(6).map(|(p, _)| p.as_str()).collect();
+        // Only add paths that fit the budget left after the header + lines. The
+        // wrapper `"\n\n_Session working set: …_"` is 25 chars; each path after
+        // the first also costs 2 for its ", " separator.
+        let mut ws: Vec<&str> = Vec::new();
+        let mut footer_cost = 25usize;
+        for (p, _) in session_files.iter().take(6) {
+            let add = p.chars().count() + if ws.is_empty() { 0 } else { 2 };
+            if footer_cost + add > budget {
+                break;
+            }
+            footer_cost += add;
+            ws.push(p.as_str());
+        }
         if !ws.is_empty() {
             md.push_str(&format!("\n\n_Session working set: {}_", ws.join(", ")));
         }
@@ -377,7 +429,7 @@ pub fn build_context(
         context_md: md,
         files_used: used,
         chars,
-        tokens_est: chars / 4,
+        tokens_est: est_tokens(chars),
         deduped_chars,
         digest_misses,
     }

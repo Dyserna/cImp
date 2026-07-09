@@ -159,32 +159,48 @@ pub fn changed_symbols(root: &Path, index: &GraphIndex) -> AppResult<ChangedSet>
 /// left to map to a symbol.
 fn parse_unified_diff(diff: &str, out: &mut HashMap<String, Vec<LineRange>>) {
     let mut current: Option<String> = None;
-    // Whether the immediately preceding line was a `--- ` (old-file) header —
-    // a `+++ ` line only starts a new file's new-side path when it follows
-    // one, guarding against a content line that happens to start with `++ `
-    // (e.g. a diff of a diff, or generated output) being misread as a file
-    // header.
+    // Real file headers (`--- a/…` / `+++ b/…`) appear only in the header block
+    // that follows a `diff --git` line, before that file's first `@@` hunk.
+    // Tracking that block prevents an *in-hunk content* line like `--- foo` or
+    // `+++ foo` — which git emits under `--unified=0` for a source line whose
+    // text starts with `--`/`++` (e.g. a SQL/Haskell/Lua comment, or a tracked
+    // `.diff`/`.patch` file) — from being misread as a file header and
+    // clobbering `current` to a bogus path.
+    let mut in_header_block = false;
     let mut prev_was_old_header = false;
     for line in diff.lines() {
-        if line.starts_with("--- ") {
+        if line.starts_with("diff --git ") {
+            in_header_block = true;
+            prev_was_old_header = false;
+            // A hunk before the next `+++` (shouldn't happen) must not map to
+            // the previous file.
+            current = None;
+            continue;
+        }
+        if in_header_block && line.starts_with("--- ") {
             prev_was_old_header = true;
             continue;
         }
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            if prev_was_old_header {
+        if in_header_block && prev_was_old_header {
+            if let Some(rest) = line.strip_prefix("+++ ") {
                 current = parse_diff_new_path(rest);
+                prev_was_old_header = false;
+                in_header_block = false; // header consumed; hunks follow
+                continue;
             }
             prev_was_old_header = false;
-            continue;
         }
-        prev_was_old_header = false;
         if let Some(rest) = line.strip_prefix("@@ ") {
+            in_header_block = false;
             let Some(file) = current.as_ref() else { continue };
             if let Some((start, len)) = parse_hunk_new_range(rest) {
                 if len > 0 {
+                    // Saturating so a malformed/corrupt hunk header with
+                    // near-`u32::MAX` values can't overflow-panic — this parser
+                    // is documented to tolerate bad input without panicking.
                     out.entry(file.clone()).or_default().push(LineRange {
                         start,
-                        end: start + len - 1,
+                        end: start.saturating_add(len).saturating_sub(1),
                     });
                 } else {
                     // F18: pure deletion. `start` is the new-file line just
@@ -193,7 +209,7 @@ fn parse_unified_diff(diff: &str, out: &mut HashMap<String, Vec<LineRange>>) {
                     let anchor = start.max(1);
                     out.entry(file.clone()).or_default().push(LineRange {
                         start: anchor,
-                        end: anchor + 1,
+                        end: anchor.saturating_add(1),
                     });
                 }
             }

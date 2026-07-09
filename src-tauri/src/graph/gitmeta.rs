@@ -126,9 +126,32 @@ pub fn collect_for(root: &Path, files: &[String]) -> AppResult<Vec<FileChurn>> {
     if files.is_empty() || !is_git_repo(root) {
         return Ok(Vec::new());
     }
+    // Bound the per-file `git log` spawns. This runs on the watcher/reindex
+    // thread, and one process spawn per file (tens of ms each on Windows)
+    // stalls it for seconds on a mass rename/branch-switch batch — which then
+    // delays draining the bounded event channel and can itself trigger the
+    // overflow → full-rebuild path. Beyond the cap, skip the incremental churn
+    // refresh; the next full `collect` (or the rebuild a large batch tends to
+    // trigger) restores precise churn anyway.
+    const MAX_INCREMENTAL_FILES: usize = 128;
+    if files.len() > MAX_INCREMENTAL_FILES {
+        tracing::debug!(
+            files = files.len(),
+            cap = MAX_INCREMENTAL_FILES,
+            "gitmeta: batch too large for incremental churn refresh — deferring to next full collect"
+        );
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for file in files {
-        let Ok(text) = run_git(root, &["log", "-1", "--format=%ct%x09%s", "--", file]) else {
+        // Normalize to git's forward-slash convention ONCE, then use the same
+        // value for both the pathspec we query and the key we store — so
+        // `collect_for` can't key a file differently from the full `collect`
+        // pass (whose keys come from git's own forward-slash `--name-only`
+        // output). The sole caller already passes repo-relative paths; this
+        // keeps that a local guarantee rather than an unstated precondition.
+        let file = normalize_path(file);
+        let Ok(text) = run_git(root, &["log", "-1", "--format=%ct%x09%s", "--", &file]) else {
             continue;
         };
         let text = text.trim();
@@ -137,7 +160,7 @@ pub fn collect_for(root: &Path, files: &[String]) -> AppResult<Vec<FileChurn>> {
         }
         if let Some((last_ts, last_subject)) = parse_header_line(text) {
             out.push(FileChurn {
-                file: normalize_path(file),
+                file,
                 last_ts,
                 last_subject,
                 touches_90d: 1,

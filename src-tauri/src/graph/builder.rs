@@ -76,7 +76,26 @@ pub fn parse_file(path: &str, src: &str, lang: Lang) -> FileGraph {
     // call/reference confidence from `Inferred` to `Extracted`. Single place,
     // walk-order-independent, covers both the bespoke walkers and the tags engine.
     fg.classify_confidence();
+    dedup_graph(&mut fg);
     fg
+}
+
+/// Collapse duplicate edges and reference sites a single file can emit — e.g. a
+/// function that calls `log()` 200 times (200 identical `Call` edges), or a
+/// repeated `use foo::bar;` — so downstream fan-out / impact / confidence
+/// counts aren't inflated by the same relationship recorded many times. Edges
+/// are keyed by `(kind, src, dst)`; references by `(name, line, col)` so that
+/// distinct call sites on different lines (genuinely distinct use sites) are
+/// kept while a site captured twice by overlapping logic is collapsed. Runs
+/// once here so it covers every language (the bespoke walkers and the tags
+/// engine alike).
+fn dedup_graph(fg: &mut FileGraph) {
+    let mut seen_edges: std::collections::HashSet<(&'static str, String, String)> =
+        std::collections::HashSet::new();
+    fg.edges.retain(|e| seen_edges.insert((e.kind.tag(), e.src.clone(), e.dst.clone())));
+    let mut seen_refs: std::collections::HashSet<(String, u32, u32)> =
+        std::collections::HashSet::new();
+    fg.references.retain(|r| seen_refs.insert((r.name.clone(), r.line, r.col)));
 }
 
 /// Chunk a Markdown file into `doc_chunk`s by heading section, so
@@ -238,7 +257,7 @@ fn parse_rust(src: &str, file: &str, fg: &mut FileGraph) {
     let Some(tree) = parser.parse(src, None) else {
         return;
     };
-    walk_items(src, file, tree.root_node(), None, false, false, fg);
+    walk_items(src, file, tree.root_node(), 0, None, false, false, fg);
 }
 
 /// Recurse over a node's named children, emitting definitions (with
@@ -247,15 +266,28 @@ fn parse_rust(src: &str, file: &str, fg: &mut FileGraph) {
 /// methods; `in_test_mod` is true once the walk has descended into a
 /// `#[cfg(test)] mod` — every fn/method found from there down is a test (V12
 /// Phase C), regardless of its own attributes.
+/// Recursion-depth cap shared by every tree walker (`walk_items`,
+/// `collect_calls_in`, `collect_rust_macro_calls`, `walk_js`, `walk_py`).
+/// tree-sitter imposes no nesting limit, so a machine-generated or adversarial
+/// file (e.g. one 60k-deep nested call expression) could otherwise recurse the
+/// native stack to an uncatchable abort. Real source nests far shallower than
+/// this; hitting the cap simply stops descending that subtree and yields
+/// whatever parsed above it — matching the module's "never panic" contract.
+const MAX_WALK_DEPTH: u32 = 512;
+
 fn walk_items(
     src: &str,
     file: &str,
     node: Node,
+    depth: u32,
     parent: Option<&str>,
     in_impl: bool,
     in_test_mod: bool,
     fg: &mut FileGraph,
 ) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let mut pending_doc: Vec<String> = Vec::new();
     // Attribute text accumulated since the last def/doc reset, so a def can be
     // checked for a preceding `#[test]`/`#[tokio::test]`/`#[rstest]` the same
@@ -292,25 +324,33 @@ fn walk_items(
             let id = emit_symbol(src, file, child, &name, skind, parent, doc, vis, is_test, fg);
 
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
-                collect_calls_in(src, file, child, &id, CallSyntax::Rust, fg);
+                collect_calls_in(src, file, child, depth + 1, &id, CallSyntax::Rust, fg);
             }
             let child_in_impl = matches!(kind, "impl_item" | "trait_item");
             // A `#[cfg(test)] mod` marks everything nested in it as tests, all
             // the way down (a plain `fn` inside needs no `#[test]` of its own).
             let child_in_test_mod = in_test_mod
                 || (kind == "mod_item" && pending_attrs.iter().any(|a| is_cfg_test_attribute(a)));
-            walk_items(src, file, child, Some(&id), child_in_impl, child_in_test_mod, fg);
+            walk_items(src, file, child, depth + 1, Some(&id), child_in_impl, child_in_test_mod, fg);
             pending_doc.clear();
             pending_attrs.clear();
         } else if kind == "use_declaration" {
-            if let Some(path) = import_path(src, child) {
-                fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), path));
+            // One edge per imported module path — a grouped/aliased/glob `use`
+            // (`use a::{b, c};`, `use a::b as c;`, `use a::*;`) expands to the
+            // individual, resolvable module paths rather than a single literal
+            // edge that never matches anything.
+            if let Some(arg) = child.child_by_field_name("argument") {
+                let mut paths = Vec::new();
+                collect_use_paths(src, arg, "", &mut paths);
+                for path in paths {
+                    fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), path));
+                }
             }
             pending_doc.clear();
             pending_attrs.clear();
         } else {
             // Descend for nested items (module bodies, impl bodies, etc.).
-            walk_items(src, file, child, parent, in_impl, in_test_mod, fg);
+            walk_items(src, file, child, depth + 1, parent, in_impl, in_test_mod, fg);
             pending_doc.clear();
             pending_attrs.clear();
         }
@@ -531,10 +571,14 @@ fn collect_calls_in(
     src: &str,
     file: &str,
     node: Node,
+    depth: u32,
     from_id: &str,
     syntax: CallSyntax,
     fg: &mut FileGraph,
 ) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == syntax.call_kind() {
@@ -548,12 +592,12 @@ fn collect_calls_in(
             let mut mc = child.walk();
             for gc in child.named_children(&mut mc) {
                 if gc.kind() == "token_tree" {
-                    collect_rust_macro_calls(src, file, gc, from_id, fg);
+                    collect_rust_macro_calls(src, file, gc, depth + 1, from_id, fg);
                 }
             }
         }
         if !syntax.is_nested_scope(child) {
-            collect_calls_in(src, file, child, from_id, syntax, fg);
+            collect_calls_in(src, file, child, depth + 1, from_id, syntax, fg);
         }
     }
 }
@@ -595,7 +639,10 @@ pub(crate) fn char_col(src: &str, node: Node) -> u32 {
 /// The zero-gap adjacency check excludes a nested macro invocation `inner!(…)`
 /// (a `!` sits between the name and its tree) and generic turbofish calls, both
 /// of which would otherwise be mis-attributed. Recurses into nested token trees.
-fn collect_rust_macro_calls(src: &str, file: &str, tree: Node, from_id: &str, fg: &mut FileGraph) {
+fn collect_rust_macro_calls(src: &str, file: &str, tree: Node, depth: u32, from_id: &str, fg: &mut FileGraph) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let mut cursor = tree.walk();
     let children: Vec<Node> = tree.named_children(&mut cursor).collect();
     for (i, child) in children.iter().enumerate() {
@@ -607,13 +654,21 @@ fn collect_rust_macro_calls(src: &str, file: &str, tree: Node, from_id: &str, fg
                         && node_text(src, *next).starts_with('(')
                     {
                         let callee = node_text(src, *child).trim().to_string();
-                        if !callee.is_empty() {
+                        // Inside a macro's opaque token tree, an `Ident(...)` is
+                        // as likely an enum-variant / tuple-struct *pattern* or
+                        // constructor (`Some(v)`, `Ok(_)`, `Foo(1)`) as a real
+                        // call. Rust functions are snake_case, so a PascalCase
+                        // initial marks the common false positives — skip them
+                        // (real snake_case calls like `foo()`/`bar()` are kept).
+                        let is_ctor_like =
+                            callee.chars().find(|c| c.is_alphabetic()).is_some_and(char::is_uppercase);
+                        if !callee.is_empty() && !is_ctor_like {
                             push_call(src, file, *child, &callee, from_id, fg);
                         }
                     }
                 }
             }
-            "token_tree" => collect_rust_macro_calls(src, file, *child, from_id, fg),
+            "token_tree" => collect_rust_macro_calls(src, file, *child, depth + 1, from_id, fg),
             _ => {}
         }
     }
@@ -653,9 +708,71 @@ fn callee_name(src: &str, call: Node) -> Option<String> {
     }
 }
 
-/// The full `use` path text, minus the `use ` prefix and trailing `;`.
-fn import_path(src: &str, node: Node) -> Option<String> {
-    node.child_by_field_name("argument").map(|n| node_text(src, n))
+/// Expand a `use` tree (the `argument` of a `use_declaration`) into the
+/// individual module paths it imports, joining each to the accumulated
+/// `prefix`. Handles the shapes that a single-string capture flattened into an
+/// unresolvable edge:
+/// - `a::b`            → `["a::b"]`
+/// - `a::b as c`       → `["a::b"]`      (the alias is dropped)
+/// - `a::{b, c::d}`    → `["a::b", "a::c::d"]`
+/// - `a::{self, b}`    → `["a", "a::b"]` (`self` is the module itself)
+/// - `a::*`            → `["a"]`         (the glob target is the module)
+fn collect_use_paths(src: &str, node: Node, prefix: &str, out: &mut Vec<String>) {
+    match node.kind() {
+        // `path as alias` — keep the path, drop the alias half.
+        "use_as_clause" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                collect_use_paths(src, path, prefix, out);
+            }
+        }
+        // `path::{ ... }` — the path extends the prefix for every list item.
+        "scoped_use_list" => {
+            let new_prefix = node
+                .child_by_field_name("path")
+                .map(|p| join_mod(prefix, node_text(src, p).trim()))
+                .unwrap_or_else(|| prefix.to_string());
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_use_paths(src, list, &new_prefix, out);
+            }
+        }
+        // `{ a, b, ... }` — each child is its own use tree under `prefix`.
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_use_paths(src, child, prefix, out);
+            }
+        }
+        // `path::*` — record the module itself (the glob never resolves to a
+        // single name). The path is the wildcard's only named child.
+        "use_wildcard" => match node.named_child(0) {
+            Some(inner) => collect_use_paths(src, inner, prefix, out),
+            None if !prefix.is_empty() => out.push(prefix.to_string()),
+            None => {}
+        },
+        // Leaf: identifier / scoped_identifier / crate / super / self / etc.
+        _ => {
+            let seg = node_text(src, node);
+            let seg = seg.trim();
+            if seg == "self" {
+                // `use a::{self}` → the module `a`.
+                if !prefix.is_empty() {
+                    out.push(prefix.to_string());
+                }
+            } else if !seg.is_empty() {
+                out.push(join_mod(prefix, seg));
+            }
+        }
+    }
+}
+
+/// Join a module path segment to a `::`-separated prefix (`""` prefix → the
+/// segment alone).
+fn join_mod(prefix: &str, seg: &str) -> String {
+    if prefix.is_empty() {
+        seg.to_string()
+    } else {
+        format!("{prefix}::{seg}")
+    }
 }
 
 /// A one-line signature: the node's first line, trimmed and length-capped.
@@ -823,7 +940,7 @@ fn parse_js_ts(src: &str, file: &str, lang: Lang, fg: &mut FileGraph) {
         return;
     };
     let file_is_test = js_is_test_file(file);
-    walk_js(src, file, tree.root_node(), None, false, file_is_test, fg);
+    walk_js(src, file, tree.root_node(), 0, None, false, file_is_test, fg);
 }
 
 /// Whether `file`'s path marks every definition in it as a test, by the common
@@ -847,11 +964,15 @@ fn walk_js(
     src: &str,
     file: &str,
     node: Node,
+    depth: u32,
     parent: Option<&str>,
     in_class: bool,
     file_is_test: bool,
     fg: &mut FileGraph,
 ) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let mut pending_doc: Vec<String> = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -883,15 +1004,15 @@ fn walk_js(
             let doc = take_doc(&mut pending_doc);
             let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, file_is_test, fg);
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
-                collect_calls_in(src, file, def_node, &id, CallSyntax::Js, fg);
+                collect_calls_in(src, file, def_node, depth + 1, &id, CallSyntax::Js, fg);
             }
             let child_in_class = matches!(def_node.kind(), "class_declaration" | "abstract_class_declaration");
-            walk_js(src, file, def_node, Some(&id), child_in_class, file_is_test, fg);
+            walk_js(src, file, def_node, depth + 1, Some(&id), child_in_class, file_is_test, fg);
             pending_doc.clear();
         } else if matches!(def_node.kind(), "lexical_declaration" | "variable_declaration") {
             // `const foo = () => {…}` / `const bar = function(){}` → a function.
             let doc = take_doc(&mut pending_doc);
-            emit_js_var_functions(src, file, def_node, parent, doc, vis, file_is_test, fg);
+            emit_js_var_functions(src, file, def_node, depth + 1, parent, doc, vis, file_is_test, fg);
             pending_doc.clear();
         } else if kind == "import_statement" {
             if let Some(srcpath) = js_import_source(src, child) {
@@ -901,7 +1022,7 @@ fn walk_js(
         } else {
             // Descend into wrappers (export of a name list, statement blocks,
             // class bodies, namespaces) keeping the enclosing symbol/parent.
-            walk_js(src, file, def_node, parent, in_class, file_is_test, fg);
+            walk_js(src, file, def_node, depth + 1, parent, in_class, file_is_test, fg);
             pending_doc.clear();
         }
     }
@@ -1032,6 +1153,7 @@ fn emit_js_var_functions(
     src: &str,
     file: &str,
     decl: Node,
+    depth: u32,
     parent: Option<&str>,
     doc: Option<String>,
     vis: Visibility,
@@ -1052,7 +1174,7 @@ fn emit_js_var_functions(
         // Only the first declarator gets the leading doc-comment.
         let this_doc = if first { doc.clone() } else { None };
         let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, vis, file_is_test, fg);
-        collect_calls_in(src, file, value, &id, CallSyntax::Js, fg);
+        collect_calls_in(src, file, value, depth + 1, &id, CallSyntax::Js, fg);
         first = false;
     }
 }
@@ -1125,7 +1247,7 @@ fn parse_python(src: &str, file: &str, fg: &mut FileGraph) {
         return;
     };
     let file_is_test_path = py_is_test_file(file);
-    walk_py(src, file, tree.root_node(), None, false, file_is_test_path, fg);
+    walk_py(src, file, tree.root_node(), 0, None, false, file_is_test_path, fg);
 }
 
 /// Whether `file`'s path matches the pytest test-file convention:
@@ -1149,11 +1271,15 @@ fn walk_py(
     src: &str,
     file: &str,
     node: Node,
+    depth: u32,
     parent: Option<&str>,
     in_class: bool,
     file_is_test_path: bool,
     fg: &mut FileGraph,
 ) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let kind = child.kind();
@@ -1182,17 +1308,17 @@ fn walk_py(
                     && name.starts_with("test_");
                 let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, is_test, fg);
                 if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
-                    collect_calls_in(src, file, def_node, &id, CallSyntax::Python, fg);
+                    collect_calls_in(src, file, def_node, depth + 1, &id, CallSyntax::Python, fg);
                 }
                 let child_in_class = def_node.kind() == "class_definition";
-                walk_py(src, file, def_node, Some(&id), child_in_class, file_is_test_path, fg);
+                walk_py(src, file, def_node, depth + 1, Some(&id), child_in_class, file_is_test_path, fg);
             }
             "import_statement" | "import_from_statement" => {
                 for m in py_import_modules(src, def_node) {
                     fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), m));
                 }
             }
-            _ => walk_py(src, file, def_node, parent, in_class, file_is_test_path, fg),
+            _ => walk_py(src, file, def_node, depth + 1, parent, in_class, file_is_test_path, fg),
         }
     }
 }
@@ -1798,6 +1924,81 @@ class Point:
                 .any(|e| e.kind == EdgeKind::Call && (e.dst == "println" || e.dst == "assert_eq")),
             "macro names must not be recorded as calls"
         );
+    }
+
+    #[test]
+    fn grouped_aliased_glob_use_expands_to_individual_import_edges() {
+        let src = "\
+use std::collections::{HashMap, HashSet};
+use std::io::Write as _W;
+use crate::foo::*;
+use serde::{self, Serialize};
+fn a() {}
+";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let imports: Vec<&str> = fg
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Import)
+            .map(|e| e.dst.as_str())
+            .collect();
+        // Grouped `use` → one edge per module (not one literal `{…}` string).
+        assert!(imports.contains(&"std::collections::HashMap"), "{imports:?}");
+        assert!(imports.contains(&"std::collections::HashSet"), "{imports:?}");
+        // Aliased `use` → the path, with the alias dropped.
+        assert!(imports.contains(&"std::io::Write"), "{imports:?}");
+        assert!(!imports.iter().any(|p| p.contains(" as ")), "alias must be dropped: {imports:?}");
+        // Glob `use` → the module itself, no trailing `*`.
+        assert!(imports.contains(&"crate::foo"), "{imports:?}");
+        assert!(!imports.iter().any(|p| p.contains('*')), "no glob star: {imports:?}");
+        // `self` in a group → the module itself.
+        assert!(imports.contains(&"serde"), "{imports:?}");
+        assert!(imports.contains(&"serde::Serialize"), "{imports:?}");
+        // Nothing left unexpanded.
+        assert!(!imports.iter().any(|p| p.contains('{')), "no unexpanded group: {imports:?}");
+    }
+
+    #[test]
+    fn macro_pattern_constructors_not_recorded_as_calls() {
+        // Inside macros, PascalCase variant/tuple-struct patterns & constructors
+        // must NOT become call edges, but real snake_case calls still must.
+        let src = "\
+fn outer() {
+    assert!(matches!(opt, Some(_)));
+    assert!(matches!(res, Ok(_)));
+    let _ = vec![Foo(1), Bar(2)];
+    println!(\"{}\", compute());
+}
+fn compute() -> i32 { 0 }
+";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        assert!(
+            fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "compute"),
+            "real snake_case call must still be recovered"
+        );
+        for bogus in ["Some", "Ok", "Foo", "Bar"] {
+            assert!(
+                !fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.dst == bogus),
+                "PascalCase `{bogus}` (a pattern/constructor) must not be a call edge"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_calls_dedup_to_one_edge_but_keep_distinct_sites() {
+        let src = "fn a() { log(); log(); log(); }\nfn log() {}\n";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let a = fg.symbols.iter().find(|s| s.name == "a").unwrap();
+        let log_edges = fg
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Call && e.src == a.id && e.dst == "log")
+            .count();
+        assert_eq!(log_edges, 1, "three calls to log() collapse to one Call edge");
+        // The three distinct call sites (different columns) remain as references.
+        let log_refs = fg.references.iter().filter(|r| r.name == "log").count();
+        assert_eq!(log_refs, 3, "distinct call sites stay as distinct references");
     }
 
     #[test]

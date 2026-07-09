@@ -49,8 +49,17 @@ pub fn start(
             if matches!(ev.kind, EventKind::Access(_)) {
                 return;
             }
+            // Drop events whose every path lies inside a high-churn build/VCS
+            // directory that's never indexed. Filtering HERE (not only later in
+            // `reindex_paths`, which respects gitignore) keeps a `cargo build`
+            // or `npm install` writing thousands of files from flooding the
+            // bounded channel and forcing back-to-back full rebuilds mid-build.
+            const SKIP_DIRS: [&str; 3] = [".git", "target", "node_modules"];
             if !ev.paths.is_empty()
-                && ev.paths.iter().all(|p| p.components().any(|c| c.as_os_str() == ".git"))
+                && ev.paths.iter().all(|p| {
+                    p.components()
+                        .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_str().unwrap_or("")))
+                })
             {
                 return;
             }

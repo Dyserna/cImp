@@ -36,7 +36,7 @@ mod watcher;
 
 pub use activity::{snapshot as graph_history, GraphCall};
 pub use builder::parse_file;
-pub use context::RetrieveResult;
+pub use context::{est_tokens, RetrieveResult};
 pub use index::{GraphIndex, GraphStats, SymbolHit};
 pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent};
 // V14 Phase D: only `UsageSnapshot` itself is named by qualified path outside

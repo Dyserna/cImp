@@ -168,7 +168,7 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
     while let Some(m) = it.next() {
         let mut def: Option<(Node, SymbolKind)> = None;
         let mut name_node: Option<Node> = None;
-        let mut is_call = false;
+        let mut call_node: Option<Node> = None;
         for cap in m.captures {
             let cname = names[cap.index as usize];
             if let Some(suffix) = cname.strip_prefix("definition.") {
@@ -176,31 +176,44 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
             } else if cname == "name" {
                 name_node = Some(cap.node);
             } else if cname == "reference.call" {
-                is_call = true;
+                call_node = Some(cap.node);
             }
         }
-        match (def, name_node) {
-            (Some((dn, kind)), Some(nn)) => {
-                let name = node_text(src, nn);
-                let name = name.trim();
-                if !name.is_empty() {
-                    defs.push(Def { node: dn, name: name.to_string(), kind });
+        match def {
+            Some((dn, kind)) => {
+                if let Some(nn) = name_node {
+                    let name = node_text(src, nn);
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        defs.push(Def { node: dn, name: name.to_string(), kind });
+                    }
                 }
             }
-            (None, Some(nn)) if is_call => {
-                let name = node_text(src, nn);
-                let name = name.trim();
-                if !name.is_empty() {
-                    calls.push(CallRef {
-                        name: name.to_string(),
-                        byte: nn.start_byte(),
-                        line: nn.start_position().row as u32 + 1,
-                        // F26: character column, not tree-sitter's byte offset.
-                        col: char_col(src, nn),
-                    });
+            // A call: prefer an explicit `@name`, but fall back to the
+            // `@reference.call` node itself — many vendored queries tag the
+            // callee identifier directly (e.g. `(identifier) @reference.call`)
+            // with no inner `@name`, and those calls were previously dropped.
+            None => {
+                if let Some(nn) = name_node.or(call_node) {
+                    // Leading identifier of the captured node, so a whole-`(call)`
+                    // capture yields `foo` rather than `foo(a, b)`.
+                    let raw = node_text(src, nn);
+                    let name = raw
+                        .split(|c: char| c == '(' || c.is_whitespace())
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if !name.is_empty() && call_node.is_some() {
+                        calls.push(CallRef {
+                            name: name.to_string(),
+                            byte: nn.start_byte(),
+                            line: nn.start_position().row as u32 + 1,
+                            // F26: character column, not tree-sitter's byte offset.
+                            col: char_col(src, nn),
+                        });
+                    }
                 }
             }
-            _ => {}
         }
     }
 

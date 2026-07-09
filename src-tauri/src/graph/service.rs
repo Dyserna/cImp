@@ -561,7 +561,7 @@ impl GraphService {
         let dependents = if names.is_empty() {
             Vec::new()
         } else {
-            idx.dependents_transitive(&names, 3, max)?
+            idx.dependents_transitive(&names, 3, max, None)?
         };
         Ok(super::impact::ImpactReport { changed: set.changed, dependents, unindexed: set.unindexed })
     }
@@ -823,17 +823,24 @@ impl GraphService {
         let idx = self.index_for(root).ok()?;
         let root_sessions: HashSet<String> =
             idx.mem_sessions().ok()?.into_iter().map(|s| s.session_id).collect();
-        let map = self.injected.lock().unwrap();
+        // Snapshot (session, injected paths) under the lock, then release it
+        // before the per-session DB round trips — holding `injected` across
+        // `mem_touched_paths` serializes all injection-map access behind SQLite
+        // lookups on the hot injection path.
+        let snapshot: Vec<(String, Vec<String>)> = {
+            let map = self.injected.lock().unwrap();
+            map.iter()
+                .filter(|(sid, _)| root_sessions.contains(sid.as_str()))
+                .map(|(sid, st)| (sid.clone(), st.files.keys().cloned().collect()))
+                .collect()
+        };
         let mut total = 0u64;
         let mut followed = 0u64;
-        for (sid, st) in map.iter() {
-            if !root_sessions.contains(sid) {
-                continue;
-            }
-            let touched = idx.mem_touched_paths(sid).unwrap_or_default();
-            for path in st.files.keys() {
+        for (sid, paths) in snapshot {
+            let touched = idx.mem_touched_paths(&sid).unwrap_or_default();
+            for path in paths {
                 total += 1;
-                if touched.contains(path) {
+                if touched.contains(&path) {
                     followed += 1;
                 }
             }
@@ -1239,18 +1246,27 @@ impl GraphService {
         // Record the files injected in full so the next turn can dedup them.
         if let Some(s) = sid {
             if ttl > 0 {
+                // Resolve each file's current hash BEFORE taking the lock, so
+                // the injection map isn't held across per-file SQLite lookups
+                // on this hot path.
+                let hashes: Vec<(String, String)> = result
+                    .files_used
+                    .iter()
+                    .filter_map(|f| match idx.stored_file_hash(f) {
+                        Ok(Some(h)) => Some((f.clone(), h)),
+                        _ => None,
+                    })
+                    .collect();
                 let mut map = self.injected.lock().unwrap();
                 let st = map.entry(s.to_string()).or_default();
-                for f in &result.files_used {
-                    if let Ok(Some(h)) = idx.stored_file_hash(f) {
-                        // Only overwrite if this turn is at least as new as the
-                        // recorded one, so an interleaved earlier retrieve can't
-                        // clobber a newer turn's record with a stale hash.
-                        match st.files.get(f) {
-                            Some((_, prev_turn)) if *prev_turn > current_turn => {}
-                            _ => {
-                                st.files.insert(f.clone(), (h, current_turn));
-                            }
+                for (f, h) in hashes {
+                    // Only overwrite if this turn is at least as new as the
+                    // recorded one, so an interleaved earlier retrieve can't
+                    // clobber a newer turn's record with a stale hash.
+                    match st.files.get(&f) {
+                        Some((_, prev_turn)) if *prev_turn > current_turn => {}
+                        _ => {
+                            st.files.insert(f, (h, current_turn));
                         }
                     }
                 }
@@ -1306,8 +1322,12 @@ impl GraphService {
             return;
         };
         let sup = sup.inner().clone();
-        let Ok(content) = std::fs::read_to_string(root.join(file)) else {
-            return;
+        // Read off the async worker — file I/O would otherwise block a tokio
+        // thread for the duration.
+        let path = root.join(file);
+        let content = match tokio::task::spawn_blocking(move || std::fs::read_to_string(path)).await {
+            Ok(Ok(c)) => c,
+            _ => return,
         };
         // Only the first 4 KiB drives the digest — enough for a doc/config head.
         let head: String = content.chars().take(4096).collect();
@@ -1327,7 +1347,15 @@ impl GraphService {
             return;
         }
         if let Ok(idx) = self.index_for(root) {
-            let _ = idx.put_digest(file, content_hash, &text, super::activity::now_ms() as i64);
+            // The SQLite write is synchronous — run it on a blocking thread so
+            // it doesn't stall an async worker.
+            let file = file.to_string();
+            let content_hash = content_hash.to_string();
+            let ts = super::activity::now_ms() as i64;
+            let _ = tokio::task::spawn_blocking(move || {
+                idx.put_digest(&file, &content_hash, &text, ts)
+            })
+            .await;
         }
     }
 
@@ -1588,8 +1616,23 @@ impl GraphService {
                 let root2 = root.to_path_buf();
                 let file2 = file_path.to_string();
                 tokio::spawn(async move {
-                    if let Ok((reports, check_errors)) = handle.await {
-                        this2.finish_post_edit(&sid2, &root2, &file2, reports, check_errors, true);
+                    // Bound the parked run: a check command that hangs (waiting
+                    // on a lock, reading stdin) must not live forever, or the
+                    // single-flight `RootRunner` coalesces every later post_edit
+                    // onto the stuck task and auto-check is silently wedged for
+                    // this root. On timeout, abort so the root isn't pinned.
+                    const PARKED_MAX_MS: u64 = 60_000;
+                    match tokio::time::timeout(
+                        Duration::from_millis(PARKED_MAX_MS),
+                        &mut handle,
+                    )
+                    .await
+                    {
+                        Ok(Ok((reports, check_errors))) => {
+                            this2.finish_post_edit(&sid2, &root2, &file2, reports, check_errors, true);
+                        }
+                        Ok(Err(_join_err)) => {}
+                        Err(_elapsed) => handle.abort(),
                     }
                 });
                 None
@@ -1720,7 +1763,7 @@ impl GraphService {
         names.sort();
         names.dedup();
         let max = g.max_rows_per_query.max(1) as usize;
-        let dependents = idx.dependents_transitive(&names, 3, max).ok()?;
+        let dependents = idx.dependents_transitive(&names, 3, max, None).ok()?;
         let files: HashSet<&str> = dependents.iter().map(|d| d.symbol.file.as_str()).collect();
         let tests = idx.tests_for(&names, 3, max).unwrap_or_default();
         crate::checks::auto::impact_note(max_callers, dependents.len(), files.len(), tests.len(), min_dependents)
@@ -1774,7 +1817,12 @@ impl GraphService {
     /// [`status`](Self::status). A no-op (logged) when a build for this root is
     /// already in flight.
     pub fn spawn_rebuild(self: &Arc<Self>, root: PathBuf) {
-        {
+        // Build the status under the lock but emit AFTER dropping it: `emit`
+        // dispatches synchronously on this thread, and a same-thread listener
+        // that read `self.statuses()` during delivery would re-lock the
+        // non-reentrant `status` mutex and self-deadlock (the discipline
+        // `patch_status` already follows).
+        let building = {
             let mut guard = self.status.lock().unwrap();
             if let Some(s) = guard.get(&root) {
                 if s.building {
@@ -1791,8 +1839,9 @@ impl GraphService {
             building.last_error = None;
             guard.insert(root.clone(), building.clone());
             building.watch_paused = self.paused.load(Ordering::Relaxed);
-            let _ = self.app.emit(GRAPH_STATUS_EVENT, &building);
-        }
+            building
+        };
+        let _ = self.app.emit(GRAPH_STATUS_EVENT, &building);
 
         let this = self.clone();
         let thread_root = root.clone();
@@ -1943,22 +1992,31 @@ impl GraphService {
             if path.components().any(|c| c.as_os_str() == sub.as_str()) {
                 continue;
             }
-            // Only files with a configured language matter (this also filters
-            // out directory events, whose path has no indexable extension).
+            let rel = rel_path(root, &path);
+
+            // Deletions/moves-away are handled BEFORE the `lang_for` gate: a
+            // removed path may be a directory (rename or `rm -r`), which has no
+            // indexable extension and would otherwise be dropped by that gate,
+            // leaking every child file's rows until a full rebuild. Drop the
+            // exact file if it was indexed AND everything indexed beneath it.
+            if !path.is_file() {
+                let was_indexed = idx.stored_file_hash(&rel).ok().flatten().is_some();
+                if was_indexed {
+                    let _ = idx.remove_file(&rel);
+                }
+                let removed_under = idx.remove_files_under(&rel).unwrap_or(0);
+                if was_indexed || removed_under > 0 {
+                    changed += 1;
+                    touched_rels.push(rel);
+                }
+                continue;
+            }
+
+            // Only files with a configured language matter.
             let Some(lang) = lang_for(&path, &snap.languages) else {
                 continue;
             };
             if lang == Lang::Markdown && !snap.index_docs {
-                continue;
-            }
-            let rel = rel_path(root, &path);
-
-            if !path.is_file() {
-                // Deleted/moved-away — drop its rows (no-op if never indexed).
-                if idx.remove_file(&rel).is_ok() {
-                    changed += 1;
-                    touched_rels.push(rel);
-                }
                 continue;
             }
             // Respect gitignore so editing a build artifact doesn't churn.
@@ -2117,7 +2175,7 @@ impl GraphService {
             s.semantic_enabled = true;
             s.embedder_configured = configured;
         });
-        let Some(embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model) else {
+        let Some(mut embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model) else {
             self.patch_status(root, |s| {
                 s.embed_state = "degraded".into();
                 s.embedder_ready = false;
@@ -2142,6 +2200,9 @@ impl GraphService {
                 }
             }
         };
+        // Pin the store dimension so a later model swap on the endpoint can't
+        // feed wrong-length vectors into a store sized to `dim`.
+        embedder.expect_dim(dim);
 
         let idx = match self.index_for(root) {
             Ok(i) => i,

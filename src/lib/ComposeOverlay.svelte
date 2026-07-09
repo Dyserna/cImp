@@ -38,6 +38,16 @@
     }
   });
 
+  // Re-measure when the draft changes programmatically (V13 Phase B's
+  // `openComposeWith` appends a sent hunk to an already-open sheet) — a
+  // direct store write doesn't fire the textarea's own `oninput`, so without
+  // this the box wouldn't grow to fit newly-appended text until the user
+  // typed something themselves.
+  $effect(() => {
+    void $composeContent;
+    if ($composeOpen) adjustHeight();
+  });
+
   // Re-clamp when min/max settings change while the sheet is open.
   $effect(() => {
     void minHeight;

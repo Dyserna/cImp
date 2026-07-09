@@ -1241,6 +1241,64 @@ pub async fn workbench_status(
     Ok(service.status(&root).await)
 }
 
+/// V13 Phase B: the Diff section's file list — status/binary/too_large per
+/// file plus the readonly (mid-merge/-rebase) and source (git vs. — until
+/// Phase C — nothing) flags. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn workbench_diff_summary(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+) -> AppResult<crate::workbench::diff::DiffSummary> {
+    let root = resolve_workbench_root(root)?;
+    service.diff_summary(&root).await
+}
+
+/// V13 Phase B: one file's full parsed diff (hunks + lines), fetched only
+/// when the frontend expands that file's row (the file list itself is
+/// virtualized around this — see `workbench_diff_summary`).
+#[tauri::command]
+pub async fn workbench_diff_file(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    path: String,
+) -> AppResult<crate::workbench::diff::FileDiff> {
+    let root = resolve_workbench_root(root)?;
+    service.diff_file(&root, &path).await
+}
+
+/// V13 Phase B B2: revert one hunk. `hunk_hash` must match the hash of the
+/// hunk currently at `hunk_index` in the file's diff (`workbench::diff::hunk_hash`)
+/// — a mismatch means the file changed since the frontend last fetched it
+/// (an agent edit raced the diff view) and the revert is refused rather than
+/// applied against stale content. Also refused while the repo is
+/// mid-merge/-rebase. Returns the file's fresh diff after a successful
+/// revert.
+#[tauri::command]
+pub async fn workbench_revert_hunk(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    path: String,
+    hunk_index: usize,
+    hunk_hash: String,
+) -> AppResult<crate::workbench::diff::FileDiff> {
+    let root = resolve_workbench_root(root)?;
+    service.revert_hunk(&root, &path, hunk_index, &hunk_hash).await
+}
+
+/// V13 Phase B: format one hunk as a fenced code block + `path:line` header
+/// for the compose overlay's "Send to agent" hunk action. Returns plain text
+/// the frontend appends to the compose draft — the submit path is unchanged.
+#[tauri::command]
+pub async fn workbench_send_hunk(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    path: String,
+    hunk_index: usize,
+) -> AppResult<String> {
+    let root = resolve_workbench_root(root)?;
+    service.send_hunk(&root, &path, hunk_index).await
+}
+
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
 /// = file changes are ignored until resumed (a manual rebuild still works).
 #[tauri::command]

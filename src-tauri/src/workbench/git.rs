@@ -130,13 +130,38 @@ pub async fn run(
     args: &[&str],
     call_timeout: Option<Duration>,
 ) -> AppResult<GitOutput> {
+    run_inner(ctx, args, None, call_timeout).await
+}
+
+/// Like [`run`], but pipes `stdin_data` to the child's stdin before waiting
+/// on its output — Phase B's hunk revert needs this to feed `git apply
+/// --reverse --unidiff-zero -` the reconstructed single-hunk patch text
+/// (`workbench::diff::build_hunk_patch`) without writing a temp file. Same
+/// timeout/env/console-suppression contract as [`run`]; the write itself is
+/// bounded by the same `call_timeout` (a stuck write is exactly as wedge-y
+/// as a stuck read, so it gets the same cap rather than an unbounded one).
+pub async fn run_with_stdin(
+    ctx: &GitCtx,
+    args: &[&str],
+    stdin_data: &[u8],
+    call_timeout: Option<Duration>,
+) -> AppResult<GitOutput> {
+    run_inner(ctx, args, Some(stdin_data), call_timeout).await
+}
+
+async fn run_inner(
+    ctx: &GitCtx,
+    args: &[&str],
+    stdin_data: Option<&[u8]>,
+    call_timeout: Option<Duration>,
+) -> AppResult<GitOutput> {
     let program = crate::pty::resolve_command("git")
         .map_err(|_| AppError::GitUnavailable("`git` was not found on PATH".to_string()))?;
 
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(&ctx.root)
-        .stdin(Stdio::null())
+        .stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Kill the child if the timeout below drops this future — without
@@ -156,17 +181,38 @@ pub async fn run(
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
 
-    let wait = timeout(call_timeout.unwrap_or(DEFAULT_TIMEOUT), cmd.output()).await;
-    let output = match wait {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            return Err(AppError::Workbench(format!("git {}: {e}", args.join(" "))));
+    let timeout_dur = call_timeout.unwrap_or(DEFAULT_TIMEOUT);
+    let run_fut = async {
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| AppError::Workbench(format!("spawn git {}: {e}", args.join(" "))))?;
+        if let Some(data) = stdin_data {
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                stdin
+                    .write_all(data)
+                    .await
+                    .map_err(|e| AppError::Workbench(format!("write git {} stdin: {e}", args.join(" "))))?;
+                // Drop here (rather than waiting for `child` to be dropped)
+                // to close the pipe and send EOF — `git apply` on the other
+                // end is reading to EOF before it does anything.
+                drop(stdin);
+            }
         }
+        child
+            .wait_with_output()
+            .await
+            .map_err(|e| AppError::Workbench(format!("git {}: {e}", args.join(" "))))
+    };
+
+    let output = match timeout(timeout_dur, run_fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(e),
         Err(_) => {
             return Err(AppError::Workbench(format!(
                 "git {} timed out after {}s",
                 args.join(" "),
-                call_timeout.unwrap_or(DEFAULT_TIMEOUT).as_secs()
+                timeout_dur.as_secs()
             )));
         }
     };
@@ -281,6 +327,33 @@ mod tests {
         assert_eq!(ctx.root, PathBuf::from("/project"));
         assert_eq!(ctx.work_tree, Some(PathBuf::from("/project")));
         assert_eq!(ctx.git_dir, Some(PathBuf::from("/project/.cimp/shadow.git")));
+    }
+
+    #[tokio::test]
+    async fn run_with_stdin_pipes_data_to_the_child() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("wb-git-stdin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = GitCtx::discover(&dir);
+        run(&ctx, &["init", "-q"], None).await.expect("git init");
+        // `git hash-object --stdin` reads its stdin and prints the blob hash
+        // it would be — a minimal, apply-independent check that bytes
+        // actually cross the pipe (`run`'s stdin is always null, so this is
+        // the one thing `run_with_stdin` adds).
+        let out = run_with_stdin(&ctx, &["hash-object", "--stdin"], b"hello\n", None)
+            .await
+            .expect("hash-object");
+        assert!(out.success(), "{out:?}");
+        // `git hash-object hello.txt` on the same content must agree —
+        // proves the exact bytes we wrote were what git hashed, not an
+        // empty/truncated stream.
+        std::fs::write(dir.join("hello.txt"), b"hello\n").unwrap();
+        let via_file = run(&ctx, &["hash-object", "hello.txt"], None).await.expect("hash-object file");
+        assert_eq!(out.stdout.trim(), via_file.stdout.trim());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

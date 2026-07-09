@@ -11,6 +11,7 @@
   // lands). The sections themselves are filled in by B/C/D.
   import { onMount } from 'svelte';
   import { workbenchStatus, type WorkbenchStatus } from './workbench';
+  import DiffView from './DiffView.svelte';
 
   type Section = 'diff' | 'timeline' | 'worktrees';
   const SECTIONS: { id: Section; label: string }[] = [
@@ -75,11 +76,12 @@
   {/if}
 
   {#if section === 'diff'}
-    <p class="placeholder">
-      Live diff pane — coming in Phase B. Once shipped, this section shows the
-      working-tree diff live as agents edit, with per-hunk revert / copy /
-      send-to-agent actions.
-    </p>
+    {#if statusError || (needsGit && gitBannerText)}
+      <!-- The banner above already explains what's missing (git or the
+           launch-dir root) — nothing more to render until that's resolved. -->
+    {:else}
+      <DiffView />
+    {/if}
   {:else if section === 'timeline'}
     <p class="placeholder">
       Checkpoint timeline — coming in Phase C. Once shipped, this section

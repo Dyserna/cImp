@@ -17,6 +17,19 @@ export function openCompose(): void {
   composeOpen.set(true);
 }
 
+/// V13 Phase B: open the compose overlay with `text` appended to whatever
+/// draft is already there — the Diff pane's "Send to agent" hunk action
+/// (`workbench_send_hunk`'s formatted fenced block). Appends rather than
+/// replaces so sending a second hunk while composing a message doesn't
+/// clobber what the user already typed; a blank existing draft just becomes
+/// `text` with no leading separator. The submit path is unchanged — this
+/// only ever populates the draft, never sends it.
+export function openComposeWith(text: string): void {
+  const existing = get(composeContent);
+  composeContent.set(existing ? `${existing}\n${text}` : text);
+  openCompose();
+}
+
 export function closeCompose(): void {
   composeOpen.set(false);
   composeContent.set('');

@@ -323,7 +323,38 @@ export interface ShellTabConfig {
   background_override: BackgroundOverrideWire | null;
 }
 
-export type TabConfig = AiToolTabConfig | ShellTabConfig;
+/// V14 Phase F: a user-created Preview tab — an embedded, localhost-scoped
+/// child webview, not a subprocess. No `command`/`args`/`cwd`/`env`/PTY
+/// fields (unlike the two configs above) since there's nothing to spawn.
+export interface PreviewTabConfig {
+  kind: 'preview';
+  id: string;
+  builtin: boolean;
+  name: string;
+  url: string;
+  /// `null` ⇒ the "Desktop" preset (fill the pane, no letterboxing).
+  /// Non-null ⇒ letterbox to a fixed CSS-pixel width (mobile/tablet
+  /// presets) — see `lib/preview/policy.ts`'s device-preset table.
+  device_width: number | null;
+  auto_reload: boolean;
+}
+
+export type TabConfig = AiToolTabConfig | ShellTabConfig | PreviewTabConfig;
+
+/// V14 Phase F: `PreviewTabConfig` has neither `theme_override` nor
+/// `background_override` — it has no terminal to theme at all (no PTY, no
+/// xterm). Call sites that read/write those two fields off a `TabConfig`
+/// looked up by id (`ConfigureTabDialog.svelte`, `SettingsApp.svelte`,
+/// `terminals.ts`) narrow through this helper so they type-check against
+/// the now-3-member union. In practice a Preview tab never reaches any of
+/// them (it offers no "Configure…" — see `TabContextMenu.svelte` — and gets
+/// no terminal entry — see `terminals.ts`'s `createTerminal` guard), so this
+/// is a type-level narrowing, not a runtime behavior change.
+export type ThemedTabConfig = AiToolTabConfig | ShellTabConfig;
+
+export function asThemedTabConfig(t: TabConfig | undefined): ThemedTabConfig | undefined {
+  return t && t.kind !== 'preview' ? t : undefined;
+}
 
 export interface SessionState {
   active_tab_id: string | null;
@@ -511,7 +542,7 @@ export interface LayoutPreset {
 /// `src-tauri/src/settings/schema.rs`. Bumped on every backend migration
 /// step. Frontend doesn't read it for any logic — it round-trips as a
 /// bare integer through the IPC bridge.
-export const CURRENT_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = 21;
 
 export interface Settings {
   /// On-disk schema version. The backend stamps `CURRENT_SCHEMA_VERSION`
@@ -594,6 +625,19 @@ export interface Settings {
   /// See `DismissedRule`'s doc comment for the (rule_id, signature) matching
   /// semantics.
   advisor_dismissed: DismissedRule[];
+  /// V14 Phase F: the last URL entered into any Preview tab in this project
+  /// — a fresh "New Preview tab" starts here (falling back to
+  /// `lib/preview/policy.ts`'s `DEFAULT_PREVIEW_URL` when `null`). Round-trips
+  /// through the ordinary per-project `.cimp/config.json` overlay diff (a
+  /// plain scalar, unlike `prompt_templates` — no bespoke read/write path
+  /// needed).
+  preview_last_url: string | null;
+  /// V14 Phase F: global gate on the Preview tab's navigation policy. `false`
+  /// (default) restricts navigation to localhost/127.0.0.1/RFC-1918 hosts;
+  /// see `lib/preview/policy.ts`'s `isAllowedPreviewHost` (frontend mirror of
+  /// the Rust `preview::is_allowed_preview_host`, used for the toolbar's own
+  /// pre-flight check before even calling the backend).
+  preview_allow_remote: boolean;
 }
 
 /// V14 Phase D2: one dismissed advisor proposal. Mirror of Rust
@@ -1272,5 +1316,7 @@ export function defaultSettings(): Settings {
     prompt_templates: [],
     templates_seeded: false,
     advisor_dismissed: [],
+    preview_last_url: null,
+    preview_allow_remote: false,
   };
 }

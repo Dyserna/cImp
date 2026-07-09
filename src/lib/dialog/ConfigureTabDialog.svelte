@@ -24,11 +24,12 @@
     categoryOf,
     effectiveBackgroundMode,
   } from '../terminal/background';
-  import type {
-    BackgroundOverrideWire,
-    TerminalBackgroundSettings,
-    TerminalThemeSettings,
-    ThemeColorsWire,
+  import {
+    asThemedTabConfig,
+    type BackgroundOverrideWire,
+    type TerminalBackgroundSettings,
+    type TerminalThemeSettings,
+    type ThemeColorsWire,
   } from '../settings/types';
   import { resolveBundledTheme, defaultPalette } from '../themes';
   import { paletteRegistry } from '../themes/registry';
@@ -96,7 +97,7 @@
   // open) via the same write path.
   let backgroundOverride = $derived<BackgroundOverrideWire | null>(
     targetTab
-      ? ($settingsStore.tabs.find((t) => t.id === targetTab)
+      ? (asThemedTabConfig($settingsStore.tabs.find((t) => t.id === targetTab))
           ?.background_override ?? null)
       : null,
   );
@@ -136,7 +137,7 @@
     // `get_shell_tab_config` doesn't carry it (kept narrow for M2's
     // shell-fields shape); the store is canonical and always in sync
     // because the backend broadcasts on change.
-    const liveTab = get(settingsStore).tabs.find((t) => t.id === tab);
+    const liveTab = asThemedTabConfig(get(settingsStore).tabs.find((t) => t.id === tab));
     themeOverride = liveTab?.theme_override ?? null;
     // V1.4-04 C: snapshot the background override so Cancel can revert
     // any live-preview edits. `backgroundOverride` itself is now a
@@ -206,7 +207,7 @@
     if (!targetTab) return;
     const live = get(settingsStore);
     if (!live.terminal.background.preview_category_flips) {
-      const tab = live.tabs.find((t) => t.id === targetTab);
+      const tab = asThemedTabConfig(live.tabs.find((t) => t.id === targetTab));
       if (tab) {
         const currentMode = effectiveBackgroundMode(
           { background_override: tab.background_override },
@@ -224,7 +225,7 @@
     }
     pendingBackgroundOverride = { kind: 'none' };
     const updated = structuredClone(live);
-    const tab = updated.tabs.find((t) => t.id === targetTab);
+    const tab = asThemedTabConfig(updated.tabs.find((t) => t.id === targetTab));
     if (!tab) return;
     tab.background_override = next;
     await applySettings(updated);
@@ -276,7 +277,7 @@
     if (!targetTab) return;
     pendingBackgroundOverride = { kind: 'none' };
     const updated = structuredClone(get(settingsStore));
-    const tab = updated.tabs.find((t) => t.id === targetTab);
+    const tab = asThemedTabConfig(updated.tabs.find((t) => t.id === targetTab));
     if (!tab) return;
     if (tab.background_override === originalBackgroundOverride) return;
     tab.background_override = originalBackgroundOverride;
@@ -300,7 +301,7 @@
           : backgroundOverride;
       if (pendingBackgroundOverride.kind === 'pending') {
         const updated = structuredClone(get(settingsStore));
-        const tab = updated.tabs.find((t) => t.id === targetTab);
+        const tab = asThemedTabConfig(updated.tabs.find((t) => t.id === targetTab));
         if (tab) {
           tab.background_override = effectiveBg;
           await applySettings(updated);

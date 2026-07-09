@@ -106,6 +106,13 @@ pub enum AppError {
     /// path reports when the abort actually succeeds.
     #[error("worktree merge left the main tree in an unclear state: {0}")]
     WorktreeMergeUnclean(String),
+
+    /// V14 Phase F: Preview tab errors — an unknown/already-closed tab id, a
+    /// navigation target rejected by `preview::is_allowed_preview_host`, or a
+    /// capture failure (including "not supported on this platform" outside
+    /// Windows).
+    #[error("preview error: {0}")]
+    Preview(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

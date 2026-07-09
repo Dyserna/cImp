@@ -217,7 +217,10 @@ pub fn spawn_processor(
         // for them anyway — see `is_shell` below.
         let detector_patterns: Vec<PermissionPattern> = match kind {
             TabKind::AiTool => (*patterns).clone(),
-            TabKind::Shell => Vec::new(),
+            // V14 Phase F: Preview tabs never reach this task at all (no PTY
+            // is ever started for one — see `tabs::config::build_launch_spec`),
+            // but the match stays exhaustive rather than falling through.
+            TabKind::Shell | TabKind::Preview => Vec::new(),
         };
         let mut detector = PermissionDetector::new(detector_patterns);
 

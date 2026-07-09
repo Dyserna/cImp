@@ -164,6 +164,60 @@ exposes it or add a small windows-rs call), (3) focus/keyboard isolation.
 Linux parity (webkit2gtk capture) checked but not blocking — Windows-first
 like the rest of the app.
 
+**D0/E0 spike RESOLVED (2026-07-09) — gate cleared, EMBEDDED path shipped.**
+No live app was available to drive this from (source-inspection + compile
+verification only, same posture as the OpenCode capture-harness spike's
+*type-level* half); the findings below are what compiling against this
+project's exact pinned versions (Tauri 2.11.0 / wry 0.55.0, per `Cargo.lock`)
+confirmed, plus what still needs a live pass:
+
+- **Child webview:** `tauri::Window::add_child(WebviewBuilder, position, size)`
+  exists and is stable-shaped in 2.11.0, gated behind the `unstable` cargo
+  feature (a Tauri naming quirk, not a claim about API risk — it's the
+  documented multi-webview API, with a runnable doctest in the tauri crate
+  itself). `Webview::{set_bounds, hide, show, navigate, close}` cover
+  open/reposition/hide-show/navigate/destroy with no further FFI. Enabled via
+  `tauri = { features = ["protocol-asset", "unstable"] }`.
+- **Capture:** wry does NOT expose `CapturePreviewAsync` directly, confirming
+  the milestone's expectation — but `Webview::with_webview` →
+  `PlatformWebview::controller()` hands back an `ICoreWebView2Controller`
+  from the `webview2-com` crate, and critically **that crate is already a
+  transitive dependency of wry 0.55 pinned to the exact same version
+  (0.38.2)** — so depending on it directly (`webview2-com = "0.38"`) gives a
+  type-IDENTICAL `ICoreWebView2Controller`, not just a COM-GUID-compatible
+  one; `.CoreWebView2()` → `ICoreWebView2::CapturePreview(format, IStream,
+  handler)` is the one COM call. Rather than the usual in-memory
+  `IStream`+`HGLOBAL` byte-extraction dance, capture points at a
+  FILE-BACKED stream (`SHCreateStreamOnFileW`) so the PNG lands on disk with
+  no manual byte copying at all — see `src-tauri/src/preview/capture.rs`.
+  This compiled cleanly (full workspace build, including `webview2-com`/
+  `windows` 0.61/`tao`/`wry` from scratch) on the first attempt once the
+  exact pinned versions were used.
+- **Result:** both halves compile cleanly against this project's real
+  dependency graph, so Phase F ships the EMBEDDED path end-to-end, not the
+  system-browser re-scope. `docs/MAINTENANCE.md` should note the new
+  Windows-only deps (`webview2-com`, `windows`) alongside the E0 findings —
+  see the Phase G TODO.
+- **NOT verified (needs a live pass — same posture as every other spike in
+  this codebase that hit its context-budget ceiling before a live run):**
+  z-order/coexistence with the xterm panes during an actual tab drag; focus/
+  keyboard isolation in practice (typing in the Preview webview vs. cImp's
+  global shortcuts — no hold-Alt-bypass-equivalent was added because
+  nothing in the source suggested WebView2 child webviews fight the host
+  window's accelerator table the way the AI-tab PTY mouse capture did, but
+  this is an assumption, not a measurement); whether the captured PNG is
+  actually pixel-correct (right viewport bounds, true CSS-pixel — not
+  HiDPI-inflated — scale, correct timing relative to paint); and the
+  `on_navigation`/`on_new_window` policy handlers' real runtime behavior
+  (only their Rust-level logic and wiring were exercised, via
+  `preview::is_allowed_preview_host`'s unit tests — not an actual denied
+  navigation in a live webview). See the `TODO(spike E0)` comments in
+  `src-tauri/src/preview/mod.rs` and `src-tauri/src/preview/capture.rs` for
+  the exact call sites.
+- Linux (webkit2gtk) capture: still not attempted, per the milestone's own
+  non-blocking allowance — `preview::capture` compiles a clear "not
+  implemented on this platform" stub for non-Windows targets.
+
 ### Edge cases
 - Dev server down: standard "connection refused" page with a retry — never an
   error dialog loop.

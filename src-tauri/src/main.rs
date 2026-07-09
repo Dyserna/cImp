@@ -15,6 +15,7 @@ mod notifications;
 mod oob;
 mod offload;
 mod postedit_hook;
+mod preview;
 mod process_guard;
 mod processing;
 mod pty;
@@ -77,9 +78,9 @@ use crate::ipc::layout::{
 };
 use crate::ipc::note::{read_note, write_note};
 use crate::ipc::tab_lifecycle::{
-    close_tab, create_ai_tab, create_ai_tab_in_worktree, create_shell_tab, default_shell_spec,
-    get_shell_tab_config, open_note_tab, open_tool_tab, reconfigure_shell_tab, rename_tab,
-    set_enabled_ai_tabs,
+    close_tab, create_ai_tab, create_ai_tab_in_worktree, create_preview_tab, create_shell_tab,
+    default_shell_spec, get_shell_tab_config, open_note_tab, open_tool_tab,
+    reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
 };
 use crate::ipc::{AppState, LaunchContext};
 use crate::settings::{
@@ -88,6 +89,10 @@ use crate::settings::{
 };
 use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::stt::SttHandle;
+use crate::preview::{
+    preview_capture, preview_close, preview_hide, preview_navigate, preview_open,
+    preview_reload, preview_set_rect, preview_show, preview_update_config,
+};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
 
@@ -384,6 +389,10 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // V14 Phase F: "open in the system browser" for Preview-tab links that
+        // fall outside the localhost/RFC-1918 navigation policy (or a denied
+        // `window.open`) — see `preview::open_external`.
+        .plugin(tauri_plugin_opener::init())
         // Windows 11 Snap Layouts for the custom TuiTitleBar maximize button
         // (id "snap-max-btn"). No-op on Linux/macOS and pre-Win11, so it's
         // registered unconditionally. The frontend attaches/detaches the
@@ -394,6 +403,11 @@ fn main() {
                 .build(),
         )
         .manage(state)
+        // V14 Phase F: one child webview per open Preview tab, keyed by tab
+        // id — needs no AppHandle to construct (unlike WorkbenchService/
+        // GraphService below), so it's managed right away rather than from
+        // inside `.setup()`.
+        .manage(preview::PreviewRegistry::default())
         .setup(move |app| {
             // Recover a poisoned guard rather than `.ok()` skipping it: silently
             // not spawning the state manager would leave the whole avatar /
@@ -689,6 +703,16 @@ fn main() {
             create_shell_tab,
             create_ai_tab,
             create_ai_tab_in_worktree,
+            create_preview_tab,
+            preview_open,
+            preview_navigate,
+            preview_reload,
+            preview_set_rect,
+            preview_hide,
+            preview_show,
+            preview_close,
+            preview_capture,
+            preview_update_config,
             close_tab,
             rename_tab,
             reconfigure_shell_tab,
@@ -946,6 +970,7 @@ fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
             let kind = match cfg {
                 TabConfig::AiTool(_) => TabKind::AiTool,
                 TabConfig::Shell(_) => TabKind::Shell,
+                TabConfig::Preview(_) => TabKind::Preview,
             };
             TabMeta {
                 id: tab_id,

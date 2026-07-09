@@ -367,6 +367,92 @@ export async function writeNote(content: string): Promise<void> {
   await invoke('write_note', { content });
 }
 
+// ── V14 Phase F: Preview tab ─────────────────────────────────────────────
+
+/// Create a new user-managed Preview tab (the toolbar's "New Preview tab"
+/// affordance). An empty `url` falls back to `Settings.preview_last_url`,
+/// then `lib/preview/policy.ts`'s `DEFAULT_PREVIEW_URL`, on the backend.
+export async function createPreviewTab(url: string): Promise<TabId> {
+  return invoke<TabId>('create_preview_tab', { url });
+}
+
+/// Open (or replace, if already open) the child webview for `tab`'s
+/// Preview pane at `url`, positioned at `rect` (logical/CSS pixels, relative
+/// to the main window's content area). Called once from the pane body's
+/// `onMount`. Rejects `url` against the live navigation policy before ever
+/// touching a webview — throws (surfaces as a toast) if it does, having
+/// already opened the URL in the system browser as a courtesy.
+export async function previewOpen(
+  tab: TabId,
+  url: string,
+  rect: { x: number; y: number; width: number; height: number },
+): Promise<void> {
+  await invoke('preview_open', { tabId: tab, url, ...rect });
+}
+
+/// Navigate an already-open Preview tab to a new URL (the toolbar's URL
+/// bar). Same policy check as `previewOpen`.
+export async function previewNavigate(tab: TabId, url: string): Promise<void> {
+  await invoke('preview_navigate', { tabId: tab, url });
+}
+
+/// Reload the Preview tab's current page (toolbar reload button + Phase F4
+/// auto-reload).
+export async function previewReload(tab: TabId): Promise<void> {
+  await invoke('preview_reload', { tabId: tab });
+}
+
+/// Reposition/resize an open Preview tab's webview — called on every pane
+/// layout change (the `ResizeObserver` on the measured body div, and the
+/// device-preset letterbox rect from `computePreviewRect`).
+export async function previewSetRect(
+  tab: TabId,
+  rect: { x: number; y: number; width: number; height: number },
+): Promise<void> {
+  await invoke('preview_set_rect', { tabId: tab, ...rect });
+}
+
+/// Hide (not destroy) a Preview tab's webview on tab-switch-away.
+export async function previewHide(tab: TabId): Promise<void> {
+  await invoke('preview_hide', { tabId: tab });
+}
+
+/// Show a previously-hidden Preview tab's webview on tab-switch-back.
+export async function previewShow(tab: TabId): Promise<void> {
+  await invoke('preview_show', { tabId: tab });
+}
+
+/// Destroy a Preview tab's webview on tab close (the pane body's
+/// `onDestroy`). A missing/already-closed tab id is a no-op on the backend.
+export async function previewClose(tab: TabId): Promise<void> {
+  await invoke('preview_close', { tabId: tab });
+}
+
+/// Snapshot the Preview tab's current viewport to a PNG in the Phase-B
+/// attach dir. Returns the saved path — the toolbar's Snapshot button then
+/// pushes it onto `composeAttachments` and opens the compose overlay, same
+/// as a pasted clipboard image.
+export async function previewCapture(tab: TabId): Promise<string> {
+  return invoke<string>('preview_capture', { tabId: tab });
+}
+
+/// Persist the toolbar's live `url`/`deviceWidth`/`autoReload` back onto the
+/// tab's settings entry (so a restart reopens with the same state) and
+/// remember `url` as the project's `preview_last_url`.
+export async function previewUpdateConfig(
+  tab: TabId,
+  url: string,
+  deviceWidth: number | null,
+  autoReload: boolean,
+): Promise<void> {
+  await invoke('preview_update_config', {
+    tabId: tab,
+    url,
+    deviceWidth,
+    autoReload,
+  });
+}
+
 /// Open `<portable-root>/logs/content/` in the OS file manager. Backend
 /// creates the folder first if it doesn't exist.
 export async function contentOpenFolder(): Promise<void> {

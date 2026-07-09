@@ -63,6 +63,15 @@ pub enum TabId {
     /// checkpoint timeline / worktrees). Same shape as [`Self::GraphMonitor`]
     /// — Shell-kind, reserved identity, no PTY, app-rendered.
     Workbench,
+    /// V14 Phase F: a user-created Preview tab (embedded localhost browser).
+    /// Unlike the reserved app-rendered tabs above, this is a genuinely new
+    /// [`TabKind`] (not a Shell-kind reserved id) because it's repeatable —
+    /// a user may open several. Carries a `"preview-<uuid>"` id; its
+    /// `PreviewTabConfig` (url/device_width/auto_reload) lives in settings.
+    /// Like the reserved dashboards, it spawns no PTY — the frontend never
+    /// calls `pty_start` for a Preview-kind tab (see `tabs::config::build_launch_spec`,
+    /// which errors if it ever were).
+    Preview(String),
 }
 
 impl TabId {
@@ -76,6 +85,7 @@ impl TabId {
             TabId::Workbench => "workbench-1",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
+            TabId::Preview(s) => s.as_str(),
         }
     }
 
@@ -94,6 +104,11 @@ impl TabId {
             // `"opencode"` doesn't start with `"ai-"`, so
             // there's no collision.
             other if other.starts_with("ai-") => TabId::Ai(other.to_string()),
+            // V14 Phase F: Preview tabs carry a `"preview-<uuid>"` id (see
+            // `create_preview_tab`) and must round-trip back to `Preview`,
+            // not `Shell`, so they keep Preview-kind behavior (no PTY,
+            // toolbar rendering) on relaunch.
+            other if other.starts_with("preview-") => TabId::Preview(other.to_string()),
             other => TabId::Shell(other.to_string()),
         }
     }
@@ -116,6 +131,11 @@ impl TabId {
             TabId::Shell(_) | TabId::OffloadServer | TabId::GraphMonitor | TabId::Workbench => {
                 TabKind::Shell
             }
+            // V14 Phase F: unlike the reserved dashboards above, Preview is a
+            // real kind of its own — it's repeatable (a user may open several),
+            // so the frontend needs a wire-visible discriminator rather than
+            // id-sniffing a single reserved string.
+            TabId::Preview(_) => TabKind::Preview,
         }
     }
 
@@ -138,7 +158,10 @@ impl TabId {
             | TabId::OffloadServer
             | TabId::GraphMonitor
             | TabId::Workbench => true,
-            TabId::Shell(_) | TabId::Ai(_) => false,
+            // Preview tabs are always user-created (no reserved/builtin
+            // instance ships by default), so — like Shell/Ai duplicates —
+            // they're always closable.
+            TabId::Shell(_) | TabId::Ai(_) | TabId::Preview(_) => false,
         }
     }
 }
@@ -161,10 +184,18 @@ impl<'de> Deserialize<'de> for TabId {
 /// notification system. V1.4-07 collapsed the AI inner discriminator
 /// (Claude was the only remaining variant after Aider was dropped);
 /// any future second AI tool would warrant re-introducing it.
+///
+/// V14 Phase F: `Preview` runs no subprocess at all (an embedded child
+/// webview, not a PTY) — the state machine / notification system treat it
+/// like `Shell` wherever they only care "is there a real process to
+/// signal about" would be wrong to assume, so call sites that fan out on
+/// `TabKind` were audited to add an explicit (usually inert) `Preview` arm
+/// rather than folding it into `Shell`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TabKind {
     AiTool,
     Shell,
+    Preview,
 }
 
 /// Static metadata describing one tab at registration time. Plumbed into the
@@ -409,15 +440,16 @@ pub enum StateEvent {
 }
 
 /// Wire-format projection of `TabKind` for the `TabCreated` event. The
-/// frontend only needs to know whether a tab is a Shell or an AI tool to
-/// gate close-button rendering and similar UI affordances; matching the
-/// internal `TabKind` shape one-to-one would have leaked the (now
-/// removed) `AiToolKind` enum.
+/// frontend only needs to know whether a tab is a Shell, an AI tool, or (V14
+/// Phase F) a Preview to gate close-button rendering and pane-body routing;
+/// matching the internal `TabKind` shape one-to-one would have leaked the
+/// (now removed) `AiToolKind` enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TabKindWire {
     AiTool,
     Shell,
+    Preview,
 }
 
 impl From<&TabKind> for TabKindWire {
@@ -425,6 +457,7 @@ impl From<&TabKind> for TabKindWire {
         match k {
             TabKind::AiTool => TabKindWire::AiTool,
             TabKind::Shell => TabKindWire::Shell,
+            TabKind::Preview => TabKindWire::Preview,
         }
     }
 }

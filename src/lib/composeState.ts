@@ -57,6 +57,18 @@ export function openComposeWith(text: string): void {
   openCompose();
 }
 
+/// V14 Phase F: the Preview toolbar's Snapshot button — push an
+/// already-saved PNG path (from `previewCapture`) onto the draft's
+/// attachments and open compose, exactly like a pasted clipboard image
+/// (Phase B). Submit still targets whatever tab is `activeTab` at send time
+/// (`submitCompose`'s existing behavior) — the caller is responsible for
+/// having focused the AI tab it wants the snapshot to go to before calling
+/// this, the same way any other compose-targeting flow works today.
+export function openComposeWithAttachment(path: string): void {
+  composeAttachments.update((a) => [...a, path]);
+  openCompose();
+}
+
 export function closeCompose(): void {
   composeOpen.set(false);
   composeContent.set('');

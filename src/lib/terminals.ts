@@ -74,6 +74,7 @@ import {
   isOffloadTab,
   isGraphMonitorTab,
   isNoteTab,
+  isPreviewTabId,
   isWorkbenchTab,
   type TabId,
 } from './tabs/types';
@@ -505,8 +506,15 @@ export function createTerminal(
   // V8-03/V9-01: the Offload Server and Code Graph monitor tabs render Svelte
   // dashboards instead of an xterm — no terminal entry for either. The Note
   // tab likewise renders a Svelte editor (NoteView), and V13's Workbench tab
-  // a sectioned dashboard (WorkbenchView) — neither has a PTY.
-  if (isOffloadTab(tabId) || isGraphMonitorTab(tabId) || isNoteTab(tabId) || isWorkbenchTab(tabId))
+  // a sectioned dashboard (WorkbenchView) — neither has a PTY. V14 Phase F:
+  // Preview tabs are an embedded child webview, not a PTY, either.
+  if (
+    isOffloadTab(tabId) ||
+    isGraphMonitorTab(tabId) ||
+    isNoteTab(tabId) ||
+    isWorkbenchTab(tabId) ||
+    isPreviewTabId(tabId)
+  )
     return;
 
   const offscreen = ensureOffscreen();
@@ -515,7 +523,15 @@ export function createTerminal(
   // not be in `settings.tabs` yet during the snapshot/event race at
   // startup; in that case we fall back to global settings alone.
   const initialSettings = get(settingsStore);
-  const initialTab = initialSettings.tabs.find((t) => t.id === tabId);
+  const initialTabRaw = initialSettings.tabs.find((t) => t.id === tabId);
+  // V14 Phase F: `PreviewTabConfig` has neither `theme_override` nor
+  // `background_override` (no terminal to theme) — narrowed out here so
+  // `effectiveTheme`/`effectiveBackgroundMode`'s structural param types are
+  // satisfied. Unreachable in practice (the guard above already returns
+  // before a Preview tab ever gets here), but the type-level exclusion
+  // documents why AiTool/Shell are the only kinds these resolvers see.
+  const initialTab =
+    initialTabRaw && initialTabRaw.kind !== 'preview' ? initialTabRaw : undefined;
   const baseTheme = initialTab
     ? effectiveTheme(initialTab, initialSettings.terminal.theme)
     : themeFromSetting(initialSettings.terminal.theme);
@@ -654,7 +670,9 @@ export function createTerminal(
       firstAppearance = false;
       return;
     }
-    const tab = s.tabs.find((t) => t.id === tabId);
+    const tabRaw = s.tabs.find((t) => t.id === tabId);
+    // See the matching narrowing comment in `createTerminal` above.
+    const tab = tabRaw && tabRaw.kind !== 'preview' ? tabRaw : undefined;
     const baseTheme = tab
       ? effectiveTheme(tab, s.terminal.theme)
       : themeFromSetting(s.terminal.theme);

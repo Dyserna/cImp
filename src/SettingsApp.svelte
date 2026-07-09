@@ -21,7 +21,13 @@
     ShellTabConfig,
     TabConfig,
   } from './lib/settings/types';
-  import { defaultSettings, findTab, findTabIndex, toPresetConfig } from './lib/settings/types';
+  import {
+    asThemedTabConfig,
+    defaultSettings,
+    findTab,
+    findTabIndex,
+    toPresetConfig,
+  } from './lib/settings/types';
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
   import { listSttModels, listInputDevices } from './lib/stt';
   import {
@@ -988,7 +994,7 @@
   );
   const activeTab = $derived(
     activeTabId && snapshot
-      ? snapshot.tabs.find((t) => t.id === activeTabId) ?? null
+      ? asThemedTabConfig(snapshot.tabs.find((t) => t.id === activeTabId)) ?? null
       : null,
   );
   const activeTabHasOverrides = $derived(
@@ -1024,7 +1030,7 @@
     patch((s) => {
       const id = s.session.active_tab_id ?? s.tabs[0]?.id;
       if (!id) return;
-      const src = s.tabs.find((t) => t.id === id);
+      const src = asThemedTabConfig(s.tabs.find((t) => t.id === id));
       if (!src) return;
       if (src.theme_override) {
         s.terminal.theme = src.theme_override;
@@ -1038,7 +1044,9 @@
           ...src.background_override,
         };
       }
+      // Preview tabs carry neither field — nothing to clear on them.
       for (const t of s.tabs) {
+        if (t.kind === 'preview') continue;
         t.theme_override = null;
         t.background_override = null;
       }

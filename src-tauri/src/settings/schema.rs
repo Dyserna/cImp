@@ -59,7 +59,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 20;
+pub const CURRENT_SCHEMA_VERSION: u8 = 21;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -214,6 +214,23 @@ pub struct Settings {
     /// changed rate re-fires the proposal even though the same `rule_id`
     /// still matches. Additive `#[serde(default)]`; empty on a fresh install.
     pub advisor_dismissed: Vec<DismissedRule>,
+    /// V14 Phase F: the last URL entered into any Preview tab, remembered so
+    /// the next "New Preview tab" starts from where the user left off rather
+    /// than the hardcoded fallback (`preview::DEFAULT_PREVIEW_URL`). A plain
+    /// scalar field (unlike `prompt_templates`) — it merges correctly through
+    /// the ordinary per-project `.cimp/config.json` overlay diff (a later
+    /// scalar write simply overwrites the earlier one; no array-replace pitfall
+    /// applies), so a project remembers its own dev-server URL without any
+    /// bespoke read/write path. `None` until the first Preview tab is created
+    /// or navigated.
+    pub preview_last_url: Option<String>,
+    /// V14 Phase F: global gate on the Preview tab's navigation policy — when
+    /// `false` (the default), `preview::is_allowed_preview_host` only allows
+    /// localhost/127.0.0.1/RFC-1918 hosts; navigation to anything else opens
+    /// in the system browser instead. Opt-in per the milestone's design: a
+    /// Preview tab is a dev-server surface, not a general (and
+    /// prompt-injectable) browsing pane beside the agent tabs.
+    pub preview_allow_remote: bool,
 }
 
 impl Default for Settings {
@@ -248,6 +265,8 @@ impl Default for Settings {
             prompt_templates: Vec::new(),
             templates_seeded: false,
             advisor_dismissed: Vec::new(),
+            preview_last_url: None,
+            preview_allow_remote: false,
         }
     }
 }
@@ -536,15 +555,18 @@ where
 }
 
 /// Discriminated tab config. The `kind` field is the JSON discriminator
-/// (`"ai_tool"` or `"shell"`), produced by serde's internally-tagged
-/// representation. Each variant carries the fields specific to its kind —
-/// AI tabs have `tts_injection` and three notification slots; Shell tabs
-/// have two notification slots and no TTS hook.
+/// (`"ai_tool"`, `"shell"`, or — V14 Phase F — `"preview"`), produced by
+/// serde's internally-tagged representation. Each variant carries the fields
+/// specific to its kind — AI tabs have `tts_injection` and three notification
+/// slots; Shell tabs have two notification slots and no TTS hook; Preview
+/// tabs have neither (no PTY at all — `url`/`device_width`/`auto_reload`
+/// drive an embedded child webview instead, see `crate::preview`).
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TabConfig {
     AiTool(AiToolTabConfig),
     Shell(ShellTabConfig),
+    Preview(PreviewTabConfig),
 }
 
 impl TabConfig {
@@ -552,6 +574,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => &c.id,
             TabConfig::Shell(c) => &c.id,
+            TabConfig::Preview(c) => &c.id,
         }
     }
 
@@ -559,6 +582,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => &c.name,
             TabConfig::Shell(c) => &c.name,
+            TabConfig::Preview(c) => &c.name,
         }
     }
 
@@ -566,6 +590,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => c.name = name,
             TabConfig::Shell(c) => c.name = name,
+            TabConfig::Preview(c) => c.name = name,
         }
     }
 
@@ -573,6 +598,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => c.builtin,
             TabConfig::Shell(c) => c.builtin,
+            TabConfig::Preview(c) => c.builtin,
         }
     }
 
@@ -580,6 +606,7 @@ impl TabConfig {
         match self {
             TabConfig::AiTool(c) => c.builtin = value,
             TabConfig::Shell(c) => c.builtin = value,
+            TabConfig::Preview(c) => c.builtin = value,
         }
     }
 }
@@ -651,6 +678,33 @@ pub struct ShellTabConfig {
     pub background_override: Option<BackgroundOverride>,
 }
 
+/// V14 Phase F: a user-created Preview tab — an embedded, localhost-scoped
+/// child webview, not a subprocess. No `command`/`args`/`cwd`/`env`/PTY
+/// fields at all (unlike `AiToolTabConfig`/`ShellTabConfig`) since there is
+/// nothing to spawn; `crate::preview` manages the child webview keyed by
+/// tab id, reading `url`/`device_width`/`auto_reload` from here.
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct PreviewTabConfig {
+    pub id: String,
+    /// Always `false` in practice — Preview has no reserved/builtin instance
+    /// (every one is user-created via the `+` menu), but the field exists so
+    /// `TabConfig`'s shared accessors (`builtin()`/`set_builtin()`) stay
+    /// uniform across variants.
+    pub builtin: bool,
+    pub name: String,
+    pub url: String,
+    /// `None` ⇒ the toolbar's "Desktop" preset (fill the available rect, no
+    /// letterboxing). `Some(w)` ⇒ letterbox to a fixed CSS-pixel width (the
+    /// mobile/tablet presets) — see `preview::policy` for the shared
+    /// device-preset table for the rect math.
+    pub device_width: Option<u32>,
+    /// Reload after a ~1s quiet period following a `fs-batch` event (V13),
+    /// while the tab is visible. Off by default — a dev server's own HMR
+    /// usually already handles this, so auto-reload is an opt-in belt for
+    /// setups without it.
+    pub auto_reload: bool,
+}
 
 /// V1.4-07: local-LLM provider configuration. When an AI tab has
 /// `use_local_provider: true`, the launch flow composes env vars from

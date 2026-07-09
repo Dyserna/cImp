@@ -48,6 +48,30 @@ pub fn save_png(session: &str, bytes: &[u8]) -> AppResult<PathBuf> {
     Ok(path)
 }
 
+/// V14 Phase F: reserve the next `n.png` path in `session`'s attach dir — for
+/// [`crate::preview::preview_capture`], whose WebView2 `CapturePreview` COM
+/// call writes PNG bytes directly to a file-backed `IStream`
+/// (`SHCreateStreamOnFileW`, opened `STGM_CREATE`, so it happily overwrites
+/// the empty placeholder below) rather than returning them to Rust as a byte
+/// buffer the way a pasted clipboard image does.
+///
+/// Touches an EMPTY file at the reserved path (rather than only computing
+/// the name) so [`next_index`] — shared with [`save_png`] for the monotonic
+/// numbering — sees it and a concurrent/subsequent `save_png`/`reserve_path`
+/// call advances past it instead of reusing the same index. Without this, a
+/// reserved-but-not-yet-captured slot (the COM call runs asynchronously,
+/// well after this returns) would be numerically invisible to the next
+/// caller, which would then claim the SAME `n.png` — a real collision, not
+/// just a numbering gap — if a capture and a paste happen to race.
+pub fn reserve_path(session: &str) -> AppResult<PathBuf> {
+    let dir = attach_dir(session);
+    fs::create_dir_all(&dir)?;
+    let index = next_index(&dir);
+    let path = dir.join(format!("{index}.png"));
+    fs::write(&path, [])?;
+    Ok(path)
+}
+
 /// Highest `n.png` stem in `dir` plus one, or 0 for an empty/fresh
 /// directory. Non-numeric or non-`.png` entries are ignored rather than
 /// treated as an error — the attach dir is exclusively ours, but being
@@ -192,5 +216,42 @@ mod tests {
         // Use an enormous max_age so even a populated real root (from other
         // tests running concurrently) is untouched by this call.
         prune(u32::MAX);
+    }
+
+    // ── V14 Phase F: reserve_path (preview::preview_capture's attach path) ──
+
+    #[test]
+    fn reserve_path_creates_the_session_dir_and_an_empty_placeholder() {
+        let session = unique_session();
+        let dir = attach_dir(&session);
+        assert!(!dir.exists());
+
+        let path = reserve_path(&session).unwrap();
+        assert!(dir.is_dir(), "reserve_path must create the session dir");
+        assert!(
+            path.exists(),
+            "reserve_path must touch a placeholder so next_index sees it"
+        );
+        assert_eq!(fs::read(&path).unwrap().len(), 0, "placeholder starts empty");
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "0.png");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reserve_path_shares_monotonic_numbering_with_save_png() {
+        let session = unique_session();
+        let p0 = save_png(&session, b"first").unwrap();
+        let reserved = reserve_path(&session).unwrap();
+        let p2 = save_png(&session, b"third").unwrap();
+
+        assert_eq!(p0.file_name().unwrap().to_str().unwrap(), "0.png");
+        // Because reserve_path touches an empty placeholder, next_index sees
+        // it — the following save_png call advances past it (to "2.png")
+        // rather than colliding with the reserved-but-not-yet-captured slot.
+        assert_eq!(reserved.file_name().unwrap().to_str().unwrap(), "1.png");
+        assert_eq!(p2.file_name().unwrap().to_str().unwrap(), "2.png");
+
+        let _ = fs::remove_dir_all(attach_dir(&session));
     }
 }

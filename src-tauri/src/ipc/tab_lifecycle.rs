@@ -268,6 +268,109 @@ pub async fn create_shell_tab(
     Ok(tab)
 }
 
+/// Create a new user-managed Preview tab (the "+"-adjacent "New Preview tab"
+/// affordance — V14 Phase F). Unlike `create_shell_tab`/`create_ai_tab`
+/// there is no command/binary/cwd/env to validate — a Preview tab has no
+/// PTY at all, just a `url`/`device_width`/`auto_reload` triple the backend
+/// child webview (`crate::preview`) reads. An empty `url` falls back to
+/// `Settings::preview_last_url` (the last URL used by any Preview tab in
+/// this project), then `preview::DEFAULT_PREVIEW_URL`.
+#[tauri::command]
+pub async fn create_preview_tab(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<TabId, TabLifecycleError> {
+    let _serializer = state.lifecycle_serializer.lock().await;
+
+    let snap = state.settings.current();
+    let resolved_url = {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            snap.preview_last_url
+                .clone()
+                .unwrap_or_else(|| crate::preview::DEFAULT_PREVIEW_URL.to_string())
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let name = unique_preview_tab_name(&snap);
+
+    let tab = TabId::Preview(format!("preview-{}", Uuid::new_v4()));
+    let tab_meta = TabMeta {
+        id: tab.clone(),
+        kind: TabKind::Preview,
+        name: name.clone(),
+    };
+
+    // Persist BEFORE registering — same ordering rationale as
+    // `create_shell_tab`/`create_ai_tab` (though Preview tabs never call
+    // `pty_start`, keeping the ordering uniform avoids a special case here).
+    {
+        let entry = crate::settings::PreviewTabConfig {
+            id: tab.as_str().to_string(),
+            builtin: false,
+            name: name.clone(),
+            url: resolved_url.clone(),
+            device_width: None,
+            auto_reload: false,
+        };
+        state.settings.mutate(move |s| {
+            s.tabs.push(TabConfig::Preview(entry.clone()));
+            s.preview_last_url = Some(resolved_url.clone());
+        });
+    }
+
+    let position = {
+        let mut registry = state.tabs.lock().await;
+        registry.insert_user_tab(tab.clone(), name.clone())
+    };
+
+    if let Err(e) = state
+        .state_signals
+        .send(StateSignal::TabAdded {
+            meta: tab_meta,
+            position,
+        })
+        .await
+    {
+        warn!(error = %e, "create_preview_tab: state-signal channel closed");
+        let id = tab.as_str().to_string();
+        state.settings.mutate(move |s| s.tabs.retain(|t| t.id() != id));
+        state.tabs.lock().await.remove_tab(&tab).await;
+        return Err(TabLifecycleError::internal("state signal channel closed"));
+    }
+
+    {
+        let mut registry = state.tabs.lock().await;
+        if let Err(e) = registry.activate(tab.clone()).await {
+            warn!(error = %e, "create_preview_tab: activate failed");
+        }
+    }
+
+    info!(?tab, "preview tab created");
+    Ok(tab)
+}
+
+/// "Preview" if untaken, else the lowest-free-integer-suffixed "Preview N"
+/// (N ≥ 2) — unlike [`unique_tab_name`] (which always suffixes, because its
+/// caller's `base` is an existing template's name), a Preview tab has no
+/// pre-existing instance to collide with, so the FIRST one is plain
+/// "Preview".
+fn unique_preview_tab_name(settings: &Settings) -> String {
+    let taken: std::collections::HashSet<&str> =
+        settings.tabs.iter().map(|t| t.name()).collect();
+    if !taken.contains("Preview") {
+        return "Preview".to_string();
+    }
+    for n in 2..1000 {
+        let candidate = format!("Preview {n}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    format!("Preview {}", Uuid::new_v4())
+}
+
 /// Pick a unique display name for a spawned duplicate by suffixing the
 /// template's name with the lowest free integer ≥ 2 (e.g. "Claude" →
 /// "Claude 2", "Claude 3"). Falls back to a uuid suffix in the
@@ -312,7 +415,7 @@ pub async fn create_ai_tab(
         })?;
         match entry {
             TabConfig::AiTool(ai) => ai.clone(),
-            TabConfig::Shell(_) => return Err(TabLifecycleError::WrongKind),
+            TabConfig::Shell(_) | TabConfig::Preview(_) => return Err(TabLifecycleError::WrongKind),
         }
     };
 
@@ -423,7 +526,7 @@ pub async fn create_ai_tab_in_worktree(
         })?;
         match entry {
             TabConfig::AiTool(ai) => ai.clone(),
-            TabConfig::Shell(_) => return Err(TabLifecycleError::WrongKind),
+            TabConfig::Shell(_) | TabConfig::Preview(_) => return Err(TabLifecycleError::WrongKind),
         }
     };
 
@@ -758,7 +861,9 @@ pub async fn reconfigure_shell_tab(
             })
         }
         Some(TabConfig::Shell(_)) => {}
-        Some(TabConfig::AiTool(_)) => return Err(TabLifecycleError::WrongKind),
+        Some(TabConfig::AiTool(_)) | Some(TabConfig::Preview(_)) => {
+            return Err(TabLifecycleError::WrongKind)
+        }
     }
     let new_command = validated.command.to_string_lossy().into_owned();
     let new_name = validated.name.clone();

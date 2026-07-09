@@ -53,10 +53,19 @@ export function isWorkbenchTab(id: TabId): boolean {
   return id === WORKBENCH_TAB_ID;
 }
 
+/// True for a Preview tab's id (`"preview-<uuid>"` — see `create_preview_tab`
+/// / `TabId::Preview` on the backend). Unlike the reserved dashboards above,
+/// there's no single constant to compare against (Preview is repeatable),
+/// so this checks the id's shape instead — the same convention the backend's
+/// own `TabId::from_str` uses to round-trip the variant.
+export function isPreviewTabId(id: TabId): boolean {
+  return id.startsWith('preview-');
+}
+
 /// Type guard for shell tabs — every non-AI-builtin ID is a shell, EXCEPT the
-/// Offload Server, Code Graph monitor, Note, and Workbench tabs, which are
-/// app-rendered (they must not get the shell closed-overlay / restart /
-/// keystroke behaviors).
+/// Offload Server, Code Graph monitor, Note, and Workbench tabs (app-rendered
+/// dashboards) and Preview tabs (an embedded webview, not a PTY) — none of
+/// these get the shell closed-overlay / restart / keystroke behaviors.
 export function isShellTab(id: TabId): boolean {
   return (
     id !== 'claude' &&
@@ -65,7 +74,8 @@ export function isShellTab(id: TabId): boolean {
     id !== OFFLOAD_SERVER_TAB_ID &&
     id !== GRAPH_MONITOR_TAB_ID &&
     id !== NOTE_TAB_ID &&
-    id !== WORKBENCH_TAB_ID
+    id !== WORKBENCH_TAB_ID &&
+    !isPreviewTabId(id)
   );
 }
 
@@ -84,7 +94,13 @@ export function isOpencodeTabId(id: string): boolean {
   return id === 'opencode';
 }
 
-export type TabKind = 'ai-tool' | 'shell';
+/// V14 Phase F: `'preview'` is a genuinely new kind (unlike the reserved
+/// app-rendered dashboards above — Workbench/Graph-monitor/Note/Offload —
+/// which are all `'shell'`-kind with a reserved id). Preview is
+/// user-creatable and repeatable, so the frontend needs the real wire kind
+/// (mirrors the Rust `TabKindWire::Preview`) rather than an id-sniffing
+/// predicate.
+export type TabKind = 'ai-tool' | 'shell' | 'preview';
 
 export interface TabMeta {
   id: TabId;

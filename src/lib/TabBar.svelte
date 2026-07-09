@@ -12,12 +12,14 @@
   import {
     closeTab as closeTabIpc,
     createAiTab,
+    createPreviewTab,
     renameTab as renameTabIpc,
     restartShellTab,
   } from './ipc';
+  import { settings } from './settings/store';
   import { openConfigureTabDialog, openNewShellTabDialog, openNewWorktreeTabDialog } from './dialog/store';
   import { openSettingsWindowToTab } from './settings/ipc';
-  import { isShellTab, type TabId } from './tabs/types';
+  import { isPreviewTabId, isShellTab, type TabId } from './tabs/types';
   import { tabMeta } from './tabs/store';
   import { requestTabIntoPane, setFocusedPane, setPaneActiveTab } from './layout/store';
   import { paneRegistry } from './layout/registry';
@@ -170,16 +172,32 @@
     menu = { x: e.clientX, y: e.clientY, tab: null };
   }
 
-  /// Suppress the browser's default context menu on the `+` button —
-  /// neither the tab menu nor the pane menu applies there.
+  /// Right-click on the `+` button opens the same pane-only menu as a
+  /// right-click on the bar background (V14 Phase F added "New Preview
+  /// tab" there) — the `+` button itself stays a left-click shortcut for
+  /// "new shell tab", but the less-common "new Preview tab" affordance
+  /// doesn't need its own dedicated button.
   function onNewTabContextMenu(e: MouseEvent): void {
     e.preventDefault();
     e.stopPropagation();
+    setFocusedPane(pane.id);
+    menu = { x: e.clientX, y: e.clientY, tab: null };
   }
 
   function onNewShellTab(): void {
     requestTabIntoPane(pane.id);
     openNewShellTabDialog();
+  }
+
+  /// V14 Phase F: "New Preview tab" (pane context menu). An empty url lets
+  /// the backend fall back to `Settings.preview_last_url` /
+  /// `DEFAULT_PREVIEW_URL` — the frontend doesn't duplicate that fallback
+  /// logic here.
+  function onNewPreviewTabAction(): void {
+    requestTabIntoPane(pane.id);
+    void createPreviewTab($settings.preview_last_url ?? '').catch((e) => {
+      console.error('create_preview_tab failed:', e);
+    });
   }
 </script>
 
@@ -244,6 +262,7 @@
 {#if menu}
   {@const t = menu.tab}
   {@const isShell = t ? isShellTab(t.id) : false}
+  {@const isPreview = t ? isPreviewTabId(t.id) : false}
   {@const closed = t ? ($perTabClosedState[t.id]?.closed ?? false) : false}
   <TabContextMenu
     x={menu.x}
@@ -253,7 +272,7 @@
       ? {
           id: t.id,
           builtin: t.builtin,
-          kind: isShell ? 'shell' : 'ai-tool',
+          kind: isPreview ? 'preview' : isShell ? 'shell' : 'ai-tool',
           canRestart: isShell && !closed,
         }
       : null}
@@ -276,7 +295,8 @@
       : undefined}
     onRestart={t ? () => onRestartTab(t.id) : undefined}
     onClose={t ? () => onCloseTab(t.id) : undefined}
-    onNewWorktreeTab={t && !isShell ? () => openNewWorktreeTabDialog(t.id, pane.id) : undefined}
+    onNewWorktreeTab={t && !isShell && !isPreview ? () => openNewWorktreeTabDialog(t.id, pane.id) : undefined}
+    onNewPreviewTab={onNewPreviewTabAction}
     onDismiss={dismissMenu}
   />
 {/if}

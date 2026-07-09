@@ -503,7 +503,7 @@ impl WorkbenchService {
             .iter()
             .filter_map(|t| match t {
                 TabConfig::AiTool(cfg) => cfg.cwd.as_ref(),
-                TabConfig::Shell(_) => None,
+                TabConfig::Shell(_) | TabConfig::Preview(_) => None,
             })
             .map(|p| p.display().to_string().replace('\\', "/"))
             .collect();

@@ -27,6 +27,7 @@
   import CodeIntelligenceView from './CodeIntelligenceView.svelte';
   import NoteView from './NoteView.svelte';
   import WorkbenchView from './WorkbenchView.svelte';
+  import PreviewToolbar from './PreviewToolbar.svelte';
   import {
     isShellTab,
     isOffloadTab,
@@ -173,6 +174,10 @@
         <NoteView />
       {:else if isWorkbenchTab(pane.active_tab_id)}
         <WorkbenchView />
+      {:else if $tabs.find((m) => m.id === pane.active_tab_id)?.kind === 'preview'}
+        {#key pane.active_tab_id}
+          <PreviewToolbar tabId={pane.active_tab_id} />
+        {/key}
       {:else}
         <TabErrorOverlay tabId={pane.active_tab_id} onretry={handleRetry} />
         {#if isShellTab(pane.active_tab_id)}

@@ -41,6 +41,14 @@ pub fn build_launch_spec(
 
     match entry {
         TabConfig::AiTool(cfg) => build_ai_tool_spec(tab, cfg, settings, launch_cwd, invocation_args),
+        // V14 Phase F: Preview tabs are an embedded child webview, not a
+        // subprocess — the frontend never calls `pty_start` for one (see
+        // `TabKind::Preview`'s doc comment), so this arm should be
+        // unreachable in practice; it exists only so the match stays
+        // exhaustive and a stray call fails cleanly instead of panicking.
+        TabConfig::Preview(_) => Err(AppError::Pty(format!(
+            "tab {id} is a Preview tab — it has no PTY to launch"
+        ))),
         TabConfig::Shell(cfg) => {
             // The detection module verified the default Shell-1 binary;
             // user-supplied paths from the New Shell Tab dialog are

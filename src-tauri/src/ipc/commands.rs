@@ -747,8 +747,8 @@ pub async fn ai_tool_tab_defaults(tab: TabId) -> AppResult<AiToolTabConfig> {
     };
     match config {
         TabConfig::AiTool(c) => Ok(c),
-        TabConfig::Shell(_) => Err(AppError::Pty(
-            "ai_tool_tab_defaults: reserved id resolved to a shell config".into(),
+        TabConfig::Shell(_) | TabConfig::Preview(_) => Err(AppError::Pty(
+            "ai_tool_tab_defaults: reserved id resolved to a non-AI-tool config".into(),
         )),
     }
 }

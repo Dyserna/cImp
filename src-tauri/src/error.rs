@@ -68,6 +68,12 @@ pub enum AppError {
     /// query, embedding). Carries human-readable context for the IPC layer.
     #[error("graph error: {0}")]
     Graph(String),
+
+    /// V12 Phase A: a `run_check` structured-diagnostics run failed (spawn,
+    /// I/O, or shell resolution). Carries human-readable context for the
+    /// tool layer; a bad/absent checker binary reads as this, not a panic.
+    #[error("check error: {0}")]
+    Checks(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

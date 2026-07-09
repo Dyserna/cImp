@@ -190,11 +190,13 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if name.starts_with("graph_") || name.starts_with("context_") {
-                // Graph + session-memory tools. Warm path: let the app's single
-                // index serve it (no second cross-process DB open; lets the app
-                // record it for the monitor and scope memory to this consumer).
-                // Fall back to a direct read-only open when the app isn't up.
+            if name.starts_with("graph_") || name.starts_with("context_") || name == "run_check" {
+                // Graph + session-memory tools, plus `run_check` (V12 Phase A —
+                // independent of the graph, but shares this dispatch surface).
+                // Warm path: let the app's single index serve it (no second
+                // cross-process DB open; lets the app record it for the monitor
+                // and scope memory to this consumer). Fall back to a direct
+                // read-only open when the app isn't up.
                 match proxy_graph(&params).await {
                     Some(r) => r,
                     None => crate::graph::handle_mcp_call(&params, consumer()).await,

@@ -68,6 +68,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-ut
 tokio-util = { version = "0.7", features = ["rt"] }
 portable-pty = "0.8"
 thiserror = "1"
+# V12 Phase A: `run_check` diagnostic parsers (tsc / generic gcc-style
+# `file:line:col: level: message`). Pure Rust, no C deps.
+regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

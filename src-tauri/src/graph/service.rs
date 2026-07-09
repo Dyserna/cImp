@@ -371,12 +371,22 @@ impl GraphService {
     ) -> Result<String, String> {
         let settings = self.settings.current();
         let sub = settings.graph.effective_db_subdir();
-        let root = super::mcp::find_graph_root(cwd, &sub)
-            .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
-        let idx = self.index_for(&root).map_err(|e| e.to_string())?;
         // The consumer selects the activity source + the memory tools' agent
         // scope, so an OpenCode tab's graph/context calls don't read as Claude's.
         let source = super::mcp::source_for_consumer(consumer);
+
+        // `run_check` (V12 Phase A) needs a project root but not a built code
+        // graph — resolve root the same way graph tools do when a graph.db
+        // exists, else fall back to `cwd` itself, and skip opening an index
+        // entirely (same rationale as `mcp::handle_call`'s special case).
+        if name == "run_check" {
+            let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
+            return super::mcp::run_check_tool(&root, &settings, source, args).await;
+        }
+
+        let root = super::mcp::find_graph_root(cwd, &sub)
+            .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
+        let idx = self.index_for(&root).map_err(|e| e.to_string())?;
         super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args).await
     }
 

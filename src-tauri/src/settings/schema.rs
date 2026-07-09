@@ -157,6 +157,15 @@ pub struct Settings {
     /// offload worker (native). Off by default. Additive — old settings
     /// files load with the feature disabled.
     pub graph: GraphSettings,
+    /// V12 Phase A: project checker commands (`cargo check`, `tsc`, `eslint`,
+    /// `pytest`, …) the `run_check` MCP tool can run. Lives at the root, not
+    /// inside `GraphSettings` — it's project tooling, independent of the code
+    /// graph (`run_check` is advertised whenever this is non-empty, whether or
+    /// not `graph.enabled`). Empty by default; rides the `.cimp/config.json`
+    /// overlay, which is where users actually set it. A model-supplied
+    /// `run_check` tool call only *selects* a `CheckDef` by name — the command
+    /// itself is never model-supplied.
+    pub checks: Vec<crate::checks::CheckDef>,
     /// Which AI-tool tabs are enabled. Each id in this list corresponds
     /// to one of the four reserved AI builtins (`claude`, `claude-local`,
     /// `aider`, `aider-local`). Adding an id opens that tab; removing
@@ -197,6 +206,7 @@ impl Default for Settings {
             external_tools: ExternalToolsSettings::default(),
             offload: OffloadSettings::default(),
             graph: GraphSettings::default(),
+            checks: Vec::new(),
             enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
         }

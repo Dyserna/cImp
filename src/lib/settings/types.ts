@@ -559,6 +559,11 @@ export interface Settings {
   offload: OffloadSettings;
   /// V9-01: per-project code knowledge graph config. Off by default.
   graph: GraphSettings;
+  /// V12 Phase A: project checker commands the `run_check` MCP tool can run
+  /// (mirror of Rust `Vec<CheckDef>`). Lives at the root, not inside
+  /// `GraphSettings` — independent of the code graph. Empty by default; set
+  /// via the `.cimp/config.json` overlay.
+  checks: CheckDef[];
   /// Which AI-tool tabs are enabled. The checkbox group in
   /// Settings → Tabs is the canonical way to flip this; the backend's
   /// `set_enabled_ai_tabs` IPC opens / closes the corresponding AI
@@ -598,6 +603,20 @@ export interface LoggingSettings {
   level: LogLevel;
   retention: LogRetention;
   content_capture: ContentCaptureSettings;
+}
+
+/// Which built-in parser decodes a check's output (mirror of Rust
+/// `ParserKind`). Wire format is kebab-case.
+export type ParserKind = 'cargo-json' | 'tsc' | 'eslint-json' | 'pytest' | 'generic-gcc';
+
+/// One configured project check the `run_check` MCP tool can run (mirror of
+/// Rust `CheckDef`). `cmd` is the full shell command line (cwd = project
+/// root); `name` is what a model-supplied `run_check` tool call selects by.
+export interface CheckDef {
+  name: string;
+  cmd: string;
+  parser: ParserKind;
+  timeout_secs: number;
 }
 
 /// V9-01: per-project code-knowledge-graph config. Mirror of Rust
@@ -1158,6 +1177,7 @@ export function defaultSettings(): Settings {
       read_advisor_mode: 'advise',
       context_llm_digests: false,
     },
+    checks: [],
     enabled_ai_tabs: ['claude'],
     logging: {
       level: 'info',

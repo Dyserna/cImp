@@ -199,22 +199,29 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
     ]
 }
 
-/// The `graph_*` MCP tool descriptors, or an empty list when the graph feature
-/// is disabled (so they're not advertised to Opus).
+/// The `graph_*` / `run_check` MCP tool descriptors. The `graph_*` set is
+/// empty when the graph feature is disabled (so it's not advertised to Opus);
+/// `run_check` (V12 Phase A) is independent of the graph — it's gated only on
+/// `checks` being non-empty, so a project with checks configured but the
+/// graph off still gets it.
 pub fn tools() -> Vec<Value> {
     let settings = current_settings();
-    if !settings.graph.enabled {
-        return Vec::new();
+    let mut specs: Vec<GraphToolSpec> = Vec::new();
+    if settings.graph.enabled {
+        specs.extend(tool_specs());
+        if settings.graph.semantic_search {
+            specs.push(semantic_spec());
+        }
+        // Code semantic search needs the embedder too: the code-embedding
+        // backfill only runs when `semantic_search` is on, so advertising the
+        // tool on `embed_code_bodies` alone would offer a tool that can never
+        // return results.
+        if settings.graph.semantic_search && settings.graph.embed_code_bodies {
+            specs.push(semantic_code_spec());
+        }
     }
-    let mut specs = tool_specs();
-    if settings.graph.semantic_search {
-        specs.push(semantic_spec());
-    }
-    // Code semantic search needs the embedder too: the code-embedding backfill
-    // only runs when `semantic_search` is on, so advertising the tool on
-    // `embed_code_bodies` alone would offer a tool that can never return results.
-    if settings.graph.semantic_search && settings.graph.embed_code_bodies {
-        specs.push(semantic_code_spec());
+    if !settings.checks.is_empty() {
+        specs.push(run_check_spec());
     }
     specs
         .into_iter()
@@ -260,14 +267,27 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
 
     let settings = current_settings();
     let sub = db_subdir(&settings);
-
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let source = source_for_consumer(consumer);
+
+    // `run_check` needs a project root but NOT a built code graph (V12 Phase
+    // A: checks are independent of the graph feature). Resolve root the same
+    // way graph tools do when a graph.db already exists (so the two features
+    // agree on "the project root" in a mixed setup), else fall back to the
+    // working directory itself — never require opening an index for this tool.
+    if name == "run_check" {
+        let root = find_graph_root(&cwd, &sub).unwrap_or(cwd);
+        return match run_check_tool(&root, &settings, source, &args).await {
+            Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
+            Err(msg) => Ok(tool_error(&msg)),
+        };
+    }
+
     let (root, idx) = match open_project_index(&cwd, &sub) {
         Ok(pair) => pair,
         Err(msg) => return Ok(tool_error(&msg)),
     };
 
-    let source = source_for_consumer(consumer);
     let result = dispatch_recorded(&root, &idx, &settings, source, name, &args).await;
 
     match result {
@@ -518,6 +538,123 @@ pub fn semantic_code_spec() -> GraphToolSpec {
             "required": ["query"]
         }),
     }
+}
+
+/// The `run_check` tool spec (V12 Phase A), advertised only when `checks` is
+/// non-empty (see [`tools`]) — independent of the graph tool set.
+pub fn run_check_spec() -> GraphToolSpec {
+    GraphToolSpec {
+        name: "run_check",
+        description: "Run one of this project's configured checker commands (build / typecheck / \
+            lint / test) and get back DEDUPLICATED, STRUCTURED diagnostics instead of a raw dump — \
+            the cheap way to see what broke after an edit. `name` selects among the project's \
+            configured checks (omit it when only one is configured; an unknown or omitted-with- \
+            multiple name returns the list of configured names). The command itself is fixed by the \
+            user's project config — never model-supplied. `changed_only: true` filters diagnostics \
+            to files touched since HEAD (pairs well with editing loops).",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Which configured check to run. Omit if only one is configured." },
+                "changed_only": { "type": "boolean", "description": "Filter diagnostics to files changed since HEAD. Default false." }
+            },
+            "required": []
+        }),
+    }
+}
+
+/// Dispatch `run_check`: look up the named (or sole) configured [`CheckDef`],
+/// run it, and format the result. Deliberately bypasses [`dispatch_recorded`]
+/// (which requires an already-open [`GraphIndex`]) — `run_check` touches
+/// neither the graph nor an index, so it can't be gated behind opening one
+/// (V12 Phase A: the checks feature must not require the graph). Records the
+/// call in the activity ring itself, in the same shape, so it still shows up
+/// in the monitor tab.
+pub(crate) async fn run_check_tool(
+    root: &Path,
+    settings: &crate::settings::Settings,
+    source: &str,
+    args: &Value,
+) -> Result<String, String> {
+    let started = super::activity::now_ms();
+    let result = run_check_inner(root, settings, args).await;
+    super::activity::record(super::activity::GraphCall {
+        ts_ms: started,
+        source: source.to_string(),
+        tool: "run_check".to_string(),
+        target: args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        chars: result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
+        ms: super::activity::now_ms().saturating_sub(started),
+        ok: result.is_ok(),
+    });
+    result
+}
+
+async fn run_check_inner(root: &Path, settings: &crate::settings::Settings, args: &Value) -> Result<String, String> {
+    if settings.checks.is_empty() {
+        return Ok(
+            "run_check is not configured for this project — add entries to the top-level `checks` \
+             array in .cimp/config.json (each a { name, cmd, parser, timeout_secs })."
+                .to_string(),
+        );
+    }
+    let requested = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let names = || settings.checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
+    let def = if requested.is_empty() {
+        match settings.checks.as_slice() {
+            [only] => only,
+            _ => {
+                return Err(format!(
+                    "run_check needs a `name` — this project has {} configured checks: {}",
+                    settings.checks.len(),
+                    names()
+                ))
+            }
+        }
+    } else {
+        match settings.checks.iter().find(|c| c.name == requested) {
+            Some(c) => c,
+            None => return Err(format!("run_check: no configured check named `{requested}` — configured: {}", names())),
+        }
+    };
+    let changed_only = args.get("changed_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let max_rows = limits(settings).0;
+    crate::checks::run(root, def, changed_only)
+        .await
+        .map(|report| fmt_check_report(&report, max_rows))
+        .map_err(|e| format!("run_check `{}` failed: {e}", def.name))
+}
+
+/// Render a [`crate::checks::CheckReport`] compactly: a header line (exit
+/// code, duration, timeout flag) then one line per diagnostic group
+/// (`severity · message (code folded in) · ×count · sample sites`), bounded
+/// by `max_rows` like every other graph tool's result.
+fn fmt_check_report(report: &crate::checks::CheckReport, max_rows: usize) -> String {
+    let mut out = format!(
+        "{} — exit {} · {} ms{}\n",
+        report.name,
+        report.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string()),
+        report.duration_ms,
+        if report.timed_out { " · TIMED OUT (partial output parsed)" } else { "" },
+    );
+    if report.groups.is_empty() {
+        out.push_str("No diagnostics.");
+        return out;
+    }
+    let mut lines: Vec<String> = report
+        .groups
+        .iter()
+        .take(max_rows)
+        .map(|g| {
+            let sites: Vec<String> = g.sites.iter().map(|(f, l)| format!("{f}:{l}")).collect();
+            format!("{} · {} · ×{} · {}", g.severity.as_str(), g.message, g.count, sites.join(", "))
+        })
+        .collect();
+    if report.groups.len() > max_rows {
+        lines.push(format!("… (+{} more groups)", report.groups.len() - max_rows));
+    }
+    out.push_str(&lines.join("\n"));
+    out
 }
 
 /// Embedder-backed semantic doc search, with a full-text fallback on any
@@ -1074,6 +1211,107 @@ pub(crate) fn find_graph_root(start: &Path, sub: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod run_check_tests {
+    use super::{fmt_check_report, run_check_inner, run_check_spec};
+    use crate::checks::{CheckDef, CheckReport, DiagGroup, ParserKind, Severity};
+    use crate::settings::Settings;
+    use serde_json::json;
+
+    fn def(name: &str, cmd: &str) -> CheckDef {
+        CheckDef { name: name.to_string(), cmd: cmd.to_string(), parser: ParserKind::GenericGcc, timeout_secs: 30 }
+    }
+
+    #[test]
+    fn spec_has_no_required_args() {
+        let spec = run_check_spec();
+        assert_eq!(spec.name, "run_check");
+        assert_eq!(spec.parameters["required"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn empty_config_reports_not_configured() {
+        let settings = Settings::default();
+        assert!(settings.checks.is_empty());
+        let out = run_check_inner(&std::env::temp_dir(), &settings, &json!({})).await.expect("ok result");
+        assert!(out.contains("not configured"), "{out}");
+        assert!(out.contains("checks"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn unknown_name_lists_configured_checks() {
+        let mut settings = Settings::default();
+        settings.checks = vec![def("cargo", "cargo check")];
+        let err = run_check_inner(&std::env::temp_dir(), &settings, &json!({ "name": "nope" }))
+            .await
+            .expect_err("unknown name should error");
+        assert!(err.contains("no configured check named `nope`"), "{err}");
+        assert!(err.contains("cargo"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_without_name_lists_configured_checks() {
+        let mut settings = Settings::default();
+        settings.checks = vec![def("cargo", "cargo check"), def("tsc", "tsc --noEmit")];
+        let err = run_check_inner(&std::env::temp_dir(), &settings, &json!({}))
+            .await
+            .expect_err("multiple configured checks with no name should error");
+        assert!(err.contains("needs a `name`"), "{err}");
+        assert!(err.contains("cargo") && err.contains("tsc"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sole_configured_check_runs_without_a_name() {
+        let cargo = which::which("cargo").expect("cargo on PATH");
+        let mut settings = Settings::default();
+        settings.checks = vec![def("only", &format!("\"{}\" --version", cargo.display()))];
+        let out = run_check_inner(&std::env::temp_dir(), &settings, &json!({})).await.expect("ok result");
+        assert!(out.contains("only"), "{out}");
+        assert!(out.contains("exit 0"), "{out}");
+    }
+
+    #[test]
+    fn fmt_check_report_renders_header_groups_and_overflow() {
+        let report = CheckReport {
+            name: "cargo".to_string(),
+            exit_code: Some(1),
+            duration_ms: 42,
+            timed_out: false,
+            groups: vec![
+                DiagGroup {
+                    key: "k1".into(),
+                    severity: Severity::Error,
+                    message: "E0425: cannot find value ‹…› in this scope".into(),
+                    count: 3,
+                    sites: vec![("src/a.rs".into(), 10), ("src/b.rs".into(), 20)],
+                },
+                DiagGroup { key: "k2".into(), severity: Severity::Warning, message: "unused import".into(), count: 1, sites: vec![("src/c.rs".into(), 1)] },
+            ],
+        };
+        let out = fmt_check_report(&report, 1);
+        assert!(out.starts_with("cargo — exit 1 · 42 ms"), "{out}");
+        assert!(out.contains("error · E0425"), "{out}");
+        assert!(out.contains("src/a.rs:10, src/b.rs:20"), "{out}");
+        // Capped at max_rows=1: only the first group's line, plus an overflow note.
+        assert!(!out.contains("unused import"), "{out}");
+        assert!(out.contains("+1 more group"), "{out}");
+    }
+
+    #[test]
+    fn fmt_check_report_no_diagnostics() {
+        let report = CheckReport { name: "cargo".into(), exit_code: Some(0), duration_ms: 5, timed_out: false, groups: vec![] };
+        let out = fmt_check_report(&report, 50);
+        assert!(out.contains("No diagnostics."), "{out}");
+    }
+
+    #[test]
+    fn fmt_check_report_flags_timeout() {
+        let report = CheckReport { name: "slow".into(), exit_code: None, duration_ms: 10_000, timed_out: true, groups: vec![] };
+        let out = fmt_check_report(&report, 50);
+        assert!(out.contains("TIMED OUT"), "{out}");
+    }
 }
 
 #[cfg(test)]

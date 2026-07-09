@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod checks;
 mod compact_hook;
 mod content;
 mod context_hook;

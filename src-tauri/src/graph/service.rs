@@ -1994,6 +1994,37 @@ impl GraphService {
             }
             let rel = rel_path(root, &path);
 
+            // A path that EXISTS as a directory was just created or renamed/
+            // moved in. Windows reports an atomic directory rename as one
+            // dir-level OLD/NEW pair — the children are never re-reported —
+            // so without walking here the moved subtree stays missing from
+            // the graph until an unrelated full rebuild (the old-name side is
+            // handled by the removal branch below). Walk it with the same
+            // tree walker as a full rebuild and index every eligible file.
+            // A stored-hash check skips unchanged children, so a redundant
+            // dir event costs one read+hash per child, not a re-parse.
+            if path.is_dir() {
+                match index_dir_tree(&idx, root, &path, &snap, &sub, max_bytes) {
+                    DirWalk::Indexed { indexed, rels } => {
+                        changed += indexed;
+                        touched_rels.extend(rels);
+                    }
+                    // Too big for the incremental path: a full rebuild does
+                    // the same per-file work on its own thread with progress
+                    // reporting and single-flight guarding, rather than
+                    // pinning the watcher thread for an unbounded stretch.
+                    // It covers this whole batch, so stop processing it.
+                    DirWalk::TooBig => {
+                        debug!(root = %root.display(), dir = %rel,
+                            "graph: moved-in directory exceeds incremental walk cap; full rebuild");
+                        drop(_w);
+                        self.spawn_rebuild(root.to_path_buf());
+                        return;
+                    }
+                }
+                continue;
+            }
+
             // Deletions/moves-away are handled BEFORE the `lang_for` gate: a
             // removed path may be a directory (rename or `rm -r`), which has no
             // indexable extension and would otherwise be dropped by that gate,
@@ -2600,6 +2631,84 @@ fn build_walker(root: &Path, snap: &GraphSettings) -> ignore::Walk {
     wb.build()
 }
 
+/// Outcome of [`index_dir_tree`] for one moved-in/created directory.
+enum DirWalk {
+    /// Walked and indexed inline: how many files changed, and their rel paths
+    /// (for the caller's incremental churn refresh).
+    Indexed { indexed: u64, rels: Vec<String> },
+    /// The subtree holds more eligible files than the incremental cap; the
+    /// caller should fall back to a full rebuild.
+    TooBig,
+}
+
+/// Index every eligible file under `dir` (a directory that just appeared in a
+/// watcher batch). Windows reports an atomic directory rename as one
+/// dir-level OLD/NEW event pair — the children are never re-reported — so
+/// without this walk a renamed/moved-in subtree would stay missing from the
+/// graph until an unrelated full rebuild. Uses the same tree walker as a full
+/// rebuild (gitignore + user ignore globs + db-subdir exclusion), the same
+/// language/size gates as the per-file incremental path, and skips children
+/// whose stored content hash already matches (e.g. their own file events
+/// landed in the same batch), so a redundant directory event costs one
+/// read+hash per child, not a re-parse.
+fn index_dir_tree(
+    idx: &GraphIndex,
+    root: &Path,
+    dir: &Path,
+    snap: &GraphSettings,
+    sub: &str,
+    max_bytes: u64,
+) -> DirWalk {
+    const MAX_DIR_WALK: usize = 4096;
+    let mut eligible = 0usize;
+    let mut indexed = 0u64;
+    let mut rels: Vec<String> = Vec::new();
+    for entry in build_walker(dir, snap) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let child = entry.into_path();
+        if child.components().any(|c| c.as_os_str() == sub) {
+            continue;
+        }
+        let Some(lang) = lang_for(&child, &snap.languages) else {
+            continue;
+        };
+        if lang == Lang::Markdown && !snap.index_docs {
+            continue;
+        }
+        match std::fs::metadata(&child) {
+            Ok(m) if m.len() > max_bytes => continue,
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        eligible += 1;
+        if eligible > MAX_DIR_WALK {
+            return DirWalk::TooBig;
+        }
+        let src = match std::fs::read_to_string(&child) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let rel = rel_path(root, &child);
+        if idx.stored_file_hash(&rel).ok().flatten().as_deref()
+            == Some(super::model::fnv1a_hex(&src).as_str())
+        {
+            continue;
+        }
+        let fg = parse_file(&rel, &src, lang);
+        match idx.index_file_graph(&fg) {
+            Ok(()) => {
+                indexed += 1;
+                rels.push(rel);
+            }
+            Err(e) => debug!(file = %rel, error = %e, "graph: incremental index failed"),
+        }
+    }
+    DirWalk::Indexed { indexed, rels }
+}
+
 /// One row of the project **language census**: a language present on disk, how
 /// many files it has, and how the graph relates to it. Drives the Code Graph
 /// tab's green/yellow/red language buttons.
@@ -2836,6 +2945,53 @@ mod tests {
         let (_, stats2) = build_tree(&idx, &dir, &snap, sub).expect("rebuild2");
         assert_eq!(stats2.files, 1);
         assert!(idx.find_symbol("gamma").unwrap().is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the directory-rename staleness bug: a moved-in directory
+    /// arrives from the watcher as a single dir-level path (Windows never
+    /// re-reports the children), and used to be a silent no-op — the subtree
+    /// stayed missing until an unrelated full rebuild. `index_dir_tree` must
+    /// walk and index it, and a second pass must skip unchanged children.
+    #[test]
+    fn moved_in_directory_is_walked_and_indexed() {
+        let dir = std::env::temp_dir().join(format!("ckg-mvdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let sub = ".ckg-test";
+        let snap = GraphSettings::default();
+        let idx = GraphIndex::open(&dir, sub).expect("open");
+        build_tree(&idx, &dir, &snap, sub).expect("initial build");
+        assert!(!idx.find_symbol("alpha").unwrap().is_empty());
+
+        // Simulate `mv src srcnew`: the watcher batch carries only the two
+        // directory paths — the removal branch drops the old side...
+        std::fs::rename(dir.join("src"), dir.join("srcnew")).unwrap();
+        idx.remove_files_under("src").expect("remove old side");
+        assert!(idx.find_symbol("alpha").unwrap().is_empty());
+
+        // ...and the walk must index the new side.
+        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX) {
+            DirWalk::Indexed { indexed, rels } => {
+                assert_eq!(indexed, 1, "one child file indexed");
+                assert_eq!(rels, vec!["srcnew/lib.rs".to_string()]);
+            }
+            DirWalk::TooBig => panic!("one file is not too big"),
+        }
+        let hits = idx.find_symbol("alpha").unwrap();
+        assert!(
+            hits.iter().any(|s| s.file == "srcnew/lib.rs"),
+            "alpha lives under the new directory: {hits:?}"
+        );
+
+        // Idempotence: unchanged children are hash-skipped on a repeat event.
+        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX) {
+            DirWalk::Indexed { indexed, .. } => assert_eq!(indexed, 0, "nothing re-indexed"),
+            DirWalk::TooBig => panic!("one file is not too big"),
+        }
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

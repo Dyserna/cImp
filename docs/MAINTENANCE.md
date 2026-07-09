@@ -976,6 +976,52 @@ bug and one HIGH-severity RCE-vector bug:
   session), and fixed a `PreviewToolbar` Back-button history bug (a
   non-pure history model that could oscillate between two entries).
 
+## Code Graph Parity (V15)
+
+**The graph schema moves 3 → 4 — the first graph-side bump since V11.** V15
+Feature 3 adds a `confidence` value column to two relations (`ref` and `edge`,
+`graph/schema.rs`), which is a *shape* change CozoDB can't `ALTER`, so it trips
+the existing reset-migration: on first launch after upgrade an old `graph.db`
+is `reset()` and fully re-derived from source (every row is re-derivable, so no
+data is lost). Both columns carry a `default 'inferred'` so a partially-written
+row is never silently `Extracted`. If you add another graph relation column,
+bump the version again and note it here.
+
+**Confidence is a two-layer computation — don't look for `Ambiguous` at parse
+time.** The bespoke walkers and the tags engine only ever stamp `Extracted`
+(same-file target, or a structural/import/doc edge) or `Inferred` (cross-file,
+name-keyed) — that's all a single-file parse can honestly know
+(`FileGraph::classify_confidence`, `graph/model.rs`). `Ambiguous` is applied at
+**query time**, the only place a name's global candidate count is visible:
+`callers`/`references` downgrade to `Ambiguous` when `symbol_count(name) > 1`;
+`callees` when a callee name resolved to more than one row; `dependents_transitive`
+and `shortest_path` fold it in via `multi_candidate_names()` and carry the
+*weakest* link along a chain (`Confidence::weaker`). If you add a new
+name-keyed consumer, apply the same override or it will over-claim certainty.
+
+**`graph_path` and `graph_architecture` are idx-only, settings-aware tools.**
+They're special-cased in `graph/mcp.rs::dispatch_recorded` (like `graph_impact`)
+so they can read `path_max_hops` / `arch_*` from settings — they do *not* fall
+through to `run_tool` (which has no settings handle). Both build their adjacency
+in Rust from a handful of relation scans (the `transitive`/`dependents_transitive`
+pattern), not Datalog recursion. Architecture clustering is deterministic label
+propagation (id-sorted, bounded iters) — approximate and honestly labelled
+"heuristic"; there is **no** warm-index cache in V1 (computed on demand each
+call), so if a large repo makes it slow, add caching keyed off the index epoch.
+
+**The Graph View tab is a fourth reserved app-rendered tab (`TabId::GraphView`).**
+It follows the Code Graph monitor pattern exactly — Shell-kind id, no PTY,
+rendered by `Pane.svelte` (`isGraphViewTab`), materialized/removed by
+`reconcile_graph_view_tab` per `graph.graph_viz` (default off). The visualization
+is a **self-contained** Canvas 2D force graph in `src/lib/GraphView.svelte` — no
+three.js / d3 dependency was added, keeping the bundle lean and offline. Live
+activity is a 1.5 s poll of `graphHistory()` (there's no push event for
+individual tool calls), matching `GraphCall.target` to rendered nodes; a real
+traversed-edge highlight isn't reconstructable because `GraphCall` carries only
+a single `target` string, so callers/callees calls approximate it via the node's
+incident call edges. If a tool-call push event is ever added, switch the poll
+to it.
+
 ## Known runtime issues to revisit
 
 ### Spurious `[[TTS]] tag exceeded max-hold without close` warnings

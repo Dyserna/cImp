@@ -56,6 +56,20 @@ pub(crate) fn tag_spec(lang: Lang) -> Option<TagSpec> {
     Some(TagSpec { lang, language, tags_query })
 }
 
+/// V12 Phase C **fallback** test detection for the generic tags engine: no
+/// vendored `tags.scm` currently ships a `@definition.test` capture, so every
+/// generic-tags language falls back to a path heuristic — Go's `_test.go`
+/// filename suffix, or a `tests/`/`spec/` path segment (Ruby's RSpec
+/// convention, and the common `tests/` layout several other grammars here
+/// share). Applied to Function/Method definitions only. A language whose
+/// project doesn't follow either convention simply never sets the bit —
+/// accurate, not wrong, the same posture as [`tags_visibility`]'s `Unknown`.
+fn tags_is_test_path(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    name.ends_with("_test.go") || lower.split('/').any(|seg| seg == "tests" || seg == "spec")
+}
+
 /// Best-effort visibility for a generic-tags language. Only Go is decidable
 /// cheaply from the name (exported iff the identifier starts uppercase); the
 /// other grammars need modifier inspection we don't do yet, so they stay
@@ -195,7 +209,8 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
         }
         let parent_id = parent.map(|p| ids[p].as_str());
         let vis = tags_visibility(spec.lang, &d.name);
-        emit_symbol(src, file, d.node, &d.name, d.kind, parent_id, None, vis, fg);
+        let is_test = matches!(d.kind, SymbolKind::Function | SymbolKind::Method) && tags_is_test_path(file);
+        emit_symbol(src, file, d.node, &d.name, d.kind, parent_id, None, vis, is_test, fg);
     }
 
     // Record every call as a reference (so `find references` sees it), then add

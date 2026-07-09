@@ -234,22 +234,29 @@ fn parse_rust(src: &str, file: &str, fg: &mut FileGraph) {
     let Some(tree) = parser.parse(src, None) else {
         return;
     };
-    walk_items(src, file, tree.root_node(), None, false, fg);
+    walk_items(src, file, tree.root_node(), None, false, false, fg);
 }
 
 /// Recurse over a node's named children, emitting definitions (with
 /// containment + doc edges), import edges, and call references. `parent` is the
 /// enclosing symbol id (for `Contains`); `in_impl` makes functions count as
-/// methods.
+/// methods; `in_test_mod` is true once the walk has descended into a
+/// `#[cfg(test)] mod` — every fn/method found from there down is a test (V12
+/// Phase C), regardless of its own attributes.
 fn walk_items(
     src: &str,
     file: &str,
     node: Node,
     parent: Option<&str>,
     in_impl: bool,
+    in_test_mod: bool,
     fg: &mut FileGraph,
 ) {
     let mut pending_doc: Vec<String> = Vec::new();
+    // Attribute text accumulated since the last def/doc reset, so a def can be
+    // checked for a preceding `#[test]`/`#[tokio::test]`/`#[rstest]` the same
+    // way `pending_doc` accumulates doc-comments.
+    let mut pending_attrs: Vec<String> = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let kind = child.kind();
@@ -265,21 +272,32 @@ fn walk_items(
                 }
                 continue;
             }
-            "attribute_item" | "inner_attribute_item" => continue,
+            "attribute_item" | "inner_attribute_item" => {
+                pending_attrs.push(node_text(src, child));
+                continue;
+            }
             _ => {}
         }
 
         if let Some((name, skind)) = def_name_kind(src, child, in_impl) {
             let doc = take_doc(&mut pending_doc);
             let vis = rust_visibility(child);
-            let id = emit_symbol(src, file, child, &name, skind, parent, doc, vis, fg);
+            let is_test = in_test_mod
+                || (matches!(skind, SymbolKind::Function | SymbolKind::Method)
+                    && pending_attrs.iter().any(|a| is_test_attribute(a)));
+            let id = emit_symbol(src, file, child, &name, skind, parent, doc, vis, is_test, fg);
 
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                 collect_calls_in(src, file, child, &id, CallSyntax::Rust, fg);
             }
             let child_in_impl = matches!(kind, "impl_item" | "trait_item");
-            walk_items(src, file, child, Some(&id), child_in_impl, fg);
+            // A `#[cfg(test)] mod` marks everything nested in it as tests, all
+            // the way down (a plain `fn` inside needs no `#[test]` of its own).
+            let child_in_test_mod = in_test_mod
+                || (kind == "mod_item" && pending_attrs.iter().any(|a| is_cfg_test_attribute(a)));
+            walk_items(src, file, child, Some(&id), child_in_impl, child_in_test_mod, fg);
             pending_doc.clear();
+            pending_attrs.clear();
         } else if kind == "use_declaration" {
             if let Some(path) = import_path(src, child) {
                 fg.edges.push(Edge {
@@ -289,12 +307,40 @@ fn walk_items(
                 });
             }
             pending_doc.clear();
+            pending_attrs.clear();
         } else {
             // Descend for nested items (module bodies, impl bodies, etc.).
-            walk_items(src, file, child, parent, in_impl, fg);
+            walk_items(src, file, child, parent, in_impl, in_test_mod, fg);
             pending_doc.clear();
+            pending_attrs.clear();
         }
     }
+}
+
+/// Whether an accumulated `#[...]`/`#![...]` attribute's text is `#[test]`,
+/// `#[tokio::test]`, `#[async_std::test]`, `#[rstest]`, `#[rstest::rstest]`, or
+/// similar (`test`/`rstest` as the leading path segment, or the path's last
+/// segment). Matches on text rather than a re-parse of the attribute's inner
+/// tree — the accepted spellings are simple enough that string matching is
+/// both simpler and cheaper than a second grammar walk.
+fn is_test_attribute(attr_text: &str) -> bool {
+    let inner = attr_text
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches('!')
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    // Drop any `(...)`/`= ...` args, keep the leading path (`tokio::test(...)` -> `tokio::test`).
+    let path = inner.split(['(', '=']).next().unwrap_or(inner).trim();
+    matches!(path, "test" | "rstest") || path.ends_with("::test") || path.ends_with("::rstest")
+}
+
+/// Whether an accumulated attribute's text is (or contains) `cfg(test)` —
+/// marks a `mod` block whose entire contents are test-only.
+fn is_cfg_test_attribute(attr_text: &str) -> bool {
+    attr_text.chars().filter(|c| !c.is_whitespace()).collect::<String>().contains("cfg(test)")
 }
 
 /// If `node` is a Rust definition, return its name + kind.
@@ -647,13 +693,36 @@ fn parse_js_ts(src: &str, file: &str, lang: Lang, fg: &mut FileGraph) {
     let Some(tree) = parser.parse(src, None) else {
         return;
     };
-    walk_js(src, file, tree.root_node(), None, false, fg);
+    let file_is_test = js_is_test_file(file);
+    walk_js(src, file, tree.root_node(), None, false, file_is_test, fg);
+}
+
+/// Whether `file`'s path marks every definition in it as a test, by the common
+/// JS/TS convention: a `*.test.*`/`*.spec.*` filename, or any `__tests__/`
+/// path segment. No per-definition signal (`test()`/`it()`/`describe()`
+/// callbacks aren't synthesized as symbols by this walker — see
+/// [`js_def_name_kind`]/[`emit_js_var_functions`]), so the file-level rule is
+/// the whole story for JS/TS (V12 Phase C).
+fn js_is_test_file(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    name.contains(".test.") || name.contains(".spec.") || lower.split('/').any(|seg| seg == "__tests__")
 }
 
 /// Recursive JS/TS item walk: declarations (functions, classes, methods,
 /// interfaces, enums, type aliases, arrow-fn consts), import edges, call
-/// references, JSDoc, and class→method containment.
-fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bool, fg: &mut FileGraph) {
+/// references, JSDoc, and class→method containment. `file_is_test` (V12 Phase
+/// C) marks every emitted definition as a test when the file itself is a test
+/// file (see [`js_is_test_file`]).
+fn walk_js(
+    src: &str,
+    file: &str,
+    node: Node,
+    parent: Option<&str>,
+    in_class: bool,
+    file_is_test: bool,
+    fg: &mut FileGraph,
+) {
     let mut pending_doc: Vec<String> = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -683,17 +752,17 @@ fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
 
         if let Some((name, skind)) = js_def_name_kind(src, def_node, in_class) {
             let doc = take_doc(&mut pending_doc);
-            let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, fg);
+            let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, file_is_test, fg);
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                 collect_calls_in(src, file, def_node, &id, CallSyntax::Js, fg);
             }
             let child_in_class = matches!(def_node.kind(), "class_declaration" | "abstract_class_declaration");
-            walk_js(src, file, def_node, Some(&id), child_in_class, fg);
+            walk_js(src, file, def_node, Some(&id), child_in_class, file_is_test, fg);
             pending_doc.clear();
         } else if matches!(def_node.kind(), "lexical_declaration" | "variable_declaration") {
             // `const foo = () => {…}` / `const bar = function(){}` → a function.
             let doc = take_doc(&mut pending_doc);
-            emit_js_var_functions(src, file, def_node, parent, doc, vis, fg);
+            emit_js_var_functions(src, file, def_node, parent, doc, vis, file_is_test, fg);
             pending_doc.clear();
         } else if kind == "import_statement" {
             if let Some(srcpath) = js_import_source(src, child) {
@@ -703,13 +772,14 @@ fn walk_js(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
         } else {
             // Descend into wrappers (export of a name list, statement blocks,
             // class bodies, namespaces) keeping the enclosing symbol/parent.
-            walk_js(src, file, def_node, parent, in_class, fg);
+            walk_js(src, file, def_node, parent, in_class, file_is_test, fg);
             pending_doc.clear();
         }
     }
 }
 
 /// Emit one symbol (+ containment + doc edges) and return its id.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_symbol(
     src: &str,
     file: &str,
@@ -719,6 +789,7 @@ pub(crate) fn emit_symbol(
     parent: Option<&str>,
     doc: Option<String>,
     vis: Visibility,
+    is_test: bool,
     fg: &mut FileGraph,
 ) -> String {
     let start = node.start_position().row as u32 + 1;
@@ -734,6 +805,7 @@ pub(crate) fn emit_symbol(
         signature: signature_of(src, node),
         doc: doc.clone(),
         visibility: vis,
+        is_test,
     });
     if let Some(p) = parent {
         fg.edges.push(Edge { kind: EdgeKind::Contains, src: p.to_string(), dst: id.clone() });
@@ -826,6 +898,7 @@ fn js_def_name_kind(src: &str, node: Node, in_class: bool) -> Option<(String, Sy
 
 /// Emit `Function` symbols for `const f = () => …` / `= function(){}` inside a
 /// `lexical_declaration`/`variable_declaration`.
+#[allow(clippy::too_many_arguments)]
 fn emit_js_var_functions(
     src: &str,
     file: &str,
@@ -833,6 +906,7 @@ fn emit_js_var_functions(
     parent: Option<&str>,
     doc: Option<String>,
     vis: Visibility,
+    file_is_test: bool,
     fg: &mut FileGraph,
 ) {
     let mut cursor = decl.walk();
@@ -848,7 +922,7 @@ fn emit_js_var_functions(
         let Some(name) = d.child_by_field_name("name").map(|n| node_text(src, n)) else { continue };
         // Only the first declarator gets the leading doc-comment.
         let this_doc = if first { doc.clone() } else { None };
-        let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, vis, fg);
+        let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, vis, file_is_test, fg);
         collect_calls_in(src, file, value, &id, CallSyntax::Js, fg);
         first = false;
     }
@@ -917,12 +991,36 @@ fn parse_python(src: &str, file: &str, fg: &mut FileGraph) {
     let Some(tree) = parser.parse(src, None) else {
         return;
     };
-    walk_py(src, file, tree.root_node(), None, false, fg);
+    let file_is_test_path = py_is_test_file(file);
+    walk_py(src, file, tree.root_node(), None, false, file_is_test_path, fg);
+}
+
+/// Whether `file`'s path matches the pytest test-file convention:
+/// `test_*.py` / `*_test.py`, or any `tests/` path segment. Combined with a
+/// `test_`-prefixed `def` name at the call site (V12 Phase C) — the file
+/// match alone isn't enough (a `tests/conftest.py` helper isn't a test).
+fn py_is_test_file(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    (name.starts_with("test_") && name.ends_with(".py"))
+        || name.ends_with("_test.py")
+        || lower.split('/').any(|seg| seg == "tests")
 }
 
 /// Recursive Python walk: `def`/`class` definitions (incl. `@decorated`),
 /// docstrings, import edges, call references, class→method containment.
-fn walk_py(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bool, fg: &mut FileGraph) {
+/// `file_is_test_path` (V12 Phase C) is the file-path half of the pytest
+/// test-detection rule (see [`py_is_test_file`]); combined with a
+/// `test_`-prefixed name at the definition site.
+fn walk_py(
+    src: &str,
+    file: &str,
+    node: Node,
+    parent: Option<&str>,
+    in_class: bool,
+    file_is_test_path: bool,
+    fg: &mut FileGraph,
+) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let kind = child.kind();
@@ -946,19 +1044,22 @@ fn walk_py(src: &str, file: &str, node: Node, parent: Option<&str>, in_class: bo
                 };
                 let doc = py_docstring(src, def_node);
                 let vis = py_visibility(&name);
-                let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, fg);
+                let is_test = file_is_test_path
+                    && matches!(skind, SymbolKind::Function | SymbolKind::Method)
+                    && name.starts_with("test_");
+                let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, is_test, fg);
                 if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                     collect_calls_in(src, file, def_node, &id, CallSyntax::Python, fg);
                 }
                 let child_in_class = def_node.kind() == "class_definition";
-                walk_py(src, file, def_node, Some(&id), child_in_class, fg);
+                walk_py(src, file, def_node, Some(&id), child_in_class, file_is_test_path, fg);
             }
             "import_statement" | "import_from_statement" => {
                 for m in py_import_modules(src, def_node) {
                     fg.edges.push(Edge { kind: EdgeKind::Import, src: file.to_string(), dst: m });
                 }
             }
-            _ => walk_py(src, file, def_node, parent, in_class, fg),
+            _ => walk_py(src, file, def_node, parent, in_class, file_is_test_path, fg),
         }
     }
 }
@@ -1078,6 +1179,10 @@ mod tests {
         fg.symbols.iter().find(|s| s.name == name).unwrap().visibility
     }
 
+    fn is_test_of(fg: &FileGraph, name: &str) -> bool {
+        fg.symbols.iter().find(|s| s.name == name).unwrap().is_test
+    }
+
     #[test]
     fn rust_visibility_classified() {
         let src = "pub fn a() {}\nfn b() {}\npub(crate) fn c() {}\npub(super) fn d() {}\n";
@@ -1105,6 +1210,92 @@ mod tests {
         assert_eq!(vis_of(&fg, "public_fn"), Visibility::Public);
         assert_eq!(vis_of(&fg, "_helper"), Visibility::Private);
         assert_eq!(vis_of(&fg, "__dunder__"), Visibility::Public);
+    }
+
+    // ── V12 Phase C: is_test detection ──────────────────────────────────
+
+    #[test]
+    fn rust_attribute_test_detected() {
+        let src = "#[test]\nfn a_test() {}\n#[tokio::test]\nasync fn tokio_test() {}\n#[rstest]\nfn an_rstest() {}\nfn plain() {}\n";
+        let fg = parse_file("src/t.rs", src, Lang::Rust);
+        assert!(is_test_of(&fg, "a_test"));
+        assert!(is_test_of(&fg, "tokio_test"));
+        assert!(is_test_of(&fg, "an_rstest"));
+        assert!(!is_test_of(&fg, "plain"));
+    }
+
+    #[test]
+    fn rust_cfg_test_mod_marks_every_fn_inside() {
+        // A plain fn (no #[test] of its own) inside a #[cfg(test)] mod is still
+        // a test — the mod-level cfg attribute is the signal.
+        let src = "fn outer() {}\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n    #[test]\n    fn it_works() {}\n}\n";
+        let fg = parse_file("src/t.rs", src, Lang::Rust);
+        assert!(!is_test_of(&fg, "outer"));
+        assert!(is_test_of(&fg, "helper"), "plain fn inside #[cfg(test)] mod is a test");
+        assert!(is_test_of(&fg, "it_works"));
+    }
+
+    #[test]
+    fn js_test_file_marks_every_function_as_test() {
+        let src = "export function checkThing() { return 1; }\nfunction helper() { return 2; }\n";
+        let fg = parse_file("src/thing.test.ts", src, Lang::TypeScript);
+        assert!(is_test_of(&fg, "checkThing"));
+        assert!(is_test_of(&fg, "helper"));
+
+        // The same source in a non-test file gets no test bit.
+        let fg2 = parse_file("src/thing.ts", src, Lang::TypeScript);
+        assert!(!is_test_of(&fg2, "checkThing"));
+    }
+
+    #[test]
+    fn js_spec_and_dunder_tests_dir_marks_test_file() {
+        let src = "function checkThing() { return 1; }\n";
+        assert!(is_test_of(&parse_file("src/thing.spec.js", src, Lang::JavaScript), "checkThing"));
+        assert!(is_test_of(&parse_file("__tests__/thing.js", src, Lang::JavaScript), "checkThing"));
+    }
+
+    #[test]
+    fn python_test_prefixed_def_in_test_file_detected() {
+        let src = "def test_add():\n    pass\ndef helper():\n    pass\n";
+        let fg = parse_file("tests/test_math.py", src, Lang::Python);
+        assert!(is_test_of(&fg, "test_add"));
+        // Not test_-prefixed, even in a test file: not a test.
+        assert!(!is_test_of(&fg, "helper"));
+    }
+
+    #[test]
+    fn python_test_prefixed_def_outside_test_path_not_detected() {
+        // `test_`-prefixed name alone isn't enough — the file must also match
+        // the pytest convention (name or `tests/` path).
+        let src = "def test_add():\n    pass\n";
+        let fg = parse_file("src/math.py", src, Lang::Python);
+        assert!(!is_test_of(&fg, "test_add"));
+    }
+
+    #[test]
+    fn python_underscore_suffix_test_file_detected() {
+        let src = "def test_sub():\n    pass\n";
+        let fg = parse_file("math_test.py", src, Lang::Python);
+        assert!(is_test_of(&fg, "test_sub"));
+    }
+
+    #[test]
+    fn generic_tags_engine_path_fallback_detects_go_test_file() {
+        let src = "package main\n\nfunc TestAdd(t *T) {\n    helper()\n}\n\nfunc helper() {}\n";
+        let fg = parse_file("pkg/math_test.go", src, Lang::Go);
+        assert!(is_test_of(&fg, "TestAdd"));
+        assert!(is_test_of(&fg, "helper"), "every fn in a _test.go file is a candidate test");
+
+        // The same source in a non-test-named Go file gets no test bit.
+        let fg2 = parse_file("pkg/math.go", src, Lang::Go);
+        assert!(!is_test_of(&fg2, "TestAdd"));
+    }
+
+    #[test]
+    fn generic_tags_engine_tests_dir_fallback() {
+        let src = "class Greeter\n  def greet(name)\n    name\n  end\nend\n";
+        let fg = parse_file("spec/greeter_spec.rb", src, Lang::Ruby);
+        assert!(is_test_of(&fg, "greet"));
     }
 
     const SRC: &str = r#"

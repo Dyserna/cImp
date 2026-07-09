@@ -35,6 +35,11 @@ pub struct SymbolHit {
     /// (after `visibility`); queries that don't select it fall back to
     /// `start_line` (a single-line span). Feeds `graph_snippet` (V11 Phase A).
     pub end_line: u32,
+    /// Whether this definition IS a test. Projected as the 9th column (after
+    /// `end_line`); queries that don't select it default to `false` — same
+    /// honest-default posture as `visibility`'s `"unknown"`. Feeds
+    /// `GraphIndex::tests_for` / `graph_tests_for` (V12 Phase C).
+    pub is_test: bool,
 }
 
 /// V12 Phase B: one symbol found to (transitively) depend on a changed root
@@ -306,9 +311,7 @@ impl GraphIndex {
                         .map(|d| DataValue::Str(d.into()))
                         .unwrap_or(DataValue::Null),
                     DataValue::Str(s.visibility.tag().into()),
-                    // `is_test` provisioned in the v3 (V11–V14) bump; V12 Phase C
-                    // replaces this literal with the walker-detected value.
-                    DataValue::Bool(false),
+                    DataValue::Bool(s.is_test),
                 ])
             })
             .collect();
@@ -434,8 +437,8 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            "?[id, name, kind, file, start_line, signature, visibility, end_line] := \
-                *symbol{id, name, kind, file, start_line, signature, visibility, end_line}, name == $name",
+            "?[id, name, kind, file, start_line, signature, visibility, end_line, is_test] := \
+                *symbol{id, name, kind, file, start_line, signature, visibility, end_line, is_test}, name == $name",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -448,9 +451,9 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            r#"?[sid, sname, skind, file, start_line, signature, visibility, end_line] :=
+            r#"?[sid, sname, skind, file, start_line, signature, visibility, end_line, is_test] :=
                 *edge{kind: ek, src: sid, dst: dn}, ek == "call", dn == $name,
-                *symbol{id: sid, name: sname, kind: skind, file, start_line, signature, visibility, end_line}
+                *symbol{id: sid, name: sname, kind: skind, file, start_line, signature, visibility, end_line, is_test}
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
@@ -463,10 +466,10 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            r#"?[id2, nm, skind, file, start_line, signature, visibility, end_line] :=
+            r#"?[id2, nm, skind, file, start_line, signature, visibility, end_line, is_test] :=
                 *symbol{id: cid, name: cn}, cn == $name,
                 *edge{kind: ek, src: cid, dst: dn}, ek == "call",
-                *symbol{id: id2, name: nm, kind: skind, file, start_line, signature, visibility, end_line}, nm == dn
+                *symbol{id: id2, name: nm, kind: skind, file, start_line, signature, visibility, end_line, is_test}, nm == dn
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
@@ -545,8 +548,8 @@ impl GraphIndex {
         // unreferenced) is naturally small, so an unbounded query is cheap.
         let rows = self.run(
             r#"call_dst[dst] := *edge{kind: k, src, dst}, k == "call"
-?[id, name, kind, file, start_line, signature, visibility, end_line] :=
-    *symbol{id, name, kind, file, start_line, signature, visibility, end_line},
+?[id, name, kind, file, start_line, signature, visibility, end_line, is_test] :=
+    *symbol{id, name, kind, file, start_line, signature, visibility, end_line, is_test},
     visibility == "public",
     not *ref{name: name},
     not call_dst[name],
@@ -629,8 +632,8 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("file".to_string(), DataValue::Str(file.into()));
         let rows = self.run(
-            "?[id, name, kind, file, start_line, signature, visibility, end_line] := \
-                *symbol{id, name, kind, file, start_line, signature, visibility, end_line}, file == $file",
+            "?[id, name, kind, file, start_line, signature, visibility, end_line, is_test] := \
+                *symbol{id, name, kind, file, start_line, signature, visibility, end_line, is_test}, file == $file",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -812,6 +815,26 @@ reach[x, y] := reach[x, z], calls[z, y]
             }
         }
         Ok(hits)
+    }
+
+    /// V12 Phase C: the **candidate** tests that (transitively) depend on one
+    /// of `roots` — the engine behind `graph_tests_for` and `graph_impact`'s
+    /// `include_tests` block. Reuses [`Self::dependents_transitive`] outright
+    /// (same BFS, same `depth`/`max`/approx semantics) and filters to symbols a
+    /// walker tagged `is_test`, rather than a second recursion. Because `max`
+    /// caps the *pre-filter* dependent set, a very tight `max` can undercount
+    /// tests that would otherwise surface a little further down the ranked
+    /// list — callers that want an exhaustive test list should pass a
+    /// generous `max`. Same caveat convention as `dead_exports`: dynamic
+    /// dispatch and fixture-driven tests have no static call edge and won't
+    /// appear here.
+    pub fn tests_for(&self, roots: &[String], depth: u32, max: usize) -> AppResult<Vec<SymbolHit>> {
+        Ok(self
+            .dependents_transitive(roots, depth, max)?
+            .into_iter()
+            .filter(|hit| hit.symbol.is_test)
+            .map(|hit| hit.symbol)
+            .collect())
     }
 
     /// Full-text-ish documentation search. MVP: a case-insensitive substring
@@ -1482,6 +1505,9 @@ reach[x, y] := reach[x, z], calls[z, y]
                     signature: cell_str(r, 5),
                     visibility: cell_str(r, 6),
                     end_line: cell_i64(r, 7) as u32,
+                    // Not projected by this query (out of Phase C's scoped 5
+                    // heads) — honest default, matching `rows_to_symbols`.
+                    is_test: false,
                 };
                 (hit, cell_f64(r, 8) as f32)
             })
@@ -2142,9 +2168,10 @@ fn text_hash(s: &str) -> String {
 }
 
 /// Map query rows shaped `[id, name, kind, file, start_line, signature,
-/// visibility, end_line]` to [`SymbolHit`]s. Queries that don't project
-/// `visibility` (7th column absent) get `"unknown"`; those that don't project
-/// `end_line` (8th column absent) fall back to `start_line`.
+/// visibility, end_line, is_test]` to [`SymbolHit`]s. Queries that don't
+/// project `visibility` (7th column absent) get `"unknown"`; those that don't
+/// project `end_line` (8th column absent) fall back to `start_line`; those
+/// that don't project `is_test` (9th column absent) default to `false`.
 fn rows_to_symbols(rows: &cozo::NamedRows) -> Vec<SymbolHit> {
     rows.rows
         .iter()
@@ -2159,6 +2186,7 @@ fn rows_to_symbols(rows: &cozo::NamedRows) -> Vec<SymbolHit> {
                 signature: cell_str(r, 5),
                 visibility: if r.len() > 6 { cell_str(r, 6) } else { "unknown".to_string() },
                 end_line: if r.len() > 7 { cell_i64(r, 7) as u32 } else { start_line },
+                is_test: cell_bool(r, 8),
             }
         })
         .collect()
@@ -2590,6 +2618,30 @@ pub struct Point { x: i32 }
             .expect("dependents");
         assert!(!both_roots.iter().any(|h| h.symbol.name == "a" || h.symbol.name == "b"));
         assert!(both_roots.iter().any(|h| h.symbol.name == "c"));
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tests_for_finds_test_two_hops_up_and_excludes_non_test_caller() {
+        // one() <- two() <- test_it() (a #[test] fn); one() is also called
+        // directly by a plain (non-test) fn, which must NOT show up.
+        let dir = std::env::temp_dir().join(format!("ckg-testsfor-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        let src = "pub fn one() {}\npub fn two() { one() }\n#[test]\nfn test_it() { two() }\npub fn plain_caller() { one() }\n";
+        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust)).expect("index");
+
+        let hits = idx.tests_for(&["one".to_string()], 3, 100).expect("tests_for");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "test_it");
+        assert!(hits[0].is_test);
+        assert!(!hits.iter().any(|s| s.name == "plain_caller"), "non-test caller excluded: {hits:?}");
+        assert!(!hits.iter().any(|s| s.name == "two"), "the intermediate non-test hop is excluded: {hits:?}");
+
+        // Depth 1 only reaches `two` (not a test), so no tests found yet.
+        let shallow = idx.tests_for(&["one".to_string()], 1, 100).expect("tests_for");
+        assert!(shallow.is_empty(), "{shallow:?}");
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

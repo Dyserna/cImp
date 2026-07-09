@@ -382,6 +382,11 @@ pub struct Symbol {
     /// Whether the definition is externally visible (drives dead-export
     /// detection). `Unknown` for languages whose walker can't tell yet.
     pub visibility: Visibility,
+    /// Whether this definition IS a test (V12 Phase C) — feeds
+    /// `GraphIndex::tests_for`/`graph_tests_for`. `false` is the honest default
+    /// for languages/constructs whose walker has no test signal, same posture
+    /// as `Visibility::Unknown`: never claim a test that isn't one.
+    pub is_test: bool,
 }
 
 /// A reference (use site) of a name. `resolved_id` is `Some` when the parser

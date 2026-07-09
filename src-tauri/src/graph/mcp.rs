@@ -162,13 +162,33 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
                 dependents), up to `depth` hops. Pass `symbols` (comma/space-separated names) to \
                 analyze specific symbols instead of the diff. Results are name-keyed and therefore \
                 APPROXIMATE, same honesty convention as `graph_references`. The default diff mode \
-                requires a git repository.",
+                requires a git repository. `include_tests: true` appends an affected-tests block \
+                (candidate tests reaching the changed symbols) — chain into a filtered test run.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "symbols": { "type": "string", "description": "Comma/space-separated symbol names to use as roots instead of the working-tree diff." },
                     "depth": { "type": "integer", "description": "Max hops to traverse from a changed symbol (default 3, clamped 1-6)." },
-                    "include_tests": { "type": "boolean", "description": "Reserved for a future release (test↔symbol mapping); currently a no-op." }
+                    "include_tests": { "type": "boolean", "description": "Append a candidate affected-tests block (file:line · name) below the dependent report. Default false." }
+                },
+                "required": []
+            }),
+        },
+        GraphToolSpec {
+            name: "graph_tests_for",
+            description: "Which tests (candidates) would exercise a symbol or file if it changed — \
+                the transitive dependents of the given root(s), filtered to definitions a walker \
+                tagged as tests (`#[test]`/pytest `test_*`/`*.test.ts`/etc., language-dependent — \
+                see each language's detection convention). Give `symbol` (one name) OR `file` \
+                (unions every definition in that file as roots). CANDIDATES ONLY: dynamic dispatch, \
+                fixtures, and parametrized runners have no static call edge and won't appear here; \
+                a symbol with no detected test coverage may still be well-tested indirectly.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string", "description": "A symbol name to find tests for." },
+                    "file": { "type": "string", "description": "A project-relative file path — finds tests for every definition in it." },
+                    "depth": { "type": "integer", "description": "Max hops to traverse (default 3, clamped 1-6)." }
                 },
                 "required": []
             }),
@@ -352,6 +372,8 @@ pub(crate) async fn dispatch_recorded(
         run_repo_map(idx, settings, args, mem_agent(source))
     } else if name == "graph_impact" {
         run_impact(root, idx, args, max_rows)
+    } else if name == "graph_tests_for" {
+        run_tests_for(idx, args, max_rows)
     } else {
         run_tool(idx, name, args, max_rows, max_snippet, mem_agent(source))
     };
@@ -370,8 +392,9 @@ pub(crate) async fn dispatch_recorded(
 /// The primary argument of a graph tool (symbol / file / query) for the
 /// history's at-a-glance column.
 fn arg_summary(name: &str, args: &Value) -> String {
-    // graph_snippet has no single primary key — prefer the symbol, else file.
-    if name == "graph_snippet" {
+    // graph_snippet/graph_tests_for have no single primary key — prefer the
+    // symbol, else file.
+    if name == "graph_snippet" || name == "graph_tests_for" {
         let sym = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
         if !sym.is_empty() {
             return sym.to_string();
@@ -822,7 +845,10 @@ fn fmt_symbols(syms: &[SymbolHit], max_rows: usize) -> String {
     let mut lines: Vec<String> = syms
         .iter()
         .take(max_rows)
-        .map(|s| format!("{} ({}) — {}:{}  {}", s.name, s.kind, s.file, s.start_line, s.signature))
+        .map(|s| {
+            let tag = if s.is_test { " [test]" } else { "" };
+            format!("{} ({}) — {}:{}  {}{}", s.name, s.kind, s.file, s.start_line, s.signature, tag)
+        })
         .collect();
     if syms.len() > max_rows {
         lines.push(format!("… (+{} more)", syms.len() - max_rows));
@@ -1189,8 +1215,9 @@ fn run_repo_map(
 /// dependents and render a compact report: the changed/root symbols, the
 /// flattened dependent list (`~` marks every hit as approximate — the call
 /// graph is name-keyed, never id-resolved), a file-level rollup, and any
-/// changed-but-unindexed files. `include_tests` is accepted but currently a
-/// no-op (Phase C wires it to an affected-tests block).
+/// changed-but-unindexed files. `include_tests: true` (V12 Phase C) appends a
+/// candidate affected-tests block below, computed with the same roots/depth
+/// via [`GraphIndex::tests_for`].
 fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> Result<String, String> {
     let depth = args
         .get("depth")
@@ -1279,8 +1306,78 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
         ));
     }
 
-    let _ = args.get("include_tests"); // accepted, no-op until Phase C
+    if args.get("include_tests").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let tests = idx.tests_for(&root_names, depth, max_rows).map_err(|e| e.to_string())?;
+        out.push_str("\n\n");
+        out.push_str(&fmt_affected_tests(&tests, max_rows));
+    }
+
     Ok(out)
+}
+
+/// Execute `graph_tests_for` (V12 Phase C): resolve the root symbol name(s) —
+/// either the `symbol` argument directly, or every NON-TEST definition name in
+/// `file` (via `outline`) — then render the candidate tests reaching them
+/// ([`GraphIndex::tests_for`]). File mode drops the file's own test
+/// definitions from the root set: `dependents_transitive` never reports a
+/// root as its own dependent, so a test living in the same file as the code
+/// it exercises (a `#[cfg(test)] mod`, very common) would otherwise
+/// self-exclude from its own result.
+fn run_tests_for(idx: &GraphIndex, args: &Value, max_rows: usize) -> Result<String, String> {
+    let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let depth = args
+        .get("depth")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(3)
+        .clamp(1, 6);
+
+    let roots: Vec<String> = if !symbol.is_empty() {
+        vec![symbol.to_string()]
+    } else if !file.is_empty() {
+        let syms = idx.outline(file).map_err(|e| e.to_string())?;
+        if syms.is_empty() {
+            return Ok(format!("No indexed definitions in {file}."));
+        }
+        let mut names: Vec<String> = syms.iter().filter(|s| !s.is_test).map(|s| s.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        if names.is_empty() {
+            return Ok(format!("{file} has no non-test definitions to find tests for."));
+        }
+        names
+    } else {
+        return Err("graph_tests_for needs either `symbol` or `file`".into());
+    };
+
+    let tests = idx.tests_for(&roots, depth, max_rows).map_err(|e| e.to_string())?;
+    Ok(fmt_affected_tests(&tests, max_rows))
+}
+
+/// Render a candidate test list (from [`GraphIndex::tests_for`]) as
+/// `file:line · name` rows under a labeled, caveated header — shared by
+/// `graph_tests_for` and `graph_impact`'s `include_tests` block.
+fn fmt_affected_tests(tests: &[SymbolHit], max_rows: usize) -> String {
+    if tests.is_empty() {
+        return "No candidate tests found reaching this change (dynamic dispatch/fixtures aren't \
+                 captured — absence here isn't proof of no coverage)."
+            .to_string();
+    }
+    let mut lines: Vec<String> = tests
+        .iter()
+        .take(max_rows)
+        .map(|s| format!("{}:{} · {}", s.file, s.start_line, s.name))
+        .collect();
+    if tests.len() > max_rows {
+        lines.push(format!("… (+{} more)", tests.len() - max_rows));
+    }
+    format!(
+        "Candidate affected tests ({}) — dynamic dispatch/fixtures aren't captured, so this may \
+         under-report:\n{}",
+        tests.len(),
+        lines.join("\n")
+    )
 }
 
 /// The caller's session working set as `(path, weight)` for repo-map ranking,
@@ -1602,6 +1699,81 @@ mod impact_tool_tests {
         let (dir, idx) = setup("clean");
         let out = run_impact(&dir, &idx, &json!({}), 50).expect("run_impact");
         assert!(out.contains("No changes detected"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_tests_appends_affected_tests_block() {
+        // Same a<-b<-c chain, plus a #[test] fn reaching c() transitively —
+        // include_tests should surface it; omitting the flag should not.
+        let dir = std::env::temp_dir().join(format!("impact-tool-tests-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        let src = "pub fn a() {}\npub fn b() { a() }\npub fn c() { b() }\n#[test]\nfn test_c() { c() }\n";
+        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust)).expect("index");
+
+        let out = run_impact(&dir, &idx, &json!({ "symbols": "a", "include_tests": true }), 50).expect("run_impact");
+        assert!(out.contains("Candidate affected tests"), "{out}");
+        assert!(out.contains("test_c"), "{out}");
+
+        // Without the flag, test_c still shows up as an ordinary dependent
+        // (it IS a real caller) but the labeled affected-tests block is absent.
+        let out_off = run_impact(&dir, &idx, &json!({ "symbols": "a" }), 50).expect("run_impact");
+        assert!(!out_off.contains("Candidate affected tests"), "{out_off}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tests_for_tool_tests {
+    use super::{run_tests_for, GraphIndex};
+    use crate::graph::{parse_file, Lang};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    /// one() <- two() <- test_it() (a #[test] fn), all in one file — the
+    /// fixture that exercises the file-mode self-exclusion fix.
+    fn setup(tag: &str) -> (PathBuf, GraphIndex) {
+        let dir = std::env::temp_dir().join(format!("tests-for-tool-{tag}-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        let src = "pub fn one() {}\npub fn two() { one() }\n#[test]\nfn test_it() { two() }\n";
+        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust)).expect("index");
+        (dir, idx)
+    }
+
+    #[test]
+    fn symbol_mode_finds_transitive_test() {
+        let (dir, idx) = setup("symbol");
+        let out = run_tests_for(&idx, &json!({ "symbol": "one" }), 50).expect("run_tests_for");
+        assert!(out.contains("test_it"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_mode_unions_non_test_file_symbols_as_roots() {
+        // The file's own test (test_it) must NOT self-exclude — file mode
+        // roots on {one, two} only, so test_it still surfaces as depth-1.
+        let (dir, idx) = setup("file");
+        let out = run_tests_for(&idx, &json!({ "file": "src/chain.rs" }), 50).expect("run_tests_for");
+        assert!(out.contains("test_it"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_args_is_an_error() {
+        let (dir, idx) = setup("missing");
+        assert!(run_tests_for(&idx, &json!({}), 50).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_tests_found_is_a_clear_message() {
+        let dir = std::env::temp_dir().join(format!("tests-for-tool-none-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/x.rs", "pub fn lonely() {}\n", Lang::Rust)).expect("index");
+        let out = run_tests_for(&idx, &json!({ "symbol": "lonely" }), 50).expect("run_tests_for");
+        assert!(out.contains("No candidate tests"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

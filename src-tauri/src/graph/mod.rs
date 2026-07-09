@@ -39,12 +39,14 @@ pub use builder::parse_file;
 pub use context::RetrieveResult;
 pub use index::{GraphIndex, GraphStats, SymbolHit};
 pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent};
-// V14 Phase C: usage-query result types, re-exported for Phase D's IPC layer
-// (`graph_usage`) — not consumed inside the graph module itself yet, so this
-// import is dead until then. Same "reserved for the next phase" posture as
-// the `GraphStats`/`SymbolHit`/`GraphToolSpec` re-exports below.
-#[allow(unused_imports)]
-pub use memory::{SessionUsageRow, TurnUsage, UsageTotals};
+// V14 Phase D: only `UsageSnapshot` itself is named by qualified path outside
+// this module (the `graph_usage` IPC handler's return type). Its nested
+// field types (`Effectiveness`/`SessionUsage`/`SessionUsageRow`/`ToolUsage`/
+// `TurnUsage`/`UsageTotals`) are used structurally, never referenced by their
+// own `crate::graph::…` path — same posture as `MemorySnapshot`'s own nested
+// `WorkingSetEntry`/`MemNote`/`SessionInfo`, which aren't re-exported here
+// either.
+pub use memory::UsageSnapshot;
 pub use mcp::{
     handle_call as handle_mcp_call, offload_query, semantic_code_spec, semantic_spec, tool_specs,
     tools as mcp_tools, GraphToolSpec,

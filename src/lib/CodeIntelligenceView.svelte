@@ -26,6 +26,9 @@
     graphFactUpdate,
     graphFactAdd,
     graphContextPreview,
+    graphUsage,
+    graphUsageAdvice,
+    advisorDismiss,
     onGraphStatus,
     onGraphAnalyses,
     type EmbedderProbe,
@@ -37,9 +40,14 @@
     type MemorySnapshot,
     type ProjectFact,
     type RetrieveResult,
+    type UsageSnapshot,
+    type AdvisorSnapshot,
+    type AdvisorProposal,
   } from './graph';
+  import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio } from './usageMath';
   import { listenManaged } from './listenManaged';
   import ToolsReference from './ToolsReference.svelte';
+  import { settings, applySettings } from './settings/store';
 
   // Reference list of the graph_* MCP tools this feature exposes to Claude (and
   // the offload worker) while the graph is enabled. Mirrors the descriptions in
@@ -241,16 +249,93 @@
     }
   }
 
-  // V10: the tab now hosts five sections. Index/Activity carry the V9 content;
-  // Memory/Context/Analyses are filled by later V10 phases. The internal tab id
-  // (`graph-monitor`) is unchanged — this is purely the in-view section router.
-  type Section = 'index' | 'activity' | 'memory' | 'context' | 'analyses';
+  // Usage (V14 Phase D/D2): the token X-ray + the budget-tuning advisor's
+  // proposals card. Fetched only while the section is open (same posture as
+  // Memory) — folded into `refresh()`'s poll below.
+  let usage = $state<UsageSnapshot | null>(null);
+  let advice = $state<AdvisorSnapshot | null>(null);
+  let advisorBusy = $state<string | null>(null); // rule_id currently applying/dismissing
+
+  async function refreshUsage(): Promise<void> {
+    try {
+      usage = await graphUsage();
+    } catch (e) {
+      console.warn('graph_usage failed', e);
+    }
+    try {
+      advice = await graphUsageAdvice();
+    } catch (e) {
+      console.warn('graph_usage_advice failed', e);
+    }
+  }
+
+  // Applies a proposal by writing the ONE named `graph.*` field it targets
+  // through the normal settings round-trip (`applySettings` — visible in
+  // Settings, undoable, migration-safe). There is no bespoke "apply" IPC —
+  // the advisor never mutates settings itself (milestone Feature 1b: never
+  // silent self-modification).
+  async function applyProposal(p: AdvisorProposal): Promise<void> {
+    advisorBusy = p.rule_id;
+    try {
+      const next = structuredClone($settings);
+      const val = Number(p.proposed);
+      switch (p.setting) {
+        case 'graph.context_min_score':
+          next.graph.context_min_score = val;
+          break;
+        case 'graph.read_advisor_min_lines':
+          next.graph.read_advisor_min_lines = val;
+          break;
+        case 'graph.context_turn_budget_chars':
+          next.graph.context_turn_budget_chars = val;
+          break;
+        default:
+          console.warn('advisor: unrecognized proposal setting', p.setting);
+          return;
+      }
+      await applySettings(next);
+      // The applied change itself will shift the underlying rate, so drop
+      // this proposal locally rather than waiting for the next poll.
+      advice = advice && { ...advice, proposals: advice.proposals.filter((x) => x.rule_id !== p.rule_id) };
+    } finally {
+      advisorBusy = null;
+    }
+  }
+
+  async function dismissProposal(p: AdvisorProposal): Promise<void> {
+    advisorBusy = p.rule_id;
+    try {
+      await advisorDismiss(p.rule_id, p.signature);
+      advice = advice && { ...advice, proposals: advice.proposals.filter((x) => x.rule_id !== p.rule_id) };
+    } catch (e) {
+      console.error('advisor_dismiss failed', e);
+    } finally {
+      advisorBusy = null;
+    }
+  }
+
+  // Stacked-bar chart derived state (This Session). Pure math lives in
+  // `./usageMath` (unit-tested); this just wires it to the current turns.
+  let usageTurns = $derived(usage?.current?.turns ?? []);
+  let usageMax = $derived(maxTurnTotal(usageTurns));
+
+  const ADVISOR_RULES_TOOLTIP =
+    'advisor.raise_context_min_score.v1: ≥5 sessions, ≥200 injections, ≥70% never re-touched → raise context_min_score.\n' +
+    'advisor.raise_read_advisor_min_lines.v1: ≥5 sessions, ≥20 reminders, ≥50% re-read anyway → raise read_advisor_min_lines.\n' +
+    'advisor.lower_context_turn_budget_chars.v1: ≥5 sessions, ≥200 injections, ≥50 turns, ≥70% unread AND ≥50% turns maxed → lower context_turn_budget_chars.';
+
+  // V10: the tab now hosts six sections. Index/Activity carry the V9 content;
+  // Memory/Context/Analyses/Usage are filled by V10/V14 phases. The internal
+  // tab id (`graph-monitor`) is unchanged — this is purely the in-view
+  // section router.
+  type Section = 'index' | 'activity' | 'memory' | 'context' | 'analyses' | 'usage';
   const SECTIONS: { id: Section; label: string }[] = [
     { id: 'index', label: 'Index' },
     { id: 'activity', label: 'Activity' },
     { id: 'memory', label: 'Memory' },
     { id: 'context', label: 'Context' },
     { id: 'analyses', label: 'Analyses' },
+    { id: 'usage', label: 'Usage' },
   ];
   let section = $state<Section>('index');
 
@@ -359,6 +444,10 @@
       await refreshMemory();
       await refreshFacts();
     }
+    // Usage (V14 Phase D/D2): same "only while visible" posture.
+    if (section === 'usage') {
+      await refreshUsage();
+    }
   }
 
   async function testEmbedder(): Promise<void> {
@@ -460,6 +549,9 @@
           if (s.id === 'memory') {
             refreshMemory();
             refreshFacts();
+          }
+          if (s.id === 'usage') {
+            refreshUsage();
           }
         }}
       >{s.label}{#if s.id === 'analyses' && analysesBadgeTotal > 0}<span class="badge" title="New since last pass">+{analysesBadgeTotal}</span>{/if}</button>
@@ -858,6 +950,147 @@
           {/if}
         </section>
       {/if}
+    </div>
+  {:else if section === 'usage'}
+    <div class="usage-sec">
+      <!-- V14 Phase D2: Advisor card, always first. -->
+      <section class="card advisor">
+        <div class="history-head">
+          Budget-tuning advisor
+          <span class="muted" title={ADVISOR_RULES_TOOLTIP}>ⓘ rules</span>
+        </div>
+        {#if !advice}
+          <p class="placeholder">Loading…</p>
+        {:else if advice.collecting}
+          <p class="placeholder">
+            Collecting data — the advisor needs at least 5 sessions and enough injections/reminders
+            before it proposes anything.
+          </p>
+        {:else if advice.proposals.length === 0}
+          <p class="placeholder">No changes suggested — data looks healthy.</p>
+        {:else}
+          <div class="rows">
+            {#each advice.proposals as p (p.rule_id)}
+              <div class="proposal">
+                <div class="prop-head">
+                  <span class="aname">{p.setting}</span>
+                  <span class="prop-vals"><code>{p.current}</code> → <code>{p.proposed}</code></span>
+                </div>
+                <p class="prop-rationale">{p.rationale}</p>
+                <div class="prop-actions">
+                  <button
+                    class="mini"
+                    disabled={advisorBusy !== null}
+                    onclick={() => applyProposal(p)}
+                  >{advisorBusy === p.rule_id ? 'Applying…' : 'Apply'}</button>
+                  <button
+                    class="mini secondary"
+                    disabled={advisorBusy !== null}
+                    onclick={() => dismissProposal(p)}
+                  >Dismiss</button>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </section>
+
+      <!-- This session: per-turn stacked bars + top consumers. -->
+      <section class="card">
+        <div class="history-head">This session</div>
+        {#if !usage || !usage.current || usage.current.turns.length === 0}
+          <p class="placeholder">No usage recorded yet this session.</p>
+        {:else}
+          <div class="ubars-legend">
+            <span><span class="dot in"></span>input</span>
+            <span><span class="dot cache"></span>cache-read</span>
+            <span><span class="dot out"></span>output</span>
+            <span><span class="dot tool"></span>est. tool-result</span>
+          </div>
+          <div class="ubars">
+            {#each usageTurns as t, i (i)}
+              {@const total = turnTotal(t)}
+              {@const est_tool = Math.round(t.tool_chars / 4)}
+              <div class="ubar-col">
+                <div
+                  class="ubar"
+                  style="height: {barHeightPct(total, usageMax)}%"
+                  title="turn {i + 1}: {t.in_tok} in / {t.cache_read} cache-read / {t.out_tok} out / ~{est_tool} est. tool"
+                >
+                  {#if total > 0}
+                    <span class="useg in" style="flex-grow: {t.in_tok}"></span>
+                    <span class="useg cache" style="flex-grow: {t.cache_read}"></span>
+                    <span class="useg out" style="flex-grow: {t.out_tok}"></span>
+                    <span class="useg tool" style="flex-grow: {est_tool}"></span>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+
+          <div class="history-head">Top consumers</div>
+          {#if usage.current.top_tools.length === 0}
+            <p class="placeholder">No tool-result usage recorded yet.</p>
+          {:else}
+            <div class="rows">
+              {#each usage.current.top_tools as t (t.tool)}
+                <div class="arow tool">
+                  <span class="aname">{t.tool}</span>
+                  <span class="akind">~{t.est_tokens.toLocaleString()} tok <span class="est-badge">est</span></span>
+                  <span class="aloc">{t.calls} call{t.calls === 1 ? '' : 's'}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        {/if}
+      </section>
+
+      <!-- Sessions: project-wide totals table. -->
+      <section class="card">
+        <div class="history-head">Sessions <span class="muted">({usage?.sessions.length ?? 0})</span></div>
+        {#if !usage || usage.sessions.length === 0}
+          <p class="placeholder">No sessions recorded yet.</p>
+        {:else}
+          <div class="rows">
+            {#each usage.sessions as s (s.session_id)}
+              <div class="arow sessrow">
+                <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}</span>
+                <span class="akind">{s.totals.in_tok.toLocaleString()} in / {s.totals.out_tok.toLocaleString()} out</span>
+                <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </section>
+
+      <!-- Effectiveness: measured counters, never fabricated savings. -->
+      <section class="card">
+        <div class="history-head">Effectiveness</div>
+        <p class="caveat">
+          Measured characters, not fabricated savings — every token figure below is
+          the same honest <code>chars / 4</code> estimate used everywhere else in this tab.
+        </p>
+        {#if usage}
+          <div class="eff-counters">
+            <div>
+              <span class="num">{usage.effectiveness.injected_chars.toLocaleString()}</span>
+              <span class="lbl">chars injected <span class="est-badge">est. ~{Math.round(usage.effectiveness.injected_chars / 4).toLocaleString()} tok</span></span>
+            </div>
+            <div>
+              <span class="num">{usage.effectiveness.deduped_chars.toLocaleString()}</span>
+              <span class="lbl">chars suppressed by dedup <span class="est-badge">est. ~{Math.round(usage.effectiveness.deduped_chars / 4).toLocaleString()} tok</span></span>
+            </div>
+            <div>
+              <span class="num">{usage.effectiveness.advisor_displaced_chars.toLocaleString()}</span>
+              <span class="lbl">chars displaced by read-advisor <span class="est-badge">est. ~{Math.round(usage.effectiveness.advisor_displaced_chars / 4).toLocaleString()} tok</span></span>
+            </div>
+            <div>
+              <span class="num">{usage.offload_local_tasks.toLocaleString()}</span>
+              <span class="lbl">tasks served locally — see the <em>Offload Server</em> tab</span>
+            </div>
+          </div>
+        {/if}
+      </section>
     </div>
   {/if}
 </div>
@@ -1391,5 +1624,155 @@
     max-height: 320px;
     overflow-y: auto;
     margin: 4px 0 0;
+  }
+
+  /* ── V14 Phase D/D2: Usage section + Advisor card ─────────────────────── */
+
+  .est-badge {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text, #ddd);
+    font-size: 9.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    vertical-align: middle;
+    opacity: 0.85;
+  }
+
+  /* Advisor card. */
+  .advisor .history-head .muted {
+    margin-left: auto;
+    cursor: help;
+    font-size: 10.5px;
+  }
+  .proposal {
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+  }
+  .proposal:last-child {
+    border-bottom: none;
+  }
+  .prop-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .prop-head .aname {
+    font-family: monospace;
+    font-size: 12px;
+  }
+  .prop-vals {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .prop-vals code {
+    background: rgba(255, 255, 255, 0.08);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .prop-rationale {
+    margin: 4px 0 6px;
+    font-size: 11.5px;
+    opacity: 0.8;
+    line-height: 1.4;
+  }
+  .prop-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  /* This-session stacked-bar chart: pure CSS/flex, no chart dependency.
+     Each turn is a column whose overall height is normalized to the tallest
+     turn (`barHeightPct`); within a bar, the four honest-accounting segments
+     stack via flex-grow proportional to their token share. */
+  .ubars-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin: 2px 0 10px;
+    font-size: 10.5px;
+    opacity: 0.75;
+  }
+  .ubars-legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .ubars-legend .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    display: inline-block;
+  }
+  .dot.in,
+  .useg.in {
+    background: #58a6ff;
+  }
+  .dot.cache,
+  .useg.cache {
+    background: #d2a8ff;
+  }
+  .dot.out,
+  .useg.out {
+    background: #3fb950;
+  }
+  .dot.tool,
+  .useg.tool {
+    background: #f0c674;
+  }
+  .ubars {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 130px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid var(--border, #333);
+    padding-bottom: 2px;
+  }
+  .ubar-col {
+    flex: 1 1 0;
+    min-width: 2px;
+    display: flex;
+    align-items: flex-end;
+    height: 100%;
+  }
+  .ubar {
+    width: 100%;
+    display: flex;
+    flex-direction: column-reverse;
+    min-height: 1px;
+  }
+  .useg {
+    flex-basis: 0;
+    min-height: 0;
+  }
+
+  .arow.tool,
+  .arow.sessrow {
+    grid-template-columns: 1fr 1fr auto;
+  }
+
+  .eff-counters {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+    gap: 12px;
+    margin-top: 6px;
+  }
+  .eff-counters .num {
+    font-size: 18px;
+    font-weight: 600;
+    display: block;
+    font-variant-numeric: tabular-nums;
+  }
+  .eff-counters .lbl {
+    font-size: 11px;
+    opacity: 0.7;
+    line-height: 1.4;
   }
 </style>

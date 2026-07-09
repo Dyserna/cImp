@@ -2089,6 +2089,113 @@ impl GraphIndex {
         Ok(rows.rows.iter().map(|r| cell_i64(r, 0)).max())
     }
 
+    /// V14 Phase D2: the agent tag currently stored for `session_id` (`"claude"`
+    /// / `"opencode"`), or `None` if the session has no row yet. Used so a
+    /// SECOND writer to the same session (the read advisor's "remind"
+    /// `mem_event`, distinct from the file-read/edit taps) never overwrites
+    /// the session's real agent with a fabricated one — `record_mem_event`'s
+    /// upsert always takes whatever `agent` it's given.
+    pub fn session_agent(&self, session_id: &str) -> AppResult<Option<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[agent] := *session{session_id, agent}, session_id == $sid",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_str(r, 0)))
+    }
+
+    /// V14 Phase D2: the distinct set of project-relative paths `session_id`
+    /// has read or edited (`mem_event` kind `"read"`/`"edit"`) — the "was it
+    /// subsequently touched" half of the injection ⋈ mem_event join (see
+    /// `GraphService::injection_follow_rate`, which joins this against the
+    /// V11-C in-memory injection state).
+    pub fn mem_touched_paths(&self, session_id: &str) -> AppResult<HashSet<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[path] := *mem_event{session_id, path, kind}, session_id == $sid, \
+                (kind == \"read\" or kind == \"edit\")",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.iter().map(|r| cell_str(r, 0)).collect())
+    }
+
+    /// V14 Phase D2: rate at which a read-advisor reminder (`mem_event` kind
+    /// `"remind"` — written by `GraphService::should_read` alongside the
+    /// process-wide Activity event) is followed by a REAL `"read"` event for
+    /// the SAME file in the SAME session — i.e. the agent re-read the file in
+    /// full anyway, despite the reminder. A high rate signals the reminder
+    /// wasn't sufficient, so `read_advisor_min_lines` should rise (those
+    /// files are evidently needed whole — let them pass instead of getting
+    /// reminded). Returns `(rate, sample count)`; `None` when no reminder has
+    /// ever fired for this project (the read advisor is off, or never
+    /// qualified a file).
+    pub fn advisor_reread_rate(&self) -> AppResult<Option<(f64, u64)>> {
+        let reminds = self.run(
+            "?[session_id, path, ts_ms] := *mem_event{session_id, kind, path, ts_ms}, kind == \"remind\"",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        if reminds.rows.is_empty() {
+            return Ok(None);
+        }
+        let reads = self.run(
+            "?[session_id, path, ts_ms] := *mem_event{session_id, kind, path, ts_ms}, kind == \"read\"",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut reads_by_key: HashMap<(String, String), Vec<i64>> = HashMap::new();
+        for r in &reads.rows {
+            reads_by_key
+                .entry((cell_str(r, 0), cell_str(r, 1)))
+                .or_default()
+                .push(cell_i64(r, 2));
+        }
+        let mut total = 0u64;
+        let mut reread = 0u64;
+        for r in &reminds.rows {
+            total += 1;
+            let key = (cell_str(r, 0), cell_str(r, 1));
+            let remind_ts = cell_i64(r, 2);
+            if reads_by_key.get(&key).is_some_and(|ts| ts.iter().any(|&t| t > remind_ts)) {
+                reread += 1;
+            }
+        }
+        Ok(Some((reread as f64 / total as f64, total)))
+    }
+
+    /// V14 Phase D: per-tool ranking for the Usage section's "top consumers"
+    /// table: `(tool, chars, calls)` descending by chars. Distinct from
+    /// [`Self::usage_per_tool`] (chars-only, feeds `SessionUsageRow.tool_chars`)
+    /// because the table also wants a call count.
+    pub fn usage_tool_ranking(&self, session_id: &str) -> AppResult<Vec<(String, u64, u64)>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        // `seq` stays in the projection for the same set-semantics reason as
+        // `usage_per_tool` — two identical (tool, chars) tool-result rows
+        // must not collapse into one.
+        let rows = self.run(
+            "?[seq, tool, chars] := *usage_stat{session_id, seq, kind, tool, chars}, \
+                session_id == $sid, kind == \"tool_result\"",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut sums: HashMap<String, (u64, u64)> = HashMap::new();
+        for r in &rows.rows {
+            let tool = cell_str_opt(r, 1).unwrap_or_else(|| "unknown".to_string());
+            let entry = sums.entry(tool).or_insert((0, 0));
+            entry.0 += cell_i64(r, 2).max(0) as u64;
+            entry.1 += 1;
+        }
+        let mut out: Vec<(String, u64, u64)> =
+            sums.into_iter().map(|(tool, (chars, calls))| (tool, chars, calls)).collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
     /// The ranked working set for `session_id`: files aggregated from its events,
     /// scored `frequency × kind_weight` with recency as the tiebreak, newest and
     /// most-edited first. Bounded to `max` entries.
@@ -4033,6 +4140,88 @@ pub struct Point { x: i32 }
         .unwrap();
         idx.mem_clear(Some("s1")).unwrap();
         assert!(idx.usage_per_tool("s1").unwrap().is_empty());
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V14 Phase D/D2: Usage section + advisor signal queries ─────────────
+
+    #[test]
+    fn usage_tool_ranking_reports_chars_and_call_counts() {
+        let dir = std::env::temp_dir().join(format!("ckg-toolrank-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        for chars in [100, 200] {
+            idx.record_usage_event(
+                "s1",
+                "claude",
+                &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars },
+                100,
+            )
+            .unwrap();
+        }
+        idx.record_usage_event(
+            "s1",
+            "claude",
+            &UsageEvent::ToolResult { tool: Some("Bash".to_string()), chars: 50 },
+            100,
+        )
+        .unwrap();
+        let ranking = idx.usage_tool_ranking("s1").unwrap();
+        assert_eq!(ranking, vec![("Read".to_string(), 300, 2), ("Bash".to_string(), 50, 1)]);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_agent_reports_the_upserted_tag() {
+        let dir = std::env::temp_dir().join(format!("ckg-sessagent-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        assert_eq!(idx.session_agent("s1").unwrap(), None, "unknown session");
+        idx.record_mem_event("s1", "opencode", "read", "a.rs", None, None, 100, None).unwrap();
+        assert_eq!(idx.session_agent("s1").unwrap(), Some("opencode".to_string()));
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mem_touched_paths_covers_read_and_edit_only() {
+        let dir = std::env::temp_dir().join(format!("ckg-touched-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s1", "claude", "edit", "b.rs", None, None, 200, None).unwrap();
+        idx.record_mem_event("s1", "claude", "query", "c.rs", None, None, 300, None).unwrap();
+        idx.record_mem_event("s1", "claude", "remind", "d.rs", None, None, 400, None).unwrap();
+        let touched = idx.mem_touched_paths("s1").unwrap();
+        assert_eq!(touched, ["a.rs".to_string(), "b.rs".to_string()].into_iter().collect());
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advisor_reread_rate_is_none_without_any_reminder() {
+        let dir = std::env::temp_dir().join(format!("ckg-reread-none-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        assert_eq!(idx.advisor_reread_rate().unwrap(), None);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advisor_reread_rate_counts_reads_strictly_after_the_reminder() {
+        let dir = std::env::temp_dir().join(format!("ckg-reread-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // s1/a.rs: reminded, then genuinely re-read afterward -> counts.
+        idx.record_mem_event("s1", "claude", "remind", "a.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 200, None).unwrap();
+        // s1/b.rs: reminded, only read BEFORE (stale/irrelevant) -> doesn't count.
+        idx.record_mem_event("s1", "claude", "read", "b.rs", None, None, 50, None).unwrap();
+        idx.record_mem_event("s1", "claude", "remind", "b.rs", None, None, 100, None).unwrap();
+        // s2/c.rs: reminded, never read again -> doesn't count.
+        idx.record_mem_event("s2", "claude", "remind", "c.rs", None, None, 100, None).unwrap();
+
+        let (rate, samples) = idx.advisor_reread_rate().unwrap().unwrap();
+        assert_eq!(samples, 3);
+        assert!((rate - (1.0 / 3.0)).abs() < 1e-9, "rate={rate}");
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }

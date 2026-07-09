@@ -308,3 +308,114 @@ export function graphFactUpdate(
 export function graphFactAdd(text: string, pin?: boolean, root?: string): Promise<void> {
   return invoke<void>('graph_fact_add', { root: root ?? null, text, pin: pin ?? null });
 }
+
+// ── V14 Phase D/D2: Usage section (token X-ray) + budget-tuning advisor ───
+
+/// One tool's ranked contribution to a session (the Usage section's "top
+/// consumers" table). Mirror of Rust `graph::ToolUsage`. `est_tokens` is a
+/// `chars / 4` estimate — always render it labeled `est.`; `calls` is exact.
+export interface ToolUsage {
+  tool: string;
+  est_tokens: number;
+  calls: number;
+}
+
+/// One turn's token breakdown. Mirror of Rust `graph::memory::TurnUsage`
+/// (V14 Phase C/D). `tool_chars` is the estimated tool-result characters
+/// that arrived just before this turn — divide by 4 for the "est. tool"
+/// stacked-bar segment.
+export interface TurnUsage {
+  msg_id: string;
+  model: string | null;
+  in_tok: number;
+  out_tok: number;
+  cache_read: number;
+  cache_make: number;
+  tool_chars: number;
+  ts_ms: number;
+}
+
+/// Summed token totals across a session's turns. Mirror of Rust
+/// `graph::memory::UsageTotals`.
+export interface UsageTotals {
+  in_tok: number;
+  out_tok: number;
+  cache_read: number;
+  cache_make: number;
+}
+
+/// The current (most-recently-active) session's usage readout. Mirror of
+/// Rust `graph::memory::SessionUsage`.
+export interface SessionUsage {
+  session_id: string;
+  turns: TurnUsage[];
+  totals: UsageTotals;
+  top_tools: ToolUsage[];
+}
+
+/// One project session's totals row (Sessions table). Mirror of Rust
+/// `graph::memory::SessionUsageRow`.
+export interface SessionUsageRow {
+  session_id: string;
+  agent: string;
+  totals: UsageTotals;
+  tool_chars: number;
+  cache_hit_ratio: number;
+  /// True when this session has no exact `usage` data (currently every
+  /// non-Claude agent) — the table's "est" badge.
+  est_only: boolean;
+}
+
+/// The Effectiveness panel's three measured counters — all exact chars, no
+/// fabricated savings figure. Mirror of Rust `graph::memory::Effectiveness`.
+export interface Effectiveness {
+  injected_chars: number;
+  deduped_chars: number;
+  advisor_displaced_chars: number;
+}
+
+/// The Usage section's full payload. Mirror of Rust `graph::UsageSnapshot`.
+export interface UsageSnapshot {
+  current: SessionUsage | null;
+  sessions: SessionUsageRow[];
+  effectiveness: Effectiveness;
+  offload_local_tasks: number;
+}
+
+/// The Usage section's token X-ray for `root` (defaults to the launch
+/// directory).
+export function graphUsage(root?: string): Promise<UsageSnapshot> {
+  return invoke<UsageSnapshot>('graph_usage', { root: root ?? null });
+}
+
+/// One budget-tuning proposal. Mirror of Rust `advisor::Proposal`.
+/// `signature` is opaque to the UI — pass it straight through to
+/// `advisorDismiss` unchanged.
+export interface AdvisorProposal {
+  setting: string;
+  current: string;
+  proposed: string;
+  rationale: string;
+  rule_id: string;
+  signature: string;
+}
+
+/// Mirror of Rust `ipc::commands::AdvisorSnapshot`. `collecting` distinguishes
+/// "not enough data yet" from "checked, all healthy" (an empty `proposals`
+/// with `collecting: false`).
+export interface AdvisorSnapshot {
+  proposals: AdvisorProposal[];
+  collecting: boolean;
+}
+
+/// The budget-tuning advisor's current proposals for `root` (defaults to the
+/// launch directory).
+export function graphUsageAdvice(root?: string): Promise<AdvisorSnapshot> {
+  return invoke<AdvisorSnapshot>('graph_usage_advice', { root: root ?? null });
+}
+
+/// Dismiss one proposal (`ruleId` + its `signature`, both echoed verbatim
+/// from the `AdvisorProposal` the user clicked Dismiss on).
+export function advisorDismiss(ruleId: string, signature: string): Promise<void> {
+  return invoke<void>('advisor_dismiss', { ruleId, signature });
+}

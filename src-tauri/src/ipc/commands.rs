@@ -1281,6 +1281,120 @@ pub async fn graph_context_preview(
     Ok(service.retrieve_context(&root, &prompt, None))
 }
 
+// ── V14 Phase D/D2: Usage section (token X-ray) + budget-tuning advisor ───
+
+/// V14 Phase D: the Usage section's full payload for `root` — the current
+/// session's per-turn series + top-tools ranking, every known session's
+/// totals row, and the effectiveness counters. `root` defaults to the launch
+/// directory.
+#[tauri::command]
+pub async fn graph_usage(
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    offload: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
+    root: Option<String>,
+) -> AppResult<crate::graph::UsageSnapshot> {
+    let root = resolve_graph_root(root)?;
+    let mut snap = graph.usage_snapshot(&root);
+    // Offload local-task count: completed runs (not still `"running"`) on
+    // `local` backends only — "N tasks served locally" per the milestone's
+    // Effectiveness panel, distinct from a run still in flight. GraphService
+    // has no dependency on OffloadService, so this is filled in here rather
+    // than inside `usage_snapshot`.
+    snap.offload_local_tasks = offload
+        .server_metrics()
+        .into_iter()
+        .filter(|b| b.kind == "local")
+        .flat_map(|b| b.metrics.runs)
+        .filter(|r| r.outcome != "running")
+        .count() as u64;
+    Ok(snap)
+}
+
+/// V14 Phase D2: the `graph_usage_advice` response. Wraps `advisor::evaluate`'s
+/// `Vec<Proposal>` with a `collecting` flag — NOT part of the milestone's
+/// literal `Vec<Proposal>` pseudocode, added because the Advisor card (D2.4)
+/// needs to distinguish "no data yet" from "checked, all healthy", and a
+/// bare `Vec<Proposal>` can't carry that distinction on its own.
+#[derive(serde::Serialize)]
+pub struct AdvisorSnapshot {
+    pub proposals: Vec<crate::advisor::Proposal>,
+    pub collecting: bool,
+}
+
+/// V14 Phase D2: the budget-tuning advisor's current proposals for `root`.
+/// Assembled fresh on every call from `GraphService`'s D2.1 signal getters —
+/// cheap (bounded Datalog queries + a small in-memory scan), no caching
+/// needed. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_usage_advice(
+    state: State<'_, AppState>,
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<AdvisorSnapshot> {
+    let root = resolve_graph_root(root)?;
+    let settings = state.settings.current();
+
+    let (injection_follow_rate, injection_follow_samples) = match graph.injection_follow_rate(&root)
+    {
+        Some((r, n)) => (Some(r), n),
+        None => (None, 0),
+    };
+    let (budget_maxed_rate, budget_maxed_samples) = match graph.budget_maxed_rate(&root) {
+        Some((r, n)) => (Some(r), n),
+        None => (None, 0),
+    };
+    let (advisor_reread_rate, advisor_reread_samples) = match graph.advisor_reread_rate(&root) {
+        Some((r, n)) => (Some(r), n),
+        None => (None, 0),
+    };
+    let session_count = graph.advisor_session_count(&root);
+
+    let sig = crate::advisor::Signals {
+        injection_follow_rate,
+        injection_follow_samples,
+        advisor_reread_rate,
+        advisor_reread_samples,
+        budget_maxed_rate,
+        budget_maxed_samples,
+        session_count,
+        graph: settings.graph.clone(),
+        dismissed: settings.advisor_dismissed.clone(),
+    };
+    let proposals = crate::advisor::evaluate(&sig);
+    // "Collecting" = nothing has cleared the cold-start floor yet: not
+    // enough sessions, OR neither of the two independent sample counts
+    // (injections / reminders) has cleared its own rule's floor. Distinct
+    // from "cleared the floor, rates are just healthy" (empty proposals,
+    // `collecting = false`).
+    let collecting = session_count < crate::advisor::MIN_SESSIONS
+        || (injection_follow_samples < crate::advisor::MIN_INJECTIONS
+            && advisor_reread_samples < crate::advisor::MIN_REMINDS);
+    Ok(AdvisorSnapshot { proposals, collecting })
+}
+
+/// V14 Phase D2: dismiss one advisor proposal (`rule_id` + its coarse rate
+/// `signature`, both echoed from the `Proposal` the user clicked Dismiss
+/// on). Persisted in `Settings.advisor_dismissed`; a materially changed rate
+/// (a different signature bucket) re-fires the proposal even for the same
+/// `rule_id`. Idempotent — dismissing the same pair twice is a no-op.
+#[tauri::command]
+pub async fn advisor_dismiss(
+    state: State<'_, AppState>,
+    rule_id: String,
+    signature: String,
+) -> AppResult<()> {
+    state.settings.mutate(move |cur| {
+        let already = cur
+            .advisor_dismissed
+            .iter()
+            .any(|d| d.rule_id == rule_id && d.signature == signature);
+        if !already {
+            cur.advisor_dismissed.push(crate::settings::DismissedRule { rule_id, signature });
+        }
+    });
+    Ok(())
+}
+
 /// V13 Phase A: resolve an optional `root` IPC argument to a project
 /// directory, falling back to the app's launch directory. Small, deliberate
 /// duplicate of `resolve_graph_root` (see the rationale in

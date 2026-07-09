@@ -200,6 +200,68 @@ pub struct SessionUsageRow {
     pub est_only: bool,
 }
 
+// ── V14 Phase D: Usage section assembly ────────────────────────────────────
+//
+// None of the structs below are stored relations — they're assembled on
+// demand by `GraphService::usage_snapshot` from `usage_stat` (Phase C above),
+// the V11-C injection/dedup in-memory accounting, and the V11-E read-advisor
+// Activity events. See `GraphService::usage_snapshot`/`effectiveness_totals`.
+
+/// One tool's ranked contribution to a session's context (the Usage
+/// section's "top consumers" table — e.g. "`Read` of `foo.rs` cost 18k
+/// twice"). `est_tokens` is the same `chars / 4` estimate used everywhere
+/// else in the graph's honest-accounting posture; `calls` is an exact row
+/// count. Distinct from [`GraphIndex::usage_per_tool`](super::index::GraphIndex::usage_per_tool)'s
+/// bare char sums (which feed `SessionUsageRow.tool_chars` and don't carry a
+/// call count) — the UI table wants both "how much" and "how many times".
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ToolUsage {
+    pub tool: String,
+    pub est_tokens: u64,
+    pub calls: u64,
+}
+
+/// The current (most-recently-active) session's usage readout: the per-turn
+/// series driving the stacked-bar chart, its summed totals, and the ranked
+/// top-tools table.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct SessionUsage {
+    pub session_id: String,
+    pub turns: Vec<TurnUsage>,
+    pub totals: UsageTotals,
+    pub top_tools: Vec<ToolUsage>,
+}
+
+/// The Effectiveness panel's three measured counters. `injected_chars` /
+/// `deduped_chars` come from the V11-C in-memory injection/dedup accounting
+/// (summed across every session currently resident there by
+/// `GraphService::effectiveness_totals` — process-wide, not persisted, lost
+/// on restart); `advisor_displaced_chars` comes from the V11-E read-advisor
+/// Activity events (the small `graph::activity` ring), deliberately NOT from
+/// `usage_stat` — `usage_stat` only knows resolved tool-result sizes, never
+/// what a reminder *avoided* sending. All three are measured characters, not
+/// fabricated "savings" — the UI still labels every derived (chars→tokens)
+/// number `est.`.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct Effectiveness {
+    pub injected_chars: u64,
+    pub deduped_chars: u64,
+    pub advisor_displaced_chars: u64,
+}
+
+/// The Usage section's full IPC payload (`graph_usage`).
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct UsageSnapshot {
+    pub current: Option<SessionUsage>,
+    pub sessions: Vec<SessionUsageRow>,
+    pub effectiveness: Effectiveness,
+    /// Completed `offload_task` runs served by a **local** backend — the
+    /// milestone's "N tasks served locally" pointer to the Offload Server
+    /// tab. Filled in by the `graph_usage` IPC handler (this module has no
+    /// dependency on `OffloadService`), `0` when offload is off/unused.
+    pub offload_local_tasks: u64,
+}
+
 /// Map an agent tool name/id to a memory event `kind` + the argument key that
 /// carries the path/target. Shared by the Claude transcript tap and the
 /// OpenCode plugin's `/memory/event` ingress so both classify identically.

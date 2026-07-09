@@ -208,6 +208,12 @@ pub struct Settings {
     /// `CURRENT_SCHEMA_VERSION` — a user who deletes all 4 starters must not
     /// have them reappear on a future migration.
     pub templates_seeded: bool,
+    /// V14 Phase D2: budget-tuning advisor proposals the user has dismissed.
+    /// Each entry suppresses ONE rule at ONE coarse (10%-bucketed) rate —
+    /// see `advisor::Proposal::signature`'s doc comment — so a materially
+    /// changed rate re-fires the proposal even though the same `rule_id`
+    /// still matches. Additive `#[serde(default)]`; empty on a fresh install.
+    pub advisor_dismissed: Vec<DismissedRule>,
 }
 
 impl Default for Settings {
@@ -241,8 +247,21 @@ impl Default for Settings {
             logging: LoggingSettings::default(),
             prompt_templates: Vec::new(),
             templates_seeded: false,
+            advisor_dismissed: Vec::new(),
         }
     }
+}
+
+/// V14 Phase D2: one dismissed advisor proposal. `rule_id` mirrors
+/// `advisor::Proposal::rule_id` (a versioned string constant, e.g.
+/// `"advisor.raise_context_min_score.v1"`); `signature` is the coarse
+/// (10%-bucketed) rate that triggered the dismissed proposal. Equality on
+/// BOTH fields is what "suppressed" means — see `advisor::evaluate`.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct DismissedRule {
+    pub rule_id: String,
+    pub signature: String,
 }
 
 /// Logging configuration. The file path is fixed at

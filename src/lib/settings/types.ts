@@ -590,6 +590,21 @@ export interface Settings {
   /// One-shot starter-seed gate; `true` once the backend has seeded the 4
   /// starter templates. See the Rust field's doc comment.
   templates_seeded: boolean;
+  /// V14 Phase D2: budget-tuning advisor proposals the user has dismissed.
+  /// See `DismissedRule`'s doc comment for the (rule_id, signature) matching
+  /// semantics.
+  advisor_dismissed: DismissedRule[];
+}
+
+/// V14 Phase D2: one dismissed advisor proposal. Mirror of Rust
+/// `settings::DismissedRule`. `rule_id` is a versioned rule constant (e.g.
+/// `"advisor.raise_context_min_score.v1"`); `signature` is the coarse
+/// (10%-bucketed) rate that triggered the dismissed proposal — a materially
+/// changed rate (different bucket) re-fires the proposal even for the same
+/// `rule_id`.
+export interface DismissedRule {
+  rule_id: string;
+  signature: string;
 }
 
 /// V14 Phase A: one saved prompt-library entry (global or project scope —
@@ -1256,5 +1271,6 @@ export function defaultSettings(): Settings {
     },
     prompt_templates: [],
     templates_seeded: false,
+    advisor_dismissed: [],
   };
 }

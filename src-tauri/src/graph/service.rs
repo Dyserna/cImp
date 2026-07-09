@@ -32,8 +32,8 @@ use crate::settings::{GraphSettings, SettingsHandle};
 use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
 use super::memory::{
-    MemorySnapshot, ProjectFact, SessionUsageRow, TurnUsage, UsageEvent, UsageTotals,
-    WorkingSetEntry,
+    Effectiveness, MemorySnapshot, ProjectFact, SessionUsage, SessionUsageRow, ToolUsage,
+    TurnUsage, UsageEvent, UsageSnapshot, UsageTotals, WorkingSetEntry,
 };
 use super::model::Lang;
 use super::parse_file;
@@ -214,6 +214,11 @@ pub struct GraphService {
     /// candidate across the ~30s `run_internal` await) don't both distill it —
     /// same single-flight shape as `digest_inflight`/[`InflightGuard`].
     distilling: StdMutex<HashSet<String>>,
+    /// V14 Phase D3: last time [`Self::record_usage`] emitted the
+    /// `usage-session-tokens` status-bar event, per session id — debounces a
+    /// fast-streaming transcript's repeated `Turn` upserts to at most one
+    /// emit every couple of seconds per session.
+    usage_emit_debounce: StdMutex<HashMap<String, Instant>>,
 }
 
 /// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
@@ -257,6 +262,20 @@ struct InjectState {
     /// `path → (content_hash_at_injection, turn_injected)` for files injected in
     /// full, so an unchanged re-candidate can be demoted to a one-line reminder.
     files: HashMap<String, (String, u32)>,
+    /// V14 Phase D: cumulative chars of full digests injected this session —
+    /// feeds the Usage section's Effectiveness panel (`injected_chars`) via
+    /// [`GraphService::effectiveness_totals`]. Honest measured accounting
+    /// (summed straight from `RetrieveResult::chars`), not a token estimate.
+    injected_chars: u64,
+    /// V14 Phase D: cumulative chars suppressed by dedup this session (V11-C
+    /// `RetrieveResult::deduped_chars`) — feeds `deduped_chars`.
+    deduped_chars: u64,
+    /// V14 Phase D2: retrieval turns observed this session, and (`turns_maxed`)
+    /// how many of them injected at least 90% of `context_turn_budget_chars`
+    /// — the advisor's "budget maxed" signal (rule 3, paired with
+    /// [`GraphService::injection_follow_rate`]).
+    turns_seen: u32,
+    turns_maxed: u32,
 }
 
 /// Per-root backfill liveness for the single-flight guard in [`spawn_backfill`].
@@ -313,6 +332,7 @@ impl GraphService {
             auto_check_sessions: StdMutex::new(HashMap::new()),
             auto_check_runner: crate::checks::auto::RootRunner::new(),
             distilling: StdMutex::new(HashSet::new()),
+            usage_emit_debounce: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -589,37 +609,62 @@ impl GraphService {
             return;
         }
         let ts = super::activity::now_ms() as i64;
-        match self.index_for(root) {
-            Ok(idx) => {
-                if let Err(e) = idx.record_usage_event(session_id, agent, &event, ts) {
-                    debug!(error = %e, "graph: record_usage_event failed");
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: record_usage_event open failed");
+                return;
+            }
+        };
+        if let Err(e) = idx.record_usage_event(session_id, agent, &event, ts) {
+            debug!(error = %e, "graph: record_usage_event failed");
+            return;
+        }
+        // V14 Phase D3: debounced session-tokens event for the status bar's
+        // usage-meter popover. Only a `Turn` row carries tokens (a
+        // `ToolResult` carries chars), and a streamed transcript upserts the
+        // same `Turn` many times as `usage` firms up — the debounce keeps
+        // that from spamming the frontend.
+        if matches!(event, UsageEvent::Turn { .. }) {
+            self.maybe_emit_session_tokens(session_id, &idx);
+        }
+    }
+
+    /// See [`Self::record_usage`]'s Phase D3 note. Best-effort: an emit
+    /// failure (no window yet, etc.) is silently dropped, same posture as
+    /// every other `self.app.emit` call in this module.
+    fn maybe_emit_session_tokens(&self, session_id: &str, idx: &GraphIndex) {
+        const DEBOUNCE: Duration = Duration::from_secs(2);
+        {
+            let mut m = self.usage_emit_debounce.lock().unwrap();
+            let now = Instant::now();
+            if let Some(last) = m.get(session_id) {
+                if now.duration_since(*last) < DEBOUNCE {
+                    return;
                 }
             }
-            Err(e) => debug!(error = %e, "graph: record_usage_event open failed"),
+            m.insert(session_id.to_string(), now);
+        }
+        if let Ok(totals) = idx.usage_session_totals(session_id) {
+            let _ = self.app.emit(
+                "usage-session-tokens",
+                &serde_json::json!({
+                    "session_id": session_id,
+                    "in_tok": totals.in_tok,
+                    "out_tok": totals.out_tok,
+                }),
+            );
         }
     }
 
     /// Summed token totals for `session_id` ("turn" rows only). Empty
     /// defaults on any store error (graph disabled, session unknown, etc.).
-    // V14 Phase C: query built now, wired into IPC by Phase D — unused until
-    // then (same posture as the `SessionUsageRow`/`TurnUsage`/`UsageTotals`
-    // re-exports in `graph/mod.rs`).
-    #[allow(dead_code)]
     pub fn usage_session_totals(&self, root: &Path, session_id: &str) -> UsageTotals {
         let Ok(idx) = self.index_for(root) else { return UsageTotals::default() };
         idx.usage_session_totals(session_id).unwrap_or_default()
     }
 
-    /// Estimated tool-result chars for `session_id`, grouped by tool name,
-    /// descending.
-    #[allow(dead_code)] // V14 Phase C: wired into IPC by Phase D.
-    pub fn usage_per_tool(&self, root: &Path, session_id: &str) -> Vec<(String, u64)> {
-        let Ok(idx) = self.index_for(root) else { return Vec::new() };
-        idx.usage_per_tool(session_id).unwrap_or_default()
-    }
-
     /// Per-turn token/tool-char series for `session_id`, oldest → newest.
-    #[allow(dead_code)] // V14 Phase C: wired into IPC by Phase D.
     pub fn usage_turn_series(&self, root: &Path, session_id: &str) -> Vec<TurnUsage> {
         let Ok(idx) = self.index_for(root) else { return Vec::new() };
         idx.usage_turn_series(session_id).unwrap_or_default()
@@ -627,11 +672,140 @@ impl GraphService {
 
     /// Per-session usage totals + cache-hit ratio + `est_only` for every
     /// known session under `root` (drives the Usage section's project
-    /// totals table — Phase D).
-    #[allow(dead_code)] // V14 Phase C: wired into IPC by Phase D.
+    /// totals table).
     pub fn usage_all_sessions(&self, root: &Path) -> Vec<SessionUsageRow> {
         let Ok(idx) = self.index_for(root) else { return Vec::new() };
         idx.usage_all_sessions().unwrap_or_default()
+    }
+
+    /// V14 Phase D: per-tool ranking (est. tokens + call count) for
+    /// `session_id`, descending.
+    pub fn usage_tool_ranking(&self, root: &Path, session_id: &str) -> Vec<ToolUsage> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.usage_tool_ranking(session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(tool, chars, calls)| ToolUsage { tool, est_tokens: chars / 4, calls })
+            .collect()
+    }
+
+    /// V14 Phase D: the Usage section's on-demand payload for `root` — the
+    /// current session's per-turn series + top-tools ranking, every known
+    /// session's totals row, and the effectiveness counters.
+    /// `offload_local_tasks` is left at `0` — the `graph_usage` IPC handler
+    /// fills it in from the (separate) `OffloadService`, which this module
+    /// has no dependency on.
+    pub fn usage_snapshot(&self, root: &Path) -> UsageSnapshot {
+        let effectiveness = self.effectiveness_totals();
+        let Ok(idx) = self.index_for(root) else {
+            return UsageSnapshot {
+                current: None,
+                sessions: Vec::new(),
+                effectiveness,
+                offload_local_tasks: 0,
+            };
+        };
+        // Reuses the per-root wrapper methods above (not `idx` directly) so
+        // this is the one place that consumes them — same "one caller,
+        // exercised for real" posture the rest of the service follows.
+        let current = idx.mem_current_session().ok().flatten().map(|sid| {
+            SessionUsage {
+                turns: self.usage_turn_series(root, &sid),
+                totals: self.usage_session_totals(root, &sid),
+                top_tools: self.usage_tool_ranking(root, &sid),
+                session_id: sid,
+            }
+        });
+        let sessions = self.usage_all_sessions(root);
+        UsageSnapshot { current, sessions, effectiveness, offload_local_tasks: 0 }
+    }
+
+    /// V14 Phase D: sum of the honest injected/deduped-char counters
+    /// accumulated in the in-memory injection-dedup state (V11-C), across
+    /// every session currently resident there, plus the read-advisor's
+    /// displaced chars (V11-E Activity events — see [`Effectiveness`]'s doc
+    /// comment for why this reads the Activity ring rather than
+    /// `usage_stat`). Process-wide and non-durable, like `injected` itself —
+    /// a restart loses the running total; good enough for an honest
+    /// "since-restart" readout, not a permanent ledger.
+    fn effectiveness_totals(&self) -> Effectiveness {
+        let advisor_displaced_chars: u64 = super::activity::snapshot()
+            .iter()
+            .filter(|c| c.source == "read_advisor" && c.tool == "remind")
+            .map(|c| c.chars as u64)
+            .sum();
+        let map = self.injected.lock().unwrap();
+        let (injected_chars, deduped_chars) = map
+            .values()
+            .fold((0u64, 0u64), |(i, d), st| (i + st.injected_chars, d + st.deduped_chars));
+        Effectiveness { injected_chars, deduped_chars, advisor_displaced_chars }
+    }
+
+    /// V14 Phase D2: fraction of files injected in full this project (across
+    /// every session currently resident in the in-memory dedup state —
+    /// V11-C) that were LATER read or edited in that same session (V10
+    /// `mem_event`), plus the sample count (distinct injected-file
+    /// instances) it's based on. Sessions in the in-memory map that don't
+    /// belong to `root` (their id doesn't appear in `root`'s own
+    /// `mem_sessions`) are excluded — the map itself isn't root-scoped, only
+    /// keyed by session id. `None` when nothing has been injected for this
+    /// root yet (context injection never fired, or the graph is off).
+    pub fn injection_follow_rate(&self, root: &Path) -> Option<(f64, u64)> {
+        let idx = self.index_for(root).ok()?;
+        let root_sessions: HashSet<String> =
+            idx.mem_sessions().ok()?.into_iter().map(|s| s.session_id).collect();
+        let map = self.injected.lock().unwrap();
+        let mut total = 0u64;
+        let mut followed = 0u64;
+        for (sid, st) in map.iter() {
+            if !root_sessions.contains(sid) {
+                continue;
+            }
+            let touched = idx.mem_touched_paths(sid).unwrap_or_default();
+            for path in st.files.keys() {
+                total += 1;
+                if touched.contains(path) {
+                    followed += 1;
+                }
+            }
+        }
+        if total == 0 { None } else { Some((followed as f64 / total as f64, total)) }
+    }
+
+    /// V14 Phase D2: fraction of retrieval turns whose injected digest filled
+    /// at least 90% of `context_turn_budget_chars` — the advisor's "the
+    /// budget is maxed out" signal (rule 3's second half). Sample count =
+    /// turns observed; same root-session scoping as
+    /// [`Self::injection_follow_rate`].
+    pub fn budget_maxed_rate(&self, root: &Path) -> Option<(f64, u64)> {
+        let idx = self.index_for(root).ok()?;
+        let root_sessions: HashSet<String> =
+            idx.mem_sessions().ok()?.into_iter().map(|s| s.session_id).collect();
+        let map = self.injected.lock().unwrap();
+        let mut seen = 0u64;
+        let mut maxed = 0u64;
+        for (sid, st) in map.iter() {
+            if !root_sessions.contains(sid) {
+                continue;
+            }
+            seen += st.turns_seen as u64;
+            maxed += st.turns_maxed as u64;
+        }
+        if seen == 0 { None } else { Some((maxed as f64 / seen as f64, seen)) }
+    }
+
+    /// V14 Phase D2: wraps [`GraphIndex::advisor_reread_rate`] — this query
+    /// is already fully root+session scoped (it reads `mem_event` from
+    /// `root`'s own index), unlike the two signals above.
+    pub fn advisor_reread_rate(&self, root: &Path) -> Option<(f64, u64)> {
+        self.index_for(root).ok()?.advisor_reread_rate().ok().flatten()
+    }
+
+    /// V14 Phase D2: how many distinct sessions this root's memory knows
+    /// about — the advisor's "≥5 sessions" half of the cold-start floor.
+    pub fn advisor_session_count(&self, root: &Path) -> u64 {
+        let Ok(idx) = self.index_for(root) else { return 0 };
+        idx.mem_sessions().map(|v| v.len() as u64).unwrap_or(0)
     }
 
     /// Ranked working set for a session (default: the current session).
@@ -946,6 +1120,26 @@ impl GraphService {
             g.context_llm_digests,
         );
 
+        // V14 Phase D/D2: honest-accounting counters for the Usage section's
+        // Effectiveness panel (injected/deduped chars) and the D2 advisor's
+        // budget-maxed signal. Tracked unconditionally — independent of the
+        // `ttl > 0` gate below, which only governs the files_used tracking
+        // used for dedup demotion.
+        if let Some(s) = sid {
+            let mut map = self.injected.lock().unwrap();
+            let st = map.entry(s.to_string()).or_default();
+            st.injected_chars += result.chars as u64;
+            st.deduped_chars += result.deduped_chars as u64;
+            st.turns_seen = st.turns_seen.saturating_add(1);
+            let budget = g.context_turn_budget_chars as u64;
+            // "Maxed" = this turn's injected chars reached ≥90% of the
+            // budget — a proxy for "the budget is the binding constraint",
+            // not "we injected literally everything that ranked in".
+            if budget > 0 && (result.chars as u64) * 10 >= budget * 9 {
+                st.turns_maxed = st.turns_maxed.saturating_add(1);
+            }
+        }
+
         // Record the files injected in full so the next turn can dedup them.
         if let Some(s) = sid {
             if ttl > 0 {
@@ -1163,11 +1357,22 @@ impl GraphService {
         let substitute = g.read_advisor_mode.eq_ignore_ascii_case("substitute");
         let text = super::context::read_advice(&idx, root, &rel, offset, substitute, g.max_body_bytes as usize);
         self.reminded.lock().ok()?.insert(key);
+        let ts = super::activity::now_ms() as i64;
+        // V14 Phase D2: also persist a root+session-scoped `mem_event{kind:
+        // "remind"}` row — distinct from the process-wide Activity event
+        // below — so `GraphIndex::advisor_reread_rate` can precisely check
+        // whether the agent re-read this exact file afterward. Reuses the
+        // session's ALREADY-established agent (never a fabricated tag): a
+        // reminder requires `mem_file_last_event_ms` to have found a prior
+        // event for this (session, file) above, so the session row is
+        // guaranteed to already exist with its real agent.
+        let agent = idx.session_agent(sid).ok().flatten().unwrap_or_else(|| "claude".to_string());
+        let _ = idx.record_mem_event(sid, &agent, "remind", &rel, None, None, ts, None);
         // Activity: `chars` is the reminder's actual size (what we returned),
         // consistent with every other graph tool's honest response-size figure —
         // not a fabricated token estimate.
         super::activity::record(super::activity::GraphCall {
-            ts_ms: super::activity::now_ms(),
+            ts_ms: ts as u64,
             source: "read_advisor".to_string(),
             tool: "remind".to_string(),
             target: rel,

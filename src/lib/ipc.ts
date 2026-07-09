@@ -125,6 +125,26 @@ export async function getClaudeUsage(): Promise<UsageResult> {
   return invoke<UsageResult>('get_claude_usage');
 }
 
+/// V14 Phase D3: the current session's running token totals, emitted
+/// (debounced ~2s) by the backend's `record_usage` tap whenever a Claude
+/// transcript line firms up a message's `usage` block. Feeds the status-bar
+/// usage-meter's "session tokens" line. Distinct from `UsageSnapshot` above
+/// (that's the Claude Code rate-limit quota; this is a live token count for
+/// the V14 token X-ray — see `graph.ts`'s own, differently-named,
+/// `UsageSnapshot` for the full Usage-section payload).
+export interface SessionTokensEvent {
+  session_id: string;
+  in_tok: number;
+  out_tok: number;
+}
+
+/// Subscribe to `usage-session-tokens`. Returns an unlisten fn.
+export function onUsageSessionTokens(
+  cb: (e: SessionTokensEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<SessionTokensEvent>('usage-session-tokens', (e) => cb(e.payload));
+}
+
 /// NVIDIA GPU stats (null when no NVIDIA GPU / NVML).
 export interface GpuStats {
   util_pct: number;

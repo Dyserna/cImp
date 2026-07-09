@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod advisor;
 mod attach;
 mod audio;
 mod checks;
@@ -41,7 +42,8 @@ use tracing::{info, warn};
 
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::ipc::commands::{
-    acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_attach_image,
+    acknowledge_error, advisor_dismiss, ai_tool_tab_defaults, close_settings_window,
+    compose_attach_image,
     compose_content_changed,
     compose_templates, compose_templates_global_get, compose_templates_global_set,
     compose_templates_project_get,
@@ -50,7 +52,7 @@ use crate::ipc::commands::{
     graph_history, graph_impact, graph_language_census,
     graph_context_preview, graph_memory, graph_memory_clear, graph_note_set_pinned, graph_rebuild,
     graph_rebuild_embeddings, graph_set_language_enabled, graph_set_watch_paused,
-    graph_status, graph_test_embedder, list_tabs,
+    graph_status, graph_test_embedder, graph_usage, graph_usage_advice, list_tabs,
     list_voices, offload_backend_restart, offload_backend_start, offload_backend_stop,
     offload_derive_opencode_provider,
     offload_server_log, offload_server_metrics, offload_server_restart, offload_server_start,
@@ -736,6 +738,9 @@ fn main() {
             graph_fact_update,
             graph_fact_add,
             graph_context_preview,
+            graph_usage,
+            graph_usage_advice,
+            advisor_dismiss,
             workbench_status,
             workbench_diff_summary,
             workbench_diff_file,

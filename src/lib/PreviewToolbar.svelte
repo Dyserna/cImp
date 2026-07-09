@@ -34,6 +34,7 @@
   import { tabMeta } from './tabs/store';
   import { openComposeWithAttachment } from './composeState';
   import { isPreviewBackendOpen, markPreviewClosed, markPreviewOpen } from './preview/state';
+  import { navigateBack, navigateForward } from './preview/history';
   import {
     computePreviewRect,
     DEFAULT_PREVIEW_URL,
@@ -159,7 +160,11 @@
     });
   }
 
-  async function navigateTo(url: string): Promise<void> {
+  // V14 code-review fix (FIX 9): `fromBack` distinguishes a Back-button
+  // navigation from every other kind (URL bar submit, a rejected-navigation
+  // fallback, ...). Only the latter pushes onto `backStack` — see
+  // `preview/history.ts`'s doc comment for the oscillation bug this fixes.
+  async function navigateTo(url: string, opts: { fromBack?: boolean } = {}): Promise<void> {
     const trimmed = url.trim();
     if (!trimmed) return;
     if (!isAllowedPreviewHost(trimmed, $settings.preview_allow_remote)) {
@@ -169,7 +174,9 @@
     }
     try {
       await previewNavigate(tabId, trimmed);
-      backStack = [...backStack, urlInput];
+      if (!opts.fromBack) {
+        backStack = navigateForward({ backStack, current: urlInput }, trimmed).backStack;
+      }
       urlInput = trimmed;
       persistConfig();
     } catch (e) {
@@ -183,9 +190,10 @@
   }
 
   function onBack(): void {
-    const prev = backStack.pop();
-    backStack = [...backStack];
-    if (prev) void navigateTo(prev);
+    const next = navigateBack({ backStack, current: urlInput });
+    if (next.current === urlInput) return; // stack was empty; nothing to go back to
+    backStack = next.backStack;
+    void navigateTo(next.current, { fromBack: true });
   }
 
   function onReload(): void {

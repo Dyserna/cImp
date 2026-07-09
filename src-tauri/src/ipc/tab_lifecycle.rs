@@ -588,6 +588,7 @@ pub async fn create_ai_tab_in_worktree(
 #[tauri::command]
 pub async fn close_tab(
     state: State<'_, AppState>,
+    preview_registry: State<'_, crate::preview::PreviewRegistry>,
     tab: TabId,
 ) -> Result<(), TabLifecycleError> {
     let _serializer = state.lifecycle_serializer.lock().await;
@@ -646,6 +647,18 @@ pub async fn close_tab(
         return Err(TabLifecycleError::TabNotFound {
             tab: tab.as_str().to_string(),
         });
+    }
+
+    // V14 code-review fix (webview leak): proactively destroy a closed
+    // Preview tab's child webview from the backend, rather than relying
+    // solely on `PreviewToolbar.svelte`'s `onDestroy` — a renderer crash,
+    // an HMR reload, or a thrown exception could skip that path entirely
+    // and leak the webview for the rest of the process's life.
+    // `destroy_if_open` is idempotent, so this is safe even if the
+    // frontend's own cleanup also runs (whichever gets there first wins;
+    // the other is a no-op).
+    if tab.kind() == TabKind::Preview {
+        crate::preview::destroy_if_open(&preview_registry, tab.as_str());
     }
 
     // V1.4-04 D.6: drop any persisted scrollback file for the closed

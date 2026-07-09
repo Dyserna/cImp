@@ -20,6 +20,7 @@
 #[cfg(windows)]
 mod windows_impl {
     use std::path::Path;
+    use std::time::Duration;
 
     use tauri::Webview;
     use tokio::sync::oneshot;
@@ -31,6 +32,14 @@ mod windows_impl {
 
     use crate::error::{AppError, AppResult};
 
+    /// V14 code-review fix (FIX 5): cap on how long `capture_to_png` waits
+    /// for the completion callback. A few seconds is generous for an
+    /// in-process viewport capture; if the tab closes concurrently (its
+    /// webview torn down mid-capture) the completion handler may simply
+    /// never run, and without a timeout the `rx.await` below hung forever —
+    /// the caller's IPC promise would never resolve or reject.
+    const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// Capture `webview`'s current viewport to a PNG at `dest`.
     ///
     /// `Webview::with_webview` dispatches its closure onto the webview's own
@@ -40,6 +49,17 @@ mod windows_impl {
     /// a oneshot channel, the same "hop to the platform's UI thread, await
     /// the result here" shape any other cross-thread platform call in this
     /// codebase uses.
+    ///
+    /// Bounded by [`CAPTURE_TIMEOUT`] (FIX 5) so a concurrent tab-close that
+    /// prevents the completion callback from ever firing surfaces as a typed
+    /// error instead of hanging the calling IPC command forever. On ANY
+    /// failure path here — dispatch failure, a reported capture error, or a
+    /// timeout — `dest` is removed if present (FIX 6): `preview_capture`'s
+    /// caller (`crate::attach::reserve_path`) already touched an empty
+    /// placeholder at `dest` (and `SHCreateStreamOnFileW` below, opened
+    /// `STGM_CREATE`, would truncate/create it too), so a failure here would
+    /// otherwise leave a stray 0-byte PNG behind rather than surfacing
+    /// cleanly as "no snapshot".
     ///
     /// TODO(spike E0): this compiles cleanly against the exact
     /// `webview2-com`/`windows` versions wry 0.55 resolves to (verified via
@@ -51,21 +71,45 @@ mod windows_impl {
     /// spike markers.
     pub async fn capture_to_png(webview: &Webview, dest: &Path) -> AppResult<()> {
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
-        let dest = dest.to_path_buf();
+        let dest_buf = dest.to_path_buf();
 
-        webview
-            .with_webview(move |platform| capture_now(platform, &dest, tx))
-            .map_err(|e| {
-                AppError::Preview(format!("capture: with_webview dispatch failed: {e}"))
-            })?;
+        if let Err(e) = webview.with_webview(move |platform| capture_now(platform, &dest_buf, tx))
+        {
+            cleanup_stray_file(dest);
+            return Err(AppError::Preview(format!(
+                "capture: with_webview dispatch failed: {e}"
+            )));
+        }
 
-        rx.await
-            .map_err(|_| {
-                AppError::Preview(
-                    "capture: the preview webview closed before the capture completed".into(),
-                )
-            })?
-            .map_err(AppError::Preview)
+        let result = match tokio::time::timeout(CAPTURE_TIMEOUT, rx).await {
+            Ok(Ok(inner)) => inner.map_err(AppError::Preview),
+            Ok(Err(_)) => Err(AppError::Preview(
+                "capture: the preview webview closed before the capture completed".into(),
+            )),
+            Err(_) => Err(AppError::Preview(format!(
+                "capture: timed out after {CAPTURE_TIMEOUT:?} waiting for the preview snapshot"
+            ))),
+        };
+
+        if result.is_err() {
+            cleanup_stray_file(dest);
+        }
+        result
+    }
+
+    /// Best-effort delete of a stray (empty or partial) capture output.
+    /// Failure is logged, not propagated — we're already on an error path
+    /// and a cleanup miss shouldn't mask the original error.
+    fn cleanup_stray_file(dest: &Path) {
+        if let Err(e) = std::fs::remove_file(dest) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %dest.display(),
+                    error = %e,
+                    "preview capture: failed to remove stray output file after a failed capture"
+                );
+            }
+        }
     }
 
     /// Runs ON the webview's own UI thread (inside `with_webview`'s

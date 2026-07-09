@@ -217,6 +217,17 @@ confirmed, plus what still needs a live pass:
 - Linux (webkit2gtk) capture: still not attempted, per the milestone's own
   non-blocking allowance — `preview::capture` compiles a clear "not
   implemented on this platform" stub for non-Windows targets.
+- **KNOWN LIMITATION (code-review pass, 2026-07-09):** the navigation
+  policy (`is_allowed_preview_host`, applied at `preview_open`/
+  `preview_navigate`, `on_navigation`, and `on_new_window`) only polices the
+  MAIN FRAME — wry exposes no subframe-navigation hook, so a policy-allowed
+  page embedding `<iframe src="https://some-remote-host">` can load remote
+  content inside the Preview tab without ever being checked. Acceptable for
+  a localhost dev-preview surface (the threat model is "don't let the tab
+  casually reach hosts you didn't ask for," not "sandbox untrusted
+  third-party content"); recorded here for a future hardening pass. See the
+  `// KNOWN LIMITATION` comment in `src-tauri/src/preview/mod.rs`'s module
+  doc comment.
 
 ### Edge cases
 - Dev server down: standard "connection refused" page with a retry — never an

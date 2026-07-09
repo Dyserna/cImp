@@ -856,6 +856,13 @@ fn main() {
                     // user never submitted), so this only ever catches
                     // directories already past the age cap, same as startup.
                     attach::prune(3);
+                    // V14 code-review fix (webview leak): best-effort drain of
+                    // every still-open Preview child webview. Each one is
+                    // otherwise destroyed only by its own tab's close (or the
+                    // frontend's `onDestroy`), so a Preview tab left open at
+                    // quit time would leave its child webview attached through
+                    // the rest of this teardown; catch it here too.
+                    preview::close_all(&app.state::<preview::PreviewRegistry>());
                     // Closing the main window also closes the settings window
                     // if it's open — otherwise it would keep the process alive
                     // with no main window. Destroy it before the main window.

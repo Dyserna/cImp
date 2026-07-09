@@ -696,7 +696,7 @@ impl GraphService {
     /// fills it in from the (separate) `OffloadService`, which this module
     /// has no dependency on.
     pub fn usage_snapshot(&self, root: &Path) -> UsageSnapshot {
-        let effectiveness = self.effectiveness_totals();
+        let effectiveness = self.effectiveness_totals(root);
         let Ok(idx) = self.index_for(root) else {
             return UsageSnapshot {
                 current: None,
@@ -728,16 +728,36 @@ impl GraphService {
     /// `usage_stat`). Process-wide and non-durable, like `injected` itself —
     /// a restart loses the running total; good enough for an honest
     /// "since-restart" readout, not a permanent ledger.
-    fn effectiveness_totals(&self) -> Effectiveness {
+    ///
+    /// V14 code-review fix (FIX 7): `injected`/`deduped` are now scoped to
+    /// `root`'s own sessions (`idx.mem_sessions()`), same as
+    /// [`Self::injection_follow_rate`]/[`Self::budget_maxed_rate`] —
+    /// previously this summed the WHOLE process-wide `injected` map, so a
+    /// multi-project cImp session would attribute every OTHER project's
+    /// injected/deduped chars to whichever root happened to call
+    /// `usage_snapshot`.
+    ///
+    /// note: `advisor_displaced_chars` is NOT root-scoped — the Activity
+    /// ring (`super::activity::snapshot`) is a single process-wide buffer
+    /// with no root/session key to filter on, unlike `injected`. Left as a
+    /// process-wide estimate; the UI already labels this figure `est.`.
+    fn effectiveness_totals(&self, root: &Path) -> Effectiveness {
         let advisor_displaced_chars: u64 = super::activity::snapshot()
             .iter()
             .filter(|c| c.source == "read_advisor" && c.tool == "remind")
             .map(|c| c.chars as u64)
             .sum();
+        let root_sessions: HashSet<String> = self
+            .index_for(root)
+            .ok()
+            .and_then(|idx| idx.mem_sessions().ok())
+            .map(|sessions| sessions.into_iter().map(|s| s.session_id).collect())
+            .unwrap_or_default();
         let map = self.injected.lock().unwrap();
         let (injected_chars, deduped_chars) = map
-            .values()
-            .fold((0u64, 0u64), |(i, d), st| (i + st.injected_chars, d + st.deduped_chars));
+            .iter()
+            .filter(|(sid, _)| root_sessions.contains(sid.as_str()))
+            .fold((0u64, 0u64), |(i, d), (_, st)| (i + st.injected_chars, d + st.deduped_chars));
         Effectiveness { injected_chars, deduped_chars, advisor_displaced_chars }
     }
 

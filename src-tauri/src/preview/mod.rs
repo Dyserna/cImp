@@ -44,6 +44,22 @@
 //! `window.open()` — always denied and forwarded to the system browser,
 //! regardless of host, since a Preview tab is explicitly not a general
 //! browser with its own tab/window model).
+//!
+//! // KNOWN LIMITATION: this policy only polices the MAIN FRAME. `wry`
+//! // exposes no subframe-navigation hook (`on_navigation` fires for
+//! // top-level navigations of the page loaded in the webview, not for
+//! // navigations initiated by an embedded `<iframe>`), so a policy-ALLOWED
+//! // page (a localhost dev server, say) that embeds `<iframe src="https://
+//! // some-remote-host">` can load and render that remote content inside the
+//! // Preview tab without ever going through `is_allowed_preview_host`. This
+//! // is acceptable for a localhost dev-preview surface (the threat model is
+//! // "don't let the Preview tab casually browse the wider internet or reach
+//! // a local network host you didn't ask for", not "sandbox untrusted
+//! // third-party content") but is recorded here for a future hardening pass
+//! // — e.g. revisiting this if/when wry grows subframe-navigation events, or
+//! // scoping via WebView2's `NavigationStarting` at the `CoreWebView2Frame`
+//! // level directly (bypassing wry) if this ever needs to be airtight. See
+//! // `docs/MILESTONE-V14...`'s E0 section for the same note in context.
 
 mod capture;
 
@@ -164,13 +180,42 @@ fn is_local_host(host: Host<&str>) -> bool {
     }
 }
 
+/// V14 code-review fix (HIGH, security): scheme allowlist for anything
+/// [`open_external`] is about to hand to the OS's system opener
+/// (`tauri_plugin_opener::open_url`, which ultimately calls into
+/// `ShellExecute`/`xdg-open`-style APIs). `is_allowed_preview_host` gates
+/// which HOSTS the in-webview navigation policy trusts, but it never
+/// restricted *scheme* — a `file:`, `javascript:`, `data:`, `mailto:`, or a
+/// registered custom-protocol URI (`ms-msdt:...`, the Follina RCE vector)
+/// has no meaningful "host" the way `http(s)` does, and some of those would
+/// otherwise sail past `open_external` untouched and reach the OS protocol
+/// handler. Only `http`/`https` are ever externally-openable; every other
+/// scheme is dropped. Pure + unit-tested independent of any webview/app
+/// handle.
+pub fn is_externally_openable(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+}
+
 /// Best-effort "open in the system browser" — used both for navigation
 /// targets the policy rejects and for every `on_new_window` request (a
 /// Preview tab has no tab/window model of its own, so ANY `target="_blank"`
 /// / `window.open()` always leaves the embedded webview and goes external,
 /// regardless of host). Failure is logged, not propagated — the caller
 /// already denied the in-webview navigation either way.
+///
+/// Scheme-gated by [`is_externally_openable`] before ever reaching the OS
+/// opener: an `http`/`https` URL forwards through `tauri_plugin_opener` as
+/// before; anything else (a custom/registered protocol handler, `file:`,
+/// `javascript:`, `data:`, ...) is silently dropped rather than handed to
+/// the OS — see that function's doc comment for why.
 fn open_external(app: &AppHandle, url: &str) {
+    if !is_externally_openable(url) {
+        tracing::debug!(url, "preview: dropped non-http(s) URL instead of opening it externally");
+        return;
+    }
     if let Err(e) = app.opener().open_url(url, None::<&str>) {
         warn!(url, error = %e, "preview: failed to open URL in the system browser");
     }
@@ -381,13 +426,45 @@ pub async fn preview_show(registry: State<'_, PreviewRegistry>, tab_id: String) 
 /// closed (or never-opened) tab is a normal race during teardown.
 #[tauri::command]
 pub async fn preview_close(registry: State<'_, PreviewRegistry>, tab_id: String) -> AppResult<()> {
-    let Some(webview) = registry.remove(&tab_id) else {
-        return Ok(());
+    destroy_if_open(&registry, &tab_id);
+    Ok(())
+}
+
+/// V14 code-review fix (webview leak): the actual close-and-remove logic
+/// shared by [`preview_close`] (frontend `PreviewToolbar.svelte`'s
+/// `onDestroy`) AND the backend's own proactive cleanup —
+/// `ipc::tab_lifecycle::close_tab` calls this when the closed tab is a
+/// Preview tab, and `main.rs`'s `CloseRequested` handler drains the whole
+/// registry on app exit. Without a backend-owned path, the child webview
+/// was destroyed ONLY by the frontend's `onDestroy`, which a renderer
+/// crash, an HMR reload, or an exception could skip entirely, leaking the
+/// child webview (and whatever page/resources it holds) for the rest of
+/// the process's life. Idempotent — a missing `tab_id` (already closed, or
+/// never opened) is a silent no-op, so calling it from multiple paths for
+/// the same tab is always safe.
+pub(crate) fn destroy_if_open(registry: &PreviewRegistry, tab_id: &str) {
+    let Some(webview) = registry.remove(tab_id) else {
+        return;
     };
     if let Err(e) = webview.close() {
-        warn!(?tab_id, error = %e, "preview_close: close failed");
+        warn!(?tab_id, error = %e, "preview: close failed");
     }
-    Ok(())
+}
+
+/// V14 code-review fix (webview leak): best-effort drain of every still-open
+/// Preview webview, for `main.rs`'s `CloseRequested` handler on app exit. A
+/// renderer that never ran its `onDestroy` (crash, forced quit) would
+/// otherwise leave child webviews attached until the whole process tears
+/// down anyway — harmless at that point, but this makes the cleanup
+/// explicit and deterministic rather than "hope the OS reaps it".
+pub fn close_all(registry: &PreviewRegistry) {
+    let tab_ids: Vec<String> = {
+        let entries = registry.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.keys().cloned().collect()
+    };
+    for tab_id in tab_ids {
+        destroy_if_open(registry, &tab_id);
+    }
 }
 
 /// Persist the toolbar's live `url`/`device_width`/`auto_reload` back onto
@@ -537,5 +614,35 @@ mod tests {
     fn webview_label_is_distinct_from_the_tab_id() {
         assert_eq!(webview_label("preview-abc"), "preview-preview-abc");
         assert_ne!(webview_label("preview-abc"), "preview-abc");
+    }
+
+    // ── V14 code-review FIX 2 (HIGH, security): external-open scheme gate ──
+
+    #[test]
+    fn http_and_https_are_externally_openable() {
+        assert!(is_externally_openable("http://example.com"));
+        assert!(is_externally_openable("https://example.com/path?x=1"));
+        assert!(is_externally_openable("HTTPS://Example.Com"));
+    }
+
+    #[test]
+    fn custom_and_dangerous_schemes_are_never_externally_openable() {
+        // The Follina-style RCE vector this fix closes: a registered OS
+        // protocol handler must never be reachable from a Preview tab's
+        // `window.open()` / rejected-navigation path.
+        assert!(!is_externally_openable("ms-msdt:x-msdt-config?..."));
+        assert!(!is_externally_openable("file:///etc/passwd"));
+        assert!(!is_externally_openable("javascript:alert(1)"));
+        assert!(!is_externally_openable("data:text/html,<script>alert(1)</script>"));
+        assert!(!is_externally_openable("mailto:someone@example.com"));
+        assert!(!is_externally_openable("about:blank"));
+        // A hypothetical custom app scheme.
+        assert!(!is_externally_openable("myapp://do-something"));
+    }
+
+    #[test]
+    fn malformed_url_is_not_externally_openable() {
+        assert!(!is_externally_openable("not a url"));
+        assert!(!is_externally_openable(""));
     }
 }

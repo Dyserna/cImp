@@ -54,6 +54,16 @@ const REREAD_HIGH: f64 = 0.5;
 /// Rule 3: a turn-budget-maxed rate at or above this is "high".
 const BUDGET_MAXED_HIGH: f64 = 0.5;
 
+/// V14 code-review fix (FIX 8): ceiling on `context_min_score` proposals.
+/// `build_context`'s additive relevance score is roughly a ~3-20 scale (see
+/// its own scoring doc comment); a `context_min_score` anywhere near the top
+/// of that range already rejects nearly every candidate file, so repeated
+/// applies of rule 1 (each `saturating_add(1)`, otherwise unbounded) could
+/// climb the floor past any real score and silently turn off injection
+/// entirely. Once the LIVE value has reached this ceiling, rule 1 stops
+/// proposing further raises — it's already as aggressive as makes sense.
+const MIN_SCORE_CEILING: u32 = 12;
+
 /// Rule 1's versioned id. Never reuse a rule id for a changed threshold or
 /// proposed-value formula — bump the version suffix instead, so an old
 /// dismissal (keyed by `rule_id` + signature) doesn't silently suppress a
@@ -148,7 +158,7 @@ pub fn evaluate(sig: &Signals) -> Vec<Proposal> {
     if let Some(follow) = sig.injection_follow_rate {
         if sig.injection_follow_samples >= MIN_INJECTIONS {
             let unused = 1.0 - follow;
-            if unused >= UNUSED_HIGH {
+            if unused >= UNUSED_HIGH && sig.graph.context_min_score < MIN_SCORE_CEILING {
                 let signature = bucket10(unused);
                 if !is_dismissed(&sig.dismissed, RULE_MIN_SCORE, &signature) {
                     let proposed = sig.graph.context_min_score.saturating_add(1);
@@ -207,9 +217,18 @@ pub fn evaluate(sig: &Signals) -> Vec<Proposal> {
             let unused = 1.0 - follow;
             if unused >= UNUSED_HIGH && maxed >= BUDGET_MAXED_HIGH {
                 let signature = bucket10(unused);
-                if !is_dismissed(&sig.dismissed, RULE_TURN_BUDGET, &signature) {
-                    let proposed =
-                        (((sig.graph.context_turn_budget_chars as f64) * 0.8) as u32).max(1_000);
+                let proposed =
+                    (((sig.graph.context_turn_budget_chars as f64) * 0.8) as u32).max(1_000);
+                // V14 code-review fix (FIX 8): the `.max(1_000)` floor means
+                // this formula can propose a value ≥ `current` when
+                // `current` is already ≤ 1250 (e.g. current=1000 ⇒
+                // proposed=1000, or current=1100 ⇒ proposed=1100.max(1000)
+                // still not a REDUCTION) — a rule whose entire premise is
+                // "lower the budget" must never propose raising (or
+                // no-op'ing) it. Only emit when it's a real reduction.
+                if proposed < sig.graph.context_turn_budget_chars
+                    && !is_dismissed(&sig.dismissed, RULE_TURN_BUDGET, &signature)
+                {
                     out.push(Proposal {
                         setting: "graph.context_turn_budget_chars".to_string(),
                         current: sig.graph.context_turn_budget_chars.to_string(),
@@ -381,6 +400,54 @@ mod tests {
             before,
             "the round-trip must actually change the settings"
         );
+    }
+
+    // ── V14 code-review FIX 8: bad-proposal guards ──────────────────────
+
+    #[test]
+    fn rule3_never_proposes_a_raise_or_no_op_for_a_small_budget() {
+        // The `.max(1_000)` floor in the proposed-value formula would
+        // otherwise RAISE the budget for any `current` below the floor
+        // (e.g. current=900 -> proposed=max(720, 1000)=1000, a raise) —
+        // contradicting a rule whose entire premise is "lower the budget".
+        let mut sig = extreme_signals();
+        sig.graph.context_turn_budget_chars = 900;
+        assert!(
+            !evaluate(&sig).iter().any(|p| p.rule_id == RULE_TURN_BUDGET),
+            "must not propose when the formula would raise (or leave unchanged) the budget"
+        );
+
+        // Exactly at the floor: proposed == current (900 -> no, use 1000
+        // here), also not a real reduction, so still must not propose.
+        let mut sig_eq = extreme_signals();
+        sig_eq.graph.context_turn_budget_chars = 1000;
+        assert!(!evaluate(&sig_eq).iter().any(|p| p.rule_id == RULE_TURN_BUDGET));
+
+        // A comfortably large current still gets a real reduction proposed.
+        let sig_large = extreme_signals(); // default context_turn_budget_chars = 6_000
+        assert!(evaluate(&sig_large).iter().any(|p| p.rule_id == RULE_TURN_BUDGET));
+    }
+
+    #[test]
+    fn rule1_stops_proposing_once_min_score_hits_the_ceiling() {
+        // At the ceiling, rule 1 must not propose a further raise — an
+        // unbounded `saturating_add(1)` applied repeatedly could otherwise
+        // climb `context_min_score` past any real score and silently kill
+        // injection entirely.
+        let mut sig = extreme_signals();
+        sig.graph.context_min_score = MIN_SCORE_CEILING;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_MIN_SCORE));
+
+        // Comfortably above the ceiling too (in case of a stale/hand-edited
+        // value higher than the ceiling itself).
+        let mut sig_above = extreme_signals();
+        sig_above.graph.context_min_score = MIN_SCORE_CEILING + 5;
+        assert!(!evaluate(&sig_above).iter().any(|p| p.rule_id == RULE_MIN_SCORE));
+
+        // Just below the ceiling: one more raise is still reasonable.
+        let mut sig_below = extreme_signals();
+        sig_below.graph.context_min_score = MIN_SCORE_CEILING - 1;
+        assert!(evaluate(&sig_below).iter().any(|p| p.rule_id == RULE_MIN_SCORE));
     }
 
     #[test]

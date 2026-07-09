@@ -753,6 +753,30 @@ pub async fn ai_tool_tab_defaults(tab: TabId) -> AppResult<AiToolTabConfig> {
     }
 }
 
+/// The body of `settings_update`'s read-modify-write, factored out so it can
+/// be exercised directly in a unit test without a full Tauri `AppState`
+/// harness (`SettingsHandle::mutate` requires the closure to run under its
+/// own lock; this is the pure logic that closure runs).
+///
+/// `incoming` is the Settings-window's full snapshot; `cur` is the live
+/// in-memory state. See the call site in `settings_update` for why
+/// `layout`/`session`/`prompt_templates`/`templates_seeded` are preserved
+/// from `cur` rather than taken from `incoming`.
+fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
+    incoming.layout = cur.layout.clone();
+    incoming.session = cur.session.clone();
+    incoming.prompt_templates = cur.prompt_templates.clone();
+    incoming.templates_seeded = cur.templates_seeded;
+    *cur = incoming;
+    // Keep the reserved feature tabs (Offload Server / Code Graph monitor /
+    // Workbench) present-iff-enabled in the persisted list.
+    crate::settings::reconcile_reserved_tabs(cur);
+    // V21: when OpenCode local-llama auto-sync is on and the local server is
+    // enabled, re-derive the provider snapshot if the primary Local command
+    // changed (no-op otherwise), so the OpenCode tab tracks command edits.
+    cur.offload.sync_opencode_provider_on_save();
+}
+
 #[tauri::command]
 pub async fn settings_update(
     state: State<'_, AppState>,
@@ -785,18 +809,21 @@ pub async fn settings_update(
     // layout the user just dragged or the active-tab the main window just set.
     // `tabs` IS legitimately edited here (TabBar reorder, ConfigureTabDialog,
     // reset-to-defaults), so it is taken from the incoming struct.
-    state.settings.mutate(move |cur| {
-        settings.layout = cur.layout.clone();
-        settings.session = cur.session.clone();
-        *cur = settings;
-        // Keep the reserved feature tabs (Offload Server / Code Graph monitor /
-        // Workbench) present-iff-enabled in the persisted list.
-        crate::settings::reconcile_reserved_tabs(cur);
-        // V21: when OpenCode local-llama auto-sync is on and the local server is
-        // enabled, re-derive the provider snapshot if the primary Local command
-        // changed (no-op otherwise), so the OpenCode tab tracks command edits.
-        cur.offload.sync_opencode_provider_on_save();
-    });
+    //
+    // V14 code-review fix (HIGH, data loss): `prompt_templates` +
+    // `templates_seeded` are ALSO out-of-band fields — they're written only
+    // by `compose_templates_global_set` -> `write_global_prompt_templates`,
+    // straight to the physical global `settings.json`, bypassing this
+    // `SettingsHandle` entirely (see that command's doc comment). The
+    // Settings window's generic snapshot can easily be stale for these two
+    // fields (e.g. fetched before a Compose-section edit), and without this
+    // preservation a completely unrelated save (theme, a toggle, ...) would
+    // stomp the live in-memory copy with that stale value, which a later
+    // read (or a diff-and-persist elsewhere) could then present as the
+    // template library having reverted or lost entries. Preserve both here,
+    // exactly like `layout`/`session`, so the dedicated compose IPC stays
+    // the only writer of the template library.
+    state.settings.mutate(move |cur| apply_incoming_settings(cur, settings));
 
     // On an `stt.enabled` edge, load or unload the Whisper model so the toggle
     // actually frees/reclaims memory (not just hides the record button). When
@@ -1896,6 +1923,47 @@ pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::is_automatic_terminal_response as auto_reply;
+    use super::apply_incoming_settings;
+    use crate::settings::{PromptTemplate, Settings};
+
+    // V14 code-review FIX 1 (HIGH, data loss): `prompt_templates` /
+    // `templates_seeded` are written out-of-band by
+    // `compose_templates_global_set` (straight to the physical global
+    // `settings.json`, bypassing `SettingsHandle`), so the live in-memory
+    // copy can legitimately hold templates the Settings window's generic
+    // snapshot doesn't know about. Simulate that: `cur` already has
+    // templates (as if the dedicated compose path had just run), the
+    // incoming snapshot is stale/empty, and applying it must NOT clobber
+    // the live templates or the seeded flag.
+    #[test]
+    fn settings_update_preserves_out_of_band_prompt_templates() {
+        let mut cur = Settings::default();
+        cur.prompt_templates = vec![
+            PromptTemplate { name: "review-this-diff".to_string(), body: "R".to_string() },
+            PromptTemplate { name: "my-new-template".to_string(), body: "N".to_string() },
+        ];
+        cur.templates_seeded = true;
+
+        // The incoming snapshot represents an unrelated Settings-window save
+        // (e.g. a theme flip) whose local copy of the template library is
+        // stale/empty because it was fetched before the compose-section edit.
+        let mut incoming = Settings::default();
+        incoming.ui.theme = "future-light".to_string();
+        assert!(incoming.prompt_templates.is_empty());
+        assert!(!incoming.templates_seeded);
+
+        apply_incoming_settings(&mut cur, incoming);
+
+        // The unrelated field DID apply...
+        assert_eq!(cur.ui.theme, "future-light");
+        // ...but the out-of-band template library and its seeded flag must
+        // be exactly as they were live, not reverted/deleted by the stale
+        // incoming snapshot.
+        assert_eq!(cur.prompt_templates.len(), 2);
+        assert_eq!(cur.prompt_templates[0].name, "review-this-diff");
+        assert_eq!(cur.prompt_templates[1].name, "my-new-template");
+        assert!(cur.templates_seeded);
+    }
 
     #[test]
     fn focus_events_are_auto() {

@@ -1633,6 +1633,15 @@ impl GraphIndex {
                 "digest",
                 ":create digest {file: String, content_hash: String => text: String, ts_ms: Int}",
             ),
+            // V12 Phase D: per-file git churn (last touch time/subject, 90-day
+            // touch count). Additive (survives a graph rebuild) — it's
+            // git-derived and fully repopulated at the end of every rebuild
+            // pass and refreshed incrementally on watcher batches, never
+            // built from parsed source like the `RELATIONS` set.
+            (
+                "commit_touch",
+                ":create commit_touch {file: String => last_ts: Int, last_subject: String, touches_90d: Int}",
+            ),
         ];
         for (name, create) in defs {
             if !existing.contains(*name) {
@@ -1992,6 +2001,112 @@ impl GraphIndex {
             }
             Ok(())
         })
+    }
+
+    // ── V12 Phase D: git churn (`commit_touch`) ──────────────────────────
+
+    /// Upsert churn rows collected by `graph::gitmeta::collect`/`collect_for`.
+    /// A full-pass `collect()` result and an incremental `collect_for()`
+    /// result are both just `:put` upserts here — same shape, same call —
+    /// the difference (precise vs. approximate `touches_90d`) lives entirely
+    /// in the collector, per its own doc comment.
+    pub fn put_commit_touches(&self, rows: &[crate::graph::gitmeta::FileChurn]) -> AppResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let data: Vec<DataValue> = rows
+            .iter()
+            .map(|c| {
+                DataValue::List(vec![
+                    DataValue::Str(c.file.as_str().into()),
+                    DataValue::Num(Num::Int(c.last_ts)),
+                    DataValue::Str(c.last_subject.as_str().into()),
+                    DataValue::Num(Num::Int(c.touches_90d as i64)),
+                ])
+            })
+            .collect();
+        self.put(
+            "?[file, last_ts, last_subject, touches_90d] <- $rows\n\
+             :put commit_touch {file => last_ts, last_subject, touches_90d}",
+            data,
+        )
+    }
+
+    /// The stored churn row for one `file`, or `None` if it has no git history
+    /// (never committed, or the project isn't a git repo — [`super::gitmeta`]
+    /// degrades to collecting nothing in that case, so the relation simply has
+    /// no row for it). Feeds the digest trailer (`graph::context::file_digest`)
+    /// and the ranking churn boost.
+    pub fn commit_touch(&self, file: &str) -> AppResult<Option<(i64, String, u32)>> {
+        if !self.existing_relations()?.contains("commit_touch") {
+            return Ok(None);
+        }
+        let mut p = BTreeMap::new();
+        p.insert("file".to_string(), DataValue::Str(file.into()));
+        let rows = self.run(
+            "?[last_ts, last_subject, touches_90d] := \
+                *commit_touch{file, last_ts, last_subject, touches_90d}, file == $file",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows
+            .rows
+            .first()
+            .map(|r| (cell_i64(r, 0), cell_str(r, 1), cell_i64(r, 2) as u32)))
+    }
+
+    /// Churn-ranked files touched within the last `days`, optionally filtered
+    /// to a `path_prefix`, most-touched first (ties broken by most-recent) —
+    /// the engine behind `graph_recent_changes`. `commit_touch` is file-level
+    /// and expected to be small (one row per ever-touched file, not per
+    /// commit), so this scans it whole and filters/sorts in Rust rather than
+    /// pushing the "within N days" comparison into Datalog.
+    pub fn recent_changes(
+        &self,
+        days: u32,
+        path_prefix: Option<&str>,
+        max: usize,
+    ) -> AppResult<Vec<crate::graph::gitmeta::FileChurn>> {
+        if !self.existing_relations()?.contains("commit_touch") {
+            return Ok(Vec::new());
+        }
+        let rows = self.run(
+            "?[file, last_ts, last_subject, touches_90d] := \
+                *commit_touch{file, last_ts, last_subject, touches_90d}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let cutoff = crate::graph::gitmeta::now_ts() - (days as i64) * 86_400;
+        let mut out: Vec<crate::graph::gitmeta::FileChurn> = rows
+            .rows
+            .iter()
+            .filter_map(|r| {
+                let last_ts = cell_i64(r, 1);
+                if last_ts < cutoff {
+                    return None;
+                }
+                let file = cell_str(r, 0);
+                if let Some(prefix) = path_prefix {
+                    if !prefix.is_empty() && !file.starts_with(prefix) {
+                        return None;
+                    }
+                }
+                Some(crate::graph::gitmeta::FileChurn {
+                    file,
+                    last_ts,
+                    last_subject: cell_str(r, 2),
+                    touches_90d: cell_i64(r, 3) as u32,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.touches_90d
+                .cmp(&a.touches_90d)
+                .then_with(|| b.last_ts.cmp(&a.last_ts))
+                .then_with(|| a.file.cmp(&b.file))
+        });
+        out.truncate(max);
+        Ok(out)
     }
 }
 
@@ -3087,6 +3202,111 @@ pub struct Point { x: i32 }
         assert_eq!(after.files, 0);
         assert_eq!(after.symbols, 0);
         assert_eq!(after.edges, 0);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V12 Phase D: commit_touch store ───────────────────────────────────
+
+    #[test]
+    fn commit_touch_roundtrip_and_incremental_overwrite() {
+        let dir = std::env::temp_dir().join(format!("ckg-churn-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        // No row yet.
+        assert!(idx.commit_touch("src/a.rs").unwrap().is_none());
+
+        // A full-pass style upsert.
+        idx.put_commit_touches(&[crate::graph::gitmeta::FileChurn {
+            file: "src/a.rs".to_string(),
+            last_ts: 1_000,
+            last_subject: "init: a".to_string(),
+            touches_90d: 3,
+        }])
+        .expect("put");
+        let (ts, subject, touches) = idx.commit_touch("src/a.rs").unwrap().expect("row present");
+        assert_eq!((ts, subject.as_str(), touches), (1_000, "init: a", 3));
+
+        // An incremental (collect_for-shaped) upsert overwrites the row —
+        // same key, new values win, nothing lingers from the old row.
+        idx.put_commit_touches(&[crate::graph::gitmeta::FileChurn {
+            file: "src/a.rs".to_string(),
+            last_ts: 2_000,
+            last_subject: "fix: a".to_string(),
+            touches_90d: 1,
+        }])
+        .expect("put incremental");
+        let (ts2, subject2, touches2) = idx.commit_touch("src/a.rs").unwrap().expect("row present");
+        assert_eq!((ts2, subject2.as_str(), touches2), (2_000, "fix: a", 1));
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recent_changes_orders_by_touches_then_recency_and_filters() {
+        let dir = std::env::temp_dir().join(format!("ckg-recent-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        let now = crate::graph::gitmeta::now_ts();
+        let day = 86_400;
+
+        idx.put_commit_touches(&[
+            // Most touches, but older than the highest-touch tie below.
+            crate::graph::gitmeta::FileChurn {
+                file: "src/hot.rs".to_string(),
+                last_ts: now - 2 * day,
+                last_subject: "hot file".to_string(),
+                touches_90d: 5,
+            },
+            // Fewer touches — should rank below hot.rs despite being newer.
+            crate::graph::gitmeta::FileChurn {
+                file: "src/warm.rs".to_string(),
+                last_ts: now - day,
+                last_subject: "warm file".to_string(),
+                touches_90d: 2,
+            },
+            // Outside the `days` window entirely — excluded regardless of
+            // touch count.
+            crate::graph::gitmeta::FileChurn {
+                file: "src/stale.rs".to_string(),
+                last_ts: now - 400 * day,
+                last_subject: "ancient".to_string(),
+                touches_90d: 99,
+            },
+            // Matches the prefix filter test below.
+            crate::graph::gitmeta::FileChurn {
+                file: "docs/readme.md".to_string(),
+                last_ts: now - day,
+                last_subject: "docs touch".to_string(),
+                touches_90d: 5,
+            },
+        ])
+        .expect("put");
+
+        // Default window (30d): stale.rs excluded; hot.rs (5 touches) ranks
+        // above both 5-touch docs/readme.md (tie-broken by recency: readme is
+        // newer) and warm.rs (2 touches).
+        let rows = idx.recent_changes(30, None, 10).expect("recent_changes");
+        let files: Vec<&str> = rows.iter().map(|c| c.file.as_str()).collect();
+        assert!(!files.contains(&"src/stale.rs"), "{files:?}");
+        assert_eq!(files[0], "docs/readme.md", "5 touches, more recent than hot.rs: {files:?}");
+        assert_eq!(files[1], "src/hot.rs", "5 touches: {files:?}");
+        assert_eq!(files[2], "src/warm.rs", "2 touches ranks last: {files:?}");
+
+        // A tight window excludes everything older than it, even a
+        // heavily-touched file.
+        let tight = idx.recent_changes(0, None, 10).expect("recent_changes");
+        assert!(tight.is_empty(), "{tight:?}");
+
+        // path_prefix filters to one subtree.
+        let docs_only = idx.recent_changes(30, Some("docs/"), 10).expect("recent_changes");
+        assert_eq!(docs_only.len(), 1);
+        assert_eq!(docs_only[0].file, "docs/readme.md");
+
+        // max caps the result count.
+        let capped = idx.recent_changes(30, None, 1).expect("recent_changes");
+        assert_eq!(capped.len(), 1);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

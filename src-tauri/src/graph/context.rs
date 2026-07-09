@@ -144,6 +144,33 @@ pub fn build_context(
         *score.entry(path.clone()).or_default() += weight;
     }
 
+    // V12 Phase D: churn boost — files touched recently in git are more
+    // likely to be what "this project" currently means. ONE fetch of the
+    // 30-day churn set (not a per-candidate DB query in this loop), then a
+    // cheap in-memory lookup per already-scored candidate. `+3` within 7
+    // days, `+1` within 30 (beside the term/doc/session weights above); a
+    // file outside the 30-day window (or with no git history at all) simply
+    // isn't in the map and gets no boost.
+    let churn: HashMap<String, i64> = idx
+        .recent_changes(30, None, 5_000)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| (c.file, c.last_ts))
+        .collect();
+    if !churn.is_empty() {
+        let now = super::gitmeta::now_ts();
+        for (file, s) in score.iter_mut() {
+            if let Some(&last_ts) = churn.get(file) {
+                let age_days = (now - last_ts) / 86_400;
+                if age_days <= 7 {
+                    *s += 3.0;
+                } else if age_days <= 30 {
+                    *s += 1.0;
+                }
+            }
+        }
+    }
+
     // Rank; bail when the best file is below the threshold (meta prompts).
     let mut ranked: Vec<(String, f64)> = score.into_iter().collect();
     ranked.sort_by(|a, b| {
@@ -283,6 +310,16 @@ fn file_digest(idx: &GraphIndex, file: &str, max_chars: usize) -> String {
     if joined.chars().count() > max_chars {
         joined = joined.chars().take(max_chars.saturating_sub(1)).collect::<String>();
         joined.push('…');
+    }
+    // V12 Phase D: optional "last change" trailer when git history exists for
+    // this file. Appended AFTER the max_chars truncation above (it's a small,
+    // separately-capped addition, not squeezed out of the signature budget) —
+    // the caller already measures the actual returned string length before
+    // debiting its own budget, so this is accounted for correctly there.
+    if let Some((last_ts, subject, _touches)) = idx.commit_touch(file).ok().flatten() {
+        let age = super::gitmeta::relative_age(super::gitmeta::now_ts(), last_ts);
+        let subject = super::gitmeta::truncate_subject(&subject, 60);
+        joined.push_str(&format!(" — last change: \"{subject}\" ({age})"));
     }
     joined
 }
@@ -559,6 +596,44 @@ mod tests {
         let empty = build_context(&idx, "hi there, thanks!", &[], 800, 6000, 3.0, &no_dedup, 0, 0, false);
         assert_eq!(empty.chars, 0);
         assert!(empty.files_used.is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn churn_boost_promotes_a_recently_touched_file_over_an_equal_score_peer() {
+        use crate::graph::{parse_file, Lang};
+        let dir = std::env::temp_dir().join(format!("ckg-churn-boost-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // Two files, each defining a same-named symbol — `find_symbol("widget")`
+        // hits both, so their base term-match score is identical.
+        idx.index_file_graph(&parse_file("src/hot.rs", "pub fn widget() {}\n", Lang::Rust))
+            .expect("index hot");
+        idx.index_file_graph(&parse_file("src/cold.rs", "pub fn widget() {}\n", Lang::Rust))
+            .expect("index cold");
+
+        // Only hot.rs has recent git history (within the 7-day boost tier).
+        let now = super::super::gitmeta::now_ts();
+        idx.put_commit_touches(&[super::super::gitmeta::FileChurn {
+            file: "src/hot.rs".to_string(),
+            last_ts: now - 86_400, // 1 day ago
+            last_subject: "fix: widget cache".to_string(),
+            touches_90d: 4,
+        }])
+        .expect("put churn");
+
+        let no_dedup = HashMap::new();
+        let r = build_context(&idx, "widget", &[], 800, 6000, 0.5, &no_dedup, 0, 0, false);
+        // Both files clear the (low) threshold and are ranked; the churned
+        // file must come first despite an identical base term-match score.
+        let pos_hot = r.files_used.iter().position(|f| f == "src/hot.rs");
+        let pos_cold = r.files_used.iter().position(|f| f == "src/cold.rs");
+        assert!(pos_hot.is_some() && pos_cold.is_some(), "{:?}", r.files_used);
+        assert!(pos_hot < pos_cold, "churned file should rank first: {:?}", r.files_used);
+        // The digest trailer surfaces the commit subject + a relative age.
+        assert!(r.context_md.contains("fix: widget cache"), "{}", r.context_md);
+        assert!(r.context_md.contains("1d ago"), "{}", r.context_md);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

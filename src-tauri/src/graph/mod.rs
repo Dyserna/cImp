@@ -22,6 +22,7 @@ mod activity;
 mod builder;
 mod context;
 mod embed;
+mod gitmeta;
 mod impact;
 mod index;
 mod mcp;

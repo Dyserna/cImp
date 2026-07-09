@@ -1060,6 +1060,10 @@ impl GraphService {
 
         let _w = self.write_lock.lock().unwrap();
         let mut changed = 0u64;
+        // V12 Phase D: rel paths touched this batch (indexed OR removed), fed
+        // to `gitmeta::collect_for` below for an incremental churn refresh —
+        // a small, bounded set since watcher batches are debounced and small.
+        let mut touched_rels: Vec<String> = Vec::new();
         for path in paths {
             // Never touch our own store directory.
             if path.components().any(|c| c.as_os_str() == sub.as_str()) {
@@ -1079,6 +1083,7 @@ impl GraphService {
                 // Deleted/moved-away — drop its rows (no-op if never indexed).
                 if idx.remove_file(&rel).is_ok() {
                     changed += 1;
+                    touched_rels.push(rel);
                 }
                 continue;
             }
@@ -1097,7 +1102,10 @@ impl GraphService {
             };
             let fg = parse_file(&rel, &src, lang);
             match idx.index_file_graph(&fg) {
-                Ok(()) => changed += 1,
+                Ok(()) => {
+                    changed += 1;
+                    touched_rels.push(rel);
+                }
                 Err(e) => debug!(file = %rel, error = %e, "graph: incremental index failed"),
             }
         }
@@ -1106,6 +1114,13 @@ impl GraphService {
             let _ = idx.prune_orphan_vectors();
             let _ = idx.prune_orphan_code_vectors();
             let _ = idx.prune_orphan_digests();
+            // V12 Phase D: incremental churn refresh for just the touched
+            // files — one small `git log -1` spawn per path, cheap at
+            // watcher-batch scale. No-ops (empty result, no error) outside a
+            // git repo.
+            if let Ok(churn) = super::gitmeta::collect_for(root, &touched_rels) {
+                let _ = idx.put_commit_touches(&churn);
+            }
         }
         drop(_w);
 
@@ -1564,6 +1579,16 @@ fn build_tree(
     let _ = idx.prune_orphan_code_vectors();
     // V11 Phase F: likewise drop cached digests for files that vanished.
     let _ = idx.prune_orphan_digests();
+
+    // V12 Phase D: refresh git churn metadata for the ranking boost + digest
+    // trailers. `commit_touch` is additive (outside `RELATIONS`, ensured by
+    // `ensure_memory_relations`), so it survives the `reset()` above and just
+    // gets repopulated here every full pass. `collect` itself degrades to an
+    // empty vec (never an error) when `root` isn't a git repo, so this is
+    // always safe to call — a non-git project just gets no churn boost.
+    if let Ok(churn) = super::gitmeta::collect(root) {
+        let _ = idx.put_commit_touches(&churn);
+    }
 
     Ok((indexed, idx.stats()?))
 }

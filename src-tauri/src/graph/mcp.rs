@@ -209,6 +209,22 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
         },
         GraphToolSpec {
+            name: "graph_recent_changes",
+            description: "What's been happening in this project lately — files ranked by git churn \
+                (most-touched, then most-recent first), each with its touch count and last commit \
+                subject. Good for orienting at the start of a fresh session. File-level only (no \
+                per-line blame), bounded to a 90-day history window. Reports unavailable when the \
+                project isn't a git repository.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "days": { "type": "integer", "description": "Only files touched within the last N days (default 14, clamped 1-90)." },
+                    "path_prefix": { "type": "string", "description": "Only files under this project-relative path prefix." }
+                },
+                "required": []
+            }),
+        },
+        GraphToolSpec {
             name: "context_recall",
             description: "Recall what THIS session has been working on — the ranked working set of \
                 files it read/edited/queried, with the symbols touched. Use at the start of a \
@@ -497,6 +513,19 @@ pub fn run_tool(
             .import_cycles(max_rows)
             .map(|v| fmt_cycles(&v, max_rows))
             .map_err(|e| e.to_string()),
+        "graph_recent_changes" => {
+            let days = args
+                .get("days")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(14)
+                .clamp(1, 90);
+            let prefix_owned = args.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+            let prefix = prefix_owned.as_deref().filter(|s| !s.is_empty());
+            idx.recent_changes(days, prefix, max_rows)
+                .map(|v| fmt_recent_changes(&v, max_rows))
+                .map_err(|e| e.to_string())
+        }
         "context_recall" => {
             let Some(sid) = idx.mem_current_session_for(agent).map_err(|e| e.to_string())? else {
                 return Ok("No session activity recorded yet.".to_string());
@@ -891,6 +920,34 @@ fn fmt_cycles(cycles: &[Vec<String>], max_rows: usize) -> String {
         .collect();
     if cycles.len() > max_rows {
         lines.push(format!("… (+{} more)", cycles.len() - max_rows));
+    }
+    lines.join("\n")
+}
+
+/// Render `graph_recent_changes` rows (churn-ranked, most-touched first) as
+/// `file · N× · "subject" (age)` lines.
+fn fmt_recent_changes(rows: &[super::gitmeta::FileChurn], max_rows: usize) -> String {
+    if rows.is_empty() {
+        return "No git churn recorded in this window — not a git repository, or nothing touched \
+                 in range."
+            .to_string();
+    }
+    let now = super::gitmeta::now_ts();
+    let mut lines: Vec<String> = rows
+        .iter()
+        .take(max_rows)
+        .map(|c| {
+            format!(
+                "{} · {}× · \"{}\" ({})",
+                c.file,
+                c.touches_90d,
+                super::gitmeta::truncate_subject(&c.last_subject, 60),
+                super::gitmeta::relative_age(now, c.last_ts)
+            )
+        })
+        .collect();
+    if rows.len() > max_rows {
+        lines.push(format!("… (+{} more)", rows.len() - max_rows));
     }
     lines.join("\n")
 }

@@ -566,6 +566,33 @@ impl GraphService {
         Ok(super::impact::ImpactReport { changed: set.changed, dependents, unindexed: set.unindexed })
     }
 
+    /// V15 Feature 1: the shortest path between two entities across the code
+    /// edge kinds. Opens the warm index; `max_hops` from `path_max_hops`
+    /// (clamped 1–32). `None` when unresolvable or no path within the bound.
+    pub fn shortest_path(
+        &self,
+        root: &Path,
+        from: &str,
+        to: &str,
+        kinds: &[super::model::EdgeKind],
+        symmetric: bool,
+    ) -> AppResult<Option<super::index::PathHit>> {
+        let hops = (self.settings.current().graph.path_max_hops.max(1) as usize).min(32);
+        self.index_for(root)?.shortest_path(from, to, kinds, hops, symmetric)
+    }
+
+    /// V15 Feature 2: the architecture overview (god nodes, subsystems,
+    /// surprising edges). Opens the warm index; bounded by the arch settings.
+    pub fn architecture(&self, root: &Path) -> AppResult<super::index::ArchReport> {
+        let g = self.settings.current().graph;
+        let max = g.max_rows_per_query.max(1) as usize;
+        self.index_for(root)?.architecture(
+            g.arch_max_communities as usize,
+            g.arch_min_community_size as usize,
+            max,
+        )
+    }
+
     // ── V10 session / action memory ──────────────────────────────────────
 
     /// Record one memory event for `root`'s current-project graph. A no-op when

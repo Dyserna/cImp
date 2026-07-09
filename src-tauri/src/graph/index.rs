@@ -19,7 +19,7 @@ use super::memory::{
     WorkingSetEntry, MAX_EVENTS_PER_SESSION, MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT,
     MAX_USAGE_PER_SESSION,
 };
-use super::model::{Confidence, FileGraph, Lang};
+use super::model::{Confidence, EdgeKind, FileGraph, Lang};
 use super::schema::{GRAPH_SCHEMA_VERSION, RELATIONS};
 
 /// One symbol returned by a lookup query.
@@ -67,6 +67,87 @@ pub struct DependentHit {
     /// discovery chain (a chain is only as certain as its least-certain link).
     /// `Ambiguous` if any hop's callee name was multi-candidate.
     pub confidence: Confidence,
+}
+
+/// One node on a traced path (V15 Feature 1). `edge_to_next`/`confidence`
+/// describe the edge leaving this node toward the next; they are `None` on the
+/// final node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathNode {
+    /// Internal node id (a symbol id, or `file:<path>` for a file node).
+    pub id: String,
+    /// Display label — the symbol name, or the file path for a file node.
+    pub label: String,
+    /// The file this node lives in (for click-through). Same as `label` for
+    /// file nodes.
+    pub file: String,
+    /// 1-based definition line, or 0 for a file node.
+    pub line: u32,
+    /// Symbol kind tag, or `"file"` for a file node.
+    pub kind: String,
+    /// The edge kind leaving this node toward the next (`call`/`import`/
+    /// `contains`), or `None` on the last node.
+    pub edge_to_next: Option<String>,
+    /// Confidence of `edge_to_next`, or `None` on the last node.
+    pub confidence: Option<Confidence>,
+}
+
+/// One hub in the architecture overview (V15 Feature 2) — a highest-degree
+/// symbol or file that much of the system flows through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GodNode {
+    pub id: String,
+    pub label: String,
+    pub file: String,
+    /// Symbol kind tag, or `"file"`.
+    pub kind: String,
+    /// Combined inbound degree (call count for a symbol, call-centrality for a file).
+    pub degree: u64,
+}
+
+/// One subsystem/community in the architecture overview (V15 Feature 2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subsystem {
+    /// Derived name — the common path prefix of member files, else the hub's stem.
+    pub name: String,
+    /// Total member file count.
+    pub size: usize,
+    /// A sample of member files (bounded).
+    pub files: Vec<String>,
+    /// The most call-central member file.
+    pub hub: String,
+}
+
+/// An edge crossing subsystem boundaries (V15 Feature 2) — candidate accidental
+/// coupling between otherwise-separate parts of the system.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SurprisingEdge {
+    pub from: String,
+    pub to: String,
+    /// Edge kind tag (`call`/`import`).
+    pub kind: String,
+    pub from_subsystem: String,
+    pub to_subsystem: String,
+}
+
+/// The architecture overview (V15 Feature 2): god nodes, subsystems, and
+/// surprising cross-subsystem edges. Topology only — no LLM, no embeddings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArchReport {
+    pub god_nodes: Vec<GodNode>,
+    pub subsystems: Vec<Subsystem>,
+    pub surprising: Vec<SurprisingEdge>,
+}
+
+/// A traced shortest path between two entities (V15 Feature 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathHit {
+    /// The ordered chain from source to target (`nodes[0]` = source).
+    pub nodes: Vec<PathNode>,
+    /// Number of hops = `nodes.len() - 1`.
+    pub hops: usize,
+    /// How many *other* shortest paths of the same length exist (0 = unique).
+    pub equal_alternatives: u64,
 }
 
 /// One reference (use site) returned by `references`.
@@ -949,6 +1030,536 @@ reach[x] := reach[z], calls[x, z]"#
             }
         }
         Ok(hits)
+    }
+
+    /// V15 Feature 1: the shortest ordered path between two code entities across
+    /// a unified view of the `Call`/`Import`/`Contains` edge kinds (restricted by
+    /// `kinds`). `from`/`to` accept a symbol name, a `file:line`, or a file path
+    /// (resolved like `graph_snippet`); an ambiguous endpoint seeds/accepts every
+    /// candidate. A Rust-side **BFS with parent pointers** over a name-resolved,
+    /// multi-kind adjacency built from one scan of each relation — the same
+    /// pattern `transitive`/`dependents_transitive` use, extended to span edge
+    /// kinds and record predecessors. `symmetric` walks edges undirected ("are
+    /// these related at all?"). Bounded by `max_hops`. Returns `None` when an
+    /// endpoint is unresolvable or no path exists within the bound.
+    pub fn shortest_path(
+        &self,
+        from: &str,
+        to: &str,
+        kinds: &[EdgeKind],
+        max_hops: usize,
+        symmetric: bool,
+    ) -> AppResult<Option<PathHit>> {
+        let want_call = kinds.contains(&EdgeKind::Call);
+        let want_import = kinds.contains(&EdgeKind::Import);
+        let want_contains = kinds.contains(&EdgeKind::Contains);
+
+        // 1. Symbols → node metadata + name→ids map.
+        let sym_rows = self.run(
+            "?[id, name, kind, file, start_line] := *symbol{id, name, kind, file, start_line}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut meta: HashMap<String, PathNode> = HashMap::new();
+        let mut name_to_ids: HashMap<String, Vec<String>> = HashMap::new();
+        for r in &sym_rows.rows {
+            let id = cell_str(r, 0);
+            let name = cell_str(r, 1);
+            name_to_ids.entry(name.clone()).or_default().push(id.clone());
+            meta.insert(
+                id.clone(),
+                PathNode {
+                    id,
+                    label: name,
+                    file: cell_str(r, 3),
+                    line: cell_i64(r, 4) as u32,
+                    kind: cell_str(r, 2),
+                    edge_to_next: None,
+                    confidence: None,
+                },
+            );
+        }
+        let multi = self.multi_candidate_names()?;
+
+        // 2. Files → node metadata + lang table (for import resolution).
+        let file_rows = self.run(
+            "?[path, lang] := *file{path, lang}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut file_lang: HashMap<String, String> = HashMap::new();
+        let mut known_files: HashSet<String> = HashSet::new();
+        for r in &file_rows.rows {
+            let path = cell_str(r, 0);
+            file_lang.insert(path.clone(), cell_str(r, 1));
+            let node_id = format!("file:{path}");
+            meta.insert(
+                node_id.clone(),
+                PathNode { id: node_id, label: path.clone(), file: path.clone(), line: 0, kind: "file".to_string(), edge_to_next: None, confidence: None },
+            );
+            known_files.insert(path);
+        }
+
+        // 3. Build the multi-kind adjacency + a per-pair edge (kind, confidence)
+        //    lookup for reconstruction. Scoped so the `add` closure's mutable
+        //    borrow of `adj`/`edge_kind` is released before the BFS reads them.
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+        let mut edge_kind: HashMap<(String, String), (EdgeKind, Confidence)> = HashMap::new();
+        {
+            let mut add = |a: String, b: String, k: EdgeKind, c: Confidence| {
+                adj.entry(a.clone()).or_default().push(b.clone());
+                let e = edge_kind.entry((a.clone(), b.clone())).or_insert((k, c));
+                e.1 = e.1.stronger(c);
+                if symmetric {
+                    adj.entry(b.clone()).or_default().push(a.clone());
+                    let er = edge_kind.entry((b, a)).or_insert((k, c));
+                    er.1 = er.1.stronger(c);
+                }
+            };
+
+            if want_call {
+                let rows = self.run(
+                    r#"?[src, dst, conf] := *edge{kind: k, src, dst, confidence: conf}, k == "call""#,
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )?;
+                for r in &rows.rows {
+                    let src = cell_str(r, 0);
+                    if !meta.contains_key(&src) {
+                        continue;
+                    }
+                    let dst = cell_str(r, 1);
+                    let conf = if multi.contains(&dst) {
+                        Confidence::Ambiguous
+                    } else {
+                        Confidence::from_tag(&cell_str(r, 2))
+                    };
+                    if let Some(ids) = name_to_ids.get(&dst) {
+                        for callee in ids {
+                            add(src.clone(), callee.clone(), EdgeKind::Call, conf);
+                        }
+                    }
+                }
+            }
+            if want_contains {
+                let rows = self.run(
+                    r#"?[src, dst] := *edge{kind: k, src, dst}, k == "contains""#,
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )?;
+                for r in &rows.rows {
+                    let (src, dst) = (cell_str(r, 0), cell_str(r, 1));
+                    if meta.contains_key(&src) && meta.contains_key(&dst) {
+                        add(src, dst, EdgeKind::Contains, Confidence::Extracted);
+                    }
+                }
+                // Synthesize file→symbol containment so a file node connects to
+                // every definition it holds (covers top-level defs that have no
+                // stored Contains parent).
+                for r in &sym_rows.rows {
+                    let id = cell_str(r, 0);
+                    let file_node = format!("file:{}", cell_str(r, 3));
+                    if meta.contains_key(&file_node) {
+                        add(file_node, id, EdgeKind::Contains, Confidence::Extracted);
+                    }
+                }
+            }
+            if want_import {
+                let rows = self.run(
+                    r#"?[src, dst, conf] := *edge{kind: k, src, dst, confidence: conf}, k == "import""#,
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )?;
+                for r in &rows.rows {
+                    let from_file = cell_str(r, 0);
+                    let module = cell_str(r, 1);
+                    let lang = Lang::from_tag(file_lang.get(&from_file).map(|s| s.as_str()).unwrap_or(""));
+                    if let Some(target) = resolve_import(lang, &from_file, &module, &known_files) {
+                        let conf = Confidence::from_tag(&cell_str(r, 2));
+                        add(format!("file:{from_file}"), format!("file:{target}"), EdgeKind::Import, conf);
+                    }
+                }
+            }
+        }
+
+        // 4. Resolve endpoints (each may yield several candidate nodes).
+        let from_nodes = self.resolve_path_endpoint(from, &name_to_ids, &known_files)?;
+        let to_set: HashSet<String> =
+            self.resolve_path_endpoint(to, &name_to_ids, &known_files)?.into_iter().collect();
+        if from_nodes.is_empty() || to_set.is_empty() {
+            return Ok(None);
+        }
+        // A source that is already a target → a zero-hop path.
+        let mut src_is_target: Vec<String> =
+            from_nodes.iter().filter(|n| to_set.contains(*n)).cloned().collect();
+        src_is_target.sort();
+        if let Some(t) = src_is_target.first() {
+            if let Some(node) = meta.get(t).cloned() {
+                return Ok(Some(PathHit {
+                    nodes: vec![node],
+                    hops: 0,
+                    equal_alternatives: (src_is_target.len() - 1) as u64,
+                }));
+            }
+        }
+
+        // 5. Level-synchronized BFS with predecessor + shortest-path-count
+        //    tracking (so `equal_alternatives` is exact, and the reported path is
+        //    deterministic — smallest-id predecessor wins ties).
+        let mut dist: HashMap<String, usize> = HashMap::new();
+        let mut parent: HashMap<String, String> = HashMap::new();
+        let mut npaths: HashMap<String, u64> = HashMap::new();
+        let mut frontier: Vec<String> = Vec::new();
+        for f in &from_nodes {
+            if meta.contains_key(f) && dist.insert(f.clone(), 0).is_none() {
+                npaths.insert(f.clone(), 1);
+                frontier.push(f.clone());
+            }
+        }
+
+        for depth in 1..=max_hops {
+            frontier.sort();
+            let mut next: Vec<String> = Vec::new();
+            for u in &frontier {
+                let up = npaths.get(u).copied().unwrap_or(0);
+                let Some(neighbors) = adj.get(u) else { continue };
+                let mut ns = neighbors.clone();
+                ns.sort();
+                ns.dedup();
+                for v in ns {
+                    match dist.get(&v).copied() {
+                        None => {
+                            dist.insert(v.clone(), depth);
+                            parent.insert(v.clone(), u.clone());
+                            npaths.insert(v.clone(), up);
+                            next.push(v);
+                        }
+                        Some(dv) if dv == depth => {
+                            *npaths.entry(v.clone()).or_insert(0) += up;
+                            if parent.get(&v).map(|p| u < p).unwrap_or(false) {
+                                parent.insert(v, u.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut hits: Vec<String> = next.iter().filter(|n| to_set.contains(*n)).cloned().collect();
+            if !hits.is_empty() {
+                hits.sort();
+                let target = &hits[0];
+                let mut chain: Vec<String> = Vec::new();
+                let mut cur = target.clone();
+                loop {
+                    chain.push(cur.clone());
+                    match parent.get(&cur) {
+                        Some(p) => cur = p.clone(),
+                        None => break,
+                    }
+                }
+                chain.reverse();
+                let mut nodes: Vec<PathNode> = Vec::with_capacity(chain.len());
+                for (i, id) in chain.iter().enumerate() {
+                    let mut n = meta.get(id).cloned().unwrap_or_else(|| PathNode {
+                        id: id.clone(), label: id.clone(), file: String::new(), line: 0,
+                        kind: "?".to_string(), edge_to_next: None, confidence: None,
+                    });
+                    if let Some(nxt) = chain.get(i + 1) {
+                        if let Some((k, c)) = edge_kind.get(&(id.clone(), nxt.clone())) {
+                            n.edge_to_next = Some(k.tag().to_string());
+                            n.confidence = Some(*c);
+                        }
+                    }
+                    nodes.push(n);
+                }
+                let hops = nodes.len() - 1;
+                let alt = npaths.get(target).copied().unwrap_or(1).saturating_sub(1);
+                return Ok(Some(PathHit { nodes, hops, equal_alternatives: alt }));
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        Ok(None)
+    }
+
+    /// Resolve a path endpoint string to its candidate node ids: a `file:line`
+    /// (→ the enclosing symbol, or the file node), a symbol name (→ every
+    /// definition of it), or a bare file path (→ the file node). Empty when it
+    /// resolves to nothing indexed.
+    fn resolve_path_endpoint(
+        &self,
+        s: &str,
+        name_to_ids: &HashMap<String, Vec<String>>,
+        known_files: &HashSet<String>,
+    ) -> AppResult<Vec<String>> {
+        let s = s.trim();
+        if let Some((f, l)) = s.rsplit_once(':') {
+            if let Ok(line) = l.trim().parse::<u32>() {
+                if known_files.contains(f) {
+                    return Ok(match self.symbol_at(f, line)? {
+                        Some(sym) => vec![sym.id],
+                        None => vec![format!("file:{f}")],
+                    });
+                }
+            }
+        }
+        if let Some(ids) = name_to_ids.get(s) {
+            if !ids.is_empty() {
+                return Ok(ids.clone());
+            }
+        }
+        if known_files.contains(s) {
+            return Ok(vec![format!("file:{s}")]);
+        }
+        Ok(Vec::new())
+    }
+
+    /// V15 Feature 2: the architecture overview — god nodes (highest-degree
+    /// hubs), subsystems (file communities via deterministic label propagation),
+    /// and surprising edges (edges crossing subsystem boundaries). Pure topology,
+    /// computed on demand from a handful of scans of the warm index; no LLM, no
+    /// embeddings. `max_communities`/`min_size` bound the subsystem report;
+    /// `max_rows` bounds god nodes and surprising edges.
+    pub fn architecture(
+        &self,
+        max_communities: usize,
+        min_size: usize,
+        max_rows: usize,
+    ) -> AppResult<ArchReport> {
+        // Symbol tables.
+        let sym_rows = self.run(
+            "?[id, name, kind, file, start_line] := *symbol{id, name, kind, file, start_line}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut sym_file: HashMap<String, String> = HashMap::new(); // id → file
+        let mut name_files: HashMap<String, Vec<String>> = HashMap::new(); // name → files
+        for r in &sym_rows.rows {
+            let id = cell_str(r, 0);
+            let name = cell_str(r, 1);
+            let file = cell_str(r, 3);
+            sym_file.insert(id, file.clone());
+            name_files.entry(name).or_default().push(file);
+        }
+
+        // File langs (for import resolution).
+        let file_rows = self.run(
+            "?[path, lang] := *file{path, lang}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut file_lang: HashMap<String, String> = HashMap::new();
+        let mut known_files: HashSet<String> = HashSet::new();
+        for r in &file_rows.rows {
+            let path = cell_str(r, 0);
+            file_lang.insert(path.clone(), cell_str(r, 1));
+            known_files.insert(path);
+        }
+
+        // Undirected file-level adjacency + a representative edge kind per pair,
+        // built from call edges (caller file ↔ callee file) and resolved imports.
+        let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut pair_kind: HashMap<(String, String), &'static str> = HashMap::new();
+        let mut link = |a: &str, b: &str, kind: &'static str,
+                        adj: &mut HashMap<String, HashSet<String>>,
+                        pair_kind: &mut HashMap<(String, String), &'static str>| {
+            if a == b {
+                return;
+            }
+            adj.entry(a.to_string()).or_default().insert(b.to_string());
+            adj.entry(b.to_string()).or_default().insert(a.to_string());
+            let key = if a < b { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) };
+            // Prefer to remember an import link over a call link when both exist.
+            pair_kind.entry(key).and_modify(|k| { if kind == "import" { *k = "import"; } }).or_insert(kind);
+        };
+
+        // Call edges → caller file ↔ each callee-name's file(s). Also inbound
+        // call counts per callee name (feeds god nodes).
+        let call_rows = self.run(
+            r#"?[src, dst] := *edge{kind: k, src, dst}, k == "call""#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut inbound_calls: HashMap<String, u64> = HashMap::new();
+        for r in &call_rows.rows {
+            let src = cell_str(r, 0);
+            let dst = cell_str(r, 1);
+            *inbound_calls.entry(dst.clone()).or_default() += 1;
+            let Some(caller_file) = sym_file.get(&src) else { continue };
+            if let Some(files) = name_files.get(&dst) {
+                for cf in files {
+                    link(caller_file, cf, "call", &mut adj, &mut pair_kind);
+                }
+            }
+        }
+
+        // Import edges → file ↔ resolved-target file.
+        let import_rows = self.run(
+            r#"?[src, dst] := *edge{kind: k, src, dst}, k == "import""#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        for r in &import_rows.rows {
+            let from_file = cell_str(r, 0);
+            let module = cell_str(r, 1);
+            let lang = Lang::from_tag(file_lang.get(&from_file).map(|s| s.as_str()).unwrap_or(""));
+            if let Some(target) = resolve_import(lang, &from_file, &module, &known_files) {
+                link(&from_file, &target, "import", &mut adj, &mut pair_kind);
+            }
+        }
+
+        // ── Label propagation (deterministic, id-sorted, bounded) ──
+        let mut files: Vec<String> = adj.keys().cloned().collect();
+        files.sort();
+        let mut label: HashMap<String, String> = files.iter().map(|f| (f.clone(), f.clone())).collect();
+        const MAX_ITERS: usize = 20;
+        for _ in 0..MAX_ITERS {
+            let mut changed = false;
+            for f in &files {
+                let Some(nbrs) = adj.get(f) else { continue };
+                if nbrs.is_empty() {
+                    continue;
+                }
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for n in nbrs {
+                    if let Some(l) = label.get(n) {
+                        *counts.entry(l.as_str()).or_default() += 1;
+                    }
+                }
+                // Most frequent neighbor label; ties → lexicographically smallest
+                // label, so the pass is deterministic run to run.
+                if let Some(best) = counts
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                    .map(|(l, _)| l.to_string())
+                {
+                    if label.get(f) != Some(&best) {
+                        label.insert(f.clone(), best);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Group into communities.
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for f in &files {
+            if let Some(l) = label.get(f) {
+                groups.entry(l.clone()).or_default().push(f.clone());
+            }
+        }
+        // File centrality → hub selection + a score map.
+        let centrality: HashMap<String, u64> =
+            self.file_centrality(usize::MAX).unwrap_or_default().into_iter().collect();
+
+        let mut communities: Vec<Vec<String>> = groups
+            .into_values()
+            .filter(|g| g.len() >= min_size.max(1))
+            .collect();
+        // Biggest first; tie-break by first (sorted) member for determinism.
+        for g in &mut communities {
+            g.sort();
+        }
+        communities.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0])));
+        communities.truncate(max_communities.max(1));
+
+        // Name each community + map file → community name (for surprising edges).
+        let mut file_comm: HashMap<String, String> = HashMap::new();
+        let mut subsystems: Vec<Subsystem> = Vec::new();
+        for members in &communities {
+            let name = community_name(members);
+            let hub = members
+                .iter()
+                .max_by(|a, b| {
+                    centrality.get(*a).copied().unwrap_or(0)
+                        .cmp(&centrality.get(*b).copied().unwrap_or(0))
+                        .then_with(|| b.cmp(a))
+                })
+                .cloned()
+                .unwrap_or_default();
+            for f in members {
+                file_comm.insert(f.clone(), name.clone());
+            }
+            subsystems.push(Subsystem {
+                name,
+                size: members.len(),
+                files: members.iter().take(6).cloned().collect(),
+                hub,
+            });
+        }
+
+        // Surprising edges: file-pairs whose endpoints are in different reported
+        // communities, ranked by how rare cross-links are between that community
+        // pair (fewer crossings = more surprising).
+        let mut cross_count: HashMap<(String, String), usize> = HashMap::new();
+        let mut candidates: Vec<((String, String), &'static str, String, String)> = Vec::new();
+        for ((a, b), kind) in &pair_kind {
+            let (Some(ca), Some(cb)) = (file_comm.get(a), file_comm.get(b)) else { continue };
+            if ca == cb {
+                continue;
+            }
+            let cpair = if ca < cb { (ca.clone(), cb.clone()) } else { (cb.clone(), ca.clone()) };
+            *cross_count.entry(cpair).or_default() += 1;
+            candidates.push(((a.clone(), b.clone()), kind, ca.clone(), cb.clone()));
+        }
+        candidates.sort_by(|x, y| {
+            let cx = {
+                let k = if x.2 < x.3 { (x.2.clone(), x.3.clone()) } else { (x.3.clone(), x.2.clone()) };
+                cross_count.get(&k).copied().unwrap_or(0)
+            };
+            let cy = {
+                let k = if y.2 < y.3 { (y.2.clone(), y.3.clone()) } else { (y.3.clone(), y.2.clone()) };
+                cross_count.get(&k).copied().unwrap_or(0)
+            };
+            cx.cmp(&cy).then_with(|| x.0.cmp(&y.0))
+        });
+        let surprising: Vec<SurprisingEdge> = candidates
+            .into_iter()
+            .take(max_rows)
+            .map(|((from, to), kind, cf, ct)| SurprisingEdge {
+                from,
+                to,
+                kind: kind.to_string(),
+                from_subsystem: cf,
+                to_subsystem: ct,
+            })
+            .collect();
+
+        // God nodes: top symbols by inbound call count + top files by centrality,
+        // merged and ranked by degree.
+        let mut god: Vec<GodNode> = Vec::new();
+        let mut sym_deg: Vec<(String, u64)> = inbound_calls.into_iter().collect();
+        sym_deg.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (name, deg) in sym_deg.iter().take(max_rows) {
+            // Represent by the first definition of the name.
+            if let Some(sym) = self.find_symbol(name)?.into_iter().next() {
+                god.push(GodNode {
+                    id: sym.id,
+                    label: name.clone(),
+                    file: sym.file,
+                    kind: sym.kind,
+                    degree: *deg,
+                });
+            }
+        }
+        for (file, deg) in self.file_centrality(max_rows)? {
+            god.push(GodNode {
+                id: format!("file:{file}"),
+                label: file.clone(),
+                file,
+                kind: "file".to_string(),
+                degree: deg,
+            });
+        }
+        god.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.label.cmp(&b.label)));
+        god.truncate(max_rows);
+
+        Ok(ArchReport { god_nodes: god, subsystems, surprising })
     }
 
     /// V12 Phase C: the **candidate** tests that (transitively) depend on one
@@ -3200,6 +3811,32 @@ fn is_entrypoint_name(name: &str) -> bool {
     )
 }
 
+/// Derive a subsystem name (V15 Feature 2) from its member files: the longest
+/// common path-segment DIRECTORY prefix (e.g. `src/graph/`), falling back to the
+/// shortest member path when the files share no common directory.
+fn community_name(files: &[String]) -> String {
+    if files.is_empty() {
+        return "misc".to_string();
+    }
+    let split: Vec<Vec<&str>> = files.iter().map(|f| f.split('/').collect()).collect();
+    let min_len = split.iter().map(|s| s.len()).min().unwrap_or(0);
+    let mut prefix: Vec<&str> = Vec::new();
+    // Stop before the last segment of the shortest path (that's a filename, not
+    // a directory), so the name is always a real containing directory.
+    for i in 0..min_len.saturating_sub(1) {
+        let seg = split[0][i];
+        if split.iter().all(|s| s[i] == seg) {
+            prefix.push(seg);
+        } else {
+            break;
+        }
+    }
+    if !prefix.is_empty() {
+        return format!("{}/", prefix.join("/"));
+    }
+    files.iter().min_by_key(|f| f.len()).cloned().unwrap_or_default()
+}
+
 /// Best-effort resolution of an import's raw module string to a concrete indexed
 /// file, per language. Returns `None` (dropped by the cycle detector) for
 /// external/unresolvable modules or languages without a resolver. Paths are
@@ -3450,6 +4087,56 @@ pub struct Point { x: i32 }
         assert!(stats.symbols >= 3);
         assert!(stats.edges >= 1);
 
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shortest_path_traces_cross_file_call_chain() {
+        let dir = std::env::temp_dir().join(format!("ckg-path-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/a.rs", "pub fn a() { b(); }\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/b.rs", "pub fn b() { c(); }\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/c.rs", "pub fn c() {}\n", Lang::Rust)).unwrap();
+
+        let kinds = [EdgeKind::Call, EdgeKind::Import, EdgeKind::Contains];
+        let hit = idx.shortest_path("a", "c", &kinds, 8, false).unwrap().expect("path a→c");
+        let labels: Vec<&str> = hit.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(labels, vec!["a", "b", "c"]);
+        assert_eq!(hit.hops, 2);
+        // Cross-file calls resolve name-only → each hop is Inferred.
+        assert_eq!(hit.nodes[0].edge_to_next.as_deref(), Some("call"));
+        assert_eq!(hit.nodes[0].confidence, Some(Confidence::Inferred));
+        assert_eq!(hit.equal_alternatives, 0);
+
+        // Directed: no reverse path within bound; symmetric finds it.
+        assert!(idx.shortest_path("c", "a", &kinds, 8, false).unwrap().is_none());
+        assert!(idx.shortest_path("c", "a", &kinds, 8, true).unwrap().is_some());
+        // Unresolvable endpoint → None.
+        assert!(idx.shortest_path("a", "nope", &kinds, 8, false).unwrap().is_none());
+        // Bound too small → None.
+        assert!(idx.shortest_path("a", "c", &kinds, 1, false).unwrap().is_none());
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn architecture_groups_files_by_directory_prefix() {
+        let dir = std::env::temp_dir().join(format!("ckg-arch-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // Two cohesive directories, each internally coupled, with no cross edges.
+        idx.index_file_graph(&parse_file("src/graph/a.rs", "pub fn ga() { gb(); }\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/graph/b.rs", "pub fn gb() { ga(); }\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/ui/x.rs", "pub fn ux() { uy(); }\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/ui/y.rs", "pub fn uy() { ux(); }\n", Lang::Rust)).unwrap();
+
+        let report = idx.architecture(12, 2, 50).expect("arch");
+        assert!(!report.god_nodes.is_empty(), "expected hubs");
+        let names: Vec<&str> = report.subsystems.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.iter().any(|n| n.contains("src/graph")), "communities: {names:?}");
+        assert!(names.iter().any(|n| n.contains("src/ui")), "communities: {names:?}");
+        // Determinism: a second run yields the identical report.
+        assert_eq!(idx.architecture(12, 2, 50).expect("arch2"), report);
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }

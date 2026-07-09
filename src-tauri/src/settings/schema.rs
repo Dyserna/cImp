@@ -1150,6 +1150,22 @@ pub struct GraphSettings {
     /// section when the counts changed. On by default — unlike the other
     /// Phase F toggles this doesn't change agent behavior, only a UI badge.
     pub analyses_auto: bool,
+    /// V15 Feature 1: hop bound for `graph_path` shortest-path tracing — how far
+    /// the BFS explores before giving up. Clamped 1–32 at the tool boundary.
+    pub path_max_hops: u32,
+    /// V15 Feature 2: max subsystems (file communities) `graph_architecture`
+    /// reports, biggest first.
+    pub arch_max_communities: u32,
+    /// V15 Feature 2: ignore communities smaller than this in the architecture
+    /// report (singletons/pairs are noise, not subsystems).
+    pub arch_min_community_size: u32,
+    /// V15 Feature 4 (STRETCH): master toggle for the reserved **Graph View**
+    /// tab (2D/3D live force-graph). Off by default — it's the human-facing
+    /// visual, not on any agent path.
+    pub graph_viz: bool,
+    /// V15 Feature 4: cap on the rendered subgraph node count so large repos
+    /// stay smooth (the view is bounded orientation, never the whole graph).
+    pub graph_viz_max_nodes: u32,
 }
 
 impl GraphSettings {
@@ -1216,6 +1232,11 @@ impl Default for GraphSettings {
             auto_check_debounce_s: 5,
             auto_impact_min_dependents: 10,
             analyses_auto: true,
+            path_max_hops: 8,
+            arch_max_communities: 12,
+            arch_min_community_size: 3,
+            graph_viz: false,
+            graph_viz_max_nodes: 1500,
         }
     }
 }

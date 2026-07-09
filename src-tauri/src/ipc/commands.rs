@@ -1210,6 +1210,154 @@ pub async fn graph_impact(
     })
 }
 
+// ── V15 Feature 1: path tracing ──────────────────────────────────────────
+
+/// One node on a traced path, serialized for the Code Intelligence tab.
+#[derive(serde::Serialize)]
+pub struct PathNodeRow {
+    pub id: String,
+    pub label: String,
+    pub file: String,
+    pub line: u32,
+    pub kind: String,
+    pub edge_to_next: Option<String>,
+    pub confidence: Option<String>,
+}
+
+/// The result of a `graph_path` trace. `found=false` means no path within the
+/// hop bound (or an unresolvable endpoint).
+#[derive(serde::Serialize)]
+pub struct PathResult {
+    pub found: bool,
+    pub nodes: Vec<PathNodeRow>,
+    pub hops: usize,
+    pub equal_alternatives: u64,
+}
+
+fn parse_path_kinds(kinds: Option<Vec<String>>) -> Vec<crate::graph::EdgeKind> {
+    use crate::graph::EdgeKind;
+    let all = || vec![EdgeKind::Call, EdgeKind::Import, EdgeKind::Contains];
+    let Some(ks) = kinds else { return all() };
+    let mut out = Vec::new();
+    for k in ks {
+        match k.trim().to_ascii_lowercase().as_str() {
+            "call" => out.push(EdgeKind::Call),
+            "import" => out.push(EdgeKind::Import),
+            "contains" => out.push(EdgeKind::Contains),
+            _ => {}
+        }
+    }
+    if out.is_empty() { all() } else { out }
+}
+
+/// V15 Feature 1 (Architecture): trace the shortest path between two entities
+/// through the call/import/containment graph. `root` defaults to the launch
+/// directory.
+#[tauri::command]
+pub async fn graph_path(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    from: String,
+    to: String,
+    kinds: Option<Vec<String>>,
+    symmetric: Option<bool>,
+) -> AppResult<PathResult> {
+    let root = resolve_graph_root(root)?;
+    let kinds = parse_path_kinds(kinds);
+    let hit = service.shortest_path(&root, from.trim(), to.trim(), &kinds, symmetric.unwrap_or(false))?;
+    Ok(match hit {
+        Some(h) => PathResult {
+            found: true,
+            nodes: h
+                .nodes
+                .into_iter()
+                .map(|n| PathNodeRow {
+                    id: n.id,
+                    label: n.label,
+                    file: n.file,
+                    line: n.line,
+                    kind: n.kind,
+                    edge_to_next: n.edge_to_next,
+                    confidence: n.confidence.map(|c| c.tag().to_string()),
+                })
+                .collect(),
+            hops: h.hops,
+            equal_alternatives: h.equal_alternatives,
+        },
+        None => PathResult { found: false, nodes: Vec::new(), hops: 0, equal_alternatives: 0 },
+    })
+}
+
+// ── V15 Feature 2: architecture overview ─────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct GodNodeRow {
+    pub id: String,
+    pub label: String,
+    pub file: String,
+    pub kind: String,
+    pub degree: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct SubsystemRow {
+    pub name: String,
+    pub size: usize,
+    pub files: Vec<String>,
+    pub hub: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct SurprisingRow {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub from_subsystem: String,
+    pub to_subsystem: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ArchResult {
+    pub god_nodes: Vec<GodNodeRow>,
+    pub subsystems: Vec<SubsystemRow>,
+    pub surprising: Vec<SurprisingRow>,
+}
+
+/// V15 Feature 2 (Architecture): the system-shape overview — god nodes,
+/// subsystems, and surprising cross-subsystem edges. `root` defaults to the
+/// launch directory.
+#[tauri::command]
+pub async fn graph_architecture(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<ArchResult> {
+    let root = resolve_graph_root(root)?;
+    let r = service.architecture(&root)?;
+    Ok(ArchResult {
+        god_nodes: r
+            .god_nodes
+            .into_iter()
+            .map(|g| GodNodeRow { id: g.id, label: g.label, file: g.file, kind: g.kind, degree: g.degree })
+            .collect(),
+        subsystems: r
+            .subsystems
+            .into_iter()
+            .map(|s| SubsystemRow { name: s.name, size: s.size, files: s.files, hub: s.hub })
+            .collect(),
+        surprising: r
+            .surprising
+            .into_iter()
+            .map(|e| SurprisingRow {
+                from: e.from,
+                to: e.to,
+                kind: e.kind,
+                from_subsystem: e.from_subsystem,
+                to_subsystem: e.to_subsystem,
+            })
+            .collect(),
+    })
+}
+
 /// V10 (Memory): the project's session/action memory — current session, its
 /// working set, notes (pinned + current-session), and the recent-sessions list.
 /// `root` defaults to the launch directory.

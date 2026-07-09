@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use super::index::{DocHit, GraphIndex, RefHit, SymbolHit};
+use super::index::{ArchReport, DocHit, GraphIndex, PathHit, RefHit, SymbolHit};
 use super::memory::{MemNote, ProjectFact, WorkingSetEntry};
+use super::model::EdgeKind;
 
 /// One graph tool's identity, description, and JSON-Schema parameters — the
 /// shared definition both surfaces render into their own shape.
@@ -155,6 +156,39 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
             }),
         },
         GraphToolSpec {
+            name: "graph_path",
+            description: "How is A connected to B? Traces the SHORTEST path between two code \
+                entities through the graph's call/import/containment edges — e.g. 'auth handler → \
+                service → repository → connection pool'. Prefer this over grep for 'how does X talk \
+                to Y' / 'what connects X and Y'. `from`/`to` accept a symbol name, `file:line`, or a \
+                file path. Each hop shows the edge kind and its confidence. Optional `kinds` \
+                (comma-separated subset of call,import,contains) restricts the edge types; \
+                `symmetric: true` walks edges undirected ('are these related at all?'); `max_hops` \
+                bounds the search. Reports plainly when there's no path — it won't invent a link.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Start entity: a symbol name, `file:line`, or a file path." },
+                    "to": { "type": "string", "description": "End entity: a symbol name, `file:line`, or a file path." },
+                    "kinds": { "type": "string", "description": "Comma-separated edge kinds to traverse (subset of call,import,contains). Default: all three." },
+                    "max_hops": { "type": "integer", "description": "Maximum hops to search (default from settings, clamped 1-32)." },
+                    "symmetric": { "type": "boolean", "description": "Walk edges undirected for a plain 'are these related' question. Default false (directed call/import flow)." }
+                },
+                "required": ["from", "to"]
+            }),
+        },
+        GraphToolSpec {
+            name: "graph_architecture",
+            description: "A once-per-project, at-a-glance map of the system's shape — for orienting \
+                in an unfamiliar codebase. Reports GOD NODES (the highest-degree hub symbols/files \
+                everything flows through), SUBSYSTEMS (cohesive file communities, each with a \
+                derived name), and SURPRISING CONNECTIONS (edges crossing subsystem boundaries — \
+                candidate accidental coupling). Topology only: no LLM, no embeddings. HEURISTIC \
+                clustering (label propagation) — treat subsystem boundaries as advisory, not \
+                authoritative. Takes no arguments.",
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        GraphToolSpec {
             name: "graph_impact",
             description: "Blast-radius / impact analysis: what could this change break? With no \
                 `symbols`, analyzes the CURRENT WORKING-TREE DIFF vs HEAD — maps changed line \
@@ -169,7 +203,8 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
                 "properties": {
                     "symbols": { "type": "string", "description": "Comma/space-separated symbol names to use as roots instead of the working-tree diff." },
                     "depth": { "type": "integer", "description": "Max hops to traverse from a changed symbol (default 3, clamped 1-6)." },
-                    "include_tests": { "type": "boolean", "description": "Append a candidate affected-tests block (file:line · name) below the dependent report. Default false." }
+                    "include_tests": { "type": "boolean", "description": "Append a candidate affected-tests block (file:line · name) below the dependent report. Default false." },
+                    "min_confidence": { "type": "string", "enum": ["extracted", "inferred", "ambiguous"], "description": "Keep only dependents at least this certain (extracted > inferred > ambiguous). Default: include all; the summary always reports the split." }
                 },
                 "required": []
             }),
@@ -400,6 +435,10 @@ pub(crate) async fn dispatch_recorded(
         run_impact(root, idx, args, max_rows)
     } else if name == "graph_tests_for" {
         run_tests_for(idx, args, max_rows)
+    } else if name == "graph_path" {
+        run_path(idx, settings, args)
+    } else if name == "graph_architecture" {
+        run_architecture(idx, settings, args, max_rows)
     } else {
         run_tool(idx, name, args, max_rows, max_snippet, mem_agent(source))
     };
@@ -432,6 +471,7 @@ fn arg_summary(name: &str, args: &Value) -> String {
         "graph_search_docs" | "graph_semantic_docs" | "graph_semantic_code" | "graph_struct_search" => "query",
         "context_note" => "text",
         "graph_impact" => "symbols",
+        "graph_path" => "from",
         _ => "name",
     };
     args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
@@ -1472,6 +1512,148 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
     }
 
     Ok(out)
+}
+
+/// Parse the optional `kinds` argument (a comma/space list) into an edge-kind
+/// set for path tracing; an empty/absent value means all three code edge kinds.
+fn parse_edge_kinds(s: Option<&str>) -> Result<Vec<EdgeKind>, String> {
+    let all = || vec![EdgeKind::Call, EdgeKind::Import, EdgeKind::Contains];
+    let Some(s) = s.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(all());
+    };
+    let mut out = Vec::new();
+    for tok in s.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
+        match tok.to_ascii_lowercase().as_str() {
+            "call" | "calls" => out.push(EdgeKind::Call),
+            "import" | "imports" => out.push(EdgeKind::Import),
+            "contains" | "containment" => out.push(EdgeKind::Contains),
+            other => {
+                return Err(format!(
+                    "graph_path `kinds` has unknown edge kind `{other}` (use call, import, contains)"
+                ))
+            }
+        }
+    }
+    Ok(if out.is_empty() { all() } else { out })
+}
+
+/// Execute `graph_path` (V15 Feature 1): trace the shortest connection between
+/// two entities. `max_hops` defaults to the configured `path_max_hops`.
+fn run_path(idx: &GraphIndex, settings: &crate::settings::Settings, args: &Value) -> Result<String, String> {
+    let from = require_str(args, "graph_path", "from")?;
+    let to = require_str(args, "graph_path", "to")?;
+    let kinds = parse_edge_kinds(args.get("kinds").and_then(|v| v.as_str()))?;
+    let symmetric = args.get("symmetric").and_then(|v| v.as_bool()).unwrap_or(false);
+    let default_hops = settings.graph.path_max_hops.max(1) as usize;
+    let max_hops = args
+        .get("max_hops")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(default_hops)
+        .clamp(1, 32);
+    match idx.shortest_path(&from, &to, &kinds, max_hops, symmetric).map_err(|e| e.to_string())? {
+        Some(hit) => Ok(fmt_path(&from, &to, &hit)),
+        None => Ok(format!(
+            "No path from `{from}` to `{to}` within {max_hops} hops (or an endpoint isn't indexed)."
+        )),
+    }
+}
+
+/// Render a traced path as a breadcrumb chain, one node per line, each arrow
+/// labelled with the edge kind and its confidence, then a summary line.
+fn fmt_path(from: &str, to: &str, hit: &PathHit) -> String {
+    if hit.nodes.is_empty() {
+        return format!("No path from `{from}` to `{to}`.");
+    }
+    let loc = |n: &super::index::PathNode| {
+        if n.kind == "file" {
+            format!("{} [file]", n.file)
+        } else {
+            format!("{} ({}:{}) [{}]", n.label, n.file, n.line, n.kind)
+        }
+    };
+    let mut lines: Vec<String> = Vec::with_capacity(hit.nodes.len());
+    for (i, n) in hit.nodes.iter().enumerate() {
+        if i == 0 {
+            lines.push(loc(n));
+        } else {
+            let prev = &hit.nodes[i - 1];
+            let k = prev.edge_to_next.as_deref().unwrap_or("?");
+            let cb = prev.confidence.map(|c| format!(" [{}]", c.tag())).unwrap_or_default();
+            lines.push(format!("  ──{k}{cb}──▶ {}", loc(n)));
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push_str(&format!("\n\n{} hop{}", hit.hops, if hit.hops == 1 { "" } else { "s" }));
+    if hit.equal_alternatives > 0 {
+        out.push_str(&format!(
+            " (+{} other path{} of equal length)",
+            hit.equal_alternatives,
+            if hit.equal_alternatives == 1 { "" } else { "s" }
+        ));
+    }
+    out.push('.');
+    out
+}
+
+/// Execute `graph_architecture` (V15 Feature 2): the system-shape overview.
+fn run_architecture(
+    idx: &GraphIndex,
+    settings: &crate::settings::Settings,
+    _args: &Value,
+    max_rows: usize,
+) -> Result<String, String> {
+    let report = idx
+        .architecture(
+            settings.graph.arch_max_communities as usize,
+            settings.graph.arch_min_community_size as usize,
+            max_rows,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(fmt_architecture(&report, max_rows))
+}
+
+/// Render an [`ArchReport`] as three compact sections.
+fn fmt_architecture(r: &ArchReport, max_rows: usize) -> String {
+    if r.god_nodes.is_empty() && r.subsystems.is_empty() {
+        return "Not enough indexed structure to map yet — index the project first.".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("## God nodes — hubs the system flows through\n");
+    if r.god_nodes.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for g in r.god_nodes.iter().take(max_rows) {
+            out.push_str(&format!("{} ({}) — {} · degree {}\n", g.label, g.kind, g.file, g.degree));
+        }
+    }
+    out.push_str("\n## Subsystems — heuristic file communities (advisory, not authoritative)\n");
+    if r.subsystems.is_empty() {
+        out.push_str("Single cohesive module — no distinct subsystems detected.\n");
+    } else {
+        for s in &r.subsystems {
+            out.push_str(&format!(
+                "• {} — {} file{} · hub {}\n   {}\n",
+                s.name,
+                s.size,
+                if s.size == 1 { "" } else { "s" },
+                s.hub,
+                s.files.join(", ")
+            ));
+        }
+    }
+    out.push_str("\n## Surprising connections — cross-subsystem edges (candidate accidental coupling; verify before acting)\n");
+    if r.surprising.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for e in r.surprising.iter().take(max_rows) {
+            out.push_str(&format!(
+                "{} ✗ {} — {} ──{}──▶ {}\n",
+                e.from_subsystem, e.to_subsystem, e.from, e.kind, e.to
+            ));
+        }
+    }
+    out
 }
 
 /// Execute `graph_tests_for` (V12 Phase C): resolve the root symbol name(s) —

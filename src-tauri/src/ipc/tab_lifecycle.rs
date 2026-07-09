@@ -1440,6 +1440,13 @@ async fn remove_ai_builtin_tab(
         warn!(?tab, error = %e, "set_enabled_ai_tabs: scrollback delete failed");
     }
 
+    // Drop the tab's typed-input echo buffer, mirroring `close_tab` — without
+    // this, disabling an AI tab via the Settings checkbox leaves its
+    // `user_input_buf` entry behind.
+    if let Ok(mut buf) = state.user_input_buf.lock() {
+        buf.remove(&tab);
+    }
+
     state.settings.mutate(|snap| {
         snap.tabs.retain(|t| t.id() != tab.as_str());
         if snap.session.active_tab_id.as_deref() == Some(tab.as_str()) {

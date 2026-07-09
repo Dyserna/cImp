@@ -206,6 +206,24 @@ impl TabRegistry {
         let Some(idx) = self.tab_order.iter().position(|t| t == tab) else {
             return false;
         };
+        // If we're removing the currently-active tab, repoint `active` to a
+        // surviving neighbor (left, else right) BEFORE dropping it, so
+        // `active()` can never return a removed id. `close_tab` already
+        // switches active away first (this branch is then a no-op), but
+        // `set_enabled_ai_tabs` does its active-switch and removal under
+        // separate lock acquisitions, so a concurrent `tab_activate` can leave
+        // `active` pointing at a to-be-removed tab. This backstop keeps the
+        // "active is always a live tab" invariant regardless of caller.
+        if self.active == *tab {
+            let neighbor = if idx > 0 {
+                self.tab_order.get(idx - 1).cloned()
+            } else {
+                self.tab_order.get(idx + 1).cloned()
+            };
+            if let Some(target) = neighbor {
+                self.active = target;
+            }
+        }
         self.tab_order.remove(idx);
         if let Some(manager) = self.managers.remove(tab) {
             if let Err(e) = manager.shutdown().await {

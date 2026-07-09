@@ -74,7 +74,16 @@ pub async fn pty_start(
     // stalls every other registry-touching command (pty_write, pty_resize,
     // tab_activate, …) behind disk latency / AV scans. Re-acquire only for the
     // seed, which does touch the registry.
-    let restored = crate::pty::scrollback::read(&tab);
+    // `scrollback::read` is a synchronous `fs::read` of the whole file; run it
+    // on the blocking pool so a large scrollback under slow / AV-scanned disk
+    // doesn't stall other IPC futures on this tokio worker (mirrors
+    // `get_system_stats`). Re-acquire the registry lock only for the seed.
+    let restored = {
+        let tab_for_read = tab.clone();
+        tauri::async_runtime::spawn_blocking(move || crate::pty::scrollback::read(&tab_for_read))
+            .await
+            .map_err(|e| AppError::Pty(format!("scrollback read join: {e}")))?
+    };
     if let Some(bytes) = &restored {
         let registry = state.tabs.lock().await;
         match registry.seed_scrollback(&tab, bytes).await {
@@ -1911,12 +1920,18 @@ pub async fn graph_set_language_enabled(
     if crate::graph::Lang::from_tag(&tag) == crate::graph::Lang::Other {
         return Err(AppError::Settings(format!("unsupported graph language: {lang}")));
     }
+    // Skip the mutate + full rebuild when the desired state already holds
+    // (re-enabling an already-present language, or disabling an absent one).
+    // A redundant rebuild re-indexes/re-embeds the whole project for nothing.
+    let already = state.settings.current().graph.languages.iter().any(|l| l == &tag);
+    if enabled == already {
+        return Ok(());
+    }
     state.settings.mutate(move |cur| {
         let langs = &mut cur.graph.languages;
-        let present = langs.iter().any(|l| l == &tag);
-        if enabled && !present {
+        if enabled {
             langs.push(tag);
-        } else if !enabled {
+        } else {
             langs.retain(|l| l != &tag);
         }
     });

@@ -13,6 +13,7 @@
   import ConfigureTabDialog from './lib/dialog/ConfigureTabDialog.svelte';
   import SaveLayoutDialog from './lib/dialog/SaveLayoutDialog.svelte';
   import ManagePresetsDialog from './lib/dialog/ManagePresetsDialog.svelte';
+  import RestoreCheckpointDialog from './lib/dialog/RestoreCheckpointDialog.svelte';
   import Toast from './lib/Toast.svelte';
   import DragGhost from './lib/dnd/DragGhost.svelte';
   import DropZoneOverlay from './lib/dnd/DropZoneOverlay.svelte';
@@ -451,6 +452,7 @@
   <ConfigureTabDialog />
   <SaveLayoutDialog />
   <ManagePresetsDialog />
+  <RestoreCheckpointDialog />
   <Toast />
 </main>
 

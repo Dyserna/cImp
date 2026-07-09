@@ -215,7 +215,14 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         // one `hooks` object — each entry is installed only when its gate is on.
         {
             let mut hooks = serde_json::Map::new();
-            if settings.graph.enabled && settings.graph.context_injection {
+            // V13 Phase C: widened from `context_injection` alone so the
+            // prompt-tap checkpoint trigger (`workbench::on_prompt`, called
+            // from the `/context/retrieve` handler BEFORE its own injection
+            // gate) still runs when the user wants checkpoints but has
+            // injection off — the milestone's Decision 4. The retrieve
+            // handler's own *injection* gate is unaffected by this; it stays
+            // on `context_injection` alone.
+            if settings.graph.enabled && (settings.graph.context_injection || settings.workbench.checkpoints) {
                 if let Some(command) = crate::statusline::context_hook_command() {
                     hooks.insert(
                         "UserPromptSubmit".to_string(),
@@ -224,16 +231,19 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
                         ] } ]),
                     );
                 }
-                // V11 Phase D: PreCompact — carry the working set through a compaction.
-                if settings.graph.compaction_context {
-                    if let Some(command) = crate::statusline::hook_command("--precompact-hook") {
-                        hooks.insert(
-                            "PreCompact".to_string(),
-                            serde_json::json!([ { "hooks": [
-                                { "type": "command", "command": command, "timeout": 5 }
-                            ] } ]),
-                        );
-                    }
+            }
+            // V11 Phase D: PreCompact — carry the working set through a
+            // compaction. Kept on its own narrower condition (still requires
+            // injection, unlike the widened UserPromptSubmit hook above) —
+            // compaction survival is meaningless without injection to feed.
+            if settings.graph.enabled && settings.graph.context_injection && settings.graph.compaction_context {
+                if let Some(command) = crate::statusline::hook_command("--precompact-hook") {
+                    hooks.insert(
+                        "PreCompact".to_string(),
+                        serde_json::json!([ { "hooks": [
+                            { "type": "command", "command": command, "timeout": 5 }
+                        ] } ]),
+                    );
                 }
             }
             // V11 Phase E: PreToolUse read advisor (opt-in; independent of the
@@ -550,19 +560,22 @@ const CIMP_AUTO_CHECK_ENABLED = {auto_check};
 const CIMP_EDIT_TOOLS = new Set(["edit", "write", "patch"]);
 
 export default async (input) => ({{
+  // V13 Phase C: this POST always fires (not gated on CIMP_INJECT_ENABLED)
+  // so the app-side prompt-tap checkpoint trigger sees every prompt even
+  // when injection is off — only APPLYING the returned text to the draft is
+  // gated. Mirrors the Claude `--context-hook` shim, which always POSTs too.
   "chat.message": async (inp, out) => {{
-    if (!CIMP_INJECT_ENABLED) return;
     const p = out.parts.find((x) => x.type === "text");
     if (!p || !p.text) return;
     try {{
       const r = await fetch(CIMP_LOOPBACK + "/context/retrieve", {{
         method: "POST",
         headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
-        body: JSON.stringify({{ cwd: input.directory, prompt: p.text, session_id: inp.sessionID }}),
+        body: JSON.stringify({{ cwd: input.directory, prompt: p.text, session_id: inp.sessionID, agent: "opencode" }}),
         signal: AbortSignal.timeout(600),
       }});
       const j = await r.json();
-      if (j && j.ok && j.text) p.text += "\n\n" + j.text;
+      if (CIMP_INJECT_ENABLED && j && j.ok && j.text) p.text += "\n\n" + j.text;
     }} catch (_e) {{}}
   }},
   "tool.execute.after": async (inp) => {{
@@ -882,7 +895,42 @@ mod tests {
         settings.graph.enabled = true;
         settings.graph.context_injection = false;
         let args = build_pre_args(&claude_cfg(), &settings);
-        // Graph on but injection off + statusline off → no --settings overlay.
+        // Graph on but injection off + statusline off + checkpoints off →
+        // no --settings overlay.
+        assert!(settings_overlay(&args).is_none());
+    }
+
+    /// V13 Phase C: the UserPromptSubmit hook (the prompt-tap checkpoint
+    /// trigger's transport) must still install when `workbench.checkpoints`
+    /// is on, even with context injection off — the milestone's Decision 4.
+    #[test]
+    fn context_hook_overlay_installed_when_checkpoints_on_even_if_injection_off() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = false;
+        settings.workbench.checkpoints = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        let overlay = settings_overlay(&args).expect("overlay present");
+        let cmd = overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("hook command is a string");
+        assert!(cmd.ends_with(" --context-hook"), "got: {cmd}");
+        // PreCompact stays off — it's still gated on context_injection alone.
+        assert!(overlay["hooks"].get("PreCompact").is_none());
+    }
+
+    /// Checkpoints alone (graph off) must NOT install the hook — the
+    /// milestone's widened condition still requires `graph.enabled` (the
+    /// hook's own gate prefix is unchanged, only the injection/checkpoints
+    /// half was widened).
+    #[test]
+    fn no_context_hook_when_checkpoints_on_but_graph_disabled() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = false;
+        settings.workbench.checkpoints = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
         assert!(settings_overlay(&args).is_none());
     }
 
@@ -953,6 +1001,30 @@ mod tests {
         let off = opencode_plugin_source(1, "x", false, false);
         assert!(off.contains("CIMP_INJECT_ENABLED = false"));
         assert!(off.contains("CIMP_AUTO_CHECK_ENABLED = false"));
+    }
+
+    /// V13 Phase C: the `/context/retrieve` POST inside `chat.message` must
+    /// NOT be gated behind an early `if (!CIMP_INJECT_ENABLED) return`
+    /// (unlike the applying-the-text step) — the prompt-tap checkpoint
+    /// trigger needs every prompt to reach the app even when injection is
+    /// off. Also carries `agent: "opencode"` so the checkpoint it fires is
+    /// attributable.
+    #[test]
+    fn opencode_chat_message_posts_retrieve_even_when_injection_disabled() {
+        let js = opencode_plugin_source(1, "x", false, false);
+        assert!(js.contains(r#"agent: "opencode""#), "missing agent field: {js}");
+        // The fetch call must appear BEFORE any inject-gated early return —
+        // i.e. there is no `if (!CIMP_INJECT_ENABLED) return;` guarding the
+        // `chat.message` handler's body ahead of the fetch.
+        let chat_message_start = js.find("\"chat.message\"").expect("chat.message handler present");
+        let fetch_pos = js[chat_message_start..].find("fetch(CIMP_LOOPBACK").expect("fetch call present");
+        let between = &js[chat_message_start..chat_message_start + fetch_pos];
+        assert!(
+            !between.contains("if (!CIMP_INJECT_ENABLED) return"),
+            "the retrieve POST must not be gated on CIMP_INJECT_ENABLED: {between}"
+        );
+        // The gate DOES still apply to actually using the response text.
+        assert!(js.contains("CIMP_INJECT_ENABLED && j && j.ok && j.text"));
     }
 
     #[test]

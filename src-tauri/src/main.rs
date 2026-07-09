@@ -60,7 +60,8 @@ use crate::ipc::commands::{
     restart_shell_tab, set_active_tab, set_window_square_corners, settings_get, settings_update,
     stt_cancel, stt_list_input_devices, stt_list_models, stt_start_recording, stt_stop_recording,
     tab_activate, tts_speak, tts_set_paused, tts_speak_selection, tts_stop, tts_test,
-    workbench_diff_file, workbench_diff_summary, workbench_revert_hunk, workbench_send_hunk,
+    workbench_checkpoint_diff, workbench_checkpoint_now, workbench_checkpoints, workbench_diff_file,
+    workbench_diff_summary, workbench_restore, workbench_revert_hunk, workbench_send_hunk,
     workbench_status,
 };
 use crate::ipc::layout::{
@@ -706,6 +707,10 @@ fn main() {
             workbench_diff_file,
             workbench_revert_hunk,
             workbench_send_hunk,
+            workbench_checkpoints,
+            workbench_checkpoint_diff,
+            workbench_checkpoint_now,
+            workbench_restore,
             theming::themes_list,
             theming::palettes_list,
         ])

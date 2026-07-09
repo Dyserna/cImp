@@ -3,6 +3,7 @@
 // and worktrees (Phase D) add their own wrappers as they land.
 
 import { invoke } from '@tauri-apps/api/core';
+import { writable } from 'svelte/store';
 
 /// Mirror of Rust `workbench::WorkbenchStatus`. `git_available: false` implies
 /// `is_repo: false` (there's no point probing further without `git`).
@@ -108,4 +109,68 @@ export function workbenchRevertHunk(
 /// overlay's "Send to agent" action.
 export function workbenchSendHunk(path: string, hunkIndex: number, root?: string): Promise<string> {
   return invoke<string>('workbench_send_hunk', { root: root ?? null, path, hunkIndex });
+}
+
+// ── Phase C: checkpoints (shadow repo) ──────────────────────────────────
+
+/// Mirror of Rust `workbench::shadow::Trigger`.
+export type CheckpointTrigger = 'prompt' | 'burst' | 'manual' | 'pre-restore';
+
+/// Mirror of Rust `workbench::shadow::Checkpoint` — one Timeline row.
+export interface Checkpoint {
+  id: string;
+  seq: number;
+  commit: string;
+  /// ISO-8601 (from git's own commit date).
+  ts: string;
+  ts_unix: number;
+  label: string;
+  trigger: CheckpointTrigger;
+  agent: string | null;
+  files_changed: number;
+}
+
+/// Mirror of Rust `workbench::shadow::RestoreReport` — the
+/// `workbench_restore` result, used for the post-restore summary.
+export interface RestoreReport {
+  pre_restore_id: string;
+  changed: string[];
+  created_since: string[];
+  deleted: string[];
+}
+
+/// The Timeline section's row list, oldest first. Empty (not an error) when
+/// checkpoints have never run for `root`.
+export function workbenchCheckpoints(root?: string): Promise<Checkpoint[]> {
+  return invoke<Checkpoint[]>('workbench_checkpoints', { root: root ?? null });
+}
+
+/// Checkpoint `id` vs. the CURRENT working tree, parsed the same way
+/// `workbenchDiffFile` is — powers both the Timeline's "Diff vs now" viewer
+/// and the restore confirmation dialog's dry-run file list.
+export function workbenchCheckpointDiff(id: string, root?: string): Promise<FileDiff[]> {
+  return invoke<FileDiff[]>('workbench_checkpoint_diff', { root: root ?? null, id });
+}
+
+/// The manual "Checkpoint now" action. `label` defaults (backend side) to
+/// "manual checkpoint" when omitted.
+export function workbenchCheckpointNow(label?: string, root?: string): Promise<string> {
+  return invoke<string>('workbench_checkpoint_now', { root: root ?? null, label: label ?? null });
+}
+
+/// Restore the working tree to checkpoint `id`. `deleteNew` MUST default to
+/// `false` at every call site — the restore confirmation dialog's "delete
+/// files created since" checkbox starts unchecked (the dangerous case is
+/// silently losing untracked new work, never keeping it).
+export function workbenchRestore(id: string, deleteNew: boolean, root?: string): Promise<RestoreReport> {
+  return invoke<RestoreReport>('workbench_restore', { root: root ?? null, id, deleteNew });
+}
+
+/// Bumped by `RestoreCheckpointDialog` after a successful
+/// `workbench_checkpoint_now`/`workbench_restore` — the Timeline section
+/// subscribes to trigger a refetch without the dialog needing a direct
+/// reference to it (both just depend on this store, not on each other).
+export const workbenchCheckpointsVersion = writable<number>(0);
+export function bumpWorkbenchCheckpointsVersion(): void {
+  workbenchCheckpointsVersion.update((n) => n + 1);
 }

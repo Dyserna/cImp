@@ -22,11 +22,15 @@ pub mod git;
 pub mod shadow;
 pub mod worktree;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::broadcast;
+use tracing::warn;
 
 use crate::error::{AppError, AppResult};
 use crate::settings::SettingsHandle;
@@ -67,6 +71,23 @@ pub struct WorkbenchService {
     app: AppHandle,
     settings: SettingsHandle,
     fs_batch_tx: broadcast::Sender<FsBatch>,
+    /// Phase C §C3: the single min-gap gate every AUTOMATIC checkpoint
+    /// trigger (prompt-tap, burst) shares — `None` until the first automatic
+    /// snapshot fires. [`checkpoint_now`](Self::checkpoint_now) (the manual
+    /// trigger) bypasses the gate itself but still updates this, so a manual
+    /// checkpoint counts toward the next automatic trigger's cooldown.
+    checkpoint_last: Mutex<Option<Instant>>,
+    /// Phase C §C3 burst trigger: per-root rolling window of distinct
+    /// changed paths seen since the window last reset. Keyed by project root
+    /// since multiple projects can be open in different tabs at once.
+    burst_state: Mutex<HashMap<PathBuf, BurstState>>,
+}
+
+/// One project root's rolling burst-trigger accumulator (see
+/// [`WorkbenchService::handle_fs_batch_for_burst`]).
+struct BurstState {
+    paths: HashSet<String>,
+    window_start: Instant,
 }
 
 /// Backend-facing status for the Workbench tab's top-of-view banner (A2): is
@@ -87,23 +108,216 @@ impl WorkbenchService {
     /// startup burst, not a steady-state buffer.
     const BROADCAST_CAPACITY: usize = 64;
 
-    pub fn new(app: AppHandle, settings: SettingsHandle) -> std::sync::Arc<Self> {
+    /// Phase C §C3 burst trigger: how long a project's rolling
+    /// distinct-path window is remembered before it resets on the next
+    /// fs-batch, independent of `checkpoint_burst_window_s` (which is read
+    /// live from settings on every batch — this cap just bounds how stale a
+    /// long-idle project's accumulator can get in memory).
+    const BURST_STATE_MAX_AGE: Duration = Duration::from_secs(3600);
+
+    pub fn new(app: AppHandle, settings: SettingsHandle) -> Arc<Self> {
         let (fs_batch_tx, _rx) = broadcast::channel(Self::BROADCAST_CAPACITY);
-        std::sync::Arc::new(Self {
+        let svc = Arc::new(Self {
             app,
             settings,
             fs_batch_tx,
-        })
+            checkpoint_last: Mutex::new(None),
+            burst_state: Mutex::new(HashMap::new()),
+        });
+        svc.clone().spawn_burst_trigger();
+        svc
     }
 
-    /// Subscribe to fs-batch events from a backend consumer (Phase B's diff
-    /// refresh, Phase C's burst-checkpoint trigger). The frontend instead
-    /// listens for the [`FS_BATCH_EVENT`] Tauri event — this channel is
-    /// backend-only. Unused until Phase B/C wire a consumer; kept public now
-    /// per §0.3's contract rather than added later.
+    /// Phase C §C3: a long-lived task (app lifetime, mirrors the offload
+    /// watch-loop pattern in `main.rs`) that subscribes to this service's own
+    /// fs-batch broadcast and feeds [`handle_fs_batch_for_burst`]. Holding a
+    /// strong `Arc` here is intentional — `WorkbenchService` is a singleton
+    /// for the app's lifetime (like `GraphService`), so there's no early-drop
+    /// case this would block; the task exits on its own once the broadcast
+    /// sender is gone (app shutdown).
+    fn spawn_burst_trigger(self: Arc<Self>) {
+        let mut rx = self.fs_batch_tx.subscribe();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(batch) => self.handle_fs_batch_for_burst(batch).await,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    /// Subscribe to fs-batch events from a backend consumer. [`Self`]'s own
+    /// Phase C burst trigger uses `fs_batch_tx.subscribe()` directly (it's
+    /// constructed before any `Arc` exists to call this method on) rather
+    /// than this method; kept public per §0.3's contract for any other
+    /// backend consumer that wants a feed (e.g. a future non-graph diff
+    /// refresh path).
     #[allow(dead_code)]
     pub fn subscribe(&self) -> broadcast::Receiver<FsBatch> {
         self.fs_batch_tx.subscribe()
+    }
+
+    /// Phase C §C3 burst trigger: accumulate `batch`'s paths into `batch.root`'s
+    /// rolling window; fire an "activity" checkpoint once the window holds at
+    /// least `checkpoint_burst_files` distinct paths within
+    /// `checkpoint_burst_window_s` (the window resets on fire OR on going
+    /// stale). [`maybe_snapshot`](Self::maybe_snapshot) separately enforces
+    /// `checkpoint_min_gap_s`, so a burst that fires right after a prompt-tap
+    /// snapshot is still debounced there.
+    async fn handle_fs_batch_for_burst(&self, batch: FsBatch) {
+        let cfg = self.settings.current();
+        if !cfg.workbench.checkpoints {
+            return;
+        }
+        let root = PathBuf::from(&batch.root);
+        let burst_files = cfg.workbench.checkpoint_burst_files.max(1) as usize;
+        let window = Duration::from_secs(cfg.workbench.checkpoint_burst_window_s.max(1) as u64);
+
+        let fire = {
+            let mut state = self.burst_state.lock().unwrap();
+            // Opportunistically drop long-idle roots so this map doesn't grow
+            // unbounded across a long session touching many projects.
+            state.retain(|_, s| s.window_start.elapsed() < Self::BURST_STATE_MAX_AGE);
+            let entry = state.entry(root.clone()).or_insert_with(|| BurstState {
+                paths: HashSet::new(),
+                window_start: Instant::now(),
+            });
+            if entry.window_start.elapsed() > window {
+                entry.paths.clear();
+                entry.window_start = Instant::now();
+            }
+            entry.paths.extend(batch.paths.iter().cloned());
+            if entry.paths.len() >= burst_files {
+                entry.paths.clear();
+                entry.window_start = Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+        if fire {
+            self.maybe_snapshot(&root, "activity".to_string(), shadow::Trigger::Burst, None).await;
+        }
+    }
+
+    /// `true` iff `settings.workbench.checkpoints` is on — the single gate
+    /// every automatic AND manual checkpoint operation checks before doing
+    /// any shadow-repo work.
+    pub fn checkpoints_enabled(&self) -> bool {
+        self.settings.current().workbench.checkpoints
+    }
+
+    /// Phase C §C3: the shared entry point for the two AUTOMATIC triggers
+    /// (prompt-tap, burst). Enforces `checkpoint_min_gap_s` against the one
+    /// shared `checkpoint_last` gate (so a rapid prompt sequence or a burst
+    /// right after a prompt-tap snapshot can't spam the shadow repo), then
+    /// does the actual `shadow::snapshot` + opportunistic `shadow::gc` on a
+    /// background task so the caller (a prompt hook, an fs-batch handler)
+    /// never blocks on it — per the milestone's "never block a prompt or the
+    /// UI thread" contract (C2). No-op entirely when checkpoints are off.
+    async fn maybe_snapshot(&self, root: &Path, label: String, trigger: shadow::Trigger, agent: Option<String>) {
+        if !self.checkpoints_enabled() {
+            return;
+        }
+        let cfg = self.settings.current();
+        let min_gap = Duration::from_secs(cfg.workbench.checkpoint_min_gap_s as u64);
+        {
+            let mut last = self.checkpoint_last.lock().unwrap();
+            if let Some(prev) = *last {
+                if prev.elapsed() < min_gap {
+                    return;
+                }
+            }
+            *last = Some(Instant::now());
+        }
+        let root = root.to_path_buf();
+        let extra_ignore = cfg.graph.ignore.clone();
+        let max_file_bytes = cfg.graph.max_file_bytes;
+        let checkpoint_max = cfg.workbench.checkpoint_max;
+        let checkpoint_max_age_days = cfg.workbench.checkpoint_max_age_days;
+        tauri::async_runtime::spawn(async move {
+            match shadow::snapshot(&root, &label, trigger, agent.as_deref(), &extra_ignore, max_file_bytes).await {
+                Ok(_) => {
+                    if let Err(e) = shadow::gc(&root, checkpoint_max, checkpoint_max_age_days).await {
+                        warn!(root = %root.display(), error = %e, "workbench: checkpoint gc failed");
+                    }
+                }
+                Err(e) => warn!(root = %root.display(), error = %e, "workbench: automatic checkpoint failed"),
+            }
+        });
+    }
+
+    /// Phase C §C3 prompt-tap trigger: called from `offload/loopback.rs`'s
+    /// `/context/retrieve` handler for EVERY prompt (Claude's
+    /// `UserPromptSubmit` shim, the OpenCode `chat.message` plugin) —
+    /// deliberately BEFORE that handler's own `context_injection` gate, so
+    /// checkpointing runs even when injection is off or yields nothing (the
+    /// milestone's Decision 4: checkpointing is decoupled from the injection
+    /// toggle even though it reuses the same transport). `agent` is whatever
+    /// the calling shim identified itself as (`"claude"`/`"opencode"`/`None`
+    /// for unknown); `prompt_head` is used as-is for the label — callers are
+    /// expected to have already truncated it (`shadow::snapshot`'s own
+    /// [`truncate_label`](shadow) is a hard backstop, not the primary cut).
+    pub async fn on_prompt(&self, root: &Path, agent: Option<String>, prompt_head: &str) {
+        let label = format!("prompt: {prompt_head}");
+        self.maybe_snapshot(root, label, shadow::Trigger::Prompt, agent).await;
+    }
+
+    /// Phase C `workbench_checkpoint_now`: the manual trigger. Unlike the
+    /// automatic triggers, this does NOT go through
+    /// [`maybe_snapshot`](Self::maybe_snapshot)'s min-gap gate or its
+    /// background-task indirection — an explicit "Checkpoint now" click is a
+    /// deliberate user action awaiting a real result (the new checkpoint id),
+    /// not something to silently throttle or defer. It still updates
+    /// `checkpoint_last` so a subsequent AUTOMATIC trigger's cooldown counts
+    /// from this snapshot too (no back-to-back auto + manual spam).
+    pub async fn checkpoint_now(&self, root: &Path, label: Option<String>) -> AppResult<shadow::CheckpointId> {
+        let cfg = self.settings.current();
+        let label = label.unwrap_or_else(|| "manual checkpoint".to_string());
+        let id = shadow::snapshot(
+            root,
+            &label,
+            shadow::Trigger::Manual,
+            None,
+            &cfg.graph.ignore,
+            cfg.graph.max_file_bytes,
+        )
+        .await?;
+        *self.checkpoint_last.lock().unwrap() = Some(Instant::now());
+        if let Err(e) = shadow::gc(root, cfg.workbench.checkpoint_max, cfg.workbench.checkpoint_max_age_days).await {
+            warn!(root = %root.display(), error = %e, "workbench: checkpoint gc failed after manual checkpoint");
+        }
+        Ok(id)
+    }
+
+    /// Phase C `workbench_checkpoints`: the Timeline section's row list.
+    pub async fn checkpoints(&self, root: &Path) -> AppResult<Vec<shadow::Checkpoint>> {
+        shadow::list(root).await
+    }
+
+    /// Phase C `workbench_checkpoint_diff`: checkpoint `id` vs. the CURRENT
+    /// working tree, parsed into the same [`diff::FileDiff`] shape the B4
+    /// `DiffView` already renders — powers both the Timeline's "Diff vs now"
+    /// action and the restore confirmation dialog's dry-run file list.
+    pub async fn checkpoint_diff(&self, root: &Path, id: &str) -> AppResult<Vec<diff::FileDiff>> {
+        let cfg = self.settings.current();
+        let text = shadow::diff_vs_now(root, id, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
+        Ok(diff::parse_unified(&text))
+    }
+
+    /// Phase C `workbench_restore`: restore the working tree to checkpoint
+    /// `id`. `delete_new` gates invariant D (files created since the
+    /// checkpoint are deleted only when explicitly requested) — see
+    /// `shadow::restore`'s doc comment for the full sequence and every
+    /// safety invariant it upholds. Updates `checkpoint_last` for the same
+    /// reason [`checkpoint_now`](Self::checkpoint_now) does.
+    pub async fn restore(&self, root: &Path, id: &str, delete_new: bool) -> AppResult<shadow::RestoreReport> {
+        let cfg = self.settings.current();
+        let report = shadow::restore(root, id, delete_new, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
+        *self.checkpoint_last.lock().unwrap() = Some(Instant::now());
+        Ok(report)
     }
 
     /// §0.3: fan a watcher-coalesced batch of changed paths out to Workbench

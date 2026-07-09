@@ -589,6 +589,13 @@ struct ContextRetrieveBody {
     /// The agent session id (scopes the working-set boost); optional.
     #[serde(default)]
     session_id: Option<String>,
+    /// V13 Phase C: which agent shim is calling — `"claude"` (set by
+    /// `context_hook.rs`) or `"opencode"` (set by the generated plugin);
+    /// absent/`None` for an unrecognized caller. Recorded on the checkpoint
+    /// it triggers (see [`WorkbenchService::on_prompt`](crate::workbench::WorkbenchService::on_prompt)),
+    /// not otherwise used by context retrieval itself.
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 /// `POST /context/retrieve`: rank files for the prompt and return the injectable
@@ -610,6 +617,25 @@ async fn handle_context_retrieve(
             .await;
         }
     };
+    let cwd = body.cwd.clone().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+
+    // V13 Phase C: fire the prompt-tap checkpoint trigger for EVERY prompt
+    // that reaches this route, BEFORE the `context_injection` gate below —
+    // checkpointing must fire even when injection is off or yields nothing
+    // (Decision 4: decoupled from the injection toggle, reusing its
+    // transport). Fire-and-forget: `on_prompt`'s own min-gap check is cheap
+    // and the real snapshot work runs on a background task inside it, so
+    // this never delays the turn waiting on a `git` round trip.
+    if let Some(workbench) = app.try_state::<Arc<crate::workbench::WorkbenchService>>() {
+        let workbench = workbench.inner().clone();
+        let root = cwd.clone();
+        let agent = body.agent.clone();
+        let prompt_head: String = body.prompt.chars().take(80).collect();
+        tauri::async_runtime::spawn(async move {
+            workbench.on_prompt(&root, agent, &prompt_head).await;
+        });
+    }
+
     let empty = serde_json::json!({ "ok": true, "text": "", "files": [], "tokens_est": 0 });
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
         return write_json(stream, 200, &empty).await;
@@ -620,7 +646,6 @@ async fn handle_context_retrieve(
     if !graph.context_injection_enabled() {
         return write_json(stream, 200, &empty).await;
     }
-    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let r = graph.retrieve_context(&cwd, &body.prompt, body.session_id.as_deref());
     // V11 Phase B: prepend the once-per-session project map. Done here (the real
     // injection path), not in `retrieve_context`, so the preview surface — which

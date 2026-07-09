@@ -12,7 +12,8 @@ export type DialogState =
   | { kind: 'new-shell-tab' }
   | { kind: 'configure-tab'; tab: TabId }
   | { kind: 'save-layout' }
-  | { kind: 'manage-presets' };
+  | { kind: 'manage-presets' }
+  | { kind: 'restore-checkpoint'; id: string; root?: string };
 
 export const dialogState: Writable<DialogState> = writable({ kind: 'none' });
 
@@ -36,6 +37,14 @@ export function openSaveLayoutDialog(): void {
 /// store; no payload needed.
 export function openManagePresetsDialog(): void {
   dialogState.set({ kind: 'manage-presets' });
+}
+
+/// V13 Phase C: opened from the Timeline section's "Restore" row action.
+/// The dialog itself fetches the dry-run diff (`workbench_checkpoint_diff`)
+/// on open to list the affected files — no diff payload needed here, just
+/// which checkpoint and (optionally) which project root.
+export function openRestoreCheckpointDialog(id: string, root?: string): void {
+  dialogState.set({ kind: 'restore-checkpoint', id, root });
 }
 
 export function closeDialog(): void {

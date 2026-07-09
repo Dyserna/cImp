@@ -1299,6 +1299,68 @@ pub async fn workbench_send_hunk(
     service.send_hunk(&root, &path, hunk_index).await
 }
 
+/// V13 Phase C: the Timeline section's row list — every checkpoint currently
+/// retained in the shadow repo, oldest first. Empty (not an error) when
+/// checkpoints have never run for `root`. `root` defaults to the launch
+/// directory.
+#[tauri::command]
+pub async fn workbench_checkpoints(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+) -> AppResult<Vec<crate::workbench::shadow::Checkpoint>> {
+    let root = resolve_workbench_root(root)?;
+    service.checkpoints(&root).await
+}
+
+/// V13 Phase C: checkpoint `id` vs. the CURRENT working tree, parsed the same
+/// way `workbench_diff_file` is — powers both the Timeline's "Diff vs now"
+/// viewer and the restore confirmation dialog's dry-run file list (the same
+/// call backs both UI surfaces; the frontend just renders it read-only for
+/// the confirmation case, since these files describe the CHECKPOINT, not a
+/// revertable live hunk).
+#[tauri::command]
+pub async fn workbench_checkpoint_diff(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    id: String,
+) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
+    let root = resolve_workbench_root(root)?;
+    service.checkpoint_diff(&root, &id).await
+}
+
+/// V13 Phase C: the manual "Checkpoint now" action. `label` defaults to
+/// "manual checkpoint" when omitted. Unlike the automatic triggers this is
+/// NOT throttled by `checkpoint_min_gap_s` — an explicit click always
+/// produces a real checkpoint (or dedupes against an unchanged tree, per
+/// `shadow::snapshot`'s own contract) rather than being silently dropped.
+#[tauri::command]
+pub async fn workbench_checkpoint_now(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    label: Option<String>,
+) -> AppResult<crate::workbench::shadow::CheckpointId> {
+    let root = resolve_workbench_root(root)?;
+    service.checkpoint_now(&root, label).await
+}
+
+/// V13 Phase C: restore the working tree to checkpoint `id`.
+/// **Safety-critical**: `delete_new` MUST default to `false` on the frontend
+/// (the confirmation dialog's "delete files created since" checkbox starts
+/// unchecked) — see `shadow::restore`'s doc comment for the invariants this
+/// upholds (a pre-restore checkpoint is always taken first; the user's own
+/// `.git`, if any, is never touched). Returns the full changed/created/
+/// deleted file lists for the UI's post-restore report.
+#[tauri::command]
+pub async fn workbench_restore(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    id: String,
+    delete_new: bool,
+) -> AppResult<crate::workbench::shadow::RestoreReport> {
+    let root = resolve_workbench_root(root)?;
+    service.restore(&root, &id, delete_new).await
+}
+
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
 /// = file changes are ignored until resumed (a manual rebuild still works).
 #[tauri::command]

@@ -11,7 +11,9 @@
   // lands). The sections themselves are filled in by B/C/D.
   import { onMount } from 'svelte';
   import { workbenchStatus, type WorkbenchStatus } from './workbench';
+  import { settings } from './settings/store';
   import DiffView from './DiffView.svelte';
+  import TimelineView from './TimelineView.svelte';
 
   type Section = 'diff' | 'timeline' | 'worktrees';
   const SECTIONS: { id: Section; label: string }[] = [
@@ -37,9 +39,10 @@
     void refreshStatus();
   });
 
-  // Diff and Worktrees both need a real git repo; Timeline needs checkpoints
-  // (Phase C — not built yet, so it always shows the "coming soon" banner
-  // for now regardless of git status).
+  // Diff and Worktrees both need a real git repo; Timeline needs
+  // checkpoints on (Phase C) — a non-git project can still use checkpoints
+  // (the shadow repo is self-contained), so Timeline's gate is independent
+  // of `needsGit`/`gitBannerText` below.
   const needsGit = $derived(section === 'diff' || section === 'worktrees');
   const gitBannerText = $derived.by(() => {
     if (!status) return null;
@@ -47,10 +50,12 @@
       return "git wasn't found on PATH. Install git to use the diff pane and worktrees.";
     }
     if (!status.is_repo) {
-      return 'This project is not a git repository yet — run `git init`, or turn on checkpoints (Settings → Workbench) once Phase C ships.';
+      return 'This project is not a git repository yet — run `git init`, or turn on checkpoints (Settings → Workbench).';
     }
     return null;
   });
+
+  const checkpointsOff = $derived(section === 'timeline' && !$settings.workbench.checkpoints);
 </script>
 
 <div class="workbench">
@@ -73,6 +78,13 @@
     <p class="banner err">Couldn't check git status: {statusError}</p>
   {:else if needsGit && gitBannerText}
     <p class="banner">{gitBannerText}</p>
+  {:else if checkpointsOff}
+    <p class="banner">
+      Checkpoints are off. Turn on "Enable automatic checkpoints" in Settings
+      → Workbench to start building a timeline — checkpoints use a separate
+      shadow git repo (<code>.cimp/shadow.git</code>); your own
+      <code>.git</code> is never touched.
+    </p>
   {/if}
 
   {#if section === 'diff'}
@@ -83,12 +95,9 @@
       <DiffView />
     {/if}
   {:else if section === 'timeline'}
-    <p class="placeholder">
-      Checkpoint timeline — coming in Phase C. Once shipped, this section
-      shows automatic snapshots of the working tree (per prompt, per burst of
-      activity, or on demand) with diff and restore actions. Checkpoints use a
-      separate shadow git repo — your own <code>.git</code> is never touched.
-    </p>
+    {#if !checkpointsOff}
+      <TimelineView />
+    {/if}
   {:else if section === 'worktrees'}
     <p class="placeholder">
       Worktree manager — coming in Phase D. Once shipped, this section lets

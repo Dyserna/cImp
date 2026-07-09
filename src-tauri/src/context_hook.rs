@@ -46,6 +46,10 @@ pub fn run() {
         "cwd": cwd,
         "prompt": prompt,
         "session_id": session_id,
+        // V13 Phase C: identifies this shim to the prompt-tap checkpoint
+        // trigger (recorded on the checkpoint it fires) — see
+        // `offload/loopback.rs`'s `ContextRetrieveBody::agent`.
+        "agent": "claude",
     })
     .to_string();
 

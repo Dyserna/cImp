@@ -298,7 +298,11 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
 /// assistant prose directly. The per-tab `tts_injection.enabled` flag is now
 /// the "speak this tab" gate read by the out-of-band sources, not a prompt
 /// injection toggle (the former free-text `instructions` field is gone).
-fn compose_capability_guidance(_cfg: &AiToolTabConfig, settings: &Settings) -> String {
+///
+/// V12 Phase E: when `graph.promote_pinned_facts` is on, a marked
+/// `## cImp project facts` block of PINNED facts is appended last (see
+/// [`fact_promotion_block`]) — launch-time only, best-effort.
+fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> String {
     let mut addendum = String::new();
     if settings.offload.enabled && settings.offload.inject_guidance {
         if !addendum.is_empty() {
@@ -315,7 +319,59 @@ fn compose_capability_guidance(_cfg: &AiToolTabConfig, settings: &Settings) -> S
             addendum.push_str(GRAPH_SEMANTIC_GUIDANCE);
         }
     }
+    if settings.graph.enabled && settings.graph.promote_pinned_facts {
+        // `cfg.cwd` is the tab's configured project root; when unset the real
+        // launch falls back to the launch directory (`std::env::current_dir()`
+        // at the time `main` computed `launch_cwd` — see `main.rs`), which is
+        // the same value this fallback reproduces without threading a root
+        // parameter through every caller (most of which have no reason to
+        // otherwise take one, and are exercised by many existing tests).
+        let root = cfg
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        if let Some(block) = fact_promotion_block(&root, settings) {
+            if !addendum.is_empty() {
+                addendum.push_str("\n\n");
+            }
+            addendum.push_str(&block);
+        }
+    }
     addendum
+}
+
+/// V12 Phase E: the `## cImp project facts` launch-time addendum — PINNED
+/// facts only, newest-pinned first, capped ~1500 chars. `None` when the graph
+/// hasn't been built at `root` yet, has no pinned facts, or can't be opened —
+/// best-effort, same posture as this module's other launch-time I/O (e.g.
+/// [`write_opencode_instructions`]).
+fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
+    const CAP_CHARS: usize = 1500;
+    let sub = settings.graph.effective_db_subdir();
+    let idx = crate::graph::GraphIndex::open_existing(root, &sub).ok()?;
+    let mut pinned: Vec<_> = idx
+        .list_project_facts(false, 200)
+        .ok()?
+        .into_iter()
+        .filter(|f| f.pinned)
+        .collect();
+    if pinned.is_empty() {
+        return None;
+    }
+    // `list_project_facts` already returns pinned-first/newest, but the
+    // pinned-only filter above could in principle be fed a differently-sorted
+    // source later — sort explicitly here so "newest-pinned first" holds
+    // regardless.
+    pinned.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+    let mut out = String::from("## cImp project facts\n");
+    for f in &pinned {
+        let line = format!("- {}\n", f.text);
+        if out.len() + line.len() > CAP_CHARS {
+            break;
+        }
+        out.push_str(&line);
+    }
+    Some(out)
 }
 
 /// V8-01: the system-prompt addendum telling Opus *when* to reach for
@@ -1158,5 +1214,80 @@ mod tests {
             Some("1"),
             "an explicit per-tab value must pass through the env merge",
         );
+    }
+
+    // ── V12 Phase E: fact promotion block ─────────────────────────────────
+
+    #[test]
+    fn fact_promotion_block_is_pinned_only_newest_first() {
+        let dir = std::env::temp_dir().join(format!("cimp-facts-{}", uuid::Uuid::new_v4()));
+        {
+            let idx = crate::graph::GraphIndex::open(&dir, ".cimp").expect("open");
+            idx.add_project_fact("f-old-pinned", "oldest pinned fact", "s1", 100, true)
+                .unwrap();
+            idx.add_project_fact("f-new-pinned", "newest pinned fact", "s1", 200, true)
+                .unwrap();
+            idx.add_project_fact("f-unpinned", "an unpinned fact must not appear", "s1", 300, false)
+                .unwrap();
+            // Dropped here, before reopening read-only below.
+        }
+
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.promote_pinned_facts = true;
+
+        let block = fact_promotion_block(&dir, &settings).expect("block present");
+        assert!(block.starts_with("## cImp project facts\n"), "{block}");
+        assert!(block.contains("newest pinned fact"), "{block}");
+        assert!(block.contains("oldest pinned fact"), "{block}");
+        assert!(!block.contains("must not appear"), "unpinned facts must not be promoted: {block}");
+
+        let pos_new = block.find("newest pinned fact").unwrap();
+        let pos_old = block.find("oldest pinned fact").unwrap();
+        assert!(pos_new < pos_old, "newest-pinned must come first: {block}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fact_promotion_block_caps_length() {
+        let dir = std::env::temp_dir().join(format!("cimp-facts-cap-{}", uuid::Uuid::new_v4()));
+        {
+            let idx = crate::graph::GraphIndex::open(&dir, ".cimp").expect("open");
+            // Enough ~100-char pinned facts to blow well past the 1500-char cap.
+            for i in 0..40 {
+                let text = format!("pinned fact number {i} with some padding text to reach length ##########");
+                idx.add_project_fact(&format!("f{i}"), &text, "s1", i as i64, true).unwrap();
+            }
+        }
+
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.promote_pinned_facts = true;
+
+        let block = fact_promotion_block(&dir, &settings).expect("block present");
+        assert!(block.len() <= 1500 + 200, "block should stay near the cap: {} chars", block.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fact_promotion_block_none_without_pinned_facts_or_graph() {
+        let dir = std::env::temp_dir().join(format!("cimp-facts-none-{}", uuid::Uuid::new_v4()));
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.promote_pinned_facts = true;
+
+        // No graph ever built at this root — best-effort `None`, no panic.
+        assert!(fact_promotion_block(&dir, &settings).is_none());
+
+        {
+            let idx = crate::graph::GraphIndex::open(&dir, ".cimp").expect("open");
+            idx.add_project_fact("f1", "an unpinned fact", "s1", 1, false).unwrap();
+        }
+        // A built graph with only unpinned facts is still `None`.
+        assert!(fact_promotion_block(&dir, &settings).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

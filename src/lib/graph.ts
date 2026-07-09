@@ -260,3 +260,37 @@ export interface RetrieveResult {
 export function graphContextPreview(prompt: string, root?: string): Promise<RetrieveResult> {
   return invoke<RetrieveResult>('graph_context_preview', { root: root ?? null, prompt });
 }
+
+/// V12 Phase E (Memory): a durable project fact. Mirror of Rust
+/// `graph::memory::ProjectFact`.
+export interface ProjectFact {
+  fact_id: string;
+  text: string;
+  /// The session that produced this fact, or `"manual"` for a UI-added fact.
+  source_session: string;
+  ts_ms: number;
+  pinned: boolean;
+  archived: boolean;
+}
+
+/// The project's live (non-archived) durable facts, pinned first then newest.
+/// `root` defaults to the launch directory.
+export function graphFacts(root?: string): Promise<ProjectFact[]> {
+  return invoke<ProjectFact[]>('graph_facts', { root: root ?? null });
+}
+
+/// Pin / unpin / archive / delete one project fact. `root` defaults to the
+/// launch directory.
+export function graphFactUpdate(
+  id: string,
+  action: 'pin' | 'unpin' | 'archive' | 'delete',
+  root?: string,
+): Promise<void> {
+  return invoke<void>('graph_fact_update', { root: root ?? null, id, action });
+}
+
+/// Manually add a project fact from the Facts UI's "add fact" input.
+/// `root` defaults to the launch directory.
+export function graphFactAdd(text: string, pin?: boolean, root?: string): Promise<void> {
+  return invoke<void>('graph_fact_add', { root: root ?? null, text, pin: pin ?? null });
+}

@@ -31,13 +31,24 @@ use crate::settings::{GraphSettings, SettingsHandle};
 
 use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
-use super::memory::{MemorySnapshot, WorkingSetEntry};
+use super::memory::{MemorySnapshot, ProjectFact, WorkingSetEntry};
 use super::model::Lang;
 use super::parse_file;
 
 /// Bumped if the embedding schema/layout changes in a way that invalidates
 /// stored vectors. Part of the epoch fingerprint alongside model + dim.
 const EMBED_SCHEMA: &str = "v1";
+
+/// V12 Phase E: the distiller's fixed extraction instruction, prepended to a
+/// session's working set + notes before the local-only completion. Verbatim
+/// per the milestone spec — do not paraphrase (the validator downstream
+/// assumes this exact output contract: 1-3 lines, no numbering, no preamble).
+const DISTILL_PROMPT_INSTRUCTION: &str = "You are distilling a coding session's memory into \
+durable project facts. From the working set and notes below, extract AT MOST 3 non-obvious, \
+durable facts a future coding session on THIS project would need. Skip anything derivable from \
+the code itself (structure, naming, what a function does). Prefer decisions, constraints, \
+gotchas, and their rationale. Output one fact per line, each <=200 chars, plain text, no \
+numbering, no preamble, no blank lines.";
 
 /// Tauri event carrying a [`GraphStatus`] snapshot whenever a root's build
 /// state changes (queued → building → ready/error). The Phase-I monitor tab
@@ -608,6 +619,139 @@ impl GraphService {
         Ok(())
     }
 
+    // ── V12 Phase E: project facts (memory distillation) ─────────────────
+
+    /// Live (non-archived) project facts for `root`'s Facts UI list — pinned
+    /// first, then newest. `root` defaults handled by the caller (IPC).
+    pub fn list_project_facts(&self, root: &Path, include_archived: bool, max: usize) -> Vec<ProjectFact> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.list_project_facts(include_archived, max).unwrap_or_default()
+    }
+
+    /// Pin/unpin a fact.
+    pub fn set_fact_pinned(&self, root: &Path, fact_id: &str, pinned: bool) -> AppResult<()> {
+        self.index_for(root)?.set_fact_pinned(fact_id, pinned)
+    }
+
+    /// Archive a fact (excludes it from the cap, `context_recall`, and
+    /// promotion, but keeps the row).
+    pub fn set_fact_archived(&self, root: &Path, fact_id: &str, archived: bool) -> AppResult<()> {
+        self.index_for(root)?.set_fact_archived(fact_id, archived)
+    }
+
+    /// Permanently delete a fact.
+    pub fn delete_fact(&self, root: &Path, fact_id: &str) -> AppResult<()> {
+        self.index_for(root)?.delete_fact(fact_id)
+    }
+
+    /// Manually add a fact from the Facts UI's "add fact" input. Recorded
+    /// with `source_session = "manual"` so the UI can distinguish it from a
+    /// distiller-produced fact (whose source session is a real session id).
+    pub fn add_project_fact_manual(&self, root: &Path, text: &str, pin: bool) -> AppResult<()> {
+        let idx = self.index_for(root)?;
+        let fact_id = uuid::Uuid::new_v4().to_string();
+        let ts = super::activity::now_ms() as i64;
+        idx.add_project_fact(&fact_id, text, "manual", ts, pin)
+    }
+
+    /// Idle-sweep candidates older than this go through the distiller.
+    const DISTILL_IDLE_MS: i64 = 24 * 60 * 60 * 1000;
+
+    /// V12 Phase E: opportunistically distill any session idle more than 24h
+    /// that hasn't been distilled yet. There's no dedicated periodic timer in
+    /// this service, so this piggybacks on the two places the store is
+    /// touched by normal activity anyway — a completed full rebuild and an
+    /// applied watcher batch (see call sites) — which keeps distillation
+    /// roughly in step with the project without a separate clock. Cheap when
+    /// there's nothing to do: one small query, no spawn.
+    pub fn spawn_distillation_sweep(self: &Arc<Self>, root: PathBuf) {
+        if !self.settings.current().graph.memory_distillation {
+            return;
+        }
+        let Ok(idx) = self.index_for(&root) else { return };
+        let cutoff = super::activity::now_ms() as i64 - Self::DISTILL_IDLE_MS;
+        let Ok(candidates) = idx.sessions_idle_undistilled(cutoff) else { return };
+        if candidates.is_empty() {
+            return;
+        }
+        let this = self.clone();
+        tauri::async_runtime::spawn(async move {
+            for sid in candidates {
+                this.distill_session(&root, &sid).await;
+            }
+        });
+    }
+
+    /// V12 Phase E: distill one session's working set + notes into at most 3
+    /// durable project facts via the **local-only** offload path
+    /// (`OffloadSupervisor::run_internal`, V11 Phase F — never remote/cloud),
+    /// then mark the session distilled either way. Gated on
+    /// `memory_distillation` + a ready local backend — no ready backend
+    /// leaves the session undistilled (V10's "evict undistilled" fallback
+    /// still applies; the sweep will retry it next pass). A validation
+    /// failure on the model's output DOES mark the session distilled — the
+    /// "never retry-loop a bad generation" posture from the milestone spec.
+    async fn distill_session(&self, root: &Path, session_id: &str) {
+        if !self.settings.current().graph.memory_distillation {
+            return;
+        }
+        let Some(sup) = self.app.try_state::<Arc<crate::offload::OffloadSupervisor>>() else {
+            return;
+        };
+        let sup = sup.inner().clone();
+        let Ok(idx) = self.index_for(root) else { return };
+        // Idempotency guard: `spawn_distillation_sweep`'s candidate query
+        // already filters to undistilled sessions, but this also protects a
+        // future direct caller (e.g. an eviction-time trigger) from
+        // re-distilling a session two triggers raced onto.
+        if idx.is_session_distilled(session_id).unwrap_or(false) {
+            return;
+        }
+
+        let working_set = idx.mem_working_set(session_id, 10).unwrap_or_default();
+        let notes = idx.mem_notes(session_id).unwrap_or_default();
+        let ts = super::activity::now_ms() as i64;
+        if working_set.is_empty() && notes.is_empty() {
+            // Nothing to distill — mark it done so the sweep doesn't keep
+            // re-selecting an empty session on every future pass.
+            let _ = idx.mark_session_distilled(session_id, ts);
+            return;
+        }
+
+        let mut body = String::new();
+        for e in &working_set {
+            body.push_str(&format!("- {} ({}x, last {})\n", e.path, e.touches, e.last_kind));
+        }
+        for n in &notes {
+            body.push_str(&format!("- note: {}\n", n.text));
+        }
+        let prompt = format!("{DISTILL_PROMPT_INSTRUCTION}\n\n{body}");
+
+        let text = match sup
+            .run_internal(prompt, 256, std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(t) => t,
+            // No ready local backend (or the call otherwise failed) — leave
+            // undistilled, per V10 semantics; retried by a later sweep.
+            Err(_) => return,
+        };
+        match super::memory::parse_distilled_facts(&text) {
+            Some(facts) => {
+                for f in facts {
+                    let fact_id = uuid::Uuid::new_v4().to_string();
+                    if let Err(e) = idx.add_project_fact(&fact_id, &f, session_id, ts, false) {
+                        debug!(error = %e, "graph: add_project_fact failed");
+                    }
+                }
+            }
+            None => {
+                debug!(session_id, "graph: distiller output failed validation, skipping insert");
+            }
+        }
+        let _ = idx.mark_session_distilled(session_id, ts);
+    }
+
     // ── V10 context injection ────────────────────────────────────────────
 
     /// Rank files for `prompt` and build the injectable digest for `root`.
@@ -972,6 +1116,9 @@ impl GraphService {
                         // Phase G: embed any new/changed doc chunks (no-op when
                         // semantic search is off).
                         this.spawn_backfill(root.clone());
+                        // V12 Phase E: opportunistic idle-session distillation
+                        // sweep (no-op when the setting is off or nothing's idle).
+                        this.spawn_distillation_sweep(root.clone());
                     }
                     Err(e) => {
                         warn!(root = %root.display(), error = %e, "graph: rebuild failed");
@@ -1142,6 +1289,9 @@ impl GraphService {
             debug!(root = %root.display(), changed, "graph: incremental re-index applied");
             // Phase G: embed the new/changed doc chunks (no-op when off).
             self.spawn_backfill(root.to_path_buf());
+            // V12 Phase E: opportunistic idle-session distillation sweep
+            // (no-op when the setting is off or nothing's idle).
+            self.spawn_distillation_sweep(root.to_path_buf());
         }
     }
 

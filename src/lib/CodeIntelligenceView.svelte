@@ -22,6 +22,9 @@
     graphMemory,
     graphMemoryClear,
     graphNoteSetPinned,
+    graphFacts,
+    graphFactUpdate,
+    graphFactAdd,
     graphContextPreview,
     onGraphStatus,
     type EmbedderProbe,
@@ -31,6 +34,7 @@
     type DeadExportRow,
     type ImpactResult,
     type MemorySnapshot,
+    type ProjectFact,
     type RetrieveResult,
   } from './graph';
   import { listenManaged } from './listenManaged';
@@ -62,6 +66,56 @@
     { name: 'context_note', desc: 'Remember a non-obvious decision/fact for this project (pin to keep it across sessions).', example: 'Note: we chose FNV hashing for stability.' },
     { name: 'context_notes', desc: "List this session's notes plus every pinned note for the project.", example: 'Show my remembered notes.' },
   ];
+
+  // Facts (V12 Phase E): durable project facts distilled from session memory
+  // (or added manually). Fetched alongside memory while the Memory section is
+  // open.
+  let facts = $state<ProjectFact[]>([]);
+  let newFactText = $state('');
+  let newFactPin = $state(false);
+  let factBusy = $state(false);
+
+  async function refreshFacts(): Promise<void> {
+    try {
+      facts = await graphFacts();
+    } catch (e) {
+      console.warn('graph_facts failed', e);
+    }
+  }
+
+  async function toggleFactPin(id: string, pinned: boolean): Promise<void> {
+    try {
+      await graphFactUpdate(id, pinned ? 'pin' : 'unpin');
+      await refreshFacts();
+    } catch (e) {
+      console.error('graph_fact_update (pin) failed', e);
+    }
+  }
+
+  async function deleteFact(id: string): Promise<void> {
+    try {
+      await graphFactUpdate(id, 'delete');
+      await refreshFacts();
+    } catch (e) {
+      console.error('graph_fact_update (delete) failed', e);
+    }
+  }
+
+  async function addFact(): Promise<void> {
+    const text = newFactText.trim();
+    if (!text || factBusy) return;
+    factBusy = true;
+    try {
+      await graphFactAdd(text, newFactPin);
+      newFactText = '';
+      newFactPin = false;
+      await refreshFacts();
+    } catch (e) {
+      console.error('graph_fact_add failed', e);
+    } finally {
+      factBusy = false;
+    }
+  }
 
   // Analyses (Phase B2): on-demand dead-export + import-cycle results. Run only
   // when the user clicks — walking the graph is comparatively expensive.
@@ -279,6 +333,7 @@
     // Memory is only fetched while its section is visible (opens the warm index).
     if (section === 'memory') {
       await refreshMemory();
+      await refreshFacts();
     }
   }
 
@@ -370,7 +425,10 @@
         class:active={section === s.id}
         onclick={() => {
           section = s.id;
-          if (s.id === 'memory') refreshMemory();
+          if (s.id === 'memory') {
+            refreshMemory();
+            refreshFacts();
+          }
         }}
       >{s.label}</button>
     {/each}
@@ -494,6 +552,50 @@
     </div>
   </section>
   {:else if section === 'memory'}
+    <section class="card">
+      <div class="history-head">Facts <span class="muted">({facts.length})</span></div>
+      <p class="caveat">
+        Durable project facts — distilled from idle sessions (when Memory
+        distillation is on) or added here. Pinned facts survive indefinitely and,
+        with Fact promotion on, ride along in the launch-time guidance for every
+        new tab.
+      </p>
+      <div class="preview-in">
+        <input
+          type="text"
+          placeholder="Add a fact this project should remember…"
+          bind:value={newFactText}
+          onkeydown={(e) => e.key === 'Enter' && addFact()}
+        />
+        <label class="pin-toggle" title="Pin (keep indefinitely, eligible for promotion)">
+          <input type="checkbox" bind:checked={newFactPin} />
+          📌
+        </label>
+        <button onclick={addFact} disabled={factBusy || !newFactText.trim()}>
+          {factBusy ? 'Adding…' : 'Add'}
+        </button>
+      </div>
+      {#if facts.length === 0}
+        <p class="placeholder">No facts yet.</p>
+      {:else}
+        <div class="rows">
+          {#each facts as f (f.fact_id)}
+            <div class="arow fact">
+              <button
+                class="pin"
+                class:pinned={f.pinned}
+                title={f.pinned ? 'Unpin' : 'Pin (keep indefinitely, eligible for promotion)'}
+                onclick={() => toggleFactPin(f.fact_id, !f.pinned)}
+              >{f.pinned ? '📌' : '📍'}</button>
+              <span class="ntext" title={`source: ${f.source_session}`}>{f.text}</span>
+              <span class="aloc">{fmtTime(f.ts_ms)}</span>
+              <button class="mini danger fact-del" onclick={() => deleteFact(f.fact_id)}>✕</button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+
     {#if !memory || (memory.working_set.length === 0 && memory.notes.length === 0 && memory.sessions.length === 0)}
       <p class="placeholder">
         No session memory yet. As Claude reads, edits, and queries files (with the
@@ -1153,6 +1255,23 @@
   }
   .arow.note {
     grid-template-columns: auto 1fr auto;
+  }
+  .arow.fact {
+    grid-template-columns: auto 1fr auto auto;
+  }
+  .fact-del {
+    opacity: 0.6;
+  }
+  .fact-del:hover {
+    opacity: 1;
+  }
+  .pin-toggle {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
   }
   .arow.sess.current .aname {
     color: var(--accent, #3b6ea5);

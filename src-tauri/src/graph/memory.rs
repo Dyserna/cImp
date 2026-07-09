@@ -65,6 +65,61 @@ pub struct MemorySnapshot {
     pub sessions: Vec<SessionInfo>,
 }
 
+// ── V12 Phase E: memory distillation (durable project facts) ─────────────
+
+/// Cap on **live** (non-archived) project facts. Inserting past the cap
+/// archives the oldest UNPINNED live fact first; a pinned fact is never
+/// auto-archived (if every live fact is pinned, the cap is simply exceeded —
+/// no data loss, just a soft overrun).
+pub const MAX_LIVE_PROJECT_FACTS: usize = 100;
+
+/// A durable project fact — either distilled from a session's working
+/// set/notes by the local-only offload path, or added manually via the Facts
+/// UI. Survives its source session's eviction (unlike `mem_event`/unpinned
+/// `mem_note`), which is the whole point: session memory is a ring buffer,
+/// project facts are the sediment it leaves behind.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ProjectFact {
+    pub fact_id: String,
+    pub text: String,
+    /// The session that produced this fact (`"manual"` for a UI-added fact).
+    pub source_session: String,
+    pub ts_ms: i64,
+    pub pinned: bool,
+    /// Archived facts are excluded from `context_recall` / promotion / the
+    /// live-facts cap, but kept (not deleted) so a bad archival is undoable
+    /// and the Facts UI can still show provenance if it chooses to.
+    pub archived: bool,
+}
+
+/// Distilled-fact line count cap: the distiller prompt asks for "AT MOST 3"
+/// facts, and a run producing more is treated as a bad generation.
+pub const MAX_DISTILLED_FACTS: usize = 3;
+/// Per-fact character cap, matching the distiller prompt's "<=200 chars".
+pub const MAX_FACT_CHARS: usize = 200;
+
+/// Parse + validate the distiller's raw model output into fact text lines.
+/// Pure and DB/network-free so it's unit-testable without a live offload
+/// backend. Splits on newlines, trims each line, drops blank lines, then
+/// requires the surviving set be non-empty, at most [`MAX_DISTILLED_FACTS`]
+/// lines, each at most [`MAX_FACT_CHARS`] characters. `None` on any
+/// violation — a bad generation is skipped (session still marked distilled
+/// by the caller), never retried in a loop.
+pub fn parse_distilled_facts(raw: &str) -> Option<Vec<String>> {
+    let lines: Vec<String> = raw
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() || lines.len() > MAX_DISTILLED_FACTS {
+        return None;
+    }
+    if lines.iter().any(|l| l.chars().count() > MAX_FACT_CHARS) {
+        return None;
+    }
+    Some(lines)
+}
+
 /// Map an agent tool name/id to a memory event `kind` + the argument key that
 /// carries the path/target. Shared by the Claude transcript tap and the
 /// OpenCode plugin's `/memory/event` ingress so both classify identically.
@@ -113,5 +168,51 @@ mod tests {
         assert_eq!(classify_tool("Task"), None);
         assert_eq!(classify_tool("TodoWrite"), None);
         assert_eq!(classify_tool("mcp__cimp-offload__graph_find_symbol"), None);
+    }
+
+    // ── V12 Phase E: distiller output validation ──────────────────────────
+
+    #[test]
+    fn parse_distilled_facts_accepts_one_to_three_clean_lines() {
+        assert_eq!(
+            parse_distilled_facts("uses FNV hashing for stability\nretry cap is 30s"),
+            Some(vec![
+                "uses FNV hashing for stability".to_string(),
+                "retry cap is 30s".to_string(),
+            ])
+        );
+        assert_eq!(
+            parse_distilled_facts("only one fact here"),
+            Some(vec!["only one fact here".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_distilled_facts_trims_and_drops_blank_lines() {
+        assert_eq!(
+            parse_distilled_facts("  fact one  \n\n\nfact two\n"),
+            Some(vec!["fact one".to_string(), "fact two".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_distilled_facts_rejects_more_than_three_lines() {
+        let raw = "one\ntwo\nthree\nfour";
+        assert_eq!(parse_distilled_facts(raw), None);
+    }
+
+    #[test]
+    fn parse_distilled_facts_rejects_an_oversized_line() {
+        let long = "x".repeat(MAX_FACT_CHARS + 1);
+        assert_eq!(parse_distilled_facts(&long), None);
+        // A line right AT the cap is fine.
+        let exact = "y".repeat(MAX_FACT_CHARS);
+        assert_eq!(parse_distilled_facts(&exact), Some(vec![exact]));
+    }
+
+    #[test]
+    fn parse_distilled_facts_rejects_empty_or_blank_output() {
+        assert_eq!(parse_distilled_facts(""), None);
+        assert_eq!(parse_distilled_facts("   \n\n  "), None);
     }
 }

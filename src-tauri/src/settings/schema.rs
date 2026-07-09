@@ -996,6 +996,20 @@ pub struct GraphSettings {
     /// `graph.db`. Off by default; needs a ready local offload backend. Never
     /// leaves the machine (local-only path).
     pub context_llm_digests: bool,
+
+    // --- V12 Phase E: memory distillation (durable project facts) ---
+    /// Distill an idle session's working set + notes into at most 3 durable
+    /// `project_fact` rows via the **local-only** offload path before/instead
+    /// of letting that knowledge evaporate with the session. Off by default —
+    /// needs a ready local offload backend and the prompt is model-dependent
+    /// (milestone Decision 3: revisit after real-session validation).
+    pub memory_distillation: bool,
+    /// Append **pinned** project facts (only pinned — the human-curated tier)
+    /// to the launch-time guidance payload (Claude `--append-system-prompt`,
+    /// OpenCode's instructions file), so durable knowledge arrives with zero
+    /// tool calls. Off by default. Launch-time only: a fact pinned mid-session
+    /// applies on the tab's next launch.
+    pub promote_pinned_facts: bool,
 }
 
 impl GraphSettings {
@@ -1056,6 +1070,8 @@ impl Default for GraphSettings {
             read_advisor_min_lines: 300,
             read_advisor_mode: "advise".to_string(),
             context_llm_digests: false,
+            memory_distillation: false,
+            promote_pinned_facts: false,
         }
     }
 }

@@ -171,6 +171,32 @@ pub fn build_context(
         }
     }
 
+    // V12 Phase E: project-fact boost — a durable fact that mentions a
+    // candidate file's stem (e.g. a fact naming "GraphService" boosts
+    // `graph/service.rs`) is a signal the file matters to this project beyond
+    // one prompt's term match. ONE fetch of the live fact set (not a
+    // per-candidate query), then a cheap substring check per already-scored
+    // candidate. Facts themselves are never injected per-turn here — only
+    // this small ranking nudge; they surface in full via `context_recall` and
+    // (pinned-only) launch-time promotion (V12 spec, Feature 5).
+    let facts: Vec<String> = idx
+        .list_project_facts(false, 100)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.text)
+        .collect();
+    if !facts.is_empty() {
+        for (file, s) in score.iter_mut() {
+            let stem = Path::new(file)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if !stem.is_empty() && facts.iter().any(|f| f.contains(stem)) {
+                *s += 2.0;
+            }
+        }
+    }
+
     // Rank; bail when the best file is below the threshold (meta prompts).
     let mut ranked: Vec<(String, f64)> = score.into_iter().collect();
     ranked.sort_by(|a, b| {
@@ -634,6 +660,33 @@ mod tests {
         // The digest trailer surfaces the commit subject + a relative age.
         assert!(r.context_md.contains("fix: widget cache"), "{}", r.context_md);
         assert!(r.context_md.contains("1d ago"), "{}", r.context_md);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_fact_boost_promotes_a_mentioned_file_over_an_equal_score_peer() {
+        use crate::graph::{parse_file, Lang};
+        let dir = std::env::temp_dir().join(format!("ckg-fact-boost-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // Two files, each defining a same-named symbol — identical base
+        // term-match score, same as the churn-boost test's fixture.
+        idx.index_file_graph(&parse_file("src/hot.rs", "pub fn widget() {}\n", Lang::Rust))
+            .expect("index hot");
+        idx.index_file_graph(&parse_file("src/cold.rs", "pub fn widget() {}\n", Lang::Rust))
+            .expect("index cold");
+
+        // A fact naming "hot" (hot.rs's stem) should boost only that file.
+        idx.add_project_fact("f1", "hot handles the retry-cache gotcha", "s1", 1, false)
+            .expect("add fact");
+
+        let no_dedup = HashMap::new();
+        let r = build_context(&idx, "widget", &[], 800, 6000, 0.5, &no_dedup, 0, 0, false);
+        let pos_hot = r.files_used.iter().position(|f| f == "src/hot.rs");
+        let pos_cold = r.files_used.iter().position(|f| f == "src/cold.rs");
+        assert!(pos_hot.is_some() && pos_cold.is_some(), "{:?}", r.files_used);
+        assert!(pos_hot < pos_cold, "the fact-mentioned file should rank first: {:?}", r.files_used);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

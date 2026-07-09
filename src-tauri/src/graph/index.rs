@@ -15,7 +15,8 @@ use cozo::{DataValue, DbInstance, MultiTransaction, Num, ScriptMutability};
 use crate::error::{AppError, AppResult};
 
 use super::memory::{
-    MemNote, SessionInfo, WorkingSetEntry, MAX_EVENTS_PER_SESSION, MAX_SESSIONS_PER_ROOT,
+    MemNote, ProjectFact, SessionInfo, WorkingSetEntry, MAX_EVENTS_PER_SESSION,
+    MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT,
 };
 use super::model::{FileGraph, Lang};
 use super::schema::{GRAPH_SCHEMA_VERSION, RELATIONS};
@@ -1642,6 +1643,23 @@ impl GraphIndex {
                 "commit_touch",
                 ":create commit_touch {file: String => last_ts: Int, last_subject: String, touches_90d: Int}",
             ),
+            // V12 Phase E: durable project facts distilled from session memory
+            // (or added manually) — additive, survives a graph rebuild AND a
+            // session's own eviction (that's the point: a fact outlives the
+            // session it came from).
+            (
+                "project_fact",
+                ":create project_fact {fact_id: String => text: String, source_session: String, \
+                    ts_ms: Int, pinned: Bool, archived: Bool}",
+            ),
+            // V12 Phase E: whether a session has already run the distiller, kept
+            // as its OWN additive relation rather than a column on `session` so
+            // the eviction-cascade shape (see `prune_sessions_in_tx`) and the
+            // core session upsert (`record_mem_event`) never need to touch it.
+            (
+                "session_distilled",
+                ":create session_distilled {session_id: String => distilled: Bool, ts_ms: Int}",
+            ),
         ];
         for (name, create) in defs {
             if !existing.contains(*name) {
@@ -2003,6 +2021,205 @@ impl GraphIndex {
         })
     }
 
+    // ── V12 Phase E: project facts (memory distillation) ─────────────────
+
+    /// Insert a new project fact (distiller output or a manual add), then
+    /// enforce the [`MAX_LIVE_PROJECT_FACTS`] cap: if the live (non-archived)
+    /// count is now over the cap, archive the oldest UNPINNED live fact.
+    /// Never archives a pinned fact — if every live fact (including the one
+    /// just inserted) is pinned, the cap is simply exceeded. All in one write
+    /// transaction so a concurrent insert can't race the cap check.
+    pub fn add_project_fact(
+        &self,
+        fact_id: &str,
+        text: &str,
+        source_session: &str,
+        ts_ms: i64,
+        pinned: bool,
+    ) -> AppResult<()> {
+        let fact_id = fact_id.to_string();
+        let text = text.to_string();
+        let source_session = source_session.to_string();
+        self.with_write_txn(move |tx| {
+            let row = DataValue::List(vec![
+                DataValue::Str(fact_id.as_str().into()),
+                DataValue::Str(text.as_str().into()),
+                DataValue::Str(source_session.as_str().into()),
+                DataValue::Num(Num::Int(ts_ms)),
+                DataValue::Bool(pinned),
+                DataValue::Bool(false),
+            ]);
+            tx_put(
+                tx,
+                "?[fact_id, text, source_session, ts_ms, pinned, archived] <- $rows\n\
+                 :put project_fact {fact_id => text, source_session, ts_ms, pinned, archived}",
+                vec![row],
+            )?;
+
+            let rows = tx_run(
+                tx,
+                "?[fact_id, ts_ms, pinned] := *project_fact{fact_id, ts_ms, pinned, archived}, archived == false",
+                BTreeMap::new(),
+            )?;
+            let live: Vec<(String, i64, bool)> = rows
+                .rows
+                .iter()
+                .map(|r| (cell_str(r, 0), cell_i64(r, 1), cell_bool(r, 2)))
+                .collect();
+            if let Some(to_archive) = fact_to_archive_for_cap(&live, MAX_LIVE_PROJECT_FACTS) {
+                archive_fact_in_tx(tx, &to_archive)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Live (non-archived) project facts unless `include_archived`, pinned
+    /// first then newest, bounded to `max`.
+    pub fn list_project_facts(&self, include_archived: bool, max: usize) -> AppResult<Vec<ProjectFact>> {
+        let script = if include_archived {
+            "?[fact_id, text, source_session, ts_ms, pinned, archived] := \
+                *project_fact{fact_id, text, source_session, ts_ms, pinned, archived}"
+        } else {
+            "?[fact_id, text, source_session, ts_ms, pinned, archived] := \
+                *project_fact{fact_id, text, source_session, ts_ms, pinned, archived}, archived == false"
+        };
+        let rows = self.run(script, BTreeMap::new(), ScriptMutability::Immutable)?;
+        let mut facts: Vec<ProjectFact> = rows
+            .rows
+            .iter()
+            .map(|r| ProjectFact {
+                fact_id: cell_str(r, 0),
+                text: cell_str(r, 1),
+                source_session: cell_str(r, 2),
+                ts_ms: cell_i64(r, 3),
+                pinned: cell_bool(r, 4),
+                archived: cell_bool(r, 5),
+            })
+            .collect();
+        facts.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.ts_ms.cmp(&a.ts_ms)));
+        facts.truncate(max);
+        Ok(facts)
+    }
+
+    /// Pin/unpin a fact (read-modify-write to keep the other columns intact).
+    pub fn set_fact_pinned(&self, fact_id: &str, pinned: bool) -> AppResult<()> {
+        self.rewrite_fact(fact_id, |f| f.pinned = pinned)
+    }
+
+    /// Archive/unarchive a fact.
+    pub fn set_fact_archived(&self, fact_id: &str, archived: bool) -> AppResult<()> {
+        self.rewrite_fact(fact_id, |f| f.archived = archived)
+    }
+
+    /// Read-modify-write one fact's row, applying `mutate` to the in-memory
+    /// copy. A no-op (not an error) when `fact_id` doesn't exist — mirrors
+    /// [`Self::mem_set_note_pinned`]'s tolerant-missing-id posture (a stale
+    /// UI row shouldn't surface an error toast).
+    fn rewrite_fact(&self, fact_id: &str, mutate: impl FnOnce(&mut ProjectFact)) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("fid".to_string(), DataValue::Str(fact_id.into()));
+        let rows = self.run(
+            "?[text, source_session, ts_ms, pinned, archived] := \
+                *project_fact{fact_id, text, source_session, ts_ms, pinned, archived}, fact_id == $fid",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let Some(r) = rows.rows.first() else { return Ok(()) };
+        let mut fact = ProjectFact {
+            fact_id: fact_id.to_string(),
+            text: cell_str(r, 0),
+            source_session: cell_str(r, 1),
+            ts_ms: cell_i64(r, 2),
+            pinned: cell_bool(r, 3),
+            archived: cell_bool(r, 4),
+        };
+        mutate(&mut fact);
+        let row = DataValue::List(vec![
+            DataValue::Str(fact.fact_id.as_str().into()),
+            DataValue::Str(fact.text.as_str().into()),
+            DataValue::Str(fact.source_session.as_str().into()),
+            DataValue::Num(Num::Int(fact.ts_ms)),
+            DataValue::Bool(fact.pinned),
+            DataValue::Bool(fact.archived),
+        ]);
+        self.put(
+            "?[fact_id, text, source_session, ts_ms, pinned, archived] <- $rows\n\
+             :put project_fact {fact_id => text, source_session, ts_ms, pinned, archived}",
+            vec![row],
+        )
+    }
+
+    /// Permanently delete a fact (vs. archive, which keeps the row).
+    pub fn delete_fact(&self, fact_id: &str) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("fid".to_string(), DataValue::Str(fact_id.into()));
+        self.run_mut(
+            "?[fact_id] := *project_fact{fact_id}, fact_id == $fid\n:rm project_fact {fact_id}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// Mark `session_id` as having run the distiller (successfully or not —
+    /// the distiller marks this even on a validation failure, per its "never
+    /// retry-loop a bad output" posture).
+    pub fn mark_session_distilled(&self, session_id: &str, ts_ms: i64) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        p.insert("ts".to_string(), DataValue::Num(Num::Int(ts_ms)));
+        self.run_mut(
+            "?[session_id, distilled, ts_ms] <- [[$sid, true, $ts]]\n\
+             :put session_distilled {session_id => distilled, ts_ms}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// Whether `session_id` has already run the distiller. `false` for a
+    /// session with no `session_distilled` row (never attempted) — same
+    /// honest-default posture as `is_test`/`visibility`.
+    pub fn is_session_distilled(&self, session_id: &str) -> AppResult<bool> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[distilled] := *session_distilled{session_id, distilled}, session_id == $sid",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().map(|r| cell_bool(r, 0)).unwrap_or(false))
+    }
+
+    /// Sessions whose `last_ms` is older than `cutoff_ms` and that haven't
+    /// been distilled yet — the candidate set for the idle-sweep trigger.
+    /// Sessions are capped at [`MAX_SESSIONS_PER_ROOT`] so both scans here
+    /// are small; no join is expressed in Datalog (simpler to read, cheap at
+    /// this scale) — the distilled-id set is built once and checked in Rust.
+    pub fn sessions_idle_undistilled(&self, cutoff_ms: i64) -> AppResult<Vec<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("cutoff".to_string(), DataValue::Num(Num::Int(cutoff_ms)));
+        let idle_rows = self.run(
+            "?[session_id] := *session{session_id, last_ms}, last_ms < $cutoff",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let idle: Vec<String> = idle_rows.rows.iter().map(|r| cell_str(r, 0)).collect();
+        if idle.is_empty() {
+            return Ok(idle);
+        }
+        let d_rows = self.run(
+            "?[session_id, distilled] := *session_distilled{session_id, distilled}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let distilled: HashSet<String> = d_rows
+            .rows
+            .iter()
+            .filter(|r| cell_bool(r, 1))
+            .map(|r| cell_str(r, 0))
+            .collect();
+        Ok(idle.into_iter().filter(|s| !distilled.contains(s)).collect())
+    }
+
     // ── V12 Phase D: git churn (`commit_touch`) ──────────────────────────
 
     /// Upsert churn rows collected by `graph::gitmeta::collect`/`collect_for`.
@@ -2140,6 +2357,53 @@ fn prune_sessions_in_tx(tx: &MultiTransaction) -> AppResult<()> {
         tx_run(tx, "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}", p)?;
     }
     Ok(())
+}
+
+/// V12 Phase E: pure cap-enforcement decision for [`GraphIndex::add_project_fact`].
+/// Given the current LIVE facts as `(fact_id, ts_ms, pinned)` and a live-count
+/// `cap`, returns the fact_id to archive to bring the set back to the cap, or
+/// `None` when already within it. Picks the oldest UNPINNED fact (ascending
+/// `ts_ms`); if every live fact is pinned, returns `None` — the cap is simply
+/// exceeded rather than archiving a pinned fact. DB-free so it's directly
+/// unit-testable.
+fn fact_to_archive_for_cap(live: &[(String, i64, bool)], cap: usize) -> Option<String> {
+    if live.len() <= cap {
+        return None;
+    }
+    live.iter()
+        .filter(|(_, _, pinned)| !*pinned)
+        .min_by_key(|(_, ts, _)| *ts)
+        .map(|(id, _, _)| id.clone())
+}
+
+/// Read-modify-write one `project_fact` row's `archived` flag to `true`
+/// inside an open transaction. Used by [`GraphIndex::add_project_fact`]'s cap
+/// enforcement; a no-op if the id is somehow already gone (best-effort, same
+/// tolerant posture as the read-modify-write helpers above).
+fn archive_fact_in_tx(tx: &MultiTransaction, fact_id: &str) -> AppResult<()> {
+    let mut p = BTreeMap::new();
+    p.insert("fid".to_string(), DataValue::Str(fact_id.into()));
+    let rows = tx_run(
+        tx,
+        "?[text, source_session, ts_ms, pinned] := \
+            *project_fact{fact_id, text, source_session, ts_ms, pinned}, fact_id == $fid",
+        p,
+    )?;
+    let Some(r) = rows.rows.first() else { return Ok(()) };
+    let row = DataValue::List(vec![
+        DataValue::Str(fact_id.into()),
+        DataValue::Str(cell_str(r, 0).as_str().into()),
+        DataValue::Str(cell_str(r, 1).as_str().into()),
+        DataValue::Num(Num::Int(cell_i64(r, 2))),
+        DataValue::Bool(cell_bool(r, 3)),
+        DataValue::Bool(true),
+    ]);
+    tx_put(
+        tx,
+        "?[fact_id, text, source_session, ts_ms, pinned, archived] <- $rows\n\
+         :put project_fact {fact_id => text, source_session, ts_ms, pinned, archived}",
+        vec![row],
+    )
 }
 
 /// Run one script inside a multi-transaction, mapping cozo errors to [`AppError`].
@@ -3307,6 +3571,166 @@ pub struct Point { x: i32 }
         // max caps the result count.
         let capped = idx.recent_changes(30, None, 1).expect("recent_changes");
         assert_eq!(capped.len(), 1);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V12 Phase E: project facts (memory distillation) ─────────────────
+
+    #[test]
+    fn fact_to_archive_for_cap_picks_oldest_unpinned_never_pinned() {
+        // Below cap: nothing to archive.
+        let below = vec![("a".to_string(), 1, false), ("b".to_string(), 2, true)];
+        assert_eq!(fact_to_archive_for_cap(&below, 5), None);
+
+        // Over cap: the oldest UNPINNED fact wins even though "old-pinned" is
+        // older still.
+        let over = vec![
+            ("old-pinned".to_string(), 1, true),
+            ("oldest-unpinned".to_string(), 2, false),
+            ("newer-unpinned".to_string(), 3, false),
+        ];
+        assert_eq!(fact_to_archive_for_cap(&over, 2), Some("oldest-unpinned".to_string()));
+
+        // Every live fact pinned: nothing safe to archive, cap simply exceeded.
+        let all_pinned = vec![("p1".to_string(), 1, true), ("p2".to_string(), 2, true)];
+        assert_eq!(fact_to_archive_for_cap(&all_pinned, 1), None);
+    }
+
+    #[test]
+    fn project_fact_cap_archives_oldest_unpinned_never_pinned() {
+        let dir = std::env::temp_dir().join(format!("ckg-factcap-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        // Seed a pinned fact plus (cap - 1) unpinned facts directly (bulk
+        // write, bypassing the cap check) so the store starts already at the
+        // cap. Bypassing `add_project_fact` for the seed keeps this test fast
+        // (one bulk transaction instead of `MAX_LIVE_PROJECT_FACTS` of them).
+        let mut rows: Vec<DataValue> = vec![DataValue::List(vec![
+            DataValue::Str("pinned-1".into()),
+            DataValue::Str("pinned fact".into()),
+            DataValue::Str("s1".into()),
+            DataValue::Num(Num::Int(1)),
+            DataValue::Bool(true),
+            DataValue::Bool(false),
+        ])];
+        for i in 0..MAX_LIVE_PROJECT_FACTS - 1 {
+            rows.push(DataValue::List(vec![
+                DataValue::Str(format!("f{i}").into()),
+                DataValue::Str(format!("fact {i}").into()),
+                DataValue::Str("s1".into()),
+                DataValue::Num(Num::Int((i + 2) as i64)),
+                DataValue::Bool(false),
+                DataValue::Bool(false),
+            ]));
+        }
+        idx.put(
+            "?[fact_id, text, source_session, ts_ms, pinned, archived] <- $rows\n\
+             :put project_fact {fact_id => text, source_session, ts_ms, pinned, archived}",
+            rows,
+        )
+        .expect("seed facts");
+
+        // One more insert pushes the live count over the cap by one — the
+        // oldest unpinned fact ("f0", ts=2) must be archived, never "pinned-1"
+        // (ts=1, older still, but pinned).
+        idx.add_project_fact("new-1", "the newest fact", "s2", 1000, false)
+            .expect("insert over cap");
+
+        let live = idx.list_project_facts(false, 1000).expect("list live");
+        assert_eq!(live.len(), MAX_LIVE_PROJECT_FACTS);
+        assert!(live.iter().any(|f| f.fact_id == "pinned-1"), "pinned fact must survive the cap");
+        assert!(live.iter().any(|f| f.fact_id == "new-1"));
+        assert!(!live.iter().any(|f| f.fact_id == "f0"), "oldest unpinned fact should be archived");
+
+        let all = idx.list_project_facts(true, 1000).expect("list all");
+        let f0 = all.iter().find(|f| f.fact_id == "f0").expect("f0 still exists, archived");
+        assert!(f0.archived);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_project_facts_orders_pinned_first_then_newest() {
+        let dir = std::env::temp_dir().join(format!("ckg-factlist-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        idx.add_project_fact("old-unpinned", "old unpinned", "s1", 100, false).unwrap();
+        idx.add_project_fact("new-unpinned", "new unpinned", "s1", 300, false).unwrap();
+        idx.add_project_fact("old-pinned", "old pinned", "s1", 50, true).unwrap();
+
+        let facts = idx.list_project_facts(false, 10).unwrap();
+        let ids: Vec<&str> = facts.iter().map(|f| f.fact_id.as_str()).collect();
+        // Pinned first (even though it's the oldest by ts_ms), then the
+        // unpinned facts newest-first.
+        assert_eq!(ids, vec!["old-pinned", "new-unpinned", "old-unpinned"]);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fact_pin_unpin_archive_delete_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("ckg-factcrud-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        idx.add_project_fact("f1", "some fact", "s1", 100, false).unwrap();
+        assert!(!idx.list_project_facts(false, 10).unwrap()[0].pinned);
+
+        idx.set_fact_pinned("f1", true).unwrap();
+        assert!(idx.list_project_facts(false, 10).unwrap()[0].pinned);
+
+        idx.set_fact_pinned("f1", false).unwrap();
+        assert!(!idx.list_project_facts(false, 10).unwrap()[0].pinned);
+
+        idx.set_fact_archived("f1", true).unwrap();
+        assert!(idx.list_project_facts(false, 10).unwrap().is_empty(), "archived facts are excluded by default");
+        let all = idx.list_project_facts(true, 10).unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].archived);
+
+        idx.delete_fact("f1").unwrap();
+        assert!(idx.list_project_facts(true, 10).unwrap().is_empty());
+
+        // Deleting/updating an unknown id is a tolerant no-op, not an error.
+        assert!(idx.set_fact_pinned("nope", true).is_ok());
+        assert!(idx.delete_fact("nope").is_ok());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_distilled_flag_roundtrip_and_idle_sweep_candidates() {
+        let dir = std::env::temp_dir().join(format!("ckg-distflag-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s2", "claude", "read", "b.rs", None, None, 200, None).unwrap();
+
+        // Neither session has been distilled yet.
+        assert!(!idx.is_session_distilled("s1").unwrap());
+        assert!(!idx.is_session_distilled("s2").unwrap());
+
+        // Both are "idle" relative to a cutoff after their last activity.
+        let idle = idx.sessions_idle_undistilled(1_000).unwrap();
+        assert_eq!(idle.len(), 2);
+        assert!(idle.contains(&"s1".to_string()));
+        assert!(idle.contains(&"s2".to_string()));
+
+        // Mark s1 distilled — it drops out of the idle-undistilled candidate
+        // set; s2 stays.
+        idx.mark_session_distilled("s1", 150).unwrap();
+        assert!(idx.is_session_distilled("s1").unwrap());
+        assert!(!idx.is_session_distilled("s2").unwrap());
+        let idle_after = idx.sessions_idle_undistilled(1_000).unwrap();
+        assert_eq!(idle_after, vec!["s2".to_string()]);
+
+        // A cutoff before either session's last activity excludes both (not
+        // idle yet).
+        assert!(idx.sessions_idle_undistilled(50).unwrap().is_empty());
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

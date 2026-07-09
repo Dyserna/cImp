@@ -1136,6 +1136,52 @@ pub async fn graph_note_set_pinned(
     service.mem_set_note_pinned(&root, &note_id, pinned)
 }
 
+/// V12 Phase E (Memory): the project's durable facts (pinned first, then
+/// newest), excluding archived ones. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_facts(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<Vec<crate::graph::ProjectFact>> {
+    let root = resolve_graph_root(root)?;
+    Ok(service.list_project_facts(&root, false, 200))
+}
+
+/// V12 Phase E (Memory): pin / unpin / archive / delete one project fact.
+/// `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_fact_update(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    id: String,
+    action: String,
+) -> AppResult<()> {
+    let root = resolve_graph_root(root)?;
+    match action.as_str() {
+        "pin" => service.set_fact_pinned(&root, &id, true),
+        "unpin" => service.set_fact_pinned(&root, &id, false),
+        "archive" => service.set_fact_archived(&root, &id, true),
+        "delete" => service.delete_fact(&root, &id),
+        other => Err(crate::error::AppError::Graph(format!(
+            "unknown fact action: {other} (expected pin|unpin|archive|delete)"
+        ))),
+    }
+}
+
+/// V12 Phase E (Memory): manually add a project fact from the Facts UI's "add
+/// fact" input (recorded with `source_session = "manual"`). `root` defaults
+/// to the launch directory.
+#[tauri::command]
+pub async fn graph_fact_add(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    text: String,
+    pin: Option<bool>,
+) -> AppResult<()> {
+    let root = resolve_graph_root(root)?;
+    service.add_project_fact_manual(&root, &text, pin.unwrap_or(false))
+}
+
 /// V10 (Context): preview what context injection WOULD prepend for `prompt`,
 /// bypassing the `context_injection` toggle (so the user can tune before
 /// enabling). Requires the graph to be enabled. `root` defaults to the launch

@@ -37,7 +37,7 @@ pub use activity::{snapshot as graph_history, GraphCall};
 pub use builder::parse_file;
 pub use context::RetrieveResult;
 pub use index::{GraphIndex, GraphStats, SymbolHit};
-pub use memory::{classify_tool, MemArg, MemorySnapshot};
+pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact};
 pub use mcp::{
     handle_call as handle_mcp_call, offload_query, semantic_code_spec, semantic_spec, tool_specs,
     tools as mcp_tools, GraphToolSpec,

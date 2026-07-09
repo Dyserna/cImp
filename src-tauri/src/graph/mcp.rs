@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use super::index::{DocHit, GraphIndex, RefHit, SymbolHit};
-use super::memory::{MemNote, WorkingSetEntry};
+use super::memory::{MemNote, ProjectFact, WorkingSetEntry};
 
 /// One graph tool's identity, description, and JSON-Schema parameters — the
 /// shared definition both surfaces render into their own shape.
@@ -530,9 +530,17 @@ pub fn run_tool(
             let Some(sid) = idx.mem_current_session_for(agent).map_err(|e| e.to_string())? else {
                 return Ok("No session activity recorded yet.".to_string());
             };
-            idx.mem_working_set(&sid, max_rows)
-                .map(|v| fmt_working_set(&v, max_rows))
-                .map_err(|e| e.to_string())
+            let ws = idx.mem_working_set(&sid, max_rows).map_err(|e| e.to_string())?;
+            let mut out = fmt_working_set(&ws, max_rows);
+            // V12 Phase E: a trailing project-facts section (pinned first,
+            // capped separately from the working set) — durable knowledge
+            // that outlived the sessions it came from.
+            let facts = idx.list_project_facts(false, 15).map_err(|e| e.to_string())?;
+            if !facts.is_empty() {
+                out.push_str("\n\n## Project facts\n");
+                out.push_str(&fmt_facts(&facts, 15));
+            }
+            Ok(out)
         }
         "context_notes" => {
             let sid = idx.mem_current_session_for(agent).map_err(|e| e.to_string())?.unwrap_or_default();
@@ -985,6 +993,23 @@ fn fmt_notes(notes: &[MemNote], max_rows: usize) -> String {
         .collect();
     if notes.len() > max_rows {
         lines.push(format!("… (+{} more)", notes.len() - max_rows));
+    }
+    lines.join("\n")
+}
+
+/// V12 Phase E: render project facts (pinned first, then newest — the order
+/// [`super::index::GraphIndex::list_project_facts`] already returns them in).
+fn fmt_facts(facts: &[ProjectFact], max_rows: usize) -> String {
+    if facts.is_empty() {
+        return "No project facts recorded yet.".to_string();
+    }
+    let mut lines: Vec<String> = facts
+        .iter()
+        .take(max_rows)
+        .map(|f| format!("{}{}", if f.pinned { "📌 " } else { "• " }, f.text))
+        .collect();
+    if facts.len() > max_rows {
+        lines.push(format!("… (+{} more)", facts.len() - max_rows));
     }
     lines.join("\n")
 }
@@ -1831,6 +1856,45 @@ mod tests_for_tool_tests {
         idx.index_file_graph(&parse_file("src/x.rs", "pub fn lonely() {}\n", Lang::Rust)).expect("index");
         let out = run_tests_for(&idx, &json!({ "symbol": "lonely" }), 50).expect("run_tests_for");
         assert!(out.contains("No candidate tests"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod recall_facts_tests {
+    use super::{run_tool, GraphIndex};
+    use serde_json::json;
+
+    #[test]
+    fn context_recall_appends_a_project_facts_section() {
+        let dir = std::env::temp_dir().join(format!("recall-facts-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
+        idx.add_project_fact("f1", "we chose FNV hashing for stability", "s1", 50, true).unwrap();
+        idx.add_project_fact("f2", "the retry cap is 30s by design", "s1", 60, false).unwrap();
+
+        let out = run_tool(&idx, "context_recall", &json!({}), 50, 200, Some("claude")).expect("run_tool");
+        assert!(out.contains("## Project facts"), "{out}");
+        assert!(out.contains("we chose FNV hashing for stability"), "{out}");
+        assert!(out.contains("the retry cap is 30s by design"), "{out}");
+        // Pinned fact renders first within the facts section.
+        let facts_idx = out.find("## Project facts").unwrap();
+        let pinned_pos = out[facts_idx..].find("FNV hashing").unwrap();
+        let unpinned_pos = out[facts_idx..].find("retry cap").unwrap();
+        assert!(pinned_pos < unpinned_pos, "{out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_recall_omits_the_facts_section_when_there_are_none() {
+        let dir = std::env::temp_dir().join(format!("recall-nofacts-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
+
+        let out = run_tool(&idx, "context_recall", &json!({}), 50, 200, Some("claude")).expect("run_tool");
+        assert!(!out.contains("## Project facts"), "{out}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

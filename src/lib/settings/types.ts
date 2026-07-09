@@ -666,6 +666,10 @@ export interface GraphSettings {
   read_advisor_mode: string;
   // V11 Phase F: local-model context digests (local-only).
   context_llm_digests: boolean;
+  // V12 Phase E: memory distillation (durable project facts, local-only).
+  memory_distillation: boolean;
+  // V12 Phase E: promote PINNED facts into launch-time guidance.
+  promote_pinned_facts: boolean;
 }
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
@@ -1176,6 +1180,8 @@ export function defaultSettings(): Settings {
       read_advisor_min_lines: 300,
       read_advisor_mode: 'advise',
       context_llm_digests: false,
+      memory_distillation: false,
+      promote_pinned_facts: false,
     },
     checks: [],
     enabled_ai_tabs: ['claude'],

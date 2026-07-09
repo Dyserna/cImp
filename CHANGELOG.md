@@ -5,7 +5,7 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.40.0] — 2026-07-10
 
 ### Added
 
@@ -298,6 +298,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `advisor_dismissed` fields; the migration is a no-op data transform (every
   new field is `#[serde(default)]`/`Option`), so an older `settings.json`
   round-trips additively.
+
+### Fixed
+
+- **Workbench module hardening** (multi-agent code review of the whole
+  module). Highlights: automatic prompt/burst checkpoints were silently
+  broken on Windows (git rejects the `\\?\` canonicalized root the
+  triggers passed — verbatim prefixes are now stripped at the spawn
+  boundary); several Workbench views mutated plain `Set`/`Map` state that
+  Svelte 5 doesn't proxy, leaving the worktree diff panel / check chips /
+  checkpoint-diff expansion visually dead (now `SvelteSet`/`SvelteMap`);
+  reverting an untracked file's hunk deleted the file with no confirmation
+  (now always confirms in explicit delete terms). Also: merges are no
+  longer refused over untracked files, discard refuses while an AI tab
+  lives in the worktree, failed worktree/shell creates no longer leak a
+  queued pane placement, per-file diff fetches guard against out-of-order
+  responses, non-UTF-8 filenames survive restore on Linux, `LC_ALL=C` is
+  pinned on spawned git, the shadow repo pins `core.hooksPath` and skips
+  redundant re-init per checkpoint, and the diff parser prefers explicit
+  header paths over the `diff --git` split.
 
 ## [0.35.0] — 2026-07-08
 

@@ -27,6 +27,7 @@
   import CodeIntelligenceView from './CodeIntelligenceView.svelte';
   import NoteView from './NoteView.svelte';
   import WorkbenchView from './WorkbenchView.svelte';
+  import GraphView from './GraphView.svelte';
   import PreviewToolbar from './PreviewToolbar.svelte';
   import {
     isShellTab,
@@ -34,6 +35,7 @@
     isGraphMonitorTab,
     isNoteTab,
     isWorkbenchTab,
+    isGraphViewTab,
     type TabId,
   } from './tabs/types';
   import { tabs } from './tabs/store';
@@ -174,6 +176,8 @@
         <NoteView />
       {:else if isWorkbenchTab(pane.active_tab_id)}
         <WorkbenchView />
+      {:else if isGraphViewTab(pane.active_tab_id)}
+        <GraphView />
       {:else if $tabs.find((m) => m.id === pane.active_tab_id)?.kind === 'preview'}
         {#key pane.active_tab_id}
           <PreviewToolbar tabId={pane.active_tab_id} />

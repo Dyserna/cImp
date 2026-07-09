@@ -29,6 +29,8 @@
     graphUsage,
     graphUsageAdvice,
     advisorDismiss,
+    graphPath,
+    graphArchitecture,
     onGraphStatus,
     onGraphAnalyses,
     type EmbedderProbe,
@@ -43,6 +45,9 @@
     type UsageSnapshot,
     type AdvisorSnapshot,
     type AdvisorProposal,
+    type PathResult,
+    type PathNodeRow,
+    type ArchResult,
   } from './graph';
   import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio } from './usageMath';
   import { listenManaged } from './listenManaged';
@@ -193,6 +198,64 @@
     }
   }
 
+  // V15 Feature 1: path tracing — the "Trace path" section. `from`/`to` accept
+  // a symbol name, `file:line`, or bare file path (resolved backend-side).
+  // Edge-kind toggles default to all three kinds checked.
+  let pathFrom = $state('');
+  let pathTo = $state('');
+  let pathSymmetric = $state(false);
+  let pathKindCall = $state(true);
+  let pathKindImport = $state(true);
+  let pathKindContains = $state(true);
+  let pathResult = $state<PathResult | null>(null);
+  let pathBusy = $state(false);
+  let pathError = $state<string | null>(null);
+
+  async function runPath(): Promise<void> {
+    if (!pathFrom.trim() || !pathTo.trim() || pathBusy) return;
+    pathBusy = true;
+    pathError = null;
+    try {
+      const kinds = [
+        pathKindCall ? 'call' : null,
+        pathKindImport ? 'import' : null,
+        pathKindContains ? 'contains' : null,
+      ].filter((k): k is string => k !== null);
+      pathResult = await graphPath(pathFrom.trim(), pathTo.trim(), {
+        kinds,
+        symmetric: pathSymmetric,
+      });
+    } catch (e) {
+      pathError = String(e);
+      pathResult = null;
+    } finally {
+      pathBusy = false;
+    }
+  }
+
+  // A file node's `label` is just its path; a symbol node shows name + loc + kind.
+  function pathNodeText(n: PathNodeRow): string {
+    return n.kind === 'file' ? n.file : `${n.label} (${n.file}:${n.line}) [${n.kind}]`;
+  }
+
+  // V15 Feature 2: the "Architecture" section — god nodes, subsystems,
+  // surprising (cross-subsystem) edges. Heuristic, advisory only.
+  let arch = $state<ArchResult | null>(null);
+  let archBusy = $state(false);
+  let archError = $state<string | null>(null);
+
+  async function runArchitecture(): Promise<void> {
+    archBusy = true;
+    archError = null;
+    try {
+      arch = await graphArchitecture();
+    } catch (e) {
+      archError = String(e);
+    } finally {
+      archBusy = false;
+    }
+  }
+
   // Memory (Phase C): per-project session/action memory. Fetched while the
   // Memory section is open (via refresh()'s poll) and on demand.
   let memory = $state<MemorySnapshot | null>(null);
@@ -328,7 +391,7 @@
   // Memory/Context/Analyses/Usage are filled by V10/V14 phases. The internal
   // tab id (`graph-monitor`) is unchanged — this is purely the in-view
   // section router.
-  type Section = 'index' | 'activity' | 'memory' | 'context' | 'analyses' | 'usage';
+  type Section = 'index' | 'activity' | 'memory' | 'context' | 'analyses' | 'usage' | 'path' | 'architecture';
   const SECTIONS: { id: Section; label: string }[] = [
     { id: 'index', label: 'Index' },
     { id: 'activity', label: 'Activity' },
@@ -336,6 +399,8 @@
     { id: 'context', label: 'Context' },
     { id: 'analyses', label: 'Analyses' },
     { id: 'usage', label: 'Usage' },
+    { id: 'path', label: 'Trace path' },
+    { id: 'architecture', label: 'Architecture' },
   ];
   let section = $state<Section>('index');
 
@@ -931,6 +996,12 @@
               <p class="placeholder">No dependents found (nothing in the index transitively calls the changed symbol(s)).</p>
             {:else}
               <div class="history-head">Dependents</div>
+              <p class="caveat">
+                Confidence along the discovery chain:
+                <span class="conf extracted">extracted</span> (most certain) →
+                <span class="conf inferred">inferred</span> →
+                <span class="conf ambiguous">ambiguous</span> (least certain).
+              </p>
               <div class="rows">
                 {#each impact.dependents as d, i (d.file + ':' + d.line + ':' + i)}
                   <div class="arow dep">
@@ -938,6 +1009,7 @@
                     <span class="akind">{d.kind}</span>
                     <span class="aloc">{d.file}:{d.line}</span>
                     <span class="muted">depth {d.depth}</span>
+                    <span class="conf {d.confidence}" title="edge confidence: {d.confidence}">{d.confidence}</span>
                   </div>
                 {/each}
               </div>
@@ -1091,6 +1163,147 @@
           </div>
         {/if}
       </section>
+    </div>
+  {:else if section === 'path'}
+    <div class="path-sec">
+      <p class="caveat">
+        Traces the shortest path between two entities over the code graph's
+        call/import/contains edges. Heuristic — a missing edge (dynamic
+        dispatch, an unindexed language) can hide a real path.
+      </p>
+      <section class="card">
+        <div class="history-head">Trace path</div>
+        <div class="preview-in path-in">
+          <input
+            type="text"
+            placeholder="symbol name, file:line, or file path"
+            bind:value={pathFrom}
+            onkeydown={(e) => e.key === 'Enter' && runPath()}
+          />
+          <span class="path-sep">→</span>
+          <input
+            type="text"
+            placeholder="symbol name, file:line, or file path"
+            bind:value={pathTo}
+            onkeydown={(e) => e.key === 'Enter' && runPath()}
+          />
+          <button onclick={runPath} disabled={pathBusy || !pathFrom.trim() || !pathTo.trim()}>
+            {pathBusy ? 'Tracing…' : 'Trace'}
+          </button>
+        </div>
+        <div class="path-opts">
+          <label class="pin-toggle">
+            <input type="checkbox" bind:checked={pathSymmetric} /> Undirected (related at all?)
+          </label>
+          <label class="pin-toggle"><input type="checkbox" bind:checked={pathKindCall} /> call</label>
+          <label class="pin-toggle"><input type="checkbox" bind:checked={pathKindImport} /> import</label>
+          <label class="pin-toggle"><input type="checkbox" bind:checked={pathKindContains} /> contains</label>
+        </div>
+
+        {#if pathError}
+          <p class="error">{pathError}</p>
+        {/if}
+
+        {#if pathResult}
+          {#if !pathResult.found}
+            <p class="placeholder">No path found within the hop limit (or an endpoint isn't indexed).</p>
+          {:else}
+            <div class="path-chain">
+              {#each pathResult.nodes as n, i (n.id + ':' + i)}
+                <div class="path-node" title={n.file}>{pathNodeText(n)}</div>
+                {#if n.edge_to_next}
+                  <div class="path-edge">
+                    ──{n.edge_to_next}{#if n.confidence}<span class="conf {n.confidence}" title="edge confidence: {n.confidence}">{n.confidence}</span>{/if}──▶
+                  </div>
+                {/if}
+              {/each}
+            </div>
+            <p class="preview-meta">
+              {pathResult.hops} hop{pathResult.hops === 1 ? '' : 's'}{#if pathResult.equal_alternatives > 0}
+                &nbsp;(+{pathResult.equal_alternatives} other path{pathResult.equal_alternatives === 1 ? '' : 's'} of equal length)
+              {/if}
+            </p>
+          {/if}
+        {/if}
+      </section>
+    </div>
+  {:else if section === 'architecture'}
+    <div class="arch-sec">
+      <p class="caveat">
+        Heuristic system-shape overview — hub degree + label-propagation
+        clustering. Advisory, not authoritative; verify before acting on it.
+      </p>
+      <div class="actions">
+        <button onclick={runArchitecture} disabled={archBusy}>
+          {archBusy ? 'Analyzing…' : 'Recompute'}
+        </button>
+      </div>
+
+      {#if archError}
+        <p class="error">{archError}</p>
+      {/if}
+
+      {#if arch}
+        <section class="card">
+          <div class="history-head">God nodes <span class="muted">({arch.god_nodes.length})</span></div>
+          <p class="caveat">Hubs the system flows through.</p>
+          {#if arch.god_nodes.length === 0}
+            <p class="placeholder">No standout hubs found.</p>
+          {:else}
+            <div class="rows">
+              {#each arch.god_nodes as g (g.id)}
+                <div class="arow god">
+                  <span class="aname">{g.label}</span>
+                  <span class="akind">{g.kind}</span>
+                  <span class="aloc">{g.file}</span>
+                  <span class="muted">degree {g.degree}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </section>
+
+        <section class="card">
+          <div class="history-head">Subsystems <span class="muted">({arch.subsystems.length})</span></div>
+          {#if arch.subsystems.length === 0}
+            <p class="placeholder">Single cohesive module — no distinct subsystems detected.</p>
+          {:else}
+            <div class="subsys-list">
+              {#each arch.subsystems as s (s.name)}
+                <details class="subsys">
+                  <summary>{s.name} — {s.size} file{s.size === 1 ? '' : 's'} · hub {s.hub}</summary>
+                  <div class="subsys-files">
+                    {#each s.files as f (f)}
+                      <div class="aloc">{f}</div>
+                    {/each}
+                  </div>
+                </details>
+              {/each}
+            </div>
+          {/if}
+        </section>
+
+        <section class="card">
+          <div class="history-head">
+            Surprising connections <span class="muted">({arch.surprising.length})</span>
+          </div>
+          <p class="caveat">
+            Candidate accidental coupling — heuristic, verify before acting.
+          </p>
+          {#if arch.surprising.length === 0}
+            <p class="placeholder">No cross-subsystem surprises found.</p>
+          {:else}
+            <div class="rows">
+              {#each arch.surprising as s, i (s.from + ':' + s.to + ':' + i)}
+                <div class="arow surprising">
+                  <span class="aname">{s.from_subsystem} ✗ {s.to_subsystem}</span>
+                  <span class="aloc">{s.from} ──{s.kind}──▶ {s.to}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </section>
+      {/if}
     </div>
   {/if}
 </div>
@@ -1774,5 +1987,100 @@
     font-size: 11px;
     opacity: 0.7;
     line-height: 1.4;
+  }
+
+  /* ── V15: confidence badges (impact dependents, path edges) ──────────── */
+  .conf {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 6px;
+    border-radius: 8px;
+    font-size: 9.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    line-height: 15px;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+  .conf.extracted {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text, #ddd);
+    opacity: 0.75;
+  }
+  .conf.inferred {
+    background: rgba(178, 106, 0, 0.28);
+    color: #f0c674;
+  }
+  .conf.ambiguous {
+    background: rgba(179, 38, 30, 0.28);
+    color: #ffb4ab;
+  }
+  .arow.dep {
+    grid-template-columns: 1fr 6rem 2fr auto auto;
+  }
+  .arow.god {
+    grid-template-columns: 1fr 6rem 2fr auto;
+  }
+  .arow.surprising {
+    grid-template-columns: 1fr 2fr;
+    white-space: normal;
+  }
+
+  /* ── V15 Feature 1: Trace path ─────────────────────────────────────────── */
+  .path-in {
+    align-items: center;
+  }
+  .path-sep {
+    opacity: 0.6;
+    flex: 0 0 auto;
+  }
+  .path-opts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    margin: 2px 0 10px;
+    font-size: 12px;
+  }
+  .path-chain {
+    display: flex;
+    flex-direction: column;
+    font-size: 12px;
+    margin: 6px 0;
+  }
+  .path-node {
+    font-family: monospace;
+    padding: 2px 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .path-edge {
+    padding: 1px 0 1px 1.2em;
+    opacity: 0.75;
+    font-size: 11px;
+    font-family: monospace;
+  }
+
+  /* ── V15 Feature 2: Architecture ───────────────────────────────────────── */
+  .subsys-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .subsys {
+    border-bottom: 1px solid var(--border, #2a2a2a);
+    padding: 4px 2px;
+    font-size: 12px;
+  }
+  .subsys summary {
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .subsys-files {
+    margin: 6px 0 4px 1.2em;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
 </style>

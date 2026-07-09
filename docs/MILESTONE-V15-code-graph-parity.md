@@ -1,6 +1,12 @@
 # V15 — Code Graph Parity (path tracing · architecture map · edge confidence · graph viz)
 
-**Status:** SPEC (written 2026-07-09). Not yet coded.
+**Status:** IMPLEMENTED (2026-07-09). Phases A–E landed on `develop`: edge
+confidence (schema 3→4), `graph_path`, `graph_architecture`, and the stretch
+Graph View tab, with settings, tests, and the Code Intelligence UI sections.
+The `Ambiguous` class is applied at query time (the only place a name's global
+candidate count is visible); parse-time confidence is `Extracted` (same-file /
+structural) vs `Inferred` (cross-file), never a silent upgrade. Architecture is
+computed on demand (no warm-index cache in V1).
 **Builds on:** V9-01 code knowledge graph (`docs/completedMilestones/MILESTONE-V9-01-code-knowledge-graph.md`), V9-02 multi-language `tags.scm` engine, V10 Context Engine (the "Code Intelligence" tab + Analyses section). Reuses the warm per-project `GraphIndex` (`graph/index.rs`), the `edge`/`ref` relations, and the existing `graph_*` MCP tool surface (`graph/mcp.rs`).
 
 ## Why

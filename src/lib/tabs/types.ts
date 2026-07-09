@@ -53,6 +53,17 @@ export function isWorkbenchTab(id: TabId): boolean {
   return id === WORKBENCH_TAB_ID;
 }
 
+/// V15 Feature 4: the reserved id of the read-only, app-rendered Graph View tab
+/// (live 2D/3D force-graph of the code graph). Shell-kind on the backend — no
+/// PTY — same pattern as the Code Graph monitor tab. Materialized only while
+/// `graph.graph_viz` is on.
+export const GRAPH_VIEW_TAB_ID = 'graph-view';
+
+/// True for the Graph View tab.
+export function isGraphViewTab(id: TabId): boolean {
+  return id === GRAPH_VIEW_TAB_ID;
+}
+
 /// True for a Preview tab's id (`"preview-<uuid>"` — see `create_preview_tab`
 /// / `TabId::Preview` on the backend). Unlike the reserved dashboards above,
 /// there's no single constant to compare against (Preview is repeatable),
@@ -75,6 +86,7 @@ export function isShellTab(id: TabId): boolean {
     id !== GRAPH_MONITOR_TAB_ID &&
     id !== NOTE_TAB_ID &&
     id !== WORKBENCH_TAB_ID &&
+    id !== GRAPH_VIEW_TAB_ID &&
     !isPreviewTabId(id)
   );
 }

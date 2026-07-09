@@ -63,6 +63,10 @@ pub enum TabId {
     /// checkpoint timeline / worktrees). Same shape as [`Self::GraphMonitor`]
     /// — Shell-kind, reserved identity, no PTY, app-rendered.
     Workbench,
+    /// V15 Feature 4: the read-only, non-closable Graph View tab (live 2D/3D
+    /// force-graph of the code graph). Same shape as [`Self::GraphMonitor`] —
+    /// Shell-kind, reserved identity, no PTY, app-rendered.
+    GraphView,
     /// V14 Phase F: a user-created Preview tab (embedded localhost browser).
     /// Unlike the reserved app-rendered tabs above, this is a genuinely new
     /// [`TabKind`] (not a Shell-kind reserved id) because it's repeatable —
@@ -83,6 +87,7 @@ impl TabId {
             TabId::OffloadServer => "offload-server",
             TabId::GraphMonitor => "graph-monitor",
             TabId::Workbench => "workbench-1",
+            TabId::GraphView => "graph-view",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
             TabId::Preview(s) => s.as_str(),
@@ -97,6 +102,7 @@ impl TabId {
             "offload-server" => TabId::OffloadServer,
             "graph-monitor" => TabId::GraphMonitor,
             "workbench-1" => TabId::Workbench,
+            "graph-view" => TabId::GraphView,
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
             // `Shell`, so they keep AI-kind behavior on relaunch. The
@@ -128,9 +134,11 @@ impl TabId {
             // purposes (it never runs a PTY, so this is inert), keeping it off
             // the per-kind match explosion. Its read-only behavior is keyed
             // off the reserved id, not the kind.
-            TabId::Shell(_) | TabId::OffloadServer | TabId::GraphMonitor | TabId::Workbench => {
-                TabKind::Shell
-            }
+            TabId::Shell(_)
+            | TabId::OffloadServer
+            | TabId::GraphMonitor
+            | TabId::Workbench
+            | TabId::GraphView => TabKind::Shell,
             // V14 Phase F: unlike the reserved dashboards above, Preview is a
             // real kind of its own — it's repeatable (a user may open several),
             // so the frontend needs a wire-visible discriminator rather than
@@ -157,7 +165,8 @@ impl TabId {
             // and the Workbench tab only by disabling workbench.
             | TabId::OffloadServer
             | TabId::GraphMonitor
-            | TabId::Workbench => true,
+            | TabId::Workbench
+            | TabId::GraphView => true,
             // Preview tabs are always user-created (no reserved/builtin
             // instance ships by default), so — like Shell/Ai duplicates —
             // they're always closable.

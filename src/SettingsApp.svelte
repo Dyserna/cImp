@@ -4018,6 +4018,95 @@
               </label>
             {/if}
 
+            <h3>Architecture &amp; path tracing</h3>
+            <small class="hint">
+              Tune V15's code-intelligence features: <code>graph_path</code>
+              (shortest-path tracing), <code>graph_architecture</code> (god
+              nodes, subsystems, surprising edges), and the live Graph View tab.
+              Edge confidence (extracted/inferred/ambiguous) is always on.
+            </small>
+            <label>
+              <span>Path tracing max hops (1–32)</span>
+              <input
+                type="number"
+                min="1"
+                max="32"
+                value={snapshot.graph.path_max_hops}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.path_max_hops = Math.min(
+                        32,
+                        Math.max(1, Number((e.currentTarget as HTMLInputElement).value) || 8),
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Max subsystems reported</span>
+              <input
+                type="number"
+                min="1"
+                value={snapshot.graph.arch_max_communities}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.arch_max_communities = Math.max(
+                        1,
+                        Number((e.currentTarget as HTMLInputElement).value) || 12,
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Minimum subsystem size</span>
+              <input
+                type="number"
+                min="1"
+                value={snapshot.graph.arch_min_community_size}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.arch_min_community_size = Math.max(
+                        1,
+                        Number((e.currentTarget as HTMLInputElement).value) || 3,
+                      )),
+                  )}
+              />
+            </label>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.graph_viz}
+                onchange={(e) =>
+                  patch((s) => (s.graph.graph_viz = (e.currentTarget as HTMLInputElement).checked))}
+              />
+              <span>Show the <strong>Graph View</strong> tab (live 2D/3D force graph)</span>
+            </label>
+            <small class="hint">
+              A dedicated tab that draws the code graph and pulses nodes as agents
+              read/edit/query the codebase. Off by default — it's a human-facing
+              visual, not on any agent path.
+            </small>
+            {#if snapshot.graph.graph_viz}
+              <label>
+                <span>Max rendered nodes</span>
+                <input
+                  type="number"
+                  min="50"
+                  value={snapshot.graph.graph_viz_max_nodes}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.graph_viz_max_nodes = Math.max(
+                          50,
+                          Number((e.currentTarget as HTMLInputElement).value) || 1500,
+                        )),
+                    )}
+                />
+              </label>
+            {/if}
+
             <h3>Offload worker access</h3>
             <label class="checkbox">
               <input

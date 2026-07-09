@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Code Graph Parity (V15).** Closes four code-only gaps benchmarked against
+  Graphify, all on top of the existing per-project graph — no multimodal
+  ingestion, no external services, everything local.
+  - **Edge confidence** — every call/reference/edge is now tagged
+    `extracted` (same-file / structural — the parser is certain), `inferred`
+    (a single cross-file name-keyed guess), or `ambiguous` (the name resolves
+    to more than one definition). Surfaced as badges on `graph_callers`,
+    `graph_callees`, `graph_references`, and `graph_impact` (which gains a
+    confidence split summary and an optional `min_confidence` filter), so the
+    agent can tell a certain caller from a probable one. Always on — a
+    correctness property, not a toggle. Forces one graph rebuild
+    (`GRAPH_SCHEMA_VERSION` 3 → 4).
+  - **`graph_path`** — trace the shortest path between two entities ("how does
+    X reach Y?") across call/import/containment edges, each hop labelled with
+    its edge kind and confidence. Directed by default; `symmetric` for a plain
+    "are these related at all?" walk; `kinds` restricts edge types; bounded by
+    the new `path_max_hops` setting (default 8).
+  - **`graph_architecture`** — a once-per-project orientation map: **god nodes**
+    (highest-degree hubs), **subsystems** (deterministic label-propagation file
+    communities, named by common path prefix), and **surprising connections**
+    (edges crossing subsystem boundaries — candidate accidental coupling).
+    Topology only, no LLM/embeddings. New settings `arch_max_communities`
+    (default 12) and `arch_min_community_size` (default 3).
+  - **Graph View tab (stretch)** — an opt-in reserved tab that draws a bounded
+    subgraph as a live 2D/3D force graph (node color = subsystem, size =
+    degree; edge color = kind, dash = confidence) and pulses nodes as agents
+    read/edit/query the codebase. Off by default (`graph_viz`), capped at
+    `graph_viz_max_nodes` (default 1500).
+  - Both new tools are exposed to the cloud Claude session and the local
+    offload worker, and mirrored as `graph_path` / `graph_architecture` /
+    `graph_viz_snapshot` Tauri commands for the Code Intelligence tab's new
+    **Trace path** and **Architecture** sections.
+
 - **Token Efficiency (V11 Context Engine II).** Builds on V10's memory/injection
   core to cut the token cost of a real agentic session: fetching one function
   instead of a whole file, orienting once instead of exploring, and not

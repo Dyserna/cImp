@@ -44,6 +44,11 @@ pub const GRAPH_MONITOR_TAB_ID: &str = "graph-monitor";
 /// `workbench.enabled` (reconciled by the integrity check, exactly like the
 /// Code Graph monitor tab). App-rendered like the graph monitor — no PTY.
 pub const WORKBENCH_TAB_ID: &str = "workbench-1";
+/// V15 Feature 4: reserved id of the read-only, app-rendered Graph View tab
+/// (live 2D/3D force-graph of the code graph). Materialized iff
+/// `graph.graph_viz` (reconciled by the integrity check, exactly like the Code
+/// Graph monitor tab). App-rendered like the monitor — no PTY.
+pub const GRAPH_VIEW_TAB_ID: &str = "graph-view";
 /// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
 /// longer a persistent builtin — it (like rustnet) launches on demand from
 /// the bottom-bar tool buttons into ordinary closable Shell tabs (uuid ids).
@@ -2085,6 +2090,24 @@ pub fn default_workbench_tab() -> TabConfig {
         id: WORKBENCH_TAB_ID.to_string(),
         builtin: true,
         name: "Workbench".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
+}
+
+/// V15 Feature 4: the reserved, non-closable Graph View tab. Same shape as the
+/// Code Graph monitor tab — Shell-kind with no command (app-rendered, no PTY).
+/// Materialized/removed by the integrity check per `graph.graph_viz`.
+pub fn default_graph_view_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: GRAPH_VIEW_TAB_ID.to_string(),
+        builtin: true,
+        name: "Graph View".to_string(),
         command: String::new(),
         args: Vec::new(),
         cwd: None,

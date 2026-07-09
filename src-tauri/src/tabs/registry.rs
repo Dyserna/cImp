@@ -70,6 +70,7 @@ fn is_builtin_id(id: &str) -> bool {
         || id == crate::settings::OFFLOAD_SERVER_TAB_ID
         || id == crate::settings::GRAPH_MONITOR_TAB_ID
         || id == crate::settings::WORKBENCH_TAB_ID
+        || id == crate::settings::GRAPH_VIEW_TAB_ID
 }
 
 /// V1.4-04 D: replicate the filename-sanitization done by

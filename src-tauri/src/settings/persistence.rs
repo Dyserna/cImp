@@ -43,11 +43,11 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
-    default_ai_tab, default_graph_monitor_tab, default_offload_server_tab, default_shell_1_tab,
-    default_workbench_tab, starter_prompt_templates,
+    default_ai_tab, default_graph_monitor_tab, default_graph_view_tab, default_offload_server_tab,
+    default_shell_1_tab, default_workbench_tab, starter_prompt_templates,
     AiTabId, LayoutNodePersisted, PromptTemplate, Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
-    GRAPH_MONITOR_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
+    GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     SHELL_DEFAULT_TAB_ID, WORKBENCH_TAB_ID,
 };
 use crate::shell::ShellSpec;
@@ -963,6 +963,7 @@ pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
     let mut changed = reconcile_offload_server_tab(settings);
     changed |= reconcile_graph_monitor_tab(settings);
     changed |= reconcile_workbench_tab(settings);
+    changed |= reconcile_graph_view_tab(settings);
     changed
 }
 
@@ -990,6 +991,62 @@ fn workbench_insert_position(tabs: &[TabConfig]) -> usize {
         if AiTabId::from_id(tab.id()).is_some()
             || tab.id() == OFFLOAD_SERVER_TAB_ID
             || tab.id() == GRAPH_MONITOR_TAB_ID
+        {
+            pos = idx + 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// V15 Feature 4: keep the read-only Graph View tab present iff
+/// `graph.graph_viz` — mirrors [`reconcile_graph_monitor_tab`]. Off by default,
+/// so the tab only appears once the user opts into the visualization. Returns
+/// `true` if tabs changed.
+fn reconcile_graph_view_tab(settings: &mut Settings) -> bool {
+    let present = settings.tabs.iter().position(|t| t.id() == GRAPH_VIEW_TAB_ID);
+    if settings.graph.graph_viz {
+        match present {
+            Some(i) => {
+                let mut changed = false;
+                if !settings.tabs[i].builtin() {
+                    settings.tabs[i].set_builtin(true);
+                    changed = true;
+                }
+                let want_name = default_graph_view_tab().name().to_string();
+                if settings.tabs[i].name() != want_name {
+                    settings.tabs[i].set_name(want_name);
+                    changed = true;
+                }
+                changed
+            }
+            None => {
+                let pos = graph_view_insert_position(&settings.tabs);
+                settings.tabs.insert(pos, default_graph_view_tab());
+                tracing::info!("integrity: materialized Graph View tab (graph_viz enabled)");
+                true
+            }
+        }
+    } else if let Some(i) = present {
+        settings.tabs.remove(i);
+        tracing::info!("integrity: removed Graph View tab (graph_viz disabled)");
+        true
+    } else {
+        false
+    }
+}
+
+/// Insert position for the Graph View tab: after the leading AI builtins AND
+/// the Offload Server + Code Graph monitor + Workbench tabs (if present), ahead
+/// of user shells — same "reserved feature tabs stay contiguous, leftmost" rule.
+fn graph_view_insert_position(tabs: &[TabConfig]) -> usize {
+    let mut pos = 0usize;
+    for (idx, tab) in tabs.iter().enumerate() {
+        if AiTabId::from_id(tab.id()).is_some()
+            || tab.id() == OFFLOAD_SERVER_TAB_ID
+            || tab.id() == GRAPH_MONITOR_TAB_ID
+            || tab.id() == WORKBENCH_TAB_ID
         {
             pos = idx + 1;
         } else {
@@ -1141,6 +1198,13 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
     //     `workbench.enabled` (default true), remove it otherwise. Same
     //     ordering rationale as 4b/4c; sits after the Code Graph monitor tab.
     if reconcile_workbench_tab(settings) {
+        changed = true;
+    }
+
+    // 4e. V15 Feature 4: materialize the read-only Graph View tab while
+    //     `graph.graph_viz` (default false), remove it otherwise. Same ordering
+    //     rationale as 4b–4d; sits after the Workbench tab.
+    if reconcile_graph_view_tab(settings) {
         changed = true;
     }
 

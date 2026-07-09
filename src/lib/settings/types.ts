@@ -763,6 +763,16 @@ export interface GraphSettings {
   /// Re-run dead-exports/import-cycles after each index pass and badge the
   /// Analyses section when the counts changed. On by default (read-only).
   analyses_auto: boolean;
+  /// V15 Feature 1: hop bound for `graph_path` shortest-path tracing (1–32).
+  path_max_hops: number;
+  /// V15 Feature 2: max subsystems `graph_architecture` reports.
+  arch_max_communities: number;
+  /// V15 Feature 2: ignore communities smaller than this in the report.
+  arch_min_community_size: number;
+  /// V15 Feature 4 (STRETCH): master toggle for the reserved Graph View tab.
+  graph_viz: boolean;
+  /// V15 Feature 4: cap on the rendered subgraph node count.
+  graph_viz_max_nodes: number;
 }
 
 /// V13 §0.4: the Workbench feature's settings. Mirror of Rust
@@ -1296,6 +1306,11 @@ export function defaultSettings(): Settings {
       auto_check_debounce_s: 5,
       auto_impact_min_dependents: 10,
       analyses_auto: true,
+      path_max_hops: 8,
+      arch_max_communities: 12,
+      arch_min_community_size: 3,
+      graph_viz: false,
+      graph_viz_max_nodes: 1500,
     },
     workbench: {
       enabled: true,

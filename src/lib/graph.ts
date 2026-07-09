@@ -189,6 +189,9 @@ export interface DependentRow {
   line: number;
   depth: number;
   approx: boolean;
+  /// V15 Feature 3: weakest edge confidence along the discovery chain
+  /// (`extracted` | `inferred` | `ambiguous`).
+  confidence: string;
 }
 
 /// V12 Phase B (Analyses): the working-tree diff's blast radius. Mirror of
@@ -246,6 +249,126 @@ export interface MemorySnapshot {
 /// The project's session/action memory. `root` defaults to the launch directory.
 export function graphMemory(root?: string): Promise<MemorySnapshot> {
   return invoke<MemorySnapshot>('graph_memory', { root: root ?? null });
+}
+
+// ── V15 Feature 1: path tracing ──────────────────────────────────────────
+
+/// One node on a traced path. Mirror of Rust `PathNodeRow`. `edge_to_next` /
+/// `confidence` describe the edge leaving this node toward the next; both are
+/// null on the final node. `line` is 0 for a file node (`kind === 'file'`).
+export interface PathNodeRow {
+  id: string;
+  label: string;
+  file: string;
+  line: number;
+  kind: string;
+  edge_to_next: string | null;
+  confidence: string | null;
+}
+
+/// The result of a `graph_path` trace. Mirror of Rust `PathResult`.
+export interface PathResult {
+  found: boolean;
+  nodes: PathNodeRow[];
+  hops: number;
+  equal_alternatives: number;
+}
+
+/// V15 Feature 1: trace the shortest path between two entities (`from`/`to` are
+/// a symbol name, `file:line`, or file path). `kinds` restricts the edge types
+/// traversed (subset of `call`/`import`/`contains`; default all). `symmetric`
+/// walks edges undirected. `root` defaults to the launch directory.
+export function graphPath(
+  from: string,
+  to: string,
+  opts?: { kinds?: string[]; symmetric?: boolean; root?: string },
+): Promise<PathResult> {
+  return invoke<PathResult>('graph_path', {
+    root: opts?.root ?? null,
+    from,
+    to,
+    kinds: opts?.kinds ?? null,
+    symmetric: opts?.symmetric ?? null,
+  });
+}
+
+// ── V15 Feature 2: architecture overview ─────────────────────────────────
+
+/// A hub in the architecture overview. Mirror of Rust `GodNodeRow`.
+export interface GodNodeRow {
+  id: string;
+  label: string;
+  file: string;
+  kind: string;
+  degree: number;
+}
+
+/// A subsystem (file community). Mirror of Rust `SubsystemRow`. `files` is a
+/// bounded sample of members; `name` is the derived common-prefix label.
+export interface SubsystemRow {
+  name: string;
+  size: number;
+  files: string[];
+  hub: string;
+}
+
+/// An edge crossing subsystem boundaries. Mirror of Rust `SurprisingRow`.
+export interface SurprisingRow {
+  from: string;
+  to: string;
+  kind: string;
+  from_subsystem: string;
+  to_subsystem: string;
+}
+
+/// The architecture overview. Mirror of Rust `ArchResult`.
+export interface ArchResult {
+  god_nodes: GodNodeRow[];
+  subsystems: SubsystemRow[];
+  surprising: SurprisingRow[];
+}
+
+/// V15 Feature 2: the system-shape overview (god nodes, subsystems, surprising
+/// edges). Heuristic clustering — advisory, not authoritative. `root` defaults
+/// to the launch directory.
+export function graphArchitecture(root?: string): Promise<ArchResult> {
+  return invoke<ArchResult>('graph_architecture', { root: root ?? null });
+}
+
+// ── V15 Feature 4: Graph View snapshot ───────────────────────────────────
+
+/// One node in the Graph View snapshot. Mirror of Rust `VizNodeRow`.
+/// `degree` = node size; `subsystem` = node color; `kind === 'file'` for files.
+export interface VizNodeRow {
+  id: string;
+  label: string;
+  file: string;
+  kind: string;
+  degree: number;
+  subsystem: string;
+}
+
+/// One edge in the Graph View snapshot. Mirror of Rust `VizEdgeRow`.
+/// `kind` = edge color (call/import/contains); `confidence` = dash pattern.
+export interface VizEdgeRow {
+  src: string;
+  dst: string;
+  kind: string;
+  confidence: string;
+}
+
+/// A bounded {nodes, edges} subgraph for the Graph View tab. Mirror of Rust
+/// `VizGraphResult`.
+export interface VizGraphResult {
+  nodes: VizNodeRow[];
+  edges: VizEdgeRow[];
+}
+
+/// V15 Feature 4: fetch the bounded subgraph for the Graph View tab (top-degree
+/// hubs + edges among them, capped at `graph_viz_max_nodes`). `root` defaults
+/// to the launch directory.
+export function graphVizSnapshot(root?: string): Promise<VizGraphResult> {
+  return invoke<VizGraphResult>('graph_viz_snapshot', { root: root ?? null });
 }
 
 /// Clear one session's memory (`session` = its id) or the whole project's

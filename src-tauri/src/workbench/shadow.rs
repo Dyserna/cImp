@@ -146,7 +146,9 @@ pub struct RestoreReport {
     pub pre_restore_id: CheckpointId,
     /// Paths whose content the `checkout` actually changed on disk (modified
     /// in place, or recreated because they'd been deleted since the
-    /// checkpoint).
+    /// checkpoint). FIX 5 / V13 code review: explicitly EXCLUDES
+    /// `created_since` — a path `checkout <target> -- .` never touches,
+    /// since it only ever writes paths present in `target`'s tree.
     pub changed: Vec<String>,
     /// Paths that exist on disk now but did not exist in the restored
     /// checkpoint — the "created since" set. Listed regardless of
@@ -268,8 +270,16 @@ async fn stage_and_write_tree(ctx: &GitCtx, root: &Path, max_file_bytes: u64) ->
 
 /// Parse `git status --porcelain=v1 -z` into the list of current-side paths
 /// changed since the index (i.e. since the last snapshot's `add -A`) — used
-/// only to decide "did anything change" and to count `Files-Changed` for the
-/// commit trailer.
+/// ONLY to count `Files-Changed` for the commit trailer. Must be called
+/// BEFORE [`stage_and_write_tree`] refreshes the index (see [`snapshot`]'s
+/// doc comment).
+///
+/// **No longer** [`snapshot`]'s dedup check (FIX 1 / V13 code review — see
+/// `snapshot`'s doc comment for the data-loss bug this stopped being used
+/// for): comparing the working tree against the shadow repo's own persistent
+/// index is only meaningful if nothing ELSE touches that index between two
+/// `snapshot` calls, which [`diff_vs_now`]'s own staging violates. Kept
+/// around purely as a display/count helper now.
 ///
 /// Deliberately NOT `git status --porcelain` (which is what an earlier
 /// version of this function used): every checkpoint is an orphan
@@ -278,12 +288,13 @@ async fn stage_and_write_tree(ctx: &GitCtx, root: &Path, max_file_bytes: u64) ->
 /// column permanently reads "unborn/empty HEAD vs a fully-staged index",
 /// i.e. EVERY previously-snapshotted file shows up as freshly `A`dded on
 /// every subsequent call, even when nothing has changed on disk. That broke
-/// the dedup guard in [`snapshot`] (verified against a real repo: a second,
-/// no-op `snapshot` call was minting a new checkpoint every time). The fix
-/// is to compare the working tree against the INDEX only (ignoring HEAD
-/// entirely) via `git diff --name-only` (tracked, modified/deleted) plus
-/// `git ls-files --others --exclude-standard` (untracked) — exactly "what
-/// would the next `add -A` touch", which is the real question here.
+/// the (now-removed) dedup guard in [`snapshot`] (verified against a real
+/// repo: a second, no-op `snapshot` call was minting a new checkpoint every
+/// time). The fix at the time was to compare the working tree against the
+/// INDEX only (ignoring HEAD entirely) via `git diff --name-only` (tracked,
+/// modified/deleted) plus `git ls-files --others --exclude-standard`
+/// (untracked) — exactly "what would the next `add -A` touch". That's still
+/// correct for a file COUNT; it just isn't a safe dedup signal any more.
 async fn changed_since_index(ctx: &GitCtx) -> AppResult<Vec<String>> {
     let diff_out = git::run(ctx, &["diff", "--no-renames", "--name-only", "-z"], None).await?;
     if !diff_out.success() {
@@ -337,6 +348,22 @@ async fn next_seq(ctx: &GitCtx) -> AppResult<u32> {
     Ok(max + 1)
 }
 
+/// The highest-numbered existing `cp-<seq>` tag, if any — [`snapshot`]'s
+/// dedup check's notion of "the last checkpoint". A tiny sibling of
+/// [`next_seq`] (same `tag -l cp-*` scan) rather than routing through
+/// [`list`], which also reads back commit messages/trailers dedup doesn't
+/// need.
+async fn latest_checkpoint_tag(ctx: &GitCtx) -> AppResult<Option<String>> {
+    let out = git::run(ctx, &["tag", "-l", "cp-*"], None).await?;
+    let max = out
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("cp-").and_then(|n| n.parse::<u32>().ok()).map(|n| (n, l.to_string())))
+        .max_by_key(|(n, _)| *n);
+    Ok(max.map(|(_, tag)| tag))
+}
+
 /// Resolve a checkpoint id (a `cp-<seq>` tag) to its commit sha. Every other
 /// function in this module that needs a concrete commit goes through this,
 /// so an unknown/garbage id fails with one consistent, typed message instead
@@ -360,15 +387,30 @@ async fn resolve_commit(ctx: &GitCtx, id: &str) -> AppResult<String> {
 /// separate sidecar file to keep in sync, and `git log`/`for-each-ref` can
 /// read it back directly (see [`list`]).
 ///
-/// **Dedup**: when nothing has changed since the index was last updated (the
-/// previous snapshot's `add -A`), this returns the EXISTING latest
-/// checkpoint instead of creating a near-duplicate commit — [`changed_since_index`]
-/// (NOT `git status`, which compares against HEAD and is permanently "dirty"
-/// for an orphan-commit repo like this one — see that function's doc
-/// comment) is the emptiness check. If there is no prior checkpoint AND
-/// nothing to snapshot (a still-empty new project), an empty baseline
-/// checkpoint is created anyway so `list`/`diff_vs_now`/`restore` always have
-/// something to anchor to.
+/// **Dedup** (FIX 1 / V13 code review — see this module's git history for the
+/// data-loss bug this replaced): a real snapshot is skipped, returning the
+/// EXISTING latest checkpoint instead, only when the CURRENT tree sha
+/// (freshly computed by `stage_and_write_tree` below, which this function
+/// now ALWAYS runs first) equals the last checkpoint's own tree sha
+/// (`<tag>^{tree}`). Comparing tree shas — not [`changed_since_index`]'s
+/// "did the working tree move since the INDEX was last updated" check, which
+/// is what this function used before — is what makes this robust to anything
+/// ELSE that mutates the shadow repo's shared, persistent index between two
+/// `snapshot` calls. [`diff_vs_now`] is exactly such a caller: its own
+/// `stage_and_write_tree` (needed to see untracked files in a dry-run diff)
+/// used to leave the index matching disk, so the NEXT `snapshot` — e.g.
+/// `restore`'s invariant-C pre-restore safety snapshot — would see "nothing
+/// changed since the index" and silently return a STALE old checkpoint
+/// instead of a real one, leaving `restore` with no valid undo point and
+/// destroying the user's uncommitted edits on `checkout`. Comparing tree
+/// shas sidesteps the whole index-staleness question: whoever staged last,
+/// the CONTENT either matches the last checkpoint or it doesn't.
+///
+/// If there is no prior checkpoint AND nothing to snapshot (a still-empty new
+/// project), an empty baseline checkpoint is created anyway so
+/// `list`/`diff_vs_now`/`restore` always have something to anchor to (`Some`
+/// vs `None` on `latest_checkpoint_tag` makes the trees compare unequal
+/// automatically in that case).
 pub async fn snapshot(
     root: &Path,
     label: &str,
@@ -380,16 +422,24 @@ pub async fn snapshot(
     ensure(root, extra_ignore).await?;
     let ctx = shadow_ctx(root);
 
+    // For the `Files-Changed` trailer only — NOT the dedup decision anymore
+    // (see this function's doc comment). Must run BEFORE staging below:
+    // once the index is refreshed by `stage_and_write_tree`, a working-tree-
+    // vs-index diff would trivially read empty.
     let changed = changed_since_index(&ctx).await?;
-    if changed.is_empty() {
-        if let Some(last) = list(root).await?.into_iter().next_back() {
-            return Ok(last.id);
+
+    // ALWAYS stage + write the tree now (this used to run only after the
+    // dedup check returned early) — see the doc comment above for why.
+    let current_tree = stage_and_write_tree(&ctx, root, max_file_bytes).await?;
+
+    if let Some(last_tag) = latest_checkpoint_tag(&ctx).await? {
+        let spec = format!("{last_tag}^{{tree}}");
+        let last_tree = git::run(&ctx, &["rev-parse", "-q", "--verify", &spec], None).await?;
+        if last_tree.success() && last_tree.stdout.trim() == current_tree {
+            return Ok(last_tag);
         }
-        // Fall through: no prior checkpoint, nothing changed — still make an
-        // empty baseline.
     }
 
-    let tree = stage_and_write_tree(&ctx, root, max_file_bytes).await?;
     let seq = next_seq(&ctx).await?;
     let tag = format!("cp-{seq}");
     let message = format!(
@@ -399,7 +449,7 @@ pub async fn snapshot(
         agent.unwrap_or("-"),
         changed.len(),
     );
-    let commit = git::run_with_stdin(&ctx, &["commit-tree", &tree, "-F", "-"], message.as_bytes(), None).await?;
+    let commit = git::run_with_stdin(&ctx, &["commit-tree", &current_tree, "-F", "-"], message.as_bytes(), None).await?;
     if !commit.success() {
         return Err(AppError::Workbench(format!(
             "shadow commit-tree failed: {}",
@@ -492,11 +542,28 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
 /// same way a real snapshot would see them — `git diff <tree> -- .` alone
 /// does not show untracked files, but this does since they get staged into
 /// the throwaway tree first.
+///
+/// **FIX 1 defense in depth**: this function's own `add -A` used to run
+/// against the shadow repo's shared, persistent index (the same one
+/// [`snapshot`] and [`restore`]'s `checkout` use) — a purely-read-only
+/// dry-run call was mutating shared state as a side effect. [`snapshot`]'s
+/// dedup no longer trusts that index's staleness (it compares tree shas
+/// instead — see its doc comment), which is the actual fix for the data-loss
+/// bug this caused; on top of that, this call now stages into a disposable
+/// SCRATCH index of its own (`GIT_INDEX_FILE` pointed at a temp file,
+/// cleaned up immediately after `write-tree`) so a dry-run diff has zero
+/// observable effect on the shadow repo's persistent index at all, belt and
+/// suspenders.
 pub async fn diff_vs_now(root: &Path, id: &str, extra_ignore: &[String], max_file_bytes: u64) -> AppResult<String> {
     ensure(root, extra_ignore).await?;
     let ctx = shadow_ctx(root);
     let target = resolve_commit(&ctx, id).await?;
-    let now_tree = stage_and_write_tree(&ctx, root, max_file_bytes).await?;
+
+    let scratch_index = git_dir_of(root).join(format!("index.diffnow-{}", uuid::Uuid::new_v4()));
+    let scratch_ctx = GitCtx { index_file: Some(scratch_index.clone()), ..ctx.clone() };
+    let now_tree = stage_and_write_tree(&scratch_ctx, root, max_file_bytes).await?;
+    let _ = std::fs::remove_file(&scratch_index);
+
     let out = git::run(&ctx, &["diff", "--no-color", "--no-renames", "--unified=3", &target, &now_tree], Some(BULK_TIMEOUT)).await?;
     if !out.success() {
         return Err(AppError::Workbench(format!("shadow diff failed: {}", out.stderr.trim())));
@@ -547,7 +614,23 @@ pub async fn restore(
             changed_out.stderr.trim()
         )));
     }
-    let changed: Vec<String> = changed_out.stdout.split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    // FIX 5 / V13 code review: the unfiltered `pre_sha..target` diff also
+    // lists every `created_since` path (present in `pre_sha`, the
+    // pre-restore state, but absent from `target`) — from `target`'s
+    // perspective those look like ordinary "differs" entries too. But
+    // `checkout <target> -- .` below only ever writes paths that exist IN
+    // `target`'s tree; a path that doesn't exist there is left on disk
+    // exactly as-is (that's invariant D — untracked new work survives a
+    // restore unless `delete_new`). So `created_since` paths are never
+    // actually rewritten by this restore, and reporting them under
+    // `changed` would tell the UI they were touched when they weren't.
+    let created_set: HashSet<&str> = created_since.iter().map(String::as_str).collect();
+    let changed: Vec<String> = changed_out
+        .stdout
+        .split('\0')
+        .filter(|s| !s.is_empty() && !created_set.contains(s))
+        .map(str::to_string)
+        .collect();
 
     // (A/B) shadow checkout — see this function's doc comment.
     let checkout = git::run(&ctx, &["checkout", &target, "--", "."], Some(BULK_TIMEOUT)).await?;
@@ -873,6 +956,13 @@ mod tests {
         // Default: delete_new = false — the new file must survive.
         let report1 = restore(&dir, &cp, false, &[], 0).await.expect("restore keep");
         assert!(report1.created_since.iter().any(|p| p == "new_work.txt"));
+        // FIX 5: `changed` must NOT also list `new_work.txt` — the checkout
+        // never touched it (it isn't in `cp`'s tree at all), so reporting it
+        // as "changed" would be wrong.
+        assert!(
+            !report1.changed.iter().any(|p| p == "new_work.txt"),
+            "changed must exclude created_since paths the checkout never touched"
+        );
         assert!(report1.deleted.is_empty(), "must not delete anything when delete_new is false");
         assert!(dir.join("new_work.txt").exists(), "new file must survive a default restore");
 
@@ -933,6 +1023,73 @@ mod tests {
         // Undo the restore by restoring the pre-restore checkpoint.
         restore(&dir, &report.pre_restore_id, false, &[], 0).await.expect("undo restore");
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v2\n", "restoring pre-restore must undo the restore");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **FIX 1 mandatory regression test** (V13 code review — CRITICAL DATA
+    /// LOSS). Reproduces the exact sequence the bug report describes: a
+    /// restore confirmation dialog's dry-run (`diff_vs_now`) runs
+    /// `stage_and_write_tree`, which used to mutate the shadow repo's
+    /// SHARED, persistent index. `snapshot`'s old dedup guard
+    /// (`changed_since_index`, working-tree-vs-INDEX) then saw "nothing
+    /// changed since the index" on the very next snapshot — even though the
+    /// user had genuinely edited a file since the last checkpoint — because
+    /// the dry-run had already silently brought the index up to date with
+    /// disk. `restore`'s invariant-C pre-restore safety snapshot is exactly
+    /// such a "next snapshot": it would wrongly dedup to the stale prior
+    /// checkpoint, leaving no real undo point, and the user's uncommitted
+    /// edit would be destroyed with no way back once `checkout` ran.
+    ///
+    /// Without the fix (tree-sha dedup in `snapshot`, plus the `diff_vs_now`
+    /// scratch-index defense in depth): `report.pre_restore_id` comes back
+    /// equal to `cp1` (the stale checkpoint, state A) instead of a genuine
+    /// snapshot of state B, so this test's first assertion fails, and the
+    /// second (undoing the restore must bring back state B) would also fail
+    /// since restoring `cp1` again just gives state A back, not state B.
+    /// With the fix: both assertions pass.
+    #[tokio::test]
+    async fn restore_after_a_dry_run_diff_preserves_uncommitted_edits() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = user_repo("dryrun-restore");
+
+        // Checkpoint cp-1: state A.
+        std::fs::write(dir.join("tracked.txt"), "state A\n").unwrap();
+        let cp1 = snapshot(&dir, "state A", Trigger::Manual, None, &[], 0).await.expect("snapshot A");
+
+        // Edit to state B — uncommitted, and NOT checkpointed anywhere yet.
+        std::fs::write(dir.join("tracked.txt"), "state B\n").unwrap();
+
+        // Simulate the restore confirmation dialog's dry-run: this stages
+        // the shadow repo's index as a side effect (or used to — see the
+        // module doc comment).
+        let _ = diff_vs_now(&dir, &cp1, &[], 0).await.expect("diff_vs_now (dry run)");
+
+        // Now actually restore to cp1. This is where the bug bites: a
+        // pre-restore snapshot that wrongly dedups against the stale cp1
+        // instead of capturing the real state-B edit has no valid undo
+        // point once `checkout` overwrites the file with state A.
+        let report = restore(&dir, &cp1, false, &[], 0).await.expect("restore");
+
+        assert_ne!(
+            report.pre_restore_id, cp1,
+            "restore must take a REAL pre-restore snapshot of state B, not dedup to the stale cp1 checkpoint"
+        );
+
+        // The working tree is now at the restore target, state A.
+        assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "state A\n");
+
+        // Undo the restore by restoring the pre-restore checkpoint — state B
+        // (the user's uncommitted edit) must come back.
+        restore(&dir, &report.pre_restore_id, false, &[], 0).await.expect("undo restore");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("tracked.txt")).unwrap(),
+            "state B\n",
+            "restoring pre_restore_id must bring back the uncommitted state-B edit that diff_vs_now's dry-run must not have destroyed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

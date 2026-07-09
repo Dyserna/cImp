@@ -74,12 +74,19 @@ pub struct WorkbenchService {
     app: AppHandle,
     settings: SettingsHandle,
     fs_batch_tx: broadcast::Sender<FsBatch>,
-    /// Phase C §C3: the single min-gap gate every AUTOMATIC checkpoint
-    /// trigger (prompt-tap, burst) shares — `None` until the first automatic
-    /// snapshot fires. [`checkpoint_now`](Self::checkpoint_now) (the manual
-    /// trigger) bypasses the gate itself but still updates this, so a manual
-    /// checkpoint counts toward the next automatic trigger's cooldown.
-    checkpoint_last: Mutex<Option<Instant>>,
+    /// Phase C §C3: the min-gap gate every AUTOMATIC checkpoint trigger
+    /// (prompt-tap, burst) shares — keyed PER PROJECT ROOT (FIX 4 / V13 code
+    /// review: this used to be a single global `Mutex<Option<Instant>>`, so
+    /// a checkpoint in project A would swallow project B's within the
+    /// min-gap — a checkpoint that never fires for a distinct project just
+    /// because some OTHER project happened to checkpoint moments earlier).
+    /// Mirrors [`Self::burst_state`]'s per-root shape. No entry for a root
+    /// until its first automatic OR manual snapshot fires.
+    /// [`checkpoint_now`](Self::checkpoint_now) (the manual trigger) bypasses
+    /// the gate itself but still updates its root's entry, so a manual
+    /// checkpoint counts toward that root's next automatic trigger's
+    /// cooldown.
+    checkpoint_last: Mutex<HashMap<PathBuf, Instant>>,
     /// Phase C §C3 burst trigger: per-root rolling window of distinct
     /// changed paths seen since the window last reset. Keyed by project root
     /// since multiple projects can be open in different tabs at once.
@@ -148,13 +155,24 @@ impl WorkbenchService {
     /// long-idle project's accumulator can get in memory).
     const BURST_STATE_MAX_AGE: Duration = Duration::from_secs(3600);
 
+    /// FIX 8 (V13 code review): `worktree_check_cache`'s sibling age-based
+    /// eviction — mirrors [`Self::BURST_STATE_MAX_AGE`]'s reasoning. Without
+    /// this, a worktree removed out-of-band (a file manager `rm -rf`
+    /// bypassing `workbench_worktree_discard`, which explicitly drops its own
+    /// entry) leaves a permanent, never-evicted row behind for the rest of
+    /// the app's lifetime. A day is generous — check results are
+    /// user-triggered (a row's "Run checks" click), not a steady-state
+    /// stream, so there's no reason to evict aggressively; this just bounds
+    /// the worst case for a long-running session across many projects.
+    const WORKTREE_CHECK_CACHE_MAX_AGE_SECS: u64 = 24 * 3600;
+
     pub fn new(app: AppHandle, settings: SettingsHandle) -> Arc<Self> {
         let (fs_batch_tx, _rx) = broadcast::channel(Self::BROADCAST_CAPACITY);
         let svc = Arc::new(Self {
             app,
             settings,
             fs_batch_tx,
-            checkpoint_last: Mutex::new(None),
+            checkpoint_last: Mutex::new(HashMap::new()),
             burst_state: Mutex::new(HashMap::new()),
             worktree_check_cache: Mutex::new(HashMap::new()),
         });
@@ -180,17 +198,6 @@ impl WorkbenchService {
                 }
             }
         });
-    }
-
-    /// Subscribe to fs-batch events from a backend consumer. [`Self`]'s own
-    /// Phase C burst trigger uses `fs_batch_tx.subscribe()` directly (it's
-    /// constructed before any `Arc` exists to call this method on) rather
-    /// than this method; kept public per §0.3's contract for any other
-    /// backend consumer that wants a feed (e.g. a future non-graph diff
-    /// refresh path).
-    #[allow(dead_code)]
-    pub fn subscribe(&self) -> broadcast::Receiver<FsBatch> {
-        self.fs_batch_tx.subscribe()
     }
 
     /// Phase C §C3 burst trigger: accumulate `batch`'s paths into `batch.root`'s
@@ -244,9 +251,10 @@ impl WorkbenchService {
     }
 
     /// Phase C §C3: the shared entry point for the two AUTOMATIC triggers
-    /// (prompt-tap, burst). Enforces `checkpoint_min_gap_s` against the one
-    /// shared `checkpoint_last` gate (so a rapid prompt sequence or a burst
-    /// right after a prompt-tap snapshot can't spam the shadow repo), then
+    /// (prompt-tap, burst). Enforces `checkpoint_min_gap_s` against `root`'s
+    /// own entry in the per-root `checkpoint_last` gate (so a rapid prompt
+    /// sequence or a burst right after a prompt-tap snapshot can't spam the
+    /// shadow repo — independently per project root), then
     /// does the actual `shadow::snapshot` + opportunistic `shadow::gc` on a
     /// background task so the caller (a prompt hook, an fs-batch handler)
     /// never blocks on it — per the milestone's "never block a prompt or the
@@ -257,16 +265,16 @@ impl WorkbenchService {
         }
         let cfg = self.settings.current();
         let min_gap = Duration::from_secs(cfg.workbench.checkpoint_min_gap_s as u64);
+        let root = root.to_path_buf();
         {
             let mut last = self.checkpoint_last.lock().unwrap();
-            if let Some(prev) = *last {
+            if let Some(prev) = last.get(&root) {
                 if prev.elapsed() < min_gap {
                     return;
                 }
             }
-            *last = Some(Instant::now());
+            last.insert(root.clone(), Instant::now());
         }
-        let root = root.to_path_buf();
         let extra_ignore = cfg.graph.ignore.clone();
         let max_file_bytes = cfg.graph.max_file_bytes;
         let checkpoint_max = cfg.workbench.checkpoint_max;
@@ -319,7 +327,7 @@ impl WorkbenchService {
             cfg.graph.max_file_bytes,
         )
         .await?;
-        *self.checkpoint_last.lock().unwrap() = Some(Instant::now());
+        self.checkpoint_last.lock().unwrap().insert(root.to_path_buf(), Instant::now());
         if let Err(e) = shadow::gc(root, cfg.workbench.checkpoint_max, cfg.workbench.checkpoint_max_age_days).await {
             warn!(root = %root.display(), error = %e, "workbench: checkpoint gc failed after manual checkpoint");
         }
@@ -350,7 +358,7 @@ impl WorkbenchService {
     pub async fn restore(&self, root: &Path, id: &str, delete_new: bool) -> AppResult<shadow::RestoreReport> {
         let cfg = self.settings.current();
         let report = shadow::restore(root, id, delete_new, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
-        *self.checkpoint_last.lock().unwrap() = Some(Instant::now());
+        self.checkpoint_last.lock().unwrap().insert(root.to_path_buf(), Instant::now());
         Ok(report)
     }
 
@@ -403,17 +411,59 @@ impl WorkbenchService {
     }
 
     /// Phase B `workbench_diff_summary`: the file list + readonly/source
-    /// flags for the Diff section. Thin pass-through to [`diff::summary`] —
-    /// kept as a service method (rather than the IPC layer calling `diff::`
-    /// directly) so later phases can add cross-cutting behavior here (e.g.
-    /// Phase C's shadow-repo fallback) without touching the IPC signature.
+    /// flags for the Diff section. [`diff::summary`] handles the git case;
+    /// this service method layers FIX 7 (V13 code review)'s Phase C
+    /// shadow-repo fallback on top for a NON-git project — when `diff::summary`
+    /// comes back with `source: None` (not a git repo) AND checkpoints are
+    /// on AND at least one checkpoint exists, diff against the LATEST
+    /// checkpoint via [`shadow::diff_vs_now`] instead, so a non-git project
+    /// with checkpoints enabled gets a working Diff pane rather than just the
+    /// requirements banner. Falls back to the plain `source: None` result
+    /// (unchanged) when checkpoints are off or there's nothing checkpointed
+    /// yet — same "frontend renders the requirements banner" contract
+    /// `diff::summary` already documents.
     pub async fn diff_summary(&self, root: &Path) -> AppResult<diff::DiffSummary> {
-        diff::summary(root).await
+        let summary = diff::summary(root).await?;
+        if summary.source.is_some() || !self.checkpoints_enabled() {
+            return Ok(summary);
+        }
+        let Some(latest) = shadow::list(root).await.unwrap_or_default().into_iter().next_back() else {
+            return Ok(summary);
+        };
+        let cfg = self.settings.current();
+        let text = shadow::diff_vs_now(root, &latest.id, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
+        let mut files: Vec<diff::FileDiffMeta> =
+            diff::parse_unified(&text).iter().map(diff::file_diff_meta_from_parsed).collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(diff::DiffSummary { files, readonly: false, source: Some(diff::DiffSource::Shadow) })
     }
 
-    /// Phase B `workbench_diff_file`: one file's full parsed diff.
+    /// Phase B `workbench_diff_file`: one file's full parsed diff. Mirrors
+    /// [`diff_summary`](Self::diff_summary)'s FIX 7 shadow-repo fallback for
+    /// a non-git project with checkpoints on: parses the SAME
+    /// `shadow::diff_vs_now` blob against the latest checkpoint and picks out
+    /// `path`'s entry. A `path` with no entry in that diff (already clean, or
+    /// the caller raced a refresh) gets the same "clean, no changes" shape
+    /// [`diff::diff_file`] returns for that case.
     pub async fn diff_file(&self, root: &Path, path: &str) -> AppResult<diff::FileDiff> {
-        diff::diff_file(root, path).await
+        if git::is_repo(root).await || !self.checkpoints_enabled() {
+            return diff::diff_file(root, path).await;
+        }
+        let Some(latest) = shadow::list(root).await.unwrap_or_default().into_iter().next_back() else {
+            return diff::diff_file(root, path).await;
+        };
+        let cfg = self.settings.current();
+        let text = shadow::diff_vs_now(root, &latest.id, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
+        if let Some(file) = diff::parse_unified(&text).into_iter().find(|f| f.path == path) {
+            return Ok(file);
+        }
+        Ok(diff::FileDiff {
+            path: path.to_string(),
+            status: diff::FileStatus::Modified,
+            binary: false,
+            hunks: Vec::new(),
+            too_large: false,
+        })
     }
 
     /// Phase B `workbench_send_hunk`. Thin wrapper over [`send_hunk`] (kept
@@ -540,10 +590,15 @@ impl WorkbenchService {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let status = WorktreeCheckStatus { pass, checked_at_unix, reports };
-        self.worktree_check_cache
-            .lock()
-            .unwrap()
-            .insert((root.to_path_buf(), slug.to_string()), status.clone());
+        {
+            let mut cache = self.worktree_check_cache.lock().unwrap();
+            // FIX 8: opportunistic age-based eviction — see
+            // `WORKTREE_CHECK_CACHE_MAX_AGE_SECS`'s doc comment.
+            cache.retain(|_, v| {
+                checked_at_unix.saturating_sub(v.checked_at_unix) < Self::WORKTREE_CHECK_CACHE_MAX_AGE_SECS
+            });
+            cache.insert((root.to_path_buf(), slug.to_string()), status.clone());
+        }
         Ok(status)
     }
 

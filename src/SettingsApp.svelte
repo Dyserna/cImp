@@ -3911,10 +3911,11 @@
             <span>Enable automatic checkpoints</span>
           </label>
           <small class="hint">
-            Off by default in V1 — Diff and Worktrees work without it; the
-            Timeline section needs this on. Not yet implemented (Phase C);
-            these fields are stored now so they take effect the moment it
-            ships.
+            Off by default in V1 — Diff and Worktrees work without it. When
+            on, cImp periodically snapshots your working tree into a separate
+            shadow git repo (your own <code>.git</code> is never touched).
+            Enable this to start capturing checkpoints; restore one from the
+            Workbench tab's Timeline section.
           </small>
           <label>
             <span>Max checkpoints kept</span>

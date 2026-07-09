@@ -95,6 +95,17 @@ pub enum AppError {
     /// [`AppError::Graph`]/[`AppError::Checks`]'s per-module catch-all.
     #[error("workbench error: {0}")]
     Workbench(String),
+
+    /// V13 Phase D `worktree::merge` (FIX 2 / V13 code review): a `git merge
+    /// --abort` issued after a failed `git merge` itself ALSO failed. Kept
+    /// distinct from [`AppError::Workbench`] so the UI can render a sharp
+    /// warning — the main tree may be left half-merged (`MERGE_HEAD` still
+    /// set, a partial checkout on disk) and needs MANUAL resolution (e.g. a
+    /// user-run `git merge --abort`), rather than the reassuring-but-false
+    /// "merge was aborted, main tree unchanged" message the plain conflict
+    /// path reports when the abort actually succeeds.
+    #[error("worktree merge left the main tree in an unclear state: {0}")]
+    WorktreeMergeUnclean(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

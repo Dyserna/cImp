@@ -485,12 +485,28 @@ pub async fn merge(root: &Path, slug: &str) -> AppResult<MergeReport> {
     let branch = branch_name(&slug);
     let merge_out = git::run(&ctx, &["merge", "--no-edit", &branch], Some(BULK_TIMEOUT)).await?;
     if !merge_out.success() {
-        // Hard safety rule: never leave the tree half-merged. Best-effort —
-        // `--abort` itself failing (e.g. the merge never got as far as
-        // writing MERGE_HEAD) doesn't change the fact that nothing here
-        // partially applied; the original merge error is what the caller
-        // needs to see either way.
-        let _ = git::run(&ctx, &["merge", "--abort"], None).await;
+        // Hard safety rule: never CLAIM the tree is clean when it isn't.
+        // `git merge --abort`'s own result must be checked (FIX 2 / V13 code
+        // review) — a failed abort (e.g. it couldn't reset the index, or the
+        // merge never got as far as writing `MERGE_HEAD` and there's nothing
+        // for `--abort` to abort in the first place, which itself makes
+        // `--abort` fail) means the main tree's state is genuinely unknown,
+        // not "aborted and unchanged". Reporting the reassuring message in
+        // that case would tell the user it's safe to keep going when it
+        // might not be.
+        let abort_out = git::run(&ctx, &["merge", "--abort"], None).await;
+        let abort_ok = matches!(&abort_out, Ok(out) if out.success());
+        if !abort_ok {
+            let abort_detail = match &abort_out {
+                Ok(out) => out.stderr.trim().to_string(),
+                Err(e) => e.to_string(),
+            };
+            return Err(AppError::WorktreeMergeUnclean(format!(
+                "merge of '{branch}' failed AND the follow-up 'git merge --abort' also failed — the main working tree may be left half-merged. Resolve it manually in a shell (check `git status`; you likely need to run `git merge --abort` yourself, or finish resolving conflicts and commit). Original merge error: {}. Abort error: {}",
+                merge_out.stderr.trim().lines().next().unwrap_or(merge_out.stderr.trim()),
+                abort_detail.lines().next().unwrap_or(&abort_detail),
+            )));
+        }
         return Err(AppError::Workbench(format!(
             "merge conflict — the merge was aborted and the main working tree is unchanged. Resolve manually in a shell (worktree branch: '{branch}'), or edit the worktree and try again. git said: {}",
             merge_out.stderr.trim().lines().next().unwrap_or(merge_out.stderr.trim())

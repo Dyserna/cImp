@@ -102,13 +102,38 @@ pub struct FileDiffMeta {
     pub removed: u32,
 }
 
-/// Where a [`DiffSummary`]/[`FileDiff`] came from. `Shadow` is unused until
-/// Phase C wires up `shadow::diff_vs_now` for non-git projects with
-/// checkpoints enabled — kept here now so the frontend's discriminated union
-/// doesn't need a schema change when that lands.
+/// Derive a [`FileDiffMeta`] row from an already-[`parse_unified`]d
+/// [`FileDiff`] — FIX 7 / V13 code review's Phase C shadow-repo fallback
+/// (`WorkbenchService::diff_summary`) uses this: `shadow::diff_vs_now`
+/// returns ONE unified-diff blob covering every changed file, parsed once,
+/// so each row can be derived straight from its parsed `FileDiff` rather than
+/// a second git-style stat call — there's no git repo to ask `--numstat` in
+/// the non-git case this fallback exists for. `added`/`removed` are counted
+/// directly from the parsed hunks' `+`/`-` markers (exact, unlike the
+/// git-backed `summary`'s `--numstat` value, but this function only ever
+/// runs on an already-parsed diff, so the count is free).
+pub fn file_diff_meta_from_parsed(file: &FileDiff) -> FileDiffMeta {
+    let added = file.hunks.iter().flat_map(|h| h.lines.iter()).filter(|(m, _)| *m == '+').count() as u32;
+    let removed = file.hunks.iter().flat_map(|h| h.lines.iter()).filter(|(m, _)| *m == '-').count() as u32;
+    FileDiffMeta {
+        path: file.path.clone(),
+        status: file.status.clone(),
+        binary: file.binary,
+        too_large: file.too_large,
+        added: if file.too_large { 0 } else { added },
+        removed: if file.too_large { 0 } else { removed },
+    }
+}
+
+/// Where a [`DiffSummary`]/[`FileDiff`] came from. `Git` is this module's own
+/// `summary`/`diff_file`, over the user's real repo; `Shadow` is
+/// [`super::WorkbenchService::diff_summary`]/`diff_file`'s FIX 7 (V13 code
+/// review) fallback for a NON-git project with checkpoints on — diffed
+/// against the latest Phase C shadow checkpoint via `shadow::diff_vs_now`
+/// instead. Kept here (rather than only in `shadow.rs`) since the frontend's
+/// discriminated union is keyed on this type either way.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-#[allow(dead_code)]
 pub enum DiffSource {
     Git,
     Shadow,
@@ -229,6 +254,21 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
                     break;
                 }
                 if *bl == "\\ No newline at end of file" {
+                    lines.next();
+                    continue;
+                }
+                if bl.is_empty() {
+                    // A blank line in the hunk body is a content line with NO
+                    // marker character AND no content — `git diff` emits this
+                    // for a genuinely empty context line (the file has a
+                    // blank line at that position that neither side
+                    // changed). Treat it as an empty context line rather than
+                    // indexing `bl[1..]` on a 0-byte string below, which
+                    // panics (`marker.len_utf8()` on the `unwrap_or(' ')`
+                    // fallback is 1, but `bl` has 0 bytes to slice) — this
+                    // function's contract is "never panics" on arbitrary diff
+                    // text (see the doc comment above).
+                    hunk.lines.push((' ', String::new()));
                     lines.next();
                     continue;
                 }
@@ -488,14 +528,15 @@ fn parse_numstat_z(raw: &str) -> std::collections::HashMap<String, (Option<u32>,
 }
 
 /// The Phase B `workbench_diff_summary` entry point. `Ok` with `source:
-/// None` (not an error) when `root` isn't a git repo — Phase C's
-/// checkpoint-vs-shadow-repo fallback isn't wired up yet (TODO below); the
-/// frontend renders the requirements banner for that case.
+/// None` (not an error) when `root` isn't a git repo — this module has no
+/// `Settings` access, so it can't know whether checkpoints are even on; the
+/// non-git shadow-repo fallback (FIX 7 / V13 code review) is layered on top
+/// of THIS result by [`super::WorkbenchService::diff_summary`], which does
+/// have `Settings`. A bare `source: None` here still means "the frontend
+/// should render the requirements banner", but only once the service-layer
+/// caller has confirmed the shadow fallback doesn't apply either.
 pub async fn summary(root: &Path) -> AppResult<DiffSummary> {
     if !git::is_repo(root).await {
-        // TODO(Phase C): once `shadow::diff_vs_now` exists, a non-git root
-        // with `settings.workbench.checkpoints` on should diff against the
-        // latest shadow snapshot instead of returning empty here.
         return Ok(DiffSummary { files: Vec::new(), readonly: false, source: None });
     }
     let ctx = GitCtx::discover(root);
@@ -858,6 +899,23 @@ index 0a207c0..2d3cebd 100644
         ]);
     }
 
+    /// FIX 3 / V13 code review: a genuinely empty line in the hunk body
+    /// (`bl` is a 0-byte string, not `" "` with a space marker) used to panic
+    /// — `bl.chars().next().unwrap_or(' ')` falls back to `' '`, then
+    /// `bl[marker.len_utf8()..]` slices `[1..]` on a 0-byte string, which is
+    /// out of bounds. This violated `parse_unified`'s documented "never
+    /// panics" contract; this test crashes the test binary against the
+    /// pre-fix code and passes cleanly against the fix.
+    #[test]
+    fn parse_unified_empty_line_in_hunk_body_does_not_panic() {
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ a/a.rs\n@@ -1,3 +1,3 @@\n line1\n\n+line2\n";
+        let files = parse_unified(diff);
+        assert_eq!(files.len(), 1);
+        // The blank line is treated as an empty context line rather than
+        // dropped or misparsed as something else.
+        assert!(files[0].hunks[0].lines.iter().any(|(m, t)| *m == ' ' && t.is_empty()));
+    }
+
     #[test]
     fn parse_unified_ignores_content_line_that_looks_like_a_header() {
         let diff = "\
@@ -872,6 +930,56 @@ diff --git a/a.rs b/a.rs
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].hunks[0].lines.len(), 2);
         assert_eq!(files[0].hunks[0].lines[0], ('+', "++ looks like a header but isn't".to_string()));
+    }
+
+    // ── file_diff_meta_from_parsed (FIX 7 shadow-repo fallback) ─────────
+
+    #[test]
+    fn file_diff_meta_from_parsed_counts_added_and_removed_lines() {
+        let diff = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,3 +1,3 @@
+ line1
+-line2
++line2X
++line2Y
+ line3
+";
+        let files = parse_unified(diff);
+        let meta = file_diff_meta_from_parsed(&files[0]);
+        assert_eq!(meta.path, "a.rs");
+        assert_eq!(meta.added, 2);
+        assert_eq!(meta.removed, 1);
+        assert!(!meta.binary);
+        assert!(!meta.too_large);
+    }
+
+    #[test]
+    fn file_diff_meta_from_parsed_zeroes_counts_when_too_large() {
+        let mut file = FileDiff {
+            path: "big.txt".into(),
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,1 @@".into(),
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![('-', "old".into()), ('+', "new".into())],
+                hash: String::new(),
+            }],
+            too_large: true,
+        };
+        let meta = file_diff_meta_from_parsed(&file);
+        assert_eq!(meta.added, 0);
+        assert_eq!(meta.removed, 0);
+        file.too_large = false;
+        let meta2 = file_diff_meta_from_parsed(&file);
+        assert_eq!(meta2.added, 1);
+        assert_eq!(meta2.removed, 1);
     }
 
     // ── hunk_hash / build_hunk_patch ────────────────────────────────────

@@ -66,8 +66,8 @@ impl GitCtx {
     /// The Phase C shadow-repo case: an explicit, separate git-dir/index
     /// sharing `root` as the work-tree. Kept here (rather than only in
     /// `shadow.rs`) since the shape is part of the harness's public contract.
-    /// Unused until Phase C wires up `workbench::shadow`.
-    #[allow(dead_code)]
+    /// Every call in `workbench::shadow` funnels through this via
+    /// `shadow_ctx`.
     pub fn shadow(root: impl Into<PathBuf>, git_dir: PathBuf, index_file: PathBuf) -> Self {
         let root = root.into();
         Self {
@@ -81,14 +81,13 @@ impl GitCtx {
 
 /// Captured result of one `git` invocation. `code` is `None` only if the
 /// process was killed by a signal (not expected on Windows; kept `Option`
-/// for parity with `std::process::ExitStatus::code()`). `stderr` is unread
-/// until a Phase B/C caller needs it for error reporting (e.g. surfacing
-/// `git apply`'s rejection reason) — captured now so no call site needs to
-/// change when one does.
+/// for parity with `std::process::ExitStatus::code()`). `stderr` is read by
+/// every Workbench module's error paths (Phase B's hunk revert, Phase C's
+/// shadow-repo ops, Phase D's worktree ops) to surface `git`'s own rejection
+/// reason to the caller.
 #[derive(Clone, Debug)]
 pub struct GitOutput {
     pub stdout: String,
-    #[allow(dead_code)]
     pub stderr: String,
     pub code: Option<i32>,
 }
@@ -269,11 +268,9 @@ fn store_is_repo(root: PathBuf, answer: bool) {
 }
 
 /// Drop any cached [`is_repo`] answer for `root` so the next call re-probes
-/// immediately. Call after an operation that changes repo-ness (e.g. Phase D
-/// `worktree::create`, or a user running `git init` that cImp itself
-/// triggered) rather than waiting out the TTL. Unused in production code
-/// until Phase D; exercised directly by this module's own tests today.
-#[allow(dead_code)]
+/// immediately. Called after an operation that changes repo-ness — Phase D's
+/// `worktree::create`/`discard` (a linked worktree's directory starts/stops
+/// being a repo) — rather than waiting out the TTL.
 pub fn invalidate_is_repo_cache(root: &Path) {
     if let Ok(mut guard) = IS_REPO_CACHE.lock() {
         if let Some(map) = guard.as_mut() {

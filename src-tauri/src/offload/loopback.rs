@@ -626,14 +626,22 @@ async fn handle_context_retrieve(
     // transport). Fire-and-forget: `on_prompt`'s own min-gap check is cheap
     // and the real snapshot work runs on a background task inside it, so
     // this never delays the turn waiting on a `git` round trip.
+    // FIX 8 (V13 code review): only spawn the task at all when checkpoints
+    // are actually on — `on_prompt`/`maybe_snapshot` already no-op when
+    // they're off, but that check used to happen AFTER a task was already
+    // spawned for every single prompt, which is needless per-prompt work
+    // (a task spawn plus a settings read) for a feature the user has
+    // disabled.
     if let Some(workbench) = app.try_state::<Arc<crate::workbench::WorkbenchService>>() {
         let workbench = workbench.inner().clone();
-        let root = cwd.clone();
-        let agent = body.agent.clone();
-        let prompt_head: String = body.prompt.chars().take(80).collect();
-        tauri::async_runtime::spawn(async move {
-            workbench.on_prompt(&root, agent, &prompt_head).await;
-        });
+        if workbench.checkpoints_enabled() {
+            let root = cwd.clone();
+            let agent = body.agent.clone();
+            let prompt_head: String = body.prompt.chars().take(80).collect();
+            tauri::async_runtime::spawn(async move {
+                workbench.on_prompt(&root, agent, &prompt_head).await;
+            });
+        }
     }
 
     let empty = serde_json::json!({ "ok": true, "text": "", "files": [], "tokens_est": 0 });

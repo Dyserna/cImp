@@ -11,8 +11,8 @@
 use tree_sitter::{Node, Parser};
 
 use super::model::{
-    doc_chunk_id, fnv1a_hex, symbol_doc_chunk_id, symbol_id, CodeChunk, DocChunk, Edge, EdgeKind,
-    FileGraph, Lang, Reference, Symbol, SymbolKind, Visibility,
+    doc_chunk_id, fnv1a_hex, symbol_doc_chunk_id, symbol_id, CodeChunk, Confidence, DocChunk, Edge,
+    EdgeKind, FileGraph, Lang, Reference, Symbol, SymbolKind, Visibility,
 };
 
 /// Max characters kept for a symbol's one-line signature.
@@ -72,6 +72,10 @@ pub fn parse_file(path: &str, src: &str, lang: Lang) -> FileGraph {
         Lang::Other => {}
     }
 
+    // V15 Feature 3: now that the whole file is parsed, upgrade same-file
+    // call/reference confidence from `Inferred` to `Extracted`. Single place,
+    // walk-order-independent, covers both the bespoke walkers and the tags engine.
+    fg.classify_confidence();
     fg
 }
 
@@ -300,11 +304,7 @@ fn walk_items(
             pending_attrs.clear();
         } else if kind == "use_declaration" {
             if let Some(path) = import_path(src, child) {
-                fg.edges.push(Edge {
-                    kind: EdgeKind::Import,
-                    src: file.to_string(),
-                    dst: path,
-                });
+                fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), path));
             }
             pending_doc.clear();
             pending_attrs.clear();
@@ -566,12 +566,11 @@ fn push_call(src: &str, file: &str, at: Node, callee: &str, from_id: &str, fg: &
         line: at.start_position().row as u32 + 1,
         col: char_col(src, at),
         resolved_id: None,
+        // Inferred by default; `FileGraph::classify_confidence` upgrades it to
+        // Extracted if `callee` is defined in this same file.
+        confidence: Confidence::Inferred,
     });
-    fg.edges.push(Edge {
-        kind: EdgeKind::Call,
-        src: from_id.to_string(),
-        dst: callee.to_string(),
-    });
+    fg.edges.push(Edge::new(EdgeKind::Call, from_id.to_string(), callee.to_string()));
 }
 
 /// The 1-based **character** column of `node`'s start. F26: tree-sitter's
@@ -896,7 +895,7 @@ fn walk_js(
             pending_doc.clear();
         } else if kind == "import_statement" {
             if let Some(srcpath) = js_import_source(src, child) {
-                fg.edges.push(Edge { kind: EdgeKind::Import, src: file.to_string(), dst: srcpath });
+                fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), srcpath));
             }
             pending_doc.clear();
         } else {
@@ -938,7 +937,7 @@ pub(crate) fn emit_symbol(
         is_test,
     });
     if let Some(p) = parent {
-        fg.edges.push(Edge { kind: EdgeKind::Contains, src: p.to_string(), dst: id.clone() });
+        fg.edges.push(Edge::new(EdgeKind::Contains, p.to_string(), id.clone()));
     }
     // V11 Phase G: a semantic *code* chunk for this symbol (doc + body), keyed by
     // the symbol's own id. The node text already begins with the signature line,
@@ -970,7 +969,7 @@ pub(crate) fn emit_symbol(
             anchor: name.to_string(),
             text,
         });
-        fg.edges.push(Edge { kind: EdgeKind::Documents, src: cid, dst: id.clone() });
+        fg.edges.push(Edge::new(EdgeKind::Documents, cid, id.clone()));
     }
     id
 }
@@ -1190,7 +1189,7 @@ fn walk_py(
             }
             "import_statement" | "import_from_statement" => {
                 for m in py_import_modules(src, def_node) {
-                    fg.edges.push(Edge { kind: EdgeKind::Import, src: file.to_string(), dst: m });
+                    fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), m));
                 }
             }
             _ => walk_py(src, file, def_node, parent, in_class, file_is_test_path, fg),

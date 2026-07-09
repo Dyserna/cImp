@@ -13,7 +13,10 @@
 /// `meta`, `usage_stat`) is additive create-if-missing and needs no bump. The
 /// bump is front-loaded here so the whole V11→V14 roadmap costs users a
 /// single rebuild.
-pub const GRAPH_SCHEMA_VERSION: i64 = 3;
+/// V15 == 4: `ref.confidence` and `edge.confidence` (edge-confidence layer,
+/// Feature 3) add a value column to two relations, forcing one rebuild — every
+/// row is re-derivable from source, so the reset-migration repopulates it.
+pub const GRAPH_SCHEMA_VERSION: i64 = 4;
 
 /// `(name, create-script)` for every stored relation. Order matters only in
 /// that all are ensured before any write.
@@ -31,11 +34,13 @@ pub const RELATIONS: &[(&str, &str)] = &[
     ),
     (
         "ref",
-        ":create ref {file: String, line: Int, col: Int, name: String => resolved_id: String?}",
+        ":create ref {file: String, line: Int, col: Int, name: String => \
+            resolved_id: String?, confidence: String default 'inferred'}",
     ),
     (
         "edge",
-        ":create edge {kind: String, src: String, dst: String}",
+        ":create edge {kind: String, src: String, dst: String => \
+            confidence: String default 'inferred'}",
     ),
     (
         "doc_chunk",

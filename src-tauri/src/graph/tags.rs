@@ -17,7 +17,7 @@
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::graph::builder::{char_col, emit_symbol, language_for};
-use crate::graph::model::{symbol_id, Edge, EdgeKind, FileGraph, Lang, Reference, SymbolKind, Visibility};
+use crate::graph::model::{symbol_id, Confidence, Edge, EdgeKind, FileGraph, Lang, Reference, SymbolKind, Visibility};
 
 /// A grammar + its vendored tags query.
 pub(crate) struct TagSpec {
@@ -238,16 +238,14 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
             line: c.line,
             col: c.col,
             resolved_id: None,
+            // Upgraded to Extracted for same-file targets by `classify_confidence`.
+            confidence: Confidence::Inferred,
         });
         let caller = smallest_container(&spans, c.byte, c.byte + 1, None, |j| {
             matches!(defs[j].kind, SymbolKind::Function | SymbolKind::Method)
         });
         if let Some(j) = caller {
-            fg.edges.push(Edge {
-                kind: EdgeKind::Call,
-                src: ids[j].clone(),
-                dst: c.name.clone(),
-            });
+            fg.edges.push(Edge::new(EdgeKind::Call, ids[j].clone(), c.name.clone()));
         }
     }
 }

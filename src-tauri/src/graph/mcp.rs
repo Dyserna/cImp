@@ -922,13 +922,23 @@ fn fmt_symbols(syms: &[SymbolHit], max_rows: usize) -> String {
         .take(max_rows)
         .map(|s| {
             let tag = if s.is_test { " [test]" } else { "" };
-            format!("{} ({}) — {}:{}  {}{}", s.name, s.kind, s.file, s.start_line, s.signature, tag)
+            format!(
+                "{} ({}) — {}:{}  {}{}{}",
+                s.name, s.kind, s.file, s.start_line, s.signature, tag, conf_badge(s.confidence)
+            )
         })
         .collect();
     if syms.len() > max_rows {
         lines.push(format!("… (+{} more)", syms.len() - max_rows));
     }
     lines.join("\n")
+}
+
+/// A ` [inferred]` / ` [ambiguous]` / ` [extracted]` badge for a row's V15
+/// edge confidence, or `""` when there's no edge behind the row. Kept terse so
+/// it rides at the end of a symbol line without crowding it.
+pub(crate) fn conf_badge(c: Option<super::model::Confidence>) -> String {
+    c.map(|c| format!(" [{}]", c.tag())).unwrap_or_default()
 }
 
 fn fmt_dead_exports(syms: &[SymbolHit], max_rows: usize) -> String {
@@ -1059,7 +1069,7 @@ fn fmt_refs(refs: &[RefHit], max_rows: usize) -> String {
     let mut lines: Vec<String> = refs
         .iter()
         .take(max_rows)
-        .map(|r| format!("{}:{}:{}", r.file, r.line, r.col))
+        .map(|r| format!("{}:{}:{}{}", r.file, r.line, r.col, conf_badge(Some(r.confidence))))
         .collect();
     if refs.len() > max_rows {
         lines.push(format!("… (+{} more)", refs.len() - max_rows));
@@ -1379,7 +1389,15 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
         });
     }
 
-    let dependents = idx.dependents_transitive(&root_names, depth, max_rows).map_err(|e| e.to_string())?;
+    let mut dependents = idx.dependents_transitive(&root_names, depth, max_rows).map_err(|e| e.to_string())?;
+
+    // V15 Feature 3: optional `min_confidence` (extracted|inferred|ambiguous)
+    // reads blast-radius conservatively — keep only dependents at least that
+    // certain. Default: include all.
+    if let Some(min) = args.get("min_confidence").and_then(|v| v.as_str()) {
+        let floor = super::model::Confidence::from_tag(min).rank();
+        dependents.retain(|d| d.confidence.rank() >= floor);
+    }
 
     let mut out = String::new();
     if !changed_syms.is_empty() {
@@ -1400,12 +1418,13 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
             .take(max_rows)
             .map(|d| {
                 format!(
-                    "{}{}:{} · {} · depth {}",
+                    "{}{}:{} · {} · depth {}{}",
                     if d.approx { "~" } else { "" },
                     d.symbol.file,
                     d.symbol.start_line,
                     d.symbol.name,
-                    d.depth
+                    d.depth,
+                    conf_badge(Some(d.confidence))
                 )
             })
             .collect();
@@ -1415,8 +1434,24 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
         out.push_str(&lines.join("\n"));
         let files: std::collections::BTreeSet<&str> =
             dependents.iter().map(|d| d.symbol.file.as_str()).collect();
+        // Confidence split so blast-radius can be read conservatively.
+        use super::model::Confidence::*;
+        let (mut ex, mut inf, mut amb) = (0usize, 0usize, 0usize);
+        for d in &dependents {
+            match d.confidence {
+                Extracted => ex += 1,
+                Inferred => inf += 1,
+                Ambiguous => amb += 1,
+            }
+        }
         out.push_str(&format!(
-            "\n\n{} file{} depend on your change (approximate — call edges are name-keyed, not id-resolved).",
+            "\n\n{} dependent{} ({} extracted, {} inferred, {} ambiguous) across {} file{} \
+             (approximate — call edges are name-keyed, not id-resolved).",
+            dependents.len(),
+            if dependents.len() == 1 { "" } else { "s" },
+            ex,
+            inf,
+            amb,
             files.len(),
             if files.len() == 1 { "" } else { "s" }
         ));
@@ -1781,7 +1816,10 @@ mod impact_tool_tests {
         assert!(out.contains("Roots: a"), "{out}");
         assert!(out.contains("~src/chain.rs:2 · b · depth 1"), "{out}");
         assert!(out.contains("~src/chain.rs:3 · c · depth 2"), "{out}");
-        assert!(out.contains("2 files depend on your change") || out.contains("1 file depend"), "{out}");
+        assert!(out.contains("2 dependents"), "{out}");
+        // Same-file call chain → every dependent edge is Extracted, none inferred.
+        assert!(out.contains("2 extracted, 0 inferred"), "{out}");
+        assert!(out.contains("[extracted]"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

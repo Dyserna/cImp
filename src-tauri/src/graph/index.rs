@@ -19,7 +19,7 @@ use super::memory::{
     WorkingSetEntry, MAX_EVENTS_PER_SESSION, MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT,
     MAX_USAGE_PER_SESSION,
 };
-use super::model::{FileGraph, Lang};
+use super::model::{Confidence, FileGraph, Lang};
 use super::schema::{GRAPH_SCHEMA_VERSION, RELATIONS};
 
 /// One symbol returned by a lookup query.
@@ -42,6 +42,11 @@ pub struct SymbolHit {
     /// honest-default posture as `visibility`'s `"unknown"`. Feeds
     /// `GraphIndex::tests_for` / `graph_tests_for` (V12 Phase C).
     pub is_test: bool,
+    /// V15 Feature 3: how certain the *edge* that surfaced this symbol is —
+    /// `Some` on callers/callees rows (the effective confidence of the call
+    /// edge, downgraded to `Ambiguous` when the queried name is multi-candidate),
+    /// `None` for plain definition lookups where no edge is involved.
+    pub confidence: Option<Confidence>,
 }
 
 /// V12 Phase B: one symbol found to (transitively) depend on a changed root
@@ -58,6 +63,10 @@ pub struct DependentHit {
     /// name-keyed (`dst` is a callee NAME, not a resolved symbol id), so
     /// every dependents hit is approximate by construction.
     pub approx: bool,
+    /// V15 Feature 3: the weakest edge confidence along this dependent's
+    /// discovery chain (a chain is only as certain as its least-certain link).
+    /// `Ambiguous` if any hop's callee name was multi-candidate.
+    pub confidence: Confidence,
 }
 
 /// One reference (use site) returned by `references`.
@@ -67,6 +76,10 @@ pub struct RefHit {
     pub file: String,
     pub line: u32,
     pub col: u32,
+    /// V15 Feature 3: the reference's confidence — its stored parse-time value
+    /// (`Extracted` if defined same-file, else `Inferred`), downgraded to
+    /// `Ambiguous` when the name resolves to more than one definition.
+    pub confidence: Confidence,
 }
 
 /// One documentation hit returned by `search_docs`.
@@ -331,6 +344,7 @@ impl GraphIndex {
                         .as_deref()
                         .map(|d| DataValue::Str(d.into()))
                         .unwrap_or(DataValue::Null),
+                    DataValue::Str(r.confidence.tag().into()),
                 ])
             })
             .collect();
@@ -368,6 +382,7 @@ impl GraphIndex {
                     DataValue::Str(e.kind.tag().into()),
                     DataValue::Str(e.src.as_str().into()),
                     DataValue::Str(e.dst.as_str().into()),
+                    DataValue::Str(e.confidence.tag().into()),
                 ])
             })
             .collect();
@@ -390,7 +405,8 @@ impl GraphIndex {
             )?;
             tx_put(
                 tx,
-                "?[file, line, col, name, resolved_id] <- $rows\n:put ref {file, line, col, name => resolved_id}",
+                "?[file, line, col, name, resolved_id, confidence] <- $rows\n\
+                 :put ref {file, line, col, name => resolved_id, confidence}",
                 ref_rows,
             )?;
             tx_put(
@@ -405,7 +421,7 @@ impl GraphIndex {
             )?;
             tx_put(
                 tx,
-                "?[kind, src, dst] <- $rows\n:put edge {kind, src, dst}",
+                "?[kind, src, dst, confidence] <- $rows\n:put edge {kind, src, dst => confidence}",
                 edge_rows,
             )?;
             Ok(())
@@ -453,14 +469,23 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            r#"?[sid, sname, skind, file, start_line, signature, visibility, end_line, is_test] :=
-                *edge{kind: ek, src: sid, dst: dn}, ek == "call", dn == $name,
+            r#"?[sid, sname, skind, file, start_line, signature, visibility, end_line, is_test, conf] :=
+                *edge{kind: ek, src: sid, dst: dn, confidence: conf}, ek == "call", dn == $name,
                 *symbol{id: sid, name: sname, kind: skind, file, start_line, signature, visibility, end_line, is_test}
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
         )?;
-        Ok(rows_to_symbols(&rows))
+        // V15 Feature 3: if the callee name resolves to more than one definition
+        // we can't know which one each caller actually targets — every hit is a
+        // superset, so mark it `Ambiguous`. Otherwise carry the edge's own
+        // confidence (col 9).
+        let ambiguous = self.symbol_count(name)? > 1;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| with_row_confidence(row_to_symbol(r), r, 9, ambiguous))
+            .collect())
     }
 
     /// Symbols called by any symbol named `name` (callees, resolved by name).
@@ -468,15 +493,28 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            r#"?[id2, nm, skind, file, start_line, signature, visibility, end_line, is_test] :=
+            r#"?[id2, nm, skind, file, start_line, signature, visibility, end_line, is_test, conf] :=
                 *symbol{id: cid, name: cn}, cn == $name,
-                *edge{kind: ek, src: cid, dst: dn}, ek == "call",
+                *edge{kind: ek, src: cid, dst: dn, confidence: conf}, ek == "call",
                 *symbol{id: id2, name: nm, kind: skind, file, start_line, signature, visibility, end_line, is_test}, nm == dn
             :limit 500"#,
             p,
             ScriptMutability::Immutable,
         )?;
-        Ok(rows_to_symbols(&rows))
+        // A callee name that resolved to >1 symbol in this result is a superset
+        // (Ambiguous); one that resolved uniquely keeps the edge's confidence.
+        let mut name_counts: HashMap<String, usize> = HashMap::new();
+        for r in &rows.rows {
+            *name_counts.entry(cell_str(r, 1)).or_default() += 1;
+        }
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| {
+                let amb = name_counts.get(&cell_str(r, 1)).copied().unwrap_or(0) > 1;
+                with_row_confidence(row_to_symbol(r), r, 9, amb)
+            })
+            .collect())
     }
 
     /// All reference (use) sites of `name`.
@@ -484,10 +522,12 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
         let rows = self.run(
-            "?[name, file, line, col] := *ref{name, file, line, col}, name == $name\n:limit 1000",
+            "?[name, file, line, col, conf] := *ref{name, file, line, col, confidence: conf}, name == $name\n:limit 1000",
             p,
             ScriptMutability::Immutable,
         )?;
+        // Multi-candidate name → the use sites could bind to any of them.
+        let ambiguous = self.symbol_count(name)? > 1;
         Ok(rows
             .rows
             .iter()
@@ -496,6 +536,11 @@ impl GraphIndex {
                 file: cell_str(r, 1),
                 line: cell_i64(r, 2) as u32,
                 col: cell_i64(r, 3) as u32,
+                confidence: if ambiguous {
+                    Confidence::Ambiguous
+                } else {
+                    Confidence::from_tag(&cell_str(r, 4))
+                },
             })
             .collect())
     }
@@ -644,6 +689,37 @@ impl GraphIndex {
         Ok(syms)
     }
 
+    /// How many definitions share the exact name `name`. Feeds the V15 Feature 3
+    /// query-time `Ambiguous` override: a name with more than one candidate makes
+    /// every name-keyed resolution of it a superset.
+    pub fn symbol_count(&self, name: &str) -> AppResult<u64> {
+        let mut p = BTreeMap::new();
+        p.insert("name".to_string(), DataValue::Str(name.into()));
+        let rows = self.run(
+            "?[count(id)] := *symbol{id, name}, name == $name",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64)
+    }
+
+    /// The set of symbol names defined by more than one definition — the names
+    /// whose every name-keyed resolution is `Ambiguous`. One aggregate scan,
+    /// shared by the impact BFS and any other multi-hop confidence pass.
+    pub fn multi_candidate_names(&self) -> AppResult<HashSet<String>> {
+        let rows = self.run(
+            "?[name, count(id)] := *symbol{id, name}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows
+            .rows
+            .iter()
+            .filter(|r| cell_i64(r, 1) > 1)
+            .map(|r| cell_str(r, 0))
+            .collect())
+    }
+
     /// The smallest symbol whose span encloses `line` (1-based) in `file`. Used
     /// by `graph_snippet`'s `file`+`line` mode. `None` when no indexed symbol
     /// contains the line (e.g. a top-of-file import region or a blank line).
@@ -774,36 +850,54 @@ reach[x] := reach[z], calls[x, z]"#
         }
         let depth = depth.clamp(1, 6);
 
-        // One scan of every name-level call edge: (caller name, callee name).
+        // One scan of every name-level call edge: (caller name, callee name,
+        // stored edge confidence).
         let rows = self.run(
-            r#"?[caller, callee] := *symbol{id: cid, name: caller}, *edge{kind: ek, src: cid, dst: callee}, ek == "call""#,
+            r#"?[caller, callee, conf] := *symbol{id: cid, name: caller}, *edge{kind: ek, src: cid, dst: callee, confidence: conf}, ek == "call""#,
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
-        // Reverse adjacency: callee name -> distinct caller names.
-        let mut rev: HashMap<String, HashSet<String>> = HashMap::new();
+        // Names defined by more than one symbol: any call edge targeting such a
+        // name is `Ambiguous` regardless of its stored confidence (we can't tell
+        // which definition it hits). One scan, reused across the whole BFS.
+        let multi = self.multi_candidate_names()?;
+        // Reverse adjacency: callee name -> distinct (caller name, effective edge
+        // confidence). Effective = Ambiguous when the callee is multi-candidate.
+        let mut rev: HashMap<String, HashMap<String, Confidence>> = HashMap::new();
         for r in &rows.rows {
             let caller = cell_str(r, 0);
             let callee = cell_str(r, 1);
-            rev.entry(callee).or_default().insert(caller);
+            let ec = if multi.contains(&callee) {
+                Confidence::Ambiguous
+            } else {
+                Confidence::from_tag(&cell_str(r, 2))
+            };
+            // Keep the strongest edge if a pair appears twice — the caller does
+            // reach the callee at least that certainly.
+            let slot = rev.entry(callee).or_default().entry(caller).or_insert(ec);
+            *slot = slot.stronger(ec);
         }
 
         let root_set: HashSet<&str> = roots.iter().map(|s| s.as_str()).collect();
-        let mut min_depth: HashMap<String, u32> = HashMap::new();
-        let mut frontier: HashSet<String> = roots.iter().cloned().collect();
+        // Per dependent: (min depth, weakest confidence along its discovery chain).
+        let mut best: HashMap<String, (u32, Confidence)> = HashMap::new();
+        // Roots seed the BFS at full certainty; each hop weakens by its edge.
+        let mut frontier: HashMap<String, Confidence> =
+            roots.iter().map(|n| (n.clone(), Confidence::Extracted)).collect();
         for d in 1..=depth {
-            let mut next_frontier: HashSet<String> = HashSet::new();
-            for name in &frontier {
+            let mut next_frontier: HashMap<String, Confidence> = HashMap::new();
+            for (name, chain_conf) in &frontier {
                 let Some(callers) = rev.get(name) else { continue };
-                for caller in callers {
+                for (caller, ec) in callers {
                     if root_set.contains(caller.as_str()) {
                         continue;
                     }
-                    // First discovery wins the depth — BFS order guarantees
-                    // that's always the minimum.
-                    if !min_depth.contains_key(caller) {
-                        min_depth.insert(caller.clone(), d);
-                        next_frontier.insert(caller.clone());
+                    // First discovery (BFS order) wins the min depth; its chain
+                    // confidence is the weakest link from a root to here.
+                    if !best.contains_key(caller) {
+                        let cc = chain_conf.weaker(*ec);
+                        best.insert(caller.clone(), (d, cc));
+                        next_frontier.insert(caller.clone(), cc);
                     }
                 }
             }
@@ -813,7 +907,8 @@ reach[x] := reach[z], calls[x, z]"#
             frontier = next_frontier;
         }
 
-        let mut names: Vec<(String, u32)> = min_depth.into_iter().collect();
+        let mut names: Vec<(String, u32, Confidence)> =
+            best.into_iter().map(|(n, (d, c))| (n, d, c)).collect();
         names.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
         // F15: resolve every dependent name to its symbol(s) in ONE query — a
@@ -825,7 +920,7 @@ reach[x] := reach[z], calls[x, z]"#
         if !names.is_empty() {
             let name_rows: Vec<DataValue> = names
                 .iter()
-                .map(|(n, _)| DataValue::List(vec![DataValue::Str(n.as_str().into())]))
+                .map(|(n, _, _)| DataValue::List(vec![DataValue::Str(n.as_str().into())]))
                 .collect();
             let mut p = BTreeMap::new();
             p.insert("names".to_string(), DataValue::List(name_rows));
@@ -843,10 +938,10 @@ reach[x] := reach[z], calls[x, z]"#
         }
 
         let mut hits: Vec<DependentHit> = Vec::new();
-        for (name, d) in names {
+        for (name, d, conf) in names {
             if let Some(syms) = by_name.remove(&name) {
                 for symbol in syms {
-                    hits.push(DependentHit { symbol, depth: d, approx: true });
+                    hits.push(DependentHit { symbol, depth: d, approx: true, confidence: conf });
                     if hits.len() >= max {
                         return Ok(hits);
                     }
@@ -1558,6 +1653,7 @@ reach[x] := reach[z], calls[x, z]"#
                     // Not projected by this query (out of Phase C's scoped 5
                     // heads) — honest default, matching `rows_to_symbols`.
                     is_test: false,
+                    confidence: None,
                 };
                 (hit, cell_f64(r, 8) as f32)
             })
@@ -3039,23 +3135,41 @@ fn text_hash(s: &str) -> String {
 /// project `end_line` (8th column absent) fall back to `start_line`; those
 /// that don't project `is_test` (9th column absent) default to `false`.
 fn rows_to_symbols(rows: &cozo::NamedRows) -> Vec<SymbolHit> {
-    rows.rows
-        .iter()
-        .map(|r| {
-            let start_line = cell_i64(r, 4) as u32;
-            SymbolHit {
-                id: cell_str(r, 0),
-                name: cell_str(r, 1),
-                kind: cell_str(r, 2),
-                file: cell_str(r, 3),
-                start_line,
-                signature: cell_str(r, 5),
-                visibility: if r.len() > 6 { cell_str(r, 6) } else { "unknown".to_string() },
-                end_line: if r.len() > 7 { cell_i64(r, 7) as u32 } else { start_line },
-                is_test: cell_bool(r, 8),
-            }
-        })
-        .collect()
+    rows.rows.iter().map(|r| row_to_symbol(r)).collect()
+}
+
+/// Attach the effective confidence to an edge-bearing symbol hit: `Ambiguous`
+/// when `ambiguous` (the name was multi-candidate), otherwise the stored edge
+/// confidence read from column `conf_col`.
+fn with_row_confidence(mut hit: SymbolHit, r: &[DataValue], conf_col: usize, ambiguous: bool) -> SymbolHit {
+    hit.confidence = Some(if ambiguous {
+        Confidence::Ambiguous
+    } else {
+        Confidence::from_tag(&cell_str(r, conf_col))
+    });
+    hit
+}
+
+/// Map one `[id, name, kind, file, start_line, signature, visibility?,
+/// end_line?, is_test?]` row into a [`SymbolHit`]. `confidence` is `None` —
+/// edge-bearing queries (callers/callees) set it from a projected `conf` column
+/// afterward via [`with_row_confidence`].
+fn row_to_symbol(r: &[DataValue]) -> SymbolHit {
+    let start_line = cell_i64(r, 4) as u32;
+    SymbolHit {
+        id: cell_str(r, 0),
+        name: cell_str(r, 1),
+        kind: cell_str(r, 2),
+        file: cell_str(r, 3),
+        start_line,
+        signature: cell_str(r, 5),
+        visibility: if r.len() > 6 { cell_str(r, 6) } else { "unknown".to_string() },
+        end_line: if r.len() > 7 { cell_i64(r, 7) as u32 } else { start_line },
+        is_test: cell_bool(r, 8),
+        // A plain definition lookup involves no edge — callers/callees set this
+        // explicitly from the surfacing edge's confidence.
+        confidence: None,
+    }
 }
 
 /// Whether `name` is a conventional entrypoint / trait-method that's routinely

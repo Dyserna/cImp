@@ -77,4 +77,10 @@ pub struct AppState {
 pub struct LaunchContext {
     pub cwd: PathBuf,
     pub extra_args: Vec<String>,
+    /// V14 Phase B: a UUID minted once per app run (`main.rs`, alongside
+    /// `launch_cwd`). Scopes the compose overlay's image-attachment temp
+    /// dir (`attach::attach_dir`) to "one directory per app run" — nothing
+    /// else in the app identified a run before this, so Phase B introduces
+    /// it rather than reusing an existing id.
+    pub launch_id: String,
 }

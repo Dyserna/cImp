@@ -7,10 +7,20 @@ import { writable, get } from 'svelte/store';
 import { ptyWrite } from './ipc';
 import { activeTab } from './tabs/state';
 import { focusTerminal } from './terminalFocus';
+import { appendAttachments } from './compose/attachments';
 
 export const composeOpen = writable<boolean>(false);
 export const composeContent = writable<string>('');
 export const composeFocused = writable<boolean>(false);
+
+/// V14 Phase B: absolute paths of images attached to the in-progress draft
+/// (pasted → `attach.rs`-saved PNGs, or dropped → referenced in place — see
+/// `ComposeOverlay.svelte`). A sibling store to `composeContent` rather than
+/// a change to its type/shape, so nothing about Phase A's text-draft
+/// handling (or any other existing reader of `composeContent`) changes.
+/// Cleared alongside it in `closeCompose`; folded into the message text by
+/// `submitCompose` via `appendAttachments`.
+export const composeAttachments = writable<string[]>([]);
 
 export function openCompose(): void {
   if (get(composeOpen)) return;
@@ -50,17 +60,24 @@ export function openComposeWith(text: string): void {
 export function closeCompose(): void {
   composeOpen.set(false);
   composeContent.set('');
+  composeAttachments.set([]);
   focusTerminal();
 }
 
 export async function submitCompose(): Promise<void> {
   const content = get(composeContent);
-  if (!content) {
+  const attachments = get(composeAttachments);
+  // `appendAttachments` returns `content` unchanged when there are no
+  // attachments, so an image-only draft (empty textarea, one pasted image)
+  // still submits — only a truly empty draft (no text AND no attachments)
+  // is a no-op.
+  const message = appendAttachments(content, attachments);
+  if (!message) {
     closeCompose();
     return;
   }
   try {
-    await ptyWrite(get(activeTab), content + '\r');
+    await ptyWrite(get(activeTab), message + '\r');
   } catch (e) {
     console.error('compose submit pty_write failed:', e);
   }

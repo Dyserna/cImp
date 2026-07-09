@@ -1,14 +1,17 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { get } from 'svelte/store';
+  import { getCurrentWebview } from '@tauri-apps/api/webview';
   import {
     composeOpen,
     composeContent,
     composeFocused,
     composeOpenPickerSignal,
+    composeAttachments,
     submitCompose,
   } from './composeState';
   import { compose as composeSettings } from './settings/store';
+  import { listenManaged } from './listenManaged';
   import TemplatePicker from './TemplatePicker.svelte';
   import {
     composeTemplates,
@@ -18,6 +21,12 @@
     hasPlaceholder,
     type ResolvedTemplate,
   } from './compose/templates';
+  import {
+    clipboardHasImage,
+    filterImagePaths,
+    readClipboardImagePng,
+    composeAttachImage,
+  } from './compose/attachments';
 
   let textareaEl: HTMLTextAreaElement | undefined = $state();
 
@@ -258,6 +267,61 @@
     }
   }
 
+  // ── V14 Phase B: image paste/drop ───────────────────────────────────
+  // Paste: `event.clipboardData.items` gives the MIME types synchronously
+  // (a plain DOM capability, unlike the denied `navigator.clipboard.read()`)
+  // — used ONLY to decide whether this is an image paste. A text-only paste
+  // returns from `clipboardHasImage` false and the event is left completely
+  // alone, so normal text paste behavior is untouched. An image paste is
+  // `preventDefault`ed (there's no textarea-native way to paste an image
+  // anyway) and the actual pixels are fetched via the Tauri clipboard
+  // plugin (`readClipboardImagePng`), which WebView2 does allow.
+  function handlePaste(e: ClipboardEvent): void {
+    const types = Array.from(e.clipboardData?.items ?? []).map((item) => item.type);
+    if (!clipboardHasImage(types)) return;
+    e.preventDefault();
+    void attachClipboardImage();
+  }
+
+  async function attachClipboardImage(): Promise<void> {
+    const bytes = await readClipboardImagePng();
+    if (!bytes) return; // no image, or re-encoding failed — nothing to attach
+    try {
+      const path = await composeAttachImage(bytes);
+      composeAttachments.update((a) => [...a, path]);
+    } catch (e) {
+      console.warn('compose_attach_image failed:', e);
+    }
+  }
+
+  function removeAttachment(path: string): void {
+    composeAttachments.update((a) => a.filter((p) => p !== path));
+  }
+
+  /// Chip label — the file name, not the full absolute path (the full path
+  /// is still available as the chip's `title` tooltip).
+  function attachmentName(path: string): string {
+    return path.split(/[\\/]/).pop() ?? path;
+  }
+
+  // Drop: the Tauri NATIVE drag-drop event (not HTML5 DOM drag events —
+  // `dragDropEnabled` defaults on, which is what makes this the right event
+  // to listen to). Registered once for the component's lifetime;
+  // `$composeOpen` is checked inside the handler so drops are only acted on
+  // while the sheet is actually showing — the terminal beneath keeps
+  // whatever drop behavior it already has the rest of the time. Files are
+  // referenced IN PLACE (no copy — `filterImagePaths` just filters the
+  // native absolute paths the OS already gave us down to image extensions).
+  listenManaged(() =>
+    getCurrentWebview().onDragDropEvent((event) => {
+      if (!get(composeOpen)) return;
+      if (event.payload.type !== 'drop') return;
+      const images = filterImagePaths(event.payload.paths);
+      if (images.length === 0) return;
+      composeAttachments.update((a) => [...a, ...images]);
+    }),
+  );
+
   function handleFocus(): void {
     composeFocused.set(true);
   }
@@ -286,6 +350,21 @@
         onPick={(i) => void insertTemplate(i)}
       />
     {/if}
+    {#if $composeAttachments.length > 0}
+      <div class="attachments-row">
+        {#each $composeAttachments as path (path)}
+          <span class="attachment-chip" title={path}>
+            <span class="attachment-name">{attachmentName(path)}</span>
+            <button
+              type="button"
+              class="attachment-remove"
+              onclick={() => removeAttachment(path)}
+              aria-label="Remove attachment {attachmentName(path)}"
+            >×</button>
+          </span>
+        {/each}
+      </div>
+    {/if}
     <div class="compose-row">
       <button
         type="button"
@@ -299,10 +378,11 @@
         bind:value={$composeContent}
         oninput={handleInput}
         onkeydown={handleKeydown}
+        onpaste={handlePaste}
         onfocus={handleFocus}
         onblur={handleBlur}
         spellcheck="true"
-        placeholder="Compose message... (/ for templates)"
+        placeholder="Compose message... (/ for templates, paste/drop an image to attach)"
         style="min-height: {minHeight}px; max-height: {maxHeight}px;"
       ></textarea>
     </div>
@@ -330,6 +410,52 @@
        tolerable; if it ever conflicts visually, raise this. */
     z-index: 50;
     box-sizing: border-box;
+  }
+
+  .attachments-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .attachment-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 220px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    padding: 3px 4px 3px 8px;
+    font-size: 12px;
+    color: var(--text-primary);
+  }
+
+  .attachment-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .attachment-remove {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    background: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1;
+  }
+
+  .attachment-remove:hover {
+    background: var(--surface-3);
+    color: var(--text-primary);
   }
 
   .compose-row {

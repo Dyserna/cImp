@@ -648,6 +648,22 @@ pub async fn compose_templates_project_get(
     Ok(crate::settings::read_project_prompt_templates(&root))
 }
 
+/// V14 Phase B: writes a pasted clipboard image (already re-encoded to PNG
+/// bytes on the frontend — see `lib/compose/attachments.ts`'s
+/// `readClipboardImagePng`, which reads via the Tauri clipboard plugin's
+/// image API rather than the WebView2-denied `navigator.clipboard`) to this
+/// app run's session-scoped attach dir and returns the absolute saved path.
+/// The frontend renders that path as a chip and, on submit, appends it to
+/// the message text (`compose/attachments.ts`'s `appendAttachments`).
+/// Dropped image *files* (`tauri://drag-drop`) skip this command entirely —
+/// they're referenced in place, never copied here.
+#[tauri::command]
+pub async fn compose_attach_image(state: State<'_, AppState>, bytes: Vec<u8>) -> AppResult<String> {
+    let session = state.launch.launch_id.clone();
+    let path = crate::attach::save_png(&session, &bytes)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 pub async fn acknowledge_error(state: State<'_, AppState>, tab: TabId) -> AppResult<()> {
     let _ = state

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod attach;
 mod audio;
 mod checks;
 mod compact_hook;
@@ -40,7 +41,8 @@ use tracing::{info, warn};
 
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::ipc::commands::{
-    acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_content_changed,
+    acknowledge_error, ai_tool_tab_defaults, close_settings_window, compose_attach_image,
+    compose_content_changed,
     compose_templates, compose_templates_global_get, compose_templates_global_set,
     compose_templates_project_get,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
@@ -166,6 +168,10 @@ fn main() {
 
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
+    // V14 Phase B: one id per app run, scoping the compose overlay's
+    // image-attachment temp dir (`attach::attach_dir`). See
+    // `LaunchContext::launch_id`'s doc comment.
+    let launch_id = uuid::Uuid::new_v4().to_string();
 
     // Window title reflects the project the user launched from. If the
     // launch cwd is anywhere inside a git working copy, the title uses
@@ -214,6 +220,12 @@ fn main() {
         content::set_enabled(snap.logging.content_capture.enabled);
         content::run_cleanup(snap.logging.content_capture.retention);
     }
+
+    // V14 Phase B: sweep compose-attach directories orphaned by a previous
+    // run that crashed or was killed before its own exit-time prune (below,
+    // in the `CloseRequested` handler) ran. Fixed 3-day age cap — not a
+    // user setting, this is opportunistic disk hygiene, not a feature.
+    attach::prune(3);
 
     // TTS / audio pipeline. Failures are non-fatal — the app launches with
     // TTS silent and a warning logged. Init is deferred to the Tauri `setup`
@@ -330,6 +342,7 @@ fn main() {
         launch: LaunchContext {
             cwd: launch_cwd,
             extra_args,
+            launch_id,
         },
         tts_segments: tts_tx,
         speak_session: speak_session.clone(),
@@ -667,6 +680,7 @@ fn main() {
             compose_templates_global_get,
             compose_templates_global_set,
             compose_templates_project_get,
+            compose_attach_image,
             acknowledge_error,
             tab_activate,
             set_active_tab,
@@ -806,6 +820,13 @@ fn main() {
                     // connections close on drop).
                     app.state::<std::sync::Arc<crate::graph::GraphService>>()
                         .shutdown();
+                    // V14 Phase B: best-effort compose-attach cleanup. Same
+                    // 3-day age cap as the startup sweep — a clean exit
+                    // doesn't guarantee THIS run's own directory is empty
+                    // (an attached image may still be sitting in a draft the
+                    // user never submitted), so this only ever catches
+                    // directories already past the age cap, same as startup.
+                    attach::prune(3);
                     // Closing the main window also closes the settings window
                     // if it's open — otherwise it would keep the process alive
                     // with no main window. Destroy it before the main window.

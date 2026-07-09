@@ -179,6 +179,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
+[dev-dependencies]
+# V14 Phase B: backdating a directory's mtime in `attach::tests` (to exercise
+# `attach::prune`'s age cutoff). Already resolved in Cargo.lock as a
+# transitive dependency of another crate; pinning it directly here adds no
+# new entries to the dependency tree.
+filetime = "0.2"
+
 [profile.release]
 codegen-units = 1
 lto = true

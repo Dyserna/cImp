@@ -1003,6 +1003,15 @@ export function focusTerminalFor(tabId: TabId): void {
   entry.term.focus();
 }
 
+/// The live xterm instance for `tabId`, if the registry is tracking one.
+/// Backs V14 Phase A template variable substitution (`{selection}`), which
+/// needs the FOCUSED pane's terminal specifically — unlike
+/// `terminalWithSelection` below, which scans every terminal for one that
+/// merely happens to have a non-empty selection.
+export function getTerminal(tabId: TabId): Terminal | undefined {
+  return entries.get(tabId)?.term;
+}
+
 /// The terminal that currently holds a non-empty selection, if any. Backs the
 /// bottom-bar "play" transport (selection lives in whichever pane the user
 /// last selected in, independent of which tab is "active"). xterm keeps its

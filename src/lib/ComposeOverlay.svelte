@@ -1,7 +1,23 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import { composeOpen, composeContent, composeFocused, submitCompose } from './composeState';
+  import { get } from 'svelte/store';
+  import {
+    composeOpen,
+    composeContent,
+    composeFocused,
+    composeOpenPickerSignal,
+    submitCompose,
+  } from './composeState';
   import { compose as composeSettings } from './settings/store';
+  import TemplatePicker from './TemplatePicker.svelte';
+  import {
+    composeTemplates,
+    substituteTemplate,
+    filterTemplates,
+    nextPlaceholderRange,
+    hasPlaceholder,
+    type ResolvedTemplate,
+  } from './compose/templates';
 
   let textareaEl: HTMLTextAreaElement | undefined = $state();
 
@@ -35,6 +51,10 @@
         textareaEl?.focus({ preventScroll: true });
         adjustHeight();
       });
+    } else {
+      // Sheet closed (submit/cancel) — the picker must not still be "open"
+      // the next time the sheet opens fresh.
+      showPicker = false;
     }
   });
 
@@ -55,8 +75,95 @@
     if ($composeOpen) adjustHeight();
   });
 
+  // ── V14 Phase A: prompt-template picker ─────────────────────────────
+  // Trigger: `/` typed when the textarea is EMPTY opens a popover listing
+  // the by-name-resolved templates (project shadows global), filtered by
+  // continued typing (subsequence-fuzzy against the name). The keystrokes
+  // themselves are NEVER intercepted — the '/' and every following
+  // character land in the textarea exactly like normal typing, and the
+  // query is just that content read back out (minus the leading '/'). This
+  // is what makes "Esc, or any non-matching input flow, dismisses into the
+  // literal text" free: there is no separate buffer to reconcile: the
+  // literal text is already sitting in the textarea the whole time.
+  let showPicker = $state(false);
+  let pickerTemplates = $state<ResolvedTemplate[]>([]);
+  let pickerQuery = $state('');
+  let pickerIndex = $state(0);
+  const pickerFiltered = $derived(filterTemplates(pickerTemplates, pickerQuery));
+
+  async function openPicker(): Promise<void> {
+    showPicker = true;
+    pickerQuery = '';
+    pickerIndex = 0;
+    try {
+      pickerTemplates = await composeTemplates();
+    } catch (e) {
+      console.warn('compose_templates fetch failed:', e);
+      pickerTemplates = [];
+    }
+  }
+
+  function closePicker(): void {
+    showPicker = false;
+  }
+
+  // Replace the textarea's current content — mid-picker this is just the
+  // "/query" the user typed, which the picker only ever exists ahead of
+  // inserting — with the chosen template's substituted body, then select
+  // the first remaining `{placeholder}` (if any) so the user can overtype
+  // it immediately. Not reachable once the picker is closed, so there is
+  // nothing to "undo" on Esc: dismissing just leaves the literal text.
+  async function insertTemplate(index: number): Promise<void> {
+    const chosen = pickerFiltered[index];
+    closePicker();
+    if (!chosen) return;
+    const substituted = await substituteTemplate(chosen.body);
+    composeContent.set(substituted);
+    const ta = textareaEl;
+    if (!ta) return;
+    ta.value = substituted;
+    adjustHeight();
+    ta.focus();
+    const ph = nextPlaceholderRange(substituted, 0);
+    if (ph) {
+      ta.setSelectionRange(ph.start, ph.end);
+    } else {
+      ta.setSelectionRange(substituted.length, substituted.length);
+    }
+  }
+
+  // The `open_compose_picker` shortcut (App.svelte) bumps this counter
+  // store; react by opening the picker once the sheet itself is open. A
+  // counter (not a boolean) so a second press while the picker is already
+  // showing still re-focuses/refreshes it. Seeded from the store's current
+  // value (not 0) so mounting this component doesn't spuriously fire.
+  let lastPickerSignal = get(composeOpenPickerSignal);
+  $effect(() => {
+    const sig = $composeOpenPickerSignal;
+    if (sig !== lastPickerSignal) {
+      lastPickerSignal = sig;
+      if ($composeOpen) void openPicker();
+    }
+  });
+
   function handleInput(): void {
     adjustHeight();
+    const val = textareaEl?.value ?? '';
+    if (!showPicker) {
+      // The whole content is now exactly '/' — i.e. it was empty and the
+      // user just typed '/'. Anything else (a '/' appended to existing
+      // text) is a literal slash, not the picker trigger.
+      if (val === '/') void openPicker();
+      return;
+    }
+    if (!val.startsWith('/')) {
+      // The picker's premise (a leading '/') is gone — deleted, selected
+      // over, pasted over. Dismiss into whatever literal text remains.
+      closePicker();
+      return;
+    }
+    pickerQuery = val.slice(1);
+    pickerIndex = 0;
   }
 
   // Insert text at the caret and mirror it into the bound store so
@@ -73,6 +180,11 @@
   }
 
   // Compose key handling, tuned for one-handed dictation/typing:
+  //   (picker open)    → ↑↓ move selection, Enter inserts, Esc dismisses;
+  //                       every other key (including further filter
+  //                       characters) falls through to normal typing.
+  //   (placeholders)   → Tab jumps to the next `{placeholder}` tab-stop
+  //                       instead of inserting a literal tab.
   //   Enter            → submit (send to the active tab)
   //   Alt+Enter        → newline (the universal "soft return")
   //   Shift+Enter      → newline (textarea default; left untouched)
@@ -82,6 +194,52 @@
   // the dispatcher handles first; this is the fallback for users whose submit
   // key isn't Enter.
   function handleKeydown(e: KeyboardEvent): void {
+    if (showPicker) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        pickerIndex = Math.min(pickerIndex + 1, Math.max(pickerFiltered.length - 1, 0));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        pickerIndex = Math.max(pickerIndex - 1, 0);
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        void insertTemplate(pickerIndex);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closePicker();
+        return;
+      }
+      // Anything else (more filter characters, Backspace, Tab, …) falls
+      // through to the textarea, whose own `oninput` re-syncs the query.
+    }
+
+    // V14 Phase A: while the draft still has unresolved `{placeholder}`
+    // tab-stops (from a just-inserted template), Tab cycles to the next
+    // one instead of inserting a literal tab. `hasPlaceholder` re-scans the
+    // live text, so this scope shrinks to nothing — and stops fighting the
+    // textarea's normal Tab behavior below — the moment every placeholder
+    // has been overtyped.
+    if (
+      !showPicker &&
+      hasPlaceholder($composeContent) &&
+      e.key === 'Tab' &&
+      !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey
+    ) {
+      e.preventDefault();
+      const ta = textareaEl;
+      if (ta) {
+        const ph = nextPlaceholderRange(ta.value, ta.selectionEnd ?? 0);
+        if (ph) ta.setSelectionRange(ph.start, ph.end);
+      }
+      return;
+    }
+
     if (e.key === 'Enter') {
       if (e.ctrlKey || e.metaKey) return;
       if (e.altKey) {
@@ -121,17 +279,33 @@
 
 {#if $composeOpen}
   <div class="compose-sheet" transition:slideY={{ duration: 200 }}>
-    <textarea
-      bind:this={textareaEl}
-      bind:value={$composeContent}
-      oninput={handleInput}
-      onkeydown={handleKeydown}
-      onfocus={handleFocus}
-      onblur={handleBlur}
-      spellcheck="true"
-      placeholder="Compose message..."
-      style="min-height: {minHeight}px; max-height: {maxHeight}px;"
-    ></textarea>
+    {#if showPicker}
+      <TemplatePicker
+        templates={pickerFiltered}
+        activeIndex={pickerIndex}
+        onPick={(i) => void insertTemplate(i)}
+      />
+    {/if}
+    <div class="compose-row">
+      <button
+        type="button"
+        class="template-btn"
+        onclick={() => void openPicker()}
+        title="Insert prompt template"
+        aria-label="Insert prompt template"
+      >📋</button>
+      <textarea
+        bind:this={textareaEl}
+        bind:value={$composeContent}
+        oninput={handleInput}
+        onkeydown={handleKeydown}
+        onfocus={handleFocus}
+        onblur={handleBlur}
+        spellcheck="true"
+        placeholder="Compose message... (/ for templates)"
+        style="min-height: {minHeight}px; max-height: {maxHeight}px;"
+      ></textarea>
+    </div>
   </div>
 {/if}
 
@@ -141,6 +315,9 @@
     bottom: 0;
     left: 0;
     right: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2, 6px);
     background: var(--surface-2);
     border-top: 1px solid var(--border-subtle);
     border-radius: var(--radius-lg) var(--radius-lg) 0 0;
@@ -155,7 +332,34 @@
     box-sizing: border-box;
   }
 
+  .compose-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+  }
+
+  .template-btn {
+    flex: 0 0 auto;
+    height: 32px;
+    width: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+    color: var(--text-primary);
+  }
+
+  .template-btn:hover {
+    border-color: var(--accent);
+  }
+
   textarea {
+    flex: 1 1 auto;
     width: 100%;
     box-sizing: border-box;
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;

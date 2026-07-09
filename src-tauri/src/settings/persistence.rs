@@ -44,8 +44,8 @@ use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
     default_ai_tab, default_graph_monitor_tab, default_offload_server_tab, default_shell_1_tab,
-    default_workbench_tab,
-    AiTabId, LayoutNodePersisted, Settings, TabConfig,
+    default_workbench_tab, starter_prompt_templates,
+    AiTabId, LayoutNodePersisted, PromptTemplate, Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
     GRAPH_MONITOR_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     SHELL_DEFAULT_TAB_ID, WORKBENCH_TAB_ID,
@@ -284,6 +284,88 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
     serde_json::from_value(merged).unwrap_or_default()
 }
 
+/// V14 Phase A: global scope of the prompt-template library, read directly
+/// from the physical global file (`<exe-dir>/settings.json`) — NOT from the
+/// live merged `Settings`, which (if the active project's overlay happens to
+/// carry its own `prompt_templates` key) would already show the OVERLAY's
+/// array in that field per the deep-merge's array-replace-wholesale rule.
+/// Reading the true global file directly is what makes "global" actually
+/// mean "every project", independent of which one cImp is launched from.
+/// Missing/corrupt file → empty (never errors; a fresh install with no
+/// global file yet has no templates to show).
+pub fn read_global_prompt_templates() -> Vec<PromptTemplate> {
+    match global_path() {
+        Ok(p) => read_prompt_templates_from(&p),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn read_prompt_templates_from(path: &Path) -> Vec<PromptTemplate> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
+        .map(|s| s.prompt_templates)
+        .unwrap_or_default()
+}
+
+/// V14 Phase A: write the prompt-template library straight to the physical
+/// global file, bypassing the normal per-project overlay diff every other
+/// Settings-window edit goes through (`settings_update` → `SettingsHandle`'s
+/// debounced saver, which diffs against the pristine global snapshot and
+/// writes into whichever project's `.cimp/config.json` is active). Without
+/// this bypass, editing the "global" library from a Settings window opened
+/// inside a customized project would silently land in that project's
+/// overlay instead — defeating the whole global/project split this feature
+/// promises. Read-modify-write: every other field in the on-disk global
+/// file is preserved untouched.
+pub fn write_global_prompt_templates(templates: Vec<PromptTemplate>) -> AppResult<()> {
+    let path = global_path()?;
+    write_prompt_templates_to(&path, templates)
+}
+
+fn write_prompt_templates_to(path: &Path, templates: Vec<PromptTemplate>) -> AppResult<()> {
+    let mut settings: Settings = if path.exists() {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    } else {
+        Settings::default()
+    };
+    settings.prompt_templates = templates;
+    // An explicit Settings-window save always counts as "seeded" — it must
+    // never be clobbered by the one-time starter injection on a later load.
+    settings.templates_seeded = true;
+    save_to(path, &settings)
+}
+
+/// V14 Phase A: project scope of the prompt-template library, read directly
+/// from the raw overlay JSON at `root` (its own `prompt_templates` key) —
+/// bypassing the typed, deep-merged `Settings` for exactly the same reason
+/// [`read_global_prompt_templates`] bypasses it. Missing overlay, missing
+/// key, or a malformed array all degrade to empty rather than erroring —
+/// project templates are a nice-to-have, not load-bearing for the app to
+/// start.
+pub fn read_project_prompt_templates(root: &Path) -> Vec<PromptTemplate> {
+    let path = overlay_read_path(root);
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("prompt_templates")
+        .and_then(|v| serde_json::from_value::<Vec<PromptTemplate>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
 /// Read the global file. Writes seeded defaults when absent. On parse
 /// failure quarantines the file and returns defaults. Runs migration on
 /// the global file in place — backup goes next to the global path itself,
@@ -344,7 +426,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
         }
     };
 
-    let typed: Settings = match serde_json::from_value(value) {
+    let mut typed: Settings = match serde_json::from_value(value) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -359,14 +441,22 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
         }
     };
 
-    if migrated {
-        // Persist the migrated shape back to disk so future launches don't
-        // re-migrate. Atomic write inside save_to keeps this safe under
-        // crash.
+    // V14 Phase A: seed the starter prompt-template library exactly once,
+    // directly against the physical global file — this is the ONE place
+    // that runs (unlike `integrity_check`, which also runs against the
+    // per-project merged `Settings` and wouldn't reliably flush a fresh
+    // seed to disk when a project overlay is active; see the function's
+    // own doc comment).
+    let seeded = seed_prompt_templates_if_needed(&mut typed);
+
+    if migrated || seeded {
+        // Persist the migrated/seeded shape back to disk so future launches
+        // don't re-migrate or re-seed. Atomic write inside save_to keeps
+        // this safe under crash.
         if let Err(e) = save_to(&path, &typed) {
-            tracing::warn!(error = %e, path = %path.display(), "settings: post-migration global save failed");
+            tracing::warn!(error = %e, path = %path.display(), "settings: post-migration/seed global save failed");
         } else {
-            tracing::info!(path = %path.display(), "settings: global migrated and rewritten");
+            tracing::info!(path = %path.display(), migrated, seeded, "settings: global migrated/seeded and rewritten");
         }
     } else {
         tracing::info!(path = %path.display(), "settings: global loaded");
@@ -545,7 +635,23 @@ fn seeded_defaults(default_shell: &ShellSpec) -> Settings {
     // V16: broot is no longer auto-seeded. It (and rustnet) launch on demand
     // from the bottom-bar tool buttons into ordinary closable Shell tabs.
     apply_portable_avatar_paths(&mut s);
+    // V14 Phase A: fresh installs get the 4 starter prompt templates.
+    seed_prompt_templates_if_needed(&mut s);
     s
+}
+
+/// V14 Phase A: seed [`starter_prompt_templates`] into `prompt_templates`
+/// exactly once, gated on `templates_seeded` rather than the schema version
+/// (see that field's doc comment). Returns `true` when it actually seeded
+/// (i.e. this was the first load), so callers know whether the physical
+/// global file needs rewriting. Idempotent — a second call is a no-op.
+fn seed_prompt_templates_if_needed(s: &mut Settings) -> bool {
+    if s.templates_seeded {
+        return false;
+    }
+    s.prompt_templates = starter_prompt_templates();
+    s.templates_seeded = true;
+    true
 }
 
 /// `<exe-dir>/../avatars/` — the portable avatar folder shipped in the
@@ -2003,6 +2109,111 @@ mod tests {
             r#"{"ui":{"theme":"canonical"}}"#
         );
         assert_eq!(overlay_read_path(&dir), cimp.join("config.json"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- V14 Phase A: prompt library persistence ------------------------
+
+    #[test]
+    fn seed_prompt_templates_if_needed_seeds_once() {
+        let mut s = Settings::default();
+        assert!(!s.templates_seeded);
+        assert!(s.prompt_templates.is_empty());
+
+        let seeded_first = seed_prompt_templates_if_needed(&mut s);
+        assert!(seeded_first);
+        assert!(s.templates_seeded);
+        assert_eq!(s.prompt_templates.len(), 4);
+
+        // A deletion the user made must stick: a second call is a no-op even
+        // though the list is now empty again.
+        s.prompt_templates.clear();
+        let seeded_second = seed_prompt_templates_if_needed(&mut s);
+        assert!(!seeded_second, "seeding must not re-fire once templates_seeded is true");
+        assert!(s.prompt_templates.is_empty(), "deleted starters must stay deleted");
+    }
+
+    #[test]
+    fn write_then_read_global_prompt_templates_round_trips() {
+        let dir = std::env::temp_dir().join(format!("cimp_tpl_global_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let templates = vec![
+            PromptTemplate { name: "a".to_string(), body: "body-a".to_string() },
+            PromptTemplate { name: "b".to_string(), body: "body-b".to_string() },
+        ];
+        write_prompt_templates_to(&path, templates.clone()).unwrap();
+
+        let read_back = read_prompt_templates_from(&path);
+        assert_eq!(read_back, templates);
+
+        // templates_seeded is forced true by an explicit write, so a later
+        // seed-if-needed pass is a no-op (a user-authored list is never
+        // clobbered by the starter set).
+        let mut settings: Settings =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(settings.templates_seeded);
+        assert!(!seed_prompt_templates_if_needed(&mut settings));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_global_prompt_templates_preserves_other_fields() {
+        let dir = std::env::temp_dir().join(format!("cimp_tpl_preserve_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut initial = Settings::default();
+        initial.ui.theme = "future-light".to_string();
+        save_to(&path, &initial).unwrap();
+
+        write_prompt_templates_to(
+            &path,
+            vec![PromptTemplate { name: "a".to_string(), body: "x".to_string() }],
+        )
+        .unwrap();
+
+        let after: Settings = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after.ui.theme, "future-light", "unrelated field must survive the R-M-W");
+        assert_eq!(after.prompt_templates.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_project_prompt_templates_reads_the_overlays_own_array() {
+        let dir = std::env::temp_dir().join(format!("cimp_tpl_project_{}", uuid::Uuid::new_v4()));
+        let cimp = dir.join(".cimp");
+        fs::create_dir_all(&cimp).unwrap();
+        fs::write(
+            cimp.join("config.json"),
+            r#"{"prompt_templates":[{"name":"p1","body":"project body"}]}"#,
+        )
+        .unwrap();
+
+        let templates = read_project_prompt_templates(&dir);
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, "p1");
+        assert_eq!(templates[0].body, "project body");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_project_prompt_templates_empty_when_overlay_absent_or_key_missing() {
+        let dir = std::env::temp_dir().join(format!("cimp_tpl_project_absent_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        // No overlay file at all.
+        assert!(read_project_prompt_templates(&dir).is_empty());
+
+        // Overlay exists but carries no `prompt_templates` key.
+        let cimp = dir.join(".cimp");
+        fs::create_dir_all(&cimp).unwrap();
+        fs::write(cimp.join("config.json"), r#"{"ui":{"theme":"x"}}"#).unwrap();
+        assert!(read_project_prompt_templates(&dir).is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

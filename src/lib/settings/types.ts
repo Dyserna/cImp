@@ -211,6 +211,9 @@ export interface ComposeSettings {
 
 export interface ShortcutSettings {
   open_compose: string | null;
+  /// V14 Phase A: open compose AND immediately open the prompt-template
+  /// picker popover. Default `Alt+/`.
+  open_compose_picker: string | null;
   submit_compose: string | null;
   cancel_compose: string | null;
   open_settings: string | null;
@@ -578,6 +581,23 @@ export interface Settings {
   /// File-logger configuration. The backend writes daily rolling log
   /// files into `<portable-root>/logs/`; this field drives the live filter.
   logging: LoggingSettings;
+  /// V14 Phase A: the global-scope prompt-template library. Read/written
+  /// through the dedicated `compose_templates_global_*` IPC (which targets
+  /// the physical global `settings.json` directly), NOT through the normal
+  /// `settingsUpdate` round-trip — see `lib/compose/templates.ts`. Kept here
+  /// mainly for schema/round-trip fidelity with the backend struct.
+  prompt_templates: PromptTemplate[];
+  /// One-shot starter-seed gate; `true` once the backend has seeded the 4
+  /// starter templates. See the Rust field's doc comment.
+  templates_seeded: boolean;
+}
+
+/// V14 Phase A: one saved prompt-library entry (global or project scope —
+/// scope is not part of the stored shape, only of the resolved picker view,
+/// see `ResolvedTemplate` in `lib/compose/templates.ts`).
+export interface PromptTemplate {
+  name: string;
+  body: string;
 }
 
 /// One of the four reserved AI-tool tab ids. Wire format mirrors the
@@ -1002,6 +1022,7 @@ export function defaultSettings(): Settings {
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {
       open_compose: 'Alt+Enter',
+      open_compose_picker: 'Alt+/',
       submit_compose: 'Enter',
       cancel_compose: 'Escape',
       open_settings: 'Ctrl+,',
@@ -1233,5 +1254,7 @@ export function defaultSettings(): Settings {
       retention: 'weekly',
       content_capture: { enabled: false, retention: 'weekly' },
     },
+    prompt_templates: [],
+    templates_seeded: false,
   };
 }

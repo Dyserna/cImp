@@ -599,6 +599,55 @@ pub async fn compose_content_changed(
     Ok(())
 }
 
+/// V14 Phase A: the compose overlay's `/` picker data source. Resolves the
+/// global prompt-template library (from the physical global `settings.json`)
+/// against `root`'s project-scope additions (its `.cimp/config.json`
+/// overlay's own `prompt_templates` array) by name — a project entry
+/// shadows a same-named global one. Deliberately reads both scopes directly
+/// off disk rather than through the merged `Settings` the rest of the app
+/// uses; see `PromptTemplate`'s doc comment for why the normal deep-merge
+/// would silently replace the global list instead of shadowing it.
+/// `root` defaults to the launch directory, mirroring `graph_rebuild`.
+#[tauri::command]
+pub async fn compose_templates(root: Option<String>) -> AppResult<Vec<crate::settings::ResolvedTemplate>> {
+    let root = resolve_graph_root(root)?;
+    let global = crate::settings::read_global_prompt_templates();
+    let project = crate::settings::read_project_prompt_templates(&root);
+    Ok(crate::settings::resolve_prompt_templates(global, project))
+}
+
+/// V14 Phase A: the Settings window's Compose section reads the raw global
+/// list (unshadowed — a template currently shadowed by a project override
+/// still needs to be editable here) directly from the physical global file.
+#[tauri::command]
+pub async fn compose_templates_global_get() -> AppResult<Vec<crate::settings::PromptTemplate>> {
+    Ok(crate::settings::read_global_prompt_templates())
+}
+
+/// V14 Phase A: the Settings window's Compose section save. Writes straight
+/// to the physical global `settings.json` — NOT through `settings_update`'s
+/// normal per-project overlay diff — so the library really is global
+/// regardless of which project this cImp session was launched from. See
+/// `settings::persistence::write_global_prompt_templates`'s doc comment.
+#[tauri::command]
+pub async fn compose_templates_global_set(
+    templates: Vec<crate::settings::PromptTemplate>,
+) -> AppResult<()> {
+    crate::settings::write_global_prompt_templates(templates)
+}
+
+/// V14 Phase A: read-only project-scope listing for the Settings window's
+/// Compose section (edited by hand in `.cimp/config.json`, not from
+/// Settings — matching the milestone's scope rule). `root` defaults to the
+/// launch directory.
+#[tauri::command]
+pub async fn compose_templates_project_get(
+    root: Option<String>,
+) -> AppResult<Vec<crate::settings::PromptTemplate>> {
+    let root = resolve_graph_root(root)?;
+    Ok(crate::settings::read_project_prompt_templates(&root))
+}
+
 #[tauri::command]
 pub async fn acknowledge_error(state: State<'_, AppState>, tab: TabId) -> AppResult<()> {
     let _ = state

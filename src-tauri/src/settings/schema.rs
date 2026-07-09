@@ -191,6 +191,23 @@ pub struct Settings {
     /// rolling files into `<portable-root>/logs/`; the level field drives
     /// the EnvFilter via a reload handle so changes apply live.
     pub logging: LoggingSettings,
+    /// V14 Phase A: the global-scope prompt-template library. Populated with
+    /// [`starter_prompt_templates`] once (see `templates_seeded`), then
+    /// entirely user-owned. Read/written through dedicated `compose_templates_*`
+    /// IPC that targets the physical global `settings.json` directly (NOT the
+    /// normal per-project overlay diff every other field goes through) — see
+    /// `settings::persistence::{read,write}_global_prompt_templates` — so the
+    /// library really is global regardless of which project cImp is launched
+    /// from. Project-scope additions live separately, in the `.cimp/config.json`
+    /// overlay's own `prompt_templates` array (see [`PromptTemplate`]'s doc
+    /// comment); this field is NOT merged with those.
+    pub prompt_templates: Vec<PromptTemplate>,
+    /// One-shot gate for the starter-template seed: `false` until the first
+    /// load seeds [`starter_prompt_templates`] into `prompt_templates` and
+    /// flips this to `true`. Deliberately independent of
+    /// `CURRENT_SCHEMA_VERSION` — a user who deletes all 4 starters must not
+    /// have them reappear on a future migration.
+    pub templates_seeded: bool,
 }
 
 impl Default for Settings {
@@ -222,6 +239,8 @@ impl Default for Settings {
             checks: Vec::new(),
             enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
+            prompt_templates: Vec::new(),
+            templates_seeded: false,
         }
     }
 }
@@ -2866,10 +2885,101 @@ impl Default for ComposeSettings {
     }
 }
 
+/// V14 Phase A: one saved prompt-library entry. `body` may contain the two
+/// immediately-resolvable variables `{selection}` / `{clipboard}` (substituted
+/// by the frontend on insert — see `lib/compose/templates.ts`) plus any
+/// number of free-form `{name}` placeholders, which stay literal as tab-stops
+/// the user fills in. Lives at `Settings::prompt_templates` (global scope);
+/// project-scope entries of the same shape live in the `.cimp/config.json`
+/// overlay's own `prompt_templates` array, read directly by the
+/// `compose_templates` resolver IPC rather than through the normal
+/// deep-merged `Settings` (see `settings::persistence::read_project_prompt_templates`
+/// — the merge would otherwise wholesale-replace the global list instead of
+/// shadowing it by name).
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct PromptTemplate {
+    pub name: String,
+    pub body: String,
+}
+
+/// The 4 starter templates seeded into the global list exactly once (guarded
+/// by `Settings::templates_seeded`, not `CURRENT_SCHEMA_VERSION` — a user who
+/// deletes all 4 must not have them reappear on a later migration). Clearly
+/// example-flavored bodies; deletable like anything else in the list.
+pub fn starter_prompt_templates() -> Vec<PromptTemplate> {
+    vec![
+        PromptTemplate {
+            name: "review-this-diff".to_string(),
+            body: "Review the following diff for correctness, style, and missed edge cases:\n\n{selection}".to_string(),
+        },
+        PromptTemplate {
+            name: "write-tests-for".to_string(),
+            body: "Write tests covering {selection}. Include the obvious edge cases.".to_string(),
+        },
+        PromptTemplate {
+            name: "explain-selection".to_string(),
+            body: "Explain what this does and why:\n\n{selection}".to_string(),
+        },
+        PromptTemplate {
+            name: "commit-message".to_string(),
+            body: "Write a concise, conventional commit message for:\n\n{selection}".to_string(),
+        },
+    ]
+}
+
+/// A template resolved by name across the two scopes — what the compose
+/// overlay's `/` picker actually renders. `scope` is `"global"` or
+/// `"project"`, surfaced in the UI so a shadowed global entry can be shown
+/// greyed with a note.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct ResolvedTemplate {
+    pub name: String,
+    pub body: String,
+    pub scope: String,
+}
+
+/// Merge global + project template lists by name: a project entry shadows a
+/// same-named global one (matching every other overlay's precedence rule),
+/// and any project-only entry is appended after the (filtered) global list.
+/// Pure and file-I/O-free so the shadowing rule is unit-testable without
+/// touching disk; `ipc::commands::compose_templates` is the thin I/O wrapper
+/// that feeds it the two raw lists (see the `PromptTemplate` doc comment for
+/// why those are read directly rather than through the merged `Settings`).
+pub fn resolve_prompt_templates(
+    global: Vec<PromptTemplate>,
+    project: Vec<PromptTemplate>,
+) -> Vec<ResolvedTemplate> {
+    let project_names: std::collections::HashSet<&str> =
+        project.iter().map(|t| t.name.as_str()).collect();
+    let mut out: Vec<ResolvedTemplate> = global
+        .into_iter()
+        .filter(|t| !project_names.contains(t.name.as_str()))
+        .map(|t| ResolvedTemplate {
+            name: t.name,
+            body: t.body,
+            scope: "global".to_string(),
+        })
+        .collect();
+    out.extend(project.into_iter().map(|t| ResolvedTemplate {
+        name: t.name,
+        body: t.body,
+        scope: "project".to_string(),
+    }));
+    out
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct ShortcutSettings {
     pub open_compose: Option<String>,
+    /// V14 Phase A: open compose (like `open_compose`) AND immediately open
+    /// the prompt-template picker popover — the discoverable keyboard path
+    /// alongside the 📋 button beside the compose textarea. Default
+    /// `Alt+/` (mirrors `open_compose`'s `Alt+Enter` and the picker's own
+    /// `/` trigger); NOT a `Ctrl+Shift+…` chord — see the V6-01 note above
+    /// on `push_to_talk`'s bare-`Ctrl+Shift` collision.
+    pub open_compose_picker: Option<String>,
     pub submit_compose: Option<String>,
     pub cancel_compose: Option<String>,
     pub open_settings: Option<String>,
@@ -2919,6 +3029,7 @@ impl Default for ShortcutSettings {
             // chord doesn't visibly arm/abort when these fire. New installs
             // get these defaults; existing settings files keep their bindings.
             open_compose: Some("Alt+Enter".to_string()),
+            open_compose_picker: Some("Alt+/".to_string()),
             // V6-01: Enter submits (one-handed send for dictation); Alt+Enter
             // (and Shift+Enter) insert a newline — see ComposeOverlay.svelte.
             submit_compose: Some("Enter".to_string()),
@@ -3294,5 +3405,65 @@ mod tests {
         assert_eq!(parsed.name, preset.name);
         assert_eq!(parsed.config.image, preset.config.image);
         assert_eq!(parsed.config.blur, preset.config.blur);
+    }
+
+    // --- V14 Phase A: prompt library -----------------------------------
+
+    #[test]
+    fn starter_prompt_templates_has_the_four_named_entries() {
+        let templates = starter_prompt_templates();
+        let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "review-this-diff",
+                "write-tests-for",
+                "explain-selection",
+                "commit-message",
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_templates_project_shadows_global_by_name() {
+        let global = vec![
+            PromptTemplate { name: "a".to_string(), body: "global-a".to_string() },
+            PromptTemplate { name: "b".to_string(), body: "global-b".to_string() },
+        ];
+        let project = vec![
+            // Shadows global "a" — project body wins, global "a" is dropped.
+            PromptTemplate { name: "a".to_string(), body: "project-a".to_string() },
+            // Project-only entry, appended after the (filtered) global list.
+            PromptTemplate { name: "c".to_string(), body: "project-c".to_string() },
+        ];
+        let resolved = resolve_prompt_templates(global, project);
+        assert_eq!(resolved.len(), 3, "shadowed global \"a\" must not appear twice");
+
+        let a = resolved.iter().find(|t| t.name == "a").unwrap();
+        assert_eq!(a.body, "project-a");
+        assert_eq!(a.scope, "project");
+
+        let b = resolved.iter().find(|t| t.name == "b").unwrap();
+        assert_eq!(b.body, "global-b");
+        assert_eq!(b.scope, "global");
+
+        let c = resolved.iter().find(|t| t.name == "c").unwrap();
+        assert_eq!(c.body, "project-c");
+        assert_eq!(c.scope, "project");
+    }
+
+    #[test]
+    fn resolve_prompt_templates_empty_project_passes_global_through() {
+        let global = vec![PromptTemplate { name: "a".to_string(), body: "x".to_string() }];
+        let resolved = resolve_prompt_templates(global, Vec::new());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].scope, "global");
+    }
+
+    #[test]
+    fn settings_default_starts_unseeded_with_no_templates() {
+        let s = Settings::default();
+        assert!(!s.templates_seeded);
+        assert!(s.prompt_templates.is_empty());
     }
 }

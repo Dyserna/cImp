@@ -17,6 +17,23 @@ export function openCompose(): void {
   composeOpen.set(true);
 }
 
+/// V14 Phase A: bumped every time something wants the compose overlay to
+/// open WITH its prompt-template picker already showing (the
+/// `open_compose_picker` shortcut). A plain counter rather than a boolean
+/// so `ComposeOverlay.svelte`'s `$effect` can detect "fired again" even
+/// when the picker is already open (a boolean flip-to-true wouldn't notify
+/// a second press while still true). The overlay owns resetting its own
+/// "last seen" bookkeeping; this store only ever counts up.
+export const composeOpenPickerSignal = writable<number>(0);
+
+/// Open compose (if not already open) and request the picker. Bound to the
+/// `open_compose_picker` shortcut in `App.svelte` and to any other future
+/// caller that wants "compose, ready to pick a template" in one call.
+export function openComposeWithPicker(): void {
+  openCompose();
+  composeOpenPickerSignal.update((n) => n + 1);
+}
+
 /// V13 Phase B: open the compose overlay with `text` appended to whatever
 /// draft is already there — the Diff pane's "Send to agent" hunk action
 /// (`workbench_send_hunk`'s formatted fenced block). Appends rather than

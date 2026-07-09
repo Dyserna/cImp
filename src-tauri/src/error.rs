@@ -81,6 +81,20 @@ pub enum AppError {
     /// of a generic index error.
     #[error("not a git repository: {0}")]
     NotAGitRepo(String),
+
+    /// V13 §0.2: the Workbench git harness (`workbench::git::run`) couldn't
+    /// find a `git` executable on PATH. Kept as one typed variant (distinct
+    /// from the generic [`AppError::CommandNotFound`]) so every Workbench UI
+    /// surface — diff pane, checkpoints, worktrees — renders the exact same
+    /// "install git" guidance instead of each inventing its own message.
+    #[error("git is not available: {0}")]
+    GitUnavailable(String),
+
+    /// V13: a generic Workbench failure (spawn I/O, timeout, unexpected `git`
+    /// output shape) that isn't the specific "git missing" case above. Mirrors
+    /// [`AppError::Graph`]/[`AppError::Checks`]'s per-module catch-all.
+    #[error("workbench error: {0}")]
+    Workbench(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

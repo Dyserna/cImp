@@ -39,6 +39,11 @@ pub const OFFLOAD_SERVER_TAB_ID: &str = "offload-server";
 /// like the Offload Server tab). Unlike the other reserved tabs it is
 /// app-rendered, not PTY-backed.
 pub const GRAPH_MONITOR_TAB_ID: &str = "graph-monitor";
+/// V13 Phase A: reserved id of the read-only, app-rendered Workbench tab
+/// (live diff / checkpoint timeline / worktrees). Materialized iff
+/// `workbench.enabled` (reconciled by the integrity check, exactly like the
+/// Code Graph monitor tab). App-rendered like the graph monitor — no PTY.
+pub const WORKBENCH_TAB_ID: &str = "workbench-1";
 /// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
 /// longer a persistent builtin — it (like rustnet) launches on demand from
 /// the bottom-bar tool buttons into ordinary closable Shell tabs (uuid ids).
@@ -157,6 +162,13 @@ pub struct Settings {
     /// offload worker (native). Off by default. Additive — old settings
     /// files load with the feature disabled.
     pub graph: GraphSettings,
+    /// V13 Phase A: the Workbench feature — live diff pane, checkpoints (a
+    /// shadow git repo), and a worktree manager, hosted in one reserved tab.
+    /// The master `enabled` flag defaults `true` (the tab itself is cheap;
+    /// each sub-feature gates itself, and checkpoints stay off by default —
+    /// see `WorkbenchSettings`). Additive — old settings files load with the
+    /// tab present but checkpoints off.
+    pub workbench: WorkbenchSettings,
     /// V12 Phase A: project checker commands (`cargo check`, `tsc`, `eslint`,
     /// `pytest`, …) the `run_check` MCP tool can run. Lives at the root, not
     /// inside `GraphSettings` — it's project tooling, independent of the code
@@ -206,6 +218,7 @@ impl Default for Settings {
             external_tools: ExternalToolsSettings::default(),
             offload: OffloadSettings::default(),
             graph: GraphSettings::default(),
+            workbench: WorkbenchSettings::default(),
             checks: Vec::new(),
             enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
@@ -1104,6 +1117,59 @@ impl Default for GraphSettings {
     }
 }
 
+/// V13 §0.4: the Workbench feature's settings. `enabled` is the master
+/// switch for the tab itself (default **on** — the tab is cheap and each
+/// section gates its own behavior); `checkpoints` is the shadow-repo
+/// snapshot feature (default **off** in V1 — proposed on-by-default once the
+/// shadow-repo cost is validated on a large real repo, per the milestone's
+/// open decision 2). The five `checkpoint_*` fields tune retention (`_max`,
+/// `_max_age_days`) and the debounced burst trigger (`_burst_files`,
+/// `_burst_window_s`, `_min_gap_s`) that Phase C's fallback-to-activity
+/// snapshot trigger reads.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(default)]
+pub struct WorkbenchSettings {
+    /// Master switch: the reserved Workbench tab exists. Off = no tab, no
+    /// fs-batch event/broadcast, no checkpoint scheduling.
+    pub enabled: bool,
+    /// Automatic checkpoint snapshots (Phase C's shadow git repo). Off by
+    /// default in V1 — the tab's Diff/Worktrees sections work without it;
+    /// Timeline needs this on.
+    pub checkpoints: bool,
+    /// Ring-buffer cap: the shadow repo keeps at most this many checkpoints
+    /// (oldest pruned first by `shadow::gc`, subject to `checkpoint_max_age_days`).
+    pub checkpoint_max: u32,
+    /// Age cap in days: checkpoints older than this are pruned regardless of
+    /// how far under `checkpoint_max` the ring is.
+    pub checkpoint_max_age_days: u32,
+    /// Burst trigger: at least this many distinct changed paths within
+    /// `checkpoint_burst_window_s` (and at least `checkpoint_min_gap_s` since
+    /// the last snapshot) fires an "activity" checkpoint — the fallback that
+    /// covers shell-tab edits and any flow that doesn't go through the
+    /// prompt-tap trigger.
+    pub checkpoint_burst_files: u32,
+    /// Time window (seconds) the burst-file count above is measured over.
+    pub checkpoint_burst_window_s: u32,
+    /// Minimum seconds between any two automatic snapshots (prompt-tap OR
+    /// burst), so a rapid-fire prompt sequence or a noisy save loop can't
+    /// spam the shadow repo with near-duplicate commits.
+    pub checkpoint_min_gap_s: u32,
+}
+
+impl Default for WorkbenchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            checkpoints: false,
+            checkpoint_max: 100,
+            checkpoint_max_age_days: 7,
+            checkpoint_burst_files: 5,
+            checkpoint_burst_window_s: 60,
+            checkpoint_min_gap_s: 120,
+        }
+    }
+}
+
 /// A named, reusable `llama-server` launch command the user can save from a
 /// Local backend's `Server command` field in the Offload → Pool editor and
 /// paste back into that field later. Stored globally in
@@ -1877,6 +1943,24 @@ pub fn default_graph_monitor_tab() -> TabConfig {
         id: GRAPH_MONITOR_TAB_ID.to_string(),
         builtin: true,
         name: "Code Intelligence".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
+}
+
+/// V13 Phase A: the reserved, non-closable Workbench tab. Same shape as the
+/// Code Graph monitor tab — Shell-kind with no command (app-rendered, no
+/// PTY). Materialized/removed by the integrity check per `workbench.enabled`.
+pub fn default_workbench_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: WORKBENCH_TAB_ID.to_string(),
+        builtin: true,
+        name: "Workbench".to_string(),
         command: String::new(),
         args: Vec::new(),
         cwd: None,

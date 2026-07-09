@@ -559,6 +559,9 @@ export interface Settings {
   offload: OffloadSettings;
   /// V9-01: per-project code knowledge graph config. Off by default.
   graph: GraphSettings;
+  /// V13 Phase A: the Workbench feature (live diff / checkpoints /
+  /// worktrees). The tab itself defaults on; checkpoints default off.
+  workbench: WorkbenchSettings;
   /// V12 Phase A: project checker commands the `run_check` MCP tool can run
   /// (mirror of Rust `Vec<CheckDef>`). Lives at the root, not inside
   /// `GraphSettings` — independent of the code graph. Empty by default; set
@@ -681,6 +684,22 @@ export interface GraphSettings {
   /// Re-run dead-exports/import-cycles after each index pass and badge the
   /// Analyses section when the counts changed. On by default (read-only).
   analyses_auto: boolean;
+}
+
+/// V13 §0.4: the Workbench feature's settings. Mirror of Rust
+/// `WorkbenchSettings`. `enabled` is the master switch for the reserved tab
+/// itself (default true — the tab is cheap; each section gates its own
+/// behavior); `checkpoints` is the shadow-repo snapshot feature (default
+/// false in V1). The five `checkpoint_*` fields tune retention and the
+/// debounced burst trigger.
+export interface WorkbenchSettings {
+  enabled: boolean;
+  checkpoints: boolean;
+  checkpoint_max: number;
+  checkpoint_max_age_days: number;
+  checkpoint_burst_files: number;
+  checkpoint_burst_window_s: number;
+  checkpoint_min_gap_s: number;
 }
 
 /// V1.4-07: local-LLM provider configuration. `base_url` and
@@ -1197,6 +1216,15 @@ export function defaultSettings(): Settings {
       auto_check_debounce_s: 5,
       auto_impact_min_dependents: 10,
       analyses_auto: true,
+    },
+    workbench: {
+      enabled: true,
+      checkpoints: false,
+      checkpoint_max: 100,
+      checkpoint_max_age_days: 7,
+      checkpoint_burst_files: 5,
+      checkpoint_burst_window_s: 60,
+      checkpoint_min_gap_s: 120,
     },
     checks: [],
     enabled_ai_tabs: ['claude'],

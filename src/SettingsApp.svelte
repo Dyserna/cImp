@@ -557,6 +557,7 @@
     | 'offload'
     | 'mcp'
     | 'graph'
+    | 'workbench'
     | 'advanced'
     | 'about';
   let activeSection = $state<SectionId>('theme');
@@ -571,6 +572,7 @@
     { id: 'offload', label: 'Offload task tools' },
     { id: 'mcp', label: 'MCP servers' },
     { id: 'graph', label: 'Code Intelligence' },
+    { id: 'workbench', label: 'Workbench' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
@@ -3872,6 +3874,138 @@
               setting.
             </small>
           {/if}
+        </section>
+      {:else if activeSection === 'workbench'}
+        <section>
+          <h2>Workbench</h2>
+          <small class="hint top">
+            Vibe-coding guardrails: a live diff pane, automatic checkpoints
+            (a separate shadow git repo — your own <code>.git</code> is never
+            touched), and a worktree manager for running parallel agents
+            safely. The tab is cheap to keep around; checkpoints are a
+            heavier, opt-in feature below.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.workbench.enabled}
+              onchange={(e) =>
+                patch(
+                  (s) => (s.workbench.enabled = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Show the Workbench tab</span>
+          </label>
+
+          <h3>Checkpoints</h3>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.workbench.checkpoints}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoints = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Enable automatic checkpoints</span>
+          </label>
+          <small class="hint">
+            Off by default in V1 — Diff and Worktrees work without it; the
+            Timeline section needs this on. Not yet implemented (Phase C);
+            these fields are stored now so they take effect the moment it
+            ships.
+          </small>
+          <label>
+            <span>Max checkpoints kept</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_max}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_max = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 100,
+                    )),
+                )}
+            />
+          </label>
+          <label>
+            <span>Max checkpoint age (days)</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_max_age_days}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_max_age_days = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 7,
+                    )),
+                )}
+            />
+          </label>
+          <small class="hint">
+            The burst trigger fires an "activity" checkpoint when a shell tab
+            or other non-hooked flow touches several files at once — the
+            fallback that covers what the per-prompt trigger can't see.
+          </small>
+          <label>
+            <span>Burst trigger: files changed</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_burst_files}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_burst_files = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 5,
+                    )),
+                )}
+            />
+          </label>
+          <label>
+            <span>Burst trigger: time window (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_burst_window_s}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_burst_window_s = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 60,
+                    )),
+                )}
+            />
+          </label>
+          <label>
+            <span>Minimum gap between snapshots (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              disabled={!snapshot.workbench.checkpoints}
+              value={snapshot.workbench.checkpoint_min_gap_s}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.workbench.checkpoint_min_gap_s = Math.max(
+                      1,
+                      Number((e.currentTarget as HTMLInputElement).value) || 120,
+                    )),
+                )}
+            />
+          </label>
         </section>
       {:else if activeSection === 'advanced'}
         <section>

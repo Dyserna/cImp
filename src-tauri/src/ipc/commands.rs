@@ -164,8 +164,10 @@ pub async fn pty_write(
 ) -> AppResult<()> {
     // V8-03: the Offload Server tab is read-only — it has no PTY of its own
     // (its content is the live llama-server output stream), so swallow any
-    // write. Defense-in-depth behind the frontend's read-only guard.
-    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor) {
+    // write. Defense-in-depth behind the frontend's read-only guard. Same for
+    // the V9-01 Code Graph monitor and V13 Workbench tabs — both app-rendered
+    // with no PTY.
+    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor | TabId::Workbench) {
         return Ok(());
     }
     // Pre-register any TTS markers in the user's input so they don't fire
@@ -700,9 +702,15 @@ pub async fn settings_update(
     // live materialize/remove after the mutate. The integrity pass that
     // normally owns those tabs only runs at load, so without this a freshly
     // enabled feature's tab wouldn't appear until the next launch.
-    let (was_graph, was_offload, was_stt, was_stt_device) = {
+    let (was_graph, was_offload, was_workbench, was_stt, was_stt_device) = {
         let old = state.settings.current();
-        (old.graph.enabled, old.offload.enabled, old.stt.enabled, old.stt.device)
+        (
+            old.graph.enabled,
+            old.offload.enabled,
+            old.workbench.enabled,
+            old.stt.enabled,
+            old.stt.device,
+        )
     };
 
     // The Settings window holds a full snapshot and replaces wholesale, but it
@@ -716,8 +724,8 @@ pub async fn settings_update(
         settings.layout = cur.layout.clone();
         settings.session = cur.session.clone();
         *cur = settings;
-        // Keep the reserved feature tabs (Offload Server / Code Graph monitor)
-        // present-iff-enabled in the persisted list.
+        // Keep the reserved feature tabs (Offload Server / Code Graph monitor /
+        // Workbench) present-iff-enabled in the persisted list.
         crate::settings::reconcile_reserved_tabs(cur);
         // V21: when OpenCode local-llama auto-sync is on and the local server is
         // enabled, re-derive the provider snapshot if the primary Local command
@@ -745,7 +753,10 @@ pub async fn settings_update(
 
     // On an actual enable/disable edge, mirror the change into the runtime so
     // the reserved tab appears/disappears live (tab bar + pane placement).
-    if now.graph.enabled != was_graph || now.offload.enabled != was_offload {
+    if now.graph.enabled != was_graph
+        || now.offload.enabled != was_offload
+        || now.workbench.enabled != was_workbench
+    {
         // Serialize against create/close_tab while we touch the registry.
         let _serializer = state.lifecycle_serializer.lock().await;
         if now.graph.enabled != was_graph {
@@ -761,6 +772,15 @@ pub async fn settings_update(
                 state.inner(),
                 TabId::OffloadServer,
                 now.offload.enabled,
+            )
+            .await;
+        }
+        // V13 Phase A: mirror the Workbench tab live too.
+        if now.workbench.enabled != was_workbench {
+            super::tab_lifecycle::sync_reserved_feature_tab(
+                state.inner(),
+                TabId::Workbench,
+                now.workbench.enabled,
             )
             .await;
         }
@@ -1194,6 +1214,31 @@ pub async fn graph_context_preview(
 ) -> AppResult<crate::graph::RetrieveResult> {
     let root = resolve_graph_root(root)?;
     Ok(service.retrieve_context(&root, &prompt, None))
+}
+
+/// V13 Phase A: resolve an optional `root` IPC argument to a project
+/// directory, falling back to the app's launch directory. Small, deliberate
+/// duplicate of `resolve_graph_root` (see the rationale in
+/// `checks/gitls.rs`'s doc comment for the sibling `run_git` split) — kept
+/// separate so `workbench` doesn't couple its root-resolution to `graph`'s.
+fn resolve_workbench_root(root: Option<String>) -> AppResult<std::path::PathBuf> {
+    match root {
+        Some(r) if !r.trim().is_empty() => Ok(std::path::PathBuf::from(r)),
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}"))),
+    }
+}
+
+/// V13 Phase A: the Workbench tab's top-of-view banner data — is `git` on
+/// PATH at all, and is `root` inside a working tree. `root` defaults to the
+/// launch directory. Cheap: `git_available` is a PATH lookup, `is_repo` a
+/// cached `rev-parse` probe (see `workbench::git::is_repo`).
+#[tauri::command]
+pub async fn workbench_status(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+) -> AppResult<crate::workbench::WorkbenchStatus> {
+    let root = resolve_workbench_root(root)?;
+    Ok(service.status(&root).await)
 }
 
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused

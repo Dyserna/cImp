@@ -26,7 +26,15 @@
   import OffloadServerView from './OffloadServerView.svelte';
   import CodeIntelligenceView from './CodeIntelligenceView.svelte';
   import NoteView from './NoteView.svelte';
-  import { isShellTab, isOffloadTab, isGraphMonitorTab, isNoteTab, type TabId } from './tabs/types';
+  import WorkbenchView from './WorkbenchView.svelte';
+  import {
+    isShellTab,
+    isOffloadTab,
+    isGraphMonitorTab,
+    isNoteTab,
+    isWorkbenchTab,
+    type TabId,
+  } from './tabs/types';
   import { tabs } from './tabs/store';
   import type { LayoutNode, PaneNode } from './layout/types';
 
@@ -163,6 +171,8 @@
         <CodeIntelligenceView />
       {:else if isNoteTab(pane.active_tab_id)}
         <NoteView />
+      {:else if isWorkbenchTab(pane.active_tab_id)}
+        <WorkbenchView />
       {:else}
         <TabErrorOverlay tabId={pane.active_tab_id} onretry={handleRetry} />
         {#if isShellTab(pane.active_tab_id)}

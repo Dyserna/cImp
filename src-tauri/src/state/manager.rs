@@ -59,6 +59,10 @@ pub enum TabId {
     /// PTY, but it is app-rendered (an in-process dashboard of the graph
     /// indexer/embedder), not a mirror of a child process's output.
     GraphMonitor,
+    /// V13 Phase A: the read-only, non-closable Workbench tab (live diff /
+    /// checkpoint timeline / worktrees). Same shape as [`Self::GraphMonitor`]
+    /// — Shell-kind, reserved identity, no PTY, app-rendered.
+    Workbench,
 }
 
 impl TabId {
@@ -69,6 +73,7 @@ impl TabId {
             TabId::OpenCode => "opencode",
             TabId::OffloadServer => "offload-server",
             TabId::GraphMonitor => "graph-monitor",
+            TabId::Workbench => "workbench-1",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
         }
@@ -81,6 +86,7 @@ impl TabId {
             "opencode" => TabId::OpenCode,
             "offload-server" => TabId::OffloadServer,
             "graph-monitor" => TabId::GraphMonitor,
+            "workbench-1" => TabId::Workbench,
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
             // `Shell`, so they keep AI-kind behavior on relaunch. The
@@ -107,7 +113,9 @@ impl TabId {
             // purposes (it never runs a PTY, so this is inert), keeping it off
             // the per-kind match explosion. Its read-only behavior is keyed
             // off the reserved id, not the kind.
-            TabId::Shell(_) | TabId::OffloadServer | TabId::GraphMonitor => TabKind::Shell,
+            TabId::Shell(_) | TabId::OffloadServer | TabId::GraphMonitor | TabId::Workbench => {
+                TabKind::Shell
+            }
         }
     }
 
@@ -125,9 +133,11 @@ impl TabId {
             | TabId::OpenCode
             // Non-closable: the Offload Server tab is removed only by
             // disabling offload, never by the close `×`. The Code Graph
-            // monitor tab is likewise removed only by disabling the graph.
+            // monitor tab is likewise removed only by disabling the graph,
+            // and the Workbench tab only by disabling workbench.
             | TabId::OffloadServer
-            | TabId::GraphMonitor => true,
+            | TabId::GraphMonitor
+            | TabId::Workbench => true,
             TabId::Shell(_) | TabId::Ai(_) => false,
         }
     }

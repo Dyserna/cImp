@@ -1508,6 +1508,20 @@ impl GraphService {
     /// created/modified files, drop rows for deleted ones, then refresh the
     /// status counts. Called from the watcher thread.
     pub fn reindex_paths(self: &Arc<Self>, root: &Path, paths: Vec<PathBuf>) {
+        // V13 §0.3: fan this coalesced batch out to Workbench consumers
+        // (fs-batch Tauri event for the frontend + an internal broadcast for
+        // backend subscribers) BEFORE any graph-specific filtering below — a
+        // batch of paths the graph itself ignores (unsupported extension,
+        // gitignored, graph disabled) can still be exactly what the diff pane
+        // or a future checkpoint burst trigger cares about. Reached via
+        // `AppHandle::state` rather than a constructor dependency so `graph`
+        // and `workbench` don't need to know about each other's lifecycle;
+        // `WorkbenchService` self-gates on `workbench.enabled`, so this is a
+        // cheap no-op when the feature is off.
+        if let Some(workbench) = self.app.try_state::<Arc<crate::workbench::WorkbenchService>>() {
+            workbench.publish_fs_batch(root, &paths);
+        }
+
         let snap = self.settings.current().graph;
         if !snap.enabled || self.paused.load(Ordering::Relaxed) {
             return;

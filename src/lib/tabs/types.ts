@@ -42,9 +42,21 @@ export function isNoteTab(id: TabId): boolean {
   return id === NOTE_TAB_ID;
 }
 
+/// V13 Phase A: the reserved id of the read-only, app-rendered Workbench tab
+/// (live diff pane / checkpoint timeline / worktrees, sectioned like Code
+/// Intelligence). Shell-kind on the backend — no PTY — same pattern as the
+/// Code Graph monitor tab (`:27`).
+export const WORKBENCH_TAB_ID = 'workbench-1';
+
+/// True for the Workbench tab.
+export function isWorkbenchTab(id: TabId): boolean {
+  return id === WORKBENCH_TAB_ID;
+}
+
 /// Type guard for shell tabs — every non-AI-builtin ID is a shell, EXCEPT the
-/// Offload Server, Code Graph monitor, and Note tabs, which are app-rendered
-/// (they must not get the shell closed-overlay / restart / keystroke behaviors).
+/// Offload Server, Code Graph monitor, Note, and Workbench tabs, which are
+/// app-rendered (they must not get the shell closed-overlay / restart /
+/// keystroke behaviors).
 export function isShellTab(id: TabId): boolean {
   return (
     id !== 'claude' &&
@@ -52,7 +64,8 @@ export function isShellTab(id: TabId): boolean {
     id !== 'opencode' &&
     id !== OFFLOAD_SERVER_TAB_ID &&
     id !== GRAPH_MONITOR_TAB_ID &&
-    id !== NOTE_TAB_ID
+    id !== NOTE_TAB_ID &&
+    id !== WORKBENCH_TAB_ID
   );
 }
 

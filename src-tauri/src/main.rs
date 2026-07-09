@@ -27,6 +27,7 @@ mod theming;
 mod tabs;
 mod tts;
 mod usage;
+mod workbench;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -59,6 +60,7 @@ use crate::ipc::commands::{
     restart_shell_tab, set_active_tab, set_window_square_corners, settings_get, settings_update,
     stt_cancel, stt_list_input_devices, stt_list_models, stt_start_recording, stt_stop_recording,
     tab_activate, tts_speak, tts_set_paused, tts_speak_selection, tts_stop, tts_test,
+    workbench_status,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -356,6 +358,7 @@ fn main() {
     let settings_for_stt = settings_handle.clone();
     let settings_for_offload = settings_handle.clone();
     let settings_for_graph = settings_handle.clone();
+    let settings_for_workbench = settings_handle.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -516,6 +519,20 @@ fn main() {
                         }
                     });
                 }
+            }
+
+            // V13 Phase A: the Workbench service (fs-batch broadcast today;
+            // checkpoint scheduling and worktree bookkeeping in later phases).
+            // Managed unconditionally, before the graph service below, since
+            // `GraphService::reindex_paths` looks it up via `AppHandle::state`
+            // on every watcher batch — construct it first so that lookup never
+            // races an empty state table during startup.
+            {
+                let workbench_service = crate::workbench::WorkbenchService::new(
+                    app.handle().clone(),
+                    settings_for_workbench.clone(),
+                );
+                app.manage(workbench_service);
             }
 
             // V9-01 code knowledge graph: the app-owned graph service that
@@ -683,6 +700,7 @@ fn main() {
             graph_fact_update,
             graph_fact_add,
             graph_context_preview,
+            workbench_status,
             theming::themes_list,
             theming::palettes_list,
         ])

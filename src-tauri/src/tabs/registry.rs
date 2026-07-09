@@ -59,15 +59,17 @@ pub struct TabRegistry {
 pub type TabRegistryHandle = Arc<TokioMutex<TabRegistry>>;
 
 /// True when `id` is a reserved builtin that cannot be closed: the four
-/// AI builtins, plus the V8-03 read-only Offload Server tab. No user Shell
-/// id is a builtin — the reserved `shell-default-1` ships as the default
-/// first shell tab on fresh installs but is closable, and the on-demand
-/// `rustnet` / `broot` tool tabs use uuid-based ids. Keep in sync with
-/// `TabId::is_builtin` in `state::manager`.
+/// AI builtins, plus the V8-03 read-only Offload Server tab, the V9-01 Code
+/// Graph monitor tab, and the V13 Workbench tab. No user Shell id is a
+/// builtin — the reserved `shell-default-1` ships as the default first shell
+/// tab on fresh installs but is closable, and the on-demand `rustnet` /
+/// `broot` tool tabs use uuid-based ids. Keep in sync with `TabId::is_builtin`
+/// in `state::manager`.
 fn is_builtin_id(id: &str) -> bool {
     AiTabId::from_id(id).is_some()
         || id == crate::settings::OFFLOAD_SERVER_TAB_ID
         || id == crate::settings::GRAPH_MONITOR_TAB_ID
+        || id == crate::settings::WORKBENCH_TAB_ID
 }
 
 /// V1.4-04 D: replicate the filename-sanitization done by

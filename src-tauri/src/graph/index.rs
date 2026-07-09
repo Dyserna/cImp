@@ -418,7 +418,10 @@ impl GraphIndex {
     /// per-file replace in [`index_file_graph`] and by the watcher when a file
     /// is deleted.
     pub fn remove_file(&self, file: &str) -> AppResult<()> {
-        self.with_write_txn(|tx| remove_file_in_tx(tx, file))
+        self.with_write_txn(|tx| {
+            let removed = remove_file_in_tx(tx, file)?;
+            purge_dangling_call_edges_in_tx(tx, removed)
+        })
     }
 
     /// Delete every indexed file whose path lies under directory `dir` (i.e.
@@ -435,9 +438,14 @@ impl GraphIndex {
             let rows = tx_run(tx, "?[path] := *file{path}, starts_with(path, $prefix)", p)?;
             let files: Vec<String> = rows.rows.iter().map(|r| cell_str(r, 0)).collect();
             let n = files.len();
+            // Purge once after ALL files are removed: a name defined by two
+            // files under `dir` would otherwise read as still-defined while
+            // the sibling awaits removal, surviving as a ghost.
+            let mut removed = std::collections::BTreeSet::new();
             for f in &files {
-                remove_file_in_tx(tx, f)?;
+                removed.extend(remove_file_in_tx(tx, f)?);
             }
+            purge_dangling_call_edges_in_tx(tx, removed)?;
             Ok(n)
         })
     }
@@ -538,7 +546,7 @@ impl GraphIndex {
         // (disk full, killed process) rolls back instead of leaving the file
         // with, say, symbols but no edges.
         self.with_write_txn(move |tx| {
-            remove_file_in_tx(tx, &file)?;
+            let removed_names = remove_file_in_tx(tx, &file)?;
             tx_put(
                 tx,
                 "?[path, lang, hash] <- $rows\n:put file {path => lang, hash}",
@@ -571,6 +579,10 @@ impl GraphIndex {
                 "?[kind, src, dst, confidence] <- $rows\n:put edge {kind, src, dst => confidence}",
                 edge_rows,
             )?;
+            // AFTER the re-insert: names the new file version still defines
+            // read as defined and keep their inbound call edges from other
+            // files; only names this edit genuinely removed are purged.
+            purge_dangling_call_edges_in_tx(tx, removed_names)?;
             Ok(())
         })
     }
@@ -3837,21 +3849,25 @@ fn tx_put(tx: &MultiTransaction, script: &str, rows: Vec<DataValue>) -> AppResul
 }
 
 /// Delete every row belonging to `file` within an open transaction (symbols,
-/// refs, doc-chunks, code-chunks, the `file` row, edges keyed by the file
-/// id-prefix or `src == file`, plus inbound call edges to names this file
-/// uniquely defined). The transaction makes this atomic with the re-insert in
-/// [`GraphIndex::index_file_graph`].
-fn remove_file_in_tx(tx: &MultiTransaction, file: &str) -> AppResult<()> {
+/// refs, doc-chunks, code-chunks, the `file` row, and edges keyed by the file
+/// id-prefix or `src == file`). Returns the names the file defined so the
+/// caller can run [`purge_dangling_call_edges_in_tx`] — after the re-insert on
+/// the replace path ([`GraphIndex::index_file_graph`]), so names the new file
+/// version still defines keep their inbound call edges from other files, or
+/// immediately on the true-delete path. The transaction makes remove + purge
+/// (+ re-insert) atomic.
+fn remove_file_in_tx(tx: &MultiTransaction, file: &str) -> AppResult<Vec<String>> {
     let prefix = format!("{file}#");
     let mut p = BTreeMap::new();
     p.insert("file".to_string(), DataValue::Str(file.into()));
 
-    // Names this file DEFINES, captured before we delete its symbols. After
-    // deletion, any of these names with no remaining definition anywhere is
-    // "dangling": its inbound call edges (owned by other files) would otherwise
-    // survive and make `callers()` report ghosts of a symbol that no longer
-    // exists. External/unresolved call targets (stdlib names that never had a
-    // symbol) are NOT in this set, so they're left untouched.
+    // Names this file DEFINES, captured before we delete its symbols. Any of
+    // these left with no definition anywhere (checked by the purge helper once
+    // the caller is done mutating) is "dangling": its inbound call edges
+    // (owned by other files) would otherwise survive and make `callers()`
+    // report ghosts of a symbol that no longer exists. External/unresolved
+    // call targets (stdlib names that never had a symbol) are NOT in this set,
+    // so they're left untouched.
     let defined = tx_run(tx, "?[name] := *symbol{file, name}, file == $file", p.clone())?;
     let defined_names: Vec<String> = defined.rows.iter().map(|r| cell_str(r, 0)).collect();
 
@@ -3887,9 +3903,21 @@ fn remove_file_in_tx(tx: &MultiTransaction, file: &str) -> AppResult<()> {
         "?[kind, src, dst] := *edge{kind, src, dst}, (starts_with(src, $prefix) or src == $file)\n:rm edge {kind, src, dst}",
         pe,
     )?;
+    Ok(defined_names)
+}
 
-    // Drop inbound call edges to names this file uniquely defined.
-    for name in defined_names {
+/// Drop inbound call edges to any of `names` that no longer has a definition.
+/// Must run in the same transaction as (and after) the removes/re-inserts it
+/// cleans up for: a name the re-index just re-inserted still has a symbol row,
+/// so its inbound edges from other files survive; only genuinely gone names
+/// lose theirs. Running this BEFORE the re-insert is the bug this split fixes —
+/// every uniquely-defined name read as dangling on an ordinary edit, deleting
+/// call edges owned by unchanged caller files.
+fn purge_dangling_call_edges_in_tx(
+    tx: &MultiTransaction,
+    names: impl IntoIterator<Item = String>,
+) -> AppResult<()> {
+    for name in names {
         let mut pn = BTreeMap::new();
         pn.insert("name".to_string(), DataValue::Str(name.as_str().into()));
         let still = tx_run(
@@ -4653,6 +4681,46 @@ pub struct Point { x: i32 }
         assert!(
             idx.callers("baz").unwrap().is_empty(),
             "no ghost callers of a deleted symbol"
+        );
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reindex_keeps_inbound_call_edges_from_other_files() {
+        // Regression: the per-file replace in `index_file_graph` used to run
+        // the dangling-name purge BEFORE re-inserting the file's symbols, so
+        // any ordinary edit of a file deleted the inbound call edges owned by
+        // its unchanged callers until they were themselves re-indexed.
+        let dir = std::env::temp_dir().join(format!("ckg-reidx-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/a.rs", "pub fn baz() {}\n", Lang::Rust))
+            .expect("index a");
+        idx.index_file_graph(&parse_file("src/b.rs", "pub fn bar() { baz() }\n", Lang::Rust))
+            .expect("index b");
+        assert!(idx.callers("baz").unwrap().iter().any(|s| s.name == "bar"));
+
+        // Re-index a.rs (an ordinary edit): `baz` is still defined, so bar's
+        // inbound call edge must survive.
+        idx.index_file_graph(&parse_file(
+            "src/a.rs",
+            "pub fn baz() {}\npub fn qux() {}\n",
+            Lang::Rust,
+        ))
+        .expect("reindex a");
+        assert!(
+            idx.callers("baz").unwrap().iter().any(|s| s.name == "bar"),
+            "re-indexing the definer must not drop inbound call edges from unchanged callers"
+        );
+
+        // Re-index a.rs with `baz` genuinely removed: now the ghost cleanup
+        // must still fire, exactly like the delete path.
+        idx.index_file_graph(&parse_file("src/a.rs", "pub fn qux() {}\n", Lang::Rust))
+            .expect("reindex a without baz");
+        assert!(
+            idx.callers("baz").unwrap().is_empty(),
+            "no ghost callers of a symbol the edit removed"
         );
 
         drop(idx);

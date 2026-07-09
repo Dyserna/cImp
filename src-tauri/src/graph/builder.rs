@@ -334,6 +334,46 @@ fn is_test_attribute(attr_text: &str) -> bool {
         .trim();
     // Drop any `(...)`/`= ...` args, keep the leading path (`tokio::test(...)` -> `tokio::test`).
     let path = inner.split(['(', '=']).next().unwrap_or(inner).trim();
+    if is_test_path(path) {
+        return true;
+    }
+    // F28: `#[cfg_attr(<pred>, test)]` conditionally applies `test` (or `rstest`).
+    // The predicate is the FIRST arg; the applied attributes follow the first
+    // top-level comma. Only those count — a bare `test` in the predicate (e.g.
+    // `cfg_attr(all(test), Serialize)`) must NOT match.
+    if path == "cfg_attr" {
+        if let Some(args) = inner
+            .strip_prefix("cfg_attr")
+            .map(str::trim)
+            .and_then(|s| s.strip_prefix('('))
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let mut depth = 0i32;
+            let mut top_comma = None;
+            for (i, c) in args.char_indices() {
+                match c {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    ',' if depth == 0 => {
+                        top_comma = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(i) = top_comma {
+                return args[i + 1..].split(',').any(|attr| {
+                    is_test_path(attr.trim().split(['(', '=']).next().unwrap_or("").trim())
+                });
+            }
+        }
+    }
+    false
+}
+
+/// Whether an attribute path (leading segment already isolated) is a test
+/// marker: `test`/`rstest`, or `*::test`/`*::rstest` (`tokio::test`, …).
+fn is_test_path(path: &str) -> bool {
     matches!(path, "test" | "rstest") || path.ends_with("::test") || path.ends_with("::rstest")
 }
 
@@ -450,27 +490,35 @@ impl CallSyntax {
         }
     }
 
-    /// Whether `kind` opens a nested scope whose calls belong to *it*, not the
-    /// current symbol — the walk must not descend into these (each gets its own
-    /// `collect_calls_in` from the item walk).
-    fn is_nested_scope(self, kind: &str) -> bool {
+    /// Whether `node` opens a nested scope that gets its OWN `collect_calls_in`
+    /// pass, so this walk must NOT descend into it (descending would attribute
+    /// its calls to the enclosing symbol as well — a double count).
+    ///
+    /// The scopes with their own pass are the NAMED definitions (collected by the
+    /// item walk) and — in JS — a function/arrow *expression* that is the value of
+    /// a `const/let f = …` declarator (collected by [`emit_js_var_functions`]).
+    /// Everything else function-shaped — Rust `closure_expression`, Python
+    /// `lambda`, and JS inline callbacks / IIFEs / object-property arrows — has NO
+    /// own pass, so we DO descend and fold its calls into the enclosing symbol.
+    /// Before this, calls made inside an anonymous closure vanished from the graph
+    /// entirely (attributed to no symbol at all).
+    fn is_nested_scope(self, node: Node) -> bool {
+        let kind = node.kind();
         match self {
-            CallSyntax::Rust => matches!(
-                kind,
-                "function_item" | "closure_expression" | "function_signature_item"
-            ),
-            CallSyntax::Js => matches!(
-                kind,
-                "function_declaration"
-                    | "generator_function_declaration"
-                    | "function"
-                    | "generator_function"
-                    | "arrow_function"
-                    | "method_definition"
-            ),
-            CallSyntax::Python => {
-                matches!(kind, "function_definition" | "class_definition" | "lambda")
-            }
+            CallSyntax::Rust => matches!(kind, "function_item" | "function_signature_item"),
+            CallSyntax::Js => match kind {
+                "function_declaration" | "generator_function_declaration" | "method_definition" => {
+                    true
+                }
+                // A function/arrow *expression* only has its own pass when it is a
+                // declarator value (`const f = () => …`); an inline callback,
+                // IIFE, or object-property arrow does not, so descend into it.
+                "arrow_function" | "function" | "function_expression" | "generator_function" => {
+                    node.parent().map(|p| p.kind()) == Some("variable_declarator")
+                }
+                _ => false,
+            },
+            CallSyntax::Python => matches!(kind, "function_definition" | "class_definition"),
         }
     }
 }
@@ -491,23 +539,83 @@ fn collect_calls_in(
     for child in node.named_children(&mut cursor) {
         if child.kind() == syntax.call_kind() {
             if let Some(callee) = syntax.callee_name(src, child) {
-                let pos = child.start_position();
-                fg.references.push(Reference {
-                    name: callee.clone(),
-                    file: file.to_string(),
-                    line: pos.row as u32 + 1,
-                    col: pos.column as u32 + 1,
-                    resolved_id: None,
-                });
-                fg.edges.push(Edge {
-                    kind: EdgeKind::Call,
-                    src: from_id.to_string(),
-                    dst: callee,
-                });
+                push_call(src, file, child, &callee, from_id, fg);
             }
         }
-        if !syntax.is_nested_scope(child.kind()) {
+        // Rust macros wrap their args in an opaque `token_tree`; recover the
+        // function calls written inside them (see [`collect_rust_macro_calls`]).
+        if matches!(syntax, CallSyntax::Rust) && child.kind() == "macro_invocation" {
+            let mut mc = child.walk();
+            for gc in child.named_children(&mut mc) {
+                if gc.kind() == "token_tree" {
+                    collect_rust_macro_calls(src, file, gc, from_id, fg);
+                }
+            }
+        }
+        if !syntax.is_nested_scope(child) {
             collect_calls_in(src, file, child, from_id, syntax, fg);
+        }
+    }
+}
+
+/// Push one `Call` reference + edge for `callee`, located at `at`'s start.
+fn push_call(src: &str, file: &str, at: Node, callee: &str, from_id: &str, fg: &mut FileGraph) {
+    fg.references.push(Reference {
+        name: callee.to_string(),
+        file: file.to_string(),
+        line: at.start_position().row as u32 + 1,
+        col: char_col(src, at),
+        resolved_id: None,
+    });
+    fg.edges.push(Edge {
+        kind: EdgeKind::Call,
+        src: from_id.to_string(),
+        dst: callee.to_string(),
+    });
+}
+
+/// The 1-based **character** column of `node`'s start. F26: tree-sitter's
+/// `Point.column` is a BYTE offset within the line, so on a line containing
+/// multi-byte characters before the token (a non-ASCII comment/string, or an
+/// identifier like `café_fn`) it overshoots the real column an editor reports;
+/// counting chars from the line start fixes it. `line` (the row) is unaffected.
+pub(crate) fn char_col(src: &str, node: Node) -> u32 {
+    let start = node.start_byte();
+    let line_start = src.get(..start).and_then(|s| s.rfind('\n')).map(|i| i + 1).unwrap_or(0);
+    src.get(line_start..start).map(|s| s.chars().count() as u32).unwrap_or(0) + 1
+}
+
+/// Rust macros (`println!`, `assert_eq!`, `vec!`, `tokio::select!`, …) wrap their
+/// arguments in a `token_tree` whose contents tree-sitter does NOT parse into
+/// `call_expression` nodes — they are raw tokens, so every function call written
+/// inside a macro is otherwise absent from the call graph. This recovers the
+/// common call shapes heuristically: a bare `identifier` immediately followed by
+/// a parenthesized `token_tree`, with no gap between them, is a call to that
+/// identifier (`foo(x)`, `path::foo(x)` via the final segment, `recv.method(x)`
+/// via the method name — the preceding `.`/`::` tokens are anonymous and ignored).
+/// The zero-gap adjacency check excludes a nested macro invocation `inner!(…)`
+/// (a `!` sits between the name and its tree) and generic turbofish calls, both
+/// of which would otherwise be mis-attributed. Recurses into nested token trees.
+fn collect_rust_macro_calls(src: &str, file: &str, tree: Node, from_id: &str, fg: &mut FileGraph) {
+    let mut cursor = tree.walk();
+    let children: Vec<Node> = tree.named_children(&mut cursor).collect();
+    for (i, child) in children.iter().enumerate() {
+        match child.kind() {
+            "identifier" => {
+                if let Some(next) = children.get(i + 1) {
+                    if next.kind() == "token_tree"
+                        && next.start_byte() == child.end_byte()
+                        && node_text(src, *next).starts_with('(')
+                    {
+                        let callee = node_text(src, *child).trim().to_string();
+                        if !callee.is_empty() {
+                            push_call(src, file, *child, &callee, from_id, fg);
+                        }
+                    }
+                }
+            }
+            "token_tree" => collect_rust_macro_calls(src, file, *child, from_id, fg),
+            _ => {}
         }
     }
 }
@@ -532,7 +640,11 @@ fn callee_name(src: &str, call: Node) -> Option<String> {
             .child_by_field_name("function")
             .map(|n| node_text(src, n))
             .unwrap_or_else(|| node_text(src, f)),
-        _ => first_line(&node_text(src, f)),
+        // F25: an unhandled callee shape (`(make_fn())()`, `arr[i]()`, an IIFE,
+        // a subscript call) has no clean identifier — drop the edge rather than
+        // recording the whole sub-expression's first line as a bogus,
+        // un-resolvable "symbol" name that pollutes ref/edge resolution.
+        _ => return None,
     };
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -956,7 +1068,11 @@ fn js_callee_name(src: &str, call: Node) -> Option<String> {
             .child_by_field_name("property")
             .map(|n| node_text(src, n))
             .unwrap_or_else(|| node_text(src, f)),
-        _ => first_line(&node_text(src, f)),
+        // F25: an unhandled callee shape (`(make_fn())()`, `arr[i]()`, an IIFE,
+        // a subscript call) has no clean identifier — drop the edge rather than
+        // recording the whole sub-expression's first line as a bogus,
+        // un-resolvable "symbol" name that pollutes ref/edge resolution.
+        _ => return None,
     };
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -1145,7 +1261,11 @@ fn py_callee_name(src: &str, call: Node) -> Option<String> {
             .child_by_field_name("attribute")
             .map(|n| node_text(src, n))
             .unwrap_or_else(|| node_text(src, f)),
-        _ => first_line(&node_text(src, f)),
+        // F25: an unhandled callee shape (`(make_fn())()`, `arr[i]()`, an IIFE,
+        // a subscript call) has no clean identifier — drop the edge rather than
+        // recording the whole sub-expression's first line as a bogus,
+        // un-resolvable "symbol" name that pollutes ref/edge resolution.
+        _ => return None,
     };
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -1240,6 +1360,20 @@ mod tests {
         assert!(is_test_of(&fg, "tokio_test"));
         assert!(is_test_of(&fg, "an_rstest"));
         assert!(!is_test_of(&fg, "plain"));
+    }
+
+    #[test]
+    fn is_test_attribute_handles_cfg_attr() {
+        // F28: a conditional `#[cfg_attr(<pred>, test)]` applies `test`.
+        assert!(is_test_attribute("#[cfg_attr(feature = \"integration\", test)]"));
+        assert!(is_test_attribute("#[cfg_attr(unix, tokio::test)]"));
+        // A bare `test` in the PREDICATE (not the applied attr) must not match.
+        assert!(!is_test_attribute("#[cfg_attr(all(test), Serialize)]"));
+        assert!(!is_test_attribute("#[cfg_attr(feature = \"x\", derive(Debug))]"));
+        // Plain forms still work.
+        assert!(is_test_attribute("#[test]"));
+        assert!(is_test_attribute("#[tokio::test]"));
+        assert!(!is_test_attribute("#[derive(Debug)]"));
     }
 
     #[test]
@@ -1597,6 +1731,74 @@ class Point:
         assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Import && e.dst == "pkg.sub"));
         let origin = fg.symbols.iter().find(|s| s.name == "origin").unwrap();
         assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == origin.id && e.dst == "getcwd"));
+    }
+
+    #[test]
+    fn calls_inside_rust_closures_attributed_to_enclosing_fn() {
+        // F1: a call inside an anonymous closure must fold into the enclosing
+        // symbol, not vanish (the closure is never emitted as its own symbol).
+        let src = "fn outer() {\n    let v = [1];\n    v.iter().for_each(|x| { helper(x); });\n}\nfn helper(x: &i32) {}\n";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        assert!(
+            fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "helper"),
+            "call inside closure should attribute to the enclosing fn"
+        );
+    }
+
+    #[test]
+    fn calls_inside_python_lambda_attributed_to_enclosing_fn() {
+        // F1 (Python): a call inside a lambda folds into the enclosing def.
+        let src = "def outer():\n    return list(map(lambda x: helper(x), [1, 2]))\n\ndef helper(x):\n    return x\n";
+        let fg = parse_file("src/a.py", src, Lang::Python);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        assert!(
+            fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "helper"),
+            "call inside lambda should attribute to the enclosing def"
+        );
+    }
+
+    #[test]
+    fn calls_inside_js_inline_callback_attributed_to_enclosing_fn() {
+        // F1 (JS): an inline arrow callback is not its own symbol, so its calls
+        // fold into the enclosing function; a `const f = () => …` still gets its
+        // own attribution (no double count).
+        let src = "function outer() {\n  [1].forEach((x) => { helper(x); });\n}\nfunction helper(x) {}\n";
+        let fg = parse_file("src/a.js", src, Lang::JavaScript);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        assert!(
+            fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "helper"),
+            "call inside inline arrow should attribute to the enclosing fn"
+        );
+    }
+
+    #[test]
+    fn calls_inside_rust_macros_extracted() {
+        // F2: calls written inside macro token-trees must appear in the graph,
+        // and the macro names themselves must not be recorded as calls.
+        let src = "fn outer() {\n    println!(\"{}\", compute());\n    assert_eq!(f(), g());\n}\nfn compute() -> i32 { 0 }\nfn f() -> i32 { 0 }\nfn g() -> i32 { 0 }\n";
+        let fg = parse_file("src/a.rs", src, Lang::Rust);
+        let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
+        for callee in ["compute", "f", "g"] {
+            assert!(
+                fg.edges
+                    .iter()
+                    .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == callee),
+                "macro-internal call `{callee}` should be extracted"
+            );
+        }
+        assert!(
+            !fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Call && (e.dst == "println" || e.dst == "assert_eq")),
+            "macro names must not be recorded as calls"
+        );
     }
 
     #[test]

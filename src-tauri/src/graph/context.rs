@@ -89,38 +89,66 @@ pub fn session_weight(last_kind: &str) -> f64 {
     }
 }
 
-/// V12 review: the fact-boost false-match fix. `fact_text.contains(stem)`
-/// (the original implementation) spuriously fires whenever a candidate
-/// file's bare stem happens to be a substring of ordinary prose in a fact —
-/// e.g. a fact mentioning "in this context" boosting `context.rs`, or "the
-/// index page" boosting `index.rs`. `true` iff `stem` appears as a
-/// WHOLE WORD in `fact` — bounded by a non-alphanumeric/non-underscore
-/// character (or string start/end) on both sides, so `retry_backoff` matches
-/// "the retry_backoff logic is fragile" but not a longer identifier like
-/// `retry_backoff_v2`. Case-sensitive: file stems and the identifiers a fact
-/// names are both written in this codebase's own snake_case convention.
+/// Whole-word, **case-insensitive** occurrence of `stem` in `fact` — the
+/// fact-boost matcher. `fact_text.contains(stem)` (the original) spuriously
+/// fired on any substring of prose ("in this context" boosting `context.rs`);
+/// the whole-word bound (a non-alphanumeric/non-underscore char, or string
+/// start/end, on both sides) fixes that, so `retry_backoff` matches "the
+/// retry_backoff logic" but not `retry_backoff_v2`.
+///
+/// F6 fix: the match is now case-INsensitive. Facts naturally name a type in
+/// its own casing (`Watcher`, `Supervisor`, `Embedder`) whose file stem is the
+/// same word lowercased, so the previous case-sensitive match silently missed
+/// the majority of natural references. (Note: this still can't bridge a stem
+/// that is only a *sub-word* of a compound identifier — a fact naming
+/// `GraphService` does not boost `service.rs`, both because `service` is a
+/// sub-word of `GraphService` and because `service` is a generic stem excluded
+/// by [`is_generic_stem`]; that is inherent to stem-based matching.)
 fn fact_mentions_stem(fact: &str, stem: &str) -> bool {
     if stem.is_empty() {
         return false;
     }
+    word_in_lower(&fact.to_ascii_lowercase(), &stem.to_ascii_lowercase())
+}
+
+/// Whole-word scan where BOTH inputs are already lowercased — lets
+/// [`build_context`] lowercase the fact set once instead of once per candidate
+/// file. See [`fact_mentions_stem`] for the boundary rule.
+fn word_in_lower(fact_l: &str, stem_l: &str) -> bool {
+    if stem_l.is_empty() {
+        return false;
+    }
     let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
-    fact.match_indices(stem).any(|(idx, matched)| {
-        let before_ok = fact[..idx].chars().next_back().map(|c| !is_word_char(c)).unwrap_or(true);
+    fact_l.match_indices(stem_l).any(|(idx, matched)| {
+        let before_ok = fact_l[..idx].chars().next_back().map(|c| !is_word_char(c)).unwrap_or(true);
         let end = idx + matched.len();
-        let after_ok = fact[end..].chars().next().map(|c| !is_word_char(c)).unwrap_or(true);
+        let after_ok = fact_l[end..].chars().next().map(|c| !is_word_char(c)).unwrap_or(true);
         before_ok && after_ok
     })
 }
 
 /// Generic module/file-organization stems that are also common in ordinary
-/// prose — so common that even a whole-word match (see
-/// [`fact_mentions_stem`]) isn't a reliable "this fact is about that file"
-/// signal. These are exactly the stems the V12 review flagged as spuriously
-/// matching (`mod.rs`, `lib.rs`, `index.rs`, `context.rs`, `service.rs`,
-/// `config.rs`) — excluded outright rather than relying on length alone,
-/// since several of them are already ≥ 4 characters.
+/// prose — so common that even a whole-word match (see [`fact_mentions_stem`])
+/// isn't a reliable "this fact is about that file" signal, so the fact boost is
+/// suppressed for them. Started as the six the V12 review flagged (`mod`,
+/// `lib`, `index`, `context`, `service`, `config`); F7 widens it to the common
+/// generic stems that also clear the ≥ 4-char length bar and were still leaking
+/// spurious boosts (a fact saying "the test suite is flaky" boosting `test.rs`,
+/// "main entry point" boosting `main.rs`, …). `stem` is expected lowercased.
 fn is_generic_stem(stem: &str) -> bool {
-    matches!(stem, "mod" | "lib" | "index" | "context" | "service" | "config")
+    matches!(
+        stem,
+        // original V12 set
+        "mod" | "lib" | "index" | "context" | "service" | "config"
+        // F7: common generic stems that leak through the length gate
+            | "main" | "app" | "api" | "base" | "core" | "common"
+            | "data" | "error" | "errors" | "event" | "events"
+            | "handler" | "handlers" | "helper" | "helpers"
+            | "model" | "models" | "node" | "server" | "client"
+            | "test" | "tests" | "type" | "types" | "util" | "utils"
+            | "value" | "values" | "state" | "item" | "items" | "list"
+            | "mock" | "mocks" | "setup" | "fixture" | "fixtures"
+    )
 }
 
 /// Rank files for `prompt` and build the injectable digest. `session_files` is
@@ -195,7 +223,12 @@ pub fn build_context(
         let now = super::gitmeta::now_ts();
         for (file, s) in score.iter_mut() {
             if let Some(&last_ts) = churn.get(file) {
-                let age_days = (now - last_ts) / 86_400;
+                // F24: clamp at 0 so a future-dated commit (clock skew across
+                // contributors, a rebased/amended commit, a bad committer clock)
+                // is treated as "just now" rather than yielding a NEGATIVE age
+                // that trivially satisfies `<= 7` and pins the file to the top
+                // churn tier no matter how far in the future it is dated.
+                let age_days = (now - last_ts).max(0) / 86_400;
                 if age_days <= 7 {
                     *s += 3.0;
                 } else if age_days <= 30 {
@@ -205,14 +238,14 @@ pub fn build_context(
         }
     }
 
-    // V12 Phase E: project-fact boost — a durable fact that mentions a
-    // candidate file's stem (e.g. a fact naming "GraphService" boosts
-    // `graph/service.rs`) is a signal the file matters to this project beyond
+    // V12 Phase E: project-fact boost — a durable fact that whole-word mentions
+    // a candidate file's (non-generic) stem, e.g. a fact naming the `Watcher`
+    // boosts `watcher.rs`, is a signal the file matters to this project beyond
     // one prompt's term match. ONE fetch of the live fact set (not a
-    // per-candidate query), then a cheap substring check per already-scored
-    // candidate. Facts themselves are never injected per-turn here — only
-    // this small ranking nudge; they surface in full via `context_recall` and
-    // (pinned-only) launch-time promotion (V12 spec, Feature 5).
+    // per-candidate query), lowercased ONCE (F6), then a cheap whole-word check
+    // per already-scored candidate. Facts themselves are never injected per-turn
+    // here — only this small ranking nudge; they surface in full via
+    // `context_recall` and (pinned-only) launch-time promotion (V12 Feature 5).
     let facts: Vec<String> = idx
         .list_project_facts(false, 100)
         .unwrap_or_default()
@@ -226,7 +259,7 @@ pub fn build_context(
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
             if stem.chars().count() >= 4
-                && !is_generic_stem(stem)
+                && !is_generic_stem(&stem.to_ascii_lowercase())
                 && facts.iter().any(|f| fact_mentions_stem(f, stem))
             {
                 *s += 2.0;
@@ -287,12 +320,15 @@ pub fn build_context(
         if suppress {
             // Demote to a one-line reminder; measure the digest chars we saved.
             let saved = file_digest(idx, &file, per_file_chars);
-            deduped_chars += saved.chars().count();
             let prev_turn = prev.map(|(_, t)| *t).unwrap_or(0);
             let line = format!("- `{file}` — injected turn {prev_turn}, unchanged");
             let cost = line.chars().count();
             if budget >= cost {
                 budget -= cost;
+                // F27: count the saved chars ONLY when the reminder is actually
+                // emitted — otherwise the "deduped" figure credited savings for a
+                // file whose reminder didn't fit the budget and was dropped.
+                deduped_chars += saved.chars().count();
                 reminders.push(line);
             }
             continue;
@@ -370,19 +406,20 @@ fn file_digest(idx: &GraphIndex, file: &str, max_chars: usize) -> String {
         }
     }
     let mut joined = parts.join("; ");
-    if joined.chars().count() > max_chars {
-        joined = joined.chars().take(max_chars.saturating_sub(1)).collect::<String>();
-        joined.push('…');
-    }
     // V12 Phase D: optional "last change" trailer when git history exists for
-    // this file. Appended AFTER the max_chars truncation above (it's a small,
-    // separately-capped addition, not squeezed out of the signature budget) —
-    // the caller already measures the actual returned string length before
-    // debiting its own budget, so this is accounted for correctly there.
+    // this file. Appended BEFORE the final cap so it counts against `max_chars`.
     if let Some((last_ts, subject, _touches)) = idx.commit_touch(file).ok().flatten() {
         let age = super::gitmeta::relative_age(super::gitmeta::now_ts(), last_ts);
         let subject = super::gitmeta::truncate_subject(&subject, 60);
         joined.push_str(&format!(" — last change: \"{subject}\" ({age})"));
+    }
+    // F23: cap the WHOLE digest (signatures + trailer) to `max_chars`. The
+    // trailer used to be appended AFTER this cap, so a digest whose signatures
+    // already filled the budget overran it by the trailer's ~90 chars, letting
+    // the assembled block exceed `turn_budget_chars`. Char-boundary safe.
+    if joined.chars().count() > max_chars {
+        joined = joined.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+        joined.push('…');
     }
     joined
 }
@@ -639,7 +676,9 @@ mod tests {
     /// Mirrors the fact-boost gate in [`build_context`] (length ≥ 4, not a
     /// generic stem, whole-word match) without needing a full graph index.
     fn boosts(fact: &str, stem: &str) -> bool {
-        stem.chars().count() >= 4 && !is_generic_stem(stem) && fact_mentions_stem(fact, stem)
+        stem.chars().count() >= 4
+            && !is_generic_stem(&stem.to_ascii_lowercase())
+            && fact_mentions_stem(fact, stem)
     }
 
     #[test]
@@ -669,12 +708,29 @@ mod tests {
     }
 
     #[test]
+    fn fact_mentions_stem_is_case_insensitive() {
+        // F6: a fact naming a type in its own casing boosts the lowercase-stem
+        // file (the common natural form the case-sensitive matcher missed).
+        assert!(fact_mentions_stem("the Watcher debounces fs events", "watcher"));
+        assert!(fact_mentions_stem("Supervisor owns the warm pool", "supervisor"));
+        // Still whole-word: a sub-word of a compound identifier does not match.
+        assert!(!fact_mentions_stem("GraphSupervisor is central", "supervisor"));
+    }
+
+    #[test]
     fn is_generic_stem_covers_the_known_false_positives() {
         for s in ["mod", "lib", "index", "context", "service", "config"] {
             assert!(is_generic_stem(s), "{s} should be excluded");
         }
+        // F7: common generic stems that clear the ≥4-char bar are excluded too.
+        for s in ["main", "test", "tests", "utils", "types", "error", "data", "core", "node"] {
+            assert!(is_generic_stem(s), "{s} should be excluded (F7)");
+        }
+        // Distinctive names still boost.
         assert!(!is_generic_stem("retry_backoff"));
         assert!(!is_generic_stem("widget"));
+        assert!(!is_generic_stem("watcher"));
+        assert!(!is_generic_stem("supervisor"));
     }
 
     #[test]

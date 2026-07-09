@@ -727,16 +727,25 @@ impl GraphIndex {
     pub fn transitive(&self, name: &str, forward: bool) -> AppResult<Vec<String>> {
         let mut p = BTreeMap::new();
         p.insert("name".to_string(), DataValue::Str(name.into()));
-        let head = if forward {
-            "?[y] := reach[x, y], x == $name"
+        // F10: SEED the recursion from `$name` rather than materializing the
+        // whole-graph closure `reach[x, y]` (every source/target pair) and
+        // filtering `x == $name` only at the head — that forced Cozo to compute
+        // reachability for every symbol before discarding all but `$name`'s row,
+        // an O(V·E) blowup on a large call graph. The seeded single-argument
+        // `reach[_]` only explores the subgraph actually reachable from `$name`.
+        let rules = if forward {
+            // Everything `$name` transitively calls.
+            r#"reach[y] := calls[x, y], x == $name
+reach[y] := reach[z], calls[z, y]"#
         } else {
-            "?[x] := reach[x, y], y == $name"
+            // Everything that transitively calls `$name`.
+            r#"reach[x] := calls[x, y], y == $name
+reach[x] := reach[z], calls[x, z]"#
         };
         let script = format!(
             r#"calls[cn, dn] := *symbol{{id: cid, name: cn}}, *edge{{kind: ek, src: cid, dst: dn}}, ek == "call"
-reach[x, y] := calls[x, y]
-reach[x, y] := reach[x, z], calls[z, y]
-{head}
+{rules}
+?[n] := reach[n]
 :limit 1000"#
         );
         let rows = self.run(&script, p, ScriptMutability::Immutable)?;
@@ -807,12 +816,40 @@ reach[x, y] := reach[x, z], calls[z, y]
         let mut names: Vec<(String, u32)> = min_depth.into_iter().collect();
         names.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
+        // F15: resolve every dependent name to its symbol(s) in ONE query — a
+        // join of the `symbol` relation against the collected name set passed as
+        // an inline relation — instead of a `find_symbol` round trip per name. A
+        // `graph_impact` with 100+ transitive dependents otherwise fired 100+
+        // individual queries on this interactive path.
+        let mut by_name: HashMap<String, Vec<SymbolHit>> = HashMap::new();
+        if !names.is_empty() {
+            let name_rows: Vec<DataValue> = names
+                .iter()
+                .map(|(n, _)| DataValue::List(vec![DataValue::Str(n.as_str().into())]))
+                .collect();
+            let mut p = BTreeMap::new();
+            p.insert("names".to_string(), DataValue::List(name_rows));
+            let rows = self.run(
+                "want[name] <- $names\n\
+                 ?[id, name, kind, file, start_line, signature, visibility, end_line, is_test] := \
+                    want[name], \
+                    *symbol{id, name, kind, file, start_line, signature, visibility, end_line, is_test}",
+                p,
+                ScriptMutability::Immutable,
+            )?;
+            for s in rows_to_symbols(&rows) {
+                by_name.entry(s.name.clone()).or_default().push(s);
+            }
+        }
+
         let mut hits: Vec<DependentHit> = Vec::new();
         for (name, d) in names {
-            for symbol in self.find_symbol(&name)? {
-                hits.push(DependentHit { symbol, depth: d, approx: true });
-                if hits.len() >= max {
-                    return Ok(hits);
+            if let Some(syms) = by_name.remove(&name) {
+                for symbol in syms {
+                    hits.push(DependentHit { symbol, depth: d, approx: true });
+                    if hits.len() >= max {
+                        return Ok(hits);
+                    }
                 }
             }
         }
@@ -1019,11 +1056,22 @@ reach[x, y] := reach[x, z], calls[z, y]
         Ok(rows.rows.first().map(|r| cell_str(r, 0)))
     }
 
-    /// Upsert a computed digest for `(file, content_hash)`.
+    /// Upsert a computed digest for `file`, keeping at most ONE row per file.
     pub fn put_digest(&self, file: &str, content_hash: &str, text: &str, ts_ms: i64) -> AppResult<()> {
         let mut p = BTreeMap::new();
         p.insert("file".to_string(), DataValue::Str(file.into()));
         p.insert("hash".to_string(), DataValue::Str(content_hash.into()));
+        // F11: drop any superseded-hash rows for this file BEFORE inserting the
+        // current one. The relation is keyed `(file, content_hash)`, so without
+        // this every edit left its old digest row behind forever —
+        // `prune_orphan_digests` only removes rows whose FILE is gone, so a
+        // still-indexed file leaked one dead row per edit and `digest_count`
+        // (the coverage readout) over-reported far above the real cache state.
+        self.run_mut(
+            "?[file, content_hash] := *digest{file, content_hash}, file == $file, content_hash != $hash\n\
+             :rm digest {file, content_hash}",
+            p.clone(),
+        )?;
         p.insert("text".to_string(), DataValue::Str(text.into()));
         p.insert("ts".to_string(), DataValue::Num(Num::Int(ts_ms)));
         self.run_mut(
@@ -2074,21 +2122,6 @@ impl GraphIndex {
         Ok(rows.rows.first().map(|r| cell_str(r, 0)))
     }
 
-    /// The most recent event timestamp (ms) for `path` in `session_id`, or
-    /// `None` if this session never touched that file. Feeds the V11 read
-    /// advisor's "already seen this file" check. `path` is project-relative.
-    pub fn mem_file_last_event_ms(&self, session_id: &str, path: &str) -> AppResult<Option<i64>> {
-        let mut p = BTreeMap::new();
-        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
-        p.insert("path".to_string(), DataValue::Str(path.into()));
-        let rows = self.run(
-            "?[ts_ms] := *mem_event{session_id, path, ts_ms}, session_id == $sid, path == $path",
-            p,
-            ScriptMutability::Immutable,
-        )?;
-        Ok(rows.rows.iter().map(|r| cell_i64(r, 0)).max())
-    }
-
     /// V14 Phase D2: the agent tag currently stored for `session_id` (`"claude"`
     /// / `"opencode"`), or `None` if the session has no row yet. Used so a
     /// SECOND writer to the same session (the read advisor's "remind"
@@ -2397,12 +2430,16 @@ impl GraphIndex {
                     tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
                     tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
                     tx_run(tx, "?[note_id] := *mem_note{note_id, session_id}, session_id == $sid\n:rm mem_note {note_id}", p.clone())?;
+                    // F5: drop the distilled flag too, else a cleared session
+                    // stays marked distilled and its later work is never distilled.
+                    tx_run(tx, "?[session_id] := *session_distilled{session_id}, session_id == $sid\n:rm session_distilled {session_id}", p.clone())?;
                     tx_run(tx, "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}", p)?;
                 }
                 None => {
                     tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}\n:rm mem_event {session_id, seq}", BTreeMap::new())?;
                     tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}\n:rm usage_stat {session_id, seq}", BTreeMap::new())?;
                     tx_run(tx, "?[note_id] := *mem_note{note_id}\n:rm mem_note {note_id}", BTreeMap::new())?;
+                    tx_run(tx, "?[session_id] := *session_distilled{session_id}\n:rm session_distilled {session_id}", BTreeMap::new())?;
                     tx_run(tx, "?[session_id] := *session{session_id}\n:rm session {session_id}", BTreeMap::new())?;
                 }
             }
@@ -2787,6 +2824,12 @@ fn prune_sessions_in_tx(tx: &MultiTransaction) -> AppResult<()> {
         tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
         tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
         tx_run(tx, "?[note_id] := *mem_note{note_id, session_id, pinned}, session_id == $sid, pinned == false\n:rm mem_note {note_id}", p.clone())?;
+        // F5: also drop the distilled-flag row. Without this it leaks one row per
+        // evicted session forever, and — because a Claude `session_id` is the
+        // transcript UUID (stable across `--resume`/`--continue`) — a resumed
+        // session that was evicted would hit `is_session_distilled == true` and
+        // the idle sweep would skip distilling all its NEW work.
+        tx_run(tx, "?[session_id] := *session_distilled{session_id}, session_id == $sid\n:rm session_distilled {session_id}", p.clone())?;
         tx_run(tx, "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}", p)?;
     }
     Ok(())
@@ -3311,6 +3354,14 @@ pub struct Point { x: i32 }
         assert!(idx.get_digest("src/a.rs", "h2").unwrap().is_none());
         assert_eq!(idx.digest_count().unwrap(), 1);
 
+        // F11: re-digesting the SAME file under a new hash supersedes the old
+        // row rather than leaking it — the count stays 1 and the stale hash is
+        // no longer a hit.
+        idx.put_digest("src/a.rs", "h2", "updated digest", 200).unwrap();
+        assert_eq!(idx.digest_count().unwrap(), 1, "one digest per file, not per edit");
+        assert!(idx.get_digest("src/a.rs", "h1").unwrap().is_none(), "old hash superseded");
+        assert_eq!(idx.get_digest("src/a.rs", "h2").unwrap().as_deref(), Some("updated digest"));
+
         // A digest for a file no longer indexed is pruned; the live one stays.
         idx.put_digest("gone.rs", "hx", "orphan", 100).unwrap();
         assert_eq!(idx.digest_count().unwrap(), 2);
@@ -3365,9 +3416,11 @@ pub struct Point { x: i32 }
         assert!(outline.iter().any(|s| s.name == "add"));
         assert!(outline.windows(2).all(|w| w[0].start_line <= w[1].start_line));
 
-        // transitive: add -> helper.
+        // transitive: add -> helper (forward), and helper <- add (backward).
         let reach = idx.transitive("add", true).expect("transitive");
         assert!(reach.contains(&"helper".to_string()));
+        let back = idx.transitive("helper", false).expect("transitive back");
+        assert!(back.contains(&"add".to_string()), "add transitively calls helper");
 
         // doc search finds the "Adds two numbers." chunk.
         let docs = idx.search_docs("numbers", 10, 200).expect("docs");
@@ -4509,6 +4562,46 @@ pub struct Point { x: i32 }
         // A cutoff before either session's last activity excludes both (not
         // idle yet).
         assert!(idx.sessions_idle_undistilled(50).unwrap().is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_distilled_flag_dropped_on_clear_and_eviction() {
+        // F5: the distilled flag must not outlive its session — neither a
+        // mem_clear nor an eviction may leave an orphan row (which would wrongly
+        // suppress distillation if the same session id recurs, e.g. a resumed
+        // Claude transcript UUID).
+        let dir = std::env::temp_dir().join(format!("ckg-distdrop-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        // mem_clear(Some) drops only the target's flag.
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s2", "claude", "read", "b.rs", None, None, 200, None).unwrap();
+        idx.mark_session_distilled("s1", 150).unwrap();
+        idx.mark_session_distilled("s2", 250).unwrap();
+        idx.mem_clear(Some("s1")).unwrap();
+        assert!(!idx.is_session_distilled("s1").unwrap(), "s1 flag cleared");
+        assert!(idx.is_session_distilled("s2").unwrap(), "s2 flag untouched");
+
+        // mem_clear(None) drops the rest.
+        idx.mem_clear(None).unwrap();
+        assert!(!idx.is_session_distilled("s2").unwrap(), "whole-project clear drops s2 flag");
+
+        // Eviction cascades the flag too: mark s0 distilled, then push it past
+        // the cap with newer sessions.
+        idx.record_mem_event("s0", "claude", "read", "a.rs", None, None, 0, None).unwrap();
+        idx.mark_session_distilled("s0", 1).unwrap();
+        for i in 0..MAX_SESSIONS_PER_ROOT {
+            let sid = format!("n{}", i + 1);
+            idx.record_mem_event(&sid, "claude", "read", "a.rs", None, None, 1000 + i as i64, None)
+                .unwrap();
+        }
+        assert!(
+            !idx.is_session_distilled("s0").unwrap(),
+            "evicted session's distilled flag was cascaded away"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

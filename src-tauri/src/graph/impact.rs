@@ -74,7 +74,26 @@ pub fn changed_symbols(root: &Path, index: &GraphIndex) -> AppResult<ChangedSet>
     }
 
     let mut ranges: HashMap<String, Vec<LineRange>> = HashMap::new();
-    if let Ok(diff) = run_git(root, &["diff", "--unified=0", "HEAD"]) {
+    // F17: harden the diff invocation like the sibling `git status` below.
+    // `core.quotePath=false` stops git C-quoting non-ASCII paths (`"b/caf\303\251.rs"`),
+    // and pinning `diff.mnemonicPrefix=false`/`diff.noprefix=false` guarantees the
+    // `a/`…`b/` prefixes `parse_diff_new_path` strips — a user's `diff.mnemonicPrefix`
+    // (→ `w/`) or `diff.noprefix` config would otherwise mangle the path so it never
+    // matches the indexed one, silently dropping those changed symbols from impact.
+    if let Ok(diff) = run_git(
+        root,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "diff.mnemonicPrefix=false",
+            "-c",
+            "diff.noprefix=false",
+            "diff",
+            "--unified=0",
+            "HEAD",
+        ],
+    ) {
         parse_unified_diff(&diff, &mut ranges);
     }
 
@@ -131,10 +150,13 @@ pub fn changed_symbols(root: &Path, index: &GraphIndex) -> AppResult<ChangedSet>
 /// Parse `git diff --unified=0 HEAD` output into per-file new-side changed
 /// line ranges. Tracks the current file via `+++ b/<path>` lines; hunk
 /// headers (`@@ -a,b +c,d @@`) contribute `[c, c+d-1]` (`d` defaults to 1
-/// when omitted — a 1-line hunk, git's own convention). A pure-deletion hunk
-/// (`d == 0`, no surviving new-side line) contributes nothing — there's
-/// nothing for a symbol span to intersect. A deleted file (`+++ /dev/null`)
-/// is likewise skipped: nothing left to map to a symbol.
+/// when omitted — a 1-line hunk, git's own convention). F18: a pure-deletion
+/// hunk (`d == 0`, no surviving new-side line) is NOT dropped — deleting lines
+/// from inside a live symbol is a genuine behavior change impact should flag,
+/// so it contributes a small range at the deletion point (`c` is the new-file
+/// line just before it, `0` if the file head was cut) so the enclosing symbol's
+/// span still intersects. A deleted FILE (`+++ /dev/null`) is skipped: nothing
+/// left to map to a symbol.
 fn parse_unified_diff(diff: &str, out: &mut HashMap<String, Vec<LineRange>>) {
     let mut current: Option<String> = None;
     // Whether the immediately preceding line was a `--- ` (old-file) header —
@@ -163,6 +185,15 @@ fn parse_unified_diff(diff: &str, out: &mut HashMap<String, Vec<LineRange>>) {
                     out.entry(file.clone()).or_default().push(LineRange {
                         start,
                         end: start + len - 1,
+                    });
+                } else {
+                    // F18: pure deletion. `start` is the new-file line just
+                    // before the cut (0 if the head was deleted); mark it and the
+                    // line after so a symbol that lost interior lines intersects.
+                    let anchor = start.max(1);
+                    out.entry(file.clone()).or_default().push(LineRange {
+                        start: anchor,
+                        end: anchor + 1,
                     });
                 }
             }
@@ -250,10 +281,29 @@ diff --git a/src/c.rs b/src/c.rs
 
         // a.rs: a 3-line addition starting at new-side line 2.
         assert_eq!(out.get("src/a.rs"), Some(&vec![LineRange { start: 2, end: 4 }]));
-        // b.rs: a delete-only hunk contributes no new-side range.
-        assert!(!out.contains_key("src/b.rs"));
-        // c.rs: deleted file (+++ /dev/null) contributes nothing.
+        // b.rs: F18 — a delete-only hunk (`+9,0`) anchors a small range at the
+        // deletion point so the enclosing symbol is still flagged.
+        assert_eq!(out.get("src/b.rs"), Some(&vec![LineRange { start: 9, end: 10 }]));
+        // c.rs: a deleted FILE (+++ /dev/null) still contributes nothing —
+        // there's no surviving symbol to map to.
         assert!(!out.contains_key("src/c.rs"));
+    }
+
+    #[test]
+    fn delete_only_hunk_at_file_head_anchors_at_line_one() {
+        // F18: `+0,0` (head of file cut) clamps the anchor to line 1 rather than 0.
+        let diff = "\
+diff --git a/src/d.rs b/src/d.rs
+--- a/src/d.rs
++++ b/src/d.rs
+@@ -1,3 +0,0 @@
+-a
+-b
+-c
+";
+        let mut out: HashMap<String, Vec<LineRange>> = HashMap::new();
+        parse_unified_diff(diff, &mut out);
+        assert_eq!(out.get("src/d.rs"), Some(&vec![LineRange { start: 1, end: 2 }]));
     }
 
     #[test]

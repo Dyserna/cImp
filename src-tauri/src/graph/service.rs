@@ -194,6 +194,14 @@ pub struct GraphService {
     /// reminded about — one reminder per file per session, so an agent that reads
     /// again after a reminder (it knows better than our heuristic) always passes.
     reminded: StdMutex<HashSet<(String, String)>>,
+    /// V11 Phase E / F4-fix: the content hash the read advisor last observed on
+    /// disk for a `(session_id, rel_path)` — i.e. what the agent actually read
+    /// last time. The staleness check compares against THIS, not the index hash:
+    /// once the watcher re-indexes an edited file the index hash matches the new
+    /// content, but the agent's context still holds the version it read before
+    /// the edit, so comparing to the index would wrongly suppress the re-read it
+    /// genuinely needs. In-memory (a restart just allows a fresh read); capped.
+    read_seen: StdMutex<HashMap<(String, String), String>>,
     /// V11 Phase F: `(root, file, content_hash)` digest jobs currently in flight,
     /// so a cache miss never spawns a duplicate local-model job for the same
     /// content. Keyed by root too, since one service manages multiple projects
@@ -328,6 +336,7 @@ impl GraphService {
             injected: StdMutex::new(HashMap::new()),
             post_compaction: StdMutex::new(HashSet::new()),
             reminded: StdMutex::new(HashSet::new()),
+            read_seen: StdMutex::new(HashMap::new()),
             digest_inflight: StdMutex::new(HashSet::new()),
             auto_check_sessions: StdMutex::new(HashMap::new()),
             auto_check_runner: crate::checks::auto::RootRunner::new(),
@@ -355,7 +364,7 @@ impl GraphService {
         }
         if let Ok(idx) = self.index_for(&root) {
             let cleared = {
-                let _w = self.write_lock.lock().unwrap();
+                let _w = self.write_guard();
                 idx.clear_vectors()
             };
             // Don't silently no-op: if the clear failed (e.g. the store was
@@ -374,7 +383,7 @@ impl GraphService {
             // leaving stale code vectors behind under a fresh doc epoch.
             if snap.embed_code_bodies {
                 let cleared_code = {
-                    let _w = self.write_lock.lock().unwrap();
+                    let _w = self.write_guard();
                     idx.clear_code_vectors()
                 };
                 if let Err(e) = cleared_code {
@@ -643,6 +652,12 @@ impl GraphService {
                     return;
                 }
             }
+            // F12: bound the map — nothing prunes it when a session ends, so it
+            // grew one entry per session id for the process lifetime. Clearing is
+            // safe (a dropped entry just allows one immediate emit).
+            if m.len() > 1024 && !m.contains_key(session_id) {
+                m.clear();
+            }
             m.insert(session_id.to_string(), now);
         }
         if let Ok(totals) = idx.usage_session_totals(session_id) {
@@ -906,6 +921,12 @@ impl GraphService {
                 None => set.clear(),
             }
         }
+        if let Ok(mut seen) = self.read_seen.lock() {
+            match session_id {
+                Some(s) => seen.retain(|(sid, _), _| sid != s),
+                None => seen.clear(),
+            }
+        }
         // V12 review: `auto_check_sessions` (debounce/baseline/pending state
         // for `/context/post_edit`) grows per session and was never evicted —
         // clear the same scope here too, mirroring `injected`/`greeted`/`reminded`.
@@ -915,6 +936,27 @@ impl GraphService {
                     sessions.remove(s);
                 }
                 None => sessions.clear(),
+            }
+        }
+        // F14: also drop the post-compaction flag. Left set, `should_read`
+        // short-circuits to "pass every read" for the cleared session until the
+        // next `retrieve_context` happens to clear it — silently disabling the
+        // read advisor for that session in the interim.
+        if let Ok(mut set) = self.post_compaction.lock() {
+            match session_id {
+                Some(s) => {
+                    set.remove(s);
+                }
+                None => set.clear(),
+            }
+        }
+        // F12: and the usage-emit debounce timestamps, which nothing else prunes.
+        if let Ok(mut m) = self.usage_emit_debounce.lock() {
+            match session_id {
+                Some(s) => {
+                    m.remove(s);
+                }
+                None => m.clear(),
             }
         }
         Ok(())
@@ -1115,8 +1157,8 @@ impl GraphService {
                 let mut map = self.injected.lock().unwrap();
                 // Bound the per-session dedup state: nothing prunes it when a
                 // session simply ends, so cap it (clearing is safe — it just
-                // re-injects once). The greeted/reminded sets hold only small
-                // strings and aren't worth a cap.
+                // re-injects once). The greeted/reminded/read_seen sets are
+                // likewise capped at their own insert sites (F13).
                 if map.len() > 1024 && !map.contains_key(s) {
                     map.clear();
                 }
@@ -1280,8 +1322,16 @@ impl GraphService {
         if map.is_empty() {
             return None;
         }
-        // Mark greeted (a rare concurrent double-render is harmless).
-        self.greeted.lock().ok()?.insert(sid.to_string());
+        // Mark greeted (a rare concurrent double-render is harmless). F13: cap
+        // the set — nothing prunes it when a session ends, so it grew one entry
+        // per greeted session for the process lifetime.
+        {
+            let mut set = self.greeted.lock().ok()?;
+            if set.len() > 1024 && !set.contains(sid) {
+                set.clear();
+            }
+            set.insert(sid.to_string());
+        }
         Some(map)
     }
 
@@ -1355,18 +1405,33 @@ impl GraphService {
             return None;
         }
         let idx = self.index_for(root).ok()?;
-        // Never seen this file this session ⇒ pass (the `?` returns on `None`).
-        idx.mem_file_last_event_ms(sid, &rel).ok().flatten()?;
 
         let abs = root.join(&rel);
         let content = std::fs::read_to_string(&abs).ok()?;
-        // Changed since it was indexed ⇒ pass. Compared by content hash (like
-        // `graph_snippet`'s staleness check) rather than mtime-vs-event-time,
-        // which a filesystem clock skew (network shares, WSL2 bind-mounts) could
-        // make wrong. Not indexed ⇒ pass.
-        match idx.stored_file_hash(&rel).ok().flatten() {
-            Some(indexed) if indexed == super::model::fnv1a_hex(&content) => {}
-            _ => return None,
+        let cur_hash = super::model::fnv1a_hex(&content);
+        // Compare against what the agent ACTUALLY read last time, not the index
+        // hash. Comparing to the index is wrong: once the watcher re-indexes an
+        // edited file, the index hash equals the NEW content, yet the agent's
+        // context still holds the version it read before the edit — so an
+        // index-hash match would wrongly suppress the re-read it genuinely needs.
+        // A file not yet read this session, or one whose content differs from the
+        // last read we observed, passes (and records the new hash) — content
+        // hash rather than mtime, so a filesystem clock skew (network shares,
+        // WSL2 bind-mounts) can't make it wrong.
+        {
+            let mut seen = self.read_seen.lock().ok()?;
+            match seen.get(&key) {
+                Some(prev) if *prev == cur_hash => {}
+                _ => {
+                    // Bound the map: nothing prunes it when a session ends
+                    // (clearing is safe — it just allows a fresh read once).
+                    if seen.len() > 1024 && !seen.contains_key(&key) {
+                        seen.clear();
+                    }
+                    seen.insert(key.clone(), cur_hash);
+                    return None;
+                }
+            }
         }
         // Small files are cheap to re-read ⇒ pass.
         if (content.lines().count() as u32) < g.read_advisor_min_lines {
@@ -1376,16 +1441,25 @@ impl GraphService {
         // Remind. Build usable content, record the reminder, and log it.
         let substitute = g.read_advisor_mode.eq_ignore_ascii_case("substitute");
         let text = super::context::read_advice(&idx, root, &rel, offset, substitute, g.max_body_bytes as usize);
-        self.reminded.lock().ok()?.insert(key);
+        // F13: cap the set — one entry per (session, file), never pruned on
+        // session end (clearing is safe: a dropped key just allows one re-remind).
+        {
+            let mut set = self.reminded.lock().ok()?;
+            if set.len() > 4096 && !set.contains(&key) {
+                set.clear();
+            }
+            set.insert(key);
+        }
         let ts = super::activity::now_ms() as i64;
         // V14 Phase D2: also persist a root+session-scoped `mem_event{kind:
         // "remind"}` row — distinct from the process-wide Activity event
         // below — so `GraphIndex::advisor_reread_rate` can precisely check
         // whether the agent re-read this exact file afterward. Reuses the
-        // session's ALREADY-established agent (never a fabricated tag): a
-        // reminder requires `mem_file_last_event_ms` to have found a prior
-        // event for this (session, file) above, so the session row is
-        // guaranteed to already exist with its real agent.
+        // session's real agent when known: reaching this branch means the agent
+        // has already read this file at least once this session (`read_seen`
+        // held its prior hash), and each executed read records a session event,
+        // so the session row normally exists — `"claude"` is a safe default if
+        // the lookup somehow misses rather than fabricating a tag.
         let agent = idx.session_agent(sid).ok().flatten().unwrap_or_else(|| "claude".to_string());
         let _ = idx.record_mem_event(sid, &agent, "remind", &rel, None, None, ts, None);
         // Activity: `chars` is the reminder's actual size (what we returned),
@@ -1759,7 +1833,7 @@ impl GraphService {
         let idx = self.index_for(root)?;
         // Hold the store-write lock across the whole rebuild so a concurrent
         // watcher batch can't write into the store mid-`reset()`.
-        let _w = self.write_lock.lock().unwrap();
+        let _w = self.write_guard();
         let (indexed, stats) = build_tree(&idx, root, &snap, &self.db_subdir())?;
 
         // Record the visited-file count alongside the authoritative row counts.
@@ -1824,7 +1898,7 @@ impl GraphService {
         let max_bytes = snap.max_file_bytes.max(1);
         let gi = build_gitignore(root, &paths);
 
-        let _w = self.write_lock.lock().unwrap();
+        let _w = self.write_guard();
         let mut changed = 0u64;
         // V12 Phase D: rel paths touched this batch (indexed OR removed), fed
         // to `gitmeta::collect_for` below for an incremental churn refresh —
@@ -1965,6 +2039,16 @@ impl GraphService {
         });
     }
 
+    /// Acquire the rebuild-serialization lock, tolerating a poisoned mutex (F9).
+    /// `write_lock` guards nothing but `()` — it only serializes writers — so a
+    /// panic in a prior holder (e.g. tree-sitter choking on pathological input
+    /// mid-rebuild) leaves no corrupt state, and must NOT permanently wedge every
+    /// future rebuild/backfill with a poison cascade through each `.unwrap()`.
+    /// Recovering the guard from the poison error keeps writers serialized.
+    fn write_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Run a store mutation under `write_lock` on a blocking thread, returning
     /// its result. An `async` caller must use this instead of locking
     /// `write_lock` directly: a full rebuild can hold the lock for many seconds,
@@ -1978,7 +2062,7 @@ impl GraphService {
     {
         let this = self.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let _w = this.write_lock.lock().unwrap();
+            let _w = this.write_guard();
             f()
         })
         .await

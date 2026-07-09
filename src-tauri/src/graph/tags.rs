@@ -16,7 +16,7 @@
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
-use crate::graph::builder::{emit_symbol, language_for};
+use crate::graph::builder::{char_col, emit_symbol, language_for};
 use crate::graph::model::{symbol_id, Edge, EdgeKind, FileGraph, Lang, Reference, SymbolKind, Visibility};
 
 /// A grammar + its vendored tags query.
@@ -58,16 +58,29 @@ pub(crate) fn tag_spec(lang: Lang) -> Option<TagSpec> {
 
 /// V12 Phase C **fallback** test detection for the generic tags engine: no
 /// vendored `tags.scm` currently ships a `@definition.test` capture, so every
-/// generic-tags language falls back to a path heuristic — Go's `_test.go`
-/// filename suffix, or a `tests/`/`spec/` path segment (Ruby's RSpec
-/// convention, and the common `tests/` layout several other grammars here
-/// share). Applied to Function/Method definitions only. A language whose
-/// project doesn't follow either convention simply never sets the bit —
-/// accurate, not wrong, the same posture as [`tags_visibility`]'s `Unknown`.
-fn tags_is_test_path(file: &str) -> bool {
+/// generic-tags language falls back to a path heuristic. The conventions are
+/// scoped per language rather than applied globally — the `spec/` segment is
+/// **Ruby-specific** (RSpec), and applying it language-agnostically wrongly
+/// tagged every symbol in an unrelated `spec/` directory (OpenAPI / protocol
+/// specs are common in Go/Kotlin/Swift/… projects). Kept broad: Go's `_test.go`
+/// filename suffix, and the widely shared `tests/` directory layout. Applied to
+/// Function/Method definitions only. A project that follows no convention simply
+/// never sets the bit — accurate, not wrong, the same posture as
+/// [`tags_visibility`]'s `Unknown`.
+fn tags_is_test_path(lang: Lang, file: &str) -> bool {
     let lower = file.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
-    name.ends_with("_test.go") || lower.split('/').any(|seg| seg == "tests" || seg == "spec")
+    if name.ends_with("_test.go") {
+        return true;
+    }
+    let has_seg = |seg: &str| lower.split('/').any(|s| s == seg);
+    match lang {
+        // RSpec's `spec/` and minitest's `test/`, both Ruby conventions.
+        Lang::Ruby => has_seg("tests") || has_seg("spec") || has_seg("test"),
+        // `tests/` is the cross-language test-dir convention; `spec/` is NOT
+        // applied here (it is not a test directory outside Ruby).
+        _ => has_seg("tests"),
+    }
 }
 
 /// Best-effort visibility for a generic-tags language. Only Go is decidable
@@ -178,12 +191,12 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
                 let name = node_text(src, nn);
                 let name = name.trim();
                 if !name.is_empty() {
-                    let p = nn.start_position();
                     calls.push(CallRef {
                         name: name.to_string(),
                         byte: nn.start_byte(),
-                        line: p.row as u32 + 1,
-                        col: p.column as u32 + 1,
+                        line: nn.start_position().row as u32 + 1,
+                        // F26: character column, not tree-sitter's byte offset.
+                        col: char_col(src, nn),
                     });
                 }
             }
@@ -209,7 +222,8 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
         }
         let parent_id = parent.map(|p| ids[p].as_str());
         let vis = tags_visibility(spec.lang, &d.name);
-        let is_test = matches!(d.kind, SymbolKind::Function | SymbolKind::Method) && tags_is_test_path(file);
+        let is_test =
+            matches!(d.kind, SymbolKind::Function | SymbolKind::Method) && tags_is_test_path(spec.lang, file);
         emit_symbol(src, file, d.node, &d.name, d.kind, parent_id, None, vis, is_test, fg);
     }
 
@@ -404,6 +418,22 @@ class Calculator {
         assert!(names_of(&fg, SymbolKind::Class).contains(&"Calculator".to_string()));
         assert!(names_of(&fg, SymbolKind::Method).contains(&"add".to_string()));
         assert!(call_targets(&fg).contains(&"compute".to_string()));
+    }
+
+    #[test]
+    fn test_path_heuristic_scopes_spec_to_ruby() {
+        // F3: `spec/` is RSpec-only — it must not tag non-Ruby files (OpenAPI /
+        // protocol `spec/` dirs are common in Go/Swift/Kotlin projects).
+        assert!(!tags_is_test_path(Lang::Go, "api/spec/openapi.go"));
+        assert!(!tags_is_test_path(Lang::Swift, "sources/spec/model.swift"));
+        assert!(tags_is_test_path(Lang::Ruby, "spec/models/user_spec.rb"));
+        // `tests/` is the shared cross-language convention.
+        assert!(tags_is_test_path(Lang::Java, "tests/footest.java"));
+        assert!(tags_is_test_path(Lang::Go, "tests/integration.go"));
+        // Go's own `_test.go` suffix works anywhere.
+        assert!(tags_is_test_path(Lang::Go, "pkg/foo_test.go"));
+        // A plain source file is not a test.
+        assert!(!tags_is_test_path(Lang::Go, "pkg/foo.go"));
     }
 }
 

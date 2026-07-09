@@ -369,17 +369,27 @@ pub(crate) async fn dispatch_recorded(
     let (max_rows, max_snippet) = limits(settings);
     let started = super::activity::now_ms();
     let result = if name == "graph_semantic_docs" {
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        semantic_query(idx, settings, query, max_rows, max_snippet).await
+        // F8: `query` is schema-required — enforce it on THIS (primary async)
+        // path too, not just in `run_tool`. An empty query would embed "" and
+        // present arbitrary nearest-neighbour rows (or, on the embedder-down
+        // fallback, unrelated full-text rows) as if they were matches.
+        match require_str(args, name, "query") {
+            Ok(query) => semantic_query(idx, settings, &query, max_rows, max_snippet).await,
+            Err(e) => Err(e),
+        }
     } else if name == "graph_semantic_code" {
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let k = args
-            .get("k")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(max_rows)
-            .clamp(1, max_rows.max(1));
-        semantic_code_query(idx, settings, query, k).await
+        match require_str(args, name, "query") {
+            Ok(query) => {
+                let k = args
+                    .get("k")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(max_rows)
+                    .clamp(1, max_rows.max(1));
+                semantic_code_query(idx, settings, &query, k).await
+            }
+            Err(e) => Err(e),
+        }
     } else if name == "graph_struct_search" {
         run_struct_search(root, idx, args, max_rows, max_snippet)
     } else if name == "graph_snippet" {
@@ -430,6 +440,20 @@ fn arg_summary(name: &str, args: &Value) -> String {
 /// Run one graph tool against an open index and format its result as compact,
 /// token-bounded text. Shared by the MCP adapter and the offload worker. `Err`
 /// is a human-readable message the caller surfaces to its model.
+/// A required string arg. Rejects missing / blank / wrong-typed values rather
+/// than silently coercing them to "" — a `find_symbol("")` (from a `null` or
+/// numeric arg the LLM sent) would otherwise match everything or nothing and
+/// mislead the model instead of surfacing a clear error. Returns the value
+/// TRIMMED (F20): an LLM commonly emits a trailing space/newline (`"foo "`),
+/// which must resolve the same as `"foo"` rather than silently missing.
+fn require_str(args: &Value, tool: &str, key: &str) -> Result<String, String> {
+    match args.get(key) {
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+        Some(Value::String(_)) | None => Err(format!("{tool} requires a non-empty string `{key}`")),
+        Some(_) => Err(format!("{tool} argument `{key}` must be a string")),
+    }
+}
+
 pub fn run_tool(
     idx: &GraphIndex,
     name: &str,
@@ -444,19 +468,7 @@ pub fn run_tool(
     let arg = |key: &str| -> String {
         args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
     };
-    // A required string arg. Rejects missing / blank / wrong-typed values rather
-    // than silently coercing them to "" — a `find_symbol("")` (from a `null` or
-    // numeric arg the LLM sent) would otherwise match everything or nothing and
-    // mislead the model instead of surfacing a clear error.
-    let req = |key: &str| -> Result<String, String> {
-        match args.get(key) {
-            Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
-            Some(Value::String(_)) | None => {
-                Err(format!("{name} requires a non-empty string `{key}`"))
-            }
-            Some(_) => Err(format!("{name} argument `{key}` must be a string")),
-        }
-    };
+    let req = |key: &str| require_str(args, name, key);
     match name {
         "graph_find_symbol" => idx
             .find_symbol(&req("name")?)
@@ -551,7 +563,21 @@ pub fn run_tool(
         "context_note" => {
             let text = req("text")?;
             let pin = args.get("pin").and_then(|v| v.as_bool()).unwrap_or(false);
-            let sid = idx.mem_current_session_for(agent).map_err(|e| e.to_string())?.unwrap_or_default();
+            // F21: an UNPINNED note needs a real session to attach to — with none,
+            // it would be stored under a sentinel "" id and never resurface in the
+            // working set the model reloads, yet the old code still said "Noted."
+            // A PINNED note is global (surfaces regardless of session), so accept
+            // it; otherwise refuse honestly instead of silently orphaning it.
+            let sid = match idx.mem_current_session_for(agent).map_err(|e| e.to_string())? {
+                Some(s) => s,
+                None if pin => String::new(),
+                None => {
+                    return Ok("No active session to attach this note to yet — retry once the \
+                               session has activity, or pass `pin: true` to save it as a durable \
+                               pinned note."
+                        .to_string())
+                }
+            };
             let note_id = uuid::Uuid::new_v4().to_string();
             let ts = super::activity::now_ms() as i64;
             idx.mem_add_note(&note_id, &sid, &text, ts, pin)
@@ -823,7 +849,16 @@ async fn semantic_code_query(
     };
     let qv = match embedder.embed_one(query).await {
         Ok(v) => v,
-        Err(_) => return unavailable(),
+        // F22: a configured-but-UNREACHABLE embedder is a genuine outage, not a
+        // benign miss (feature off / no vectors yet). Return Err so the activity
+        // ring records ok=false instead of a steady stream of "unavailable"
+        // successes that mask the outage — while still guiding the model.
+        Err(e) => {
+            return Err(format!(
+                "semantic code search: embedding backend unreachable ({e}); \
+                 try `graph_find_symbol` or `graph_struct_search` instead"
+            ))
+        }
     };
     match idx.semantic_code_search(&qv, &epoch, k) {
         Ok(hits) if !hits.is_empty() => {
@@ -1282,7 +1317,11 @@ fn run_repo_map(
     let budget = args
         .get("budget_chars")
         .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
+        // F19: clamp the model-supplied value like every sibling int arg. Raw, a
+        // `budget_chars: 900000000` emits a map far larger than the budget this
+        // tool exists to conserve (blowing the context window), and `0` yields a
+        // degenerate empty map with no error.
+        .map(|n| (n as usize).clamp(500, 200_000))
         .unwrap_or(settings.graph.repo_map_budget_chars as usize);
     let boost = repo_map_session_boost(idx, agent);
     let map = super::context::repo_map(idx, budget, &boost);

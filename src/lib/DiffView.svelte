@@ -7,6 +7,7 @@
   // those whenever a new summary lands (a cheap re-diff per expanded file,
   // not a rebuild of the whole view).
   import { onMount, onDestroy } from 'svelte';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
   import {
     workbenchDiffFile,
@@ -20,10 +21,14 @@
   import { pairHunkLines, wordDiff } from './diffWords';
   import { openComposeWith } from './composeState';
 
-  let expanded = $state<Set<string>>(new Set());
-  let fileDiffs = $state<Map<string, FileDiff>>(new Map());
-  let fileErrors = $state<Map<string, string>>(new Map());
-  let revertErrors = $state<Map<string, string>>(new Map());
+  // SvelteSet/SvelteMap, NOT plain Set/Map in $state: Svelte 5's proxy only
+  // deep-proxies plain objects/arrays, so in-place .add()/.set() on a plain
+  // collection triggers no re-render — expanding a file would only become
+  // visible whenever the next summary refresh happened to re-render the list.
+  const expanded = new SvelteSet<string>();
+  const fileDiffs = new SvelteMap<string, FileDiff>();
+  const fileErrors = new SvelteMap<string, string>();
+  const revertErrors = new SvelteMap<string, string>();
   let viewMode = $state<'unified' | 'side-by-side'>('unified');
 
   let release: (() => void) | null = null;
@@ -36,12 +41,22 @@
     release = null;
   });
 
+  // Per-path fetch tokens: successive summaries can put two
+  // `workbench_diff_file` calls for one path in flight (edit → revert in
+  // quick succession), and without this the FIRST (stale) response resolving
+  // last would clobber the fresher diff — same out-of-order guard the
+  // summary store's `refreshSeq` applies at its level.
+  const loadSeq = new Map<string, number>();
   async function loadFile(path: string): Promise<void> {
+    const seq = (loadSeq.get(path) ?? 0) + 1;
+    loadSeq.set(path, seq);
     try {
       const fd = await workbenchDiffFile(path);
+      if (loadSeq.get(path) !== seq) return; // a newer fetch superseded this one
       fileDiffs.set(path, fd);
       fileErrors.delete(path);
     } catch (e) {
+      if (loadSeq.get(path) !== seq) return;
       fileErrors.set(path, String(e));
       console.warn('workbench_diff_file failed:', e);
     }
@@ -102,8 +117,23 @@
   // that a hunk revert is a one-click, easily-redone-by-hand action.
   const REVERT_CONFIRM_LINES = 20;
 
-  async function doRevert(path: string, hunkIndex: number, hunk: Hunk): Promise<void> {
-    if (hunk.lines.length > REVERT_CONFIRM_LINES) {
+  // The file list renders plain rows (no windowing), so cap it: a pathological
+  // change set (first snapshot of a vendored tree, say) would otherwise mount
+  // tens of thousands of DOM rows at once and freeze the webview. Per-file
+  // CONTENT is already capped backend-side (1 MiB); this bounds the row count,
+  // with an explicit "showing first N" notice so truncation is never silent.
+  const MAX_FILE_ROWS = 500;
+
+  async function doRevert(path: string, hunkIndex: number, hunk: Hunk, status: FileStatus): Promise<void> {
+    if (status.kind === 'Untracked') {
+      // An untracked file's "diff" is one synthesized whole-file hunk against
+      // /dev/null, so reverting it DELETES the file — and the content exists
+      // nowhere in git, so it's unrecoverable. Always confirm, in delete
+      // terms, regardless of the size threshold below.
+      if (!confirm(`'${path}' is untracked — reverting deletes the whole file from disk, and it isn't in git so it can't be recovered. Delete it?`)) {
+        return;
+      }
+    } else if (hunk.lines.length > REVERT_CONFIRM_LINES) {
       if (!confirm(`Revert this ${hunk.lines.length}-line hunk in ${path}? This edits the file on disk immediately.`)) {
         return;
       }
@@ -132,6 +162,11 @@
       <span class="count">
         {summary.files.length === 0 ? 'No changes' : `${summary.files.length} file${summary.files.length === 1 ? '' : 's'} changed`}
       </span>
+      {#if $workbenchDiffError}
+        <span class="stale-note" title={$workbenchDiffError}>
+          refresh failed — showing the last good diff
+        </span>
+      {/if}
       {#if summary.readonly}
         <span class="readonly-note" title="A merge or rebase is in progress — hunk reverts are disabled until it's resolved.">
           read-only (merge/rebase in progress)
@@ -144,7 +179,10 @@
     </div>
 
     <div class="file-list">
-      {#each summary.files as f (f.path)}
+      {#if summary.files.length > MAX_FILE_ROWS}
+        <p class="msg">Showing the first {MAX_FILE_ROWS} of {summary.files.length} changed files.</p>
+      {/if}
+      {#each summary.files.slice(0, MAX_FILE_ROWS) as f (f.path)}
         <div class="file-row">
           <button
             type="button"
@@ -190,7 +228,7 @@
                           class="revert"
                           disabled={summary.readonly}
                           title={summary.readonly ? 'Disabled — a merge or rebase is in progress' : 'Revert this hunk'}
-                          onclick={() => void doRevert(f.path, hunkIndex, hunk)}
+                          onclick={() => void doRevert(f.path, hunkIndex, hunk, f.status)}
                         >Revert</button>
                       </span>
                     </div>
@@ -283,6 +321,10 @@
     color: var(--text-secondary);
   }
   .readonly-note {
+    color: var(--text-warning);
+    font-size: var(--font-size-xs);
+  }
+  .stale-note {
     color: var(--text-warning);
     font-size: var(--font-size-xs);
   }

@@ -1643,7 +1643,21 @@ pub async fn advisor_dismiss(
 /// separate so `workbench` doesn't couple its root-resolution to `graph`'s.
 fn resolve_workbench_root(root: Option<String>) -> AppResult<std::path::PathBuf> {
     match root {
-        Some(r) if !r.trim().is_empty() => Ok(std::path::PathBuf::from(r)),
+        Some(r) if !r.trim().is_empty() => {
+            let path = std::path::PathBuf::from(r);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                // Absolutize a relative root here at the IPC boundary: the
+                // workbench layer joins sub-paths onto it AND hands it to
+                // spawned `git` as `current_dir`, and git resolves argument
+                // paths relative to that same cwd — a relative root would
+                // double up (`root/root/.cimp/…`).
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(path))
+                    .map_err(|e| AppError::Settings(format!("cwd: {e}")))
+            }
+        }
         _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}"))),
     }
 }
@@ -1814,9 +1828,16 @@ pub async fn workbench_worktree_diff(
 #[tauri::command]
 pub async fn workbench_worktree_create(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    state: State<'_, AppState>,
     root: Option<String>,
     slug: String,
 ) -> AppResult<String> {
+    // Same serializer `create_ai_tab_in_worktree` holds: two concurrent
+    // creates for one slug could otherwise both pass `worktree::create`'s
+    // existence check before either runs `git worktree add` (git's own
+    // locking makes the loser fail, but with an opaque "branch already
+    // exists" instead of the typed duplicate-slug error).
+    let _serializer = state.lifecycle_serializer.lock().await;
     let root = resolve_workbench_root(root)?;
     let path = service.worktree_create(&root, &slug).await?;
     Ok(path.display().to_string())

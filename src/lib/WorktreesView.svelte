@@ -5,6 +5,7 @@
   // Merge / Discard / Open shell here).
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import {
     workbenchWorktrees,
     workbenchWorktreeDiff,
@@ -19,7 +20,7 @@
     type WorktreeCheckStatus,
   } from './workbench';
   import { createShellTab, defaultShellSpec } from './ipc';
-  import { focusedPane, requestTabIntoPane } from './layout/store';
+  import { cancelLastPlacement, focusedPane, requestTabIntoPane } from './layout/store';
   import { pairHunkLines } from './diffWords';
   import { errorMessage } from './errors';
 
@@ -27,15 +28,19 @@
   let loading = $state(true);
   let loadError = $state<string | null>(null);
 
-  let expandedDiff = $state<Set<string>>(new Set());
-  let diffs = $state<Map<string, FileDiff[]>>(new Map());
-  let diffErrors = $state<Map<string, string>>(new Map());
+  // SvelteSet/SvelteMap, NOT plain Set/Map in $state: Svelte 5's proxy only
+  // deep-proxies plain objects/arrays, so in-place .add()/.set() on a plain
+  // collection triggers no re-render — the diff panel, check chips, and row
+  // errors below would silently never appear.
+  const expandedDiff = new SvelteSet<string>();
+  const diffs = new SvelteMap<string, FileDiff[]>();
+  const diffErrors = new SvelteMap<string, string>();
 
-  let checkStatuses = $state<Map<string, WorktreeCheckStatus | null>>(new Map());
-  let checking = $state<Set<string>>(new Set());
+  const checkStatuses = new SvelteMap<string, WorktreeCheckStatus | null>();
+  const checking = new SvelteSet<string>();
 
-  let busySlugs = $state<Set<string>>(new Set());
-  let rowErrors = $state<Map<string, string>>(new Map());
+  const busySlugs = new SvelteSet<string>();
+  const rowErrors = new SvelteMap<string, string>();
 
   async function load(): Promise<void> {
     loading = true;
@@ -44,16 +49,19 @@
       worktrees = await workbenchWorktrees();
       // Pick up the merge-readiness chip's last cached result for each row
       // (doesn't re-run checks — just whatever was last computed this
-      // session).
-      for (const w of worktrees) {
-        if (!checkStatuses.has(w.slug)) {
-          try {
-            checkStatuses.set(w.slug, await workbenchWorktreeCheckStatus(w.slug));
-          } catch {
-            // Non-fatal — the chip just shows "not checked yet".
-          }
-        }
-      }
+      // session). Fetched concurrently — serial awaits would add one IPC
+      // round-trip of latency per worktree.
+      await Promise.all(
+        worktrees
+          .filter((w) => !checkStatuses.has(w.slug))
+          .map(async (w) => {
+            try {
+              checkStatuses.set(w.slug, await workbenchWorktreeCheckStatus(w.slug));
+            } catch {
+              // Non-fatal — the chip just shows "not checked yet".
+            }
+          }),
+      );
     } catch (e) {
       loadError = errorMessage(e);
     } finally {
@@ -87,6 +95,7 @@
   }
 
   async function runChecks(slug: string): Promise<void> {
+    if (checking.has(slug)) return;
     checking.add(slug);
     try {
       const status = await workbenchWorktreeRunChecks(slug);
@@ -155,6 +164,9 @@
         notificationsExited: spec.notifications_exited,
       });
     } catch (e) {
+      // The shell tab was never created, so the pane placement queued above
+      // would mis-route the next tab created anywhere — cancel it.
+      cancelLastPlacement();
       rowErrors.set(w.slug, errorMessage(e));
     }
   }

@@ -88,6 +88,12 @@ impl GitCtx {
 #[derive(Clone, Debug)]
 pub struct GitOutput {
     pub stdout: String,
+    /// Raw stdout bytes, for `-z` consumers whose entries are FILENAMES: on
+    /// Linux a filename may be arbitrary non-UTF-8 bytes, which the lossy
+    /// `stdout` decode corrupts (U+FFFD), so a path re-derived from it no
+    /// longer names the real file. Split these on `0x00` and convert each
+    /// entry via [`bytes_to_path`] instead.
+    pub stdout_bytes: Vec<u8>,
     pub stderr: String,
     pub code: Option<i32>,
 }
@@ -110,10 +116,50 @@ impl GitOutput {
 /// subprocess — so the mapping is unit-testable on its own.
 fn env_overrides(ctx: &GitCtx) -> [(&'static str, Option<PathBuf>); 3] {
     [
-        ("GIT_DIR", ctx.git_dir.clone()),
-        ("GIT_WORK_TREE", ctx.work_tree.clone()),
-        ("GIT_INDEX_FILE", ctx.index_file.clone()),
+        ("GIT_DIR", ctx.git_dir.as_deref().map(subprocess_path)),
+        ("GIT_WORK_TREE", ctx.work_tree.as_deref().map(subprocess_path)),
+        ("GIT_INDEX_FILE", ctx.index_file.as_deref().map(subprocess_path)),
     ]
+}
+
+/// Strip a Windows verbatim prefix (`\\?\C:\…` → `C:\…`, `\\?\UNC\srv\share\…`
+/// → `\\srv\share\…`) from any path handed to the spawned `git`. MSYS git
+/// rejects verbatim paths in the `GIT_DIR`-family env vars (`fatal: not a git
+/// repository: '\\?\…'`), so a caller that normalized its root through
+/// [`canonical_path`] — which returns the verbatim form on Windows — would
+/// otherwise have every shadow-repo command fail (this silently killed the
+/// automatic prompt/burst checkpoints, whose failures are warn-and-drop by
+/// design). Applied centrally here (env vars + `current_dir`) rather than at
+/// each call site so no caller has to know which path spelling is spawn-safe.
+/// The legacy form is equivalent for these paths: they originate as legacy
+/// paths that canonicalization promoted, never as names that REQUIRE the
+/// verbatim form. Non-verbatim paths (and everything on non-Windows) pass
+/// through unchanged.
+fn subprocess_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let base = match prefix.kind() {
+        Prefix::VerbatimDisk(letter) => PathBuf::from(format!(r"{}:\", letter as char)),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut s = std::ffi::OsString::from(r"\\");
+            s.push(server);
+            s.push(r"\");
+            s.push(share);
+            s.push(r"\");
+            PathBuf::from(s)
+        }
+        _ => return path.to_path_buf(),
+    };
+    let mut out = base;
+    for component in components {
+        if let Component::Normal(part) = component {
+            out.push(part);
+        }
+    }
+    out
 }
 
 /// Run `git <args>` against `ctx`, console-suppressed on Windows (the
@@ -159,7 +205,7 @@ async fn run_inner(
 
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
-        .current_dir(&ctx.root)
+        .current_dir(subprocess_path(&ctx.root))
         .stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -167,6 +213,11 @@ async fn run_inner(
         // it a timed-out `git` (e.g. hung on a credential prompt) would keep
         // running detached instead of being reaped.
         .kill_on_drop(true);
+    // Pin the child's locale: several callers parse git's human-readable
+    // output (`worktree::merge` matches "Fast-forward" on stdout), which is
+    // localized under a non-English LANG/LC_ALL and would silently
+    // mis-parse. `-z`/porcelain outputs are locale-independent either way.
+    cmd.env("LC_ALL", "C");
     for (key, value) in env_overrides(ctx) {
         match value {
             Some(v) => {
@@ -229,9 +280,28 @@ async fn run_inner(
 
     Ok(GitOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stdout_bytes: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         code: output.status.code(),
     })
+}
+
+/// Convert one raw `-z` entry (a filename as git printed it) into a
+/// filesystem path. On Unix a filename is an arbitrary byte sequence and
+/// must round-trip exactly — a lossy UTF-8 decode would substitute U+FFFD
+/// and the resulting path would silently miss the real file (e.g.
+/// `restore`'s `delete_new` failing to delete it). On Windows git emits
+/// valid Unicode, so the lossy decode is exact there.
+pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 /// Normalize a path into a stable key for comparison and caching that survives
@@ -329,6 +399,60 @@ mod tests {
             overrides[2],
             ("GIT_INDEX_FILE", Some(PathBuf::from("/project/.cimp/shadow.git/index")))
         );
+    }
+
+    /// Verbatim (`\\?\`) forms must be stripped before reaching the spawned
+    /// `git` — MSYS git rejects them in `GIT_DIR`-family env vars, which is
+    /// how the automatic checkpoints silently broke (their caller normalizes
+    /// the root via [`canonical_path`], which returns the verbatim form on
+    /// Windows). Windows-only: `Prefix` parsing doesn't exist elsewhere.
+    #[test]
+    #[cfg(windows)]
+    fn subprocess_path_strips_verbatim_prefixes() {
+        assert_eq!(subprocess_path(Path::new(r"\\?\C:\proj\sub")), PathBuf::from(r"C:\proj\sub"));
+        assert_eq!(
+            subprocess_path(Path::new(r"\\?\UNC\srv\share\proj")),
+            PathBuf::from(r"\\srv\share\proj")
+        );
+        // Non-verbatim spellings pass through untouched.
+        assert_eq!(subprocess_path(Path::new(r"C:\proj")), PathBuf::from(r"C:\proj"));
+        assert_eq!(subprocess_path(Path::new(r"\\srv\share\proj")), PathBuf::from(r"\\srv\share\proj"));
+    }
+
+    #[test]
+    fn bytes_to_path_roundtrips_plain_names() {
+        assert_eq!(bytes_to_path(b"src/a.txt"), PathBuf::from("src/a.txt"));
+    }
+
+    /// On Unix, non-UTF-8 filename bytes must survive exactly — that's the
+    /// whole reason `-z` consumers go through bytes instead of the lossy
+    /// `stdout` string.
+    #[test]
+    #[cfg(unix)]
+    fn bytes_to_path_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw: &[u8] = b"caf\xe9.txt"; // latin-1 e-acute — invalid UTF-8
+        assert_eq!(bytes_to_path(raw).as_os_str().as_bytes(), raw);
+    }
+
+    #[test]
+    fn subprocess_path_passes_through_prefixless_paths() {
+        assert_eq!(subprocess_path(Path::new("/project/sub")), PathBuf::from("/project/sub"));
+        assert_eq!(subprocess_path(Path::new("relative/path")), PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn env_overrides_strip_verbatim_from_every_var() {
+        let ctx = GitCtx::shadow(
+            PathBuf::from(r"\\?\C:\proj"),
+            PathBuf::from(r"\\?\C:\proj\.cimp\shadow.git"),
+            PathBuf::from(r"\\?\C:\proj\.cimp\shadow.git\index"),
+        );
+        let overrides = env_overrides(&ctx);
+        assert_eq!(overrides[0].1, Some(PathBuf::from(r"C:\proj\.cimp\shadow.git")));
+        assert_eq!(overrides[1].1, Some(PathBuf::from(r"C:\proj")));
+        assert_eq!(overrides[2].1, Some(PathBuf::from(r"C:\proj\.cimp\shadow.git\index")));
     }
 
     /// The safety property: a `GitCtx::discover` (all `None`) must produce

@@ -312,12 +312,24 @@ pub async fn create(root: &Path, slug: &str) -> AppResult<PathBuf> {
         ));
     }
 
+    // A leftover `cimp/<slug>` branch (a prior create whose best-effort
+    // rollback couldn't delete it, or a user-made branch in our namespace)
+    // would make `worktree add -b` fail with an opaque "branch already
+    // exists" — surface it as instructions instead, since dir+meta absence
+    // alone doesn't prove the slug is free.
+    let branch = branch_name(&slug);
+    let existing = git::run(&ctx, &["rev-parse", "-q", "--verify", &format!("refs/heads/{branch}")], None).await?;
+    if existing.success() {
+        return Err(AppError::Workbench(format!(
+            "branch '{branch}' already exists (likely left over from an earlier worktree) — delete it with `git branch -D {branch}` or pick a different name."
+        )));
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| AppError::Workbench(format!("create {}: {e}", parent.display())))?;
     }
 
-    let branch = branch_name(&slug);
     let path_str = path.to_string_lossy().into_owned();
     let add = git::run(&ctx, &["worktree", "add", &path_str, "-b", &branch], Some(BULK_TIMEOUT)).await?;
     if !add.success() {
@@ -465,9 +477,11 @@ pub async fn list(root: &Path) -> AppResult<Vec<WorktreeInfo>> {
 /// Preconditions (each a plain typed error, not a `git` error dump, so the
 /// UI can show instructions):
 ///   - `slug` must resolve to a known cImp worktree ([`read_meta`]).
-///   - the main tree must be clean (`git status --porcelain` empty) — a
-///     `git merge` into a dirty tree can itself fail confusingly or, worse,
-///     partially apply; refused outright instead.
+///   - the main tree must have no uncommitted changes to TRACKED files
+///     (`git status --porcelain --untracked-files=no` empty) — a `git merge`
+///     into a dirty tree can itself fail confusingly or, worse, partially
+///     apply; refused outright instead. Untracked files are fine: git only
+///     objects when the merge would overwrite one, and protects it.
 ///   - the main tree must be ON the recorded base branch — merging
 ///     `cimp/<slug>` into whatever branch happens to be checked out would
 ///     silently merge it into the wrong place.
@@ -497,7 +511,12 @@ pub async fn merge(root: &Path, slug: &str) -> AppResult<MergeReport> {
         )));
     }
 
-    let status = git::run(&ctx, &["status", "--porcelain"], None).await?;
+    // `--untracked-files=no`: untracked files don't make a merge unsafe (git
+    // itself refuses only when the merge would overwrite one, and that refusal
+    // surfaces through the conflict path below) — without it, one stray build
+    // artifact or agent-written scratch file in the main tree would block
+    // every merge with a misleading "uncommitted changes" error.
+    let status = git::run(&ctx, &["status", "--porcelain", "--untracked-files=no"], None).await?;
     if !status.success() {
         return Err(AppError::Workbench(format!(
             "couldn't check the main tree's status: {}",
@@ -977,10 +996,60 @@ mod tests {
         }
         let dir = user_repo("merge-dirty");
         create(&dir, "feature").await.expect("create");
-        std::fs::write(dir.join("a.txt"), "uncommitted\n").unwrap();
+        // Modify a TRACKED file (`a.txt` is committed by `user_repo`) —
+        // untracked files deliberately don't count as dirty (see the
+        // untracked test below).
+        std::fs::write(dir.join("a.txt"), "uncommitted edit\n").unwrap();
 
         let err = merge(&dir, "feature").await.unwrap_err();
         assert!(matches!(err, AppError::Workbench(_)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Untracked files in the main tree must NOT block a merge — `git merge`
+    /// only objects when it would overwrite one (and then protects it). A
+    /// build artifact or agent scratch file used to refuse every merge with a
+    /// misleading "uncommitted changes" error.
+    #[tokio::test]
+    async fn merge_proceeds_when_main_tree_has_only_untracked_files() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = user_repo("merge-untracked");
+        let wt_path = create(&dir, "feature").await.expect("create");
+        std::fs::write(wt_path.join("feat.txt"), "feature work\n").unwrap();
+        git(&wt_path, &["add", "feat.txt"]);
+        git(&wt_path, &["commit", "-q", "-m", "feature commit"]);
+
+        // An untracked scratch file in the main tree, unrelated to the merge.
+        std::fs::write(dir.join("scratch.log"), "build noise\n").unwrap();
+
+        let report = merge(&dir, "feature").await.expect("merge with untracked file present");
+        assert!(report.fast_forward);
+        assert!(dir.join("feat.txt").exists());
+        assert!(dir.join("scratch.log").exists(), "the untracked file must be left alone");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A leftover `cimp/<slug>` branch (failed rollback, user-made) must be
+    /// reported as a clear typed error, not git's opaque "branch already
+    /// exists" out of `worktree add`.
+    #[tokio::test]
+    async fn create_refuses_when_the_branch_already_exists() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = user_repo("branch-collision");
+        git(&dir, &["branch", "cimp/feature"]);
+
+        let err = create(&dir, "feature").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cimp/feature"), "error should name the branch: {msg}");
+        assert!(msg.contains("already exists"), "error should say it exists: {msg}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

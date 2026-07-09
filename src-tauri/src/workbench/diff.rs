@@ -199,6 +199,15 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
         let mut status = FileStatus::Modified;
         let mut binary = false;
         let mut renamed_from: Option<String> = None;
+        // The current path as stated by the explicit header lines (`+++ b/`,
+        // `rename to`, or — for a deletion, whose `+++` side is `/dev/null` —
+        // the `--- a/` line). Preferred over [`parse_diff_git_line`]'s
+        // first-`" b/"` split of the `diff --git` line, which mis-splits a
+        // path containing that literal substring (e.g. `lib b/x.rs`). Stays
+        // `None` for git's quoted-path form (`+++ "b/…"`), where the split
+        // fallback applies — unquoting is out of V1 scope either way.
+        let mut path_from_headers: Option<String> = None;
+        let mut old_path_header: Option<String> = None;
 
         // Header lines between `diff --git` and the first hunk (or the
         // binary marker, or the next file's `diff --git`).
@@ -226,7 +235,12 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
                     renamed_from = Some(l["copy from ".len()..].to_string());
                     lines.next();
                 }
-                Some(l) if l.starts_with("rename to ") || l.starts_with("copy to ") => {
+                Some(l) if l.starts_with("rename to ") => {
+                    path_from_headers = Some(l["rename to ".len()..].to_string());
+                    lines.next();
+                }
+                Some(l) if l.starts_with("copy to ") => {
+                    path_from_headers = Some(l["copy to ".len()..].to_string());
                     lines.next();
                 }
                 Some(l) if l.starts_with("index ") => {
@@ -238,15 +252,25 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
                     break;
                 }
                 Some(l) if l.starts_with("--- ") => {
+                    if let Some(p) = l.strip_prefix("--- a/") {
+                        old_path_header = Some(p.to_string());
+                    }
                     lines.next();
                 }
                 Some(l) if l.starts_with("+++ ") => {
+                    if let Some(p) = l.strip_prefix("+++ b/") {
+                        path_from_headers = Some(p.to_string());
+                    } else if *l == "+++ /dev/null" {
+                        // A deletion: the current name is on the `---` side.
+                        path_from_headers = old_path_header.take();
+                    }
                     lines.next();
                     break;
                 }
                 _ => break,
             }
         }
+        let new_path = path_from_headers.unwrap_or(new_path);
         if let Some(from) = renamed_from {
             status = FileStatus::Renamed { from };
         }
@@ -311,10 +335,11 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
             hunks.push(hunk);
         }
 
-        // The `diff --git a/X b/Y` line's `Y` is the file's current path in
-        // every case (modify/add/delete/rename) — deletions still show the
-        // original name there (only the `+++` line says `/dev/null`), so
-        // there's no need to special-case deletions here.
+        // `new_path` here is the explicit-header path when one was found
+        // (see `path_from_headers` above) or the `diff --git a/X b/Y` line's
+        // `Y` otherwise — which is the file's current path in every case
+        // (modify/add/delete/rename); deletions still show the original name
+        // there (only the `+++` line says `/dev/null`).
         files.push(FileDiff { path: new_path, status, binary, hunks, too_large: false });
     }
 
@@ -322,10 +347,12 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
 }
 
 /// Split a `diff --git a/<old> b/<new>` line's tail (everything after `"diff
-/// --git "`) into `(old, new)`. Splits on the first `" b/"` — doesn't handle
-/// a path that itself contains the literal substring `" b/"` (git would quote
-/// such a path in double quotes; unquoting isn't implemented in V1, mirroring
-/// the "mechanical, no exotic edge cases" scope of this milestone).
+/// --git "`) into `(old, new)`. Splits on the first `" b/"` — mis-splits a
+/// path that itself contains that literal substring, which is why
+/// [`parse_unified`] prefers the explicit `+++ b/` / `rename to` header lines
+/// when present and only falls back to this split (git QUOTES such paths in
+/// the header lines too; unquoting isn't implemented in V1, mirroring the
+/// "mechanical, no exotic edge cases" scope of this milestone).
 fn parse_diff_git_line(rest: &str) -> Option<(String, String)> {
     let idx = rest.find(" b/")?;
     let old = rest[..idx].strip_prefix("a/").unwrap_or(&rest[..idx]).to_string();
@@ -731,7 +758,21 @@ pub async fn diff_file(root: &Path, path: &str) -> AppResult<FileDiff> {
     // `parse_unified` derives it from the diff text and can never produce
     // `Untracked` — `git status`'s verdict is the more authoritative source
     // anyway.
-    let Some(mut file) = parsed.pop() else {
+    //
+    // Pick the section whose path matches the requested one, not blindly the
+    // last: when `git status` says rename but `git diff -M` doesn't agree
+    // (similarity below threshold), the two-path Renamed invocation above
+    // emits TWO sections — old-path all-deleted and new-path all-added — and
+    // "last" would be whichever sorts later, potentially the wrong file's
+    // hunks presented under this path. Fall back to the last section when
+    // nothing matches (e.g. the quoted-path form, where the parsed path
+    // isn't byte-identical to `path`).
+    let matched = parsed.iter().position(|f| f.path == path);
+    let picked = match matched {
+        Some(i) => Some(parsed.swap_remove(i)),
+        None => parsed.pop(),
+    };
+    let Some(mut file) = picked else {
         return Ok(FileDiff { path: path.to_string(), status: entry.status, binary: false, hunks: Vec::new(), too_large: false });
     };
     file.status = entry.status;
@@ -867,6 +908,45 @@ diff --git a/b.rs b/b.rs
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].path, "a.rs");
         assert_eq!(files[1].path, "b.rs");
+    }
+
+    #[test]
+    fn parse_unified_prefers_the_explicit_header_path_over_the_diff_git_split() {
+        // A path containing the literal " b/" mis-splits the `diff --git`
+        // line (first-occurrence split) — the `+++ b/` header line is
+        // authoritative.
+        let diff = "\
+diff --git a/lib b/x.rs b/lib b/x.rs
+index 1111111..2222222 100644
+--- a/lib b/x.rs
++++ b/lib b/x.rs
+@@ -1,1 +1,1 @@
+-old
++new
+";
+        let files = parse_unified(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "lib b/x.rs");
+    }
+
+    #[test]
+    fn parse_unified_deletion_takes_the_current_path_from_the_minus_header() {
+        // For a deletion the `+++` side is `/dev/null`; the `--- a/` line
+        // carries the name, and must win over the `diff --git` split when the
+        // path contains " b/".
+        let diff = "\
+diff --git a/lib b/x.rs b/lib b/x.rs
+deleted file mode 100644
+index 1111111..0000000
+--- a/lib b/x.rs
++++ /dev/null
+@@ -1,1 +0,0 @@
+-gone
+";
+        let files = parse_unified(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "lib b/x.rs");
+        assert_eq!(files[0].status, FileStatus::Deleted);
     }
 
     #[test]

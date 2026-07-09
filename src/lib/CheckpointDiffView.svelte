@@ -6,12 +6,16 @@
   // there's nothing "current" to apply a reverse patch to) and no lazy
   // per-file fetch: the whole parsed diff arrives in one
   // `workbench_checkpoint_diff` call and is rendered as-is, unified only.
+  import { SvelteSet } from 'svelte/reactivity';
   import type { FileStatus, FileDiff } from './workbench';
   import { pairHunkLines, wordDiff } from './diffWords';
 
   let { files }: { files: FileDiff[] } = $props();
 
-  let expanded = $state<Set<string>>(new Set());
+  // SvelteSet, NOT a plain Set in $state: Svelte 5 doesn't proxy Set, so an
+  // in-place .add() would never re-render — and with static props there's no
+  // other refresh here to mask it, leaving expansion completely dead.
+  const expanded = new SvelteSet<string>();
   function toggleExpand(path: string): void {
     if (expanded.has(path)) expanded.delete(path);
     else expanded.add(path);

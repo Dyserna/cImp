@@ -5,7 +5,6 @@
   // banner explains the toggle otherwise) — this component assumes the
   // feature is enabled and just deals with fetching/rendering/acting on
   // whatever checkpoints already exist.
-  import { onMount } from 'svelte';
   import {
     workbenchCheckpoints,
     workbenchCheckpointDiff,
@@ -42,12 +41,11 @@
     }
   }
 
-  onMount(() => {
-    void refresh();
-  });
-
   // Refetch after a restore (or a future "checkpoint now" from elsewhere)
-  // bumps the shared version store — see `workbench.ts`'s doc comment.
+  // bumps the shared version store — see `workbench.ts`'s doc comment. The
+  // effect's initial run also covers the first load on mount (no separate
+  // `onMount` fetch — that would fire a duplicate `workbench_checkpoints`
+  // call every time the view mounts).
   $effect(() => {
     $workbenchCheckpointsVersion;
     void refresh();

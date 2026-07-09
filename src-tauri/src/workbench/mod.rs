@@ -522,14 +522,22 @@ impl WorkbenchService {
         if infos.is_empty() {
             return Ok(infos);
         }
-        // Canonicalize both the tab cwds and each worktree's path before
-        // comparing: `info.path` is git's resolved worktree path while a tab
-        // `cwd` is stored as-configured, so an exact string compare misses
-        // matches that differ only by drive-letter case, 8.3 short name, or
-        // the `\\?\` prefix — showing a worktree as having no live tab and
-        // prompting a duplicate.
-        let live_paths: HashSet<PathBuf> = self
-            .settings
+        let live_paths = self.live_tab_paths();
+        for info in &mut infos {
+            info.has_live_tab = live_paths.contains(&git::canonical_path(Path::new(&info.path)));
+        }
+        Ok(infos)
+    }
+
+    /// Canonicalized `cwd` of every configured AI tab — the "live tab" test
+    /// behind [`Self::worktrees`]' `has_live_tab` flag and
+    /// [`Self::worktree_discard`]'s refusal. Canonicalize both the tab cwds
+    /// and each compared worktree path: a worktree path is git's resolved
+    /// form while a tab `cwd` is stored as-configured, so an exact string
+    /// compare misses matches that differ only by drive-letter case, 8.3
+    /// short name, or the `\\?\` prefix.
+    fn live_tab_paths(&self) -> HashSet<PathBuf> {
+        self.settings
             .current()
             .tabs
             .iter()
@@ -538,11 +546,7 @@ impl WorkbenchService {
                 TabConfig::Shell(_) | TabConfig::Preview(_) => None,
             })
             .map(|p| git::canonical_path(p))
-            .collect();
-        for info in &mut infos {
-            info.has_live_tab = live_paths.contains(&git::canonical_path(Path::new(&info.path)));
-        }
-        Ok(infos)
+            .collect()
     }
 
     /// Phase D D3's per-row **Diff** action: worktree `slug` vs. the base
@@ -570,10 +574,21 @@ impl WorkbenchService {
     }
 
     /// Phase D `workbench_worktree_discard`. Double-confirmation is the
-    /// frontend's job (D3); this is the unconditional action once confirmed.
-    /// Also drops any cached check status for `slug` so a later re-creation
-    /// under the same name doesn't show a stale chip.
+    /// frontend's job (D3); this is the unconditional action once confirmed —
+    /// except while an AI tab is still open in the worktree, which is refused:
+    /// on Windows the removal would fail anyway (the tab's PTY holds the
+    /// directory as its cwd, leaving a confusing git error), and on Linux it
+    /// would succeed and yank the directory out from under the still-running
+    /// agent. Also drops any cached check status for `slug` so a later
+    /// re-creation under the same name doesn't show a stale chip.
     pub async fn worktree_discard(&self, root: &Path, slug: &str) -> AppResult<()> {
+        if let Ok(path) = worktree::resolve_path(root, slug) {
+            if self.live_tab_paths().contains(&git::canonical_path(&path)) {
+                return Err(AppError::Workbench(format!(
+                    "an AI tab is still open in worktree '{slug}' — close that tab first, then discard."
+                )));
+            }
+        }
         worktree::discard(root, slug).await?;
         self.worktree_check_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(&(root.to_path_buf(), slug.to_string()));
         Ok(())

@@ -205,35 +205,60 @@ pub struct RestoreReport {
 /// byte-faithful on Windows: `core.autocrlf=false`/`core.fileMode=false` so
 /// line-ending/permission churn never shows up as a spurious diff, `user.*`
 /// so `commit-tree` has an identity without touching the user's own git
-/// config, `gc.auto=0` since [`gc`] runs `git gc` explicitly instead. Also
-/// (re)seeds `info/exclude` — see [`seed_exclude`].
+/// config, `gc.auto=0` since [`gc`] runs `git gc` explicitly instead, and
+/// `core.hooksPath` pointed at a never-existing directory so a global
+/// hooksPath can't run user hooks inside shadow operations. The init+config
+/// block runs once per shadow repo (marker-keyed); `info/exclude` is
+/// (re)seeded every call — see [`seed_exclude`].
 pub async fn ensure(root: &Path, extra_ignore: &[String]) -> AppResult<()> {
     let ctx = shadow_ctx(root);
     let git_dir = git_dir_of(root);
     std::fs::create_dir_all(root.join(".cimp"))
         .map_err(|e| AppError::Workbench(format!("create .cimp dir: {e}")))?;
 
-    let init = git::run(&ctx, &["init", "-q"], None).await?;
-    if !init.success() {
-        return Err(AppError::Workbench(format!(
-            "shadow git init failed: {}",
-            init.stderr.trim()
-        )));
-    }
-    for (key, value) in [
-        ("core.autocrlf", "false"),
-        ("core.fileMode", "false"),
-        ("user.name", "cimp"),
-        ("user.email", "cimp@local"),
-        ("gc.auto", "0"),
-    ] {
-        let out = git::run(&ctx, &["config", key, value], None).await?;
-        if !out.success() {
+    // One-time init + config pinning, keyed on a marker written only AFTER
+    // the whole block succeeds. `ensure` runs before EVERY snapshot/diff/
+    // restore, and re-running init + 6 config writes is ~7 redundant
+    // subprocess spawns per checkpoint (real milliseconds on Windows). The
+    // marker is versioned rather than keying on `HEAD` existing, so a shadow
+    // repo created before a config key was added (core.hooksPath) gets
+    // re-pinned exactly once. `info/exclude` is still re-seeded every call —
+    // `extra_ignore` tracks settings and can change between calls.
+    let config_marker = git_dir.join("cimp-config-v2");
+    if !config_marker.exists() {
+        let init = git::run(&ctx, &["init", "-q"], None).await?;
+        if !init.success() {
             return Err(AppError::Workbench(format!(
-                "shadow git config {key}={value} failed: {}",
-                out.stderr.trim()
+                "shadow git init failed: {}",
+                init.stderr.trim()
             )));
         }
+        // hooksPath: an absolute path to a directory that never exists, so a
+        // user's GLOBAL core.hooksPath can't inject hooks into shadow-repo
+        // operations (restore's `checkout` would otherwise run a
+        // post-checkout hook with GIT_DIR pointed at the shadow repo).
+        // Deliberately not "" — an empty value's behavior is underspecified,
+        // and a RELATIVE path would resolve against the work tree, which the
+        // user controls.
+        let hooks_disabled = git_dir.join("hooks-disabled").to_string_lossy().into_owned();
+        for (key, value) in [
+            ("core.autocrlf", "false"),
+            ("core.fileMode", "false"),
+            ("core.hooksPath", hooks_disabled.as_str()),
+            ("user.name", "cimp"),
+            ("user.email", "cimp@local"),
+            ("gc.auto", "0"),
+        ] {
+            let out = git::run(&ctx, &["config", key, value], None).await?;
+            if !out.success() {
+                return Err(AppError::Workbench(format!(
+                    "shadow git config {key}={value} failed: {}",
+                    out.stderr.trim()
+                )));
+            }
+        }
+        std::fs::write(&config_marker, b"2\n")
+            .map_err(|e| AppError::Workbench(format!("write shadow config marker: {e}")))?;
     }
     seed_exclude(&git_dir, extra_ignore)?;
     Ok(())
@@ -703,7 +728,19 @@ pub async fn restore(
             added.stderr.trim()
         )));
     }
-    let created_since: Vec<String> = added.stdout.split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    // Work at the BYTE level for the `-z` entries here: these are filenames,
+    // and on Linux a filename can be non-UTF-8 — the lossy `stdout` decode
+    // would corrupt it, so the `delete_new` removal below would silently miss
+    // the real file and the created/changed set math would misclassify it.
+    // The lossy form is derived alongside purely for the report (display).
+    let created_raw: Vec<Vec<u8>> = added
+        .stdout_bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    let created_since: Vec<String> =
+        created_raw.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
 
     let changed_out = git::run(&ctx, &["diff", "--no-renames", "--name-only", "-z", &pre_sha, &target], None).await?;
     if !changed_out.success() {
@@ -722,12 +759,12 @@ pub async fn restore(
     // restore unless `delete_new`). So `created_since` paths are never
     // actually rewritten by this restore, and reporting them under
     // `changed` would tell the UI they were touched when they weren't.
-    let created_set: HashSet<&str> = created_since.iter().map(String::as_str).collect();
+    let created_set: HashSet<&[u8]> = created_raw.iter().map(Vec::as_slice).collect();
     let changed: Vec<String> = changed_out
-        .stdout
-        .split('\0')
+        .stdout_bytes
+        .split(|b| *b == 0)
         .filter(|s| !s.is_empty() && !created_set.contains(s))
-        .map(str::to_string)
+        .map(|b| String::from_utf8_lossy(b).into_owned())
         .collect();
 
     // (A/B) shadow checkout — see this function's doc comment.
@@ -736,14 +773,16 @@ pub async fn restore(
         return Err(AppError::Workbench(format!("shadow checkout failed: {}", checkout.stderr.trim())));
     }
 
-    // (D) opt-in deletion of files created since the checkpoint.
+    // (D) opt-in deletion of files created since the checkpoint. Paths come
+    // from the RAW bytes (`bytes_to_path`), not the lossy report strings —
+    // see the comment on `created_raw` above.
     let mut deleted = Vec::new();
     if delete_new {
-        for path in &created_since {
-            let abs = root.join(path);
+        for (raw, display) in created_raw.iter().zip(&created_since) {
+            let abs = root.join(git::bytes_to_path(raw));
             if abs.is_file() || abs.is_symlink() {
                 if std::fs::remove_file(&abs).is_ok() {
-                    deleted.push(path.clone());
+                    deleted.push(display.clone());
                 }
             }
         }
@@ -997,6 +1036,33 @@ mod tests {
         assert_eq!(cps[0].agent, Some("claude".to_string()));
         assert_eq!(cps[0].files_changed, 1);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: the automatic triggers (`WorkbenchService::maybe_snapshot`)
+    /// normalize the root through `git::canonical_path`, which on Windows
+    /// returns the `\\?\` verbatim form — and MSYS git rejects verbatim paths
+    /// in the `GIT_DIR`-family env vars (`fatal: not a git repository:
+    /// '\\?\…'`). That silently killed every prompt/burst checkpoint (their
+    /// failures are warn-and-drop by design) while manual checkpoints, which
+    /// pass the raw root, kept working. `git::run` now strips the verbatim
+    /// prefix at the spawn boundary; this exercises the exact call shape the
+    /// automatic path makes. Only bites on Windows — elsewhere `canonical_path`
+    /// returns a plain path and this is an ordinary snapshot test.
+    #[tokio::test]
+    async fn snapshot_and_gc_work_from_a_canonicalized_root() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempdir("verbatim");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let canon = git::canonical_path(&dir);
+        let id = snapshot(&canon, "prompt: auto", Trigger::Prompt, Some("claude"), &[], 0)
+            .await
+            .expect("snapshot from canonicalized root");
+        assert_eq!(id, "cp-1");
+        gc(&canon, 5, 5).await.expect("gc from canonicalized root");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -383,6 +383,20 @@
   let section = $state<Section>('overview');
 
   let roots = $state<GraphStatus[]>([]);
+  // Index cards in a stable, hierarchy-shaped order: shallower paths first
+  // (the root project tops the list, sub-projects sit below it), and projects
+  // at the same depth alphabetically. `roots` itself keeps backend arrival
+  // order — only the display is sorted.
+  const sortedRoots = $derived(
+    [...roots].sort((a, b) => rootDepth(a.root) - rootDepth(b.root) || cmpPath(a.root, b.root)),
+  );
+  function rootDepth(p: string): number {
+    // Count path segments, tolerant of either separator and a trailing slash.
+    return p.replace(/[\\/]+$/, '').split(/[\\/]+/).length;
+  }
+  function cmpPath(a: string, b: string): number {
+    return a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true });
+  }
   let paused = $state<boolean>(false);
   let busy = $state<boolean>(false);
   let probe = $state<EmbedderProbe | null>(null);
@@ -754,7 +768,7 @@
       <strong>Rebuild index</strong>.
     </p>
   {:else}
-    {#each roots as r (r.root)}
+    {#each sortedRoots as r (r.root)}
       <section class="card">
         <div class="row title">
           <span class="root" title={r.root}>{r.root}</span>

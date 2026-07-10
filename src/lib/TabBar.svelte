@@ -21,6 +21,7 @@
   import { openSettingsWindowToTab } from './settings/ipc';
   import { isPreviewTabId, isShellTab, type TabId } from './tabs/types';
   import { tabMeta } from './tabs/store';
+  import { hiddenTabs } from './tabs/visibility';
   import { cancelPlacement, requestTabIntoPane, setFocusedPane, setPaneActiveTab } from './layout/store';
   import { paneRegistry } from './layout/registry';
   import { beginDrag } from './dnd/drag';
@@ -33,6 +34,10 @@
   // tab-created event).
 
   let { pane }: { pane: PaneNode } = $props();
+
+  // UI-hidden tabs (status-bar eye button) are simply not rendered here —
+  // they keep their slot in pane.tab_ids and their running backend state.
+  const visibleTabIds = $derived(pane.tab_ids.filter((id) => !$hiddenTabs.has(id)));
 
   // Per-pane rename mode flag. Two-way bound on each Tab instance.
   let renamingTab = $state<TabId | null>(null);
@@ -92,11 +97,11 @@
     };
   });
 
-  // Re-evaluate when the tab list changes (add / remove / rename can
-  // shift scrollWidth without firing scroll). Reading pane.tab_ids and
-  // .length wires the reactive dependency.
+  // Re-evaluate when the tab list changes (add / remove / rename / hide can
+  // shift scrollWidth without firing scroll). Reading visibleTabIds.length
+  // wires the reactive dependency on both the pane's list and the hidden set.
   $effect(() => {
-    pane.tab_ids.length;
+    visibleTabIds.length;
     queueMicrotask(updateScrollEdges);
   });
 
@@ -231,7 +236,7 @@
     class:fade-right={canScrollRight}
   >
     <div class="tab-list" bind:this={listEl}>
-      {#each pane.tab_ids as id (id)}
+      {#each visibleTabIds as id (id)}
         {@const meta = $tabs.find((m) => m.id === id)}
         {#if meta}
           <Tab

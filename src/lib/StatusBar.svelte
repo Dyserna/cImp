@@ -8,6 +8,7 @@
   import AnnouncementsButton from './status/AnnouncementsButton.svelte';
   import VolumeSlider from './status/VolumeSlider.svelte';
   import SettingsButton from './status/SettingsButton.svelte';
+  import TabVisibilityButton from './status/TabVisibilityButton.svelte';
   import StatusBarArrangement from './status/StatusBarArrangement.svelte';
   import SelectionTtsControls from './status/SelectionTtsControls.svelte';
   import ToolLaunchButton from './status/ToolLaunchButton.svelte';
@@ -40,6 +41,7 @@
       <AnnouncementsButton />
     {/if}
     <span class="sep" aria-hidden="true"></span>
+    <TabVisibilityButton />
     <SettingsButton />
   </div>
 </div>

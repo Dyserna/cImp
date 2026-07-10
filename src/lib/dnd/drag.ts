@@ -30,6 +30,7 @@ import { get, writable } from 'svelte/store';
 import { commitDrop } from '../layout/store';
 import type { PaneId } from '../layout/types';
 import type { TabId } from '../tabs/types';
+import { fullReorderIndex } from '../tabs/visibility';
 import { computeDropTarget } from './dropTarget';
 import type { DragState, DropTarget } from './types';
 
@@ -138,10 +139,21 @@ function onPointerUp(event: Event): void {
   if (event.pointerId !== state.pointerId) return;
 
   const wasDragging = state.kind === 'dragging';
-  const committed: DropTarget | null = wasDragging ? state.dropTarget : null;
+  let committed: DropTarget | null = wasDragging ? state.dropTarget : null;
   const { tabId, sourcePaneId } = state;
   cleanup(wasDragging);
-  if (committed) commitDrop(tabId, sourcePaneId, committed);
+  if (committed) {
+    // The hit-tester's reorder index counts RENDERED tabs; translate it to
+    // an index into the pane's full tab list, which still contains any
+    // UI-hidden tabs (identity when nothing is hidden).
+    if (committed.kind === 'reorder') {
+      committed = {
+        ...committed,
+        insertIndex: fullReorderIndex(committed.paneId, committed.insertIndex),
+      };
+    }
+    commitDrop(tabId, sourcePaneId, committed);
+  }
 }
 
 function onPointerCancel(event: Event): void {

@@ -90,4 +90,11 @@ describe('fmtTok', () => {
     expect(fmtTok(-5)).toBe('0');
     expect(fmtTok(Number.NaN)).toBe('0');
   });
+
+  test('a fractional count at the 1000 boundary never prints a bare "1000"', () => {
+    // Regression (2026-07 review): the < 1000 branch tested BEFORE rounding,
+    // so 999.6 rounded up inside it and printed "1000" with no suffix.
+    expect(fmtTok(999.6)).toBe('1.0k');
+    expect(fmtTok(999.4)).toBe('999');
+  });
 });

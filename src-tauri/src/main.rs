@@ -213,17 +213,22 @@ fn main() {
     // the legacy `_shell_1_tmp` interim key.
     let settings_handle = settings::init(&default_shell, &launch_cwd);
 
-    // Apply the user's saved log level to the live filter. RUST_LOG, when
-    // set, was already locked in by `logging::init` and remains in effect
-    // until the user picks a new level here — at which point we reload to
-    // the chosen level and the env override is overridden. The cleanup
+    // Apply the user's saved log level to the live filter — unless a valid
+    // RUST_LOG was locked in by `logging::init`, in which case the env
+    // override stays in effect until the user picks a new level LIVE in
+    // Settings (the broadcast loop below reloads on change; an explicit
+    // mid-session pick wins over the env var). Calling `set_level`
+    // unconditionally here used to clobber the RUST_LOG filter with the
+    // saved level milliseconds after startup. The cleanup
     // pass deletes old rolled files per the user's retention setting.
     // Content capture is disabled by default — `set_enabled` mirrors the
     // saved flag, and the cleanup pass also runs against the content
     // subdirectory.
     {
         let snap = settings_handle.current();
-        logging::set_level(snap.logging.level);
+        if !logging::env_override_active() {
+            logging::set_level(snap.logging.level);
+        }
         logging::run_cleanup(snap.logging.retention);
         content::set_enabled(snap.logging.content_capture.enabled);
         content::run_cleanup(snap.logging.content_capture.retention);

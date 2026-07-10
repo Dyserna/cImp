@@ -116,6 +116,15 @@ describe('hasPlaceholder', () => {
   test('false once placeholders have all been overtyped away', () => {
     expect(hasPlaceholder('do the thing now')).toBe(false);
   });
+
+  test('${name} interpolation syntax from substituted code is NOT a placeholder', () => {
+    // Regression (2026-07 review): a {selection} substitution splicing in
+    // code like `Hello ${name}!` used to leave the Tab-jump handler active
+    // forever — the tab-stop scan re-reads the live draft and cannot tell a
+    // template placeholder from the user's own pasted interpolation.
+    expect(hasPlaceholder('console.log(`Hello ${name}!`)')).toBe(false);
+    expect(hasPlaceholder('echo "${HOME}"')).toBe(false);
+  });
 });
 
 describe('nextPlaceholderRange', () => {
@@ -143,6 +152,15 @@ describe('nextPlaceholderRange', () => {
 
   test('returns null when no placeholder remains', () => {
     expect(nextPlaceholderRange('nothing here', 0)).toBeNull();
+  });
+
+  test('skips ${name} spans inside substituted code, jumping to the real placeholder', () => {
+    // Regression (2026-07 review): after `{selection}` splices in a template
+    // literal, Tab used to select `{name}` inside the user's pasted code —
+    // overtyping it silently deleted their own code.
+    const text = 'Explain:\nHello ${name}!\n\nContext:\n{context}';
+    const ph = nextPlaceholderRange(text, 0)!;
+    expect(text.slice(ph.start, ph.end)).toBe('{context}');
   });
 
   test('self-heals once a placeholder has been overtyped: re-scanning the edited text skips it', () => {
@@ -177,6 +195,16 @@ describe('substituteVariables', () => {
   test('repeated variables are all substituted', () => {
     const out = substituteVariables('{selection} and {selection} again', 'X', '');
     expect(out).toBe('X and X again');
+  });
+
+  test('a substituted value containing $-patterns is inserted verbatim (function replacement)', () => {
+    const out = substituteVariables('[{selection}]', 'cost $& and $1', '');
+    expect(out).toBe('[cost $& and $1]');
+  });
+
+  test('${selection} is interpolation syntax, not a substitutable placeholder', () => {
+    const out = substituteVariables('run ${selection} and {selection}', 'SEL', '');
+    expect(out).toBe('run ${selection} and SEL');
   });
 });
 

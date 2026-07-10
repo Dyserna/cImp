@@ -18,6 +18,7 @@ const NAMED_KEYS: Record<string, string> = {
   esc: 'escape',
   escape: 'escape',
   space: ' ',
+  plus: '+',
   tab: 'tab',
   backspace: 'backspace',
   delete: 'delete',
@@ -36,11 +37,27 @@ export function parseShortcut(s: string | null | undefined): ShortcutPredicate |
   if (!s) return null;
   const trimmed = s.trim();
   if (!trimmed) return null;
-  const parts = trimmed.split('+').map((p) => p.trim()).filter((p) => p.length > 0);
-  if (parts.length === 0) return null;
-  const lastRaw = parts[parts.length - 1].toLowerCase();
+  // The literal plus key collides with the '+' separator: a captured string
+  // from an older build looks like "Ctrl++" (or a bare "+"), which a naive
+  // split-and-filter collapses into a modifier-only, never-matching
+  // predicate. Peel a trailing '+' off as the key before splitting. (The
+  // capture UI now emits "Ctrl+Plus", mapped back via NAMED_KEYS, but stored
+  // strings must keep working.)
+  let keyRaw: string;
+  let modifierParts: string[];
+  if (trimmed.endsWith('+')) {
+    keyRaw = '+';
+    const rest = trimmed.slice(0, -1).replace(/\+$/, '');
+    modifierParts = rest.split('+').map((p) => p.trim()).filter((p) => p.length > 0);
+  } else {
+    const parts = trimmed.split('+').map((p) => p.trim()).filter((p) => p.length > 0);
+    if (parts.length === 0) return null;
+    keyRaw = parts[parts.length - 1];
+    modifierParts = parts.slice(0, -1);
+  }
+  const lastRaw = keyRaw.toLowerCase();
   const key = NAMED_KEYS[lastRaw] ?? lastRaw;
-  const modifiers = new Set(parts.slice(0, -1).map((p) => p.toLowerCase()));
+  const modifiers = new Set(modifierParts.map((p) => p.toLowerCase()));
   return {
     key,
     ctrl: modifiers.has('ctrl') || modifiers.has('control'),
@@ -77,6 +94,12 @@ export function formatShortcut(event: KeyboardEvent): string {
 }
 
 function displayKey(k: string): string {
+  // Two keys whose raw `event.key` is unrepresentable in the string format:
+  // a literal ' ' is trimmed/filtered away by `parseShortcut`, and a literal
+  // '+' collides with the separator. Emit the parseable names instead
+  // (NAMED_KEYS maps them back on the parse side).
+  if (k === ' ') return 'Space';
+  if (k === '+') return 'Plus';
   // One-character keys: upper-case so "ctrl+e" displays as "Ctrl+E".
   if (k.length === 1) return k.toUpperCase();
   // Named keys: capitalize the first letter for readability.

@@ -60,12 +60,24 @@ fn ebin_dirs() -> Vec<PathBuf> {
 
 /// Filenames to try for a bare command name. On Windows the executable
 /// extensions are tried first (covering both real `.exe`s and `.cmd`/`.bat`
-/// shims), then the name verbatim. A name that already carries an extension is
-/// trusted as-is.
+/// shims), then the name verbatim. Only a name that already carries a real
+/// EXECUTABLE extension is trusted as-is — `Path::extension()` splits on the
+/// last dot with no notion of "is this an extension", so a versioned name
+/// like `aws2.1` or `python3.11` reports `Some("1")` and would otherwise
+/// never get its `aws2.1.exe` trial, silently missing the bundled copy.
 fn candidate_names(name: &str) -> Vec<String> {
     #[cfg(windows)]
     {
-        if Path::new(name).extension().is_some() {
+        let has_exec_ext = Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                matches!(
+                    e.to_ascii_lowercase().as_str(),
+                    "exe" | "cmd" | "bat" | "com"
+                )
+            });
+        if has_exec_ext {
             return vec![name.to_string()];
         }
         vec![
@@ -81,12 +93,32 @@ fn candidate_names(name: &str) -> Vec<String> {
     }
 }
 
-/// First existing file named like `name` across `dirs`.
+/// Whether a resolved `ebin` hit is actually runnable. On Unix a bundled
+/// file that lost its `+x` bit (zip extraction without permission bits, a
+/// hand-dropped file) would otherwise "resolve" here and then fail at spawn
+/// time with EACCES — skipping it lets the PATH fallback take over instead.
+/// On Windows existence is sufficient.
+fn is_runnable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// First existing (and runnable) file named like `name` across `dirs`.
 fn lookup_in_dirs(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
     for dir in dirs {
         for candidate in candidate_names(name) {
             let p = dir.join(&candidate);
-            if p.is_file() {
+            if p.is_file() && is_runnable(&p) {
                 return Some(p);
             }
         }
@@ -123,6 +155,43 @@ mod tests {
         let dirs = vec![dir.clone()];
         assert_eq!(lookup_in_dirs(&dirs, "demo-tool"), Some(file));
         assert_eq!(lookup_in_dirs(&dirs, "not-there"), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression (2026-07 review): a versioned name like `aws2.1` must
+    /// still get its `.exe`/`.cmd`/`.bat` trials — `Path::extension()`
+    /// reports `Some("1")` for it, which used to short-circuit to the
+    /// verbatim name only.
+    #[cfg(windows)]
+    #[test]
+    fn dotted_but_not_extensioned_names_still_try_exe() {
+        let names = candidate_names("aws2.1");
+        assert!(names.contains(&"aws2.1.exe".to_string()));
+        assert!(names.contains(&"aws2.1".to_string()));
+        // A real executable extension is still trusted as-is.
+        assert_eq!(candidate_names("tool.exe"), vec!["tool.exe".to_string()]);
+        assert_eq!(candidate_names("shim.CMD"), vec!["shim.CMD".to_string()]);
+    }
+
+    /// A bundled file without the executable bit must be skipped so the
+    /// PATH fallback can win, instead of resolving and failing with EACCES
+    /// at spawn time.
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_ebin_file_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cimp-ebin-noexec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plain-file");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dirs = vec![dir.clone()];
+        assert_eq!(lookup_in_dirs(&dirs, "plain-file"), None);
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(lookup_in_dirs(&dirs, "plain-file"), Some(file));
 
         std::fs::remove_dir_all(&dir).ok();
     }

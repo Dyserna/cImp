@@ -15,8 +15,12 @@
 //!   3. The settings-broadcast loop calls `set_level` whenever the level
 //!      field of a broadcast settings update differs from the previous one.
 //!
-//! `RUST_LOG`, when set, overrides the saved level at step 1 — the dev
-//! workflow (`RUST_LOG=cimp=trace npm run tauri dev`) keeps working.
+//! `RUST_LOG`, when set (and valid), overrides the saved level: `init`
+//! records the override in `ENV_OVERRIDE` and `main` skips step 2 when
+//! [`env_override_active`] reports true — the dev workflow
+//! (`RUST_LOG=cimp=trace npm run tauri dev`) keeps working for the whole
+//! session. A LIVE level change from Settings (step 3) still wins over the
+//! env var: picking a level mid-session is an explicit user action.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -30,6 +34,18 @@ use crate::settings::{LogLevel, LogRetention};
 /// Reload handle for the file-logger's EnvFilter. Set once during `init`
 /// and read every time the user changes the level from settings.
 static RELOAD_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+
+/// Whether `init` built its filter from a valid `RUST_LOG`. `main` consults
+/// this to skip the startup `set_level(saved_level)` call — without the
+/// check, the saved settings level unconditionally clobbered the env
+/// override milliseconds after startup, breaking the documented
+/// `RUST_LOG=cimp=trace` dev workflow every run.
+static ENV_OVERRIDE: OnceLock<bool> = OnceLock::new();
+
+/// True when a valid `RUST_LOG` filter was installed at `init` time.
+pub fn env_override_active() -> bool {
+    ENV_OVERRIDE.get().copied().unwrap_or(false)
+}
 
 /// `<exe-dir>/../logs/` — sibling of `bin/` and `models/` at the portable
 /// root. Falls back to `./logs/` if `current_exe()` is unavailable
@@ -56,8 +72,24 @@ pub fn init(initial: LogLevel) -> WorkerGuard {
     let appender = rolling::daily(&dir, "cimp.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(initial.as_filter_str()));
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(f) => {
+            let _ = ENV_OVERRIDE.set(true);
+            f
+        }
+        Err(e) => {
+            // `try_from_default_env` fails both when RUST_LOG is unset
+            // (normal) and when it's set but malformed — only the latter
+            // deserves a diagnostic, and tracing isn't up yet, so stderr
+            // is the only place it can go (same as the create_dir_all
+            // failure above).
+            if std::env::var_os("RUST_LOG").is_some() {
+                eprintln!("logging: invalid RUST_LOG ({e}); using the default level");
+            }
+            let _ = ENV_OVERRIDE.set(false);
+            EnvFilter::new(initial.as_filter_str())
+        }
+    };
 
     let (filter_layer, handle) = reload::Layer::new(filter);
     let _ = RELOAD_HANDLE.set(handle);

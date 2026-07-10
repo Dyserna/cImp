@@ -53,7 +53,12 @@ export function cacheHitRatio(cacheRead: number, inTok: number): number {
 /// Exact values belong in the row's tooltip, not here.
 export function fmtTok(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return '0';
-  if (n < 1000) return String(Math.round(n));
+  // Round BEFORE the branch test: a fractional n in [999.5, 1000) would
+  // otherwise round up inside the small-count branch and print a bare
+  // "1000" (no suffix) — inconsistent with fmtTok(1000) === "1.0k".
+  // Current callers pass integers, but the utility shouldn't rely on it.
+  const rounded = Math.round(n);
+  if (rounded < 1000) return String(rounded);
   if (n < 999_500) {
     const k = n / 1000;
     return (k < 10 ? k.toFixed(1) : String(Math.round(k))) + 'k';

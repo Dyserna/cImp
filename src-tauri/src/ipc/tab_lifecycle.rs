@@ -924,12 +924,15 @@ pub async fn reconfigure_shell_tab(
 /// added in M4).
 #[tauri::command]
 pub fn default_shell_spec() -> DefaultShellWire {
-    let (spec, _source) = detect::default_shell_resolution();
+    let (spec, source) = detect::default_shell_resolution();
     let notif_defaults = ShellNotificationConfig::default();
     DefaultShellWire {
         command: spec.command.to_string_lossy().into_owned(),
         args: spec.args.join(" "),
-        git_bash_found: detect::was_default_git_bash_found(),
+        // Derived from the resolution above — `was_default_git_bash_found`
+        // used to re-run the entire probe chain (file checks, registry
+        // read, PATH walk) for this one bool.
+        git_bash_found: detect::is_git_bash_source(&source),
         notifications_error: notif_defaults.error.text,
         notifications_exited: notif_defaults.exited.text,
     }

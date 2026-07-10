@@ -37,7 +37,7 @@ mod watcher;
 pub use activity::{root_key as activity_root_key, snapshot as graph_history, GraphCall};
 pub use builder::parse_file;
 pub use context::{est_tokens, RetrieveResult};
-pub use index::{GraphIndex, GraphStats, SymbolHit};
+pub use index::GraphIndex;
 pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent};
 // V14 Phase D: only `UsageSnapshot` itself is named by qualified path outside
 // this module (the `graph_usage` IPC handler's return type). Its nested
@@ -49,7 +49,7 @@ pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent}
 pub use memory::UsageSnapshot;
 pub use mcp::{
     handle_call as handle_mcp_call, offload_query, semantic_code_spec, semantic_spec, tool_specs,
-    tools as mcp_tools, GraphToolSpec,
+    tools as mcp_tools,
 };
 pub use model::*;
 pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus};

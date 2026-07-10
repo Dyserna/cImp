@@ -10,14 +10,7 @@
   // undocumented Anthropic oauth/usage endpoint. We poll on
   // `usage.poll_interval_secs`; the countdown ticks locally between polls.
   import { settings } from '../settings/store';
-  import {
-    getClaudeUsage,
-    onUsageSessionTokens,
-    type UsageResult,
-    type UsageSnapshot,
-    type SessionTokensEvent,
-  } from '../ipc';
-  import { listenManaged } from '../listenManaged';
+  import { getClaudeUsage, type UsageResult, type UsageSnapshot } from '../ipc';
 
   // Floor on the poll cadence so a hand-edited tiny interval can't hammer the
   // undocumented endpoint.
@@ -36,14 +29,6 @@
   // read (429 / transient failure). Dims the numbers to signal they may be old.
   let stale = $state(false);
   let now = $state(Date.now());
-
-  // V14 Phase D3: current session's running token totals (token X-ray),
-  // pushed by a debounced backend event rather than polled — a separate
-  // feature (graph.enabled) from the rate-limit quota above, so it's shown
-  // independent of that toggle. `null` until the first event arrives (e.g.
-  // the graph is off, or nothing has been recorded yet this session).
-  let sessionTokens = $state<SessionTokensEvent | null>(null);
-  listenManaged(() => onUsageSessionTokens((e) => (sessionTokens = e)));
 
   const usage = $derived($settings.usage);
   // The Claude Code usage quota only makes sense when the subscription Claude
@@ -277,20 +262,6 @@
   </div>
 {/if}
 
-{#if sessionTokens}
-  <!-- V14 Phase D3: session tokens line — deliberately its own small element
-       rather than folded into the quota widget's markup above, so it still
-       shows when the quota tracker itself is disabled/hidden (they're
-       independent features: `usage.enabled` vs. `graph.enabled`). -->
-  <div
-    class="session-tokens"
-    title="Current session token usage (token X-ray) — see Code Intelligence → Usage for the full breakdown."
-  >
-    <span class="name">session tokens</span>
-    <span class="vals">{sessionTokens.in_tok.toLocaleString()} in / {sessionTokens.out_tok.toLocaleString()} out</span>
-  </div>
-{/if}
-
 <style>
   /* A flex row of stacked columns (label, bar, %, countdown, clock) with
      short dividers between groups. Each column is a 2-row grid: the 5h
@@ -376,25 +347,5 @@
   }
   .clk {
     color: var(--text-secondary);
-  }
-
-  /* V14 Phase D3: session tokens line. */
-  .session-tokens {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-1);
-    font-size: 11px;
-    line-height: 1;
-    color: var(--text-secondary);
-    white-space: nowrap;
-    user-select: none;
-  }
-  .session-tokens .name {
-    font-weight: 600;
-    color: var(--accent);
-  }
-  .session-tokens .vals {
-    font-variant-numeric: tabular-nums;
-    color: var(--text-primary);
   }
 </style>

@@ -222,11 +222,6 @@ pub struct GraphService {
     /// candidate across the ~30s `run_internal` await) don't both distill it —
     /// same single-flight shape as `digest_inflight`/[`InflightGuard`].
     distilling: StdMutex<HashSet<String>>,
-    /// V14 Phase D3: last time [`Self::record_usage`] emitted the
-    /// `usage-session-tokens` status-bar event, per session id — debounces a
-    /// fast-streaming transcript's repeated `Turn` upserts to at most one
-    /// emit every couple of seconds per session.
-    usage_emit_debounce: StdMutex<HashMap<String, Instant>>,
 }
 
 /// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
@@ -341,7 +336,6 @@ impl GraphService {
             auto_check_sessions: StdMutex::new(HashMap::new()),
             auto_check_runner: crate::checks::auto::RootRunner::new(),
             distilling: StdMutex::new(HashSet::new()),
-            usage_emit_debounce: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -661,48 +655,6 @@ impl GraphService {
         };
         if let Err(e) = idx.record_usage_event(session_id, agent, &event, ts) {
             debug!(error = %e, "graph: record_usage_event failed");
-            return;
-        }
-        // V14 Phase D3: debounced session-tokens event for the status bar's
-        // usage-meter popover. Only a `Turn` row carries tokens (a
-        // `ToolResult` carries chars), and a streamed transcript upserts the
-        // same `Turn` many times as `usage` firms up — the debounce keeps
-        // that from spamming the frontend.
-        if matches!(event, UsageEvent::Turn { .. }) {
-            self.maybe_emit_session_tokens(session_id, &idx);
-        }
-    }
-
-    /// See [`Self::record_usage`]'s Phase D3 note. Best-effort: an emit
-    /// failure (no window yet, etc.) is silently dropped, same posture as
-    /// every other `self.app.emit` call in this module.
-    fn maybe_emit_session_tokens(&self, session_id: &str, idx: &GraphIndex) {
-        const DEBOUNCE: Duration = Duration::from_secs(2);
-        {
-            let mut m = self.usage_emit_debounce.lock().unwrap();
-            let now = Instant::now();
-            if let Some(last) = m.get(session_id) {
-                if now.duration_since(*last) < DEBOUNCE {
-                    return;
-                }
-            }
-            // F12: bound the map — nothing prunes it when a session ends, so it
-            // grew one entry per session id for the process lifetime. Clearing is
-            // safe (a dropped entry just allows one immediate emit).
-            if m.len() > 1024 && !m.contains_key(session_id) {
-                m.clear();
-            }
-            m.insert(session_id.to_string(), now);
-        }
-        if let Ok(totals) = idx.usage_session_totals(session_id) {
-            let _ = self.app.emit(
-                "usage-session-tokens",
-                &serde_json::json!({
-                    "session_id": session_id,
-                    "in_tok": totals.in_tok,
-                    "out_tok": totals.out_tok,
-                }),
-            );
         }
     }
 
@@ -989,15 +941,6 @@ impl GraphService {
                     set.remove(s);
                 }
                 None => set.clear(),
-            }
-        }
-        // F12: and the usage-emit debounce timestamps, which nothing else prunes.
-        if let Ok(mut m) = self.usage_emit_debounce.lock() {
-            match session_id {
-                Some(s) => {
-                    m.remove(s);
-                }
-                None => m.clear(),
             }
         }
         Ok(())

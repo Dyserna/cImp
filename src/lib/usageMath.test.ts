@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio } from './usageMath';
+import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio, fmtTok } from './usageMath';
 
 function turn(over: Partial<{ in_tok: number; cache_read: number; out_tok: number; tool_chars: number }>) {
   return { in_tok: 0, cache_read: 0, out_tok: 0, tool_chars: 0, ...over };
@@ -60,5 +60,34 @@ describe('cacheHitRatio', () => {
 
   test('no denominator (nothing recorded yet) is 0, not NaN', () => {
     expect(cacheHitRatio(0, 0)).toBe(0);
+  });
+});
+
+describe('fmtTok', () => {
+  test('small counts stay exact', () => {
+    expect(fmtTok(0)).toBe('0');
+    expect(fmtTok(412)).toBe('412');
+    expect(fmtTok(999)).toBe('999');
+  });
+
+  test('thousands: one decimal below 10k, integer k above', () => {
+    expect(fmtTok(1000)).toBe('1.0k');
+    expect(fmtTok(9_949)).toBe('9.9k');
+    expect(fmtTok(61_800)).toBe('62k');
+    expect(fmtTok(999_400)).toBe('999k');
+  });
+
+  test('the k→M boundary never shows "1000k"', () => {
+    expect(fmtTok(999_500)).toBe('1.00M');
+  });
+
+  test('millions: two decimals below 10M, one above', () => {
+    expect(fmtTok(1_234_000)).toBe('1.23M');
+    expect(fmtTok(61_234_567)).toBe('61.2M');
+  });
+
+  test('garbage in, zero out', () => {
+    expect(fmtTok(-5)).toBe('0');
+    expect(fmtTok(Number.NaN)).toBe('0');
   });
 });

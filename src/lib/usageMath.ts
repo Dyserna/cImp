@@ -45,3 +45,19 @@ export function cacheHitRatio(cacheRead: number, inTok: number): number {
   const denom = cacheRead + inTok;
   return denom > 0 ? cacheRead / denom : 0;
 }
+
+/// Compact token-count formatter for the Sessions table's per-row billing
+/// stats, where four multi-million counts share one line ("61.2M", "9.9k",
+/// "412"). One decimal below 10k, integer k below 1M (the 999,500 boundary
+/// keeps "1000k" from ever appearing), two decimals below 10M, one above.
+/// Exact values belong in the row's tooltip, not here.
+export function fmtTok(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  if (n < 1000) return String(Math.round(n));
+  if (n < 999_500) {
+    const k = n / 1000;
+    return (k < 10 ? k.toFixed(1) : String(Math.round(k))) + 'k';
+  }
+  const m = n / 1_000_000;
+  return (m < 10 ? m.toFixed(2) : m.toFixed(1)) + 'M';
+}

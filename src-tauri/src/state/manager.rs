@@ -67,6 +67,11 @@ pub enum TabId {
     /// force-graph of the code graph). Same shape as [`Self::GraphMonitor`] —
     /// Shell-kind, reserved identity, no PTY, app-rendered.
     GraphView,
+    /// The read-only, non-closable Tool Activity tab (unified graph-call +
+    /// offload-request feed plus the tool reference lists). Same shape as
+    /// [`Self::GraphMonitor`] — Shell-kind, reserved identity, no PTY,
+    /// app-rendered.
+    ToolActivity,
     /// V14 Phase F: a user-created Preview tab (embedded localhost browser).
     /// Unlike the reserved app-rendered tabs above, this is a genuinely new
     /// [`TabKind`] (not a Shell-kind reserved id) because it's repeatable —
@@ -88,6 +93,7 @@ impl TabId {
             TabId::GraphMonitor => "graph-monitor",
             TabId::Workbench => "workbench-1",
             TabId::GraphView => "graph-view",
+            TabId::ToolActivity => "tool-activity",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
             TabId::Preview(s) => s.as_str(),
@@ -103,6 +109,7 @@ impl TabId {
             "graph-monitor" => TabId::GraphMonitor,
             "workbench-1" => TabId::Workbench,
             "graph-view" => TabId::GraphView,
+            "tool-activity" => TabId::ToolActivity,
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
             // `Shell`, so they keep AI-kind behavior on relaunch. The
@@ -138,7 +145,8 @@ impl TabId {
             | TabId::OffloadServer
             | TabId::GraphMonitor
             | TabId::Workbench
-            | TabId::GraphView => TabKind::Shell,
+            | TabId::GraphView
+            | TabId::ToolActivity => TabKind::Shell,
             // V14 Phase F: unlike the reserved dashboards above, Preview is a
             // real kind of its own — it's repeatable (a user may open several),
             // so the frontend needs a wire-visible discriminator rather than
@@ -166,7 +174,8 @@ impl TabId {
             | TabId::OffloadServer
             | TabId::GraphMonitor
             | TabId::Workbench
-            | TabId::GraphView => true,
+            | TabId::GraphView
+            | TabId::ToolActivity => true,
             // Preview tabs are always user-created (no reserved/builtin
             // instance ships by default), so — like Shell/Ai duplicates —
             // they're always closable.

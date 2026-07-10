@@ -377,6 +377,9 @@ export interface UiSettings {
   theme: string;
   /// Arrangement of the bottom status bar's movable left cluster.
   status_bar: StatusBarLayout;
+  /// Show the reserved Tool Activity tab (unified graph-call + offload
+  /// request feed, plus the tool reference lists). Default true.
+  tool_activity_tab: boolean;
 }
 
 /// A display panel in the status bar's movable left cluster.
@@ -1179,6 +1182,7 @@ export function defaultSettings(): Settings {
           { component: 'system_stats', gap: 0 },
         ],
       },
+      tool_activity_tab: true,
     },
     // Default terminal palette is paired with the default UI theme
     // (tui-orange → GitHub Dark); the pairing comes from each theme's

@@ -64,6 +64,18 @@ export function isGraphViewTab(id: TabId): boolean {
   return id === GRAPH_VIEW_TAB_ID;
 }
 
+/// The reserved id of the read-only, app-rendered Tool Activity tab — the
+/// unified feed of graph-tool calls + offload requests, plus the graph/offload
+/// tool reference lists. Shell-kind on the backend — no PTY — same pattern as
+/// the Code Graph monitor tab. Materialized while `ui.tool_activity_tab` is on
+/// (default true).
+export const TOOL_ACTIVITY_TAB_ID = 'tool-activity';
+
+/// True for the Tool Activity tab.
+export function isToolActivityTab(id: TabId): boolean {
+  return id === TOOL_ACTIVITY_TAB_ID;
+}
+
 /// True for a Preview tab's id (`"preview-<uuid>"` — see `create_preview_tab`
 /// / `TabId::Preview` on the backend). Unlike the reserved dashboards above,
 /// there's no single constant to compare against (Preview is repeatable),
@@ -87,6 +99,7 @@ export function isShellTab(id: TabId): boolean {
     id !== NOTE_TAB_ID &&
     id !== WORKBENCH_TAB_ID &&
     id !== GRAPH_VIEW_TAB_ID &&
+    id !== TOOL_ACTIVITY_TAB_ID &&
     !isPreviewTabId(id)
   );
 }

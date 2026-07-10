@@ -49,6 +49,12 @@ pub const WORKBENCH_TAB_ID: &str = "workbench-1";
 /// `graph.graph_viz` (reconciled by the integrity check, exactly like the Code
 /// Graph monitor tab). App-rendered like the monitor — no PTY.
 pub const GRAPH_VIEW_TAB_ID: &str = "graph-view";
+/// Reserved id of the read-only, app-rendered Tool Activity tab — a unified
+/// feed of graph-tool calls + offload requests, plus the graph/offload tool
+/// reference lists. Materialized iff `ui.tool_activity_tab` (default true,
+/// reconciled by the integrity check, exactly like the Code Graph monitor
+/// tab). App-rendered like the monitor — no PTY.
+pub const TOOL_ACTIVITY_TAB_ID: &str = "tool-activity";
 /// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
 /// longer a persistent builtin — it (like rustnet) launches on demand from
 /// the bottom-bar tool buttons into ordinary closable Shell tabs (uuid ids).
@@ -2118,6 +2124,24 @@ pub fn default_graph_view_tab() -> TabConfig {
     })
 }
 
+/// The reserved, non-closable Tool Activity tab. Same shape as the Code Graph
+/// monitor tab — Shell-kind with no command (app-rendered, no PTY).
+/// Materialized/removed by the integrity check per `ui.tool_activity_tab`.
+pub fn default_tool_activity_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: TOOL_ACTIVITY_TAB_ID.to_string(),
+        builtin: true,
+        name: "Tool Activity".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
+}
+
 /// Default Shell-1 entry. Takes the resolved platform default shell so the
 /// `command` and `args` fields land on the right binary for the host. The
 /// reserved id is just the seed value for the first shell tab on a fresh
@@ -2650,6 +2674,11 @@ pub struct UiSettings {
     /// lacking the key deserialize to the default `[usage, system_stats]`
     /// via the struct-level `#[serde(default)]`.
     pub status_bar: StatusBarLayout,
+    /// Show the reserved Tool Activity tab (unified graph-call + offload
+    /// request feed, plus the tool reference lists). Default true; old files
+    /// lacking the key deserialize to true via the struct-level
+    /// `#[serde(default)]`. Reconciled like the other reserved feature tabs.
+    pub tool_activity_tab: bool,
 }
 
 impl Default for UiSettings {
@@ -2657,6 +2686,7 @@ impl Default for UiSettings {
         Self {
             theme: "tui-orange".to_string(),
             status_bar: StatusBarLayout::default(),
+            tool_activity_tab: true,
         }
     }
 }

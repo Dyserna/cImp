@@ -44,7 +44,7 @@ transitions while there.
 
 ## Session 2 — TTS text-processing path (~850 lines)
 
-- [ ] Done — findings: __
+- [x] Done — findings: 16 (2026-07-10)
 - `src-tauri/src/tts/phonemize.rs` (287) — untouched since v0.23 rename
 - `src-tauri/src/processing/segmenter.rs` (131)
 - `src-tauri/src/processing/patterns_file.rs` (210)
@@ -124,3 +124,4 @@ usage math rounding.
 | Date | Session | Findings | Commit |
 |------|---------|----------|--------|
 | 2026-07-10 | 1 — avatar/animation frontend | 10 fixed (3 sprite-player races/freezes, empty-manifest + tile-contract degrades, loadedSet retry latch, fallback rotation key, stale crossfade timer, listener ownership, ghost per-tab entries) + tests for the state-transition logic | (this commit) |
+| 2026-07-10 | 2 — TTS text-processing path | 16 fixed. segmenter: "No." merged next sentence, NFD combining accents fragmented words, CRLF killed paragraph breaks, punctuation-only segments synthesized, no split before closing quote/bracket. prose: fence close ignored marker length (code leaked into speech), tables spoken with pipes, ~~strikethrough~~ tildes spoken, nested blockquote `>` leaked, image `!` leaked, `#hashtag` eaten as heading, false doc claims. phonemize: one symbol-run token ("###", "->") silently dropped the whole sentence's audio (retry without symbol tokens), 510-token truncation cut mid-word. Refuted: NBSP split miss (sanitizer runs first), unclosed-fence swallow (CommonMark semantics, now documented). Deferred: HTML-tag stripping (rare, risky), patterns.json all-or-nothing parse + non-atomic seed write (documented design). + regression tests for all fixes | (this commit) |

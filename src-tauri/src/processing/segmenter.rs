@@ -7,12 +7,17 @@
 
 const ABBREVS: &[&str] = &[
     "Dr", "Mr", "Mrs", "Ms", "Jr", "Sr", "St", "Inc", "Ltd", "Co", "Corp",
-    "vs", "etc", "Mt", "No",
+    "vs", "etc", "Mt",
     // Internal-dot abbreviations: when we hit the *second* dot of "e.g."
     // the preceding word (read alpha + dot back) is "e.g" — the list below
     // matches that form.
     "e.g", "i.e", "a.m", "p.m",
 ];
+
+/// Abbreviations that are also common standalone words ("No." ends a sentence
+/// far more often than it means "number"). Only suppress the split when the
+/// next word starts with a digit ("No. 5").
+const ABBREVS_BEFORE_DIGIT: &[&str] = &["No"];
 
 pub fn segment_sentences(text: &str) -> Vec<String> {
     let cleaned = sanitize_for_tts(text);
@@ -59,8 +64,12 @@ pub fn segment_sentences(text: &str) -> Vec<String> {
                     continue;
                 }
             }
-            // Split if followed by whitespace or end-of-string.
-            let end = i + 1;
+            // Split if followed by whitespace or end-of-string, allowing a
+            // run of closing quotes/brackets in between (`He said "Stop." X`).
+            let mut end = i + 1;
+            while end < n && matches!(bytes[end], b'"' | b'\'' | b')' | b']') {
+                end += 1;
+            }
             let next_is_break = end >= n || bytes[end].is_ascii_whitespace();
             if next_is_break {
                 push_trim(&mut sentences, &text[start..end]);
@@ -82,7 +91,9 @@ pub fn segment_sentences(text: &str) -> Vec<String> {
 
 fn push_trim(sentences: &mut Vec<String>, s: &str) {
     let trimmed = s.trim();
-    if !trimmed.is_empty() {
+    // Punctuation-only fragments ("...", ".") have nothing to speak; sending
+    // them to synthesis wastes a request and can produce a garbled utterance.
+    if trimmed.chars().any(|c| c.is_alphanumeric()) {
         sentences.push(trimmed.to_string());
     }
 }
@@ -98,11 +109,19 @@ fn push_trim(sentences: &mut Vec<String>, s: &str) {
 /// word boundaries intact.
 fn sanitize_for_tts(text: &str) -> String {
     text.chars()
-        .map(|c| {
+        .filter_map(|c| {
             if c.is_alphanumeric() || c.is_ascii_punctuation() || c == ' ' || c == '\n' || c == '\t' {
-                c
+                Some(c)
+            } else if c == '\r' {
+                // Drop rather than space out: a `\r` between the two newlines
+                // of a CRLF paragraph break would defeat the `\n\n` check.
+                None
+            } else if ('\u{0300}'..='\u{036F}').contains(&c) {
+                // Combining diacritics (NFD text: "réserve" as e + U+0301).
+                // Spacing them out would split the word in two.
+                Some(c)
             } else {
-                ' '
+                Some(' ')
             }
         })
         .collect()
@@ -127,5 +146,16 @@ fn is_abbreviation(text: &str, dot_idx: usize) -> bool {
         return false;
     }
     let word = &text[start..dot_idx];
-    ABBREVS.iter().any(|a| word.eq_ignore_ascii_case(a))
+    if ABBREVS.iter().any(|a| word.eq_ignore_ascii_case(a)) {
+        return true;
+    }
+    if ABBREVS_BEFORE_DIGIT.iter().any(|a| word.eq_ignore_ascii_case(a)) {
+        // "No. 5" is an abbreviation; "No. It doesn't." is a sentence end.
+        let mut j = dot_idx + 1;
+        while j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        return j < bytes.len() && bytes[j].is_ascii_digit();
+    }
+    false
 }

@@ -19,6 +19,10 @@ use crate::error::{AppError, AppResult};
 /// `(1, 512)` input and pads with a 0 at each end, leaving 510 real tokens.
 pub const MAX_TOKENS: usize = 510;
 
+/// Token id of the space character in the Kokoro vocab (see [`build_vocab`]);
+/// used as the word-boundary marker when truncating over-long sequences.
+const SPACE_ID: i64 = 16;
+
 #[derive(Debug)]
 pub struct PhonemeTokens {
     /// `[0, ...ids..., 0]` — the tensor that feeds `input_ids`.
@@ -26,8 +30,10 @@ pub struct PhonemeTokens {
     /// Unpadded token count. Index into the voicepack with this — Kokoro's
     /// style embeddings vary by utterance length.
     pub raw_count: usize,
-    /// The raw IPA string for diagnostics. Read by the espeak OOV-fallback
-    /// test to assert real G2P (not letter-spelling); unused in normal builds.
+    /// The raw IPA string for diagnostics — the *untruncated* G2P output, so
+    /// it can describe more than `padded_ids` encodes when the 510-token cap
+    /// hit. Read by the espeak OOV-fallback test to assert real G2P (not
+    /// letter-spelling); unused in normal builds.
     #[cfg_attr(not(test), allow(dead_code))]
     pub phonemes: String,
 }
@@ -46,10 +52,31 @@ impl Phonemizer {
     }
 
     pub fn phonemize(&self, text: &str) -> AppResult<PhonemeTokens> {
-        let (phonemes, _tokens) = self
-            .g2p
-            .g2p(text)
-            .map_err(|e| AppError::Tts(format!("g2p: {e}")))?;
+        let (phonemes, _tokens) = match self.g2p.g2p(text) {
+            Ok(res) => res,
+            Err(first) => {
+                // One unphonemizable token fails the whole sentence: espeak
+                // returns no phonemes for pure symbol runs ("###", "->"),
+                // misaki propagates that as Err, and the sentence's audio
+                // would be dropped entirely. Retry without symbol-only
+                // tokens before giving up.
+                let cleaned: String = text
+                    .split_whitespace()
+                    .filter(|w| w.chars().any(char::is_alphanumeric))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if cleaned.is_empty() {
+                    return Err(AppError::Tts(format!("g2p: {first}")));
+                }
+                tracing::debug!(
+                    error = %first,
+                    "g2p failed; retrying without symbol-only tokens"
+                );
+                self.g2p
+                    .g2p(&cleaned)
+                    .map_err(|e| AppError::Tts(format!("g2p: {e}")))?
+            }
+        };
 
         let mut ids: Vec<i64> = Vec::with_capacity(phonemes.chars().count() + 2);
         let mut unknown_count = 0usize;
@@ -68,12 +95,21 @@ impl Phonemizer {
         }
 
         if ids.len() > MAX_TOKENS {
+            // Cut at the last word boundary (space token) inside the limit so
+            // the audio doesn't clip mid-word; a single boundary-free run
+            // still gets the hard cut.
+            let cut = ids[..MAX_TOKENS]
+                .iter()
+                .rposition(|&id| id == SPACE_ID)
+                .filter(|&p| p > 0)
+                .unwrap_or(MAX_TOKENS);
             tracing::warn!(
                 len = ids.len(),
+                cut,
                 limit = MAX_TOKENS,
                 "phoneme sequence exceeds Kokoro's 510-token limit; truncating"
             );
-            ids.truncate(MAX_TOKENS);
+            ids.truncate(cut);
         }
 
         let raw_count = ids.len();
@@ -239,6 +275,29 @@ mod tests {
         assert_eq!(v.get(&'a'), Some(&43));
         assert_eq!(v.get(&'h'), Some(&50));
         assert_eq!(v.get(&' '), Some(&16));
+    }
+
+    #[test]
+    fn symbol_run_does_not_kill_the_sentence() {
+        // A pure symbol token ("###") can make the espeak fallback return no
+        // phonemes, failing the whole g2p call; the retry without symbol-only
+        // tokens must still voice the real words.
+        let p = Phonemizer::new();
+        let toks = p.phonemize("see ### here").expect("sentence should survive");
+        assert!(toks.raw_count > 0);
+    }
+
+    #[test]
+    fn truncation_cuts_at_word_boundary() {
+        let p = Phonemizer::new();
+        let long = "hello world ".repeat(80);
+        let toks = p.phonemize(&long).unwrap();
+        // For spaced text the boundary cut lands strictly below the cap
+        // (a hard cut would sit exactly at MAX_TOKENS).
+        assert!(toks.raw_count < MAX_TOKENS);
+        assert!(toks.raw_count > 0);
+        assert_eq!(toks.padded_ids.len(), toks.raw_count + 2);
+        assert_ne!(toks.padded_ids[toks.raw_count], SPACE_ID);
     }
 
     #[test]

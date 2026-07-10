@@ -685,7 +685,7 @@
         {#if usage.current.top_tools.length === 0}
           <p class="placeholder">No tool-result usage recorded yet.</p>
         {:else}
-          <div class="rows">
+          <div class="rows scroll5">
             {#each usage.current.top_tools as t (t.tool)}
               <div class="arow tool">
                 <span class="aname">{t.tool}</span>
@@ -704,7 +704,7 @@
       {#if !usage || usage.sessions.length === 0}
         <p class="placeholder">No sessions recorded yet.</p>
       {:else}
-        <div class="rows">
+        <div class="rows scroll10">
           {#each usage.sessions as s (s.session_id)}
             <div
               class="arow sessrow"
@@ -1624,6 +1624,17 @@
     display: flex;
     flex-direction: column;
   }
+  /* Bounded lists: show ~N rows (an .arow is ~21.5px), scroll the rest. */
+  .rows.scroll5,
+  .rows.scroll10 {
+    overflow-y: auto;
+  }
+  .rows.scroll5 {
+    max-height: 108px;
+  }
+  .rows.scroll10 {
+    max-height: 215px;
+  }
   .arow {
     display: grid;
     grid-template-columns: 1fr 6rem 2fr;
@@ -1894,14 +1905,40 @@
   .arow.sessrow {
     grid-template-columns: minmax(6rem, 1fr) auto auto;
   }
+  /* Constant width + right alignment so the percentages line up too. */
+  .arow.sessrow .aloc {
+    min-width: 14ch;
+    text-align: right;
+  }
   .sess-stats {
-    display: flex;
-    gap: 12px;
+    /* Fixed tracks so the values line up as columns ACROSS rows (fmtTok is
+       ≤ 6 chars and each column's label is constant); flex sized every row
+       by its own content, so nothing aligned vertically. */
+    display: grid;
+    grid-template-columns: 4.6rem 5.2rem 7.2rem 7.8rem;
     font-size: 11px;
     opacity: 0.85;
   }
   .sess-stats b {
     font-weight: 600;
+  }
+  .sess-stats > span {
+    position: relative;
+    text-align: right;
+    padding-left: 13px;
+    white-space: nowrap;
+  }
+  /* Subtle mid-height tick between values — a hint of a column boundary,
+     deliberately not a full-height rule (this must not read as a table). */
+  .sess-stats > span + span::before {
+    content: '';
+    position: absolute;
+    left: 5px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 1px;
+    height: 0.8em;
+    background: var(--border, #444);
   }
 
   .eff-counters {

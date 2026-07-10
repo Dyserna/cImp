@@ -17,7 +17,9 @@ pub const MAX_SESSIONS_PER_ROOT: usize = 20;
 pub const MAX_EVENTS_PER_SESSION: i64 = 500;
 
 /// One file in a session's working set, aggregated from its events and scored
-/// `recency × frequency × kind_weight` by the ranker.
+/// `frequency × kind_weight` by the ranker, with recency as the tie-break
+/// (see `GraphIndex::mem_working_set` — recency is deliberately not a score
+/// factor, it only orders equal scores).
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct WorkingSetEntry {
     pub path: String,
@@ -100,16 +102,29 @@ pub const MAX_FACT_CHARS: usize = 200;
 
 /// Parse + validate the distiller's raw model output into fact text lines.
 /// Pure and DB/network-free so it's unit-testable without a live offload
-/// backend. Splits on newlines, trims each line, drops blank lines, then
-/// requires the surviving set be non-empty, at most [`MAX_DISTILLED_FACTS`]
-/// lines, each at most [`MAX_FACT_CHARS`] characters. `None` on any
-/// violation — a bad generation is skipped (session still marked distilled
-/// by the caller), never retried in a loop.
+/// backend.
+///
+/// The prompt demands "plain text, no numbering, no preamble", but small
+/// local models routinely disobey — so each line is normalized before
+/// validation (these facts are persisted verbatim into the user-visible
+/// Facts UI otherwise): code-fence marker lines and preamble/header lines
+/// ending in `:` are dropped, and leading bullet (`-`/`*`/`•`) or numbering
+/// (`1.`/`1)`) markers are stripped. The surviving set must be non-empty, at
+/// most [`MAX_DISTILLED_FACTS`] lines, each at most [`MAX_FACT_CHARS`]
+/// characters. `None` on any violation — a bad generation is skipped
+/// (session still marked distilled by the caller), never retried in a loop.
 pub fn parse_distilled_facts(raw: &str) -> Option<Vec<String>> {
     let lines: Vec<String> = raw
         .lines()
-        .map(|l| l.trim().to_string())
+        .map(str::trim)
+        // Code-fence markers around the output are wrapper, not facts.
+        .filter(|l| !l.starts_with("```") && !l.starts_with("~~~"))
+        // A line ending in `:` is a preamble/header ("Here are the facts:"),
+        // never a complete one-line fact.
+        .filter(|l| !l.ends_with(':'))
+        .map(strip_list_marker)
         .filter(|l| !l.is_empty())
+        .map(str::to_string)
         .collect();
     if lines.is_empty() || lines.len() > MAX_DISTILLED_FACTS {
         return None;
@@ -118,6 +133,29 @@ pub fn parse_distilled_facts(raw: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(lines)
+}
+
+/// Strip one leading markdown list marker — bullet (`- `, `* `, `• `) or
+/// number (`1. `, `12) `) — from a trimmed line, returning the re-trimmed
+/// remainder. A line that is only a marker collapses to `""` (dropped by the
+/// caller). Non-list lines pass through unchanged.
+fn strip_list_marker(line: &str) -> &str {
+    if matches!(line, "-" | "*" | "•") {
+        return ""; // marker-only line — nothing behind it.
+    }
+    if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).or_else(|| line.strip_prefix("• ")) {
+        return rest.trim_start();
+    }
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        let rest = &line[digits..];
+        if let Some(rest) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')) {
+            if rest.is_empty() || rest.starts_with(' ') {
+                return rest.trim_start();
+            }
+        }
+    }
+    line
 }
 
 // ── V14 Phase C: usage / cost accounting ──────────────────────────────────
@@ -356,5 +394,58 @@ mod tests {
     fn parse_distilled_facts_rejects_empty_or_blank_output() {
         assert_eq!(parse_distilled_facts(""), None);
         assert_eq!(parse_distilled_facts("   \n\n  "), None);
+    }
+
+    // Legacy sweep session 5: small models routinely wrap output in
+    // preambles/bullets/fences despite the prompt; those used to be persisted
+    // verbatim as user-visible project facts.
+
+    #[test]
+    fn parse_distilled_facts_drops_preamble_and_strips_bullets() {
+        let raw = "Here are the facts:\n- uses FNV hashing for stability\n- retry cap is 30s";
+        assert_eq!(
+            parse_distilled_facts(raw),
+            Some(vec![
+                "uses FNV hashing for stability".to_string(),
+                "retry cap is 30s".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_distilled_facts_strips_numbering_and_fences() {
+        let raw = "```\n1. offload uses a warm pool\n2) espeak fallback needs LLVM\n```";
+        assert_eq!(
+            parse_distilled_facts(raw),
+            Some(vec![
+                "offload uses a warm pool".to_string(),
+                "espeak fallback needs LLVM".to_string(),
+            ])
+        );
+        // A decimal number is NOT numbering — the fact passes through whole.
+        assert_eq!(
+            parse_distilled_facts("3.5s is the startup budget"),
+            Some(vec!["3.5s is the startup budget".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_distilled_facts_rejects_wrapper_only_output() {
+        // Nothing but wrapper noise must still read as a bad generation.
+        assert_eq!(parse_distilled_facts("Here are the facts:\n```\n```"), None);
+        assert_eq!(parse_distilled_facts("- \n* "), None);
+    }
+
+    #[test]
+    fn parse_distilled_facts_counts_facts_after_normalization() {
+        // Preamble + 3 real facts: 4 raw lines used to be rejected wholesale;
+        // now the preamble is dropped and the 3 facts survive.
+        let raw = "Key facts:\n- a\n- b\n- c";
+        assert_eq!(
+            parse_distilled_facts(raw),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        // …but 4 real facts still exceed the cap.
+        assert_eq!(parse_distilled_facts("- a\n- b\n- c\n- d"), None);
     }
 }

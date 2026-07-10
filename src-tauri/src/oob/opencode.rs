@@ -70,49 +70,79 @@ pub async fn run(port: u16, ctx: OobContext) {
             return;
         }
         match consume(&client, &url, &ctx).await {
-            Ok(()) => return, // cancelled cleanly inside.
+            Ok(StreamEnd::Cancelled) => return,
+            Ok(StreamEnd::Closed) => {
+                // A live SSE stream never ends gracefully in normal operation,
+                // so a clean close means the server went away (e.g. the TUI
+                // restarted its HTTP server) — reconnect, don't stop.
+                trace!(tab = ?ctx.tab, "OpenCode OOB: stream closed; reconnecting");
+            }
             Err(e) => {
                 trace!(tab = ?ctx.tab, error = %e, "OpenCode OOB: stream ended; reconnecting");
-                tokio::select! {
-                    _ = ctx.cancel.cancelled() => return,
-                    _ = sleep(RECONNECT_DELAY) => {}
-                }
             }
+        }
+        tokio::select! {
+            _ = ctx.cancel.cancelled() => return,
+            _ = sleep(RECONNECT_DELAY) => {}
         }
     }
 }
 
+/// Why one connection's event loop stopped (the non-error cases).
+#[derive(Debug, PartialEq, Eq)]
+enum StreamEnd {
+    /// The tab's cancel token fired — stop the adapter for good.
+    Cancelled,
+    /// The server closed the stream — reconnect and keep listening.
+    Closed,
+}
+
 /// One connection lifetime: open the SSE stream and process events until it
-/// ends or the cancel token fires. Returns `Ok(())` only on cancellation.
-async fn consume(client: &reqwest::Client, url: &str, ctx: &OobContext) -> reqwest::Result<()> {
+/// ends or the cancel token fires.
+async fn consume(
+    client: &reqwest::Client,
+    url: &str,
+    ctx: &OobContext,
+) -> reqwest::Result<StreamEnd> {
     let resp = tokio::select! {
-        _ = ctx.cancel.cancelled() => return Ok(()),
+        _ = ctx.cancel.cancelled() => return Ok(StreamEnd::Cancelled),
         r = client.get(url).send() => r?,
     };
     let mut resp = resp.error_for_status()?;
     debug!(tab = ?ctx.tab, "OpenCode OOB: event stream connected");
 
     let mut state = Tracker::default();
-    let mut line_buf = String::new();
+    // Raw bytes: chunk boundaries can split a multi-byte UTF-8 sequence, so
+    // decoding happens per COMPLETE line (in `drain_lines`), never per chunk —
+    // a per-chunk lossy decode would corrupt the split character to U+FFFD.
+    let mut line_buf: Vec<u8> = Vec::new();
 
     loop {
         let chunk = tokio::select! {
-            _ = ctx.cancel.cancelled() => return Ok(()),
-            c = resp.chunk() => c?,
+            _ = ctx.cancel.cancelled() => return Ok(StreamEnd::Cancelled),
+            c = resp.chunk() => c,
         };
         let chunk = match chunk {
-            Some(c) => c,
-            None => {
-                // Stream closed; flush remainder and signal idle.
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                // Stream closed; flush the remainder and release Thinking —
+                // the fresh Tracker after reconnect starts with `working:
+                // false` and can't release a stale edge from this connection.
                 state.flush_all(ctx).await;
-                return Ok(());
+                state.set_working(ctx, false);
+                return Ok(StreamEnd::Closed);
+            }
+            Err(e) => {
+                // Deliberately no flush: after a mid-message error the
+                // buffered deltas are partial and the reconnected stream may
+                // re-serve the message fuller. But Thinking must not stay
+                // stuck across the gap (same reasoning as the close branch).
+                state.set_working(ctx, false);
+                return Err(e);
             }
         };
-        line_buf.push_str(&String::from_utf8_lossy(&chunk));
-        // Process complete lines; keep any trailing partial line buffered.
-        while let Some(nl) = line_buf.find('\n') {
-            let line: String = line_buf.drain(..=nl).collect();
-            let line = line.trim_end();
+        line_buf.extend_from_slice(&chunk);
+        for line in drain_lines(&mut line_buf) {
             if let Some(payload) = line.strip_prefix("data:") {
                 if let Ok(ev) = serde_json::from_str::<Value>(payload.trim()) {
                     state.handle(&ev, ctx).await;
@@ -120,6 +150,18 @@ async fn consume(client: &reqwest::Client, url: &str, ctx: &OobContext) -> reqwe
             }
         }
     }
+}
+
+/// Drain every complete (`\n`-terminated) line out of `buf`, trailing-trimmed;
+/// a trailing partial line stays buffered. Lines are decoded only once
+/// complete, so a UTF-8 sequence split across two chunk reads survives intact.
+fn drain_lines(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=nl).collect();
+        lines.push(String::from_utf8_lossy(&line).trim_end().to_string());
+    }
+    lines
 }
 
 /// Per-connection accumulation of assistant messages and working state.
@@ -138,10 +180,9 @@ struct Tracker {
     /// used when a part arrives without deltas (e.g. a short message).
     part_snapshot: HashMap<String, String>,
     /// partID -> part type ("text" / "reasoning" / ...). Unknown ⇒ treated as
-    /// speakable text (reasoning parts are reliably declared).
+    /// speakable text (reasoning parts are reliably declared); a declared
+    /// non-"text" type is skipped at flush.
     part_type: HashMap<String, String>,
-    /// partID -> owning messageID.
-    part_msg: HashMap<String, String>,
     /// messageID -> partIDs in first-seen order (preserves answer order).
     msg_parts: HashMap<String, Vec<String>>,
     /// messageIDs known to be assistant messages.
@@ -163,10 +204,14 @@ impl Tracker {
                     if let Some(id) = info.get("id").and_then(Value::as_str) {
                         self.assistant.insert(id.to_string());
                         self.set_working(ctx, true);
+                        // Present-but-null must read as "not completed": a
+                        // nullable-until-set `completed` field would otherwise
+                        // flush (and latch) a still-streaming message, dropping
+                        // everything that arrives after.
                         let completed = info
                             .get("time")
                             .and_then(|t| t.get("completed"))
-                            .is_some();
+                            .is_some_and(|v| !v.is_null());
                         if completed {
                             self.flush(id, ctx).await;
                         }
@@ -205,15 +250,22 @@ impl Tracker {
             "session.idle" => {
                 self.flush_all(ctx).await;
                 self.set_working(ctx, false);
+                // Turn over: whatever part state is still buffered belongs to
+                // messages that will never flush (user echoes, tool parts).
+                // Without this a long-lived session accumulates every part it
+                // ever streamed. `assistant`/`flushed` are kept — they hold
+                // only message ids (small) and guard against double-speaking.
+                self.part_text.clear();
+                self.part_snapshot.clear();
+                self.part_type.clear();
+                self.msg_parts.clear();
             }
             _ => {}
         }
     }
 
-    /// Record a part under its message, preserving first-seen order, and its
-    /// owning messageID.
+    /// Record a part under its message, preserving first-seen order.
     fn register_part(&mut self, mid: &str, pid: &str) {
-        self.part_msg.entry(pid.to_string()).or_insert_with(|| mid.to_string());
         let parts = self.msg_parts.entry(mid.to_string()).or_default();
         if !parts.iter().any(|p| p == pid) {
             parts.push(pid.to_string());
@@ -221,34 +273,48 @@ impl Tracker {
     }
 
     /// Speak a single assistant message once: concatenate its non-reasoning
-    /// parts in order and hand them to TTS.
+    /// parts in order and hand them to TTS. Consumes the message's buffered
+    /// part state so it doesn't accumulate across a long session.
     async fn flush(&mut self, mid: &str, ctx: &OobContext) {
         if self.flushed.contains(mid) || !self.assistant.contains(mid) {
             return;
         }
-        self.flushed.insert(mid.to_string());
-        let Some(parts) = self.msg_parts.get(mid) else {
+        // No parts registered yet: a completed `message.updated` can be
+        // observed before any of the message's parts (joining the stream
+        // mid-turn, or reordered delivery). Do NOT latch `flushed` here —
+        // the parts may still arrive, and `session.idle`'s flush_all gets a
+        // second chance to speak them.
+        let Some(parts) = self.msg_parts.remove(mid) else {
             return;
         };
+        self.flushed.insert(mid.to_string());
         let mut out = String::new();
-        for pid in parts {
-            // Skip reasoning; unknown type defaults to speakable text.
-            if self.part_type.get(pid).map(String::as_str) == Some("reasoning") {
+        for pid in &parts {
+            // Skip any part DECLARED as something other than text (reasoning
+            // today; guards future tool/patch/etc. part types too). Unknown
+            // (never declared) defaults to speakable text — reasoning parts
+            // are reliably declared.
+            if self.part_type.get(pid).is_some_and(|t| t != "text") {
                 continue;
             }
-            let text = self
-                .part_text
-                .get(pid)
-                .filter(|t| !t.trim().is_empty())
-                .or_else(|| self.part_snapshot.get(pid))
-                .map(String::as_str)
-                .unwrap_or("");
+            let streamed = self.part_text.get(pid).map(String::as_str).unwrap_or("");
+            let snapshot = self.part_snapshot.get(pid).map(String::as_str).unwrap_or("");
+            // Prefer whichever view is fuller: deltas can be missing entirely
+            // (short message ⇒ snapshot only) or partial (stream joined
+            // mid-message ⇒ the accumulated deltas hold only the tail while
+            // the `message.part.updated` snapshot carries the full text).
+            let text = if snapshot.len() > streamed.len() { snapshot } else { streamed };
             if !text.trim().is_empty() {
                 if !out.is_empty() {
                     out.push('\n');
                 }
                 out.push_str(text);
             }
+        }
+        for pid in &parts {
+            self.part_text.remove(pid);
+            self.part_snapshot.remove(pid);
+            self.part_type.remove(pid);
         }
         if !out.trim().is_empty() {
             trace!(tab = ?ctx.tab, "OpenCode OOB: speaking assistant message (reasoning excluded)");
@@ -460,6 +526,230 @@ mod tests {
         t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
         assert!(matches!(tts_rx.try_recv(), Ok(TtsRequest::Synthesize { .. })));
         // Working state went up then down.
+        assert!(matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStarted { .. })));
+        assert!(matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStopped { .. })));
+    }
+
+    // ── Legacy sweep session 5 regressions ────────────────────────────────
+
+    #[test]
+    fn drain_lines_survives_utf8_split_across_chunks() {
+        // Regression: the old code lossily decoded each chunk independently,
+        // so a multi-byte char straddling a chunk boundary became U+FFFD.
+        let line = "data: {\"delta\":\"café ready\"}\n";
+        let bytes = line.as_bytes();
+        let split = line.find('é').unwrap() + 1; // inside the 2-byte é
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&bytes[..split]);
+        assert!(drain_lines(&mut buf).is_empty(), "no complete line yet");
+        buf.extend_from_slice(&bytes[split..]);
+        assert_eq!(drain_lines(&mut buf), vec!["data: {\"delta\":\"café ready\"}".to_string()]);
+        assert!(buf.is_empty(), "fully drained");
+        // A trailing partial line stays buffered.
+        buf.extend_from_slice(b"data: {\"a\":1}\ndata: {\"b\"");
+        assert_eq!(drain_lines(&mut buf), vec!["data: {\"a\":1}".to_string()]);
+        assert_eq!(buf, b"data: {\"b\"");
+    }
+
+    #[tokio::test]
+    async fn completed_null_is_not_completed() {
+        // Regression: `time.completed: null` used to read as "completed",
+        // flushing (and latching) a still-streaming message so the rest of
+        // its text was permanently dropped.
+        let (ctx, mut tts_rx, _sig) = ctx_with("opencode");
+        let mut t = Tracker::default();
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{"created":1,"completed":null}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":"First half"}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(tts_rx.try_recv().is_err(), "null completed must not flush");
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":" and second half."}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{"created":1,"completed":2}}}}"#),
+            &ctx,
+        )
+        .await;
+        match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => {
+                assert_eq!(text, "First half and second half.")
+            }
+            other => panic!("expected the full message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_before_parts_is_spoken_once_at_idle() {
+        // Regression: a completed `message.updated` observed before any of the
+        // message's parts (mid-turn stream join / reordering) used to latch
+        // `flushed` with nothing buffered, so the text arriving right after
+        // was never spoken.
+        let (ctx, mut tts_rx, _sig) = ctx_with("opencode");
+        let mut t = Tracker::default();
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{"created":1,"completed":2}}}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(tts_rx.try_recv().is_err());
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":"Late but here."}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Late but here."),
+            other => panic!("expected idle to recover the message, got {other:?}"),
+        }
+        // And only once.
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        assert!(tts_rx.try_recv().is_err(), "must not double-speak");
+    }
+
+    #[tokio::test]
+    async fn fuller_snapshot_wins_over_partial_deltas() {
+        // Regression: non-empty accumulated deltas used to shadow a fuller
+        // `message.part.updated` snapshot, speaking only the tail of a
+        // message whose early deltas were missed (mid-message reconnect).
+        let (ctx, mut tts_rx, _sig) = ctx_with("opencode");
+        let mut t = Tracker::default();
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":"world."}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"part":{"id":"p1","type":"text","messageID":"m1","text":"Hello world."}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Hello world."),
+            other => panic!("expected the snapshot text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_non_text_part_is_not_spoken() {
+        // Forward-compat: a future part type (tool/patch/...) that streams
+        // text deltas must not be read aloud — only undeclared parts default
+        // to speakable.
+        let (ctx, mut tts_rx, _sig) = ctx_with("opencode");
+        let mut t = Tracker::default();
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"part":{"id":"p1","type":"tool","messageID":"m1","text":"Running tests"}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":"Running tests"}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        assert!(tts_rx.try_recv().is_err(), "tool part must not be spoken");
+    }
+
+    #[tokio::test]
+    async fn part_buffers_are_pruned_after_flush_and_idle() {
+        // Regression: the Tracker used to keep every part's text/snapshot/type
+        // (and every user-message part) for the life of the connection.
+        let (ctx, mut tts_rx, _sig) = ctx_with("opencode");
+        let mut t = Tracker::default();
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":"Spoken."}}"#),
+            &ctx,
+        )
+        .await;
+        // A user-message echo part that never flushes.
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"u1","partID":"pu","field":"text","delta":"my prompt"}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        assert!(matches!(tts_rx.try_recv(), Ok(TtsRequest::Synthesize { .. })));
+        assert!(t.part_text.is_empty(), "part text pruned");
+        assert!(t.part_snapshot.is_empty(), "snapshots pruned");
+        assert!(t.part_type.is_empty(), "types pruned");
+        assert!(t.msg_parts.is_empty(), "part lists pruned");
+        assert!(t.flushed.contains("m1"), "double-speak latch kept");
+    }
+
+    #[tokio::test]
+    async fn stream_close_is_reported_for_reconnect_and_releases_thinking() {
+        // Regression twofer against a real (minimal) SSE server:
+        //  * a clean server close used to return the same `Ok` as cancellation,
+        //    permanently stopping the reconnect loop after one TUI restart;
+        //  * it also left the avatar stuck in Thinking (no Stopped signal).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await.unwrap();
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            sock.write_all(
+                b"data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"m1\",\"role\":\"assistant\",\"time\":{}}}}\n",
+            )
+            .await
+            .unwrap();
+            sock.write_all(
+                b"data: {\"type\":\"message.part.delta\",\"properties\":{\"messageID\":\"m1\",\"partID\":\"p1\",\"field\":\"text\",\"delta\":\"Mid-turn text.\"}}\n",
+            )
+            .await
+            .unwrap();
+            // Close WITHOUT session.idle: a mid-turn server restart.
+            sock.shutdown().await.unwrap();
+        });
+        let (ctx, mut tts_rx, mut sig) = ctx_with("opencode");
+        let client = reqwest::Client::new();
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consume(&client, &format!("http://127.0.0.1:{port}/event"), &ctx),
+        )
+        .await
+        .expect("consume must return when the stream closes")
+        .expect("clean close is not an error");
+        server.await.unwrap();
+        assert_eq!(end, StreamEnd::Closed, "close must ask for a reconnect, not read as cancel");
+        // Buffered text was flushed on close…
+        match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Mid-turn text."),
+            other => panic!("expected the buffered message, got {other:?}"),
+        }
+        // …and Thinking was released (Started then Stopped).
         assert!(matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStarted { .. })));
         assert!(matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStopped { .. })));
     }

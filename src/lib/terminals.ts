@@ -76,6 +76,8 @@ import {
   isNoteTab,
   isPreviewTabId,
   isWorkbenchTab,
+  isGraphViewTab,
+  isToolActivityTab,
   type TabId,
 } from './tabs/types';
 
@@ -513,6 +515,8 @@ export function createTerminal(
     isGraphMonitorTab(tabId) ||
     isNoteTab(tabId) ||
     isWorkbenchTab(tabId) ||
+    isGraphViewTab(tabId) ||
+    isToolActivityTab(tabId) ||
     isPreviewTabId(tabId)
   )
     return;

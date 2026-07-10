@@ -2440,6 +2440,23 @@
               <small class="error">{aiTabsError}</small>
             {/if}
           </fieldset>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.ui.tool_activity_tab}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.ui.tool_activity_tab = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Show the <strong>Tool Activity</strong> tab</span>
+          </label>
+          <small class="hint">
+            One place to watch tool usage: a unified feed of code-intelligence
+            graph calls and offload requests, plus the graph/offload tool
+            reference lists.
+          </small>
           <div class="sub-tabs" role="tablist" aria-label="Tabs sub-sections">
             <button
               type="button"

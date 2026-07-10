@@ -44,11 +44,12 @@ use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
     default_ai_tab, default_graph_monitor_tab, default_graph_view_tab, default_offload_server_tab,
-    default_shell_1_tab, default_workbench_tab, starter_prompt_templates,
+    default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
+    starter_prompt_templates,
     AiTabId, LayoutNodePersisted, PromptTemplate, Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
-    SHELL_DEFAULT_TAB_ID, WORKBENCH_TAB_ID,
+    SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
 use crate::shell::ShellSpec;
 
@@ -964,6 +965,7 @@ pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
     changed |= reconcile_graph_monitor_tab(settings);
     changed |= reconcile_workbench_tab(settings);
     changed |= reconcile_graph_view_tab(settings);
+    changed |= reconcile_tool_activity_tab(settings);
     changed
 }
 
@@ -1047,6 +1049,65 @@ fn graph_view_insert_position(tabs: &[TabConfig]) -> usize {
             || tab.id() == OFFLOAD_SERVER_TAB_ID
             || tab.id() == GRAPH_MONITOR_TAB_ID
             || tab.id() == WORKBENCH_TAB_ID
+        {
+            pos = idx + 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// Keep the read-only Tool Activity tab present iff `ui.tool_activity_tab`
+/// — mirrors [`reconcile_graph_monitor_tab`]. On by default (the tab is the
+/// one place that surfaces tool usage across graph + offload), so it ships on
+/// fresh installs and existing files alike; untick the Settings checkbox to
+/// drop it. Returns `true` if tabs changed.
+fn reconcile_tool_activity_tab(settings: &mut Settings) -> bool {
+    let present = settings.tabs.iter().position(|t| t.id() == TOOL_ACTIVITY_TAB_ID);
+    if settings.ui.tool_activity_tab {
+        match present {
+            Some(i) => {
+                let mut changed = false;
+                if !settings.tabs[i].builtin() {
+                    settings.tabs[i].set_builtin(true);
+                    changed = true;
+                }
+                let want_name = default_tool_activity_tab().name().to_string();
+                if settings.tabs[i].name() != want_name {
+                    settings.tabs[i].set_name(want_name);
+                    changed = true;
+                }
+                changed
+            }
+            None => {
+                let pos = tool_activity_insert_position(&settings.tabs);
+                settings.tabs.insert(pos, default_tool_activity_tab());
+                tracing::info!("integrity: materialized Tool Activity tab (tool_activity_tab enabled)");
+                true
+            }
+        }
+    } else if let Some(i) = present {
+        settings.tabs.remove(i);
+        tracing::info!("integrity: removed Tool Activity tab (tool_activity_tab disabled)");
+        true
+    } else {
+        false
+    }
+}
+
+/// Insert position for the Tool Activity tab: after the leading AI builtins
+/// AND the other reserved feature tabs (Offload Server + Code Graph monitor +
+/// Workbench + Graph View, if present), ahead of user shells — same "reserved
+/// feature tabs stay contiguous, leftmost" rule.
+fn tool_activity_insert_position(tabs: &[TabConfig]) -> usize {
+    let mut pos = 0usize;
+    for (idx, tab) in tabs.iter().enumerate() {
+        if AiTabId::from_id(tab.id()).is_some()
+            || tab.id() == OFFLOAD_SERVER_TAB_ID
+            || tab.id() == GRAPH_MONITOR_TAB_ID
+            || tab.id() == WORKBENCH_TAB_ID
+            || tab.id() == GRAPH_VIEW_TAB_ID
         {
             pos = idx + 1;
         } else {
@@ -1208,6 +1269,13 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         changed = true;
     }
 
+    // 4f. Materialize the read-only Tool Activity tab while
+    //     `ui.tool_activity_tab` (default true), remove it otherwise. Same
+    //     ordering rationale as 4b–4e; sits after the Graph View tab.
+    if reconcile_tool_activity_tab(settings) {
+        changed = true;
+    }
+
     // 5. Backend layout sanity. The frontend owns the deep integrity
     //    walk (orphan placement, empty-pane collapse) — it has the tree
     //    helpers. The backend's job here is just to keep the file
@@ -1307,6 +1375,7 @@ mod tests {
         // ships via `seeded_defaults`, not the integrity check.
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
         assert!(changed);
@@ -1319,6 +1388,7 @@ mod tests {
     fn integrity_seeds_both_when_enabled_ai_tabs_is_both_claudes() {
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
@@ -1332,6 +1402,7 @@ mod tests {
     fn integrity_seeds_only_claude_local_when_setting_is_claude_local_only() {
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![AiTabId::ClaudeLocal];
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
@@ -1345,6 +1416,7 @@ mod tests {
         use crate::settings::schema::{NotificationSlot, TabConfig};
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![AiTabId::Claude];
         integrity_check(&mut s); // seed the claude tab
 
@@ -1373,6 +1445,7 @@ mod tests {
         use crate::settings::schema::{NotificationSlot, TabConfig};
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![AiTabId::Claude];
         integrity_check(&mut s);
 
@@ -1400,6 +1473,7 @@ mod tests {
     fn integrity_seeds_opencode_at_canonical_position() {
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
             AiTabId::ClaudeLocal,
@@ -1416,6 +1490,7 @@ mod tests {
     fn integrity_no_offload_tab_when_disabled() {
         let mut s = Settings::default(); // offload disabled by default
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         integrity_check(&mut s);
         assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
     }
@@ -1424,6 +1499,7 @@ mod tests {
     fn integrity_materializes_offload_tab_after_ai_builtins() {
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         s.offload.enabled = true;
         integrity_check(&mut s);
@@ -1439,6 +1515,7 @@ mod tests {
     fn integrity_removes_offload_tab_when_disabled() {
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.offload.enabled = true;
         integrity_check(&mut s);
         assert!(s.tabs.iter().any(|t| t.id() == OFFLOAD_SERVER_TAB_ID));
@@ -1453,6 +1530,7 @@ mod tests {
     fn reconcile_reserved_tabs_materializes_and_removes_both_live() {
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.offload.enabled = true;
         s.graph.enabled = true;
         // The live toggle path uses reconcile_reserved_tabs (not the full
@@ -1529,12 +1607,49 @@ mod tests {
     }
 
     #[test]
+    fn integrity_materializes_tool_activity_tab_by_default() {
+        // `ui.tool_activity_tab` defaults true, so a fresh install's tab list
+        // includes the Tool Activity tab without anyone touching the flag —
+        // positioned after the other reserved feature tabs (here: Workbench,
+        // the only other default-on one).
+        let mut s = Settings::default();
+        integrity_check(&mut s);
+        assert!(s.tabs.iter().any(|t| t.id() == TOOL_ACTIVITY_TAB_ID));
+        let workbench_pos = s.tabs.iter().position(|t| t.id() == WORKBENCH_TAB_ID).unwrap();
+        let tool_activity_pos =
+            s.tabs.iter().position(|t| t.id() == TOOL_ACTIVITY_TAB_ID).unwrap();
+        assert!(workbench_pos < tool_activity_pos);
+    }
+
+    #[test]
+    fn reconcile_reserved_tabs_covers_tool_activity_live_toggle() {
+        // Start from an already-materialized tab (`ui.tool_activity_tab`
+        // defaulting true) and disable live — same shape as the Workbench
+        // live-toggle test above.
+        let mut s = Settings::default();
+        integrity_check(&mut s);
+        assert!(s.tabs.iter().any(|t| t.id() == TOOL_ACTIVITY_TAB_ID));
+
+        s.ui.tool_activity_tab = false;
+        assert!(reconcile_reserved_tabs(&mut s));
+        assert!(s.tabs.iter().all(|t| t.id() != TOOL_ACTIVITY_TAB_ID));
+        // Idempotent while it stays disabled.
+        assert!(!reconcile_reserved_tabs(&mut s));
+
+        // Re-enabling live materializes it again.
+        s.ui.tool_activity_tab = true;
+        assert!(reconcile_reserved_tabs(&mut s));
+        assert!(s.tabs.iter().any(|t| t.id() == TOOL_ACTIVITY_TAB_ID));
+    }
+
+    #[test]
     fn integrity_inserts_opencode_between_claude_local_and_user_shell() {
         // User has [claude, claude-local, shell-foo] and now enables
         // opencode. The new tab should land at index 2 (after claude-local,
         // before the shell), not at the end.
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
             AiTabId::ClaudeLocal,
@@ -1570,6 +1685,7 @@ mod tests {
         // hand-edit, or post-migration drift) reconciles to the setting.
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         let _shell = fake_default_shell();
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         integrity_check(&mut s);
@@ -1589,6 +1705,7 @@ mod tests {
         // with at least one AI tab.
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = Vec::new();
         let changed = integrity_check(&mut s);
         assert!(changed);
@@ -1603,6 +1720,7 @@ mod tests {
         // integrity check should leave it absent.
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         assert!(s
@@ -1618,6 +1736,7 @@ mod tests {
         // works.
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a legacy-shaped shell-default-1 with builtin: true.
@@ -1649,6 +1768,7 @@ mod tests {
     fn integrity_forces_builtin_true_on_ai_builtins() {
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Tamper: flip claude's builtin to false.
@@ -1664,6 +1784,7 @@ mod tests {
     fn integrity_preserves_user_tabs() {
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a user shell tab.
@@ -1702,6 +1823,7 @@ mod tests {
         let _shell = fake_default_shell();
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         integrity_check(&mut s);
         let text = serde_json::to_string(&s).unwrap();
@@ -1718,6 +1840,7 @@ mod tests {
         // Enable both so the check has both AI tabs to validate.
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         let _shell = fake_default_shell();
         integrity_check(&mut s);
@@ -1744,6 +1867,7 @@ mod tests {
     fn integrity_corrects_use_local_provider_on_opencode() {
         let mut s = Settings::default();
         s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
+        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
         s.enabled_ai_tabs = vec![AiTabId::OpenCode];
         integrity_check(&mut s);
         // Tamper: opencode → local (it has no local variant; canonical is false).

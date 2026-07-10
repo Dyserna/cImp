@@ -596,9 +596,17 @@ pub async fn close_tab(
     // V8-03: the Offload Server tab is never closable (removed only by
     // disabling offload). V9-01: the Code Graph monitor tab likewise (removed
     // only by disabling the graph). V13 Phase A: the Workbench tab likewise
-    // (removed only by disabling workbench). Guard explicitly so a hand-edit
+    // (removed only by disabling workbench). V15: the Graph View tab likewise
+    // (removed only by disabling graph_viz). Guard explicitly so a hand-edit
     // that clears the `builtin` flag still can't close them.
-    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor | TabId::Workbench) {
+    if matches!(
+        tab,
+        TabId::OffloadServer
+            | TabId::GraphMonitor
+            | TabId::Workbench
+            | TabId::GraphView
+            | TabId::ToolActivity
+    ) {
         return Err(TabLifecycleError::BuiltinNotClosable);
     }
     {

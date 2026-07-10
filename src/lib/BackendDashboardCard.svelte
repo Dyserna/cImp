@@ -1,9 +1,10 @@
 <script lang="ts">
   // One backend's card in the Offload Server tab. Local owned servers and
   // reachable LAN llama-servers render the full live dashboard (slots,
-  // throughput, queue, context, history); cloud/down backends render a
-  // compact status line. The raw server log is available only for Local
-  // backends (cImp owns their process); remote logs live on the box.
+  // throughput, queue, context); cloud/down backends render a compact status
+  // line. The per-request History feed lives in the Tool Activity tab. The
+  // raw server log is available only for Local backends (cImp owns their
+  // process); remote logs live on the box.
   import { onMount } from 'svelte';
   import {
     offloadServerLog,
@@ -78,10 +79,6 @@
     if (showLog && logEl) logEl.scrollTop = logEl.scrollHeight;
   });
 
-  function fmtTime(ms: number): string {
-    if (!ms) return '—';
-    return new Date(ms).toLocaleTimeString();
-  }
   function fmtTps(n: number | null | undefined): string {
     return n == null ? '—' : `${Math.round(n)} tok/s`;
   }
@@ -206,33 +203,8 @@
       {/each}
     </div>
 
-    <div class="history">
-      <div class="history-head">History <span class="muted">(newest first)</span></div>
-      <!-- Body reserves exactly five rows from the start; older entries scroll. -->
-      <div class="history-body">
-        {#if metrics.history.length === 0}
-          <div class="history-empty">No requests yet.</div>
-        {:else}
-          <div class="history-rows">
-            {#each metrics.history as r (r.start_ms + '-' + r.slot)}
-              <div class="hrow">
-                <span class="htime">{fmtTime(r.start_ms)} → {fmtTime(r.end_ms)}</span>
-                <span class="hdur">{r.duration_s.toFixed(1)}s</span>
-                <span class="hslot">slot {r.slot}</span>
-                <span
-                  class="htok"
-                  title="{r.prompt_tokens.toLocaleString()} prompt + {r.tokens.toLocaleString()} generated"
-                >
-                  {(r.prompt_tokens + r.tokens).toLocaleString()} tok
-                  <span class="muted">· {r.tokens.toLocaleString()} out</span>
-                </span>
-                <span class="htps">{Math.round(r.avg_tps)} tok/s</span>
-              </div>
-            {/each}
-          </div>
-        {/if}
-      </div>
-    </div>
+    <!-- The per-request History feed moved to the Tool Activity tab's unified
+         Activities view (ToolActivityView.svelte). -->
   {:else}
     <div class="status">{stateText()}</div>
   {/if}
@@ -429,49 +401,6 @@
   .slot-tps {
     text-align: right;
     font-variant-numeric: tabular-nums;
-  }
-  .history {
-    /* One history row's box height; five of these are reserved below. */
-    --hrow-h: 1.5rem;
-  }
-  .history-head {
-    font-weight: 600;
-    margin-bottom: 0.3rem;
-  }
-  .history-body {
-    /* Reserve five rows up front (no layout jump as requests arrive) and
-       scroll once history grows past five entries. */
-    height: calc(5 * var(--hrow-h));
-    overflow-y: auto;
-  }
-  .history-empty {
-    color: var(--text-secondary, #8b949e);
-    font-style: italic;
-  }
-  .history-rows {
-    display: flex;
-    flex-direction: column;
-  }
-  .hrow {
-    display: grid;
-    grid-template-columns: minmax(10rem, 1.3fr) 3.5rem 3.5rem minmax(9rem, 1.7fr) 5.5rem;
-    align-items: center;
-    gap: 0.5rem;
-    height: var(--hrow-h);
-    box-sizing: border-box;
-    padding: 0.2rem 0.3rem;
-    border-bottom: 1px solid var(--border-subtle, #21262d);
-    font-variant-numeric: tabular-nums;
-    font-size: 0.92em;
-    white-space: nowrap;
-  }
-  .hrow .htok,
-  .hrow .htps {
-    text-align: right;
-  }
-  .hdur,
-  .hslot {
-    color: var(--text-secondary, #8b949e);
   }
   .dot {
     width: 0.55rem;

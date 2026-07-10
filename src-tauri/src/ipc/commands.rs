@@ -174,9 +174,16 @@ pub async fn pty_write(
     // V8-03: the Offload Server tab is read-only — it has no PTY of its own
     // (its content is the live llama-server output stream), so swallow any
     // write. Defense-in-depth behind the frontend's read-only guard. Same for
-    // the V9-01 Code Graph monitor and V13 Workbench tabs — both app-rendered
-    // with no PTY.
-    if matches!(tab, TabId::OffloadServer | TabId::GraphMonitor | TabId::Workbench) {
+    // the V9-01 Code Graph monitor, V13 Workbench, and V15 Graph View tabs —
+    // all app-rendered with no PTY.
+    if matches!(
+        tab,
+        TabId::OffloadServer
+            | TabId::GraphMonitor
+            | TabId::Workbench
+            | TabId::GraphView
+            | TabId::ToolActivity
+    ) {
         return Ok(());
     }
     // Pre-register any TTS markers in the user's input so they don't fire
@@ -804,12 +811,14 @@ pub async fn settings_update(
     // live materialize/remove after the mutate. The integrity pass that
     // normally owns those tabs only runs at load, so without this a freshly
     // enabled feature's tab wouldn't appear until the next launch.
-    let (was_graph, was_offload, was_workbench, was_stt, was_stt_device) = {
+    let (was_graph, was_offload, was_workbench, was_graph_viz, was_tool_activity, was_stt, was_stt_device) = {
         let old = state.settings.current();
         (
             old.graph.enabled,
             old.offload.enabled,
             old.workbench.enabled,
+            old.graph.graph_viz,
+            old.ui.tool_activity_tab,
             old.stt.enabled,
             old.stt.device,
         )
@@ -861,6 +870,8 @@ pub async fn settings_update(
     if now.graph.enabled != was_graph
         || now.offload.enabled != was_offload
         || now.workbench.enabled != was_workbench
+        || now.graph.graph_viz != was_graph_viz
+        || now.ui.tool_activity_tab != was_tool_activity
     {
         // Serialize against create/close_tab while we touch the registry.
         let _serializer = state.lifecycle_serializer.lock().await;
@@ -886,6 +897,24 @@ pub async fn settings_update(
                 state.inner(),
                 TabId::Workbench,
                 now.workbench.enabled,
+            )
+            .await;
+        }
+        // V15 Feature 4: mirror the Graph View tab live too.
+        if now.graph.graph_viz != was_graph_viz {
+            super::tab_lifecycle::sync_reserved_feature_tab(
+                state.inner(),
+                TabId::GraphView,
+                now.graph.graph_viz,
+            )
+            .await;
+        }
+        // Mirror the Tool Activity tab live too.
+        if now.ui.tool_activity_tab != was_tool_activity {
+            super::tab_lifecycle::sync_reserved_feature_tab(
+                state.inner(),
+                TabId::ToolActivity,
+                now.ui.tool_activity_tab,
             )
             .await;
         }

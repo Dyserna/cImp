@@ -16,18 +16,9 @@
     type BackendDashboard,
   } from './offload';
   import { listenManaged } from './listenManaged';
-  import ToolsReference from './ToolsReference.svelte';
 
-  // Reference list of the tools the offload feature provides. `offload_task` is
-  // the MCP tool Claude calls to delegate; read_file / code_search /
-  // run_command are the native tools the local worker uses to complete the
-  // task (toggle them in Settings → Offload → Tools). Static docs.
-  const OFFLOAD_TOOLS = [
-    { name: 'offload_task', desc: 'Delegate a token-heavy subtask to the local model and get back only the synthesized result — conserving the main session’s context.', example: 'Offload: summarize every TODO/FIXME across the repo and group them by theme.' },
-    { name: 'read_file', desc: 'Worker reads a file (within the configured allowed roots).', example: 'Read src/offload/openai.rs, lines 1–200.' },
-    { name: 'code_search', desc: 'Worker searches the codebase with ripgrep.', example: 'Search the repo for predicted_per_second.' },
-    { name: 'run_command', desc: 'Worker runs an allowlisted, read-only command.', example: 'Run git log --oneline -20.' },
-  ];
+  // The offload tool reference list moved to the Tool Activity tab
+  // (ToolActivityView.svelte), alongside the graph tools.
 
   let dashboards = $state<BackendDashboard[]>([]);
 
@@ -108,12 +99,6 @@
       </section>
     {/if}
   {/if}
-
-  <ToolsReference
-    title="Offload tools"
-    tools={OFFLOAD_TOOLS}
-    note="offload_task is the tool Claude calls to delegate; the rest are the tools the local worker uses to complete the task."
-  />
 </div>
 
 <style>

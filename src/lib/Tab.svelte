@@ -110,15 +110,24 @@
   }
 
   function onRenameKeyDown(e: KeyboardEvent): void {
+    // Keep every key local to the input. It is nested inside the tab
+    // <button>, so a bubbled Space (or Enter) keyboard-activates the button —
+    // simulated click → tab switch steals focus → blur-submit closes the
+    // editor mid-typing. Capture-phase global shortcuts have already run by
+    // the time this fires, so they are unaffected.
+    e.stopPropagation();
     if (e.key === 'Enter') {
       e.preventDefault();
-      e.stopPropagation();
       submitRename();
     } else if (e.key === 'Escape') {
       e.preventDefault();
-      e.stopPropagation();
       cancelRename();
     }
+  }
+
+  function onRenameKeyUp(e: KeyboardEvent): void {
+    // Space activation of a <button> fires on keyup — stop that too.
+    e.stopPropagation();
   }
 
   function onCloseClick(e: MouseEvent): void {
@@ -203,28 +212,28 @@
       </span>
     </span>
   {:else if renaming}
-    {#if indicator}
-      <span
-        class="indicator indicator-{indicator}"
-        aria-label={`status: ${indicator}`}
-      ></span>
-    {/if}
+    <span
+      class="indicator indicator-{indicator ?? 'none'}"
+      aria-label={indicator ? `status: ${indicator}` : undefined}
+      aria-hidden={indicator ? undefined : true}
+    ></span>
     <input
       bind:this={renameInputEl}
       bind:value={renameValue}
       class="rename-input"
       type="text"
       onkeydown={onRenameKeyDown}
+      onkeyup={onRenameKeyUp}
       onblur={submitRename}
       onclick={(e) => e.stopPropagation()}
+      onpointerdown={(e) => e.stopPropagation()}
     />
   {:else}
-    {#if indicator}
-      <span
-        class="indicator indicator-{indicator}"
-        aria-label={`status: ${indicator}`}
-      ></span>
-    {/if}
+    <span
+      class="indicator indicator-{indicator ?? 'none'}"
+      aria-label={indicator ? `status: ${indicator}` : undefined}
+      aria-hidden={indicator ? undefined : true}
+    ></span>
     <span class="label">{label}</span>
     {#if onnew}
       <span
@@ -322,6 +331,10 @@
     color: var(--text-bright);
     background: var(--surface-3);
   }
+  /* The dot's slot is ALWAYS rendered (indicator-none = transparent) so a
+     tab's width never changes as activity flips on/off — with several tabs
+     rapidly switching states, conditional rendering made the whole bar
+     jitter. */
   .indicator {
     display: inline-block;
     width: 8px;

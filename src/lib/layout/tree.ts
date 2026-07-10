@@ -125,12 +125,17 @@ export function removeTab(
 /// Move a tab between panes (or reorder within the same pane). The
 /// underlying ops are remove + insert, so this is the composition of
 /// those two; the resulting tree is consistent at every step.
+///
+/// No-op when `toPaneId` doesn't exist: without this guard the remove
+/// would run but the insert would match nothing, and the tab would
+/// silently vanish from the tree.
 export function moveTab(
   root: LayoutNode,
   tabId: TabId,
   toPaneId: PaneId,
   position: number,
 ): LayoutNode {
+  if (!findPane(root, toPaneId)) return root;
   const { tree: removed } = removeTab(root, tabId);
   return insertTabIntoPane(removed, toPaneId, tabId, position, { activate: true });
 }

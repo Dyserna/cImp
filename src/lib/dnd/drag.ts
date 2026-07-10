@@ -5,10 +5,18 @@
 //
 // Pointer events (not mouse events) with `setPointerCapture` on the
 // source tab give us reliable behavior when the cursor leaves the
-// window: pointermove keeps firing on the captured element, and
+// window: pointermove keeps firing for the captured pointer, and
 // pointerup arrives even if the actual release happens off-screen.
 // Window-level mousemove/mouseup tend to drop events under WebView2
 // once the pointer crosses the chrome.
+//
+// The move/up/cancel handlers are attached to `window`, not to the
+// source element: captured pointer events retarget to the source tab
+// but still bubble to window, so the captured path works identically —
+// and if capture failed (some webviews refuse it) or the source
+// element is unmounted mid-drag, in-window pointer events still reach
+// the handlers instead of silently stranding the state machine in
+// `pending`/`dragging` with a frozen ghost.
 //
 // Click suppression: a click is synthesized after pointerdown→
 // pointerup on the same captured element. After a real drag (state
@@ -50,6 +58,15 @@ export function beginDrag(
   sourcePaneId: PaneId,
   event: PointerEvent,
 ): void {
+  // Only one drag can be in flight. A non-idle state here means either
+  // a second pointer went down mid-drag (multi-touch / pen + mouse) or
+  // a previous drag's pointerup never reached us (e.g. capture refused
+  // and released off-element). Force-cancel the stale machine first so
+  // its capture and cursor override are released — otherwise they leak
+  // for the life of the old element (and `cursor: grabbing` sticks
+  // app-wide until some later cleanup happens to run).
+  if (get(dragState).kind !== 'idle') cleanup(false);
+
   if (event.button !== 0) return; // left button only
   const target = event.target;
   if (target instanceof Element && target.closest(NON_DRAG_TARGET_SELECTOR)) {
@@ -60,9 +77,9 @@ export function beginDrag(
   try {
     sourceEl.setPointerCapture(event.pointerId);
   } catch {
-    // Some webviews can refuse capture (rare). The handlers fall back
-    // to bubbling through the document; clientX/Y stay correct either
-    // way.
+    // Some webviews can refuse capture (rare). The window-level
+    // handlers below still receive in-window pointer events via
+    // bubbling; capture only adds off-window tracking on top.
   }
   dragState.set({
     kind: 'pending',
@@ -73,9 +90,9 @@ export function beginDrag(
     pointerId: event.pointerId,
     sourceEl,
   });
-  sourceEl.addEventListener('pointermove', onPointerMove);
-  sourceEl.addEventListener('pointerup', onPointerUp);
-  sourceEl.addEventListener('pointercancel', onPointerCancel);
+  window.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerup', onPointerUp);
+  window.addEventListener('pointercancel', onPointerCancel);
   window.addEventListener('keydown', onKeyDown, true);
 }
 
@@ -164,10 +181,10 @@ function cleanup(suppressClick: boolean): void {
     } catch {
       // Already released (browsers auto-release on pointerup).
     }
-    state.sourceEl.removeEventListener('pointermove', onPointerMove);
-    state.sourceEl.removeEventListener('pointerup', onPointerUp);
-    state.sourceEl.removeEventListener('pointercancel', onPointerCancel);
   }
+  window.removeEventListener('pointermove', onPointerMove);
+  window.removeEventListener('pointerup', onPointerUp);
+  window.removeEventListener('pointercancel', onPointerCancel);
   window.removeEventListener('keydown', onKeyDown, true);
   document.body.style.cursor = '';
   dragState.set({ kind: 'idle' });

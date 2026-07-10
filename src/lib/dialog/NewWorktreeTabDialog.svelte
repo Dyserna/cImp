@@ -10,7 +10,7 @@
   import { onMount } from 'svelte';
   import { closeDialog, dialogState } from './store';
   import { createAiTabInWorktree, type TabLifecycleError } from '../ipc';
-  import { cancelLastPlacement, requestTabIntoPane } from '../layout/store';
+  import { cancelPlacement, requestTabIntoPane } from '../layout/store';
   import { bumpWorkbenchWorktreesVersion } from '../workbench';
   import { errorMessage } from '../errors';
 
@@ -50,8 +50,8 @@
     if (busy || !template || !paneId || !slugValid) return;
     busy = true;
     error = null;
+    const placement = requestTabIntoPane(paneId);
     try {
-      requestTabIntoPane(paneId);
       await createAiTabInWorktree(template, trimmed);
       bumpWorkbenchWorktreesVersion();
       closeDialog();
@@ -60,7 +60,7 @@
       // placement queued above will never be consumed — cancel it, or the
       // next tab created ANYWHERE would be silently routed into this pane
       // (the layout store's placement contract).
-      cancelLastPlacement();
+      cancelPlacement(placement);
       const wire = e as TabLifecycleError | string | null;
       if (wire && typeof wire === 'object' && 'kind' in wire) {
         error = wire.kind === 'internal' ? wire.message : wire.kind;

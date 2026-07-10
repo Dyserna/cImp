@@ -30,7 +30,7 @@ Sessions are ordered by priority; they are independent, so any order works.
 
 ## Session 1 — Avatar/animation frontend cluster (~700 lines)
 
-- [ ] Done — findings: __
+- [x] Done — findings: 10 (2026-07-10)
 - `src/lib/spritePlayer.ts` (330) — animation state machine
 - `src/lib/avatarState.ts` (232)
 - `src/lib/avatarConfig.ts` (127)
@@ -123,4 +123,4 @@ usage math rounding.
 
 | Date | Session | Findings | Commit |
 |------|---------|----------|--------|
-|      |         |          |        |
+| 2026-07-10 | 1 — avatar/animation frontend | 10 fixed (3 sprite-player races/freezes, empty-manifest + tile-contract degrades, loadedSet retry latch, fallback rotation key, stale crossfade timer, listener ownership, ghost per-tab entries) + tests for the state-transition logic | (this commit) |

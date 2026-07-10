@@ -251,6 +251,7 @@ fn load_themes() -> Vec<ThemeWire> {
                     continue;
                 }
                 let Some(folder_id) = path.file_name().and_then(|n| n.to_str()) else {
+                    tracing::warn!(path = %path.display(), "theming: non-UTF-8 theme folder name; skipped");
                     continue;
                 };
                 let json = std::fs::read_to_string(path.join("theme.json"));
@@ -284,6 +285,16 @@ fn load_palettes() -> Vec<PaletteWire> {
         map.insert(p.name.clone(), p);
     }
 
+    // Filenames already loaded from disk, keyed by the palette's internal
+    // `name` — nothing enforces name-vs-filename agreement (unlike themes,
+    // whose id must match the folder), so two files can declare the same name
+    // and whichever `read_dir` enumerates last silently wins, in an
+    // unspecified order. That stays last-wins (changing it could break
+    // existing setups) but is now warned about, so "my edits don't show up"
+    // is diagnosable. Overriding the *embedded* namesake is the normal case
+    // and stays silent.
+    let mut disk_sources: HashMap<String, String> = HashMap::new();
+
     if let Some(dir) = palettes_dir() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -297,10 +308,18 @@ fn load_palettes() -> Vec<PaletteWire> {
                     .unwrap_or("?")
                     .to_string();
                 let Ok(json) = std::fs::read_to_string(&path) else {
+                    tracing::warn!(file = %file_name, "theming: palette file unreadable; skipped");
                     continue;
                 };
                 match build_palette(&json) {
                     Ok(p) => {
+                        if let Some(earlier) = disk_sources.get(&p.name) {
+                            tracing::warn!(
+                                palette = %p.name, file = %file_name, overrides = %earlier,
+                                "theming: duplicate palette name across files; this file wins"
+                            );
+                        }
+                        disk_sources.insert(p.name.clone(), file_name);
                         map.insert(p.name.clone(), p);
                     }
                     Err(e) => {

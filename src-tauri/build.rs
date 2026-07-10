@@ -52,10 +52,14 @@ fn copy_theming_assets() {
             continue;
         }
         let dst = profile_dir.join(folder);
-        // Remove any stale copy first so a file deleted from the source doesn't
-        // linger next to the exe and keep getting served.
-        let _ = std::fs::remove_dir_all(&dst);
-        copy_dir_all(&src, &dst).expect("failed to copy theming assets next to exe");
+        // Sync (overwrite + prune stale), never delete-then-copy: a copy that
+        // fails partway (a file locked by a running dev instance, AV scan)
+        // must not leave the destination emptier than it started. A failed
+        // sync is a warning, not a build failure — the app degrades to its
+        // embedded fallback theme/palette and stays usable.
+        if let Err(e) = sync_dir(&src, &dst) {
+            println!("cargo:warning=couldn't sync {folder}/ next to the exe ({e}); the built app may see a stale copy");
+        }
     }
 }
 
@@ -86,7 +90,19 @@ fn copy_espeak_data() {
     match find_espeak_data(build_root).or_else(find_system_espeak_data) {
         Some(src) => {
             println!("cargo:rerun-if-changed={}", src.display());
-            copy_dir_all(&src, &dst).expect("failed to copy espeak-ng-data");
+            if let Err(e) = sync_dir(&src, &dst) {
+                // A running app instance can hold espeak data files open on
+                // Windows; if a usable copy is already in place, don't fail
+                // the whole build over a refresh we couldn't complete.
+                if dst.join("phontab").is_file() {
+                    println!(
+                        "cargo:warning=couldn't refresh espeak-ng-data next to the exe ({e}); \
+                         keeping the existing copy (likely in use by a running instance)"
+                    );
+                } else {
+                    panic!("failed to copy espeak-ng-data: {e}");
+                }
+            }
         }
         None if cfg!(windows) => {
             panic!("espeak-rs-sys did not produce espeak-ng-data; rebuild that crate");
@@ -137,7 +153,12 @@ fn find_espeak_data(build_root: &Path) -> Option<PathBuf> {
         if !candidate.is_dir() {
             continue;
         }
-        let mtime = entry.metadata().ok().and_then(|m| m.modified().ok())?;
+        // A failed metadata read (e.g. cargo cleaning an old hash dir
+        // concurrently) skips this candidate only — `?` here would abort the
+        // whole search and discard an already-found `best`.
+        let Some(mtime) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
         if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
             best = Some((mtime, candidate));
         }
@@ -145,16 +166,36 @@ fn find_espeak_data(build_root: &Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+/// Mirror `src` into `dst`: copy/overwrite every source entry, then prune
+/// destination entries the source no longer has (so a deleted theme doesn't
+/// linger next to the exe and keep getting served). Unlike delete-then-copy,
+/// a copy that fails partway leaves the previous files in place rather than
+/// an emptied directory. `is_dir()` on the *path* (not the dir-entry type) so
+/// a symlink to a directory recurses instead of failing `fs::copy` (system
+/// espeak-ng-data on Linux can contain symlinks).
+fn sync_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        let ty = entry.file_type()?;
         let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst_path)?;
+        if entry.path().is_dir() {
+            sync_dir(&entry.path(), &dst_path)?;
         } else {
             std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    for entry in std::fs::read_dir(dst)? {
+        let entry = entry?;
+        if !src.join(entry.file_name()).exists() {
+            let p = entry.path();
+            let stale = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+            if let Err(e) = stale {
+                println!("cargo:warning=couldn't remove stale {} ({e})", p.display());
+            }
         }
     }
     Ok(())

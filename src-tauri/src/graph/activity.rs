@@ -10,6 +10,7 @@
 //! monitor tab without the app.)
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,11 @@ const CAP: usize = 200;
 pub struct GraphCall {
     /// Unix epoch millis when the call started.
     pub ts_ms: u64,
+    /// The project root the call ran against, in [`root_key`] form. The ring
+    /// is process-wide across every indexed root; this is what lets a
+    /// per-project consumer (the Graph View pulse feed) keep another
+    /// project's activity from lighting up same-named nodes in its graph.
+    pub root: String,
     /// Who issued it: `"claude"` (cloud session) or `"offload"` (local worker).
     pub source: String,
     /// The tool name, e.g. `graph_find_symbol`.
@@ -54,6 +60,19 @@ pub fn snapshot() -> Vec<GraphCall> {
         .unwrap_or_default()
 }
 
+/// The canonical string form a root is recorded (and filtered) under.
+/// Recorders and the scoped `graph_history` filter must both go through this:
+/// the same directory reaches them in different spellings (the launch cwd vs.
+/// a `find_graph_root` ancestor walk, drive-letter vs. verbatim `\\?\` form on
+/// Windows), and canonicalizing both sides makes those compare equal. Falls
+/// back to the path as given (e.g. the directory vanished mid-call).
+pub fn root_key(root: &Path) -> String {
+    std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
 /// Current Unix epoch in milliseconds (0 if the clock is before the epoch).
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -69,6 +88,7 @@ mod tests {
     fn call(target: &str) -> GraphCall {
         GraphCall {
             ts_ms: now_ms(),
+            root: root_key(Path::new(".")),
             source: "offload".into(),
             tool: "graph_outline".into(),
             target: target.into(),
@@ -76,6 +96,20 @@ mod tests {
             ms: 0,
             ok: true,
         }
+    }
+
+    #[test]
+    fn root_key_is_stable_across_spellings() {
+        // The same directory reached via different relative spellings must
+        // produce the same key — that equality is what the scoped
+        // `graph_history` filter relies on.
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(root_key(&cwd), root_key(Path::new(".")));
+        // A path that doesn't exist falls back to its literal form.
+        assert_eq!(
+            root_key(Path::new("definitely/not/a/real/dir")),
+            Path::new("definitely/not/a/real/dir").to_string_lossy()
+        );
     }
 
     #[test]

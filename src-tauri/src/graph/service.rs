@@ -1529,6 +1529,7 @@ impl GraphService {
         // not a fabricated token estimate.
         super::activity::record(super::activity::GraphCall {
             ts_ms: ts as u64,
+            root: super::activity::root_key(root),
             source: "read_advisor".to_string(),
             tool: "remind".to_string(),
             target: rel,
@@ -1712,6 +1713,7 @@ impl GraphService {
         // a same-turn fix).
         super::activity::record(super::activity::GraphCall {
             ts_ms: super::activity::now_ms(),
+            root: super::activity::root_key(root),
             source: "auto_check".to_string(),
             tool: "auto_check".to_string(),
             target: file_path.to_string(),

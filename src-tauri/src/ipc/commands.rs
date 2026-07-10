@@ -1137,10 +1137,22 @@ pub async fn graph_test_embedder(
 }
 
 /// V9-01: recent graph tool calls (cloud Claude + offload worker), newest
-/// first — the monitor tab's activity list.
+/// first — the monitor tab's activity list. The ring is process-wide across
+/// every indexed root; pass `scoped: true` (with an optional `root`, default
+/// the launch directory) to filter to one project's calls — the Graph View
+/// pulse feed uses this so another project's activity can't light up
+/// same-named nodes here. The Tool Activity tab omits it and sees everything.
 #[tauri::command]
-pub async fn graph_history() -> AppResult<Vec<crate::graph::GraphCall>> {
-    Ok(crate::graph::graph_history())
+pub async fn graph_history(
+    root: Option<String>,
+    scoped: Option<bool>,
+) -> AppResult<Vec<crate::graph::GraphCall>> {
+    let calls = crate::graph::graph_history();
+    if !scoped.unwrap_or(false) {
+        return Ok(calls);
+    }
+    let key = crate::graph::activity_root_key(&resolve_graph_root(root)?);
+    Ok(calls.into_iter().filter(|c| c.root == key).collect())
 }
 
 /// V10: one candidate dead export (unused public symbol) for the Analyses tab.

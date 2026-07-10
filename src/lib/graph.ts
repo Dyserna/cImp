@@ -113,7 +113,9 @@ export function graphTestEmbedder(): Promise<EmbedderProbe> {
 /// One recorded graph tool call. Mirror of Rust `graph::GraphCall`.
 export interface GraphCall {
   ts_ms: number;
-  source: 'claude' | 'opencode' | 'offload';
+  /// Canonicalized project root the call ran against.
+  root: string;
+  source: 'claude' | 'opencode' | 'offload' | 'read_advisor' | 'auto_check';
   tool: string;
   target: string;
   chars: number;
@@ -122,8 +124,13 @@ export interface GraphCall {
 }
 
 /// Recent graph tool calls (cloud Claude + offload worker), newest first.
-export function graphHistory(): Promise<GraphCall[]> {
-  return invoke<GraphCall[]>('graph_history');
+/// The ring spans every indexed root; pass `scoped: true` (with an optional
+/// `root`, default the launch directory) to see one project's calls only.
+export function graphHistory(opts?: { root?: string; scoped?: boolean }): Promise<GraphCall[]> {
+  return invoke<GraphCall[]>('graph_history', {
+    root: opts?.root ?? null,
+    scoped: opts?.scoped ?? false,
+  });
 }
 
 /// Subscribe to live per-root status transitions (emitted as one status at a

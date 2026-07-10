@@ -172,6 +172,12 @@ pub struct VizGraph {
     pub edges: Vec<VizEdge>,
 }
 
+/// Most definitions one call edge may fan out to in the viz snapshot (a call
+/// edge stores the callee NAME; common names resolve to dozens of defs).
+pub const VIZ_CALL_FANOUT_MAX: usize = 4;
+/// Edge budget per node for the viz snapshot's hard edge cap.
+pub const VIZ_EDGES_PER_NODE: usize = 4;
+
 /// A traced shortest path between two entities (V15 Feature 1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathHit {
@@ -1698,6 +1704,17 @@ reach[x] := reach[z], calls[x, z]"#
     /// `max_nodes` highest-degree nodes and the resolved edges among them (never
     /// the whole graph). Nodes carry a subsystem label (color) and degree (size);
     /// edges carry kind (color) and confidence (dash). Offline, read-only.
+    ///
+    /// Edges are bounded too — the top hubs are by construction the densest
+    /// slice of the graph, and the frontend pays per edge per frame (spring
+    /// force + canvas stroke), so an uncapped edge list froze the whole
+    /// webview on big projects:
+    /// - a call to a many-definition name fans out to at most
+    ///   [`VIZ_CALL_FANOUT_MAX`] candidates (a call edge stores the callee
+    ///   NAME; hyper-common names like `new` resolve to dozens of definitions,
+    ///   and drawing caller × every-candidate is quadratic noise, not signal);
+    /// - the final list is capped at `max_nodes * VIZ_EDGES_PER_NODE`,
+    ///   dropping lowest-confidence edges first.
     pub fn viz_snapshot(&self, max_nodes: usize) -> AppResult<VizGraph> {
         let max_nodes = max_nodes.max(1);
 
@@ -1778,8 +1795,9 @@ reach[x] := reach[z], calls[x, z]"#
             let dst = cell_str(r, 1);
             let conf = if multi.contains(&dst) { Confidence::Ambiguous } else { Confidence::from_tag(&cell_str(r, 2)) };
             if let Some(ids) = name_to_ids.get(&dst) {
-                let ids = ids.clone();
-                for callee in ids {
+                let mut ids = ids.clone();
+                ids.sort(); // deterministic pick when the fan-out is capped
+                for callee in ids.into_iter().take(VIZ_CALL_FANOUT_MAX) {
                     push_edge(&mut edges, &mut seen, &mut meta, &src, &callee, "call", conf);
                 }
             }
@@ -1824,6 +1842,21 @@ reach[x] := reach[z], calls[x, z]"#
         }
         let kept: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
         edges.retain(|e| kept.contains(&e.src) && kept.contains(&e.dst));
+
+        // Hard edge cap: dropping lowest-confidence edges first (stable sort
+        // keeps the original deterministic order within each class). Node
+        // degrees stay as computed above — the cap bounds what's DRAWN, not
+        // the truth about how connected a node is.
+        let max_edges = max_nodes.saturating_mul(VIZ_EDGES_PER_NODE);
+        if edges.len() > max_edges {
+            let rank = |c: &str| match c {
+                "extracted" => 0u8,
+                "inferred" => 1,
+                _ => 2,
+            };
+            edges.sort_by_key(|e| rank(&e.confidence));
+            edges.truncate(max_edges);
+        }
 
         Ok(VizGraph { nodes, edges })
     }
@@ -4398,6 +4431,42 @@ pub struct Point { x: i32 }
         assert!(idx.shortest_path("a", "nope", &kinds, 8, false).unwrap().is_none());
         // Bound too small → None.
         assert!(idx.shortest_path("a", "c", &kinds, 1, false).unwrap().is_none());
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the Graph View freeze: a call edge stores the callee
+    /// NAME, and the viz snapshot used to fan out to EVERY definition of that
+    /// name — hyper-common names (`new`: 33 defs in this repo) multiplied one
+    /// call site into dozens of drawn edges, with no overall edge cap, and the
+    /// frontend's per-edge-per-frame cost pinned the webview thread.
+    #[test]
+    fn viz_snapshot_caps_call_fanout_and_total_edges() {
+        let dir = std::env::temp_dir().join(format!("ckg-viz-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        for i in 0..9 {
+            idx.index_file_graph(&parse_file(
+                &format!("src/d{i}.rs"),
+                "pub fn dup() {}\n",
+                Lang::Rust,
+            ))
+            .unwrap();
+        }
+        idx.index_file_graph(&parse_file("src/main.rs", "pub fn caller() { dup(); }\n", Lang::Rust))
+            .unwrap();
+
+        let g = idx.viz_snapshot(100).expect("viz");
+        let calls: Vec<_> = g.edges.iter().filter(|e| e.kind == "call").collect();
+        assert_eq!(
+            calls.len(),
+            VIZ_CALL_FANOUT_MAX,
+            "one call site × 9 same-named defs is capped, not fanned out: {calls:?}"
+        );
+        // A multi-candidate callee name renders as ambiguous (dotted).
+        assert!(calls.iter().all(|e| e.confidence == "ambiguous"));
+        // The overall bound the frontend's frame budget relies on.
+        assert!(g.edges.len() <= g.nodes.len() * VIZ_EDGES_PER_NODE);
+
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }

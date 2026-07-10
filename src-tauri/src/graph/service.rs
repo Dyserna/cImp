@@ -1949,7 +1949,7 @@ impl GraphService {
             // A stored-hash check skips unchanged children, so a redundant
             // dir event costs one read+hash per child, not a re-parse.
             if path.is_dir() {
-                match index_dir_tree(&idx, root, &path, &snap, &sub, max_bytes) {
+                match index_dir_tree(&idx, root, &path, &snap, &sub, max_bytes, &gi) {
                     DirWalk::Indexed { indexed, rels } => {
                         changed += indexed;
                         touched_rels.extend(rels);
@@ -2596,6 +2596,13 @@ enum DirWalk {
 /// whose stored content hash already matches (e.g. their own file events
 /// landed in the same batch), so a redundant directory event costs one
 /// read+hash per child, not a re-parse.
+///
+/// `gi` must cover `dir` itself: the walker below STARTS at `dir`, and the
+/// `ignore` crate never matches a walk root against ignore rules — so a
+/// gitignore rule that excludes the directory (e.g. `dist` written by a
+/// frontend build) would silently not fire, and the whole artifact subtree
+/// (minified bundles included) would be parsed into the graph. That exact
+/// leak polluted this repo's own graph with `dist/assets/*.js`.
 fn index_dir_tree(
     idx: &GraphIndex,
     root: &Path,
@@ -2603,8 +2610,12 @@ fn index_dir_tree(
     snap: &GraphSettings,
     sub: &str,
     max_bytes: u64,
+    gi: &Gitignore,
 ) -> DirWalk {
     const MAX_DIR_WALK: usize = 4096;
+    if gi.matched_path_or_any_parents(dir, true).is_ignore() {
+        return DirWalk::Indexed { indexed: 0, rels: Vec::new() };
+    }
     let mut eligible = 0usize;
     let mut indexed = 0u64;
     let mut rels: Vec<String> = Vec::new();
@@ -2919,7 +2930,7 @@ mod tests {
         assert!(idx.find_symbol("alpha").unwrap().is_empty());
 
         // ...and the walk must index the new side.
-        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX) {
+        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX, &Gitignore::empty()) {
             DirWalk::Indexed { indexed, rels } => {
                 assert_eq!(indexed, 1, "one child file indexed");
                 assert_eq!(rels, vec!["srcnew/lib.rs".to_string()]);
@@ -2933,10 +2944,46 @@ mod tests {
         );
 
         // Idempotence: unchanged children are hash-skipped on a repeat event.
-        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX) {
+        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX, &Gitignore::empty()) {
             DirWalk::Indexed { indexed, .. } => assert_eq!(indexed, 0, "nothing re-indexed"),
             DirWalk::TooBig => panic!("one file is not too big"),
         }
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the gitignored-directory leak: a dir event for an
+    /// ignored directory (a frontend build recreating `dist/`) used to be
+    /// walked anyway — `index_dir_tree`'s walker starts INSIDE the dir, so the
+    /// parent `.gitignore` rule excluding the dir itself never fired, and the
+    /// minified bundles were parsed into the graph (thousands of one-letter
+    /// symbols + `new`/`get`/`set` hubs that then exploded the viz snapshot).
+    #[test]
+    fn ignored_directory_event_is_not_walked() {
+        let dir = std::env::temp_dir().join(format!("ckg-igdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("dist/assets")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "dist\n").unwrap();
+        std::fs::write(dir.join("dist/assets/app.js"), "export function bundled() {}\n").unwrap();
+
+        let sub = ".ckg-test";
+        let snap = GraphSettings::default();
+        let idx = GraphIndex::open(&dir, sub).expect("open");
+
+        // Same matcher construction as `reindex_paths` for this batch.
+        let gi = build_gitignore(&dir, &[dir.join("dist/assets")]);
+
+        // The dir itself and any subdir of it must both be no-ops.
+        for target in ["dist", "dist/assets"] {
+            match index_dir_tree(&idx, &dir, &dir.join(target), &snap, sub, u64::MAX, &gi) {
+                DirWalk::Indexed { indexed, rels } => {
+                    assert_eq!(indexed, 0, "{target}: nothing indexed");
+                    assert!(rels.is_empty(), "{target}: no touched rels");
+                }
+                DirWalk::TooBig => panic!("{target}: ignored dir must not be walked at all"),
+            }
+        }
+        assert!(idx.find_symbol("bundled").unwrap().is_empty(), "bundle symbol never indexed");
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

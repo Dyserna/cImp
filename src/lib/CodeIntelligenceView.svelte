@@ -358,8 +358,17 @@
 
   // Stacked-bar chart derived state (This Session). Pure math lives in
   // `./usageMath` (unit-tested); this just wires it to the current turns.
+  // The chart shows the newest turns that FIT the card's width (each bar
+  // needs ~5px: 2px min column + 3px gap) — an unbounded session used to
+  // push the flex row right out of the card on narrow panes.
   let usageTurns = $derived(usage?.current?.turns ?? []);
-  let usageMax = $derived(maxTurnTotal(usageTurns));
+  let ubarsWidth = $state(0);
+  const BAR_MIN_PX = 5;
+  let shownTurns = $derived.by(() => {
+    const cap = ubarsWidth > 0 ? Math.max(10, Math.floor(ubarsWidth / BAR_MIN_PX)) : 60;
+    return usageTurns.length > cap ? usageTurns.slice(-cap) : usageTurns;
+  });
+  let usageMax = $derived(maxTurnTotal(shownTurns));
 
   const ADVISOR_RULES_TOOLTIP =
     'advisor.raise_context_min_score.v1: ≥5 sessions, ≥200 injections, ≥70% never re-touched → raise context_min_score.\n' +
@@ -650,7 +659,12 @@
 
     <!-- This session: per-turn stacked bars + top consumers. -->
     <section class="card">
-      <div class="history-head">This session</div>
+      <div class="history-head">
+        This session
+        {#if shownTurns.length < usageTurns.length}
+          <span class="muted">(last {shownTurns.length} of {usageTurns.length} turns)</span>
+        {/if}
+      </div>
       {#if !usage || !usage.current || usage.current.turns.length === 0}
         <p class="placeholder">No usage recorded yet this session.</p>
       {:else}
@@ -660,15 +674,16 @@
           <span><span class="dot out"></span>output</span>
           <span><span class="dot tool"></span>est. tool-result</span>
         </div>
-        <div class="ubars">
-          {#each usageTurns as t, i (i)}
+        <div class="ubars" bind:clientWidth={ubarsWidth}>
+          {#each shownTurns as t, i (i)}
             {@const total = turnTotal(t)}
             {@const est_tool = Math.round(t.tool_chars / 4)}
+            {@const turnNo = usageTurns.length - shownTurns.length + i + 1}
             <div class="ubar-col">
               <div
                 class="ubar"
                 style="height: {barHeightPct(total, usageMax)}%"
-                title="turn {i + 1}: {t.in_tok} in / {t.cache_read} cache-read / {t.out_tok} out / ~{est_tool} est. tool"
+                title="turn {turnNo}: {t.in_tok} in / {t.cache_read} cache-read / {t.out_tok} out / ~{est_tool} est. tool"
               >
                 {#if total > 0}
                   <span class="useg in" style="flex-grow: {t.in_tok}"></span>
@@ -1624,10 +1639,21 @@
     display: flex;
     flex-direction: column;
   }
-  /* Bounded lists: show ~N rows (an .arow is ~21.5px), scroll the rest. */
+  /* Bounded lists: show ~N rows (an .arow is ~21.5px), scroll the rest.
+     Horizontal overflow scrolls too — the sessrow stat columns are fixed-
+     width for cross-row alignment, so on a narrow pane the rows would
+     otherwise escape the card. width: max-content makes each row (and its
+     border) span the full scrollable width, not just the visible strip. */
   .rows.scroll5,
   .rows.scroll10 {
     overflow-y: auto;
+    overflow-x: auto;
+  }
+  .rows.scroll5 > .arow,
+  .rows.scroll10 > .arow {
+    min-width: 100%;
+    width: max-content;
+    box-sizing: border-box;
   }
   .rows.scroll5 {
     max-height: 108px;

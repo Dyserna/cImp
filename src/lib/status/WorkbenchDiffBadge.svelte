@@ -8,7 +8,7 @@
   import { onDestroy } from 'svelte';
   import { settings } from '../settings/store';
   import { workbenchDiff, watchWorkbenchDiff } from '../workbenchDiff';
-  import { setFocusedPaneActiveTab } from '../layout/store';
+  import { revealTab } from '../tabs/visibility';
   import { WORKBENCH_TAB_ID } from '../tabs/types';
 
   let release: (() => void) | null = null;
@@ -33,8 +33,11 @@
   const count = $derived($workbenchDiff?.files.length ?? 0);
   const visible = $derived($settings.workbench.enabled && count > 0);
 
+  // revealTab (not a bare activate) so a UI-hidden Workbench tab is
+  // re-inserted into the layout — hidden tabs live outside the tree, so
+  // setFocusedPaneActiveTab alone would silently no-op.
   function open(): void {
-    setFocusedPaneActiveTab(WORKBENCH_TAB_ID);
+    revealTab(WORKBENCH_TAB_ID);
   }
 </script>
 

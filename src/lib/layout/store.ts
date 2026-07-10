@@ -281,6 +281,24 @@ export function applyTabClosedFromLayout(tabId: TabId): void {
   });
 }
 
+/// Re-insert a tab that exists in the tabs store but is absent from the
+/// layout tree — a UI-hidden tab being revealed (hiding removes the tab
+/// from the tree exactly like closing does, so its pane space is freed;
+/// see tabs/visibility.ts). Appends it to the focused pane, makes it that
+/// pane's active tab, and focuses the pane. No-op when the tab already
+/// lives in some pane (defensive against a double-reveal).
+export function restoreTabToLayout(tabId: TabId): void {
+  layout.update((state) => {
+    if (findPaneContainingTab(state.tree, tabId)) return state;
+    const focused =
+      findPaneInTree(state.tree, state.focused_pane_id) ?? firstPane(state.tree);
+    const tree = insertTabIntoPane(state.tree, focused.id, tabId, focused.tab_ids.length, {
+      activate: true,
+    });
+    return { tree, focused_pane_id: focused.id };
+  });
+}
+
 /// Set the active tab of a specific pane. The pane is also focused as a
 /// side effect — clicking a tab is a focus action by definition.
 export function setPaneActiveTab(paneId: PaneId, tabId: TabId): void {

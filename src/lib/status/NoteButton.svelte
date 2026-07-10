@@ -5,7 +5,7 @@
   // create-and-open and re-activate). Its content lives in the project's
   // .cimp/cimp.note.txt file and autosaves.
   import { openNoteTab } from '../ipc';
-  import { setFocusedPaneActiveTab } from '../layout/store';
+  import { revealTab } from '../tabs/visibility';
 
   async function open() {
     try {
@@ -16,8 +16,11 @@
       // the singleton re-activate path it brings an already-open note tab
       // forward even when it sits in a non-focused pane (the backend's
       // out-of-pane ActiveTabChanged broadcast is intentionally ignored by
-      // the frontend, so we focus it explicitly here).
-      setFocusedPaneActiveTab(id);
+      // the frontend, so we focus it explicitly here). revealTab also
+      // un-hides a UI-hidden note tab, re-inserting it into the focused
+      // pane — a plain activate would no-op since hidden tabs live outside
+      // the layout tree.
+      revealTab(id);
     } catch (e) {
       console.error('open_note_tab failed:', e);
     }

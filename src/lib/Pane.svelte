@@ -41,20 +41,9 @@
     type TabId,
   } from './tabs/types';
   import { tabs } from './tabs/store';
-  import { hiddenTabs, setTabHidden } from './tabs/visibility';
   import type { LayoutNode, PaneNode } from './layout/types';
 
   let { pane }: { pane: PaneNode } = $props();
-
-  // If something explicitly activates a UI-hidden tab (the Note button, the
-  // Workbench diff badge, a backend broadcast), un-hide it — an active tab
-  // with no entry in the bar would render orphaned content. This never
-  // fights a hide: setTabHidden re-points active tabs synchronously, so by
-  // the time effects flush the hidden-but-active state is already resolved.
-  $effect(() => {
-    const active = pane.active_tab_id;
-    if (active !== null && $hiddenTabs.has(active)) setTabHidden(active, false);
-  });
 
   let paneEl: HTMLDivElement | undefined = $state();
   let slotEl: HTMLDivElement | undefined = $state();

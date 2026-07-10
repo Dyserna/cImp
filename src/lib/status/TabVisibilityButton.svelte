@@ -1,10 +1,12 @@
 <script lang="ts">
   // Bottom-bar eye button: a popover listing every currently-open tab with a
-  // visibility checkbox. Unchecking hides the tab from the tab bars ONLY —
-  // it stays in the layout, its PTY / backend feed keeps running, and the
-  // Settings toggle that materializes it is untouched — so re-checking shows
-  // an up-to-date tab instantly. Sits next to the Settings button as the
-  // quick alternative to enabling/disabling whole features in Settings.
+  // visibility checkbox. Unchecking removes the tab from the layout exactly
+  // like closing it — its space is freed and emptied panes collapse — but
+  // its PTY / backend feed keeps running and the Settings toggle that
+  // materializes it is untouched. Re-checking re-inserts the tab into the
+  // focused pane and activates it, showing its up-to-date content instantly.
+  // Sits next to the Settings button as the quick alternative to
+  // enabling/disabling whole features in Settings.
   import { tabs } from '../tabs/store';
   import { hiddenTabs, setTabHidden, showAllTabs } from '../tabs/visibility';
 

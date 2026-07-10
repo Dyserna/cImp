@@ -13,6 +13,7 @@ import {
   applyTabCreatedToLayout,
 } from './layout/store';
 import { createTerminal, destroyTerminal } from './terminals';
+import { forgetHiddenTab } from './tabs/visibility';
 import { clearTabError } from './tabs/errorState';
 import { type TabId } from './tabs/types';
 
@@ -212,10 +213,17 @@ export function startAvatarStateListener(): Promise<void> {
         });
         createTerminal(e.tab);
         applyTabCreatedToLayout(e.tab);
+        // The tab is now IN the layout; a lingering hidden flag (builtin
+        // re-materialized from Settings reuses its stable id) would
+        // contradict the hidden ⇔ not-in-layout invariant.
+        forgetHiddenTab(e.tab);
       } else if (e.type === 'tab-closed') {
         closedTabs.add(e.tab);
         applyTabClosed(e.tab);
         applyTabClosedFromLayout(e.tab);
+        // Prune the hidden flag so a future tab reusing this id doesn't
+        // start life invisibly hidden.
+        forgetHiddenTab(e.tab);
         destroyTerminal(e.tab);
         dropPerTabEntries(e.tab);
         perTabError.update((m) => {

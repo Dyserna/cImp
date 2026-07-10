@@ -37,6 +37,7 @@
   const EDGE_OTHER = '#9aa3b2';
   const PULSE_CLOUD = '#7fd4ff';
   const PULSE_LOCAL = '#ffb454';
+  const PULSE_ADVISOR = '#d2a8ff';
   const ACCENT_COLOR = '#bb55ff';
   const PULSE_MS = 600;
   const FOCUS_MS = 900;
@@ -101,6 +102,7 @@
   let edgeConfsPresent = $state<string[]>([]);
   let sawCloudPulse = $state(false);
   let sawLocalPulse = $state(false);
+  let sawAdvisorPulse = $state(false);
   let hoveredNode = $state<SimNode | null>(null);
   let hoverPos = $state<{ x: number; y: number }>({ x: 0, y: 0 });
   let focusedNodeId = $state<string | null>(null);
@@ -631,8 +633,13 @@
     const matched = matchNodes(call.target);
     if (matched.length === 0) return;
     const isCloud = call.source === 'claude' || call.source === 'opencode';
-    const color = isCloud ? PULSE_CLOUD : PULSE_LOCAL;
-    if (isCloud) sawCloudPulse = true; else sawLocalPulse = true;
+    // read_advisor/auto_check are backend-internal services, not offload
+    // worker traffic — they get their own pulse bucket.
+    const isAdvisor = call.source === 'read_advisor' || call.source === 'auto_check';
+    const color = isCloud ? PULSE_CLOUD : isAdvisor ? PULSE_ADVISOR : PULSE_LOCAL;
+    if (isCloud) sawCloudPulse = true;
+    else if (isAdvisor) sawAdvisorPulse = true;
+    else sawLocalPulse = true;
     const now = performance.now();
     for (const n of matched) {
       n.pulseUntil = now + PULSE_MS; n.pulseColor = color;
@@ -989,7 +996,7 @@
                 {/each}
               </div>
             {/if}
-            {#if sawCloudPulse || sawLocalPulse}
+            {#if sawCloudPulse || sawLocalPulse || sawAdvisorPulse}
               <div class="legend-section">
                 <h4>Live activity pulse</h4>
                 {#if sawCloudPulse}
@@ -997,6 +1004,9 @@
                 {/if}
                 {#if sawLocalPulse}
                   <div class="legend-row"><span class="swatch" style="background:{PULSE_LOCAL}"></span>local offload worker</div>
+                {/if}
+                {#if sawAdvisorPulse}
+                  <div class="legend-row"><span class="swatch" style="background:{PULSE_ADVISOR}"></span>advisor / auto-check (background)</div>
                 {/if}
               </div>
             {/if}

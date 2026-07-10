@@ -830,47 +830,136 @@ fn canonical_insert_position(tabs: &[TabConfig], id: AiTabId) -> usize {
     pos
 }
 
-/// V8-03: keep the read-only Offload Server tab present iff `offload.enabled`.
-/// Inserts it right after the leading AI builtins (before user shell tabs) when
-/// enabling, removes it when disabling, and re-forces `builtin: true` on a
-/// surviving entry so a hand-edit can't make it closable. Returns `true` if the
-/// tabs array changed.
-fn reconcile_offload_server_tab(settings: &mut Settings) -> bool {
-    let present = settings
-        .tabs
-        .iter()
-        .position(|t| t.id() == OFFLOAD_SERVER_TAB_ID);
-    if settings.offload.enabled {
+/// One row per reserved feature tab, in canonical left-to-right tab-strip
+/// order. THE single persistence-side registry of the reserved dashboards:
+/// the reconcile loop derives presence (from `enabled`), the default entry,
+/// the integrity log lines, and the insert position (contiguous after the
+/// leading AI builtins, in this array's order) from the row — adding the
+/// next reserved tab is one new row here, not a new copy-pasted
+/// `reconcile_*_tab` + `*_insert_position` pair.
+struct ReservedTabSpec {
+    /// The reserved tab id (a `*_TAB_ID` constant).
+    id: &'static str,
+    /// Display label for the integrity log lines.
+    log_name: &'static str,
+    /// The gating flag's name, as it reads in the integrity log lines.
+    flag: &'static str,
+    /// Reads the settings flag that gates the tab's presence.
+    enabled: fn(&Settings) -> bool,
+    /// Builds the default `TabConfig` materialized when the flag turns on.
+    default_tab: fn() -> TabConfig,
+    /// Re-force the display name to the default on every reconcile — how a
+    /// rename reaches existing installs (the tab is persisted and never
+    /// re-materialized; the V10 Code Graph → Code Intelligence rename shipped
+    /// this way). The older Offload Server / Workbench tabs predate the
+    /// mechanism and keep whatever name the file carries.
+    sync_name: bool,
+}
+
+const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
+    ReservedTabSpec {
+        id: OFFLOAD_SERVER_TAB_ID,
+        log_name: "Offload Server",
+        flag: "offload",
+        enabled: |s| s.offload.enabled,
+        default_tab: default_offload_server_tab,
+        sync_name: false,
+    },
+    ReservedTabSpec {
+        id: GRAPH_MONITOR_TAB_ID,
+        log_name: "Code Graph monitor",
+        flag: "graph",
+        enabled: |s| s.graph.enabled,
+        default_tab: default_graph_monitor_tab,
+        sync_name: true,
+    },
+    ReservedTabSpec {
+        id: WORKBENCH_TAB_ID,
+        log_name: "Workbench",
+        flag: "workbench",
+        enabled: |s| s.workbench.enabled,
+        default_tab: default_workbench_tab,
+        sync_name: false,
+    },
+    ReservedTabSpec {
+        id: GRAPH_VIEW_TAB_ID,
+        log_name: "Graph View",
+        flag: "graph_viz",
+        enabled: |s| s.graph.graph_viz,
+        default_tab: default_graph_view_tab,
+        sync_name: true,
+    },
+    ReservedTabSpec {
+        id: TOOL_ACTIVITY_TAB_ID,
+        log_name: "Tool Activity",
+        flag: "tool_activity_tab",
+        enabled: |s| s.ui.tool_activity_tab,
+        default_tab: default_tool_activity_tab,
+        sync_name: true,
+    },
+];
+
+/// Keep one reserved feature tab present iff its gating flag is on. Inserts
+/// it at its canonical position when enabling, removes it when disabling,
+/// and re-forces `builtin: true` (plus the default display name when
+/// `sync_name`) on a surviving entry so a hand-edit can't make it closable.
+/// Returns `true` if the tabs array changed.
+fn reconcile_reserved_tab(settings: &mut Settings, spec: &ReservedTabSpec) -> bool {
+    let present = settings.tabs.iter().position(|t| t.id() == spec.id);
+    if (spec.enabled)(settings) {
         match present {
             Some(i) => {
+                let mut changed = false;
                 if !settings.tabs[i].builtin() {
                     settings.tabs[i].set_builtin(true);
-                    return true;
+                    changed = true;
                 }
-                false
+                if spec.sync_name {
+                    let want_name = (spec.default_tab)().name().to_string();
+                    if settings.tabs[i].name() != want_name {
+                        settings.tabs[i].set_name(want_name);
+                        changed = true;
+                    }
+                }
+                changed
             }
             None => {
-                let pos = offload_insert_position(&settings.tabs);
-                settings.tabs.insert(pos, default_offload_server_tab());
-                tracing::info!("integrity: materialized Offload Server tab (offload enabled)");
+                let pos = reserved_tab_insert_position(&settings.tabs, spec.id);
+                settings.tabs.insert(pos, (spec.default_tab)());
+                tracing::info!(
+                    "integrity: materialized {} tab ({} enabled)",
+                    spec.log_name,
+                    spec.flag
+                );
                 true
             }
         }
     } else if let Some(i) = present {
         settings.tabs.remove(i);
-        tracing::info!("integrity: removed Offload Server tab (offload disabled)");
+        tracing::info!(
+            "integrity: removed {} tab ({} disabled)",
+            spec.log_name,
+            spec.flag
+        );
         true
     } else {
         false
     }
 }
 
-/// Insert position for the Offload Server tab: right after the contiguous
-/// leading AI builtins, ahead of any user shell tabs.
-fn offload_insert_position(tabs: &[TabConfig]) -> usize {
+/// Insert position for the reserved tab `id`: after the contiguous leading
+/// AI builtins AND every reserved tab that precedes `id` in
+/// [`RESERVED_TAB_SPECS`] order, ahead of user shells — the "reserved
+/// feature tabs stay contiguous, leftmost, in canonical order" rule.
+fn reserved_tab_insert_position(tabs: &[TabConfig], id: &str) -> usize {
+    let rank = RESERVED_TAB_SPECS
+        .iter()
+        .position(|s| s.id == id)
+        .unwrap_or(RESERVED_TAB_SPECS.len());
     let mut pos = 0usize;
     for (idx, tab) in tabs.iter().enumerate() {
-        if AiTabId::from_id(tab.id()).is_some() {
+        let earlier_reserved = RESERVED_TAB_SPECS[..rank].iter().any(|s| s.id == tab.id());
+        if AiTabId::from_id(tab.id()).is_some() || earlier_reserved {
             pos = idx + 1;
         } else {
             break;
@@ -879,242 +968,17 @@ fn offload_insert_position(tabs: &[TabConfig]) -> usize {
     pos
 }
 
-/// V9-01: keep the read-only Code Graph monitor tab present iff `graph.enabled`
-/// — mirrors [`reconcile_offload_server_tab`]. Returns `true` if tabs changed.
-fn reconcile_graph_monitor_tab(settings: &mut Settings) -> bool {
-    let present = settings
-        .tabs
-        .iter()
-        .position(|t| t.id() == GRAPH_MONITOR_TAB_ID);
-    if settings.graph.enabled {
-        match present {
-            Some(i) => {
-                // Keep the reserved tab's builtin flag and display name in sync
-                // with the current default. The V10 rename (Code Graph → Code
-                // Intelligence) reaches existing installs through here, since the
-                // tab is already persisted and never re-materialized.
-                let mut changed = false;
-                if !settings.tabs[i].builtin() {
-                    settings.tabs[i].set_builtin(true);
-                    changed = true;
-                }
-                let want_name = default_graph_monitor_tab().name().to_string();
-                if settings.tabs[i].name() != want_name {
-                    settings.tabs[i].set_name(want_name);
-                    changed = true;
-                }
-                changed
-            }
-            None => {
-                let pos = graph_monitor_insert_position(&settings.tabs);
-                settings.tabs.insert(pos, default_graph_monitor_tab());
-                tracing::info!("integrity: materialized Code Graph monitor tab (graph enabled)");
-                true
-            }
-        }
-    } else if let Some(i) = present {
-        settings.tabs.remove(i);
-        tracing::info!("integrity: removed Code Graph monitor tab (graph disabled)");
-        true
-    } else {
-        false
-    }
-}
-
-/// V13 Phase A: keep the read-only Workbench tab present iff
-/// `workbench.enabled` — mirrors [`reconcile_graph_monitor_tab`]. `enabled`
-/// defaults `true`, so this materializes the tab for existing users on their
-/// first load after upgrading (the same self-healing mechanism that
-/// introduced the Code Graph monitor tab — no explicit schema migration
-/// needed since `WorkbenchSettings` round-trips via `#[serde(default)]`).
-/// Returns `true` if tabs changed.
-fn reconcile_workbench_tab(settings: &mut Settings) -> bool {
-    let present = settings.tabs.iter().position(|t| t.id() == WORKBENCH_TAB_ID);
-    if settings.workbench.enabled {
-        match present {
-            Some(i) => {
-                if !settings.tabs[i].builtin() {
-                    settings.tabs[i].set_builtin(true);
-                    return true;
-                }
-                false
-            }
-            None => {
-                let pos = workbench_insert_position(&settings.tabs);
-                settings.tabs.insert(pos, default_workbench_tab());
-                tracing::info!("integrity: materialized Workbench tab (workbench enabled)");
-                true
-            }
-        }
-    } else if let Some(i) = present {
-        settings.tabs.remove(i);
-        tracing::info!("integrity: removed Workbench tab (workbench disabled)");
-        true
-    } else {
-        false
-    }
-}
-
-/// Re-run the reserved feature-tab reconciles (Offload Server + Code Graph
-/// monitor + Workbench) so the persisted tab list matches the current enable
-/// flags. The full [`integrity_check`] only runs at load-from-disk; the live
+/// Re-run every reserved feature-tab reconcile (in [`RESERVED_TAB_SPECS`]
+/// order) so the persisted tab list matches the current enable flags. The
+/// full [`integrity_check`] only runs at load-from-disk; the live
 /// settings-update path calls this so toggling a feature materializes/removes
 /// its reserved tab immediately. Returns `true` if `settings.tabs` changed.
 pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
-    let mut changed = reconcile_offload_server_tab(settings);
-    changed |= reconcile_graph_monitor_tab(settings);
-    changed |= reconcile_workbench_tab(settings);
-    changed |= reconcile_graph_view_tab(settings);
-    changed |= reconcile_tool_activity_tab(settings);
+    let mut changed = false;
+    for spec in RESERVED_TAB_SPECS {
+        changed |= reconcile_reserved_tab(settings, spec);
+    }
     changed
-}
-
-/// Insert position for the Code Graph monitor tab: after the leading AI
-/// builtins AND the Offload Server tab (if present), ahead of user shells.
-fn graph_monitor_insert_position(tabs: &[TabConfig]) -> usize {
-    let mut pos = 0usize;
-    for (idx, tab) in tabs.iter().enumerate() {
-        if AiTabId::from_id(tab.id()).is_some() || tab.id() == OFFLOAD_SERVER_TAB_ID {
-            pos = idx + 1;
-        } else {
-            break;
-        }
-    }
-    pos
-}
-
-/// Insert position for the Workbench tab: after the leading AI builtins AND
-/// the Offload Server + Code Graph monitor tabs (if present), ahead of user
-/// shells — the same "reserved feature tabs stay contiguous, leftmost" rule
-/// as the other two.
-fn workbench_insert_position(tabs: &[TabConfig]) -> usize {
-    let mut pos = 0usize;
-    for (idx, tab) in tabs.iter().enumerate() {
-        if AiTabId::from_id(tab.id()).is_some()
-            || tab.id() == OFFLOAD_SERVER_TAB_ID
-            || tab.id() == GRAPH_MONITOR_TAB_ID
-        {
-            pos = idx + 1;
-        } else {
-            break;
-        }
-    }
-    pos
-}
-
-/// V15 Feature 4: keep the read-only Graph View tab present iff
-/// `graph.graph_viz` — mirrors [`reconcile_graph_monitor_tab`]. Off by default,
-/// so the tab only appears once the user opts into the visualization. Returns
-/// `true` if tabs changed.
-fn reconcile_graph_view_tab(settings: &mut Settings) -> bool {
-    let present = settings.tabs.iter().position(|t| t.id() == GRAPH_VIEW_TAB_ID);
-    if settings.graph.graph_viz {
-        match present {
-            Some(i) => {
-                let mut changed = false;
-                if !settings.tabs[i].builtin() {
-                    settings.tabs[i].set_builtin(true);
-                    changed = true;
-                }
-                let want_name = default_graph_view_tab().name().to_string();
-                if settings.tabs[i].name() != want_name {
-                    settings.tabs[i].set_name(want_name);
-                    changed = true;
-                }
-                changed
-            }
-            None => {
-                let pos = graph_view_insert_position(&settings.tabs);
-                settings.tabs.insert(pos, default_graph_view_tab());
-                tracing::info!("integrity: materialized Graph View tab (graph_viz enabled)");
-                true
-            }
-        }
-    } else if let Some(i) = present {
-        settings.tabs.remove(i);
-        tracing::info!("integrity: removed Graph View tab (graph_viz disabled)");
-        true
-    } else {
-        false
-    }
-}
-
-/// Insert position for the Graph View tab: after the leading AI builtins AND
-/// the Offload Server + Code Graph monitor + Workbench tabs (if present), ahead
-/// of user shells — same "reserved feature tabs stay contiguous, leftmost" rule.
-fn graph_view_insert_position(tabs: &[TabConfig]) -> usize {
-    let mut pos = 0usize;
-    for (idx, tab) in tabs.iter().enumerate() {
-        if AiTabId::from_id(tab.id()).is_some()
-            || tab.id() == OFFLOAD_SERVER_TAB_ID
-            || tab.id() == GRAPH_MONITOR_TAB_ID
-            || tab.id() == WORKBENCH_TAB_ID
-        {
-            pos = idx + 1;
-        } else {
-            break;
-        }
-    }
-    pos
-}
-
-/// Keep the read-only Tool Activity tab present iff `ui.tool_activity_tab`
-/// — mirrors [`reconcile_graph_monitor_tab`]. On by default (the tab is the
-/// one place that surfaces tool usage across graph + offload), so it ships on
-/// fresh installs and existing files alike; untick the Settings checkbox to
-/// drop it. Returns `true` if tabs changed.
-fn reconcile_tool_activity_tab(settings: &mut Settings) -> bool {
-    let present = settings.tabs.iter().position(|t| t.id() == TOOL_ACTIVITY_TAB_ID);
-    if settings.ui.tool_activity_tab {
-        match present {
-            Some(i) => {
-                let mut changed = false;
-                if !settings.tabs[i].builtin() {
-                    settings.tabs[i].set_builtin(true);
-                    changed = true;
-                }
-                let want_name = default_tool_activity_tab().name().to_string();
-                if settings.tabs[i].name() != want_name {
-                    settings.tabs[i].set_name(want_name);
-                    changed = true;
-                }
-                changed
-            }
-            None => {
-                let pos = tool_activity_insert_position(&settings.tabs);
-                settings.tabs.insert(pos, default_tool_activity_tab());
-                tracing::info!("integrity: materialized Tool Activity tab (tool_activity_tab enabled)");
-                true
-            }
-        }
-    } else if let Some(i) = present {
-        settings.tabs.remove(i);
-        tracing::info!("integrity: removed Tool Activity tab (tool_activity_tab disabled)");
-        true
-    } else {
-        false
-    }
-}
-
-/// Insert position for the Tool Activity tab: after the leading AI builtins
-/// AND the other reserved feature tabs (Offload Server + Code Graph monitor +
-/// Workbench + Graph View, if present), ahead of user shells — same "reserved
-/// feature tabs stay contiguous, leftmost" rule.
-fn tool_activity_insert_position(tabs: &[TabConfig]) -> usize {
-    let mut pos = 0usize;
-    for (idx, tab) in tabs.iter().enumerate() {
-        if AiTabId::from_id(tab.id()).is_some()
-            || tab.id() == OFFLOAD_SERVER_TAB_ID
-            || tab.id() == GRAPH_MONITOR_TAB_ID
-            || tab.id() == WORKBENCH_TAB_ID
-            || tab.id() == GRAPH_VIEW_TAB_ID
-        {
-            pos = idx + 1;
-        } else {
-            break;
-        }
-    }
-    pos
 }
 
 /// All three reserved AI tab ids. Used by the integrity check's "is this
@@ -1238,41 +1102,13 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         changed = true;
     }
 
-    // 4b. V8-03: materialize the read-only Offload Server tab while offload is
-    //     enabled, and remove it otherwise. Runs before the layout sanity pass
-    //     so a freshly-materialized tab is a valid layout id (and the
-    //     frontend's orphan placement drops it into a pane); a removed one is
-    //     pruned from the layout by step 5. Toggling `offload.enabled` takes
-    //     effect on the next launch (like backend autostart / the loopback).
-    if reconcile_offload_server_tab(settings) {
-        changed = true;
-    }
-
-    // 4c. V9-01: materialize the read-only Code Graph monitor tab while the
-    //     graph is enabled, remove it otherwise. Same ordering rationale as 4b;
-    //     sits after the Offload Server tab in the tab strip.
-    if reconcile_graph_monitor_tab(settings) {
-        changed = true;
-    }
-
-    // 4d. V13 Phase A: materialize the read-only Workbench tab while
-    //     `workbench.enabled` (default true), remove it otherwise. Same
-    //     ordering rationale as 4b/4c; sits after the Code Graph monitor tab.
-    if reconcile_workbench_tab(settings) {
-        changed = true;
-    }
-
-    // 4e. V15 Feature 4: materialize the read-only Graph View tab while
-    //     `graph.graph_viz` (default false), remove it otherwise. Same ordering
-    //     rationale as 4b–4d; sits after the Workbench tab.
-    if reconcile_graph_view_tab(settings) {
-        changed = true;
-    }
-
-    // 4f. Materialize the read-only Tool Activity tab while
-    //     `ui.tool_activity_tab` (default true), remove it otherwise. Same
-    //     ordering rationale as 4b–4e; sits after the Graph View tab.
-    if reconcile_tool_activity_tab(settings) {
+    // 4b. Materialize each reserved feature tab while its gating flag is on,
+    //     and remove it otherwise (see RESERVED_TAB_SPECS for the set and its
+    //     canonical order). Runs before the layout sanity pass so a
+    //     freshly-materialized tab is a valid layout id (and the frontend's
+    //     orphan placement drops it into a pane); a removed one is pruned
+    //     from the layout by step 5.
+    if reconcile_reserved_tabs(settings) {
         changed = true;
     }
 
@@ -1367,15 +1203,25 @@ mod tests {
         }
     }
 
+    /// `Settings::default()` with every default-ON reserved feature tab
+    /// turned off (currently Workbench + Tool Activity), so tab-count
+    /// assertions only see the tabs a test explicitly sets up. A future
+    /// default-on reserved tab gets disabled HERE once, not in every test
+    /// body. Tests that exercise a specific reserved tab re-enable its flag.
+    fn base_test_settings() -> Settings {
+        let mut s = Settings::default();
+        s.workbench.enabled = false;
+        s.ui.tool_activity_tab = false;
+        s
+    }
+
     #[test]
     fn integrity_seeds_only_claude_on_empty_with_default_setting() {
         // Default `enabled_ai_tabs = [claude]` means a fresh install
         // gets the subscription Claude tab only; the integrity check
         // mustn't re-seed claude-local. The closable shell-default-1
         // ships via `seeded_defaults`, not the integrity check.
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
         assert!(changed);
@@ -1386,9 +1232,7 @@ mod tests {
 
     #[test]
     fn integrity_seeds_both_when_enabled_ai_tabs_is_both_claudes() {
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
@@ -1400,9 +1244,7 @@ mod tests {
 
     #[test]
     fn integrity_seeds_only_claude_local_when_setting_is_claude_local_only() {
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![AiTabId::ClaudeLocal];
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
@@ -1414,9 +1256,7 @@ mod tests {
     #[test]
     fn integrity_backfills_default_question_slot_on_upgraded_ai_tab() {
         use crate::settings::schema::{NotificationSlot, TabConfig};
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![AiTabId::Claude];
         integrity_check(&mut s); // seed the claude tab
 
@@ -1443,9 +1283,7 @@ mod tests {
     #[test]
     fn integrity_does_not_clobber_user_customized_question_slot() {
         use crate::settings::schema::{NotificationSlot, TabConfig};
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![AiTabId::Claude];
         integrity_check(&mut s);
 
@@ -1471,9 +1309,7 @@ mod tests {
 
     #[test]
     fn integrity_seeds_opencode_at_canonical_position() {
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
             AiTabId::ClaudeLocal,
@@ -1488,18 +1324,14 @@ mod tests {
 
     #[test]
     fn integrity_no_offload_tab_when_disabled() {
-        let mut s = Settings::default(); // offload disabled by default
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings(); // offload disabled by default
         integrity_check(&mut s);
         assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
     }
 
     #[test]
     fn integrity_materializes_offload_tab_after_ai_builtins() {
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         s.offload.enabled = true;
         integrity_check(&mut s);
@@ -1513,9 +1345,7 @@ mod tests {
 
     #[test]
     fn integrity_removes_offload_tab_when_disabled() {
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.offload.enabled = true;
         integrity_check(&mut s);
         assert!(s.tabs.iter().any(|t| t.id() == OFFLOAD_SERVER_TAB_ID));
@@ -1528,9 +1358,7 @@ mod tests {
 
     #[test]
     fn reconcile_reserved_tabs_materializes_and_removes_both_live() {
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.offload.enabled = true;
         s.graph.enabled = true;
         // The live toggle path uses reconcile_reserved_tabs (not the full
@@ -1647,9 +1475,7 @@ mod tests {
         // User has [claude, claude-local, shell-foo] and now enables
         // opencode. The new tab should land at index 2 (after claude-local,
         // before the shell), not at the end.
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![
             AiTabId::Claude,
             AiTabId::ClaudeLocal,
@@ -1683,9 +1509,7 @@ mod tests {
     fn integrity_drops_disabled_ai_tab() {
         // Loading a file where the setting and tabs disagree (e.g. a
         // hand-edit, or post-migration drift) reconciles to the setting.
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         let _shell = fake_default_shell();
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         integrity_check(&mut s);
@@ -1703,9 +1527,7 @@ mod tests {
         // A hand-edited file with `enabled_ai_tabs: []` is invalid;
         // integrity forces it back to [claude] so the user always boots
         // with at least one AI tab.
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = Vec::new();
         let changed = integrity_check(&mut s);
         assert!(changed);
@@ -1718,9 +1540,7 @@ mod tests {
     fn integrity_does_not_restore_shell_default_1() {
         // Closing shell-default-1 must persist across launches: the
         // integrity check should leave it absent.
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         assert!(s
@@ -1734,9 +1554,7 @@ mod tests {
         // Older settings files persisted shell-default-1 with builtin: true.
         // Loading those files must demote the entry so the close button
         // works.
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a legacy-shaped shell-default-1 with builtin: true.
@@ -1766,9 +1584,7 @@ mod tests {
 
     #[test]
     fn integrity_forces_builtin_true_on_ai_builtins() {
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Tamper: flip claude's builtin to false.
@@ -1782,9 +1598,7 @@ mod tests {
 
     #[test]
     fn integrity_preserves_user_tabs() {
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a user shell tab.
@@ -1821,9 +1635,7 @@ mod tests {
     #[test]
     fn v1_2_round_trip() {
         let _shell = fake_default_shell();
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         integrity_check(&mut s);
         let text = serde_json::to_string(&s).unwrap();
@@ -1838,9 +1650,7 @@ mod tests {
         // A hand-edit must not be able to silently flip the
         // subscription Claude tab into local-LLM mode (or vice versa).
         // Enable both so the check has both AI tabs to validate.
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
         let _shell = fake_default_shell();
         integrity_check(&mut s);
@@ -1865,9 +1675,7 @@ mod tests {
 
     #[test]
     fn integrity_corrects_use_local_provider_on_opencode() {
-        let mut s = Settings::default();
-        s.workbench.enabled = false; // V13 Phase A: keep pre-existing tab-count assertions unaffected
-        s.ui.tool_activity_tab = false; // Tool Activity tab likewise (default true)
+        let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![AiTabId::OpenCode];
         integrity_check(&mut s);
         // Tamper: opencode → local (it has no local variant; canonical is false).

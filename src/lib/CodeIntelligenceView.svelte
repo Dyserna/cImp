@@ -48,6 +48,7 @@
     type ArchResult,
   } from './graph';
   import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio, fmtTok } from './usageMath';
+  import { fmtTime } from './format';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
 
@@ -293,16 +294,21 @@
   let advisorBusy = $state<string | null>(null); // rule_id currently applying/dismissing
 
   async function refreshUsage(): Promise<void> {
-    try {
-      usage = await graphUsage();
-    } catch (e) {
-      console.warn('graph_usage failed', e);
-    }
-    try {
-      advice = await graphUsageAdvice();
-    } catch (e) {
-      console.warn('graph_usage_advice failed', e);
-    }
+    // Independent fetches — run concurrently so the 2s Overview poll pays
+    // one round-trip of wall time, not two. Each keeps its last good value
+    // on failure, same as before.
+    const [u, a] = await Promise.all([
+      graphUsage().catch((e) => {
+        console.warn('graph_usage failed', e);
+        return null;
+      }),
+      graphUsageAdvice().catch((e) => {
+        console.warn('graph_usage_advice failed', e);
+        return null;
+      }),
+    ]);
+    if (u) usage = u;
+    if (a) advice = a;
   }
 
   // Applies a proposal by writing the ONE named `graph.*` field it targets
@@ -442,10 +448,6 @@
     } finally {
       langBusy = null;
     }
-  }
-
-  function fmtTime(ms: number): string {
-    return ms ? new Date(ms).toLocaleTimeString() : '—';
   }
 
   function upsert(s: GraphStatus): void {

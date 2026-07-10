@@ -9,9 +9,9 @@
 //! records into *that* process's ring, which is simply never read — there's no
 //! monitor tab without the app.)
 
-use std::collections::VecDeque;
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// How many recent calls to retain. Oldest are dropped past this.
@@ -60,6 +60,14 @@ pub fn snapshot() -> Vec<GraphCall> {
         .unwrap_or_default()
 }
 
+/// Memo for [`root_key`]: `canonicalize` is a real filesystem syscall and the
+/// key is requested on every recorded tool call and advisor/auto-check event,
+/// always for the same small set of roots (plus a few per-tab cwds) — cache
+/// the successful answers. Failures (e.g. a vanished directory) are NOT
+/// cached, so a transient error can't stick.
+static ROOT_KEYS: LazyLock<Mutex<HashMap<PathBuf, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// The canonical string form a root is recorded (and filtered) under.
 /// Recorders and the scoped `graph_history` filter must both go through this:
 /// the same directory reaches them in different spellings (the launch cwd vs.
@@ -67,10 +75,27 @@ pub fn snapshot() -> Vec<GraphCall> {
 /// Windows), and canonicalizing both sides makes those compare equal. Falls
 /// back to the path as given (e.g. the directory vanished mid-call).
 pub fn root_key(root: &Path) -> String {
-    std::fs::canonicalize(root)
-        .unwrap_or_else(|_| root.to_path_buf())
-        .to_string_lossy()
-        .to_string()
+    if let Ok(cache) = ROOT_KEYS.lock() {
+        if let Some(key) = cache.get(root) {
+            return key.clone();
+        }
+    }
+    match std::fs::canonicalize(root) {
+        Ok(canon) => {
+            let key = canon.to_string_lossy().to_string();
+            if let Ok(mut cache) = ROOT_KEYS.lock() {
+                // Bounded memo: the key set is tiny in practice; a wholesale
+                // clear on the (unexpected) way past the cap keeps it O(1)
+                // without needing an eviction policy.
+                if cache.len() >= 256 {
+                    cache.clear();
+                }
+                cache.insert(root.to_path_buf(), key.clone());
+            }
+            key
+        }
+        Err(_) => root.to_string_lossy().to_string(),
+    }
 }
 
 /// Current Unix epoch in milliseconds (0 if the clock is before the epoch).

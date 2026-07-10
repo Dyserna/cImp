@@ -85,22 +85,33 @@ export function isPreviewTabId(id: TabId): boolean {
   return id.startsWith('preview-');
 }
 
+/// THE single source of truth for "app-rendered, no-PTY" tabs: the reserved
+/// dashboards (Offload Server, Code Graph monitor, Note, Workbench, Graph
+/// View, Tool Activity) plus Preview tabs (an embedded webview). Every guard
+/// that used to hand-enumerate these must call this instead — a new
+/// app-rendered tab is added HERE (plus its own isXTab predicate above) and
+/// nowhere else. Mirrors the Rust side's reserved-tab set.
+export function isAppRenderedTab(id: TabId): boolean {
+  return (
+    isOffloadTab(id) ||
+    isGraphMonitorTab(id) ||
+    isNoteTab(id) ||
+    isWorkbenchTab(id) ||
+    isGraphViewTab(id) ||
+    isToolActivityTab(id) ||
+    isPreviewTabId(id)
+  );
+}
+
 /// Type guard for shell tabs — every non-AI-builtin ID is a shell, EXCEPT the
-/// Offload Server, Code Graph monitor, Note, and Workbench tabs (app-rendered
-/// dashboards) and Preview tabs (an embedded webview, not a PTY) — none of
-/// these get the shell closed-overlay / restart / keystroke behaviors.
+/// app-rendered tabs (see `isAppRenderedTab`) — none of these get the shell
+/// closed-overlay / restart / keystroke behaviors.
 export function isShellTab(id: TabId): boolean {
   return (
     id !== 'claude' &&
     id !== 'claude-local' &&
     id !== 'opencode' &&
-    id !== OFFLOAD_SERVER_TAB_ID &&
-    id !== GRAPH_MONITOR_TAB_ID &&
-    id !== NOTE_TAB_ID &&
-    id !== WORKBENCH_TAB_ID &&
-    id !== GRAPH_VIEW_TAB_ID &&
-    id !== TOOL_ACTIVITY_TAB_ID &&
-    !isPreviewTabId(id)
+    !isAppRenderedTab(id)
   );
 }
 

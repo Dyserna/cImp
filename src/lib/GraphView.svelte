@@ -49,9 +49,10 @@
   const NEAR_3D = 8;
 
   // Physics tuning. O(n^2) repulsion is fine up to a few hundred nodes (the
-  // backend caps the snapshot around ~1500); above MAX_REPEL_FULL we sample a
-  // bounded number of partners per node per frame instead of every pair, so a
-  // large graph never blows the frame budget.
+  // backend caps the snapshot: `graph_viz_max_nodes` nodes, ~4 edges/node);
+  // above MAX_REPEL_FULL we sample a bounded number of partners per node per
+  // frame instead of every pair, so a large graph never blows the frame
+  // budget.
   const REPULSION_K = 2600;
   const SPRING_K = 0.02;
   const SPRING_LEN = 70;
@@ -61,6 +62,12 @@
   const MAX_REPEL_FULL = 500;
   const REPEL_SAMPLE = 40;
   const REPEL_CUTOFF_SQ = 90000; // 300 world units
+  // Hard settle deadline: sampled repulsion (n > MAX_REPEL_FULL) injects
+  // random-noise forces every frame, so kinetic energy can hover above
+  // IDLE_KE_THRESHOLD indefinitely — without a deadline the sim (and its
+  // full-canvas redraw) never went idle and pinned the webview thread, which
+  // froze the whole app while the tab was visible. Any interaction re-arms it.
+  const SIM_MAX_MS = 10_000;
 
   interface SimNode extends VizNodeRow {
     x: number; y: number; z: number;
@@ -131,6 +138,7 @@
 
   // Animation / interaction bookkeeping.
   let idle = true;
+  let simStartTs = 0; // when the sim last left idle — for the SIM_MAX_MS deadline
   let running = false;
   let rafId = 0;
   let lastTs = 0;
@@ -340,17 +348,46 @@
   function drawEdges(now: number): void {
     if (!ctx) return;
     const is3d = mode === '3d';
+    // Batch by style: one beginPath/setLineDash/stroke PER (kind, confidence)
+    // GROUP (≤ ~9 of them), not per edge — per-edge strokes made frame cost
+    // O(edges) canvas state changes and pinned the webview thread on large
+    // snapshots. Highlighted edges are few; they draw individually on top.
+    const groups = new Map<string, SimEdge[]>();
+    const highlighted: SimEdge[] = [];
     for (const e of edges) {
       // 3D: skip edges with a culled endpoint (2D leaves sz at 0).
       if (is3d && (e.src.sz < 0 || e.dst.sz < 0)) continue;
-      const highlighted = e.highlightUntil > now;
+      if (e.highlightUntil > now) {
+        highlighted.push(e);
+        continue;
+      }
+      const key = e.kind + '|' + e.confidence;
+      let g = groups.get(key);
+      if (!g) groups.set(key, (g = []));
+      g.push(e);
+    }
+    ctx.globalAlpha = 0.4;
+    ctx.lineWidth = 1;
+    for (const g of groups.values()) {
+      ctx.beginPath();
+      for (const e of g) {
+        ctx.moveTo(e.src.sx, e.src.sy);
+        ctx.lineTo(e.dst.sx, e.dst.sy);
+      }
+      // The dash pattern restarts at each moveTo subpath, so one shared path
+      // renders identically to the old per-edge strokes.
+      ctx.setLineDash(dashFor(g[0].confidence));
+      ctx.strokeStyle = edgeColor(g[0].kind);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 0.95;
+    ctx.lineWidth = 2.5;
+    for (const e of highlighted) {
       ctx.beginPath();
       ctx.moveTo(e.src.sx, e.src.sy);
       ctx.lineTo(e.dst.sx, e.dst.sy);
       ctx.setLineDash(dashFor(e.confidence));
-      ctx.strokeStyle = highlighted ? (e.highlightColor ?? edgeColor(e.kind)) : edgeColor(e.kind);
-      ctx.globalAlpha = highlighted ? 0.95 : 0.4;
-      ctx.lineWidth = highlighted ? 2.5 : 1;
+      ctx.strokeStyle = e.highlightColor ?? edgeColor(e.kind);
       ctx.stroke();
     }
     ctx.setLineDash([]);
@@ -469,8 +506,12 @@
     lastTs = ts;
 
     if (!idle) {
-      const moving = simulate(dt);
-      if (!moving) idle = true;
+      if (ts - simStartTs > SIM_MAX_MS) {
+        idle = true;
+      } else {
+        const moving = simulate(dt);
+        if (!moving) idle = true;
+      }
     }
     const now = performance.now();
     const pulsing = decayActive(now);
@@ -495,6 +536,9 @@
     rafId = requestAnimationFrame(loop);
   }
   function kick(): void {
+    // Only re-arm the deadline on an idle→active transition, so a stream of
+    // kicks (drag mousemove, activity pulses) can't extend it forever.
+    if (idle) simStartTs = performance.now();
     idle = false;
     wake();
   }
@@ -547,7 +591,8 @@
     edgeConfsPresent = [...new Set(newEdges.map((e) => e.confidence))].sort();
     focusedNodeId = null;
     hoveredNode = null;
-    idle = false;
+    // No `idle = false` here: resetView() → kick() flips it, and kick's
+    // idle→active check is what re-arms the SIM_MAX_MS settle deadline.
     resetView();
     // fitView2D/3D bail on a zero-sized viewport; defer the fit to the first
     // real applyResize so a load that beats the ResizeObserver doesn't land

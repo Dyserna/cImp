@@ -358,8 +358,17 @@
 
   // Stacked-bar chart derived state (This Session). Pure math lives in
   // `./usageMath` (unit-tested); this just wires it to the current turns.
+  // The chart shows the newest turns that FIT the card's width (each bar
+  // needs ~5px: 2px min column + 3px gap) — an unbounded session used to
+  // push the flex row right out of the card on narrow panes.
   let usageTurns = $derived(usage?.current?.turns ?? []);
-  let usageMax = $derived(maxTurnTotal(usageTurns));
+  let ubarsWidth = $state(0);
+  const BAR_MIN_PX = 5;
+  let shownTurns = $derived.by(() => {
+    const cap = ubarsWidth > 0 ? Math.max(10, Math.floor(ubarsWidth / BAR_MIN_PX)) : 60;
+    return usageTurns.length > cap ? usageTurns.slice(-cap) : usageTurns;
+  });
+  let usageMax = $derived(maxTurnTotal(shownTurns));
 
   const ADVISOR_RULES_TOOLTIP =
     'advisor.raise_context_min_score.v1: ≥5 sessions, ≥200 injections, ≥70% never re-touched → raise context_min_score.\n' +
@@ -650,7 +659,12 @@
 
     <!-- This session: per-turn stacked bars + top consumers. -->
     <section class="card">
-      <div class="history-head">This session</div>
+      <div class="history-head">
+        This session
+        {#if shownTurns.length < usageTurns.length}
+          <span class="muted">(last {shownTurns.length} of {usageTurns.length} turns)</span>
+        {/if}
+      </div>
       {#if !usage || !usage.current || usage.current.turns.length === 0}
         <p class="placeholder">No usage recorded yet this session.</p>
       {:else}
@@ -660,15 +674,16 @@
           <span><span class="dot out"></span>output</span>
           <span><span class="dot tool"></span>est. tool-result</span>
         </div>
-        <div class="ubars">
-          {#each usageTurns as t, i (i)}
+        <div class="ubars" bind:clientWidth={ubarsWidth}>
+          {#each shownTurns as t, i (i)}
             {@const total = turnTotal(t)}
             {@const est_tool = Math.round(t.tool_chars / 4)}
+            {@const turnNo = usageTurns.length - shownTurns.length + i + 1}
             <div class="ubar-col">
               <div
                 class="ubar"
                 style="height: {barHeightPct(total, usageMax)}%"
-                title="turn {i + 1}: {t.in_tok} in / {t.cache_read} cache-read / {t.out_tok} out / ~{est_tool} est. tool"
+                title="turn {turnNo}: {t.in_tok} in / {t.cache_read} cache-read / {t.out_tok} out / ~{est_tool} est. tool"
               >
                 {#if total > 0}
                   <span class="useg in" style="flex-grow: {t.in_tok}"></span>
@@ -685,7 +700,7 @@
         {#if usage.current.top_tools.length === 0}
           <p class="placeholder">No tool-result usage recorded yet.</p>
         {:else}
-          <div class="rows">
+          <div class="rows scroll5">
             {#each usage.current.top_tools as t (t.tool)}
               <div class="arow tool">
                 <span class="aname">{t.tool}</span>
@@ -704,7 +719,7 @@
       {#if !usage || usage.sessions.length === 0}
         <p class="placeholder">No sessions recorded yet.</p>
       {:else}
-        <div class="rows">
+        <div class="rows scroll10">
           {#each usage.sessions as s (s.session_id)}
             <div
               class="arow sessrow"
@@ -1624,6 +1639,28 @@
     display: flex;
     flex-direction: column;
   }
+  /* Bounded lists: show ~N rows (an .arow is ~21.5px), scroll the rest.
+     Horizontal overflow scrolls too — the sessrow stat columns are fixed-
+     width for cross-row alignment, so on a narrow pane the rows would
+     otherwise escape the card. width: max-content makes each row (and its
+     border) span the full scrollable width, not just the visible strip. */
+  .rows.scroll5,
+  .rows.scroll10 {
+    overflow-y: auto;
+    overflow-x: auto;
+  }
+  .rows.scroll5 > .arow,
+  .rows.scroll10 > .arow {
+    min-width: 100%;
+    width: max-content;
+    box-sizing: border-box;
+  }
+  .rows.scroll5 {
+    max-height: 108px;
+  }
+  .rows.scroll10 {
+    max-height: 215px;
+  }
   .arow {
     display: grid;
     grid-template-columns: 1fr 6rem 2fr;
@@ -1894,14 +1931,40 @@
   .arow.sessrow {
     grid-template-columns: minmax(6rem, 1fr) auto auto;
   }
+  /* Constant width + right alignment so the percentages line up too. */
+  .arow.sessrow .aloc {
+    min-width: 14ch;
+    text-align: right;
+  }
   .sess-stats {
-    display: flex;
-    gap: 12px;
+    /* Fixed tracks so the values line up as columns ACROSS rows (fmtTok is
+       ≤ 6 chars and each column's label is constant); flex sized every row
+       by its own content, so nothing aligned vertically. */
+    display: grid;
+    grid-template-columns: 4.6rem 5.2rem 7.2rem 7.8rem;
     font-size: 11px;
     opacity: 0.85;
   }
   .sess-stats b {
     font-weight: 600;
+  }
+  .sess-stats > span {
+    position: relative;
+    text-align: right;
+    padding-left: 13px;
+    white-space: nowrap;
+  }
+  /* Subtle mid-height tick between values — a hint of a column boundary,
+     deliberately not a full-height rule (this must not read as a table). */
+  .sess-stats > span + span::before {
+    content: '';
+    position: absolute;
+    left: 5px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 1px;
+    height: 0.8em;
+    background: var(--border, #444);
   }
 
   .eff-counters {

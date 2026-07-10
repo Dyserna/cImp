@@ -21,6 +21,7 @@
   import { openSettingsWindowToTab } from './settings/ipc';
   import { isPreviewTabId, isShellTab, type TabId } from './tabs/types';
   import { tabMeta } from './tabs/store';
+  import { hiddenTabs } from './tabs/visibility';
   import { cancelPlacement, requestTabIntoPane, setFocusedPane, setPaneActiveTab } from './layout/store';
   import { paneRegistry } from './layout/registry';
   import { beginDrag } from './dnd/drag';
@@ -33,6 +34,10 @@
   // tab-created event).
 
   let { pane }: { pane: PaneNode } = $props();
+
+  // UI-hidden tabs (status-bar eye button) are simply not rendered here —
+  // they keep their slot in pane.tab_ids and their running backend state.
+  const visibleTabIds = $derived(pane.tab_ids.filter((id) => !$hiddenTabs.has(id)));
 
   // Per-pane rename mode flag. Two-way bound on each Tab instance.
   let renamingTab = $state<TabId | null>(null);
@@ -92,11 +97,11 @@
     };
   });
 
-  // Re-evaluate when the tab list changes (add / remove / rename can
-  // shift scrollWidth without firing scroll). Reading pane.tab_ids and
-  // .length wires the reactive dependency.
+  // Re-evaluate when the tab list changes (add / remove / rename / hide can
+  // shift scrollWidth without firing scroll). Reading visibleTabIds.length
+  // wires the reactive dependency on both the pane's list and the hidden set.
   $effect(() => {
-    pane.tab_ids.length;
+    visibleTabIds.length;
     queueMicrotask(updateScrollEdges);
   });
 
@@ -113,6 +118,13 @@
       tabEl?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
     });
   });
+
+  /// Arrow-button scroll (replaces the under-tab scrollbar, which ate
+  /// vertical space and clashed with the TUI look). One click moves
+  /// roughly one tab width; smooth-scroll keeps the motion readable.
+  function scrollTabs(dir: -1 | 1): void {
+    listEl?.scrollBy({ left: dir * 120, behavior: 'smooth' });
+  }
 
   function onTabClick(tabId: TabId): void {
     setPaneActiveTab(pane.id, tabId);
@@ -219,43 +231,66 @@
   oncontextmenu={onBarContextMenu}
 >
   <div
-    class="tab-list"
+    class="tab-list-wrap"
     class:fade-left={canScrollLeft}
     class:fade-right={canScrollRight}
-    bind:this={listEl}
   >
-    {#each pane.tab_ids as id (id)}
-      {@const meta = $tabs.find((m) => m.id === id)}
-      {#if meta}
-        <Tab
-          tabId={id}
-          label={meta.name}
-          active={pane.active_tab_id === id}
-          builtin={meta.builtin}
-          canSkipCloseConfirm={$perTabClosedState[id]?.closed ?? false}
-          avatarState={$perTabAvatarState[id] ?? 'Idle'}
-          awaitingPermission={$perTabAwaitingPermission[id] ?? false}
-          doneWhileAway={$perTabDoneWhileAway[id] ?? false}
-          bind:renaming={
-            () => renamingTab === id,
-            (v) => {
-              if (v) renamingTab = id;
-              else if (renamingTab === id) renamingTab = null;
+    <div class="tab-list" bind:this={listEl}>
+      {#each visibleTabIds as id (id)}
+        {@const meta = $tabs.find((m) => m.id === id)}
+        {#if meta}
+          <Tab
+            tabId={id}
+            label={meta.name}
+            active={pane.active_tab_id === id}
+            builtin={meta.builtin}
+            canSkipCloseConfirm={$perTabClosedState[id]?.closed ?? false}
+            avatarState={$perTabAvatarState[id] ?? 'Idle'}
+            awaitingPermission={$perTabAwaitingPermission[id] ?? false}
+            doneWhileAway={$perTabDoneWhileAway[id] ?? false}
+            bind:renaming={
+              () => renamingTab === id,
+              (v) => {
+                if (v) renamingTab = id;
+                else if (renamingTab === id) renamingTab = null;
+              }
             }
-          }
-          onclick={() => onTabClick(id)}
-          onclose={meta.builtin ? undefined : () => onCloseTab(id)}
-          onnew={meta.kind === 'ai-tool' && meta.builtin
-            ? () => onSpawnAiTab(id)
-            : undefined}
-          oncontextmenu={(e) => onTabContextMenu(id, meta.builtin, e)}
-          onpointerdowndrag={(e) => beginDrag(id, pane.id, e)}
-          onrename={(newName) => onRenameTab(id, newName)}
-        />
-      {/if}
-    {/each}
+            onclick={() => onTabClick(id)}
+            onclose={meta.builtin ? undefined : () => onCloseTab(id)}
+            onnew={meta.kind === 'ai-tool' && meta.builtin
+              ? () => onSpawnAiTab(id)
+              : undefined}
+            oncontextmenu={(e) => onTabContextMenu(id, meta.builtin, e)}
+            onpointerdowndrag={(e) => beginDrag(id, pane.id, e)}
+            onrename={(newName) => onRenameTab(id, newName)}
+          />
+        {/if}
+      {/each}
+    </div>
   </div>
   <div class="tab-bar-end">
+    {#if canScrollLeft || canScrollRight}
+      <button
+        type="button"
+        class="scroll-arrow"
+        aria-label="Scroll tabs left"
+        title="Scroll tabs left"
+        disabled={!canScrollLeft}
+        onclick={() => scrollTabs(-1)}
+      >
+        ‹
+      </button>
+      <button
+        type="button"
+        class="scroll-arrow scroll-arrow-right"
+        aria-label="Scroll tabs right"
+        title="Scroll tabs right"
+        disabled={!canScrollRight}
+        onclick={() => scrollTabs(1)}
+      >
+        ›
+      </button>
+    {/if}
     <button
       type="button"
       class="new-tab"
@@ -325,6 +360,18 @@
     overflow: hidden;
     position: relative;
   }
+  /* Non-scrolling wrapper around the scrollable list. It exists so the
+     edge-fade pseudo-elements have a positioned ancestor whose edges
+     coincide exactly with the list's visible edges — no magic offsets
+     that would drift when the end-zone (arrows + `+` button) changes
+     width. */
+  .tab-list-wrap {
+    position: relative;
+    display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
   .tab-list {
     display: flex;
     flex-direction: row;
@@ -332,29 +379,21 @@
     min-width: 0;
     overflow-x: auto;
     overflow-y: hidden;
-    /* Thin scrollbar so the per-pane bar (narrower than v1.2's
-       full-width one) doesn't lose much vertical space when overflow
-       kicks in. */
-    scrollbar-width: thin;
-    scrollbar-color: var(--text-disabled) transparent;
+    /* No scrollbar: it resized the (deliberately compact) tabs and broke
+       the TUI look. Overflow is signalled by the edge fades and scrolled
+       via the arrow buttons next to the `+` (plus wheel / drag-to-edge). */
+    scrollbar-width: none;
   }
   .tab-list::-webkit-scrollbar {
-    height: 4px;
+    display: none;
   }
-  .tab-list::-webkit-scrollbar-thumb {
-    background: var(--text-disabled);
-    border-radius: 2px;
-  }
-  .tab-list::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  /* Edge-fade gradients: pseudo-elements positioned over the .tab-bar
-     (not the scrollable list) so they don't move with scroll. Visibility
-     is class-toggled by the reactive scroll-state effect, so a fully
-     in-view bar shows neither fade. The gradients fade out the leftmost
-     / rightmost few px of tabs, telling the user "more content here". */
-  .tab-list.fade-left::before,
-  .tab-list.fade-right::after {
+  /* Edge-fade gradients: pseudo-elements on the non-scrolling wrapper so
+     they don't move with scroll. Visibility is class-toggled by the
+     reactive scroll-state effect, so a fully in-view bar shows neither
+     fade. The gradients fade out the leftmost / rightmost few px of tabs,
+     telling the user "more content here". */
+  .tab-list-wrap.fade-left::before,
+  .tab-list-wrap.fade-right::after {
     content: '';
     position: absolute;
     top: 0;
@@ -363,24 +402,51 @@
     pointer-events: none;
     z-index: 1;
   }
-  .tab-list.fade-left::before {
+  .tab-list-wrap.fade-left::before {
     left: 0;
     background: linear-gradient(to right, var(--surface-2), transparent);
   }
-  .tab-list.fade-right::after {
-    /* Anchored to the right edge of the scrollable list — which sits
-       just inside .tab-bar-end. The list's flex: 1 1 auto means its
-       right edge moves with the bar's available width, so right: 0
-       relative to the list's positioned ancestor (the .tab-bar) lands
-       at the end of the list, not the end of the bar. The +button's
-       width is accounted for by the flex layout. */
-    right: 32px;
+  .tab-list-wrap.fade-right::after {
+    right: 0;
     background: linear-gradient(to left, var(--surface-2), transparent);
   }
   .tab-bar-end {
     display: flex;
     flex: 0 0 auto;
     border-left: 1px solid var(--border-subtle);
+  }
+  .scroll-arrow {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--text-tertiary);
+    font-size: 16px;
+    width: 20px;
+    height: 100%;
+    cursor: pointer;
+    line-height: 30px;
+    padding: 0;
+    user-select: none;
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
+  }
+  /* The gap the user reads as "two characters" between the arrows and
+     the `+` button. */
+  .scroll-arrow-right {
+    margin-right: 2ch;
+  }
+  .scroll-arrow:hover:not(:disabled) {
+    background: var(--surface-3);
+    color: var(--text-primary);
+  }
+  .scroll-arrow:disabled {
+    color: var(--text-disabled);
+    cursor: default;
+  }
+  .scroll-arrow:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .new-tab {
     appearance: none;

@@ -31,6 +31,7 @@
   import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
   import { applyTabCreated } from './lib/tabs/store';
+  import { isTabHidden, reconcileActiveTabsWithHidden } from './lib/tabs/visibility';
   import {
     applyTabCreatedToLayout,
     closeFocusedPane,
@@ -171,6 +172,10 @@
       } catch (e) {
         console.error('list_tabs failed:', e);
       }
+      // A persisted layout (or the legacy session active id) can restore an
+      // active tab the user had UI-hidden — re-point those panes at a
+      // visible neighbor before the panes render.
+      reconcileActiveTabsWithHidden();
       if (disposed) return;
       // Install the debounced save subscription AFTER hydration so the
       // first emission (the just-set layout from settings) is the one
@@ -194,10 +199,11 @@
       // *focused pane's* tab list (V4-03 reinterpretation of v1.2's
       // global Ctrl+N). No-op when the focused pane has fewer than N
       // tabs. The closest analogs are iTerm2 and VS Code, both of which
-      // scope Cmd+N / Ctrl+N to the current group / pane.
+      // scope Cmd+N / Ctrl+N to the current group / pane. UI-hidden tabs
+      // are skipped so N matches what the tab bar actually shows.
       const switchToPosition = (n: number) => () => {
         const pane = get(focusedPane);
-        const target = pane.tab_ids[n - 1];
+        const target = pane.tab_ids.filter((id) => !isTabHidden(id))[n - 1];
         if (!target) return;
         setPaneActiveTab(pane.id, target);
         // Mirror to the backend so audio / avatar / window-title

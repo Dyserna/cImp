@@ -11,7 +11,7 @@ import type { SplitDirection } from './types';
 import {
   layout,
   requestTabIntoSplit,
-  cancelLastPlacement,
+  cancelPlacement,
 } from './store';
 
 /// Split the focused pane in `direction` and put a fresh Shell tab in
@@ -61,7 +61,7 @@ export async function splitFocusedPaneWithNewShell(
   const shellCount = get(tabs).filter((m) => !m.builtin).length;
   const name = `Shell ${shellCount + 1}`;
 
-  requestTabIntoSplit(sourcePaneId, direction, placeOn);
+  const placement = requestTabIntoSplit(sourcePaneId, direction, placeOn);
   try {
     await createShellTab({
       name,
@@ -73,7 +73,7 @@ export async function splitFocusedPaneWithNewShell(
       notificationsExited,
     });
   } catch (e) {
-    cancelLastPlacement();
+    cancelPlacement(placement);
     console.error('create_shell_tab failed:', e);
   }
 }

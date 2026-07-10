@@ -17,7 +17,7 @@
 //! |----------|------------------------------------------------------------------|-------------------------------------------|----------|
 //! | Windows  | Git for Windows installed in `C:\Program Files\Git`              | `C:\Program Files\Git\bin\bash.exe`       | yes      |
 //! | Windows  | Git for Windows installed in `C:\Program Files (x86)\Git`        | `C:\Program Files (x86)\Git\bin\bash.exe` | n/a (rare) |
-//! | Windows  | Git for Windows installed elsewhere (e.g. `D:\dev\Git`)          | Path read from `HKLM\SOFTWARE\GitForWindows\InstallPath` | n/a (rare) |
+//! | Windows  | Git for Windows installed elsewhere (e.g. `D:\dev\Git`)          | Path read from `HKLM`/`HKCU` `\SOFTWARE\GitForWindows\InstallPath` | n/a (rare) |
 //! | Windows  | No Git for Windows; `bash.exe` on PATH from MSYS2                | The PATH-resolved bash                    | n/a (rare) |
 //! | Windows  | No Git, no MSYS2, no bash on PATH                                | `powershell.exe -NoLogo` with banner      | yes      |
 //! | Linux    | `$SHELL=/bin/bash` (typical)                                     | `/bin/bash -i`                            | deferred |
@@ -31,7 +31,7 @@
 //! sanitization is required.
 
 use std::path::PathBuf;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Path;
 
 use tracing::info;
@@ -57,8 +57,10 @@ pub fn default_shell_resolution() -> (ShellSpec, ShellSource) {
     #[cfg(not(any(unix, windows)))]
     {
         // Targets like wasm — the app doesn't actually build for these,
-        // but keep the function total.
-        warn!("shell detection: unknown platform; using /bin/sh");
+        // but keep the function total. Fully qualified: the `warn` import
+        // above is `#[cfg(windows)]`-gated, so a bare `warn!` here would
+        // fail to compile on exactly the targets this arm exists for.
+        tracing::warn!("shell detection: unknown platform; using /bin/sh");
         (
             ShellSpec {
                 command: PathBuf::from("/bin/sh"),
@@ -81,12 +83,14 @@ pub fn default_shell() -> ShellSpec {
     spec
 }
 
-/// True when the resolved default came from a Git Bash probe (any of the
-/// three Windows paths). M2's new-shell-tab dialog uses this to decide
-/// whether to render the install-Git banner.
-pub fn was_default_git_bash_found() -> bool {
+/// True when `source` is any of the three Windows Git Bash probes. M2's
+/// new-shell-tab dialog uses this (via `default_shell_spec`) to decide
+/// whether to render the install-Git banner. Takes the already-resolved
+/// source rather than re-running the whole probe chain (file checks,
+/// registry read, PATH walk) a second time per dialog open.
+pub fn is_git_bash_source(source: &ShellSource) -> bool {
     matches!(
-        default_shell_resolution().1,
+        source,
         ShellSource::GitBashProgramFiles
             | ShellSource::GitBashRegistry
             | ShellSource::GitBashPath
@@ -154,18 +158,16 @@ fn resolve_windows() -> (ShellSpec, ShellSource) {
     }
 
     if let Some(path) = git_bash_from_registry() {
-        if path.is_file() {
-            return (
-                ShellSpec {
-                    command: path,
-                    args: vec!["--login".to_string(), "-i".to_string()],
-                },
-                ShellSource::GitBashRegistry,
-            );
-        }
+        return (
+            ShellSpec {
+                command: path,
+                args: vec!["--login".to_string(), "-i".to_string()],
+            },
+            ShellSource::GitBashRegistry,
+        );
     }
 
-    if let Ok(path) = which::which("bash.exe") {
+    if let Some(path) = bash_from_path() {
         return (
             ShellSpec {
                 command: path,
@@ -190,16 +192,74 @@ fn resolve_windows() -> (ShellSpec, ShellSource) {
 
 #[cfg(windows)]
 fn git_bash_from_registry() -> Option<PathBuf> {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
     use winreg::RegKey;
 
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let key = hklm.open_subkey(r"SOFTWARE\GitForWindows").ok()?;
-    let install_path: String = key.get_value("InstallPath").ok()?;
-    let mut path = PathBuf::from(install_path);
-    path.push("bin");
-    path.push("bash.exe");
-    Some(path)
+    // Git for Windows writes `InstallPath` under HKLM only for admin
+    // installs; a per-user "just for me" install (common on locked-down
+    // machines, lands in %LocalAppData%\Programs\Git) writes HKCU instead.
+    // Probe both, validating per hive so a stale HKLM leftover from an
+    // uninstall still falls through to a live HKCU install.
+    for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+        let Ok(key) = RegKey::predef(hive).open_subkey(r"SOFTWARE\GitForWindows") else {
+            continue;
+        };
+        let Ok(install_path) = key.get_value::<String, _>("InstallPath") else {
+            continue;
+        };
+        let mut path = PathBuf::from(install_path);
+        path.push("bin");
+        path.push("bash.exe");
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// A PATH-resolved `bash.exe` that is NOT the WSL launcher shim. Windows
+/// ships `C:\Windows\System32\bash.exe` whenever the WSL optional feature
+/// is (or ever was) enabled, and System32 is unconditionally on PATH — a
+/// bare `which("bash.exe")` on a Git-Bash-less box with WSL would resolve
+/// that shim, mislabel it `GitBashPath` (suppressing the install-Git
+/// banner), and pre-fill the new-tab dialog with a shell that boots a WSL
+/// distro (or errors when none is installed) instead of Git Bash.
+#[cfg(windows)]
+fn bash_from_path() -> Option<PathBuf> {
+    let windir = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(PathBuf::from);
+    for candidate in which::which_all("bash.exe").ok()? {
+        if windir
+            .as_ref()
+            .is_some_and(|w| path_starts_with_ci(&candidate, w))
+        {
+            warn!(
+                path = %candidate.display(),
+                "shell detection: skipping the WSL bash.exe shim on PATH"
+            );
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// Case-insensitive "is `path` strictly under `dir`". Windows paths compare
+/// case-insensitively and PATH entries' casing is whatever the user's
+/// environment happens to contain (`C:\WINDOWS\system32` vs
+/// `C:\Windows\System32`), so a plain `Path::starts_with` is not enough.
+#[cfg(windows)]
+fn path_starts_with_ci(path: &Path, dir: &Path) -> bool {
+    let p: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    let d: Vec<String> = dir
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    !d.is_empty() && p.len() > d.len() && p[..d.len()] == d[..]
 }
 
 #[cfg(unix)]
@@ -250,5 +310,41 @@ mod tests {
     fn unix_default_uses_interactive_flag() {
         let (spec, _) = default_shell_resolution();
         assert_eq!(spec.args, vec!["-i".to_string()]);
+    }
+
+    /// Regression (2026-07 review): the PATH probe must skip the WSL shim
+    /// at `%SystemRoot%\System32\bash.exe` — and Windows path comparison is
+    /// case-insensitive, so the guard must be too.
+    #[cfg(windows)]
+    #[test]
+    fn wsl_shim_detection_is_case_insensitive_and_strict() {
+        let dir = Path::new(r"C:\Windows");
+        assert!(path_starts_with_ci(
+            Path::new(r"C:\WINDOWS\System32\bash.exe"),
+            dir
+        ));
+        assert!(path_starts_with_ci(
+            Path::new(r"c:\windows\system32\bash.exe"),
+            dir
+        ));
+        assert!(!path_starts_with_ci(
+            Path::new(r"C:\Program Files\Git\bin\bash.exe"),
+            dir
+        ));
+        // Equal path is not "under" the dir.
+        assert!(!path_starts_with_ci(Path::new(r"C:\Windows"), dir));
+        // A sibling whose name merely shares the prefix must not match.
+        assert!(!path_starts_with_ci(
+            Path::new(r"C:\Windows2\bash.exe"),
+            dir
+        ));
+    }
+
+    #[test]
+    fn git_bash_sources_are_recognized() {
+        assert!(is_git_bash_source(&ShellSource::GitBashProgramFiles));
+        assert!(is_git_bash_source(&ShellSource::GitBashRegistry));
+        assert!(is_git_bash_source(&ShellSource::GitBashPath));
+        assert!(!is_git_bash_source(&ShellSource::PowerShellFallback));
     }
 }

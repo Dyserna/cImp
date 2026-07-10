@@ -171,19 +171,11 @@ pub async fn pty_write(
     tab: TabId,
     input: String,
 ) -> AppResult<()> {
-    // V8-03: the Offload Server tab is read-only — it has no PTY of its own
-    // (its content is the live llama-server output stream), so swallow any
-    // write. Defense-in-depth behind the frontend's read-only guard. Same for
-    // the V9-01 Code Graph monitor, V13 Workbench, and V15 Graph View tabs —
-    // all app-rendered with no PTY.
-    if matches!(
-        tab,
-        TabId::OffloadServer
-            | TabId::GraphMonitor
-            | TabId::Workbench
-            | TabId::GraphView
-            | TabId::ToolActivity
-    ) {
+    // The reserved dashboard tabs are read-only — app-rendered with no PTY
+    // of their own — so swallow any write. Defense-in-depth behind the
+    // frontend's read-only guard; one shared predicate so a new reserved
+    // dashboard can't miss this swallow.
+    if tab.is_reserved_dashboard() {
         return Ok(());
     }
     // Pre-register any TTS markers in the user's input so they don't fire
@@ -807,21 +799,26 @@ pub async fn settings_update(
     // avatar. User overrides are preserved; see `apply_portable_avatar_paths`.
     crate::settings::apply_portable_avatar_paths(&mut settings);
 
-    // Snapshot the pre-update feature flags so we can drive the reserved tabs'
-    // live materialize/remove after the mutate. The integrity pass that
-    // normally owns those tabs only runs at load, so without this a freshly
-    // enabled feature's tab wouldn't appear until the next launch.
-    let (was_graph, was_offload, was_workbench, was_graph_viz, was_tool_activity, was_stt, was_stt_device) = {
+    // The reserved feature tabs and the settings flag gating each. ONE table
+    // drives both the pre-update snapshot and the post-update live
+    // materialize/remove below, so a new reserved tab can't be snapshotted
+    // but not synced (or vice versa) — the miss used to surface as "the tab
+    // only appears after a restart". The integrity pass that normally owns
+    // these tabs only runs at load.
+    const RESERVED_TAB_FLAGS: &[(TabId, fn(&Settings) -> bool)] = &[
+        (TabId::GraphMonitor, |s| s.graph.enabled),
+        (TabId::OffloadServer, |s| s.offload.enabled),
+        (TabId::Workbench, |s| s.workbench.enabled),
+        (TabId::GraphView, |s| s.graph.graph_viz),
+        (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
+    ];
+
+    // Snapshot the pre-update flags (reserved tabs via the table, plus the
+    // STT pair handled separately below).
+    let (was_reserved, was_stt, was_stt_device) = {
         let old = state.settings.current();
-        (
-            old.graph.enabled,
-            old.offload.enabled,
-            old.workbench.enabled,
-            old.graph.graph_viz,
-            old.ui.tool_activity_tab,
-            old.stt.enabled,
-            old.stt.device,
-        )
+        let was: Vec<bool> = RESERVED_TAB_FLAGS.iter().map(|(_, flag)| flag(&old)).collect();
+        (was, old.stt.enabled, old.stt.device)
     };
 
     // The Settings window holds a full snapshot and replaces wholesale, but it
@@ -867,56 +864,19 @@ pub async fn settings_update(
 
     // On an actual enable/disable edge, mirror the change into the runtime so
     // the reserved tab appears/disappears live (tab bar + pane placement).
-    if now.graph.enabled != was_graph
-        || now.offload.enabled != was_offload
-        || now.workbench.enabled != was_workbench
-        || now.graph.graph_viz != was_graph_viz
-        || now.ui.tool_activity_tab != was_tool_activity
-    {
+    let now_reserved: Vec<bool> = RESERVED_TAB_FLAGS.iter().map(|(_, flag)| flag(&now)).collect();
+    if now_reserved != was_reserved {
         // Serialize against create/close_tab while we touch the registry.
         let _serializer = state.lifecycle_serializer.lock().await;
-        if now.graph.enabled != was_graph {
-            super::tab_lifecycle::sync_reserved_feature_tab(
-                state.inner(),
-                TabId::GraphMonitor,
-                now.graph.enabled,
-            )
-            .await;
-        }
-        if now.offload.enabled != was_offload {
-            super::tab_lifecycle::sync_reserved_feature_tab(
-                state.inner(),
-                TabId::OffloadServer,
-                now.offload.enabled,
-            )
-            .await;
-        }
-        // V13 Phase A: mirror the Workbench tab live too.
-        if now.workbench.enabled != was_workbench {
-            super::tab_lifecycle::sync_reserved_feature_tab(
-                state.inner(),
-                TabId::Workbench,
-                now.workbench.enabled,
-            )
-            .await;
-        }
-        // V15 Feature 4: mirror the Graph View tab live too.
-        if now.graph.graph_viz != was_graph_viz {
-            super::tab_lifecycle::sync_reserved_feature_tab(
-                state.inner(),
-                TabId::GraphView,
-                now.graph.graph_viz,
-            )
-            .await;
-        }
-        // Mirror the Tool Activity tab live too.
-        if now.ui.tool_activity_tab != was_tool_activity {
-            super::tab_lifecycle::sync_reserved_feature_tab(
-                state.inner(),
-                TabId::ToolActivity,
-                now.ui.tool_activity_tab,
-            )
-            .await;
+        for (i, (tab, _)) in RESERVED_TAB_FLAGS.iter().enumerate() {
+            if now_reserved[i] != was_reserved[i] {
+                super::tab_lifecycle::sync_reserved_feature_tab(
+                    state.inner(),
+                    tab.clone(),
+                    now_reserved[i],
+                )
+                .await;
+            }
         }
     }
     Ok(())
@@ -1137,10 +1097,22 @@ pub async fn graph_test_embedder(
 }
 
 /// V9-01: recent graph tool calls (cloud Claude + offload worker), newest
-/// first — the monitor tab's activity list.
+/// first — the monitor tab's activity list. The ring is process-wide across
+/// every indexed root; pass `scoped: true` (with an optional `root`, default
+/// the launch directory) to filter to one project's calls — the Graph View
+/// pulse feed uses this so another project's activity can't light up
+/// same-named nodes here. The Tool Activity tab omits it and sees everything.
 #[tauri::command]
-pub async fn graph_history() -> AppResult<Vec<crate::graph::GraphCall>> {
-    Ok(crate::graph::graph_history())
+pub async fn graph_history(
+    root: Option<String>,
+    scoped: Option<bool>,
+) -> AppResult<Vec<crate::graph::GraphCall>> {
+    let calls = crate::graph::graph_history();
+    if !scoped.unwrap_or(false) {
+        return Ok(calls);
+    }
+    let key = crate::graph::activity_root_key(&resolve_graph_root(root)?);
+    Ok(calls.into_iter().filter(|c| c.root == key).collect())
 }
 
 /// V10: one candidate dead export (unused public symbol) for the Analyses tab.

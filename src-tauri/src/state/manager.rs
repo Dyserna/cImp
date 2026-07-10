@@ -155,32 +155,37 @@ impl TabId {
         }
     }
 
-    /// True for the reserved non-closable builtins: the four AI builtins
-    /// (which `+` spawns duplicates of). Spawned `Ai(_)` duplicates and all
-    /// `Shell(_)` tabs are closable, so they return false — including the
-    /// on-demand `rustnet` / `broot` tool tabs, which are ordinary uuid-id
-    /// Shell tabs. This is the canonical `builtin` flag surfaced to the
-    /// frontend (gates the close `×`; the spawn `+` is additionally gated on
-    /// AI-tool kind); keep it in sync with `tabs::registry`'s `is_builtin_id`.
+    /// THE single enumeration of the reserved app-rendered dashboard tabs:
+    /// Shell-kind with a reserved identity and NO PTY (Offload Server, Code
+    /// Graph monitor, Workbench, Graph View, Tool Activity). Every guard
+    /// that needs "is this one of the reserved dashboards?" — the pty-write
+    /// swallow, the close refusal, the builtin flag — derives from this
+    /// predicate, so a new reserved dashboard is added HERE (plus `as_str`/
+    /// `from_str`/`kind`, which the compiler forces via the new variant) and
+    /// the guards pick it up automatically. Mirrors the frontend's
+    /// `isAppRenderedTab` (minus Note/Preview, which aren't reserved).
+    pub fn is_reserved_dashboard(&self) -> bool {
+        matches!(
+            self,
+            TabId::OffloadServer
+                | TabId::GraphMonitor
+                | TabId::Workbench
+                | TabId::GraphView
+                | TabId::ToolActivity
+        )
+    }
+
+    /// True for the reserved non-closable builtins: the AI builtins (which
+    /// `+` spawns duplicates of) plus the reserved dashboards (removed only
+    /// by disabling their feature, never by the close `×`). Spawned `Ai(_)`
+    /// duplicates, all `Shell(_)` tabs (including the on-demand `rustnet` /
+    /// `broot` tool tabs), and user-created Preview tabs are closable. This
+    /// is the canonical `builtin` flag surfaced to the frontend (gates the
+    /// close `×`; the spawn `+` is additionally gated on AI-tool kind).
+    /// `tabs::registry`'s `is_builtin_id` delegates here.
     pub fn is_builtin(&self) -> bool {
-        match self {
-            TabId::Claude
-            | TabId::ClaudeLocal
-            | TabId::OpenCode
-            // Non-closable: the Offload Server tab is removed only by
-            // disabling offload, never by the close `×`. The Code Graph
-            // monitor tab is likewise removed only by disabling the graph,
-            // and the Workbench tab only by disabling workbench.
-            | TabId::OffloadServer
-            | TabId::GraphMonitor
-            | TabId::Workbench
-            | TabId::GraphView
-            | TabId::ToolActivity => true,
-            // Preview tabs are always user-created (no reserved/builtin
-            // instance ships by default), so — like Shell/Ai duplicates —
-            // they're always closable.
-            TabId::Shell(_) | TabId::Ai(_) | TabId::Preview(_) => false,
-        }
+        matches!(self, TabId::Claude | TabId::ClaudeLocal | TabId::OpenCode)
+            || self.is_reserved_dashboard()
     }
 }
 

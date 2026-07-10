@@ -21,7 +21,7 @@
   import { openSettingsWindowToTab } from './settings/ipc';
   import { isPreviewTabId, isShellTab, type TabId } from './tabs/types';
   import { tabMeta } from './tabs/store';
-  import { requestTabIntoPane, setFocusedPane, setPaneActiveTab } from './layout/store';
+  import { cancelPlacement, requestTabIntoPane, setFocusedPane, setPaneActiveTab } from './layout/store';
   import { paneRegistry } from './layout/registry';
   import { beginDrag } from './dnd/drag';
   import type { PaneNode } from './layout/types';
@@ -132,8 +132,11 @@
   /// Routes the new tab into this pane via the same pending-placement
   /// cell the New Shell Tab `+` uses, so it lands next to its origin.
   function onSpawnAiTab(template: TabId): void {
-    requestTabIntoPane(pane.id);
+    const placement = requestTabIntoPane(pane.id);
     void createAiTab(template).catch((e) => {
+      // No tab-created will arrive to consume the placement — cancel it
+      // or it would silently re-route the next tab created anywhere.
+      cancelPlacement(placement);
       console.error('create_ai_tab failed:', e);
     });
   }
@@ -184,9 +187,13 @@
     menu = { x: e.clientX, y: e.clientY, tab: null };
   }
 
+  /// The dialog enqueues the pane placement itself at submit time (and
+  /// cancels it if the create IPC fails). Pushing it here at open time
+  /// leaked the placement whenever the dialog was cancelled — no
+  /// tab-created ever consumed it, so the next tab created anywhere in
+  /// the app was silently routed into this pane.
   function onNewShellTab(): void {
-    requestTabIntoPane(pane.id);
-    openNewShellTabDialog();
+    openNewShellTabDialog(pane.id);
   }
 
   /// V14 Phase F: "New Preview tab" (pane context menu). An empty url lets
@@ -194,8 +201,11 @@
   /// `DEFAULT_PREVIEW_URL` — the frontend doesn't duplicate that fallback
   /// logic here.
   function onNewPreviewTabAction(): void {
-    requestTabIntoPane(pane.id);
+    const placement = requestTabIntoPane(pane.id);
     void createPreviewTab($settings.preview_last_url ?? '').catch((e) => {
+      // Same contract as onSpawnAiTab: a failed create must release
+      // its queued placement.
+      cancelPlacement(placement);
       console.error('create_preview_tab failed:', e);
     });
   }

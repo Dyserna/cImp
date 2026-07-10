@@ -15,29 +15,45 @@
 /// Convert assistant markdown to a plain-prose string suitable for TTS.
 /// Fenced code blocks are removed entirely; inline markup is unwrapped to its
 /// text. Returns possibly-multiline prose; the segmenter splits it.
+///
+/// Expects one *complete* message text — fence state does not persist across
+/// calls, so feeding incremental chunks would mis-handle fences that span
+/// chunk boundaries. An unclosed fence swallows the rest of the message
+/// (CommonMark: it runs to end of input).
 pub fn to_speakable(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
-    let mut in_fence = false;
-    let mut fence_marker: &str = "";
+    // Open fence: (marker char, opening run length).
+    let mut fence: Option<(char, usize)> = None;
 
     for line in md.lines() {
         let trimmed = line.trim_start();
-        // Fenced code blocks open/close on ``` or ~~~ (3+). Track the marker so
-        // a ``` inside a ~~~ block doesn't prematurely close it.
-        if let Some(marker) = fence_open_marker(trimmed) {
-            if in_fence {
-                if trimmed.starts_with(fence_marker) {
-                    in_fence = false;
-                    fence_marker = "";
+        if let Some((ch, len)) = fence_marker(trimmed) {
+            match fence {
+                Some((open_ch, open_len)) => {
+                    // A closing fence is the same char, at least as long, and
+                    // has nothing else on the line (CommonMark). Anything else
+                    // — e.g. a ```python line inside a ````-fenced example —
+                    // is code-block content and stays skipped.
+                    if ch == open_ch
+                        && len >= open_len
+                        && trimmed[len..].trim().is_empty()
+                    {
+                        fence = None;
+                    }
                 }
-            } else {
-                in_fence = true;
-                fence_marker = marker;
+                None => fence = Some((ch, len)),
             }
             continue; // never speak the fence line itself
         }
-        if in_fence {
+        if fence.is_some() {
             continue; // body of a code block — skip
+        }
+        if trimmed.starts_with('|') {
+            if let Some(row) = table_row_to_prose(trimmed) {
+                out.push_str(&strip_inline(&row));
+                out.push('\n');
+            }
+            continue; // separator rows (|---|---|) speak nothing
         }
         out.push_str(&strip_inline(line));
         out.push('\n');
@@ -46,16 +62,38 @@ pub fn to_speakable(md: &str) -> String {
     out
 }
 
-/// If `line` (already left-trimmed) opens or closes a code fence, return the
-/// fence marker (\"```\" or \"~~~\"); else `None`.
-fn fence_open_marker(line: &str) -> Option<&'static str> {
-    if line.starts_with("```") {
-        Some("```")
-    } else if line.starts_with("~~~") {
-        Some("~~~")
-    } else {
-        None
+/// If `line` (already left-trimmed) starts with a code-fence run (3+ backticks
+/// or tildes), return the fence char and run length; else `None`.
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let first = line.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
     }
+    let len = line.chars().take_while(|&c| c == first).count();
+    (len >= 3).then_some((first, len))
+}
+
+/// Render a `| a | b |` table row as prose: cells joined with commas, closed
+/// with a period so each row becomes its own sentence. Header-separator rows
+/// (only pipes, dashes, colons) return `None`.
+fn table_row_to_prose(line: &str) -> Option<String> {
+    if line
+        .chars()
+        .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+    {
+        return None;
+    }
+    let cells: Vec<&str> = line
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    let mut row = cells.join(", ");
+    if !row.ends_with(['.', '!', '?']) {
+        row.push('.');
+    }
+    Some(row)
 }
 
 /// Strip the loudest inline markdown from one line: drop inline-code backticks
@@ -73,6 +111,9 @@ fn strip_inline(line: &str) -> String {
 
     // Unwrap links: [text](url) -> text. Cheap single pass.
     s = unwrap_links(&s);
+
+    // GFM strikethrough: ~~gone~~ -> gone. A lone ~ ("~5 minutes") survives.
+    s = s.replace("~~", "");
 
     // Remove inline-code backticks and `*` emphasis markers, keeping inner
     // text. `_` is dropped only when it's an emphasis delimiter (adjacent to a
@@ -102,13 +143,18 @@ fn strip_inline(line: &str) -> String {
 
 /// Remove a single leading markdown block marker from a left-trimmed line.
 fn strip_lead_marker(lead: &str) -> &str {
-    // ATX heading: one or more '#', then a space.
-    if let Some(rest) = lead.strip_prefix('#') {
-        let rest = rest.trim_start_matches('#');
-        return rest.trim_start();
+    // ATX heading: one or more '#', then a space (or nothing). "#hashtag" and
+    // "#1 priority" are prose, not headings.
+    if lead.starts_with('#') {
+        let rest = lead.trim_start_matches('#');
+        if rest.is_empty() || rest.starts_with(' ') {
+            return rest.trim_start();
+        }
+        return lead;
     }
-    if let Some(rest) = lead.strip_prefix('>') {
-        return rest.trim_start();
+    // Blockquote, including nested ("> > deep").
+    if lead.starts_with('>') {
+        return lead.trim_start_matches(['>', ' ']);
     }
     for bullet in ["- ", "* ", "+ "] {
         if let Some(rest) = lead.strip_prefix(bullet) {
@@ -126,17 +172,26 @@ fn strip_lead_marker(lead: &str) -> &str {
     lead
 }
 
-/// Replace `[text](url)` with `text`. Bare `[text]` without a paren group is
-/// left as-is (the brackets are dropped by the segmenter's sanitizer).
+/// Replace `[text](url)` and `![alt](url)` with the text/alt. Bare `[text]`
+/// without a paren group is left as-is (the stray brackets are skipped later
+/// at the phonemizer's vocab lookup, so they're inaudible).
 fn unwrap_links(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'[' {
-            if let Some(close) = s[i + 1..].find(']') {
-                let text_start = i + 1;
-                let text_end = i + 1 + close;
+        // `![alt](url)` — parse from the `[`; the `!` is dropped with the url.
+        let bracket = if bytes[i] == b'[' {
+            Some(i)
+        } else if bytes[i] == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            Some(i + 1)
+        } else {
+            None
+        };
+        if let Some(b_idx) = bracket {
+            if let Some(close) = s[b_idx + 1..].find(']') {
+                let text_start = b_idx + 1;
+                let text_end = b_idx + 1 + close;
                 let after = text_end + 1;
                 if after < bytes.len() && bytes[after] == b'(' {
                     if let Some(paren) = s[after + 1..].find(')') {
@@ -213,5 +268,64 @@ mod tests {
     fn code_only_message_speaks_nothing() {
         let md = "```\nall code\nno prose\n```";
         assert!(to_speakable(md).trim().is_empty());
+    }
+
+    #[test]
+    fn longer_fence_is_not_closed_by_shorter_run() {
+        // A ````-fenced example *containing* a ``` block: the inner fences are
+        // content, not closers — nothing inside may leak into speech.
+        let md = "before\n````markdown\n```python\nprint(1)\n```\n````\nafter";
+        let out = to_speakable(md);
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+        assert!(!out.contains("print"));
+        assert!(!out.contains("python"));
+    }
+
+    #[test]
+    fn fence_content_line_starting_with_marker_does_not_close() {
+        // Closing fence must be the run alone on its line.
+        let md = "```\n```echo not a close\nstill code\n```\nprose";
+        let out = to_speakable(md);
+        assert!(!out.contains("still code"));
+        assert!(out.contains("prose"));
+    }
+
+    #[test]
+    fn table_rows_become_comma_prose() {
+        let md = "| Name | Age |\n| --- | --- |\n| Alice | 30 |";
+        let out = to_speakable(md);
+        assert!(out.contains("Name, Age."));
+        assert!(out.contains("Alice, 30."));
+        assert!(!out.contains('|'));
+        assert!(!out.contains("---"));
+    }
+
+    #[test]
+    fn strikethrough_is_unwrapped_but_lone_tilde_survives() {
+        let out = to_speakable("This is ~~deprecated~~ in ~5 minutes.");
+        assert!(out.contains("deprecated"));
+        assert!(!out.contains("~~"));
+        assert!(out.contains("~5 minutes"));
+    }
+
+    #[test]
+    fn nested_blockquote_fully_stripped() {
+        let out = to_speakable("> > deeply nested");
+        assert_eq!(out.trim(), "deeply nested");
+    }
+
+    #[test]
+    fn image_drops_the_bang() {
+        let out = to_speakable("See ![diagram](http://x) below.");
+        assert!(out.contains("See diagram below."));
+        assert!(!out.contains('!'));
+    }
+
+    #[test]
+    fn hashtag_word_is_not_a_heading() {
+        let out = to_speakable("#hashtag stays\n#1 priority");
+        assert!(out.contains("#hashtag stays"));
+        assert!(out.contains("#1 priority"));
     }
 }

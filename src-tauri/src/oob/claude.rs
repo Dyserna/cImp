@@ -328,32 +328,43 @@ fn record_tool_events(obj: &Value, project_dir: &Path, session_id: &str, ctx: &O
         }
         let Some(name) = part.get("name").and_then(Value::as_str) else { continue };
         let Some((kind, arg)) = crate::graph::classify_tool(name) else { continue };
-        let input = part.get("input");
-        let get = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
-        let (path, detail) = match arg {
-            // Read/Edit key the target as `file_path`; NotebookRead/NotebookEdit
-            // key it as `notebook_path`.
-            crate::graph::MemArg::Path => (
-                get("file_path").or_else(|| get("notebook_path")).unwrap_or("").to_string(),
-                None,
-            ),
-            crate::graph::MemArg::Pattern => (
-                get("pattern").or_else(|| get("path")).unwrap_or("").to_string(),
-                None,
-            ),
-            crate::graph::MemArg::Command => (
-                String::new(),
-                get("command").map(|c| c.chars().take(200).collect::<String>()),
-            ),
-        };
-        // A read/edit/grep with no target carries nothing worth recording.
-        if matches!(arg, crate::graph::MemArg::Path | crate::graph::MemArg::Pattern)
-            && path.is_empty()
-        {
-            continue;
-        }
+        let Some((path, detail)) = mem_target(arg, part.get("input")) else { continue };
         ctx.record_mem(project_dir, session_id, "claude", kind, &path, None, None, detail.as_deref());
     }
+}
+
+/// Extract a classified tool's recordable target from its `input` args, or
+/// `None` when the event carries nothing worth recording — a read/edit/grep
+/// with no path, or a shell call with no `command` (recording those would
+/// only evict useful events from the per-session ring). Mirrors the OpenCode
+/// ingress guard in `offload::loopback::handle_memory_event` so both taps
+/// classify identically.
+fn mem_target(
+    arg: crate::graph::MemArg,
+    input: Option<&Value>,
+) -> Option<(String, Option<String>)> {
+    let get = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
+    let (path, detail) = match arg {
+        // Read/Edit key the target as `file_path`; NotebookRead/NotebookEdit
+        // key it as `notebook_path`.
+        crate::graph::MemArg::Path => (
+            get("file_path").or_else(|| get("notebook_path")).unwrap_or("").to_string(),
+            None,
+        ),
+        crate::graph::MemArg::Pattern => (
+            get("pattern").or_else(|| get("path")).unwrap_or("").to_string(),
+            None,
+        ),
+        crate::graph::MemArg::Command => (
+            String::new(),
+            get("command").map(|c| c.chars().take(200).collect::<String>()),
+        ),
+    };
+    let recordable = match arg {
+        crate::graph::MemArg::Command => detail.is_some(),
+        _ => !path.is_empty(),
+    };
+    recordable.then_some((path, detail))
 }
 
 // ── V14 Phase C: token/cost usage tap ─────────────────────────────────────
@@ -944,6 +955,28 @@ mod tests {
         ring.insert("toolu_1".to_string(), "Read".to_string());
         ring.clear();
         assert_eq!(ring.get("toolu_1"), None);
+    }
+
+    #[test]
+    fn mem_target_skips_events_with_no_usable_target() {
+        // Regression (legacy sweep session 5): a Bash tool_use with a missing
+        // `command` used to record a content-free mem_event (empty path, no
+        // detail), wasting a ring slot — the OpenCode ingress in
+        // offload::loopback already guarded this; both taps now match.
+        use crate::graph::MemArg;
+        let input = obj(r#"{"description":"oops, no command key"}"#);
+        assert_eq!(mem_target(MemArg::Command, Some(&input)), None);
+        assert_eq!(mem_target(MemArg::Path, Some(&input)), None);
+        assert_eq!(mem_target(MemArg::Pattern, Some(&input)), None);
+        assert_eq!(mem_target(MemArg::Command, None), None);
+
+        let bash = obj(r#"{"command":"cargo test"}"#);
+        assert_eq!(
+            mem_target(MemArg::Command, Some(&bash)),
+            Some((String::new(), Some("cargo test".to_string())))
+        );
+        let read = obj(r#"{"file_path":"src/main.rs"}"#);
+        assert_eq!(mem_target(MemArg::Path, Some(&read)), Some(("src/main.rs".to_string(), None)));
     }
 
     #[test]

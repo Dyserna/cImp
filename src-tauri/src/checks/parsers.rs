@@ -4,6 +4,7 @@
 //! never an error — a checker's output format drifting across versions
 //! should degrade the diagnostic count, not break `run_check` outright.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -11,15 +12,36 @@ use serde::Deserialize;
 
 use super::{Diag, ParserKind, Severity};
 
-/// Dispatch to the parser named by `kind`.
+/// Dispatch to the parser named by `kind`. The line-oriented parsers get
+/// ANSI-stripped input — a user-configured checker command can leak color
+/// (FORCE_COLOR, a tool that doesn't tty-detect), and escape sequences glued
+/// to the file path would otherwise break both the regex match and the
+/// downstream changed-file comparison. The JSON parsers don't need it (JSON
+/// string content never carries raw ESC from these tools).
 pub fn parse(kind: ParserKind, stdout: &str, stderr: &str) -> Vec<Diag> {
     match kind {
         ParserKind::CargoJson => parse_cargo_json(stdout),
-        ParserKind::Tsc => parse_tsc(stdout, stderr),
         ParserKind::EslintJson => parse_eslint_json(stdout),
-        ParserKind::Pytest => parse_pytest(stdout, stderr),
-        ParserKind::GenericGcc => parse_generic_gcc(stdout, stderr),
+        ParserKind::Tsc => parse_tsc(&strip_ansi(stdout), &strip_ansi(stderr)),
+        ParserKind::Pytest => parse_pytest(&strip_ansi(stdout), &strip_ansi(stderr)),
+        ParserKind::GenericGcc => parse_generic_gcc(&strip_ansi(stdout), &strip_ansi(stderr)),
     }
+}
+
+fn ansi_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // CSI sequences (colors, cursor movement, erase-line) — the escape shapes
+    // CLI checkers actually emit.
+    RE.get_or_init(|| Regex::new("\x1b\\[[0-9;?]*[A-Za-z]").expect("valid regex"))
+}
+
+/// Remove ANSI CSI escape sequences. Borrows unchanged input (the common,
+/// color-free case) so the per-run cost is one `contains` scan.
+fn strip_ansi(s: &str) -> Cow<'_, str> {
+    if !s.contains('\x1b') {
+        return Cow::Borrowed(s);
+    }
+    ansi_re().replace_all(s, "")
 }
 
 // ── cargo --message-format=json ───────────────────────────────────────────
@@ -95,21 +117,42 @@ fn tsc_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^(.+)\((\d+),(\d+)\): (error|warning) (TS\d+): (.*)$").expect("valid regex"))
 }
 
+/// tsc's project-level diagnostics carry no `file(line,col):` prefix at all —
+/// `error TS18003: No inputs were found in config file 'tsconfig.json'.` — and
+/// dropping them would make a completely broken tsconfig read as *zero*
+/// diagnostics. Mirrors the cargo parser's span-less handling: empty location.
+fn tsc_global_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(error|warning) (TS\d+): (.*)$").expect("valid regex"))
+}
+
 fn parse_tsc(stdout: &str, stderr: &str) -> Vec<Diag> {
     let re = tsc_re();
+    let global_re = tsc_global_re();
     stdout
         .lines()
         .chain(stderr.lines())
         .filter_map(|line| {
-            let caps = re.captures(line)?;
-            let severity = if &caps[4] == "error" { Severity::Error } else { Severity::Warning };
+            if let Some(caps) = re.captures(line) {
+                let severity = if &caps[4] == "error" { Severity::Error } else { Severity::Warning };
+                return Some(Diag {
+                    severity,
+                    code: Some(caps[5].to_string()),
+                    message: caps[6].to_string(),
+                    file: caps[1].to_string(),
+                    line: caps[2].parse().ok()?,
+                    col: caps[3].parse().ok(),
+                });
+            }
+            let caps = global_re.captures(line)?;
+            let severity = if &caps[1] == "error" { Severity::Error } else { Severity::Warning };
             Some(Diag {
                 severity,
-                code: Some(caps[5].to_string()),
-                message: caps[6].to_string(),
-                file: caps[1].to_string(),
-                line: caps[2].parse().ok()?,
-                col: caps[3].parse().ok(),
+                code: Some(caps[2].to_string()),
+                message: caps[3].to_string(),
+                file: String::new(),
+                line: 0,
+                col: None,
             })
         })
         .collect()
@@ -129,7 +172,10 @@ struct EslintFileResult {
 struct EslintMessage {
     #[serde(rename = "ruleId", default)]
     rule_id: Option<String>,
-    /// 2 = error, 1 = warning (eslint's own convention).
+    /// 2 = error, 1 = warning (eslint's own convention). Defaulted so one
+    /// message missing the field degrades to a warning instead of failing the
+    /// whole-document parse (which would null out the entire run).
+    #[serde(default)]
     severity: u8,
     message: String,
     #[serde(default)]
@@ -142,7 +188,10 @@ struct EslintMessage {
 /// message stream) — a malformed/truncated document yields no diagnostics
 /// rather than a partial parse.
 fn parse_eslint_json(stdout: &str) -> Vec<Diag> {
-    let Ok(files) = serde_json::from_str::<Vec<EslintFileResult>>(stdout.trim()) else {
+    // A wrapper script can prefix the stream with a UTF-8 BOM, which `trim`
+    // does not strip and which would fail the whole-document parse.
+    let doc = stdout.trim_start_matches('\u{feff}').trim();
+    let Ok(files) = serde_json::from_str::<Vec<EslintFileResult>>(doc) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -167,7 +216,7 @@ fn parse_pytest(stdout: &str, stderr: &str) -> Vec<Diag> {
     for line in stdout.lines().chain(stderr.lines()) {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("FAILED ") {
-            let (nodeid, message) = match rest.split_once(" - ") {
+            let (nodeid, message) = match split_nodeid_reason(rest) {
                 Some((n, m)) => (n, m.trim().to_string()),
                 None => (rest, "test failed".to_string()),
             };
@@ -178,6 +227,25 @@ fn parse_pytest(stdout: &str, stderr: &str) -> Vec<Diag> {
         }
     }
     out
+}
+
+/// Split a `FAILED` line's remainder into `(nodeid, reason)` at the first
+/// ` - ` **outside brackets** — a parametrized node id can itself contain the
+/// separator (`test_foo.py::test_bar[a - b] - AssertionError`), and a naive
+/// `split_once` would cut inside the parameter, garbling the message.
+fn split_nodeid_reason(rest: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    for (i, b) in rest.bytes().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b' ' if depth == 0 && rest[i..].starts_with(" - ") => {
+                return Some((&rest[..i], &rest[i + 3..]));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The pytest tail line, e.g. `====== 2 failed, 10 passed in 1.23s =======` —
@@ -194,13 +262,20 @@ fn pytest_summary_line(line: &str) -> Option<&str> {
 
 fn generic_gcc_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^(.+?):(\d+)(?::(\d+))?:\s*(error|warning|note)?:?\s*(.*)$").expect("valid regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"^(.+?):(\d+)(?::(\d+))?:\s*(fatal error|error|warning|note)?:?\s*(.*)$")
+            .expect("valid regex")
+    })
 }
 
 /// `file:line[:col]: [error|warning|note:] message` — gcc/clang's classic
 /// shape and the fallback for anything else line-oriented. Lines with no
 /// trailing message (a bare `file:line:` with nothing after it) are skipped —
 /// almost always a false match on non-diagnostic output (e.g. a timestamp).
+/// Two more junk shapes are rejected: an all-digit "file" (a timestamp like
+/// `12:34:56 Build succeeded` matches the regex as file="12") and a "file"
+/// starting with whitespace (compilers print paths at column 0; indented
+/// matches are decoration like cargo's `  --> src/main.rs:2:5`).
 fn parse_generic_gcc(stdout: &str, stderr: &str) -> Vec<Diag> {
     let re = generic_gcc_re();
     stdout
@@ -212,8 +287,12 @@ fn parse_generic_gcc(stdout: &str, stderr: &str) -> Vec<Diag> {
             if message.is_empty() {
                 return None;
             }
+            let file = &caps[1];
+            if file.bytes().all(|b| b.is_ascii_digit()) || file.starts_with(char::is_whitespace) {
+                return None;
+            }
             let severity = match caps.get(4).map(|m| m.as_str()) {
-                Some("error") => Severity::Error,
+                Some("error") | Some("fatal error") => Severity::Error,
                 Some("warning") => Severity::Warning,
                 _ => Severity::Note,
             };
@@ -337,5 +416,94 @@ not json at all
     #[test]
     fn generic_gcc_skips_lines_with_no_message() {
         assert!(parse_generic_gcc("src/main.c:10:5:\n", "").is_empty());
+    }
+
+    #[test]
+    fn tsc_global_error_without_location_is_captured() {
+        // A broken tsconfig produces file-less errors; dropping them would
+        // make the run read as zero diagnostics.
+        let diags = parse_tsc("error TS18003: No inputs were found in config file 'tsconfig.json'.\n", "");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].code.as_deref(), Some("TS18003"));
+        assert_eq!(diags[0].file, "");
+        assert_eq!(diags[0].line, 0);
+        assert!(diags[0].message.contains("No inputs"));
+    }
+
+    #[test]
+    fn tsc_windows_path_with_drive_letter_parses() {
+        let diags = parse_tsc(r"C:\repo\src\app.ts(12,5): error TS2345: bad arg", "");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file, r"C:\repo\src\app.ts");
+        assert_eq!(diags[0].line, 12);
+    }
+
+    #[test]
+    fn ansi_colored_output_still_parses() {
+        let colored = "\x1b[96msrc/app.ts\x1b[0m(\x1b[93m12\x1b[0m,\x1b[93m5\x1b[0m): \x1b[91merror\x1b[0m TS2345: bad arg\n";
+        let diags = parse(ParserKind::Tsc, colored, "");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file, "src/app.ts");
+        assert_eq!(diags[0].line, 12);
+        assert_eq!(diags[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn strip_ansi_borrows_when_clean() {
+        assert!(matches!(strip_ansi("no escapes here"), Cow::Borrowed(_)));
+        assert_eq!(strip_ansi("\x1b[1;31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn eslint_message_without_severity_degrades_to_warning() {
+        // One message missing `severity` must not null out the whole run.
+        let json = r#"[{"filePath":"/repo/a.js","messages":[
+            {"ruleId":"x","message":"no severity","line":1},
+            {"ruleId":"y","severity":2,"message":"real error","line":2}
+        ]}]"#;
+        let diags = parse_eslint_json(json);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[1].severity, Severity::Error);
+    }
+
+    #[test]
+    fn eslint_json_with_bom_parses() {
+        let json = format!("\u{feff}{ESLINT_JSON}");
+        assert_eq!(parse_eslint_json(&json).len(), 2);
+    }
+
+    #[test]
+    fn pytest_parametrized_nodeid_with_dash_splits_after_brackets() {
+        let diags = parse_pytest("FAILED tests/test_foo.py::test_bar[a - b] - AssertionError: nope\n", "");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file, "tests/test_foo.py");
+        assert_eq!(diags[0].message, "AssertionError: nope");
+    }
+
+    #[test]
+    fn generic_gcc_fatal_error_is_error_severity() {
+        let diags = parse_generic_gcc("src/main.c:1:10: fatal error: bar.h: No such file or directory\n", "");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].message, "bar.h: No such file or directory");
+    }
+
+    #[test]
+    fn generic_gcc_rejects_timestamp_and_indented_decoration() {
+        // `12:34:56 Build succeeded` matches the regex shape with file="12";
+        // cargo's human `  --> src/main.rs:2:5` matches with an indented file.
+        let out = "12:34:56 Build succeeded\n  --> src/main.rs:2:5\n";
+        assert!(parse_generic_gcc(out, "").is_empty());
+    }
+
+    #[test]
+    fn generic_gcc_windows_drive_letter_path_parses() {
+        let diags = parse_generic_gcc(r"C:\repo\src\main.c:10:5: error: bad", "");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file, r"C:\repo\src\main.c");
+        assert_eq!(diags[0].line, 10);
+        assert_eq!(diags[0].severity, Severity::Error);
     }
 }

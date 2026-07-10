@@ -106,22 +106,27 @@ impl OobContext {
             return;
         }
         for sentence in crate::processing::segment_sentences(&prose) {
-            if self.cancel.is_cancelled() {
+            // Re-check the toggle per sentence so switching TTS off mid-burst
+            // cuts the rest of a long message (the doc above promises a live
+            // read), and race the bounded send against the cancel token so a
+            // closing tab isn't held hostage by a backed-up TTS channel.
+            if self.cancel.is_cancelled() || !self.tts_enabled() {
                 return;
             }
-            // Bounded channel; if the worker is backed up, awaiting applies
-            // natural backpressure rather than dropping speech.
-            if self
-                .tts
-                .send(TtsRequest::Synthesize {
-                    tab: self.tab.clone(),
-                    text: sentence,
-                    suppressible: true,
-                })
-                .await
-                .is_err()
-            {
-                return; // worker gone — stop feeding.
+            let send = self.tts.send(TtsRequest::Synthesize {
+                tab: self.tab.clone(),
+                text: sentence,
+                suppressible: true,
+            });
+            tokio::select! {
+                _ = self.cancel.cancelled() => return,
+                // Bounded channel; if the worker is backed up, awaiting applies
+                // natural backpressure rather than dropping speech.
+                res = send => {
+                    if res.is_err() {
+                        return; // worker gone — stop feeding.
+                    }
+                }
             }
         }
     }
@@ -166,5 +171,54 @@ impl OobContext {
         if let Some(mem) = self.mem.as_ref() {
             mem.record_usage(root, session_id, agent, event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+    use std::time::Duration;
+
+    fn ctx(tts: tokio::sync::mpsc::Sender<TtsRequest>) -> OobContext {
+        let (sig_tx, _sig_rx) = tokio::sync::mpsc::channel(4);
+        let mut defaults = Settings::default();
+        defaults.tabs.push(crate::settings::default_opencode_tab());
+        let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
+        OobContext {
+            tab: TabId::from_str("opencode"),
+            tts,
+            state_signals: sig_tx,
+            settings,
+            cancel: CancellationToken::new(),
+            mem: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn speak_aborts_promptly_on_cancel_while_channel_is_full() {
+        // Regression: `speak` used to await the bounded TTS send without
+        // racing the cancel token — a closing tab could sit parked behind a
+        // backed-up channel until the worker drained a slot.
+        let (tts_tx, _tts_rx) = tokio::sync::mpsc::channel(1);
+        let ctx = ctx(tts_tx.clone());
+        // Fill the single slot so the next send parks (the receiver is held,
+        // not read, so nothing ever drains).
+        tts_tx
+            .try_send(TtsRequest::Synthesize {
+                tab: TabId::from_str("opencode"),
+                text: "plug".into(),
+                suppressible: true,
+            })
+            .unwrap();
+        let cancel = ctx.cancel.clone();
+        let speaker = tokio::spawn(async move { ctx.speak("One. Two. Three.").await });
+        // Give speak() time to park inside the send.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), speaker)
+            .await
+            .expect("speak must return promptly once cancelled")
+            .unwrap();
     }
 }

@@ -131,27 +131,46 @@ export type PendingTabPlacement =
 const placementQueue: PendingTabPlacement[] = [];
 
 /// Note that the next created tab should be placed into `paneId`. Used
-/// by the per-pane `+` button.
-export function requestTabIntoPane(paneId: PaneId): void {
-  placementQueue.push({ kind: 'pane', paneId });
+/// by the per-pane `+` button. Returns the queued placement so the
+/// caller can `cancelPlacement` it if its create IPC fails.
+export function requestTabIntoPane(paneId: PaneId): PendingTabPlacement {
+  const placement: PendingTabPlacement = { kind: 'pane', paneId };
+  placementQueue.push(placement);
+  return placement;
 }
 
 /// Note that the next created tab should land in a fresh pane created
 /// by splitting `sourcePaneId`. Used by the keyboard split shortcuts
-/// and the pane context menu's split entries.
+/// and the pane context menu's split entries. Returns the queued
+/// placement so the caller can `cancelPlacement` it on IPC failure.
 export function requestTabIntoSplit(
   sourcePaneId: PaneId,
   direction: SplitDirection,
   placeOn: 'first' | 'second',
-): void {
-  placementQueue.push({ kind: 'split', sourcePaneId, direction, placeOn });
+): PendingTabPlacement {
+  const placement: PendingTabPlacement = { kind: 'split', sourcePaneId, direction, placeOn };
+  placementQueue.push(placement);
+  return placement;
 }
 
-/// Drop the most recently enqueued placement. Called when the create IPC a
-/// request was paired with fails — no `tab-created` will arrive to consume it,
-/// so leaving it queued would mis-route the next real tab.
-export function cancelLastPlacement(): void {
-  placementQueue.pop();
+/// Remove a specific queued placement. Called when the create IPC a
+/// request was paired with fails — no `tab-created` will arrive to
+/// consume it, so leaving it queued would mis-route the next real tab.
+///
+/// Identity-based (not "pop the last") because two guided creations can
+/// be in flight at once: with queue [A, B], A's IPC failing must remove
+/// A, not B — a LIFO pop would cancel the still-valid B and leave the
+/// stale A to hijack B's own tab-created event. No-op when the
+/// placement was already consumed.
+export function cancelPlacement(placement: PendingTabPlacement): void {
+  const idx = placementQueue.indexOf(placement);
+  if (idx >= 0) placementQueue.splice(idx, 1);
+}
+
+/// Test-only queue reset so placement tests are order-independent.
+/// Never call this from production code.
+export function _resetPlacementQueueForTests(): void {
+  placementQueue.length = 0;
 }
 
 /// Place a newly-created tab into the layout. Routing rules:
@@ -281,23 +300,14 @@ export function setFocusedPane(paneId: PaneId): void {
   });
 }
 
-/// Split the focused pane in the given direction, moving its currently
-/// active tab into the new pane. New pane gets focus. No-op when the
-/// focused pane has no active tab (empty pane). Used by the M1 debug
-/// menu and the Ctrl+\ / Ctrl+Shift+\ shortcuts in M3.
-export function splitFocusedPane(direction: SplitDirection): void {
-  layout.update((state) => {
-    const pane = findPaneInTree(state.tree, state.focused_pane_id);
-    if (!pane || !pane.active_tab_id) return state;
-    const result = splitPaneOp(state.tree, pane.id, direction, pane.active_tab_id);
-    if (!result) return state;
-    return { tree: result.tree, focused_pane_id: result.newPaneId };
-  });
-}
-
 /// Replace the entire tree with a single root pane containing every tab
 /// in the current layout, in their current document order. Convenience
 /// for the debug menu's "Reset layout" entry.
+///
+/// The merged pane's active tab is the *focused* pane's active tab (the
+/// one driving avatar/audio/compose routing right now), falling back to
+/// the first active tab in document order — resetting the layout
+/// shouldn't silently switch what the user is looking at.
 export function resetLayoutToSinglePane(): void {
   layout.update((state) => {
     const allTabs: TabId[] = [];
@@ -308,12 +318,14 @@ export function resetLayoutToSinglePane(): void {
         firstActive = pane.active_tab_id;
       }
     }
+    const focusedActive =
+      findPaneInTree(state.tree, state.focused_pane_id)?.active_tab_id ?? null;
     const id = newPaneId();
     const root: PaneNode = {
       type: 'pane',
       id,
       tab_ids: allTabs,
-      active_tab_id: firstActive ?? allTabs[0] ?? null,
+      active_tab_id: focusedActive ?? firstActive ?? allTabs[0] ?? null,
     };
     return { tree: root, focused_pane_id: id };
   });
@@ -503,10 +515,12 @@ export function closeFocusedPane(): void {
       const { tree: afterRemove } = removeTab(tree, tabId);
       const target = findPaneInTree(afterRemove, targetPaneId);
       if (!target) {
-        // Defensive: target vanished. Stop here; the layer below will
-        // collapse whatever's left.
-        tree = afterRemove;
-        break;
+        // Defensive: target vanished (unreachable — removeTab never
+        // deletes panes). Abort the whole op atomically: continuing to
+        // the closePane below would drop the just-removed tab on the
+        // floor AND destroy every not-yet-moved tab with the source
+        // pane subtree.
+        return state;
       }
       tree = insertTabIntoPane(afterRemove, targetPaneId, tabId, target.tab_ids.length, {
         activate: false,
@@ -621,8 +635,10 @@ export function moveAllTabsToPane(sourcePaneId: PaneId, targetPaneId: PaneId): v
       const { tree: afterRemove } = removeTab(tree, tabId);
       const t = findPaneInTree(afterRemove, targetPaneId);
       if (!t) {
-        tree = afterRemove;
-        break;
+        // Defensive: target vanished (unreachable — removeTab never
+        // deletes panes). Abort atomically rather than losing the
+        // removed tab and collapsing the rest with the source pane.
+        return state;
       }
       tree = insertTabIntoPane(afterRemove, targetPaneId, tabId, t.tab_ids.length, {
         activate: false,

@@ -156,15 +156,25 @@ export function clearAvatarError(tab: TabId): void {
   perTabError.update((m) => ({ ...m, [tab]: null }));
 }
 
-let unlistenStatePromise: Promise<UnlistenFn> | null = null;
-let unlistenErrorPromise: Promise<UnlistenFn> | null = null;
+let statePromise: Promise<UnlistenFn> | null = null;
+let errorPromise: Promise<UnlistenFn> | null = null;
 
-/// Subscribe to backend state broadcasts. Idempotent.
-export function startAvatarStateListener(): Promise<UnlistenFn> {
-  if (!unlistenStatePromise) {
-    unlistenStatePromise = listen<StateEvent>('avatar-state', (event) => {
+/// Tab ids closed this session. Per-tab events can arrive late (emitted
+/// around the close); without this guard a stale `state-changed` /
+/// `avatar-error` after `tab-closed` would resurrect a ghost cache entry
+/// that nothing ever cleans up again.
+const closedTabs = new Set<TabId>();
+
+/// Subscribe to backend state broadcasts. Idempotent, and app-lifetime by
+/// design: these events drive global stores (tabs, activeTab, layout,
+/// terminals), not just the avatar overlay, so nothing may ever unsubscribe
+/// them — which is why no UnlistenFn is exposed.
+export function startAvatarStateListener(): Promise<void> {
+  if (!statePromise) {
+    statePromise = listen<StateEvent>('avatar-state', (event) => {
       const e = event.payload;
       if (e.type === 'state-changed') {
+        if (closedTabs.has(e.tab)) return;
         perTabState.update((m) => ({ ...m, [e.tab]: e.state }));
         if (e.state !== 'Error') {
           perTabError.update((m) => ({ ...m, [e.tab]: null }));
@@ -172,10 +182,13 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
       } else if (e.type === 'active-tab-changed') {
         activeTab.set(e.tab);
       } else if (e.type === 'awaiting-permission-changed') {
+        if (closedTabs.has(e.tab)) return;
         perTabAwaitingPermission.update((m) => ({ ...m, [e.tab]: e.awaiting }));
       } else if (e.type === 'done-while-away-changed') {
+        if (closedTabs.has(e.tab)) return;
         perTabDoneWhileAway.update((m) => ({ ...m, [e.tab]: e.done }));
       } else if (e.type === 'tab-closed-state-changed') {
+        if (closedTabs.has(e.tab)) return;
         perTabClosedState.update((m) => ({
           ...m,
           [e.tab]: {
@@ -188,6 +201,7 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
         // Seed per-tab caches BEFORE applying to the tabs store so any
         // subscriber that reacts to `tabs` changes (e.g., TabBar
         // rendering) finds non-stale per-tab data on first paint.
+        closedTabs.delete(e.tab); // id reuse: the new tab is live again
         seedPerTabEntries(e.tab);
         applyTabCreated({
           tab: e.tab,
@@ -199,6 +213,7 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
         createTerminal(e.tab);
         applyTabCreatedToLayout(e.tab);
       } else if (e.type === 'tab-closed') {
+        closedTabs.add(e.tab);
         applyTabClosed(e.tab);
         applyTabClosedFromLayout(e.tab);
         destroyTerminal(e.tab);
@@ -218,13 +233,14 @@ export function startAvatarStateListener(): Promise<UnlistenFn> {
       }
     });
   }
-  if (!unlistenErrorPromise) {
-    unlistenErrorPromise = listen<AvatarErrorInfo>('avatar-error', (event) => {
+  if (!errorPromise) {
+    errorPromise = listen<AvatarErrorInfo>('avatar-error', (event) => {
       const info = event.payload;
+      if (closedTabs.has(info.tab)) return;
       perTabError.update((m) => ({ ...m, [info.tab]: info }));
     });
   }
-  return unlistenStatePromise;
+  return statePromise.then(() => undefined);
 }
 
 /// Read-only access to `tabs` for callers that import from this module.

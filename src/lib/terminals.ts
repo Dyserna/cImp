@@ -69,17 +69,7 @@ import { setTerminalFocuser } from './terminalFocus';
 import { perTabClosedState } from './avatarState';
 import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
-import {
-  isShellTab,
-  isOffloadTab,
-  isGraphMonitorTab,
-  isNoteTab,
-  isPreviewTabId,
-  isWorkbenchTab,
-  isGraphViewTab,
-  isToolActivityTab,
-  type TabId,
-} from './tabs/types';
+import { isShellTab, isAppRenderedTab, type TabId } from './tabs/types';
 
 const OFFSCREEN_ID = 'terminal-offscreen';
 
@@ -505,21 +495,10 @@ export function createTerminal(
   } = {},
 ): void {
   if (entries.has(tabId)) return;
-  // V8-03/V9-01: the Offload Server and Code Graph monitor tabs render Svelte
-  // dashboards instead of an xterm — no terminal entry for either. The Note
-  // tab likewise renders a Svelte editor (NoteView), and V13's Workbench tab
-  // a sectioned dashboard (WorkbenchView) — neither has a PTY. V14 Phase F:
-  // Preview tabs are an embedded child webview, not a PTY, either.
-  if (
-    isOffloadTab(tabId) ||
-    isGraphMonitorTab(tabId) ||
-    isNoteTab(tabId) ||
-    isWorkbenchTab(tabId) ||
-    isGraphViewTab(tabId) ||
-    isToolActivityTab(tabId) ||
-    isPreviewTabId(tabId)
-  )
-    return;
+  // App-rendered tabs (reserved dashboards, Note, Preview) render Svelte
+  // content or an embedded webview instead of an xterm — no terminal entry.
+  // One shared predicate so a new app-rendered tab can't miss this guard.
+  if (isAppRenderedTab(tabId)) return;
 
   const offscreen = ensureOffscreen();
 

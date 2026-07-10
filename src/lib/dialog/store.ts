@@ -10,7 +10,7 @@ import type { PaneId } from '../layout/types';
 
 export type DialogState =
   | { kind: 'none' }
-  | { kind: 'new-shell-tab' }
+  | { kind: 'new-shell-tab'; paneId: PaneId | null }
   | { kind: 'configure-tab'; tab: TabId }
   | { kind: 'save-layout' }
   | { kind: 'manage-presets' }
@@ -19,8 +19,13 @@ export type DialogState =
 
 export const dialogState: Writable<DialogState> = writable({ kind: 'none' });
 
-export function openNewShellTabDialog(): void {
-  dialogState.set({ kind: 'new-shell-tab' });
+/// `paneId` is where the new shell tab should land: the pane whose `+`
+/// button opened the dialog, or `null` (default — the Ctrl+T shortcut
+/// path) for "the focused pane". The dialog enqueues the placement at
+/// submit time, not here — pushing it at open time leaked a stale
+/// placement whenever the dialog was cancelled.
+export function openNewShellTabDialog(paneId: PaneId | null = null): void {
+  dialogState.set({ kind: 'new-shell-tab', paneId });
 }
 
 export function openConfigureTabDialog(tab: TabId): void {

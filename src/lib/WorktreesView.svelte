@@ -20,7 +20,7 @@
     type WorktreeCheckStatus,
   } from './workbench';
   import { createShellTab, defaultShellSpec } from './ipc';
-  import { cancelLastPlacement, focusedPane, requestTabIntoPane } from './layout/store';
+  import { cancelPlacement, focusedPane, requestTabIntoPane } from './layout/store';
   import { pairHunkLines } from './diffWords';
   import { errorMessage } from './errors';
 
@@ -151,7 +151,7 @@
 
   async function openShellHere(w: WorktreeInfo): Promise<void> {
     const pane = get(focusedPane);
-    requestTabIntoPane(pane.id);
+    const placement = requestTabIntoPane(pane.id);
     try {
       const spec = await defaultShellSpec();
       await createShellTab({
@@ -166,7 +166,7 @@
     } catch (e) {
       // The shell tab was never created, so the pane placement queued above
       // would mis-route the next tab created anywhere — cancel it.
-      cancelLastPlacement();
+      cancelPlacement(placement);
       rowErrors.set(w.slug, errorMessage(e));
     }
   }

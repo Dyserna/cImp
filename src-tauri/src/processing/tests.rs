@@ -78,6 +78,51 @@ fn segmenter_fragment_no_punctuation() {
     assert_eq!(segs, vec!["Just a moment".to_string()]);
 }
 
+#[test]
+fn segmenter_no_as_sentence_splits() {
+    // "No." is a full sentence unless followed by a number ("No. 5").
+    let segs = segment_sentences("Does this work? No. It doesn't.");
+    assert_eq!(segs.len(), 3);
+    assert_eq!(segs[1], "No.");
+}
+
+#[test]
+fn segmenter_no_before_number_is_abbreviation() {
+    let segs = segment_sentences("See No. 5 for details.");
+    assert_eq!(segs, vec!["See No. 5 for details.".to_string()]);
+}
+
+#[test]
+fn segmenter_crlf_paragraph_break() {
+    let segs = segment_sentences("First para\r\n\r\nSecond para");
+    assert_eq!(segs.len(), 2);
+    assert_eq!(segs[0], "First para");
+    assert_eq!(segs[1], "Second para");
+}
+
+#[test]
+fn segmenter_punctuation_only_speaks_nothing() {
+    assert!(segment_sentences("...").is_empty());
+    assert!(segment_sentences(" . ").is_empty());
+    assert!(segment_sentences("?!").is_empty());
+}
+
+#[test]
+fn segmenter_splits_after_closing_quote() {
+    let segs = segment_sentences("He said \"Stop.\" Then he left.");
+    assert_eq!(segs.len(), 2);
+    assert_eq!(segs[0], "He said \"Stop.\"");
+    assert_eq!(segs[1], "Then he left.");
+}
+
+#[test]
+fn segmenter_keeps_combining_diacritics_intact() {
+    // NFD text: é as e + U+0301. The sanitizer must not split the word.
+    let segs = segment_sentences("Update your re\u{301}sume\u{301} today.");
+    assert_eq!(segs.len(), 1);
+    assert!(segs[0].contains("re\u{301}sume\u{301}"));
+}
+
 // ---------------- processing layer behaviour (V20 forwarder) ----------------
 
 #[test]

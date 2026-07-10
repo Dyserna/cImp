@@ -47,7 +47,8 @@
     type PathNodeRow,
     type ArchResult,
   } from './graph';
-  import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio } from './usageMath';
+  import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio, fmtTok } from './usageMath';
+  import { fmtTime } from './format';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
 
@@ -293,16 +294,21 @@
   let advisorBusy = $state<string | null>(null); // rule_id currently applying/dismissing
 
   async function refreshUsage(): Promise<void> {
-    try {
-      usage = await graphUsage();
-    } catch (e) {
-      console.warn('graph_usage failed', e);
-    }
-    try {
-      advice = await graphUsageAdvice();
-    } catch (e) {
-      console.warn('graph_usage_advice failed', e);
-    }
+    // Independent fetches — run concurrently so the 2s Overview poll pays
+    // one round-trip of wall time, not two. Each keeps its last good value
+    // on failure, same as before.
+    const [u, a] = await Promise.all([
+      graphUsage().catch((e) => {
+        console.warn('graph_usage failed', e);
+        return null;
+      }),
+      graphUsageAdvice().catch((e) => {
+        console.warn('graph_usage_advice failed', e);
+        return null;
+      }),
+    ]);
+    if (u) usage = u;
+    if (a) advice = a;
   }
 
   // Applies a proposal by writing the ONE named `graph.*` field it targets
@@ -360,7 +366,7 @@
     'advisor.raise_read_advisor_min_lines.v1: ≥5 sessions, ≥20 reminders, ≥50% re-read anyway → raise read_advisor_min_lines.\n' +
     'advisor.lower_context_turn_budget_chars.v1: ≥5 sessions, ≥200 injections, ≥50 turns, ≥70% unread AND ≥50% turns maxed → lower context_turn_budget_chars.';
 
-  // The Overview section stacks the status groups (Index, then Usage) as one
+  // The Overview section stacks the status groups (Usage, then Index) as one
   // at-a-glance dashboard. The activity feed + graph-tools reference moved to
   // the Tool Activity tab; Memory/Context/Analyses/Usage content is filled by
   // V10/V14 phases. The internal tab id (`graph-monitor`) is unchanged — this
@@ -377,6 +383,20 @@
   let section = $state<Section>('overview');
 
   let roots = $state<GraphStatus[]>([]);
+  // Index cards in a stable, hierarchy-shaped order: shallower paths first
+  // (the root project tops the list, sub-projects sit below it), and projects
+  // at the same depth alphabetically. `roots` itself keeps backend arrival
+  // order — only the display is sorted.
+  const sortedRoots = $derived(
+    [...roots].sort((a, b) => rootDepth(a.root) - rootDepth(b.root) || cmpPath(a.root, b.root)),
+  );
+  function rootDepth(p: string): number {
+    // Count path segments, tolerant of either separator and a trailing slash.
+    return p.replace(/[\\/]+$/, '').split(/[\\/]+/).length;
+  }
+  function cmpPath(a: string, b: string): number {
+    return a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true });
+  }
   let paused = $state<boolean>(false);
   let busy = $state<boolean>(false);
   let probe = $state<EmbedderProbe | null>(null);
@@ -442,10 +462,6 @@
     } finally {
       langBusy = null;
     }
-  }
-
-  function fmtTime(ms: number): string {
-    return ms ? new Date(ms).toLocaleTimeString() : '—';
   }
 
   function upsert(s: GraphStatus): void {
@@ -588,95 +604,6 @@
   </nav>
 
   {#if section === 'overview'}
-  <h3 class="group-head">Index</h3>
-  {#if probe}
-    <p class="probe {probe.ok ? 'ok' : 'err'}">
-      <span class="probe-dot"></span>
-      Embedder: {probe.message}
-    </p>
-  {/if}
-
-  {#if roots.length === 0}
-    <p class="empty">
-      No project indexed yet. Enable the graph in Settings → Code graph and click
-      <strong>Rebuild index</strong>.
-    </p>
-  {:else}
-    {#each roots as r (r.root)}
-      <section class="card">
-        <div class="row title">
-          <span class="root" title={r.root}>{r.root}</span>
-          <span class="badge {stateClass(r.state)}">
-            {r.building ? 'building…' : r.state}
-          </span>
-        </div>
-
-        <div class="counts">
-          <div><span class="num">{r.files}</span><span class="lbl">files</span></div>
-          <div><span class="num">{r.symbols}</span><span class="lbl">symbols</span></div>
-          <div><span class="num">{r.edges}</span><span class="lbl">edges</span></div>
-          <div><span class="num">{r.files_indexed}</span><span class="lbl">last scan</span></div>
-        </div>
-
-        {#if census[r.root] && census[r.root].length > 0}
-          <div class="lang-legend">
-            <span><span class="dot green"></span>indexed</span>
-            <span><span class="dot yellow"></span>available — click to add</span>
-            <span><span class="dot red"></span>unsupported</span>
-          </div>
-          <div class="langs">
-            {#each census[r.root] as l (l.key)}
-              <button
-                type="button"
-                class="lang-btn {langColor(l)}"
-                class:busy={langBusy === l.key}
-                disabled={!l.supported || langBusy !== null || r.building}
-                title={langTitle(l)}
-                onclick={() => toggleLang(r.root, l)}
-              >
-                <span class="lang-name">{l.label}</span>
-                <span class="lang-n">{l.files}</span>
-              </button>
-            {/each}
-          </div>
-        {/if}
-
-        {#if r.last_error}
-          <p class="error">Index error: {r.last_error}</p>
-        {/if}
-
-        <div class="embed">
-          <div class="row">
-            <span class="section-label">Semantic search</span>
-            {#if !r.semantic_enabled}
-              <span class="badge">off</span>
-            {:else}
-              <span class="badge {stateClass(r.embed_state)}">{r.embed_state}</span>
-            {/if}
-          </div>
-
-          {#if r.semantic_enabled}
-            <div class="bar" title="{r.embedded} / {r.embed_total} chunks embedded">
-              <div class="fill" style="width: {pct(r.embedded, r.embed_total)}%"></div>
-            </div>
-            <div class="embed-meta">
-              <span>{r.embedded}/{r.embed_total} embedded ({pct(r.embedded, r.embed_total)}%)</span>
-              {#if r.embed_pending > 0}<span>· {r.embed_pending} pending</span>{/if}
-              {#if r.code_embed_total > 0}<span>· code: {r.code_embedded}/{r.code_embed_total} chunks</span>{/if}
-              <span>· embedder: {r.embedder_configured ? (r.embedder_ready ? 'ready' : 'unreachable') : 'not configured'}</span>
-            </div>
-          {/if}
-          {#if r.digests > 0}
-            <div class="embed-meta"><span>{r.digests} context digest{r.digests === 1 ? '' : 's'} cached</span></div>
-          {/if}
-          {#if r.semantic_enabled && r.embed_error}
-            <p class="error">Embedder: {r.embed_error}</p>
-          {/if}
-        </div>
-      </section>
-    {/each}
-  {/if}
-
   <h3 class="group-head">Usage</h3>
   <div class="usage-sec">
     <!-- V14 Phase D2: Advisor card, always first. -->
@@ -779,9 +706,17 @@
       {:else}
         <div class="rows">
           {#each usage.sessions as s (s.session_id)}
-            <div class="arow sessrow">
+            <div
+              class="arow sessrow"
+              title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens`}
+            >
               <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}</span>
-              <span class="akind">{s.totals.in_tok.toLocaleString()} in / {s.totals.out_tok.toLocaleString()} out</span>
+              <span class="sess-stats tnum">
+                <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
+                <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
+                <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
+                <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
+              </span>
               <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
             </div>
           {/each}
@@ -818,6 +753,95 @@
       {/if}
     </section>
   </div>
+
+  <h3 class="group-head">Index</h3>
+  {#if probe}
+    <p class="probe {probe.ok ? 'ok' : 'err'}">
+      <span class="probe-dot"></span>
+      Embedder: {probe.message}
+    </p>
+  {/if}
+
+  {#if roots.length === 0}
+    <p class="empty">
+      No project indexed yet. Enable the graph in Settings → Code graph and click
+      <strong>Rebuild index</strong>.
+    </p>
+  {:else}
+    {#each sortedRoots as r (r.root)}
+      <section class="card">
+        <div class="row title">
+          <span class="root" title={r.root}>{r.root}</span>
+          <span class="badge {stateClass(r.state)}">
+            {r.building ? 'building…' : r.state}
+          </span>
+        </div>
+
+        <div class="counts">
+          <div><span class="num">{r.files}</span><span class="lbl">files</span></div>
+          <div><span class="num">{r.symbols}</span><span class="lbl">symbols</span></div>
+          <div><span class="num">{r.edges}</span><span class="lbl">edges</span></div>
+          <div><span class="num">{r.files_indexed}</span><span class="lbl">last scan</span></div>
+        </div>
+
+        {#if census[r.root] && census[r.root].length > 0}
+          <div class="lang-legend">
+            <span><span class="dot green"></span>indexed</span>
+            <span><span class="dot yellow"></span>available — click to add</span>
+            <span><span class="dot red"></span>unsupported</span>
+          </div>
+          <div class="langs">
+            {#each census[r.root] as l (l.key)}
+              <button
+                type="button"
+                class="lang-btn {langColor(l)}"
+                class:busy={langBusy === l.key}
+                disabled={!l.supported || langBusy !== null || r.building}
+                title={langTitle(l)}
+                onclick={() => toggleLang(r.root, l)}
+              >
+                <span class="lang-name">{l.label}</span>
+                <span class="lang-n">{l.files}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+
+        {#if r.last_error}
+          <p class="error">Index error: {r.last_error}</p>
+        {/if}
+
+        <div class="embed">
+          <div class="row">
+            <span class="section-label">Semantic search</span>
+            {#if !r.semantic_enabled}
+              <span class="badge">off</span>
+            {:else}
+              <span class="badge {stateClass(r.embed_state)}">{r.embed_state}</span>
+            {/if}
+          </div>
+
+          {#if r.semantic_enabled}
+            <div class="bar" title="{r.embedded} / {r.embed_total} chunks embedded">
+              <div class="fill" style="width: {pct(r.embedded, r.embed_total)}%"></div>
+            </div>
+            <div class="embed-meta">
+              <span>{r.embedded}/{r.embed_total} embedded ({pct(r.embedded, r.embed_total)}%)</span>
+              {#if r.embed_pending > 0}<span>· {r.embed_pending} pending</span>{/if}
+              {#if r.code_embed_total > 0}<span>· code: {r.code_embedded}/{r.code_embed_total} chunks</span>{/if}
+              <span>· embedder: {r.embedder_configured ? (r.embedder_ready ? 'ready' : 'unreachable') : 'not configured'}</span>
+            </div>
+          {/if}
+          {#if r.digests > 0}
+            <div class="embed-meta"><span>{r.digests} context digest{r.digests === 1 ? '' : 's'} cached</span></div>
+          {/if}
+          {#if r.semantic_enabled && r.embed_error}
+            <p class="error">Embedder: {r.embed_error}</p>
+          {/if}
+        </div>
+      </section>
+    {/each}
+  {/if}
 
   {:else if section === 'memory'}
     <section class="card">
@@ -1536,7 +1560,7 @@
     letter-spacing: 0.04em;
     opacity: 0.7;
   }
-  /* Group divider inside the Overview section (Index / Usage). */
+  /* Group divider inside the Overview section (Usage / Index). */
   .group-head {
     margin: 18px 0 8px;
     font-size: 11px;
@@ -1863,9 +1887,21 @@
     min-height: 0;
   }
 
-  .arow.tool,
-  .arow.sessrow {
+  .arow.tool {
     grid-template-columns: 1fr 1fr auto;
+  }
+  /* agent | the four billing stats | cache-hit % */
+  .arow.sessrow {
+    grid-template-columns: minmax(6rem, 1fr) auto auto;
+  }
+  .sess-stats {
+    display: flex;
+    gap: 12px;
+    font-size: 11px;
+    opacity: 0.85;
+  }
+  .sess-stats b {
+    font-weight: 600;
   }
 
   .eff-counters {

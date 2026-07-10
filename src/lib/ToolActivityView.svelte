@@ -15,6 +15,9 @@
     type BackendDashboard,
   } from './offload';
   import { listenManaged } from './listenManaged';
+  import { settings } from './settings/store';
+  import { fmtTime } from './format';
+  import { fmtTok } from './usageMath';
   import ToolsReference from './ToolsReference.svelte';
 
   // Reference list of the graph_* MCP tools the code graph exposes to Claude
@@ -81,11 +84,22 @@
   }
 
   // Armed at component init so teardown survives an unmount during an await.
-  listenManaged(() => onOffloadServerMetrics((rows) => (dashboards = rows)));
+  let pushedMetrics = false;
+  listenManaged(() =>
+    onOffloadServerMetrics((rows) => {
+      pushedMetrics = true;
+      dashboards = rows;
+    })
+  );
 
   onMount(async () => {
+    // The seed fetch runs alongside the first graph poll; a pushed snapshot
+    // that lands while it's in flight is fresher than the one-shot response,
+    // so the seed must never clobber it.
+    const seed = offloadServerMetrics();
     await refresh();
-    dashboards = await offloadServerMetrics();
+    const seeded = await seed;
+    if (!pushedMetrics) dashboards = seeded;
     poll = setInterval(refresh, 2000);
   });
 
@@ -105,23 +119,16 @@
     ok: boolean;
   }
 
-  function fmtTime(ms: number): string {
-    return ms ? new Date(ms).toLocaleTimeString() : '—';
-  }
-  function fmtSize(chars: number): string {
-    return chars >= 1000 ? `${(chars / 1000).toFixed(1)}k chars` : `${chars} chars`;
-  }
-
   const rows = $derived.by(() => {
     const out: ActivityRow[] = [];
     for (const c of graphCalls) {
       out.push({
-        key: `g-${c.ts_ms}-${c.tool}-${c.target}`,
+        key: `g-${c.ts_ms}-${c.tool}-${c.target}-${c.source}`,
         ts: c.ts_ms,
         kind: 'graph',
         source: c.source,
         main: `${c.tool.replace('graph_', '')} · ${c.target}`,
-        meta: `${c.ms}ms · ${fmtSize(c.chars)}`,
+        meta: `${c.ms}ms · ${fmtTok(c.chars)} chars`,
         ok: c.ok,
       });
     }
@@ -138,8 +145,21 @@
         });
       }
     }
+    // No combined cap: both sources are already ring-capped upstream (graph
+    // history at 200, offload history at 50 per backend), and slicing the
+    // merged feed would let a graph-heavy burst silently crowd every offload
+    // row out of view.
     out.sort((a, b) => b.ts - a.ts);
-    return out.slice(0, 200);
+    // A repeat of the same call shape within one millisecond is possible
+    // (e.g. batched tool dispatch); suffix repeats so the keyed {#each}
+    // never sees duplicate keys.
+    const seen = new Map<string, number>();
+    for (const r of out) {
+      const n = seen.get(r.key) ?? 0;
+      seen.set(r.key, n + 1);
+      if (n > 0) r.key = `${r.key}-${n}`;
+    }
+    return out;
   });
 </script>
 
@@ -158,6 +178,14 @@
       >{s.label}</button>
     {/each}
   </nav>
+
+  {#if !$settings.graph.enabled && !$settings.offload.enabled}
+    <div class="feature-note">
+      The code graph and offload are both disabled (Settings → Code Graph /
+      Offload), so none of these tools are registered with any agent and no
+      activity will be recorded here.
+    </div>
+  {/if}
 
   {#if section === 'activities'}
     <section class="card history">
@@ -282,6 +310,20 @@
   .history-rows {
     display: flex;
     flex-direction: column;
+    /* Bounded like the predecessors' 5-row .history-body (scaled up for a
+       dedicated tab): the feed scrolls internally, so new rows never grow
+       the card or jump the page layout. */
+    max-height: calc(24 * var(--hrow-h));
+    overflow-y: auto;
+  }
+  .feature-note {
+    border: 1px solid rgba(227, 179, 65, 0.5);
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    background: rgba(227, 179, 65, 0.08);
+    color: #e3b341;
+    font-size: 12px;
   }
   .hrow {
     display: grid;
@@ -316,8 +358,9 @@
   .hkind.offload {
     color: #3fb950;
   }
-  /* Agent-source accents for graph rows (claude/opencode/offload), matching
-     the palette the Code Intelligence activity feed used. */
+  /* Agent-source accents for graph rows (claude/opencode/offload, plus the
+     backend-internal read_advisor/auto_check services), matching the palette
+     the Code Intelligence activity feed used. */
   .hsrc.claude {
     color: #58a6ff;
   }
@@ -326,6 +369,12 @@
   }
   .hsrc.offload {
     color: #3fb950;
+  }
+  .hsrc.read_advisor {
+    color: #e3b341;
+  }
+  .hsrc.auto_check {
+    color: #f0883e;
   }
   .hmain {
     overflow: hidden;

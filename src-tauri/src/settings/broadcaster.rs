@@ -41,6 +41,13 @@ pub struct SettingsHandle {
     // routing through the debounced saver task. The saver owns its own copies.
     global: Arc<Settings>,
     launch_cwd: Arc<PathBuf>,
+    // Serializes (snapshot-read + persistence::save) across the debounced
+    // saver and `flush()`. Both hold this across the READ as well as the
+    // write, so whichever writer runs second is guaranteed to persist a
+    // state at least as new as the first — without it, a saver already
+    // mid-write with an older snapshot could complete its atomic rename
+    // AFTER a shutdown `flush()` and clobber the newer data with stale.
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl SettingsHandle {
@@ -48,8 +55,15 @@ impl SettingsHandle {
         let (tx, _) = broadcast::channel::<Settings>(BROADCAST_CAPACITY);
         let (save_tx, save_rx) = mpsc::unbounded_channel::<()>();
         let inner = Arc::new(Mutex::new(initial));
+        let save_lock = Arc::new(Mutex::new(()));
 
-        spawn_saver(inner.clone(), save_rx, global.clone(), launch_cwd.clone());
+        spawn_saver(
+            inner.clone(),
+            save_rx,
+            global.clone(),
+            launch_cwd.clone(),
+            save_lock.clone(),
+        );
 
         Self {
             inner,
@@ -57,6 +71,7 @@ impl SettingsHandle {
             save_tx,
             global: Arc::new(global),
             launch_cwd: Arc::new(launch_cwd),
+            save_lock,
         }
     }
 
@@ -94,10 +109,15 @@ impl SettingsHandle {
                 Err(poisoned) => poisoned.into_inner(),
             };
             *g = new.clone();
+            // Broadcast while STILL HOLDING the lock: `broadcast::Sender::send`
+            // is non-blocking (ring-buffer write, no await), and emitting under
+            // the lock is what guarantees broadcast order matches store-update
+            // order. Sent outside, two concurrent writers could deliver the
+            // older state LAST, leaving every subscriber stale until the next
+            // unrelated change ("sees the latest state eventually" broken).
+            // A `send` failure just means "no receivers" — fine, no-op.
+            let _ = self.tx.send(new);
         }
-        // A `send` failure here means "no receivers" — that's fine, just a
-        // no-op until something subscribes. We don't surface the error.
-        let _ = self.tx.send(new);
         // Save channel never fails unless the saver task has died, in which
         // case we've lost persistence — log and continue running in-memory.
         if self.save_tx.send(()).is_err() {
@@ -114,15 +134,17 @@ impl SettingsHandle {
     /// All settings-mutating IPC commands should funnel through this instead
     /// of the clone-out/replace pattern.
     pub fn mutate<F: FnOnce(&mut Settings)>(&self, f: F) {
-        let new = {
+        {
             let mut g = match self.inner.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
             f(&mut g);
-            g.clone()
-        };
-        let _ = self.tx.send(new);
+            // Send under the lock — see `set()` for why: broadcast order must
+            // match mutation order or a subscriber's last-observed state can
+            // end up stale relative to the store.
+            let _ = self.tx.send(g.clone());
+        }
         if self.save_tx.send(()).is_err() {
             tracing::warn!("settings: saver task is gone; changes will not persist");
         }
@@ -132,6 +154,12 @@ impl SettingsHandle {
     /// debounce. Intended for shutdown so an edit made within the debounce
     /// window is not silently lost when the saver task is still mid-sleep.
     pub fn flush(&self) {
+        // Hold the save lock across snapshot + write so an in-flight
+        // debounced save can't complete after us with an older snapshot.
+        let _write_guard = match self.save_lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let snapshot = self.current();
         if let Err(e) = persistence::save(&snapshot, &self.launch_cwd, &self.global) {
             tracing::warn!(error = %e, "settings: flush save failed");
@@ -146,6 +174,7 @@ fn spawn_saver(
     mut rx: mpsc::UnboundedReceiver<()>,
     global: Settings,
     launch_cwd: PathBuf,
+    save_lock: Arc<Mutex<()>>,
 ) {
     tauri::async_runtime::spawn(async move {
         while rx.recv().await.is_some() {
@@ -155,12 +184,21 @@ fn spawn_saver(
             tokio::time::sleep(SAVE_DEBOUNCE).await;
             while rx.try_recv().is_ok() {}
 
+            // Snapshot + write under the shared save lock (see the field doc
+            // on `SettingsHandle::save_lock`): guarantees the second of two
+            // racing writers persists the newer-or-equal state.
+            let _write_guard = match save_lock.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Recover from poisoning like every other lock site in this file
+            // (`current()`/`set()`/`mutate()` all do). Poisoning is permanent
+            // on std::sync::Mutex, so a `continue` here wouldn't skip one
+            // cycle — it would silently disable persistence for the rest of
+            // the process lifetime after a single panic-while-locked.
             let snapshot = match inner.lock() {
                 Ok(g) => g.clone(),
-                Err(e) => {
-                    tracing::warn!(error = %e, "settings: lock poisoned during save");
-                    continue;
-                }
+                Err(poisoned) => poisoned.into_inner().clone(),
             };
             if let Err(e) = persistence::save(&snapshot, &launch_cwd, &global) {
                 tracing::warn!(error = %e, "settings: save failed");
@@ -169,4 +207,62 @@ fn spawn_saver(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::LogLevel;
+
+    /// Regression (2026-07 review): `set`/`mutate` used to broadcast AFTER
+    /// releasing the store lock, so two racing writers could deliver the
+    /// older state last — every subscriber then stayed stale until the next
+    /// unrelated change, violating the "sees the latest state eventually"
+    /// contract. Sending under the lock makes broadcast order match store
+    /// order: once all writers finish, the last message in the channel must
+    /// equal `current()`.
+    #[test]
+    fn last_broadcast_matches_store_after_concurrent_mutates() {
+        // Unique temp launch dir so the debounced saver can't write an
+        // overlay into the repo if it fires before the test ends.
+        let tmp = std::env::temp_dir().join(format!("cimp-bcast-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let handle = SettingsHandle::new(Settings::default(), Settings::default(), tmp.clone());
+        let mut rx = handle.subscribe();
+
+        // 4 threads × 8 mutations = 32 messages — under BROADCAST_CAPACITY
+        // (64), so nothing lags out of the ring buffer and the drain below
+        // sees every send in order.
+        let mut joins = Vec::new();
+        for t in 0..4u8 {
+            let h = handle.clone();
+            joins.push(std::thread::spawn(move || {
+                for i in 0..8u8 {
+                    h.mutate(|s| {
+                        s.logging.level = if (t + i) % 2 == 0 {
+                            LogLevel::Debug
+                        } else {
+                            LogLevel::Warn
+                        };
+                    });
+                }
+            }));
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+
+        let mut last = None;
+        while let Ok(s) = rx.try_recv() {
+            last = Some(s);
+        }
+        let last = last.expect("at least one broadcast was delivered");
+        assert_eq!(
+            serde_json::to_value(&last).unwrap(),
+            serde_json::to_value(&handle.current()).unwrap(),
+            "the final broadcast must reflect the final store state"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

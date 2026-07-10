@@ -182,6 +182,117 @@ describe('validateAndRepairLayout', () => {
     const out = validateAndRepairLayout(persisted, tabs);
     expect(out).toEqual(persisted);
   });
+
+  test('dedupes a tab id repeated within one pane', () => {
+    // A duplicate key inside a pane's tab_ids breaks the keyed {#each}
+    // in TabBar.svelte — the sieve must keep only the first occurrence.
+    const persisted: LayoutPersisted = {
+      tree: pane('p1', ['tabA', 'tabA', 'tabB'], 'tabA'),
+      focused_pane_id: 'p1',
+    };
+    const tabs = [shellTab('tabA'), shellTab('tabB')];
+    const out = validateAndRepairLayout(persisted, tabs);
+    expect(out.tree.type).toBe('pane');
+    if (out.tree.type === 'pane') {
+      expect(out.tree.tab_ids).toEqual(['tabA', 'tabB']);
+      expect(out.tree.active_tab_id).toBe('tabA');
+    }
+  });
+
+  test('dedupes a tab id present in two panes — first occurrence in document order wins', () => {
+    // Cross-pane duplicates make two panes fight over the single
+    // terminal-host element; the later occurrence is dropped and the
+    // emptied pane collapses.
+    const persisted: LayoutPersisted = {
+      tree: split(
+        's1',
+        pane('p1', ['tabA'], 'tabA'),
+        pane('p2', ['tabA'], 'tabA'),
+      ),
+      focused_pane_id: 'p1',
+    };
+    const tabs = [shellTab('tabA')];
+    const out = validateAndRepairLayout(persisted, tabs);
+    expect(out.tree.type).toBe('pane');
+    if (out.tree.type === 'pane') {
+      expect(out.tree.id).toBe('p1');
+      expect(out.tree.tab_ids).toEqual(['tabA']);
+    }
+    expect(out.focused_pane_id).toBe('p1');
+  });
+
+  test('clamps out-of-range split ratios and leaves in-range ones alone', () => {
+    const tree = split('s1', pane('p1', ['tabA'], 'tabA'), pane('p2', ['tabB'], 'tabB'));
+    (tree as { ratio: number }).ratio = 5.0;
+    const inner: LayoutNode = {
+      type: 'split',
+      id: 's2',
+      direction: 'horizontal',
+      ratio: -3.0,
+      first: pane('p3', ['tabC'], 'tabC'),
+      second: pane('p4', ['tabD'], 'tabD'),
+    };
+    const outer: LayoutNode = {
+      type: 'split',
+      id: 's0',
+      direction: 'horizontal',
+      ratio: 0.42,
+      first: tree,
+      second: inner,
+    };
+    const tabs = ['tabA', 'tabB', 'tabC', 'tabD'].map(shellTab);
+    const out = validateAndRepairLayout({ tree: outer, focused_pane_id: 'p1' }, tabs);
+    expect(out.tree.type).toBe('split');
+    if (out.tree.type === 'split') {
+      expect(out.tree.ratio).toBeCloseTo(0.42); // untouched
+      if (out.tree.first.type === 'split') {
+        expect(out.tree.first.ratio).toBeCloseTo(0.95); // clamped down
+      }
+      if (out.tree.second.type === 'split') {
+        expect(out.tree.second.ratio).toBeCloseTo(0.05); // clamped up
+      }
+    }
+  });
+
+  test('non-finite split ratio resets to 0.5', () => {
+    const tree = split('s1', pane('p1', ['tabA'], 'tabA'), pane('p2', ['tabB'], 'tabB'));
+    (tree as { ratio: number }).ratio = Number.NaN;
+    const out = validateAndRepairLayout(
+      { tree, focused_pane_id: 'p1' },
+      [shellTab('tabA'), shellTab('tabB')],
+    );
+    if (out.tree.type === 'split') {
+      expect(out.tree.ratio).toBe(0.5);
+    } else {
+      throw new Error('expected split root');
+    }
+  });
+
+  test('orphans are placed once even when two panes share the focused id', () => {
+    // Corrupt duplicate-pane-id file: appending the orphans to every
+    // matching pane would manufacture cross-pane duplicate tab ids.
+    const persisted: LayoutPersisted = {
+      tree: split(
+        's1',
+        pane('dup', ['tabA'], 'tabA'),
+        pane('dup', ['tabB'], 'tabB'),
+      ),
+      focused_pane_id: 'dup',
+    };
+    const tabs = [shellTab('tabA'), shellTab('tabB'), shellTab('tabN')];
+    const out = validateAndRepairLayout(persisted, tabs);
+    let count = 0;
+    const stack: LayoutNode[] = [out.tree];
+    while (stack.length > 0) {
+      const node = stack.pop()!;
+      if (node.type === 'pane') {
+        count += node.tab_ids.filter((id) => id === 'tabN').length;
+      } else {
+        stack.push(node.first, node.second);
+      }
+    }
+    expect(count).toBe(1);
+  });
 });
 
 describe('defaultLayoutForTabs', () => {

@@ -1492,7 +1492,7 @@ reach[x] := reach[z], calls[x, z]"#
         // built from call edges (caller file ↔ callee file) and resolved imports.
         let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
         let mut pair_kind: HashMap<(String, String), &'static str> = HashMap::new();
-        let mut link = |a: &str, b: &str, kind: &'static str,
+        let link = |a: &str, b: &str, kind: &'static str,
                         adj: &mut HashMap<String, HashSet<String>>,
                         pair_kind: &mut HashMap<(String, String), &'static str>| {
             if a == b {
@@ -1755,7 +1755,7 @@ reach[x] := reach[z], calls[x, z]"#
         let multi = self.multi_candidate_names()?;
         let mut edges: Vec<VizEdge> = Vec::new();
         let mut seen: HashSet<(String, String, &'static str)> = HashSet::new();
-        let mut push_edge = |edges: &mut Vec<VizEdge>, seen: &mut HashSet<(String, String, &'static str)>, meta: &mut HashMap<String, VizNode>, a: &str, b: &str, kind: &'static str, conf: Confidence| {
+        let push_edge = |edges: &mut Vec<VizEdge>, seen: &mut HashSet<(String, String, &'static str)>, meta: &mut HashMap<String, VizNode>, a: &str, b: &str, kind: &'static str, conf: Confidence| {
             if a == b || !meta.contains_key(a) || !meta.contains_key(b) {
                 return;
             }

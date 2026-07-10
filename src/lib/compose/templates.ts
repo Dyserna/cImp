@@ -77,7 +77,15 @@ export function filterTemplates(
 // group), while `substituteVariables` needs the bare name to distinguish
 // `{selection}`/`{clipboard}` from an arbitrary tab-stop — one pattern serves
 // both rather than keeping two near-identical regexes in sync.
-const PLACEHOLDER_PATTERN = /\{([a-zA-Z0-9_]+)\}/g;
+//
+// The `(?<!\$)` lookbehind excludes `${name}` — interpolation syntax in
+// JS/TS template literals and shell — because the tab-stop scan re-reads the
+// LIVE draft: once a `{selection}` substitution splices in real code, any
+// `${var}` inside it would otherwise become a bogus tab-stop (Tab selects a
+// span of the user's own pasted code, and overtyping it silently deletes
+// that code). Template authors lose the ability to write a placeholder
+// immediately after a literal `$`; that's the right trade.
+const PLACEHOLDER_PATTERN = /(?<!\$)\{([a-zA-Z0-9_]+)\}/g;
 
 /// Whether `text` still contains at least one literal `{name}` placeholder.
 /// Drives whether the compose overlay's Tab-jump handler is active at all —

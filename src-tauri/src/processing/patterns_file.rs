@@ -102,7 +102,10 @@ pub fn load_or_seed() -> Vec<PermissionPattern> {
 
 fn read_file(path: &Path) -> Result<PatternsFile, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+    // Editors on Windows may save the hand-edited file as "UTF-8 with BOM";
+    // serde_json rejects the BOM, which would silently revert to defaults.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(text).map_err(|e| format!("parse: {e}"))
 }
 
 fn write_file(path: &Path, body: &PatternsFile) -> Result<(), String> {
@@ -196,6 +199,23 @@ mod tests {
             "scripts/patterns.default.json is out of sync with default_file(); \
              regenerate it from the current defaults"
         );
+    }
+
+    #[test]
+    fn bom_prefixed_file_still_parses() {
+        // Windows editors may save the hand-edited file as UTF-8 with BOM;
+        // that must not silently revert the user's patterns to defaults.
+        let dir = std::env::temp_dir().join(format!(
+            "cimp_patterns_bom_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PATTERNS_FILE_NAME);
+        let body = serde_json::to_string(&default_file()).unwrap();
+        fs::write(&path, format!("\u{feff}{body}")).unwrap();
+        let parsed = read_file(&path).expect("BOM file should parse");
+        assert_eq!(parsed.patterns.len(), default_file().patterns.len());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

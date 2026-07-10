@@ -444,6 +444,7 @@ pub(crate) async fn dispatch_recorded(
     };
     super::activity::record(super::activity::GraphCall {
         ts_ms: started,
+        root: super::activity::root_key(root),
         source: source.to_string(),
         tool: name.to_string(),
         target: arg_summary(name, args),
@@ -741,6 +742,7 @@ pub(crate) async fn run_check_tool(
     let result = run_check_inner(root, settings, args).await;
     super::activity::record(super::activity::GraphCall {
         ts_ms: started,
+        root: super::activity::root_key(root),
         source: source.to_string(),
         tool: "run_check".to_string(),
         target: args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),

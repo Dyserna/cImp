@@ -183,6 +183,16 @@ describe('moveTab', () => {
     const p = next as PaneNode;
     expect(p.tab_ids).toEqual(['b', 'c', 'a']);
   });
+
+  test('no-ops (tab preserved) when the destination pane does not exist', () => {
+    // Regression: the remove+insert composition used to run the remove
+    // even when the insert could never match, silently dropping the tab
+    // from the tree.
+    const root = split('s1', 'horizontal', 0.5, pane('p1', ['a', 'b']), pane('p2', ['c']));
+    const next = moveTab(root, 'b', 'pX', 0);
+    expect(next).toBe(root);
+    expect(findPaneContainingTab(next, 'b')!.id).toBe('p1');
+  });
 });
 
 describe('setActiveTabId', () => {

@@ -37,6 +37,7 @@
   const EDGE_OTHER = '#9aa3b2';
   const PULSE_CLOUD = '#7fd4ff';
   const PULSE_LOCAL = '#ffb454';
+  const PULSE_ADVISOR = '#d2a8ff';
   const ACCENT_COLOR = '#bb55ff';
   const PULSE_MS = 600;
   const FOCUS_MS = 900;
@@ -67,7 +68,7 @@
     fx: number; fy: number; fz: number;
     r: number;
     sx: number; sy: number; sr: number; sz: number;
-    pulseStart: number; pulseUntil: number; pulseColor: string | null;
+    pulseUntil: number; pulseColor: string | null;
   }
   interface SimEdge {
     src: SimNode; dst: SimNode;
@@ -77,7 +78,11 @@
 
   // ── DOM refs ─────────────────────────────────────────────────────────────
   let containerEl: HTMLDivElement;
-  let canvasEl: HTMLCanvasElement;
+  // Reactive ($state) so the lifecycle $effect acquires the 2D context off
+  // the binding itself — robust to mount order and to the element ever being
+  // conditionally rendered again (doing it in onMount once read an unbound
+  // ref, threw, and froze the tab on its "disabled" banner).
+  let canvasEl = $state<HTMLCanvasElement | null>(null);
   let ctx: CanvasRenderingContext2D | null = null;
 
   // ── Reactive UI state ────────────────────────────────────────────────────
@@ -88,12 +93,16 @@
   let edgeCount = $state(0);
   let legendOpen = $state(true);
   let graphEnabled = $state(false);
+  // The configured snapshot cap (graph.graph_viz_max_nodes) — when nodeCount
+  // hits it, the header notes the graph is a top-N-by-degree truncation.
+  let vizMax = $state(1500);
   let subsystemsPresent = $state<string[]>([]);
   let hasUncategorized = $state(false);
   let edgeKindsPresent = $state<string[]>([]);
   let edgeConfsPresent = $state<string[]>([]);
   let sawCloudPulse = $state(false);
   let sawLocalPulse = $state(false);
+  let sawAdvisorPulse = $state(false);
   let hoveredNode = $state<SimNode | null>(null);
   let hoverPos = $state<{ x: number; y: number }>({ x: 0, y: 0 });
   let focusedNodeId = $state<string | null>(null);
@@ -149,6 +158,10 @@
   let io: IntersectionObserver | undefined;
   let resizeDebounce: ReturnType<typeof setTimeout> | undefined;
   let pendingSize: { w: number; h: number } | null = null;
+  // Set when buildSim's fit ran before the canvas had a measured size (a
+  // fast fetch can beat the ResizeObserver's debounce); applyResize consumes
+  // it and re-fits once real dimensions arrive.
+  let needsFit = false;
 
   // Live-activity poll. `graph.ts` exposes no push event for individual tool
   // calls (only `graph-status`/`graph-analyses`), so per the task's fallback
@@ -156,6 +169,9 @@
   // against the newest `ts_ms` already processed.
   let historyTimer: ReturnType<typeof setInterval> | undefined;
   let lastHistoryTs = 0;
+  // The first poll after (re)mount only seeds the high-water mark — replaying
+  // the whole ring as one simultaneous burst is a light show, not signal.
+  let historySeeded = false;
 
   let unsubSettings: (() => void) | undefined;
 
@@ -303,8 +319,14 @@
         const dx = n.x - b.ex, dy = n.y - b.ey, dz = n.z - b.ez;
         const rx = dx * b.xx + dy * b.xy + dz * b.xz;
         const ry = dx * b.yx + dy * b.yy + dz * b.yz;
-        let fz = -(dx * b.zx + dy * b.zy + dz * b.zz);
-        if (fz < NEAR_3D) fz = NEAR_3D;
+        const fz = -(dx * b.zx + dy * b.zy + dz * b.zz);
+        if (fz < NEAR_3D) {
+          // At/behind the near plane: cull (sz = -1, parked far off-screen)
+          // rather than clamping, which smeared the node across the screen
+          // and drew distorted edges to it.
+          n.sx = -1e6; n.sy = -1e6; n.sr = 0; n.sz = -1;
+          continue;
+        }
         const scale = camFocal / fz;
         n.sx = viewW / 2 + rx * scale;
         n.sy = viewH / 2 - ry * scale;
@@ -317,7 +339,10 @@
   // ── Rendering ─────────────────────────────────────────────────────────────
   function drawEdges(now: number): void {
     if (!ctx) return;
+    const is3d = mode === '3d';
     for (const e of edges) {
+      // 3D: skip edges with a culled endpoint (2D leaves sz at 0).
+      if (is3d && (e.src.sz < 0 || e.dst.sz < 0)) continue;
       const highlighted = e.highlightUntil > now;
       ctx.beginPath();
       ctx.moveTo(e.src.sx, e.src.sy);
@@ -334,8 +359,10 @@
 
   function drawNodes(now: number): void {
     if (!ctx) return;
-    const order = mode === '3d' ? [...nodes].sort((a, b) => b.sz - a.sz) : nodes;
+    const is3d = mode === '3d';
+    const order = is3d ? [...nodes].sort((a, b) => b.sz - a.sz) : nodes;
     for (const n of order) {
+      if (is3d && n.sz < 0) continue;
       const isFile = n.kind === 'file';
       ctx.fillStyle = n.subsystem ? subsystemColor(n.subsystem) : UNCATEGORIZED_COLOR;
       ctx.globalAlpha = 1;
@@ -496,7 +523,7 @@
         vx: old?.vx ?? 0, vy: old?.vy ?? 0, vz: old?.vz ?? 0,
         fx: 0, fy: 0, fz: 0,
         r, sx: 0, sy: 0, sr: 0, sz: 0,
-        pulseStart: 0, pulseUntil: 0, pulseColor: null,
+        pulseUntil: 0, pulseColor: null,
       };
       newNodes.push(sn);
       newById.set(row.id, sn);
@@ -522,6 +549,10 @@
     hoveredNode = null;
     idle = false;
     resetView();
+    // fitView2D/3D bail on a zero-sized viewport; defer the fit to the first
+    // real applyResize so a load that beats the ResizeObserver doesn't land
+    // at zoom 1 with most of the layout off-screen.
+    needsFit = viewW <= 0 || viewH <= 0;
   }
 
   async function refresh(): Promise<void> {
@@ -602,11 +633,16 @@
     const matched = matchNodes(call.target);
     if (matched.length === 0) return;
     const isCloud = call.source === 'claude' || call.source === 'opencode';
-    const color = isCloud ? PULSE_CLOUD : PULSE_LOCAL;
-    if (isCloud) sawCloudPulse = true; else sawLocalPulse = true;
+    // read_advisor/auto_check are backend-internal services, not offload
+    // worker traffic — they get their own pulse bucket.
+    const isAdvisor = call.source === 'read_advisor' || call.source === 'auto_check';
+    const color = isCloud ? PULSE_CLOUD : isAdvisor ? PULSE_ADVISOR : PULSE_LOCAL;
+    if (isCloud) sawCloudPulse = true;
+    else if (isAdvisor) sawAdvisorPulse = true;
+    else sawLocalPulse = true;
     const now = performance.now();
     for (const n of matched) {
-      n.pulseStart = now; n.pulseUntil = now + PULSE_MS; n.pulseColor = color;
+      n.pulseUntil = now + PULSE_MS; n.pulseColor = color;
     }
     // No per-edge result is available from GraphCall (tool + target only) —
     // approximate "traversed edge" for callers/callees calls by lighting up
@@ -628,12 +664,16 @@
   async function pollHistory(): Promise<void> {
     if (!graphEnabled) return;
     try {
-      const calls = await graphHistory();
-      if (calls.length === 0) return;
+      // Scoped: the ring spans every indexed root, and another project's
+      // calls would light up same-named nodes in this graph.
+      const calls = await graphHistory({ root, scoped: true });
       const fresh = calls.filter((c) => c.ts_ms > lastHistoryTs).sort((a, b) => a.ts_ms - b.ts_ms);
-      let newest = lastHistoryTs;
-      for (const c of calls) if (c.ts_ms > newest) newest = c.ts_ms;
-      lastHistoryTs = newest;
+      for (const c of calls) if (c.ts_ms > lastHistoryTs) lastHistoryTs = c.ts_ms;
+      // First poll: seed the high-water mark only. Parked (hidden/unsized):
+      // advance past what won't be shown rather than saving it up for a
+      // burst on return. Either way, no replayed backlog.
+      if (!historySeeded) { historySeeded = true; return; }
+      if (!visible) return;
       for (const c of fresh) applyActivity(c);
     } catch {
       // Non-fatal — keep the last-known pulses/state and retry next tick.
@@ -641,6 +681,9 @@
   }
   function startHistoryPoll(): void {
     if (historyTimer) return;
+    // Re-seed on every (re)start — calls that landed while polling was off
+    // (graph disabled) are backlog, not live activity.
+    historySeeded = false;
     void pollHistory();
     historyTimer = setInterval(() => void pollHistory(), 1500);
   }
@@ -663,7 +706,14 @@
     canvasEl.height = Math.max(1, Math.round(h * dpr));
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     viewW = w; viewH = h;
+    // ~58° vertical FOV regardless of window size (a fixed focal length made
+    // the effective FOV a function of how big the pane happened to be).
+    camFocal = Math.max(200, viewH * 0.9);
     updateVisibility();
+    if (needsFit && nodes.length > 0) {
+      needsFit = false;
+      resetView();
+    }
     wake();
   }
   function handleResize(entries: ResizeObserverEntry[]): void {
@@ -762,7 +812,7 @@
   }
 
   function onWheel(e: WheelEvent): void {
-    if (nodes.length === 0) return;
+    if (nodes.length === 0 || !canvasEl) return;
     e.preventDefault();
     const rect = canvasEl.getBoundingClientRect();
     const mx = e.clientX - rect.left;
@@ -796,8 +846,26 @@
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
-  onMount(() => {
+  // Acquire the 2D context off the binding rather than in onMount — safe
+  // against mount order and against the canvas ever being conditionally
+  // rendered again (the onMount version read an unbound ref, threw, and took
+  // the settings subscription below down with it).
+  $effect(() => {
+    if (!canvasEl) {
+      ctx = null;
+      return;
+    }
     ctx = canvasEl.getContext('2d');
+    // Size the fresh canvas immediately — the ResizeObserver's debounced
+    // pass may not have fired yet.
+    if (!pendingSize && containerEl) {
+      const r = containerEl.getBoundingClientRect();
+      pendingSize = { w: r.width, h: r.height };
+    }
+    applyResize();
+  });
+
+  onMount(() => {
     ro = new ResizeObserver(handleResize);
     ro.observe(containerEl);
     io = new IntersectionObserver(handleIntersect, { threshold: 0 });
@@ -807,6 +875,7 @@
     // `graphEnabled` and kicks off the first load/poll without a separate
     // one-off read.
     unsubSettings = settings.subscribe((s) => {
+      vizMax = Math.max(1, s.graph.graph_viz_max_nodes);
       const en = s.graph.enabled;
       if (en === graphEnabled) return;
       graphEnabled = en;
@@ -834,14 +903,29 @@
       <button type="button" class="seg" class:active={mode === '2d'} onclick={() => setMode('2d')}>2D</button>
       <button type="button" class="seg" class:active={mode === '3d'} onclick={() => setMode('3d')}>3D</button>
     </div>
-    <button type="button" class="secondary" onclick={resetView} disabled={nodes.length === 0}>Reset view</button>
+    <button type="button" class="secondary" onclick={resetView} disabled={nodeCount === 0}>Reset view</button>
     <button type="button" class="secondary" onclick={() => void refresh()} disabled={loading || !graphEnabled}>
       {loading ? 'Loading…' : 'Refresh'}
     </button>
-    <span class="counts tnum">{nodeCount} nodes · {edgeCount} edges</span>
+    <span class="counts tnum">
+      {nodeCount} nodes · {edgeCount} edges{nodeCount >= vizMax ? ` · top ${vizMax} hubs by degree` : ''}
+    </span>
   </header>
 
+  <!-- The canvas stays mounted through every state (banners overlay it):
+       swapping it out on each refresh recreated the element + 2D context and,
+       worse, meant the view could never be size-fitted before first paint. -->
   <div class="canvas-wrap">
+    <canvas
+      bind:this={canvasEl}
+      class="graph-canvas"
+      onmousedown={onCanvasMouseDown}
+      onmousemove={onCanvasMouseMove}
+      onmouseleave={onCanvasMouseLeave}
+      onwheel={onWheel}
+      oncontextmenu={(e) => e.preventDefault()}
+    ></canvas>
+
     {#if !graphEnabled}
       <p class="banner">
         Graph View is disabled. Turn on the code graph (Settings → Code Intelligence) to use it.
@@ -851,21 +935,13 @@
         Couldn't load the graph: {fetchError}
         <button type="button" class="secondary" onclick={() => void refresh()}>Retry</button>
       </p>
-    {:else if loading}
+    {:else if loading && nodeCount === 0}
       <p class="banner">Loading graph…</p>
     {:else if nodeCount === 0}
       <p class="banner">No indexed graph yet. Build the code graph from the Code Intelligence tab first.</p>
-    {:else}
-      <canvas
-        bind:this={canvasEl}
-        class="graph-canvas"
-        onmousedown={onCanvasMouseDown}
-        onmousemove={onCanvasMouseMove}
-        onmouseleave={onCanvasMouseLeave}
-        onwheel={onWheel}
-        oncontextmenu={(e) => e.preventDefault()}
-      ></canvas>
+    {/if}
 
+    {#if nodeCount > 0}
       {#if hoveredNode}
         <div class="tooltip" style="left:{hoverPos.x + 14}px; top:{hoverPos.y + 14}px;">
           <strong>{hoveredNode.label}</strong>
@@ -920,7 +996,7 @@
                 {/each}
               </div>
             {/if}
-            {#if sawCloudPulse || sawLocalPulse}
+            {#if sawCloudPulse || sawLocalPulse || sawAdvisorPulse}
               <div class="legend-section">
                 <h4>Live activity pulse</h4>
                 {#if sawCloudPulse}
@@ -928,6 +1004,9 @@
                 {/if}
                 {#if sawLocalPulse}
                   <div class="legend-row"><span class="swatch" style="background:{PULSE_LOCAL}"></span>local offload worker</div>
+                {/if}
+                {#if sawAdvisorPulse}
+                  <div class="legend-row"><span class="swatch" style="background:{PULSE_ADVISOR}"></span>advisor / auto-check (background)</div>
                 {/if}
               </div>
             {/if}
@@ -1009,13 +1088,19 @@
     cursor: grab;
   }
   .banner {
-    margin: 16px;
+    /* Overlays the always-mounted canvas (above the tooltip's z-index 5). */
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    right: 16px;
+    z-index: 6;
+    margin: 0;
     padding: 8px 10px;
     border-radius: 6px;
     font-size: 12px;
     border: 1px solid var(--border, #444);
-    background: rgba(255, 255, 255, 0.04);
-    opacity: 0.9;
+    background: var(--panel, #1e1e1e);
+    opacity: 0.95;
   }
   .banner.err {
     background: rgba(179, 38, 30, 0.18);

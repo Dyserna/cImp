@@ -17,7 +17,7 @@
     spriteManifestUrl,
     spriteBaseUrl,
   } from './avatarConfig';
-  import { SpritePlayer } from './spritePlayer';
+  import { SpritePlayer, resolveStateGroup } from './spritePlayer';
 
   // Active UI theme drives which `/avatar/<theme>/` subfolder the bundled
   // defaults resolve from. Subscribed separately because `avatarSettings`
@@ -33,7 +33,6 @@
   let displayedState: AvatarState = 'Idle';
   let transitionTimer: ReturnType<typeof setTimeout> | null = null;
   let isFirstRender = true;
-  let unlisten: (() => void) | undefined;
 
   // --- Sprite variant ------------------------------------------------------
   // When `avatar.kind === 'sprite'`, the canvas below is shown instead of the
@@ -49,13 +48,15 @@
   const spriteSet = $derived($avatarSettings.sprite.set);
 
   function applySpriteState(state: AvatarState): void {
-    if (!player) return;
+    const p = player;
+    if (!p) return;
     // Behaviour is manifest-driven: each set's `groups` maps state -> animation
-    // list (rotated when >1). If a set defines no group for this state, fall
-    // back to its Idle group so any conformant set still animates; setAnims
-    // further falls back to all animations if even that is empty.
-    const list = player.groupFor(state);
-    player.setAnims(state, list.length ? list : player.groupFor('Idle'));
+    // list (rotated when >1). States without a group share the Idle group AND
+    // the 'Idle' rotation key (so moving between two fallback states doesn't
+    // restart the identical animation); setAnims further falls back to all
+    // animations if even the Idle group is empty.
+    const { key, names } = resolveStateGroup((s) => p.groupFor(s), state);
+    p.setAnims(key, names);
   }
 
   // Player lifecycle + manifest (re)load. Re-runs when the render kind, the
@@ -73,6 +74,14 @@
       }
       return;
     }
+    // Entering sprite mode cancels any in-flight media crossfade. Left
+    // running, the stale timer would later clobber displayedSrc/displayedState
+    // and block the settings-resync $effect (gated on transitionTimer ===
+    // null) after a switch back to the media kind.
+    if (transitionTimer !== null) {
+      clearTimeout(transitionTimer);
+      transitionTimer = null;
+    }
     if (!player) player = new SpritePlayer(el);
     if (set !== loadedSet) {
       loadedSet = set;
@@ -81,7 +90,12 @@
         .then(() => {
           if (p === player) applySpriteState(displayedState);
         })
-        .catch((e) => console.error('avatar sprite set failed to load', e));
+        .catch((e) => {
+          console.error('avatar sprite set failed to load', e);
+          // Un-latch so the next effect run may retry this set; otherwise a
+          // transient failure leaves the canvas blank for the whole session.
+          if (p === player && loadedSet === set) loadedSet = '';
+        });
     }
   });
 
@@ -136,14 +150,20 @@
     handleStateChange(newState);
   });
 
-  onMount(async () => {
+  onMount(() => {
     // Initialize displayedSrc from current settings on first paint.
     displayedSrc = resolveImageSrc(
       get(avatarSettings).images,
       'Idle',
       get(settings).ui.theme,
     );
-    unlisten = await startAvatarStateListener();
+    // App-lifetime listener shared with App.svelte (it drives the tabs /
+    // activeTab stores, not just this overlay) — started here too so the
+    // avatar reacts even before App's async onMount reaches it, but never
+    // torn down by this component.
+    startAvatarStateListener().catch((e) =>
+      console.error('startAvatarStateListener failed:', e),
+    );
   });
 
   onDestroy(() => {
@@ -151,7 +171,6 @@
     if (transitionTimer !== null) clearTimeout(transitionTimer);
     player?.destroy();
     player = null;
-    unlisten?.();
   });
 
   function handleStateChange(newState: AvatarState) {

@@ -5,6 +5,39 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.1] — 2026-07-10
+
+### Added
+
+- **Tool Activity tab.** A new reserved, read-only tab that gathers tool
+  usage in one place, with three sections: **Activities** (a unified,
+  newest-first feed merging the code-intelligence graph-call history with
+  every offload backend's request history), **Graph tools**, and **Offload
+  tools** (the two tool reference lists, moved here from the Code
+  Intelligence and Offload Server tabs). Gated by the new
+  `ui.tool_activity_tab` setting (default on) with a checkbox in
+  Settings → Tabs.
+
+### Changed
+
+- **Code Intelligence tab restructured.** The Index, Usage, and Activity
+  subtabs are consolidated: a single **Overview** subtab now stacks the
+  status groups top-to-bottom (Index, then Usage). The activity feed and the
+  graph-tools reference moved to the Tool Activity tab; Memory / Context /
+  Analyses / Trace path / Architecture are unchanged.
+- The Offload Server tab's tools reference and the per-backend **History**
+  block moved to the Tool Activity tab (the collapsible **Offload runs** log
+  stays on each backend card).
+
+### Fixed
+
+- Toggling **Show the Graph View tab** now materializes/removes the tab
+  live — previously the live settings-update path never mirrored
+  `graph.graph_viz` into the runtime, so the tab only appeared (or
+  disappeared) after an app restart. The Graph View tab was also missing
+  from the read-only write guard, the non-closable guard, and the
+  frontend's no-PTY skip list; all now match the other reserved tabs.
+
 ## [0.40.0] — 2026-07-10
 
 ### Added

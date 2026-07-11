@@ -2773,10 +2773,12 @@ impl Default for StatuslineSettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UiSettings {
-    /// Active UI chrome theme. Two values currently ship, both ratatui-style
+    /// Active UI chrome theme. Four values currently ship, all ratatui-style
     /// (custom title bar, square borders): `"tui-orange"` (Gruvbox surfaces +
-    /// Claude Code's accent orange, #d77757) and `"tui-grey"` (the OpenCode Grey
-    /// palette + OpenCode's cool light-grey accent, #c8ccd0). New installs land
+    /// Claude Code's accent orange, #d77757), `"tui-blue"` and `"tui-green"`
+    /// (the same Gruvbox layout with blue #7aa2f7 / green #98c379 accents),
+    /// and `"tui-grey"` (the OpenCode Grey palette + OpenCode's cool
+    /// light-grey accent, #c8ccd0). New installs land
     /// on `"tui-orange"` so the chrome accent matches Claude Code's orange. The
     /// avatar still defaults to the animated `impSprites` mascot independently
     /// (see [`AvatarKind`] / [`SpriteSettings`]).

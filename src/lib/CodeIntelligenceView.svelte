@@ -370,6 +370,37 @@
   });
   let usageMax = $derived(maxTurnTotal(shownTurns));
 
+  // Chart segment colors: each legend dot is a native color input. The
+  // committed value lives in settings (`graph.usage_color_*`, persisted by
+  // the backend); `chartPreview` holds the live value while a picker is open
+  // (`oninput` fires per drag tick) so the chart recolors immediately without
+  // a settings round-trip per tick.
+  const CHART_SEGS = [
+    { key: 'in', label: 'input', field: 'usage_color_in' },
+    { key: 'cache', label: 'cache-read', field: 'usage_color_cache' },
+    { key: 'out', label: 'output', field: 'usage_color_out' },
+    { key: 'tool', label: 'est. tool-result', field: 'usage_color_tool' },
+  ] as const;
+  type ChartSegKey = (typeof CHART_SEGS)[number]['key'];
+  let chartPreview = $state<Partial<Record<ChartSegKey, string>>>({});
+  let chartColors = $derived({
+    in: chartPreview.in ?? $settings.graph.usage_color_in,
+    cache: chartPreview.cache ?? $settings.graph.usage_color_cache,
+    out: chartPreview.out ?? $settings.graph.usage_color_out,
+    tool: chartPreview.tool ?? $settings.graph.usage_color_tool,
+  });
+  async function commitChartColor(
+    seg: (typeof CHART_SEGS)[number],
+    value: string,
+  ): Promise<void> {
+    const next = structuredClone($settings);
+    next.graph[seg.field] = value;
+    // applySettings updates the store optimistically (and rolls back on
+    // failure), so the preview can be dropped afterwards either way.
+    await applySettings(next);
+    chartPreview[seg.key] = undefined;
+  }
+
   const ADVISOR_RULES_TOOLTIP =
     'advisor.raise_context_min_score.v1: ≥5 sessions, ≥200 injections, ≥70% never re-touched → raise context_min_score.\n' +
     'advisor.raise_read_advisor_min_lines.v1: ≥5 sessions, ≥20 reminders, ≥50% re-read anyway → raise read_advisor_min_lines.\n' +
@@ -657,8 +688,13 @@
       {/if}
     </section>
 
-    <!-- This session: per-turn stacked bars + top consumers. -->
-    <section class="card">
+    <!-- This session: per-turn stacked bars + top consumers. The segment
+         colors flow from settings (via the legend's color pickers) into CSS
+         vars scoped to this card. -->
+    <section
+      class="card"
+      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}"
+    >
       <div class="history-head">
         This session
         {#if shownTurns.length < usageTurns.length}
@@ -669,10 +705,19 @@
         <p class="placeholder">No usage recorded yet this session.</p>
       {:else}
         <div class="ubars-legend">
-          <span><span class="dot in"></span>input</span>
-          <span><span class="dot cache"></span>cache-read</span>
-          <span><span class="dot out"></span>output</span>
-          <span><span class="dot tool"></span>est. tool-result</span>
+          {#each CHART_SEGS as s (s.key)}
+            <span>
+              <input
+                type="color"
+                class="dot"
+                value={chartColors[s.key]}
+                title="{s.label} — click to pick a color"
+                oninput={(e) => (chartPreview[s.key] = e.currentTarget.value)}
+                onchange={(e) => commitChartColor(s, e.currentTarget.value)}
+              />
+              {s.label}
+            </span>
+          {/each}
         </div>
         <div class="ubars" bind:clientWidth={ubarsWidth}>
           {#each shownTurns as t, i (i)}
@@ -1875,27 +1920,37 @@
     align-items: center;
     gap: 5px;
   }
-  .ubars-legend .dot {
-    width: 8px;
-    height: 8px;
+  /* Each legend dot is a native color input stripped down to its swatch —
+     click to recolor that segment (persisted via settings). */
+  .ubars-legend input.dot {
+    width: 11px;
+    height: 11px;
+    padding: 0;
+    border: 1px solid var(--border, #444);
     border-radius: 2px;
-    display: inline-block;
+    background: none;
+    cursor: pointer;
+    -webkit-appearance: none;
+    appearance: none;
   }
-  .dot.in,
+  .ubars-legend input.dot::-webkit-color-swatch-wrapper {
+    padding: 0;
+  }
+  .ubars-legend input.dot::-webkit-color-swatch {
+    border: none;
+    border-radius: 1px;
+  }
   .useg.in {
-    background: #58a6ff;
+    background: var(--ubar-in, #58a6ff);
   }
-  .dot.cache,
   .useg.cache {
-    background: #d2a8ff;
+    background: var(--ubar-cache, #d2a8ff);
   }
-  .dot.out,
   .useg.out {
-    background: #3fb950;
+    background: var(--ubar-out, #3fb950);
   }
-  .dot.tool,
   .useg.tool {
-    background: #f0c674;
+    background: var(--ubar-tool, #f0c674);
   }
   .ubars {
     display: flex;

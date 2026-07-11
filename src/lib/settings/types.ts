@@ -776,6 +776,12 @@ export interface GraphSettings {
   graph_viz: boolean;
   /// V15 Feature 4: cap on the rendered subgraph node count.
   graph_viz_max_nodes: number;
+  /// "This session" stacked-bar chart segment colors (`#rrggbb`), edited by
+  /// clicking the chart's legend swatches in the Code Intelligence tab.
+  usage_color_in: string;
+  usage_color_cache: string;
+  usage_color_out: string;
+  usage_color_tool: string;
 }
 
 /// V13 §0.4: the Workbench feature's settings. Mirror of Rust
@@ -1315,6 +1321,10 @@ export function defaultSettings(): Settings {
       arch_min_community_size: 3,
       graph_viz: false,
       graph_viz_max_nodes: 1500,
+      usage_color_in: '#58a6ff',
+      usage_color_cache: '#d2a8ff',
+      usage_color_out: '#3fb950',
+      usage_color_tool: '#f0c674',
     },
     workbench: {
       enabled: true,

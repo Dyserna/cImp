@@ -1177,6 +1177,13 @@ pub struct GraphSettings {
     /// V15 Feature 4: cap on the rendered subgraph node count so large repos
     /// stay smooth (the view is bounded orientation, never the whole graph).
     pub graph_viz_max_nodes: u32,
+    /// Segment colors for the Code Intelligence tab's "This session"
+    /// stacked-bar chart (`#rrggbb`). Edited in-place by clicking the chart's
+    /// legend swatches; defaults match the original hard-coded palette.
+    pub usage_color_in: String,
+    pub usage_color_cache: String,
+    pub usage_color_out: String,
+    pub usage_color_tool: String,
 }
 
 impl GraphSettings {
@@ -1248,6 +1255,10 @@ impl Default for GraphSettings {
             arch_min_community_size: 3,
             graph_viz: false,
             graph_viz_max_nodes: 1500,
+            usage_color_in: "#58a6ff".to_string(),
+            usage_color_cache: "#d2a8ff".to_string(),
+            usage_color_out: "#3fb950".to_string(),
+            usage_color_tool: "#f0c674".to_string(),
         }
     }
 }

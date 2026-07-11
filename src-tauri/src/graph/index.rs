@@ -176,15 +176,51 @@ pub struct VizGraph {
     pub edges: Vec<VizEdge>,
 }
 
+/// Per-file Graph View presence (drives the Workbench jump button's state).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VizFileStatus {
+    pub path: String,
+    /// The file exists in the graph index at all.
+    pub indexed: bool,
+    /// Rolled-up file-level call/import degree. 0 means the file never
+    /// appears in the viz snapshot (degree-0 nodes are filtered out before
+    /// the top-N cut), so there is nothing to jump to.
+    pub degree: u64,
+}
+
 /// Most definitions one call edge may fan out to in the viz snapshot (a call
 /// edge stores the callee NAME; common names resolve to dozens of defs).
 pub const VIZ_CALL_FANOUT_MAX: usize = 4;
+/// Hard cap on edges returned by a `viz_ego` query — a hub file can touch
+/// hundreds of files, and the injected ego shares the Graph View's per-frame
+/// budget with the rest of the rendered snapshot.
+pub const VIZ_EGO_EDGES_MAX: usize = 200;
 /// Edge budget per node for the viz snapshot's hard edge cap.
 pub const VIZ_EDGES_PER_NODE: usize = 4;
 /// Per-node drawn-neighbor quota: an edge survives only while one of its
 /// endpoints still has quota (strongest edges kept first), so dense file
 /// graphs stay readable instead of becoming a hairball.
 pub const VIZ_NEIGHBORS_PER_NODE: usize = 3;
+
+/// Confidence ordering for viz edge ranking (strongest first).
+fn viz_conf_rank(c: &str) -> u8 {
+    match c {
+        "extracted" => 0,
+        "inferred" => 1,
+        _ => 2,
+    }
+}
+
+/// The longest subsystem name (a directory prefix) that prefixes `file`, or
+/// empty when the file falls outside every named subsystem.
+fn viz_subsystem_of(sub_names: &[String], file: &str) -> String {
+    sub_names
+        .iter()
+        .filter(|n| file.starts_with(n.as_str()))
+        .max_by_key(|n| n.len())
+        .cloned()
+        .unwrap_or_default()
+}
 
 /// A traced shortest path between two entities (V15 Feature 1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1735,7 +1771,149 @@ reach[x] := reach[z], calls[x, z]"#
     ///   `max_nodes * VIZ_EDGES_PER_NODE`.
     pub fn viz_snapshot(&self, max_nodes: usize) -> AppResult<VizGraph> {
         let max_nodes = max_nodes.max(1);
+        let (meta, edges, weights) = self.viz_rollup()?;
+        let sub_names = self.viz_subsystem_names();
 
+        // Keep the top `max_nodes` by degree (ties by id for determinism).
+        let mut nodes: Vec<VizNode> = meta.into_values().filter(|n| n.degree > 0).collect();
+        nodes.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.id.cmp(&b.id)));
+        nodes.truncate(max_nodes);
+        for n in &mut nodes {
+            n.subsystem = viz_subsystem_of(&sub_names, &n.file);
+        }
+        let kept: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        let mut weighted: Vec<(VizEdge, u64)> = edges
+            .into_iter()
+            .zip(weights)
+            .filter(|(e, _)| kept.contains(&e.src) && kept.contains(&e.dst))
+            .collect();
+
+        // Drawn-edge cap, strongest first: order by rolled-up weight, then
+        // confidence, then a deterministic key; each node gets at most
+        // VIZ_NEIGHBORS_PER_NODE drawn incident edges (an edge draws while
+        // EITHER endpoint still has quota, so a hub's strongest spokes stay
+        // even after the hub itself is saturated), all under the global
+        // max_nodes * VIZ_EDGES_PER_NODE bound. Edges over quota are KEPT
+        // with `drawn: false` — the frontend's connections panel and
+        // selection highlight need the full set; only ambient rendering and
+        // the spring sim are bounded by the flag. Node degrees stay as
+        // computed above.
+        weighted.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| viz_conf_rank(&a.0.confidence).cmp(&viz_conf_rank(&b.0.confidence)))
+                .then_with(|| (&a.0.src, &a.0.dst, &a.0.kind).cmp(&(&b.0.src, &b.0.dst, &b.0.kind)))
+        });
+        let max_edges = max_nodes.saturating_mul(VIZ_EDGES_PER_NODE);
+        let mut used: HashMap<String, usize> = HashMap::new();
+        let mut drawn_count = 0usize;
+        let mut final_edges: Vec<VizEdge> = Vec::with_capacity(weighted.len());
+        for (mut e, _) in weighted {
+            let su = used.get(&e.src).copied().unwrap_or(0);
+            let du = used.get(&e.dst).copied().unwrap_or(0);
+            if drawn_count < max_edges && (su < VIZ_NEIGHBORS_PER_NODE || du < VIZ_NEIGHBORS_PER_NODE) {
+                e.drawn = true;
+                drawn_count += 1;
+                *used.entry(e.src.clone()).or_default() += 1;
+                *used.entry(e.dst.clone()).or_default() += 1;
+            }
+            final_edges.push(e);
+        }
+
+        Ok(VizGraph { nodes, edges: final_edges })
+    }
+
+    /// Workbench ⌖ support: per-file Graph View presence for a batch of
+    /// repo-relative paths. `indexed` = the file exists in the graph at all;
+    /// `degree` = its rolled-up file-level call/import degree (0 ⇒ the file
+    /// can never appear in the snapshot, so there is nothing to jump to).
+    /// One rollup pass covers the whole batch.
+    pub fn viz_file_status(&self, paths: &[String]) -> AppResult<Vec<VizFileStatus>> {
+        let (meta, _, _) = self.viz_rollup()?;
+        Ok(paths
+            .iter()
+            .map(|p| match meta.get(&format!("file:{p}")) {
+                Some(n) => VizFileStatus { path: p.clone(), indexed: true, degree: n.degree },
+                None => VizFileStatus { path: p.clone(), indexed: false, degree: 0 },
+            })
+            .collect())
+    }
+
+    /// Workbench ⌖ support: the 1-hop FILE ego of `path`, computed on the
+    /// FULL rollup — i.e. regardless of the snapshot's top-N-by-degree cut —
+    /// so a jump to a low-degree file can temporarily inject it (plus every
+    /// file it calls/imports, either direction) into the rendered graph.
+    /// Incident edges come strongest-first, capped at [`VIZ_EGO_EDGES_MAX`],
+    /// all marked `drawn`. Empty when the file isn't indexed; a lone node
+    /// when it has no connections.
+    pub fn viz_ego(&self, path: &str) -> AppResult<VizGraph> {
+        let id = format!("file:{path}");
+        let (mut meta, edges, weights) = self.viz_rollup()?;
+        if !meta.contains_key(&id) {
+            return Ok(VizGraph::default());
+        }
+        let mut incident: Vec<(VizEdge, u64)> = edges
+            .into_iter()
+            .zip(weights)
+            .filter(|(e, _)| e.src == id || e.dst == id)
+            .collect();
+        // Same strongest-first order as the snapshot's drawn-edge cap.
+        incident.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| viz_conf_rank(&a.0.confidence).cmp(&viz_conf_rank(&b.0.confidence)))
+                .then_with(|| (&a.0.src, &a.0.dst, &a.0.kind).cmp(&(&b.0.src, &b.0.dst, &b.0.kind)))
+        });
+        incident.truncate(VIZ_EGO_EDGES_MAX);
+
+        // Target first, then neighbors in edge-strength order.
+        let mut ids: Vec<String> = vec![id.clone()];
+        let mut seen: HashSet<String> = HashSet::from([id]);
+        for (e, _) in &incident {
+            for end in [&e.src, &e.dst] {
+                if seen.insert(end.clone()) {
+                    ids.push(end.clone());
+                }
+            }
+        }
+        let sub_names = self.viz_subsystem_names();
+        let nodes: Vec<VizNode> = ids
+            .into_iter()
+            .filter_map(|nid| meta.remove(&nid))
+            .map(|mut n| {
+                n.subsystem = viz_subsystem_of(&sub_names, &n.file);
+                n
+            })
+            .collect();
+        let edges = incident
+            .into_iter()
+            .map(|(mut e, _)| {
+                e.drawn = true;
+                e
+            })
+            .collect();
+        Ok(VizGraph { nodes, edges })
+    }
+
+    /// Subsystem names (directory prefixes) from the architecture pass — the
+    /// viz node color buckets. Cheap reuse of the pass's named buckets —
+    /// `max_rows = 0` because only `subsystems` is consumed, so the god-node
+    /// and surprising-edge computations (including the file-centrality scan)
+    /// are skipped entirely.
+    fn viz_subsystem_names(&self) -> Vec<String> {
+        self.architecture(64, 1, 0)
+            .unwrap_or_default()
+            .subsystems
+            .into_iter()
+            .map(|s| s.name)
+            .collect()
+    }
+
+    /// The shared FILE-level rollup behind the Graph View queries
+    /// (`viz_snapshot` / `viz_file_status` / `viz_ego`): EVERY indexed file
+    /// as a `VizNode` (degree = unique rolled-up call/import edges touching
+    /// it, subsystem left empty) plus the deduplicated edge list with its
+    /// index-aligned rolled-up weights. No top-N cut and no drawn-edge cap —
+    /// each caller applies its own bounds.
+    fn viz_rollup(&self) -> AppResult<(HashMap<String, VizNode>, Vec<VizEdge>, Vec<u64>)> {
         // Symbol table — not nodes anymore, just the lookups that resolve a
         // call edge (symbol-id src, callee-NAME dst) to its file endpoints.
         let sym_rows = self.run(
@@ -1771,22 +1949,6 @@ reach[x] := reach[z], calls[x, z]"#
             known_files.insert(path);
         }
 
-        // Subsystem coloring: the longest subsystem name (a dir prefix) that
-        // prefixes a file. Cheap reuse of the architecture pass's named
-        // buckets — `max_rows = 0` because only `subsystems` is consumed, so
-        // the god-node and surprising-edge computations (including the
-        // file-centrality scan) are skipped entirely.
-        let arch = self.architecture(64, 1, 0).unwrap_or_default();
-        let sub_names: Vec<String> = arch.subsystems.iter().map(|s| s.name.clone()).collect();
-        let subsystem_of = |file: &str| -> String {
-            sub_names
-                .iter()
-                .filter(|n| file.starts_with(n.as_str()))
-                .max_by_key(|n| n.len())
-                .cloned()
-                .unwrap_or_default()
-        };
-
         let multi = self.multi_candidate_names()?;
         let mut edges: Vec<VizEdge> = Vec::new();
         // Rolled-up weight per edge, index-aligned with `edges`: how many
@@ -1797,18 +1959,13 @@ reach[x] := reach[z], calls[x, z]"#
         // symbol pairs between the same two files) collapse into one edge
         // that keeps the best confidence seen.
         let mut edge_ix: HashMap<(String, String, &'static str), usize> = HashMap::new();
-        let conf_rank = |c: &str| match c {
-            "extracted" => 0u8,
-            "inferred" => 1,
-            _ => 2,
-        };
         let push_edge = |edges: &mut Vec<VizEdge>, weights: &mut Vec<u64>, edge_ix: &mut HashMap<(String, String, &'static str), usize>, meta: &mut HashMap<String, VizNode>, a: &str, b: &str, kind: &'static str, conf: Confidence| {
             if a == b || !meta.contains_key(a) || !meta.contains_key(b) {
                 return;
             }
             if let Some(&i) = edge_ix.get(&(a.to_string(), b.to_string(), kind)) {
                 weights[i] += 1;
-                if conf_rank(conf.tag()) < conf_rank(&edges[i].confidence) {
+                if viz_conf_rank(conf.tag()) < viz_conf_rank(&edges[i].confidence) {
                     edges[i].confidence = conf.tag().to_string();
                 }
                 return;
@@ -1857,52 +2014,7 @@ reach[x] := reach[z], calls[x, z]"#
             }
         }
 
-        // Keep the top `max_nodes` by degree (ties by id for determinism).
-        let mut nodes: Vec<VizNode> = meta.into_values().filter(|n| n.degree > 0).collect();
-        nodes.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.id.cmp(&b.id)));
-        nodes.truncate(max_nodes);
-        for n in &mut nodes {
-            n.subsystem = subsystem_of(&n.file);
-        }
-        let kept: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
-        let mut weighted: Vec<(VizEdge, u64)> = edges
-            .into_iter()
-            .zip(weights)
-            .filter(|(e, _)| kept.contains(&e.src) && kept.contains(&e.dst))
-            .collect();
-
-        // Drawn-edge cap, strongest first: order by rolled-up weight, then
-        // confidence, then a deterministic key; each node gets at most
-        // VIZ_NEIGHBORS_PER_NODE drawn incident edges (an edge draws while
-        // EITHER endpoint still has quota, so a hub's strongest spokes stay
-        // even after the hub itself is saturated), all under the global
-        // max_nodes * VIZ_EDGES_PER_NODE bound. Edges over quota are KEPT
-        // with `drawn: false` — the frontend's connections panel and
-        // selection highlight need the full set; only ambient rendering and
-        // the spring sim are bounded by the flag. Node degrees stay as
-        // computed above.
-        weighted.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| conf_rank(&a.0.confidence).cmp(&conf_rank(&b.0.confidence)))
-                .then_with(|| (&a.0.src, &a.0.dst, &a.0.kind).cmp(&(&b.0.src, &b.0.dst, &b.0.kind)))
-        });
-        let max_edges = max_nodes.saturating_mul(VIZ_EDGES_PER_NODE);
-        let mut used: HashMap<String, usize> = HashMap::new();
-        let mut drawn_count = 0usize;
-        let mut final_edges: Vec<VizEdge> = Vec::with_capacity(weighted.len());
-        for (mut e, _) in weighted {
-            let su = used.get(&e.src).copied().unwrap_or(0);
-            let du = used.get(&e.dst).copied().unwrap_or(0);
-            if drawn_count < max_edges && (su < VIZ_NEIGHBORS_PER_NODE || du < VIZ_NEIGHBORS_PER_NODE) {
-                e.drawn = true;
-                drawn_count += 1;
-                *used.entry(e.src.clone()).or_default() += 1;
-                *used.entry(e.dst.clone()).or_default() += 1;
-            }
-            final_edges.push(e);
-        }
-
-        Ok(VizGraph { nodes, edges: final_edges })
+        Ok((meta, edges, weights))
     }
 
     /// V12 Phase C: the **candidate** tests that (transitively) depend on one
@@ -4520,6 +4632,54 @@ pub struct Point { x: i32 }
         // connections panel.
         let drawn = g.edges.iter().filter(|e| e.drawn).count();
         assert!(drawn <= g.nodes.len() * VIZ_EDGES_PER_NODE);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Workbench ⌖ support queries work on the FULL rollup, not the
+    /// snapshot's top-N-by-degree cut: `viz_file_status` reports per-file
+    /// presence + degree (0-degree and unindexed files disable the jump
+    /// button), and `viz_ego` returns a file the cut dropped plus its 1-hop
+    /// file neighborhood so the frontend can inject it temporarily.
+    #[test]
+    fn viz_file_status_and_ego_ignore_the_top_n_cut() {
+        let dir = std::env::temp_dir().join(format!("ckg-viz-ego-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // hub is called from three files (degree 3); leaf has exactly one
+        // edge (its call to hub); lone is indexed but fully disconnected.
+        idx.index_file_graph(&parse_file("src/hub.rs", "pub fn hub() {}\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/s1.rs", "pub fn s1() { hub(); }\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/s2.rs", "pub fn s2() { hub(); }\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/leaf.rs", "pub fn leaf() { hub(); }\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/lone.rs", "pub fn lone() {}\n", Lang::Rust)).unwrap();
+
+        // A max_nodes=1 snapshot keeps only the hub — leaf falls off the cut.
+        let snap = idx.viz_snapshot(1).expect("snapshot");
+        assert_eq!(snap.nodes.len(), 1);
+        assert_eq!(snap.nodes[0].id, "file:src/hub.rs");
+
+        let status = idx
+            .viz_file_status(&["src/leaf.rs".into(), "src/lone.rs".into(), "src/nope.rs".into()])
+            .expect("status");
+        assert_eq!(status.len(), 3);
+        assert!(status[0].indexed && status[0].degree >= 1, "leaf: {:?}", status[0]);
+        assert!(status[1].indexed && status[1].degree == 0, "lone: {:?}", status[1]);
+        assert!(!status[2].indexed && status[2].degree == 0, "nope: {:?}", status[2]);
+
+        // Ego of the dropped file: itself first, its neighbor, one drawn edge.
+        let ego = idx.viz_ego("src/leaf.rs").expect("ego");
+        let ids: Vec<&str> = ego.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["file:src/leaf.rs", "file:src/hub.rs"]);
+        assert_eq!(ego.edges.len(), 1);
+        assert!(ego.edges[0].drawn);
+        assert_eq!(ego.edges[0].src, "file:src/leaf.rs");
+        assert_eq!(ego.edges[0].dst, "file:src/hub.rs");
+        // A disconnected file egos to a lone node; an unindexed path to nothing.
+        let lone = idx.viz_ego("src/lone.rs").expect("ego lone");
+        assert_eq!(lone.nodes.len(), 1);
+        assert!(lone.edges.is_empty());
+        assert!(idx.viz_ego("src/nope.rs").expect("ego nope").nodes.is_empty());
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

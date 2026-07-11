@@ -169,8 +169,8 @@ cargo/npm — check their sources manually.
 
 | Component | What / where | Update check |
 |---|---|---|
-| Kokoro TTS model | `kokoro-v1.0.onnx` + `voices/af_heart.bin` (Apache 2.0) — downloaded at release time from HuggingFace | HF model card; bump the download URL in `release.yml`. |
-| Whisper STT model | `ggml-small.bin` (~466 MB, MIT) — committed via Git LFS, verified vs `models/CHECKSUMS.txt` | whisper.cpp ggml model releases. |
+| Kokoro TTS model | `kokoro-v1.0.onnx` + `voices/*.bin` voicepacks (Apache 2.0) — fetched from the `models-v1` GitHub release by `scripts/fetch-models.ps1`, verified vs `models/CHECKSUMS.txt` | HF model card; publish updated blobs with `scripts/publish-models-release.ps1` (bump the tag on changes). |
+| Whisper STT model | `ggml-small.bin` (~466 MB, MIT) — fetched from the `models-v1` GitHub release, verified vs `models/CHECKSUMS.txt` | whisper.cpp ggml model releases. |
 | `llama-server` (llama.cpp) | offload backend **and** embedding server; user-run, not bundled | <https://github.com/ggml-org/llama.cpp/releases> — rebuild/redownload periodically. |
 | Offload model | Qwen3.6-35B-A3B (GGUF, quantized) on the local llama-server | newer Qwen / quant releases. |
 | Embedding model | Qwen3-Embedding-4B Q8_0, 2560-dim, on `mcp1:8085` (RTX 3070) | re-embed the graph if you change model/dims (auto-probed). |

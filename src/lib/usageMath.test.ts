@@ -1,5 +1,14 @@
 import { describe, expect, test } from 'vitest';
-import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio, fmtTok } from './usageMath';
+import {
+  turnTotal,
+  maxTurnTotal,
+  barHeightPct,
+  cacheHitRatio,
+  fmtTok,
+  costUsd,
+  sessionCost,
+  fmtUsd,
+} from './usageMath';
 
 function turn(over: Partial<{ in_tok: number; cache_read: number; out_tok: number; tool_chars: number }>) {
   return { in_tok: 0, cache_read: 0, out_tok: 0, tool_chars: 0, ...over };
@@ -96,5 +105,54 @@ describe('fmtTok', () => {
     // so 999.6 rounded up inside it and printed "1000" with no suffix.
     expect(fmtTok(999.6)).toBe('1.0k');
     expect(fmtTok(999.4)).toBe('999');
+  });
+});
+
+describe('costUsd', () => {
+  test('tokens × $/MTok, in dollars', () => {
+    expect(costUsd(1_000_000, 5)).toBe(5);
+    expect(costUsd(500_000, 10)).toBe(5);
+    expect(costUsd(0, 25)).toBe(0);
+  });
+
+  test('non-finite inputs (half-typed custom price field) cost 0, not NaN', () => {
+    expect(costUsd(Number.NaN, 5)).toBe(0);
+    expect(costUsd(1000, Number.NaN)).toBe(0);
+    expect(costUsd(1000, Number.POSITIVE_INFINITY)).toBe(0);
+  });
+});
+
+describe('sessionCost', () => {
+  const rates = { input: 5, cache_write: 6.25, cache_read: 0.5, output: 25 };
+
+  test('maps each UsageTotals category to its rate and sums the total', () => {
+    const c = sessionCost(
+      { in_tok: 1_000_000, cache_make: 2_000_000, cache_read: 4_000_000, out_tok: 100_000 },
+      rates,
+    );
+    expect(c.input).toBe(5);
+    expect(c.cache_write).toBe(12.5);
+    expect(c.cache_read).toBe(2);
+    expect(c.output).toBe(2.5);
+    expect(c.total).toBe(22);
+  });
+
+  test('an all-zero session costs zero', () => {
+    const c = sessionCost({ in_tok: 0, cache_make: 0, cache_read: 0, out_tok: 0 }, rates);
+    expect(c.total).toBe(0);
+  });
+});
+
+describe('fmtUsd', () => {
+  test('2 decimals from $1 up, 4 below so sub-cent costs stay visible', () => {
+    expect(fmtUsd(22)).toBe('$22.00');
+    expect(fmtUsd(1)).toBe('$1.00');
+    expect(fmtUsd(0.1234)).toBe('$0.1234');
+    expect(fmtUsd(0.0004)).toBe('$0.0004');
+    expect(fmtUsd(0)).toBe('$0.0000');
+  });
+
+  test('non-finite guards to $0.00', () => {
+    expect(fmtUsd(Number.NaN)).toBe('$0.00');
   });
 });

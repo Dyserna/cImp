@@ -60,6 +60,14 @@ Thumbs.db
 #.idea/
 .aider*
 
+# Model blobs (Kokoro TTS + voicepacks + Whisper STT). Not in git — they
+# moved out of Git LFS (CI pulls burned the LFS bandwidth quota) to assets
+# on the `models-v1` GitHub release. Fetch with scripts/fetch-models.ps1
+# (or .sh); only models/CHECKSUMS.txt is tracked.
+models/*.onnx
+models/ggml-*.bin
+models/voices/*.bin
+
 # Local release-staging output (workflow assembles this in CI; ignore if
 # you experiment with `npm run tauri build` followed by manual staging).
 staging/

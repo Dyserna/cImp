@@ -242,6 +242,19 @@ pub struct Settings {
     /// Preview tab is a dev-server surface, not a general (and
     /// prompt-injectable) browsing pane beside the agent tabs.
     pub preview_allow_remote: bool,
+    /// Provider/model token-price table ($ per million tokens) backing the
+    /// Code Intelligence tab's per-session cost popup. App-wide like
+    /// `prompt_templates`: read/written through dedicated `llm_pricing_*`
+    /// IPC that targets the physical global `settings.json` directly (see
+    /// `settings::persistence::{read,write}_global_llm_pricing`), NOT the
+    /// per-project overlay diff — an array field would be replaced wholesale
+    /// by the overlay merge, so routing it through `settings_update` would
+    /// silently scope "global" edits to one project. Seeded with current
+    /// Anthropic API + GitHub Copilot prices via the serde/`Default` default
+    /// (a file that carries the key — even as `[]` — keeps what it has, so
+    /// deleted seeds stay deleted; no `templates_seeded`-style flag needed).
+    #[serde(default = "default_llm_pricing")]
+    pub llm_pricing: Vec<LlmPricingModel>,
 }
 
 impl Default for Settings {
@@ -278,8 +291,68 @@ impl Default for Settings {
             advisor_dismissed: Vec::new(),
             preview_last_url: None,
             preview_allow_remote: false,
+            llm_pricing: default_llm_pricing(),
         }
     }
+}
+
+/// One provider/model price entry: USD per million tokens (MTok) for the four
+/// billing categories the transcripts report (`UsageTotals`' `in_tok` /
+/// `cache_make` / `cache_read` / `out_tok`). Fully user-editable in
+/// Settings → LLM pricing; the session-cost popup multiplies these against a
+/// session's token totals. `(provider, model)` is the display identity — no
+/// uniqueness is enforced, the popup just lists rows in order.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct LlmPricingModel {
+    pub provider: String,
+    pub model: String,
+    /// $/MTok for uncached input tokens.
+    pub input: f64,
+    /// $/MTok for cache-write (cache-creation) tokens.
+    pub cache_write: f64,
+    /// $/MTok for cache-read tokens.
+    pub cache_read: f64,
+    /// $/MTok for output tokens.
+    pub output: f64,
+}
+
+/// Fresh-install price seeds (as of 2026-07): Anthropic API list prices
+/// (cache write = 1.25x input at the default 5-minute TTL, cache read =
+/// 0.1x input) and GitHub Copilot's per-token prices from its June 2026
+/// usage-based billing (the Sonnet 5 row is the promo rate that runs
+/// through 2026-08-31). Copilot's OpenAI/Google rows had no published
+/// cache-write premium, so those seed cache_write = input; all values are
+/// plain editable rows, not constants the app depends on.
+pub fn default_llm_pricing() -> Vec<LlmPricingModel> {
+    fn row(provider: &str, model: &str, prices: [f64; 4]) -> LlmPricingModel {
+        LlmPricingModel {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            input: prices[0],
+            cache_write: prices[1],
+            cache_read: prices[2],
+            output: prices[3],
+        }
+    }
+    vec![
+        row("Anthropic", "Claude Fable 5", [10.0, 12.5, 1.0, 50.0]),
+        row("Anthropic", "Claude Opus 4.8", [5.0, 6.25, 0.5, 25.0]),
+        row("Anthropic", "Claude Opus 4.7", [5.0, 6.25, 0.5, 25.0]),
+        row("Anthropic", "Claude Opus 4.6", [5.0, 6.25, 0.5, 25.0]),
+        row("Anthropic", "Claude Sonnet 5", [3.0, 3.75, 0.3, 15.0]),
+        row("Anthropic", "Claude Sonnet 4.6", [3.0, 3.75, 0.3, 15.0]),
+        row("Anthropic", "Claude Haiku 4.5", [1.0, 1.25, 0.1, 5.0]),
+        row("Copilot", "Claude Sonnet 5 (promo)", [2.0, 2.5, 0.2, 10.0]),
+        row("Copilot", "Claude Sonnet 4.6", [3.0, 3.75, 0.3, 15.0]),
+        row("Copilot", "Claude Opus 4.8", [5.0, 6.25, 0.5, 25.0]),
+        row("Copilot", "Claude Haiku 4.5", [1.0, 1.25, 0.1, 5.0]),
+        row("Copilot", "GPT-5 mini", [0.25, 0.25, 0.025, 2.0]),
+        row("Copilot", "GPT-5.4", [2.5, 2.5, 0.25, 15.0]),
+        row("Copilot", "GPT-5.5", [5.0, 5.0, 0.5, 30.0]),
+        row("Copilot", "Gemini 2.5 Pro", [1.25, 1.25, 0.31, 10.0]),
+        row("Copilot", "Gemini 3.5 Flash", [1.5, 1.5, 0.38, 9.0]),
+    ]
 }
 
 /// V14 Phase D2: one dismissed advisor proposal. `rule_id` mirrors
@@ -1177,6 +1250,30 @@ pub struct GraphSettings {
     /// V15 Feature 4: cap on the rendered subgraph node count so large repos
     /// stay smooth (the view is bounded orientation, never the whole graph).
     pub graph_viz_max_nodes: u32,
+    /// Graph View tuning (all multipliers on the built-in behavior, `1.0` =
+    /// unchanged): file-node radius. One size doesn't fit every repo — a
+    /// dense monorepo wants smaller nodes/wider spacing than a 50-file tool.
+    pub graph_viz_node_scale: f32,
+    /// Directory-cluster size multiplier (the leash radius files orbit their
+    /// folder anchor at — bigger = looser, larger folder discs).
+    pub graph_viz_dir_scale: f32,
+    /// Edge line-width multiplier (ambient, emphasized, highlighted and the
+    /// aggregate folder↔folder edges all scale together).
+    pub graph_viz_edge_width: f32,
+    /// Spacing multiplier between FILE nodes (connected-pair rest length and
+    /// the matching node↔node repulsion).
+    pub graph_viz_node_spacing: f32,
+    /// Spacing multiplier between DIRECTORY clusters (anchor↔anchor rest
+    /// length and the matching cluster repulsion).
+    pub graph_viz_cluster_spacing: f32,
+    /// Directory-clustering tightness multiplier (the strength of the spring
+    /// leashing each file to its folder anchor — higher = files hug their
+    /// folder harder, lower = topology wins over directory grouping).
+    pub graph_viz_cluster_strength: f32,
+    /// Edge colors (`#rrggbb`): call edges and import edges. The remaining
+    /// hues (highlight pulses, subsystem palette) stay built-in.
+    pub graph_viz_color_call: String,
+    pub graph_viz_color_import: String,
     /// Segment colors for the Code Intelligence tab's "This session"
     /// stacked-bar chart (`#rrggbb`). Edited in-place by clicking the chart's
     /// legend swatches; defaults match the original hard-coded palette.
@@ -1255,6 +1352,14 @@ impl Default for GraphSettings {
             arch_min_community_size: 3,
             graph_viz: false,
             graph_viz_max_nodes: 1500,
+            graph_viz_node_scale: 1.0,
+            graph_viz_dir_scale: 1.0,
+            graph_viz_edge_width: 1.0,
+            graph_viz_node_spacing: 1.0,
+            graph_viz_cluster_spacing: 1.0,
+            graph_viz_cluster_strength: 1.0,
+            graph_viz_color_call: "#4fb3ff".to_string(),
+            graph_viz_color_import: "#ff8a3d".to_string(),
             usage_color_in: "#58a6ff".to_string(),
             usage_color_cache: "#d2a8ff".to_string(),
             usage_color_out: "#3fb950".to_string(),

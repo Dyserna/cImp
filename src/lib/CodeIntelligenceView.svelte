@@ -46,11 +46,23 @@
     type PathResult,
     type PathNodeRow,
     type ArchResult,
+    type SessionUsageRow,
   } from './graph';
-  import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio, fmtTok } from './usageMath';
+  import {
+    turnTotal,
+    maxTurnTotal,
+    barHeightPct,
+    cacheHitRatio,
+    fmtTok,
+    sessionCost,
+    fmtUsd,
+    type PriceRates,
+  } from './usageMath';
   import { fmtTime } from './format';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
+  import { llmPricingGet } from './settings/ipc';
+  import type { LlmPricingModel } from './settings/types';
 
   // The graph_* tool reference list and the recent-calls activity feed both
   // moved to the Tool Activity tab (ToolActivityView.svelte).
@@ -310,6 +322,44 @@
     if (u) usage = u;
     if (a) advice = a;
   }
+
+  // Session-cost popup: clicking a row in the Sessions card opens a modal
+  // that prices that session's token totals against a provider/model entry
+  // from the global LLM price table (Settings → LLM pricing), or against
+  // hand-typed custom rates. The table is fetched fresh on every open so
+  // edits made in the Settings window apply without reopening the tab.
+  let costSession = $state<SessionUsageRow | null>(null);
+  let costPricing = $state<LlmPricingModel[]>([]);
+  // Index into `costPricing`; `costPricing.length` is the sentinel for the
+  // trailing "Custom" option. Remembered across opens within this tab.
+  let costSelIdx = $state(0);
+  let costCustom = $state<PriceRates>({ input: 0, cache_write: 0, cache_read: 0, output: 0 });
+
+  async function openCostPopup(s: SessionUsageRow): Promise<void> {
+    costSession = s;
+    try {
+      costPricing = await llmPricingGet();
+    } catch (e) {
+      console.warn('llm_pricing_get failed', e);
+      costPricing = [];
+    }
+    // A shrunken table can strand the remembered index past the Custom
+    // sentinel — clamp back to the first provider (or Custom when empty).
+    if (costSelIdx > costPricing.length) costSelIdx = 0;
+  }
+  function closeCostPopup(): void {
+    costSession = null;
+  }
+  function onCostKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Escape' && costSession) {
+      e.stopPropagation();
+      closeCostPopup();
+    }
+  }
+  const costRates = $derived<PriceRates>(
+    costSelIdx < costPricing.length ? costPricing[costSelIdx] : costCustom,
+  );
+  const costRows = $derived(costSession ? sessionCost(costSession.totals, costRates) : null);
 
   // Applies a proposal by writing the ONE named `graph.*` field it targets
   // through the normal settings round-trip (`applySettings` — visible in
@@ -608,6 +658,8 @@
   }
 </script>
 
+<svelte:window onkeydown={onCostKeydown} />
+
 <div class="graph-monitor">
   <header>
     <h2>Code Intelligence</h2>
@@ -646,44 +698,27 @@
   {#if section === 'overview'}
   <h3 class="group-head">Usage</h3>
   <div class="usage-sec">
-    <!-- V14 Phase D2: Advisor card, always first. -->
-    <section class="card advisor">
-      <div class="history-head">
-        Budget-tuning advisor
-        <span class="muted" title={ADVISOR_RULES_TOOLTIP}>ⓘ rules</span>
-      </div>
-      {#if !advice}
-        <p class="placeholder">Loading…</p>
-      {:else if advice.collecting}
-        <p class="placeholder">
-          Collecting data — the advisor needs at least 5 sessions and enough injections/reminders
-          before it proposes anything.
-        </p>
-      {:else if advice.proposals.length === 0}
-        <p class="placeholder">No changes suggested — data looks healthy.</p>
-      {:else}
-        <div class="rows">
-          {#each advice.proposals as p (p.rule_id)}
-            <div class="proposal">
-              <div class="prop-head">
-                <span class="aname">{p.setting}</span>
-                <span class="prop-vals"><code>{p.current}</code> → <code>{p.proposed}</code></span>
-              </div>
-              <p class="prop-rationale">{p.rationale}</p>
-              <div class="prop-actions">
-                <button
-                  class="mini"
-                  disabled={advisorBusy !== null}
-                  onclick={() => applyProposal(p)}
-                >{advisorBusy === p.rule_id ? 'Applying…' : 'Apply'}</button>
-                <button
-                  class="mini secondary"
-                  disabled={advisorBusy !== null}
-                  onclick={() => dismissProposal(p)}
-                >Dismiss</button>
-              </div>
-            </div>
-          {/each}
+    <!-- Effectiveness: measured counters, never fabricated savings. -->
+    <section class="card">
+      <div class="history-head">Effectiveness</div>
+      {#if usage}
+        <div class="eff-counters">
+          <div>
+            <span class="num">{usage.effectiveness.injected_chars.toLocaleString()}</span>
+            <span class="lbl">chars injected <span class="est-badge">est. ~{Math.round(usage.effectiveness.injected_chars / 4).toLocaleString()} tok</span></span>
+          </div>
+          <div>
+            <span class="num">{usage.effectiveness.deduped_chars.toLocaleString()}</span>
+            <span class="lbl">chars suppressed by dedup <span class="est-badge">est. ~{Math.round(usage.effectiveness.deduped_chars / 4).toLocaleString()} tok</span></span>
+          </div>
+          <div>
+            <span class="num">{usage.effectiveness.advisor_displaced_chars.toLocaleString()}</span>
+            <span class="lbl">chars displaced by read-advisor <span class="est-badge">est. ~{Math.round(usage.effectiveness.advisor_displaced_chars / 4).toLocaleString()} tok</span></span>
+          </div>
+          <div>
+            <span class="num">{usage.offload_local_tasks.toLocaleString()}</span>
+            <span class="lbl">tasks served locally — see the <em>Offload Server</em> tab</span>
+          </div>
         </div>
       {/if}
     </section>
@@ -691,16 +726,16 @@
     <!-- This session: per-turn stacked bars + top consumers. The segment
          colors flow from settings (via the legend's color pickers) into CSS
          vars scoped to this card. -->
-    <section
+    <details
       class="card"
       style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}"
     >
-      <div class="history-head">
+      <summary class="history-head">
         This session
         {#if shownTurns.length < usageTurns.length}
           <span class="muted">(last {shownTurns.length} of {usageTurns.length} turns)</span>
         {/if}
-      </div>
+      </summary>
       {#if !usage || !usage.current || usage.current.turns.length === 0}
         <p class="placeholder">No usage recorded yet this session.</p>
       {:else}
@@ -756,19 +791,63 @@
           </div>
         {/if}
       {/if}
-    </section>
+    </details>
+
+    <!-- V14 Phase D2: Advisor card. -->
+    <details class="card advisor">
+      <summary class="history-head">
+        Budget-tuning advisor
+        <span class="muted" title={ADVISOR_RULES_TOOLTIP}>ⓘ rules</span>
+      </summary>
+      {#if !advice}
+        <p class="placeholder">Loading…</p>
+      {:else if advice.collecting}
+        <p class="placeholder">
+          Collecting data — the advisor needs at least 5 sessions and enough injections/reminders
+          before it proposes anything.
+        </p>
+      {:else if advice.proposals.length === 0}
+        <p class="placeholder">No changes suggested — data looks healthy.</p>
+      {:else}
+        <div class="rows">
+          {#each advice.proposals as p (p.rule_id)}
+            <div class="proposal">
+              <div class="prop-head">
+                <span class="aname">{p.setting}</span>
+                <span class="prop-vals"><code>{p.current}</code> → <code>{p.proposed}</code></span>
+              </div>
+              <p class="prop-rationale">{p.rationale}</p>
+              <div class="prop-actions">
+                <button
+                  class="mini"
+                  disabled={advisorBusy !== null}
+                  onclick={() => applyProposal(p)}
+                >{advisorBusy === p.rule_id ? 'Applying…' : 'Apply'}</button>
+                <button
+                  class="mini secondary"
+                  disabled={advisorBusy !== null}
+                  onclick={() => dismissProposal(p)}
+                >Dismiss</button>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </details>
 
     <!-- Sessions: project-wide totals table. -->
-    <section class="card">
-      <div class="history-head">Sessions <span class="muted">({usage?.sessions.length ?? 0})</span></div>
+    <details class="card">
+      <summary class="history-head">Sessions <span class="muted">({usage?.sessions.length ?? 0})</span></summary>
       {#if !usage || usage.sessions.length === 0}
         <p class="placeholder">No sessions recorded yet.</p>
       {:else}
         <div class="rows scroll10">
           {#each usage.sessions as s (s.session_id)}
-            <div
+            <button
+              type="button"
               class="arow sessrow"
-              title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens`}
+              title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens — click for cost`}
+              onclick={() => void openCostPopup(s)}
             >
               <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}</span>
               <span class="sess-stats tnum">
@@ -778,40 +857,11 @@
                 <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
               </span>
               <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
-            </div>
+            </button>
           {/each}
         </div>
       {/if}
-    </section>
-
-    <!-- Effectiveness: measured counters, never fabricated savings. -->
-    <section class="card">
-      <div class="history-head">Effectiveness</div>
-      <p class="caveat">
-        Measured characters, not fabricated savings — every token figure below is
-        the same honest <code>chars / 4</code> estimate used everywhere else in this tab.
-      </p>
-      {#if usage}
-        <div class="eff-counters">
-          <div>
-            <span class="num">{usage.effectiveness.injected_chars.toLocaleString()}</span>
-            <span class="lbl">chars injected <span class="est-badge">est. ~{Math.round(usage.effectiveness.injected_chars / 4).toLocaleString()} tok</span></span>
-          </div>
-          <div>
-            <span class="num">{usage.effectiveness.deduped_chars.toLocaleString()}</span>
-            <span class="lbl">chars suppressed by dedup <span class="est-badge">est. ~{Math.round(usage.effectiveness.deduped_chars / 4).toLocaleString()} tok</span></span>
-          </div>
-          <div>
-            <span class="num">{usage.effectiveness.advisor_displaced_chars.toLocaleString()}</span>
-            <span class="lbl">chars displaced by read-advisor <span class="est-badge">est. ~{Math.round(usage.effectiveness.advisor_displaced_chars / 4).toLocaleString()} tok</span></span>
-          </div>
-          <div>
-            <span class="num">{usage.offload_local_tasks.toLocaleString()}</span>
-            <span class="lbl">tasks served locally — see the <em>Offload Server</em> tab</span>
-          </div>
-        </div>
-      {/if}
-    </section>
+    </details>
   </div>
 
   <h3 class="group-head">Index</h3>
@@ -1326,6 +1376,83 @@
           {/if}
         </section>
       {/if}
+    </div>
+  {/if}
+
+  <!-- Session-cost popup: tokens × $/MTok for the clicked Sessions row. -->
+  {#if costSession && costRows}
+    <div class="cost-backdrop" onclick={closeCostPopup} role="presentation"></div>
+    <div class="cost-dialog" role="dialog" aria-modal="true" aria-label="Session cost">
+      <div class="cost-title">
+        <span>
+          Session cost <span class="muted">· {costSession.agent}</span>
+          {#if costSession.est_only}
+            <span class="est-badge" title="No exact usage data for this agent — chars-only estimate; the cost below is an estimate too">est</span>
+          {/if}
+        </span>
+        <button type="button" class="cost-close" aria-label="Close" onclick={closeCostPopup}>×</button>
+      </div>
+
+      <label class="cost-provider">
+        <span>Pricing</span>
+        <select bind:value={costSelIdx}>
+          {#each costPricing as p, i (i)}
+            <option value={i}>{p.provider} — {p.model}</option>
+          {/each}
+          <option value={costPricing.length}>Custom…</option>
+        </select>
+      </label>
+
+      {#if costSelIdx >= costPricing.length}
+        <div class="cost-custom">
+          <label><span>Input $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.input} /></label>
+          <label><span>Cache write $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.cache_write} /></label>
+          <label><span>Cache read $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.cache_read} /></label>
+          <label><span>Output $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.output} /></label>
+        </div>
+      {/if}
+
+      <table class="cost-table tnum">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Input</th>
+            <th>Cache write</th>
+            <th>Cache read</th>
+            <th>Output</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th>Session tokens</th>
+            <td title={costSession.totals.in_tok.toLocaleString()}>{fmtTok(costSession.totals.in_tok)}</td>
+            <td title={costSession.totals.cache_make.toLocaleString()}>{fmtTok(costSession.totals.cache_make)}</td>
+            <td title={costSession.totals.cache_read.toLocaleString()}>{fmtTok(costSession.totals.cache_read)}</td>
+            <td title={costSession.totals.out_tok.toLocaleString()}>{fmtTok(costSession.totals.out_tok)}</td>
+          </tr>
+          <tr>
+            <th>$ / MTok</th>
+            <td>{costRates.input}</td>
+            <td>{costRates.cache_write}</td>
+            <td>{costRates.cache_read}</td>
+            <td>{costRates.output}</td>
+          </tr>
+          <tr>
+            <th>Cost</th>
+            <td>{fmtUsd(costRows.input)}</td>
+            <td>{fmtUsd(costRows.cache_write)}</td>
+            <td>{fmtUsd(costRows.cache_read)}</td>
+            <td>{fmtUsd(costRows.output)}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="cost-total">
+        Total session cost <b>{fmtUsd(costRows.total)}</b>
+      </div>
+      <small class="cost-hint">
+        Prices are editable in Settings → LLM pricing.
+      </small>
     </div>
   {/if}
 </div>
@@ -1859,6 +1986,30 @@
     opacity: 0.85;
   }
 
+  /* Collapsible usage cards. The flex .history-head summary suppresses the
+     native disclosure marker, so draw our own chevron. */
+  .usage-sec details.card > summary {
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+  }
+  .usage-sec details.card > summary::-webkit-details-marker {
+    display: none;
+  }
+  .usage-sec details.card:not([open]) > summary {
+    margin-bottom: 0;
+  }
+  .usage-sec details.card > summary::before {
+    content: '▸';
+    display: inline-block;
+    opacity: 0.55;
+    font-size: 11px;
+    transition: transform 0.12s ease;
+  }
+  .usage-sec details.card[open] > summary::before {
+    transform: rotate(90deg);
+  }
+
   /* Advisor card. */
   .advisor .history-head .muted {
     margin-left: auto;
@@ -1985,6 +2136,133 @@
   /* agent | the four billing stats | cache-hit % */
   .arow.sessrow {
     grid-template-columns: minmax(6rem, 1fr) auto auto;
+  }
+  /* The session rows are <button>s (they open the cost popup) — strip the UA
+     button chrome so they keep rendering as plain grid rows. */
+  button.arow.sessrow {
+    background: none;
+    border: none;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    width: 100%;
+    cursor: pointer;
+  }
+  button.arow.sessrow:hover {
+    background: var(--surface-raised, rgba(255, 255, 255, 0.04));
+  }
+
+  /* Session-cost popup. Fixed-position so it centers on the window even
+     though this tab's root is its own absolutely-positioned scroll box. */
+  .cost-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 100;
+  }
+  .cost-dialog {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 101;
+    min-width: 30rem;
+    max-width: min(44rem, calc(100vw - 2rem));
+    background: var(--surface-3, #1d1d1d);
+    border: 1px solid var(--border, #333);
+    border-radius: 8px;
+    padding: 14px 16px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+    font-size: 13px;
+  }
+  .cost-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  .cost-close {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+  }
+  .cost-close:hover {
+    color: var(--text, #fff);
+  }
+  .cost-provider {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .cost-provider select {
+    flex: 1;
+  }
+  .cost-custom {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+    margin-bottom: 10px;
+  }
+  .cost-custom label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .cost-custom input {
+    width: 6.5rem;
+    text-align: right;
+  }
+  .cost-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 10px;
+  }
+  .cost-table th,
+  .cost-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+  }
+  .cost-table thead th {
+    text-align: right;
+    font-weight: 600;
+    color: var(--text-subtle, #999);
+  }
+  .cost-table tbody th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--text-subtle, #999);
+    white-space: nowrap;
+  }
+  .cost-table td {
+    text-align: right;
+    white-space: nowrap;
+  }
+  .cost-table tbody tr:last-child th,
+  .cost-table tbody tr:last-child td {
+    font-weight: 600;
+    color: var(--text, #ddd);
+  }
+  .cost-total {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 14px;
+    margin-bottom: 6px;
+  }
+  .cost-total b {
+    font-size: 16px;
+  }
+  .cost-hint {
+    color: var(--text-subtle, #999);
   }
   /* Constant width + right alignment so the percentages line up too. */
   .arow.sessrow .aloc {

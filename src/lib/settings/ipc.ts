@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AiToolTabConfig, Settings } from './types';
+import type { AiToolTabConfig, LlmPricingModel, Settings } from './types';
 import type { TabId } from '../tabs/types';
 
 export async function settingsGet(): Promise<Settings> {
@@ -52,4 +52,20 @@ export async function aiToolTabDefaults(tab: TabId): Promise<AiToolTabConfig> {
 /// restored on next launch. Backend debounces the save.
 export async function setActiveTab(tab: TabId): Promise<void> {
   await invoke('set_active_tab', { tab });
+}
+
+/// The global LLM price table ($ per MTok per provider/model), read straight
+/// from the physical global `settings.json` (missing file/key → the backend's
+/// seeded Anthropic/Copilot defaults). Used by the Code Intelligence tab's
+/// session-cost popup and the Settings → LLM pricing editor.
+export async function llmPricingGet(): Promise<LlmPricingModel[]> {
+  return invoke('llm_pricing_get');
+}
+
+/// Save the LLM price table straight to the physical global `settings.json`
+/// — NOT through `settingsUpdate`'s per-project overlay diff (an array field
+/// would land in the project overlay instead of global). Mirror of
+/// `composeTemplatesGlobalSet`.
+export async function llmPricingSet(pricing: LlmPricingModel[]): Promise<void> {
+  await invoke('llm_pricing_set', { pricing });
 }

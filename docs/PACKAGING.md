@@ -69,14 +69,21 @@ Per-platform targets:
 
 ## Kokoro Model Files
 
-The portable zip ships `kokoro-v1.0.onnx` + `af_heart.bin` (Apache 2.0,
-attributed in `NOTICE`). The release workflow downloads them from
-HuggingFace at build time — they are not checked into the source repo.
+The portable zip ships `kokoro-v1.0.onnx` + every `voices/*.bin` voicepack
+(Apache 2.0, attributed in `NOTICE`). The blobs are not checked into the
+source repo: they live as assets on the `models-v1` GitHub release (they
+were briefly in-repo via Git LFS, but the release workflow's LFS pulls
+exhausted the free bandwidth quota; release-asset downloads are unmetered)
+and are fetched + SHA-256-verified against `models/CHECKSUMS.txt` by
+`scripts/fetch-models.ps1`, which the workflow runs behind an
+`actions/cache` layer so warm CI runs download nothing.
 
 Source builds (`npm run tauri build` locally without the workflow) need
 the model files dropped into `<exe-dir>/../models/` — for a `cargo run`
 that means `src-tauri/target/models/`, for a portable-staged build it's
-the `models/` sibling of `bin/`. There is no APPDATA fallback.
+the `models/` sibling of `bin/`. There is no APPDATA fallback. After a
+fresh clone, `scripts/fetch-models.ps1` (or `.sh`) populates the repo's
+`models/` folder.
 
 Alternative distribution shapes considered and rejected:
 
@@ -94,10 +101,9 @@ Alternative distribution shapes considered and rejected:
 
 The **full** portable zip also ships a ggml Whisper model — default
 `ggml-small.bin` (~466 MB, MIT, attributed in `NOTICE`) — into the same
-`<exe-dir>/../models/` directory as the Kokoro assets. Unlike Kokoro it is
-**committed via Git LFS** (alongside the Kokoro model + voicepacks) and
-verified against `models/CHECKSUMS.txt` by the workflow's existing
-"Verify committed assets" step; no build-time download.
+`<exe-dir>/../models/` directory as the Kokoro assets. Like Kokoro it is
+hosted on the `models-v1` GitHub release and fetched + verified against
+`models/CHECKSUMS.txt` by the workflow's "Fetch + verify models" step.
 
 The **slim / no-models** zip does **not** include it, so re-extracting a
 no-models update never clobbers a user's local `ggml-*.bin`. The full zip
@@ -109,7 +115,7 @@ they appear in Settings → Speech-to-text → Model. A missing configured
 model degrades gracefully to an in-UI "model not found" state (the app
 still launches; the record button surfaces an error on first use). The
 release-staging copy is guarded by `Test-Path` so a release can ship
-before the LFS blob is committed.
+before the blob is listed in `CHECKSUMS.txt`.
 
 ## TTS GPU — portable WebGPU (the released zip)
 

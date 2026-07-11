@@ -24,6 +24,8 @@
   import { revealFileInGraph } from './graphReveal';
   import { revealTab } from './tabs/visibility';
   import { GRAPH_VIEW_TAB_ID } from './tabs/types';
+  import { graphVizFileStatus, onGraphStatus, type VizFileStatus } from './graph';
+  import type { UnlistenFn } from '@tauri-apps/api/event';
 
   // SvelteSet/SvelteMap, NOT plain Set/Map in $state: Svelte 5's proxy only
   // deep-proxies plain objects/arrays, so in-place .add()/.set() on a plain
@@ -36,13 +38,59 @@
   let viewMode = $state<'unified' | 'side-by-side'>('unified');
 
   let release: (() => void) | null = null;
+  let unsubGraphStatus: UnlistenFn | undefined;
   onMount(() => {
     release = watchWorkbenchDiff();
     void refreshWorkbenchDiffNow();
+    // Statuses only move when the graph re-indexes, so refresh them on each
+    // completed index pass (the fs-watcher re-indexes exactly the files that
+    // change) rather than on every diff-summary tick.
+    void onGraphStatus((s) => {
+      if (s.state !== 'ready') return;
+      void loadGraphStatuses(lastStatusPaths, true);
+    }).then((un) => (unsubGraphStatus = un));
   });
   onDestroy(() => {
     release?.();
     release = null;
+    unsubGraphStatus?.();
+    unsubGraphStatus = undefined;
+  });
+
+  // ── ⌖ button state — per-file graph presence ─────────────────────────────
+  // The jump button disables for files the graph can't show: not indexed at
+  // all, or indexed with zero rolled-up import/call edges (degree-0 files are
+  // never in the viz snapshot). While a status is unknown (fetch pending or
+  // failed) the button stays enabled and the Graph View's own reveal-miss
+  // notice is the fallback.
+  const graphStatuses = new SvelteMap<string, VizFileStatus>();
+  let statusSeq = 0;
+  let lastStatusKey = '';
+  let lastStatusPaths: string[] = [];
+  async function loadGraphStatuses(paths: string[], force = false): Promise<void> {
+    const key = paths.join('\n');
+    if (!force && key === lastStatusKey) return; // same visible list — nothing moved
+    lastStatusKey = key;
+    lastStatusPaths = paths;
+    if (paths.length === 0) {
+      graphStatuses.clear();
+      return;
+    }
+    const seq = ++statusSeq;
+    try {
+      const rows = await graphVizFileStatus(paths);
+      if (seq !== statusSeq) return; // a newer fetch superseded this one
+      graphStatuses.clear();
+      for (const r of rows) graphStatuses.set(r.path, r);
+    } catch (e) {
+      // Keep whatever statuses we had — unknown files fall back to enabled.
+      console.warn('graph_viz_file_status failed:', e);
+    }
+  }
+  $effect(() => {
+    if (!$settings.graph.enabled || !$settings.graph.graph_viz) return;
+    const files = $workbenchDiff?.files ?? [];
+    void loadGraphStatuses(files.slice(0, MAX_FILE_ROWS).map((f) => f.path));
   });
 
   // Per-path fetch tokens: successive summaries can put two
@@ -221,11 +269,17 @@
               {/if}
             </button>
             {#if $settings.graph.enabled && $settings.graph.graph_viz}
+              {@const gs = graphStatuses.get(f.path)}
               <button
                 type="button"
                 class="graph-jump"
-                title="Show in Graph View"
+                title={gs && !gs.indexed
+                  ? 'Not in the code graph (file isn’t indexed)'
+                  : gs && gs.degree === 0
+                    ? 'No imports or calls in the code graph'
+                    : 'Show in Graph View'}
                 aria-label="Show {f.path} in Graph View"
+                disabled={gs !== undefined && (!gs.indexed || gs.degree === 0)}
                 onclick={() => jumpToGraph(f.path)}
               >⌖</button>
             {/if}
@@ -401,9 +455,13 @@
     font-size: var(--font-size-md);
     cursor: pointer;
   }
-  .graph-jump:hover {
+  .graph-jump:hover:not(:disabled) {
     background: var(--surface-3);
     color: var(--text-primary);
+  }
+  .graph-jump:disabled {
+    opacity: 0.35;
+    cursor: default;
   }
   .file-header {
     appearance: none;

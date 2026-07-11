@@ -21,9 +21,10 @@ espeak-ng:
 ------------------------------------------------------------------------
 
 The portable Windows zip distribution of cImp bundles the Kokoro 82M
-ONNX model and the af_heart voicepack. These files are not included in
-the source repository and are downloaded at build time from the
-onnx-community mirror on HuggingFace; their license is independent of
+ONNX model and its voicepacks. These files are not included in the
+source repository; they are distributed via the project's `models-v1`
+GitHub release (originally obtained from the onnx-community mirror on
+HuggingFace) and fetched at build time. Their license is independent of
 the cImp source license above.
 
 Kokoro-82M-v1.0-ONNX:
@@ -48,8 +49,9 @@ whisper.cpp:
 
 The portable Windows zip (full variant only) bundles a ggml Whisper
 speech-to-text model (default `ggml-small.bin`). Like the Kokoro model,
-it is tracked via Git LFS rather than committed to source, and its
-license is independent of the cImp source license above.
+it is distributed via the project's `models-v1` GitHub release rather
+than committed to source, and its license is independent of the cImp
+source license above.
 
 Whisper (ggml models):
   Source: https://huggingface.co/ggerganov/whisper.cpp

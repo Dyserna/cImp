@@ -46,6 +46,57 @@ export function cacheHitRatio(cacheRead: number, inTok: number): number {
   return denom > 0 ? cacheRead / denom : 0;
 }
 
+/// The four $/MTok rates the session-cost popup multiplies against a
+/// session's `UsageTotals`. Structural subset of the settings-side
+/// `LlmPricingModel` (which additionally carries `provider`/`model`), so a
+/// pricing row can be passed directly.
+export interface PriceRates {
+  input: number;
+  cache_write: number;
+  cache_read: number;
+  output: number;
+}
+
+/// The token counts a cost is computed from — field names match
+/// `UsageTotals` (`graph.ts`) so a `SessionUsageRow.totals` passes directly.
+export interface CostTokens {
+  in_tok: number;
+  out_tok: number;
+  cache_read: number;
+  cache_make: number;
+}
+
+/// tokens × ($ per million tokens) → dollars. Guards non-finite inputs to 0
+/// so a half-typed custom price field ("", ".", NaN) renders as $0 rather
+/// than NaN across the whole table.
+export function costUsd(tokens: number, perMTok: number): number {
+  if (!Number.isFinite(tokens) || !Number.isFinite(perMTok)) return 0;
+  return (tokens / 1_000_000) * perMTok;
+}
+
+/// Per-category dollar cost of a session plus the grand total — the popup's
+/// third table row and the line under it. Category mapping: `in_tok` bills
+/// at the input rate, `cache_make` (cache-creation) at cache_write,
+/// `cache_read` at cache_read, `out_tok` at output.
+export function sessionCost(
+  totals: CostTokens,
+  rates: PriceRates,
+): { input: number; cache_write: number; cache_read: number; output: number; total: number } {
+  const input = costUsd(totals.in_tok, rates.input);
+  const cache_write = costUsd(totals.cache_make, rates.cache_write);
+  const cache_read = costUsd(totals.cache_read, rates.cache_read);
+  const output = costUsd(totals.out_tok, rates.output);
+  return { input, cache_write, cache_read, output, total: input + cache_write + cache_read + output };
+}
+
+/// Dollar formatter for the cost table: 2 decimals from $1 up, 4 below so
+/// sub-cent costs (a short session at Haiku rates) don't collapse to
+/// "$0.00". Non-finite guards to "$0.00" like `costUsd`.
+export function fmtUsd(n: number): string {
+  if (!Number.isFinite(n)) return '$0.00';
+  return '$' + (Math.abs(n) >= 1 ? n.toFixed(2) : n.toFixed(4));
+}
+
 /// Compact token-count formatter for the Sessions table's per-row billing
 /// stats, where four multi-million counts share one line ("61.2M", "9.9k",
 /// "412"). One decimal below 10k, integer k below 1M (the 999,500 boundary

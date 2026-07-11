@@ -12,13 +12,16 @@
   import { onMount, onDestroy } from 'svelte';
   import {
     graphVizSnapshot,
+    graphVizEgo,
     graphHistory,
     onGraphStatus,
     type VizGraphResult,
     type VizNodeRow,
+    type VizEdgeRow,
     type GraphCall,
   } from './graph';
   import { settings } from './settings/store';
+  import type { Settings } from './settings/types';
   import { graphReveal, clearGraphReveal } from './graphReveal';
 
   // Mirrors WorkbenchView/CodeIntelligenceView: an optional project root:
@@ -49,6 +52,23 @@
   const MIN_DIST_3D = 80;
   const MAX_DIST_3D = 4000;
   const NEAR_3D = 8;
+
+  // ── Settings-driven tuning (Settings → Code Intelligence → Graph View
+  // tuning). Multipliers on the base constants below — one size doesn't fit
+  // every repo. The numeric knobs are read at frame rate by the physics/
+  // render loop, so they live in a plain object updated by the settings
+  // subscription (applyTuning), NOT in $state; the two edge colors ARE
+  // $state because the legend/connections templates render them too.
+  let tune = {
+    nodeScale: 1,
+    dirScale: 1,
+    edgeWidth: 1,
+    nodeSpacing: 1,
+    clusterSpacing: 1,
+    clusterStrength: 1,
+  };
+  let edgeCallColor = $state(EDGE_CALL);
+  let edgeImportColor = $state(EDGE_IMPORT);
 
   // Physics tuning. O(n^2) repulsion is fine up to a few hundred nodes (the
   // backend caps the snapshot: `graph_viz_max_nodes` nodes, ~4 edges/node);
@@ -185,6 +205,13 @@
   // the reveal can arrive before the first buildSim).
   let pendingReveal: string | null = null;
   let revealMissTimer: ReturnType<typeof setTimeout> | undefined;
+  // The last plain snapshot from the backend, and whether the sim currently
+  // carries an injected reveal ego on top of it (a jump target the top-N cut
+  // dropped, plus its neighbors). Clearing the selection rebuilds from
+  // `lastSnap`, which is what removes the injected nodes again.
+  let lastSnap: VizGraphResult | null = null;
+  let egoInjected = false;
+  let egoSeq = 0;
 
   // View transform.
   let viewW = 0;
@@ -266,8 +293,8 @@
     return SUBSYSTEM_PALETTE[hashStr(name) % SUBSYSTEM_PALETTE.length];
   }
   function edgeColor(kind: string): string {
-    if (kind === 'call') return EDGE_CALL;
-    if (kind === 'import') return EDGE_IMPORT;
+    if (kind === 'call') return edgeCallColor;
+    if (kind === 'import') return edgeImportColor;
     if (kind === 'contains') return EDGE_CONTAINS;
     return EDGE_OTHER;
   }
@@ -351,6 +378,17 @@
   });
 
   // ── Force simulation ─────────────────────────────────────────────────────
+  // Log-scaled and small: rolled-up file degrees span 1..hundreds, and a
+  // sqrt scale ballooned every hub into an edge-hiding blob. The settings
+  // knob multiplies the whole curve.
+  function nodeRadius(deg: number): number {
+    return clamp(2 + Math.log2(1 + deg) * 0.8, 2, 7) * tune.nodeScale;
+  }
+  // Rest length of the member↔anchor leash — the directory cluster's size.
+  function leashFor(memberCount: number): number {
+    return (12 + Math.sqrt(memberCount) * 6) * tune.dirScale;
+  }
+
   function initPosition(index: number, total: number): { x: number; y: number; z: number } {
     const golden = Math.PI * (3 - Math.sqrt(5));
     const theta = index * golden;
@@ -366,9 +404,12 @@
     const dy = a.y - b.y;
     const dz = a.z - b.z;
     const distSq = dx * dx + dy * dy + dz * dz + 0.01;
-    if (distSq > REPEL_CUTOFF_SQ) return;
+    // Spacing scales the repulsion (and its cutoff) quadratically so the
+    // node↔node equilibrium distance scales ~linearly with the knob.
+    const sp2 = tune.nodeSpacing * tune.nodeSpacing;
+    if (distSq > REPEL_CUTOFF_SQ * sp2) return;
     const dist = Math.sqrt(distSq);
-    const f = (REPULSION_K * weight) / distSq;
+    const f = (REPULSION_K * sp2 * weight) / distSq;
     const fx = (dx / dist) * f;
     const fy = (dy / dist) * f;
     const fz = (dz / dist) * f;
@@ -390,7 +431,7 @@
     // as a cone. This way leaves come to the hub, not the reverse.
     const degA = Math.max(1, a.degree || 1);
     const degB = Math.max(1, b.degree || 1);
-    const f = (SPRING_K / Math.min(degA, degB)) * (dist - SPRING_LEN);
+    const f = (SPRING_K / Math.min(degA, degB)) * (dist - SPRING_LEN * tune.nodeSpacing);
     const biasA = degB / (degA + degB);
     const fx = (dx / dist) * f;
     const fy = (dy / dist) * f;
@@ -434,16 +475,19 @@
 
     {
       for (const c of clusters) { c.fx = 0; c.fy = 0; c.fz = 0; }
-      // Anchor↔anchor repulsion: the gross cluster separation.
+      // Anchor↔anchor repulsion: the gross cluster separation. The spacing
+      // knob scales it (and its cutoff) quadratically, same rationale as
+      // applyRepulsion's node-spacing scaling.
+      const csp2 = tune.clusterSpacing * tune.clusterSpacing;
       for (let i = 0; i < clusters.length; i++) {
         const a = clusters[i];
         for (let j = i + 1; j < clusters.length; j++) {
           const b = clusters[j];
           const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
           const d2 = dx * dx + dy * dy + dz * dz + 0.01;
-          if (d2 > DIR_REPEL_CUTOFF_SQ) continue;
+          if (d2 > DIR_REPEL_CUTOFF_SQ * csp2) continue;
           const dist = Math.sqrt(d2);
-          const f = DIR_REPULSION_K / d2;
+          const f = (DIR_REPULSION_K * csp2) / d2;
           const fx = (dx / dist) * f, fy = (dy / dist) * f, fz = (dz / dist) * f;
           a.fx += fx; a.fy += fy; a.fz += fz;
           b.fx -= fx; b.fy -= fy; b.fz -= fz;
@@ -455,7 +499,7 @@
         const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
         const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.01;
         const k = DIR_EDGE_K * Math.min(4, 1 + Math.log2(1 + de.weight));
-        const f = k * (dist - DIR_EDGE_LEN);
+        const f = k * (dist - DIR_EDGE_LEN * tune.clusterSpacing);
         const fx = (dx / dist) * f, fy = (dy / dist) * f, fz = (dz / dist) * f;
         a.fx += fx; a.fy += fy; a.fz += fz;
         b.fx -= fx; b.fy -= fy; b.fz -= fz;
@@ -469,7 +513,7 @@
         for (const m of c.members) {
           const dx = c.x - m.x, dy = c.y - m.y, dz = c.z - m.z;
           const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.01;
-          const f = DIR_MEMBER_K * (dist - c.leash);
+          const f = DIR_MEMBER_K * tune.clusterStrength * (dist - c.leash);
           const fx = (dx / dist) * f, fy = (dy / dist) * f, fz = (dz / dist) * f;
           m.fx += fx; m.fy += fy; m.fz += fz;
           c.fx -= fx * inv; c.fy -= fy * inv; c.fz -= fz * inv;
@@ -543,7 +587,9 @@
       const scale = camFocal / fz;
       n.sx = viewW / 2 + rx * scale;
       n.sy = viewH / 2 - ry * scale;
-      n.sr = clamp(n.r * scale, 1, 16);
+      // The screen-radius ceiling grows with the node-scale knob so scaling
+      // up isn't silently flattened for close-by nodes.
+      n.sr = clamp(n.r * scale, 1, 16 * Math.max(1, tune.nodeScale));
       n.sz = fz;
     }
     for (const c of clusters) {
@@ -626,8 +672,8 @@
         ctx.beginPath();
         ctx.moveTo(de.a.sx, de.a.sy);
         ctx.lineTo(de.b.sx, de.b.sy);
-        ctx.lineWidth = Math.min(5, 1 + Math.log2(1 + de.weight));
-        ctx.strokeStyle = de.callW >= de.importW ? EDGE_CALL : EDGE_IMPORT;
+        ctx.lineWidth = Math.min(5, 1 + Math.log2(1 + de.weight)) * tune.edgeWidth;
+        ctx.strokeStyle = de.callW >= de.importW ? edgeCallColor : edgeImportColor;
         ctx.globalAlpha = 0.3;
         ctx.stroke();
       }
@@ -726,7 +772,7 @@
       g.push(e);
     }
     ctx.globalAlpha = selDir ? 0.4 : 0.16;
-    ctx.lineWidth = 1;
+    ctx.lineWidth = tune.edgeWidth;
     for (const g of groups.values()) {
       ctx.beginPath();
       for (const e of g) {
@@ -740,14 +786,14 @@
       ctx.stroke();
     }
     ctx.globalAlpha = 0.85;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 1.5 * tune.edgeWidth;
     for (const e of emphasized) {
       ctx.setLineDash(dashFor(e.confidence));
       ctx.strokeStyle = edgeColor(e.kind);
       strokeEdgePath(e);
     }
     ctx.globalAlpha = 0.95;
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 2.5 * tune.edgeWidth;
     for (const e of highlighted) {
       ctx.setLineDash(dashFor(e.confidence));
       ctx.strokeStyle = e.highlightColor ?? edgeColor(e.kind);
@@ -936,10 +982,7 @@
       const pos = old
         ? { x: old.x, y: old.y, z: old.z }
         : initPosition(i, snap.nodes.length);
-      const deg = row.degree || 0;
-      // Log-scaled and small: rolled-up file degrees span 1..hundreds, and
-      // the old sqrt scale ballooned every hub into an edge-hiding blob.
-      const r = clamp(2 + Math.log2(1 + deg) * 0.8, 2, 7);
+      const r = nodeRadius(row.degree || 0);
       const sn: SimNode = {
         ...row,
         x: pos.x, y: pos.y, z: pos.z,
@@ -985,7 +1028,7 @@
       }
       const c: DirCluster = {
         name: dir, members,
-        leash: 12 + Math.sqrt(members.length) * 6,
+        leash: leashFor(members.length),
         x: ax, y: ay, z: az,
         vx: 0, vy: 0, vz: 0, fx: 0, fy: 0, fz: 0,
         sx: 0, sy: 0, sz: 0, discR: 0,
@@ -1060,6 +1103,9 @@
     fetchError = null;
     try {
       const snap = await graphVizSnapshot(root);
+      // A fresh snapshot replaces any injected reveal ego wholesale.
+      lastSnap = snap;
+      egoInjected = false;
       buildSim(snap);
     } catch (e) {
       fetchError = String(e);
@@ -1175,6 +1221,11 @@
   }
 
   // ── Workbench reveal (graphReveal store) ─────────────────────────────────
+  function showRevealMiss(msg: string): void {
+    revealMiss = msg;
+    if (revealMissTimer) clearTimeout(revealMissTimer);
+    revealMissTimer = setTimeout(() => (revealMiss = null), 5000);
+  }
   function tryReveal(): void {
     if (!pendingReveal || nodes.length === 0) return;
     const path = pendingReveal;
@@ -1184,10 +1235,78 @@
       selectNode(node);
       return;
     }
-    revealMiss = `${path} isn't in the rendered graph (top ${vizMax} files by degree)`;
-    if (revealMissTimer) clearTimeout(revealMissTimer);
-    revealMissTimer = setTimeout(() => (revealMiss = null), 5000);
+    // Not in the rendered snapshot (below the top-N-by-degree cut) — inject
+    // its ego from the full graph instead of giving up.
+    void revealViaEgo(path);
   }
+  // Fetch the jump target's 1-hop file ego (computed on the FULL rollup,
+  // ignoring the top-N cut), merge it into the sim, and select it. The
+  // injected nodes/edges live only until the selection is cleared — the
+  // $effect below then rebuilds from the plain snapshot.
+  async function revealViaEgo(path: string): Promise<void> {
+    const seq = ++egoSeq;
+    try {
+      const ego = await graphVizEgo(path, root);
+      if (seq !== egoSeq || !lastSnap) return; // superseded by a newer jump / teardown
+      const target = ego.nodes.find((n) => n.file === path);
+      if (!target) {
+        showRevealMiss(`${path} isn't in the code graph`);
+        return;
+      }
+      if (ego.edges.length === 0) {
+        showRevealMiss(`${path} has no imports or calls in the code graph`);
+        return;
+      }
+      const baseIds = new Set(lastSnap.nodes.map((n) => n.id));
+      buildSim(mergeEgo(lastSnap, ego));
+      egoInjected = true;
+      // buildSim's tail runs tryReveal — a jump that arrived mid-fetch may
+      // have started a newer reveal; don't fight it for the selection.
+      if (seq !== egoSeq) return;
+      // Spawn each injected node next to an already-placed neighbor instead
+      // of buildSim's golden-spiral fringe, so the focus jump lands inside
+      // the layout rather than panning across it.
+      for (const row of ego.nodes) {
+        if (baseIds.has(row.id)) continue;
+        const sn = nodeById.get(row.id);
+        if (!sn) continue;
+        const anchor = (edgesByNode.get(row.id) ?? [])
+          .map((e) => (e.src.id === row.id ? e.dst : e.src))
+          .find((n) => baseIds.has(n.id));
+        if (anchor) {
+          sn.x = anchor.x + (Math.random() - 0.5) * 40;
+          sn.y = anchor.y + (Math.random() - 0.5) * 40;
+          sn.z = anchor.z + (Math.random() - 0.5) * 40;
+        }
+      }
+      const node = nodeById.get(target.id);
+      if (node) selectNode(node);
+    } catch (e) {
+      showRevealMiss(`couldn't look up ${path} in the graph: ${e}`);
+    }
+  }
+  // The snapshot plus the ego's extra nodes/edges (deduplicated — neighbors
+  // that already render keep their existing node; an ego edge that the
+  // snapshot already carries keeps the snapshot's drawn flag).
+  function mergeEgo(base: VizGraphResult, ego: VizGraphResult): VizGraphResult {
+    const nodeIds = new Set(base.nodes.map((n) => n.id));
+    const edgeKey = (e: VizEdgeRow) => `${e.src}\n${e.dst}\n${e.kind}`;
+    const edgeIds = new Set(base.edges.map(edgeKey));
+    return {
+      nodes: [...base.nodes, ...ego.nodes.filter((n) => !nodeIds.has(n.id))],
+      edges: [...base.edges, ...ego.edges.filter((e) => !edgeIds.has(edgeKey(e)))],
+    };
+  }
+  // "Once the selection is cleared, hide the file again": with an ego
+  // injected and no selection left at all (empty-canvas click, Esc), rebuild
+  // from the plain snapshot. A directory focus or hopping to a neighbor is
+  // still a selection, so the injected nodes survive those.
+  $effect(() => {
+    if (selectedNodeId || selectedDir) return;
+    if (!egoInjected || !lastSnap) return;
+    egoInjected = false;
+    buildSim(lastSnap);
+  });
   $effect(() => {
     const req = $graphReveal;
     if (!req) return;
@@ -1269,6 +1388,45 @@
   }
   function stopHistoryPoll(): void {
     if (historyTimer) { clearInterval(historyTimer); historyTimer = undefined; }
+  }
+
+  // ── Settings tuning ──────────────────────────────────────────────────────
+  // Adopt the settings' Graph View tuning knobs (all clamped to the UI's
+  // 0.2–5 range in case a hand-edited settings file goes wild). Geometry
+  // knobs (spacing / cluster size / tightness) re-heat the sim so the layout
+  // re-settles into the new equilibrium; appearance knobs (node size, edge
+  // width/color) only need a repaint. Values buildSim baked into the live
+  // nodes/clusters (radius, leash) are recomputed in place.
+  function applyTuning(g: Settings['graph']): void {
+    const knob = (v: number) => clamp(Number(v) || 1, 0.2, 5);
+    const next = {
+      nodeScale: knob(g.graph_viz_node_scale),
+      dirScale: knob(g.graph_viz_dir_scale),
+      edgeWidth: knob(g.graph_viz_edge_width),
+      nodeSpacing: knob(g.graph_viz_node_spacing),
+      clusterSpacing: knob(g.graph_viz_cluster_spacing),
+      clusterStrength: knob(g.graph_viz_cluster_strength),
+    };
+    const nextCall = g.graph_viz_color_call || EDGE_CALL;
+    const nextImport = g.graph_viz_color_import || EDGE_IMPORT;
+    const geomChanged =
+      next.dirScale !== tune.dirScale ||
+      next.nodeSpacing !== tune.nodeSpacing ||
+      next.clusterSpacing !== tune.clusterSpacing ||
+      next.clusterStrength !== tune.clusterStrength;
+    const lookChanged =
+      next.nodeScale !== tune.nodeScale ||
+      next.edgeWidth !== tune.edgeWidth ||
+      nextCall !== edgeCallColor ||
+      nextImport !== edgeImportColor;
+    tune = next;
+    edgeCallColor = nextCall;
+    edgeImportColor = nextImport;
+    if ((!geomChanged && !lookChanged) || nodes.length === 0) return;
+    for (const n of nodes) n.r = nodeRadius(n.degree);
+    for (const c of clusters) c.leash = leashFor(c.members.length);
+    if (geomChanged) kick(0.5);
+    else wake(); // a single repaint frame picks up sizes/widths/colors
   }
 
   // ── Resize / visibility plumbing ─────────────────────────────────────────
@@ -1488,6 +1646,7 @@
     // one-off read.
     unsubSettings = settings.subscribe((s) => {
       vizMax = Math.max(1, s.graph.graph_viz_max_nodes);
+      applyTuning(s.graph);
       const en = s.graph.enabled;
       if (en === graphEnabled) return;
       graphEnabled = en;

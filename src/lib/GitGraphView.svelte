@@ -22,6 +22,25 @@
   let error = $state<string | null>(null);
   let loading = $state(false);
 
+  // Auto-refresh: poll while mounted (the component is destroyed on every
+  // tab/section switch, so this only ticks while the graph is actually on
+  // screen). Background ticks never show the loading state, never clobber
+  // the last-good graph with a transient error, and skip the `graph`
+  // reassignment entirely when nothing changed (no pointless re-render of
+  // up-to-500 keyed rows every tick).
+  const AUTO_REFRESH_MS = 5000;
+  let refreshing = false;
+  let lastFingerprint = '';
+
+  /// Everything the rendered graph depends on: commit set/order, ref
+  /// decorations (a branch pointer can move without any new commit), HEAD,
+  /// and truncation.
+  function fingerprint(g: GitGraph): string {
+    return `${g.head ?? ''}|${g.truncated}|${g.commits
+      .map((c) => `${c.hash}:${c.refs.join(',')}`)
+      .join(';')}`;
+  }
+
   // Click-to-expand commit detail — the same message-body + per-file-diff
   // panel a Session-commits row expands to. Single selection (one commit
   // open at a time): the detail panel splits the rails SVG in two, and one
@@ -45,20 +64,33 @@
     }
   }
 
-  async function refresh(): Promise<void> {
-    loading = true;
+  async function refresh(background = false): Promise<void> {
+    if (refreshing) return; // a slow git walk mustn't stack overlapping calls
+    refreshing = true;
+    if (!background) loading = true;
     try {
-      graph = await workbenchGitGraph();
+      const g = await workbenchGitGraph();
+      const fp = fingerprint(g);
+      if (fp !== lastFingerprint || graph === null) {
+        lastFingerprint = fp;
+        graph = g;
+      }
       error = null;
     } catch (e) {
-      error = String(e);
+      // A background tick keeps showing the last good graph (a transient
+      // git failure — e.g. mid-gc lock — shouldn't blank the view); only a
+      // manual refresh or a still-empty view surfaces the error.
+      if (!background || graph === null) error = String(e);
     } finally {
+      refreshing = false;
       loading = false;
     }
   }
 
   onMount(() => {
     void refresh();
+    const timer = setInterval(() => void refresh(true), AUTO_REFRESH_MS);
+    return () => clearInterval(timer);
   });
 
   // ── Lane layout ──────────────────────────────────────────────────────
@@ -193,7 +225,13 @@
         {#if graph.truncated}<span class="trunc">(showing the most recent — history truncated)</span>{/if}
       </span>
     {/if}
-    <button type="button" class="refresh" onclick={() => void refresh()} disabled={loading}>
+    <button
+      type="button"
+      class="refresh"
+      title="The graph also refreshes automatically every 5 seconds"
+      onclick={() => void refresh()}
+      disabled={loading}
+    >
       {loading ? 'Refreshing…' : 'Refresh'}
     </button>
   </div>

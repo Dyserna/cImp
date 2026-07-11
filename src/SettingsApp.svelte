@@ -11,6 +11,8 @@
     aiToolTabDefaults,
     consumeSettingsDeepLink,
     listVoices,
+    llmPricingGet,
+    llmPricingSet,
     requestTabRestart,
   } from './lib/settings/ipc';
   import { listen } from '@tauri-apps/api/event';
@@ -54,6 +56,7 @@
     ServerCommandTemplate,
     RemoteBackendTemplate,
     PromptTemplate,
+    LlmPricingModel,
   } from './lib/settings/types';
   import {
     composeTemplatesGlobalGet,
@@ -214,6 +217,65 @@
       composeTemplatesDirty = false;
     } catch (e) {
       composeTemplatesError = `${e}`;
+    }
+  }
+
+  // LLM pricing section: the provider/model $/MTok table behind the Code
+  // Intelligence tab's session-cost popup. Global-only like the compose
+  // templates — edited here, saved through the dedicated `llm_pricing_set`
+  // IPC (straight to the physical global settings.json, NOT `patch`/
+  // `applySettings` — an array field would otherwise land in the project
+  // overlay; see `llm_pricing_set`'s doc comment).
+  let llmPricing = $state<LlmPricingModel[]>([]);
+  let llmPricingLoading = $state(true);
+  let llmPricingDirty = $state(false);
+  let llmPricingError = $state<string | null>(null);
+
+  async function loadLlmPricing(): Promise<void> {
+    llmPricingLoading = true;
+    llmPricingError = null;
+    try {
+      llmPricing = await llmPricingGet();
+      llmPricingDirty = false;
+    } catch (e) {
+      llmPricingError = `${e}`;
+    } finally {
+      llmPricingLoading = false;
+    }
+  }
+  function addLlmPricingRow(): void {
+    llmPricing = [
+      ...llmPricing,
+      { provider: 'Custom', model: `model-${llmPricing.length + 1}`, input: 0, cache_write: 0, cache_read: 0, output: 0 },
+    ];
+    llmPricingDirty = true;
+  }
+  function editLlmPricingText(i: number, field: 'provider' | 'model', value: string): void {
+    llmPricing = llmPricing.map((r, idx) => (idx === i ? { ...r, [field]: value } : r));
+    llmPricingDirty = true;
+  }
+  function editLlmPricingRate(
+    i: number,
+    field: 'input' | 'cache_write' | 'cache_read' | 'output',
+    value: string,
+  ): void {
+    // Clamp garbage/negatives to 0 so a saved row can never poison the cost
+    // popup's math with NaN or a negative price.
+    const n = Math.max(0, Number(value) || 0);
+    llmPricing = llmPricing.map((r, idx) => (idx === i ? { ...r, [field]: n } : r));
+    llmPricingDirty = true;
+  }
+  function deleteLlmPricingRow(i: number): void {
+    llmPricing = llmPricing.filter((_, idx) => idx !== i);
+    llmPricingDirty = true;
+  }
+  async function saveLlmPricing(): Promise<void> {
+    llmPricingError = null;
+    try {
+      await llmPricingSet($state.snapshot(llmPricing));
+      llmPricingDirty = false;
+    } catch (e) {
+      llmPricingError = `${e}`;
     }
   }
 
@@ -625,6 +687,7 @@
     | 'offload'
     | 'mcp'
     | 'graph'
+    | 'pricing'
     | 'workbench'
     | 'advanced'
     | 'about';
@@ -641,6 +704,7 @@
     { id: 'offload', label: 'Offload task tools' },
     { id: 'mcp', label: 'MCP servers' },
     { id: 'graph', label: 'Code Intelligence' },
+    { id: 'pricing', label: 'LLM pricing' },
     { id: 'workbench', label: 'Workbench' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
@@ -737,6 +801,7 @@
       .then((d) => (inputDevices = d))
       .catch((e) => console.warn('stt_list_input_devices failed', e));
     void loadComposeTemplates();
+    void loadLlmPricing();
     for (const t of AI_TABS) {
       aiToolTabDefaults(t)
         .then((d) => {
@@ -4208,6 +4273,111 @@
             </small>
           {/if}
         </section>
+      {:else if activeSection === 'pricing'}
+        <section>
+          <h2>LLM pricing</h2>
+          <small class="hint top">
+            Provider/model token prices (USD per <strong>million tokens</strong>,
+            "MTok") used by the Code Intelligence tab's session-cost popup —
+            click any row in Usage → Sessions to price that session. Fresh
+            installs are seeded with current Anthropic API and GitHub Copilot
+            rates; every value is editable. Saved to the global settings file,
+            not this project's overlay.
+          </small>
+          {#if llmPricingLoading}
+            <small class="hint">Loading…</small>
+          {:else}
+            {#if llmPricing.length === 0}
+              <small class="hint">No entries — add one below.</small>
+            {:else}
+              <div class="pricing-head-row">
+                <span>Provider</span>
+                <span>Model</span>
+                <span class="num">Input</span>
+                <span class="num">Cache write</span>
+                <span class="num">Cache read</span>
+                <span class="num">Output</span>
+                <span></span>
+              </div>
+              <!-- Keyed by index deliberately, same as the MCP editor: rows are
+                   editable and replaced (cloned) on every edit, so a value-based
+                   key would change mid-edit and drop input focus. -->
+              {#each llmPricing as row, i (i)}
+                <div class="pricing-row">
+                  <input
+                    type="text"
+                    placeholder="Provider"
+                    value={row.provider}
+                    oninput={(e) =>
+                      editLlmPricingText(i, 'provider', (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <input
+                    type="text"
+                    placeholder="Model"
+                    value={row.model}
+                    oninput={(e) =>
+                      editLlmPricingText(i, 'model', (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <input
+                    type="number"
+                    class="num"
+                    min="0"
+                    step="0.01"
+                    title="$ per MTok, input tokens"
+                    value={row.input}
+                    onchange={(e) =>
+                      editLlmPricingRate(i, 'input', (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <input
+                    type="number"
+                    class="num"
+                    min="0"
+                    step="0.01"
+                    title="$ per MTok, cache-write tokens"
+                    value={row.cache_write}
+                    onchange={(e) =>
+                      editLlmPricingRate(i, 'cache_write', (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <input
+                    type="number"
+                    class="num"
+                    min="0"
+                    step="0.01"
+                    title="$ per MTok, cache-read tokens"
+                    value={row.cache_read}
+                    onchange={(e) =>
+                      editLlmPricingRate(i, 'cache_read', (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <input
+                    type="number"
+                    class="num"
+                    min="0"
+                    step="0.01"
+                    title="$ per MTok, output tokens"
+                    value={row.output}
+                    onchange={(e) =>
+                      editLlmPricingRate(i, 'output', (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <button type="button" class="secondary danger" onclick={() => deleteLlmPricingRow(i)}>
+                    Delete
+                  </button>
+                </div>
+              {/each}
+            {/if}
+            <div class="button-row">
+              <button type="button" onclick={addLlmPricingRow}>Add model</button>
+              <button type="button" disabled={!llmPricingDirty} onclick={() => void saveLlmPricing()}>
+                Save
+              </button>
+              {#if llmPricingDirty}
+                <small class="hint">Unsaved changes</small>
+              {/if}
+            </div>
+            {#if llmPricingError}
+              <small class="error">{llmPricingError}</small>
+            {/if}
+          {/if}
+        </section>
       {:else if activeSection === 'workbench'}
         <section>
           <h2>Workbench</h2>
@@ -4585,6 +4755,26 @@
     gap: 0.5rem;
     margin-top: 0.4rem;
     flex-wrap: wrap;
+  }
+  /* LLM pricing editor: shared column template so the header row and every
+     data row line up as a table. Provider/model get the flexible tracks; the
+     four $/MTok fields are fixed-width numerics. */
+  .pricing-head-row,
+  .pricing-row {
+    display: grid;
+    grid-template-columns: minmax(6rem, 0.7fr) minmax(9rem, 1fr) 5.5rem 5.5rem 5.5rem 5.5rem auto;
+    gap: 0.4rem;
+    align-items: center;
+    margin-top: 0.4rem;
+  }
+  .pricing-head-row {
+    font-size: var(--font-size-sm);
+    color: var(--text-subtle, #999);
+    margin-top: 0.8rem;
+  }
+  .pricing-head-row .num,
+  .pricing-row input.num {
+    text-align: right;
   }
   .mcp-field {
     display: flex;

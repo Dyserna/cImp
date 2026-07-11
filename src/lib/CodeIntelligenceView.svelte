@@ -46,11 +46,23 @@
     type PathResult,
     type PathNodeRow,
     type ArchResult,
+    type SessionUsageRow,
   } from './graph';
-  import { turnTotal, maxTurnTotal, barHeightPct, cacheHitRatio, fmtTok } from './usageMath';
+  import {
+    turnTotal,
+    maxTurnTotal,
+    barHeightPct,
+    cacheHitRatio,
+    fmtTok,
+    sessionCost,
+    fmtUsd,
+    type PriceRates,
+  } from './usageMath';
   import { fmtTime } from './format';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
+  import { llmPricingGet } from './settings/ipc';
+  import type { LlmPricingModel } from './settings/types';
 
   // The graph_* tool reference list and the recent-calls activity feed both
   // moved to the Tool Activity tab (ToolActivityView.svelte).
@@ -310,6 +322,44 @@
     if (u) usage = u;
     if (a) advice = a;
   }
+
+  // Session-cost popup: clicking a row in the Sessions card opens a modal
+  // that prices that session's token totals against a provider/model entry
+  // from the global LLM price table (Settings → LLM pricing), or against
+  // hand-typed custom rates. The table is fetched fresh on every open so
+  // edits made in the Settings window apply without reopening the tab.
+  let costSession = $state<SessionUsageRow | null>(null);
+  let costPricing = $state<LlmPricingModel[]>([]);
+  // Index into `costPricing`; `costPricing.length` is the sentinel for the
+  // trailing "Custom" option. Remembered across opens within this tab.
+  let costSelIdx = $state(0);
+  let costCustom = $state<PriceRates>({ input: 0, cache_write: 0, cache_read: 0, output: 0 });
+
+  async function openCostPopup(s: SessionUsageRow): Promise<void> {
+    costSession = s;
+    try {
+      costPricing = await llmPricingGet();
+    } catch (e) {
+      console.warn('llm_pricing_get failed', e);
+      costPricing = [];
+    }
+    // A shrunken table can strand the remembered index past the Custom
+    // sentinel — clamp back to the first provider (or Custom when empty).
+    if (costSelIdx > costPricing.length) costSelIdx = 0;
+  }
+  function closeCostPopup(): void {
+    costSession = null;
+  }
+  function onCostKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Escape' && costSession) {
+      e.stopPropagation();
+      closeCostPopup();
+    }
+  }
+  const costRates = $derived<PriceRates>(
+    costSelIdx < costPricing.length ? costPricing[costSelIdx] : costCustom,
+  );
+  const costRows = $derived(costSession ? sessionCost(costSession.totals, costRates) : null);
 
   // Applies a proposal by writing the ONE named `graph.*` field it targets
   // through the normal settings round-trip (`applySettings` — visible in
@@ -608,6 +658,8 @@
   }
 </script>
 
+<svelte:window onkeydown={onCostKeydown} />
+
 <div class="graph-monitor">
   <header>
     <h2>Code Intelligence</h2>
@@ -791,9 +843,11 @@
       {:else}
         <div class="rows scroll10">
           {#each usage.sessions as s (s.session_id)}
-            <div
+            <button
+              type="button"
               class="arow sessrow"
-              title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens`}
+              title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens — click for cost`}
+              onclick={() => void openCostPopup(s)}
             >
               <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}</span>
               <span class="sess-stats tnum">
@@ -803,7 +857,7 @@
                 <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
               </span>
               <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
-            </div>
+            </button>
           {/each}
         </div>
       {/if}
@@ -1322,6 +1376,83 @@
           {/if}
         </section>
       {/if}
+    </div>
+  {/if}
+
+  <!-- Session-cost popup: tokens × $/MTok for the clicked Sessions row. -->
+  {#if costSession && costRows}
+    <div class="cost-backdrop" onclick={closeCostPopup} role="presentation"></div>
+    <div class="cost-dialog" role="dialog" aria-modal="true" aria-label="Session cost">
+      <div class="cost-title">
+        <span>
+          Session cost <span class="muted">· {costSession.agent}</span>
+          {#if costSession.est_only}
+            <span class="est-badge" title="No exact usage data for this agent — chars-only estimate; the cost below is an estimate too">est</span>
+          {/if}
+        </span>
+        <button type="button" class="cost-close" aria-label="Close" onclick={closeCostPopup}>×</button>
+      </div>
+
+      <label class="cost-provider">
+        <span>Pricing</span>
+        <select bind:value={costSelIdx}>
+          {#each costPricing as p, i (i)}
+            <option value={i}>{p.provider} — {p.model}</option>
+          {/each}
+          <option value={costPricing.length}>Custom…</option>
+        </select>
+      </label>
+
+      {#if costSelIdx >= costPricing.length}
+        <div class="cost-custom">
+          <label><span>Input $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.input} /></label>
+          <label><span>Cache write $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.cache_write} /></label>
+          <label><span>Cache read $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.cache_read} /></label>
+          <label><span>Output $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.output} /></label>
+        </div>
+      {/if}
+
+      <table class="cost-table tnum">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Input</th>
+            <th>Cache write</th>
+            <th>Cache read</th>
+            <th>Output</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th>Session tokens</th>
+            <td title={costSession.totals.in_tok.toLocaleString()}>{fmtTok(costSession.totals.in_tok)}</td>
+            <td title={costSession.totals.cache_make.toLocaleString()}>{fmtTok(costSession.totals.cache_make)}</td>
+            <td title={costSession.totals.cache_read.toLocaleString()}>{fmtTok(costSession.totals.cache_read)}</td>
+            <td title={costSession.totals.out_tok.toLocaleString()}>{fmtTok(costSession.totals.out_tok)}</td>
+          </tr>
+          <tr>
+            <th>$ / MTok</th>
+            <td>{costRates.input}</td>
+            <td>{costRates.cache_write}</td>
+            <td>{costRates.cache_read}</td>
+            <td>{costRates.output}</td>
+          </tr>
+          <tr>
+            <th>Cost</th>
+            <td>{fmtUsd(costRows.input)}</td>
+            <td>{fmtUsd(costRows.cache_write)}</td>
+            <td>{fmtUsd(costRows.cache_read)}</td>
+            <td>{fmtUsd(costRows.output)}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="cost-total">
+        Total session cost <b>{fmtUsd(costRows.total)}</b>
+      </div>
+      <small class="cost-hint">
+        Prices are editable in Settings → LLM pricing.
+      </small>
     </div>
   {/if}
 </div>
@@ -2005,6 +2136,133 @@
   /* agent | the four billing stats | cache-hit % */
   .arow.sessrow {
     grid-template-columns: minmax(6rem, 1fr) auto auto;
+  }
+  /* The session rows are <button>s (they open the cost popup) — strip the UA
+     button chrome so they keep rendering as plain grid rows. */
+  button.arow.sessrow {
+    background: none;
+    border: none;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    width: 100%;
+    cursor: pointer;
+  }
+  button.arow.sessrow:hover {
+    background: var(--surface-raised, rgba(255, 255, 255, 0.04));
+  }
+
+  /* Session-cost popup. Fixed-position so it centers on the window even
+     though this tab's root is its own absolutely-positioned scroll box. */
+  .cost-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 100;
+  }
+  .cost-dialog {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 101;
+    min-width: 30rem;
+    max-width: min(44rem, calc(100vw - 2rem));
+    background: var(--surface-3, #1d1d1d);
+    border: 1px solid var(--border, #333);
+    border-radius: 8px;
+    padding: 14px 16px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+    font-size: 13px;
+  }
+  .cost-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  .cost-close {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+  }
+  .cost-close:hover {
+    color: var(--text, #fff);
+  }
+  .cost-provider {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .cost-provider select {
+    flex: 1;
+  }
+  .cost-custom {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+    margin-bottom: 10px;
+  }
+  .cost-custom label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .cost-custom input {
+    width: 6.5rem;
+    text-align: right;
+  }
+  .cost-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 10px;
+  }
+  .cost-table th,
+  .cost-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+  }
+  .cost-table thead th {
+    text-align: right;
+    font-weight: 600;
+    color: var(--text-subtle, #999);
+  }
+  .cost-table tbody th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--text-subtle, #999);
+    white-space: nowrap;
+  }
+  .cost-table td {
+    text-align: right;
+    white-space: nowrap;
+  }
+  .cost-table tbody tr:last-child th,
+  .cost-table tbody tr:last-child td {
+    font-weight: 600;
+    color: var(--text, #ddd);
+  }
+  .cost-total {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 14px;
+    margin-bottom: 6px;
+  }
+  .cost-total b {
+    font-size: 16px;
+  }
+  .cost-hint {
+    color: var(--text-subtle, #999);
   }
   /* Constant width + right alignment so the percentages line up too. */
   .arow.sessrow .aloc {

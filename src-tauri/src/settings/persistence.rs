@@ -46,7 +46,7 @@ use crate::settings::schema::{
     default_ai_tab, default_graph_monitor_tab, default_graph_view_tab, default_offload_server_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
     starter_prompt_templates,
-    AiTabId, LayoutNodePersisted, PromptTemplate, Settings, TabConfig,
+    AiTabId, LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
@@ -340,6 +340,52 @@ fn write_prompt_templates_to(path: &Path, templates: Vec<PromptTemplate>) -> App
     // An explicit Settings-window save always counts as "seeded" — it must
     // never be clobbered by the one-time starter injection on a later load.
     settings.templates_seeded = true;
+    save_to(path, &settings)
+}
+
+/// Global-only LLM price table, read directly from the physical global file
+/// for the same reason as [`read_global_prompt_templates`]: the deep-merge
+/// would replace the array wholesale if a project overlay happened to carry
+/// the key, and "global" must mean every project. Missing file → the seeded
+/// defaults (a fresh install shows current Anthropic/Copilot prices); a file
+/// that carries the key — even as `[]` — keeps exactly what it has.
+pub fn read_global_llm_pricing() -> Vec<LlmPricingModel> {
+    let Ok(path) = global_path() else {
+        return crate::settings::default_llm_pricing();
+    };
+    read_llm_pricing_from(&path)
+}
+
+fn read_llm_pricing_from(path: &Path) -> Vec<LlmPricingModel> {
+    if !path.exists() {
+        return crate::settings::default_llm_pricing();
+    }
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
+        .map(|s| s.llm_pricing)
+        .unwrap_or_else(crate::settings::default_llm_pricing)
+}
+
+/// Write the LLM price table straight to the physical global file, bypassing
+/// the per-project overlay diff — mirror of [`write_global_prompt_templates`]
+/// (see its doc comment for why the bypass exists). Read-modify-write: every
+/// other field in the on-disk global file is preserved untouched.
+pub fn write_global_llm_pricing(pricing: Vec<LlmPricingModel>) -> AppResult<()> {
+    let path = global_path()?;
+    write_llm_pricing_to(&path, pricing)
+}
+
+fn write_llm_pricing_to(path: &Path, pricing: Vec<LlmPricingModel>) -> AppResult<()> {
+    let mut settings: Settings = if path.exists() {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    } else {
+        Settings::default()
+    };
+    settings.llm_pricing = pricing;
     save_to(path, &settings)
 }
 
@@ -2175,6 +2221,55 @@ mod tests {
         let after: Settings = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after.ui.theme, "future-light", "unrelated field must survive the R-M-W");
         assert_eq!(after.prompt_templates.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_then_read_global_llm_pricing_round_trips() {
+        let dir = std::env::temp_dir().join(format!("cimp_price_global_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A missing file reads as the seeded defaults, never empty.
+        let seeded = read_llm_pricing_from(&path);
+        assert_eq!(seeded, crate::settings::default_llm_pricing());
+        assert!(!seeded.is_empty());
+
+        let pricing = vec![LlmPricingModel {
+            provider: "Anthropic".to_string(),
+            model: "Claude Opus 4.8".to_string(),
+            input: 5.0,
+            cache_write: 6.25,
+            cache_read: 0.5,
+            output: 25.0,
+        }];
+        write_llm_pricing_to(&path, pricing.clone()).unwrap();
+        assert_eq!(read_llm_pricing_from(&path), pricing);
+
+        // Deleting every row must stick: an explicit empty write reads back
+        // empty (the key is present in the file), not as re-seeded defaults.
+        write_llm_pricing_to(&path, Vec::new()).unwrap();
+        assert!(read_llm_pricing_from(&path).is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_global_llm_pricing_preserves_other_fields() {
+        let dir = std::env::temp_dir().join(format!("cimp_price_preserve_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut initial = Settings::default();
+        initial.ui.theme = "future-light".to_string();
+        save_to(&path, &initial).unwrap();
+
+        write_llm_pricing_to(&path, Vec::new()).unwrap();
+
+        let after: Settings = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after.ui.theme, "future-light", "unrelated field must survive the R-M-W");
+        assert!(after.llm_pricing.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

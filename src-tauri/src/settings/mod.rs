@@ -18,7 +18,8 @@ mod schema;
 pub use broadcaster::SettingsHandle;
 pub use persistence::{
     apply_portable_avatar_paths, load_readonly, reconcile_reserved_tabs,
-    read_global_prompt_templates, read_project_prompt_templates, write_global_prompt_templates,
+    read_global_llm_pricing, read_global_prompt_templates, read_project_prompt_templates,
+    write_global_llm_pricing, write_global_prompt_templates,
 };
 pub use schema::*;
 

@@ -641,6 +641,29 @@ export interface Settings {
   /// the Rust `preview::is_allowed_preview_host`, used for the toolbar's own
   /// pre-flight check before even calling the backend).
   preview_allow_remote: boolean;
+  /// Provider/model token-price table ($ per MTok) for the session-cost
+  /// popup. Read/written through the dedicated `llm_pricing_*` IPC (physical
+  /// global `settings.json` only — see `lib/settings/ipc.ts`), NOT through
+  /// the normal `settingsUpdate` round-trip; kept here for schema fidelity
+  /// with the backend struct, like `prompt_templates`.
+  llm_pricing: LlmPricingModel[];
+}
+
+/// One provider/model price row: USD per million tokens for the four billing
+/// categories a session's `UsageTotals` reports. Mirror of Rust
+/// `settings::LlmPricingModel`. Fresh installs are seeded backend-side with
+/// current Anthropic API + GitHub Copilot prices (`default_llm_pricing`).
+export interface LlmPricingModel {
+  provider: string;
+  model: string;
+  /// $/MTok for uncached input tokens (`in_tok`).
+  input: number;
+  /// $/MTok for cache-write tokens (`cache_make`).
+  cache_write: number;
+  /// $/MTok for cache-read tokens (`cache_read`).
+  cache_read: number;
+  /// $/MTok for output tokens (`out_tok`).
+  output: number;
 }
 
 /// V14 Phase D2: one dismissed advisor proposal. Mirror of Rust
@@ -1368,5 +1391,9 @@ export function defaultSettings(): Settings {
     advisor_dismissed: [],
     preview_last_url: null,
     preview_allow_remote: false,
+    // Real defaults are seeded Rust-side (`default_llm_pricing`); this local
+    // fallback is only pre-init UI state and is never written back (the
+    // field is out-of-band in `settings_update`, like `prompt_templates`).
+    llm_pricing: [],
   };
 }

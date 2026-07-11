@@ -648,6 +648,27 @@ pub async fn compose_templates_global_set(
     crate::settings::write_global_prompt_templates(templates)
 }
 
+/// LLM price table for the session-cost popup and its Settings editor. Reads
+/// the raw global list directly from the physical global `settings.json`
+/// (missing file/key → the seeded Anthropic/Copilot defaults) — same
+/// global-only posture as `compose_templates_global_get`.
+#[tauri::command]
+pub async fn llm_pricing_get() -> AppResult<Vec<crate::settings::LlmPricingModel>> {
+    Ok(crate::settings::read_global_llm_pricing())
+}
+
+/// Save the LLM price table straight to the physical global `settings.json` —
+/// NOT through `settings_update`'s per-project overlay diff — so provider
+/// price edits apply to every project. Mirror of
+/// `compose_templates_global_set`; see
+/// `settings::persistence::write_global_llm_pricing`'s doc comment.
+#[tauri::command]
+pub async fn llm_pricing_set(
+    pricing: Vec<crate::settings::LlmPricingModel>,
+) -> AppResult<()> {
+    crate::settings::write_global_llm_pricing(pricing)
+}
+
 /// V14 Phase A: read-only project-scope listing for the Settings window's
 /// Compose section (edited by hand in `.cimp/config.json`, not from
 /// Settings — matching the milestone's scope rule). `root` defaults to the
@@ -779,6 +800,11 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     incoming.session = cur.session.clone();
     incoming.prompt_templates = cur.prompt_templates.clone();
     incoming.templates_seeded = cur.templates_seeded;
+    // `llm_pricing` is out-of-band exactly like `prompt_templates`: written
+    // only by `llm_pricing_set` -> `write_global_llm_pricing`, straight to
+    // the physical global file. Preserve it so a stale Settings-window
+    // snapshot can't stomp a price edit made through the dedicated IPC.
+    incoming.llm_pricing = cur.llm_pricing.clone();
     *cur = incoming;
     // Keep the reserved feature tabs (Offload Server / Code Graph monitor /
     // Workbench) present-iff-enabled in the persisted list.
@@ -2261,6 +2287,33 @@ mod tests {
         assert_eq!(cur.prompt_templates[0].name, "review-this-diff");
         assert_eq!(cur.prompt_templates[1].name, "my-new-template");
         assert!(cur.templates_seeded);
+    }
+
+    // Same stale-snapshot scenario for the LLM price table, which is written
+    // only by `llm_pricing_set` -> `write_global_llm_pricing`: an unrelated
+    // Settings-window save must not revert live price edits.
+    #[test]
+    fn settings_update_preserves_out_of_band_llm_pricing() {
+        let mut cur = Settings::default();
+        cur.llm_pricing = vec![crate::settings::LlmPricingModel {
+            provider: "Custom".to_string(),
+            model: "my-model".to_string(),
+            input: 1.0,
+            cache_write: 2.0,
+            cache_read: 0.5,
+            output: 4.0,
+        }];
+
+        let mut incoming = Settings::default();
+        incoming.ui.theme = "future-light".to_string();
+        assert_ne!(incoming.llm_pricing, cur.llm_pricing); // stale (seeded defaults)
+
+        apply_incoming_settings(&mut cur, incoming);
+
+        assert_eq!(cur.ui.theme, "future-light");
+        assert_eq!(cur.llm_pricing.len(), 1);
+        assert_eq!(cur.llm_pricing[0].provider, "Custom");
+        assert_eq!(cur.llm_pricing[0].model, "my-model");
     }
 
     #[test]

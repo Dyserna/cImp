@@ -90,3 +90,7 @@ foreach ($line in $entries) {
 }
 
 if ($failed) { exit 1 }
+# Explicit success code: publish-models-release.ps1 gates on $LASTEXITCODE,
+# which stays stale/null (→ treated as failure) if this script just falls
+# off the end in a fresh shell.
+exit 0

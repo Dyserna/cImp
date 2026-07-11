@@ -3173,6 +3173,38 @@ impl GraphIndex {
         Ok(t)
     }
 
+    /// Distinct model ids across `session_id`'s turns, descending by the
+    /// total tokens (input + output + cache) attributed to each. Turns with
+    /// no model recorded are skipped, as is `"<synthetic>"` — Claude Code
+    /// stamps that pseudo-model on locally fabricated messages (errors,
+    /// interrupts) and it would pollute a "which model ran this session"
+    /// readout.
+    pub fn usage_session_models(&self, session_id: &str) -> AppResult<Vec<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        // Same `seq`-keeps-rows-distinct reasoning as `usage_session_totals`.
+        let rows = self.run(
+            "?[seq, model, in_tok, out_tok, cache_read, cache_make] := \
+                *usage_stat{session_id, seq, kind, model, in_tok, out_tok, cache_read, cache_make}, \
+                session_id == $sid, kind == \"turn\"",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut sums: HashMap<String, u64> = HashMap::new();
+        for r in &rows.rows {
+            let Some(model) = cell_str_opt(r, 1) else { continue };
+            if model == "<synthetic>" {
+                continue;
+            }
+            let toks: u64 =
+                (2..=5).map(|i| cell_i64(r, i).max(0) as u64).sum();
+            *sums.entry(model).or_insert(0) += toks;
+        }
+        let mut out: Vec<(String, u64)> = sums.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok(out.into_iter().map(|(m, _)| m).collect())
+    }
+
     /// Estimated tool-result characters for `session_id`, grouped by tool
     /// name (`"unknown"` when the id → name join missed — see the claude
     /// tap's `ToolNameRing`), descending by chars.
@@ -3249,6 +3281,7 @@ impl GraphIndex {
         for s in sessions {
             let totals = self.usage_session_totals(&s.session_id)?;
             let per_tool = self.usage_per_tool(&s.session_id)?;
+            let models = self.usage_session_models(&s.session_id)?;
             let tool_chars: u64 = per_tool.iter().map(|(_, c)| *c).sum();
             let denom = totals.cache_read + totals.in_tok;
             let cache_hit_ratio =
@@ -3262,6 +3295,7 @@ impl GraphIndex {
                 cache_hit_ratio,
                 started_ms: s.started_ms,
                 last_ms: s.last_ms,
+                models,
             });
         }
         Ok(out)
@@ -5560,6 +5594,50 @@ pub struct Point { x: i32 }
             100,
         )
         .unwrap();
+        // Two modeled turns (opus outweighs sonnet in tokens) plus a
+        // `<synthetic>` turn that must NOT surface in `models`.
+        idx.record_usage_event(
+            "c1",
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: "m2".to_string(),
+                model: Some("claude-sonnet-5".to_string()),
+                in_tok: 5,
+                out_tok: 5,
+                cache_read: 0,
+                cache_make: 0,
+            },
+            110,
+        )
+        .unwrap();
+        idx.record_usage_event(
+            "c1",
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: "m3".to_string(),
+                model: Some("claude-opus-4-8".to_string()),
+                in_tok: 200,
+                out_tok: 20,
+                cache_read: 0,
+                cache_make: 0,
+            },
+            120,
+        )
+        .unwrap();
+        idx.record_usage_event(
+            "c1",
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: "m4".to_string(),
+                model: Some("<synthetic>".to_string()),
+                in_tok: 1,
+                out_tok: 1,
+                cache_read: 0,
+                cache_make: 0,
+            },
+            130,
+        )
+        .unwrap();
         idx.record_usage_event(
             "o1",
             "opencode",
@@ -5571,15 +5649,21 @@ pub struct Point { x: i32 }
         let rows = idx.usage_all_sessions().unwrap();
         let claude = rows.iter().find(|r| r.session_id == "c1").expect("c1 present");
         assert!(!claude.est_only, "claude sessions carry exact usage");
-        assert_eq!(claude.totals.in_tok, 100);
-        // cache_read / (cache_read + in_tok) = 50 / 150.
-        assert!((claude.cache_hit_ratio - (50.0 / 150.0)).abs() < 1e-9);
+        assert_eq!(claude.totals.in_tok, 306);
+        // cache_read / (cache_read + in_tok) = 50 / 356.
+        assert!((claude.cache_hit_ratio - (50.0 / 356.0)).abs() < 1e-9);
+        assert_eq!(
+            claude.models,
+            vec!["claude-opus-4-8".to_string(), "claude-sonnet-5".to_string()],
+            "models rank by tokens desc; model-less and <synthetic> turns excluded"
+        );
 
         let opencode = rows.iter().find(|r| r.session_id == "o1").expect("o1 present");
         assert!(opencode.est_only, "opencode sessions have no exact usage — always est-only");
         assert_eq!(opencode.totals.in_tok, 0, "a tool_result-only session has zero token totals");
         assert_eq!(opencode.tool_chars, 20);
         assert_eq!(opencode.cache_hit_ratio, 0.0, "no denominator ⇒ 0.0, not NaN");
+        assert!(opencode.models.is_empty(), "tool_result-only session has no models");
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

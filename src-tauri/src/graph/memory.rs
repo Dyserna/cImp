@@ -240,6 +240,10 @@ pub struct SessionUsageRow {
     /// `session` relation via [`SessionInfo`].
     pub started_ms: i64,
     pub last_ms: i64,
+    /// Distinct model ids seen across the session's turns, descending by
+    /// total tokens attributed to each (`"<synthetic>"` rows excluded).
+    /// Empty when no turn carried a model (e.g. tool-result-only sessions).
+    pub models: Vec<String>,
 }
 
 // ── V14 Phase D: Usage section assembly ────────────────────────────────────

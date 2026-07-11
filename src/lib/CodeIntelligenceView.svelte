@@ -400,6 +400,16 @@
     costSelIdx < costPricing.length ? costPricing[costSelIdx] : costCustom,
   );
   const costRows = $derived(costSession ? sessionCost(costSession.totals, costRates) : null);
+  // Which model ran the session: the single model when there's one, or
+  // "mixed (<top model>)" when several — `models` arrives ranked by tokens
+  // desc, so [0] is the top consumer. Empty when no turn carried a model.
+  const costModel = $derived(
+    !costSession || costSession.models.length === 0
+      ? ''
+      : costSession.models.length === 1
+        ? costSession.models[0]
+        : `mixed (${costSession.models[0]})`,
+  );
 
   // Applies a proposal by writing the ONE named `graph.*` field it targets
   // through the normal settings round-trip (`applySettings` — visible in
@@ -878,15 +888,15 @@
               <button
                 type="button"
                 class="arow sessrow"
-                title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens — click for cost`}
+                title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.cache_make.toLocaleString()} cache-write · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.out_tok.toLocaleString()} output tokens — click for cost`}
                 onclick={() => void openCostPopup(s)}
               >
                 <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}<span class="sess-date">{fmtDate(s.started_ms)}</span></span>
                 <span class="sess-stats tnum">
                   <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
-                  <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
-                  <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
                   <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
+                  <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
+                  <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
                 </span>
                 <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
               </button>
@@ -1451,6 +1461,9 @@
 
       <div class="cost-when muted">
         {fmtDate(costSession.started_ms)} · {fmtTime(costSession.started_ms)} – {fmtTime(costSession.last_ms)}
+        {#if costModel}
+          <span title={costSession.models.length > 1 ? `All models: ${costSession.models.join(', ')}` : undefined}>· {costModel}</span>
+        {/if}
       </div>
 
       <label class="cost-provider">

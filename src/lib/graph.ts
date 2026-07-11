@@ -525,6 +525,9 @@ export interface SessionUsageRow {
   /// Session start / last-activity timestamps (epoch ms).
   started_ms: number;
   last_ms: number;
+  /// Distinct model ids seen across the session's turns, descending by
+  /// tokens attributed to each; empty when no turn carried a model.
+  models: string[];
 }
 
 /// The Effectiveness panel's three measured counters — all exact chars, no

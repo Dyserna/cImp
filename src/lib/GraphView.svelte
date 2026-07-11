@@ -55,9 +55,9 @@
   // above MAX_REPEL_FULL we sample a bounded number of partners per node per
   // frame instead of every pair, so a large graph never blows the frame
   // budget.
-  const REPULSION_K = 2600;
+  const REPULSION_K = 1600;
   const SPRING_K = 0.05;
-  const SPRING_LEN = 70;
+  const SPRING_LEN = 45;
   const GRAVITY_K = 0.0025;
   const DAMPING = 0.85;
   // Per-frame speed cap (world units). Even with degree-normalized springs
@@ -68,6 +68,17 @@
   const MAX_REPEL_FULL = 500;
   const REPEL_SAMPLE = 40;
   const REPEL_CUTOFF_SQ = 90000; // 300 world units
+  // Directory clustering (the only layout): files leash to an invisible
+  // per-directory anchor, anchors repel hard and spring together only where
+  // cross-dir file edges exist, and cross-dir file edges render as ONE
+  // aggregate edge per directory pair (per-file cross links only appear
+  // routed through the anchors when a node is selected).
+  const DIR_MEMBER_K = 0.06; // member ↔ anchor leash spring
+  const DIR_EDGE_K = 0.015; // anchor ↔ anchor aggregate spring
+  const DIR_EDGE_LEN = 420;
+  const DIR_REPULSION_K = 90000;
+  const DIR_REPEL_CUTOFF_SQ = 1440000; // 1200 world units
+
   // Cooling: forces are scaled by an exponentially decaying alpha (d3-style)
   // so the layout always converges, even under sampled-repulsion noise
   // (n > MAX_REPEL_FULL) whose kinetic energy alone never drops below
@@ -84,11 +95,31 @@
     r: number;
     sx: number; sy: number; sr: number; sz: number;
     pulseUntil: number; pulseColor: string | null;
+    dir: string;
   }
   interface SimEdge {
     src: SimNode; dst: SimNode;
     kind: string; confidence: string;
     highlightUntil: number; highlightColor: string | null;
+    intra: boolean; // both endpoints in the same directory
+    // Over-quota edges arrive with drawn=false: they feed the connections
+    // panel, dir-edge weights, and the selection highlight, but are neither
+    // simulated as springs nor drawn as ambient lines.
+    drawn: boolean;
+  }
+  interface DirCluster {
+    name: string;
+    members: SimNode[];
+    leash: number; // rest length of the member↔anchor spring
+    x: number; y: number; z: number;
+    vx: number; vy: number; vz: number;
+    fx: number; fy: number; fz: number;
+    sx: number; sy: number; sz: number;
+    discR: number; // projected disc radius (computed at render)
+  }
+  interface DirEdge {
+    a: DirCluster; b: DirCluster;
+    weight: number; callW: number; importW: number;
   }
 
   // ── DOM refs ─────────────────────────────────────────────────────────────
@@ -133,6 +164,9 @@
   let simVersion = $state(0);
   // Transient "that file isn't in the rendered graph" notice (Workbench jump).
   let revealMiss = $state<string | null>(null);
+  // Focused directory (mutually exclusive with selectedNodeId): the view
+  // zooms into the cluster and shows only its members + internal edges.
+  let selectedDir = $state<string | null>(null);
 
   // ── Non-reactive simulation state (mutated at animation-frame rate — kept
   // out of $state so every position update doesn't trigger Svelte's
@@ -143,6 +177,10 @@
   // Incident (drawn) edges per node id — the connections panel + ego
   // highlight read this instead of scanning the whole edge list.
   let edgesByNode = new Map<string, SimEdge[]>();
+  // Directory clusters (the grouping layout — see the constants block).
+  let clusters: DirCluster[] = [];
+  let clusterByDir = new Map<string, DirCluster>();
+  let dirEdges: DirEdge[] = [];
   // Workbench jump request waiting for the snapshot to load (mount order:
   // the reveal can arrive before the first buildSim).
   let pendingReveal: string | null = null;
@@ -184,6 +222,8 @@
   let orbitVelTheta = 0;
   let orbitVelPhi = 0;
   let focusTarget: { x: number; y: number; z: number } | null = null;
+  // Animated dolly target (directory focus zooms in); null = keep camDist.
+  let focusDist: number | null = null;
   let focusRingUntil = 0;
 
   // Visibility gating (pause when hidden).
@@ -240,6 +280,10 @@
     const i = p.lastIndexOf('/');
     return i >= 0 ? p.slice(i + 1) : p;
   }
+  function dirOf(file: string): string {
+    const i = file.lastIndexOf('/');
+    return i >= 0 ? file.slice(0, i) : '(root)';
+  }
   function normalize3(x: number, y: number, z: number): [number, number, number] {
     const len = Math.hypot(x, y, z) || 1;
     return [x / len, y / len, z / len];
@@ -286,8 +330,25 @@
   });
   const shownConnCount = $derived(connGroups.reduce((t, g) => t + g.rows.length, 0));
   // ‹ also restores a cleared selection to the current history entry.
-  const canBack = $derived(hopIx > 0 || (hopIx >= 0 && !selectedNodeId));
+  const canBack = $derived(hopIx > 0 || (hopIx >= 0 && !selectedNodeId && !selectedDir));
   const canForward = $derived(hopIx < hopHistory.length - 1);
+  // Focused directory (mutually exclusive with a node selection).
+  const selectedDirCluster = $derived.by(() => {
+    void simVersion;
+    return !selectedNodeId && selectedDir ? (clusterByDir.get(selectedDir) ?? null) : null;
+  });
+  const dirMembers = $derived.by(() => {
+    const c = selectedDirCluster;
+    if (!c) return [] as SimNode[];
+    return [...c.members].sort((a, b) => b.degree - a.degree || a.file.localeCompare(b.file));
+  });
+  const dirIntraCount = $derived.by(() => {
+    const c = selectedDirCluster;
+    if (!c) return 0;
+    let n = 0;
+    for (const e of edges) if (e.src.dir === c.name && e.dst.dir === c.name) n++;
+    return n;
+  });
 
   // ── Force simulation ─────────────────────────────────────────────────────
   function initPosition(index: number, total: number): { x: number; y: number; z: number } {
@@ -363,7 +424,72 @@
         }
       }
     }
-    for (const e of edges) applySpring(e);
+    // Cross-directory file springs are OFF (the anchors carry that
+    // attraction as one aggregate spring per directory pair). Over-quota
+    // (undrawn) edges never pull.
+    for (const e of edges) {
+      if (!e.drawn || !e.intra) continue;
+      applySpring(e);
+    }
+
+    {
+      for (const c of clusters) { c.fx = 0; c.fy = 0; c.fz = 0; }
+      // Anchor↔anchor repulsion: the gross cluster separation.
+      for (let i = 0; i < clusters.length; i++) {
+        const a = clusters[i];
+        for (let j = i + 1; j < clusters.length; j++) {
+          const b = clusters[j];
+          const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+          const d2 = dx * dx + dy * dy + dz * dz + 0.01;
+          if (d2 > DIR_REPEL_CUTOFF_SQ) continue;
+          const dist = Math.sqrt(d2);
+          const f = DIR_REPULSION_K / d2;
+          const fx = (dx / dist) * f, fy = (dy / dist) * f, fz = (dz / dist) * f;
+          a.fx += fx; a.fy += fy; a.fz += fz;
+          b.fx -= fx; b.fy -= fy; b.fz -= fz;
+        }
+      }
+      // Aggregate directory springs (weight-boosted, capped).
+      for (const de of dirEdges) {
+        const a = de.a, b = de.b;
+        const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.01;
+        const k = DIR_EDGE_K * Math.min(4, 1 + Math.log2(1 + de.weight));
+        const f = k * (dist - DIR_EDGE_LEN);
+        const fx = (dx / dist) * f, fy = (dy / dist) * f, fz = (dz / dist) * f;
+        a.fx += fx; a.fy += fy; a.fz += fz;
+        b.fx -= fx; b.fy -= fy; b.fz -= fz;
+      }
+      // Member leash: files orbit their directory anchor at ~leash distance.
+      for (const c of clusters) {
+        c.fx += -c.x * GRAVITY_K;
+        c.fy += -c.y * GRAVITY_K;
+        c.fz += -c.z * GRAVITY_K;
+        const inv = 1 / c.members.length;
+        for (const m of c.members) {
+          const dx = c.x - m.x, dy = c.y - m.y, dz = c.z - m.z;
+          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.01;
+          const f = DIR_MEMBER_K * (dist - c.leash);
+          const fx = (dx / dist) * f, fy = (dy / dist) * f, fz = (dz / dist) * f;
+          m.fx += fx; m.fy += fy; m.fz += fz;
+          c.fx -= fx * inv; c.fy -= fy * inv; c.fz -= fz * inv;
+        }
+      }
+      // Integrate anchors (same cooling/damping/cap as nodes).
+      for (const c of clusters) {
+        c.vx = (c.vx + c.fx * alpha * dts) * DAMPING;
+        c.vy = (c.vy + c.fy * alpha * dts) * DAMPING;
+        c.vz = (c.vz + c.fz * alpha * dts) * DAMPING;
+        const sp = Math.hypot(c.vx, c.vy, c.vz);
+        if (sp > MAX_VEL) {
+          const s = MAX_VEL / sp;
+          c.vx *= s; c.vy *= s; c.vz *= s;
+        }
+        c.x += c.vx * dts;
+        c.y += c.vy * dts;
+        c.z += c.vz * dts;
+      }
+    }
 
     let ke = 0;
     for (const node of nodes) {
@@ -420,9 +546,131 @@
       n.sr = clamp(n.r * scale, 1, 16);
       n.sz = fz;
     }
+    for (const c of clusters) {
+      const dx = c.x - b.ex, dy = c.y - b.ey, dz = c.z - b.ez;
+      const rx = dx * b.xx + dy * b.xy + dz * b.xz;
+      const ry = dx * b.yx + dy * b.yy + dz * b.yz;
+      const fz = -(dx * b.zx + dy * b.zy + dz * b.zz);
+      if (fz < NEAR_3D) {
+        c.sx = -1e6; c.sy = -1e6; c.sz = -1; c.discR = 0;
+        continue;
+      }
+      const scale = camFocal / fz;
+      c.sx = viewW / 2 + rx * scale;
+      c.sy = viewH / 2 - ry * scale;
+      c.sz = fz;
+    }
   }
 
   // ── Rendering ─────────────────────────────────────────────────────────────
+  // The selected node's 1-hop neighborhood (via ALL incident edges, drawn or
+  // not). Null when no node is selected. With a selection active, everything
+  // outside this set is HIDDEN, not dimmed.
+  function currentEgoIds(): Set<string> | null {
+    if (!selectedNodeId || !nodeById.has(selectedNodeId)) return null;
+    const ego = new Set([selectedNodeId]);
+    for (const e of edgesByNode.get(selectedNodeId) ?? []) {
+      ego.add(e.src.id);
+      ego.add(e.dst.id);
+    }
+    return ego;
+  }
+  // Which nodes render/pick at all: node selection → its ego set; directory
+  // focus → that directory's members; otherwise everything.
+  function visibleNodeIds(): Set<string> | null {
+    const ego = currentEgoIds();
+    if (ego) return ego;
+    if (selectedDir) {
+      const c = clusterByDir.get(selectedDir);
+      if (c) return new Set(c.members.map((m) => m.id));
+    }
+    return null;
+  }
+  // Which directory discs render/pick: ego dirs, the focused dir, or all.
+  function visibleDirNames(): Set<string> | null {
+    const ego = currentEgoIds();
+    if (ego) {
+      const dirs = new Set<string>();
+      for (const id of ego) {
+        const n = nodeById.get(id);
+        if (n) dirs.add(n.dir);
+      }
+      return dirs;
+    }
+    if (selectedDir) return new Set([selectedDir]);
+    return null;
+  }
+
+  // Directory layer: translucent discs around each cluster, one aggregate
+  // edge per connected directory pair (thicker = more file links), labels.
+  // Drawn beneath the file edges/nodes. With a selection active only the
+  // directories that contain ego nodes keep their (dimmed) discs — the
+  // aggregate edges disappear in favor of the explicit routed links.
+  function drawDirLayer(): void {
+    if (!ctx) return;
+    const egoDirs = visibleDirNames();
+    for (const c of clusters) {
+      if (c.sz < 0) { c.discR = 0; continue; }
+      let r = 10;
+      for (const m of c.members) {
+        if (m.sz < 0) continue;
+        const d = Math.hypot(m.sx - c.sx, m.sy - c.sy) + m.sr;
+        if (d > r) r = d;
+      }
+      c.discR = r + 6;
+    }
+    if (!egoDirs) {
+      ctx.setLineDash([]);
+      for (const de of dirEdges) {
+        if (de.a.sz < 0 || de.b.sz < 0) continue;
+        ctx.beginPath();
+        ctx.moveTo(de.a.sx, de.a.sy);
+        ctx.lineTo(de.b.sx, de.b.sy);
+        ctx.lineWidth = Math.min(5, 1 + Math.log2(1 + de.weight));
+        ctx.strokeStyle = de.callW >= de.importW ? EDGE_CALL : EDGE_IMPORT;
+        ctx.globalAlpha = 0.3;
+        ctx.stroke();
+      }
+    }
+    ctx.lineWidth = 1;
+    ctx.font = '10px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    for (const c of clusters) {
+      if (c.sz < 0) continue;
+      if (egoDirs && !egoDirs.has(c.name)) continue;
+      ctx.beginPath();
+      ctx.arc(c.sx, c.sy, c.discR, 0, Math.PI * 2);
+      ctx.globalAlpha = egoDirs ? 0.04 : 0.06;
+      ctx.fillStyle = '#8fa4c0';
+      ctx.fill();
+      ctx.globalAlpha = egoDirs ? 0.1 : 0.16;
+      ctx.strokeStyle = '#8fa4c0';
+      ctx.stroke();
+      const label = c.name.length > 26 ? '…' + c.name.slice(-25) : c.name;
+      ctx.globalAlpha = egoDirs ? 0.4 : 0.6;
+      ctx.fillStyle = '#dde2eb';
+      ctx.fillText(label, c.sx, c.sy - c.discR - 4);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Stroke one file edge; in cluster mode a cross-directory edge is routed
+  // through the two directory anchors (file → dirA → dirB → file), so the
+  // selected file's remote links visibly travel the directory connection.
+  function strokeEdgePath(e: SimEdge): void {
+    if (!ctx) return;
+    ctx.beginPath();
+    ctx.moveTo(e.src.sx, e.src.sy);
+    if (!e.intra) {
+      const ca = clusterByDir.get(e.src.dir);
+      const cb = clusterByDir.get(e.dst.dir);
+      if (ca && ca.sz >= 0) ctx.lineTo(ca.sx, ca.sy);
+      if (cb && cb.sz >= 0) ctx.lineTo(cb.sx, cb.sy);
+    }
+    ctx.lineTo(e.dst.sx, e.dst.sy);
+    ctx.stroke();
+  }
+
   function drawEdges(now: number): void {
     if (!ctx) return;
     // Batch by style: one beginPath/setLineDash/stroke PER (kind, confidence)
@@ -433,6 +681,7 @@
     // field, so connectivity is traceable by pointing at (or selecting) a
     // node. An active selection dims the rest of the field even further.
     const selNode = selectedNodeId ? (nodeById.get(selectedNodeId) ?? null) : null;
+    const selDir = !selNode ? selectedDir : null;
     const hovNode = hoveredNode;
     const groups = new Map<string, SimEdge[]>();
     const highlighted: SimEdge[] = [];
@@ -444,19 +693,39 @@
         highlighted.push(e);
         continue;
       }
+      // With a node selection, emphasis belongs to the selected node only —
+      // hover-emphasizing a neighbor would draw bright lines to endpoints
+      // that the ego view hides. Under directory focus, hover emphasis is
+      // limited to fully-internal edges for the same reason.
       if (
-        (selNode && (e.src === selNode || e.dst === selNode)) ||
-        (hovNode && (e.src === hovNode || e.dst === hovNode))
+        selNode
+          ? e.src === selNode || e.dst === selNode
+          : hovNode &&
+            (e.src === hovNode || e.dst === hovNode) &&
+            (!selDir || (e.src.dir === selDir && e.dst.dir === selDir))
       ) {
         emphasized.push(e);
         continue;
+      }
+      // With a node selection the ambient field is hidden entirely — only
+      // the selected node's own (emphasized) edges remain.
+      if (selNode) continue;
+      if (selDir) {
+        // Directory focus: ALL of the directory's internal edges (drawn or
+        // over-quota), nothing else.
+        if (e.src.dir !== selDir || e.dst.dir !== selDir) continue;
+      } else {
+        // Over-quota edges are list/highlight-only, never ambient lines,
+        // and ambient cross-directory links are represented by the
+        // aggregate directory edge, not drawn individually.
+        if (!e.drawn || !e.intra) continue;
       }
       const key = e.kind + '|' + e.confidence;
       let g = groups.get(key);
       if (!g) groups.set(key, (g = []));
       g.push(e);
     }
-    ctx.globalAlpha = selNode ? 0.05 : 0.16;
+    ctx.globalAlpha = selDir ? 0.4 : 0.16;
     ctx.lineWidth = 1;
     for (const g of groups.values()) {
       ctx.beginPath();
@@ -473,22 +742,16 @@
     ctx.globalAlpha = 0.85;
     ctx.lineWidth = 1.5;
     for (const e of emphasized) {
-      ctx.beginPath();
-      ctx.moveTo(e.src.sx, e.src.sy);
-      ctx.lineTo(e.dst.sx, e.dst.sy);
       ctx.setLineDash(dashFor(e.confidence));
       ctx.strokeStyle = edgeColor(e.kind);
-      ctx.stroke();
+      strokeEdgePath(e);
     }
     ctx.globalAlpha = 0.95;
     ctx.lineWidth = 2.5;
     for (const e of highlighted) {
-      ctx.beginPath();
-      ctx.moveTo(e.src.sx, e.src.sy);
-      ctx.lineTo(e.dst.sx, e.dst.sy);
       ctx.setLineDash(dashFor(e.confidence));
       ctx.strokeStyle = e.highlightColor ?? edgeColor(e.kind);
-      ctx.stroke();
+      strokeEdgePath(e);
     }
     ctx.setLineDash([]);
     ctx.globalAlpha = 1;
@@ -496,22 +759,15 @@
 
   function drawNodes(now: number): void {
     if (!ctx) return;
-    // Ego set: with a selection active, the selected node + its 1-hop
-    // neighborhood stay bright and everything else fades back.
-    let egoIds: Set<string> | null = null;
-    if (selectedNodeId && nodeById.has(selectedNodeId)) {
-      egoIds = new Set([selectedNodeId]);
-      for (const e of edgesByNode.get(selectedNodeId) ?? []) {
-        egoIds.add(e.src.id);
-        egoIds.add(e.dst.id);
-      }
-    }
+    // With a node selection only the ego set renders; under directory focus
+    // only that directory's members do.
+    const egoIds = visibleNodeIds();
     const order = [...nodes].sort((a, b) => b.sz - a.sz);
     for (const n of order) {
       if (n.sz < 0) continue;
-      const dimmed = egoIds !== null && !egoIds.has(n.id);
+      if (egoIds !== null && !egoIds.has(n.id)) continue;
       ctx.fillStyle = n.subsystem ? subsystemColor(n.subsystem) : UNCATEGORIZED_COLOR;
-      ctx.globalAlpha = dimmed ? 0.25 : 1;
+      ctx.globalAlpha = 1;
       ctx.beginPath();
       ctx.arc(n.sx, n.sy, n.sr, 0, Math.PI * 2);
       ctx.fill();
@@ -558,6 +814,7 @@
     project();
     ctx.clearRect(0, 0, viewW, viewH);
     const now = performance.now();
+    drawDirLayer();
     drawEdges(now);
     drawNodes(now);
   }
@@ -572,16 +829,29 @@
   }
 
   function stepViewAnimation(dt: number): boolean {
-    if (!focusTarget) return false;
+    if (!focusTarget && focusDist === null) return false;
     const k = 1 - Math.exp(-dt * 0.008);
-    camTargetX += (focusTarget.x - camTargetX) * k;
-    camTargetY += (focusTarget.y - camTargetY) * k;
-    camTargetZ += (focusTarget.z - camTargetZ) * k;
-    const d = Math.hypot(focusTarget.x - camTargetX, focusTarget.y - camTargetY, focusTarget.z - camTargetZ);
-    if (d < 0.5) {
-      camTargetX = focusTarget.x; camTargetY = focusTarget.y; camTargetZ = focusTarget.z; focusTarget = null; return false;
+    let moving = false;
+    if (focusTarget) {
+      camTargetX += (focusTarget.x - camTargetX) * k;
+      camTargetY += (focusTarget.y - camTargetY) * k;
+      camTargetZ += (focusTarget.z - camTargetZ) * k;
+      const d = Math.hypot(focusTarget.x - camTargetX, focusTarget.y - camTargetY, focusTarget.z - camTargetZ);
+      if (d < 0.5) {
+        camTargetX = focusTarget.x; camTargetY = focusTarget.y; camTargetZ = focusTarget.z; focusTarget = null;
+      } else {
+        moving = true;
+      }
     }
-    return true;
+    if (focusDist !== null) {
+      camDist += (focusDist - camDist) * k;
+      if (Math.abs(focusDist - camDist) < 1) {
+        camDist = focusDist; focusDist = null;
+      } else {
+        moving = true;
+      }
+    }
+    return moving;
   }
 
   function stepMomentum(dt: number): boolean {
@@ -677,6 +947,7 @@
         fx: 0, fy: 0, fz: 0,
         r, sx: 0, sy: 0, sr: 0, sz: 0,
         pulseUntil: 0, pulseColor: null,
+        dir: dirOf(row.file),
       };
       newNodes.push(sn);
       newById.set(row.id, sn);
@@ -686,7 +957,57 @@
       const s = newById.get(row.src);
       const d = newById.get(row.dst);
       if (!s || !d) continue;
-      newEdges.push({ src: s, dst: d, kind: row.kind, confidence: row.confidence, highlightUntil: 0, highlightColor: null });
+      newEdges.push({
+        src: s, dst: d, kind: row.kind, confidence: row.confidence,
+        highlightUntil: 0, highlightColor: null,
+        intra: s.dir === d.dir,
+        drawn: row.drawn,
+      });
+    }
+
+    // Directory clusters: one anchor per directory (position preserved across
+    // refreshes), plus ONE aggregate edge per connected directory pair.
+    const prevClusters = clusterByDir;
+    const membersByDir = new Map<string, SimNode[]>();
+    for (const n of newNodes) {
+      let m = membersByDir.get(n.dir);
+      if (!m) membersByDir.set(n.dir, (m = []));
+      m.push(n);
+    }
+    const newClusterByDir = new Map<string, DirCluster>();
+    const newClusters: DirCluster[] = [];
+    for (const [dir, members] of membersByDir) {
+      const old = prevClusters.get(dir);
+      let ax = old?.x ?? 0, ay = old?.y ?? 0, az = old?.z ?? 0;
+      if (!old) {
+        for (const m of members) { ax += m.x; ay += m.y; az += m.z; }
+        ax /= members.length; ay /= members.length; az /= members.length;
+      }
+      const c: DirCluster = {
+        name: dir, members,
+        leash: 12 + Math.sqrt(members.length) * 6,
+        x: ax, y: ay, z: az,
+        vx: 0, vy: 0, vz: 0, fx: 0, fy: 0, fz: 0,
+        sx: 0, sy: 0, sz: 0, discR: 0,
+      };
+      newClusterByDir.set(dir, c);
+      newClusters.push(c);
+    }
+    const newDirEdges: DirEdge[] = [];
+    const dirEdgeIx = new Map<string, DirEdge>();
+    for (const e of newEdges) {
+      if (e.intra) continue;
+      const [a, b] = e.src.dir < e.dst.dir ? [e.src.dir, e.dst.dir] : [e.dst.dir, e.src.dir];
+      const key = a + '\n' + b;
+      let de = dirEdgeIx.get(key);
+      if (!de) {
+        de = { a: newClusterByDir.get(a)!, b: newClusterByDir.get(b)!, weight: 0, callW: 0, importW: 0 };
+        dirEdgeIx.set(key, de);
+        newDirEdges.push(de);
+      }
+      de.weight += 1;
+      if (e.kind === 'call') de.callW += 1;
+      else if (e.kind === 'import') de.importW += 1;
     }
 
     const newByNode = new Map<string, SimEdge[]>();
@@ -703,14 +1024,18 @@
     edges = newEdges;
     nodeById = newById;
     edgesByNode = newByNode;
+    clusters = newClusters;
+    clusterByDir = newClusterByDir;
+    dirEdges = newDirEdges;
     nodeCount = newNodes.length;
-    edgeCount = newEdges.length;
+    edgeCount = newEdges.filter((e) => e.drawn).length;
     subsystemsPresent = [...new Set(newNodes.map((n) => n.subsystem).filter((s) => s))].sort();
     hasUncategorized = newNodes.some((n) => !n.subsystem);
     edgeKindsPresent = [...new Set(newEdges.map((e) => e.kind))].sort();
     edgeConfsPresent = [...new Set(newEdges.map((e) => e.confidence))].sort();
-    // Selection survives a refresh as long as its node is still present.
+    // Selection survives a refresh as long as its node/dir is still present.
     if (selectedNodeId && !newById.has(selectedNodeId)) selectedNodeId = null;
+    if (selectedDir && !newClusterByDir.has(selectedDir)) selectedDir = null;
     hoveredNode = null;
     simVersion += 1;
     const isFresh = prev.size === 0;
@@ -760,46 +1085,70 @@
     // back also re-enables the settle-time auto-fit.
     fitView();
     focusTarget = null;
+    focusDist = null;
     orbitVelTheta = 0; orbitVelPhi = 0;
     userInteracted = false;
     wake();
   }
 
   // ── Selection + hop history ──────────────────────────────────────────────
+  // History entries: node ids (`file:<path>`) and focused dirs (`dir:<name>`).
+  function historyPush(id: string): void {
+    if (hopHistory[hopIx] === id) return;
+    hopHistory = [...hopHistory.slice(0, hopIx + 1), id];
+    hopIx = hopHistory.length - 1;
+  }
   function selectNode(node: SimNode, push = true): void {
     selectedNodeId = node.id;
+    selectedDir = null;
     focusRingUntil = performance.now() + FOCUS_MS;
     focusTarget = { x: node.x, y: node.y, z: node.z };
-    if (push && hopHistory[hopIx] !== node.id) {
-      hopHistory = [...hopHistory.slice(0, hopIx + 1), node.id];
-      hopIx = hopHistory.length - 1;
+    focusDist = null;
+    if (push) historyPush(node.id);
+    wake();
+  }
+  function selectDir(c: DirCluster, push = true): void {
+    selectedNodeId = null;
+    selectedDir = c.name;
+    focusTarget = { x: c.x, y: c.y, z: c.z };
+    // Dolly in far enough to frame the whole cluster (~58° vertical FOV).
+    let maxR = c.leash;
+    for (const m of c.members) {
+      maxR = Math.max(maxR, Math.hypot(m.x - c.x, m.y - c.y, m.z - c.z));
     }
+    focusDist = clamp(maxR * 2.4 + 60, MIN_DIST_3D, MAX_DIST_3D);
+    if (push) historyPush('dir:' + c.name);
     wake();
   }
   function clearSelection(): void {
     selectedNodeId = null;
+    selectedDir = null;
     wake();
   }
+  function hopResolvable(id: string): boolean {
+    return id.startsWith('dir:') ? clusterByDir.has(id.slice(4)) : nodeById.has(id);
+  }
   function hopTo(ix: number): void {
-    const node = nodeById.get(hopHistory[ix]);
-    if (!node) return;
+    const id = hopHistory[ix];
+    if (!hopResolvable(id)) return;
     hopIx = ix;
-    selectNode(node, false);
+    if (id.startsWith('dir:')) selectDir(clusterByDir.get(id.slice(4))!, false);
+    else selectNode(nodeById.get(id)!, false);
   }
   function hopBack(): void {
     // A cleared selection restores the current entry before stepping back.
-    if (!selectedNodeId && hopIx >= 0 && nodeById.has(hopHistory[hopIx])) {
+    if (!selectedNodeId && !selectedDir && hopIx >= 0 && hopResolvable(hopHistory[hopIx])) {
       hopTo(hopIx);
       return;
     }
-    // Skip entries whose node fell out of the snapshot since.
+    // Skip entries whose node/dir fell out of the snapshot since.
     for (let i = hopIx - 1; i >= 0; i--) {
-      if (nodeById.has(hopHistory[i])) { hopTo(i); return; }
+      if (hopResolvable(hopHistory[i])) { hopTo(i); return; }
     }
   }
   function hopForward(): void {
     for (let i = hopIx + 1; i < hopHistory.length; i++) {
-      if (nodeById.has(hopHistory[i])) { hopTo(i); return; }
+      if (hopResolvable(hopHistory[i])) { hopTo(i); return; }
     }
   }
 
@@ -977,13 +1326,31 @@
   function pickNode(mx: number, my: number): SimNode | null {
     // Front-most (smallest camera depth) within the hit radius wins —
     // nearest-in-2D kept selecting nodes hidden far behind the one the
-    // cursor is visibly on in a dense cluster.
+    // cursor is visibly on in a dense cluster. Only visible nodes pick.
+    const vis = visibleNodeIds();
     let best: SimNode | null = null;
     let bestZ = Infinity;
     for (const n of nodes) {
       if (n.sz < 0) continue;
+      if (vis && !vis.has(n.id)) continue;
       const d = Math.hypot(mx - n.sx, my - n.sy);
       if (d <= Math.max(n.sr, 10) && n.sz < bestZ) { best = n; bestZ = n.sz; }
+    }
+    return best;
+  }
+
+  function pickDir(mx: number, my: number): DirCluster | null {
+    // Front-most visible disc under the cursor (checked only after pickNode
+    // misses, so nodes win over their disc). discR comes from the last
+    // drawDirLayer pass.
+    const dirs = visibleDirNames();
+    let best: DirCluster | null = null;
+    let bestZ = Infinity;
+    for (const c of clusters) {
+      if (c.sz < 0 || c.discR <= 0) continue;
+      if (dirs && !dirs.has(c.name)) continue;
+      const d = Math.hypot(mx - c.sx, my - c.sy);
+      if (d <= c.discR && c.sz < bestZ) { best = c; bestZ = c.sz; }
     }
     return best;
   }
@@ -998,6 +1365,7 @@
     dragging = true;
     orbitVelTheta = 0; orbitVelPhi = 0;
     focusTarget = null;
+    focusDist = null;
     userInteracted = true;
     window.addEventListener('mousemove', onWindowMouseMove);
     window.addEventListener('mouseup', onWindowMouseUp);
@@ -1035,8 +1403,16 @@
     window.removeEventListener('mouseup', onWindowMouseUp);
     if (!dragMoved && canvasEl) {
       const rect = canvasEl.getBoundingClientRect();
-      const hit = pickNode(e.clientX - rect.left, e.clientY - rect.top);
-      if (hit) selectNode(hit); else clearSelection();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const hit = pickNode(mx, my);
+      if (hit) {
+        selectNode(hit);
+      } else {
+        const dirHit = pickDir(mx, my);
+        if (dirHit) selectDir(dirHit);
+        else clearSelection();
+      }
     }
     wake();
   }
@@ -1048,7 +1424,7 @@
     if (e.key === 'Escape') {
       // Close the search dropdown first, then clear the selection.
       if (searchQuery) searchQuery = '';
-      else if (selectedNodeId) clearSelection();
+      else if (selectedNodeId || selectedDir) clearSelection();
     } else if (e.key === 'Backspace' && !typing && canBack) {
       e.preventDefault();
       hopBack();
@@ -1059,6 +1435,7 @@
     if (nodes.length === 0 || !canvasEl) return;
     e.preventDefault();
     camDist = clamp(camDist * Math.exp(e.deltaY * 0.0015), MIN_DIST_3D, MAX_DIST_3D);
+    focusDist = null; // the wheel takes over any in-flight dolly
     userInteracted = true;
     wake();
   }
@@ -1254,6 +1631,30 @@
             {:else if shownConnCount < selectedNode.degree}
               <div class="conn-note">strongest {shownConnCount} of ~{selectedNode.degree} connections shown</div>
             {/if}
+          </div>
+        </div>
+      {:else if selectedDirCluster}
+        <div class="conn-panel">
+          <div class="conn-head">
+            <button type="button" class="nav" onclick={hopBack} disabled={!canBack} title="Back (Backspace)">‹</button>
+            <button type="button" class="nav" onclick={hopForward} disabled={!canForward} title="Forward">›</button>
+            <div class="conn-title">
+              <strong title={selectedDirCluster.name}>{selectedDirCluster.name}</strong>
+              <div class="conn-meta">{dirMembers.length} files · {dirIntraCount} internal links</div>
+            </div>
+            <button type="button" class="nav" onclick={clearSelection} title="Clear selection (Esc)">✕</button>
+          </div>
+          <div class="conn-body">
+            <div class="legend-section">
+              <h4>files</h4>
+              {#each dirMembers as m (m.id)}
+                <button type="button" class="conn-row" title={m.file} onclick={() => selectNode(m)}>
+                  <span class="swatch" style="background:{m.subsystem ? subsystemColor(m.subsystem) : UNCATEGORIZED_COLOR}"></span>
+                  <span class="conn-file">{basename(m.file)}</span>
+                  <span class="sr-deg tnum">{m.degree}</span>
+                </button>
+              {/each}
+            </div>
           </div>
         </div>
       {/if}
@@ -1549,6 +1950,8 @@
   }
   .conn-body {
     padding: 0 8px 8px;
+    /* ~8 rows visible; the rest scrolls so the box never grows huge. */
+    max-height: 200px;
     overflow-y: auto;
   }
   .conn-row {

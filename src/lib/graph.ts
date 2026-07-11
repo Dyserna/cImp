@@ -364,6 +364,9 @@ export interface VizEdgeRow {
   dst: string;
   kind: string;
   confidence: string;
+  /// `false` = over the per-node drawn quota: shown in the connections
+  /// panel / selection highlight, but not as an ambient line.
+  drawn: boolean;
 }
 
 /// A bounded {nodes, edges} subgraph for the Graph View tab. Mirror of Rust

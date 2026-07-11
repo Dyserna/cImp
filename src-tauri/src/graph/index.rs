@@ -162,6 +162,10 @@ pub struct VizEdge {
     pub kind: String,
     /// Confidence tag (`extracted`/`inferred`/`ambiguous`) — edge dash pattern.
     pub confidence: String,
+    /// Whether the edge made the per-node drawn quota. `false` edges are NOT
+    /// rendered as ambient lines — they exist so the frontend can list and
+    /// highlight a selected node's FULL connection set.
+    pub drawn: bool,
 }
 
 /// A bounded subgraph for the Graph View tab (V15 Feature 4): the top-degree
@@ -1812,7 +1816,7 @@ reach[x] := reach[z], calls[x, z]"#
             edge_ix.insert((a.to_string(), b.to_string(), kind), edges.len());
             if let Some(n) = meta.get_mut(a) { n.degree += 1; }
             if let Some(n) = meta.get_mut(b) { n.degree += 1; }
-            edges.push(VizEdge { src: a.to_string(), dst: b.to_string(), kind: kind.to_string(), confidence: conf.tag().to_string() });
+            edges.push(VizEdge { src: a.to_string(), dst: b.to_string(), kind: kind.to_string(), confidence: conf.tag().to_string(), drawn: false });
             weights.push(1);
         };
 
@@ -1868,13 +1872,15 @@ reach[x] := reach[z], calls[x, z]"#
             .collect();
 
         // Drawn-edge cap, strongest first: order by rolled-up weight, then
-        // confidence, then a deterministic key; each node keeps at most
-        // VIZ_NEIGHBORS_PER_NODE incident edges (an edge survives while
+        // confidence, then a deterministic key; each node gets at most
+        // VIZ_NEIGHBORS_PER_NODE drawn incident edges (an edge draws while
         // EITHER endpoint still has quota, so a hub's strongest spokes stay
         // even after the hub itself is saturated), all under the global
-        // max_nodes * VIZ_EDGES_PER_NODE bound. Node degrees stay as
-        // computed above — the cap bounds what's DRAWN, not the truth about
-        // how connected a node is.
+        // max_nodes * VIZ_EDGES_PER_NODE bound. Edges over quota are KEPT
+        // with `drawn: false` — the frontend's connections panel and
+        // selection highlight need the full set; only ambient rendering and
+        // the spring sim are bounded by the flag. Node degrees stay as
+        // computed above.
         weighted.sort_by(|a, b| {
             b.1.cmp(&a.1)
                 .then_with(|| conf_rank(&a.0.confidence).cmp(&conf_rank(&b.0.confidence)))
@@ -1882,22 +1888,21 @@ reach[x] := reach[z], calls[x, z]"#
         });
         let max_edges = max_nodes.saturating_mul(VIZ_EDGES_PER_NODE);
         let mut used: HashMap<String, usize> = HashMap::new();
-        let mut drawn: Vec<VizEdge> = Vec::new();
-        for (e, _) in weighted {
-            if drawn.len() >= max_edges {
-                break;
-            }
+        let mut drawn_count = 0usize;
+        let mut final_edges: Vec<VizEdge> = Vec::with_capacity(weighted.len());
+        for (mut e, _) in weighted {
             let su = used.get(&e.src).copied().unwrap_or(0);
             let du = used.get(&e.dst).copied().unwrap_or(0);
-            if su >= VIZ_NEIGHBORS_PER_NODE && du >= VIZ_NEIGHBORS_PER_NODE {
-                continue;
+            if drawn_count < max_edges && (su < VIZ_NEIGHBORS_PER_NODE || du < VIZ_NEIGHBORS_PER_NODE) {
+                e.drawn = true;
+                drawn_count += 1;
+                *used.entry(e.src.clone()).or_default() += 1;
+                *used.entry(e.dst.clone()).or_default() += 1;
             }
-            *used.entry(e.src.clone()).or_default() += 1;
-            *used.entry(e.dst.clone()).or_default() += 1;
-            drawn.push(e);
+            final_edges.push(e);
         }
 
-        Ok(VizGraph { nodes, edges: drawn })
+        Ok(VizGraph { nodes, edges: final_edges })
     }
 
     /// V12 Phase C: the **candidate** tests that (transitively) depend on one
@@ -4510,8 +4515,11 @@ pub struct Point { x: i32 }
         );
         // A multi-candidate callee name renders as ambiguous (dotted).
         assert!(calls.iter().all(|e| e.confidence == "ambiguous"));
-        // The overall bound the frontend's frame budget relies on.
-        assert!(g.edges.len() <= g.nodes.len() * VIZ_EDGES_PER_NODE);
+        // The overall bound the frontend's frame budget relies on applies to
+        // DRAWN edges — over-quota edges ride along with drawn=false for the
+        // connections panel.
+        let drawn = g.edges.iter().filter(|e| e.drawn).count();
+        assert!(drawn <= g.nodes.len() * VIZ_EDGES_PER_NODE);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

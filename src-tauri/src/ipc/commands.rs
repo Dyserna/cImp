@@ -1394,6 +1394,9 @@ pub struct VizEdgeRow {
     pub dst: String,
     pub kind: String,
     pub confidence: String,
+    /// `false` = over the per-node drawn quota: listed/highlighted by the
+    /// frontend but not rendered as an ambient line.
+    pub drawn: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1420,7 +1423,7 @@ pub async fn graph_viz_snapshot(
         edges: g
             .edges
             .into_iter()
-            .map(|e| VizEdgeRow { src: e.src, dst: e.dst, kind: e.kind, confidence: e.confidence })
+            .map(|e| VizEdgeRow { src: e.src, dst: e.dst, kind: e.kind, confidence: e.confidence, drawn: e.drawn })
             .collect(),
     })
 }

@@ -522,6 +522,9 @@ export interface SessionUsageRow {
   /// True when this session has no exact `usage` data (currently every
   /// non-Claude agent) — the table's "est" badge.
   est_only: boolean;
+  /// Session start / last-activity timestamps (epoch ms).
+  started_ms: number;
+  last_ms: number;
 }
 
 /// The Effectiveness panel's three measured counters — all exact chars, no

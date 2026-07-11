@@ -236,6 +236,10 @@ pub struct SessionUsageRow {
     /// True when this session has no exact `usage` data — currently every
     /// non-Claude agent (see the OpenCode C3 spike note atop `oob/opencode.rs`).
     pub est_only: bool,
+    /// Session start / last-activity timestamps (epoch ms), from the
+    /// `session` relation via [`SessionInfo`].
+    pub started_ms: i64,
+    pub last_ms: i64,
 }
 
 // ── V14 Phase D: Usage section assembly ────────────────────────────────────

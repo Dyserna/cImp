@@ -3250,6 +3250,8 @@ impl GraphIndex {
                 totals,
                 tool_chars,
                 cache_hit_ratio,
+                started_ms: s.started_ms,
+                last_ms: s.last_ms,
             });
         }
         Ok(out)

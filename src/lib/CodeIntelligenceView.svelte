@@ -58,7 +58,7 @@
     fmtUsd,
     type PriceRates,
   } from './usageMath';
-  import { fmtTime } from './format';
+  import { fmtDate, fmtTime } from './format';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
   import { llmPricingGet } from './settings/ipc';
@@ -663,16 +663,6 @@
 <div class="graph-monitor">
   <header>
     <h2>Code Intelligence</h2>
-    <div class="actions">
-      <button onclick={doRebuild} disabled={busy}>Rebuild index</button>
-      <button onclick={doRebuildEmbeddings} disabled={busy}>Rebuild embeddings</button>
-      <button class="secondary" onclick={testEmbedder} disabled={probing}>
-        {probing ? 'Testing…' : 'Test connection'}
-      </button>
-      <button class="secondary" onclick={togglePause}>
-        {paused ? 'Resume watch' : 'Pause watch'}
-      </button>
-    </div>
   </header>
 
   <nav class="sections">
@@ -849,7 +839,7 @@
               title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens — click for cost`}
               onclick={() => void openCostPopup(s)}
             >
-              <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}</span>
+              <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}<span class="sess-date">{fmtDate(s.started_ms)}</span></span>
               <span class="sess-stats tnum">
                 <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
                 <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
@@ -864,7 +854,19 @@
     </details>
   </div>
 
-  <h3 class="group-head">Index</h3>
+  <div class="group-row">
+    <h3 class="group-head">Index</h3>
+    <div class="actions">
+      <button onclick={doRebuild} disabled={busy}>Rebuild index</button>
+      <button onclick={doRebuildEmbeddings} disabled={busy}>Rebuild embeddings</button>
+      <button class="secondary" onclick={testEmbedder} disabled={probing}>
+        {probing ? 'Testing…' : 'Test connection'}
+      </button>
+      <button class="secondary" onclick={togglePause}>
+        {paused ? 'Resume watch' : 'Pause watch'}
+      </button>
+    </div>
+  </div>
   {#if probe}
     <p class="probe {probe.ok ? 'ok' : 'err'}">
       <span class="probe-dot"></span>
@@ -1393,6 +1395,10 @@
         <button type="button" class="cost-close" aria-label="Close" onclick={closeCostPopup}>×</button>
       </div>
 
+      <div class="cost-when muted">
+        {fmtDate(costSession.started_ms)} · {fmtTime(costSession.started_ms)} – {fmtTime(costSession.last_ms)}
+      </div>
+
       <label class="cost-provider">
         <span>Pricing</span>
         <select bind:value={costSelIdx}>
@@ -1760,6 +1766,21 @@
   }
   .group-head:first-of-type {
     margin-top: 0;
+  }
+  /* Group divider variant carrying the index actions on its right edge. */
+  .group-row {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 18px 0 8px;
+    border-bottom: 1px solid var(--border, #333);
+    padding-bottom: 4px;
+  }
+  .group-row .group-head {
+    margin: 0;
+    border-bottom: none;
+    padding-bottom: 0;
   }
   .embed {
     margin-top: 10px;
@@ -2176,6 +2197,11 @@
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
     font-size: 13px;
   }
+  .cost-when {
+    font-size: 12px;
+    margin: -6px 0 10px;
+    font-variant-numeric: tabular-nums;
+  }
   .cost-title {
     display: flex;
     align-items: center;
@@ -2268,6 +2294,13 @@
   .arow.sessrow .aloc {
     min-width: 14ch;
     text-align: right;
+  }
+  .sess-date {
+    margin-left: 8px;
+    font-weight: 400;
+    font-size: 11px;
+    opacity: 0.6;
+    font-variant-numeric: tabular-nums;
   }
   .sess-stats {
     /* Fixed tracks so the values line up as columns ACROSS rows (fmtTok is

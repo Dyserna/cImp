@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod activity;
 mod advisor;
 mod attach;
 mod audio;
@@ -43,7 +44,8 @@ use tracing::{info, warn};
 
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::ipc::commands::{
-    acknowledge_error, advisor_dismiss, ai_tool_tab_defaults, close_settings_window,
+    acknowledge_error, activity_clear, activity_delete, activity_detail, activity_list,
+    advisor_dismiss, ai_tool_tab_defaults, close_settings_window,
     compose_attach_image,
     compose_content_changed,
     compose_templates, compose_templates_global_get, compose_templates_global_set,
@@ -763,6 +765,10 @@ fn main() {
             graph_set_language_enabled,
             graph_test_embedder,
             graph_history,
+            activity_list,
+            activity_detail,
+            activity_delete,
+            activity_clear,
             graph_dead_exports,
             graph_cycles,
             graph_impact,

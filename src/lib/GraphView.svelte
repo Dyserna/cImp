@@ -1363,9 +1363,15 @@
   async function pollHistory(): Promise<void> {
     if (!graphEnabled) return;
     try {
-      // Scoped: the ring spans every indexed root, and another project's
-      // calls would light up same-named nodes in this graph.
-      const calls = await graphHistory({ root, scoped: true });
+      // Scoped: the store spans every indexed root, and another project's
+      // calls would light up same-named nodes in this graph. After the first
+      // (seeding) poll, only entries past the high-water mark are fetched —
+      // the steady-state poll returns ~0 rows instead of the whole history.
+      const calls = await graphHistory({
+        root,
+        scoped: true,
+        sinceTs: historySeeded ? lastHistoryTs : undefined,
+      });
       const fresh = calls.filter((c) => c.ts_ms > lastHistoryTs).sort((a, b) => a.ts_ms - b.ts_ms);
       for (const c of calls) if (c.ts_ms > lastHistoryTs) lastHistoryTs = c.ts_ms;
       // First poll: seed the high-water mark only. Parked (hidden/unsized):

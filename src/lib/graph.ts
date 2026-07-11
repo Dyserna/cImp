@@ -110,8 +110,12 @@ export function graphTestEmbedder(): Promise<EmbedderProbe> {
   return invoke<EmbedderProbe>('graph_test_embedder');
 }
 
-/// One recorded graph tool call. Mirror of Rust `graph::GraphCall`.
+/// One recorded graph tool call — a kind=graph projection of the persistent
+/// activity store (Rust `activity::ActivityEntry`). The Tool Activity tab
+/// uses the full store via `activity.ts`.
 export interface GraphCall {
+  /// Stable id in the activity store (survives restarts).
+  id: number;
   ts_ms: number;
   /// Canonicalized project root the call ran against.
   root: string;
@@ -124,12 +128,20 @@ export interface GraphCall {
 }
 
 /// Recent graph tool calls (cloud Claude + offload worker), newest first.
-/// The ring spans every indexed root; pass `scoped: true` (with an optional
+/// The store spans every indexed root; pass `scoped: true` (with an optional
 /// `root`, default the launch directory) to see one project's calls only.
-export function graphHistory(opts?: { root?: string; scoped?: boolean }): Promise<GraphCall[]> {
+/// `sinceTs` trims the response to entries newer than the caller's
+/// high-water mark, so a steady poll isn't re-fetching hundreds of rows it
+/// already has.
+export function graphHistory(opts?: {
+  root?: string;
+  scoped?: boolean;
+  sinceTs?: number;
+}): Promise<GraphCall[]> {
   return invoke<GraphCall[]>('graph_history', {
     root: opts?.root ?? null,
     scoped: opts?.scoped ?? false,
+    sinceTs: opts?.sinceTs ?? null,
   });
 }
 

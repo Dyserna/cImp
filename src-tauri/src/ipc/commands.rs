@@ -1123,22 +1123,86 @@ pub async fn graph_test_embedder(
 }
 
 /// V9-01: recent graph tool calls (cloud Claude + offload worker), newest
-/// first — the monitor tab's activity list. The ring is process-wide across
-/// every indexed root; pass `scoped: true` (with an optional `root`, default
-/// the launch directory) to filter to one project's calls — the Graph View
-/// pulse feed uses this so another project's activity can't light up
-/// same-named nodes here. The Tool Activity tab omits it and sees everything.
+/// first. The store is process-wide across every indexed root; pass
+/// `scoped: true` (with an optional `root`, default the launch directory) to
+/// filter to one project's calls — the Graph View pulse feed uses this so
+/// another project's activity can't light up same-named nodes here.
+///
+/// The persistent activity store also holds offload runs; this endpoint keeps
+/// its historical contract of graph calls only (the pulse feed maps
+/// tool/target onto graph nodes). The Tool Activity tab uses
+/// [`activity_list`] and sees everything.
+/// `since_ts` (optional) trims the response to entries newer than the
+/// caller's high-water mark, so the 1.5–2s pollers aren't re-serializing
+/// hundreds of unchanged rows every tick. All store calls run on the
+/// blocking pool: the first access loads the JSONL mirror from disk, and
+/// mutations rewrite it — neither belongs on a tokio worker thread.
 #[tauri::command]
 pub async fn graph_history(
     root: Option<String>,
     scoped: Option<bool>,
-) -> AppResult<Vec<crate::graph::GraphCall>> {
-    let calls = crate::graph::graph_history();
-    if !scoped.unwrap_or(false) {
-        return Ok(calls);
-    }
-    let key = crate::graph::activity_root_key(&resolve_graph_root(root)?);
-    Ok(calls.into_iter().filter(|c| c.root == key).collect())
+    since_ts: Option<u64>,
+) -> AppResult<Vec<crate::activity::ActivityEntry>> {
+    let key = if scoped.unwrap_or(false) {
+        Some(crate::activity::root_key(&resolve_graph_root(root)?))
+    } else {
+        None
+    };
+    run_on_blocking_pool(move || {
+        let mut calls: Vec<_> = crate::activity::snapshot_since(since_ts.unwrap_or(0))
+            .into_iter()
+            .filter(|c| c.kind == crate::activity::ActivityKind::Graph.as_str())
+            .collect();
+        if let Some(key) = key {
+            calls.retain(|c| c.root == key);
+        }
+        calls
+    })
+    .await
+}
+
+/// The unified tool-activity feed (graph calls + offload runs), newest first,
+/// without payloads — the Tool Activity tab's poll.
+#[tauri::command]
+pub async fn activity_list(
+    since_ts: Option<u64>,
+) -> AppResult<Vec<crate::activity::ActivityEntry>> {
+    run_on_blocking_pool(move || crate::activity::snapshot_since(since_ts.unwrap_or(0))).await
+}
+
+/// One activity's full record — including the captured request/response
+/// payloads — for the detail popup. `None` when the entry was deleted (or
+/// aged out) between the list poll and the click.
+#[tauri::command]
+pub async fn activity_detail(id: u64) -> AppResult<Option<crate::activity::ActivityRecord>> {
+    run_on_blocking_pool(move || crate::activity::detail(id)).await
+}
+
+/// Delete one activity entry (persists immediately).
+#[tauri::command]
+pub async fn activity_delete(id: u64) -> AppResult<()> {
+    run_on_blocking_pool(move || {
+        crate::activity::delete(id);
+    })
+    .await
+}
+
+/// Clear the whole activity history (persists immediately).
+#[tauri::command]
+pub async fn activity_clear() -> AppResult<()> {
+    run_on_blocking_pool(crate::activity::clear).await
+}
+
+/// Run a synchronous activity-store operation on tokio's blocking pool —
+/// the store does file I/O under its lock (see the module's blocking note).
+async fn run_on_blocking_pool<T, F>(f: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| crate::error::AppError::Ipc(format!("activity task join: {e}")))
 }
 
 /// V10: one candidate dead export (unused public symbol) for the Analyses tab.

@@ -402,7 +402,7 @@ pub(crate) async fn dispatch_recorded(
     args: &Value,
 ) -> Result<String, String> {
     let (max_rows, max_snippet) = limits(settings);
-    let started = super::activity::now_ms();
+    let started = crate::activity::now_ms();
     let result = if name == "graph_semantic_docs" {
         // F8: `query` is schema-required — enforce it on THIS (primary async)
         // path too, not just in `run_tool`. An empty query would embed "" and
@@ -442,17 +442,31 @@ pub(crate) async fn dispatch_recorded(
     } else {
         run_tool(idx, name, args, max_rows, max_snippet, mem_agent(source))
     };
-    super::activity::record(super::activity::GraphCall {
-        ts_ms: started,
-        root: super::activity::root_key(root),
-        source: source.to_string(),
-        tool: name.to_string(),
-        target: arg_summary(name, args),
-        chars: result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
-        ms: super::activity::now_ms().saturating_sub(started),
-        ok: result.is_ok(),
+    crate::activity::record_bg(crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::Graph,
+            started,
+            crate::activity::root_key(root),
+            source.to_string(),
+            name.to_string(),
+            arg_summary(name, args),
+            result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
+            crate::activity::now_ms().saturating_sub(started),
+            result.is_ok(),
+        ),
+        request: serde_json::to_string_pretty(args).unwrap_or_default(),
+        response: activity_response(&result),
     });
     result
+}
+
+/// The response payload captured for the activity detail popup: the tool's
+/// text on success, the error message (marked) on failure.
+fn activity_response(result: &Result<String, String>) -> String {
+    match result {
+        Ok(text) => text.clone(),
+        Err(msg) => format!("[error] {msg}"),
+    }
 }
 
 /// The primary argument of a graph tool (symbol / file / query) for the
@@ -633,7 +647,7 @@ pub fn run_tool(
                 }
             };
             let note_id = uuid::Uuid::new_v4().to_string();
-            let ts = super::activity::now_ms() as i64;
+            let ts = crate::activity::now_ms() as i64;
             idx.mem_add_note(&note_id, &sid, &text, ts, pin)
                 .map(|_| format!("Noted{}.", if pin { " (pinned, kept across sessions)" } else { "" }))
                 .map_err(|e| e.to_string())
@@ -738,17 +752,22 @@ pub(crate) async fn run_check_tool(
     source: &str,
     args: &Value,
 ) -> Result<String, String> {
-    let started = super::activity::now_ms();
+    let started = crate::activity::now_ms();
     let result = run_check_inner(root, settings, args).await;
-    super::activity::record(super::activity::GraphCall {
-        ts_ms: started,
-        root: super::activity::root_key(root),
-        source: source.to_string(),
-        tool: "run_check".to_string(),
-        target: args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        chars: result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
-        ms: super::activity::now_ms().saturating_sub(started),
-        ok: result.is_ok(),
+    crate::activity::record_bg(crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::Graph,
+            started,
+            crate::activity::root_key(root),
+            source.to_string(),
+            "run_check".to_string(),
+            args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
+            crate::activity::now_ms().saturating_sub(started),
+            result.is_ok(),
+        ),
+        request: serde_json::to_string_pretty(args).unwrap_or_default(),
+        response: activity_response(&result),
     });
     result
 }

@@ -65,10 +65,34 @@ jobs:
           # full history so the "previous tag" lookup in the release-notes
           # step finds prior tags
           fetch-depth: 0
-          # Pull the LFS blobs (Kokoro ONNX model + .bin voicepacks). Without
-          # this, the LFS-tracked files come down as pointer stubs and the
-          # checksum / staging steps fail.
-          lfs: true
+
+      # Model blobs (Kokoro ONNX + voicepacks + Whisper) are NOT in git.
+      # They used to be Git-LFS files, but every release run pulled ~820 MB
+      # in BOTH build jobs and exhausted the LFS bandwidth quota; they now
+      # live as assets on the `models-v1` GitHub release (unmetered
+      # downloads). The cache keeps warm runs from downloading at all;
+      # fetch-models.ps1 hashes everything against models/CHECKSUMS.txt and
+      # downloads only missing/corrupt files, so a cache hit is a cheap
+      # verify-only pass, a corrupt cache self-heals, and the old
+      # "Verify committed Kokoro assets" step is subsumed.
+      - name: Restore models cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            models/kokoro-v1.0.onnx
+            models/ggml-small.bin
+            models/voices/*.bin
+          key: models-${{ hashFiles('models/CHECKSUMS.txt') }}
+          # one shared cache for the Windows and Linux jobs
+          enableCrossOsArchive: true
+          # a superseded cache still seeds most files; the fetch step
+          # re-downloads only what changed
+          restore-keys: |
+            models-
+
+      - name: Fetch + verify models
+        shell: pwsh
+        run: ./scripts/fetch-models.ps1
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -139,43 +163,6 @@ jobs:
           # provides glslc for the shader generator).
           "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-
-      - name: Verify committed Kokoro assets against models/CHECKSUMS.txt
-        # The model + voicepacks are tracked via Git LFS in `models/` and
-        # checked out by the previous step (lfs: true). This step is a
-        # defense-in-depth integrity check: it catches a corrupt LFS fetch
-        # or an accidentally-edited blob before the release builds.
-        # Filenames in CHECKSUMS.txt are relative to `models/`.
-        shell: pwsh
-        run: |
-          function Compute-Sha256($path) {
-            (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
-          }
-
-          $checksums = Get-Content models/CHECKSUMS.txt |
-            Where-Object { $_ -and $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$' }
-
-          $fail = 0
-          foreach ($line in $checksums) {
-            $parts = $line -split '\s+', 2
-            if ($parts.Count -lt 2) { continue }
-            $expected = $parts[0].ToLower()
-            $name = $parts[1].Trim()
-            $path = "models/$name"
-            if (-not (Test-Path $path)) {
-              Write-Host "::error::CHECKSUMS.txt names $name but $path is missing (LFS not pulled?)"
-              $fail = 1
-              continue
-            }
-            $actual = Compute-Sha256 $path
-            if ($expected -ne $actual) {
-              Write-Host "::error::SHA-256 mismatch for $name (expected $expected, got $actual)"
-              $fail = 1
-            } else {
-              Write-Host "verified  $name  $expected"
-            }
-          }
-          if ($fail -eq 1) { exit 1 }
 
       - name: Install npm deps
         # `npm install` rather than `npm ci` because the committed lockfile
@@ -268,18 +255,19 @@ jobs:
           Copy-Item -Recurse themes/* "$stageFull/bin/themes/"
           Copy-Item -Recurse palettes/* "$stageFull/bin/palettes/"
 
-          # Kokoro ONNX model and every voicepack the repo carries via
-          # Git LFS. Shipping all voices means the user can switch via
-          # Settings -> Audio without re-downloading anything; the
-          # voicepacks are ~512 KB each so the cost is small.
+          # Kokoro ONNX model and every voicepack, fetched from the
+          # models-v1 release by the fetch step. Shipping all voices means
+          # the user can switch via Settings -> Audio without re-downloading
+          # anything; the voicepacks are ~512 KB each so the cost is small.
           Copy-Item models/kokoro-v1.0.onnx "$stageFull/models/"
           Copy-Item models/voices/*.bin "$stageFull/models/voices/"
 
-          # V6-01: bundled offline STT (Whisper) model, also via Git LFS.
-          # Full zip only — the slim/no-models zip is untouched so a no-models
-          # update never clobbers a user's local ggml-*.bin. Guarded so a
-          # release can ship before the LFS blob is committed (STT just
-          # degrades to "model not found" until the user drops one in).
+          # V6-01: bundled offline STT (Whisper) model, also from the
+          # models-v1 release. Full zip only — the slim/no-models zip is
+          # untouched so a no-models update never clobbers a user's local
+          # ggml-*.bin. Guarded so a release can ship before the blob is
+          # listed in CHECKSUMS.txt (STT just degrades to "model not found"
+          # until the user drops one in).
           if (Test-Path models/ggml-small.bin) {
             Copy-Item models/ggml-small.bin "$stageFull/models/"
           } else {
@@ -529,8 +517,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.build-windows.outputs.tag }}
-          # Kokoro ONNX model + voicepacks + Whisper model are Git-LFS blobs.
-          lfs: true
+
+      # Same models cache + fetch as build-windows (see the comment there).
+      # build-windows runs first and populates the cache, so this is
+      # normally a pure cache hit with zero downloads.
+      - name: Restore models cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            models/kokoro-v1.0.onnx
+            models/ggml-small.bin
+            models/voices/*.bin
+          key: models-${{ hashFiles('models/CHECKSUMS.txt') }}
+          enableCrossOsArchive: true
+          restore-keys: |
+            models-
+
+      - name: Fetch + verify models
+        shell: pwsh
+        run: ./scripts/fetch-models.ps1
 
       - name: Install Linux build dependencies
         shell: bash
@@ -638,7 +643,8 @@ jobs:
           cp -r themes "$stageFull/bin/themes"
           cp -r palettes "$stageFull/bin/palettes"
 
-          # Kokoro model + all voicepacks + Whisper STT model (Git LFS).
+          # Kokoro model + all voicepacks + Whisper STT model (fetched from
+          # the models-v1 release by the fetch step).
           cp models/kokoro-v1.0.onnx "$stageFull/models/"
           cp models/voices/*.bin "$stageFull/models/voices/"
           if [ -f models/ggml-small.bin ]; then

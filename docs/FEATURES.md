@@ -164,4 +164,4 @@ dependency/component breadth) — this is the *capability* breadth.
 - System monitor panel (CPU/mem/GPU via sysinfo + nvml) with graceful degradation
 - Anonymous usage tracking with retry/backoff
 - Rolling file logs (tracing) with env-filter levels
-- Portable Windows zip (single binary, models bundled) + slim no-models variant; Git LFS models w/ checksum verification; CI release workflow
+- Portable Windows zip (single binary, models bundled) + slim no-models variant; release-hosted models (`scripts/fetch-models.ps1`) w/ checksum verification; CI release workflow

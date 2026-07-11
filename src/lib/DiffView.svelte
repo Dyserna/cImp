@@ -20,6 +20,10 @@
   import { workbenchDiff, workbenchDiffError, watchWorkbenchDiff, refreshWorkbenchDiffNow } from './workbenchDiff';
   import { pairHunkLines, wordDiff } from './diffWords';
   import { openComposeWith } from './composeState';
+  import { settings } from './settings/store';
+  import { revealFileInGraph } from './graphReveal';
+  import { revealTab } from './tabs/visibility';
+  import { GRAPH_VIEW_TAB_ID } from './tabs/types';
 
   // SvelteSet/SvelteMap, NOT plain Set/Map in $state: Svelte 5's proxy only
   // deep-proxies plain objects/arrays, so in-place .add()/.set() on a plain
@@ -149,6 +153,14 @@
       console.error('workbench_revert_hunk failed:', e);
     }
   }
+
+  // Jump to this file's node in the Graph View tab, as if it were clicked
+  // there. The button only renders when the settings-gated Graph View tab
+  // can exist, so revealTab never silently no-ops.
+  function jumpToGraph(path: string): void {
+    revealFileInGraph(path);
+    revealTab(GRAPH_VIEW_TAB_ID);
+  }
 </script>
 
 <div class="diff-view">
@@ -184,26 +196,40 @@
       {/if}
       {#each summary.files.slice(0, MAX_FILE_ROWS) as f (f.path)}
         <div class="file-row">
-          <button
-            type="button"
-            class="file-header"
-            onclick={() => toggleExpand(f.path)}
-            aria-expanded={expanded.has(f.path) && !f.binary && !f.too_large}
-            disabled={f.binary || f.too_large}
-          >
-            <span class="chevron" aria-hidden="true">{expanded.has(f.path) ? '▾' : '▸'}</span>
-            <span class="status-chip status-{f.status.kind.toLowerCase()}" title={statusTitle(f.status)}>{statusLabel(f.status)}</span>
-            <span class="path">{f.path}</span>
-            {#if f.status.kind === 'Renamed'}<span class="from-path">← {f.status.from}</span>{/if}
-            {#if f.binary}<span class="tag">binary</span>{/if}
-            {#if f.too_large}<span class="tag">too large</span>{/if}
-            {#if !f.binary && !f.too_large && (f.added > 0 || f.removed > 0)}
-              <span class="counts">
-                {#if f.added > 0}<span class="added">+{f.added}</span>{/if}
-                {#if f.removed > 0}<span class="removed">-{f.removed}</span>{/if}
-              </span>
+          <!-- The expand toggle is itself a <button>, so the graph-jump
+               button must be a SIBLING (nested interactive elements are
+               invalid); this flex wrapper keeps them on one visual row. -->
+          <div class="file-row-head">
+            <button
+              type="button"
+              class="file-header"
+              onclick={() => toggleExpand(f.path)}
+              aria-expanded={expanded.has(f.path) && !f.binary && !f.too_large}
+              disabled={f.binary || f.too_large}
+            >
+              <span class="chevron" aria-hidden="true">{expanded.has(f.path) ? '▾' : '▸'}</span>
+              <span class="status-chip status-{f.status.kind.toLowerCase()}" title={statusTitle(f.status)}>{statusLabel(f.status)}</span>
+              <span class="path">{f.path}</span>
+              {#if f.status.kind === 'Renamed'}<span class="from-path">← {f.status.from}</span>{/if}
+              {#if f.binary}<span class="tag">binary</span>{/if}
+              {#if f.too_large}<span class="tag">too large</span>{/if}
+              {#if !f.binary && !f.too_large && (f.added > 0 || f.removed > 0)}
+                <span class="counts">
+                  {#if f.added > 0}<span class="added">+{f.added}</span>{/if}
+                  {#if f.removed > 0}<span class="removed">-{f.removed}</span>{/if}
+                </span>
+              {/if}
+            </button>
+            {#if $settings.graph.enabled && $settings.graph.graph_viz}
+              <button
+                type="button"
+                class="graph-jump"
+                title="Show in Graph View"
+                aria-label="Show {f.path} in Graph View"
+                onclick={() => jumpToGraph(f.path)}
+              >⌖</button>
             {/if}
-          </button>
+          </div>
 
           {#if expanded.has(f.path) && !f.binary && !f.too_large}
             {@const fd = fileDiffs.get(f.path)}
@@ -359,9 +385,30 @@
     border-radius: var(--radius-md);
     overflow: hidden;
   }
+  .file-row-head {
+    display: flex;
+    align-items: stretch;
+    background: var(--surface-2);
+  }
+  .graph-jump {
+    appearance: none;
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    border-left: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    padding: 0 10px;
+    font-size: var(--font-size-md);
+    cursor: pointer;
+  }
+  .graph-jump:hover {
+    background: var(--surface-3);
+    color: var(--text-primary);
+  }
   .file-header {
     appearance: none;
-    width: 100%;
+    flex: 1 1 auto;
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: var(--space-2);

@@ -3,8 +3,12 @@
   // splitter between them. M3 wires:
   //
   //   * mousedown-driven resize: dragging the splitter line adjusts the
-  //     split's `ratio` in the layout store. Min-size constraints clamp
-  //     during drag so neither pane can shrink below MIN_PANE_*_PX.
+  //     split's `ratio` in the layout store — plus compensating ratios on
+  //     the nested same-direction splits touching the divider, so ONLY the
+  //     two panes directly adjacent to the divider change size (all other
+  //     panes keep their absolute px; math in layout/resize.ts). Min-size
+  //     constraints clamp during drag so neither adjacent pane can shrink
+  //     below MIN_PANE_*_PX.
   //
   //   * Visual-only render clamp: when the application window resizes
   //     such that a stored ratio would violate min sizes, the ratio is
@@ -20,7 +24,8 @@
 
   import { onDestroy } from 'svelte';
   import LayoutNodeRenderer from './LayoutNodeRenderer.svelte';
-  import { setSplitRatio } from './layout/store';
+  import { setSplitRatios } from './layout/store';
+  import { planSplitterDrag, ratiosForOffset } from './layout/resize';
   import {
     MIN_PANE_HEIGHT_PX,
     MIN_PANE_WIDTH_PX,
@@ -99,8 +104,16 @@
     if (total <= 0) return;
 
     const minPx = isHorizontal ? MIN_PANE_WIDTH_PX : MIN_PANE_HEIGHT_PX;
-    const minRatio = total < 2 * minPx ? 0 : minPx / total;
-    const maxRatio = total < 2 * minPx ? 1 : 1 - minRatio;
+    // Snapshot the drag plan once at mousedown: the divider-adjacent
+    // chains and their pixel sizes. Every mousemove recomputes all ratios
+    // from this snapshot plus the live cursor offset, so rounding can't
+    // accumulate across moves. `clampedRatio` anchors the plan to where
+    // the divider is actually rendered.
+    const maybePlan = planSplitterDrag(split, total, clampedRatio, minPx);
+    if (!maybePlan) return;
+    // Re-bind after the null guard so the narrowed type reaches onMove's
+    // closure (TS doesn't propagate the guard into nested functions).
+    const plan = maybePlan;
 
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
@@ -109,13 +122,9 @@
     // grabbing arbitrary tab labels under it as the pointer moves.
     document.body.style.userSelect = 'none';
 
-    const splitId = split.id;
-
     function onMove(e: MouseEvent): void {
       const offset = (isHorizontal ? e.clientX : e.clientY) - start;
-      const raw = offset / total;
-      const next = Math.max(minRatio, Math.min(maxRatio, raw));
-      setSplitRatio(splitId, next);
+      setSplitRatios(ratiosForOffset(plan, offset));
     }
 
     function onUp(): void {

@@ -1,15 +1,26 @@
-// UI-only tab visibility (the status bar's eye button). Hiding a tab removes
-// it from every pane's TAB BAR and nothing else: the tab keeps its slot in
-// the layout tree and the tabs store, its PTY / backend feed keeps running,
-// and the Settings toggles that materialize builtin tabs are untouched — so
-// un-hiding shows an up-to-date tab, not a restarted one. The set lives in
+// UI-only tab visibility (the status bar's eye button). A hidden tab is
+// removed from the layout tree exactly as if it were closed — its tab-bar
+// slot disappears, a pane emptied by the hide collapses, and the surviving
+// panes take over the freed space — but unlike a real close, the tab stays
+// in the tabs store and its PTY / backend feed keeps running. Un-hiding
+// re-inserts the tab into the focused pane and activates it, so its
+// still-live content is immediately visible. The hidden set lives in
 // localStorage rather than settings because it's a per-machine *view*
 // preference, deliberately decoupled from whether a feature is enabled.
+//
+// Invariant: a tab is hidden ⇔ it is absent from the layout tree (while
+// still present in the tabs store). Everything that renders or indexes
+// pane.tab_ids therefore needs no hidden-awareness at all.
 
 import { get, writable, type Writable } from 'svelte/store';
-import { layout } from '../layout/store';
-import type { LayoutNode, PaneNode } from '../layout/types';
+import {
+  applyTabClosedFromLayout,
+  focusedActiveTabId,
+  restoreTabToLayout,
+  setFocusedPaneActiveTab,
+} from '../layout/store';
 import { switchTab } from './state';
+import { tabMeta } from './store';
 import type { TabId } from './types';
 
 const STORAGE_KEY = 'cimp.hidden-tabs.v1';
@@ -35,59 +46,18 @@ function persist(set: ReadonlySet<TabId>): void {
   }
 }
 
-/// The hidden tab ids. Subscribed by TabBar (render filter), the Ctrl+N
-/// shortcut handler (index over visible tabs only), and the popover
-/// (checkbox state). Stale ids (tabs closed while hidden) are harmless —
-/// they simply never match a live tab again.
+/// The hidden tab ids. Subscribed by the popover (checkbox state + count
+/// pip). Stale ids (tabs closed while hidden) are pruned by the tab-closed
+/// lifecycle hook via `forgetHiddenTab`; any that predate that hook are
+/// harmless — the popover lists only live tabs and the restore path checks
+/// the tabs store before touching the layout.
 export const hiddenTabs: Writable<ReadonlySet<TabId>> = writable(load());
 
 export function isTabHidden(id: TabId): boolean {
   return get(hiddenTabs).has(id);
 }
 
-function mapPanes(root: LayoutNode, fn: (p: PaneNode) => PaneNode): LayoutNode {
-  if (root.type === 'pane') return fn(root);
-  const first = mapPanes(root.first, fn);
-  const second = mapPanes(root.second, fn);
-  if (first === root.first && second === root.second) return root;
-  return { ...root, first, second };
-}
-
-/// Re-point every pane whose active tab is hidden at its nearest visible
-/// neighbor (rightward first, then leftward; `null` when the whole pane is
-/// hidden — the pane then renders empty but its tabs keep running). Focus is
-/// left alone: hiding a tab in a background pane must not steal it. When the
-/// FOCUSED pane's active tab changes, the switch is mirrored to the backend
-/// so audio/avatar/compose routing follows — same contract as a tab click.
-export function reconcileActiveTabsWithHidden(): void {
-  const hidden = get(hiddenTabs);
-  let focusedSwitch: TabId | null = null;
-  layout.update((state) => {
-    let changed = false;
-    const tree = mapPanes(state.tree, (pane) => {
-      const active = pane.active_tab_id;
-      if (active === null || !hidden.has(active)) return pane;
-      const idx = pane.tab_ids.indexOf(active);
-      const after = pane.tab_ids.slice(idx + 1).find((id) => !hidden.has(id));
-      const before = pane.tab_ids
-        .slice(0, Math.max(idx, 0))
-        .reverse()
-        .find((id) => !hidden.has(id));
-      const next = after ?? before ?? null;
-      changed = true;
-      if (pane.id === state.focused_pane_id && next !== null) focusedSwitch = next;
-      return { ...pane, active_tab_id: next };
-    });
-    return changed ? { ...state, tree } : state;
-  });
-  if (focusedSwitch !== null) void switchTab(focusedSwitch);
-}
-
-/// Hide or show one tab in the UI. Hiding also re-points any pane that had
-/// it active (see `reconcileActiveTabsWithHidden`) — synchronously, so
-/// Pane.svelte's reveal-on-explicit-activation effect never sees the
-/// transient hidden-but-active state and can't fight the hide.
-export function setTabHidden(id: TabId, hide: boolean): void {
+function mark(id: TabId, hide: boolean): void {
   hiddenTabs.update((old) => {
     if (hide === old.has(id)) return old;
     const next = new Set(old);
@@ -96,33 +66,79 @@ export function setTabHidden(id: TabId, hide: boolean): void {
     persist(next);
     return next;
   });
-  if (hide) reconcileActiveTabsWithHidden();
 }
 
-/// Clear the whole hidden set (the popover's "Show all").
+/// Mirror a layout-driven change of the focused pane's active tab to the
+/// backend, so audio/avatar/compose routing follows — same contract as a
+/// tab click. `before` is the focused active id captured before the layout
+/// mutation.
+function mirrorFocusedSwitch(before: TabId | null): void {
+  const after = get(focusedActiveTabId);
+  if (after !== null && after !== before) void switchTab(after);
+}
+
+/// Hide or show one tab.
+///
+///   * Hide: remove the tab from whichever pane holds it via the same
+///     lifecycle op a real close uses — the pane re-points its active tab
+///     at a neighbor, and a pane left empty collapses so its space is
+///     redistributed. The PTY / terminal host are untouched.
+///   * Show: re-insert the tab at the end of the focused pane and activate
+///     it (the whole point of un-hiding is to look at it) — the terminal
+///     host re-attaches and re-fits on activation, so the live content is
+///     visible immediately.
+export function setTabHidden(id: TabId, hide: boolean): void {
+  if (hide === isTabHidden(id)) return;
+  const before = get(focusedActiveTabId);
+  mark(id, hide);
+  if (hide) {
+    applyTabClosedFromLayout(id);
+  } else if (tabMeta(id)) {
+    restoreTabToLayout(id);
+  }
+  mirrorFocusedSwitch(before);
+}
+
+/// Clear the whole hidden set (the popover's "Show all"). Every live hidden
+/// tab is restored into the focused pane in set order; stale ids are simply
+/// dropped.
 export function showAllTabs(): void {
+  const before = get(focusedActiveTabId);
+  for (const id of get(hiddenTabs)) {
+    if (tabMeta(id)) restoreTabToLayout(id);
+  }
   const empty = new Set<TabId>();
   hiddenTabs.set(empty);
   persist(empty);
+  mirrorFocusedSwitch(before);
 }
 
-/// Translate a reorder insert index computed over the RENDERED (visible)
-/// tabs into an index into the pane's full `tab_ids`. The dnd hit-tester
-/// measures DOM rects, and hidden tabs have no rect — without this, a drop
-/// with hidden tabs present would land shifted left by however many hidden
-/// tabs precede it.
-export function fullReorderIndex(paneId: string, visibleIndex: number): number {
-  const hidden = get(hiddenTabs);
-  if (hidden.size === 0) return visibleIndex;
-  let pane: PaneNode | null = null;
-  mapPanes(get(layout).tree, (p) => {
-    if (p.id === paneId) pane = p;
-    return p;
-  });
-  if (pane === null) return visibleIndex;
-  const tabIds: readonly TabId[] = (pane as PaneNode).tab_ids;
-  const visible = tabIds.filter((id) => !hidden.has(id));
-  if (visibleIndex >= visible.length) return tabIds.length;
-  const idx = tabIds.indexOf(visible[visibleIndex]);
-  return idx < 0 ? tabIds.length : idx;
+/// Bring a tab on-screen: un-hide it if hidden (which re-inserts and
+/// activates it), otherwise activate it in whichever pane holds it. Used by
+/// explicit activation affordances (Note button, Workbench diff badge) that
+/// must work whether or not the user has hidden their tab.
+export function revealTab(id: TabId): void {
+  if (isTabHidden(id)) setTabHidden(id, false);
+  else setFocusedPaneActiveTab(id);
+}
+
+/// Drop a tab's hidden flag without touching the layout. Runtime lifecycle
+/// hook, called on:
+///   * tab-created — the create path has just placed the tab in the layout,
+///     so a lingering flag would break the hidden ⇔ not-in-layout invariant
+///     (builtin tabs re-materialized from Settings reuse their stable id);
+///   * tab-closed — prune, so a future tab reusing the id doesn't start
+///     life invisibly hidden.
+export function forgetHiddenTab(id: TabId): void {
+  mark(id, false);
+}
+
+/// Remove every hidden tab from the just-hydrated layout tree. Startup
+/// hook: a saved layout never contains hidden tabs, but
+/// `validateAndRepairLayout` re-adds them as orphans (they ARE in
+/// settings.tabs), and the legacy no-layout path seeds every tab. Runs
+/// before the panes render; panes emptied by the strip collapse exactly as
+/// a live hide would.
+export function stripHiddenTabsFromLayout(): void {
+  for (const id of get(hiddenTabs)) applyTabClosedFromLayout(id);
 }

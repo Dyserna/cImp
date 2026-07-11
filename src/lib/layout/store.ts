@@ -24,6 +24,7 @@ import {
   removeTab,
   setActiveTabId,
   setSplitRatio as setSplitRatioOp,
+  setSplitRatios as setSplitRatiosOp,
   splitPane as splitPaneOp,
 } from './tree';
 import {
@@ -281,6 +282,24 @@ export function applyTabClosedFromLayout(tabId: TabId): void {
   });
 }
 
+/// Re-insert a tab that exists in the tabs store but is absent from the
+/// layout tree — a UI-hidden tab being revealed (hiding removes the tab
+/// from the tree exactly like closing does, so its pane space is freed;
+/// see tabs/visibility.ts). Appends it to the focused pane, makes it that
+/// pane's active tab, and focuses the pane. No-op when the tab already
+/// lives in some pane (defensive against a double-reveal).
+export function restoreTabToLayout(tabId: TabId): void {
+  layout.update((state) => {
+    if (findPaneContainingTab(state.tree, tabId)) return state;
+    const focused =
+      findPaneInTree(state.tree, state.focused_pane_id) ?? firstPane(state.tree);
+    const tree = insertTabIntoPane(state.tree, focused.id, tabId, focused.tab_ids.length, {
+      activate: true,
+    });
+    return { tree, focused_pane_id: focused.id };
+  });
+}
+
 /// Set the active tab of a specific pane. The pane is also focused as a
 /// side effect — clicking a tab is a focus action by definition.
 export function setPaneActiveTab(paneId: PaneId, tabId: TabId): void {
@@ -460,6 +479,21 @@ export function commitDrop(
 export function setSplitRatio(splitId: SplitId, ratio: number): void {
   layout.update((state) => {
     const tree = setSplitRatioOp(state.tree, splitId, ratio);
+    if (tree === state.tree) return state;
+    return { ...state, tree };
+  });
+}
+
+/// Apply several split-ratio updates atomically — one store update, one
+/// tree walk, one render. The splitter drag uses this to move a divider
+/// while keeping every pane NOT adjacent to it at its absolute size: the
+/// dragged split's ratio and the compensating ratios of its nested
+/// same-direction splits must land in the same frame (see layout/resize.ts).
+export function setSplitRatios(
+  updates: ReadonlyArray<{ id: SplitId; ratio: number }>,
+): void {
+  layout.update((state) => {
+    const tree = setSplitRatiosOp(state.tree, updates);
     if (tree === state.tree) return state;
     return { ...state, tree };
   });

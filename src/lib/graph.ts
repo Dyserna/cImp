@@ -345,7 +345,8 @@ export function graphArchitecture(root?: string): Promise<ArchResult> {
 // ── V15 Feature 4: Graph View snapshot ───────────────────────────────────
 
 /// One node in the Graph View snapshot. Mirror of Rust `VizNodeRow`.
-/// `degree` = node size; `subsystem` = node color; `kind === 'file'` for files.
+/// The snapshot is FILE-level: every node is a file (`kind === 'file'`,
+/// `label === file`). `degree` = node size; `subsystem` = node color.
 export interface VizNodeRow {
   id: string;
   label: string;
@@ -356,12 +357,16 @@ export interface VizNodeRow {
 }
 
 /// One edge in the Graph View snapshot. Mirror of Rust `VizEdgeRow`.
-/// `kind` = edge color (call/import/contains); `confidence` = dash pattern.
+/// `kind` = edge color (call/import — calls are rolled up to file→file);
+/// `confidence` = dash pattern.
 export interface VizEdgeRow {
   src: string;
   dst: string;
   kind: string;
   confidence: string;
+  /// `false` = over the per-node drawn quota: shown in the connections
+  /// panel / selection highlight, but not as an ambient line.
+  drawn: boolean;
 }
 
 /// A bounded {nodes, edges} subgraph for the Graph View tab. Mirror of Rust
@@ -371,9 +376,9 @@ export interface VizGraphResult {
   edges: VizEdgeRow[];
 }
 
-/// V15 Feature 4: fetch the bounded subgraph for the Graph View tab (top-degree
-/// hubs + edges among them, capped at `graph_viz_max_nodes`). `root` defaults
-/// to the launch directory.
+/// V15 Feature 4: fetch the bounded FILE-level subgraph for the Graph View
+/// tab (top-degree files + rolled-up edges among them, capped at
+/// `graph_viz_max_nodes`). `root` defaults to the launch directory.
 export function graphVizSnapshot(root?: string): Promise<VizGraphResult> {
   return invoke<VizGraphResult>('graph_viz_snapshot', { root: root ?? null });
 }

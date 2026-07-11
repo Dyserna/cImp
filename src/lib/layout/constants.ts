@@ -14,3 +14,9 @@ export const MIN_PANE_WIDTH_PX = 200;
 /// minimum because terminal output is line-oriented — a few rows is
 /// still useful, where a few columns is not.
 export const MIN_PANE_HEIGHT_PX = 100;
+
+/// Thickness of the draggable splitter bar between a split's children.
+/// Must match the `.splitter` width/height in Split.svelte's CSS — the
+/// drag math (layout/resize.ts) subtracts it when converting between a
+/// split's ratio and its children's pixel sizes.
+export const SPLITTER_THICKNESS_PX = 4;

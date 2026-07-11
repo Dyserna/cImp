@@ -665,7 +665,7 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
 /// cleaned up immediately after `write-tree`) so a dry-run diff has zero
 /// observable effect on the shadow repo's persistent index at all, belt and
 /// suspenders.
-pub async fn diff_vs_now(root: &Path, id: &str, extra_ignore: &[String], max_file_bytes: u64) -> AppResult<String> {
+pub async fn diff_vs_now(root: &Path, id: &str, extra_ignore: &[String], max_file_bytes: u64, context: u32) -> AppResult<String> {
     let lock = shadow_lock(root);
     let _guard = lock.lock().await;
     ensure(root, extra_ignore).await?;
@@ -680,7 +680,8 @@ pub async fn diff_vs_now(root: &Path, id: &str, extra_ignore: &[String], max_fil
     let scratch_ctx = GitCtx { index_file: Some(scratch_index.clone()), ..ctx.clone() };
     let now_tree = stage_and_write_tree(&scratch_ctx, root, max_file_bytes).await?;
 
-    let out = git::run(&ctx, &["diff", "--no-color", "--no-renames", "--unified=3", &target, &now_tree], Some(BULK_TIMEOUT)).await?;
+    let unified = format!("--unified={}", context.min(super::diff::MAX_CONTEXT));
+    let out = git::run(&ctx, &["diff", "--no-color", "--no-renames", &unified, &target, &now_tree], Some(BULK_TIMEOUT)).await?;
     if !out.success() {
         return Err(AppError::Workbench(format!("shadow diff failed: {}", out.stderr.trim())));
     }
@@ -1258,7 +1259,7 @@ mod tests {
         // Simulate the restore confirmation dialog's dry-run: this stages
         // the shadow repo's index as a side effect (or used to — see the
         // module doc comment).
-        let _ = diff_vs_now(&dir, &cp1, &[], 0).await.expect("diff_vs_now (dry run)");
+        let _ = diff_vs_now(&dir, &cp1, &[], 0, 3).await.expect("diff_vs_now (dry run)");
 
         // Now actually restore to cp1. This is where the bug bites: a
         // pre-restore snapshot that wrongly dedups against the stale cp1
@@ -1364,7 +1365,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "line1\nline2X\n").unwrap();
         std::fs::write(dir.join("b.txt"), "brand new\n").unwrap();
 
-        let text = diff_vs_now(&dir, &cp, &[], 0).await.expect("diff_vs_now");
+        let text = diff_vs_now(&dir, &cp, &[], 0, 3).await.expect("diff_vs_now");
         let parsed = crate::workbench::diff::parse_unified(&text);
         assert!(parsed.iter().any(|f| f.path == "a.txt"));
         assert!(parsed.iter().any(|f| f.path == "b.txt"), "new untracked file must show up in diff_vs_now");

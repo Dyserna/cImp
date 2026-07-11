@@ -23,6 +23,16 @@ use super::git::{self, GitCtx};
 /// something the pane should ever attempt, let alone virtualize.
 pub const MAX_DIFF_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 
+/// git's own default unified-diff context — what every diff surface renders
+/// unless the caller asks for more.
+pub const DEFAULT_CONTEXT: u32 = 3;
+
+/// Upper clamp for a frontend-supplied context value. The "full file" toggle
+/// sends a huge context so the whole file arrives as one hunk; anything at or
+/// above any real file's line count behaves identically, so the exact value
+/// only bounds the argument, it doesn't change output.
+pub const MAX_CONTEXT: u32 = 10_000_000;
+
 /// How many leading bytes of a file's content we sniff for a NUL byte to
 /// call it binary — the same buffer size git itself uses for this heuristic,
 /// applied here only to UNTRACKED files (tracked ones get git's own verdict
@@ -696,6 +706,15 @@ fn looks_binary(bytes: &[u8]) -> bool {
 /// path, can't see the old one and would show a rename as a from-scratch
 /// add (verified against real `git` output; see this module's tests).
 pub async fn diff_file(root: &Path, path: &str) -> AppResult<FileDiff> {
+    diff_file_ctx(root, path, DEFAULT_CONTEXT).await
+}
+
+/// [`diff_file`] with an explicit unified-context width — the frontend's
+/// per-file "diff ↔ full file" toggle passes a huge `context` so the whole
+/// file arrives as one hunk (change highlighting intact). Everything else
+/// (revert, send-to-agent) goes through the [`DEFAULT_CONTEXT`] wrapper so
+/// hunk indices/hashes stay stable.
+pub async fn diff_file_ctx(root: &Path, path: &str, context: u32) -> AppResult<FileDiff> {
     let ctx = GitCtx::discover(root);
     let status_out = git::run(&ctx, &["status", "--porcelain=v1", "-z"], None).await?;
     let entries = parse_status_z(&status_out.stdout);
@@ -731,6 +750,7 @@ pub async fn diff_file(root: &Path, path: &str) -> AppResult<FileDiff> {
         return Ok(FileDiff { path: path.to_string(), status: entry.status, binary: false, hunks: Vec::new(), too_large: true });
     }
 
+    let unified = format!("--unified={}", context.min(MAX_CONTEXT));
     let diff_out = if let FileStatus::Renamed { from } = &entry.status {
         // Scope the diff to BOTH paths so git's rename detection (default-on
         // for `git diff`) has the old content to compare against; `-M` makes
@@ -738,13 +758,13 @@ pub async fn diff_file(root: &Path, path: &str) -> AppResult<FileDiff> {
         // config.
         git::run(&ctx, &[
             "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-color",
-            "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "-M", "HEAD", "--",
+            "--src-prefix=a/", "--dst-prefix=b/", &unified, "-M", "HEAD", "--",
             from.as_str(), path,
         ], None).await?
     } else {
         git::run(&ctx, &[
             "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-color",
-            "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "HEAD", "--", path,
+            "--src-prefix=a/", "--dst-prefix=b/", &unified, "HEAD", "--", path,
         ], None).await?
     };
 

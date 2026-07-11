@@ -282,16 +282,17 @@ pub fn commit_counts_from(
 /// One commit vs. its first parent (the whole commit for a root commit),
 /// parsed into the same [`super::diff::FileDiff`] shape every other diff
 /// surface renders. Read-only — no revert applies to a historical commit.
-pub async fn commit_diff(root: &Path, hash: &str) -> AppResult<Vec<super::diff::FileDiff>> {
+pub async fn commit_diff(root: &Path, hash: &str, context: u32) -> AppResult<Vec<super::diff::FileDiff>> {
     validate_hash(hash)?;
     let ctx = GitCtx::discover(root);
+    let unified = format!("--unified={}", context.min(super::diff::MAX_CONTEXT));
     // `-m --first-parent` pins a merge commit's diff to its first parent
     // (the classic "what did the merge bring in" view) instead of the
     // combined `@@@` format `parse_unified` doesn't speak.
     let out = git::run(
         &ctx,
         &[
-            "show", "--no-color", "--format=", "--unified=3", "--first-parent", "-m",
+            "show", "--no-color", "--format=", &unified, "--first-parent", "-m",
             "--no-renames", hash,
         ],
         Some(LOG_TIMEOUT),
@@ -443,14 +444,14 @@ mod tests {
         commit_file(&dir, "a.txt", "one\n", "first");
         commit_file(&dir, "a.txt", "two\n", "second");
         let commits = session_commits(&dir, 0, i64::MAX, &[]).await.unwrap().commits;
-        let files = commit_diff(&dir, &commits[0].hash).await.unwrap();
+        let files = commit_diff(&dir, &commits[0].hash, 3).await.unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "a.txt");
         assert_eq!(files[0].hunks.len(), 1);
         // Root commit renders as an all-added diff, not an error.
-        let root_files = commit_diff(&dir, &commits[1].hash).await.unwrap();
+        let root_files = commit_diff(&dir, &commits[1].hash, 3).await.unwrap();
         assert_eq!(root_files.len(), 1);
-        assert!(commit_diff(&dir, "HEAD").await.is_err());
+        assert!(commit_diff(&dir, "HEAD", 3).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

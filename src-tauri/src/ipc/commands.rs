@@ -1834,17 +1834,30 @@ pub async fn workbench_diff_summary(
     service.diff_summary(&root).await
 }
 
+/// Clamp a frontend-supplied unified-context width for the Workbench diff
+/// commands: absent means git's default (3); the "full file" toggle sends a
+/// huge value, bounded by `diff::MAX_CONTEXT` so the argument can't be
+/// arbitrary.
+fn diff_context(context: Option<u32>) -> u32 {
+    context
+        .unwrap_or(crate::workbench::diff::DEFAULT_CONTEXT)
+        .min(crate::workbench::diff::MAX_CONTEXT)
+}
+
 /// V13 Phase B: one file's full parsed diff (hunks + lines), fetched only
 /// when the frontend expands that file's row (the file list itself is
-/// virtualized around this — see `workbench_diff_summary`).
+/// virtualized around this — see `workbench_diff_summary`). `context` is the
+/// unified-context width (default 3); the frontend's "full file" toggle
+/// passes a huge value so the whole file arrives as one hunk.
 #[tauri::command]
 pub async fn workbench_diff_file(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     path: String,
+    context: Option<u32>,
 ) -> AppResult<crate::workbench::diff::FileDiff> {
     let root = resolve_workbench_root(root)?;
-    service.diff_file(&root, &path).await
+    service.diff_file(&root, &path, diff_context(context)).await
 }
 
 /// V13 Phase B B2: revert one hunk. `hunk_hash` must match the hash of the
@@ -1904,9 +1917,10 @@ pub async fn workbench_checkpoint_diff(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     id: String,
+    context: Option<u32>,
 ) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
     let root = resolve_workbench_root(root)?;
-    service.checkpoint_diff(&root, &id).await
+    service.checkpoint_diff(&root, &id, diff_context(context)).await
 }
 
 /// V13 Phase C: the manual "Checkpoint now" action. `label` defaults to
@@ -1962,9 +1976,10 @@ pub async fn workbench_worktree_diff(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     slug: String,
+    context: Option<u32>,
 ) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
     let root = resolve_workbench_root(root)?;
-    service.worktree_diff(&root, &slug).await
+    service.worktree_diff(&root, &slug, diff_context(context)).await
 }
 
 /// Session-commits section: the union of commits caught live from the
@@ -2030,9 +2045,10 @@ pub async fn workbench_commit_diff(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     hash: String,
+    context: Option<u32>,
 ) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
     let root = resolve_workbench_root(root)?;
-    service.commit_diff(&root, &hash).await
+    service.commit_diff(&root, &hash, diff_context(context)).await
 }
 
 /// The Git-graph section: up to `limit` commits from every ref in

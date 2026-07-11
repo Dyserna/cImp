@@ -48,7 +48,7 @@
     loading = true;
     loadError = null;
     try {
-      files = await workbenchCheckpointDiff(checkpointId, root);
+      files = await workbenchCheckpointDiff(checkpointId, undefined, root);
     } catch (e) {
       loadError = errorMessage(e);
     } finally {

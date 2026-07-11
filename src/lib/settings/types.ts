@@ -34,7 +34,7 @@ export interface TransitionSettings {
 }
 
 export interface WaveformSettings {
-  /// Render the audio waveform over the avatar. Default true.
+  /// Render the audio waveform over the avatar. Default false.
   visible: boolean;
   color: string;
   line_width: number;
@@ -366,14 +366,14 @@ export interface ProcessingSettings {
 }
 
 export interface UiSettings {
-  /// Active UI chrome theme. Two values currently ship, both ratatui-style
+  /// Active UI chrome theme. The shipped values are all ratatui-style
   /// (custom title bar, square borders): `"tui-orange"` (Gruvbox surfaces +
-  /// Claude Code's accent orange) and `"tui-grey"` (OpenCode Grey palette +
-  /// OpenCode's cool light-grey accent). New installs default to `"tui-orange"`
-  /// so the chrome accent matches Claude Code's orange; the avatar still
-  /// defaults to the animated `impSprites` mascot independently. Distinct from
-  /// `terminal.theme`, which governs the xterm.js terminal palette inside
-  /// each tab.
+  /// Claude Code's accent orange), `"tui-blue"`, `"tui-green"`, and
+  /// `"tui-grey"` (OpenCode Grey palette + OpenCode's cool light-grey
+  /// accent). New installs default to `"tui-blue"` (paired with the OpenCode
+  /// Grey terminal palette); the avatar still defaults to the animated
+  /// `impSprites` mascot independently. Distinct from `terminal.theme`,
+  /// which governs the xterm.js terminal palette inside each tab.
   theme: string;
   /// Arrangement of the bottom status bar's movable left cluster.
   status_bar: StatusBarLayout;
@@ -1081,7 +1081,7 @@ export function defaultSettings(): Settings {
       size: { width_px: 140, height_px: 140 },
       position: 'top-right',
       margin: { x_px: 21, y_px: 0 },
-      opacity: 1.0,
+      opacity: 0.5,
       show_border: false,
       images: {
         idle: null,
@@ -1093,7 +1093,7 @@ export function defaultSettings(): Settings {
       sprite: { set: 'impSprites' },
       transition: { path: '/avatar/Transition.mp4', duration_ms: 400 },
       waveform: {
-        visible: true,
+        visible: false,
         color: '',
         line_width: 2.0,
         glow_intensity: 0.6,
@@ -1217,7 +1217,7 @@ export function defaultSettings(): Settings {
     layout: null,
     layout_presets: [],
     ui: {
-      theme: 'tui-orange',
+      theme: 'tui-blue',
       status_bar: {
         items: [
           { component: 'usage', gap: 0 },
@@ -1227,10 +1227,10 @@ export function defaultSettings(): Settings {
       tool_activity_tab: true,
     },
     // Default terminal palette is paired with the default UI theme
-    // (tui-orange → GitHub Dark); the pairing comes from each theme's
+    // (tui-blue → OpenCode Grey); the pairing comes from each theme's
     // `palette` metadata (theme.json), applied by SettingsApp on theme switch.
     terminal: {
-      theme: { name: 'GitHub Dark', custom: null },
+      theme: { name: 'OpenCode Grey', custom: null },
       background: {
         image: null,
         color: null,

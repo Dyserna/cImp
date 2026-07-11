@@ -10,7 +10,12 @@
   import type { FileStatus, FileDiff } from './workbench';
   import { pairHunkLines, wordDiff } from './diffWords';
 
-  let { files }: { files: FileDiff[] } = $props();
+  // `fetchFull` (optional) powers the per-file "diff ↔ full file" toggle: it
+  // fetches the SAME diff with a huge unified context (whole file as one
+  // hunk, change highlighting intact). One call covers every file — the
+  // result is cached for the component's lifetime, which is scoped to one
+  // commit/checkpoint/worktree anyway. No prop → no toggle rendered.
+  let { files, fetchFull }: { files: FileDiff[]; fetchFull?: () => Promise<FileDiff[]> } = $props();
 
   // SvelteSet, NOT a plain Set in $state: Svelte 5 doesn't proxy Set, so an
   // in-place .add() would never re-render — and with static props there's no
@@ -19,6 +24,39 @@
   function toggleExpand(path: string): void {
     if (expanded.has(path)) expanded.delete(path);
     else expanded.add(path);
+  }
+
+  // Paths currently showing the full-file view (per-file, so one giant file
+  // doesn't force every other expanded file into full mode too).
+  const fullView = new SvelteSet<string>();
+  let fullFiles = $state<FileDiff[] | null>(null);
+  let fullError = $state<string | null>(null);
+  let fullLoading = $state(false);
+
+  async function toggleFull(path: string): Promise<void> {
+    if (fullView.has(path)) {
+      fullView.delete(path);
+      return;
+    }
+    fullView.add(path);
+    if (fullFiles !== null || fullLoading || !fetchFull) return;
+    fullLoading = true;
+    fullError = null;
+    try {
+      fullFiles = await fetchFull();
+    } catch (e) {
+      fullError = String(e);
+    } finally {
+      fullLoading = false;
+    }
+  }
+
+  /// The hunks to render for `f`: the full-file variant when toggled on and
+  /// loaded, the normal diff otherwise. Falls back to the diff for a path the
+  /// full fetch didn't return (e.g. a pure rename with no hunks).
+  function displayFile(f: FileDiff): FileDiff {
+    if (!fullView.has(f.path) || !fullFiles) return f;
+    return fullFiles.find((x) => x.path === f.path) ?? f;
   }
 
   function statusLabel(s: FileStatus): string {
@@ -55,11 +93,24 @@
           </button>
 
           {#if expanded.has(f.path) && !f.binary && !f.too_large}
+            {@const shown = displayFile(f)}
             <div class="file-body">
-              {#if f.hunks.length === 0}
+              {#if fetchFull}
+                <div class="body-toolbar">
+                  <div class="view-toggle" role="group" aria-label="Diff or full file">
+                    <button type="button" class:active={!fullView.has(f.path)} onclick={() => { fullView.delete(f.path); }}>Diff</button>
+                    <button type="button" class:active={fullView.has(f.path)} onclick={() => void toggleFull(f.path)}>Full file</button>
+                  </div>
+                </div>
+              {/if}
+              {#if fullView.has(f.path) && fullError}
+                <p class="msg err">Couldn't load the full file: {fullError}</p>
+              {:else if fullView.has(f.path) && !fullFiles}
+                <p class="msg">Loading full file…</p>
+              {:else if shown.hunks.length === 0}
                 <p class="msg">No hunks.</p>
               {:else}
-                {#each f.hunks as hunk, hunkIndex (hunkIndex)}
+                {#each shown.hunks as hunk, hunkIndex (hunkIndex)}
                   <div class="hunk">
                     <div class="hunk-header">{hunk.header}</div>
                     <div class="hunk-body">
@@ -103,6 +154,34 @@
     opacity: 0.7;
     font-style: italic;
     padding: var(--space-2) 0;
+  }
+  .msg.err {
+    color: var(--text-danger-soft, #ffb4ab);
+    font-style: normal;
+  }
+  .body-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 4px;
+  }
+  .view-toggle {
+    display: inline-flex;
+    gap: 2px;
+  }
+  .view-toggle button {
+    appearance: none;
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    border-radius: var(--radius-sm);
+    padding: 2px 8px;
+    font-size: var(--font-size-xs);
+    cursor: pointer;
+  }
+  .view-toggle button.active {
+    background: var(--accent-muted);
+    border-color: var(--accent);
+    color: var(--text-primary);
   }
   .file-list {
     display: flex;

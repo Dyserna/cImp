@@ -5,7 +5,16 @@
   // branch/tag tips. Read-only; data is `workbench_git_graph` (every ref,
   // topological order, so children always render above their parents).
   import { onMount } from 'svelte';
-  import { workbenchGitGraph, type CommitInfo, type GitGraph } from './workbench';
+  import { SvelteMap } from 'svelte/reactivity';
+  import {
+    workbenchGitGraph,
+    workbenchCommitDiff,
+    FULL_FILE_CONTEXT,
+    type CommitInfo,
+    type FileDiff,
+    type GitGraph,
+  } from './workbench';
+  import CheckpointDiffView from './CheckpointDiffView.svelte';
   import RefChip from './RefChip.svelte';
   import { fmtDate, fmtTime } from './format';
 
@@ -13,20 +22,75 @@
   let error = $state<string | null>(null);
   let loading = $state(false);
 
-  async function refresh(): Promise<void> {
-    loading = true;
+  // Auto-refresh: poll while mounted (the component is destroyed on every
+  // tab/section switch, so this only ticks while the graph is actually on
+  // screen). Background ticks never show the loading state, never clobber
+  // the last-good graph with a transient error, and skip the `graph`
+  // reassignment entirely when nothing changed (no pointless re-render of
+  // up-to-500 keyed rows every tick).
+  const AUTO_REFRESH_MS = 5000;
+  let refreshing = false;
+  let lastFingerprint = '';
+
+  /// Everything the rendered graph depends on: commit set/order, ref
+  /// decorations (a branch pointer can move without any new commit), HEAD,
+  /// and truncation.
+  function fingerprint(g: GitGraph): string {
+    return `${g.head ?? ''}|${g.truncated}|${g.commits
+      .map((c) => `${c.hash}:${c.refs.join(',')}`)
+      .join(';')}`;
+  }
+
+  // Click-to-expand commit detail — the same message-body + per-file-diff
+  // panel a Session-commits row expands to. Single selection (one commit
+  // open at a time): the detail panel splits the rails SVG in two, and one
+  // split keeps that simple. Diffs are cached by hash (a commit's diff is
+  // immutable).
+  let selected = $state<string | null>(null);
+  type DiffState = { files: FileDiff[] } | { error: string };
+  const diffs = new SvelteMap<string, DiffState>();
+
+  async function select(c: CommitInfo): Promise<void> {
+    if (selected === c.hash) {
+      selected = null;
+      return;
+    }
+    selected = c.hash;
+    if (diffs.has(c.hash)) return;
     try {
-      graph = await workbenchGitGraph();
+      diffs.set(c.hash, { files: await workbenchCommitDiff(c.hash) });
+    } catch (e) {
+      diffs.set(c.hash, { error: String(e) });
+    }
+  }
+
+  async function refresh(background = false): Promise<void> {
+    if (refreshing) return; // a slow git walk mustn't stack overlapping calls
+    refreshing = true;
+    if (!background) loading = true;
+    try {
+      const g = await workbenchGitGraph();
+      const fp = fingerprint(g);
+      if (fp !== lastFingerprint || graph === null) {
+        lastFingerprint = fp;
+        graph = g;
+      }
       error = null;
     } catch (e) {
-      error = String(e);
+      // A background tick keeps showing the last good graph (a transient
+      // git failure — e.g. mid-gc lock — shouldn't blank the view); only a
+      // manual refresh or a still-empty view surfaces the error.
+      if (!background || graph === null) error = String(e);
     } finally {
+      refreshing = false;
       loading = false;
     }
   }
 
   onMount(() => {
     void refresh();
+    const timer = setInterval(() => void refresh(true), AUTO_REFRESH_MS);
+    return () => clearInterval(timer);
   });
 
   // ── Lane layout ──────────────────────────────────────────────────────
@@ -116,6 +180,15 @@
 
   const laid = $derived(graph ? layout(graph.commits) : null);
 
+  // Index of the selected commit's row, or -1. The detail panel renders
+  // BETWEEN two rail segments (rows 0..=selIdx, panel, rows selIdx+1..) so
+  // every row keeps its fixed ROW_H slot within its segment and the rails
+  // stay pixel-aligned — one continuous SVG can't absorb a variable-height
+  // panel in the middle.
+  const selIdx = $derived(
+    laid && selected ? laid.rows.findIndex((r) => r.commit.hash === selected) : -1,
+  );
+
   // ── SVG geometry ─────────────────────────────────────────────────────
   // ONE svg spans the whole rails column (a per-row svg would create
   // hundreds of separate SVG documents for the browser to lay out); rows
@@ -152,7 +225,13 @@
         {#if graph.truncated}<span class="trunc">(showing the most recent — history truncated)</span>{/if}
       </span>
     {/if}
-    <button type="button" class="refresh" onclick={() => void refresh()} disabled={loading}>
+    <button
+      type="button"
+      class="refresh"
+      title="The graph also refreshes automatically every 5 seconds"
+      onclick={() => void refresh()}
+      disabled={loading}
+    >
       {loading ? 'Refreshing…' : 'Refresh'}
     </button>
   </div>
@@ -164,43 +243,79 @@
   {:else if graph.commits.length === 0}
     <p class="msg">No commits yet.</p>
   {:else}
-    <div class="rows">
-      <svg
-        class="rails"
-        width={graphWidth}
-        height={laid.rows.length * ROW_H}
-        viewBox={`0 0 ${graphWidth} ${laid.rows.length * ROW_H}`}
-        aria-hidden="true"
-      >
-        {#each laid.rows as row, i (row.commit.hash)}
-          <g transform={`translate(0, ${i * ROW_H})`}>
-            {#each row.top as e, j (j)}
-              <path d={edgePath(e, 'top')} stroke={PALETTE[e.color % PALETTE.length]} />
-            {/each}
-            {#each row.bottom as e, j (j)}
-              <path d={edgePath(e, 'bottom')} stroke={PALETTE[e.color % PALETTE.length]} />
-            {/each}
-            <circle
-              cx={x(row.lane)}
-              cy={ROW_H / 2}
-              r={DOT_R}
-              fill={PALETTE[row.color % PALETTE.length]}
-            />
-          </g>
-        {/each}
-      </svg>
-      {#each laid.rows as row (row.commit.hash)}
-        <div class="row" style={`padding-left: ${graphWidth + 8}px; height: ${ROW_H}px`}>
-          <span class="hash">{row.commit.short}</span>
-          {#each row.commit.refs as r (r)}
-            <RefChip {r} />
+    {#snippet segment(rows: Row[], offset: number)}
+      <div class="seg">
+        <svg
+          class="rails"
+          width={graphWidth}
+          height={rows.length * ROW_H}
+          viewBox={`0 0 ${graphWidth} ${rows.length * ROW_H}`}
+          aria-hidden="true"
+        >
+          {#each rows as row, i (row.commit.hash)}
+            <g transform={`translate(0, ${i * ROW_H})`}>
+              {#each row.top as e, j (j)}
+                <path d={edgePath(e, 'top')} stroke={PALETTE[e.color % PALETTE.length]} />
+              {/each}
+              {#each row.bottom as e, j (j)}
+                <path d={edgePath(e, 'bottom')} stroke={PALETTE[e.color % PALETTE.length]} />
+              {/each}
+              <circle
+                cx={x(row.lane)}
+                cy={ROW_H / 2}
+                r={DOT_R}
+                fill={PALETTE[row.color % PALETTE.length]}
+              />
+            </g>
           {/each}
-          <span class="subject" title={row.commit.subject}>{row.commit.subject}</span>
-          <span class="meta">
-            {row.commit.author} · {fmtDate(row.commit.ts_ms)} {fmtTime(row.commit.ts_ms)}
-          </span>
+        </svg>
+        {#each rows as row, i (row.commit.hash)}
+          <button
+            type="button"
+            class="row"
+            class:alt={(offset + i) % 2 === 1}
+            class:selected={row.commit.hash === selected}
+            aria-expanded={row.commit.hash === selected}
+            style={`padding-left: ${graphWidth + 8}px; height: ${ROW_H}px`}
+            onclick={() => void select(row.commit)}
+          >
+            <span class="hash">{row.commit.short}</span>
+            {#each row.commit.refs as r (r)}
+              <RefChip {r} />
+            {/each}
+            <span class="subject" title={row.commit.subject}>{row.commit.subject}</span>
+            <span class="meta">
+              {row.commit.author} · {fmtDate(row.commit.ts_ms)} {fmtTime(row.commit.ts_ms)}
+            </span>
+          </button>
+        {/each}
+      </div>
+    {/snippet}
+
+    <div class="rows">
+      {#if selIdx === -1}
+        {@render segment(laid.rows, 0)}
+      {:else}
+        {@render segment(laid.rows.slice(0, selIdx + 1), 0)}
+        {@const sel = laid.rows[selIdx].commit}
+        {@const diff = diffs.get(sel.hash)}
+        <div class="detail">
+          {#if sel.body}
+            <pre class="message">{sel.body}</pre>
+          {/if}
+          {#if !diff}
+            <p class="msg">Loading diff…</p>
+          {:else if 'error' in diff}
+            <p class="msg err">Couldn't load this commit's diff: {diff.error}</p>
+          {:else}
+            <CheckpointDiffView
+              files={diff.files}
+              fetchFull={() => workbenchCommitDiff(sel.hash, FULL_FILE_CONTEXT)}
+            />
+          {/if}
         </div>
-      {/each}
+        {@render segment(laid.rows.slice(selIdx + 1), selIdx + 1)}
+      {/if}
     </div>
   {/if}
 </div>
@@ -248,10 +363,12 @@
     cursor: default;
   }
   .rows {
-    position: relative;
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-md);
     overflow-x: auto;
+  }
+  .seg {
+    position: relative;
   }
   .rails {
     position: absolute;
@@ -265,18 +382,51 @@
     stroke-width: 1.5;
   }
   .row {
+    appearance: none;
+    width: 100%;
     display: flex;
     align-items: center;
     gap: var(--space-2);
     padding-right: var(--space-2);
     min-width: 0;
     box-sizing: border-box;
+    background: transparent;
+    border: none;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    text-align: left;
+    cursor: pointer;
   }
-  .row:nth-child(even) {
+  /* Zebra striping via an explicit global-index class — :nth-child parity
+     would reset per segment (the rails svg is a sibling) and drift across
+     the detail-panel split. */
+  .row.alt {
     background: rgba(255, 255, 255, 0.02);
   }
   .row:hover {
     background: var(--surface-2);
+  }
+  .row.selected {
+    background: var(--accent-muted, rgba(59, 110, 165, 0.25));
+  }
+  .detail {
+    background: var(--surface-sunken);
+    border-top: 1px solid var(--border-subtle);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: var(--space-2);
+  }
+  .message {
+    margin: 0 0 var(--space-2);
+    padding: var(--space-2);
+    background: var(--surface-2);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-faint);
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
   }
   .hash {
     flex: 0 0 auto;

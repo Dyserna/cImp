@@ -20,11 +20,11 @@
 
   type Section = 'diff' | 'timeline' | 'worktrees' | 'session-commits' | 'git-graph';
   const SECTIONS: { id: Section; label: string }[] = [
+    { id: 'git-graph', label: 'Git graph' },
     { id: 'diff', label: 'Diff' },
+    { id: 'session-commits', label: 'Session commits' },
     { id: 'timeline', label: 'Timeline' },
     { id: 'worktrees', label: 'Worktrees' },
-    { id: 'session-commits', label: 'Session commits' },
-    { id: 'git-graph', label: 'Git graph' },
   ];
   let section = $state<Section>('diff');
 

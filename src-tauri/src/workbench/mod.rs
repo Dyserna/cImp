@@ -363,9 +363,9 @@ impl WorkbenchService {
     /// working tree, parsed into the same [`diff::FileDiff`] shape the B4
     /// `DiffView` already renders — powers both the Timeline's "Diff vs now"
     /// action and the restore confirmation dialog's dry-run file list.
-    pub async fn checkpoint_diff(&self, root: &Path, id: &str) -> AppResult<Vec<diff::FileDiff>> {
+    pub async fn checkpoint_diff(&self, root: &Path, id: &str, context: u32) -> AppResult<Vec<diff::FileDiff>> {
         let cfg = self.settings.current();
-        let text = shadow::diff_vs_now(root, id, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
+        let text = shadow::diff_vs_now(root, id, &cfg.graph.ignore, cfg.graph.max_file_bytes, context).await?;
         Ok(diff::parse_unified(&text))
     }
 
@@ -461,7 +461,7 @@ impl WorkbenchService {
             return Ok(summary);
         };
         let cfg = self.settings.current();
-        let text = shadow::diff_vs_now(root, &latest.id, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
+        let text = shadow::diff_vs_now(root, &latest.id, &cfg.graph.ignore, cfg.graph.max_file_bytes, diff::DEFAULT_CONTEXT).await?;
         let mut files: Vec<diff::FileDiffMeta> =
             diff::parse_unified(&text).iter().map(diff::file_diff_meta_from_parsed).collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -475,9 +475,9 @@ impl WorkbenchService {
     /// `path`'s entry. A `path` with no entry in that diff (already clean, or
     /// the caller raced a refresh) gets the same "clean, no changes" shape
     /// [`diff::diff_file`] returns for that case.
-    pub async fn diff_file(&self, root: &Path, path: &str) -> AppResult<diff::FileDiff> {
+    pub async fn diff_file(&self, root: &Path, path: &str, context: u32) -> AppResult<diff::FileDiff> {
         if git::is_repo(root).await || !self.checkpoints_enabled() {
-            return diff::diff_file(root, path).await;
+            return diff::diff_file_ctx(root, path, context).await;
         }
         let latest = match shadow::list(root).await {
             Ok(list) => list.into_iter().next_back(),
@@ -487,10 +487,10 @@ impl WorkbenchService {
             }
         };
         let Some(latest) = latest else {
-            return diff::diff_file(root, path).await;
+            return diff::diff_file_ctx(root, path, context).await;
         };
         let cfg = self.settings.current();
-        let text = shadow::diff_vs_now(root, &latest.id, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
+        let text = shadow::diff_vs_now(root, &latest.id, &cfg.graph.ignore, cfg.graph.max_file_bytes, context).await?;
         if let Some(file) = diff::parse_unified(&text).into_iter().find(|f| f.path == path) {
             return Ok(file);
         }
@@ -564,8 +564,8 @@ impl WorkbenchService {
     /// branch it was cut from, via [`worktree::diff_against_base`]. Read-only
     /// (a diff between two commits, not the working tree) — no revert action
     /// applies here.
-    pub async fn worktree_diff(&self, root: &Path, slug: &str) -> AppResult<Vec<diff::FileDiff>> {
-        worktree::diff_against_base(root, slug).await
+    pub async fn worktree_diff(&self, root: &Path, slug: &str, context: u32) -> AppResult<Vec<diff::FileDiff>> {
+        worktree::diff_against_base(root, slug, context).await
     }
 
     /// Short TTL for [`Self::session_commit_counts`]'s cached commit-times
@@ -624,8 +624,8 @@ impl WorkbenchService {
 
     /// One commit vs. its first parent, in the shared [`diff::FileDiff`]
     /// shape. Read-only.
-    pub async fn commit_diff(&self, root: &Path, hash: &str) -> AppResult<Vec<diff::FileDiff>> {
-        history::commit_diff(root, hash).await
+    pub async fn commit_diff(&self, root: &Path, hash: &str, context: u32) -> AppResult<Vec<diff::FileDiff>> {
+        history::commit_diff(root, hash, context).await
     }
 
     /// The Git-graph section's topologically-ordered commit list + HEAD.

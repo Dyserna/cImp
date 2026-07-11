@@ -12,6 +12,7 @@
     sessionCommitsRequest,
     workbenchSessionCommits,
     workbenchCommitDiff,
+    FULL_FILE_CONTEXT,
     type CommitInfo,
     type FileDiff,
     type SessionCommitsRequest,
@@ -142,7 +143,7 @@
                 {:else if 'error' in diff}
                   <p class="msg err">Couldn't load this commit's diff: {diff.error}</p>
                 {:else}
-                  <CheckpointDiffView files={diff.files} />
+                  <CheckpointDiffView files={diff.files} fetchFull={() => workbenchCommitDiff(c.hash, FULL_FILE_CONTEXT)} />
                 {/if}
               </div>
             {/if}

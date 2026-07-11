@@ -2386,9 +2386,10 @@
   .sess-stats {
     /* Fixed tracks so the values line up as columns ACROSS rows (fmtTok is
        ≤ 6 chars and each column's label is constant); flex sized every row
-       by its own content, so nothing aligned vertically. */
+       by its own content, so nothing aligned vertically. Track order MUST
+       match the span order: in · cache-write · cache-read · out. */
     display: grid;
-    grid-template-columns: 4.6rem 5.2rem 7.2rem 7.8rem;
+    grid-template-columns: 4.6rem 7.8rem 7.2rem 4.6rem;
     font-size: 11px;
     opacity: 0.85;
   }

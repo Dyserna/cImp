@@ -18,8 +18,8 @@
 //! before it joins the registry, and anything that fails verification is
 //! skipped with a `tracing::warn!` (it never appears in Settings).
 //!
-//! As a last-resort fallback, the embedded theme (`tui-orange`) and embedded
-//! palette (`GitHub Dark`) are compiled into the binary via `include_str!`
+//! As a last-resort fallback, the embedded theme (`tui-blue`) and embedded
+//! palette (`OpenCode Grey`) are compiled into the binary via `include_str!`
 //! — so even if both folders are missing/empty or every file on disk is
 //! malformed, those two are always present and the app stays usable. They are
 //! also the defaults new installs land on, so the fallback matches the normal
@@ -194,39 +194,39 @@ fn build_palette(json: &str) -> Result<PaletteWire, String> {
 
 // ---- embedded fallback ---------------------------------------------------
 //
-// Only one theme/palette is embedded as a last-resort fallback — `tui-orange`
-// and `GitHub Dark`. These are also the defaults new installs land on, so the
+// Only one theme/palette is embedded as a last-resort fallback — `tui-blue`
+// and `OpenCode Grey`. These are also the defaults new installs land on, so the
 // fallback matches the normal look. Compiled in from the same repo-root source
 // files that ship in the release, so the embed can never drift from the
 // on-disk copy.
 
-const EMBEDDED_THEME_ID: &str = "tui-orange";
+const EMBEDDED_THEME_ID: &str = "tui-blue";
 const EMBEDDED_THEME_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-orange/theme.json"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-blue/theme.json"));
 const EMBEDDED_THEME_CSS: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-orange/theme.css"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-blue/theme.css"));
 
 const EMBEDDED_PALETTE_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../palettes/GitHub Dark.json"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../palettes/OpenCode Grey.json"));
 
-/// The compiled-in `tui-orange` theme. `None` only if the embedded source
+/// The compiled-in `tui-blue` theme. `None` only if the embedded source
 /// somehow fails verification, which a unit test guards against.
 fn embedded_theme() -> Option<ThemeWire> {
     match build_theme(EMBEDDED_THEME_ID, EMBEDDED_THEME_JSON, EMBEDDED_THEME_CSS) {
         Ok(t) => Some(t),
         Err(e) => {
-            tracing::error!(error = %e, "theming: embedded tui-orange failed verification");
+            tracing::error!(error = %e, "theming: embedded tui-blue failed verification");
             None
         }
     }
 }
 
-/// The compiled-in `GitHub Dark` palette. See [`embedded_theme`].
+/// The compiled-in `OpenCode Grey` palette. See [`embedded_theme`].
 fn embedded_palette() -> Option<PaletteWire> {
     match build_palette(EMBEDDED_PALETTE_JSON) {
         Ok(p) => Some(p),
         Err(e) => {
-            tracing::error!(error = %e, "theming: embedded GitHub Dark failed verification");
+            tracing::error!(error = %e, "theming: embedded OpenCode Grey failed verification");
             None
         }
     }
@@ -409,11 +409,11 @@ mod tests {
         // The embedded defaults must still be present.
         assert!(
             load_themes().iter().any(|t| t.id == EMBEDDED_THEME_ID),
-            "load_themes must include the embedded tui-orange fallback"
+            "load_themes must include the embedded tui-blue fallback"
         );
         assert!(
-            load_palettes().iter().any(|p| p.name == "GitHub Dark"),
-            "load_palettes must include the embedded GitHub Dark fallback"
+            load_palettes().iter().any(|p| p.name == "OpenCode Grey"),
+            "load_palettes must include the embedded OpenCode Grey fallback"
         );
     }
 
@@ -421,27 +421,27 @@ mod tests {
     fn embedded_fallbacks_verify() {
         // The compiled-in last-resort fallbacks must always be valid and be the
         // two documented defaults (also the new-install defaults).
-        let theme = embedded_theme().expect("embedded tui-orange verifies");
+        let theme = embedded_theme().expect("embedded tui-blue verifies");
         assert_eq!(theme.id, EMBEDDED_THEME_ID);
         assert!(!theme.decorations);
-        assert_eq!(theme.palette, "GitHub Dark");
+        assert_eq!(theme.palette, "OpenCode Grey");
 
-        let palette = embedded_palette().expect("embedded GitHub Dark verifies");
-        assert_eq!(palette.name, "GitHub Dark");
+        let palette = embedded_palette().expect("embedded OpenCode Grey verifies");
+        assert_eq!(palette.name, "OpenCode Grey");
         assert_eq!(palette.colors.len(), REQUIRED_PALETTE_KEYS.len());
     }
 
     #[test]
-    fn embedded_tui_orange_theme_pairs_with_github_dark() {
-        // The embedded `tui-orange` fallback theme — also the default new-install
+    fn embedded_tui_blue_theme_pairs_with_opencode_grey() {
+        // The embedded `tui-blue` fallback theme — also the default new-install
         // theme — must exist on disk, hide the OS chrome, and pair with the
-        // GitHub Dark palette (the embedded + default terminal palette).
-        let dir = repo_themes().join("tui-orange");
-        let json = std::fs::read_to_string(dir.join("theme.json")).expect("tui-orange theme.json");
-        let css = std::fs::read_to_string(dir.join("theme.css")).expect("tui-orange theme.css");
-        let t = build_theme("tui-orange", &json, &css).expect("tui-orange valid");
+        // OpenCode Grey palette (the embedded + default terminal palette).
+        let dir = repo_themes().join("tui-blue");
+        let json = std::fs::read_to_string(dir.join("theme.json")).expect("tui-blue theme.json");
+        let css = std::fs::read_to_string(dir.join("theme.css")).expect("tui-blue theme.css");
+        let t = build_theme("tui-blue", &json, &css).expect("tui-blue valid");
         assert!(!t.decorations);
-        assert_eq!(t.palette, "GitHub Dark");
+        assert_eq!(t.palette, "OpenCode Grey");
     }
 
     #[test]

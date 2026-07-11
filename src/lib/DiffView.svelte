@@ -13,6 +13,7 @@
     workbenchDiffFile,
     workbenchRevertHunk,
     workbenchSendHunk,
+    FULL_FILE_CONTEXT,
     type FileStatus,
     type Hunk,
     type FileDiff,
@@ -36,6 +37,12 @@
   const fileErrors = new SvelteMap<string, string>();
   const revertErrors = new SvelteMap<string, string>();
   let viewMode = $state<'unified' | 'side-by-side'>('unified');
+  // Files showing the FULL-file view (huge unified context — the whole file
+  // as one hunk, change highlighting intact). Hunk actions that echo an
+  // index/hash back to the backend (Send to agent, Revert) are hidden in this
+  // mode: the backend re-derives the diff at the default context, so a
+  // full-context hunk's index/hash would never match.
+  const fullView = new SvelteSet<string>();
 
   let release: (() => void) | null = null;
   let unsubGraphStatus: UnlistenFn | undefined;
@@ -103,7 +110,7 @@
     const seq = (loadSeq.get(path) ?? 0) + 1;
     loadSeq.set(path, seq);
     try {
-      const fd = await workbenchDiffFile(path);
+      const fd = await workbenchDiffFile(path, fullView.has(path) ? FULL_FILE_CONTEXT : undefined);
       if (loadSeq.get(path) !== seq) return; // a newer fetch superseded this one
       fileDiffs.set(path, fd);
       fileErrors.delete(path);
@@ -128,6 +135,16 @@
   function toggleExpand(path: string): void {
     if (expanded.has(path)) expanded.delete(path);
     else expanded.add(path);
+  }
+
+  function setFull(path: string, full: boolean): void {
+    if (full === fullView.has(path)) return;
+    if (full) fullView.add(path);
+    else fullView.delete(path);
+    // The refetch-expanded $effect re-runs anyway (it tracks `fullView` via
+    // loadFile's synchronous read), but call directly so a not-yet-expanded
+    // file still can't end up stale.
+    void loadFile(path);
   }
 
   function statusLabel(s: FileStatus): string {
@@ -288,7 +305,14 @@
           {#if expanded.has(f.path) && !f.binary && !f.too_large}
             {@const fd = fileDiffs.get(f.path)}
             {@const err = fileErrors.get(f.path)}
+            {@const full = fullView.has(f.path)}
             <div class="file-body">
+              <div class="body-toolbar">
+                <div class="view-toggle" role="group" aria-label="Diff or full file">
+                  <button type="button" class:active={!full} onclick={() => setFull(f.path, false)}>Diff</button>
+                  <button type="button" class:active={full} onclick={() => setFull(f.path, true)}>Full file</button>
+                </div>
+              </div>
               {#if err}
                 <p class="msg err">{err}</p>
               {:else if !fd}
@@ -302,14 +326,16 @@
                       <span class="hunk-header">{hunk.header}</span>
                       <span class="hunk-actions">
                         <button type="button" onclick={() => copyHunk(hunk)}>Copy</button>
-                        <button type="button" onclick={() => void sendHunk(f.path, hunkIndex)}>Send to agent</button>
-                        <button
-                          type="button"
-                          class="revert"
-                          disabled={summary.readonly}
-                          title={summary.readonly ? 'Disabled — a merge or rebase is in progress' : 'Revert this hunk'}
-                          onclick={() => void doRevert(f.path, hunkIndex, hunk, f.status)}
-                        >Revert</button>
+                        {#if !full}
+                          <button type="button" onclick={() => void sendHunk(f.path, hunkIndex)}>Send to agent</button>
+                          <button
+                            type="button"
+                            class="revert"
+                            disabled={summary.readonly}
+                            title={summary.readonly ? 'Disabled — a merge or rebase is in progress' : 'Revert this hunk'}
+                            onclick={() => void doRevert(f.path, hunkIndex, hunk, f.status)}
+                          >Revert</button>
+                        {/if}
                       </span>
                     </div>
                     {#if revertErrors.get(`${f.path}:${hunkIndex}`)}
@@ -539,6 +565,14 @@
   .file-body {
     background: var(--surface-sunken);
     padding: var(--space-2);
+  }
+  .body-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 4px;
+  }
+  .body-toolbar .view-toggle {
+    margin-left: 0;
   }
 
   .hunk + .hunk {

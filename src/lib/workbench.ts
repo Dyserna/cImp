@@ -82,8 +82,16 @@ export function workbenchDiffSummary(root?: string): Promise<DiffSummary> {
   return invoke<DiffSummary>('workbench_diff_summary', { root: root ?? null });
 }
 
-export function workbenchDiffFile(path: string, root?: string): Promise<FileDiff> {
-  return invoke<FileDiff>('workbench_diff_file', { root: root ?? null, path });
+/// Unified-context width for the per-file "Full file" view: larger than any
+/// real file's line count, so the backend's `git diff --unified=<n>` returns
+/// the whole file as one hunk (change highlighting intact). Clamped
+/// backend-side (`diff::MAX_CONTEXT`).
+export const FULL_FILE_CONTEXT = 999_999;
+
+/// `context` is the unified-context width — omit for git's default (3), pass
+/// `FULL_FILE_CONTEXT` for the whole-file view.
+export function workbenchDiffFile(path: string, context?: number, root?: string): Promise<FileDiff> {
+  return invoke<FileDiff>('workbench_diff_file', { root: root ?? null, path, context: context ?? null });
 }
 
 /// Revert one hunk. `hunkHash` must be `Hunk.hash` from the last fetched
@@ -148,8 +156,8 @@ export function workbenchCheckpoints(root?: string): Promise<Checkpoint[]> {
 /// Checkpoint `id` vs. the CURRENT working tree, parsed the same way
 /// `workbenchDiffFile` is — powers both the Timeline's "Diff vs now" viewer
 /// and the restore confirmation dialog's dry-run file list.
-export function workbenchCheckpointDiff(id: string, root?: string): Promise<FileDiff[]> {
-  return invoke<FileDiff[]>('workbench_checkpoint_diff', { root: root ?? null, id });
+export function workbenchCheckpointDiff(id: string, context?: number, root?: string): Promise<FileDiff[]> {
+  return invoke<FileDiff[]>('workbench_checkpoint_diff', { root: root ?? null, id, context: context ?? null });
 }
 
 /// The manual "Checkpoint now" action. `label` defaults (backend side) to
@@ -236,8 +244,8 @@ export function workbenchWorktrees(root?: string): Promise<WorktreeInfo[]> {
 /// from, parsed the same way `workbenchDiffFile` is. Read-only — there is
 /// no revert action on this diff (it's a diff between two commits, not the
 /// working tree).
-export function workbenchWorktreeDiff(slug: string, root?: string): Promise<FileDiff[]> {
-  return invoke<FileDiff[]>('workbench_worktree_diff', { root: root ?? null, slug });
+export function workbenchWorktreeDiff(slug: string, context?: number, root?: string): Promise<FileDiff[]> {
+  return invoke<FileDiff[]>('workbench_worktree_diff', { root: root ?? null, slug, context: context ?? null });
 }
 
 /// Create a bare worktree (no tab) for `slug` — used by the Worktrees
@@ -349,8 +357,8 @@ export function workbenchSessionCommitCounts(
 
 /// One commit vs. its first parent, in the same `FileDiff` shape the other
 /// diff surfaces render. Read-only.
-export function workbenchCommitDiff(hash: string, root?: string): Promise<FileDiff[]> {
-  return invoke<FileDiff[]>('workbench_commit_diff', { root: root ?? null, hash });
+export function workbenchCommitDiff(hash: string, context?: number, root?: string): Promise<FileDiff[]> {
+  return invoke<FileDiff[]>('workbench_commit_diff', { root: root ?? null, hash, context: context ?? null });
 }
 
 /// The Git-graph section's commit list (topological order) + HEAD branch.

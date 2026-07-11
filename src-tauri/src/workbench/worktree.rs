@@ -592,13 +592,14 @@ pub async fn merge(root: &Path, slug: &str) -> AppResult<MergeReport> {
 /// render this with the same file/hunk shapes. Read-only: this is a diff
 /// between two commits, not a working-tree diff, so there is no revert
 /// action here (unlike Phase B's `DiffView`).
-pub async fn diff_against_base(root: &Path, slug: &str) -> AppResult<Vec<super::diff::FileDiff>> {
+pub async fn diff_against_base(root: &Path, slug: &str, context: u32) -> AppResult<Vec<super::diff::FileDiff>> {
     let slug = sanitize_slug(slug)?;
     let meta = read_meta(root, &slug)?;
     let ctx = GitCtx::discover(root);
     let branch = branch_name(&slug);
     let spec = format!("{}...{}", meta.base, branch);
-    let out = git::run(&ctx, &["diff", "--no-color", "--no-renames", "--unified=3", &spec], Some(BULK_TIMEOUT)).await?;
+    let unified = format!("--unified={}", context.min(super::diff::MAX_CONTEXT));
+    let out = git::run(&ctx, &["diff", "--no-color", "--no-renames", &unified, &spec], Some(BULK_TIMEOUT)).await?;
     if !out.success() {
         return Err(AppError::Workbench(format!(
             "git diff {spec} failed: {}",
@@ -926,7 +927,7 @@ mod tests {
         git(&dir, &["add", "main_only.txt"]);
         git(&dir, &["commit", "-q", "-m", "main commit"]);
 
-        let files = diff_against_base(&dir, "feature").await.expect("diff_against_base");
+        let files = diff_against_base(&dir, "feature", 3).await.expect("diff_against_base");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "feat.txt");
 

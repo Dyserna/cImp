@@ -15,6 +15,7 @@
     workbenchWorktreeCheckStatus,
     workbenchWorktreesVersion,
     bumpWorkbenchWorktreesVersion,
+    FULL_FILE_CONTEXT,
     type WorktreeInfo,
     type FileDiff,
     type WorktreeCheckStatus,
@@ -35,6 +36,11 @@
   const expandedDiff = new SvelteSet<string>();
   const diffs = new SvelteMap<string, FileDiff[]>();
   const diffErrors = new SvelteMap<string, string>();
+  // Worktrees whose diff panel shows the FULL-file view (huge unified
+  // context — whole file as one hunk) instead of the normal 3-line diff;
+  // fetched separately and cached in `fullDiffs`.
+  const fullDiff = new SvelteSet<string>();
+  const fullDiffs = new SvelteMap<string, FileDiff[]>();
 
   const checkStatuses = new SvelteMap<string, WorktreeCheckStatus | null>();
   const checking = new SvelteSet<string>();
@@ -88,6 +94,25 @@
     try {
       const files = await workbenchWorktreeDiff(slug);
       diffs.set(slug, files);
+      diffErrors.delete(slug);
+    } catch (e) {
+      diffErrors.set(slug, errorMessage(e));
+    }
+  }
+
+  function toggleFullDiff(slug: string, full: boolean): void {
+    if (!full) {
+      fullDiff.delete(slug);
+      return;
+    }
+    fullDiff.add(slug);
+    if (!fullDiffs.has(slug)) void loadFullDiff(slug);
+  }
+
+  async function loadFullDiff(slug: string): Promise<void> {
+    try {
+      const files = await workbenchWorktreeDiff(slug, FULL_FILE_CONTEXT);
+      fullDiffs.set(slug, files);
       diffErrors.delete(slug);
     } catch (e) {
       diffErrors.set(slug, errorMessage(e));
@@ -244,9 +269,16 @@
           {/if}
 
           {#if expandedDiff.has(w.slug)}
-            {@const files = diffs.get(w.slug)}
+            {@const full = fullDiff.has(w.slug)}
+            {@const files = full ? fullDiffs.get(w.slug) : diffs.get(w.slug)}
             {@const err = diffErrors.get(w.slug)}
             <div class="diff-panel">
+              <div class="diff-toolbar">
+                <div class="view-toggle" role="group" aria-label="Diff or full file">
+                  <button type="button" class:active={!full} onclick={() => toggleFullDiff(w.slug, false)}>Diff</button>
+                  <button type="button" class:active={full} onclick={() => toggleFullDiff(w.slug, true)}>Full file</button>
+                </div>
+              </div>
               {#if err}
                 <p class="msg err">{err}</p>
               {:else if !files}
@@ -410,6 +442,30 @@
     margin-top: var(--space-2);
     border-top: 1px solid var(--border-faint);
     padding-top: var(--space-2);
+  }
+  .diff-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 4px;
+  }
+  .view-toggle {
+    display: inline-flex;
+    gap: 2px;
+  }
+  .view-toggle button {
+    appearance: none;
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    border-radius: var(--radius-sm);
+    padding: 2px 8px;
+    font-size: var(--font-size-xs);
+    cursor: pointer;
+  }
+  .view-toggle button.active {
+    background: var(--accent-muted);
+    border-color: var(--accent);
+    color: var(--text-primary);
   }
   .diff-file {
     margin-bottom: var(--space-2);

@@ -10,6 +10,7 @@
     workbenchCheckpointDiff,
     workbenchCheckpointNow,
     workbenchCheckpointsVersion,
+    FULL_FILE_CONTEXT,
     type Checkpoint,
     type FileDiff,
   } from './workbench';
@@ -154,7 +155,10 @@
               {:else if diffErrors.get(cp.id)}
                 <p class="msg err">{diffErrors.get(cp.id)}</p>
               {:else}
-                <CheckpointDiffView files={diffFiles.get(cp.id) ?? []} />
+                <CheckpointDiffView
+                  files={diffFiles.get(cp.id) ?? []}
+                  fetchFull={() => workbenchCheckpointDiff(cp.id, FULL_FILE_CONTEXT)}
+                />
               {/if}
             </div>
           {/if}

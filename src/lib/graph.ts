@@ -383,6 +383,29 @@ export function graphVizSnapshot(root?: string): Promise<VizGraphResult> {
   return invoke<VizGraphResult>('graph_viz_snapshot', { root: root ?? null });
 }
 
+/// Per-file Graph View presence. Mirror of Rust `VizFileStatusRow`.
+export interface VizFileStatus {
+  path: string;
+  /// The file exists in the graph index at all.
+  indexed: boolean;
+  /// Rolled-up file-level call/import degree (0 = nothing to jump to).
+  degree: number;
+}
+
+/// Workbench ⌖ support: per-file Graph View presence for a batch of
+/// repo-relative paths — drives the jump button's enabled state.
+export function graphVizFileStatus(paths: string[], root?: string): Promise<VizFileStatus[]> {
+  return invoke<VizFileStatus[]>('graph_viz_file_status', { root: root ?? null, paths });
+}
+
+/// Workbench ⌖ support: the 1-hop FILE ego of `path` regardless of the
+/// snapshot's top-N-by-degree cut — merged into the rendered graph
+/// temporarily when a jump targets a file the snapshot dropped. Empty when
+/// the file isn't indexed; a lone node when it has no connections.
+export function graphVizEgo(path: string, root?: string): Promise<VizGraphResult> {
+  return invoke<VizGraphResult>('graph_viz_ego', { root: root ?? null, path });
+}
+
 /// Clear one session's memory (`session` = its id) or the whole project's
 /// (`session` omitted).
 export function graphMemoryClear(session?: string, root?: string): Promise<void> {

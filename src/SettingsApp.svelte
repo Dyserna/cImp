@@ -4122,6 +4122,64 @@
                     )}
                 />
               </label>
+              <h3>Graph View tuning</h3>
+              <small class="hint">
+                Multipliers on the built-in layout/appearance (1.0 = default;
+                0.2–5). One size doesn't fit every repo — a dense monorepo
+                usually wants smaller nodes and wider spacing than a small
+                project. Changes apply live to an open Graph View tab.
+              </small>
+              {#each [
+                { key: 'graph_viz_node_scale', label: 'File node size' },
+                { key: 'graph_viz_dir_scale', label: 'Folder cluster size' },
+                { key: 'graph_viz_edge_width', label: 'Edge line width' },
+                { key: 'graph_viz_node_spacing', label: 'Spacing between files' },
+                { key: 'graph_viz_cluster_spacing', label: 'Spacing between folders' },
+                { key: 'graph_viz_cluster_strength', label: 'Folder grouping tightness' },
+              ] as knob (knob.key)}
+                <label>
+                  <span>{knob.label}</span>
+                  <input
+                    type="number"
+                    min="0.2"
+                    max="5"
+                    step="0.1"
+                    value={(snapshot.graph as unknown as Record<string, number>)[knob.key]}
+                    onchange={(e) =>
+                      patch(
+                        (s) =>
+                          ((s.graph as unknown as Record<string, number>)[knob.key] = Math.min(
+                            5,
+                            Math.max(0.2, Number((e.currentTarget as HTMLInputElement).value) || 1),
+                          )),
+                      )}
+                  />
+                </label>
+              {/each}
+              <div class="row">
+                <label>
+                  <span>Call edge color</span>
+                  <input
+                    type="color"
+                    value={snapshot.graph.graph_viz_color_call}
+                    onchange={(e) =>
+                      patch(
+                        (s) => (s.graph.graph_viz_color_call = (e.currentTarget as HTMLInputElement).value),
+                      )}
+                  />
+                </label>
+                <label>
+                  <span>Import edge color</span>
+                  <input
+                    type="color"
+                    value={snapshot.graph.graph_viz_color_import}
+                    onchange={(e) =>
+                      patch(
+                        (s) => (s.graph.graph_viz_color_import = (e.currentTarget as HTMLInputElement).value),
+                      )}
+                  />
+                </label>
+              </div>
             {/if}
 
             <h3>Offload worker access</h3>

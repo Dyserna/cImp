@@ -1428,6 +1428,59 @@ pub async fn graph_viz_snapshot(
     })
 }
 
+/// Per-file Graph View presence (Workbench ⌖ button state).
+#[derive(serde::Serialize)]
+pub struct VizFileStatusRow {
+    pub path: String,
+    /// The file exists in the graph index at all.
+    pub indexed: bool,
+    /// Rolled-up file-level call/import degree (0 = nothing to jump to).
+    pub degree: u64,
+}
+
+/// Workbench ⌖ support: per-file Graph View presence for a batch of
+/// repo-relative paths — the jump button disables for unindexed or
+/// connection-less files. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn graph_viz_file_status(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    paths: Vec<String>,
+) -> AppResult<Vec<VizFileStatusRow>> {
+    let root = resolve_graph_root(root)?;
+    Ok(service
+        .viz_file_status(&root, &paths)?
+        .into_iter()
+        .map(|s| VizFileStatusRow { path: s.path, indexed: s.indexed, degree: s.degree })
+        .collect())
+}
+
+/// Workbench ⌖ support: the 1-hop FILE ego of `path` regardless of the
+/// snapshot's top-N-by-degree cut — the Graph View injects it temporarily
+/// when a jump targets a file the rendered snapshot dropped. `root` defaults
+/// to the launch directory.
+#[tauri::command]
+pub async fn graph_viz_ego(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    path: String,
+) -> AppResult<VizGraphResult> {
+    let root = resolve_graph_root(root)?;
+    let g = service.viz_ego(&root, &path)?;
+    Ok(VizGraphResult {
+        nodes: g
+            .nodes
+            .into_iter()
+            .map(|n| VizNodeRow { id: n.id, label: n.label, file: n.file, kind: n.kind, degree: n.degree, subsystem: n.subsystem })
+            .collect(),
+        edges: g
+            .edges
+            .into_iter()
+            .map(|e| VizEdgeRow { src: e.src, dst: e.dst, kind: e.kind, confidence: e.confidence, drawn: e.drawn })
+            .collect(),
+    })
+}
+
 /// V10 (Memory): the project's session/action memory — current session, its
 /// working set, notes (pinned + current-session), and the recent-sessions list.
 /// `root` defaults to the launch directory.

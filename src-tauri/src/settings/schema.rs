@@ -1177,6 +1177,30 @@ pub struct GraphSettings {
     /// V15 Feature 4: cap on the rendered subgraph node count so large repos
     /// stay smooth (the view is bounded orientation, never the whole graph).
     pub graph_viz_max_nodes: u32,
+    /// Graph View tuning (all multipliers on the built-in behavior, `1.0` =
+    /// unchanged): file-node radius. One size doesn't fit every repo — a
+    /// dense monorepo wants smaller nodes/wider spacing than a 50-file tool.
+    pub graph_viz_node_scale: f32,
+    /// Directory-cluster size multiplier (the leash radius files orbit their
+    /// folder anchor at — bigger = looser, larger folder discs).
+    pub graph_viz_dir_scale: f32,
+    /// Edge line-width multiplier (ambient, emphasized, highlighted and the
+    /// aggregate folder↔folder edges all scale together).
+    pub graph_viz_edge_width: f32,
+    /// Spacing multiplier between FILE nodes (connected-pair rest length and
+    /// the matching node↔node repulsion).
+    pub graph_viz_node_spacing: f32,
+    /// Spacing multiplier between DIRECTORY clusters (anchor↔anchor rest
+    /// length and the matching cluster repulsion).
+    pub graph_viz_cluster_spacing: f32,
+    /// Directory-clustering tightness multiplier (the strength of the spring
+    /// leashing each file to its folder anchor — higher = files hug their
+    /// folder harder, lower = topology wins over directory grouping).
+    pub graph_viz_cluster_strength: f32,
+    /// Edge colors (`#rrggbb`): call edges and import edges. The remaining
+    /// hues (highlight pulses, subsystem palette) stay built-in.
+    pub graph_viz_color_call: String,
+    pub graph_viz_color_import: String,
     /// Segment colors for the Code Intelligence tab's "This session"
     /// stacked-bar chart (`#rrggbb`). Edited in-place by clicking the chart's
     /// legend swatches; defaults match the original hard-coded palette.
@@ -1255,6 +1279,14 @@ impl Default for GraphSettings {
             arch_min_community_size: 3,
             graph_viz: false,
             graph_viz_max_nodes: 1500,
+            graph_viz_node_scale: 1.0,
+            graph_viz_dir_scale: 1.0,
+            graph_viz_edge_width: 1.0,
+            graph_viz_node_spacing: 1.0,
+            graph_viz_cluster_spacing: 1.0,
+            graph_viz_cluster_strength: 1.0,
+            graph_viz_color_call: "#4fb3ff".to_string(),
+            graph_viz_color_import: "#ff8a3d".to_string(),
             usage_color_in: "#58a6ff".to_string(),
             usage_color_cache: "#d2a8ff".to_string(),
             usage_color_out: "#3fb950".to_string(),

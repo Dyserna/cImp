@@ -776,6 +776,19 @@ export interface GraphSettings {
   graph_viz: boolean;
   /// V15 Feature 4: cap on the rendered subgraph node count.
   graph_viz_max_nodes: number;
+  /// Graph View tuning — multipliers on the built-in behavior (1.0 =
+  /// unchanged): file-node radius, directory-cluster size (leash radius),
+  /// edge line width, file↔file spacing, cluster↔cluster spacing, and how
+  /// tightly files hug their folder anchor.
+  graph_viz_node_scale: number;
+  graph_viz_dir_scale: number;
+  graph_viz_edge_width: number;
+  graph_viz_node_spacing: number;
+  graph_viz_cluster_spacing: number;
+  graph_viz_cluster_strength: number;
+  /// Edge colors (`#rrggbb`) for call and import edges.
+  graph_viz_color_call: string;
+  graph_viz_color_import: string;
   /// "This session" stacked-bar chart segment colors (`#rrggbb`), edited by
   /// clicking the chart's legend swatches in the Code Intelligence tab.
   usage_color_in: string;
@@ -1321,6 +1334,14 @@ export function defaultSettings(): Settings {
       arch_min_community_size: 3,
       graph_viz: false,
       graph_viz_max_nodes: 1500,
+      graph_viz_node_scale: 1.0,
+      graph_viz_dir_scale: 1.0,
+      graph_viz_edge_width: 1.0,
+      graph_viz_node_spacing: 1.0,
+      graph_viz_cluster_spacing: 1.0,
+      graph_viz_cluster_strength: 1.0,
+      graph_viz_color_call: '#4fb3ff',
+      graph_viz_color_import: '#ff8a3d',
       usage_color_in: '#58a6ff',
       usage_color_cache: '#d2a8ff',
       usage_color_out: '#3fb950',

@@ -594,6 +594,24 @@ impl GraphService {
         self.index_for(root)?.viz_snapshot(max)
     }
 
+    /// Workbench ⌖ support: per-file Graph View presence (indexed? rolled-up
+    /// degree?) for a batch of repo-relative paths — drives the jump button's
+    /// enabled state. Opens the warm index.
+    pub fn viz_file_status(
+        &self,
+        root: &Path,
+        paths: &[String],
+    ) -> AppResult<Vec<super::index::VizFileStatus>> {
+        self.index_for(root)?.viz_file_status(paths)
+    }
+
+    /// Workbench ⌖ support: the 1-hop FILE ego of `path` regardless of the
+    /// snapshot's top-N-by-degree cut, so the Graph View can temporarily
+    /// inject a hidden file and its neighbors. Opens the warm index.
+    pub fn viz_ego(&self, root: &Path, path: &str) -> AppResult<super::index::VizGraph> {
+        self.index_for(root)?.viz_ego(path)
+    }
+
     // ── V10 session / action memory ──────────────────────────────────────
 
     /// Record one memory event for `root`'s current-project graph. A no-op when

@@ -63,6 +63,9 @@
   import { settings, applySettings } from './settings/store';
   import { llmPricingGet } from './settings/ipc';
   import type { LlmPricingModel } from './settings/types';
+  import { workbenchSessionCommitCounts, openSessionCommits } from './workbench';
+  import { revealTab } from './tabs/visibility';
+  import { WORKBENCH_TAB_ID } from './tabs/types';
 
   // The graph_* tool reference list and the recent-calls activity feed both
   // moved to the Tool Activity tab (ToolActivityView.svelte).
@@ -321,6 +324,43 @@
     ]);
     if (u) usage = u;
     if (a) advice = a;
+    // Unawaited on purpose: commitCounts is independent $state that renders
+    // when it lands — the poll's critical path shouldn't wait on a git
+    // subprocess round trip.
+    if ($settings.workbench.enabled) void refreshCommitCounts();
+  }
+
+  // Per-session commit counts (session_id → count) for the Sessions card's
+  // "commits" button — zero (or unknown) disables it. The backend caches the
+  // underlying git walk per root (WorkbenchService::COMMIT_TIMES_TTL); this
+  // 10s throttle just keeps the 2s Overview poll from paying IPC churn for
+  // answers that can't have changed yet.
+  let commitCounts = $state<Record<string, number>>({});
+  let commitCountsAt = 0;
+
+  async function refreshCommitCounts(): Promise<void> {
+    if (!usage || usage.sessions.length === 0) return;
+    const now = Date.now();
+    if (now - commitCountsAt < 10_000) return;
+    commitCountsAt = now;
+    try {
+      commitCounts = await workbenchSessionCommitCounts(
+        usage.sessions.map((s) => ({
+          session_id: s.session_id,
+          from_ms: s.started_ms,
+          to_ms: s.last_ms,
+        })),
+      );
+    } catch (e) {
+      console.warn('workbench_session_commit_counts failed', e);
+    }
+  }
+
+  // Jump to the Workbench tab's Session-commits section scoped to `s` — the
+  // same store-bus + revealTab pattern as DiffView's jump-to-graph button.
+  function openCommits(s: SessionUsageRow): void {
+    openSessionCommits(s.session_id, s.agent, s.started_ms, s.last_ms);
+    revealTab(WORKBENCH_TAB_ID);
   }
 
   // Session-cost popup: clicking a row in the Sessions card opens a modal
@@ -833,21 +873,35 @@
       {:else}
         <div class="rows scroll10">
           {#each usage.sessions as s (s.session_id)}
-            <button
-              type="button"
-              class="arow sessrow"
-              title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens — click for cost`}
-              onclick={() => void openCostPopup(s)}
-            >
-              <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}<span class="sess-date">{fmtDate(s.started_ms)}</span></span>
-              <span class="sess-stats tnum">
-                <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
-                <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
-                <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
-                <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
-              </span>
-              <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
-            </button>
+            {@const nCommits = commitCounts[s.session_id] ?? 0}
+            <div class="sessrow-wrap">
+              <button
+                type="button"
+                class="arow sessrow"
+                title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens — click for cost`}
+                onclick={() => void openCostPopup(s)}
+              >
+                <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}<span class="sess-date">{fmtDate(s.started_ms)}</span></span>
+                <span class="sess-stats tnum">
+                  <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
+                  <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
+                  <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
+                  <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
+                </span>
+                <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
+              </button>
+              {#if $settings.workbench.enabled}
+                <button
+                  type="button"
+                  class="mini secondary commits-btn"
+                  disabled={nCommits === 0}
+                  title={nCommits === 0
+                    ? 'No commits during this session'
+                    : `Show the ${nCommits} commit${nCommits === 1 ? '' : 's'} made during this session in the Workbench`}
+                  onclick={() => openCommits(s)}
+                >⎇ {nCommits}</button>
+              {/if}
+            </div>
           {/each}
         </div>
       {/if}
@@ -1843,7 +1897,7 @@
     overflow-x: auto;
   }
   .rows.scroll5 > .arow,
-  .rows.scroll10 > .arow {
+  .rows.scroll10 > .sessrow-wrap {
     min-width: 100%;
     width: max-content;
     box-sizing: border-box;
@@ -2158,20 +2212,34 @@
   .arow.sessrow {
     grid-template-columns: minmax(6rem, 1fr) auto auto;
   }
-  /* The session rows are <button>s (they open the cost popup) — strip the UA
-     button chrome so they keep rendering as plain grid rows. */
+  /* Each row is a flex wrapper holding TWO buttons (the cost-popup row and
+     the Workbench commits jump) — nesting them would be invalid HTML. The
+     row divider lives on the wrapper so it spans both. */
+  .sessrow-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+  }
+  /* The main row area is a <button> (it opens the cost popup) — strip the UA
+     button chrome so it keeps rendering as a plain grid row. */
   button.arow.sessrow {
     background: none;
     border: none;
-    border-bottom: 1px solid var(--border, #2a2a2a);
     color: inherit;
     font: inherit;
     text-align: left;
-    width: 100%;
+    flex: 1 1 auto;
+    min-width: 0;
     cursor: pointer;
   }
   button.arow.sessrow:hover {
     background: var(--surface-raised, rgba(255, 255, 255, 0.04));
+  }
+  .commits-btn {
+    flex: 0 0 auto;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   /* Session-cost popup. Fixed-position so it centers on the window even

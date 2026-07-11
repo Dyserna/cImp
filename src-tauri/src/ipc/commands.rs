@@ -1903,6 +1903,87 @@ pub async fn workbench_worktree_diff(
     service.worktree_diff(&root, &slug).await
 }
 
+/// Session-commits section: the union of commits caught live from the
+/// session's transcript (the graph memory's `session_commit` provenance,
+/// flagged `tracked`) and commits whose committer time falls inside the
+/// session's window. The frontend's `from_ms..=to_ms` is only a fallback
+/// snapshot — when the graph's own `session` relation knows the session,
+/// its (fresher) window is merged in, so a commit made after the frontend's
+/// last poll still lands inside the window. Newest first. `root` defaults
+/// to the launch directory.
+#[tauri::command]
+pub async fn workbench_session_commits(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    session_id: String,
+    from_ms: i64,
+    to_ms: i64,
+) -> AppResult<crate::workbench::history::SessionCommits> {
+    let root = resolve_workbench_root(root)?;
+    let recorded = graph.session_commit_hashes(&root, &session_id);
+    let (from_ms, to_ms) = match graph.session_windows(&root).get(&session_id) {
+        Some((s, l)) => (from_ms.min(*s), to_ms.max(*l)),
+        None => (from_ms, to_ms),
+    };
+    service.session_commits(&root, from_ms, to_ms, &recorded).await
+}
+
+/// Per-session commit counts (session_id → count) for the Sessions card's
+/// per-row "commits" button — a zero count disables it. One cached
+/// lightweight `git log` walk serves every window (see
+/// `WorkbenchService::session_commit_counts`); recorded transcript-caught
+/// commits count even when they fall outside a window. Frontend-supplied
+/// windows are widened with the graph's own canonical session windows, same
+/// as `workbench_session_commits`.
+#[tauri::command]
+pub async fn workbench_session_commit_counts(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    windows: Vec<crate::workbench::history::SessionWindow>,
+) -> AppResult<std::collections::HashMap<String, u32>> {
+    let root = resolve_workbench_root(root)?;
+    let recorded = graph.session_commit_hashes_all(&root);
+    let canonical = graph.session_windows(&root);
+    let windows: Vec<_> = windows
+        .into_iter()
+        .map(|mut w| {
+            if let Some((s, l)) = canonical.get(&w.session_id) {
+                w.from_ms = w.from_ms.min(*s);
+                w.to_ms = w.to_ms.max(*l);
+            }
+            w
+        })
+        .collect();
+    service.session_commit_counts(&root, &windows, &recorded).await
+}
+
+/// One commit vs. its first parent, parsed the same way `workbench_diff_file`
+/// is — the Session-commits section's expanded-commit file list. Read-only.
+#[tauri::command]
+pub async fn workbench_commit_diff(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    hash: String,
+) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
+    let root = resolve_workbench_root(root)?;
+    service.commit_diff(&root, &hash).await
+}
+
+/// The Git-graph section: up to `limit` commits from every ref in
+/// topological order (children before parents — what the frontend's lane
+/// layout needs) plus the current branch name.
+#[tauri::command]
+pub async fn workbench_git_graph(
+    service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
+    root: Option<String>,
+    limit: Option<usize>,
+) -> AppResult<crate::workbench::history::GitGraph> {
+    let root = resolve_workbench_root(root)?;
+    service.git_graph(&root, limit.unwrap_or(500)).await
+}
+
 /// V13 Phase D: create a bare worktree (no tab) for `slug` — the Worktrees
 /// section's own "create" affordance. Returns the new worktree's absolute
 /// path. See `workbench::worktree::create`'s doc comment for the full

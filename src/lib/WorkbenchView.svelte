@@ -10,19 +10,34 @@
   // explaining what each section needs (git, or checkpoints once Phase C
   // lands). The sections themselves are filled in by B/C/D.
   import { onMount } from 'svelte';
-  import { workbenchStatus, type WorkbenchStatus } from './workbench';
+  import { workbenchStatus, sessionCommitsRequest, takeSessionCommitsRoute, type WorkbenchStatus } from './workbench';
   import { settings } from './settings/store';
   import DiffView from './DiffView.svelte';
   import TimelineView from './TimelineView.svelte';
   import WorktreesView from './WorktreesView.svelte';
+  import SessionCommitsView from './SessionCommitsView.svelte';
+  import GitGraphView from './GitGraphView.svelte';
 
-  type Section = 'diff' | 'timeline' | 'worktrees';
+  type Section = 'diff' | 'timeline' | 'worktrees' | 'session-commits' | 'git-graph';
   const SECTIONS: { id: Section; label: string }[] = [
     { id: 'diff', label: 'Diff' },
     { id: 'timeline', label: 'Timeline' },
     { id: 'worktrees', label: 'Worktrees' },
+    { id: 'session-commits', label: 'Session commits' },
+    { id: 'git-graph', label: 'Git graph' },
   ];
   let section = $state<Section>('diff');
+
+  // A Sessions-card "commits" click (Code Intelligence tab) reveals this tab
+  // AND must land on the Session-commits section — switch on every new
+  // request (nonce), while plain section clicks stay untouched. The latch
+  // lives in workbench.ts MODULE scope (takeSessionCommitsRoute): this
+  // component is destroyed/recreated on tab switches, so component-local
+  // state would reset and replay the store's last request on every remount.
+  $effect(() => {
+    const req = $sessionCommitsRequest;
+    if (req && takeSessionCommitsRoute(req.nonce)) section = 'session-commits';
+  });
 
   let status = $state<WorkbenchStatus | null>(null);
   let statusError = $state<string | null>(null);
@@ -44,7 +59,9 @@
   // checkpoints on (Phase C) — a non-git project can still use checkpoints
   // (the shadow repo is self-contained), so Timeline's gate is independent
   // of `needsGit`/`gitBannerText` below.
-  const needsGit = $derived(section === 'diff' || section === 'worktrees');
+  const needsGit = $derived(
+    section === 'diff' || section === 'worktrees' || section === 'session-commits' || section === 'git-graph',
+  );
   const gitBannerText = $derived.by(() => {
     if (!status) return null;
     if (!status.git_available) {
@@ -104,6 +121,18 @@
       <!-- The banner above already explains what's missing. -->
     {:else}
       <WorktreesView />
+    {/if}
+  {:else if section === 'session-commits'}
+    {#if statusError || (needsGit && gitBannerText)}
+      <!-- The banner above already explains what's missing. -->
+    {:else}
+      <SessionCommitsView />
+    {/if}
+  {:else if section === 'git-graph'}
+    {#if statusError || (needsGit && gitBannerText)}
+      <!-- The banner above already explains what's missing. -->
+    {:else}
+      <GitGraphView />
     {/if}
   {/if}
 </div>

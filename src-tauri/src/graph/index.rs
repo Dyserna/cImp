@@ -2889,6 +2889,16 @@ impl GraphIndex {
                     in_tok: Int, out_tok: Int, cache_read: Int, cache_make: Int, \
                     tool: String?, chars: Int, ts_ms: Int}",
             ),
+            // Session→commit provenance: git commits caught live from the
+            // agent transcript (the OOB tap sees the `git commit` tool call
+            // and parses the produced hash from its output). `hash` is
+            // whatever git printed — usually the short form — matched by
+            // prefix at query time. Additive, evicted with its session
+            // (`prune_sessions_in_tx`), same posture as `usage_stat`.
+            (
+                "session_commit",
+                ":create session_commit {session_id: String, hash: String => ts_ms: Int}",
+            ),
         ];
         for (name, create) in defs {
             if !existing.contains(*name) {
@@ -3257,6 +3267,51 @@ impl GraphIndex {
         Ok(out)
     }
 
+    /// Record one commit caught live from an agent transcript for
+    /// `session_id` — see `session_commit` in
+    /// [`Self::ensure_memory_relations`]. `hash` is stored as git printed it
+    /// (usually the short form; matched by prefix at query time). Upsert by
+    /// (session, hash) so re-parsing the same transcript line (watcher
+    /// restart, backfill) is idempotent.
+    pub fn record_session_commit(&self, session_id: &str, hash: &str, ts_ms: i64) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        p.insert("hash".to_string(), DataValue::Str(hash.into()));
+        p.insert("ts".to_string(), DataValue::Num(Num::Int(ts_ms)));
+        self.run_mut(
+            "?[session_id, hash, ts_ms] <- [[$sid, $hash, $ts]]\n:put session_commit {session_id, hash => ts_ms}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// Every commit hash recorded for `session_id`, oldest first.
+    pub fn session_commit_hashes(&self, session_id: &str) -> AppResult<Vec<String>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[ts_ms, hash] := *session_commit{session_id, hash, ts_ms}, session_id == $sid\n:order ts_ms",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.iter().map(|r| cell_str(r, 1)).collect())
+    }
+
+    /// Recorded commit hashes for EVERY session in one scan (session_id →
+    /// hashes) — the Sessions card's per-row counts want all of them at once.
+    pub fn session_commit_hashes_all(&self) -> AppResult<std::collections::HashMap<String, Vec<String>>> {
+        let rows = self.run(
+            "?[session_id, hash] := *session_commit{session_id, hash}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for r in &rows.rows {
+            out.entry(cell_str(r, 0)).or_default().push(cell_str(r, 1));
+        }
+        Ok(out)
+    }
+
     /// The session with the most recent activity (across all agents), or `None`.
     pub fn mem_current_session(&self) -> AppResult<Option<String>> {
         self.mem_current_session_for(None)
@@ -3593,6 +3648,7 @@ impl GraphIndex {
                     p.insert("sid".to_string(), DataValue::Str(sid.into()));
                     tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
                     tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
+                    tx_run(tx, "?[session_id, hash] := *session_commit{session_id, hash}, session_id == $sid\n:rm session_commit {session_id, hash}", p.clone())?;
                     tx_run(tx, "?[note_id] := *mem_note{note_id, session_id}, session_id == $sid\n:rm mem_note {note_id}", p.clone())?;
                     // F5: drop the distilled flag too, else a cleared session
                     // stays marked distilled and its later work is never distilled.
@@ -3602,6 +3658,7 @@ impl GraphIndex {
                 None => {
                     tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}\n:rm mem_event {session_id, seq}", BTreeMap::new())?;
                     tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}\n:rm usage_stat {session_id, seq}", BTreeMap::new())?;
+                    tx_run(tx, "?[session_id, hash] := *session_commit{session_id, hash}\n:rm session_commit {session_id, hash}", BTreeMap::new())?;
                     tx_run(tx, "?[note_id] := *mem_note{note_id}\n:rm mem_note {note_id}", BTreeMap::new())?;
                     tx_run(tx, "?[session_id] := *session_distilled{session_id}\n:rm session_distilled {session_id}", BTreeMap::new())?;
                     tx_run(tx, "?[session_id] := *session{session_id}\n:rm session {session_id}", BTreeMap::new())?;
@@ -3987,6 +4044,7 @@ fn prune_sessions_in_tx(tx: &MultiTransaction) -> AppResult<()> {
         p.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
         tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
         tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
+        tx_run(tx, "?[session_id, hash] := *session_commit{session_id, hash}, session_id == $sid\n:rm session_commit {session_id, hash}", p.clone())?;
         tx_run(tx, "?[note_id] := *mem_note{note_id, session_id, pinned}, session_id == $sid, pinned == false\n:rm mem_note {note_id}", p.clone())?;
         // F5: also drop the distilled-flag row. Without this it leaks one row per
         // evicted session forever, and — because a Claude `session_id` is the

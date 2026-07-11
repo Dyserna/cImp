@@ -650,6 +650,52 @@ impl GraphService {
         }
     }
 
+    /// Record one git commit caught live from an agent transcript (the OOB
+    /// tap saw the `git commit` tool call and parsed the produced hash out
+    /// of its output). Same best-effort posture as [`Self::record_mem_event`]:
+    /// no-op when the graph is disabled, store errors logged, never
+    /// propagated.
+    pub fn record_session_commit(&self, root: &Path, session_id: &str, hash: &str) {
+        if !self.settings.current().graph.enabled {
+            return;
+        }
+        let ts = super::activity::now_ms() as i64;
+        match self.index_for(root) {
+            Ok(idx) => {
+                if let Err(e) = idx.record_session_commit(session_id, hash, ts) {
+                    debug!(error = %e, "graph: record_session_commit failed");
+                }
+            }
+            Err(e) => debug!(error = %e, "graph: record_session_commit open failed"),
+        }
+    }
+
+    /// Every commit hash recorded for `session_id` (git-printed, usually
+    /// short — match by prefix), oldest first. Empty on any store error.
+    pub fn session_commit_hashes(&self, root: &Path, session_id: &str) -> Vec<String> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.session_commit_hashes(session_id).unwrap_or_default()
+    }
+
+    /// Recorded commit hashes for every session (session_id → hashes) in one
+    /// scan. Empty on any store error.
+    pub fn session_commit_hashes_all(&self, root: &Path) -> std::collections::HashMap<String, Vec<String>> {
+        let Ok(idx) = self.index_for(root) else { return Default::default() };
+        idx.session_commit_hashes_all().unwrap_or_default()
+    }
+
+    /// The graph's own `(started_ms, last_ms)` window for every session —
+    /// the CANONICAL session windows (the `session` relation), fresher than
+    /// any frontend snapshot for the live session. Empty on any store error.
+    pub fn session_windows(&self, root: &Path) -> std::collections::HashMap<String, (i64, i64)> {
+        let Ok(idx) = self.index_for(root) else { return Default::default() };
+        idx.mem_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.session_id, (s.started_ms, s.last_ms)))
+            .collect()
+    }
+
     // ── V14 Phase C: usage / cost accounting ──────────────────────────────
 
     /// Record one usage/cost event for `root`'s current-project graph. A

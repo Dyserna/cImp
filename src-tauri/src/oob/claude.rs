@@ -47,6 +47,10 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     // attributed to the tool that produced it for usage accounting. Same
     // per-session lifetime as `agents` — cleared on session rotation below.
     let mut tool_names = ToolNameRing::default();
+    // Session→commit provenance: tool_use ids whose command is a `git
+    // commit` invocation, awaiting their result (see `record_commit_events`).
+    // Same per-session lifetime as `tool_names`.
+    let mut commit_calls = IdRing::default();
     let mut cur: Option<PathBuf> = None;
     let mut offset: u64 = 0;
     // The first file we attach to may already hold a long backlog from before
@@ -83,6 +87,7 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 // The tool-name ring is per-session too: a new file means old
                 // tool_use ids can never see a matching tool_result.
                 tool_names.clear();
+                commit_calls.clear();
             }
             Some(_) => {}
             None => {
@@ -108,6 +113,7 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 &mut seen,
                 &mut agents,
                 &mut tool_names,
+                &mut commit_calls,
                 &project_dir,
                 &session_id,
                 &ctx,
@@ -131,6 +137,7 @@ async fn drain_new_lines(
     seen: &mut HashSet<String>,
     agents: &mut HashSet<String>,
     tool_names: &mut ToolNameRing,
+    commit_calls: &mut IdRing,
     project_dir: &Path,
     session_id: &str,
     ctx: &OobContext,
@@ -171,6 +178,7 @@ async fn drain_new_lines(
             update_agents(&obj, agents, ctx);
             record_tool_events(&obj, project_dir, session_id, ctx);
             record_usage(&obj, tool_names, project_dir, session_id, ctx);
+            record_commit_events(&obj, commit_calls, project_dir, session_id, ctx);
             for (key, text) in assistant_texts(&obj) {
                 if seen.insert(key) {
                     trace!(tab = ?ctx.tab, "Claude OOB: speaking assistant block");
@@ -461,21 +469,258 @@ fn extract_tool_results(obj: &Value) -> Vec<(String, usize)> {
     out
 }
 
-/// Character length of a `tool_result` block's `content`, which is either a
+/// The text pieces of a `tool_result` block's `content`, which is either a
 /// plain string or an array of blocks (`{"type":"text","text":...}` plus
-/// possibly non-text blocks, e.g. images — only text blocks count towards
-/// the char estimate).
-fn tool_result_chars(content: &Value) -> usize {
+/// possibly non-text blocks, e.g. images — only text blocks count). The one
+/// shape-aware extraction both [`tool_result_chars`] and
+/// [`tool_result_text`] build on, so the two readings of the same data can
+/// never disagree.
+fn tool_result_text_blocks(content: &Value) -> Vec<&str> {
     match content {
-        Value::String(s) => s.chars().count(),
+        Value::String(s) => vec![s.as_str()],
         Value::Array(items) => items
             .iter()
             .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
             .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .map(|t| t.chars().count())
-            .sum(),
-        _ => 0,
+            .collect(),
+        _ => Vec::new(),
     }
+}
+
+/// Character length of a `tool_result` block's `content` — the estimated-
+/// token proxy for usage accounting.
+fn tool_result_chars(content: &Value) -> usize {
+    tool_result_text_blocks(content).iter().map(|t| t.chars().count()).sum()
+}
+
+// ── Session→commit provenance tap ─────────────────────────────────────────
+
+/// The text of a `tool_result` block's `content`, joined with newlines —
+/// built on the same [`tool_result_text_blocks`] extraction as
+/// [`tool_result_chars`], for [`parse_commit_hashes`] to scan.
+fn tool_result_text(content: &Value) -> String {
+    tool_result_text_blocks(content).join("\n")
+}
+
+/// True when `content` marks its `tool_result` as an error (the API's
+/// `is_error` flag) — a failed command's output must never be mined for
+/// commit hashes (hook noise from an ABORTED commit could match the shape).
+fn tool_result_is_error(part: &Value) -> bool {
+    part.get("is_error").and_then(Value::as_bool) == Some(true)
+}
+
+/// Git global flags that take their value as a SEPARATE token (the `=`
+/// forms are single tokens and skipped by the leading-`-` rule).
+const GIT_VALUE_FLAGS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"];
+
+/// Token-level check for "this shell command actually invokes `git commit`":
+/// finds a `git` token (bare, path-suffixed, or `git.exe`), skips global
+/// flags (and the separate value of [`GIT_VALUE_FLAGS`]), and requires the
+/// first remaining token to be exactly `commit`. Chained commands work
+/// because a later `git` token restarts the scan (`git add . && git commit`).
+/// Unlike a substring check this does NOT match `git log --grep=commit` or
+/// a mention of "commit" in a message argument.
+fn is_git_commit_invocation(cmd: &str) -> bool {
+    let mut tokens = cmd.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        let base = tok.trim_matches('"').trim_matches('\'');
+        let is_git = base == "git"
+            || base.ends_with("/git")
+            || base.ends_with("\\git")
+            || base.ends_with("git.exe");
+        if !is_git {
+            continue;
+        }
+        while let Some(next) = tokens.peek().copied() {
+            if GIT_VALUE_FLAGS.contains(&next) {
+                tokens.next();
+                tokens.next(); // the flag's value
+            } else if next.starts_with('-') {
+                tokens.next();
+            } else {
+                break;
+            }
+        }
+        if tokens.peek().copied() == Some("commit") {
+            return true;
+        }
+        // Not a commit subcommand — keep scanning for a later `git` token.
+    }
+    false
+}
+
+/// Bounded insertion-ordered id set for commit tool_use ids awaiting their
+/// result — membership is all that matters (unlike [`ToolNameRing`], which
+/// maps to a value). Same eviction posture and cap as the name ring.
+#[derive(Default)]
+struct IdRing {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl IdRing {
+    fn insert(&mut self, id: String) {
+        if self.ids.insert(id.clone()) {
+            self.order.push_back(id);
+            while self.order.len() > TOOL_NAME_RING_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.ids.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    /// Drop one resolved id. Its `order` entry is left behind and ages out
+    /// with the ring — only `ids` membership matters.
+    fn remove(&mut self, id: &str) {
+        self.ids.remove(id);
+    }
+
+    fn clear(&mut self) {
+        self.ids.clear();
+        self.order.clear();
+    }
+}
+
+/// Extract created-commit hashes from a `git commit` invocation's output.
+/// Git prints one summary line per commit created:
+///
+/// ```text
+/// [develop 337bc57] feat(code-intel): session dates
+/// [main (root-commit) abc1234] initial
+/// [detached HEAD 1a2b3c4] fixup
+/// ```
+///
+/// Scan: a line whose first char (after trim) is `[` with a closing `]`,
+/// whose bracketed content's LAST whitespace-separated token is 7–40 hex
+/// chars — that token is the (usually short) hash. Line-oriented and
+/// dependency-free (no regex crate), tolerant of hook noise around the
+/// summary line. Deduped, in output order. A false positive (bracketed log
+/// noise ending in a hex-looking token) is harmless: recorded hashes are
+/// prefix-matched against the REAL `git log` at query time, so a bogus one
+/// simply never matches anything.
+fn parse_commit_hashes(output: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix('[') else { continue };
+        let Some(close) = rest.find(']') else { continue };
+        let Some(tok) = rest[..close].split_whitespace().last() else { continue };
+        let is_hash = (7..=40).contains(&tok.len()) && tok.bytes().all(|b| b.is_ascii_hexdigit());
+        if is_hash && !out.iter().any(|h| h == tok) {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// Attach commits to their session as they happen: a `tool_use` whose shell
+/// `command` is a real `git commit` invocation ([`is_git_commit_invocation`])
+/// marks its id in `commit_calls`; the paired SUCCESSFUL `tool_result`'s
+/// text is scanned for git's `[branch hash]` summary and every hash found is
+/// recorded against the session. Error results are skipped entirely — an
+/// aborted commit's hook noise must never be mined for hashes. A successful
+/// commit that printed no summary (`git commit -q`) still gets provenance
+/// via a `git rev-parse HEAD` fallback ([`spawn_head_fallback`]). Sidechain
+/// (sub-agent) lines are NOT skipped — a sub-agent's commit is still this
+/// session's commit. A no-op when memory isn't wired.
+///
+/// OpenCode has no equivalent tap: its `chat.message` plugin ingress (see
+/// `offload::loopback::handle_memory_event`) doesn't carry tool outputs, so
+/// OpenCode sessions fall back to the Workbench's time-window association.
+fn record_commit_events(
+    obj: &Value,
+    commit_calls: &mut IdRing,
+    project_dir: &Path,
+    session_id: &str,
+    ctx: &OobContext,
+) {
+    if ctx.mem.is_none() {
+        return;
+    }
+    let Some(parts) = message_parts(obj) else { return };
+    match obj.get("type").and_then(Value::as_str) {
+        // Mark candidate commit commands (assistant lines). `--dry-run`
+        // never creates a commit and prints no summary, so tracking it
+        // would only arm the HEAD fallback with a false positive — skip.
+        Some("assistant") => {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    continue;
+                }
+                let Some(id) = part.get("id").and_then(Value::as_str) else { continue };
+                let Some(cmd) = part
+                    .get("input")
+                    .and_then(|i| i.get("command"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if is_git_commit_invocation(cmd) && !cmd.contains("--dry-run") {
+                    commit_calls.insert(id.to_string());
+                }
+            }
+        }
+        // Resolve results (user lines) for marked ids.
+        Some("user") => {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                let Some(id) = part.get("tool_use_id").and_then(Value::as_str) else { continue };
+                if !commit_calls.contains(id) {
+                    continue;
+                }
+                commit_calls.remove(id);
+                if tool_result_is_error(part) {
+                    continue; // the commit failed — nothing was created.
+                }
+                let text = tool_result_text(part.get("content").unwrap_or(&Value::Null));
+                let hashes = parse_commit_hashes(&text);
+                if hashes.is_empty() {
+                    // Succeeded but printed no summary (`git commit -q`, or
+                    // output swallowed by a wrapper) — resolve HEAD instead.
+                    spawn_head_fallback(ctx, project_dir, session_id);
+                    continue;
+                }
+                for hash in hashes {
+                    debug!(tab = ?ctx.tab, %hash, "Claude OOB: session commit caught");
+                    ctx.record_commit(project_dir, session_id, &hash);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Quiet-commit fallback: a commit-shaped command succeeded but its output
+/// carried no `[branch hash]` summary line — resolve the repo's HEAD right
+/// now and record that. The transcript is tailed near-real-time (200ms
+/// poll), so HEAD is still the commit the command just created except in
+/// pathological rapid-fire cases; recording HEAD is then still a commit this
+/// session made moments ago. Best-effort: any git failure is dropped
+/// silently (the time-window fallback still covers the commit).
+fn spawn_head_fallback(ctx: &OobContext, project_dir: &Path, session_id: &str) {
+    let Some(mem) = ctx.mem.clone() else { return };
+    let root = project_dir.to_path_buf();
+    let session_id = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let git_ctx = crate::workbench::git::GitCtx::discover(&root);
+        match crate::workbench::git::run(&git_ctx, &["rev-parse", "HEAD"], None).await {
+            Ok(out) if out.success() => {
+                let hash = out.stdout.trim().to_string();
+                if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    debug!(%hash, "Claude OOB: session commit resolved via HEAD fallback");
+                    mem.record_session_commit(&root, &session_id, &hash);
+                }
+            }
+            _ => {}
+        }
+    });
 }
 
 /// V14 Phase C: feed the token/cost X-ray from one transcript line — a `Turn`
@@ -603,6 +848,86 @@ mod tests {
         )
         .unwrap();
         assert!(assistant_texts(&obj).is_empty());
+    }
+
+    // --- Session→commit provenance (record_commit_events) ---
+
+    #[test]
+    fn parse_commit_hashes_reads_git_summary_lines() {
+        let out = "[develop 337bc57] feat(code-intel): session dates\n 5 files changed, 60 insertions(+)";
+        assert_eq!(parse_commit_hashes(out), vec!["337bc57"]);
+        // Root-commit and detached-HEAD decorations still end with the hash.
+        assert_eq!(parse_commit_hashes("[main (root-commit) abc1234] initial"), vec!["abc1234"]);
+        assert_eq!(parse_commit_hashes("[detached HEAD 1a2b3c4] fixup"), vec!["1a2b3c4"]);
+        // Two commits from one chained command; duplicates collapse.
+        let two = "[develop aaa1111] one\nnoise\n[develop bbb2222] two\n[develop bbb2222] two";
+        assert_eq!(parse_commit_hashes(two), vec!["aaa1111", "bbb2222"]);
+        // An all-digit token is still a legitimate short hash (~4% of them
+        // are); bogus ones are filtered at query time by prefix-matching
+        // against the real log.
+        assert_eq!(parse_commit_hashes("[develop 1234567] all-digit hash"), vec!["1234567"]);
+        // Non-hex or short tokens are not hashes.
+        assert!(parse_commit_hashes("[branch xyzzy99] not hex").is_empty());
+        assert!(parse_commit_hashes("[short ab12] too short").is_empty());
+        assert!(parse_commit_hashes("no brackets at all").is_empty());
+    }
+
+    #[test]
+    fn is_git_commit_invocation_matches_real_commits_only() {
+        assert!(is_git_commit_invocation("git commit -m 'x'"));
+        assert!(is_git_commit_invocation("git -C sub commit --amend"));
+        assert!(is_git_commit_invocation("git -c user.name=x commit"));
+        assert!(is_git_commit_invocation("git add . && git commit -m 'y'"));
+        assert!(is_git_commit_invocation(r#"& "C:\Program Files\Git\bin\git.exe" commit -m z"#));
+        assert!(!is_git_commit_invocation("git status"));
+        assert!(!is_git_commit_invocation("git log --grep=commit"));
+        assert!(!is_git_commit_invocation("git log --grep commit"));
+        assert!(!is_git_commit_invocation("echo commit && git status"));
+        assert!(!is_git_commit_invocation("cargo build"));
+    }
+
+    #[test]
+    fn record_commit_events_is_a_noop_without_graph_memory() {
+        // ctx.mem is None; must not panic and must not mark the ring (the
+        // early return happens before the tool_use scan).
+        let (ctx, _rx) = agent_ctx();
+        let mut ring = IdRing::default();
+        let line: Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"git commit -m x"}}
+            ]}}"#,
+        )
+        .unwrap();
+        record_commit_events(&line, &mut ring, Path::new("."), "s1", &ctx);
+        assert!(!ring.contains("toolu_1"));
+    }
+
+    #[test]
+    fn tool_result_is_error_reads_the_flag() {
+        let err: Value = serde_json::from_str(
+            r#"{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"hook failed"}"#,
+        )
+        .unwrap();
+        let ok: Value = serde_json::from_str(
+            r#"{"type":"tool_result","tool_use_id":"t1","content":"[develop 337bc57] x"}"#,
+        )
+        .unwrap();
+        assert!(tool_result_is_error(&err));
+        assert!(!tool_result_is_error(&ok));
+    }
+
+    #[test]
+    fn id_ring_membership_and_eviction() {
+        let mut ring = IdRing::default();
+        ring.insert("a".to_string());
+        assert!(ring.contains("a"));
+        ring.remove("a");
+        assert!(!ring.contains("a"));
+        for i in 0..(TOOL_NAME_RING_CAP + 1) {
+            ring.insert(format!("id_{i}"));
+        }
+        assert!(!ring.contains("id_0")); // oldest evicted at cap
+        assert!(ring.contains(&format!("id_{TOOL_NAME_RING_CAP}")));
     }
 
     // --- Task sub-agent tracking (update_agents) ---

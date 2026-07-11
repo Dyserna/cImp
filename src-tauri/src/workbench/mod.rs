@@ -22,6 +22,7 @@
 
 pub mod diff;
 pub mod git;
+pub mod history;
 pub mod shadow;
 pub mod worktree;
 
@@ -97,6 +98,15 @@ pub struct WorkbenchService {
     /// [`worktree_run_checks`](Self::worktree_run_checks) (an explicit row
     /// button, or a future auto-check hook) refreshes an entry.
     worktree_check_cache: Mutex<HashMap<(PathBuf, String), WorktreeCheckStatus>>,
+    /// Short-TTL cache for the Sessions card's per-session commit-count
+    /// probe: the lightweight `(hash, ts_ms)` walk behind
+    /// [`session_commit_counts`](Self::session_commit_counts), keyed per
+    /// root. The counts poll is periodic (every open view ticks it), so the
+    /// git subprocess should run at most once per
+    /// [`COMMIT_TIMES_TTL`](Self::COMMIT_TIMES_TTL) per root regardless of
+    /// how many callers ask — same server-side posture as
+    /// [`Self::worktree_check_cache`].
+    commit_times_cache: Mutex<HashMap<PathBuf, (Instant, Arc<Vec<(String, i64)>>)>>,
 }
 
 /// One project root's rolling burst-trigger accumulator (see
@@ -175,6 +185,7 @@ impl WorkbenchService {
             checkpoint_last: Mutex::new(HashMap::new()),
             burst_state: Mutex::new(HashMap::new()),
             worktree_check_cache: Mutex::new(HashMap::new()),
+            commit_times_cache: Mutex::new(HashMap::new()),
         });
         svc.clone().spawn_burst_trigger();
         svc
@@ -555,6 +566,71 @@ impl WorkbenchService {
     /// applies here.
     pub async fn worktree_diff(&self, root: &Path, slug: &str) -> AppResult<Vec<diff::FileDiff>> {
         worktree::diff_against_base(root, slug).await
+    }
+
+    /// Short TTL for [`Self::session_commit_counts`]'s cached commit-times
+    /// walk — long enough that a 2s frontend poll never re-spawns git,
+    /// short enough that a fresh commit's badge appears promptly.
+    const COMMIT_TIMES_TTL: Duration = Duration::from_secs(10);
+
+    /// Session-commits section: the union of commits recorded live for the
+    /// session (`recorded` hash prefixes, flagged `tracked`) and commits
+    /// whose committer time falls inside `from_ms..=to_ms` — see
+    /// [`history::session_commits`].
+    pub async fn session_commits(
+        &self,
+        root: &Path,
+        from_ms: i64,
+        to_ms: i64,
+        recorded: &[String],
+    ) -> AppResult<history::SessionCommits> {
+        history::session_commits(root, from_ms, to_ms, recorded).await
+    }
+
+    /// Per-session commit counts for the Sessions card's button state — one
+    /// lightweight (hash + time) log walk shared across every window AND
+    /// every caller: the walk is cached per root for
+    /// [`COMMIT_TIMES_TTL`](Self::COMMIT_TIMES_TTL), so periodic polls hit
+    /// the cache instead of re-spawning git. Same union semantics as
+    /// [`Self::session_commits`].
+    pub async fn session_commit_counts(
+        &self,
+        root: &Path,
+        windows: &[history::SessionWindow],
+        recorded: &HashMap<String, Vec<String>>,
+    ) -> AppResult<HashMap<String, u32>> {
+        let key = git::canonical_path(root);
+        let cached = {
+            let cache = self.commit_times_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .get(&key)
+                .filter(|(at, _)| at.elapsed() < Self::COMMIT_TIMES_TTL)
+                .map(|(_, times)| times.clone())
+        };
+        let times = match cached {
+            Some(times) => times,
+            None => {
+                let (walk, _) = history::log_commit_times(root, history::MAX_LOG_COMMITS).await?;
+                let times = Arc::new(walk);
+                self.commit_times_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, (Instant::now(), times.clone()));
+                times
+            }
+        };
+        Ok(history::commit_counts_from(&times, windows, recorded))
+    }
+
+    /// One commit vs. its first parent, in the shared [`diff::FileDiff`]
+    /// shape. Read-only.
+    pub async fn commit_diff(&self, root: &Path, hash: &str) -> AppResult<Vec<diff::FileDiff>> {
+        history::commit_diff(root, hash).await
+    }
+
+    /// The Git-graph section's topologically-ordered commit list + HEAD.
+    pub async fn git_graph(&self, root: &Path, limit: usize) -> AppResult<history::GitGraph> {
+        history::git_graph(root, limit).await
     }
 
     /// Phase D `workbench_worktree_create`. Thin pass-through to

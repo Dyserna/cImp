@@ -284,3 +284,112 @@ export const workbenchWorktreesVersion = writable<number>(0);
 export function bumpWorkbenchWorktreesVersion(): void {
   workbenchWorktreesVersion.update((n) => n + 1);
 }
+
+// ── Session commits + git graph ─────────────────────────────────────────
+
+/// Mirror of Rust `workbench::history::CommitInfo` — one commit, shared by
+/// the Session-commits list and the Git-graph node.
+export interface CommitInfo {
+  hash: string;
+  short: string;
+  /// Parent hashes, first parent first.
+  parents: string[];
+  /// Committer timestamp, epoch ms.
+  ts_ms: number;
+  author: string;
+  /// `%D` decorations, e.g. "HEAD -> develop", "tag: v0.40.5", "origin/develop".
+  refs: string[];
+  subject: string;
+  body: string;
+  /// True when this commit was caught live from the session's transcript
+  /// (exact provenance) rather than merely falling inside the session's
+  /// time window. Always false in the git-graph payload.
+  tracked: boolean;
+}
+
+/// Mirror of Rust `workbench::history::GitGraph`.
+export interface GitGraph {
+  /// Current branch name; null when detached or on an unborn branch.
+  head: string | null;
+  /// Topological order — children strictly before parents.
+  commits: CommitInfo[];
+  truncated: boolean;
+}
+
+/// Mirror of Rust `workbench::history::SessionCommits` — the commit list
+/// plus whether the backend's log walk hit its cap before reaching the
+/// window's start (older commits may be missing).
+export interface SessionCommits {
+  commits: CommitInfo[];
+  truncated: boolean;
+}
+
+/// One session's commits: the union of commits caught live from its
+/// transcript (`tracked: true`) and commits (from every ref) whose committer
+/// time falls inside the session's window (the backend widens
+/// `fromMs..=toMs` with its own fresher session bounds). Newest first.
+export function workbenchSessionCommits(
+  sessionId: string,
+  fromMs: number,
+  toMs: number,
+  root?: string,
+): Promise<SessionCommits> {
+  return invoke<SessionCommits>('workbench_session_commits', { root: root ?? null, sessionId, fromMs, toMs });
+}
+
+/// Per-session commit counts (session_id → count) for the Sessions card's
+/// per-row "commits" button — zero disables it. One backend log walk serves
+/// every window.
+export function workbenchSessionCommitCounts(
+  windows: { session_id: string; from_ms: number; to_ms: number }[],
+  root?: string,
+): Promise<Record<string, number>> {
+  return invoke<Record<string, number>>('workbench_session_commit_counts', { root: root ?? null, windows });
+}
+
+/// One commit vs. its first parent, in the same `FileDiff` shape the other
+/// diff surfaces render. Read-only.
+export function workbenchCommitDiff(hash: string, root?: string): Promise<FileDiff[]> {
+  return invoke<FileDiff[]>('workbench_commit_diff', { root: root ?? null, hash });
+}
+
+/// The Git-graph section's commit list (topological order) + HEAD branch.
+export function workbenchGitGraph(limit?: number, root?: string): Promise<GitGraph> {
+  return invoke<GitGraph>('workbench_git_graph', { root: root ?? null, limit: limit ?? null });
+}
+
+/// The Sessions card's "commits" button writes the clicked session here and
+/// reveals the Workbench tab; `WorkbenchView` switches to the Session-commits
+/// section on a nonce change and `SessionCommitsView` renders the request.
+/// Deliberately NOT cleared after consumption (unlike `graphReveal`) — the
+/// section keeps showing the last-picked session while the user browses
+/// other sections.
+export interface SessionCommitsRequest {
+  sessionId: string;
+  agent: string;
+  fromMs: number;
+  toMs: number;
+  nonce: number;
+}
+
+let sessionCommitsNonce = 0;
+
+export const sessionCommitsRequest = writable<SessionCommitsRequest | null>(null);
+
+export function openSessionCommits(sessionId: string, agent: string, fromMs: number, toMs: number): void {
+  sessionCommitsNonce += 1;
+  sessionCommitsRequest.set({ sessionId, agent, fromMs, toMs, nonce: sessionCommitsNonce });
+}
+
+/// One-shot routing latch for WorkbenchView's "jump to the Session-commits
+/// section" effect. MODULE scope, not component state: WorkbenchView is
+/// destroyed and recreated on every tab switch, so a component-local latch
+/// would reset and replay the (never-cleared) store's last request, yanking
+/// the user back to Session commits after they had navigated away.
+let routedSessionCommitsNonce = 0;
+
+export function takeSessionCommitsRoute(nonce: number): boolean {
+  if (nonce === routedSessionCommitsNonce) return false;
+  routedSessionCommitsNonce = nonce;
+  return true;
+}

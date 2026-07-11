@@ -236,6 +236,14 @@ pub struct SessionUsageRow {
     /// True when this session has no exact `usage` data — currently every
     /// non-Claude agent (see the OpenCode C3 spike note atop `oob/opencode.rs`).
     pub est_only: bool,
+    /// Session start / last-activity timestamps (epoch ms), from the
+    /// `session` relation via [`SessionInfo`].
+    pub started_ms: i64,
+    pub last_ms: i64,
+    /// Distinct model ids seen across the session's turns, descending by
+    /// total tokens attributed to each (`"<synthetic>"` rows excluded).
+    /// Empty when no turn carried a model (e.g. tool-result-only sessions).
+    pub models: Vec<String>,
 }
 
 // ── V14 Phase D: Usage section assembly ────────────────────────────────────
@@ -275,11 +283,14 @@ pub struct SessionUsage {
 /// (summed across every session currently resident there by
 /// `GraphService::effectiveness_totals` — process-wide, not persisted, lost
 /// on restart); `advisor_displaced_chars` comes from the V11-E read-advisor
-/// Activity events (the small `graph::activity` ring), deliberately NOT from
+/// Activity events in the `crate::activity` store, deliberately NOT from
 /// `usage_stat` — `usage_stat` only knows resolved tool-result sizes, never
-/// what a reminder *avoided* sending. All three are measured characters, not
-/// fabricated "savings" — the UI still labels every derived (chars→tokens)
-/// number `est.`.
+/// what a reminder *avoided* sending. NOTE: that store PERSISTS across
+/// restarts (JSONL mirror), so the since-restart semantics of this counter
+/// hinge on `effectiveness_totals`' `ts_ms >= process_start_ms()` filter —
+/// do not remove that filter as "redundant". All three are measured
+/// characters, not fabricated "savings" — the UI still labels every derived
+/// (chars→tokens) number `est.`.
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 pub struct Effectiveness {
     pub injected_chars: u64,

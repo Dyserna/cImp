@@ -545,6 +545,7 @@ impl OffloadService {
         // the On→Auto retry below targets the live backend, not the failed one.
         let mut active = chosen;
         let run_id = self.run_id_seq.fetch_add(1, Ordering::Relaxed);
+        let run_started = now_ms();
         self.run_begin(&backend_name, run_id, &instructions, thinking);
         let mut trace = RunTrace::default();
 
@@ -624,6 +625,39 @@ impl OffloadService {
             (Err(_), _) => "failed",
         };
         self.run_finish(&backend_name, run_id, outcome, std::mem::take(&mut trace.calls));
+
+        // Mirror the completed run into the unified, persistent tool-activity
+        // store (the Tool Activity tab's feed): full instruction text (+ any
+        // caller-supplied context) as the request, the synthesized answer (or
+        // the error) as the response.
+        let request = match context.as_deref() {
+            Some(ctx) if !ctx.is_empty() => {
+                format!("{instructions}\n\n--- context ---\n{ctx}")
+            }
+            _ => instructions.clone(),
+        };
+        let response = match &result {
+            Ok(text) => text.clone(),
+            Err(e) => format!("[error] {e}"),
+        };
+        crate::activity::record_bg(crate::activity::ActivityRecord {
+            entry: crate::activity::ActivityEntry::new(
+                crate::activity::ActivityKind::Offload,
+                run_started,
+                session_cwd
+                    .as_deref()
+                    .map(crate::activity::root_key)
+                    .unwrap_or_default(),
+                backend_name.clone(),
+                "offload_task".to_string(),
+                instruction_headline(&instructions),
+                result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
+                now_ms().saturating_sub(run_started),
+                result.is_ok(),
+            ),
+            request,
+            response,
+        });
         result
     }
 
@@ -631,7 +665,7 @@ impl OffloadService {
     fn run_begin(&self, backend: &str, id: u64, instructions: &str, thinking: ThinkingMode) {
         let rec = RunRecord {
             id,
-            instructions: instructions.chars().take(160).collect(),
+            instructions: instruction_headline(instructions),
             thinking: thinking_label(thinking).into(),
             started_ms: now_ms(),
             ended_ms: 0,
@@ -1312,6 +1346,12 @@ fn compute_global_cap(snap: &OffloadSettings) -> u32 {
 /// Opus session and a local worker are unaffected.
 fn worker_graph_allowed(graph_enabled: bool, is_remote: bool, allow_remote: bool) -> bool {
     graph_enabled && (!is_remote || allow_remote)
+}
+
+/// The 160-char instruction headline shared by the run log's row and the
+/// activity feed's target column — one definition so the two can't drift.
+fn instruction_headline(instructions: &str) -> String {
+    instructions.chars().take(160).collect()
 }
 
 /// The run log's thinking-mode label (`"on"`/`"off"`/`"auto"`).

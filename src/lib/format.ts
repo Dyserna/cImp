@@ -5,3 +5,8 @@
 export function fmtTime(ms: number): string {
   return ms ? new Date(ms).toLocaleTimeString() : '—';
 }
+
+/// Locale calendar date for an epoch-ms timestamp, '—' when unset (0).
+export function fmtDate(ms: number): string {
+  return ms ? new Date(ms).toLocaleDateString() : '—';
+}

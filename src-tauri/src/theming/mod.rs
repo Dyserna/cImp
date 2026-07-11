@@ -381,7 +381,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("shipped theme {id} invalid: {e}"));
             count += 1;
         }
-        assert_eq!(count, 2, "expected 2 shipped themes");
+        assert_eq!(count, 4, "expected 4 shipped themes");
     }
 
     #[test]

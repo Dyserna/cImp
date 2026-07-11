@@ -637,7 +637,7 @@ impl GraphService {
         // the graph's stored file paths (agents send absolute or `\`-separated
         // paths). A pattern/command that isn't under root passes through.
         let rel = relativize_path(root, path);
-        let ts = super::activity::now_ms() as i64;
+        let ts = crate::activity::now_ms() as i64;
         match self.index_for(root) {
             Ok(idx) => {
                 if let Err(e) =
@@ -648,6 +648,52 @@ impl GraphService {
             }
             Err(e) => debug!(error = %e, "graph: record_mem_event open failed"),
         }
+    }
+
+    /// Record one git commit caught live from an agent transcript (the OOB
+    /// tap saw the `git commit` tool call and parsed the produced hash out
+    /// of its output). Same best-effort posture as [`Self::record_mem_event`]:
+    /// no-op when the graph is disabled, store errors logged, never
+    /// propagated.
+    pub fn record_session_commit(&self, root: &Path, session_id: &str, hash: &str) {
+        if !self.settings.current().graph.enabled {
+            return;
+        }
+        let ts = crate::activity::now_ms() as i64;
+        match self.index_for(root) {
+            Ok(idx) => {
+                if let Err(e) = idx.record_session_commit(session_id, hash, ts) {
+                    debug!(error = %e, "graph: record_session_commit failed");
+                }
+            }
+            Err(e) => debug!(error = %e, "graph: record_session_commit open failed"),
+        }
+    }
+
+    /// Every commit hash recorded for `session_id` (git-printed, usually
+    /// short — match by prefix), oldest first. Empty on any store error.
+    pub fn session_commit_hashes(&self, root: &Path, session_id: &str) -> Vec<String> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.session_commit_hashes(session_id).unwrap_or_default()
+    }
+
+    /// Recorded commit hashes for every session (session_id → hashes) in one
+    /// scan. Empty on any store error.
+    pub fn session_commit_hashes_all(&self, root: &Path) -> std::collections::HashMap<String, Vec<String>> {
+        let Ok(idx) = self.index_for(root) else { return Default::default() };
+        idx.session_commit_hashes_all().unwrap_or_default()
+    }
+
+    /// The graph's own `(started_ms, last_ms)` window for every session —
+    /// the CANONICAL session windows (the `session` relation), fresher than
+    /// any frontend snapshot for the live session. Empty on any store error.
+    pub fn session_windows(&self, root: &Path) -> std::collections::HashMap<String, (i64, i64)> {
+        let Ok(idx) = self.index_for(root) else { return Default::default() };
+        idx.mem_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.session_id, (s.started_ms, s.last_ms)))
+            .collect()
     }
 
     // ── V14 Phase C: usage / cost accounting ──────────────────────────────
@@ -663,7 +709,7 @@ impl GraphService {
         if !self.settings.current().graph.enabled {
             return;
         }
-        let ts = super::activity::now_ms() as i64;
+        let ts = crate::activity::now_ms() as i64;
         let idx = match self.index_for(root) {
             Ok(idx) => idx,
             Err(e) => {
@@ -757,13 +803,17 @@ impl GraphService {
     /// `usage_snapshot`.
     ///
     /// note: `advisor_displaced_chars` is NOT root-scoped — the Activity
-    /// ring (`super::activity::snapshot`) is a single process-wide buffer
+    /// store (`crate::activity::snapshot`) is a single process-wide buffer
     /// with no root/session key to filter on, unlike `injected`. Left as a
     /// process-wide estimate; the UI already labels this figure `est.`.
+    /// The store persists across restarts now, so the sum additionally
+    /// filters to entries recorded since this process started — keeping the
+    /// "since-restart" semantics this readout documents.
     fn effectiveness_totals(&self, root: &Path) -> Effectiveness {
-        let advisor_displaced_chars: u64 = super::activity::snapshot()
+        let since = crate::activity::process_start_ms();
+        let advisor_displaced_chars: u64 = crate::activity::snapshot()
             .iter()
-            .filter(|c| c.source == "read_advisor" && c.tool == "remind")
+            .filter(|c| c.source == "read_advisor" && c.tool == "remind" && c.ts_ms >= since)
             .map(|c| c.chars as u64)
             .sum();
         let root_sessions: HashSet<String> = self
@@ -995,7 +1045,7 @@ impl GraphService {
     pub fn add_project_fact_manual(&self, root: &Path, text: &str, pin: bool) -> AppResult<()> {
         let idx = self.index_for(root)?;
         let fact_id = uuid::Uuid::new_v4().to_string();
-        let ts = super::activity::now_ms() as i64;
+        let ts = crate::activity::now_ms() as i64;
         idx.add_project_fact(&fact_id, text, "manual", ts, pin)
     }
 
@@ -1014,7 +1064,7 @@ impl GraphService {
             return;
         }
         let Ok(idx) = self.index_for(&root) else { return };
-        let cutoff = super::activity::now_ms() as i64 - Self::DISTILL_IDLE_MS;
+        let cutoff = crate::activity::now_ms() as i64 - Self::DISTILL_IDLE_MS;
         let Ok(candidates) = idx.sessions_idle_undistilled(cutoff) else { return };
         if candidates.is_empty() {
             return;
@@ -1071,7 +1121,7 @@ impl GraphService {
 
         let working_set = idx.mem_working_set(session_id, 10).unwrap_or_default();
         let notes = idx.mem_notes(session_id).unwrap_or_default();
-        let ts = super::activity::now_ms() as i64;
+        let ts = crate::activity::now_ms() as i64;
         if working_set.is_empty() && notes.is_empty() {
             // Nothing to distill — mark it done so the sweep doesn't keep
             // re-selecting an empty session on every future pass.
@@ -1312,7 +1362,7 @@ impl GraphService {
             // it doesn't stall an async worker.
             let file = file.to_string();
             let content_hash = content_hash.to_string();
-            let ts = super::activity::now_ms() as i64;
+            let ts = crate::activity::now_ms() as i64;
             let _ = tokio::task::spawn_blocking(move || {
                 idx.put_digest(&file, &content_hash, &text, ts)
             })
@@ -1473,7 +1523,7 @@ impl GraphService {
             }
             set.insert(key);
         }
-        let ts = super::activity::now_ms() as i64;
+        let ts = crate::activity::now_ms() as i64;
         // V14 Phase D2: also persist a root+session-scoped `mem_event{kind:
         // "remind"}` row — distinct from the process-wide Activity event
         // below — so `GraphIndex::advisor_reread_rate` can precisely check
@@ -1488,15 +1538,20 @@ impl GraphService {
         // Activity: `chars` is the reminder's actual size (what we returned),
         // consistent with every other graph tool's honest response-size figure —
         // not a fabricated token estimate.
-        super::activity::record(super::activity::GraphCall {
-            ts_ms: ts as u64,
-            root: super::activity::root_key(root),
-            source: "read_advisor".to_string(),
-            tool: "remind".to_string(),
-            target: rel,
-            chars: text.chars().count(),
-            ms: 0,
-            ok: true,
+        crate::activity::record_bg(crate::activity::ActivityRecord {
+            request: format!("agent re-read of `{rel}` (the trigger — no explicit request)"),
+            response: text.clone(),
+            entry: crate::activity::ActivityEntry::new(
+                crate::activity::ActivityKind::Graph,
+                ts as u64,
+                crate::activity::root_key(root),
+                "read_advisor".to_string(),
+                "remind".to_string(),
+                rel,
+                text.chars().count(),
+                0,
+                true,
+            ),
         });
         Some(text)
     }
@@ -1672,15 +1727,20 @@ impl GraphService {
         // Activity: one event per injection — the graduation evidence for
         // milestone Decision 4 (whether auto-check injections correlate with
         // a same-turn fix).
-        super::activity::record(super::activity::GraphCall {
-            ts_ms: super::activity::now_ms(),
-            root: super::activity::root_key(root),
-            source: "auto_check".to_string(),
-            tool: "auto_check".to_string(),
-            target: file_path.to_string(),
-            chars: block.chars().count(),
-            ms: 0,
-            ok: true,
+        crate::activity::record_bg(crate::activity::ActivityRecord {
+            entry: crate::activity::ActivityEntry::new(
+                crate::activity::ActivityKind::Graph,
+                crate::activity::now_ms(),
+                crate::activity::root_key(root),
+                "auto_check".to_string(),
+                "auto_check".to_string(),
+                file_path.to_string(),
+                block.chars().count(),
+                0,
+                true,
+            ),
+            request: format!("agent edit of `{file_path}` (the trigger — no explicit request)"),
+            response: block.clone(),
         });
 
         if park {

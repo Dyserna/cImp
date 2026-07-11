@@ -1,20 +1,23 @@
 <script lang="ts">
   // The read-only, app-rendered Tool Activity tab — one place to see what
   // tools the agents are using and which tools are available. Three sections:
-  // Activities (a unified, newest-first feed merging the code-intelligence
-  // graph-call history with the offload backends' request history), Graph
-  // tools, and Offload tools (the two reference lists, moved here from the
-  // Code Intelligence and Offload Server tabs). Same reserved/no-PTY pattern
-  // as CodeIntelligenceView; rendered by Pane.svelte for the `tool-activity`
-  // tab id.
+  // Activities (the unified, newest-first feed from the backend's persistent
+  // activity store — graph/context tool calls plus completed offload_task
+  // runs, surviving app restarts), Graph tools, and Offload tools (the two
+  // reference lists, moved here from the Code Intelligence and Offload Server
+  // tabs). Rows are clickable (a popup shows the captured request/response),
+  // individually deletable, and the whole history can be cleared. Same
+  // reserved/no-PTY pattern as CodeIntelligenceView; rendered by Pane.svelte
+  // for the `tool-activity` tab id.
   import { onMount, onDestroy } from 'svelte';
-  import { graphHistory, type GraphCall } from './graph';
   import {
-    offloadServerMetrics,
-    onOffloadServerMetrics,
-    type BackendDashboard,
-  } from './offload';
-  import { listenManaged } from './listenManaged';
+    activityClear,
+    activityDelete,
+    activityDetail,
+    activityList,
+    type ActivityEntry,
+    type ActivityRecord,
+  } from './activity';
   import { settings } from './settings/store';
   import { fmtTime } from './format';
   import { fmtTok } from './usageMath';
@@ -68,99 +71,137 @@
   ];
   let section = $state<Section>('activities');
 
-  // Graph-call history is poll-based (same 2s cadence CodeIntelligenceView
-  // used); offload request history rides the pushed dashboard snapshots, with
-  // a one-shot fetch to seed before the first poller tick.
-  let graphCalls = $state<GraphCall[]>([]);
-  let dashboards = $state<BackendDashboard[]>([]);
+  // The unified feed is poll-based (same 2s cadence CodeIntelligenceView
+  // used); both feed kinds land in the backend's single persistent store, so
+  // one endpoint covers everything.
+  let entries = $state<ActivityEntry[]>([]);
   let poll: ReturnType<typeof setInterval> | null = null;
+  // Bumped by every local mutation (delete/clear). A poll response that was
+  // already in flight when a mutation landed is stale — applying it would
+  // resurrect just-deleted rows for a poll cycle — so refresh() drops it.
+  let mutationSeq = 0;
 
   async function refresh(): Promise<void> {
+    const seq = mutationSeq;
     try {
-      graphCalls = await graphHistory();
+      const list = await activityList();
+      if (seq === mutationSeq) entries = list;
     } catch {
-      /* graph disabled — the feed just shows offload rows */
+      /* backend unavailable mid-teardown — keep whatever we have */
     }
   }
 
-  // Armed at component init so teardown survives an unmount during an await.
-  let pushedMetrics = false;
-  listenManaged(() =>
-    onOffloadServerMetrics((rows) => {
-      pushedMetrics = true;
-      dashboards = rows;
-    })
-  );
+  // ── Detail popup ──────────────────────────────────────────────────────
+  let detailOpen = $state(false);
+  let detail = $state<ActivityRecord | null>(null);
+  let detailMissing = $state(false);
+  // Fetch token: a click on row B while row A's (slower) fetch is in flight
+  // must not let A's late response overwrite the popup — the Delete button
+  // acts on `detail.id`, so a stale overwrite would delete the wrong entry.
+  let detailSeq = 0;
 
-  onMount(async () => {
-    // The seed fetch runs alongside the first graph poll; a pushed snapshot
-    // that lands while it's in flight is fresher than the one-shot response,
-    // so the seed must never clobber it.
-    const seed = offloadServerMetrics();
-    await refresh();
-    const seeded = await seed;
-    if (!pushedMetrics) dashboards = seeded;
+  async function openDetail(id: number): Promise<void> {
+    const seq = ++detailSeq;
+    detailOpen = true;
+    detail = null;
+    detailMissing = false;
+    try {
+      const rec = await activityDetail(id);
+      if (seq !== detailSeq) return; // superseded by a later click / close
+      if (rec) detail = rec;
+      else detailMissing = true;
+    } catch {
+      if (seq === detailSeq) detailMissing = true;
+    }
+  }
+
+  function closeDetail(): void {
+    detailSeq += 1; // invalidate any in-flight fetch
+    detailOpen = false;
+    detail = null;
+    detailMissing = false;
+  }
+
+  // ── Delete / clear ────────────────────────────────────────────────────
+  // Both update optimistically, then unconditionally refresh AFTER the final
+  // seq bump: the bump invalidates any poll that raced the backend mutation,
+  // and the trailing refresh (which captures the post-bump seq) repaints
+  // authoritatively — restoring the rows if the backend call failed.
+  async function removeEntry(id: number): Promise<void> {
+    mutationSeq += 1;
+    entries = entries.filter((e) => e.id !== id);
+    if (detail?.id === id) closeDetail();
+    try {
+      await activityDelete(id);
+    } catch {
+      /* the refresh below restores the row */
+    }
+    mutationSeq += 1;
+    void refresh();
+  }
+
+  // Two-step confirm (same pattern as SaveLayoutDialog's overwrite): the
+  // first click arms the button, a second within 4s clears for real.
+  let confirmClear = $state(false);
+  let clearTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function clearHistory(): Promise<void> {
+    if (!confirmClear) {
+      confirmClear = true;
+      clearTimer = setTimeout(() => (confirmClear = false), 4000);
+      return;
+    }
+    if (clearTimer) clearTimeout(clearTimer);
+    clearTimer = null;
+    confirmClear = false;
+    mutationSeq += 1;
+    entries = [];
+    closeDetail();
+    try {
+      await activityClear();
+    } catch {
+      /* the refresh below restores the feed */
+    }
+    mutationSeq += 1;
+    void refresh();
+  }
+
+  function onKeyDown(e: KeyboardEvent): void {
+    if (e.key === 'Escape' && detailOpen) {
+      e.preventDefault();
+      closeDetail();
+    }
+  }
+
+  onMount(() => {
+    void refresh();
     poll = setInterval(refresh, 2000);
+    window.addEventListener('keydown', onKeyDown);
   });
 
   onDestroy(() => {
     if (poll) clearInterval(poll);
+    if (clearTimer) clearTimeout(clearTimer);
+    window.removeEventListener('keydown', onKeyDown);
   });
 
-  // One unified feed row. `source` is the agent (claude/opencode/offload) for
-  // graph calls and the backend name for offload requests.
-  interface ActivityRow {
-    key: string;
-    ts: number;
-    kind: 'graph' | 'offload';
-    source: string;
-    main: string;
-    meta: string;
-    ok: boolean;
+  // Agent sources with a dedicated accent class; anything else (offload
+  // backend names are user-chosen) falls back to the default row color rather
+  // than leaking arbitrary strings into the class attribute.
+  const KNOWN_SOURCES = new Set(['claude', 'opencode', 'offload', 'read_advisor', 'auto_check']);
+  function srcClass(source: string): string {
+    return KNOWN_SOURCES.has(source) ? ` ${source}` : '';
   }
 
-  const rows = $derived.by(() => {
-    const out: ActivityRow[] = [];
-    for (const c of graphCalls) {
-      out.push({
-        key: `g-${c.ts_ms}-${c.tool}-${c.target}-${c.source}`,
-        ts: c.ts_ms,
-        kind: 'graph',
-        source: c.source,
-        main: `${c.tool.replace('graph_', '')} · ${c.target}`,
-        meta: `${c.ms}ms · ${fmtTok(c.chars)} chars`,
-        ok: c.ok,
-      });
-    }
-    for (const d of dashboards) {
-      for (const r of d.metrics.history) {
-        out.push({
-          key: `o-${d.name}-${r.start_ms}-${r.slot}`,
-          ts: r.start_ms,
-          kind: 'offload',
-          source: d.name,
-          main: `request · slot ${r.slot}`,
-          meta: `${r.duration_s.toFixed(1)}s · ${(r.prompt_tokens + r.tokens).toLocaleString()} tok · ${Math.round(r.avg_tps)} tok/s`,
-          ok: true,
-        });
-      }
-    }
-    // No combined cap: both sources are already ring-capped upstream (graph
-    // history at 200, offload history at 50 per backend), and slicing the
-    // merged feed would let a graph-heavy burst silently crowd every offload
-    // row out of view.
-    out.sort((a, b) => b.ts - a.ts);
-    // A repeat of the same call shape within one millisecond is possible
-    // (e.g. batched tool dispatch); suffix repeats so the keyed {#each}
-    // never sees duplicate keys.
-    const seen = new Map<string, number>();
-    for (const r of out) {
-      const n = seen.get(r.key) ?? 0;
-      seen.set(r.key, n + 1);
-      if (n > 0) r.key = `${r.key}-${n}`;
-    }
-    return out;
-  });
+  function rowMain(e: ActivityEntry): string {
+    const tool = e.kind === 'graph' ? e.tool.replace('graph_', '') : e.tool;
+    return e.target ? `${tool} · ${e.target}` : tool;
+  }
+
+  function rowMeta(e: ActivityEntry): string {
+    const dur = e.ms >= 10_000 ? `${(e.ms / 1000).toFixed(1)}s` : `${e.ms}ms`;
+    return `${dur} · ${fmtTok(e.chars)} chars`;
+  }
 </script>
 
 <div class="tool-activity">
@@ -190,27 +231,57 @@
   {#if section === 'activities'}
     <section class="card history">
       <div class="history-head">
-        Recent tool activity <span class="muted">(newest first)</span>
+        <span>Recent tool activity <span class="muted">(newest first)</span></span>
+        {#if entries.length > 0}
+          <button
+            type="button"
+            class="clear-btn"
+            class:arm={confirmClear}
+            onclick={clearHistory}
+          >{confirmClear ? 'Confirm clear' : 'Clear history'}</button>
+        {/if}
       </div>
       <p class="caveat">
-        Code-intelligence graph calls and offload requests, merged into one
-        chronological feed. Graph calls appear when an agent queries the code
-        graph; offload requests when a backend serves a delegated task.
+        Code-intelligence graph calls and offload runs, merged into one
+        chronological feed that survives restarts. Click a row to see the
+        actual request and response; × deletes a single entry.
       </p>
-      {#if rows.length === 0}
+      {#if entries.length === 0}
         <div class="history-empty">
           No tool activity yet — query the graph from a Claude tab or run an
           offload_task and it shows up here.
         </div>
       {:else}
         <div class="history-rows">
-          {#each rows as r (r.key)}
-            <div class="hrow" class:err={!r.ok}>
-              <span class="htime">{fmtTime(r.ts)}</span>
+          {#each entries as r (r.id)}
+            <div
+              class="hrow"
+              class:err={!r.ok}
+              role="button"
+              tabindex="0"
+              onclick={() => void openDetail(r.id)}
+              onkeydown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  void openDetail(r.id);
+                }
+              }}
+            >
+              <span class="htime">{fmtTime(r.ts_ms)}</span>
               <span class="hkind {r.kind}">{r.kind}</span>
-              <span class="hsrc {r.source}">{r.source}</span>
-              <span class="hmain" title={r.main}>{r.main}</span>
-              <span class="hmeta">{r.meta}</span>
+              <span class="hsrc{srcClass(r.source)}" title={r.source}>{r.source}</span>
+              <span class="hmain" title={rowMain(r)}>{rowMain(r)}</span>
+              <span class="hmeta">{rowMeta(r)}</span>
+              <button
+                type="button"
+                class="hdel"
+                title="Delete entry"
+                aria-label="Delete entry"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void removeEntry(r.id);
+                }}
+              >×</button>
             </div>
           {/each}
         </div>
@@ -230,6 +301,53 @@
     />
   {/if}
 </div>
+
+{#if detailOpen}
+  <div class="backdrop" onclick={closeDetail} role="presentation"></div>
+  <div class="detail-card" role="dialog" aria-label="Tool activity detail">
+    {#if detail}
+      <header class="detail-head">
+        <div class="detail-title">
+          <span class="hkind {detail.kind}">{detail.kind}</span>
+          <span class="detail-tool">{detail.tool}</span>
+          {#if !detail.ok}<span class="detail-failed">failed</span>{/if}
+        </div>
+        <button type="button" class="detail-close" onclick={closeDetail} aria-label="Close">×</button>
+      </header>
+      <div class="detail-meta">
+        {fmtTime(detail.ts_ms)} · {detail.source} · {rowMeta(detail)}{#if detail.target}&nbsp;· <span title={detail.target}>{detail.target}</span>{/if}
+      </div>
+      <div class="detail-body">
+        <div class="payload">
+          <div class="payload-head">Request</div>
+          <pre>{detail.request || '(not captured)'}</pre>
+        </div>
+        <div class="payload">
+          <div class="payload-head">Response</div>
+          <pre>{detail.response || '(not captured)'}</pre>
+        </div>
+      </div>
+      <footer class="detail-actions">
+        <button
+          type="button"
+          class="detail-delete"
+          onclick={() => {
+            if (detail) void removeEntry(detail.id);
+          }}
+        >Delete entry</button>
+        <button type="button" class="detail-dismiss" onclick={closeDetail}>Close</button>
+      </footer>
+    {:else if detailMissing}
+      <header class="detail-head">
+        <div class="detail-title">Entry not found</div>
+        <button type="button" class="detail-close" onclick={closeDetail} aria-label="Close">×</button>
+      </header>
+      <div class="detail-meta">This entry was deleted or has aged out of the history.</div>
+    {:else}
+      <div class="detail-meta">Loading…</div>
+    {/if}
+  </div>
+{/if}
 
 <style>
   .tool-activity {
@@ -300,8 +418,33 @@
     --hrow-h: 1.55rem;
   }
   .history-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     font-weight: 600;
     margin-bottom: 6px;
+  }
+  .clear-btn {
+    border: 1px solid var(--border, #3a3a3a);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text, #ddd);
+    font-size: 11px;
+    font-weight: 400;
+    padding: 2px 10px;
+    cursor: pointer;
+    opacity: 0.75;
+  }
+  .clear-btn:hover {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.06);
+  }
+  /* Armed state: the second click clears for real. */
+  .clear-btn.arm {
+    color: #ffb4ab;
+    border-color: #ffb4ab;
+    opacity: 1;
   }
   .history-empty {
     opacity: 0.6;
@@ -327,7 +470,7 @@
   }
   .hrow {
     display: grid;
-    grid-template-columns: 5.5rem 4.5rem 6rem 1fr 12rem;
+    grid-template-columns: 5.5rem 4.5rem 6rem 1fr 12rem 1.4rem;
     align-items: center;
     gap: 8px;
     height: var(--hrow-h);
@@ -336,8 +479,35 @@
     border-bottom: 1px solid var(--border, #2a2a2a);
     font-size: 0.86em;
     white-space: nowrap;
+    cursor: pointer;
+  }
+  .hrow:hover,
+  .hrow:focus-visible {
+    background: rgba(255, 255, 255, 0.05);
+    outline: none;
   }
   .hrow.err {
+    color: #ffb4ab;
+  }
+  /* Per-row delete: kept invisible until the row is hovered/focused so the
+     feed stays visually calm. */
+  .hdel {
+    border: none;
+    background: transparent;
+    color: var(--text, #ddd);
+    font-size: 1em;
+    line-height: 1;
+    padding: 0 2px;
+    cursor: pointer;
+    opacity: 0;
+  }
+  .hrow:hover .hdel,
+  .hrow:focus-visible .hdel,
+  .hdel:focus-visible {
+    opacity: 0.6;
+  }
+  .hdel:hover {
+    opacity: 1 !important;
     color: #ffb4ab;
   }
   .hkind,
@@ -387,5 +557,128 @@
   .muted {
     opacity: 0.6;
     font-weight: 400;
+  }
+
+  /* ── Detail popup (request/response) — dialog conventions per
+     SaveLayoutDialog: fixed backdrop + centered card. ─────────────────── */
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 100;
+  }
+  .detail-card {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    flex-direction: column;
+    width: min(820px, calc(100vw - 40px));
+    max-height: min(80vh, 900px);
+    background: var(--surface-3, var(--panel, #1e1e1e));
+    border: 1px solid var(--border-subtle, var(--border, #3a3a3a));
+    border-radius: var(--radius-lg, 10px);
+    padding: 14px 16px;
+    color: var(--text-primary, var(--text, #ddd));
+    z-index: 101;
+    box-shadow: var(--shadow-lg, 0 8px 32px rgba(0, 0, 0, 0.5));
+    box-sizing: border-box;
+    font-size: 13px;
+  }
+  .detail-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 0 0 4px;
+  }
+  .detail-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    min-width: 0;
+  }
+  .detail-tool {
+    font-family: var(--font-mono, monospace);
+  }
+  .detail-failed {
+    color: #ffb4ab;
+    text-transform: uppercase;
+    font-size: 0.8em;
+  }
+  .detail-close {
+    border: none;
+    background: transparent;
+    color: var(--text, #ddd);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 2px 6px;
+  }
+  .detail-close:hover {
+    opacity: 1;
+  }
+  .detail-meta {
+    font-size: 11px;
+    opacity: 0.7;
+    margin-bottom: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .detail-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .payload-head {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    opacity: 0.7;
+    margin-bottom: 4px;
+  }
+  .payload pre {
+    margin: 0;
+    padding: 8px 10px;
+    background: var(--surface-sunken, rgba(0, 0, 0, 0.3));
+    border: 1px solid var(--border, #2a2a2a);
+    border-radius: 6px;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+  .detail-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .detail-actions button {
+    padding: 4px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border, #3a3a3a);
+    background: transparent;
+    color: var(--text, #ddd);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .detail-actions button:hover {
+    background: rgba(255, 255, 255, 0.06);
+  }
+  .detail-delete {
+    color: #ffb4ab;
+    border-color: rgba(255, 180, 171, 0.5);
+  }
+  .detail-delete:hover {
+    border-color: #ffb4ab;
   }
 </style>

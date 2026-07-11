@@ -158,6 +158,15 @@ impl OobContext {
         }
     }
 
+    /// Session→commit provenance: record one git commit caught from the
+    /// transcript (see `claude::record_commit_events`) — a no-op when memory
+    /// isn't wired or the graph is disabled (mirrors [`Self::record_mem`]).
+    pub fn record_commit(&self, root: &std::path::Path, session_id: &str, hash: &str) {
+        if let Some(mem) = self.mem.as_ref() {
+            mem.record_session_commit(root, session_id, hash);
+        }
+    }
+
     /// V14 Phase C: record one usage/cost event via the graph service — a
     /// no-op when memory isn't wired or the graph is disabled (mirrors
     /// [`Self::record_mem`]). Never blocks or errors the tap.

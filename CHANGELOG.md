@@ -5,6 +5,35 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] — 2026-07-11
+
+### Added
+
+- **Persistent Tool Activity history.** The Activities feed survives app
+  restarts: entries are mirrored to `tool-activity.jsonl` next to the
+  executable. Clicking a row opens a popup with the actual request and
+  response (graph tool args + output; offload instructions + synthesized
+  answer, payloads truncated at 16k/24k chars). Rows can be deleted
+  individually and the whole history cleared (two-step confirm).
+- Retention is per feed kind (graph 400 / offload 100), so chatty graph
+  telemetry can never evict the rarer offload run history.
+- **Session commits + git graph Workbench tabs.** Per-session commit lists
+  with live commit provenance (transcript tap ∪ time-window) and a
+  railway-style git graph view.
+- **tui-blue and tui-green theme variants.**
+- Code Intelligence: the session cost popup shows the session's model, and
+  token ordering matches the Claude UI.
+
+### Changed
+
+- The Activities feed's offload rows are now one per completed
+  `offload_task` run (with payloads) instead of the per-slot llama-server
+  request records; the slot-level history remains on the Offload Server
+  tab's backend cards.
+- `graph_history` / `activity_list` accept a `since_ts` high-water mark;
+  the Graph View pulse feed uses it, so its steady-state 1.5s poll no
+  longer re-fetches the whole history.
+
 ## [0.40.1] — 2026-07-10
 
 ### Added

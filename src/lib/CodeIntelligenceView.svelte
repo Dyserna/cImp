@@ -58,11 +58,14 @@
     fmtUsd,
     type PriceRates,
   } from './usageMath';
-  import { fmtTime } from './format';
+  import { fmtDate, fmtTime } from './format';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
   import { llmPricingGet } from './settings/ipc';
   import type { LlmPricingModel } from './settings/types';
+  import { workbenchSessionCommitCounts, openSessionCommits } from './workbench';
+  import { revealTab } from './tabs/visibility';
+  import { WORKBENCH_TAB_ID } from './tabs/types';
 
   // The graph_* tool reference list and the recent-calls activity feed both
   // moved to the Tool Activity tab (ToolActivityView.svelte).
@@ -321,6 +324,43 @@
     ]);
     if (u) usage = u;
     if (a) advice = a;
+    // Unawaited on purpose: commitCounts is independent $state that renders
+    // when it lands — the poll's critical path shouldn't wait on a git
+    // subprocess round trip.
+    if ($settings.workbench.enabled) void refreshCommitCounts();
+  }
+
+  // Per-session commit counts (session_id → count) for the Sessions card's
+  // "commits" button — zero (or unknown) disables it. The backend caches the
+  // underlying git walk per root (WorkbenchService::COMMIT_TIMES_TTL); this
+  // 10s throttle just keeps the 2s Overview poll from paying IPC churn for
+  // answers that can't have changed yet.
+  let commitCounts = $state<Record<string, number>>({});
+  let commitCountsAt = 0;
+
+  async function refreshCommitCounts(): Promise<void> {
+    if (!usage || usage.sessions.length === 0) return;
+    const now = Date.now();
+    if (now - commitCountsAt < 10_000) return;
+    commitCountsAt = now;
+    try {
+      commitCounts = await workbenchSessionCommitCounts(
+        usage.sessions.map((s) => ({
+          session_id: s.session_id,
+          from_ms: s.started_ms,
+          to_ms: s.last_ms,
+        })),
+      );
+    } catch (e) {
+      console.warn('workbench_session_commit_counts failed', e);
+    }
+  }
+
+  // Jump to the Workbench tab's Session-commits section scoped to `s` — the
+  // same store-bus + revealTab pattern as DiffView's jump-to-graph button.
+  function openCommits(s: SessionUsageRow): void {
+    openSessionCommits(s.session_id, s.agent, s.started_ms, s.last_ms);
+    revealTab(WORKBENCH_TAB_ID);
   }
 
   // Session-cost popup: clicking a row in the Sessions card opens a modal
@@ -360,6 +400,16 @@
     costSelIdx < costPricing.length ? costPricing[costSelIdx] : costCustom,
   );
   const costRows = $derived(costSession ? sessionCost(costSession.totals, costRates) : null);
+  // Which model ran the session: the single model when there's one, or
+  // "mixed (<top model>)" when several — `models` arrives ranked by tokens
+  // desc, so [0] is the top consumer. Empty when no turn carried a model.
+  const costModel = $derived(
+    !costSession || costSession.models.length === 0
+      ? ''
+      : costSession.models.length === 1
+        ? costSession.models[0]
+        : `mixed (${costSession.models[0]})`,
+  );
 
   // Applies a proposal by writing the ONE named `graph.*` field it targets
   // through the normal settings round-trip (`applySettings` — visible in
@@ -663,16 +713,6 @@
 <div class="graph-monitor">
   <header>
     <h2>Code Intelligence</h2>
-    <div class="actions">
-      <button onclick={doRebuild} disabled={busy}>Rebuild index</button>
-      <button onclick={doRebuildEmbeddings} disabled={busy}>Rebuild embeddings</button>
-      <button class="secondary" onclick={testEmbedder} disabled={probing}>
-        {probing ? 'Testing…' : 'Test connection'}
-      </button>
-      <button class="secondary" onclick={togglePause}>
-        {paused ? 'Resume watch' : 'Pause watch'}
-      </button>
-    </div>
   </header>
 
   <nav class="sections">
@@ -843,28 +883,54 @@
       {:else}
         <div class="rows scroll10">
           {#each usage.sessions as s (s.session_id)}
-            <button
-              type="button"
-              class="arow sessrow"
-              title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.out_tok.toLocaleString()} output · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.cache_make.toLocaleString()} cache-write tokens — click for cost`}
-              onclick={() => void openCostPopup(s)}
-            >
-              <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}</span>
-              <span class="sess-stats tnum">
-                <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
-                <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
-                <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
-                <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
-              </span>
-              <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
-            </button>
+            {@const nCommits = commitCounts[s.session_id] ?? 0}
+            <div class="sessrow-wrap">
+              <button
+                type="button"
+                class="arow sessrow"
+                title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.cache_make.toLocaleString()} cache-write · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.out_tok.toLocaleString()} output tokens — click for cost`}
+                onclick={() => void openCostPopup(s)}
+              >
+                <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}<span class="sess-date">{fmtDate(s.started_ms)}</span></span>
+                <span class="sess-stats tnum">
+                  <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
+                  <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
+                  <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
+                  <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
+                </span>
+                <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
+              </button>
+              {#if $settings.workbench.enabled}
+                <button
+                  type="button"
+                  class="mini secondary commits-btn"
+                  disabled={nCommits === 0}
+                  title={nCommits === 0
+                    ? 'No commits during this session'
+                    : `Show the ${nCommits} commit${nCommits === 1 ? '' : 's'} made during this session in the Workbench`}
+                  onclick={() => openCommits(s)}
+                >⎇ {nCommits}</button>
+              {/if}
+            </div>
           {/each}
         </div>
       {/if}
     </details>
   </div>
 
-  <h3 class="group-head">Index</h3>
+  <div class="group-row">
+    <h3 class="group-head">Index</h3>
+    <div class="actions">
+      <button onclick={doRebuild} disabled={busy}>Rebuild index</button>
+      <button onclick={doRebuildEmbeddings} disabled={busy}>Rebuild embeddings</button>
+      <button class="secondary" onclick={testEmbedder} disabled={probing}>
+        {probing ? 'Testing…' : 'Test connection'}
+      </button>
+      <button class="secondary" onclick={togglePause}>
+        {paused ? 'Resume watch' : 'Pause watch'}
+      </button>
+    </div>
+  </div>
   {#if probe}
     <p class="probe {probe.ok ? 'ok' : 'err'}">
       <span class="probe-dot"></span>
@@ -1393,6 +1459,13 @@
         <button type="button" class="cost-close" aria-label="Close" onclick={closeCostPopup}>×</button>
       </div>
 
+      <div class="cost-when muted">
+        {fmtDate(costSession.started_ms)} · {fmtTime(costSession.started_ms)} – {fmtTime(costSession.last_ms)}
+        {#if costModel}
+          <span title={costSession.models.length > 1 ? `All models: ${costSession.models.join(', ')}` : undefined}>· {costModel}</span>
+        {/if}
+      </div>
+
       <label class="cost-provider">
         <span>Pricing</span>
         <select bind:value={costSelIdx}>
@@ -1761,6 +1834,21 @@
   .group-head:first-of-type {
     margin-top: 0;
   }
+  /* Group divider variant carrying the index actions on its right edge. */
+  .group-row {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 18px 0 8px;
+    border-bottom: 1px solid var(--border, #333);
+    padding-bottom: 4px;
+  }
+  .group-row .group-head {
+    margin: 0;
+    border-bottom: none;
+    padding-bottom: 0;
+  }
   .embed {
     margin-top: 10px;
     border-top: 1px solid var(--border, #333);
@@ -1822,7 +1910,7 @@
     overflow-x: auto;
   }
   .rows.scroll5 > .arow,
-  .rows.scroll10 > .arow {
+  .rows.scroll10 > .sessrow-wrap {
     min-width: 100%;
     width: max-content;
     box-sizing: border-box;
@@ -2137,20 +2225,34 @@
   .arow.sessrow {
     grid-template-columns: minmax(6rem, 1fr) auto auto;
   }
-  /* The session rows are <button>s (they open the cost popup) — strip the UA
-     button chrome so they keep rendering as plain grid rows. */
+  /* Each row is a flex wrapper holding TWO buttons (the cost-popup row and
+     the Workbench commits jump) — nesting them would be invalid HTML. The
+     row divider lives on the wrapper so it spans both. */
+  .sessrow-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border-bottom: 1px solid var(--border, #2a2a2a);
+  }
+  /* The main row area is a <button> (it opens the cost popup) — strip the UA
+     button chrome so it keeps rendering as a plain grid row. */
   button.arow.sessrow {
     background: none;
     border: none;
-    border-bottom: 1px solid var(--border, #2a2a2a);
     color: inherit;
     font: inherit;
     text-align: left;
-    width: 100%;
+    flex: 1 1 auto;
+    min-width: 0;
     cursor: pointer;
   }
   button.arow.sessrow:hover {
     background: var(--surface-raised, rgba(255, 255, 255, 0.04));
+  }
+  .commits-btn {
+    flex: 0 0 auto;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   /* Session-cost popup. Fixed-position so it centers on the window even
@@ -2175,6 +2277,11 @@
     padding: 14px 16px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
     font-size: 13px;
+  }
+  .cost-when {
+    font-size: 12px;
+    margin: -6px 0 10px;
+    font-variant-numeric: tabular-nums;
   }
   .cost-title {
     display: flex;
@@ -2268,6 +2375,13 @@
   .arow.sessrow .aloc {
     min-width: 14ch;
     text-align: right;
+  }
+  .sess-date {
+    margin-left: 8px;
+    font-weight: 400;
+    font-size: 11px;
+    opacity: 0.6;
+    font-variant-numeric: tabular-nums;
   }
   .sess-stats {
     /* Fixed tracks so the values line up as columns ACROSS rows (fmtTok is

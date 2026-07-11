@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod activity;
 mod advisor;
 mod attach;
 mod audio;
@@ -43,7 +44,8 @@ use tracing::{info, warn};
 
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::ipc::commands::{
-    acknowledge_error, advisor_dismiss, ai_tool_tab_defaults, close_settings_window,
+    acknowledge_error, activity_clear, activity_delete, activity_detail, activity_list,
+    advisor_dismiss, ai_tool_tab_defaults, close_settings_window,
     compose_attach_image,
     compose_content_changed,
     compose_templates, compose_templates_global_get, compose_templates_global_set,
@@ -70,11 +72,12 @@ use crate::ipc::commands::{
     restart_shell_tab, set_active_tab, set_window_square_corners, settings_get, settings_update,
     stt_cancel, stt_list_input_devices, stt_list_models, stt_start_recording, stt_stop_recording,
     tab_activate, tts_speak, tts_set_paused, tts_speak_selection, tts_stop, tts_test,
-    workbench_checkpoint_diff, workbench_checkpoint_now, workbench_checkpoints, workbench_diff_file,
-    workbench_diff_summary, workbench_restore, workbench_revert_hunk, workbench_send_hunk,
-    workbench_status, workbench_worktree_check_status, workbench_worktree_create,
-    workbench_worktree_diff, workbench_worktree_discard, workbench_worktree_merge,
-    workbench_worktree_run_checks, workbench_worktrees,
+    workbench_checkpoint_diff, workbench_checkpoint_now, workbench_checkpoints,
+    workbench_commit_diff, workbench_diff_file, workbench_diff_summary, workbench_git_graph,
+    workbench_restore, workbench_revert_hunk, workbench_send_hunk, workbench_session_commit_counts,
+    workbench_session_commits, workbench_status, workbench_worktree_check_status,
+    workbench_worktree_create, workbench_worktree_diff, workbench_worktree_discard,
+    workbench_worktree_merge, workbench_worktree_run_checks, workbench_worktrees,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -762,6 +765,10 @@ fn main() {
             graph_set_language_enabled,
             graph_test_embedder,
             graph_history,
+            activity_list,
+            activity_detail,
+            activity_delete,
+            activity_clear,
             graph_dead_exports,
             graph_cycles,
             graph_impact,
@@ -796,6 +803,10 @@ fn main() {
             workbench_worktree_discard,
             workbench_worktree_run_checks,
             workbench_worktree_check_status,
+            workbench_session_commits,
+            workbench_session_commit_counts,
+            workbench_commit_diff,
+            workbench_git_graph,
             theming::themes_list,
             theming::palettes_list,
         ])

@@ -9,8 +9,9 @@
 // so the resolver returns a complete xterm.js `ITheme` *synchronously* — before
 // the backend registry has loaded, and after any IPC failure: `Default` (the
 // merge base for "Custom" palettes; its fg/bg preserves the pre-V1.4 hardcoded
-// look), `GitHub Dark` (the default terminal palette, paired with the default
-// tui-orange theme and embedded as the backend fallback), and `Tomorrow Night`.
+// look), `OpenCode Grey` (the default terminal palette, paired with the default
+// tui-blue theme and embedded as the backend fallback), `GitHub Dark`, and
+// `Tomorrow Night`.
 
 import type { ITheme } from '@xterm/xterm';
 
@@ -66,6 +67,30 @@ export const FALLBACK_PALETTES: Record<string, ThemeColors> = {
     brightCyan: '#8abeb7',
     brightWhite: '#ffffff',
   },
+  'OpenCode Grey': {
+    foreground: '#d4d6d8',
+    background: '#131516',
+    cursor: '#d4d6d8',
+    cursorAccent: '#131516',
+    selectionBackground: '#2e3236',
+    selectionForeground: '#f0f2f4',
+    black: '#131516',
+    red: '#c98a8a',
+    green: '#9bb38a',
+    yellow: '#cdb88a',
+    blue: '#8aa3c0',
+    magenta: '#b39ac0',
+    cyan: '#8ab8b3',
+    white: '#c2c5c8',
+    brightBlack: '#5a5f63',
+    brightRed: '#d9a3a3',
+    brightGreen: '#b3c79f',
+    brightYellow: '#ddcaa0',
+    brightBlue: '#a3bbd6',
+    brightMagenta: '#c8b3d6',
+    brightCyan: '#a3ccc7',
+    brightWhite: '#f0f2f4',
+  },
   'GitHub Dark': {
     foreground: '#c9d1d9',
     background: '#0d1117',
@@ -102,8 +127,8 @@ let paletteOrder: string[] = Object.keys(FALLBACK_PALETTES);
 
 /// Replace the live palette map from the backend registry. Fallback palettes
 /// are always retained underneath so `Default` (the Custom merge base),
-/// `GitHub Dark` (the default terminal palette), and `Tomorrow Night` survive
-/// even if the disk folder somehow omits them.
+/// `OpenCode Grey` (the default terminal palette), `GitHub Dark`, and
+/// `Tomorrow Night` survive even if the disk folder somehow omits them.
 export function setPalettes(palettes: { name: string; colors: ThemeColors }[]): void {
   const map: Record<string, ThemeColors> = { ...FALLBACK_PALETTES };
   for (const p of palettes) map[p.name] = p.colors;

@@ -2465,7 +2465,7 @@ impl Default for AvatarSettings {
             },
             position: AvatarPosition::TopRight,
             margin: AvatarMargin { x_px: 21, y_px: 0 },
-            opacity: 1.0,
+            opacity: 0.5,
             show_border: false,
             images: AvatarImages::default(),
             sprite: SpriteSettings::default(),
@@ -2589,7 +2589,7 @@ pub struct WaveformSettings {
     /// non-empty value is a user override that wins regardless of theme.
     /// Render the audio waveform over the avatar. When false the waveform
     /// canvas is hidden entirely (the avatar itself is unaffected). Toggled
-    /// by the "Show waveform" checkbox in Settings → Waveform.
+    /// by the "Show waveform" checkbox in Settings → Waveform. Defaults off.
     pub visible: bool,
     pub color: String,
     pub line_width: f32,
@@ -2600,7 +2600,7 @@ pub struct WaveformSettings {
 impl Default for WaveformSettings {
     fn default() -> Self {
         Self {
-            visible: true,
+            visible: false,
             color: String::new(),
             line_width: 2.0,
             glow_intensity: 0.6,
@@ -2779,7 +2779,8 @@ pub struct UiSettings {
     /// (the same Gruvbox layout with blue #7aa2f7 / green #98c379 accents),
     /// and `"tui-grey"` (the OpenCode Grey palette + OpenCode's cool
     /// light-grey accent, #c8ccd0). New installs land
-    /// on `"tui-orange"` so the chrome accent matches Claude Code's orange. The
+    /// on `"tui-blue"` (paired with the OpenCode Grey terminal palette via
+    /// its theme.json). The
     /// avatar still defaults to the animated `impSprites` mascot independently
     /// (see [`AvatarKind`] / [`SpriteSettings`]).
     /// The pre-V1.13 `"tui"` value is rewritten to `"tui-orange"` by the
@@ -2802,7 +2803,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: "tui-orange".to_string(),
+            theme: "tui-blue".to_string(),
             status_bar: StatusBarLayout::default(),
             tool_activity_tab: true,
         }
@@ -2895,10 +2896,10 @@ pub struct TerminalThemeSettings {
 impl Default for TerminalThemeSettings {
     fn default() -> Self {
         Self {
-            // Paired with the default `tui-orange` UI theme (whose theme.json
-            // points at the GitHub Dark palette). The frontend's theme picker
+            // Paired with the default `tui-blue` UI theme (whose theme.json
+            // points at the OpenCode Grey palette). The frontend's theme picker
             // re-pairs this when the user switches UI theme.
-            name: "GitHub Dark".to_string(),
+            name: "OpenCode Grey".to_string(),
             custom: None,
         }
     }

@@ -322,7 +322,9 @@ fn active_palette_colors() -> HashMap<String, String> {
         }
     }
     let name = if theme.name.is_empty() {
-        "GitHub Dark".to_string()
+        // The default terminal palette (paired with the default tui-blue UI
+        // theme) — same value TerminalThemeSettings::default() writes.
+        "OpenCode Grey".to_string()
     } else {
         theme.name
     };

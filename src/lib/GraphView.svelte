@@ -1,7 +1,9 @@
 <script lang="ts">
-  // V15 Feature 4 (stretch): a live, interactive 2D/3D visualization of the
+  // V15 Feature 4 (stretch): a live, interactive 3D visualization of the
   // project's code graph. Renders the bounded `graphVizSnapshot()` subgraph
-  // with a small self-contained force simulation (no external deps — plain
+  // (FILE-level: files are the only nodes; calls are rolled up to file→file
+  // backend-side — symbol nodes were too many to render or read) with a
+  // small self-contained force simulation (no external deps — plain
   // Canvas 2D + TypeScript), and pulses nodes as the graph tool history shows
   // an agent (cloud or the local offload worker) touching them, so a viewer
   // can watch the agent "walk" the codebase live. Mirrors the app-rendered
@@ -11,11 +13,13 @@
   import {
     graphVizSnapshot,
     graphHistory,
+    onGraphStatus,
     type VizGraphResult,
     type VizNodeRow,
     type GraphCall,
   } from './graph';
   import { settings } from './settings/store';
+  import { graphReveal, clearGraphReveal } from './graphReveal';
 
   // Mirrors WorkbenchView/CodeIntelligenceView: an optional project root:
   // neither currently receives one from `Pane.svelte` (both default to the
@@ -24,8 +28,8 @@
   let { root = undefined }: { root?: string } = $props();
 
   // ── Chart-specific colors (not app design tokens — Okabe-Ito categorical
-  // palette, colorblind-safe; node shape (circle/square) and edge dash
-  // pattern carry redundant non-hue channels alongside these). ────────────
+  // palette, colorblind-safe; the edge dash pattern carries a redundant
+  // non-hue channel alongside these). ─────────────────────────────────────
   const SUBSYSTEM_PALETTE = [
     '#E69F00', '#56B4E9', '#009E73', '#F0E442',
     '#0072B2', '#D55E00', '#CC79A7', '#999999',
@@ -42,8 +46,6 @@
   const PULSE_MS = 600;
   const FOCUS_MS = 900;
 
-  const MIN_ZOOM_2D = 0.05;
-  const MAX_ZOOM_2D = 8;
   const MIN_DIST_3D = 80;
   const MAX_DIST_3D = 4000;
   const NEAR_3D = 8;
@@ -54,19 +56,25 @@
   // frame instead of every pair, so a large graph never blows the frame
   // budget.
   const REPULSION_K = 2600;
-  const SPRING_K = 0.02;
+  const SPRING_K = 0.05;
   const SPRING_LEN = 70;
   const GRAVITY_K = 0.0025;
   const DAMPING = 0.85;
+  // Per-frame speed cap (world units). Even with degree-normalized springs
+  // (see applySpring) a hot start can make the integrator overshoot; the cap
+  // guarantees no node gets flung out of the cluster in a single frame.
+  const MAX_VEL = 40;
   const IDLE_KE_THRESHOLD = 0.05;
   const MAX_REPEL_FULL = 500;
   const REPEL_SAMPLE = 40;
   const REPEL_CUTOFF_SQ = 90000; // 300 world units
-  // Hard settle deadline: sampled repulsion (n > MAX_REPEL_FULL) injects
-  // random-noise forces every frame, so kinetic energy can hover above
-  // IDLE_KE_THRESHOLD indefinitely — without a deadline the sim (and its
-  // full-canvas redraw) never went idle and pinned the webview thread, which
-  // froze the whole app while the tab was visible. Any interaction re-arms it.
+  // Cooling: forces are scaled by an exponentially decaying alpha (d3-style)
+  // so the layout always converges, even under sampled-repulsion noise
+  // (n > MAX_REPEL_FULL) whose kinetic energy alone never drops below
+  // IDLE_KE_THRESHOLD. SIM_MAX_MS stays as a hard backstop so a stuck sim
+  // can never pin the webview thread indefinitely.
+  const ALPHA_DECAY = 0.02; // per ~16.7ms frame
+  const ALPHA_MIN = 0.02; // below this the layout counts as settled
   const SIM_MAX_MS = 10_000;
 
   interface SimNode extends VizNodeRow {
@@ -93,7 +101,6 @@
   let ctx: CanvasRenderingContext2D | null = null;
 
   // ── Reactive UI state ────────────────────────────────────────────────────
-  let mode = $state<'2d' | '3d'>('2d');
   let loading = $state(true);
   let fetchError = $state<string | null>(null);
   let nodeCount = $state(0);
@@ -112,7 +119,20 @@
   let sawAdvisorPulse = $state(false);
   let hoveredNode = $state<SimNode | null>(null);
   let hoverPos = $state<{ x: number; y: number }>({ x: 0, y: 0 });
-  let focusedNodeId = $state<string | null>(null);
+  // Persistent selection (drives the ego highlight + connections panel).
+  let selectedNodeId = $state<string | null>(null);
+  // Hop history: node ids in visit order. `hopIx` points at the current
+  // entry; a new selection truncates the forward branch (browser-style).
+  let hopHistory = $state<string[]>([]);
+  let hopIx = $state(-1);
+  // Search box (type-ahead over node file paths).
+  let searchQuery = $state('');
+  let searchSel = $state(0);
+  // Bumped on every buildSim so $derived values that read the non-reactive
+  // nodes/edges arrays recompute when the graph data changes.
+  let simVersion = $state(0);
+  // Transient "that file isn't in the rendered graph" notice (Workbench jump).
+  let revealMiss = $state<string | null>(null);
 
   // ── Non-reactive simulation state (mutated at animation-frame rate — kept
   // out of $state so every position update doesn't trigger Svelte's
@@ -120,14 +140,17 @@
   let nodes: SimNode[] = [];
   let edges: SimEdge[] = [];
   let nodeById = new Map<string, SimNode>();
-  let everEntered3D = false;
+  // Incident (drawn) edges per node id — the connections panel + ego
+  // highlight read this instead of scanning the whole edge list.
+  let edgesByNode = new Map<string, SimEdge[]>();
+  // Workbench jump request waiting for the snapshot to load (mount order:
+  // the reveal can arrive before the first buildSim).
+  let pendingReveal: string | null = null;
+  let revealMissTimer: ReturnType<typeof setTimeout> | undefined;
 
   // View transform.
   let viewW = 0;
   let viewH = 0;
-  let zoom2D = 1;
-  let viewCenterX = 0;
-  let viewCenterY = 0;
   let camTheta = 0.6;
   let camPhi = 0.35;
   let camDist = 600;
@@ -138,6 +161,14 @@
 
   // Animation / interaction bookkeeping.
   let idle = true;
+  let alpha = 0; // force-cooling factor; kick() re-heats it
+  // Pointer/wheel interaction only wakes the *render* loop — it must never
+  // re-heat the physics (re-heating on every wheel tick / drag move is what
+  // made a settled layout explode on zoom). While the sim is settling and
+  // the user hasn't touched the view yet, the camera auto-fits each frame so
+  // the expanding layout stays framed instead of reading as spontaneous
+  // zooming.
+  let userInteracted = false;
   let simStartTs = 0; // when the sim last left idle — for the SIM_MAX_MS deadline
   let running = false;
   let rafId = 0;
@@ -150,8 +181,6 @@
   let dragLastX = 0;
   let dragLastY = 0;
   let dragLastT = 0;
-  let panVelX = 0;
-  let panVelY = 0;
   let orbitVelTheta = 0;
   let orbitVelPhi = 0;
   let focusTarget: { x: number; y: number; z: number } | null = null;
@@ -182,6 +211,7 @@
   let historySeeded = false;
 
   let unsubSettings: (() => void) | undefined;
+  let unsubStatus: (() => void) | undefined;
 
   // ── Small math / color helpers ──────────────────────────────────────────
   function clamp(v: number, lo: number, hi: number): number {
@@ -206,6 +236,10 @@
     if (confidence === 'ambiguous') return [1, 3];
     return [];
   }
+  function basename(p: string): string {
+    const i = p.lastIndexOf('/');
+    return i >= 0 ? p.slice(i + 1) : p;
+  }
   function normalize3(x: number, y: number, z: number): [number, number, number] {
     const len = Math.hypot(x, y, z) || 1;
     return [x / len, y / len, z / len];
@@ -217,28 +251,66 @@
     return [ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx];
   }
 
+  // ── Selection / search / history (derived) ──────────────────────────────
+  const selectedNode = $derived.by(() => {
+    void simVersion; // re-resolve against the rebuilt node set
+    return selectedNodeId ? (nodeById.get(selectedNodeId) ?? null) : null;
+  });
+  const searchMatches = $derived.by(() => {
+    void simVersion;
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return [];
+    return nodes
+      .filter((n) => n.file.toLowerCase().includes(q))
+      .sort((a, b) => b.degree - a.degree || a.file.localeCompare(b.file))
+      .slice(0, 12);
+  });
+  interface ConnGroup { title: string; kind: string; rows: SimNode[]; }
+  const connGroups = $derived.by(() => {
+    const sel = selectedNode;
+    if (!sel) return [] as ConnGroup[];
+    const inc = edgesByNode.get(sel.id) ?? [];
+    const grp = (title: string, kind: string, out: boolean): ConnGroup => ({
+      title,
+      kind,
+      rows: inc
+        .filter((e) => e.kind === kind && (out ? e.src === sel : e.dst === sel))
+        .map((e) => (out ? e.dst : e.src)),
+    });
+    return [
+      grp('calls →', 'call', true),
+      grp('← called by', 'call', false),
+      grp('imports →', 'import', true),
+      grp('← imported by', 'import', false),
+    ];
+  });
+  const shownConnCount = $derived(connGroups.reduce((t, g) => t + g.rows.length, 0));
+  // ‹ also restores a cleared selection to the current history entry.
+  const canBack = $derived(hopIx > 0 || (hopIx >= 0 && !selectedNodeId));
+  const canForward = $derived(hopIx < hopHistory.length - 1);
+
   // ── Force simulation ─────────────────────────────────────────────────────
-  function initPosition(index: number, total: number, seedZ: boolean): { x: number; y: number; z: number } {
+  function initPosition(index: number, total: number): { x: number; y: number; z: number } {
     const golden = Math.PI * (3 - Math.sqrt(5));
     const theta = index * golden;
     const r = Math.sqrt(index + 0.5) * 8 * Math.max(1, Math.sqrt(total) / 10);
     const x = Math.cos(theta) * r;
     const y = Math.sin(theta) * r;
-    const z = seedZ ? (Math.random() - 0.5) * r : 0;
+    const z = (Math.random() - 0.5) * r;
     return { x, y, z };
   }
 
   function applyRepulsion(a: SimNode, b: SimNode, weight: number): void {
     const dx = a.x - b.x;
     const dy = a.y - b.y;
-    const dz = mode === '3d' ? a.z - b.z : 0;
+    const dz = a.z - b.z;
     const distSq = dx * dx + dy * dy + dz * dz + 0.01;
     if (distSq > REPEL_CUTOFF_SQ) return;
     const dist = Math.sqrt(distSq);
     const f = (REPULSION_K * weight) / distSq;
     const fx = (dx / dist) * f;
     const fy = (dy / dist) * f;
-    const fz = mode === '3d' ? (dz / dist) * f : 0;
+    const fz = (dz / dist) * f;
     a.fx += fx; a.fy += fy; a.fz += fz;
     b.fx -= fx; b.fy -= fy; b.fz -= fz;
   }
@@ -247,14 +319,23 @@
     const a = e.src, b = e.dst;
     const dx = b.x - a.x;
     const dy = b.y - a.y;
-    const dz = mode === '3d' ? b.z - a.z : 0;
+    const dz = b.z - a.z;
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.01;
-    const f = SPRING_K * (dist - SPRING_LEN);
+    // d3-force-style degree normalization: an edge's strength is divided by
+    // its smaller endpoint degree and the displacement is biased toward the
+    // lighter endpoint. Without this a hub accumulates the stiffness of ALL
+    // its springs — the integrator overshoots, the hub oscillates outward
+    // and freezes stranded far from the cluster with its edges fanning back
+    // as a cone. This way leaves come to the hub, not the reverse.
+    const degA = Math.max(1, a.degree || 1);
+    const degB = Math.max(1, b.degree || 1);
+    const f = (SPRING_K / Math.min(degA, degB)) * (dist - SPRING_LEN);
+    const biasA = degB / (degA + degB);
     const fx = (dx / dist) * f;
     const fy = (dy / dist) * f;
-    const fz = mode === '3d' ? (dz / dist) * f : 0;
-    a.fx += fx; a.fy += fy; a.fz += fz;
-    b.fx -= fx; b.fy -= fy; b.fz -= fz;
+    const fz = (dz / dist) * f;
+    a.fx += fx * biasA; a.fy += fy * biasA; a.fz += fz * biasA;
+    b.fx -= fx * (1 - biasA); b.fy -= fy * (1 - biasA); b.fz -= fz * (1 - biasA);
   }
 
   function simulate(dtMs: number): boolean {
@@ -274,30 +355,36 @@
         for (let s = 0; s < REPEL_SAMPLE; s++) {
           const j = (Math.random() * n) | 0;
           if (j === i) continue;
-          applyRepulsion(a, nodes[j], n / REPEL_SAMPLE);
+          // Halved weight: applyRepulsion pushes BOTH endpoints, and every
+          // node is drawn both as `a` and (in expectation) as someone's `b`,
+          // so the full n/REPEL_SAMPLE weight double-counted repulsion and
+          // blew large layouts apart.
+          applyRepulsion(a, nodes[j], n / (2 * REPEL_SAMPLE));
         }
       }
     }
     for (const e of edges) applySpring(e);
 
     let ke = 0;
-    const is3d = mode === '3d';
     for (const node of nodes) {
       node.fx += -node.x * GRAVITY_K;
       node.fy += -node.y * GRAVITY_K;
-      node.vx = (node.vx + node.fx * dts) * DAMPING;
-      node.vy = (node.vy + node.fy * dts) * DAMPING;
+      node.fz += -node.z * GRAVITY_K;
+      node.vx = (node.vx + node.fx * alpha * dts) * DAMPING;
+      node.vy = (node.vy + node.fy * alpha * dts) * DAMPING;
+      node.vz = (node.vz + node.fz * alpha * dts) * DAMPING;
+      const sp = Math.hypot(node.vx, node.vy, node.vz);
+      if (sp > MAX_VEL) {
+        const s = MAX_VEL / sp;
+        node.vx *= s; node.vy *= s; node.vz *= s;
+      }
       node.x += node.vx * dts;
       node.y += node.vy * dts;
-      ke += node.vx * node.vx + node.vy * node.vy;
-      if (is3d) {
-        node.fz += -node.z * GRAVITY_K;
-        node.vz = (node.vz + node.fz * dts) * DAMPING;
-        node.z += node.vz * dts;
-        ke += node.vz * node.vz;
-      }
+      node.z += node.vz * dts;
+      ke += node.vx * node.vx + node.vy * node.vy + node.vz * node.vz;
     }
-    return ke / n > IDLE_KE_THRESHOLD;
+    alpha *= Math.pow(1 - ALPHA_DECAY, dts);
+    return alpha > ALPHA_MIN && ke / n > IDLE_KE_THRESHOLD;
   }
 
   // ── Camera / projection ──────────────────────────────────────────────────
@@ -314,51 +401,54 @@
   }
 
   function project(): void {
-    if (mode === '2d') {
-      for (const n of nodes) {
-        n.sx = viewW / 2 + (n.x - viewCenterX) * zoom2D;
-        n.sy = viewH / 2 + (n.y - viewCenterY) * zoom2D;
-        n.sr = Math.max(2, n.r * zoom2D);
-        n.sz = 0;
+    const b = computeCameraBasis();
+    for (const n of nodes) {
+      const dx = n.x - b.ex, dy = n.y - b.ey, dz = n.z - b.ez;
+      const rx = dx * b.xx + dy * b.xy + dz * b.xz;
+      const ry = dx * b.yx + dy * b.yy + dz * b.yz;
+      const fz = -(dx * b.zx + dy * b.zy + dz * b.zz);
+      if (fz < NEAR_3D) {
+        // At/behind the near plane: cull (sz = -1, parked far off-screen)
+        // rather than clamping, which smeared the node across the screen
+        // and drew distorted edges to it.
+        n.sx = -1e6; n.sy = -1e6; n.sr = 0; n.sz = -1;
+        continue;
       }
-    } else {
-      const b = computeCameraBasis();
-      for (const n of nodes) {
-        const dx = n.x - b.ex, dy = n.y - b.ey, dz = n.z - b.ez;
-        const rx = dx * b.xx + dy * b.xy + dz * b.xz;
-        const ry = dx * b.yx + dy * b.yy + dz * b.yz;
-        const fz = -(dx * b.zx + dy * b.zy + dz * b.zz);
-        if (fz < NEAR_3D) {
-          // At/behind the near plane: cull (sz = -1, parked far off-screen)
-          // rather than clamping, which smeared the node across the screen
-          // and drew distorted edges to it.
-          n.sx = -1e6; n.sy = -1e6; n.sr = 0; n.sz = -1;
-          continue;
-        }
-        const scale = camFocal / fz;
-        n.sx = viewW / 2 + rx * scale;
-        n.sy = viewH / 2 - ry * scale;
-        n.sr = clamp(n.r * scale, 1.5, 40);
-        n.sz = fz;
-      }
+      const scale = camFocal / fz;
+      n.sx = viewW / 2 + rx * scale;
+      n.sy = viewH / 2 - ry * scale;
+      n.sr = clamp(n.r * scale, 1, 16);
+      n.sz = fz;
     }
   }
 
   // ── Rendering ─────────────────────────────────────────────────────────────
   function drawEdges(now: number): void {
     if (!ctx) return;
-    const is3d = mode === '3d';
     // Batch by style: one beginPath/setLineDash/stroke PER (kind, confidence)
     // GROUP (≤ ~9 of them), not per edge — per-edge strokes made frame cost
     // O(edges) canvas state changes and pinned the webview thread on large
     // snapshots. Highlighted edges are few; they draw individually on top.
+    // The hovered/selected node's own edges draw bright on top of the dimmed
+    // field, so connectivity is traceable by pointing at (or selecting) a
+    // node. An active selection dims the rest of the field even further.
+    const selNode = selectedNodeId ? (nodeById.get(selectedNodeId) ?? null) : null;
+    const hovNode = hoveredNode;
     const groups = new Map<string, SimEdge[]>();
     const highlighted: SimEdge[] = [];
+    const emphasized: SimEdge[] = [];
     for (const e of edges) {
-      // 3D: skip edges with a culled endpoint (2D leaves sz at 0).
-      if (is3d && (e.src.sz < 0 || e.dst.sz < 0)) continue;
+      // Skip edges with a near-plane-culled endpoint.
+      if (e.src.sz < 0 || e.dst.sz < 0) continue;
       if (e.highlightUntil > now) {
         highlighted.push(e);
+        continue;
+      }
+      if (
+        (selNode && (e.src === selNode || e.dst === selNode)) ||
+        (hovNode && (e.src === hovNode || e.dst === hovNode))
+      ) {
+        emphasized.push(e);
         continue;
       }
       const key = e.kind + '|' + e.confidence;
@@ -366,7 +456,7 @@
       if (!g) groups.set(key, (g = []));
       g.push(e);
     }
-    ctx.globalAlpha = 0.4;
+    ctx.globalAlpha = selNode ? 0.05 : 0.16;
     ctx.lineWidth = 1;
     for (const g of groups.values()) {
       ctx.beginPath();
@@ -378,6 +468,16 @@
       // renders identically to the old per-edge strokes.
       ctx.setLineDash(dashFor(g[0].confidence));
       ctx.strokeStyle = edgeColor(g[0].kind);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 0.85;
+    ctx.lineWidth = 1.5;
+    for (const e of emphasized) {
+      ctx.beginPath();
+      ctx.moveTo(e.src.sx, e.src.sy);
+      ctx.lineTo(e.dst.sx, e.dst.sy);
+      ctx.setLineDash(dashFor(e.confidence));
+      ctx.strokeStyle = edgeColor(e.kind);
       ctx.stroke();
     }
     ctx.globalAlpha = 0.95;
@@ -396,20 +496,24 @@
 
   function drawNodes(now: number): void {
     if (!ctx) return;
-    const is3d = mode === '3d';
-    const order = is3d ? [...nodes].sort((a, b) => b.sz - a.sz) : nodes;
-    for (const n of order) {
-      if (is3d && n.sz < 0) continue;
-      const isFile = n.kind === 'file';
-      ctx.fillStyle = n.subsystem ? subsystemColor(n.subsystem) : UNCATEGORIZED_COLOR;
-      ctx.globalAlpha = 1;
-      ctx.beginPath();
-      if (isFile) {
-        const s = n.sr * 1.6;
-        ctx.rect(n.sx - s / 2, n.sy - s / 2, s, s);
-      } else {
-        ctx.arc(n.sx, n.sy, n.sr, 0, Math.PI * 2);
+    // Ego set: with a selection active, the selected node + its 1-hop
+    // neighborhood stay bright and everything else fades back.
+    let egoIds: Set<string> | null = null;
+    if (selectedNodeId && nodeById.has(selectedNodeId)) {
+      egoIds = new Set([selectedNodeId]);
+      for (const e of edgesByNode.get(selectedNodeId) ?? []) {
+        egoIds.add(e.src.id);
+        egoIds.add(e.dst.id);
       }
+    }
+    const order = [...nodes].sort((a, b) => b.sz - a.sz);
+    for (const n of order) {
+      if (n.sz < 0) continue;
+      const dimmed = egoIds !== null && !egoIds.has(n.id);
+      ctx.fillStyle = n.subsystem ? subsystemColor(n.subsystem) : UNCATEGORIZED_COLOR;
+      ctx.globalAlpha = dimmed ? 0.25 : 1;
+      ctx.beginPath();
+      ctx.arc(n.sx, n.sy, n.sr, 0, Math.PI * 2);
       ctx.fill();
       const isHovered = hoveredNode?.id === n.id;
       ctx.lineWidth = isHovered ? 2 : 1;
@@ -427,15 +531,22 @@
         ctx.stroke();
         ctx.restore();
       }
-      if (n.id === focusedNodeId && focusRingUntil > now) {
-        const alpha = clamp((focusRingUntil - now) / FOCUS_MS, 0, 1);
+      if (n.id === selectedNodeId) {
+        // Persistent selection ring, plus the expanding just-selected pulse.
         ctx.save();
-        ctx.globalAlpha = alpha * 0.8;
+        ctx.globalAlpha = 0.9;
         ctx.strokeStyle = ACCENT_COLOR;
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.arc(n.sx, n.sy, n.sr + 6 + (1 - alpha) * 16, 0, Math.PI * 2);
+        ctx.arc(n.sx, n.sy, n.sr + 3, 0, Math.PI * 2);
         ctx.stroke();
+        if (focusRingUntil > now) {
+          const alpha = clamp((focusRingUntil - now) / FOCUS_MS, 0, 1);
+          ctx.globalAlpha = alpha * 0.8;
+          ctx.beginPath();
+          ctx.arc(n.sx, n.sy, n.sr + 6 + (1 - alpha) * 16, 0, Math.PI * 2);
+          ctx.stroke();
+        }
         ctx.restore();
       }
     }
@@ -456,27 +567,19 @@
     let active = false;
     for (const n of nodes) if (n.pulseUntil > now) { active = true; break; }
     if (!active) for (const e of edges) if (e.highlightUntil > now) { active = true; break; }
-    if (!active && focusedNodeId && focusRingUntil > now) active = true;
+    if (!active && selectedNodeId && focusRingUntil > now) active = true;
     return active;
   }
 
   function stepViewAnimation(dt: number): boolean {
     if (!focusTarget) return false;
     const k = 1 - Math.exp(-dt * 0.008);
-    if (mode === '2d') {
-      viewCenterX += (focusTarget.x - viewCenterX) * k;
-      viewCenterY += (focusTarget.y - viewCenterY) * k;
-      if (Math.hypot(focusTarget.x - viewCenterX, focusTarget.y - viewCenterY) < 0.5) {
-        viewCenterX = focusTarget.x; viewCenterY = focusTarget.y; focusTarget = null; return false;
-      }
-    } else {
-      camTargetX += (focusTarget.x - camTargetX) * k;
-      camTargetY += (focusTarget.y - camTargetY) * k;
-      camTargetZ += (focusTarget.z - camTargetZ) * k;
-      const d = Math.hypot(focusTarget.x - camTargetX, focusTarget.y - camTargetY, focusTarget.z - camTargetZ);
-      if (d < 0.5) {
-        camTargetX = focusTarget.x; camTargetY = focusTarget.y; camTargetZ = focusTarget.z; focusTarget = null; return false;
-      }
+    camTargetX += (focusTarget.x - camTargetX) * k;
+    camTargetY += (focusTarget.y - camTargetY) * k;
+    camTargetZ += (focusTarget.z - camTargetZ) * k;
+    const d = Math.hypot(focusTarget.x - camTargetX, focusTarget.y - camTargetY, focusTarget.z - camTargetZ);
+    if (d < 0.5) {
+      camTargetX = focusTarget.x; camTargetY = focusTarget.y; camTargetZ = focusTarget.z; focusTarget = null; return false;
     }
     return true;
   }
@@ -484,14 +587,7 @@
   function stepMomentum(dt: number): boolean {
     if (dragging) return false;
     let moving = false;
-    if (mode === '2d') {
-      if (Math.abs(panVelX) > 0.0005 || Math.abs(panVelY) > 0.0005) {
-        viewCenterX += panVelX * dt;
-        viewCenterY += panVelY * dt;
-        panVelX *= 0.9; panVelY *= 0.9;
-        moving = true;
-      }
-    } else if (Math.abs(orbitVelTheta) > 0.00002 || Math.abs(orbitVelPhi) > 0.00002) {
+    if (Math.abs(orbitVelTheta) > 0.00002 || Math.abs(orbitVelPhi) > 0.00002) {
       camTheta += orbitVelTheta * dt;
       camPhi = clamp(camPhi + orbitVelPhi * dt, -1.45, 1.45);
       orbitVelTheta *= 0.88; orbitVelPhi *= 0.88;
@@ -508,9 +604,16 @@
     if (!idle) {
       if (ts - simStartTs > SIM_MAX_MS) {
         idle = true;
+        // Drop residual velocities — a deadline stop can land mid-flight,
+        // and carrying that momentum into the next re-heat made nodes burst.
+        for (const n of nodes) { n.vx = 0; n.vy = 0; n.vz = 0; }
       } else {
         const moving = simulate(dt);
         if (!moving) idle = true;
+        else if (!userInteracted && !dragging) {
+          // Keep the settling layout framed; stops at the first user touch.
+          fitView();
+        }
       }
     }
     const now = performance.now();
@@ -535,9 +638,13 @@
     lastTs = 0;
     rafId = requestAnimationFrame(loop);
   }
-  function kick(): void {
+  // Re-heat the physics. Only data/layout changes call this — pointer and
+  // wheel handlers call wake() instead, so moving the camera never re-boils
+  // a settled layout.
+  function kick(heat = 1): void {
+    alpha = Math.max(alpha, heat);
     // Only re-arm the deadline on an idle→active transition, so a stream of
-    // kicks (drag mousemove, activity pulses) can't extend it forever.
+    // kicks can't extend it forever.
     if (idle) simStartTs = performance.now();
     idle = false;
     wake();
@@ -558,9 +665,11 @@
       const old = prev.get(row.id);
       const pos = old
         ? { x: old.x, y: old.y, z: old.z }
-        : initPosition(i, snap.nodes.length, mode === '3d');
+        : initPosition(i, snap.nodes.length);
       const deg = row.degree || 0;
-      const r = clamp(4 + Math.sqrt(deg) * 2.2, 4, 22);
+      // Log-scaled and small: rolled-up file degrees span 1..hundreds, and
+      // the old sqrt scale ballooned every hub into an edge-hiding blob.
+      const r = clamp(2 + Math.log2(1 + deg) * 0.8, 2, 7);
       const sn: SimNode = {
         ...row,
         x: pos.x, y: pos.y, z: pos.z,
@@ -580,24 +689,45 @@
       newEdges.push({ src: s, dst: d, kind: row.kind, confidence: row.confidence, highlightUntil: 0, highlightColor: null });
     }
 
+    const newByNode = new Map<string, SimEdge[]>();
+    for (const e of newEdges) {
+      let a = newByNode.get(e.src.id);
+      if (!a) newByNode.set(e.src.id, (a = []));
+      a.push(e);
+      let b = newByNode.get(e.dst.id);
+      if (!b) newByNode.set(e.dst.id, (b = []));
+      b.push(e);
+    }
+
     nodes = newNodes;
     edges = newEdges;
     nodeById = newById;
+    edgesByNode = newByNode;
     nodeCount = newNodes.length;
     edgeCount = newEdges.length;
     subsystemsPresent = [...new Set(newNodes.map((n) => n.subsystem).filter((s) => s))].sort();
     hasUncategorized = newNodes.some((n) => !n.subsystem);
     edgeKindsPresent = [...new Set(newEdges.map((e) => e.kind))].sort();
     edgeConfsPresent = [...new Set(newEdges.map((e) => e.confidence))].sort();
-    focusedNodeId = null;
+    // Selection survives a refresh as long as its node is still present.
+    if (selectedNodeId && !newById.has(selectedNodeId)) selectedNodeId = null;
     hoveredNode = null;
-    // No `idle = false` here: resetView() → kick() flips it, and kick's
-    // idle→active check is what re-arms the SIM_MAX_MS settle deadline.
-    resetView();
-    // fitView2D/3D bail on a zero-sized viewport; defer the fit to the first
-    // real applyResize so a load that beats the ResizeObserver doesn't land
-    // at zoom 1 with most of the layout off-screen.
-    needsFit = viewW <= 0 || viewH <= 0;
+    simVersion += 1;
+    const isFresh = prev.size === 0;
+    if (isFresh) {
+      // First data: hand the camera to the settle-time auto-fit. Incremental
+      // refreshes (Refresh button, index-pass auto-refresh) keep the prior
+      // positions AND the user's camera — no view yank mid-look.
+      userInteracted = false;
+      resetView();
+      // If the canvas has no measured size yet (a fast fetch can beat the
+      // ResizeObserver), defer a re-fit to the first real applyResize.
+      needsFit = viewW <= 0 || viewH <= 0;
+    }
+    // A fresh graph settles from scratch; a refresh that kept the previous
+    // positions only needs a gentle nudge into the new equilibrium.
+    kick(isFresh ? 1 : 0.3);
+    tryReveal();
   }
 
   async function refresh(): Promise<void> {
@@ -614,20 +744,7 @@
   }
 
   // ── View fitting ─────────────────────────────────────────────────────────
-  function fitView2D(): void {
-    if (nodes.length === 0 || viewW <= 0 || viewH <= 0) return;
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    for (const n of nodes) {
-      if (n.x < minX) minX = n.x; if (n.x > maxX) maxX = n.x;
-      if (n.y < minY) minY = n.y; if (n.y > maxY) maxY = n.y;
-    }
-    viewCenterX = (minX + maxX) / 2;
-    viewCenterY = (minY + maxY) / 2;
-    const spanX = Math.max(1, maxX - minX);
-    const spanY = Math.max(1, maxY - minY);
-    zoom2D = clamp(Math.min(viewW / spanX, viewH / spanY) * 0.85, MIN_ZOOM_2D, MAX_ZOOM_2D);
-  }
-  function fitView3D(): void {
+  function fitView(): void {
     if (nodes.length === 0) return;
     let cx = 0, cy = 0, cz = 0;
     for (const n of nodes) { cx += n.x; cy += n.y; cz += n.z; }
@@ -639,39 +756,108 @@
     camDist = clamp(maxR * 2.2 + 80, MIN_DIST_3D, MAX_DIST_3D);
   }
   function resetView(): void {
-    if (mode === '2d') fitView2D(); else fitView3D();
+    // Camera refit only — it does not re-heat the physics. Handing the view
+    // back also re-enables the settle-time auto-fit.
+    fitView();
     focusTarget = null;
-    panVelX = 0; panVelY = 0; orbitVelTheta = 0; orbitVelPhi = 0;
-    kick();
+    orbitVelTheta = 0; orbitVelPhi = 0;
+    userInteracted = false;
+    wake();
   }
 
-  function setMode(m: '2d' | '3d'): void {
-    if (mode === m) return;
-    mode = m;
-    if (m === '3d' && !everEntered3D) {
-      everEntered3D = true;
-      for (const n of nodes) n.z = (Math.random() - 0.5) * 200;
-    }
-    resetView();
-  }
-
-  function focusNode(node: SimNode): void {
-    focusedNodeId = node.id;
+  // ── Selection + hop history ──────────────────────────────────────────────
+  function selectNode(node: SimNode, push = true): void {
+    selectedNodeId = node.id;
     focusRingUntil = performance.now() + FOCUS_MS;
     focusTarget = { x: node.x, y: node.y, z: node.z };
-    kick();
+    if (push && hopHistory[hopIx] !== node.id) {
+      hopHistory = [...hopHistory.slice(0, hopIx + 1), node.id];
+      hopIx = hopHistory.length - 1;
+    }
+    wake();
   }
+  function clearSelection(): void {
+    selectedNodeId = null;
+    wake();
+  }
+  function hopTo(ix: number): void {
+    const node = nodeById.get(hopHistory[ix]);
+    if (!node) return;
+    hopIx = ix;
+    selectNode(node, false);
+  }
+  function hopBack(): void {
+    // A cleared selection restores the current entry before stepping back.
+    if (!selectedNodeId && hopIx >= 0 && nodeById.has(hopHistory[hopIx])) {
+      hopTo(hopIx);
+      return;
+    }
+    // Skip entries whose node fell out of the snapshot since.
+    for (let i = hopIx - 1; i >= 0; i--) {
+      if (nodeById.has(hopHistory[i])) { hopTo(i); return; }
+    }
+  }
+  function hopForward(): void {
+    for (let i = hopIx + 1; i < hopHistory.length; i++) {
+      if (nodeById.has(hopHistory[i])) { hopTo(i); return; }
+    }
+  }
+
+  // ── Search ───────────────────────────────────────────────────────────────
+  function pickSearch(n: SimNode): void {
+    selectNode(n);
+    searchQuery = '';
+    searchSel = 0;
+  }
+  function onSearchKey(e: KeyboardEvent): void {
+    const matches = searchMatches;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      searchSel = Math.min(searchSel + 1, matches.length - 1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      searchSel = Math.max(searchSel - 1, 0);
+    } else if (e.key === 'Enter' && matches.length > 0) {
+      e.preventDefault();
+      pickSearch(matches[clamp(searchSel, 0, matches.length - 1)]);
+    } else if (e.key === 'Escape') {
+      searchQuery = '';
+    }
+  }
+
+  // ── Workbench reveal (graphReveal store) ─────────────────────────────────
+  function tryReveal(): void {
+    if (!pendingReveal || nodes.length === 0) return;
+    const path = pendingReveal;
+    pendingReveal = null;
+    const node = nodeById.get('file:' + path);
+    if (node) {
+      selectNode(node);
+      return;
+    }
+    revealMiss = `${path} isn't in the rendered graph (top ${vizMax} files by degree)`;
+    if (revealMissTimer) clearTimeout(revealMissTimer);
+    revealMissTimer = setTimeout(() => (revealMiss = null), 5000);
+  }
+  $effect(() => {
+    const req = $graphReveal;
+    if (!req) return;
+    pendingReveal = req.path;
+    // Consume so a later (re)mount doesn't replay this request.
+    clearGraphReveal();
+    tryReveal();
+  });
 
   // ── Live activity (poll graphHistory — no push event exists per-call) ────
   function matchNodes(target: string): SimNode[] {
+    // Nodes are files only, so a symbol-name target can't be resolved here —
+    // it matches only when the call target names (or contains) a file path.
     if (!target) return [];
-    const exact = nodes.filter((n) => n.label === target || n.file === target);
+    const exact = nodes.filter((n) => n.file === target);
     if (exact.length) return exact.slice(0, 3);
     const bare = target.split(':')[0];
-    const byFile = nodes.filter((n) => n.kind === 'file' && (n.file === bare || bare.endsWith(n.file) || n.file.endsWith(bare)));
-    if (byFile.length) return byFile.slice(0, 3);
-    const bySymbol = nodes.filter((n) => n.kind !== 'file' && n.label.length >= 3 && target.includes(n.label));
-    return bySymbol.slice(0, 3);
+    const byFile = nodes.filter((n) => n.file === bare || bare.endsWith(n.file) || n.file.endsWith(bare));
+    return byFile.slice(0, 3);
   }
 
   function applyActivity(call: GraphCall): void {
@@ -703,7 +889,7 @@
         }
       }
     }
-    kick();
+    wake();
   }
 
   async function pollHistory(): Promise<void> {
@@ -789,12 +975,15 @@
 
   // ── Mouse interaction ────────────────────────────────────────────────────
   function pickNode(mx: number, my: number): SimNode | null {
+    // Front-most (smallest camera depth) within the hit radius wins —
+    // nearest-in-2D kept selecting nodes hidden far behind the one the
+    // cursor is visibly on in a dense cluster.
     let best: SimNode | null = null;
-    let bestDist = Infinity;
+    let bestZ = Infinity;
     for (const n of nodes) {
+      if (n.sz < 0) continue;
       const d = Math.hypot(mx - n.sx, my - n.sy);
-      const hitR = Math.max(n.sr, 7);
-      if (d <= hitR && d < bestDist) { best = n; bestDist = d; }
+      if (d <= Math.max(n.sr, 10) && n.sz < bestZ) { best = n; bestZ = n.sz; }
     }
     return best;
   }
@@ -805,13 +994,14 @@
     dragLastX = e.clientX; dragLastY = e.clientY;
     dragLastT = performance.now();
     dragMoved = false;
-    isPanDrag = mode === '3d' && (e.button === 2 || e.shiftKey);
+    isPanDrag = e.button === 2 || e.shiftKey;
     dragging = true;
-    panVelX = 0; panVelY = 0; orbitVelTheta = 0; orbitVelPhi = 0;
+    orbitVelTheta = 0; orbitVelPhi = 0;
     focusTarget = null;
+    userInteracted = true;
     window.addEventListener('mousemove', onWindowMouseMove);
     window.addEventListener('mouseup', onWindowMouseUp);
-    kick();
+    wake();
   }
 
   function onWindowMouseMove(e: MouseEvent): void {
@@ -822,12 +1012,7 @@
     const dt = Math.max(1, now - dragLastT);
     if (Math.abs(e.clientX - dragStartX) + Math.abs(e.clientY - dragStartY) > 4) dragMoved = true;
 
-    if (mode === '2d') {
-      viewCenterX -= dx / zoom2D;
-      viewCenterY -= dy / zoom2D;
-      panVelX = -dx / zoom2D / dt;
-      panVelY = -dy / zoom2D / dt;
-    } else if (isPanDrag) {
+    if (isPanDrag) {
       const b = computeCameraBasis();
       const worldPerPx = camDist / camFocal;
       camTargetX -= (b.xx * dx - b.yx * dy) * worldPerPx;
@@ -840,7 +1025,7 @@
       orbitVelPhi = -dy * 0.006 / dt;
     }
     dragLastX = e.clientX; dragLastY = e.clientY; dragLastT = now;
-    kick();
+    wake();
   }
 
   function onWindowMouseUp(e: MouseEvent): void {
@@ -851,27 +1036,31 @@
     if (!dragMoved && canvasEl) {
       const rect = canvasEl.getBoundingClientRect();
       const hit = pickNode(e.clientX - rect.left, e.clientY - rect.top);
-      if (hit) focusNode(hit); else focusedNodeId = null;
+      if (hit) selectNode(hit); else clearSelection();
     }
-    kick();
+    wake();
+  }
+
+  function onWindowKeyDown(e: KeyboardEvent): void {
+    if (!visible) return;
+    const t = e.target as HTMLElement | null;
+    const typing = !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+    if (e.key === 'Escape') {
+      // Close the search dropdown first, then clear the selection.
+      if (searchQuery) searchQuery = '';
+      else if (selectedNodeId) clearSelection();
+    } else if (e.key === 'Backspace' && !typing && canBack) {
+      e.preventDefault();
+      hopBack();
+    }
   }
 
   function onWheel(e: WheelEvent): void {
     if (nodes.length === 0 || !canvasEl) return;
     e.preventDefault();
-    const rect = canvasEl.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-    if (mode === '2d') {
-      const worldBeforeX = viewCenterX + (mx - viewW / 2) / zoom2D;
-      const worldBeforeY = viewCenterY + (my - viewH / 2) / zoom2D;
-      zoom2D = clamp(zoom2D * Math.exp(-e.deltaY * 0.0015), MIN_ZOOM_2D, MAX_ZOOM_2D);
-      viewCenterX = worldBeforeX - (mx - viewW / 2) / zoom2D;
-      viewCenterY = worldBeforeY - (my - viewH / 2) / zoom2D;
-    } else {
-      camDist = clamp(camDist * Math.exp(e.deltaY * 0.0015), MIN_DIST_3D, MAX_DIST_3D);
-    }
-    kick();
+    camDist = clamp(camDist * Math.exp(e.deltaY * 0.0015), MIN_DIST_3D, MAX_DIST_3D);
+    userInteracted = true;
+    wake();
   }
 
   function onCanvasMouseMove(e: MouseEvent): void {
@@ -916,6 +1105,7 @@
     io = new IntersectionObserver(handleIntersect, { threshold: 0 });
     io.observe(containerEl);
     document.addEventListener('visibilitychange', handleVisChange);
+    window.addEventListener('keydown', onWindowKeyDown);
     // Fires synchronously with the current value, so this both seeds
     // `graphEnabled` and kicks off the first load/poll without a separate
     // one-off read.
@@ -927,6 +1117,16 @@
       if (en) { void refresh(); startHistoryPoll(); }
       else { stopHistoryPoll(); stopLoop(); }
     });
+    // The startup fetch races the background index build — a snapshot pulled
+    // mid-build only holds the files indexed so far. Re-pull whenever an
+    // index pass for this root completes (also keeps the graph current with
+    // the fs-watcher's incremental re-indexes; positions/camera are
+    // preserved by buildSim's incremental path).
+    void onGraphStatus((s) => {
+      if (s.state !== 'ready' || !graphEnabled) return;
+      if (root && s.root !== root) return;
+      void refresh();
+    }).then((un) => (unsubStatus = un));
   });
 
   onDestroy(() => {
@@ -935,18 +1135,39 @@
     ro?.disconnect();
     io?.disconnect();
     document.removeEventListener('visibilitychange', handleVisChange);
+    window.removeEventListener('keydown', onWindowKeyDown);
     window.removeEventListener('mousemove', onWindowMouseMove);
     window.removeEventListener('mouseup', onWindowMouseUp);
     if (resizeDebounce) clearTimeout(resizeDebounce);
+    if (revealMissTimer) clearTimeout(revealMissTimer);
     unsubSettings?.();
+    unsubStatus?.();
   });
 </script>
 
 <div class="graph-view" bind:this={containerEl}>
   <header class="controls">
-    <div class="toggle-group" role="group" aria-label="View mode">
-      <button type="button" class="seg" class:active={mode === '2d'} onclick={() => setMode('2d')}>2D</button>
-      <button type="button" class="seg" class:active={mode === '3d'} onclick={() => setMode('3d')}>3D</button>
+    <div class="search">
+      <input
+        type="text"
+        placeholder="Find file…"
+        bind:value={searchQuery}
+        oninput={() => (searchSel = 0)}
+        onkeydown={onSearchKey}
+        disabled={nodeCount === 0}
+      />
+      {#if searchMatches.length > 0}
+        <ul class="search-results">
+          {#each searchMatches as m, i (m.id)}
+            <li>
+              <button type="button" class:sel={i === searchSel} title={m.file} onclick={() => pickSearch(m)}>
+                <span class="sr-file">{m.file}</span>
+                <span class="sr-deg tnum">{m.degree}</span>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
     </div>
     <button type="button" class="secondary" onclick={resetView} disabled={nodeCount === 0}>Reset view</button>
     <button type="button" class="secondary" onclick={() => void refresh()} disabled={loading || !graphEnabled}>
@@ -984,14 +1205,56 @@
       <p class="banner">Loading graph…</p>
     {:else if nodeCount === 0}
       <p class="banner">No indexed graph yet. Build the code graph from the Code Intelligence tab first.</p>
+    {:else if revealMiss}
+      <p class="banner">{revealMiss}</p>
     {/if}
 
     {#if nodeCount > 0}
       {#if hoveredNode}
         <div class="tooltip" style="left:{hoverPos.x + 14}px; top:{hoverPos.y + 14}px;">
-          <strong>{hoveredNode.label}</strong>
-          <div>{hoveredNode.file}</div>
-          <div>{hoveredNode.kind} · degree {hoveredNode.degree}</div>
+          <strong>{hoveredNode.file}</strong>
+          <div>{hoveredNode.subsystem || '(uncategorized)'} · degree {hoveredNode.degree}</div>
+        </div>
+      {/if}
+
+      {#if selectedNode}
+        <div class="conn-panel">
+          <div class="conn-head">
+            <button type="button" class="nav" onclick={hopBack} disabled={!canBack} title="Back (Backspace)">‹</button>
+            <button type="button" class="nav" onclick={hopForward} disabled={!canForward} title="Forward">›</button>
+            <div class="conn-title">
+              <strong title={selectedNode.file}>{basename(selectedNode.file)}</strong>
+              <div class="conn-path">{selectedNode.file}</div>
+              <div class="conn-meta">
+                <span
+                  class="swatch"
+                  style="background:{selectedNode.subsystem ? subsystemColor(selectedNode.subsystem) : UNCATEGORIZED_COLOR}"
+                ></span>
+                {selectedNode.subsystem || '(uncategorized)'} · degree {selectedNode.degree}
+              </div>
+            </div>
+            <button type="button" class="nav" onclick={clearSelection} title="Clear selection (Esc)">✕</button>
+          </div>
+          <div class="conn-body">
+            {#each connGroups as g (g.title)}
+              {#if g.rows.length > 0}
+                <div class="legend-section">
+                  <h4>{g.title}</h4>
+                  {#each g.rows as nb, i (g.title + nb.id + i)}
+                    <button type="button" class="conn-row" title={nb.file} onclick={() => selectNode(nb)}>
+                      <span class="line" style="background:{edgeColor(g.kind)}"></span>
+                      <span class="conn-file">{basename(nb.file)}</span>
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            {/each}
+            {#if shownConnCount === 0}
+              <div class="conn-note">no drawn connections for this file</div>
+            {:else if shownConnCount < selectedNode.degree}
+              <div class="conn-note">strongest {shownConnCount} of ~{selectedNode.degree} connections shown</div>
+            {/if}
+          </div>
         </div>
       {/if}
 
@@ -1013,10 +1276,8 @@
               </div>
             {/if}
             <div class="legend-section">
-              <h4>Node size / shape</h4>
-              <div class="legend-row">size = call/reference degree</div>
-              <div class="legend-row"><span class="swatch shape-circle"></span>symbol</div>
-              <div class="legend-row"><span class="swatch shape-square"></span>file</div>
+              <h4>Node (one per file)</h4>
+              <div class="legend-row">size = call/import degree</div>
             </div>
             {#if edgeKindsPresent.length > 0}
               <div class="legend-section">
@@ -1082,26 +1343,70 @@
     border-bottom: 1px solid var(--border, #333);
     flex: 0 0 auto;
   }
-  .toggle-group {
-    display: flex;
-    gap: 2px;
+  .search {
+    position: relative;
+    flex: 0 1 260px;
+    min-width: 140px;
+  }
+  .search input {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--panel, #1e1e1e);
+    border: 1px solid var(--border, #444);
+    color: var(--text, #ddd);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+  .search input:disabled {
+    opacity: 0.5;
+  }
+  .search-results {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 8;
+    margin: 0;
+    padding: 4px;
+    list-style: none;
+    background: var(--panel, #1e1e1e);
     border: 1px solid var(--border, #444);
     border-radius: 6px;
-    overflow: hidden;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+    max-height: 280px;
+    overflow-y: auto;
   }
-  .seg {
-    padding: 4px 10px;
+  .search-results button {
+    display: flex;
+    width: 100%;
+    gap: 8px;
+    align-items: baseline;
     border: none;
     background: transparent;
     color: var(--text, #ddd);
-    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 4px;
     cursor: pointer;
-    opacity: 0.75;
+    font-size: 12px;
+    text-align: left;
   }
-  .seg.active {
+  .search-results button.sel,
+  .search-results button:hover {
     background: var(--accent, #3b6ea5);
     color: #fff;
-    opacity: 1;
+  }
+  .sr-file {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sr-deg {
+    flex: 0 0 auto;
+    opacity: 0.65;
+    font-size: 11px;
   }
   button.secondary {
     padding: 4px 10px;
@@ -1174,6 +1479,108 @@
     display: block;
     font-size: 12px;
   }
+  .conn-panel {
+    position: absolute;
+    right: 10px;
+    top: 10px;
+    z-index: 5;
+    width: 260px;
+    max-width: 45%;
+    max-height: calc(100% - 20px);
+    display: flex;
+    flex-direction: column;
+    border-radius: 6px;
+    border: 1px solid var(--border, #444);
+    background: var(--panel, #1e1e1e);
+    color: var(--text, #ddd);
+    font-size: 11px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  }
+  .conn-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 8px;
+    border-bottom: 1px solid var(--border, #444);
+  }
+  .conn-head .nav {
+    flex: 0 0 auto;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    line-height: 1;
+    border: 1px solid var(--border, #444);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text, #ddd);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .conn-head .nav:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+  .conn-head .nav:not(:disabled):hover {
+    background: var(--accent, #3b6ea5);
+    color: #fff;
+  }
+  .conn-title {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .conn-title strong {
+    display: block;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .conn-path {
+    opacity: 0.65;
+    word-break: break-all;
+    margin-top: 1px;
+  }
+  .conn-meta {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 3px;
+    opacity: 0.85;
+  }
+  .conn-body {
+    padding: 0 8px 8px;
+    overflow-y: auto;
+  }
+  .conn-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: var(--text, #ddd);
+    padding: 2px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    text-align: left;
+  }
+  .conn-row:hover {
+    background: var(--accent, #3b6ea5);
+    color: #fff;
+  }
+  .conn-file {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .conn-note {
+    margin-top: 6px;
+    opacity: 0.55;
+    font-style: italic;
+  }
   .legend {
     position: absolute;
     left: 10px;
@@ -1226,14 +1633,6 @@
     border-radius: 50%;
     flex: 0 0 auto;
     display: inline-block;
-  }
-  .swatch.shape-circle {
-    border-radius: 50%;
-    background: var(--text, #ddd);
-  }
-  .swatch.shape-square {
-    border-radius: 2px;
-    background: var(--text, #ddd);
   }
   .line {
     width: 16px;

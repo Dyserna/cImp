@@ -177,6 +177,10 @@ pub struct VizGraph {
 pub const VIZ_CALL_FANOUT_MAX: usize = 4;
 /// Edge budget per node for the viz snapshot's hard edge cap.
 pub const VIZ_EDGES_PER_NODE: usize = 4;
+/// Per-node drawn-neighbor quota: an edge survives only while one of its
+/// endpoints still has quota (strongest edges kept first), so dense file
+/// graphs stay readable instead of becoming a hairball.
+pub const VIZ_NEIGHBORS_PER_NODE: usize = 3;
 
 /// A traced shortest path between two entities (V15 Feature 1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1700,46 +1704,56 @@ reach[x] := reach[z], calls[x, z]"#
         Ok(ArchReport { god_nodes: god, subsystems, surprising })
     }
 
-    /// V15 Feature 4: a bounded subgraph for the Graph View tab — the top
-    /// `max_nodes` highest-degree nodes and the resolved edges among them (never
-    /// the whole graph). Nodes carry a subsystem label (color) and degree (size);
-    /// edges carry kind (color) and confidence (dash). Offline, read-only.
+    /// V15 Feature 4: a bounded subgraph for the Graph View tab — FILE-level
+    /// only. Symbol nodes made even medium projects too dense to render or
+    /// read (thousands of nodes, most of them `contains` leaves), so
+    /// symbol→symbol call edges are rolled up to edges between their
+    /// containing files and `contains` edges (file→symbol by construction)
+    /// are dropped entirely; intra-file calls self-collapse and vanish.
+    /// Nodes are the top `max_nodes` highest-degree files carrying a
+    /// subsystem label (color) and degree (size); edges carry kind (color)
+    /// and the best confidence seen for the pair (dash). Offline, read-only.
     ///
-    /// Edges are bounded too — the top hubs are by construction the densest
-    /// slice of the graph, and the frontend pays per edge per frame (spring
+    /// Edges are bounded too — the frontend pays per edge per frame (spring
     /// force + canvas stroke), so an uncapped edge list froze the whole
     /// webview on big projects:
     /// - a call to a many-definition name fans out to at most
-    ///   [`VIZ_CALL_FANOUT_MAX`] candidates (a call edge stores the callee
-    ///   NAME; hyper-common names like `new` resolve to dozens of definitions,
-    ///   and drawing caller × every-candidate is quadratic noise, not signal);
-    /// - the final list is capped at `max_nodes * VIZ_EDGES_PER_NODE`,
-    ///   dropping lowest-confidence edges first.
+    ///   [`VIZ_CALL_FANOUT_MAX`] candidate files (a call edge stores the
+    ///   callee NAME; hyper-common names like `new` resolve to dozens of
+    ///   definitions, and drawing caller × every-candidate is quadratic
+    ///   noise, not signal);
+    /// - duplicate (src, dst, kind) pairs collapse into one WEIGHTED edge
+    ///   (weight = how many rolled-up call sites/imports it stands for),
+    ///   keeping the highest confidence seen;
+    /// - each node keeps at most [`VIZ_NEIGHBORS_PER_NODE`] drawn edges
+    ///   (strongest first; an edge survives while either endpoint still has
+    ///   quota), and the final list is capped at
+    ///   `max_nodes * VIZ_EDGES_PER_NODE`.
     pub fn viz_snapshot(&self, max_nodes: usize) -> AppResult<VizGraph> {
         let max_nodes = max_nodes.max(1);
 
-        // Node metadata (symbols + files).
+        // Symbol table — not nodes anymore, just the lookups that resolve a
+        // call edge (symbol-id src, callee-NAME dst) to its file endpoints.
         let sym_rows = self.run(
-            "?[id, name, kind, file] := *symbol{id, name, kind, file}",
+            "?[id, name, file] := *symbol{id, name, file}",
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
-        let mut meta: HashMap<String, VizNode> = HashMap::new();
-        let mut name_to_ids: HashMap<String, Vec<String>> = HashMap::new();
+        let mut sym_file: HashMap<String, String> = HashMap::new();
+        let mut name_to_files: HashMap<String, Vec<String>> = HashMap::new();
         for r in &sym_rows.rows {
             let id = cell_str(r, 0);
             let name = cell_str(r, 1);
-            name_to_ids.entry(name.clone()).or_default().push(id.clone());
-            meta.insert(
-                id.clone(),
-                VizNode { id, label: name, file: cell_str(r, 3), kind: cell_str(r, 2), degree: 0, subsystem: String::new() },
-            );
+            let file = cell_str(r, 2);
+            name_to_files.entry(name).or_default().push(file.clone());
+            sym_file.insert(id, file);
         }
         let file_rows = self.run(
             "?[path, lang] := *file{path, lang}",
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
+        let mut meta: HashMap<String, VizNode> = HashMap::new();
         let mut file_lang: HashMap<String, String> = HashMap::new();
         let mut known_files: HashSet<String> = HashSet::new();
         for r in &file_rows.rows {
@@ -1771,20 +1785,38 @@ reach[x] := reach[z], calls[x, z]"#
 
         let multi = self.multi_candidate_names()?;
         let mut edges: Vec<VizEdge> = Vec::new();
-        let mut seen: HashSet<(String, String, &'static str)> = HashSet::new();
-        let push_edge = |edges: &mut Vec<VizEdge>, seen: &mut HashSet<(String, String, &'static str)>, meta: &mut HashMap<String, VizNode>, a: &str, b: &str, kind: &'static str, conf: Confidence| {
+        // Rolled-up weight per edge, index-aligned with `edges`: how many
+        // call sites / imports the collapsed (src, dst, kind) pair stands
+        // for. Drives the strongest-first drawn-edge cap below.
+        let mut weights: Vec<u64> = Vec::new();
+        // (src, dst, kind) → index into `edges`: rolled-up duplicates (many
+        // symbol pairs between the same two files) collapse into one edge
+        // that keeps the best confidence seen.
+        let mut edge_ix: HashMap<(String, String, &'static str), usize> = HashMap::new();
+        let conf_rank = |c: &str| match c {
+            "extracted" => 0u8,
+            "inferred" => 1,
+            _ => 2,
+        };
+        let push_edge = |edges: &mut Vec<VizEdge>, weights: &mut Vec<u64>, edge_ix: &mut HashMap<(String, String, &'static str), usize>, meta: &mut HashMap<String, VizNode>, a: &str, b: &str, kind: &'static str, conf: Confidence| {
             if a == b || !meta.contains_key(a) || !meta.contains_key(b) {
                 return;
             }
-            if !seen.insert((a.to_string(), b.to_string(), kind)) {
+            if let Some(&i) = edge_ix.get(&(a.to_string(), b.to_string(), kind)) {
+                weights[i] += 1;
+                if conf_rank(conf.tag()) < conf_rank(&edges[i].confidence) {
+                    edges[i].confidence = conf.tag().to_string();
+                }
                 return;
             }
+            edge_ix.insert((a.to_string(), b.to_string(), kind), edges.len());
             if let Some(n) = meta.get_mut(a) { n.degree += 1; }
             if let Some(n) = meta.get_mut(b) { n.degree += 1; }
             edges.push(VizEdge { src: a.to_string(), dst: b.to_string(), kind: kind.to_string(), confidence: conf.tag().to_string() });
+            weights.push(1);
         };
 
-        // Call edges (name-resolved).
+        // Call edges (name-resolved), rolled up to file→file.
         let call_rows = self.run(
             r#"?[src, dst, conf] := *edge{kind: k, src, dst, confidence: conf}, k == "call""#,
             BTreeMap::new(),
@@ -1793,29 +1825,17 @@ reach[x] := reach[z], calls[x, z]"#
         for r in &call_rows.rows {
             let src = cell_str(r, 0);
             let dst = cell_str(r, 1);
+            let Some(from_file) = sym_file.get(&src) else { continue };
             let conf = if multi.contains(&dst) { Confidence::Ambiguous } else { Confidence::from_tag(&cell_str(r, 2)) };
-            if let Some(ids) = name_to_ids.get(&dst) {
-                let mut ids = ids.clone();
-                ids.sort(); // deterministic pick when the fan-out is capped
-                for callee in ids.into_iter().take(VIZ_CALL_FANOUT_MAX) {
-                    push_edge(&mut edges, &mut seen, &mut meta, &src, &callee, "call", conf);
+            if let Some(files) = name_to_files.get(&dst) {
+                let mut files: Vec<&String> = files.iter().collect();
+                files.sort(); // deterministic pick when the fan-out is capped
+                files.dedup();
+                let from_id = format!("file:{from_file}");
+                for callee_file in files.into_iter().take(VIZ_CALL_FANOUT_MAX) {
+                    push_edge(&mut edges, &mut weights, &mut edge_ix, &mut meta, &from_id, &format!("file:{callee_file}"), "call", conf);
                 }
             }
-        }
-        // Contains edges (stored + synthesized file→symbol).
-        let contains_rows = self.run(
-            r#"?[src, dst] := *edge{kind: k, src, dst}, k == "contains""#,
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
-        for r in &contains_rows.rows {
-            let (src, dst) = (cell_str(r, 0), cell_str(r, 1));
-            push_edge(&mut edges, &mut seen, &mut meta, &src, &dst, "contains", Confidence::Extracted);
-        }
-        for r in &sym_rows.rows {
-            let id = cell_str(r, 0);
-            let fnode = format!("file:{}", cell_str(r, 3));
-            push_edge(&mut edges, &mut seen, &mut meta, &fnode, &id, "contains", Confidence::Extracted);
         }
         // Import edges (resolved file→file).
         let import_rows = self.run(
@@ -1829,7 +1849,7 @@ reach[x] := reach[z], calls[x, z]"#
             let lang = Lang::from_tag(file_lang.get(&from_file).map(|s| s.as_str()).unwrap_or(""));
             if let Some(target) = resolve_import(lang, &from_file, &module, &known_files) {
                 let conf = Confidence::from_tag(&cell_str(r, 2));
-                push_edge(&mut edges, &mut seen, &mut meta, &format!("file:{from_file}"), &format!("file:{target}"), "import", conf);
+                push_edge(&mut edges, &mut weights, &mut edge_ix, &mut meta, &format!("file:{from_file}"), &format!("file:{target}"), "import", conf);
             }
         }
 
@@ -1841,24 +1861,43 @@ reach[x] := reach[z], calls[x, z]"#
             n.subsystem = subsystem_of(&n.file);
         }
         let kept: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
-        edges.retain(|e| kept.contains(&e.src) && kept.contains(&e.dst));
+        let mut weighted: Vec<(VizEdge, u64)> = edges
+            .into_iter()
+            .zip(weights)
+            .filter(|(e, _)| kept.contains(&e.src) && kept.contains(&e.dst))
+            .collect();
 
-        // Hard edge cap: dropping lowest-confidence edges first (stable sort
-        // keeps the original deterministic order within each class). Node
-        // degrees stay as computed above — the cap bounds what's DRAWN, not
-        // the truth about how connected a node is.
+        // Drawn-edge cap, strongest first: order by rolled-up weight, then
+        // confidence, then a deterministic key; each node keeps at most
+        // VIZ_NEIGHBORS_PER_NODE incident edges (an edge survives while
+        // EITHER endpoint still has quota, so a hub's strongest spokes stay
+        // even after the hub itself is saturated), all under the global
+        // max_nodes * VIZ_EDGES_PER_NODE bound. Node degrees stay as
+        // computed above — the cap bounds what's DRAWN, not the truth about
+        // how connected a node is.
+        weighted.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| conf_rank(&a.0.confidence).cmp(&conf_rank(&b.0.confidence)))
+                .then_with(|| (&a.0.src, &a.0.dst, &a.0.kind).cmp(&(&b.0.src, &b.0.dst, &b.0.kind)))
+        });
         let max_edges = max_nodes.saturating_mul(VIZ_EDGES_PER_NODE);
-        if edges.len() > max_edges {
-            let rank = |c: &str| match c {
-                "extracted" => 0u8,
-                "inferred" => 1,
-                _ => 2,
-            };
-            edges.sort_by_key(|e| rank(&e.confidence));
-            edges.truncate(max_edges);
+        let mut used: HashMap<String, usize> = HashMap::new();
+        let mut drawn: Vec<VizEdge> = Vec::new();
+        for (e, _) in weighted {
+            if drawn.len() >= max_edges {
+                break;
+            }
+            let su = used.get(&e.src).copied().unwrap_or(0);
+            let du = used.get(&e.dst).copied().unwrap_or(0);
+            if su >= VIZ_NEIGHBORS_PER_NODE && du >= VIZ_NEIGHBORS_PER_NODE {
+                continue;
+            }
+            *used.entry(e.src.clone()).or_default() += 1;
+            *used.entry(e.dst.clone()).or_default() += 1;
+            drawn.push(e);
         }
 
-        Ok(VizGraph { nodes, edges })
+        Ok(VizGraph { nodes, edges: drawn })
     }
 
     /// V12 Phase C: the **candidate** tests that (transitively) depend on one
@@ -4440,6 +4479,8 @@ pub struct Point { x: i32 }
     /// name — hyper-common names (`new`: 33 defs in this repo) multiplied one
     /// call site into dozens of drawn edges, with no overall edge cap, and the
     /// frontend's per-edge-per-frame cost pinned the webview thread.
+    /// Also guards the file-level contract: files are the only nodes, calls
+    /// roll up to file→file, and `contains` edges are gone.
     #[test]
     fn viz_snapshot_caps_call_fanout_and_total_edges() {
         let dir = std::env::temp_dir().join(format!("ckg-viz-{}", uuid::Uuid::new_v4()));
@@ -4456,11 +4497,16 @@ pub struct Point { x: i32 }
             .unwrap();
 
         let g = idx.viz_snapshot(100).expect("viz");
+        // File-level graph: no symbol nodes, no contains edges, and the call
+        // edges connect file:… ids.
+        assert!(g.nodes.iter().all(|n| n.kind == "file"), "nodes: {:?}", g.nodes);
+        assert!(g.edges.iter().all(|e| e.kind != "contains"), "edges: {:?}", g.edges);
         let calls: Vec<_> = g.edges.iter().filter(|e| e.kind == "call").collect();
+        assert!(calls.iter().all(|e| e.src.starts_with("file:") && e.dst.starts_with("file:")));
         assert_eq!(
             calls.len(),
             VIZ_CALL_FANOUT_MAX,
-            "one call site × 9 same-named defs is capped, not fanned out: {calls:?}"
+            "one call site × 9 same-named defs (in 9 files) is capped, not fanned out: {calls:?}"
         );
         // A multi-candidate callee name renders as ambiguous (dotted).
         assert!(calls.iter().all(|e| e.confidence == "ambiguous"));

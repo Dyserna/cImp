@@ -1,0 +1,5 @@
+# Shell scripts must stay LF: they may run from a Windows working copy under
+# WSL or Git Bash, where a CRLF shebang/line ending breaks bash outright.
+# (The Git-LFS rules that used to live here are gone — the model blobs moved
+# to assets on the `models-v1` GitHub release; see scripts/fetch-models.ps1.)
+*.sh text eol=lf

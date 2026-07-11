@@ -16,6 +16,7 @@ import {
   removeTab,
   setActiveTabId,
   setSplitRatio,
+  setSplitRatios,
   splitPane,
 } from './tree';
 import {
@@ -398,6 +399,38 @@ describe('setSplitRatio', () => {
     const next = setSplitRatio(root, 's2', 0.7) as SplitNode;
     expect((next.second as SplitNode).ratio).toBeCloseTo(0.7);
     expect(next.ratio).toBeCloseTo(0.5);
+  });
+});
+
+describe('setSplitRatios', () => {
+  test('applies several updates in one walk, with the same clamp', () => {
+    const inner = split('s2', 'horizontal', 0.5, pane('p2', ['x']), pane('p3', ['y']));
+    const root = split('s1', 'horizontal', 0.5, pane('p1', ['a']), inner);
+    const next = setSplitRatios(root, [
+      { id: 's1', ratio: 0.3 },
+      { id: 's2', ratio: 0.999 },
+    ]) as SplitNode;
+    expect(next.ratio).toBeCloseTo(0.3);
+    expect((next.second as SplitNode).ratio).toBeCloseTo(0.95);
+  });
+
+  test('unknown ids are ignored; untouched subtrees keep identity', () => {
+    const left = pane('p1', ['a']);
+    const inner = split('s2', 'horizontal', 0.5, pane('p2', ['x']), pane('p3', ['y']));
+    const root = split('s1', 'horizontal', 0.5, left, inner);
+    const next = setSplitRatios(root, [
+      { id: 's2', ratio: 0.7 },
+      { id: 'nope', ratio: 0.2 },
+    ]) as SplitNode;
+    expect((next.second as SplitNode).ratio).toBeCloseTo(0.7);
+    expect(next.ratio).toBeCloseTo(0.5);
+    expect(next.first).toBe(left);
+  });
+
+  test('empty updates and no-op ratios return the same root reference', () => {
+    const root = split('s1', 'horizontal', 0.5, pane('p1', ['a']), pane('p2', ['b']));
+    expect(setSplitRatios(root, [])).toBe(root);
+    expect(setSplitRatios(root, [{ id: 's1', ratio: 0.5 }])).toBe(root);
   });
 });
 

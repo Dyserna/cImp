@@ -256,6 +256,32 @@ export function setSplitRatio(root: LayoutNode, splitId: SplitId, ratio: number)
   return { ...root, first, second };
 }
 
+/// Apply several ratio updates in one immutable walk. The splitter drag
+/// compensates nested splits so only the divider-adjacent panes resize
+/// (see layout/resize.ts); those ratios must land atomically — applying
+/// them one `setSplitRatio` at a time would render intermediate frames
+/// with mis-sized panes. Same `[0.05, 0.95]` clamp per ratio.
+export function setSplitRatios(
+  root: LayoutNode,
+  updates: ReadonlyArray<{ id: SplitId; ratio: number }>,
+): LayoutNode {
+  if (updates.length === 0) return root;
+  return applyRatioMap(root, new Map(updates.map((u) => [u.id, u.ratio])));
+}
+
+function applyRatioMap(root: LayoutNode, byId: Map<SplitId, number>): LayoutNode {
+  if (root.type === 'pane') return root;
+  const first = applyRatioMap(root.first, byId);
+  const second = applyRatioMap(root.second, byId);
+  const wanted = byId.get(root.id);
+  const ratio =
+    wanted === undefined ? root.ratio : Math.max(0.05, Math.min(0.95, wanted));
+  if (first === root.first && second === root.second && ratio === root.ratio) {
+    return root;
+  }
+  return { ...root, first, second, ratio };
+}
+
 /// Yield every pane in document order (left-to-right, depth-first). Used
 /// by integrity checks (e.g. orphan-tab detection in M4) and by callers
 /// that need to iterate every pane regardless of nesting.

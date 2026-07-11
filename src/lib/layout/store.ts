@@ -24,6 +24,7 @@ import {
   removeTab,
   setActiveTabId,
   setSplitRatio as setSplitRatioOp,
+  setSplitRatios as setSplitRatiosOp,
   splitPane as splitPaneOp,
 } from './tree';
 import {
@@ -478,6 +479,21 @@ export function commitDrop(
 export function setSplitRatio(splitId: SplitId, ratio: number): void {
   layout.update((state) => {
     const tree = setSplitRatioOp(state.tree, splitId, ratio);
+    if (tree === state.tree) return state;
+    return { ...state, tree };
+  });
+}
+
+/// Apply several split-ratio updates atomically — one store update, one
+/// tree walk, one render. The splitter drag uses this to move a divider
+/// while keeping every pane NOT adjacent to it at its absolute size: the
+/// dragged split's ratio and the compensating ratios of its nested
+/// same-direction splits must land in the same frame (see layout/resize.ts).
+export function setSplitRatios(
+  updates: ReadonlyArray<{ id: SplitId; ratio: number }>,
+): void {
+  layout.update((state) => {
+    const tree = setSplitRatiosOp(state.tree, updates);
     if (tree === state.tree) return state;
     return { ...state, tree };
   });

@@ -5,6 +5,36 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.1] — 2026-07-12
+
+### Added
+
+- **Workbench: git-graph commit details.** Clicking a commit in the Git
+  graph expands the same detail a Session-commits row shows — the full
+  message body plus the per-file diff against its first parent.
+- **Workbench: diff ↔ full-file toggle.** Every diff surface (live Diff
+  pane, Session commits, Timeline, Worktrees, git-graph detail) can switch
+  a file between the normal 3-line-context diff and a whole-file view with
+  the changes still highlighted.
+- **Workbench: git graph auto-refresh.** The graph polls every 5 s while
+  visible; background refreshes are flicker-free, keep the last good graph
+  on transient git failures, and skip re-rendering when nothing changed.
+
+### Changed
+
+- Workbench sections reordered: Git graph · Diff · Session commits ·
+  Timeline · Worktrees.
+- **New-install defaults:** UI theme `tui-blue` paired with the
+  `OpenCode Grey` terminal palette (the embedded last-resort fallback and
+  the statusline palette fallback follow); avatar opacity 50%; waveform
+  overlay off. Existing settings files keep their persisted values.
+
+### Fixed
+
+- Code Intelligence: the Sessions card's cache-write/cache-read/out
+  columns misaligned after the token reorder — cache-write overlapped
+  cache-read and a wide gap sat before "out".
+
 ## [0.41.0] — 2026-07-11
 
 ### Added

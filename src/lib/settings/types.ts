@@ -628,6 +628,11 @@ export interface Settings {
   /// See `DismissedRule`'s doc comment for the (rule_id, signature) matching
   /// semantics.
   advisor_dismissed: DismissedRule[];
+  /// Advisor proposals the user has APPLIED — the Apply-cooldown's memory
+  /// (one entry per rule + project root). Written only by the dedicated
+  /// `advisor_mark_applied` IPC (`lib/graph.ts` `advisorMarkApplied`); kept
+  /// here for schema/round-trip fidelity with the backend struct.
+  advisor_applied: AppliedRule[];
   /// V14 Phase F: the last URL entered into any Preview tab in this project
   /// — a fresh "New Preview tab" starts here (falling back to
   /// `lib/preview/policy.ts`'s `DEFAULT_PREVIEW_URL` when `null`). Round-trips
@@ -711,6 +716,17 @@ export function harnessStatusBlocks(status: string): boolean {
 export interface DismissedRule {
   rule_id: string;
   signature: string;
+}
+
+/// One APPLIED advisor proposal — the Apply-cooldown's memory. Mirror of
+/// Rust `settings::AppliedRule`: the rule stays quiet until `root` has seen
+/// a few more sessions than `session_count` (the count at apply time), so
+/// the advisor re-evaluates on fresh post-change data instead of instantly
+/// re-proposing off the cumulative pre-apply rates.
+export interface AppliedRule {
+  rule_id: string;
+  root: string;
+  session_count: number;
 }
 
 /// V14 Phase A: one saved prompt-library entry (global or project scope —
@@ -1439,6 +1455,7 @@ export function defaultSettings(): Settings {
     prompt_templates: [],
     templates_seeded: false,
     advisor_dismissed: [],
+    advisor_applied: [],
     preview_last_url: null,
     preview_allow_remote: false,
     // Real defaults are seeded Rust-side (`default_llm_pricing`); this local

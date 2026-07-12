@@ -1775,6 +1775,19 @@ pub async fn graph_usage_advice(
         .map(|e| e.target.clone())
         .collect();
 
+    // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
+    // only THIS root's, so an Apply in one project never mutes another
+    // (whose own session count may be far lower). Both this filter and the
+    // writer (`advisor_mark_applied`) derive the string from
+    // `resolve_graph_root`, so the forms compare equal.
+    let root_str = root.to_string_lossy().to_string();
+    let applied: Vec<crate::settings::AppliedRule> = settings
+        .advisor_applied
+        .iter()
+        .filter(|a| a.root == root_str)
+        .cloned()
+        .collect();
+
     let sig = crate::advisor::Signals {
         injection_follow_rate,
         injection_follow_samples,
@@ -1785,6 +1798,7 @@ pub async fn graph_usage_advice(
         session_count,
         graph: settings.graph.clone(),
         dismissed: settings.advisor_dismissed.clone(),
+        applied,
         claude_last_seen: hv.claude_last_seen,
         claude_last_verified: hv.claude_last_verified,
         remind_count,
@@ -1852,6 +1866,36 @@ pub async fn advisor_dismiss(
         if !already {
             cur.advisor_dismissed.push(crate::settings::DismissedRule { rule_id, signature });
         }
+    });
+    Ok(())
+}
+
+/// Record that the user APPLIED an advisor proposal, starting the rule's
+/// Apply cooldown (`advisor::APPLY_COOLDOWN_SESSIONS` sessions of quiet so
+/// fresh post-change data can accumulate before the rule re-evaluates — the
+/// rates are cumulative, and an immediate re-proposal would be judging the
+/// OLD value's data). Captures the root's session count server-side at call
+/// time; one record per (rule, root), re-applying replaces it. Called by
+/// the Advisor card's Apply right after the `settings_update` that writes
+/// the proposed value — the settings write itself stays the ordinary path
+/// (never silent self-modification).
+#[tauri::command]
+pub async fn advisor_mark_applied(
+    state: State<'_, AppState>,
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    rule_id: String,
+) -> AppResult<()> {
+    let root = resolve_graph_root(root)?;
+    let session_count = graph.advisor_session_count(&root);
+    let root_str = root.to_string_lossy().to_string();
+    state.settings.mutate(move |cur| {
+        cur.advisor_applied.retain(|a| !(a.rule_id == rule_id && a.root == root_str));
+        cur.advisor_applied.push(crate::settings::AppliedRule {
+            rule_id,
+            root: root_str,
+            session_count,
+        });
     });
     Ok(())
 }

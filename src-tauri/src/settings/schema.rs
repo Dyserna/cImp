@@ -225,6 +225,15 @@ pub struct Settings {
     /// changed rate re-fires the proposal even though the same `rule_id`
     /// still matches. Additive `#[serde(default)]`; empty on a fresh install.
     pub advisor_dismissed: Vec<DismissedRule>,
+    /// Advisor proposals the user has APPLIED, with the project's session
+    /// count at apply time. Each entry holds its rule quiet for
+    /// `advisor::APPLY_COOLDOWN_SESSIONS` further sessions — the advisor's
+    /// rates are cumulative, so an immediate re-proposal after Apply would be
+    /// judging data collected almost entirely under the OLD value, not
+    /// evidence the raise failed. One entry per (rule, project root);
+    /// re-applying replaces it (see `ipc::commands::advisor_mark_applied`).
+    /// Additive `#[serde(default)]`; empty on a fresh install.
+    pub advisor_applied: Vec<AppliedRule>,
     /// V14 Phase F: the last URL entered into any Preview tab, remembered so
     /// the next "New Preview tab" starts from where the user left off rather
     /// than the hardcoded fallback (`preview::DEFAULT_PREVIEW_URL`). A plain
@@ -298,6 +307,7 @@ impl Default for Settings {
             prompt_templates: Vec::new(),
             templates_seeded: false,
             advisor_dismissed: Vec::new(),
+            advisor_applied: Vec::new(),
             preview_last_url: None,
             preview_allow_remote: false,
             llm_pricing: default_llm_pricing(),
@@ -459,6 +469,21 @@ pub fn default_llm_pricing() -> Vec<LlmPricingModel> {
 pub struct DismissedRule {
     pub rule_id: String,
     pub signature: String,
+}
+
+/// One APPLIED advisor proposal — the Apply-cooldown's memory. `rule_id`
+/// mirrors `advisor::Proposal::rule_id`; `root` is the project root the
+/// Apply happened in (the advisor's rates are per-root, so a cooldown in one
+/// project must not mute another); `session_count` is that root's distinct
+/// session count at apply time. The rule stays quiet until the root has seen
+/// `advisor::APPLY_COOLDOWN_SESSIONS` further sessions — see
+/// `advisor::evaluate`.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct AppliedRule {
+    pub rule_id: String,
+    pub root: String,
+    pub session_count: u64,
 }
 
 /// Logging configuration. The file path is fixed at

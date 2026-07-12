@@ -28,6 +28,7 @@
     graphUsage,
     graphUsageAdvice,
     advisorDismiss,
+    advisorMarkApplied,
     graphPath,
     graphArchitecture,
     onGraphStatus,
@@ -468,8 +469,14 @@
       }
       await applySettings(next);
       advisorError = null;
-      // The applied change itself will shift the underlying rate, so drop
-      // this proposal locally rather than waiting for the next poll.
+      // Start the rule's Apply cooldown: it stays quiet for a few sessions
+      // so fresh post-change data can accumulate before it re-evaluates —
+      // the underlying rates are cumulative, and without this the rule
+      // would re-propose on the very next poll off data collected almost
+      // entirely under the OLD value. Best-effort: a failure here just
+      // means the old always-re-propose behavior for this one apply.
+      await advisorMarkApplied(p.rule_id).catch((e) => console.warn('advisor_mark_applied failed', e));
+      // Drop the proposal locally rather than waiting for the next poll.
       advice = advice && { ...advice, proposals: advice.proposals.filter((x) => x.rule_id !== p.rule_id) };
     } finally {
       advisorBusy = null;
@@ -545,7 +552,8 @@
     'drift.injection_unseen.v1: ≥5 sessions, ≥30 injections, ≤2% follow → injected context likely never reaches the model.\n' +
     'drift.usage_fields_gone.v1: ≥2 Claude sessions, all without token fields → the transcript usage schema changed.\n' +
     'drift.payload.v1: any shim-reported payload missing required fields.\n' +
-    'drift.read_bypass.v1: ≥10 reminders, ≥40% answered via shell reads (est.) → disable read_advisor.';
+    'drift.read_bypass.v1: ≥10 reminders, ≥40% answered via shell reads (est.) → disable read_advisor.\n' +
+    'After an Apply, that rule stays quiet for 3 further sessions so fresh post-change data can accumulate before it re-evaluates.';
 
   // ── V16 Feature 8: tokens | est. cost toggle ─────────────────────────
   // Cost mode multiplies each bar segment by its $/MTok price before

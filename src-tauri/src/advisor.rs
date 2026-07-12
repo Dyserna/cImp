@@ -19,7 +19,7 @@
 //! never reused for a changed rule) and listed in the Usage section's
 //! Advisor card tooltip — inspectable, not magic.
 
-use crate::settings::{DismissedRule, GraphSettings};
+use crate::settings::{AppliedRule, DismissedRule, GraphSettings};
 
 // ── Cold-start floor ────────────────────────────────────────────────────
 //
@@ -43,6 +43,16 @@ pub const MIN_REMINDS: u64 = 20;
 /// Rule 3's second floor: retrieval turns observed (its `budget_maxed_rate`
 /// signal).
 pub const MIN_TURNS: u64 = 50;
+
+/// Apply cooldown: after the user APPLIES a proposal, that rule stays quiet
+/// until this many further sessions have been observed for the root. The
+/// advisor's rates are cumulative over the tracked sessions, so a
+/// re-evaluation right after Apply is dominated by data collected under the
+/// OLD value — re-proposing off it would look like "the raise didn't work"
+/// when nothing new has been measured yet. Distinct from a dismissal: it
+/// expires on its own, and it re-fires at ANY rate bucket afterwards (the
+/// whole point is to come back with fresh post-change numbers).
+pub const APPLY_COOLDOWN_SESSIONS: u64 = 3;
 
 // ── "High rate" thresholds ──────────────────────────────────────────────
 
@@ -157,6 +167,11 @@ pub struct Signals {
     pub graph: GraphSettings,
     /// The user's dismissed-proposal list (`Settings::advisor_dismissed`).
     pub dismissed: Vec<DismissedRule>,
+    /// The user's applied-proposal records (`Settings::advisor_applied`),
+    /// ALREADY filtered to this root by the caller — the advisor never sees
+    /// another project's cooldowns. Each holds its rule quiet until
+    /// [`APPLY_COOLDOWN_SESSIONS`] sessions after the apply.
+    pub applied: Vec<AppliedRule>,
 
     // ── V16 drift signals ───────────────────────────────────────────────
     /// Feature 1: latest Claude Code version seen in a transcript (empty
@@ -255,11 +270,29 @@ pub fn evaluate(sig: &Signals) -> Vec<Proposal> {
 
     // Global cold-start floor: no TUNING rule proposes below it, no matter
     // how extreme an individual rate looks.
-    if sig.session_count < MIN_SESSIONS {
-        return out;
+    if sig.session_count >= MIN_SESSIONS {
+        out.extend(tuning_rules(sig, advisor_disable_proposed));
     }
-    out.extend(tuning_rules(sig, advisor_disable_proposed));
+
+    // Apply cooldown, last so it covers every rule class uniformly: a rule
+    // the user just applied doesn't speak again until the root has seen
+    // APPLY_COOLDOWN_SESSIONS further sessions — the rates it would re-judge
+    // are cumulative and still dominated by pre-apply data. Warn-only rules
+    // have no Apply and thus never accrue a record; they pass untouched.
+    out.retain(|p| !in_apply_cooldown(sig, p.rule_id));
     out
+}
+
+/// Whether `rule_id` was applied recently enough that it must stay quiet.
+/// `saturating_add` so a hand-edited huge stored count can't wrap; a stored
+/// count AHEAD of the live one (root DB pruned/rebuilt) just extends the
+/// cooldown until the count catches back up — fail-quiet, matching the
+/// advisor's posture everywhere else.
+fn in_apply_cooldown(sig: &Signals, rule_id: &str) -> bool {
+    sig.applied.iter().any(|a| {
+        a.rule_id == rule_id
+            && sig.session_count < a.session_count.saturating_add(APPLY_COOLDOWN_SESSIONS)
+    })
 }
 
 /// Signature for the version-keyed drift rules: the SEEN Claude version, or
@@ -719,6 +752,56 @@ mod tests {
         let mut sig = extreme_signals();
         sig.budget_maxed_rate = None;
         assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_TURN_BUDGET));
+    }
+
+    #[test]
+    fn apply_cooldown_suppresses_the_applied_rule_until_enough_new_sessions() {
+        // Applied at the current session count: quiet, even at an extreme rate.
+        let mut sig = extreme_signals();
+        sig.applied = vec![AppliedRule {
+            rule_id: RULE_MIN_SCORE.to_string(),
+            root: String::new(), // root-filtering is the caller's job
+            session_count: sig.session_count,
+        }];
+        let ids: Vec<&str> = evaluate(&sig).iter().map(|p| p.rule_id).collect();
+        assert!(!ids.contains(&RULE_MIN_SCORE), "freshly applied rule must stay quiet");
+        // Other rules are untouched by another rule's cooldown.
+        assert!(ids.contains(&RULE_ADVISOR_LINES));
+        assert!(ids.contains(&RULE_TURN_BUDGET));
+
+        // One session short of expiry: still quiet.
+        let mut sig_short = extreme_signals();
+        sig_short.session_count = MIN_SESSIONS + APPLY_COOLDOWN_SESSIONS - 1;
+        sig_short.applied = vec![AppliedRule {
+            rule_id: RULE_MIN_SCORE.to_string(),
+            root: String::new(),
+            session_count: MIN_SESSIONS,
+        }];
+        assert!(!evaluate(&sig_short).iter().any(|p| p.rule_id == RULE_MIN_SCORE));
+
+        // Cooldown elapsed: re-fires (any bucket — an apply is not a dismissal).
+        let mut sig_done = extreme_signals();
+        sig_done.session_count = MIN_SESSIONS + APPLY_COOLDOWN_SESSIONS;
+        sig_done.applied = vec![AppliedRule {
+            rule_id: RULE_MIN_SCORE.to_string(),
+            root: String::new(),
+            session_count: MIN_SESSIONS,
+        }];
+        assert!(evaluate(&sig_done).iter().any(|p| p.rule_id == RULE_MIN_SCORE));
+    }
+
+    #[test]
+    fn apply_cooldown_covers_drift_disable_proposals_too() {
+        // Applying "disable read_advisor" flips the setting, which already
+        // gates the rule off — but if the user re-enables it within the
+        // cooldown, the drift rule must not fire again off the same stale rate.
+        let mut sig = read_reason_signals();
+        sig.applied = vec![AppliedRule {
+            rule_id: RULE_DRIFT_READ_REASON.to_string(),
+            root: String::new(),
+            session_count: sig.session_count,
+        }];
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
     }
 
     #[test]

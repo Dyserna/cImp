@@ -614,6 +614,16 @@ export function advisorDismiss(ruleId: string, signature: string): Promise<void>
   return invoke<void>('advisor_dismiss', { ruleId, signature });
 }
 
+/// Record that a proposal was APPLIED, starting its cooldown: the rule stays
+/// quiet for a few sessions so fresh post-change data can accumulate before
+/// the advisor re-evaluates (the rates are cumulative — an immediate
+/// re-proposal would be judging the OLD value's data). Called right after
+/// the `applySettings` that wrote the proposed value. `root` defaults to the
+/// launch directory, matching `graphUsageAdvice`.
+export function advisorMarkApplied(ruleId: string, root?: string): Promise<void> {
+  return invoke<void>('advisor_mark_applied', { ruleId, root: root ?? null });
+}
+
 /// V16 Feature 1: stamp the currently-seen Claude Code version as verified
 /// (the Advisor card's "Mark verified" — the user just re-ran the
 /// MAINTENANCE.md contract checks).

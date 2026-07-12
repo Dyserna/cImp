@@ -26,6 +26,7 @@
   import { errorMessage } from './errors';
   import { WORKBENCH_TAB_ID } from './tabs/types';
   import { onAppViewShown } from './appViewVisibility';
+  import { loadViewSet, saveViewSet } from './viewSection';
 
   let worktrees = $state<WorktreeInfo[]>([]);
   let loading = $state(true);
@@ -35,14 +36,20 @@
   // deep-proxies plain objects/arrays, so in-place .add()/.set() on a plain
   // collection triggers no re-render — the diff panel, check chips, and row
   // errors below would silently never appear.
-  const expandedDiff = new SvelteSet<string>();
+  // Expansion and full-file toggles persist (viewSection.ts) like the
+  // sibling Diff/Session-commits sections — this component is destroyed on
+  // every section/tab switch. A stale slug simply matches no row; `load()`
+  // refetches the diffs for whatever restored expansions still exist.
+  const expandedDiff = new SvelteSet<string>(loadViewSet('worktrees', 'expanded-diff'));
   const diffs = new SvelteMap<string, FileDiff[]>();
   const diffErrors = new SvelteMap<string, string>();
   // Worktrees whose diff panel shows the FULL-file view (huge unified
   // context — whole file as one hunk) instead of the normal 3-line diff;
   // fetched separately and cached in `fullDiffs`.
-  const fullDiff = new SvelteSet<string>();
+  const fullDiff = new SvelteSet<string>(loadViewSet('worktrees', 'full-diff'));
   const fullDiffs = new SvelteMap<string, FileDiff[]>();
+  $effect(() => saveViewSet('worktrees', 'expanded-diff', expandedDiff));
+  $effect(() => saveViewSet('worktrees', 'full-diff', fullDiff));
 
   const checkStatuses = new SvelteMap<string, WorktreeCheckStatus | null>();
   const checking = new SvelteSet<string>();
@@ -70,6 +77,13 @@
             }
           }),
       );
+      // Fetch the diff panels a restored (persisted) expansion re-opened —
+      // toggleDiff/toggleFullDiff only fetch on click, so without this a
+      // remount would render restored panels empty.
+      for (const w of worktrees) {
+        if (expandedDiff.has(w.slug) && !diffs.has(w.slug)) void loadDiff(w.slug);
+        if (fullDiff.has(w.slug) && !fullDiffs.has(w.slug)) void loadFullDiff(w.slug);
+      }
     } catch (e) {
       loadError = errorMessage(e);
     } finally {

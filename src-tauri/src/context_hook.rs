@@ -30,17 +30,19 @@ pub fn run() {
         Err(_) => return,
     };
     let prompt = v.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+    let session_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
+    let cwd_raw = v.get("cwd").and_then(|s| s.as_str()).unwrap_or("");
+    // V16 Feature 3: report payload-shape drift BEFORE any early return, so
+    // a payload broken enough to make this shim bail still gets counted.
+    report_contract_drift(
+        "context_hook",
+        &missing_fields(&[("session_id", !session_id.is_empty()), ("cwd", !cwd_raw.is_empty())]),
+        session_id,
+    );
     if prompt.trim().is_empty() {
         return;
     }
-    let session_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
-    let cwd = v
-        .get("cwd")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
-        .unwrap_or_default();
+    let cwd = resolve_cwd(cwd_raw);
 
     let body = serde_json::json!({
         "cwd": cwd,
@@ -74,6 +76,48 @@ pub fn run() {
 pub(crate) fn post_loopback(path: &str, body: &str) -> Option<String> {
     let disc = crate::offload::loopback::read_discovery()?;
     post_context(disc.port, &disc.token, path, body)
+}
+
+/// The working directory a hook payload names, falling back to the shim's
+/// own process cwd when the field is absent/empty (Claude spawns hook shims
+/// in the project directory, so the fallback is usually right). Shared by
+/// all three shims (`--context-hook` / `--precompact-hook` / `--read-hook`),
+/// like `missing_fields`/`report_contract_drift`.
+pub(crate) fn resolve_cwd(cwd_raw: &str) -> String {
+    if !cwd_raw.is_empty() {
+        return cwd_raw.to_string();
+    }
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// V16 Feature 3: the required-field names a hook payload is missing —
+/// `(name, present-and-non-empty)` pairs in, missing names out. Split from
+/// the reporter so the check is unit-testable without a socket.
+pub(crate) fn missing_fields(checks: &[(&'static str, bool)]) -> Vec<&'static str> {
+    checks.iter().filter(|(_, present)| !present).map(|(name, _)| *name).collect()
+}
+
+/// V16 Feature 3: report a hook payload that is missing required fields to
+/// the app (`POST /activity/contract_drift`) so payload-shape drift is
+/// caught at the earliest observable point. Fire-and-forget: the shim keeps
+/// failing open exactly as before — this report is the only difference on
+/// the broken path, and the happy path never POSTs it. Rate-limiting (one
+/// event per shim per session) is app-side, so a systematically broken
+/// payload can't flood the Activity store.
+pub(crate) fn report_contract_drift(shim: &str, missing: &[&'static str], session_id: &str) {
+    if missing.is_empty() {
+        return;
+    }
+    let body = serde_json::json!({
+        "shim": shim,
+        "missing": missing,
+        "session_id": session_id,
+    })
+    .to_string();
+    let _ = post_loopback("/activity/contract_drift", &body);
 }
 
 /// Minimal blocking HTTP/1.1 POST to a loopback route; returns the response's

@@ -288,6 +288,8 @@ pub fn build_context(
     }
 
     // Rank; bail when the best file is below the threshold (meta prompts).
+    // `min_score` is also enforced per-file in the packing loop below — this
+    // early return only short-circuits the all-below-floor turn.
     let mut ranked: Vec<(String, f64)> = score.into_iter().collect();
     ranked.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
@@ -312,7 +314,15 @@ pub fn build_context(
     // newline below.
     const HEADER: &str = "## Relevant context (cImp)\n";
     let mut budget = turn_budget_chars.saturating_sub(HEADER.chars().count());
-    for (file, _s) in ranked {
+    for (file, s) in ranked {
+        // The relevance floor applies per FILE, not just to the turn's top
+        // match: `ranked` is sorted descending, so the first below-floor
+        // score ends the scan — marginal tail files must not ride in under
+        // a strong #1 (they were the bulk of the advisor's measured
+        // injected-but-never-touched waste).
+        if s < min_score {
+            break;
+        }
         // Hard cap on total emitted lines (full digests + reminders) so a broad
         // prompt on a big project can't produce an enormous block.
         if used.len() + reminders.len() >= 24 {
@@ -808,6 +818,48 @@ mod tests {
         let empty = build_context(&idx, "hi there, thanks!", &[], 800, 6000, 3.0, &no_dedup, 0, 0, false);
         assert_eq!(empty.chars, 0);
         assert!(empty.files_used.is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn min_score_drops_individual_below_floor_files_not_just_the_turn() {
+        use crate::graph::{parse_file, Lang};
+        let dir = std::env::temp_dir().join(format!("ckg-ctx-floor-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // `definer.rs` DEFINES the prompt term (+3); `caller.rs` merely
+        // references it (+1). No git/docs/facts in this fixture, so those
+        // are the exact scores.
+        idx.index_file_graph(&parse_file(
+            "src/definer.rs",
+            "pub fn build_widget() {}\n",
+            Lang::Rust,
+        ))
+        .expect("index definer");
+        idx.index_file_graph(&parse_file(
+            "src/caller.rs",
+            "pub fn other() { build_widget(); }\n",
+            Lang::Rust,
+        ))
+        .expect("index caller");
+
+        let no_dedup = HashMap::new();
+        // Floor between the two scores: the turn passes (top file scores 3)
+        // but the below-floor tail file must be dropped, not ride in under
+        // the strong top match.
+        let r = build_context(&idx, "refactor build_widget", &[], 800, 6000, 2.0, &no_dedup, 0, 0, false);
+        assert!(r.files_used.contains(&"src/definer.rs".to_string()));
+        assert!(
+            !r.files_used.contains(&"src/caller.rs".to_string()),
+            "a file scoring below min_score must not be injected even when the top file clears the gate"
+        );
+
+        // Floor below both: both inject (the old behavior for genuinely
+        // above-floor files is unchanged).
+        let both = build_context(&idx, "refactor build_widget", &[], 800, 6000, 1.0, &no_dedup, 0, 0, false);
+        assert!(both.files_used.contains(&"src/definer.rs".to_string()));
+        assert!(both.files_used.contains(&"src/caller.rs".to_string()));
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

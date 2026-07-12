@@ -53,6 +53,11 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     let mut commit_calls = IdRing::default();
     let mut cur: Option<PathBuf> = None;
     let mut offset: u64 = 0;
+    // V16 Feature 1: capture the Claude CLI version (each transcript entry
+    // carries a top-level `version` field) at most once per session file —
+    // the write is change-guarded downstream, this flag just avoids re-parsing
+    // for it on every line.
+    let mut version_noted = false;
     // The first file we attach to may already hold a long backlog from before
     // launch; skip it by seeking to EOF. Files that appear *later* (a new
     // session) are read from the start.
@@ -88,6 +93,7 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 // tool_use ids can never see a matching tool_result.
                 tool_names.clear();
                 commit_calls.clear();
+                version_noted = false;
             }
             Some(_) => {}
             None => {
@@ -114,6 +120,7 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 &mut agents,
                 &mut tool_names,
                 &mut commit_calls,
+                &mut version_noted,
                 &project_dir,
                 &session_id,
                 &ctx,
@@ -138,6 +145,7 @@ async fn drain_new_lines(
     agents: &mut HashSet<String>,
     tool_names: &mut ToolNameRing,
     commit_calls: &mut IdRing,
+    version_noted: &mut bool,
     project_dir: &Path,
     session_id: &str,
     ctx: &OobContext,
@@ -175,7 +183,9 @@ async fn drain_new_lines(
             continue;
         }
         if let Ok(obj) = serde_json::from_str::<Value>(line) {
+            note_cli_version(&obj, version_noted);
             update_agents(&obj, agents, ctx);
+            note_user_turn(&obj, session_id, ctx);
             record_tool_events(&obj, project_dir, session_id, ctx);
             record_usage(&obj, tool_names, project_dir, session_id, ctx);
             record_commit_events(&obj, commit_calls, project_dir, session_id, ctx);
@@ -188,6 +198,28 @@ async fn drain_new_lines(
         }
     }
     offset
+}
+
+/// V16 Feature 1: record the Claude Code CLI version from a transcript entry's
+/// top-level `version` field into the global `harness_versions` tripwire state.
+/// Once per session file (`noted` flips on the first line that carries one);
+/// the actual disk write is additionally change-guarded in
+/// `note_harness_version`, and runs on a blocking thread — this is called from
+/// the async tail loop.
+fn note_cli_version(obj: &Value, noted: &mut bool) {
+    if *noted {
+        return;
+    }
+    let Some(v) = obj.get("version").and_then(Value::as_str) else {
+        return;
+    };
+    let v = v.trim();
+    if v.is_empty() {
+        return;
+    }
+    *noted = true;
+    let v = v.to_string();
+    tokio::task::spawn_blocking(move || crate::settings::note_harness_version("claude", &v));
 }
 
 /// The `tool_use` name Claude Code emits when it launches a sub-agent. Keyed
@@ -251,6 +283,23 @@ fn is_user_prompt(obj: &Value) -> bool {
             .any(|p| p.get("type").and_then(Value::as_str) != Some("tool_result")),
         _ => false,
     }
+}
+
+/// V16 review fix: forward a genuine user prompt to the graph service as a
+/// turn boundary for the read advisor's trust-TTL / compounding clocks —
+/// with context injection off, `retrieve_context` never runs and nothing
+/// else ticks `InjectState.turn` (the service no-ops when injection is on,
+/// so the two clocks can't double-count). Sidechain lines (a sub-agent's
+/// internal prompts) and `isMeta` lines (harness-inserted user messages —
+/// local-command output, caveats) are not turns.
+fn note_user_turn(obj: &Value, session_id: &str, ctx: &OobContext) {
+    if obj.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || obj.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || !is_user_prompt(obj)
+    {
+        return;
+    }
+    ctx.note_user_turn(session_id);
 }
 
 /// Update the in-flight `Task` sub-agent set from one transcript line and emit
@@ -335,6 +384,16 @@ fn record_tool_events(obj: &Value, project_dir: &Path, session_id: &str, ctx: &O
             continue;
         }
         let Some(name) = part.get("name").and_then(Value::as_str) else { continue };
+        // V16 Feature 4: every Bash command is also tested against the
+        // session's recent read-advisor reminders — a `cat`/`Get-Content`
+        // of a just-reminded file is the advisor's blind spot, and this tap
+        // already sees the full command string for free.
+        if name == "Bash" {
+            if let Some(cmd) = part.get("input").and_then(|i| i.get("command")).and_then(Value::as_str)
+            {
+                ctx.check_bypass(project_dir, session_id, cmd);
+            }
+        }
         let Some((kind, arg)) = crate::graph::classify_tool(name) else { continue };
         let Some((path, detail)) = mem_target(arg, part.get("input")) else { continue };
         ctx.record_mem(project_dir, session_id, "claude", kind, &path, None, None, detail.as_deref());

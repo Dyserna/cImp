@@ -10,17 +10,20 @@
 //! re-reading a large unchanged file. On `pass`, any error, or a non-Read tool
 //! we print nothing and the Read proceeds.
 //!
-//! TODO(spike E1): confirm that a PreToolUse deny's `permissionDecisionReason`
-//! is surfaced **to the model** (not only the user) on the pinned Claude Code
-//! version. If it is not, the advisor can't substitute content and the phase is
-//! cancelled per the milestone — a bare deny is worse than nothing.
+//! Spike E1 (V16 Feature 0): whether a PreToolUse deny's
+//! `permissionDecisionReason` is surfaced **to the model** (not only the
+//! user) — recipe in `docs/MAINTENANCE.md` → harness contracts; outcome
+//! recorded in `harness_versions.e1_status` (global settings). `"fail"`
+//! hard-blocks the advisor (toggle disabled, hook not installed — see
+//! `tabs/config.rs`), and the `drift.read_reason.v1` Advisor canary watches
+//! for the symptom (~100% remind→immediate re-read) at runtime either way.
 //!
 //! Synchronous and dependency-light like the sibling shims; fails open (prints
 //! nothing) so it can never wrongly block a legitimate read.
 
 use std::io::{Read, Write};
 
-use crate::context_hook::post_loopback;
+use crate::context_hook::{missing_fields, post_loopback, report_contract_drift, resolve_cwd};
 
 pub fn run() {
     let mut input = String::new();
@@ -31,24 +34,34 @@ pub fn run() {
         Ok(v) => v,
         Err(_) => return,
     };
-    // Only advise on Read (the matcher should already scope this, but be safe).
-    if v.get("tool_name").and_then(|t| t.as_str()) != Some("Read") {
-        return;
-    }
+    let tool_name = v.get("tool_name").and_then(|t| t.as_str());
     let tool_input = v.get("tool_input").cloned().unwrap_or(serde_json::Value::Null);
     let file_path = tool_input.get("file_path").and_then(|p| p.as_str()).unwrap_or("");
+    let session_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
+    let cwd_raw = v.get("cwd").and_then(|s| s.as_str()).unwrap_or("");
+    // V16 Feature 3: payload-shape drift report, before every early return.
+    // A DIFFERENT tool_name is a matcher-config matter, not payload drift —
+    // only its ABSENCE (and `tool_input.file_path`'s, when the tool is Read
+    // or unknown) counts.
+    report_contract_drift(
+        "read_hook",
+        &missing_fields(&[
+            ("session_id", !session_id.is_empty()),
+            ("cwd", !cwd_raw.is_empty()),
+            ("tool_name", tool_name.is_some()),
+            ("tool_input.file_path", tool_name.is_some_and(|t| t != "Read") || !file_path.is_empty()),
+        ]),
+        session_id,
+    );
+    // Only advise on Read (the matcher should already scope this, but be safe).
+    if tool_name != Some("Read") {
+        return;
+    }
     if file_path.trim().is_empty() {
         return;
     }
     let offset = tool_input.get("offset").and_then(|o| o.as_u64());
-    let session_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
-    let cwd = v
-        .get("cwd")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
-        .unwrap_or_default();
+    let cwd = resolve_cwd(cwd_raw);
 
     let body = serde_json::json!({
         "cwd": cwd,

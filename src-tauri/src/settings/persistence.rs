@@ -46,7 +46,8 @@ use crate::settings::schema::{
     default_ai_tab, default_graph_monitor_tab, default_graph_view_tab, default_offload_server_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
     starter_prompt_templates,
-    AiTabId, LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings, TabConfig,
+    AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings,
+    TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
@@ -183,7 +184,13 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     //    read from the resolved location (canonical `.cimp/config.json`, or the
     //    legacy file if the move couldn't happen).
     migrate_legacy_overlay(launch_cwd);
-    let overlay_value = read_overlay(&overlay_read_path(launch_cwd), true);
+    let overlay_value = read_overlay(&overlay_read_path(launch_cwd), true).map(|mut v| {
+        // Per-install fields never belong in an overlay (see
+        // `OVERLAY_BANNED_KEYS`) — drop them before the merge so an overlay
+        // contaminated by a pre-guard version can't shadow the global file.
+        strip_overlay_banned(&mut v);
+        v
+    });
 
     // 3. Merge the (now both-current-shape) global + overlay.
     let mut merged = match serde_json::to_value(&global) {
@@ -279,7 +286,8 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         Some(v) => v,
         None => return Settings::default(),
     };
-    if let Some(overlay) = read_overlay(&overlay_read_path(launch_cwd), false) {
+    if let Some(mut overlay) = read_overlay(&overlay_read_path(launch_cwd), false) {
+        strip_overlay_banned(&mut overlay);
         deep_merge(&mut merged, overlay);
     }
     serde_json::from_value(merged).unwrap_or_default()
@@ -327,15 +335,22 @@ pub fn write_global_prompt_templates(templates: Vec<PromptTemplate>) -> AppResul
     write_prompt_templates_to(&path, templates)
 }
 
+/// Read-modify-write base shared by every out-of-band global writer: the
+/// physical file parsed as `Settings`, or defaults when missing/corrupt (a
+/// corrupt file is the normal `load` path's problem — these writers must
+/// still be able to record their one field).
+fn read_settings_or_default(path: &Path) -> Settings {
+    if !path.exists() {
+        return Settings::default();
+    }
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
 fn write_prompt_templates_to(path: &Path, templates: Vec<PromptTemplate>) -> AppResult<()> {
-    let mut settings: Settings = if path.exists() {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
-    } else {
-        Settings::default()
-    };
+    let mut settings = read_settings_or_default(path);
     settings.prompt_templates = templates;
     // An explicit Settings-window save always counts as "seeded" — it must
     // never be clobbered by the one-time starter injection on a later load.
@@ -377,16 +392,91 @@ pub fn write_global_llm_pricing(pricing: Vec<LlmPricingModel>) -> AppResult<()> 
 }
 
 fn write_llm_pricing_to(path: &Path, pricing: Vec<LlmPricingModel>) -> AppResult<()> {
-    let mut settings: Settings = if path.exists() {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
-    } else {
-        Settings::default()
-    };
+    let mut settings = read_settings_or_default(path);
     settings.llm_pricing = pricing;
     save_to(path, &settings)
+}
+
+/// Mtime-gated cache for [`read_global_harness_versions`]: the Advisor card
+/// polls it every ~2s and tab spawns consult it, but the answer only changes
+/// when the global file does — re-read + re-parse the whole `Settings` only
+/// when the file's mtime moved (a hand edit or an out-of-process write still
+/// shows up through the mtime), otherwise a metadata stat is the entire
+/// cost. In-process writers ([`mutate_global_harness_versions`]) refresh the
+/// cache directly so a same-timestamp write can't serve a stale value.
+static HV_CACHE: std::sync::Mutex<Option<(std::time::SystemTime, HarnessVersions)>> =
+    std::sync::Mutex::new(None);
+
+/// V16 Feature 1: harness version + contract state, read straight from the
+/// physical global file for the same reason as [`read_global_llm_pricing`] —
+/// it's per-install state and must never be shadowed by (or diffed into) a
+/// project overlay. Missing/corrupt file → defaults (all-unverified).
+/// Cheap to call from polls and spawn paths (see [`HV_CACHE`]).
+pub fn read_global_harness_versions() -> HarnessVersions {
+    let Ok(path) = global_path() else {
+        return HarnessVersions::default();
+    };
+    let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) else {
+        return HarnessVersions::default();
+    };
+    if let Ok(cache) = HV_CACHE.lock() {
+        if let Some((cached_at, hv)) = cache.as_ref() {
+            if *cached_at == mtime {
+                return hv.clone();
+            }
+        }
+    }
+    let hv = read_settings_or_default(&path).harness_versions;
+    if let Ok(mut cache) = HV_CACHE.lock() {
+        *cache = Some((mtime, hv.clone()));
+    }
+    hv
+}
+
+/// Mutate the global `harness_versions` state in place (read-modify-write on
+/// the physical global file, every other field preserved — mirror of
+/// [`write_global_prompt_templates`]). Returns the post-mutation state.
+/// No-ops (no disk write) when the mutation leaves the state unchanged, so
+/// background callers polling a version can call this freely.
+pub fn mutate_global_harness_versions(
+    mutate: impl FnOnce(&mut HarnessVersions),
+) -> AppResult<HarnessVersions> {
+    let path = global_path()?;
+    let mut settings = read_settings_or_default(&path);
+    let before = settings.harness_versions.clone();
+    mutate(&mut settings.harness_versions);
+    if settings.harness_versions == before {
+        return Ok(before);
+    }
+    let after = settings.harness_versions.clone();
+    save_to(&path, &settings)?;
+    // Refresh the read cache under the post-write mtime — never leave it
+    // holding the pre-write value for a same-timestamp write.
+    if let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) {
+        if let Ok(mut cache) = HV_CACHE.lock() {
+            *cache = Some((mtime, after.clone()));
+        }
+    }
+    Ok(after)
+}
+
+/// Record a harness version observation (V16 Feature 1's tripwire input).
+/// `harness` is `"claude"` (from the OOB transcript tap) or `"opencode"`
+/// (from `opencode --version` at tab spawn). Change-guarded — safe to call
+/// once per session/spawn without file churn.
+pub fn note_harness_version(harness: &str, version: &str) {
+    let version = version.trim();
+    if version.is_empty() {
+        return;
+    }
+    let res = mutate_global_harness_versions(|hv| match harness {
+        "claude" => hv.claude_last_seen = version.to_string(),
+        "opencode" => hv.opencode_last_seen = version.to_string(),
+        _ => {}
+    });
+    if let Err(e) = res {
+        tracing::warn!("failed to record {harness} version {version}: {e}");
+    }
 }
 
 /// V14 Phase A: project scope of the prompt-template library, read directly
@@ -551,16 +641,44 @@ fn read_overlay(path: &Path, quarantine: bool) -> Option<Value> {
     }
 }
 
+/// Top-level `Settings` fields that are PER-INSTALL state, written straight
+/// to the physical global file by dedicated writers
+/// (`write_global_llm_pricing`, `mutate_global_harness_versions`) — and must
+/// therefore never appear in a per-project overlay: not written into one by
+/// [`save`]'s diff (those writers bypass the in-memory `global` baseline, so
+/// a later unrelated save would see the field as "changed" and pin the stale
+/// value into the overlay, shadowing every future global write for that
+/// project), and not honored from one at load ([`load`] strips them before
+/// the merge, which also heals overlays contaminated before this guard
+/// existed).
+///
+/// NOT the same set as the fields `apply_incoming_settings`
+/// (ipc/commands.rs) preserves across a Settings-window round trip:
+/// `prompt_templates`/`templates_seeded` are out-of-band there too, but a
+/// project overlay legitimately carries its own project-scoped template
+/// library ([`read_project_prompt_templates`]), so they are NOT banned here.
+const OVERLAY_BANNED_KEYS: &[&str] = &["llm_pricing", "harness_versions"];
+
+fn strip_overlay_banned(v: &mut Value) {
+    if let Value::Object(map) = v {
+        for k in OVERLAY_BANNED_KEYS {
+            map.remove(*k);
+        }
+    }
+}
+
 /// Write the diff between `settings` and `global` to the custom overlay
 /// file in `launch_cwd`. If the diff is empty, deletes any existing
 /// overlay (so a user who reverts every change ends up with a clean
 /// directory).
 pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppResult<()> {
     let path = custom_path(launch_cwd);
-    let current = serde_json::to_value(settings)
+    let mut current = serde_json::to_value(settings)
         .map_err(|e| AppError::Settings(format!("serialize current: {e}")))?;
-    let baseline = serde_json::to_value(global)
+    let mut baseline = serde_json::to_value(global)
         .map_err(|e| AppError::Settings(format!("serialize global: {e}")))?;
+    strip_overlay_banned(&mut current);
+    strip_overlay_banned(&mut baseline);
 
     match diff(&current, &baseline) {
         Some(delta) => {
@@ -2239,8 +2357,9 @@ mod tests {
         let pricing = vec![LlmPricingModel {
             provider: "Anthropic".to_string(),
             model: "Claude Opus 4.8".to_string(),
+            model_prefix: "claude-opus-4-8".to_string(),
             input: 5.0,
-            cache_write: 6.25,
+            cache_write: 10.0,
             cache_read: 0.5,
             output: 25.0,
         }];

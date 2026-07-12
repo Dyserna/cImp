@@ -137,6 +137,11 @@ fn resolve_oob_source(
         });
     }
     if command_is(&cfg.command, "opencode") {
+        // V16 Feature 1: record the OpenCode version for the harness
+        // tripwire. Spawn-time only (the event stream carries no version);
+        // fire-and-forget on a plain thread so a slow/hung `--version` can
+        // never delay the tab launch.
+        note_opencode_version(&cfg.command);
         let port = alloc_loopback_port()?;
         extra_args.push("--port".to_string());
         extra_args.push(port.to_string());
@@ -145,6 +150,35 @@ fn resolve_oob_source(
         return Some(crate::oob::OobSpec::OpenCodeEvent { port });
     }
     None
+}
+
+/// V16 Feature 1: run `opencode --version` once per tab spawn and record the
+/// first output line into the global `harness_versions` tripwire state.
+/// Best-effort in every direction: unresolvable binary, spawn failure, or
+/// junk output all just skip the note (`note_harness_version` also ignores
+/// empty strings and no-ops on an unchanged version).
+fn note_opencode_version(command: &str) {
+    let Ok(binary) = resolve_command(command) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let mut cmd = std::process::Command::new(binary);
+        cmd.arg("--version");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW, same convention as every spawned subprocess.
+            cmd.creation_flags(0x0800_0000);
+        }
+        let Ok(out) = cmd.output() else {
+            return;
+        };
+        // `opencode --version` prints a bare version (e.g. "1.4.2"); take the
+        // first line defensively in case a future build adds a banner.
+        let version = String::from_utf8_lossy(&out.stdout);
+        let version = version.lines().next().unwrap_or("").trim().to_string();
+        crate::settings::note_harness_version("opencode", &version);
+    });
 }
 
 /// Reserve a free loopback TCP port by binding `127.0.0.1:0` and reading the
@@ -256,7 +290,19 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
             }
             // V11 Phase E: PreToolUse read advisor (opt-in; independent of the
             // injection toggle, but still needs the graph). Matches only `Read`.
-            if settings.graph.enabled && settings.graph.read_advisor {
+            // V16 Feature 0: a recorded E1 spike FAILURE (the deny reason
+            // never reaches the model — every remind would be a bare
+            // refusal) hard-blocks the read advisor regardless of the
+            // toggle; the Settings UI renders the block disabled with the
+            // same condition. `e1_blocked` fails closed on unrecognized
+            // hand-typed values; the registry refreshes `harness_versions`
+            // from the physical global file at spawn, so a hand-recorded
+            // outcome takes effect on the next tab launch, not the next app
+            // restart.
+            if settings.graph.enabled
+                && settings.graph.read_advisor
+                && !settings.harness_versions.e1_blocked()
+            {
                 if let Some(command) = crate::statusline::hook_command("--read-hook") {
                     hooks.insert(
                         "PreToolUse".to_string(),
@@ -906,6 +952,56 @@ mod tests {
         // Graph on but injection off + statusline off + checkpoints off →
         // no --settings overlay.
         assert!(settings_overlay(&args).is_none());
+    }
+
+    /// V16 Feature 0: the read-advisor PreToolUse hook installs when the
+    /// graph + toggle are on and the E1 contract isn't recorded as failed —
+    /// and a recorded `e1_status == "fail"` hard-blocks it REGARDLESS of
+    /// the toggle (a deny whose reason never reaches the model is a bare
+    /// refusal; worse than no advisor).
+    #[test]
+    fn read_hook_overlay_gated_on_toggle_and_e1_status() {
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.read_advisor = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        let overlay = settings_overlay(&args).expect("overlay present");
+        let cmd = overlay["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("hook command is a string");
+        assert!(cmd.ends_with(" --read-hook"), "got: {cmd}");
+        assert_eq!(overlay["hooks"]["PreToolUse"][0]["matcher"], "Read");
+
+        // E1 recorded as failed ⇒ no PreToolUse hook even with the toggle on.
+        settings.harness_versions.e1_status = "fail".to_string();
+        let args = build_pre_args(&claude_cfg(), &settings);
+        let overlay = settings_overlay(&args);
+        assert!(
+            overlay.map_or(true, |o| o["hooks"].get("PreToolUse").is_none()),
+            "e1_status=fail must block the read hook"
+        );
+
+        // Unverified (the default) does NOT block — Feature 0's posture is
+        // opt-in-until-proven-broken, not blocked-until-proven-working.
+        settings.harness_versions.e1_status = "unverified".to_string();
+        let args = build_pre_args(&claude_cfg(), &settings);
+        assert!(settings_overlay(&args).is_some_and(|o| o["hooks"]["PreToolUse"].is_array()));
+
+        // The statuses are hand-editable strings; anything unrecognized
+        // fails CLOSED (a typo'd failure record must not install the hook).
+        for status in ["Fail", " fail ", "failed", "faill"] {
+            settings.harness_versions.e1_status = status.to_string();
+            let args = build_pre_args(&claude_cfg(), &settings);
+            let overlay = settings_overlay(&args);
+            assert!(
+                overlay.map_or(true, |o| o["hooks"].get("PreToolUse").is_none()),
+                "unrecognized e1_status {status:?} must fail closed"
+            );
+        }
+        // Recognized non-fail spellings still pass, case-folded.
+        settings.harness_versions.e1_status = "Pass".to_string();
+        let args = build_pre_args(&claude_cfg(), &settings);
+        assert!(settings_overlay(&args).is_some_and(|o| o["hooks"]["PreToolUse"].is_array()));
     }
 
     /// V13 Phase C: the UserPromptSubmit hook (the prompt-tap checkpoint

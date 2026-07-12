@@ -16,6 +16,7 @@
     type TabLifecycleError,
   } from '../ipc';
   import ShellTabFields from './ShellTabFields.svelte';
+  import EnvEditor from '../settings/EnvEditor.svelte';
   import {
     settings as settingsStore,
     applySettings,
@@ -42,6 +43,7 @@
   let command = $state('');
   let argsString = $state('');
   let cwd = $state('');
+  let env = $state<Record<string, string>>({});
   let notificationsError = $state('');
   let notificationsExited = $state('');
   let themeOverride = $state<TerminalThemeSettings | null>(null);
@@ -149,6 +151,7 @@
       command = cfg.command;
       argsString = cfg.args;
       cwd = cfg.cwd ?? '';
+      env = cfg.env ?? {};
       notificationsError = cfg.notifications_error;
       notificationsExited = cfg.notifications_exited;
     } catch (e) {
@@ -158,6 +161,7 @@
       command = '';
       argsString = '';
       cwd = '';
+      env = {};
       notificationsError = '';
       notificationsExited = '';
     }
@@ -314,7 +318,7 @@
         command,
         argsString,
         cwd: cwd.trim() === '' ? null : cwd,
-        env: {},
+        env,
         notificationsError,
         notificationsExited,
         themeOverride,
@@ -369,6 +373,13 @@
       bind:notificationsExited
       {error}
     />
+    <div class="env-field">
+      <span class="env-label">Environment variables</span>
+      <EnvEditor {env} onchange={(v) => (env = v)} />
+      <small class="hint-row no-indent">
+        Extra env vars for this shell's process. Applied on next restart.
+      </small>
+    </div>
     {#if error && !['empty-name', 'command-not-found', 'cwd-not-found'].includes(error.kind)}
       <div class="generic-error">
         {#if error.kind === 'wrong-kind'}
@@ -538,6 +549,20 @@
     display: block;
     margin-bottom: var(--space-2);
     margin-left: 140px;
+  }
+  .hint-row.no-indent {
+    margin-left: 0;
+    margin-top: var(--space-1);
+  }
+  .env-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-bottom: var(--space-3);
+  }
+  .env-label {
+    font-size: var(--font-size-sm);
+    color: var(--text-quiet);
   }
   .actions {
     display: flex;

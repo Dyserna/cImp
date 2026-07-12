@@ -5,6 +5,50 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.4] — 2026-07-12
+
+### Added
+
+- **Harness-contract hardening (V16).** The Claude Code / OpenCode
+  integration contracts are now actively monitored instead of assumed:
+  a version tripwire surfaces untested CLI upgrades (with a "Mark
+  verified" flow), new `drift.*` advisor canaries fire when the hook,
+  injection, or usage surfaces stop behaving (silent read hook, unseen
+  injections, vanished usage fields, malformed payloads, shell-read
+  bypasses), the read-hook shim validates its payload contract, and a
+  failed E1 hook check hard-blocks the dependent features rather than
+  letting them run silently broken. The read advisor's trust is now on
+  a TTL, re-verified as sessions pass.
+- **Usage: tokens | est. cost toggle.** The Usage cards can render as
+  estimated dollar cost using the price table (models auto-matched by
+  prefix; mixed-model sessions labeled "est · mixed"), and the
+  Effectiveness line now compounds cache-read savings.
+- **Settings UI: token-efficiency controls.** The V11 read-advisor
+  knobs (master toggle, min lines, advise/substitute mode) and LLM
+  digests are editable in Code Intelligence settings; the
+  injection-gated knobs (dedup TTL, repo map on session start,
+  compaction context) nest under the Context injection toggle.
+- **Settings UI: full-schema gap closure.** Every user-facing setting
+  now has an editor: all bindable shortcuts (tab 3–9, new shell tab,
+  close tab, pane focus/split/close), per-tab env vars via a shared
+  key/value editor, terminal scrollback (ring size / persist / restore),
+  background snapshot lines, preview_allow_remote, offload global
+  concurrency and per-backend declared model.
+
+### Fixed
+
+- **Advisor: context_min_score is enforced per file.** The score floor
+  now applies inside context packing (not just to the top match), so
+  marginal tail files no longer ride in under a strong #1 — they were
+  the bulk of the injected-but-never-touched waste.
+- **Advisor: Apply starts a 3-session cooldown.** Applying a proposal
+  no longer risks an immediate re-proposal judged on data collected
+  under the old value; unlike a dismissal, the cooldown expires on its
+  own.
+- **Shell-tab dialogs no longer wipe env vars.** Configure Tab and New
+  Shell Tab previously saved `env: {}`, silently discarding hand-edited
+  per-tab env vars.
+
 ## [0.41.3] — 2026-07-12
 
 ### Added

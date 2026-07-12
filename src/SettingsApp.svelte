@@ -10,6 +10,7 @@
   import {
     aiToolTabDefaults,
     consumeSettingsDeepLink,
+    harnessVersionsGet,
     listVoices,
     llmPricingGet,
     llmPricingSet,
@@ -18,6 +19,7 @@
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
+    HarnessVersions,
     ProcessingDevice,
     Settings,
     ShellTabConfig,
@@ -28,6 +30,7 @@
     defaultSettings,
     findTab,
     findTabIndex,
+    harnessStatusBlocks,
     toPresetConfig,
   } from './lib/settings/types';
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
@@ -246,11 +249,11 @@
   function addLlmPricingRow(): void {
     llmPricing = [
       ...llmPricing,
-      { provider: 'Custom', model: `model-${llmPricing.length + 1}`, input: 0, cache_write: 0, cache_read: 0, output: 0 },
+      { provider: 'Custom', model: `model-${llmPricing.length + 1}`, model_prefix: '', input: 0, cache_write: 0, cache_read: 0, output: 0 },
     ];
     llmPricingDirty = true;
   }
-  function editLlmPricingText(i: number, field: 'provider' | 'model', value: string): void {
+  function editLlmPricingText(i: number, field: 'provider' | 'model' | 'model_prefix', value: string): void {
     llmPricing = llmPricing.map((r, idx) => (idx === i ? { ...r, [field]: value } : r));
     llmPricingDirty = true;
   }
@@ -320,6 +323,14 @@
   // V8-02 backend pool: live per-backend status rows + a refresh loop while
   // the Offload section is open.
   let backendStatuses = $state<BackendStatus[]>([]);
+  // V16 Feature 6: the Code Intelligence section's `context_llm_digests`
+  // toggle is health-aware — enabled only when a LOCAL backend is ready
+  // (the digest path is local-only by design). Polled by the same
+  // `startBackendStatusPolling` loop the Offload section uses. Turning the
+  // feature OFF is always allowed; only turning it ON is gated.
+  const localOffloadReady = $derived(
+    backendStatuses.some((b) => b.kind === 'local' && b.state === 'ready'),
+  );
   // V8-03 warm pool: honest global in-flight + per-MCP-server health.
   let serviceStatus = $state<ServiceStatus | null>(null);
   let backendStatusTimer: ReturnType<typeof setInterval> | null = null;
@@ -677,6 +688,16 @@
   let tabDefaults = $state<Record<string, AiToolTabConfig | null>>({});
   let snapshot = $state<Settings | null>(null);
 
+  // V16: `harness_versions` is out-of-band — written straight to the
+  // physical global file by the transcript tap / hand edits — so the
+  // settings snapshot only reflects app startup. Fetched fresh once per
+  // Settings-window open; the E1 hard block below prefers it so a
+  // just-recorded outcome disables the toggle without an app restart.
+  let harnessFresh = $state<HarnessVersions | null>(null);
+  const e1Blocked = $derived(
+    harnessStatusBlocks((harnessFresh ?? snapshot?.harness_versions)?.e1_status ?? ''),
+  );
+
   // Sidebar nav: which group is visible. The template gates each <section>
   // on this so only one group renders at a time. Default lands on 'theme'
   // (Appearance sits at the top of the nav order).
@@ -715,6 +736,31 @@
     { id: 'about', label: 'About' },
   ];
   const REPO_URL = 'https://github.com/Dyserna/cImp';
+
+  // Shortcut rows rendered as loops — the numbered tab slots and the pane
+  // actions are 16 near-identical <label> rows otherwise. Every key is a
+  // `string | null` field of the shortcuts slice.
+  type ShortcutKey = keyof Settings['shortcuts'];
+  const TAB_SHORTCUT_ROWS: readonly (readonly [ShortcutKey, string])[] = [
+    ['switch_to_tab_3', 'Switch to tab 3'],
+    ['switch_to_tab_4', 'Switch to tab 4'],
+    ['switch_to_tab_5', 'Switch to tab 5'],
+    ['switch_to_tab_6', 'Switch to tab 6'],
+    ['switch_to_tab_7', 'Switch to tab 7'],
+    ['switch_to_tab_8', 'Switch to tab 8'],
+    ['switch_to_tab_9', 'Switch to tab 9'],
+    ['new_shell_tab', 'New shell tab'],
+    ['close_tab', 'Close current tab'],
+  ];
+  const PANE_SHORTCUT_ROWS: readonly (readonly [ShortcutKey, string])[] = [
+    ['focus_pane_left', 'Focus pane left'],
+    ['focus_pane_right', 'Focus pane right'],
+    ['focus_pane_up', 'Focus pane up'],
+    ['focus_pane_down', 'Focus pane down'],
+    ['split_pane_horizontal', 'Split pane (side by side)'],
+    ['split_pane_vertical', 'Split pane (stacked)'],
+    ['close_pane', 'Close focused pane'],
+  ];
 
   // Sub-tab nav within the Tabs section. Each AI builtin gets its own
   // sub-tab; every Shell tab is grouped under 'shells'. Keeps the
@@ -807,6 +853,9 @@
       .catch((e) => console.warn('stt_list_input_devices failed', e));
     void loadComposeTemplates();
     void loadLlmPricing();
+    harnessVersionsGet()
+      .then((hv) => (harnessFresh = hv))
+      .catch((e) => console.warn('harness_versions_get failed', e));
     for (const t of AI_TABS) {
       aiToolTabDefaults(t)
         .then((d) => {
@@ -2073,6 +2122,26 @@
             the Configure Tab dialog. Color, opacity, blur, size, position,
             and tint always preview live.
           </small>
+          <label>
+            <span>Scrollback kept across renderer switches (lines)</span>
+            <input
+              type="number"
+              min="0"
+              value={snapshot.terminal.background.snapshot_lines}
+              onchange={(e) =>
+                patch((s) => {
+                  const n = Number((e.currentTarget as HTMLInputElement).value);
+                  s.terminal.background.snapshot_lines = Number.isFinite(n)
+                    ? Math.max(0, Math.floor(n))
+                    : 2000;
+                })}
+            />
+          </label>
+          <small class="hint">
+            Rows re-painted when a background change switches the terminal
+            renderer (WebGL ↔ DOM). Higher keeps more history through the
+            flip at the cost of a bigger in-memory snapshot.
+          </small>
         </section>
         <section>
           <h2>Display</h2>
@@ -2527,6 +2596,24 @@
             graph calls and offload requests, plus the graph/offload tool
             reference lists.
           </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.preview_allow_remote}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.preview_allow_remote = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Allow <strong>Preview</strong> tabs to load remote URLs</span>
+          </label>
+          <small class="hint">
+            Off (default) restricts Preview-tab navigation to localhost and
+            private-network (RFC&nbsp;1918) hosts — the tab is meant for your
+            own dev servers. On lets a Preview tab load any http(s) URL in its
+            embedded webview.
+          </small>
           <div class="sub-tabs" role="tablist" aria-label="Tabs sub-sections">
             <button
               type="button"
@@ -2862,8 +2949,9 @@
               }
             />
           </label>
+          <h3>Tabs</h3>
           <label>
-            <span>Switch to Claude tab</span>
+            <span>Switch to tab 1</span>
             <ShortcutCapture
               bind:value={
                 () => snapshot!.shortcuts.switch_to_tab_1,
@@ -2872,7 +2960,7 @@
             />
           </label>
           <label>
-            <span>Switch to Claude (local) tab</span>
+            <span>Switch to tab 2</span>
             <ShortcutCapture
               bind:value={
                 () => snapshot!.shortcuts.switch_to_tab_2,
@@ -2880,6 +2968,32 @@
               }
             />
           </label>
+          {#each TAB_SHORTCUT_ROWS as [key, label] (key)}
+            <label>
+              <span>{label}</span>
+              <ShortcutCapture
+                bind:value={
+                  () => snapshot!.shortcuts[key],
+                  (v) => patch((s) => (s.shortcuts[key] = v))
+                }
+              />
+            </label>
+          {/each}
+
+          <h3>Panes</h3>
+          {#each PANE_SHORTCUT_ROWS as [key, label] (key)}
+            <label>
+              <span>{label}</span>
+              <ShortcutCapture
+                bind:value={
+                  () => snapshot!.shortcuts[key],
+                  (v) => patch((s) => (s.shortcuts[key] = v))
+                }
+              />
+            </label>
+          {/each}
+
+          <h3>Voice</h3>
           <label>
             <span>Push-to-talk (speech-to-text)</span>
             <ShortcutCapture
@@ -3376,6 +3490,22 @@
                     placeholder="e.g. 16000"
                   />
                 </label>
+                <label>
+                  <span>Declared model name (when /props is absent)</span>
+                  <input
+                    type="text"
+                    placeholder="e.g. qwen3-32b"
+                    value={backend.declared_model}
+                    oninput={(e) =>
+                      updateBackend(i, (b) => {
+                        b.declared_model = (e.currentTarget as HTMLInputElement).value.trim();
+                      })}
+                  />
+                  <small class="hint">
+                    Cosmetic label shown for this backend when the endpoint
+                    doesn't report its model.
+                  </small>
+                </label>
               {/if}
 
               <hr class="card-divider lg" />
@@ -3537,6 +3667,28 @@
               When every slot is busy and this many tasks are already waiting,
               new offloads are rejected immediately instead of queuing. Blank
               keeps the unbounded queue (each waits up to the timeout above).
+            </small>
+          </label>
+          <label>
+            <span>Global concurrency (blank = auto)</span>
+            <input
+              type="number"
+              min="1"
+              placeholder="auto"
+              value={snapshot.offload.global_concurrency ?? ''}
+              onchange={(e) => {
+                const raw = (e.currentTarget as HTMLInputElement).value.trim();
+                const n = Math.floor(+raw);
+                patch(
+                  (s) =>
+                    (s.offload.global_concurrency =
+                      raw === '' || !Number.isFinite(n) || n <= 0 ? null : n),
+                );
+              }}
+            />
+            <small class="hint">
+              Cap on offload tasks in flight across the whole app. Blank
+              auto-sizes from the summed per-backend slot counts.
             </small>
           </label>
           {:else}
@@ -4120,7 +4272,175 @@
                 />
                 <span>Rank session-hot files first (from Memory)</span>
               </label>
+              <label>
+                <span>Dedup TTL (turns, 0 = re-inject every turn)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.context_dedup_ttl_turns}
+                  onchange={(e) =>
+                    patch((s) => {
+                      // 0 is a valid value (dedup off), so keep it — a bare
+                      // `|| 10` would treat the falsy 0 as "unset" and revert it.
+                      const n = Number((e.currentTarget as HTMLInputElement).value);
+                      s.graph.context_dedup_ttl_turns = Number.isFinite(n) ? Math.max(0, n) : 10;
+                    })}
+                />
+              </label>
+              <small class="hint">
+                A file injected in full is demoted to a one-line "unchanged"
+                reminder on later turns until it changes or this many turns pass.
+              </small>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.repo_map_on_session_start}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.repo_map_on_session_start = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Prepend the project map to each new session's first turn</span>
+              </label>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.compaction_context}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.compaction_context = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Feed working set + pinned notes to Claude's compactor</span>
+              </label>
+              <small class="hint">
+                On compaction (<code>PreCompact</code> hook) the session's working
+                set and pinned notes are handed to the summarizer so they survive.
+                Costs a few hundred chars once per compaction. Re-launch the tab to
+                pick up changes.
+              </small>
             {/if}
+
+            <h3>Token efficiency</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.read_advisor}
+                disabled={e1Blocked}
+                onchange={(e) =>
+                  patch(
+                    (s) => (s.graph.read_advisor = (e.currentTarget as HTMLInputElement).checked),
+                  )}
+              />
+              <span>Redundant-read advisor (Claude tabs)</span>
+            </label>
+            {#if e1Blocked}
+              <small class="hint">
+                Blocked: the E1 contract check recorded that Claude Code does
+                <strong>not</strong> surface a deny reason to the model on this
+                version — every reminder would be a bare refusal, worse than no
+                advisor. The hook is not installed regardless of this toggle.
+                Re-run the check in <code>MAINTENANCE.md</code> → harness
+                contracts after the next Claude Code update.
+              </small>
+            {:else}
+              <small class="hint">
+                Intercepts a <code>Read</code> of a file already read unchanged this
+                session and answers with a cheap outline reminder instead of
+                re-reading it. Changes the agent's tool behaviour — strictly opt-in.
+                Claude tabs only for now. Re-launch the tab to pick it up.
+              </small>
+            {/if}
+            {#if snapshot.graph.read_advisor && !e1Blocked}
+              <label>
+                <span>Min file size to advise (lines)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.read_advisor_min_lines}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.read_advisor_min_lines = Math.max(
+                          0,
+                          Number((e.currentTarget as HTMLInputElement).value) || 300,
+                        )),
+                    )}
+                />
+              </label>
+              <small class="hint">
+                Files with fewer lines than this always pass — a small file is
+                cheap to re-read; the reminder isn't worth it.
+              </small>
+              <label>
+                <span>Reminder mode</span>
+                <select
+                  value={snapshot.graph.read_advisor_mode}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.read_advisor_mode = (
+                          e.currentTarget as HTMLSelectElement
+                        ).value),
+                    )}
+                >
+                  <option value="advise">Advise — outline reminder only</option>
+                  <option value="substitute">Substitute — outline + most relevant symbol body</option>
+                </select>
+              </label>
+              <label>
+                <span>Trust TTL (retrieve turns, 0 = whole session)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.read_advisor_ttl_turns}
+                  onchange={(e) =>
+                    patch((s) => {
+                      // 0 is a valid value (TTL off), so keep it — a bare
+                      // `|| 0` happens to coincide here, but stay explicit.
+                      const n = Number((e.currentTarget as HTMLInputElement).value);
+                      s.graph.read_advisor_ttl_turns = Number.isFinite(n) ? Math.max(0, n) : 0;
+                    })}
+                />
+              </label>
+              <small class="hint">
+                After this many retrieval turns since the advisor last saw the
+                file read in full, a <code>Read</code> passes again — bounds how
+                long the agent's memory is trusted across context loss the
+                advisor can't observe (context editing, tool-result truncation).
+              </small>
+            {/if}
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.context_llm_digests}
+                disabled={!snapshot.graph.context_llm_digests && !localOffloadReady}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.context_llm_digests = (
+                        e.currentTarget as HTMLInputElement
+                      ).checked),
+                  )}
+              />
+              <span>Local-model digests for outline-poor files</span>
+            </label>
+            <small class="hint">
+              For files with no useful outline (docs, configs, long scripts), the
+              <strong>local</strong> offload backend writes a 3-line semantic
+              digest, cached in <code>graph.db</code>. Needs a ready local offload
+              backend; never leaves this machine.
+              {#if !localOffloadReady}
+                <strong>No local offload backend is ready</strong> — start one in
+                Settings → Offload to enable this.
+              {/if}
+            </small>
 
             <h3>Architecture &amp; path tracing</h3>
             <small class="hint">
@@ -4300,11 +4620,14 @@
           <h2>LLM pricing</h2>
           <small class="hint top">
             Provider/model token prices (USD per <strong>million tokens</strong>,
-            "MTok") used by the Code Intelligence tab's session-cost popup —
-            click any row in Usage → Sessions to price that session. Fresh
-            installs are seeded with current Anthropic API and GitHub Copilot
-            rates; every value is editable. Saved to the global settings file,
-            not this project's overlay.
+            "MTok") used by the Code Intelligence tab's session-cost popup and
+            its Usage view's <em>est. cost</em> mode (auto-matched by the
+            <em>Id prefix</em> column). Fresh installs are seeded with current
+            Anthropic API and GitHub Copilot rates — Anthropic cache-write at
+            the 1-hour-TTL 2× rate Claude Code sessions actually pay; every
+            value is editable, and prices drift, so corrections are yours to
+            make (no auto-update). Saved to the global settings file, not this
+            project's overlay.
           </small>
           {#if llmPricingLoading}
             <small class="hint">Loading…</small>
@@ -4315,6 +4638,7 @@
               <div class="pricing-head-row">
                 <span>Provider</span>
                 <span>Model</span>
+                <span title="Transcript model-id prefix this row auto-matches in the Usage view's cost mode (e.g. claude-opus-4-8). Longest match wins; empty = manual-pick only.">Id prefix</span>
                 <span class="num">Input</span>
                 <span class="num">Cache write</span>
                 <span class="num">Cache read</span>
@@ -4339,6 +4663,14 @@
                     value={row.model}
                     oninput={(e) =>
                       editLlmPricingText(i, 'model', (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <input
+                    type="text"
+                    placeholder="e.g. claude-opus-4-8"
+                    title="Transcript model-id prefix for cost-mode auto-match (longest wins; empty = manual-pick only)"
+                    value={row.model_prefix}
+                    oninput={(e) =>
+                      editLlmPricingText(i, 'model_prefix', (e.currentTarget as HTMLInputElement).value)}
                   />
                   <input
                     type="number"
@@ -4656,6 +4988,68 @@
         </section>
 
         <section>
+          <h2>Terminal scrollback</h2>
+          <small class="hint top">
+            Each tab's PTY output is kept in an in-memory ring buffer so
+            re-opened panes and restarts can replay history.
+          </small>
+          <label>
+            <span>Ring buffer size (bytes per tab)</span>
+            <input
+              type="number"
+              min="4096"
+              value={snapshot.terminal.scrollback.ring_bytes}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.terminal.scrollback.ring_bytes = Math.max(
+                      4096,
+                      Number((e.currentTarget as HTMLInputElement).value) || 262144,
+                    )),
+                )}
+            />
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.terminal.scrollback.persist}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.terminal.scrollback.persist = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Save scrollback to disk on exit</span>
+          </label>
+          <small class="hint">
+            On graceful exit each tab's ring is written to
+            <code>scrollback/&lt;tab-id&gt;.bin</code> in the config
+            directory. Terminal output can contain sensitive text — leave
+            off if that shouldn't touch disk.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.terminal.scrollback.restore_on_launch}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.terminal.scrollback.restore_on_launch = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Restore saved scrollback on launch</span>
+          </label>
+          <small class="hint">
+            Replays the persisted bytes into each tab before live output
+            resumes on the next launch.
+          </small>
+        </section>
+
+        <section>
           <h2>Reset</h2>
           <small class="hint top">
             Replace every setting with its factory default. Wipes
@@ -4784,7 +5178,8 @@
   .pricing-head-row,
   .pricing-row {
     display: grid;
-    grid-template-columns: minmax(6rem, 0.7fr) minmax(9rem, 1fr) 5.5rem 5.5rem 5.5rem 5.5rem auto;
+    /* V16 Feature 8 added the Id-prefix column between Model and Input. */
+    grid-template-columns: minmax(6rem, 0.7fr) minmax(8rem, 1fr) minmax(7rem, 0.9fr) 5.5rem 5.5rem 5.5rem 5.5rem auto;
     gap: 0.4rem;
     align-items: center;
     margin-top: 0.4rem;

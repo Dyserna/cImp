@@ -225,6 +225,15 @@ pub struct Settings {
     /// changed rate re-fires the proposal even though the same `rule_id`
     /// still matches. Additive `#[serde(default)]`; empty on a fresh install.
     pub advisor_dismissed: Vec<DismissedRule>,
+    /// Advisor proposals the user has APPLIED, with the project's session
+    /// count at apply time. Each entry holds its rule quiet for
+    /// `advisor::APPLY_COOLDOWN_SESSIONS` further sessions — the advisor's
+    /// rates are cumulative, so an immediate re-proposal after Apply would be
+    /// judging data collected almost entirely under the OLD value, not
+    /// evidence the raise failed. One entry per (rule, project root);
+    /// re-applying replaces it (see `ipc::commands::advisor_mark_applied`).
+    /// Additive `#[serde(default)]`; empty on a fresh install.
+    pub advisor_applied: Vec<AppliedRule>,
     /// V14 Phase F: the last URL entered into any Preview tab, remembered so
     /// the next "New Preview tab" starts from where the user left off rather
     /// than the hardcoded fallback (`preview::DEFAULT_PREVIEW_URL`). A plain
@@ -255,6 +264,15 @@ pub struct Settings {
     /// deleted seeds stay deleted; no `templates_seeded`-style flag needed).
     #[serde(default = "default_llm_pricing")]
     pub llm_pricing: Vec<LlmPricingModel>,
+    /// V16 Feature 1: per-install harness version + contract-verification
+    /// state. Global-only like `llm_pricing` (a harness install is per
+    /// machine, not per project): read/written through
+    /// `settings::persistence::{read,write}_global_harness_versions`, which
+    /// target the physical global `settings.json` directly — background
+    /// writers (the transcript tap, tab spawn) must never land this in a
+    /// project overlay diff.
+    #[serde(default)]
+    pub harness_versions: HarnessVersions,
 }
 
 impl Default for Settings {
@@ -289,9 +307,83 @@ impl Default for Settings {
             prompt_templates: Vec::new(),
             templates_seeded: false,
             advisor_dismissed: Vec::new(),
+            advisor_applied: Vec::new(),
             preview_last_url: None,
             preview_allow_remote: false,
             llm_pricing: default_llm_pricing(),
+            harness_versions: HarnessVersions::default(),
+        }
+    }
+}
+
+/// V16 Feature 1 (harness version tripwire) + Feature 0 (contract spikes):
+/// what harness versions this install has seen, which Claude Code version
+/// the hook contracts were last hands-on verified against, and the recorded
+/// outcomes of the two V11 `TODO(spike)` contracts. All plain strings so a
+/// hand edit in `settings.json` is always possible (the D0/E1 outcomes are
+/// *recorded* here after a manual spike run — see
+/// `docs/MAINTENANCE.md` → "Claude Code / OpenCode CLIs").
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct HarnessVersions {
+    /// Latest Claude Code version observed in a transcript (`version` field
+    /// on session JSONL entries), e.g. `"2.1.14"`. Empty until a Claude tab
+    /// has run once. Written by the OOB tap, once per session at most.
+    pub claude_last_seen: String,
+    /// Claude Code version the MAINTENANCE.md contract checks were last run
+    /// against. Set from the Advisor card's "Mark verified" action (or by
+    /// hand). `claude_last_seen != claude_last_verified` ⇒ the Advisor
+    /// raises the `drift.harness_version.v1` notice.
+    pub claude_last_verified: String,
+    /// Latest OpenCode version from `opencode --version` at tab spawn.
+    /// Informational for now (no verified-against tracking — the OpenCode
+    /// contract surface is the generated plugin, gated by its own spike).
+    /// Write-only today: nothing consumes it yet — recorded so the history
+    /// exists when the OpenCode spike lands, not wired anywhere.
+    pub opencode_last_seen: String,
+    /// Outcome of the E1 spike (PreToolUse deny `permissionDecisionReason`
+    /// reaches the model): `"unverified" | "pass" | "fail"`. `"fail"` hard
+    /// blocks the read advisor — the Settings toggle renders disabled and
+    /// `tabs/config.rs` refuses to install the PreToolUse hook regardless of
+    /// `graph.read_advisor`.
+    pub e1_status: String,
+    /// Outcome of the D0 spike (PreCompact `additionalContext` reaches the
+    /// compaction prompt): `"unverified" | "pass" | "fail"`. Informational —
+    /// a fail warns (the feature degrades to a no-op, it can't misbehave).
+    pub d0_status: String,
+}
+
+impl HarnessVersions {
+    /// Whether a recorded spike status blocks its feature. The statuses are
+    /// deliberately hand-editable strings (see the struct doc), so this is
+    /// the ONE comparison allowed to interpret them — never compare against
+    /// a bare `"fail"` literal at a call site. Normalizes (trim +
+    /// case-fold) and fails CLOSED: anything that isn't a recognized
+    /// non-fail value (`"unverified"`, `"pass"`, or empty/missing) blocks,
+    /// so a hand-typed `"Fail"`/`"failed"` surfaces as the disabled toggle
+    /// + uninstalled hook instead of silently sailing past the gate.
+    /// Mirrored in the frontend as `harnessStatusBlocks`
+    /// (src/lib/settings/types.ts) — keep the two in sync.
+    pub fn status_blocks(status: &str) -> bool {
+        let s = status.trim().to_ascii_lowercase();
+        !(s.is_empty() || s == "unverified" || s == "pass")
+    }
+
+    /// The E1 hard block (PreToolUse deny reason never reaches the model —
+    /// see `tabs/config.rs` and the Settings toggle).
+    pub fn e1_blocked(&self) -> bool {
+        Self::status_blocks(&self.e1_status)
+    }
+}
+
+impl Default for HarnessVersions {
+    fn default() -> Self {
+        Self {
+            claude_last_seen: String::new(),
+            claude_last_verified: String::new(),
+            opencode_last_seen: String::new(),
+            e1_status: "unverified".to_string(),
+            d0_status: "unverified".to_string(),
         }
     }
 }
@@ -307,6 +399,11 @@ impl Default for Settings {
 pub struct LlmPricingModel {
     pub provider: String,
     pub model: String,
+    /// V16 Feature 8: transcript model-id prefix this row auto-matches
+    /// (e.g. `"claude-opus-4-8"` matches both the bare alias and dated
+    /// snapshots). Longest matching prefix wins; empty = manual-pick only
+    /// (the row still appears in the cost popup's dropdown).
+    pub model_prefix: String,
     /// $/MTok for uncached input tokens.
     pub input: f64,
     /// $/MTok for cache-write (cache-creation) tokens.
@@ -318,17 +415,24 @@ pub struct LlmPricingModel {
 }
 
 /// Fresh-install price seeds (as of 2026-07): Anthropic API list prices
-/// (cache write = 1.25x input at the default 5-minute TTL, cache read =
-/// 0.1x input) and GitHub Copilot's per-token prices from its June 2026
-/// usage-based billing (the Sonnet 5 row is the promo rate that runs
-/// through 2026-08-31). Copilot's OpenAI/Google rows had no published
-/// cache-write premium, so those seed cache_write = input; all values are
-/// plain editable rows, not constants the app depends on.
+/// and GitHub Copilot's per-token prices from its June 2026 usage-based
+/// billing (the Sonnet 5 row is the promo rate that runs through
+/// 2026-08-31). V16 decision (2026-07-12): the Anthropic rows seed cache
+/// write at the **1-hour-TTL 2x-input rate** — Claude Code sessions use the
+/// 1h cache, so the 5-minute tier's 1.25x would undersell what those
+/// sessions actually pay (cache read stays 0.1x input). Copilot's
+/// OpenAI/Google rows had no published cache-write premium, so those seed
+/// cache_write = input; all values are plain editable rows, not constants
+/// the app depends on. Anthropic rows carry a `model_prefix` so the Usage
+/// view's cost mode can auto-match transcript model ids (longest prefix
+/// wins); Copilot rows are manual-pick only (Copilot sessions never appear
+/// in the Claude transcript tap).
 pub fn default_llm_pricing() -> Vec<LlmPricingModel> {
-    fn row(provider: &str, model: &str, prices: [f64; 4]) -> LlmPricingModel {
+    fn row(provider: &str, model: &str, prefix: &str, prices: [f64; 4]) -> LlmPricingModel {
         LlmPricingModel {
             provider: provider.to_string(),
             model: model.to_string(),
+            model_prefix: prefix.to_string(),
             input: prices[0],
             cache_write: prices[1],
             cache_read: prices[2],
@@ -336,22 +440,22 @@ pub fn default_llm_pricing() -> Vec<LlmPricingModel> {
         }
     }
     vec![
-        row("Anthropic", "Claude Fable 5", [10.0, 12.5, 1.0, 50.0]),
-        row("Anthropic", "Claude Opus 4.8", [5.0, 6.25, 0.5, 25.0]),
-        row("Anthropic", "Claude Opus 4.7", [5.0, 6.25, 0.5, 25.0]),
-        row("Anthropic", "Claude Opus 4.6", [5.0, 6.25, 0.5, 25.0]),
-        row("Anthropic", "Claude Sonnet 5", [3.0, 3.75, 0.3, 15.0]),
-        row("Anthropic", "Claude Sonnet 4.6", [3.0, 3.75, 0.3, 15.0]),
-        row("Anthropic", "Claude Haiku 4.5", [1.0, 1.25, 0.1, 5.0]),
-        row("Copilot", "Claude Sonnet 5 (promo)", [2.0, 2.5, 0.2, 10.0]),
-        row("Copilot", "Claude Sonnet 4.6", [3.0, 3.75, 0.3, 15.0]),
-        row("Copilot", "Claude Opus 4.8", [5.0, 6.25, 0.5, 25.0]),
-        row("Copilot", "Claude Haiku 4.5", [1.0, 1.25, 0.1, 5.0]),
-        row("Copilot", "GPT-5 mini", [0.25, 0.25, 0.025, 2.0]),
-        row("Copilot", "GPT-5.4", [2.5, 2.5, 0.25, 15.0]),
-        row("Copilot", "GPT-5.5", [5.0, 5.0, 0.5, 30.0]),
-        row("Copilot", "Gemini 2.5 Pro", [1.25, 1.25, 0.31, 10.0]),
-        row("Copilot", "Gemini 3.5 Flash", [1.5, 1.5, 0.38, 9.0]),
+        row("Anthropic", "Claude Fable 5", "claude-fable-5", [10.0, 20.0, 1.0, 50.0]),
+        row("Anthropic", "Claude Opus 4.8", "claude-opus-4-8", [5.0, 10.0, 0.5, 25.0]),
+        row("Anthropic", "Claude Opus 4.7", "claude-opus-4-7", [5.0, 10.0, 0.5, 25.0]),
+        row("Anthropic", "Claude Opus 4.6", "claude-opus-4-6", [5.0, 10.0, 0.5, 25.0]),
+        row("Anthropic", "Claude Sonnet 5", "claude-sonnet-5", [3.0, 6.0, 0.3, 15.0]),
+        row("Anthropic", "Claude Sonnet 4.6", "claude-sonnet-4-6", [3.0, 6.0, 0.3, 15.0]),
+        row("Anthropic", "Claude Haiku 4.5", "claude-haiku-4-5", [1.0, 2.0, 0.1, 5.0]),
+        row("Copilot", "Claude Sonnet 5 (promo)", "", [2.0, 2.5, 0.2, 10.0]),
+        row("Copilot", "Claude Sonnet 4.6", "", [3.0, 3.75, 0.3, 15.0]),
+        row("Copilot", "Claude Opus 4.8", "", [5.0, 6.25, 0.5, 25.0]),
+        row("Copilot", "Claude Haiku 4.5", "", [1.0, 1.25, 0.1, 5.0]),
+        row("Copilot", "GPT-5 mini", "", [0.25, 0.25, 0.025, 2.0]),
+        row("Copilot", "GPT-5.4", "", [2.5, 2.5, 0.25, 15.0]),
+        row("Copilot", "GPT-5.5", "", [5.0, 5.0, 0.5, 30.0]),
+        row("Copilot", "Gemini 2.5 Pro", "", [1.25, 1.25, 0.31, 10.0]),
+        row("Copilot", "Gemini 3.5 Flash", "", [1.5, 1.5, 0.38, 9.0]),
     ]
 }
 
@@ -365,6 +469,21 @@ pub fn default_llm_pricing() -> Vec<LlmPricingModel> {
 pub struct DismissedRule {
     pub rule_id: String,
     pub signature: String,
+}
+
+/// One APPLIED advisor proposal — the Apply-cooldown's memory. `rule_id`
+/// mirrors `advisor::Proposal::rule_id`; `root` is the project root the
+/// Apply happened in (the advisor's rates are per-root, so a cooldown in one
+/// project must not mute another); `session_count` is that root's distinct
+/// session count at apply time. The rule stays quiet until the root has seen
+/// `advisor::APPLY_COOLDOWN_SESSIONS` further sessions — see
+/// `advisor::evaluate`.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct AppliedRule {
+    pub rule_id: String,
+    pub root: String,
+    pub session_count: u64,
 }
 
 /// Logging configuration. The file path is fixed at
@@ -1189,6 +1308,12 @@ pub struct GraphSettings {
     /// `"advise"` (remind with the outline) or `"substitute"` (also include the
     /// most relevant symbol body). Default `"advise"`.
     pub read_advisor_mode: String,
+    /// V16 Feature 5: trust TTL — after this many retrieval turns since the
+    /// advisor last observed a full read of a file, a `Read` passes again
+    /// (bounds how long the advisor trusts the agent's memory across context
+    /// loss it can't observe: context editing, tool-result truncation).
+    /// 0 = off (the pre-V16 behavior: trust for the whole session).
+    pub read_advisor_ttl_turns: u32,
 
     // --- V11 Phase F: local-model context digests ---
     /// For files with no useful outline (docs/configs/long scripts), have the
@@ -1281,6 +1406,9 @@ pub struct GraphSettings {
     pub usage_color_cache: String,
     pub usage_color_out: String,
     pub usage_color_tool: String,
+    /// V16 Feature 8: the cache-write segment's color — new alongside the
+    /// four above now that `cache_make` is plotted as its own segment.
+    pub usage_color_write: String,
 }
 
 impl GraphSettings {
@@ -1340,6 +1468,7 @@ impl Default for GraphSettings {
             read_advisor: false,
             read_advisor_min_lines: 300,
             read_advisor_mode: "advise".to_string(),
+            read_advisor_ttl_turns: 0,
             context_llm_digests: false,
             memory_distillation: false,
             promote_pinned_facts: false,
@@ -1364,6 +1493,7 @@ impl Default for GraphSettings {
             usage_color_cache: "#d2a8ff".to_string(),
             usage_color_out: "#3fb950".to_string(),
             usage_color_tool: "#f0c674".to_string(),
+            usage_color_write: "#e3738d".to_string(),
         }
     }
 }

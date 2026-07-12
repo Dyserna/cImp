@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -193,7 +193,14 @@ pub struct GraphService {
     /// V11 Phase E: `(session_id, rel_path)` pairs the read advisor has already
     /// reminded about — one reminder per file per session, so an agent that reads
     /// again after a reminder (it knows better than our heuristic) always passes.
-    reminded: StdMutex<HashSet<(String, String)>>,
+    /// V16 Feature 4: the value records WHEN the reminder fired (turn + wall
+    /// clock) and how many chars it displaced, so the transcript tap's bypass
+    /// matcher can test "shell read of a just-reminded file" and the
+    /// Effectiveness accounting can un-count a bypassed remind.
+    /// Keyed session-first so `check_bypass` (which runs on EVERY Claude
+    /// Bash `tool_use` across all tabs) scans only its own session's
+    /// reminders, not the whole process-wide set.
+    reminded: StdMutex<HashMap<String, HashMap<String, RemindMark>>>,
     /// V11 Phase E / F4-fix: the content hash the read advisor last observed on
     /// disk for a `(session_id, rel_path)` — i.e. what the agent actually read
     /// last time. The staleness check compares against THIS, not the index hash:
@@ -201,7 +208,9 @@ pub struct GraphService {
     /// content, but the agent's context still holds the version it read before
     /// the edit, so comparing to the index would wrongly suppress the re-read it
     /// genuinely needs. In-memory (a restart just allows a fresh read); capped.
-    read_seen: StdMutex<HashMap<(String, String), String>>,
+    /// V16 Feature 5: the value also records the retrieve-turn the observation
+    /// happened on, so the trust TTL can expire it.
+    read_seen: StdMutex<HashMap<(String, String), (String, u32)>>,
     /// V11 Phase F: `(root, file, content_hash)` digest jobs currently in flight,
     /// so a cache miss never spawns a duplicate local-model job for the same
     /// content. Keyed by root too, since one service manages multiple projects
@@ -222,6 +231,15 @@ pub struct GraphService {
     /// candidate across the ~30s `run_internal` await) don't both distill it —
     /// same single-flight shape as `digest_inflight`/[`InflightGuard`].
     distilling: StdMutex<HashSet<String>>,
+    /// V16 Feature 2: per-root cache of the full-scan drift signals — see
+    /// [`DriftDbSignals`].
+    drift_signals: StdMutex<HashMap<PathBuf, DriftDbSignals>>,
+    /// V16 Feature 4: reminder-TEXT chars of every bypassed reminder since
+    /// this process started — the like-for-like subtrahend for the panel's
+    /// displaced figure (which sums reminder text, not file content).
+    /// Process-wide + since-restart, matching the Activity-based sums in
+    /// [`Self::effectiveness_totals`].
+    bypassed_advice_chars: AtomicU64,
 }
 
 /// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
@@ -279,6 +297,54 @@ struct InjectState {
     /// [`GraphService::injection_follow_rate`]).
     turns_seen: u32,
     turns_maxed: u32,
+    /// V16 Feature 9: chars kept OUT of context so far this session —
+    /// dedup-suppressed digests plus advisor-displaced reads. A bypassed
+    /// remind (Feature 4) is subtracted back out (it displaced nothing).
+    displaced_chars_total: u64,
+    /// V16 Feature 9: the compounding readout — on every retrieve turn,
+    /// `displaced_chars_total` is added again, because content kept out of
+    /// context at turn N is re-saved as a cache read on EVERY turn after N
+    /// (the API re-sends the whole conversation each turn). Measured
+    /// turn-by-turn as the session actually runs — no projection.
+    compounded_chars: u64,
+}
+
+/// V16 Feature 4: when (and how big) a read-advisor reminder was, so the
+/// transcript tap's bypass matcher can test "shell read within the window"
+/// and un-count the displaced chars. One mark per `(session, file)` — the
+/// remind-once semantics are unchanged.
+struct RemindMark {
+    /// The session's retrieve-turn counter when the reminder fired (0 when
+    /// context injection is off and the clock never ticks).
+    turn: u32,
+    /// Wall clock of the reminder — the bypass window's fallback when the
+    /// turn clock isn't ticking.
+    ts_ms: u64,
+    /// Chars of the file content the reminder displaced (the file size, not
+    /// the reminder text — what a bypass re-spends).
+    chars: u64,
+    /// Chars of the reminder TEXT that was returned (the Activity `remind`
+    /// event's own size). Kept alongside `chars` because the two are
+    /// different units: the panel's displaced figure sums reminder text, so
+    /// netting a bypass out of it must subtract reminder text too — not the
+    /// whole-file `chars` (one big-file bypass would wipe out the entire
+    /// metric).
+    advice_chars: u64,
+    /// Set once a bypass was recorded against this reminder, so repeated
+    /// `cat`s of the same file count one bypass, not N.
+    bypassed: bool,
+}
+
+/// V16 drift signals that need full-relation scans (`large_reread_pairs`
+/// walks every read event + every symbol span; `claude_tokenless_sessions`
+/// walks every usage row). The Overview's advice poll asks every 2s, but
+/// these only change when new events land — cache per root with a short TTL
+/// instead of rescanning per tick.
+struct DriftDbSignals {
+    at: Instant,
+    large_reread_pairs: u64,
+    claude_sessions: u64,
+    claude_tokenless: u64,
 }
 
 /// Per-root backfill liveness for the single-flight guard in [`spawn_backfill`].
@@ -330,7 +396,9 @@ impl GraphService {
             greeted: StdMutex::new(HashSet::new()),
             injected: StdMutex::new(HashMap::new()),
             post_compaction: StdMutex::new(HashSet::new()),
-            reminded: StdMutex::new(HashSet::new()),
+            reminded: StdMutex::new(HashMap::new()),
+            drift_signals: StdMutex::new(HashMap::new()),
+            bypassed_advice_chars: AtomicU64::new(0),
             read_seen: StdMutex::new(HashMap::new()),
             digest_inflight: StdMutex::new(HashSet::new()),
             auto_check_sessions: StdMutex::new(HashMap::new()),
@@ -811,11 +879,26 @@ impl GraphService {
     /// "since-restart" semantics this readout documents.
     fn effectiveness_totals(&self, root: &Path) -> Effectiveness {
         let since = crate::activity::process_start_ms();
-        let advisor_displaced_chars: u64 = crate::activity::snapshot()
+        let activity = crate::activity::snapshot();
+        let advisor_displaced_chars: u64 = activity
             .iter()
             .filter(|c| c.source == "read_advisor" && c.tool == "remind" && c.ts_ms >= since)
             .map(|c| c.chars as u64)
             .sum();
+        // V16 Feature 4 honest-accounting: a remind the agent answered with a
+        // shell read displaced nothing. `bypassed_chars` (whole-file, from
+        // the Activity audit events) is what the shell re-read actually
+        // re-spent; `bypassed_advice_chars` (reminder text, from the atomic
+        // counter `check_bypass` feeds) is the like-for-like amount to net
+        // out of `advisor_displaced_chars`, which also sums reminder text —
+        // subtracting file sizes from text sizes would let one big-file
+        // bypass zero the whole metric.
+        let bypassed_chars: u64 = activity
+            .iter()
+            .filter(|c| c.source == "read_advisor" && c.tool == "bypass" && c.ts_ms >= since)
+            .map(|c| c.chars as u64)
+            .sum();
+        let bypassed_advice_chars = self.bypassed_advice_chars.load(Ordering::Relaxed);
         let root_sessions: HashSet<String> = self
             .index_for(root)
             .ok()
@@ -823,11 +906,20 @@ impl GraphService {
             .map(|sessions| sessions.into_iter().map(|s| s.session_id).collect())
             .unwrap_or_default();
         let map = self.injected.lock().unwrap();
-        let (injected_chars, deduped_chars) = map
+        let (injected_chars, deduped_chars, compounded_chars) = map
             .iter()
             .filter(|(sid, _)| root_sessions.contains(sid.as_str()))
-            .fold((0u64, 0u64), |(i, d), (_, st)| (i + st.injected_chars, d + st.deduped_chars));
-        Effectiveness { injected_chars, deduped_chars, advisor_displaced_chars }
+            .fold((0u64, 0u64, 0u64), |(i, d, c), (_, st)| {
+                (i + st.injected_chars, d + st.deduped_chars, c + st.compounded_chars)
+            });
+        Effectiveness {
+            injected_chars,
+            deduped_chars,
+            advisor_displaced_chars,
+            bypassed_chars,
+            bypassed_advice_chars,
+            compounded_chars,
+        }
     }
 
     /// V14 Phase D2: fraction of files injected in full this project (across
@@ -978,7 +1070,9 @@ impl GraphService {
         }
         if let Ok(mut set) = self.reminded.lock() {
             match session_id {
-                Some(s) => set.retain(|(sid, _)| sid != s),
+                Some(s) => {
+                    set.remove(s);
+                }
                 None => set.clear(),
             }
         }
@@ -1245,6 +1339,13 @@ impl GraphService {
             st.injected_chars += result.chars as u64;
             st.deduped_chars += result.deduped_chars as u64;
             st.turns_seen = st.turns_seen.saturating_add(1);
+            // V16 Feature 9: dedup-suppressed chars join the compounding
+            // base, and everything displaced SO FAR is re-counted once per
+            // retrieve turn — content kept out of context is saved again as
+            // a cache read on every later turn.
+            st.displaced_chars_total =
+                st.displaced_chars_total.saturating_add(result.deduped_chars as u64);
+            st.compounded_chars = st.compounded_chars.saturating_add(st.displaced_chars_total);
             let budget = g.context_turn_budget_chars as u64;
             // "Maxed" = this turn's injected chars reached ≥90% of the
             // budget — a proxy for "the budget is the binding constraint",
@@ -1474,10 +1575,16 @@ impl GraphService {
         }
         // One reminder per file per session — a second read always passes.
         let key = (sid.to_string(), rel.clone());
-        if self.reminded.lock().ok()?.contains(&key) {
+        if self.reminded.lock().ok()?.get(sid).is_some_and(|m| m.contains_key(&rel)) {
             return None;
         }
         let idx = self.index_for(root).ok()?;
+
+        // The session's turn counter — the V16 trust-TTL clock (and the
+        // bypass window's turn stamp). Ticked by `retrieve_context` when
+        // injection is on, by the transcript tap's [`Self::note_user_turn`]
+        // otherwise.
+        let cur_turn = self.session_turn(sid);
 
         let abs = root.join(&rel);
         let content = std::fs::read_to_string(&abs).ok()?;
@@ -1494,14 +1601,25 @@ impl GraphService {
         {
             let mut seen = self.read_seen.lock().ok()?;
             match seen.get(&key) {
-                Some(prev) if *prev == cur_hash => {}
+                Some((prev, seen_turn)) if *prev == cur_hash => {
+                    // V16 Feature 5 — trust TTL: unchanged content, but the
+                    // last observed read is older than the TTL (in retrieve
+                    // turns) ⇒ stop trusting the agent's memory of it (context
+                    // editing / tool-result truncation are invisible to us)
+                    // and let the read through, re-stamping the observation.
+                    let ttl = g.read_advisor_ttl_turns;
+                    if ttl > 0 && cur_turn.saturating_sub(*seen_turn) > ttl {
+                        seen.insert(key.clone(), (cur_hash, cur_turn));
+                        return None;
+                    }
+                }
                 _ => {
                     // Bound the map: nothing prunes it when a session ends
                     // (clearing is safe — it just allows a fresh read once).
                     if seen.len() > 1024 && !seen.contains_key(&key) {
                         seen.clear();
                     }
-                    seen.insert(key.clone(), cur_hash);
+                    seen.insert(key.clone(), (cur_hash, cur_turn));
                     return None;
                 }
             }
@@ -1514,14 +1632,35 @@ impl GraphService {
         // Remind. Build usable content, record the reminder, and log it.
         let substitute = g.read_advisor_mode.eq_ignore_ascii_case("substitute");
         let text = super::context::read_advice(&idx, root, &rel, offset, substitute, g.max_body_bytes as usize);
-        // F13: cap the set — one entry per (session, file), never pruned on
+        let displaced = content.chars().count() as u64;
+        let advice_chars = text.chars().count() as u64;
+        // F13: cap the map — one entry per (session, file), never pruned on
         // session end (clearing is safe: a dropped key just allows one re-remind).
         {
             let mut set = self.reminded.lock().ok()?;
-            if set.len() > 4096 && !set.contains(&key) {
+            let total: usize = set.values().map(HashMap::len).sum();
+            if total > 4096 && !set.get(sid).is_some_and(|m| m.contains_key(&rel)) {
                 set.clear();
             }
-            set.insert(key);
+            set.entry(sid.to_string()).or_default().insert(
+                rel.clone(),
+                RemindMark {
+                    turn: cur_turn,
+                    ts_ms: crate::activity::now_ms(),
+                    chars: displaced,
+                    advice_chars,
+                    bypassed: false,
+                },
+            );
+        }
+        // V16 Feature 9: the displaced file content joins this session's
+        // compounding base — every later retrieve turn re-counts it as a
+        // cache read avoided. (Session-scoped, unlike the process-wide
+        // Activity sum the panel also shows; the two coexist — Activity
+        // stays the audit trail.)
+        if let Ok(mut map) = self.injected.lock() {
+            let st = map.entry(sid.to_string()).or_default();
+            st.displaced_chars_total = st.displaced_chars_total.saturating_add(displaced);
         }
         let ts = crate::activity::now_ms() as i64;
         // V14 Phase D2: also persist a root+session-scoped `mem_event{kind:
@@ -1554,6 +1693,207 @@ impl GraphService {
             ),
         });
         Some(text)
+    }
+
+    /// V16 Feature 4: test a Bash command's path-like tokens against this
+    /// session's recent read-advisor reminders; record a `bypass` Activity
+    /// event (and un-count the displaced chars) for each hit. Called from
+    /// the OOB transcript tap on every Claude Bash `tool_use` — detection is
+    /// free there; no new hook (a `PostToolUse` shim spawn per shell command
+    /// was considered and rejected, see the milestone doc).
+    ///
+    /// Matching is deliberately heuristic (labeled `est.` everywhere it's
+    /// counted): a token matches a reminded file when it equals the file's
+    /// relative path, is a path ending in it, or shares its basename. The
+    /// window is ≤3 retrieve turns after the remind, with a 5-minute
+    /// wall-clock fallback for sessions where injection is off and the turn
+    /// clock never ticks. One bypass per reminder (`RemindMark::bypassed`).
+    pub fn check_bypass(&self, root: &Path, session_id: &str, command: &str) {
+        const BYPASS_TURNS: u32 = 3;
+        const BYPASS_MS: u64 = 5 * 60 * 1000;
+        if session_id.is_empty() {
+            return;
+        }
+        let g = self.settings.current().graph;
+        if !g.enabled || !g.read_advisor {
+            return;
+        }
+        let tokens = path_like_tokens(command);
+        if tokens.is_empty() {
+            return;
+        }
+        let cur_turn = self.session_turn(session_id);
+        let now = crate::activity::now_ms();
+
+        // Collect hits under the lock, record outside it. Session-keyed map:
+        // only this session's own reminders are scanned.
+        let mut hits: Vec<(String, u64, u64)> = Vec::new();
+        if let Ok(mut set) = self.reminded.lock() {
+            if let Some(marks) = set.get_mut(session_id) {
+                for (rel, mark) in marks.iter_mut() {
+                    if mark.bypassed {
+                        continue;
+                    }
+                    // "Within 3 retrieve turns of the remind" when the turn
+                    // clock is ticking; the 5-minute wall-clock window when it
+                    // isn't (injection off ⇒ the counter never advances, and a
+                    // 0-0 turn delta would otherwise match forever).
+                    let in_window = if cur_turn > mark.turn {
+                        cur_turn - mark.turn <= BYPASS_TURNS
+                    } else {
+                        now.saturating_sub(mark.ts_ms) <= BYPASS_MS
+                    };
+                    if !in_window {
+                        continue;
+                    }
+                    if tokens.iter().any(|t| token_matches_path(t, rel)) {
+                        mark.bypassed = true;
+                        hits.push((rel.clone(), mark.chars, mark.advice_chars));
+                    }
+                }
+            }
+        }
+        for (rel, chars, advice_chars) in hits {
+            // Un-count from the session's compounding base — a bypassed
+            // remind displaced nothing, so it stops compounding from this
+            // turn forward (already-compounded turns stay counted; the
+            // readout is measured, not retroactive).
+            if let Ok(mut map) = self.injected.lock() {
+                if let Some(st) = map.get_mut(session_id) {
+                    st.displaced_chars_total = st.displaced_chars_total.saturating_sub(chars);
+                }
+            }
+            // The panel's displaced figure sums reminder TEXT — net this
+            // bypass out of it in the same unit (`effectiveness_totals`),
+            // not in whole-file chars (which would let one big-file bypass
+            // zero the entire metric).
+            self.bypassed_advice_chars.fetch_add(advice_chars, Ordering::Relaxed);
+            crate::activity::record_bg(crate::activity::ActivityRecord {
+                request: format!("shell read of `{rel}` after a read-advisor reminder (est.)"),
+                response: String::new(),
+                entry: crate::activity::ActivityEntry::new(
+                    crate::activity::ActivityKind::Graph,
+                    now,
+                    crate::activity::root_key(root),
+                    "read_advisor".to_string(),
+                    "bypass".to_string(),
+                    rel,
+                    chars as usize,
+                    0,
+                    false, // a bypass is a miss for the advisor — flag it
+                ),
+            });
+        }
+    }
+
+    /// The session's turn counter — 0 when nothing ever ticked it. Ticked by
+    /// `retrieve_context` (one per retrieve) when context injection is on,
+    /// and by [`Self::note_user_turn`] (one per genuine user prompt from the
+    /// transcript tap) when it's off.
+    fn session_turn(&self, session_id: &str) -> u32 {
+        self.injected
+            .lock()
+            .ok()
+            .and_then(|m| m.get(session_id).map(|st| st.turn))
+            .unwrap_or(0)
+    }
+
+    /// V16 review fix: advance the session's turn clock on a genuine user
+    /// prompt when CONTEXT INJECTION IS OFF. `retrieve_context` is the clock
+    /// when injection is on (one tick per retrieve); with injection off it
+    /// never runs, `InjectState.turn` stays 0 forever, and (a) the read
+    /// advisor's trust TTL (`read_advisor_ttl_turns`) could never expire —
+    /// the one decision it exists to govern — and (b) the Feature-9
+    /// compounding readout never accrues. Gated exactly opposite to the
+    /// injection tick so the two clocks can't double-count a turn; gated on
+    /// the read advisor because nothing else consumes the clock offline.
+    pub fn note_user_turn(&self, session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        let g = self.settings.current().graph;
+        if !g.enabled || !g.read_advisor || g.context_injection {
+            return;
+        }
+        if let Ok(mut map) = self.injected.lock() {
+            // Same bound as `retrieve_context`'s insert site.
+            if map.len() > 1024 && !map.contains_key(session_id) {
+                map.clear();
+            }
+            let st = map.entry(session_id.to_string()).or_default();
+            st.turn = st.turn.saturating_add(1);
+            // Feature 9: displaced content is saved again on every later
+            // turn — the same per-turn re-count `retrieve_context` does when
+            // injection is on.
+            st.compounded_chars = st.compounded_chars.saturating_add(st.displaced_chars_total);
+        }
+    }
+
+    /// V16 Feature 2 drift signals that need full-relation scans, cached per
+    /// root for [`DRIFT_SIGNALS_TTL`] (the Overview polls every 2s; these
+    /// only change when new events land): `large_reread_pairs` — (session,
+    /// file) pairs with ≥2 observed reads of a file at/above
+    /// `read_advisor_min_lines`, the condition `should_read` reminds on
+    /// (zero reminds + many large re-reads ⇒ the hook isn't firing) — plus
+    /// `GraphIndex::claude_tokenless_sessions`' two counts.
+    pub fn drift_db_signals(&self, root: &Path) -> (u64, u64, u64) {
+        const DRIFT_SIGNALS_TTL: Duration = Duration::from_secs(30);
+        if let Ok(cache) = self.drift_signals.lock() {
+            if let Some(s) = cache.get(root) {
+                if s.at.elapsed() < DRIFT_SIGNALS_TTL {
+                    return (s.large_reread_pairs, s.claude_sessions, s.claude_tokenless);
+                }
+            }
+        }
+        let (pairs, claude, tokenless) = match self.index_for(root) {
+            Ok(idx) => {
+                let min_lines = self.settings.current().graph.read_advisor_min_lines;
+                let pairs = idx.large_reread_pairs(min_lines).unwrap_or(0);
+                let (claude, tokenless) = idx.claude_tokenless_sessions().unwrap_or((0, 0));
+                (pairs, claude, tokenless)
+            }
+            Err(_) => (0, 0, 0),
+        };
+        if let Ok(mut cache) = self.drift_signals.lock() {
+            cache.insert(
+                root.to_path_buf(),
+                DriftDbSignals {
+                    at: Instant::now(),
+                    large_reread_pairs: pairs,
+                    claude_sessions: claude,
+                    claude_tokenless: tokenless,
+                },
+            );
+        }
+        (pairs, claude, tokenless)
+    }
+
+    /// V16 Feature 4 (`drift.read_bypass.v1` signal): share of read-advisor
+    /// reminders answered with a shell read, from the process-wide Activity
+    /// events since this run started (est. — same posture as the panel's
+    /// displaced figure). Sample count = reminders. `None` when the advisor
+    /// never reminded this run. Takes the caller's snapshot so one
+    /// `graph_usage_advice` call clones the activity ring once, not once per
+    /// signal.
+    pub fn bypass_rate(&self, activity: &[crate::activity::ActivityEntry]) -> Option<(f64, u64)> {
+        let since = crate::activity::process_start_ms();
+        let mut reminds = 0u64;
+        let mut bypasses = 0u64;
+        for e in activity {
+            if e.source != "read_advisor" || e.ts_ms < since {
+                continue;
+            }
+            match e.tool.as_str() {
+                "remind" => reminds += 1,
+                "bypass" => bypasses += 1,
+                _ => {}
+            }
+        }
+        if reminds == 0 {
+            None
+        } else {
+            Some(((bypasses as f64 / reminds as f64).min(1.0), reminds))
+        }
     }
 
     /// Whether context injection is currently enabled (graph + toggle). The
@@ -2511,6 +2851,66 @@ fn relativize_path(root: &Path, path: &str) -> String {
         return String::new();
     }
     rel_path(root, Path::new(path))
+}
+
+/// V16 Feature 4: extract path-like candidate tokens from a shell command —
+/// quoted segments (single or double) plus whitespace-split tokens that
+/// contain a path separator. Deliberately NOT a shell parser (the milestone
+/// spec's "simple heuristic"): the consumer only ever compares candidates
+/// against a small set of just-reminded files, so false candidates cost
+/// nothing and false negatives only under-count (events are labeled est.).
+fn path_like_tokens(command: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |t: &str| {
+        let t = t.trim().trim_matches(|c| c == ',' || c == ';' || c == ')' || c == '(');
+        if t.len() > 1 && out.iter().all(|p| p != t) {
+            out.push(t.to_string());
+        }
+    };
+    // Quoted segments, both kinds — a path with spaces only survives here.
+    for quote in ['"', '\''] {
+        let mut parts = command.split(quote);
+        parts.next(); // before the first quote
+        while let (Some(inside), rest) = (parts.next(), parts.next()) {
+            push(inside);
+            if rest.is_none() {
+                break;
+            }
+        }
+    }
+    for tok in command.split_whitespace() {
+        if tok.contains('/') || tok.contains('\\') {
+            push(tok.trim_matches(|c| c == '"' || c == '\''));
+        }
+    }
+    out
+}
+
+/// V16 Feature 4: whether a command token plausibly refers to the reminded
+/// file at (project-relative, `/`-separated) `rel`. Full-path match, a
+/// longer path ENDING in the relative path (an absolute spelling of it), or
+/// a bare basename match — normalized to `/` so `src\a.rs` and `src/a.rs`
+/// compare equal.
+fn token_matches_path(token: &str, rel: &str) -> bool {
+    let norm = token.replace('\\', "/");
+    let norm = norm.trim_end_matches('/');
+    if norm.is_empty() || rel.is_empty() {
+        return false;
+    }
+    if norm == rel {
+        return true;
+    }
+    if norm.len() > rel.len() && norm.ends_with(rel) {
+        // Require a boundary before the suffix so `notsrc/a.rs` doesn't
+        // match `src/a.rs`.
+        let boundary = norm.as_bytes()[norm.len() - rel.len() - 1];
+        if boundary == b'/' {
+            return true;
+        }
+    }
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    let tok_base = norm.rsplit('/').next().unwrap_or(norm);
+    !base.is_empty() && tok_base == base
 }
 
 /// Reset `idx` and re-index every supported file under `root`, honoring

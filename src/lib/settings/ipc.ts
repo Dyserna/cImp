@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AiToolTabConfig, LlmPricingModel, Settings } from './types';
+import type { AiToolTabConfig, HarnessVersions, LlmPricingModel, Settings } from './types';
 import type { TabId } from '../tabs/types';
 
 export async function settingsGet(): Promise<Settings> {
@@ -68,4 +68,13 @@ export async function llmPricingGet(): Promise<LlmPricingModel[]> {
 /// `composeTemplatesGlobalSet`.
 export async function llmPricingSet(pricing: LlmPricingModel[]): Promise<void> {
   await invoke('llm_pricing_set', { pricing });
+}
+
+/// V16 Feature 1: the harness version + contract state, read fresh from the
+/// physical global `settings.json` — the settings snapshot only reflects app
+/// startup, but `harness_versions` is written out-of-band (transcript tap,
+/// hand edits per MAINTENANCE.md). Used by the Settings window so the E1
+/// hard block reflects a just-recorded outcome without an app restart.
+export async function harnessVersionsGet(): Promise<HarnessVersions> {
+  return invoke('harness_versions_get');
 }

@@ -28,6 +28,7 @@
     graphUsage,
     graphUsageAdvice,
     advisorDismiss,
+    advisorMarkApplied,
     graphPath,
     graphArchitecture,
     onGraphStatus,
@@ -56,6 +57,8 @@
     fmtTok,
     sessionCost,
     fmtUsd,
+    matchPricing,
+    turnCost,
     type PriceRates,
   } from './usageMath';
   import { fmtDate, fmtTime } from './format';
@@ -67,7 +70,15 @@
   import { revealTab } from './tabs/visibility';
   import { GRAPH_MONITOR_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
-  import { loadCardOpen, loadViewSection, saveCardOpen, saveViewSection } from './viewSection';
+  import {
+    loadCardOpen,
+    loadViewSection,
+    loadViewString,
+    saveCardOpen,
+    saveViewSection,
+    saveViewString,
+  } from './viewSection';
+  import { harnessMarkVerified } from './graph';
 
   // The graph_* tool reference list and the recent-calls activity feed both
   // moved to the Tool Activity tab (ToolActivityView.svelte).
@@ -309,6 +320,10 @@
   let usage = $state<UsageSnapshot | null>(null);
   let advice = $state<AdvisorSnapshot | null>(null);
   let advisorBusy = $state<string | null>(null); // rule_id currently applying/dismissing
+  // Rendered in the Advisor card when an Apply can't be honored (e.g. a
+  // proposal names a setting this build has no case for) — cleared on the
+  // next successful apply.
+  let advisorError = $state<string | null>(null);
 
   async function refreshUsage(): Promise<void> {
     // Independent fetches — run concurrently so the 2s Overview poll pays
@@ -326,6 +341,11 @@
     ]);
     if (u) usage = u;
     if (a) advice = a;
+    // V16 Feature 8: the cost view's auto-match price table. Fetched once
+    // per view lifetime here (not per poll — prices change rarely); the
+    // cost POPUP still refetches on every open, so Settings edits apply
+    // there immediately either way.
+    if (costMode === 'cost' && pricingTable === null) void refreshPricingTable();
     // Unawaited on purpose: commitCounts is independent $state that renders
     // when it lands — the poll's critical path shouldn't wait on a git
     // subprocess round trip.
@@ -433,13 +453,30 @@
         case 'graph.context_turn_budget_chars':
           next.graph.context_turn_budget_chars = val;
           break;
+        // V16 drift rules (drift.read_reason.v1 / drift.read_bypass.v1):
+        // the only boolean the advisor can propose — always a disable.
+        case 'graph.read_advisor':
+          next.graph.read_advisor = p.proposed === 'true';
+          break;
         default:
+          // A rule proposing a setting this switch doesn't know is a bug
+          // (a new advisor rule shipped without its Apply case) — surface
+          // it in the card instead of a silent console-only no-op behind a
+          // working-looking Apply button.
+          advisorError = `Can't apply "${p.setting}" — this build has no Apply handler for it (report this).`;
           console.warn('advisor: unrecognized proposal setting', p.setting);
           return;
       }
       await applySettings(next);
-      // The applied change itself will shift the underlying rate, so drop
-      // this proposal locally rather than waiting for the next poll.
+      advisorError = null;
+      // Start the rule's Apply cooldown: it stays quiet for a few sessions
+      // so fresh post-change data can accumulate before it re-evaluates —
+      // the underlying rates are cumulative, and without this the rule
+      // would re-propose on the very next poll off data collected almost
+      // entirely under the OLD value. Best-effort: a failure here just
+      // means the old always-re-propose behavior for this one apply.
+      await advisorMarkApplied(p.rule_id).catch((e) => console.warn('advisor_mark_applied failed', e));
+      // Drop the proposal locally rather than waiting for the next poll.
       advice = advice && { ...advice, proposals: advice.proposals.filter((x) => x.rule_id !== p.rule_id) };
     } finally {
       advisorBusy = null;
@@ -480,6 +517,7 @@
   const CHART_SEGS = [
     { key: 'in', label: 'input', field: 'usage_color_in' },
     { key: 'cache', label: 'cache-read', field: 'usage_color_cache' },
+    { key: 'write', label: 'cache-write', field: 'usage_color_write' },
     { key: 'out', label: 'output', field: 'usage_color_out' },
     { key: 'tool', label: 'est. tool-result', field: 'usage_color_tool' },
   ] as const;
@@ -488,6 +526,7 @@
   let chartColors = $derived({
     in: chartPreview.in ?? $settings.graph.usage_color_in,
     cache: chartPreview.cache ?? $settings.graph.usage_color_cache,
+    write: chartPreview.write ?? $settings.graph.usage_color_write,
     out: chartPreview.out ?? $settings.graph.usage_color_out,
     tool: chartPreview.tool ?? $settings.graph.usage_color_tool,
   });
@@ -506,7 +545,82 @@
   const ADVISOR_RULES_TOOLTIP =
     'advisor.raise_context_min_score.v1: ≥5 sessions, ≥200 injections, ≥70% never re-touched → raise context_min_score.\n' +
     'advisor.raise_read_advisor_min_lines.v1: ≥5 sessions, ≥20 reminders, ≥50% re-read anyway → raise read_advisor_min_lines.\n' +
-    'advisor.lower_context_turn_budget_chars.v1: ≥5 sessions, ≥200 injections, ≥50 turns, ≥70% unread AND ≥50% turns maxed → lower context_turn_budget_chars.';
+    'advisor.lower_context_turn_budget_chars.v1: ≥5 sessions, ≥200 injections, ≥50 turns, ≥70% unread AND ≥50% turns maxed → lower context_turn_budget_chars.\n' +
+    'drift.harness_version.v1: Claude Code version ≠ last-verified → re-verify the hook contracts (Mark verified).\n' +
+    'drift.read_reason.v1: ≥15 reminders, ≥90% immediately re-read → the deny reason isn’t reaching the model; disable read_advisor.\n' +
+    'drift.read_hook_silent.v1: ≥3 sessions, ≥10 large re-reads (est.), 0 reminders → the PreToolUse hook isn’t firing.\n' +
+    'drift.injection_unseen.v1: ≥5 sessions, ≥30 injections, ≤2% follow → injected context likely never reaches the model.\n' +
+    'drift.usage_fields_gone.v1: ≥2 Claude sessions, all without token fields → the transcript usage schema changed.\n' +
+    'drift.payload.v1: any shim-reported payload missing required fields.\n' +
+    'drift.read_bypass.v1: ≥10 reminders, ≥40% answered via shell reads (est.) → disable read_advisor.\n' +
+    'After an Apply, that rule stays quiet for 3 further sessions so fresh post-change data can accumulate before it re-evaluates.';
+
+  // ── V16 Feature 8: tokens | est. cost toggle ─────────────────────────
+  // Cost mode multiplies each bar segment by its $/MTok price before
+  // stacking — same segments, same colors, different heights. Prices come
+  // from the global LLM price table, auto-matched by the longest
+  // `model_prefix` against each turn's / session's model id. No match ⇒
+  // token bars with a hint (never a made-up cost). Per-user choice,
+  // persisted like the section selection.
+  let costMode = $state<'tokens' | 'cost'>(
+    loadViewString('code-intelligence', 'usage-cost-mode') === 'cost' ? 'cost' : 'tokens',
+  );
+  $effect(() => saveViewString('code-intelligence', 'usage-cost-mode', costMode));
+  // `null` = not fetched yet (fetch on first need); `[]` = fetched, empty.
+  let pricingTable = $state<LlmPricingModel[] | null>(null);
+  async function refreshPricingTable(): Promise<void> {
+    try {
+      pricingTable = await llmPricingGet();
+    } catch (e) {
+      console.warn('llm_pricing_get failed', e);
+      pricingTable = [];
+    }
+  }
+  function setCostMode(mode: 'tokens' | 'cost'): void {
+    costMode = mode;
+    if (mode === 'cost' && pricingTable === null) void refreshPricingTable();
+  }
+  // The current session's dominant model: the newest turn that carried one.
+  const currentModel = $derived.by(() => {
+    for (let i = usageTurns.length - 1; i >= 0; i--) {
+      const m = usageTurns[i].model;
+      if (m) return m;
+    }
+    return null;
+  });
+  const currentRates = $derived(matchPricing(currentModel, pricingTable ?? []));
+  const costActive = $derived(costMode === 'cost' && currentRates !== null);
+  // Cost-mode normalization denominator (max per-turn dollar total).
+  const usageCostMax = $derived.by(() => {
+    if (!costActive || !currentRates) return 1;
+    return Math.max(1e-9, ...shownTurns.map((t) => turnCost(t, currentRates).total));
+  });
+
+  // V16 Feature 4 honest-accounting: the panel's displaced figure is NET of
+  // bypassed reminds (a displaced Read that came back via `cat` displaced
+  // nothing). Subtract `bypassed_advice_chars` — the reminder-TEXT chars of
+  // the bypassed reminders, the same unit `advisor_displaced_chars` sums —
+  // never the whole-file `bypassed_chars` (one big-file bypass would zero
+  // the entire metric).
+  const netDisplacedChars = $derived(
+    Math.max(
+      0,
+      (usage?.effectiveness.advisor_displaced_chars ?? 0) -
+        (usage?.effectiveness.bypassed_advice_chars ?? 0),
+    ),
+  );
+
+  async function markVerified(p: AdvisorProposal): Promise<void> {
+    advisorBusy = p.rule_id;
+    try {
+      await harnessMarkVerified();
+      advice = advice && { ...advice, proposals: advice.proposals.filter((x) => x.rule_id !== p.rule_id) };
+    } catch (e) {
+      console.error('harness_mark_verified failed', e);
+    } finally {
+      advisorBusy = null;
+    }
+  }
 
   // The Overview section stacks the status groups (Usage, then Index) as one
   // at-a-glance dashboard. The activity feed + graph-tools reference moved to
@@ -784,8 +898,22 @@
             <span class="lbl">chars suppressed by dedup <span class="est-badge">est. ~{Math.round(usage.effectiveness.deduped_chars / 4).toLocaleString()} tok</span></span>
           </div>
           <div>
-            <span class="num">{usage.effectiveness.advisor_displaced_chars.toLocaleString()}</span>
-            <span class="lbl">chars displaced by read-advisor <span class="est-badge">est. ~{Math.round(usage.effectiveness.advisor_displaced_chars / 4).toLocaleString()} tok</span></span>
+            <span class="num" title={usage.effectiveness.bypassed_advice_chars > 0
+              ? `${usage.effectiveness.advisor_displaced_chars.toLocaleString()} displaced − ${usage.effectiveness.bypassed_advice_chars.toLocaleString()} from reminders answered via shell reads (${usage.effectiveness.bypassed_chars.toLocaleString()} file chars re-read, est.)`
+              : undefined}>{netDisplacedChars.toLocaleString()}</span>
+            <span class="lbl">chars displaced by read-advisor{#if usage.effectiveness.bypassed_advice_chars > 0}&nbsp;(net of bypasses){/if} <span class="est-badge">est. ~{Math.round(netDisplacedChars / 4).toLocaleString()} tok</span></span>
+          </div>
+          <div>
+            <span
+              class="num"
+              title="Content kept out of context is saved again on every later turn — the API re-sends the whole conversation per turn, so displaced chars are re-counted once per subsequent retrieve turn. Measured as the session runs; no projection."
+            >{usage.effectiveness.compounded_chars.toLocaleString()}</span>
+            <span class="lbl">chars of cache-reads avoided (compounding)
+              <span class="est-badge">est. ~{Math.round(usage.effectiveness.compounded_chars / 4).toLocaleString()} tok</span>
+              {#if costActive && currentRates}
+                <span class="est-badge" title="At the matched model's cache-read rate">est. {fmtUsd((usage.effectiveness.compounded_chars / 4 / 1_000_000) * currentRates.cache_read)}</span>
+              {/if}
+            </span>
           </div>
           <div>
             <span class="num">{usage.offload_local_tasks.toLocaleString()}</span>
@@ -801,7 +929,7 @@
     <details
       class="card"
       bind:open={sessionCardOpen}
-      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}"
+      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-write: {chartColors.write}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}"
     >
       <summary class="history-head">
         This session
@@ -812,6 +940,30 @@
       {#if !usage || !usage.current || usage.current.turns.length === 0}
         <p class="placeholder">No usage recorded yet this session.</p>
       {:else}
+        <!-- V16 Feature 8: tokens | est. cost. Cost mode reprices the same
+             segments by $/MTok (auto-matched on the session's model);
+             tokens stays the default. -->
+        <div class="cost-toggle">
+          <button
+            class="mini {costMode === 'tokens' ? '' : 'secondary'}"
+            onclick={() => setCostMode('tokens')}
+          >tokens</button>
+          <button
+            class="mini {costMode === 'cost' ? '' : 'secondary'}"
+            onclick={() => setCostMode('cost')}
+          >est. cost</button>
+          {#if costMode === 'cost' && !costActive}
+            <span class="muted">
+              {#if pricingTable === null}
+                loading prices…
+              {:else if !currentModel}
+                no model id on this session's turns — showing tokens
+              {:else}
+                no price row matches <code>{currentModel}</code> (Settings → LLM pricing) — showing tokens
+              {/if}
+            </span>
+          {/if}
+        </div>
         <div class="ubars-legend">
           {#each CHART_SEGS as s (s.key)}
             <span>
@@ -829,20 +981,32 @@
         </div>
         <div class="ubars" bind:clientWidth={ubarsWidth}>
           {#each shownTurns as t, i (i)}
-            {@const total = turnTotal(t)}
             {@const est_tool = Math.round(t.tool_chars / 4)}
+            {@const cost = costActive && currentRates ? turnCost(t, currentRates) : null}
+            {@const total = cost ? cost.total : turnTotal(t)}
+            {@const max = cost ? usageCostMax : usageMax}
             {@const turnNo = usageTurns.length - shownTurns.length + i + 1}
             <div class="ubar-col">
               <div
                 class="ubar"
-                style="height: {barHeightPct(total, usageMax)}%"
-                title="turn {turnNo}: {t.in_tok} in / {t.cache_read} cache-read / {t.out_tok} out / ~{est_tool} est. tool"
+                style="height: {barHeightPct(total, max)}%"
+                title={cost
+                  ? `turn ${turnNo} (est.): ${fmtUsd(cost.input)} in / ${fmtUsd(cost.cache_read)} cache-read / ${fmtUsd(cost.cache_write)} cache-write / ${fmtUsd(cost.output)} out / ${fmtUsd(cost.tool)} est. tool — ${fmtUsd(cost.total)}`
+                  : `turn ${turnNo}: ${t.in_tok} in / ${t.cache_read} cache-read / ${t.cache_make} cache-write / ${t.out_tok} out / ~${est_tool} est. tool`}
               >
                 {#if total > 0}
-                  <span class="useg in" style="flex-grow: {t.in_tok}"></span>
-                  <span class="useg cache" style="flex-grow: {t.cache_read}"></span>
-                  <span class="useg out" style="flex-grow: {t.out_tok}"></span>
-                  <span class="useg tool" style="flex-grow: {est_tool}"></span>
+                  <!-- One segment list for both modes (order matches
+                       CHART_SEGS: in / cache-read / cache-write / out /
+                       tool) so a new segment can't be added to one mode and
+                       missed in the other. -->
+                  {@const segs = cost
+                    ? [cost.input, cost.cache_read, cost.cache_write, cost.output, cost.tool].map(
+                        (v) => v * 1e6,
+                      )
+                    : [t.in_tok, t.cache_read, t.cache_make, t.out_tok, est_tool]}
+                  {#each CHART_SEGS as s, si (s.key)}
+                    <span class="useg {s.key}" style="flex-grow: {segs[si]}"></span>
+                  {/each}
                 {/if}
               </div>
             </div>
@@ -872,6 +1036,9 @@
         Budget-tuning advisor
         <span class="muted" title={ADVISOR_RULES_TOOLTIP}>ⓘ rules</span>
       </summary>
+      {#if advisorError}
+        <p class="placeholder">{advisorError}</p>
+      {/if}
       {#if !advice}
         <p class="placeholder">Loading…</p>
       {:else if advice.collecting}
@@ -886,16 +1053,25 @@
           {#each advice.proposals as p (p.rule_id)}
             <div class="proposal">
               <div class="prop-head">
-                <span class="aname">{p.setting}</span>
+                <span class="aname">{p.setting || p.rule_id}</span>
                 <span class="prop-vals"><code>{p.current}</code> → <code>{p.proposed}</code></span>
               </div>
               <p class="prop-rationale">{p.rationale}</p>
               <div class="prop-actions">
-                <button
-                  class="mini"
-                  disabled={advisorBusy !== null}
-                  onclick={() => applyProposal(p)}
-                >{advisorBusy === p.rule_id ? 'Applying…' : 'Apply'}</button>
+                {#if p.action === 'mark_verified'}
+                  <button
+                    class="mini"
+                    disabled={advisorBusy !== null}
+                    title="Stamp the currently-seen Claude Code version as verified — do this AFTER re-running the MAINTENANCE.md contract checks"
+                    onclick={() => markVerified(p)}
+                  >{advisorBusy === p.rule_id ? 'Marking…' : 'Mark verified'}</button>
+                {:else if !p.warn_only}
+                  <button
+                    class="mini"
+                    disabled={advisorBusy !== null}
+                    onclick={() => applyProposal(p)}
+                  >{advisorBusy === p.rule_id ? 'Applying…' : 'Apply'}</button>
+                {/if}
                 <button
                   class="mini secondary"
                   disabled={advisorBusy !== null}
@@ -925,12 +1101,35 @@
                 onclick={() => void openCostPopup(s)}
               >
                 <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}<span class="sess-date">{fmtDate(s.started_ms)}</span></span>
-                <span class="sess-stats tnum">
-                  <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
-                  <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
-                  <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
-                  <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
-                </span>
+                {#if costMode === 'cost'}
+                  {@const rowRates = matchPricing(s.models[0] ?? null, pricingTable ?? [])}
+                  {#if rowRates}
+                    <span class="sess-stats tnum">
+                      {#each Object.entries(sessionCost(s.totals, rowRates)) as [cat, usd] (cat)}
+                        {#if cat !== 'total'}
+                          <span><b>{fmtUsd(usd)}</b> {cat.replace('_', '-').replace('input', 'in').replace('output', 'out')}</span>
+                        {/if}
+                      {/each}
+                      <span><b>{fmtUsd(sessionCost(s.totals, rowRates).total)}</b> total <span
+                          class="est-badge"
+                          title={s.models.length > 1
+                            ? `Mixed models — the whole session is priced at ${s.models[0]}'s rates (its top consumer by tokens); the other models' tokens are mispriced. Click for the manual cost popup.`
+                            : 'Estimated from the auto-matched price row'}
+                        >{s.models.length > 1 ? 'est · mixed' : 'est'}</span></span>
+                    </span>
+                  {:else}
+                    <span class="sess-stats tnum muted" title="No price row auto-matches this session's model — add a model_prefix in Settings → LLM pricing, or click for the manual cost popup">
+                      no price match{#if s.models[0]}&nbsp;(<code>{s.models[0]}</code>){/if}
+                    </span>
+                  {/if}
+                {:else}
+                  <span class="sess-stats tnum">
+                    <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
+                    <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
+                    <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
+                    <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
+                  </span>
+                {/if}
                 <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
               </button>
               {#if $settings.workbench.enabled}
@@ -2218,8 +2417,20 @@
   .useg.cache {
     background: var(--ubar-cache, #d2a8ff);
   }
+  /* V16 Feature 8: cache-write got its own segment. */
+  .useg.write {
+    background: var(--ubar-write, #e3738d);
+  }
   .useg.out {
     background: var(--ubar-out, #3fb950);
+  }
+  /* V16 Feature 8: the tokens | est. cost mode toggle above the bars. */
+  .cost-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 2px 0 8px;
+    font-size: 10.5px;
   }
   .useg.tool {
     background: var(--ubar-tool, #f0c674);

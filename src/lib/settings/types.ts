@@ -628,6 +628,11 @@ export interface Settings {
   /// See `DismissedRule`'s doc comment for the (rule_id, signature) matching
   /// semantics.
   advisor_dismissed: DismissedRule[];
+  /// Advisor proposals the user has APPLIED — the Apply-cooldown's memory
+  /// (one entry per rule + project root). Written only by the dedicated
+  /// `advisor_mark_applied` IPC (`lib/graph.ts` `advisorMarkApplied`); kept
+  /// here for schema/round-trip fidelity with the backend struct.
+  advisor_applied: AppliedRule[];
   /// V14 Phase F: the last URL entered into any Preview tab in this project
   /// — a fresh "New Preview tab" starts here (falling back to
   /// `lib/preview/policy.ts`'s `DEFAULT_PREVIEW_URL` when `null`). Round-trips
@@ -647,6 +652,10 @@ export interface Settings {
   /// the normal `settingsUpdate` round-trip; kept here for schema fidelity
   /// with the backend struct, like `prompt_templates`.
   llm_pricing: LlmPricingModel[];
+  /// V16 Feature 1: harness version tripwire + contract state. Out-of-band
+  /// like `llm_pricing` (global-only; preserved against stale snapshots by
+  /// `apply_incoming_settings`); kept here for schema fidelity.
+  harness_versions: HarnessVersions;
 }
 
 /// One provider/model price row: USD per million tokens for the four billing
@@ -656,6 +665,10 @@ export interface Settings {
 export interface LlmPricingModel {
   provider: string;
   model: string;
+  /// V16 Feature 8: transcript model-id prefix this row auto-matches (e.g.
+  /// `"claude-opus-4-8"`). Longest matching prefix wins; empty = manual-pick
+  /// only. See `usageMath.ts`'s `matchPricing`.
+  model_prefix: string;
   /// $/MTok for uncached input tokens (`in_tok`).
   input: number;
   /// $/MTok for cache-write tokens (`cache_make`).
@@ -664,6 +677,34 @@ export interface LlmPricingModel {
   cache_read: number;
   /// $/MTok for output tokens (`out_tok`).
   output: number;
+}
+
+/// V16 Feature 1: per-install harness version + contract-verification state.
+/// Mirror of Rust `settings::HarnessVersions`. Out-of-band like
+/// `llm_pricing`: written by the transcript tap / tab spawn /
+/// `harness_mark_verified`, straight to the physical global `settings.json`.
+export interface HarnessVersions {
+  claude_last_seen: string;
+  claude_last_verified: string;
+  opencode_last_seen: string;
+  /// E1 spike outcome (`"unverified" | "pass" | "fail"`): a blocking status
+  /// (see `harnessStatusBlocks`) hard blocks the read advisor (Settings
+  /// block disabled, hook not installed).
+  e1_status: string;
+  /// D0 spike outcome (informational — the feature degrades to a no-op).
+  d0_status: string;
+}
+
+/// Whether a recorded spike status blocks its feature — the ONE comparison
+/// allowed to interpret `e1_status`/`d0_status` (never compare a bare
+/// `'fail'` literal at a call site). Mirror of Rust
+/// `HarnessVersions::status_blocks` (settings/schema.rs) — keep in sync.
+/// Normalizes (trim + case-fold) and fails CLOSED: the statuses are
+/// hand-editable strings, so anything that isn't a recognized non-fail
+/// value blocks rather than silently sailing past the gate.
+export function harnessStatusBlocks(status: string): boolean {
+  const s = status.trim().toLowerCase();
+  return !(s === '' || s === 'unverified' || s === 'pass');
 }
 
 /// V14 Phase D2: one dismissed advisor proposal. Mirror of Rust
@@ -675,6 +716,17 @@ export interface LlmPricingModel {
 export interface DismissedRule {
   rule_id: string;
   signature: string;
+}
+
+/// One APPLIED advisor proposal — the Apply-cooldown's memory. Mirror of
+/// Rust `settings::AppliedRule`: the rule stays quiet until `root` has seen
+/// a few more sessions than `session_count` (the count at apply time), so
+/// the advisor re-evaluates on fresh post-change data instead of instantly
+/// re-proposing off the cumulative pre-apply rates.
+export interface AppliedRule {
+  rule_id: string;
+  root: string;
+  session_count: number;
 }
 
 /// V14 Phase A: one saved prompt-library entry (global or project scope —
@@ -772,6 +824,9 @@ export interface GraphSettings {
   read_advisor: boolean;
   read_advisor_min_lines: number;
   read_advisor_mode: string;
+  // V16 Feature 5: trust TTL in retrieve turns (0 = off) — after this many
+  // turns since the advisor last observed a full read, a Read passes again.
+  read_advisor_ttl_turns: number;
   // V11 Phase F: local-model context digests (local-only).
   context_llm_digests: boolean;
   // V12 Phase E: memory distillation (durable project facts, local-only).
@@ -818,6 +873,8 @@ export interface GraphSettings {
   usage_color_cache: string;
   usage_color_out: string;
   usage_color_tool: string;
+  // V16 Feature 8: the cache-write segment's color.
+  usage_color_write: string;
 }
 
 /// V13 §0.4: the Workbench feature's settings. Mirror of Rust
@@ -1352,6 +1409,7 @@ export function defaultSettings(): Settings {
       read_advisor: false,
       read_advisor_min_lines: 300,
       read_advisor_mode: 'advise',
+      read_advisor_ttl_turns: 0,
       context_llm_digests: false,
       memory_distillation: false,
       promote_pinned_facts: false,
@@ -1376,6 +1434,7 @@ export function defaultSettings(): Settings {
       usage_color_cache: '#d2a8ff',
       usage_color_out: '#3fb950',
       usage_color_tool: '#f0c674',
+      usage_color_write: '#e3738d',
     },
     workbench: {
       enabled: true,
@@ -1396,11 +1455,19 @@ export function defaultSettings(): Settings {
     prompt_templates: [],
     templates_seeded: false,
     advisor_dismissed: [],
+    advisor_applied: [],
     preview_last_url: null,
     preview_allow_remote: false,
     // Real defaults are seeded Rust-side (`default_llm_pricing`); this local
     // fallback is only pre-init UI state and is never written back (the
     // field is out-of-band in `settings_update`, like `prompt_templates`).
     llm_pricing: [],
+    harness_versions: {
+      claude_last_seen: '',
+      claude_last_verified: '',
+      opencode_last_seen: '',
+      e1_status: 'unverified',
+      d0_status: 'unverified',
+    },
   };
 }

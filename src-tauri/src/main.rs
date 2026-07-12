@@ -45,7 +45,8 @@ use tracing::{info, warn};
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::ipc::commands::{
     acknowledge_error, activity_clear, activity_delete, activity_detail, activity_list,
-    advisor_dismiss, ai_tool_tab_defaults, close_settings_window,
+    advisor_dismiss, advisor_mark_applied, ai_tool_tab_defaults, close_settings_window,
+    harness_mark_verified, harness_versions_get,
     compose_attach_image,
     compose_content_changed,
     compose_templates, compose_templates_global_get, compose_templates_global_set,
@@ -787,6 +788,9 @@ fn main() {
             graph_usage,
             graph_usage_advice,
             advisor_dismiss,
+            advisor_mark_applied,
+            harness_versions_get,
+            harness_mark_verified,
             workbench_status,
             workbench_diff_summary,
             workbench_diff_file,

@@ -22,6 +22,9 @@
   import { fmtTime } from './format';
   import { fmtTok } from './usageMath';
   import ToolsReference from './ToolsReference.svelte';
+  import { TOOL_ACTIVITY_TAB_ID } from './tabs/types';
+  import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import { loadViewSection, saveViewSection } from './viewSection';
 
   // Reference list of the graph_* MCP tools the code graph exposes to Claude
   // (and the offload worker) while the graph is enabled. Mirrors the
@@ -69,7 +72,12 @@
     { id: 'graph-tools', label: 'Graph tools' },
     { id: 'offload-tools', label: 'Offload tools' },
   ];
-  let section = $state<Section>('activities');
+  // The selection survives the component's destroy/recreate cycle (tab
+  // switch, hide/un-hide) and app restarts — see viewSection.ts.
+  let section = $state<Section>(
+    loadViewSection('tool-activity', SECTIONS.map((s) => s.id), 'activities'),
+  );
+  $effect(() => saveViewSection('tool-activity', section));
 
   // The unified feed is poll-based (same 2s cadence CodeIntelligenceView
   // used); both feed kinds land in the backend's single persistent store, so
@@ -173,9 +181,15 @@
     }
   }
 
+  // Keep-alive (appViews.ts): the poll idles while the tab is off-screen
+  // and a fresh refresh runs the moment it comes back.
+  const unsubShown = onAppViewShown(TOOL_ACTIVITY_TAB_ID, () => void refresh());
+
   onMount(() => {
     void refresh();
-    poll = setInterval(refresh, 2000);
+    poll = setInterval(() => {
+      if (isAppViewVisible(TOOL_ACTIVITY_TAB_ID)) void refresh();
+    }, 2000);
     window.addEventListener('keydown', onKeyDown);
   });
 
@@ -183,6 +197,7 @@
     if (poll) clearInterval(poll);
     if (clearTimer) clearTimeout(clearTimer);
     window.removeEventListener('keydown', onKeyDown);
+    unsubShown();
   });
 
   // Agent sources with a dedicated accent class; anything else (offload
@@ -292,12 +307,14 @@
       title="Graph tools"
       tools={GRAPH_TOOLS}
       note="MCP tools exposed to Claude (and the offload worker) while the graph is enabled. Ask in natural language — Claude picks the tool."
+      persistKey="tool-activity.graph-tools"
     />
   {:else if section === 'offload-tools'}
     <ToolsReference
       title="Offload tools"
       tools={OFFLOAD_TOOLS}
       note="offload_task is the tool Claude calls to delegate; the rest are the tools the local worker uses to complete the task."
+      persistKey="tool-activity.offload-tools"
     />
   {/if}
 </div>

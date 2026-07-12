@@ -12,6 +12,9 @@
   import { onMount } from 'svelte';
   import { workbenchStatus, sessionCommitsRequest, takeSessionCommitsRoute, type WorkbenchStatus } from './workbench';
   import { settings } from './settings/store';
+  import { WORKBENCH_TAB_ID } from './tabs/types';
+  import { onAppViewShown } from './appViewVisibility';
+  import { loadViewSection, saveViewSection } from './viewSection';
   import DiffView from './DiffView.svelte';
   import TimelineView from './TimelineView.svelte';
   import WorktreesView from './WorktreesView.svelte';
@@ -26,7 +29,12 @@
     { id: 'timeline', label: 'Timeline' },
     { id: 'worktrees', label: 'Worktrees' },
   ];
-  let section = $state<Section>('diff');
+  // The selection survives the component's destroy/recreate cycle (tab
+  // switch, hide/un-hide) and app restarts — see viewSection.ts.
+  let section = $state<Section>(
+    loadViewSection('workbench', SECTIONS.map((s) => s.id), 'diff'),
+  );
+  $effect(() => saveViewSection('workbench', section));
 
   // A Sessions-card "commits" click (Code Intelligence tab) reveals this tab
   // AND must land on the Session-commits section — switch on every new
@@ -53,6 +61,9 @@
 
   onMount(() => {
     void refreshStatus();
+    // Keep-alive (appViews.ts): the component is no longer remounted on
+    // re-activation, so re-check git availability whenever the tab returns.
+    return onAppViewShown(WORKBENCH_TAB_ID, () => void refreshStatus());
   });
 
   // Diff and Worktrees both need a real git repo; Timeline needs

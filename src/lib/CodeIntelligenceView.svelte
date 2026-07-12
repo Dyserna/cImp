@@ -65,7 +65,9 @@
   import type { LlmPricingModel } from './settings/types';
   import { workbenchSessionCommitCounts, openSessionCommits } from './workbench';
   import { revealTab } from './tabs/visibility';
-  import { WORKBENCH_TAB_ID } from './tabs/types';
+  import { GRAPH_MONITOR_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
+  import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import { loadCardOpen, loadViewSection, saveCardOpen, saveViewSection } from './viewSection';
 
   // The graph_* tool reference list and the recent-calls activity feed both
   // moved to the Tool Activity tab (ToolActivityView.svelte).
@@ -520,7 +522,23 @@
     { id: 'path', label: 'Trace path' },
     { id: 'architecture', label: 'Architecture' },
   ];
-  let section = $state<Section>('overview');
+  // The selection survives the component's destroy/recreate cycle (tab
+  // switch, hide/un-hide) and app restarts — see viewSection.ts. The
+  // section-gated fetches (memory, usage) still run on mount because
+  // `refresh()` re-checks `section` itself.
+  let section = $state<Section>(
+    loadViewSection('code-intelligence', SECTIONS.map((s) => s.id), 'overview'),
+  );
+  $effect(() => saveViewSection('code-intelligence', section));
+
+  // Open/collapsed state of the Overview usage cards — native <details>
+  // elements, so a remount would otherwise snap them back to collapsed.
+  let sessionCardOpen = $state(loadCardOpen('code-intelligence', 'usage-this-session'));
+  let advisorCardOpen = $state(loadCardOpen('code-intelligence', 'usage-advisor'));
+  let sessionsCardOpen = $state(loadCardOpen('code-intelligence', 'usage-sessions'));
+  $effect(() => saveCardOpen('code-intelligence', 'usage-this-session', sessionCardOpen));
+  $effect(() => saveCardOpen('code-intelligence', 'usage-advisor', advisorCardOpen));
+  $effect(() => saveCardOpen('code-intelligence', 'usage-sessions', sessionsCardOpen));
 
   let roots = $state<GraphStatus[]>([]);
   // Index cards in a stable, hierarchy-shaped order: shallower paths first
@@ -658,11 +676,18 @@
     }),
   );
 
+  // Keep-alive (appViews.ts): this component now lives for the app's
+  // lifetime, so the poll idles while the tab is off-screen and a fresh
+  // refresh runs the moment it comes back.
+  const unsubShown = onAppViewShown(GRAPH_MONITOR_TAB_ID, () => void refresh());
+
   onMount(async () => {
     await refresh();
     // A light poll backstops the event for coverage/progress counters that
     // change without a discrete state transition.
-    poll = setInterval(refresh, 2000);
+    poll = setInterval(() => {
+      if (isAppViewVisible(GRAPH_MONITOR_TAB_ID)) void refresh();
+    }, 2000);
     // Probe the embedder once on open so reachability is visible immediately,
     // without waiting for a backfill to populate the per-root embed status.
     void testEmbedder();
@@ -670,6 +695,7 @@
 
   onDestroy(() => {
     if (poll) clearInterval(poll);
+    unsubShown();
   });
 
   async function doRebuild(): Promise<void> {
@@ -768,6 +794,7 @@
          vars scoped to this card. -->
     <details
       class="card"
+      bind:open={sessionCardOpen}
       style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}"
     >
       <summary class="history-head">
@@ -834,7 +861,7 @@
     </details>
 
     <!-- V14 Phase D2: Advisor card. -->
-    <details class="card advisor">
+    <details class="card advisor" bind:open={advisorCardOpen}>
       <summary class="history-head">
         Budget-tuning advisor
         <span class="muted" title={ADVISOR_RULES_TOOLTIP}>ⓘ rules</span>
@@ -876,7 +903,7 @@
     </details>
 
     <!-- Sessions: project-wide totals table. -->
-    <details class="card">
+    <details class="card" bind:open={sessionsCardOpen}>
       <summary class="history-head">Sessions <span class="muted">({usage?.sessions.length ?? 0})</span></summary>
       {#if !usage || usage.sessions.length === 0}
         <p class="placeholder">No sessions recorded yet.</p>

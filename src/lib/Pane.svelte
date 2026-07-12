@@ -23,23 +23,9 @@
   import TabBar from './TabBar.svelte';
   import TabErrorOverlay from './TabErrorOverlay.svelte';
   import ClosedShellOverlay from './ClosedShellOverlay.svelte';
-  import OffloadServerView from './OffloadServerView.svelte';
-  import CodeIntelligenceView from './CodeIntelligenceView.svelte';
-  import NoteView from './NoteView.svelte';
-  import WorkbenchView from './WorkbenchView.svelte';
-  import GraphView from './GraphView.svelte';
-  import ToolActivityView from './ToolActivityView.svelte';
   import PreviewToolbar from './PreviewToolbar.svelte';
-  import {
-    isShellTab,
-    isOffloadTab,
-    isGraphMonitorTab,
-    isNoteTab,
-    isWorkbenchTab,
-    isGraphViewTab,
-    isToolActivityTab,
-    type TabId,
-  } from './tabs/types';
+  import { attachAppView, detachAppView, isAppViewTab } from './appViews';
+  import { isShellTab, type TabId } from './tabs/types';
   import { tabs } from './tabs/store';
   import type { LayoutNode, PaneNode } from './layout/types';
 
@@ -47,6 +33,7 @@
 
   let paneEl: HTMLDivElement | undefined = $state();
   let slotEl: HTMLDivElement | undefined = $state();
+  let appSlotEl: HTMLDivElement | undefined = $state();
   let mountedTab: TabId | null = $state(null);
 
   // Register this pane's root element with the DOM registry so the
@@ -78,14 +65,21 @@
   // effect below still fires `focusTerminalFor` when the focused
   // pane's tab is unchanged.
   $effect(() => {
-    if (!slotEl) return;
+    if (!slotEl || !appSlotEl) return;
     const desired = pane.active_tab_id;
     if (mountedTab === desired) return;
     if (mountedTab !== null) {
       detachTerminal(mountedTab, slotEl);
+      detachAppView(mountedTab, appSlotEl);
     }
-    if (desired !== null && hasTerminal(desired)) {
-      attachTerminal(desired, slotEl, { focus: focused });
+    if (desired !== null) {
+      if (hasTerminal(desired)) {
+        attachTerminal(desired, slotEl, { focus: focused });
+      }
+      // App-rendered dashboards are registry-owned keep-alive hosts, same
+      // portal pattern as terminals (no-op for every other tab id) — their
+      // component state survives tab switches, hides, and pane moves.
+      attachAppView(desired, appSlotEl);
     }
     mountedTab = desired;
   });
@@ -98,6 +92,7 @@
     return () => {
       if (mountedTab !== null && slotEl) {
         detachTerminal(mountedTab, slotEl);
+        if (appSlotEl) detachAppView(mountedTab, appSlotEl);
         mountedTab = null;
       }
     };
@@ -169,24 +164,16 @@
   <TabBar {pane} />
   <div class="pane-content">
     <div class="terminal-slot" bind:this={slotEl}></div>
+    <!-- The reserved app-rendered dashboards portal in here (see the attach
+         effect above) — they used to render inline, but that destroyed them
+         on every tab switch/hide, resetting all their state. -->
+    <div class="app-slot" bind:this={appSlotEl}></div>
     {#if pane.active_tab_id !== null}
-      {#if isOffloadTab(pane.active_tab_id)}
-        <OffloadServerView />
-      {:else if isGraphMonitorTab(pane.active_tab_id)}
-        <CodeIntelligenceView />
-      {:else if isNoteTab(pane.active_tab_id)}
-        <NoteView />
-      {:else if isWorkbenchTab(pane.active_tab_id)}
-        <WorkbenchView />
-      {:else if isGraphViewTab(pane.active_tab_id)}
-        <GraphView />
-      {:else if isToolActivityTab(pane.active_tab_id)}
-        <ToolActivityView />
-      {:else if $tabs.find((m) => m.id === pane.active_tab_id)?.kind === 'preview'}
+      {#if $tabs.find((m) => m.id === pane.active_tab_id)?.kind === 'preview'}
         {#key pane.active_tab_id}
           <PreviewToolbar tabId={pane.active_tab_id} />
         {/key}
-      {:else}
+      {:else if !isAppViewTab(pane.active_tab_id)}
         <TabErrorOverlay tabId={pane.active_tab_id} onretry={handleRetry} />
         {#if isShellTab(pane.active_tab_id)}
           <ClosedShellOverlay tabId={pane.active_tab_id} />
@@ -218,6 +205,14 @@
   .terminal-slot {
     position: absolute;
     inset: 0;
+  }
+  /* Paints above the terminal slot (later sibling). Click-through when
+     empty — an attached .app-view-host re-enables its own pointer events
+     (inline style, set by appViews.ts) — so shell/AI tabs are unaffected. */
+  .app-slot {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
   }
   /* Focused-pane indicator: a 2px accent line along the top edge of
      the focused pane's tab bar. Top placement (not bottom) so it

@@ -3,18 +3,29 @@
   // with a one-line description and a short example prompt. Styled to match the
   // "Raw server log" collapsible in the Offload Server tab (caret toggle + a
   // bordered, sunken panel). Reused by the Code Graph and Offload Server tabs.
+  import { loadCardOpen, saveCardOpen } from './viewSection';
+
   interface ToolRef {
     name: string;
     desc: string;
     example: string;
   }
+  // `persistKey` (optional) makes the open/collapsed state survive the
+  // destroy/recreate cycle of the hosting tab (and app restarts) — see
+  // viewSection.ts. No key → ephemeral, as before.
   let {
     title = 'Tools',
     tools,
     note = '',
-  }: { title?: string; tools: ToolRef[]; note?: string } = $props();
+    persistKey,
+  }: { title?: string; tools: ToolRef[]; note?: string; persistKey?: string } = $props();
 
-  let open = $state(false);
+  // svelte-ignore state_referenced_locally — persistKey is a static
+  // identity; only the initial value matters for seeding the open state.
+  let open = $state(persistKey ? loadCardOpen('tools-ref', persistKey) : false);
+  $effect(() => {
+    if (persistKey) saveCardOpen('tools-ref', persistKey, open);
+  });
 </script>
 
 <div class="tools-ref">

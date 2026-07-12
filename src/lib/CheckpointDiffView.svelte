@@ -1,3 +1,29 @@
+<script lang="ts" module>
+  import { SvelteSet } from 'svelte/reactivity';
+
+  // Per-instance expansion state, keyed by the parent's `stateKey` and held
+  // at MODULE scope so it survives the destroy/recreate cycle that tears
+  // this component down with its parent (section/tab switch, hide/un-hide,
+  // collapsing and re-expanding a commit row). Session-scoped on purpose —
+  // commit hashes are meaningless across projects and this never needs to
+  // hit disk; growth is bounded by how many diffs the user actually opens.
+  interface KeyedState {
+    expanded: SvelteSet<string>;
+    fullView: SvelteSet<string>;
+  }
+  const keyedStates = new Map<string, KeyedState>();
+
+  function stateFor(stateKey: string | undefined): KeyedState {
+    if (!stateKey) return { expanded: new SvelteSet(), fullView: new SvelteSet() };
+    let s = keyedStates.get(stateKey);
+    if (!s) {
+      s = { expanded: new SvelteSet(), fullView: new SvelteSet() };
+      keyedStates.set(stateKey, s);
+    }
+    return s;
+  }
+</script>
+
 <script lang="ts">
   // V13 Phase C — read-only rendering of a checkpoint's diff-vs-now
   // (`workbench_checkpoint_diff`), shown in the Timeline section's "Diff vs
@@ -6,7 +32,6 @@
   // there's nothing "current" to apply a reverse patch to) and no lazy
   // per-file fetch: the whole parsed diff arrives in one
   // `workbench_checkpoint_diff` call and is rendered as-is, unified only.
-  import { SvelteSet } from 'svelte/reactivity';
   import type { FileStatus, FileDiff } from './workbench';
   import { pairHunkLines, wordDiff } from './diffWords';
 
@@ -15,30 +40,37 @@
   // hunk, change highlighting intact). One call covers every file — the
   // result is cached for the component's lifetime, which is scoped to one
   // commit/checkpoint/worktree anyway. No prop → no toggle rendered.
-  let { files, fetchFull }: { files: FileDiff[]; fetchFull?: () => Promise<FileDiff[]> } = $props();
+  //
+  // `stateKey` (optional) opts this instance into the module-scope keyed
+  // state above, so its expansion survives a remount. The key must pin down
+  // ONE immutable diff (e.g. `git-graph:<hash>`) — parents whose instance
+  // can be repointed at a different diff must recreate it ({#key}) so the
+  // captured state can't bleed across. No prop → ephemeral, as before.
+  let {
+    files,
+    fetchFull,
+    stateKey,
+  }: { files: FileDiff[]; fetchFull?: () => Promise<FileDiff[]>; stateKey?: string } = $props();
 
   // SvelteSet, NOT a plain Set in $state: Svelte 5 doesn't proxy Set, so an
   // in-place .add() would never re-render — and with static props there's no
   // other refresh here to mask it, leaving expansion completely dead.
-  const expanded = new SvelteSet<string>();
+  // svelte-ignore state_referenced_locally — the key is an init-time
+  // identity by contract (see the prop doc above): a parent that repoints
+  // the instance must {#key} it, so capturing the initial value is correct.
+  const { expanded, fullView } = stateFor(stateKey);
   function toggleExpand(path: string): void {
     if (expanded.has(path)) expanded.delete(path);
     else expanded.add(path);
   }
 
-  // Paths currently showing the full-file view (per-file, so one giant file
-  // doesn't force every other expanded file into full mode too).
-  const fullView = new SvelteSet<string>();
+  // (`fullView` holds the paths showing the full-file view — per-file, so
+  // one giant file doesn't force every other expanded file into full mode.)
   let fullFiles = $state<FileDiff[] | null>(null);
   let fullError = $state<string | null>(null);
   let fullLoading = $state(false);
 
-  async function toggleFull(path: string): Promise<void> {
-    if (fullView.has(path)) {
-      fullView.delete(path);
-      return;
-    }
-    fullView.add(path);
+  async function ensureFullFiles(): Promise<void> {
     if (fullFiles !== null || fullLoading || !fetchFull) return;
     fullLoading = true;
     fullError = null;
@@ -50,6 +82,20 @@
       fullLoading = false;
     }
   }
+
+  async function toggleFull(path: string): Promise<void> {
+    if (fullView.has(path)) {
+      fullView.delete(path);
+      return;
+    }
+    fullView.add(path);
+    await ensureFullFiles();
+  }
+
+  // A remount restores `fullView` but the full-file content is a fresh
+  // component-local fetch — kick it off now, or restored toggles would sit
+  // at "Loading full file…" forever (toggleFull only fetches on click).
+  if (fullView.size > 0) void ensureFullFiles();
 
   /// The hunks to render for `f`: the full-file variant when toggled on and
   /// loaded, the normal diff otherwise. Falls back to the diff for a path the

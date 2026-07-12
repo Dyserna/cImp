@@ -6,6 +6,7 @@
   // body plus a read-only per-file diff (`CheckpointDiffView`, the same
   // renderer the Timeline and Worktrees sections reuse). Commits caught live
   // from the session's transcript carry a "✓ agent" provenance chip.
+  import { onMount } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { get } from 'svelte/store';
   import {
@@ -20,6 +21,9 @@
   import CheckpointDiffView from './CheckpointDiffView.svelte';
   import RefChip from './RefChip.svelte';
   import { fmtDate, fmtTime } from './format';
+  import { WORKBENCH_TAB_ID } from './tabs/types';
+  import { onAppViewShown } from './appViewVisibility';
+  import { loadViewSet, saveViewSet } from './viewSection';
 
   let commits = $state<CommitInfo[] | null>(null);
   let truncated = $state(false);
@@ -28,9 +32,14 @@
   // so in-place mutation would never re-render (same reasoning as
   // CheckpointDiffView's SvelteSet). One map holds each commit's diff-load
   // outcome — success and error can never fall out of sync.
+  //
+  // `expanded` persists across the component's destroy/recreate cycle
+  // (section/tab switch, hide/un-hide) and app restarts — a hash outside the
+  // currently-shown session's window matches no row and is inert.
   type DiffState = { files: FileDiff[] } | { error: string };
-  const expanded = new SvelteSet<string>();
+  const expanded = new SvelteSet<string>(loadViewSet('session-commits', 'expanded'));
   const diffs = new SvelteMap<string, DiffState>();
+  $effect(() => saveViewSet('session-commits', 'expanded', expanded));
 
   // Refetch on every new button click (nonce), not on store identity — a
   // remount with the same pending request must also load, hence the local
@@ -43,11 +52,23 @@
     void load(req);
   });
 
+  // Keep-alive (appViews.ts): the Workbench tab is no longer remounted on
+  // re-activation, so a still-running session's window is re-walked when the
+  // tab returns — the remount used to do this implicitly.
+  onMount(() =>
+    onAppViewShown(WORKBENCH_TAB_ID, () => {
+      const req = get(sessionCommitsRequest);
+      if (req) void load(req);
+    }),
+  );
+
   async function load(req: SessionCommitsRequest): Promise<void> {
     commits = null;
     truncated = false;
     error = null;
-    expanded.clear();
+    // `expanded` deliberately survives the reload (it's persisted — see
+    // above); the diff cache is dropped for memory hygiene and refetched
+    // below for whichever expanded commits this session actually shows.
     diffs.clear();
     try {
       const res = await workbenchSessionCommits(req.sessionId, req.fromMs, req.toMs);
@@ -57,9 +78,22 @@
       if (get(sessionCommitsRequest)?.nonce !== req.nonce) return;
       commits = res.commits;
       truncated = res.truncated;
+      // Restored expansions need their diffs fetched here — toggle() only
+      // fetches on click.
+      for (const c of res.commits) {
+        if (expanded.has(c.hash) && !diffs.has(c.hash)) void loadDiff(c.hash);
+      }
     } catch (e) {
       if (get(sessionCommitsRequest)?.nonce !== req.nonce) return;
       error = String(e);
+    }
+  }
+
+  async function loadDiff(hash: string): Promise<void> {
+    try {
+      diffs.set(hash, { files: await workbenchCommitDiff(hash) });
+    } catch (e) {
+      diffs.set(hash, { error: String(e) });
     }
   }
 
@@ -69,12 +103,7 @@
       return;
     }
     expanded.add(c.hash);
-    if (diffs.has(c.hash)) return;
-    try {
-      diffs.set(c.hash, { files: await workbenchCommitDiff(c.hash) });
-    } catch (e) {
-      diffs.set(c.hash, { error: String(e) });
-    }
+    if (!diffs.has(c.hash)) await loadDiff(c.hash);
   }
 </script>
 
@@ -143,7 +172,11 @@
                 {:else if 'error' in diff}
                   <p class="msg err">Couldn't load this commit's diff: {diff.error}</p>
                 {:else}
-                  <CheckpointDiffView files={diff.files} fetchFull={() => workbenchCommitDiff(c.hash, FULL_FILE_CONTEXT)} />
+                  <CheckpointDiffView
+                    files={diff.files}
+                    fetchFull={() => workbenchCommitDiff(c.hash, FULL_FILE_CONTEXT)}
+                    stateKey={`session-commits:${c.hash}`}
+                  />
                 {/if}
               </div>
             {/if}

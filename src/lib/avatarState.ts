@@ -13,6 +13,7 @@ import {
   applyTabCreatedToLayout,
 } from './layout/store';
 import { createTerminal, destroyTerminal } from './terminals';
+import { destroyAppView } from './appViews';
 import { forgetHiddenTab } from './tabs/visibility';
 import { clearTabError } from './tabs/errorState';
 import { type TabId } from './tabs/types';
@@ -225,6 +226,9 @@ export function startAvatarStateListener(): Promise<void> {
         // start life invisibly hidden.
         forgetHiddenTab(e.tab);
         destroyTerminal(e.tab);
+        // Keep-alive app views (Workbench, Graph View, …) are only truly
+        // unmounted here — a plain hide/tab-switch just detaches them.
+        destroyAppView(e.tab);
         dropPerTabEntries(e.tab);
         perTabError.update((m) => {
           if (!(e.tab in m)) return m;

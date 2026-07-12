@@ -5,6 +5,28 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.2] — 2026-07-12
+
+### Fixed
+
+- **App tabs no longer reset when switched away, hidden, or restored.**
+  The app-rendered dashboards (Workbench, Code Intelligence, Tool
+  Activity, Graph View, Offload Server, Note) are now kept alive behind
+  the scenes instead of being rebuilt on every activation — selections,
+  expanded rows, scroll, and the Graph View's laid-out 3D graph all
+  survive tab switches, hide/un-hide, and moving the tab between panes.
+  While off-screen their polls idle; data refreshes the moment they
+  return.
+- **View state survives app restarts.** The selected sub-tab in
+  Workbench / Code Intelligence / Tool Activity, the Usage cards' and
+  tool-reference lists' open state, the Diff pane's expanded files,
+  full-file toggles and Unified/Side-by-side layout, the Git graph's
+  selected commit, and Session commits' expanded commits are persisted
+  per machine.
+- **Git graph:** switching the selected commit no longer leaks the
+  previous commit's full-file content or file expansion into the newly
+  selected one.
+
 ## [0.41.1] — 2026-07-12
 
 ### Added

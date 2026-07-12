@@ -17,17 +17,21 @@
   import CheckpointDiffView from './CheckpointDiffView.svelte';
   import RefChip from './RefChip.svelte';
   import { fmtDate, fmtTime } from './format';
+  import { WORKBENCH_TAB_ID } from './tabs/types';
+  import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import { loadViewString, saveViewString } from './viewSection';
 
   let graph = $state<GitGraph | null>(null);
   let error = $state<string | null>(null);
   let loading = $state(false);
 
-  // Auto-refresh: poll while mounted (the component is destroyed on every
-  // tab/section switch, so this only ticks while the graph is actually on
-  // screen). Background ticks never show the loading state, never clobber
-  // the last-good graph with a transient error, and skip the `graph`
-  // reassignment entirely when nothing changed (no pointless re-render of
-  // up-to-500 keyed rows every tick).
+  // Auto-refresh: poll while mounted. The component is destroyed on section
+  // switches, but the Workbench tab itself is now keep-alive (appViews.ts),
+  // so ticks additionally gate on the tab being on screen — hidden, the poll
+  // idles and a refresh fires on return instead. Background ticks never show
+  // the loading state, never clobber the last-good graph with a transient
+  // error, and skip the `graph` reassignment entirely when nothing changed
+  // (no pointless re-render of up-to-500 keyed rows every tick).
   const AUTO_REFRESH_MS = 5000;
   let refreshing = false;
   let lastFingerprint = '';
@@ -46,21 +50,24 @@
   // open at a time): the detail panel splits the rails SVG in two, and one
   // split keeps that simple. Diffs are cached by hash (a commit's diff is
   // immutable).
-  let selected = $state<string | null>(null);
+  // The selection persists across the component's destroy/recreate cycle
+  // (tab/section switch, hide/un-hide) and app restarts. A stale hash (the
+  // commit fell off the truncated graph, or another repo) matches no row —
+  // selIdx stays -1 and nothing renders or fetches.
+  let selected = $state<string | null>(loadViewString('git-graph', 'selected'));
+  $effect(() => saveViewString('git-graph', 'selected', selected));
   type DiffState = { files: FileDiff[] } | { error: string };
   const diffs = new SvelteMap<string, DiffState>();
 
-  async function select(c: CommitInfo): Promise<void> {
-    if (selected === c.hash) {
-      selected = null;
-      return;
-    }
-    selected = c.hash;
-    if (diffs.has(c.hash)) return;
+  function select(c: CommitInfo): void {
+    selected = selected === c.hash ? null : c.hash;
+  }
+
+  async function loadDiff(hash: string): Promise<void> {
     try {
-      diffs.set(c.hash, { files: await workbenchCommitDiff(c.hash) });
+      diffs.set(hash, { files: await workbenchCommitDiff(hash) });
     } catch (e) {
-      diffs.set(c.hash, { error: String(e) });
+      diffs.set(hash, { error: String(e) });
     }
   }
 
@@ -89,8 +96,14 @@
 
   onMount(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(true), AUTO_REFRESH_MS);
-    return () => clearInterval(timer);
+    const timer = setInterval(() => {
+      if (isAppViewVisible(WORKBENCH_TAB_ID)) void refresh(true);
+    }, AUTO_REFRESH_MS);
+    const unsubShown = onAppViewShown(WORKBENCH_TAB_ID, () => void refresh(true));
+    return () => {
+      clearInterval(timer);
+      unsubShown();
+    };
   });
 
   // ── Lane layout ──────────────────────────────────────────────────────
@@ -189,6 +202,15 @@
     laid && selected ? laid.rows.findIndex((r) => r.commit.hash === selected) : -1,
   );
 
+  // Fetch the visible selection's diff whenever it's missing — covers both a
+  // fresh click and a selection restored on mount (which has to wait for the
+  // graph to load and prove the hash still exists). Diffs are immutable by
+  // hash, so the cache check re-satisfies the effect after the set().
+  $effect(() => {
+    if (selIdx === -1 || !selected || diffs.has(selected)) return;
+    void loadDiff(selected);
+  });
+
   // ── SVG geometry ─────────────────────────────────────────────────────
   // ONE svg spans the whole rails column (a per-row svg would create
   // hundreds of separate SVG documents for the browser to lay out); rows
@@ -277,7 +299,7 @@
             class:selected={row.commit.hash === selected}
             aria-expanded={row.commit.hash === selected}
             style={`padding-left: ${graphWidth + 8}px; height: ${ROW_H}px`}
-            onclick={() => void select(row.commit)}
+            onclick={() => select(row.commit)}
           >
             <span class="hash">{row.commit.short}</span>
             {#each row.commit.refs as r (r)}
@@ -308,10 +330,16 @@
           {:else if 'error' in diff}
             <p class="msg err">Couldn't load this commit's diff: {diff.error}</p>
           {:else}
-            <CheckpointDiffView
-              files={diff.files}
-              fetchFull={() => workbenchCommitDiff(sel.hash, FULL_FILE_CONTEXT)}
-            />
+            <!-- Keyed per commit: switching the selection must not reuse the
+                 instance, or the previous commit's cached full-file content
+                 and expansion would bleed into the new one. -->
+            {#key sel.hash}
+              <CheckpointDiffView
+                files={diff.files}
+                fetchFull={() => workbenchCommitDiff(sel.hash, FULL_FILE_CONTEXT)}
+                stateKey={`git-graph:${sel.hash}`}
+              />
+            {/key}
           {/if}
         </div>
         {@render segment(laid.rows.slice(selIdx + 1), selIdx + 1)}

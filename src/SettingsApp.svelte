@@ -4120,7 +4120,137 @@
                 />
                 <span>Rank session-hot files first (from Memory)</span>
               </label>
+              <label>
+                <span>Dedup TTL (turns, 0 = re-inject every turn)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.context_dedup_ttl_turns}
+                  onchange={(e) =>
+                    patch((s) => {
+                      // 0 is a valid value (dedup off), so keep it — a bare
+                      // `|| 10` would treat the falsy 0 as "unset" and revert it.
+                      const n = Number((e.currentTarget as HTMLInputElement).value);
+                      s.graph.context_dedup_ttl_turns = Number.isFinite(n) ? Math.max(0, n) : 10;
+                    })}
+                />
+              </label>
+              <small class="hint">
+                A file injected in full is demoted to a one-line "unchanged"
+                reminder on later turns until it changes or this many turns pass.
+              </small>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.repo_map_on_session_start}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.repo_map_on_session_start = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Prepend the project map to each new session's first turn</span>
+              </label>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.compaction_context}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.compaction_context = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Feed working set + pinned notes to Claude's compactor</span>
+              </label>
+              <small class="hint">
+                On compaction (<code>PreCompact</code> hook) the session's working
+                set and pinned notes are handed to the summarizer so they survive.
+                Costs a few hundred chars once per compaction. Re-launch the tab to
+                pick up changes.
+              </small>
             {/if}
+
+            <h3>Token efficiency</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.read_advisor}
+                onchange={(e) =>
+                  patch(
+                    (s) => (s.graph.read_advisor = (e.currentTarget as HTMLInputElement).checked),
+                  )}
+              />
+              <span>Redundant-read advisor (Claude tabs)</span>
+            </label>
+            <small class="hint">
+              Intercepts a <code>Read</code> of a file already read unchanged this
+              session and answers with a cheap outline reminder instead of
+              re-reading it. Changes the agent's tool behaviour — strictly opt-in.
+              Claude tabs only for now. Re-launch the tab to pick it up.
+            </small>
+            {#if snapshot.graph.read_advisor}
+              <label>
+                <span>Min file size to advise (lines)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.read_advisor_min_lines}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.read_advisor_min_lines = Math.max(
+                          0,
+                          Number((e.currentTarget as HTMLInputElement).value) || 300,
+                        )),
+                    )}
+                />
+              </label>
+              <small class="hint">
+                Files with fewer lines than this always pass — a small file is
+                cheap to re-read; the reminder isn't worth it.
+              </small>
+              <label>
+                <span>Reminder mode</span>
+                <select
+                  value={snapshot.graph.read_advisor_mode}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.read_advisor_mode = (
+                          e.currentTarget as HTMLSelectElement
+                        ).value),
+                    )}
+                >
+                  <option value="advise">Advise — outline reminder only</option>
+                  <option value="substitute">Substitute — outline + most relevant symbol body</option>
+                </select>
+              </label>
+            {/if}
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.context_llm_digests}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.context_llm_digests = (
+                        e.currentTarget as HTMLInputElement
+                      ).checked),
+                  )}
+              />
+              <span>Local-model digests for outline-poor files</span>
+            </label>
+            <small class="hint">
+              For files with no useful outline (docs, configs, long scripts), the
+              <strong>local</strong> offload backend writes a 3-line semantic
+              digest, cached in <code>graph.db</code>. Needs a ready local offload
+              backend; never leaves this machine.
+            </small>
 
             <h3>Architecture &amp; path tracing</h3>
             <small class="hint">

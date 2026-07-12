@@ -1,6 +1,13 @@
 # V16 — Harness Contract Hardening (Read Advisor II)
 
-**Status:** SPEC (written 2026-07-12). Not yet coded.
+**Status:** SPEC (written 2026-07-12). Not yet coded, except Feature 6's
+basic controls (shipped 2026-07-12 ahead of the milestone): the Token
+efficiency group (`read_advisor` + min-lines + mode, `context_llm_digests`)
+and the injection-nested knobs (`context_dedup_ttl_turns`,
+`repo_map_on_session_start`, `compaction_context`) are in
+`SettingsApp.svelte`. Still owed by Feature 6: the E1-fail disabled state
+(Feature 0), the trust-TTL input (Feature 5), and the
+`context_llm_digests` offload-health awareness.
 **Builds on:** V11 token efficiency (`read_hook.rs` / `compact_hook.rs`, the
 `should_read` verdict path, remind-once state), V14 workflow visibility (the
 Advisor card + versioned rules in `advisor.rs`, the Usage section, `usage_stat`

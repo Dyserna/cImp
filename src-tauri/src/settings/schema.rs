@@ -1746,6 +1746,11 @@ pub enum OffloadBackendKind {
         server_command: String,
         /// Spawn at app launch and keep warm (else lazy on first offload).
         autostart: bool,
+        /// When true, the Offload Server tab's Start button shows the
+        /// command in an editable confirm popup first; an edited command is
+        /// used for that launch only and never persisted.
+        #[serde(default)]
+        show_command_on_start: bool,
     },
     /// cImp holds a `base_url` (+ optional auth) and health-checks it; it
     /// cannot start/stop the process. A LAN box or a cloud API.
@@ -1795,7 +1800,10 @@ impl std::fmt::Debug for OffloadBackend {
             OffloadBackendKind::Local {
                 server_command,
                 autostart,
-            } => format!("Local {{ server_command: {server_command:?}, autostart: {autostart} }}"),
+                show_command_on_start,
+            } => format!(
+                "Local {{ server_command: {server_command:?}, autostart: {autostart}, show_command_on_start: {show_command_on_start} }}"
+            ),
             OffloadBackendKind::Remote {
                 base_url,
                 auth_token,
@@ -1823,6 +1831,7 @@ impl Default for OffloadBackendKind {
         OffloadBackendKind::Local {
             server_command: String::new(),
             autostart: false,
+            show_command_on_start: false,
         }
     }
 }
@@ -1875,6 +1884,7 @@ impl OffloadSettings {
             kind: OffloadBackendKind::Local {
                 server_command: self.server_command.clone(),
                 autostart: self.autostart,
+                show_command_on_start: false,
             },
             declared_context: None,
             declared_model: String::new(),
@@ -3367,8 +3377,28 @@ mod tests {
             kind: OffloadBackendKind::Local {
                 server_command: cmd.to_string(),
                 autostart: false,
+                show_command_on_start: false,
             },
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn local_backend_kind_defaults_show_command_on_start() {
+        // A pre-existing config written before the field existed must
+        // deserialize with the popup off (opt-in behavior).
+        let kind: OffloadBackendKind = serde_json::from_value(json!({
+            "type": "local",
+            "server_command": "llama-server --port 8080 --jinja",
+            "autostart": true,
+        }))
+        .expect("legacy local kind deserializes");
+        match kind {
+            OffloadBackendKind::Local {
+                show_command_on_start,
+                ..
+            } => assert!(!show_command_on_start, "missing field must default to false"),
+            _ => panic!("expected Local kind"),
         }
     }
 

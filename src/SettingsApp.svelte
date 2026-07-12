@@ -356,7 +356,7 @@
         {
           name: uniqueBackendName('local'),
           enabled: true,
-          kind: { type: 'local', server_command: '', autostart: false },
+          kind: { type: 'local', server_command: '', autostart: false, show_command_on_start: false },
           declared_context: null,
           declared_model: '',
           tier: 'quality',
@@ -388,7 +388,12 @@
         {
           name: 'local',
           enabled: true,
-          kind: { type: 'local', server_command: s.offload.server_command, autostart: s.offload.autostart },
+          kind: {
+            type: 'local',
+            server_command: s.offload.server_command,
+            autostart: s.offload.autostart,
+            show_command_on_start: false,
+          },
           declared_context: null,
           declared_model: '',
           tier: 'quality',
@@ -3130,6 +3135,23 @@
                     placeholder="llama-server --model … --port 8080 --jinja -ngl 99 --ctx-size 150000"
                   ></textarea>
                 </label>
+                <label class="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={backend.kind.show_command_on_start}
+                    onchange={(e) =>
+                      updateBackend(i, (b) => {
+                        if (b.kind.type === 'local')
+                          b.kind.show_command_on_start = (e.currentTarget as HTMLInputElement).checked;
+                      })}
+                  />
+                  <span>Show command on start</span>
+                </label>
+                <small class="hint">
+                  The Offload Server tab's Start button opens the command in an
+                  editable popup first — edits apply to that launch only and are
+                  not saved here.
+                </small>
                 <div class="button-row template-actions">
                   <button
                     type="button"

@@ -6,11 +6,15 @@
   // this component down with its parent (section/tab switch, hide/un-hide,
   // collapsing and re-expanding a commit row). Session-scoped on purpose —
   // commit hashes are meaningless across projects and this never needs to
-  // hit disk; growth is bounded by how many diffs the user actually opens.
+  // hit disk. Capped LRU-style: the app stays open for days, so "one entry
+  // per commit ever clicked into" would otherwise grow without bound; the
+  // least-recently-mounted key is evicted first (losing only the expansion
+  // memory of a diff the user hasn't looked at in 200 diffs).
   interface KeyedState {
     expanded: SvelteSet<string>;
     fullView: SvelteSet<string>;
   }
+  const KEYED_STATES_CAP = 200;
   const keyedStates = new Map<string, KeyedState>();
 
   function stateFor(stateKey: string | undefined): KeyedState {
@@ -18,7 +22,15 @@
     let s = keyedStates.get(stateKey);
     if (!s) {
       s = { expanded: new SvelteSet(), fullView: new SvelteSet() };
-      keyedStates.set(stateKey, s);
+    } else {
+      // Re-insert so Map iteration order doubles as recency order.
+      keyedStates.delete(stateKey);
+    }
+    keyedStates.set(stateKey, s);
+    while (keyedStates.size > KEYED_STATES_CAP) {
+      const oldest = keyedStates.keys().next().value;
+      if (oldest === undefined) break;
+      keyedStates.delete(oldest);
     }
     return s;
   }

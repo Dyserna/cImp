@@ -15,6 +15,7 @@
   import ManagePresetsDialog from './lib/dialog/ManagePresetsDialog.svelte';
   import RestoreCheckpointDialog from './lib/dialog/RestoreCheckpointDialog.svelte';
   import NewWorktreeTabDialog from './lib/dialog/NewWorktreeTabDialog.svelte';
+  import OffloadStartCommandDialog from './lib/dialog/OffloadStartCommandDialog.svelte';
   import Toast from './lib/Toast.svelte';
   import DragGhost from './lib/dnd/DragGhost.svelte';
   import DropZoneOverlay from './lib/dnd/DropZoneOverlay.svelte';
@@ -468,6 +469,7 @@
   <ManagePresetsDialog />
   <RestoreCheckpointDialog />
   <NewWorktreeTabDialog />
+  <OffloadStartCommandDialog />
   <Toast />
 </main>
 

@@ -678,8 +678,14 @@
 
   // Keep-alive (appViews.ts): this component now lives for the app's
   // lifetime, so the poll idles while the tab is off-screen and a fresh
-  // refresh runs the moment it comes back.
-  const unsubShown = onAppViewShown(GRAPH_MONITOR_TAB_ID, () => void refresh());
+  // refresh runs the moment it comes back. Re-probe the embedder too —
+  // pre-keep-alive, the remount re-ran the reachability probe on every tab
+  // visit, and nothing else ever updates it (an embedder started while the
+  // tab was hidden would otherwise show "unreachable" until a manual probe).
+  const unsubShown = onAppViewShown(GRAPH_MONITOR_TAB_ID, () => {
+    void refresh();
+    void testEmbedder();
+  });
 
   onMount(async () => {
     await refresh();

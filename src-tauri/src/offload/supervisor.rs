@@ -137,6 +137,7 @@ fn local_command(b: &OffloadBackend) -> Option<(String, bool)> {
         OffloadBackendKind::Local {
             server_command,
             autostart,
+            ..
         } => Some((server_command.clone(), *autostart)),
         _ => None,
     }
@@ -336,11 +337,23 @@ impl OffloadSupervisor {
         let name = self
             .primary_name()
             .ok_or_else(|| AppError::Offload("no local backend configured".into()))?;
-        self.start_backend(&name).await
+        self.start_backend(&name, None).await
     }
 
-    /// Start one named Local backend if not already running. Idempotent.
-    pub async fn start_backend(self: &Arc<Self>, name: &str) -> AppResult<()> {
+    /// Start one named Local backend if not already running. Idempotent —
+    /// except with a `command_override`, where an already-running backend is
+    /// an error (silently ignoring the edited command would let the popup
+    /// report success while the old process keeps running).
+    ///
+    /// `command_override` (the Offload Server tab's "show command on start"
+    /// popup) replaces the backend's configured `server_command` for this
+    /// launch only — it is never persisted, and goes through the exact same
+    /// parse/validation as the configured command.
+    pub async fn start_backend(
+        self: &Arc<Self>,
+        name: &str,
+        command_override: Option<String>,
+    ) -> AppResult<()> {
         let snap = self.settings.current().offload;
         if !snap.enabled {
             return Err(AppError::OffloadNotReady("offload is disabled".into()));
@@ -354,8 +367,14 @@ impl OffloadSupervisor {
 
         let mut guard = self.running.lock().await;
         if guard.contains_key(name) {
+            if command_override.is_some() {
+                return Err(AppError::Offload(format!(
+                    "`{name}` is already running — stop it first to start with an edited command"
+                )));
+            }
             return Ok(()); // already running/starting
         }
+        let command = command_override.unwrap_or(command);
         if command.trim().is_empty() {
             // Drop the `running` lock before the set_state await so a slow
             // event emit can't block other backend start/stop calls.
@@ -433,7 +452,7 @@ impl OffloadSupervisor {
         }
         for b in local_backends(&snap) {
             if let Some((_, true)) = local_command(&b) {
-                if let Err(e) = self.start_backend(&b.name).await {
+                if let Err(e) = self.start_backend(&b.name, None).await {
                     warn!(backend = %b.name, error = %e, "offload: autostart failed");
                 }
             }
@@ -500,7 +519,7 @@ impl OffloadSupervisor {
     /// Restart one named Local backend (Reset): stop, then start.
     pub async fn restart_backend(self: &Arc<Self>, name: &str) -> AppResult<()> {
         self.stop_backend(name).await;
-        self.start_backend(name).await
+        self.start_backend(name, None).await
     }
 
     /// Run one offload task against a ready **local** backend (used by the

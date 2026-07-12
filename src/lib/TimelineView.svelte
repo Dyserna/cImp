@@ -20,13 +20,19 @@
   import CheckpointDiffView from './CheckpointDiffView.svelte';
   import { WORKBENCH_TAB_ID } from './tabs/types';
   import { onAppViewShown } from './appViewVisibility';
+  import { loadViewString, saveViewString } from './viewSection';
 
   let checkpoints = $state<Checkpoint[]>([]);
   let loading = $state(false);
   let loadError = $state<string | null>(null);
   let creatingNow = $state(false);
 
-  let openDiffFor = $state<string | null>(null);
+  // The open "Diff vs now" persists (viewSection.ts) like the sibling
+  // sections' expansions — a stale id matches no row and renders nothing;
+  // refresh() fetches the diff for a restored id (toggleDiff only fetches
+  // on click).
+  let openDiffFor = $state<string | null>(loadViewString('timeline', 'open-diff'));
+  $effect(() => saveViewString('timeline', 'open-diff', openDiffFor));
   let diffFiles = $state<Map<string, FileDiff[]>>(new Map());
   let diffErrors = $state<Map<string, string>>(new Map());
   let diffLoading = $state<Set<string>>(new Set());
@@ -38,6 +44,9 @@
       // Newest first — the shadow module returns oldest-first (matches
       // `git log`'s natural iteration order for the backing commits).
       checkpoints = (await workbenchCheckpoints()).slice().reverse();
+      if (openDiffFor !== null && checkpoints.some((c) => c.id === openDiffFor)) {
+        void loadDiffFor(openDiffFor);
+      }
     } catch (e) {
       loadError = errorMessage(e);
     } finally {
@@ -78,21 +87,24 @@
       return;
     }
     openDiffFor = id;
-    if (!diffFiles.has(id)) {
-      diffLoading.add(id);
+    await loadDiffFor(id);
+  }
+
+  async function loadDiffFor(id: string): Promise<void> {
+    if (diffFiles.has(id) || diffLoading.has(id)) return;
+    diffLoading.add(id);
+    diffLoading = new Set(diffLoading);
+    try {
+      const files = await workbenchCheckpointDiff(id);
+      diffFiles.set(id, files);
+      diffFiles = new Map(diffFiles);
+      diffErrors.delete(id);
+    } catch (e) {
+      diffErrors.set(id, errorMessage(e));
+      diffErrors = new Map(diffErrors);
+    } finally {
+      diffLoading.delete(id);
       diffLoading = new Set(diffLoading);
-      try {
-        const files = await workbenchCheckpointDiff(id);
-        diffFiles.set(id, files);
-        diffFiles = new Map(diffFiles);
-        diffErrors.delete(id);
-      } catch (e) {
-        diffErrors.set(id, errorMessage(e));
-        diffErrors = new Map(diffErrors);
-      } finally {
-        diffLoading.delete(id);
-        diffLoading = new Set(diffLoading);
-      }
     }
   }
 
@@ -166,6 +178,7 @@
                 <CheckpointDiffView
                   files={diffFiles.get(cp.id) ?? []}
                   fetchFull={() => workbenchCheckpointDiff(cp.id, FULL_FILE_CONTEXT)}
+                  stateKey={`timeline:${cp.id}`}
                 />
               {/if}
             </div>

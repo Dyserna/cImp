@@ -113,8 +113,14 @@
       console.warn('graph_viz_file_status failed:', e);
     }
   }
+  // Gated on visibility like the refetch-expanded effect below: the summary
+  // store keeps ticking while the Workbench tab is off-screen (it also feeds
+  // the status-bar badge), and without the gate each tick would fire
+  // graph_viz_file_status IPC for a view nobody can see. On return the flip
+  // re-runs this; the same-key dedup inside loadGraphStatuses makes that
+  // re-run free when nothing moved.
   $effect(() => {
-    if (!$settings.graph.enabled || !$settings.graph.graph_viz) return;
+    if (!$settings.graph.enabled || !$settings.graph.graph_viz || !$workbenchVisible) return;
     const files = $workbenchDiff?.files ?? [];
     void loadGraphStatuses(files.slice(0, MAX_FILE_ROWS).map((f) => f.path));
   });

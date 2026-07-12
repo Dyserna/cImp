@@ -932,13 +932,17 @@ pub async fn offload_statuses(
     Ok(supervisor.statuses().await)
 }
 
-/// V8-02: start one named Local backend (idempotent).
+/// V8-02: start one named Local backend (idempotent). `command_override`
+/// (the Offload Server tab's "show command on start" popup) launches with
+/// that command instead of the configured one for this start only — it goes
+/// through the same parse/validation and is never persisted.
 #[tauri::command]
 pub async fn offload_backend_start(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
     name: String,
+    command_override: Option<String>,
 ) -> AppResult<()> {
-    supervisor.inner().start_backend(&name).await
+    supervisor.inner().start_backend(&name, command_override).await
 }
 
 /// V8-02: stop one named Local backend (idempotent).

@@ -5,6 +5,35 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.3] — 2026-07-12
+
+### Added
+
+- **Offload: "Show command on start" confirm dialog.** A new per-Local-
+  backend checkbox (Settings → Offload, under the server command) makes
+  the Offload Server tab's Start button open the `llama-server` command
+  in an editable confirm dialog first. The edited command applies to
+  that launch only — it is validated by the same parse as the configured
+  command (errors render inline) and is never written back to Settings.
+  Starting with an edited command while the server is already running is
+  an explicit error instead of a silent no-op.
+
+### Fixed
+
+- **Offload routing follows the running server.** When the local
+  backend is up, offload routing and the dashboard now use the URL the
+  server was actually launched with rather than re-parsing the saved
+  command, so a one-shot command override (or an edited-but-not-yet-
+  restarted command) can't point tasks at the wrong host/port.
+- **Keep-alive follow-ups (0.41.2):** the Code Intelligence embedder
+  reachability probe re-runs when the tab returns (it no longer sticks
+  on "unreachable" after starting the embedder while the tab was
+  hidden); the Diff pane stops issuing graph-status queries while the
+  Workbench tab is off-screen; Worktrees diff-panel expansion and the
+  Timeline's open "Diff vs now" (including per-file expansion) now
+  persist like the sibling sections; the per-commit diff-expansion
+  memory is capped instead of growing for the app's lifetime.
+
 ## [0.41.2] — 2026-07-12
 
 ### Fixed

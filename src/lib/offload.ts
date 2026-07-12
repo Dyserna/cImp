@@ -89,8 +89,12 @@ export async function offloadStatuses(): Promise<BackendStatus[]> {
   return invoke('offload_statuses');
 }
 
-export async function offloadBackendStart(name: string): Promise<void> {
-  await invoke('offload_backend_start', { name });
+/// Start a Local backend. `commandOverride` (from the Offload Server tab's
+/// "show command on start" popup) launches with that command instead of the
+/// configured one for this start only — it is validated by the same backend
+/// parse as the configured command and never persisted.
+export async function offloadBackendStart(name: string, commandOverride?: string): Promise<void> {
+  await invoke('offload_backend_start', { name, commandOverride: commandOverride ?? null });
 }
 
 export async function offloadBackendStop(name: string): Promise<void> {

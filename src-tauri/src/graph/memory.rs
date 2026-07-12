@@ -296,6 +296,23 @@ pub struct Effectiveness {
     pub injected_chars: u64,
     pub deduped_chars: u64,
     pub advisor_displaced_chars: u64,
+    /// V16 Feature 4: WHOLE-FILE chars of reminded files the agent re-read
+    /// via the shell anyway (`bypass` Activity events, est.) — what the
+    /// bypasses actually re-spent. Display/audit only; NOT the netting
+    /// subtrahend (different unit from `advisor_displaced_chars`, which
+    /// sums reminder text).
+    pub bypassed_chars: u64,
+    /// V16 Feature 4 (review fix): reminder-TEXT chars of bypassed
+    /// reminders — the like-for-like amount the UI subtracts from
+    /// `advisor_displaced_chars` (same unit: both sum reminder text). Kept
+    /// separate from `bypassed_chars` so the subtraction is visible AND
+    /// unit-consistent.
+    pub bypassed_advice_chars: u64,
+    /// V16 Feature 9: the compounding readout — displaced chars re-counted
+    /// on every subsequent retrieve turn (content kept out of context is
+    /// saved again as a cache read each later turn). Root-scoped via the
+    /// same session-map filtering as the other in-memory counters.
+    pub compounded_chars: u64,
 }
 
 /// The Usage section's full IPC payload (`graph_usage`).

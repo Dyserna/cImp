@@ -286,7 +286,13 @@ impl TabRegistry {
             .managers
             .get(&tab)
             .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
-        let snap = settings.current();
+        let mut snap = settings.current();
+        // V16: `harness_versions` is written out-of-band to the physical
+        // global file (transcript tap, hand edit per MAINTENANCE.md) — the
+        // live snapshot only reflects app startup. Re-read at spawn so the
+        // E1-fail hard block in `build_pre_args` sees a just-recorded
+        // outcome without an app restart (mtime-cached; a stat per spawn).
+        snap.harness_versions = crate::settings::read_global_harness_versions();
         // build_launch_spec resolves the command via PATH; "binary not on
         // PATH" is the most common failure surface. Shell tabs route this
         // to a dedicated `ShellLaunchFailed` signal that pins the tab to
@@ -350,7 +356,10 @@ impl TabRegistry {
             .get(&tab)
             .ok_or_else(|| AppError::Pty(format!("unknown tab {tab:?}")))?;
         manager.shutdown().await?;
-        let snap = settings.current();
+        let mut snap = settings.current();
+        // Same out-of-band refresh as `start_subprocess` — a restart is
+        // exactly when a hand-recorded E1 outcome should take effect.
+        snap.harness_versions = crate::settings::read_global_harness_versions();
         let spec = match build_launch_spec(tab.clone(), &snap, launch_cwd, invocation_args) {
             Ok(s) => s,
             Err(e) => {

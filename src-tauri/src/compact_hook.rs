@@ -8,18 +8,19 @@
 //! and (b) returns a compact block (ranked working set + pinned notes) to carry
 //! through the summary. We print that block as the hook's additional context.
 //!
-//! TODO(spike D0): the exact stdout field that reaches the *compaction prompt*
-//! is unverified against the pinned Claude Code version. We emit the documented
-//! `hookSpecificOutput.additionalContext` shape (mirroring the UserPromptSubmit
-//! hook); the server-side side effects above happen regardless of how Claude
-//! consumes stdout, so the feature degrades safely if this field is ignored.
+//! Spike D0 (V16 Feature 0): whether the emitted
+//! `hookSpecificOutput.additionalContext` reaches the *compaction prompt* —
+//! recipe in `docs/MAINTENANCE.md` → harness contracts; outcome recorded in
+//! `harness_versions.d0_status` (global settings, informational). The
+//! server-side side effects above happen regardless of how Claude consumes
+//! stdout, so the feature degrades safely if this field is ignored.
 //!
 //! Dependency-light and synchronous, like `--context-hook`; prints nothing and
 //! exits 0 on any error so it never blocks or perturbs a compaction.
 
 use std::io::{Read, Write};
 
-use crate::context_hook::post_loopback;
+use crate::context_hook::{missing_fields, post_loopback, report_contract_drift, resolve_cwd};
 
 pub fn run() {
     let mut input = String::new();
@@ -34,13 +35,14 @@ pub fn run() {
     // "manual" (a `/compact`) or "auto" (context-window pressure); forwarded to
     // the route but not currently acted on (it's ignored server-side today).
     let trigger = v.get("trigger").and_then(|s| s.as_str()).unwrap_or("");
-    let cwd = v
-        .get("cwd")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
-        .unwrap_or_default();
+    let cwd_raw = v.get("cwd").and_then(|s| s.as_str()).unwrap_or("");
+    // V16 Feature 3: payload-shape drift report (fail-open unchanged).
+    report_contract_drift(
+        "compact_hook",
+        &missing_fields(&[("session_id", !session_id.is_empty()), ("cwd", !cwd_raw.is_empty())]),
+        session_id,
+    );
+    let cwd = resolve_cwd(cwd_raw);
 
     let body = serde_json::json!({
         "cwd": cwd,

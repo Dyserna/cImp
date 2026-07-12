@@ -301,8 +301,8 @@ What each feature depends on, and the early-warning signal that it broke:
 | Feature | Contract it depends on | Where wired | Symptom if the contract drifts |
 |---|---|---|---|
 | Context injection (V10) | `UserPromptSubmit` hook stdout (`hookSpecificOutput.additionalContext`) reaches the model | `context_hook.rs`, overlay in `tabs/config.rs` | Effectiveness "chars injected" keeps growing but injected files are never followed (Advisor follow-rate collapses); agent re-explores constantly |
-| Compaction survival (V11-D) | `PreCompact` hook stdout reaches the compaction prompt — **still `TODO(spike)`, never hands-on verified** (see the V11 section) | `compact_hook.rs` | Hard to observe (server-side dedup-clear stays correct regardless); post-compaction re-exploration despite the feature being on |
-| Read advisor (V11-E) | `PreToolUse` deny's `permissionDecisionReason` is surfaced **to the model** — also still `TODO(spike)` | `read_hook.rs` | Activity `read_advisor`/`remind` events nearly always followed by an immediate full re-read (the V14 Advisor rule fires at ≥50% — ~100% means the reason text isn't reaching the model, i.e. bare refusals); or the remind counter flatlines while large unchanged files keep being re-read (hook not firing at all) |
+| Compaction survival (V11-D) | `PreCompact` hook stdout reaches the compaction prompt — spike **D0**; outcome recorded in `harness_versions.d0_status` (still `unverified` until run — see the V16 spike recipes below) | `compact_hook.rs` | Hard to observe (server-side dedup-clear stays correct regardless); post-compaction re-exploration despite the feature being on |
+| Read advisor (V11-E) | `PreToolUse` deny's `permissionDecisionReason` is surfaced **to the model** — spike **E1**; outcome recorded in `harness_versions.e1_status` (`"fail"` hard-blocks the advisor: Settings toggle disabled + hook never installed) | `read_hook.rs` | `drift.read_reason.v1` fires (~100% remind→immediate full re-read = bare refusals); `drift.read_hook_silent.v1` fires (remind counter flatlines while large unchanged files keep being re-read) |
 | Post-edit checks (V12) | `PostToolUse` hook fires for `Edit`/`Write`/`MultiEdit` with the documented payload shape | `postedit_hook.rs` route `/context/post_edit` | Auto-check diagnostics stop appearing after edit bursts |
 | Permission detection | TUI prompt text matches "Esc to cancel · Tab to amend" | scanner (see memory / V2-03) | Permission notifications stop firing; recharacterize via `RUST_LOG=perm_capture=debug` |
 | Statusline / usage | `--settings` overlay accepted at spawn; transcript JSONL `usage` fields present | `statusline/mod.rs`, OOB tap | Status bar context/usage goes blank; Usage section stops populating |
@@ -314,19 +314,60 @@ already-read file, and watch (a) the Code Intelligence → Usage Effectiveness
 counters move, (b) Activity logging `remind` events *without* an immediate
 identical full `Read` right after, (c) the status-bar context/usage line
 populating. For OpenCode, confirm a session shows up under Memory. Any drift:
-re-run the V10/V11 spike method (capture harness) documented in the V11
-section's `TODO(spike)` block before trusting the feature again.
+re-run the spike recipes below before trusting the feature again.
 
-**Hardening ideas if drift becomes a recurring problem** (not implemented,
-recorded 2026-07-12): record the harness version per tab spawn (transcript
-metadata carries it) and badge the Advisor card "harness updated — contracts
-unverified" on change; shim-side validation of the hook input JSON shape with
-a `contract_drift` Activity event on mismatch (shims already fail open); a
-runtime canary that auto-suggests disabling `read_advisor` when the
-remind→immediate-re-read rate hits ~100%; a `PostToolUse` Bash tap to count
-advisor *bypasses* (`cat`/`Get-Content` of a just-reminded file). The
-`tool.execute.before` OpenCode veto spike (V11 Feature 5) is also still open —
-required before extending the read advisor to OpenCode.
+**V16 (2026-07-12) — drift detection is now built in.** The "hardening ideas"
+recorded here earlier all shipped as V16:
+
+- **Version tripwire** — the OOB tap records the Claude CLI version from the
+  transcript (`harness_versions.claude_last_seen` in the global
+  `settings.json`); `opencode --version` is captured at tab spawn. When
+  `last_seen ≠ claude_last_verified` the Advisor card raises
+  `drift.harness_version.v1` with a **Mark verified** action — click it only
+  AFTER re-running the recipes below.
+- **Runtime canaries** — `drift.read_reason.v1` (~100% remind→re-read ⇒
+  propose disabling `read_advisor`), `drift.read_hook_silent.v1` (large
+  re-reads but zero reminds ⇒ hook not firing), `drift.injection_unseen.v1`
+  (injection follow-rate ~0%), `drift.usage_fields_gone.v1` (Claude sessions
+  without token fields). All on the Advisor card, `src-tauri/src/advisor.rs`.
+- **Shim payload validation** — the three shims POST
+  `/activity/contract_drift` when required fields go missing (still fail
+  open); surfaced as `drift.payload.v1`.
+- **Bypass detection** — the transcript tap counts shell reads of
+  just-reminded files (`read_advisor`/`bypass` Activity events, est.);
+  `drift.read_bypass.v1` proposes disabling the advisor at ≥40%.
+
+**Spike recipes (Feature 0 — record outcomes in
+`harness_versions.{e1_status,d0_status}` in the global `settings.json`):**
+
+- **E1 (read advisor deny reason reaches the model).** With the app running
+  and `graph.enabled` + `graph.read_advisor` on, open a Claude tab in a
+  project with a large indexed file. Have the agent `Read` the file twice in
+  one session (second read unchanged). On the second read the hook denies
+  with the outline reminder. **Pass:** the model's next message references
+  the outline content (it *acts on* the reminder — e.g. answers from it, or
+  targets a specific symbol next). **Fail:** the model reports a bare
+  permission refusal and immediately retries/hits the same wall (check the
+  transcript JSONL for what the model actually received). Record
+  `"e1_status": "pass"` or `"fail"`; `"fail"` disables the Settings toggle
+  and blocks the hook install until changed back after a harness update.
+  A hand edit takes effect on the next tab launch/restart (the spawn path
+  re-reads the global file) and in a freshly opened Settings window — no
+  app restart needed. Anything other than `"unverified"`/`"pass"` (any
+  casing) is treated as a failure — the gate fails closed on typos.
+- **D0 (PreCompact additionalContext reaches the compaction prompt).** With
+  `compaction_context` on, run a session up to a `/compact` (manual is
+  fine). **Pass:** the post-compaction summary retains working-set files /
+  pinned notes fed by `/context/compaction` (compare against the block the
+  route returned — visible via `RUST_LOG=debug`). **Fail:** summary shows no
+  trace of it. Record `"d0_status"` accordingly (informational — a fail
+  degrades to a no-op, nothing misbehaves).
+- **OpenCode veto (V16 Feature 7 gate, still open).** In a scratch project,
+  add a `tool.execute.before` handler to the generated
+  `.opencode/plugin/cimp-inject.js` that throws for a known file's read and
+  observe whether (a) the read is vetoed and (b) the thrown message reaches
+  the model. Pass ⇒ implement the OpenCode read advisor per the V16 spec;
+  fail ⇒ record Claude-only as permanent-until-upstream-changes here.
 
 ## Offload backends (V8-01 / V8-02)
 

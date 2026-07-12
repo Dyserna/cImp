@@ -805,6 +805,15 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // the physical global file. Preserve it so a stale Settings-window
     // snapshot can't stomp a price edit made through the dedicated IPC.
     incoming.llm_pricing = cur.llm_pricing.clone();
+    // `harness_versions` is likewise out-of-band (V16): written by the OOB
+    // transcript tap / tab spawn / `harness_mark_verified`, straight to the
+    // physical global file. A stale Settings-window snapshot must not revert
+    // a version observation or a Mark-verified. (The persistence layer
+    // additionally bans `llm_pricing`/`harness_versions` from project
+    // overlays wholesale — `OVERLAY_BANNED_KEYS` in settings/persistence.rs;
+    // this list here covers the in-memory round trip, that one the on-disk
+    // diff/merge. Keep both in mind when adding an out-of-band field.)
+    incoming.harness_versions = cur.harness_versions.clone();
     *cur = incoming;
     // Keep the reserved feature tabs (Offload Server / Code Graph monitor /
     // Workbench) present-iff-enabled in the persisted list.
@@ -1741,6 +1750,31 @@ pub async fn graph_usage_advice(
     };
     let session_count = graph.advisor_session_count(&root);
 
+    // V16 drift signals. `harness_versions` is read from the physical global
+    // file (not the live merged settings) so background writes — the tap
+    // noting a version mid-run — are visible without a restart (mtime-cached,
+    // so the 2s poll doesn't re-parse the file every tick).
+    let hv = crate::settings::read_global_harness_versions();
+    // `remind_count` (drift.read_hook_silent.v1) is the same total-remind-rows
+    // count `advisor_reread_rate` just scanned for — reuse its sample count
+    // instead of a second identical Datalog scan.
+    let remind_count = advisor_reread_samples;
+    let (large_reread_pairs, claude_sessions, claude_tokenless_sessions) =
+        graph.drift_db_signals(&root);
+    // One clone of the activity ring serves both the bypass-rate signal and
+    // the contract-drift filter.
+    let activity = crate::activity::snapshot();
+    let (bypass_rate, bypass_samples) = match graph.bypass_rate(&activity) {
+        Some((r, n)) => (Some(r), n),
+        None => (None, 0),
+    };
+    let since = crate::activity::process_start_ms();
+    let contract_drift: Vec<String> = activity
+        .iter()
+        .filter(|e| e.source == "harness" && e.tool == "contract_drift" && e.ts_ms >= since)
+        .map(|e| e.target.clone())
+        .collect();
+
     let sig = crate::advisor::Signals {
         injection_follow_rate,
         injection_follow_samples,
@@ -1751,17 +1785,52 @@ pub async fn graph_usage_advice(
         session_count,
         graph: settings.graph.clone(),
         dismissed: settings.advisor_dismissed.clone(),
+        claude_last_seen: hv.claude_last_seen,
+        claude_last_verified: hv.claude_last_verified,
+        remind_count,
+        large_reread_pairs,
+        claude_sessions,
+        claude_tokenless_sessions,
+        contract_drift,
+        bypass_rate,
+        bypass_samples,
     };
     let proposals = crate::advisor::evaluate(&sig);
     // "Collecting" = nothing has cleared the cold-start floor yet: not
     // enough sessions, OR neither of the two independent sample counts
     // (injections / reminders) has cleared its own rule's floor. Distinct
     // from "cleared the floor, rates are just healthy" (empty proposals,
-    // `collecting = false`).
-    let collecting = session_count < crate::advisor::MIN_SESSIONS
-        || (injection_follow_samples < crate::advisor::MIN_INJECTIONS
-            && advisor_reread_samples < crate::advisor::MIN_REMINDS);
+    // `collecting = false`). V16: drift canaries carry their OWN floors and
+    // can fire below the tuning floor (a version bump is a fact, not a
+    // statistic) — a non-empty proposal list must therefore always render,
+    // so `collecting` yields to it.
+    let collecting = proposals.is_empty()
+        && (session_count < crate::advisor::MIN_SESSIONS
+            || (injection_follow_samples < crate::advisor::MIN_INJECTIONS
+                && advisor_reread_samples < crate::advisor::MIN_REMINDS));
     Ok(AdvisorSnapshot { proposals, collecting })
+}
+
+/// V16 Feature 1: the harness version + contract-verification state, read
+/// from the physical global `settings.json` (fresh — background writers
+/// bypass the live settings snapshot).
+#[tauri::command]
+pub async fn harness_versions_get() -> AppResult<crate::settings::HarnessVersions> {
+    Ok(crate::settings::read_global_harness_versions())
+}
+
+/// V16 Feature 1: the Advisor card's "Mark verified" action — stamp the
+/// currently-seen Claude Code version as the last-verified one (the user
+/// just re-ran the MAINTENANCE.md contract checks). Also mirrors the change
+/// into the live settings so the open Settings window sees it without a
+/// restart.
+#[tauri::command]
+pub async fn harness_mark_verified(state: State<'_, AppState>) -> AppResult<()> {
+    let after = crate::settings::mutate_global_harness_versions(|hv| {
+        hv.claude_last_verified = hv.claude_last_seen.clone();
+    })?;
+    state.settings.mutate(move |cur| cur.harness_versions = after);
+    Ok(())
 }
 
 /// V14 Phase D2: dismiss one advisor proposal (`rule_id` + its coarse rate
@@ -2463,6 +2532,7 @@ mod tests {
         cur.llm_pricing = vec![crate::settings::LlmPricingModel {
             provider: "Custom".to_string(),
             model: "my-model".to_string(),
+            model_prefix: String::new(),
             input: 1.0,
             cache_write: 2.0,
             cache_read: 0.5,

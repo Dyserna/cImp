@@ -167,6 +167,27 @@ impl OobContext {
         }
     }
 
+    /// V16 Feature 4: test a Bash command against this session's recent
+    /// read-advisor reminders (shell reads of a just-reminded file are the
+    /// advisor's blind spot) — a no-op when memory isn't wired or the
+    /// advisor is off (the service gates internally). Best-effort like the
+    /// other tap recorders.
+    pub fn check_bypass(&self, root: &std::path::Path, session_id: &str, command: &str) {
+        if let Some(mem) = self.mem.as_ref() {
+            mem.check_bypass(root, session_id, command);
+        }
+    }
+
+    /// V16 review fix: a genuine user prompt is a turn boundary for the read
+    /// advisor's trust-TTL and compounding clocks when context injection is
+    /// off (the service gates internally — see
+    /// `GraphService::note_user_turn`). A no-op when memory isn't wired.
+    pub fn note_user_turn(&self, session_id: &str) {
+        if let Some(mem) = self.mem.as_ref() {
+            mem.note_user_turn(session_id);
+        }
+    }
+
     /// V14 Phase C: record one usage/cost event via the graph service — a
     /// no-op when memory isn't wired or the graph is disabled (mirrors
     /// [`Self::record_mem`]). Never blocks or errors the tap.

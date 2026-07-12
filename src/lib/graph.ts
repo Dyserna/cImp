@@ -542,12 +542,24 @@ export interface SessionUsageRow {
   models: string[];
 }
 
-/// The Effectiveness panel's three measured counters — all exact chars, no
+/// The Effectiveness panel's measured counters — all exact chars, no
 /// fabricated savings figure. Mirror of Rust `graph::memory::Effectiveness`.
 export interface Effectiveness {
   injected_chars: number;
   deduped_chars: number;
   advisor_displaced_chars: number;
+  /// V16 Feature 4: WHOLE-FILE chars of reminded files re-read via the
+  /// shell anyway (est.) — what the bypasses re-spent. Display/audit only;
+  /// NOT the netting subtrahend (different unit from
+  /// `advisor_displaced_chars`, which sums reminder text).
+  bypassed_chars: number;
+  /// V16 Feature 4: reminder-TEXT chars of bypassed reminders — the
+  /// like-for-like amount to subtract from `advisor_displaced_chars`
+  /// (both sum reminder text).
+  bypassed_advice_chars: number;
+  /// V16 Feature 9: displaced chars re-counted on every later retrieve turn
+  /// ("content kept out of context is saved again each turn").
+  compounded_chars: number;
 }
 
 /// The Usage section's full payload. Mirror of Rust `graph::UsageSnapshot`.
@@ -574,6 +586,12 @@ export interface AdvisorProposal {
   rationale: string;
   rule_id: string;
   signature: string;
+  /// V16: warn-only drift canaries render no Apply button (`setting` is
+  /// empty).
+  warn_only: boolean;
+  /// V16: bespoke card action — currently only `"mark_verified"` (the
+  /// harness version tripwire → `harnessMarkVerified`).
+  action: string | null;
 }
 
 /// Mirror of Rust `ipc::commands::AdvisorSnapshot`. `collecting` distinguishes
@@ -594,4 +612,11 @@ export function graphUsageAdvice(root?: string): Promise<AdvisorSnapshot> {
 /// from the `AdvisorProposal` the user clicked Dismiss on).
 export function advisorDismiss(ruleId: string, signature: string): Promise<void> {
   return invoke<void>('advisor_dismiss', { ruleId, signature });
+}
+
+/// V16 Feature 1: stamp the currently-seen Claude Code version as verified
+/// (the Advisor card's "Mark verified" — the user just re-ran the
+/// MAINTENANCE.md contract checks).
+export function harnessMarkVerified(): Promise<void> {
+  return invoke<void>('harness_mark_verified');
 }

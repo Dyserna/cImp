@@ -8,17 +8,21 @@ import {
   costUsd,
   sessionCost,
   fmtUsd,
+  matchPricing,
+  turnCost,
 } from './usageMath';
 
-function turn(over: Partial<{ in_tok: number; cache_read: number; out_tok: number; tool_chars: number }>) {
-  return { in_tok: 0, cache_read: 0, out_tok: 0, tool_chars: 0, ...over };
+function turn(
+  over: Partial<{ in_tok: number; cache_read: number; cache_make: number; out_tok: number; tool_chars: number }>,
+) {
+  return { in_tok: 0, cache_read: 0, cache_make: 0, out_tok: 0, tool_chars: 0, ...over };
 }
 
 describe('turnTotal', () => {
   test('sums exact tokens plus estimated tool tokens (chars / 4)', () => {
-    expect(turnTotal(turn({ in_tok: 100, cache_read: 50, out_tok: 20, tool_chars: 40 }))).toBe(
-      100 + 50 + 20 + 10,
-    );
+    expect(
+      turnTotal(turn({ in_tok: 100, cache_read: 50, cache_make: 5, out_tok: 20, tool_chars: 40 })),
+    ).toBe(100 + 50 + 5 + 20 + 10);
   });
 
   test('rounds a non-multiple-of-4 tool_chars', () => {
@@ -140,6 +144,53 @@ describe('sessionCost', () => {
   test('an all-zero session costs zero', () => {
     const c = sessionCost({ in_tok: 0, cache_make: 0, cache_read: 0, out_tok: 0 }, rates);
     expect(c.total).toBe(0);
+  });
+});
+
+describe('matchPricing (V16 Feature 8)', () => {
+  const rates = { input: 5, cache_write: 10, cache_read: 0.5, output: 25 };
+  const rows = [
+    { model_prefix: 'claude-opus-4', name: 'family', ...rates },
+    { model_prefix: 'claude-opus-4-8', name: 'exact', ...rates },
+    { model_prefix: '', name: 'manual-only', ...rates },
+  ];
+
+  test('longest matching prefix wins', () => {
+    expect(matchPricing('claude-opus-4-8', rows)?.name).toBe('exact');
+    // A dated snapshot still hits the longest prefix.
+    expect(matchPricing('claude-opus-4-8-20260115', rows)?.name).toBe('exact');
+    // A sibling model falls back to the shorter family prefix.
+    expect(matchPricing('claude-opus-4-7', rows)?.name).toBe('family');
+  });
+
+  test('empty prefixes never auto-match; unknown models match nothing', () => {
+    expect(matchPricing('gpt-5.5', rows)).toBeNull();
+    expect(matchPricing('', rows)).toBeNull();
+    expect(matchPricing(null, rows)).toBeNull();
+    expect(matchPricing(undefined, rows)).toBeNull();
+  });
+});
+
+describe('turnCost (V16 Feature 8)', () => {
+  const rates = { input: 5, cache_write: 10, cache_read: 0.5, output: 25 };
+
+  test('prices each segment at its own rate; tool chars bill at input rate on chars/4', () => {
+    const c = turnCost(
+      { in_tok: 1_000_000, cache_read: 1_000_000, cache_make: 1_000_000, out_tok: 1_000_000, tool_chars: 4_000_000 },
+      rates,
+    );
+    expect(c.input).toBe(5);
+    expect(c.cache_read).toBe(0.5);
+    expect(c.cache_write).toBe(10);
+    expect(c.output).toBe(25);
+    expect(c.tool).toBe(5); // 1M est. tokens at the input rate
+    expect(c.total).toBe(45.5);
+  });
+
+  test('an all-zero turn costs zero', () => {
+    expect(
+      turnCost({ in_tok: 0, cache_read: 0, cache_make: 0, out_tok: 0, tool_chars: 0 }, rates).total,
+    ).toBe(0);
   });
 });
 

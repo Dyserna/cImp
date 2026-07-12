@@ -7,16 +7,17 @@ import type { TurnUsage } from './graph';
 
 /// The subset of `TurnUsage` the chart math actually needs — lets callers
 /// (and tests) pass plain object literals without the transcript-only
-/// fields (`msg_id`/`model`/`cache_make`/`ts_ms`).
-export type TurnTokens = Pick<TurnUsage, 'in_tok' | 'cache_read' | 'out_tok' | 'tool_chars'>;
+/// fields (`msg_id`/`model`/`ts_ms`). V16 Feature 8 added `cache_make`
+/// (cache-write) as its own bar segment, so it joined the subset.
+export type TurnTokens = Pick<TurnUsage, 'in_tok' | 'cache_read' | 'cache_make' | 'out_tok' | 'tool_chars'>;
 
-/// One turn's total token footprint: input + cache-read + output tokens
-/// (exact, from the transcript's `usage` block) plus the estimated tool
-/// tokens (`tool_chars / 4`, rounded). This is what the stacked bar's
-/// height is normalized against — NOT just `in_tok + out_tok`, since a
-/// tool-heavy turn can be dominated by tool-result chars.
+/// One turn's total token footprint: input + cache-read + cache-write +
+/// output tokens (exact, from the transcript's `usage` block) plus the
+/// estimated tool tokens (`tool_chars / 4`, rounded). This is what the
+/// stacked bar's height is normalized against — NOT just `in_tok +
+/// out_tok`, since a tool-heavy turn can be dominated by tool-result chars.
 export function turnTotal(t: TurnTokens): number {
-  return t.in_tok + t.cache_read + t.out_tok + Math.round(t.tool_chars / 4);
+  return t.in_tok + t.cache_read + t.cache_make + t.out_tok + Math.round(t.tool_chars / 4);
 }
 
 /// The tallest turn's total in `turns` — the stacked-bar chart's
@@ -87,6 +88,45 @@ export function sessionCost(
   const cache_read = costUsd(totals.cache_read, rates.cache_read);
   const output = costUsd(totals.out_tok, rates.output);
   return { input, cache_write, cache_read, output, total: input + cache_write + cache_read + output };
+}
+
+/// V16 Feature 8: the pricing-row fields the auto-matcher needs — a
+/// structural subset of the settings-side `LlmPricingModel`.
+export interface PricingRow extends PriceRates {
+  model_prefix: string;
+}
+
+/// V16 Feature 8: pick the pricing row whose `model_prefix` prefixes the
+/// transcript model id (e.g. prefix `"claude-opus-4-8"` matches the bare
+/// alias and any dated snapshot). Longest prefix wins; rows with an empty
+/// prefix never auto-match (manual-pick only). `null` when nothing matches —
+/// the caller renders token-mode with a hint rather than a made-up cost.
+export function matchPricing<T extends PricingRow>(model: string | null | undefined, rows: readonly T[]): T | null {
+  if (!model) return null;
+  let best: T | null = null;
+  for (const row of rows) {
+    const p = row.model_prefix;
+    if (!p || !model.startsWith(p)) continue;
+    if (!best || p.length > best.model_prefix.length) best = row;
+  }
+  return best;
+}
+
+/// V16 Feature 8: one turn's estimated dollar cost per bar segment (input /
+/// cache-read / cache-write / output / est. tool). Tool-result chars have no
+/// exact token count; they bill at the input rate on the same chars/4
+/// estimate the token view uses. Values are dollars — the stacked bar's
+/// flex-grow weights in cost mode.
+export function turnCost(
+  t: Pick<TurnUsage, 'in_tok' | 'cache_read' | 'cache_make' | 'out_tok' | 'tool_chars'>,
+  rates: PriceRates,
+): { input: number; cache_read: number; cache_write: number; output: number; tool: number; total: number } {
+  const input = costUsd(t.in_tok, rates.input);
+  const cache_read = costUsd(t.cache_read, rates.cache_read);
+  const cache_write = costUsd(t.cache_make, rates.cache_write);
+  const output = costUsd(t.out_tok, rates.output);
+  const tool = costUsd(Math.round(t.tool_chars / 4), rates.input);
+  return { input, cache_read, cache_write, output, tool, total: input + cache_read + cache_write + output + tool };
 }
 
 /// Dollar formatter for the cost table: 2 decimals from $1 up, 4 below so

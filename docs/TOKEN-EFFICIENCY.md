@@ -82,6 +82,29 @@ propose-and-confirm changes to the V10/V11 knobs (e.g. raise
 `read_advisor_min_lines` when reminders are usually followed by a full
 re-read anyway).
 
+## 6. Harness contract hardening (V16)
+
+Everything above rides on hook contracts of two self-updating CLIs cImp
+doesn't pin. V16 adds detection + honest pricing:
+
+- **Version tripwire + drift canaries** — the Advisor card gains a
+  `drift.*` rule class: harness-version-changed (with a Mark-verified
+  action), reminder-reasons-not-reaching-the-model, hook-silent,
+  injection-unseen, usage-fields-gone, shim payload drift
+  (`/activity/contract_drift`), and shell-bypass detection. See
+  `docs/MAINTENANCE.md` → harness contracts for the spike recipes and the
+  `harness_versions` state (global `settings.json`).
+- **Trust TTL** (`read_advisor_ttl_turns`, default 0=off) — bounds how long
+  the advisor trusts the agent's memory of a file across context loss it
+  can't observe (context editing, tool-result truncation).
+- **Price-weighted Usage view** — a **tokens | est. cost** toggle on the
+  per-turn bars and Sessions table; segments repriced by $/MTok from the
+  global LLM price table, auto-matched by `model_prefix` (longest wins; no
+  match ⇒ tokens + a hint). Cache-write is now its own bar segment.
+  Anthropic seed rows use the 1h-TTL 2× cache-write rate Claude Code
+  sessions actually pay.
+- **Compounding savings** — the Effectiveness card's new line (see below).
+
 ---
 
 ## The Effectiveness card
@@ -97,7 +120,8 @@ restart,"** not a permanent ledger.
 |---|---|---|---|
 | **chars injected** | Cumulative chars of full digests actually injected into prompts by the context engine, summed from each retrieve's measured output | This project's sessions, since restart | **Spend** — what injection costs |
 | **chars suppressed by dedup** | Chars of digests that *would* have been re-injected but were demoted/dropped because the file was unchanged since its last injection | This project's sessions, since restart | **Direct measured saving** |
-| **chars displaced by read-advisor** | Sizes of the file Reads the advisor denied with a reminder (Activity events `source: read_advisor`, `tool: remind`) | Process-wide (Activity store has no per-project key), since process start | **Saving, estimated** — hence the `est.` label |
+| **chars displaced by read-advisor** | Sizes of the reminder texts the advisor answered Reads with (Activity events `source: read_advisor`, `tool: remind`), **net of bypasses** (V16: a remind the agent answered with a shell `cat` displaced nothing — the bypassed reminders' *text* chars are subtracted, the same unit as the displaced sum; the whole-file chars the shell re-read appear separately in the tooltip, est.) | Process-wide (Activity store has no per-project key), since process start | **Saving, estimated** — hence the `est.` label |
+| **chars of cache-reads avoided (compounding)** | V16: displaced chars re-counted once per subsequent turn — the API re-sends the whole conversation every turn, so content kept out at turn N is saved again as a cache read on every turn after N. The turn clock is the injection retrieve when context injection is on, or genuine user prompts seen by the transcript tap when it's off (so the readout accrues for read-advisor-only sessions too). Measured turn-by-turn as the session runs, no projection; with a matched price row it also shows an `est. $` at the cache-read rate | This project's sessions, since restart | **Saving, estimated (compounding)** |
 | **tasks served locally** | Count of offload jobs the local llama-server handled instead of the cloud model (filled in from the OffloadService) | Offload host | **Proxy count** — whole subtasks diverted; volume on the Offload Server tab |
 
 ### How to interpret it

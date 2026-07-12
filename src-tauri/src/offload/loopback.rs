@@ -19,6 +19,7 @@
 //! observe task text — the same localhost-dev-server trust assumption,
 //! documented in MAINTENANCE.md.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -348,6 +349,7 @@ async fn handle_conn(
         ("POST", "/context/should_read") => handle_should_read(&mut stream, &app, &req).await,
         ("POST", "/context/post_edit") => handle_post_edit(&mut stream, &app, &req).await,
         ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
+        ("POST", "/activity/contract_drift") => handle_contract_drift(&mut stream, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
         ("GET", "/describe") => {
@@ -771,6 +773,71 @@ async fn handle_should_read(stream: &mut TcpStream, app: &AppHandle, req: &Reque
         }
         None => write_json(stream, 200, &pass).await,
     }
+}
+
+/// A `POST /activity/contract_drift` request body (V16 Feature 3): a hook
+/// shim reporting a payload that was missing required fields.
+#[derive(Deserialize)]
+struct ContractDriftBody {
+    shim: String,
+    #[serde(default)]
+    missing: Vec<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Rate-limit state for `handle_contract_drift`: `(shim, session_id)` pairs
+/// already recorded this app run. A systematically broken payload fires the
+/// shim on every hook invocation — without this, one bad session would
+/// flood the Activity store's graph ring. Process-lifetime is the right
+/// scope: the Advisor's `drift.payload.v1` reads events since process
+/// start anyway. A missing `session_id` (itself likely part of the drift)
+/// buckets under the empty string — still one event per shim per run.
+static CONTRACT_DRIFT_SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
+    std::sync::OnceLock::new();
+
+/// `POST /activity/contract_drift` (V16 Feature 3): record a shim's
+/// payload-drift report as an Activity event (`source: "harness"`,
+/// `tool: "contract_drift"`), rate-limited to one per shim per session.
+/// Always answers `{ok: true}` — the shim is fail-open and fire-and-forget.
+async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResult<()> {
+    let ok = serde_json::json!({ "ok": true });
+    let body: ContractDriftBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let session = body.session_id.unwrap_or_default();
+    let fresh = {
+        let seen = CONTRACT_DRIFT_SEEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        seen.insert((body.shim.clone(), session.clone()))
+    };
+    if fresh {
+        let missing = body.missing.join(", ");
+        crate::activity::record_bg(crate::activity::ActivityRecord {
+            entry: crate::activity::ActivityEntry::new(
+                crate::activity::ActivityKind::Graph,
+                crate::activity::now_ms(),
+                String::new(), // no root — the report is about the harness, not a project
+                "harness".to_string(),
+                "contract_drift".to_string(),
+                format!("{}: {missing}", body.shim),
+                missing.chars().count(),
+                0,
+                false, // a drift report is never "ok" — it flags the entry in the feed
+            ),
+            request: format!("shim {} payload missing required fields (session {session})", body.shim),
+            response: missing,
+        });
+    }
+    write_json(stream, 200, &ok).await
 }
 
 /// A `POST /context/post_edit` request body (the Claude `PostToolUse` shim, or

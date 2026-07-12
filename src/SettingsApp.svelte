@@ -10,6 +10,7 @@
   import {
     aiToolTabDefaults,
     consumeSettingsDeepLink,
+    harnessVersionsGet,
     listVoices,
     llmPricingGet,
     llmPricingSet,
@@ -18,6 +19,7 @@
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
+    HarnessVersions,
     ProcessingDevice,
     Settings,
     ShellTabConfig,
@@ -28,6 +30,7 @@
     defaultSettings,
     findTab,
     findTabIndex,
+    harnessStatusBlocks,
     toPresetConfig,
   } from './lib/settings/types';
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
@@ -246,11 +249,11 @@
   function addLlmPricingRow(): void {
     llmPricing = [
       ...llmPricing,
-      { provider: 'Custom', model: `model-${llmPricing.length + 1}`, input: 0, cache_write: 0, cache_read: 0, output: 0 },
+      { provider: 'Custom', model: `model-${llmPricing.length + 1}`, model_prefix: '', input: 0, cache_write: 0, cache_read: 0, output: 0 },
     ];
     llmPricingDirty = true;
   }
-  function editLlmPricingText(i: number, field: 'provider' | 'model', value: string): void {
+  function editLlmPricingText(i: number, field: 'provider' | 'model' | 'model_prefix', value: string): void {
     llmPricing = llmPricing.map((r, idx) => (idx === i ? { ...r, [field]: value } : r));
     llmPricingDirty = true;
   }
@@ -320,6 +323,14 @@
   // V8-02 backend pool: live per-backend status rows + a refresh loop while
   // the Offload section is open.
   let backendStatuses = $state<BackendStatus[]>([]);
+  // V16 Feature 6: the Code Intelligence section's `context_llm_digests`
+  // toggle is health-aware — enabled only when a LOCAL backend is ready
+  // (the digest path is local-only by design). Polled by the same
+  // `startBackendStatusPolling` loop the Offload section uses. Turning the
+  // feature OFF is always allowed; only turning it ON is gated.
+  const localOffloadReady = $derived(
+    backendStatuses.some((b) => b.kind === 'local' && b.state === 'ready'),
+  );
   // V8-03 warm pool: honest global in-flight + per-MCP-server health.
   let serviceStatus = $state<ServiceStatus | null>(null);
   let backendStatusTimer: ReturnType<typeof setInterval> | null = null;
@@ -677,6 +688,16 @@
   let tabDefaults = $state<Record<string, AiToolTabConfig | null>>({});
   let snapshot = $state<Settings | null>(null);
 
+  // V16: `harness_versions` is out-of-band — written straight to the
+  // physical global file by the transcript tap / hand edits — so the
+  // settings snapshot only reflects app startup. Fetched fresh once per
+  // Settings-window open; the E1 hard block below prefers it so a
+  // just-recorded outcome disables the toggle without an app restart.
+  let harnessFresh = $state<HarnessVersions | null>(null);
+  const e1Blocked = $derived(
+    harnessStatusBlocks((harnessFresh ?? snapshot?.harness_versions)?.e1_status ?? ''),
+  );
+
   // Sidebar nav: which group is visible. The template gates each <section>
   // on this so only one group renders at a time. Default lands on 'theme'
   // (Appearance sits at the top of the nav order).
@@ -832,6 +853,9 @@
       .catch((e) => console.warn('stt_list_input_devices failed', e));
     void loadComposeTemplates();
     void loadLlmPricing();
+    harnessVersionsGet()
+      .then((hv) => (harnessFresh = hv))
+      .catch((e) => console.warn('harness_versions_get failed', e));
     for (const t of AI_TABS) {
       aiToolTabDefaults(t)
         .then((d) => {
@@ -4308,6 +4332,7 @@
               <input
                 type="checkbox"
                 checked={snapshot.graph.read_advisor}
+                disabled={e1Blocked}
                 onchange={(e) =>
                   patch(
                     (s) => (s.graph.read_advisor = (e.currentTarget as HTMLInputElement).checked),
@@ -4315,13 +4340,24 @@
               />
               <span>Redundant-read advisor (Claude tabs)</span>
             </label>
-            <small class="hint">
-              Intercepts a <code>Read</code> of a file already read unchanged this
-              session and answers with a cheap outline reminder instead of
-              re-reading it. Changes the agent's tool behaviour — strictly opt-in.
-              Claude tabs only for now. Re-launch the tab to pick it up.
-            </small>
-            {#if snapshot.graph.read_advisor}
+            {#if e1Blocked}
+              <small class="hint">
+                Blocked: the E1 contract check recorded that Claude Code does
+                <strong>not</strong> surface a deny reason to the model on this
+                version — every reminder would be a bare refusal, worse than no
+                advisor. The hook is not installed regardless of this toggle.
+                Re-run the check in <code>MAINTENANCE.md</code> → harness
+                contracts after the next Claude Code update.
+              </small>
+            {:else}
+              <small class="hint">
+                Intercepts a <code>Read</code> of a file already read unchanged this
+                session and answers with a cheap outline reminder instead of
+                re-reading it. Changes the agent's tool behaviour — strictly opt-in.
+                Claude tabs only for now. Re-launch the tab to pick it up.
+              </small>
+            {/if}
+            {#if snapshot.graph.read_advisor && !e1Blocked}
               <label>
                 <span>Min file size to advise (lines)</span>
                 <input
@@ -4358,11 +4394,33 @@
                   <option value="substitute">Substitute — outline + most relevant symbol body</option>
                 </select>
               </label>
+              <label>
+                <span>Trust TTL (retrieve turns, 0 = whole session)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.read_advisor_ttl_turns}
+                  onchange={(e) =>
+                    patch((s) => {
+                      // 0 is a valid value (TTL off), so keep it — a bare
+                      // `|| 0` happens to coincide here, but stay explicit.
+                      const n = Number((e.currentTarget as HTMLInputElement).value);
+                      s.graph.read_advisor_ttl_turns = Number.isFinite(n) ? Math.max(0, n) : 0;
+                    })}
+                />
+              </label>
+              <small class="hint">
+                After this many retrieval turns since the advisor last saw the
+                file read in full, a <code>Read</code> passes again — bounds how
+                long the agent's memory is trusted across context loss the
+                advisor can't observe (context editing, tool-result truncation).
+              </small>
             {/if}
             <label class="checkbox">
               <input
                 type="checkbox"
                 checked={snapshot.graph.context_llm_digests}
+                disabled={!snapshot.graph.context_llm_digests && !localOffloadReady}
                 onchange={(e) =>
                   patch(
                     (s) =>
@@ -4378,6 +4436,10 @@
               <strong>local</strong> offload backend writes a 3-line semantic
               digest, cached in <code>graph.db</code>. Needs a ready local offload
               backend; never leaves this machine.
+              {#if !localOffloadReady}
+                <strong>No local offload backend is ready</strong> — start one in
+                Settings → Offload to enable this.
+              {/if}
             </small>
 
             <h3>Architecture &amp; path tracing</h3>
@@ -4558,11 +4620,14 @@
           <h2>LLM pricing</h2>
           <small class="hint top">
             Provider/model token prices (USD per <strong>million tokens</strong>,
-            "MTok") used by the Code Intelligence tab's session-cost popup —
-            click any row in Usage → Sessions to price that session. Fresh
-            installs are seeded with current Anthropic API and GitHub Copilot
-            rates; every value is editable. Saved to the global settings file,
-            not this project's overlay.
+            "MTok") used by the Code Intelligence tab's session-cost popup and
+            its Usage view's <em>est. cost</em> mode (auto-matched by the
+            <em>Id prefix</em> column). Fresh installs are seeded with current
+            Anthropic API and GitHub Copilot rates — Anthropic cache-write at
+            the 1-hour-TTL 2× rate Claude Code sessions actually pay; every
+            value is editable, and prices drift, so corrections are yours to
+            make (no auto-update). Saved to the global settings file, not this
+            project's overlay.
           </small>
           {#if llmPricingLoading}
             <small class="hint">Loading…</small>
@@ -4573,6 +4638,7 @@
               <div class="pricing-head-row">
                 <span>Provider</span>
                 <span>Model</span>
+                <span title="Transcript model-id prefix this row auto-matches in the Usage view's cost mode (e.g. claude-opus-4-8). Longest match wins; empty = manual-pick only.">Id prefix</span>
                 <span class="num">Input</span>
                 <span class="num">Cache write</span>
                 <span class="num">Cache read</span>
@@ -4597,6 +4663,14 @@
                     value={row.model}
                     oninput={(e) =>
                       editLlmPricingText(i, 'model', (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <input
+                    type="text"
+                    placeholder="e.g. claude-opus-4-8"
+                    title="Transcript model-id prefix for cost-mode auto-match (longest wins; empty = manual-pick only)"
+                    value={row.model_prefix}
+                    oninput={(e) =>
+                      editLlmPricingText(i, 'model_prefix', (e.currentTarget as HTMLInputElement).value)}
                   />
                   <input
                     type="number"
@@ -5104,7 +5178,8 @@
   .pricing-head-row,
   .pricing-row {
     display: grid;
-    grid-template-columns: minmax(6rem, 0.7fr) minmax(9rem, 1fr) 5.5rem 5.5rem 5.5rem 5.5rem auto;
+    /* V16 Feature 8 added the Id-prefix column between Model and Input. */
+    grid-template-columns: minmax(6rem, 0.7fr) minmax(8rem, 1fr) minmax(7rem, 0.9fr) 5.5rem 5.5rem 5.5rem 5.5rem auto;
     gap: 0.4rem;
     align-items: center;
     margin-top: 0.4rem;

@@ -3453,6 +3453,97 @@ impl GraphIndex {
         Ok(Some((reread as f64 / total as f64, total)))
     }
 
+    /// V16 Feature 2 (`drift.usage_fields_gone.v1` signals): Claude sessions
+    /// with at least one message-level `usage_stat` row, and how many of
+    /// those carry ZERO tokens across every such row (in/out/cache all 0 —
+    /// the transcript's `message.usage` shape changed under the tap while
+    /// messages kept flowing). Sessions with no usage rows at all appear in
+    /// NEITHER count: a session that never spoke isn't evidence, and
+    /// counting it in the denominator would let one idle session suppress
+    /// the canary (the advisor fires on `tokenless == claude_sessions`).
+    ///
+    /// (Deliberately NOT `SessionUsageRow.est_only` — that flag means "this
+    /// AGENT never reports exact usage" (`agent != "claude"`), which is
+    /// tautologically false for every Claude session.)
+    ///
+    /// Datalog's set semantics may collapse identical projected rows, but
+    /// that can't change a zero-vs-nonzero verdict or row presence, which is
+    /// all this reads.
+    pub fn claude_tokenless_sessions(&self) -> AppResult<(u64, u64)> {
+        let sess = self.run(
+            "?[session_id] := *session{session_id, agent}, agent == \"claude\"",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let claude_ids: HashSet<String> = sess.rows.iter().map(|r| cell_str(r, 0)).collect();
+        if claude_ids.is_empty() {
+            return Ok((0, 0));
+        }
+        let rows = self.run(
+            "?[session_id, in_tok, out_tok, cache_read, cache_make] := \
+                *usage_stat{session_id, kind, in_tok, out_tok, cache_read, cache_make}, \
+                kind != \"tool_result\"",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut token_sum: HashMap<String, u64> = HashMap::new();
+        for r in &rows.rows {
+            let sid = cell_str(r, 0);
+            if !claude_ids.contains(&sid) {
+                continue;
+            }
+            let toks: u64 = (1..=4).map(|i| cell_i64(r, i).max(0) as u64).sum();
+            *token_sum.entry(sid).or_default() += toks;
+        }
+        let with_rows = token_sum.len() as u64;
+        let tokenless = token_sum.values().filter(|&&t| t == 0).count() as u64;
+        Ok((with_rows, tokenless))
+    }
+
+    /// V16 Feature 2 (`drift.read_hook_silent.v1`): (session, file) pairs
+    /// with ≥2 observed `read` events of a file whose indexed span reaches
+    /// `min_lines` — an estimate of "re-reads the advisor should have
+    /// reminded on". File size is approximated by the max symbol `end_line`
+    /// (the `file` relation stores no line count); files with no indexed
+    /// symbols never count, and hash-unchanged isn't reconstructible
+    /// retroactively — both under-count, which is the safe direction for a
+    /// breakage detector.
+    pub fn large_reread_pairs(&self, min_lines: u32) -> AppResult<u64> {
+        let reads = self.run(
+            "?[session_id, path, seq] := *mem_event{session_id, seq, kind, path}, kind == \"read\"",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        if reads.rows.is_empty() {
+            return Ok(0);
+        }
+        let mut read_counts: HashMap<(String, String), u64> = HashMap::new();
+        for r in &reads.rows {
+            *read_counts.entry((cell_str(r, 0), cell_str(r, 1))).or_default() += 1;
+        }
+        let spans = self.run(
+            "?[file, l] := *symbol{file, end_line: l}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut max_line: HashMap<String, i64> = HashMap::new();
+        for r in &spans.rows {
+            let file = cell_str(r, 0);
+            let l = cell_i64(r, 1);
+            let e = max_line.entry(file).or_default();
+            if l > *e {
+                *e = l;
+            }
+        }
+        let min = min_lines as i64;
+        Ok(read_counts
+            .into_iter()
+            .filter(|((_, path), n)| {
+                *n >= 2 && max_line.get(path).is_some_and(|&l| l >= min)
+            })
+            .count() as u64)
+    }
+
     /// V14 Phase D: per-tool ranking for the Usage section's "top consumers"
     /// table: `(tool, chars, calls)` descending by chars. Distinct from
     /// [`Self::usage_per_tool`] (chars-only, feeds `SessionUsageRow.tool_chars`)

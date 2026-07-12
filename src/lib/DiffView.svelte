@@ -26,23 +26,42 @@
   import { revealTab } from './tabs/visibility';
   import { GRAPH_VIEW_TAB_ID } from './tabs/types';
   import { graphVizFileStatus, onGraphStatus, type VizFileStatus } from './graph';
+  import { WORKBENCH_TAB_ID } from './tabs/types';
+  import { appViewVisibility } from './appViewVisibility';
+  import { loadViewSet, loadViewString, saveViewSet, saveViewString } from './viewSection';
   import type { UnlistenFn } from '@tauri-apps/api/event';
+
+  // Keep-alive (appViews.ts): reading this store inside the refetch effect
+  // below both pauses per-file re-diffs while the Workbench tab is
+  // off-screen AND re-runs them the moment it returns.
+  const workbenchVisible = appViewVisibility(WORKBENCH_TAB_ID);
 
   // SvelteSet/SvelteMap, NOT plain Set/Map in $state: Svelte 5's proxy only
   // deep-proxies plain objects/arrays, so in-place .add()/.set() on a plain
   // collection triggers no re-render — expanding a file would only become
   // visible whenever the next summary refresh happened to re-render the list.
-  const expanded = new SvelteSet<string>();
+  //
+  // Expanded rows, full-file toggles, and the layout mode persist (see
+  // viewSection.ts) — this component is destroyed on every section/tab
+  // switch. A persisted path that's no longer in the diff summary simply has
+  // no row to render; the refetch-expanded $effect below re-fetches whatever
+  // IS still visible.
+  const expanded = new SvelteSet<string>(loadViewSet('diff', 'expanded'));
   const fileDiffs = new SvelteMap<string, FileDiff>();
   const fileErrors = new SvelteMap<string, string>();
   const revertErrors = new SvelteMap<string, string>();
-  let viewMode = $state<'unified' | 'side-by-side'>('unified');
+  let viewMode = $state<'unified' | 'side-by-side'>(
+    loadViewString('diff', 'view-mode') === 'side-by-side' ? 'side-by-side' : 'unified',
+  );
   // Files showing the FULL-file view (huge unified context — the whole file
   // as one hunk, change highlighting intact). Hunk actions that echo an
   // index/hash back to the backend (Send to agent, Revert) are hidden in this
   // mode: the backend re-derives the diff at the default context, so a
   // full-context hunk's index/hash would never match.
-  const fullView = new SvelteSet<string>();
+  const fullView = new SvelteSet<string>(loadViewSet('diff', 'full-view'));
+  $effect(() => saveViewSet('diff', 'expanded', expanded));
+  $effect(() => saveViewSet('diff', 'full-view', fullView));
+  $effect(() => saveViewString('diff', 'view-mode', viewMode));
 
   let release: (() => void) | null = null;
   let unsubGraphStatus: UnlistenFn | undefined;
@@ -128,7 +147,7 @@
   // `expanded` below makes it a tracked dependency), which is what actually
   // fetches a newly-expanded file the first time.
   $effect(() => {
-    if (!$workbenchDiff) return;
+    if (!$workbenchDiff || !$workbenchVisible) return;
     for (const path of expanded) void loadFile(path);
   });
 

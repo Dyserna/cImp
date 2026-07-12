@@ -24,6 +24,8 @@
   import { cancelPlacement, focusedPane, requestTabIntoPane } from './layout/store';
   import { pairHunkLines } from './diffWords';
   import { errorMessage } from './errors';
+  import { WORKBENCH_TAB_ID } from './tabs/types';
+  import { onAppViewShown } from './appViewVisibility';
 
   let worktrees = $state<WorktreeInfo[]>([]);
   let loading = $state(true);
@@ -78,7 +80,14 @@
   onMount(() => {
     void load();
     const unsub = workbenchWorktreesVersion.subscribe(() => void load());
-    return unsub;
+    // Keep-alive (appViews.ts): worktree changes made outside cImp while the
+    // tab was off-screen don't bump the version store — refetch on return
+    // (the pre-keep-alive remount used to cover this).
+    const unsubShown = onAppViewShown(WORKBENCH_TAB_ID, () => void load());
+    return () => {
+      unsub();
+      unsubShown();
+    };
   });
 
   function toggleDiff(slug: string): void {

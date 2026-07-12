@@ -14,9 +14,12 @@
     type Checkpoint,
     type FileDiff,
   } from './workbench';
+  import { onMount } from 'svelte';
   import { openRestoreCheckpointDialog } from './dialog/store';
   import { errorMessage } from './errors';
   import CheckpointDiffView from './CheckpointDiffView.svelte';
+  import { WORKBENCH_TAB_ID } from './tabs/types';
+  import { onAppViewShown } from './appViewVisibility';
 
   let checkpoints = $state<Checkpoint[]>([]);
   let loading = $state(false);
@@ -51,6 +54,11 @@
     $workbenchCheckpointsVersion;
     void refresh();
   });
+
+  // Keep-alive (appViews.ts): auto-checkpoints that landed while the tab was
+  // off-screen don't bump the version store — refetch when the tab returns
+  // (the pre-keep-alive remount used to cover this).
+  onMount(() => onAppViewShown(WORKBENCH_TAB_ID, () => void refresh()));
 
   async function checkpointNow(): Promise<void> {
     creatingNow = true;

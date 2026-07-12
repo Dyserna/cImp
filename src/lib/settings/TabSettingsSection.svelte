@@ -7,6 +7,7 @@
     ThemeColorsWire,
   } from './types';
   import ArrayEditor from './ArrayEditor.svelte';
+  import EnvEditor from './EnvEditor.svelte';
   import NotificationEditor from './NotificationEditor.svelte';
   import Pill from '../Pill.svelte';
   import ThemeSwatch from './ThemeSwatch.svelte';
@@ -203,6 +204,26 @@
       />
       <small class="hint">
         Appended to every spawn of this tab. One arg per row.
+      </small>
+    </label>
+
+    <label class="field">
+      <span>
+        Environment variables
+        {#if restartRequired}
+          <Pill variant="orange" size="xs">restart required</Pill>
+        {/if}
+      </span>
+      <EnvEditor
+        env={settings.env}
+        onchange={(v) => update('env', v)}
+      />
+      <small class="hint">
+        Extra environment variables for this tab's subprocess. They
+        override any values cImp synthesizes (e.g. the
+        <code>ANTHROPIC_*</code> set from "Use local LLM provider").
+        Values are stored cleartext in settings.json. Restart this tab
+        after changing.
       </small>
     </label>
 

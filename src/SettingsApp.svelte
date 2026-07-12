@@ -716,6 +716,31 @@
   ];
   const REPO_URL = 'https://github.com/Dyserna/cImp';
 
+  // Shortcut rows rendered as loops — the numbered tab slots and the pane
+  // actions are 16 near-identical <label> rows otherwise. Every key is a
+  // `string | null` field of the shortcuts slice.
+  type ShortcutKey = keyof Settings['shortcuts'];
+  const TAB_SHORTCUT_ROWS: readonly (readonly [ShortcutKey, string])[] = [
+    ['switch_to_tab_3', 'Switch to tab 3'],
+    ['switch_to_tab_4', 'Switch to tab 4'],
+    ['switch_to_tab_5', 'Switch to tab 5'],
+    ['switch_to_tab_6', 'Switch to tab 6'],
+    ['switch_to_tab_7', 'Switch to tab 7'],
+    ['switch_to_tab_8', 'Switch to tab 8'],
+    ['switch_to_tab_9', 'Switch to tab 9'],
+    ['new_shell_tab', 'New shell tab'],
+    ['close_tab', 'Close current tab'],
+  ];
+  const PANE_SHORTCUT_ROWS: readonly (readonly [ShortcutKey, string])[] = [
+    ['focus_pane_left', 'Focus pane left'],
+    ['focus_pane_right', 'Focus pane right'],
+    ['focus_pane_up', 'Focus pane up'],
+    ['focus_pane_down', 'Focus pane down'],
+    ['split_pane_horizontal', 'Split pane (side by side)'],
+    ['split_pane_vertical', 'Split pane (stacked)'],
+    ['close_pane', 'Close focused pane'],
+  ];
+
   // Sub-tab nav within the Tabs section. Each AI builtin gets its own
   // sub-tab; every Shell tab is grouped under 'shells'. Keeps the
   // previously-collapsible <details> wall navigable.
@@ -2073,6 +2098,26 @@
             the Configure Tab dialog. Color, opacity, blur, size, position,
             and tint always preview live.
           </small>
+          <label>
+            <span>Scrollback kept across renderer switches (lines)</span>
+            <input
+              type="number"
+              min="0"
+              value={snapshot.terminal.background.snapshot_lines}
+              onchange={(e) =>
+                patch((s) => {
+                  const n = Number((e.currentTarget as HTMLInputElement).value);
+                  s.terminal.background.snapshot_lines = Number.isFinite(n)
+                    ? Math.max(0, Math.floor(n))
+                    : 2000;
+                })}
+            />
+          </label>
+          <small class="hint">
+            Rows re-painted when a background change switches the terminal
+            renderer (WebGL ↔ DOM). Higher keeps more history through the
+            flip at the cost of a bigger in-memory snapshot.
+          </small>
         </section>
         <section>
           <h2>Display</h2>
@@ -2527,6 +2572,24 @@
             graph calls and offload requests, plus the graph/offload tool
             reference lists.
           </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.preview_allow_remote}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.preview_allow_remote = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Allow <strong>Preview</strong> tabs to load remote URLs</span>
+          </label>
+          <small class="hint">
+            Off (default) restricts Preview-tab navigation to localhost and
+            private-network (RFC&nbsp;1918) hosts — the tab is meant for your
+            own dev servers. On lets a Preview tab load any http(s) URL in its
+            embedded webview.
+          </small>
           <div class="sub-tabs" role="tablist" aria-label="Tabs sub-sections">
             <button
               type="button"
@@ -2862,8 +2925,9 @@
               }
             />
           </label>
+          <h3>Tabs</h3>
           <label>
-            <span>Switch to Claude tab</span>
+            <span>Switch to tab 1</span>
             <ShortcutCapture
               bind:value={
                 () => snapshot!.shortcuts.switch_to_tab_1,
@@ -2872,7 +2936,7 @@
             />
           </label>
           <label>
-            <span>Switch to Claude (local) tab</span>
+            <span>Switch to tab 2</span>
             <ShortcutCapture
               bind:value={
                 () => snapshot!.shortcuts.switch_to_tab_2,
@@ -2880,6 +2944,32 @@
               }
             />
           </label>
+          {#each TAB_SHORTCUT_ROWS as [key, label] (key)}
+            <label>
+              <span>{label}</span>
+              <ShortcutCapture
+                bind:value={
+                  () => snapshot!.shortcuts[key],
+                  (v) => patch((s) => (s.shortcuts[key] = v))
+                }
+              />
+            </label>
+          {/each}
+
+          <h3>Panes</h3>
+          {#each PANE_SHORTCUT_ROWS as [key, label] (key)}
+            <label>
+              <span>{label}</span>
+              <ShortcutCapture
+                bind:value={
+                  () => snapshot!.shortcuts[key],
+                  (v) => patch((s) => (s.shortcuts[key] = v))
+                }
+              />
+            </label>
+          {/each}
+
+          <h3>Voice</h3>
           <label>
             <span>Push-to-talk (speech-to-text)</span>
             <ShortcutCapture
@@ -3376,6 +3466,22 @@
                     placeholder="e.g. 16000"
                   />
                 </label>
+                <label>
+                  <span>Declared model name (when /props is absent)</span>
+                  <input
+                    type="text"
+                    placeholder="e.g. qwen3-32b"
+                    value={backend.declared_model}
+                    oninput={(e) =>
+                      updateBackend(i, (b) => {
+                        b.declared_model = (e.currentTarget as HTMLInputElement).value.trim();
+                      })}
+                  />
+                  <small class="hint">
+                    Cosmetic label shown for this backend when the endpoint
+                    doesn't report its model.
+                  </small>
+                </label>
               {/if}
 
               <hr class="card-divider lg" />
@@ -3537,6 +3643,28 @@
               When every slot is busy and this many tasks are already waiting,
               new offloads are rejected immediately instead of queuing. Blank
               keeps the unbounded queue (each waits up to the timeout above).
+            </small>
+          </label>
+          <label>
+            <span>Global concurrency (blank = auto)</span>
+            <input
+              type="number"
+              min="1"
+              placeholder="auto"
+              value={snapshot.offload.global_concurrency ?? ''}
+              onchange={(e) => {
+                const raw = (e.currentTarget as HTMLInputElement).value.trim();
+                const n = Math.floor(+raw);
+                patch(
+                  (s) =>
+                    (s.offload.global_concurrency =
+                      raw === '' || !Number.isFinite(n) || n <= 0 ? null : n),
+                );
+              }}
+            />
+            <small class="hint">
+              Cap on offload tasks in flight across the whole app. Blank
+              auto-sizes from the summed per-backend slot counts.
             </small>
           </label>
           {:else}
@@ -4783,6 +4911,68 @@
               Delete all files
             </button>
           </div>
+        </section>
+
+        <section>
+          <h2>Terminal scrollback</h2>
+          <small class="hint top">
+            Each tab's PTY output is kept in an in-memory ring buffer so
+            re-opened panes and restarts can replay history.
+          </small>
+          <label>
+            <span>Ring buffer size (bytes per tab)</span>
+            <input
+              type="number"
+              min="4096"
+              value={snapshot.terminal.scrollback.ring_bytes}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.terminal.scrollback.ring_bytes = Math.max(
+                      4096,
+                      Number((e.currentTarget as HTMLInputElement).value) || 262144,
+                    )),
+                )}
+            />
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.terminal.scrollback.persist}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.terminal.scrollback.persist = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Save scrollback to disk on exit</span>
+          </label>
+          <small class="hint">
+            On graceful exit each tab's ring is written to
+            <code>scrollback/&lt;tab-id&gt;.bin</code> in the config
+            directory. Terminal output can contain sensitive text — leave
+            off if that shouldn't touch disk.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.terminal.scrollback.restore_on_launch}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.terminal.scrollback.restore_on_launch = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Restore saved scrollback on launch</span>
+          </label>
+          <small class="hint">
+            Replays the persisted bytes into each tab before live output
+            resumes on the next launch.
+          </small>
         </section>
 
         <section>

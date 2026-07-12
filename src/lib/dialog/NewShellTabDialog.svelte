@@ -11,11 +11,13 @@
   import { tabs } from '../tabs/store';
   import { errorMessage } from '../errors';
   import ShellTabFields from './ShellTabFields.svelte';
+  import EnvEditor from '../settings/EnvEditor.svelte';
 
   let name = $state('');
   let command = $state('');
   let argsString = $state('');
   let cwd = $state('');
+  let env = $state<Record<string, string>>({});
   let notificationsError = $state('');
   let notificationsExited = $state('');
   let error = $state<TabLifecycleError | null>(null);
@@ -66,6 +68,7 @@
       showGitBashBanner = false;
     }
     cwd = '';
+    env = {};
   }
 
   function cancel(): void {
@@ -87,7 +90,7 @@
         command,
         argsString,
         cwd: cwd.trim() === '' ? null : cwd,
-        env: {},
+        env,
         notificationsError,
         notificationsExited,
       });
@@ -146,6 +149,10 @@
       {error}
       {showGitBashBanner}
     />
+    <div class="env-field">
+      <span class="env-label">Environment variables</span>
+      <EnvEditor {env} onchange={(v) => (env = v)} />
+    </div>
     {#if error && !['empty-name', 'command-not-found', 'cwd-not-found'].includes(error.kind)}
       <div class="generic-error">
         {#if error.kind === 'spawn-failed'}
@@ -194,6 +201,16 @@
     margin: 0 0 var(--space-4);
     font-size: 16px;
     font-weight: 600;
+  }
+  .env-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-bottom: var(--space-3);
+  }
+  .env-label {
+    font-size: var(--font-size-sm);
+    color: var(--text-quiet);
   }
   .actions {
     display: flex;

@@ -1326,6 +1326,7 @@ mod tests {
             kind: crate::settings::OffloadBackendKind::Local {
                 server_command: "llama-server -a my-model --port 9001 --jinja".to_string(),
                 autostart: false,
+                show_command_on_start: false,
             },
             ..Default::default()
         }];

@@ -863,21 +863,19 @@ impl OffloadService {
         server_command: &str,
         lazy_start: bool,
     ) -> Option<PoolEntry> {
-        if server_command.trim().is_empty() {
-            return None;
-        }
-        let cmd = ServerCommand::parse(server_command).ok()?;
-        let base_url = cmd.base_url();
-
         if let Some(server) = self.supervisor.running_server(&b.name).await {
-            // Refresh health/props on the warm handle.
+            // Refresh health/props on the warm handle. Checked before parsing
+            // the configured command so a server launched via the Start
+            // popup's command override (possibly on a different host/port, or
+            // with the configured command since edited) is still routed to at
+            // the URL it actually listens on.
             let ready = server.health_check().await;
             if ready {
                 let _ = server.refresh_props().await;
             }
             return Some(PoolEntry {
                 name: b.name.clone(),
-                base_url,
+                base_url: server.base_url(),
                 auth_token: None,
                 cloud_blocked: false,
                 tier: b.tier,
@@ -891,15 +889,22 @@ impl OffloadService {
             });
         }
 
-        // Not running. On an actual offload, warm it for next time (the
-        // "start on first offload" behavior); NEVER from describe()/health
-        // polling, so listing capabilities or a background probe can't load a
-        // multi-GB model the user didn't ask to start.
+        // Not running: everything below works off the configured command.
+        if server_command.trim().is_empty() {
+            return None;
+        }
+        let cmd = ServerCommand::parse(server_command).ok()?;
+        let base_url = cmd.base_url();
+
+        // On an actual offload, warm it for next time (the "start on first
+        // offload" behavior); NEVER from describe()/health polling, so
+        // listing capabilities or a background probe can't load a multi-GB
+        // model the user didn't ask to start.
         if lazy_start {
             let supervisor = self.supervisor.clone();
             let name = b.name.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = supervisor.start_backend(&name).await {
+                if let Err(e) = supervisor.start_backend(&name, None).await {
                     debug!(backend = %name, error = %e, "offload: lazy start failed");
                 }
             });
@@ -1397,6 +1402,7 @@ mod tests {
             kind: OffloadBackendKind::Local {
                 server_command: format!("llama-server --jinja -np {np}"),
                 autostart: false,
+                show_command_on_start: false,
             },
             ..Default::default()
         }

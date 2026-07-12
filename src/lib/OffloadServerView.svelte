@@ -16,6 +16,9 @@
     type BackendDashboard,
   } from './offload';
   import { listenManaged } from './listenManaged';
+  import { get } from 'svelte/store';
+  import { settings } from './settings/store';
+  import { openOffloadStartCommandDialog } from './dialog/store';
 
   // The offload tool reference list moved to the Tool Activity tab
   // (ToolActivityView.svelte), alongside the graph tools.
@@ -52,6 +55,24 @@
       busy = false;
     }
   }
+
+  // "Show command on start" (Settings → Offload → Local backend): Start first
+  // opens the configured server command in an editable confirm dialog
+  // (OffloadStartCommandDialog, mounted in App.svelte); the edited command is
+  // used for that launch only — never persisted. Reads the live settings
+  // store synchronously, so there's no async gap for a double-click to race
+  // through. A legacy pool-empty config has no per-backend flag → plain start.
+  function onStartClick(): void {
+    const name = localName;
+    if (busy || !name) return;
+    const backend = get(settings).offload.backends.find((b) => b.name === name);
+    const kind = backend?.kind.type === 'local' ? backend.kind : null;
+    if (kind?.show_command_on_start) {
+      openOffloadStartCommandDialog(name, kind.server_command);
+    } else {
+      void runLifecycle(offloadBackendStart);
+    }
+  }
 </script>
 
 <div class="dash">
@@ -69,7 +90,7 @@
             type="button"
             class="lc-btn"
             disabled={busy || !localName}
-            onclick={() => runLifecycle(offloadBackendStart)}
+            onclick={onStartClick}
           >Start</button>
           <button
             type="button"

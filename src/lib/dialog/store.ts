@@ -15,7 +15,8 @@ export type DialogState =
   | { kind: 'save-layout' }
   | { kind: 'manage-presets' }
   | { kind: 'restore-checkpoint'; id: string; root?: string }
-  | { kind: 'new-worktree-tab'; template: TabId; paneId: PaneId };
+  | { kind: 'new-worktree-tab'; template: TabId; paneId: PaneId }
+  | { kind: 'offload-start-command'; name: string; command: string };
 
 export const dialogState: Writable<DialogState> = writable({ kind: 'none' });
 
@@ -60,6 +61,14 @@ export function openRestoreCheckpointDialog(id: string, root?: string): void {
 /// tab once spawned (mirrors the plain "+" duplicate's `requestTabIntoPane`).
 export function openNewWorktreeTabDialog(template: TabId, paneId: PaneId): void {
   dialogState.set({ kind: 'new-worktree-tab', template, paneId });
+}
+
+/// Opened by the Offload Server tab's Start button when the Local backend's
+/// "Show command on start" setting is on. `command` seeds the editable
+/// textarea with the configured `server_command`; the dialog launches with
+/// the (possibly edited) command as a one-shot override — never persisted.
+export function openOffloadStartCommandDialog(name: string, command: string): void {
+  dialogState.set({ kind: 'offload-start-command', name, command });
 }
 
 export function closeDialog(): void {

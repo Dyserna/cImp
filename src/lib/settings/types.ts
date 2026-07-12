@@ -906,7 +906,14 @@ export const LOCAL_DATA_TOOLS = ['read_file', 'code_search', 'run_command', 'fil
 /// `OffloadBackendKind`). Local = cImp owns the process; Remote = a
 /// health-checked URL (LAN or cloud).
 export type OffloadBackendKind =
-  | { type: 'local'; server_command: string; autostart: boolean }
+  | {
+      type: 'local';
+      server_command: string;
+      autostart: boolean;
+      /// When true, the Offload Server tab's Start button opens an editable
+      /// confirm popup with the command; edits apply to that launch only.
+      show_command_on_start: boolean;
+    }
   | { type: 'remote'; base_url: string; auth_token: string; is_cloud: boolean; cloud_consent: boolean };
 
 /// V8-02: one backend in the offload pool (mirror of Rust `OffloadBackend`).

@@ -281,7 +281,9 @@ bill.
 - Prices come from a small per-model price table in `settings.json`
   (`usage_prices: [{model_prefix, input, cache_read, cache_write, output}]`,
   $/MTok), shipped with defaults for the current Claude models (e.g. Opus:
-  5 / 0.5 / 6.25 / 25) and editable in the same settings group as Feature 6.
+  5 / 0.5 / 10 / 25 — cache-write at the **1h-TTL 2× multiplier**, which is
+  what Claude Code sessions actually use; the API's 5m tier is 1.25× but
+  doesn't apply here) and editable in the same settings group as Feature 6.
   Match by longest `model_prefix` against the session's model id (already in
   the transcript `usage_stat` rows); no match ⇒ that session renders
   token-mode only, with a hint. **No network calls, no price scraping** —
@@ -351,27 +353,32 @@ Suggested order **0 → A → B → C → D → E → F → H → I → G → J*
 no dependencies and are the highest user-visible value per line — fine to
 land alongside 0/A.
 
-## Decisions — OPEN
+## Decisions — RESOLVED (2026-07-12)
 
-1. **E1-fail posture** — proposed: hard-block the toggle (Feature 0) rather
-   than delete the feature; the next harness update may restore the contract.
-   Confirm before Phase 0.
-2. **Bypass threshold** (≥40% in `drift.read_bypass.v1`) — placeholder; tune
-   once real bypass rates are observed. Same for `drift.read_reason.v1`'s 90%.
-3. **Where `harness_versions` lives** — proposed: global `settings.json`
-   (it's per-install, not per-project). Alternative: a sidecar state file next
-   to `tool-activity.jsonl`. Decide in Phase A.
-4. **`version` field name in the Claude transcript** — assumed `version`;
-   confirm against the current JSONL during Phase A (cheap: one session,
-   grep the tap's input).
-5. **Default price-table values** — proposed: ship current published API
-   $/MTok for the mainstream Claude models and let users edit; no auto-update
-   mechanism (prices are config, drift is the user's to correct). Confirm the
-   cache-write multiplier to default (Claude Code uses the 1h TTL ⇒ 2× input,
-   but the transcript may not distinguish TTLs).
-6. **Cost view default mode** — proposed: default to tokens (the current
+1. **E1-fail posture** — DECIDED: hard-block the toggle (Feature 0), don't
+   delete the feature; the next harness update may restore the contract.
+2. **Where `harness_versions` lives** — DECIDED: global `settings.json`
+   (it's per-install, not per-project).
+3. **Default price-table values** — DECIDED: ship current published API
+   $/MTok for the mainstream Claude models, editable, no auto-update.
+   Cache-write defaults to the **1h-TTL 2× multiplier** (what Claude Code
+   actually uses; e.g. Opus 4.8 write = $10/MTok, not the 5m-tier $6.25).
+   No TTL knob — a user on a different pattern edits the write price directly.
+4. **Cost view default mode** — DECIDED: default to tokens (the current
    view), cost as the toggle; per-user choice persisted via the existing
    view-state mechanism (`viewSection.ts`).
+
+## Remaining implementation-time checks (not decisions)
+
+- **Bypass thresholds** (≥40% in `drift.read_bypass.v1`, ≥90% in
+  `drift.read_reason.v1`) — placeholders; tune once real rates are observed.
+- **`version` field name in the Claude transcript** — assumed `version`;
+  confirm against the current JSONL during Phase A (cheap: one session,
+  grep the tap's input).
+- **Cache-write column** — verify whether `usage_stat` rows already carry
+  `cache_creation_input_tokens` before adding the segment (Feature 8).
+- **Feature 0 (D0/E1) and Feature 7 (OpenCode `tool.execute.before`) spike
+  outcomes** — empirical; recorded in MAINTENANCE.md when run.
 
 ## Cost note
 

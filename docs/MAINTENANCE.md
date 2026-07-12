@@ -176,6 +176,8 @@ cargo/npm — check their sources manually.
 | Embedding model | Qwen3-Embedding-4B Q8_0, 2560-dim, on `mcp1:8085` (RTX 3070) | re-embed the graph if you change model/dims (auto-probed). |
 | Offload MCP servers | `ddg` + `context7` as Streamable-HTTP endpoints (`172.21.1.11:17201/17202`); plus stdio `git`/`fetch`/`fs`/`context7` | each MCP server's own repo; live-reloadable in Settings → Tools. |
 | WebView2 runtime | Windows system component (or installer-bundled) | OS-managed; relevant only if shipping an installer. |
+| Claude Code CLI | user-installed, self-updating; hosts the V10–V14 hook contracts (injection, PreCompact, read advisor, post-edit, statusline) | see **Claude Code / OpenCode CLIs — hook & plugin behavior contracts** below; re-check after visible CLI updates. |
+| OpenCode CLI | user-installed, self-updating; hosts the generated `.opencode/plugin` (injection + memory feed) | same section below. |
 
 ---
 
@@ -284,6 +286,47 @@ cargo/npm — check their sources manually.
   0.16). Re-verify `FullParams` / `WhisperContextParameters` / `WhisperState`
   against `src/stt/engine.rs` when bumping. Watch
   <https://github.com/tazz4843/whisper-rs/releases>.
+
+### Claude Code / OpenCode CLIs — hook & plugin behavior contracts (V10–V14)
+
+The two agent harnesses are user-installed, auto-updating CLIs that cImp does
+**not** pin — yet several features depend on undocumented or loosely-documented
+behavior contracts that a harness update can silently change. **Re-run this
+checklist periodically and after any noticeable Claude Code / OpenCode
+update** (both CLIs self-update aggressively; `claude --version` /
+`opencode --version`).
+
+What each feature depends on, and the early-warning signal that it broke:
+
+| Feature | Contract it depends on | Where wired | Symptom if the contract drifts |
+|---|---|---|---|
+| Context injection (V10) | `UserPromptSubmit` hook stdout (`hookSpecificOutput.additionalContext`) reaches the model | `context_hook.rs`, overlay in `tabs/config.rs` | Effectiveness "chars injected" keeps growing but injected files are never followed (Advisor follow-rate collapses); agent re-explores constantly |
+| Compaction survival (V11-D) | `PreCompact` hook stdout reaches the compaction prompt — **still `TODO(spike)`, never hands-on verified** (see the V11 section) | `compact_hook.rs` | Hard to observe (server-side dedup-clear stays correct regardless); post-compaction re-exploration despite the feature being on |
+| Read advisor (V11-E) | `PreToolUse` deny's `permissionDecisionReason` is surfaced **to the model** — also still `TODO(spike)` | `read_hook.rs` | Activity `read_advisor`/`remind` events nearly always followed by an immediate full re-read (the V14 Advisor rule fires at ≥50% — ~100% means the reason text isn't reaching the model, i.e. bare refusals); or the remind counter flatlines while large unchanged files keep being re-read (hook not firing at all) |
+| Post-edit checks (V12) | `PostToolUse` hook fires for `Edit`/`Write`/`MultiEdit` with the documented payload shape | `postedit_hook.rs` route `/context/post_edit` | Auto-check diagnostics stop appearing after edit bursts |
+| Permission detection | TUI prompt text matches "Esc to cancel · Tab to amend" | scanner (see memory / V2-03) | Permission notifications stop firing; recharacterize via `RUST_LOG=perm_capture=debug` |
+| Statusline / usage | `--settings` overlay accepted at spawn; transcript JSONL `usage` fields present | `statusline/mod.rs`, OOB tap | Status bar context/usage goes blank; Usage section stops populating |
+| OpenCode injection + memory (V10) | `chat.message` plugin hook + `tool.execute.after`; `OPENCODE_CONFIG_CONTENT` env | generated `.opencode/plugin` | OpenCode sessions stop appearing in Memory; no injection for OpenCode tabs |
+
+**How to check (~10 min):** open a Claude tab with `context_injection` (and,
+where enabled, `read_advisor`) on, run a couple of prompts against a large
+already-read file, and watch (a) the Code Intelligence → Usage Effectiveness
+counters move, (b) Activity logging `remind` events *without* an immediate
+identical full `Read` right after, (c) the status-bar context/usage line
+populating. For OpenCode, confirm a session shows up under Memory. Any drift:
+re-run the V10/V11 spike method (capture harness) documented in the V11
+section's `TODO(spike)` block before trusting the feature again.
+
+**Hardening ideas if drift becomes a recurring problem** (not implemented,
+recorded 2026-07-12): record the harness version per tab spawn (transcript
+metadata carries it) and badge the Advisor card "harness updated — contracts
+unverified" on change; shim-side validation of the hook input JSON shape with
+a `contract_drift` Activity event on mismatch (shims already fail open); a
+runtime canary that auto-suggests disabling `read_advisor` when the
+remind→immediate-re-read rate hits ~100%; a `PostToolUse` Bash tap to count
+advisor *bypasses* (`cat`/`Get-Content` of a just-reminded file). The
+`tool.execute.before` OpenCode veto spike (V11 Feature 5) is also still open —
+required before extending the read advisor to OpenCode.
 
 ## Offload backends (V8-01 / V8-02)
 

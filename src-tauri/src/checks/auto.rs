@@ -295,6 +295,22 @@ mod tests {
         assert!(diff_groups(&baseline, &fresh).is_empty());
     }
 
+    #[test]
+    fn diff_groups_newly_failing_test_vs_baseline_is_kept() {
+        // A cargo-test/jest failure is just another DiagGroup keyed by its
+        // normalized message — a test that starts failing (absent from the
+        // baseline of prior failures) rides the same new-vs-baseline diff as
+        // any compile diagnostic. No parser code change; this pins that.
+        let baseline = to_baseline(&[group("error||tests::still_broken failed", 1)]);
+        let fresh = vec![
+            group("error||tests::still_broken failed", 1),
+            group("error||tests::newly_broken failed", 1),
+        ];
+        let diff = diff_groups(&baseline, &fresh);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].key, "error||tests::newly_broken failed");
+    }
+
     // ── parked-block drain ──────────────────────────────────────────────
 
     #[test]

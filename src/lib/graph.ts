@@ -562,12 +562,23 @@ export interface Effectiveness {
   compounded_chars: number;
 }
 
+/// The advertised tool-surface size for both consumers (MCP + offload worker),
+/// measured post-`lean_tools`-filter. Mirror of Rust `graph::mcp::SurfaceStats`.
+export interface SurfaceStats {
+  mcp_tools: number;
+  mcp_chars: number;
+  offload_tools: number;
+  offload_chars: number;
+}
+
 /// The Usage section's full payload. Mirror of Rust `graph::UsageSnapshot`.
 export interface UsageSnapshot {
   current: SessionUsage | null;
   sessions: SessionUsageRow[];
   effectiveness: Effectiveness;
   offload_local_tasks: number;
+  /// V17 Phase E: measured tool-surface size (est. tokens ≈ chars / 4).
+  surface: SurfaceStats;
 }
 
 /// The Usage section's token X-ray for `root` (defaults to the launch

@@ -441,6 +441,10 @@ impl OffloadService {
         // so an offload from a session in repo A reads repo A — not the app's
         // own launch directory. `None` falls back to the app's cwd.
         session_cwd: Option<PathBuf>,
+        // V21 F9: optional JSON Schema — when set, the worker's final-synthesis
+        // turn is grammar-constrained to matching JSON (threaded to `run_on` →
+        // `OffloadTask::schema`). `None` leaves the answer free-form.
+        schema: Option<serde_json::Value>,
         // Trips when the calling session goes away (loopback disconnect) so the
         // in-flight chat stream is dropped and llama-server frees the slot
         // instead of running an orphan to completion.
@@ -511,6 +515,7 @@ impl OffloadService {
             .iter()
             .map(|p| BackendView {
                 name: p.name.clone(),
+                base_url: p.base_url.clone(),
                 ready: p.ready,
                 cloud_blocked: p.cloud_blocked,
                 n_ctx: p.n_ctx,
@@ -551,7 +556,7 @@ impl OffloadService {
 
         // First attempt with the requested thinking mode.
         let first = self
-            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), overall_deadline, Some(&mut trace), &cancel)
+            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), schema.clone(), overall_deadline, Some(&mut trace), &cancel)
             .await;
 
         // One fail-over on a connection-class failure: drop the failed
@@ -574,7 +579,7 @@ impl OffloadService {
                         self.run_rekey(&backend_name, &new_name, run_id);
                         backend_name = new_name;
                         active = next;
-                        self.run_on(&pool[next], &views[next], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), overall_deadline, Some(&mut trace), &cancel)
+                        self.run_on(&pool[next], &views[next], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), schema.clone(), overall_deadline, Some(&mut trace), &cancel)
                             .await
                     }
                     _ => Err(e),
@@ -601,7 +606,7 @@ impl OffloadService {
             let retry_deadline = Instant::now() + timeout;
             let pre_retry = trace.calls.len();
             result = self
-                .run_on(&pool[active], &views[active], &snap, &instructions, context.clone(), ThinkingMode::Auto, session_cwd.clone(), retry_deadline, Some(&mut trace), &cancel)
+                .run_on(&pool[active], &views[active], &snap, &instructions, context.clone(), ThinkingMode::Auto, session_cwd.clone(), schema.clone(), retry_deadline, Some(&mut trace), &cancel)
                 .await;
             recovered = result.is_ok();
             // The retry's agent loop numbers its calls from step 0 again; offset
@@ -617,6 +622,61 @@ impl OffloadService {
             }
         }
 
+        // V21 F5 — tier escalation: a fast-tier run that came back only
+        // partially verified gets ONE re-run on a distinct, ready quality
+        // backend, and the better answer wins (quality wins; a failed escalation
+        // keeps the fast answer). Structurally inert unless a second, quality-tier
+        // backend exists (zero-config setups never escalate) and gated by
+        // `escalate_partial` (default on). At most one escalation per task (this
+        // runs once, not in a loop); `escalation_target` also blocks
+        // quality→quality and same-instance re-runs.
+        let mut escalated_from: Option<&str> = None;
+        let partial = snap.escalate_partial
+            && result
+                .as_ref()
+                .map(|t| agent::answer_verified_level(t) == agent::VerifiedLevel::Partially)
+                .unwrap_or(false);
+        if partial {
+            if let Some(q) = router::escalation_target(&views, &req, active) {
+                info!(
+                    target: "offload",
+                    run_id,
+                    from = %views[active].name,
+                    to = %views[q].name,
+                    "offload: escalating partially-verified fast-tier answer to the quality backend"
+                );
+                let esc_deadline = Instant::now() + timeout;
+                let pre_esc = trace.calls.len();
+                let esc = self
+                    .run_on(&pool[q], &views[q], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), schema.clone(), esc_deadline, Some(&mut trace), &cancel)
+                    .await;
+                // The escalation's agent loop numbers its calls from step 0 again;
+                // offset them so they continue after the earlier steps in the run
+                // log rather than colliding (mirrors the On→Auto retry above).
+                let base = trace.calls[..pre_esc]
+                    .iter()
+                    .map(|c| c.step)
+                    .max()
+                    .map_or(0, |m| m + 1);
+                for c in trace.calls[pre_esc..].iter_mut() {
+                    c.step += base;
+                }
+                match esc {
+                    Ok(q_text) => {
+                        // Quality wins (ties to quality). Label the extra cost.
+                        result = Ok(agent::append_escalation_note(&q_text));
+                        escalated_from = Some("fast");
+                    }
+                    Err(e) => warn!(
+                        target: "offload",
+                        run_id,
+                        error = %e,
+                        "offload: quality escalation failed; keeping the fast answer"
+                    ),
+                }
+            }
+        }
+
         // Close the run-log record: color by outcome (failed = red, recovered
         // = amber, success = normal).
         let outcome = match (&result, recovered) {
@@ -624,7 +684,7 @@ impl OffloadService {
             (Ok(_), false) => "success",
             (Err(_), _) => "failed",
         };
-        self.run_finish(&backend_name, run_id, outcome, std::mem::take(&mut trace.calls));
+        self.run_finish(&backend_name, run_id, outcome, escalated_from, std::mem::take(&mut trace.calls));
 
         // Mirror the completed run into the unified, persistent tool-activity
         // store (the Tool Activity tab's feed): full instruction text (+ any
@@ -670,6 +730,7 @@ impl OffloadService {
             started_ms: now_ms(),
             ended_ms: 0,
             outcome: "running".into(),
+            escalated_from: None,
             calls: Vec::new(),
         };
         let mut log = self.run_log.lock().unwrap();
@@ -699,13 +760,23 @@ impl OffloadService {
         }
     }
 
-    /// Finalize a run record with its captured calls + final outcome.
-    fn run_finish(&self, backend: &str, id: u64, outcome: &str, calls: Vec<CallRecord>) {
+    /// Finalize a run record with its captured calls + final outcome. V21 F5:
+    /// `escalated_from` labels a run that was re-run on the quality backend after
+    /// a partial fast-tier answer (visible cost in the run log).
+    fn run_finish(
+        &self,
+        backend: &str,
+        id: u64,
+        outcome: &str,
+        escalated_from: Option<&str>,
+        calls: Vec<CallRecord>,
+    ) {
         let mut log = self.run_log.lock().unwrap();
         if let Some(dq) = log.get_mut(backend) {
             if let Some(rec) = dq.iter_mut().find(|r| r.id == id) {
                 rec.calls = calls;
                 rec.outcome = outcome.into();
+                rec.escalated_from = escalated_from.map(|s| s.to_string());
                 rec.ended_ms = now_ms();
             }
         }
@@ -736,6 +807,7 @@ impl OffloadService {
         context: Option<String>,
         thinking: ThinkingMode,
         session_cwd: Option<PathBuf>,
+        schema: Option<serde_json::Value>,
         deadline: Instant,
         trace: Option<&mut RunTrace>,
         cancel: &CancellationToken,
@@ -797,6 +869,7 @@ impl OffloadService {
             instructions: instructions.to_string(),
             context,
             thinking,
+            schema,
         };
         agent::run(&self.client, &cfg, &router, task, deadline, trace, cancel).await
     }

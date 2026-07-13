@@ -98,6 +98,11 @@ pub struct RunRecord {
     /// `"running"` | `"success"` | `"recovered"` (on→auto retry worked) |
     /// `"failed"`.
     pub outcome: String,
+    /// V21 F5: `Some("fast")` when this run was escalated from the fast tier to
+    /// the quality backend after a partially-verified result (so the extra cost
+    /// is visible in the run log). `None`/absent for normal runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_from: Option<String>,
     pub calls: Vec<CallRecord>,
 }
 

@@ -5,7 +5,7 @@
 import { writable, type Writable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { OpencodeLocalProvider } from './settings/types';
+import type { OpencodeLocalProvider, Settings } from './settings/types';
 
 /// Mirror of Rust `OffloadState` (serde tag = "state").
 export type OffloadState =
@@ -189,6 +189,21 @@ export async function offloadReloadMcp(): Promise<ServiceStatus | null> {
   }
 }
 
+/// V21 F7: merge the curated read-only command preset (`git` + `cargo`
+/// metadata/tree, with the `cargo` policy that pins it to those verbs) into the
+/// live offload settings, and return the updated Settings so the caller can
+/// refresh its snapshot. Idempotent — re-invoking adds nothing and never
+/// clobbers a user-authored `cargo` policy. Returns `null` if the command
+/// fails (e.g. the app isn't reachable).
+export async function offloadEnableReadonlyCommands(): Promise<Settings | null> {
+  try {
+    return await invoke<Settings>('offload_enable_readonly_commands');
+  } catch (e) {
+    console.warn('offload_enable_readonly_commands failed', e);
+    return null;
+  }
+}
+
 /// V8-03: a captured `llama-server` output line (mirror of Rust `ServerLogLine`).
 export interface ServerLogLine {
   backend: string;
@@ -254,6 +269,9 @@ export interface RunRecord {
   ended_ms: number;
   /// 'running' | 'success' | 'recovered' | 'failed'.
   outcome: string;
+  /// V21 F5: 'fast' when this run was escalated from the fast tier to the
+  /// quality backend after a partial result. Absent for normal runs.
+  escalated_from?: string | null;
   calls: CallRecord[];
 }
 export interface ServerMetrics {

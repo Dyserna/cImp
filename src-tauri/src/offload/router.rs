@@ -39,6 +39,10 @@ const AUTO_FAST_MAX_CONTEXT: u32 = 6_000;
 #[derive(Clone, Debug)]
 pub struct BackendView {
     pub name: String,
+    /// Base URL of the backend's server. Used by the V21 F5 escalation guard to
+    /// refuse escalating onto the *same* server instance (two backend entries can
+    /// point at one llama-server).
+    pub base_url: String,
     /// Healthy per the last probe.
     pub ready: bool,
     /// Cloud backend whose consent toggle is off — never eligible.
@@ -226,6 +230,54 @@ pub fn select(backends: &[BackendView], req: &RouteRequest) -> Result<usize, Rou
     Ok(best)
 }
 
+/// V21 F5: pick a backend to escalate a partially-verified fast-tier answer to.
+/// `ran` is the index of the backend that produced the answer. Returns the index
+/// of a distinct, ready, quality-tier backend on a *different* server instance
+/// whose tool scope still satisfies the task, or `None` when escalation is not
+/// warranted (then it is inert). Pure — no I/O.
+///
+/// The caller enforces the remaining preconditions: the `escalate_partial`
+/// setting is on, the marker parsed as `partially`, and this is the task's single
+/// escalation attempt (at most one per task).
+///
+/// Guards, all here: the run must have resolved to a **fast** backend (never
+/// quality→quality); the target must be **ready**, not **cloud-blocked**,
+/// **quality** tier, a **different instance** (distinct `base_url`) from `ran`
+/// (never the same server), and must **allow the task's required tools** — the
+/// same privacy boundary [`select`] enforces, so a local-data task is never
+/// escalated onto a cloud backend that denies file tools. Among candidates,
+/// prefer a free slot, then one that fits the estimated context, then the
+/// largest per-slot budget.
+pub fn escalation_target(
+    backends: &[BackendView],
+    req: &RouteRequest,
+    ran: usize,
+) -> Option<usize> {
+    let from = backends.get(ran)?;
+    if from.tier != BackendTier::Fast {
+        return None; // never escalate a quality-tier run
+    }
+    backends
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| {
+            *i != ran
+                && b.ready
+                && !b.cloud_blocked
+                && b.tier == BackendTier::Quality
+                && b.base_url != from.base_url
+                && b.allows_all(&req.required_tools)
+        })
+        .max_by_key(|(_, b)| {
+            (
+                b.has_free_slot() as u8,
+                b.fits_context(req.estimated_context) as u8,
+                b.per_slot_budget().unwrap_or(0),
+            )
+        })
+        .map(|(i, _)| i)
+}
+
 /// Keyword signals that a task touches the user's local machine (files,
 /// code, repo, commands) — its results must not leave the box, so the
 /// router requires a local-data tool (which excludes cloud backends).
@@ -315,6 +367,9 @@ mod tests {
     ) -> BackendView {
         BackendView {
             name: name.to_string(),
+            // Distinct per name so the F5 same-instance guard treats differently
+            // named test backends as different servers.
+            base_url: format!("http://backend/{name}"),
             ready,
             cloud_blocked: false,
             n_ctx,
@@ -472,6 +527,92 @@ mod tests {
         // project — must require local tools, not be cloud-eligible.
         let r = analyze_task("Summarize the documentation in this project", None, TierHint::Auto);
         assert!(r.required_tools.contains(&"read_file".to_string()));
+    }
+
+    // ── V21 F5 — tier escalation target ────────────────────────────────────
+
+    #[test]
+    fn escalation_picks_distinct_ready_quality_for_a_fast_run() {
+        let bs = vec![
+            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view("big", true, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All),
+        ];
+        // Ran on the fast backend (index 0) → escalate to the quality one.
+        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), Some(1));
+    }
+
+    #[test]
+    fn no_escalation_when_run_was_quality() {
+        // Never quality→quality: a run that resolved to a quality backend has no
+        // escalation target even if another quality backend exists.
+        let bs = vec![
+            view("q1", true, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All),
+            view("q2", true, BackendTier::Quality, Some(120_000), 1, 0, ToolScope::All),
+        ];
+        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), None);
+    }
+
+    #[test]
+    fn no_escalation_without_a_quality_backend() {
+        // Only fast backends configured → nothing to escalate to (inert).
+        let bs = vec![
+            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view("fast2", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+        ];
+        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), None);
+    }
+
+    #[test]
+    fn no_escalation_to_a_down_quality_backend() {
+        let bs = vec![
+            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view("big", false, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All), // down
+        ];
+        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), None);
+    }
+
+    #[test]
+    fn no_escalation_to_the_same_instance() {
+        // Two entries pointing at the SAME server (same base_url): escalation
+        // would just re-run on the identical instance → refused.
+        let mut fast = view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All);
+        let mut big = view("big", true, BackendTier::Quality, Some(16_000), 1, 0, ToolScope::All);
+        fast.base_url = "http://same:8080".into();
+        big.base_url = "http://same:8080".into();
+        let bs = vec![fast, big];
+        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), None);
+    }
+
+    #[test]
+    fn escalation_respects_the_tool_privacy_boundary() {
+        // A local-data task (needs read_file) must not escalate onto a cloud
+        // quality backend that denies file tools — same boundary as `select`.
+        let cloud = view(
+            "cloud",
+            true,
+            BackendTier::Quality,
+            Some(128_000),
+            4,
+            0,
+            ToolScope::default_for(true),
+        );
+        let bs = vec![
+            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            cloud,
+        ];
+        assert_eq!(escalation_target(&bs, &req(&["read_file"], 500, TierHint::Auto), 0), None);
+        // But a web-only task (no required local tools) may escalate to it.
+        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), Some(1));
+    }
+
+    #[test]
+    fn escalation_prefers_a_free_quality_slot() {
+        let bs = vec![
+            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view("busy-q", true, BackendTier::Quality, Some(150_000), 1, 1, ToolScope::All), // full
+            view("free-q", true, BackendTier::Quality, Some(120_000), 1, 0, ToolScope::All), // free
+        ];
+        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), Some(2));
     }
 
     #[test]

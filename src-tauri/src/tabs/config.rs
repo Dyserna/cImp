@@ -304,12 +304,21 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
                 && !settings.harness_versions.e1_blocked()
             {
                 if let Some(command) = crate::statusline::hook_command("--read-hook") {
-                    hooks.insert(
-                        "PreToolUse".to_string(),
-                        serde_json::json!([ { "matcher": "Read", "hooks": [
-                            { "type": "command", "command": command, "timeout": 5 }
-                        ] } ]),
-                    );
+                    let mut entries = vec![serde_json::json!({
+                        "matcher": "Read",
+                        "hooks": [ { "type": "command", "command": command.clone(), "timeout": 5 } ]
+                    })];
+                    // V17 Phase B: a second matcher intercepts a whole-file shell
+                    // read (`cat FILE`) of an already-read file via the SAME
+                    // `--read-hook` shim (which dispatches on `tool_name`). Gated
+                    // on the sub-toggle, so it's a zero overlay delta when off.
+                    if settings.graph.read_advisor_shell {
+                        entries.push(serde_json::json!({
+                            "matcher": "Bash",
+                            "hooks": [ { "type": "command", "command": command.clone(), "timeout": 5 } ]
+                        }));
+                    }
+                    hooks.insert("PreToolUse".to_string(), serde_json::Value::Array(entries));
                 }
             }
             // V12 Phase F (6a/6b): PostToolUse auto-check after an edit — opt-in
@@ -477,8 +486,9 @@ search for 'where is X defined', 'who calls X', and impact analysis. `graph_dead
 candidate unused public symbols and `graph_cycles` lists import cycles. For the edit→check→fix \
 loop: before changing shared code run `graph_impact` (what your working-tree diff could break) and \
 `graph_tests_for` (which tests cover a symbol); after edits run `run_check {changed_only:true}` for \
-deduplicated diagnostics instead of a raw build dump; `graph_recent_changes` shows what's been \
-churning lately. This project also has \
+deduplicated diagnostics instead of a raw build dump — including test runs: prefer a configured \
+test check over running the test command in Bash; it returns failures only; `graph_recent_changes` \
+shows what's been churning lately. This project also has \
 session memory: call `context_recall` at the start of a follow-up task to reload what this session \
 has been working on, and `context_note` to record a non-obvious decision (pin=true to keep it \
 across sessions) so it survives into later sessions.";
@@ -1002,6 +1012,48 @@ mod tests {
         settings.harness_versions.e1_status = "Pass".to_string();
         let args = build_pre_args(&claude_cfg(), &settings);
         assert!(settings_overlay(&args).is_some_and(|o| o["hooks"]["PreToolUse"].is_array()));
+    }
+
+    /// V17 Phase B: the second `PreToolUse` **Bash** matcher (whole-file shell
+    /// read interception) is present exactly when every gate holds —
+    /// `read_advisor` AND `read_advisor_shell` AND E1 not failed. The `Read`
+    /// matcher tracks `read_advisor` + E1 alone (the sub-toggle never affects
+    /// it), and the sub-toggle being off is a zero overlay delta for the Bash
+    /// side.
+    #[test]
+    fn shell_read_bash_matcher_gated_on_full_matrix() {
+        // Whether the overlay carries a PreToolUse entry for `matcher`.
+        fn has_matcher(read_advisor: bool, shell: bool, e1: &str, matcher: &str) -> bool {
+            let mut settings = Settings::default();
+            settings.graph.enabled = true;
+            settings.graph.read_advisor = read_advisor;
+            settings.graph.read_advisor_shell = shell;
+            settings.harness_versions.e1_status = e1.to_string();
+            let args = build_pre_args(&claude_cfg(), &settings);
+            settings_overlay(&args)
+                .and_then(|o| o["hooks"]["PreToolUse"].as_array().cloned())
+                .is_some_and(|arr| arr.iter().any(|e| e["matcher"] == matcher))
+        }
+
+        for &read_advisor in &[false, true] {
+            for &shell in &[false, true] {
+                for e1 in ["unverified", "pass", "fail"] {
+                    let e1_ok = e1 != "fail";
+                    let read_present = read_advisor && e1_ok;
+                    let bash_present = read_advisor && shell && e1_ok;
+                    assert_eq!(
+                        has_matcher(read_advisor, shell, e1, "Read"),
+                        read_present,
+                        "Read matcher: read_advisor={read_advisor} shell={shell} e1={e1}"
+                    );
+                    assert_eq!(
+                        has_matcher(read_advisor, shell, e1, "Bash"),
+                        bash_present,
+                        "Bash matcher: read_advisor={read_advisor} shell={shell} e1={e1}"
+                    );
+                }
+            }
+        }
     }
 
     /// V13 Phase C: the UserPromptSubmit hook (the prompt-tap checkpoint

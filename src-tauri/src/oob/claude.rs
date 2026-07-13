@@ -10,6 +10,18 @@
 //! tool blocks.
 //!
 //! Latency is sub-second in practice (spike 0b), well within TTS comfort.
+//!
+//! ## Sub-agent transcripts (two contracts)
+//!
+//! Sub-agent traffic has lived in two places across CLI releases: inline in
+//! the parent transcript as `isSidechain:true` lines (1.x), and — since the
+//! 2.x contract (observed 2.1.207) — in per-agent files at
+//! `<slug>/<session_id>/subagents/agent-<id>.jsonl`. The parent drain handles
+//! the inline form; [`SubagentState`] tails the per-agent files, feeding ONLY
+//! the usage and commit-provenance taps (a sub-agent's tokens/commits are the
+//! parent session's spend; its reads, prompts, and text are not the parent's
+//! working set, turn clocks, or TTS). `drift_tick` is the canary that fires
+//! when this contract moves again.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -51,6 +63,9 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     // commit` invocation, awaiting their result (see `record_commit_events`).
     // Same per-session lifetime as `tool_names`.
     let mut commit_calls = IdRing::default();
+    // Sub-agent transcript tails + the drift canary state (see module doc).
+    // Same per-session lifetime as the rings — reset on rotation below.
+    let mut subs = SubagentState::default();
     let mut cur: Option<PathBuf> = None;
     let mut offset: u64 = 0;
     // V16 Feature 1: capture the Claude CLI version (each transcript entry
@@ -76,6 +91,9 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 } else {
                     0
                 };
+                // Sub-agent files inherit the same backlog posture: attached
+                // mid-session ⇒ pre-existing agent transcripts seek to EOF.
+                subs.reset(first_attach);
                 first_attach = false;
                 cur = Some(path);
                 // Any agents we were tracking belonged to the previous session
@@ -121,11 +139,17 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 &mut tool_names,
                 &mut commit_calls,
                 &mut version_noted,
+                &mut subs,
                 &project_dir,
                 &session_id,
                 &ctx,
             )
             .await;
+            // Sub-agent transcripts (2.x contract): drain usage/commits from
+            // `<sid>/subagents/*.jsonl`, then tick the drift canary. Both are
+            // mem-gated inside — pure TTS setups skip the extra IO entirely.
+            subs.scan(&root, &session_id, &project_dir, &ctx);
+            subs.drift_tick(&project_dir, &session_id, &ctx);
         }
 
         tokio::select! {
@@ -146,36 +170,15 @@ async fn drain_new_lines(
     tool_names: &mut ToolNameRing,
     commit_calls: &mut IdRing,
     version_noted: &mut bool,
+    subs: &mut SubagentState,
     project_dir: &Path,
     session_id: &str,
     ctx: &OobContext,
 ) -> u64 {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return offset, // rotated away mid-loop; retry next tick.
+    let Some((complete, new_offset)) = read_complete_lines(path, offset) else {
+        return offset; // nothing new/complete, or rotated away mid-loop.
     };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(offset);
-    if len <= offset {
-        return offset; // nothing new (or truncated/rotated).
-    }
-    if file.seek(SeekFrom::Start(offset)).is_err() {
-        return offset;
-    }
-    let mut buf = String::new();
-    if file.read_to_string(&mut buf).is_err() {
-        return offset;
-    }
-
-    // Only consume up to the last newline; a trailing partial line is left for
-    // the next tick (offset not advanced past it).
-    let last_nl = match buf.rfind('\n') {
-        Some(i) => i,
-        None => return offset, // no complete line yet.
-    };
-    let complete = &buf[..=last_nl];
-    offset += complete.len() as u64;
+    offset = new_offset;
 
     for line in complete.lines() {
         let line = line.trim();
@@ -184,7 +187,14 @@ async fn drain_new_lines(
         }
         if let Ok(obj) = serde_json::from_str::<Value>(line) {
             note_cli_version(&obj, version_noted);
-            update_agents(&obj, agents, ctx);
+            // Canary fact: an inline sidechain line means the 1.x sub-agent
+            // contract is (still) live — see `SubagentState::drift_tick`.
+            if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                subs.sidechain_seen = true;
+            }
+            let delta = update_agents(&obj, agents, ctx);
+            subs.launch_seen |= delta.launched;
+            subs.completion_seen |= delta.completed;
             note_user_turn(&obj, session_id, ctx);
             record_tool_events(&obj, project_dir, session_id, ctx);
             record_usage(&obj, tool_names, project_dir, session_id, ctx);
@@ -222,11 +232,14 @@ fn note_cli_version(obj: &Value, noted: &mut bool) {
     tokio::task::spawn_blocking(move || crate::settings::note_harness_version("claude", &v));
 }
 
-/// The `tool_use` name Claude Code emits when it launches a sub-agent. Keyed
-/// as a named constant so the one dependency on this string is greppable if a
-/// future release renames it (see also the `esc to interrupt` marker in
-/// `processing::permission`).
-const TASK_TOOL_NAME: &str = "Task";
+/// The `tool_use` names Claude Code emits when it launches a sub-agent:
+/// `"Task"` through the 1.x CLIs, `"Agent"` since the 2.x transcript contract
+/// (observed 2.1.207) — both matched so either vintage works. Keyed as a
+/// named constant so the one dependency on these strings is greppable if a
+/// future release renames the tool again; `SubagentState::drift_tick` is the
+/// canary that catches such a rename in the wild (transcript files present
+/// with no recognized launch).
+const AGENT_TOOL_NAMES: &[&str] = &["Task", "Agent"];
 
 /// The content-block array of a transcript line's `message`, or `None` when the
 /// line has no array content (a plain-string user prompt, or a non-message
@@ -302,14 +315,28 @@ fn note_user_turn(obj: &Value, session_id: &str, ctx: &OobContext) {
     ctx.note_user_turn(session_id);
 }
 
-/// Update the in-flight `Task` sub-agent set from one transcript line and emit
+/// What one transcript line did to the tracked sub-agent set — the canary
+/// facts `drain_new_lines` folds into [`SubagentState`].
+#[derive(Default, Clone, Copy)]
+struct AgentDelta {
+    /// At least one sub-agent launch (`tool_use` named per
+    /// [`AGENT_TOOL_NAMES`]) was tracked from this line.
+    launched: bool,
+    /// At least one `tool_result` cleared a TRACKED launch id — a genuine
+    /// agent completion (turn-boundary reclaims of orphaned ids don't count).
+    completed: bool,
+}
+
+/// Update the in-flight sub-agent set from one transcript line and emit
 /// `AgentsActiveChanged` when the running count crosses the zero boundary.
+/// Returns the line's [`AgentDelta`] for the sub-agent drift canary.
 ///
-/// A `Task` launch is a `tool_use` block with `"name":"Task"` (in an assistant
-/// message); its completion is a `tool_result` block whose `tool_use_id` matches
-/// (in the following user message). `agents` holds only Task ids, so removing a
-/// non-Task `tool_use_id` is a harmless no-op — we don't need to know which tool
-/// a result belongs to, only whether it clears a tracked Task.
+/// An agent launch is a `tool_use` block named per [`AGENT_TOOL_NAMES`] (in
+/// an assistant message); its completion is a `tool_result` block whose
+/// `tool_use_id` matches (in the following user message). `agents` holds only
+/// launch ids, so removing another tool's `tool_use_id` is a harmless no-op —
+/// we don't need to know which tool a result belongs to, only whether it
+/// clears a tracked agent.
 ///
 /// Sidechain lines (a sub-agent's own internal messages, `isSidechain:true`) are
 /// skipped so a nested tool_use/result inside an agent can't perturb the parent
@@ -322,9 +349,10 @@ fn note_user_turn(obj: &Value, session_id: &str, ctx: &OobContext) {
 /// writing its `tool_result`, so without this a stale id would keep the avatar
 /// wedged in Thinking until the process exits. (The state manager also has a
 /// time-based backstop for the walk-away case.)
-fn update_agents(obj: &Value, agents: &mut HashSet<String>, ctx: &OobContext) {
+fn update_agents(obj: &Value, agents: &mut HashSet<String>, ctx: &OobContext) -> AgentDelta {
+    let mut delta = AgentDelta::default();
     if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-        return;
+        return delta;
     }
 
     let was_active = !agents.is_empty();
@@ -334,22 +362,28 @@ fn update_agents(obj: &Value, agents: &mut HashSet<String>, ctx: &OobContext) {
         for part in parts {
             match part.get("type").and_then(Value::as_str) {
                 Some("tool_use")
-                    if part.get("name").and_then(Value::as_str) == Some(TASK_TOOL_NAME) =>
+                    if part
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| AGENT_TOOL_NAMES.contains(&n)) =>
                 {
                     if let Some(id) = part.get("id").and_then(Value::as_str) {
                         agents.insert(id.to_string());
+                        delta.launched = true;
                     }
                 }
                 Some("tool_result") => {
                     if let Some(id) = part.get("tool_use_id").and_then(Value::as_str) {
-                        agents.remove(id);
+                        if agents.remove(id) {
+                            delta.completed = true;
+                        }
                     }
                 }
                 _ => {}
             }
         }
     } else {
-        return;
+        return delta;
     }
 
     let now_active = !agents.is_empty();
@@ -360,6 +394,7 @@ fn update_agents(obj: &Value, agents: &mut HashSet<String>, ctx: &OobContext) {
             active: now_active,
         });
     }
+    delta
 }
 
 /// V10: record file/query memory events from an assistant line's `tool_use`
@@ -789,7 +824,10 @@ fn spawn_head_fallback(ctx: &OobContext, project_dir: &Path, session_id: &str) {
 /// `record_tool_events`). Unlike `record_tool_events`, sidechain (sub-agent)
 /// lines are NOT skipped: a sub-agent's tokens are real spend against the
 /// same session and must be counted, even though its file touches aren't
-/// tracked as the parent's working set.
+/// tracked as the parent's working set. Under the 1.x contract those lines
+/// arrive inline through the parent drain; under the 2.x contract the same
+/// lines live in `subagents/*.jsonl` and reach this function via
+/// [`SubagentState::scan`] instead.
 fn record_usage(obj: &Value, tool_names: &mut ToolNameRing, project_dir: &Path, session_id: &str, ctx: &OobContext) {
     if ctx.mem.is_none() {
         return;
@@ -822,6 +860,215 @@ fn record_usage(obj: &Value, tool_names: &mut ToolNameRing, project_dir: &Path, 
             crate::graph::UsageEvent::ToolResult { tool, chars: chars as u32 },
         );
     }
+}
+
+// ── Sub-agent transcript tail (2.x contract) + drift canary ───────────────
+
+/// Where the 2.x CLIs write sub-agent transcripts: one JSONL per agent at
+/// `<projects-root>/<session_id>/subagents/agent-<id>.jsonl` (plus a small
+/// `agent-<id>.meta.json` we don't read). The lines inside carry the same
+/// shape as the parent transcript (including `isSidechain:true`).
+fn subagents_dir(root: &Path, session_id: &str) -> PathBuf {
+    root.join(session_id).join("subagents")
+}
+
+/// Ticks a drift condition must hold before it's reported: the parent file
+/// and the subagents dir are written by separate handles, so one 200ms poll
+/// can catch a launch line before its transcript file exists (or vice
+/// versa). Three ticks (~600ms) outlives any such write-order race.
+const DRIFT_CONFIRM_TICKS: u32 = 3;
+
+/// Tail state for one sub-agent transcript file: read offset plus the same
+/// tool-name / commit-call rings the parent tail keeps (tool_use ids never
+/// cross files, so per-file rings can't mis-join).
+#[derive(Default)]
+struct SubagentFile {
+    offset: u64,
+    tool_names: ToolNameRing,
+    commit_calls: IdRing,
+}
+
+/// Session-scoped sub-agent state: the per-file tails for
+/// [`subagents_dir`]'s `*.jsonl`, plus the facts the drift canary reasons
+/// over. Reset on session rotation (a new transcript file is a new session,
+/// with its own subagents dir).
+#[derive(Default)]
+struct SubagentState {
+    files: HashMap<PathBuf, SubagentFile>,
+    /// Files already present on the FIRST scan seek to EOF when the app
+    /// attached mid-session — mirrors the parent tail's backlog skip.
+    skip_backlog: bool,
+    scanned_once: bool,
+    /// Canary facts (see [`Self::drift_tick`]).
+    launch_seen: bool,
+    completion_seen: bool,
+    sidechain_seen: bool,
+    drift_ticks: u32,
+    drift_reported: bool,
+}
+
+impl SubagentState {
+    /// Fresh state for a new session file. `skip_backlog` is the parent
+    /// tail's first-attach flag at rotation time.
+    fn reset(&mut self, skip_backlog: bool) {
+        *self = SubagentState { skip_backlog, ..SubagentState::default() };
+    }
+
+    /// One poll tick: discover and drain `<root>/<sid>/subagents/*.jsonl`,
+    /// feeding ONLY the usage and commit-provenance taps — a sub-agent's
+    /// tokens and commits are real spend/output of the parent session, but
+    /// its file touches, prompts, and text stay out of the parent's working
+    /// set, turn clocks, avatar state, and TTS (the same split the inline
+    /// sidechain contract had). A no-op when memory isn't wired: every tap
+    /// this feeds is mem-gated, so the extra IO would buy nothing.
+    fn scan(&mut self, root: &Path, session_id: &str, project_dir: &Path, ctx: &OobContext) {
+        if ctx.mem.is_none() {
+            return;
+        }
+        let dir = subagents_dir(root, session_id);
+        let first_scan = !self.scanned_once;
+        self.scanned_once = true;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return, // no sub-agents (yet) — the common case.
+        };
+        let seek_to_eof = first_scan && self.skip_backlog;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let tail = self.files.entry(path.clone()).or_insert_with(|| SubagentFile {
+                offset: if seek_to_eof { len } else { 0 },
+                ..SubagentFile::default()
+            });
+            if len <= tail.offset {
+                continue; // nothing new — skip the open entirely.
+            }
+            let Some((complete, new_offset)) = read_complete_lines(&path, tail.offset) else {
+                continue;
+            };
+            tail.offset = new_offset;
+            for line in complete.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(obj) = serde_json::from_str::<Value>(line) {
+                    record_usage(&obj, &mut tail.tool_names, project_dir, session_id, ctx);
+                    record_commit_events(
+                        &obj,
+                        &mut tail.commit_calls,
+                        project_dir,
+                        session_id,
+                        ctx,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The sub-agent drift canary: report (once per session, as an Activity
+    /// event with `tool: "subagent_drift"` that the advisor's
+    /// `drift.subagent_transcripts.v1` rule reads) when the transcript
+    /// contract has visibly moved again. Two detectable shapes:
+    ///
+    ///  • an agent genuinely completed but its traffic showed up neither
+    ///    inline (`isSidechain` lines) nor as `subagents/*.jsonl` — the
+    ///    transcripts moved somewhere this tail doesn't watch, and the
+    ///    session's sub-agent token spend is being silently dropped;
+    ///  • `subagents/*.jsonl` exist but no launch `tool_use` was ever
+    ///    recognized — the launcher tool was renamed again (as Task→Agent
+    ///    was); usage still counts, but the agents-active avatar hold is
+    ///    dead. Suppressed when we attached mid-session (`skip_backlog`):
+    ///    the launches may simply predate the attach.
+    ///
+    /// A simultaneous rename AND relocation is invisible from this vantage —
+    /// nothing observable remains — so this canary covers single-axis drift
+    /// only. Conditions must hold [`DRIFT_CONFIRM_TICKS`] consecutive ticks
+    /// (write-order races between the two locations resolve within one).
+    /// Mem-gated like `scan`: without memory `files` never populates, which
+    /// would make the "transcripts missing" arm a false constant.
+    fn drift_tick(&mut self, project_dir: &Path, session_id: &str, ctx: &OobContext) {
+        if ctx.mem.is_none() || self.drift_reported {
+            return;
+        }
+        let Some(summary) = self.drift_condition() else {
+            self.drift_ticks = 0;
+            return;
+        };
+        self.drift_ticks += 1;
+        if self.drift_ticks < DRIFT_CONFIRM_TICKS {
+            return;
+        }
+        self.drift_reported = true;
+        debug!(session = session_id, summary, "Claude OOB: sub-agent contract drift");
+        report_subagent_drift(project_dir, session_id, summary);
+    }
+
+    /// Pure half of [`Self::drift_tick`]: which drift condition currently
+    /// holds, if any. Split out so the state machine is testable without
+    /// touching the global Activity store.
+    fn drift_condition(&self) -> Option<&'static str> {
+        if self.completion_seen && !self.sidechain_seen && self.files.is_empty() {
+            return Some(
+                "sub-agent completed but no sidechain lines and no subagents/*.jsonl — \
+                 transcripts moved; sub-agent token spend is not being counted",
+            );
+        }
+        if !self.launch_seen && !self.skip_backlog && !self.files.is_empty() {
+            return Some(
+                "subagents/*.jsonl present but no Task/Agent launch tool_use recognized — \
+                 launcher tool renamed; agents-active tracking is blind",
+            );
+        }
+        None
+    }
+}
+
+/// Record one sub-agent drift report in the Activity store (`source:
+/// "harness"`, `tool: "subagent_drift"` — same channel discipline as the
+/// hook shims' `contract_drift` events, which the advisor also reads from
+/// the ring). Fire-and-forget; the caller rate-limits to once per session.
+fn report_subagent_drift(project_dir: &Path, session_id: &str, summary: &str) {
+    crate::activity::record_bg(crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::Graph,
+            crate::activity::now_ms(),
+            project_dir.to_string_lossy().to_string(),
+            "harness".to_string(),
+            "subagent_drift".to_string(),
+            summary.to_string(),
+            summary.chars().count(),
+            0,
+            false, // a drift report is never "ok" — it flags the entry in the feed
+        ),
+        request: format!("sub-agent transcript contract drift (session {session_id})"),
+        response: summary.to_string(),
+    });
+}
+
+/// Read complete new lines from `path` starting at `offset`: the chunk up to
+/// (and including) the last newline, plus the advanced offset. `None` when
+/// nothing new/complete is readable — a trailing partial line waits for the
+/// next tick (offset not advanced past it), and a vanished/rotated file just
+/// retries next tick.
+fn read_complete_lines(path: &Path, offset: u64) -> Option<(String, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(offset);
+    if len <= offset {
+        return None; // nothing new (or truncated/rotated).
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    let last_nl = buf.rfind('\n')?;
+    buf.truncate(last_nl + 1);
+    let new_offset = offset + buf.len() as u64;
+    Some((buf, new_offset))
 }
 
 /// `~/.claude/projects/<slug>/` for `project_dir`. `None` if no home dir.
@@ -1017,13 +1264,18 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
-    /// Assistant message launching one Task agent.
-    fn launch(id: &str) -> Value {
+    /// Assistant message launching one sub-agent via the named tool.
+    fn launch_named(id: &str, name: &str) -> Value {
         obj(&format!(
             r#"{{"type":"assistant","message":{{"id":"a1","content":[
-                {{"type":"tool_use","id":"{id}","name":"Task","input":{{}}}}
+                {{"type":"tool_use","id":"{id}","name":"{name}","input":{{}}}}
             ]}}}}"#
         ))
+    }
+
+    /// Assistant message launching one Task agent (the 1.x tool name).
+    fn launch(id: &str) -> Value {
+        launch_named(id, "Task")
     }
 
     /// User message carrying the tool_result for `id`.
@@ -1122,6 +1374,53 @@ mod tests {
         // Result for a tool we never tracked (e.g. a Read) must not emit.
         update_agents(&result("toolu_never_seen"), &mut agents, &ctx);
         assert!(sig.try_recv().is_err());
+    }
+
+    #[test]
+    fn agent_named_launch_is_tracked_like_task() {
+        // The 2.x CLIs renamed the launcher tool Task → Agent; both names
+        // must hold the avatar (this pins the AGENT_TOOL_NAMES contract).
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+
+        update_agents(&launch_named("toolu_a", "Agent"), &mut agents, &ctx);
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+        ));
+
+        update_agents(&result("toolu_a"), &mut agents, &ctx);
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+        ));
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn update_agents_reports_launch_and_completion_deltas() {
+        let (ctx, _sig) = agent_ctx();
+        let mut agents = HashSet::new();
+
+        let d = update_agents(&launch("toolu_a"), &mut agents, &ctx);
+        assert!(d.launched && !d.completed);
+
+        // A stray result for an untracked id is NOT a completion.
+        let d = update_agents(&result("toolu_other"), &mut agents, &ctx);
+        assert!(!d.launched && !d.completed);
+
+        // The tracked id's result is.
+        let d = update_agents(&result("toolu_a"), &mut agents, &ctx);
+        assert!(!d.launched && d.completed);
+
+        // A turn-boundary reclaim (user prompt clearing orphans) is not a
+        // completion either — the canary must not trust orphaned agents to
+        // have written transcripts.
+        update_agents(&launch("toolu_b"), &mut agents, &ctx);
+        let prompt = obj(r#"{"type":"user","message":{"content":"next question"}}"#);
+        let d = update_agents(&prompt, &mut agents, &ctx);
+        assert!(!d.launched && !d.completed);
+        assert!(agents.is_empty());
     }
 
     #[test]
@@ -1378,5 +1677,105 @@ mod tests {
         );
         record_usage(&line, &mut ring, &dir, "s1", &ctx);
         assert_eq!(ring.get("toolu_1"), None, "mem is None, so the tap is a full no-op");
+    }
+
+    // ── Sub-agent transcript tail + drift canary ──────────────────────────
+
+    #[test]
+    fn read_complete_lines_holds_back_partial_trailing_line() {
+        let dir = std::env::temp_dir().join(format!("oob-subagent-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-x.jsonl");
+
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":2}\n{\"partial").unwrap();
+        let (chunk, offset) = read_complete_lines(&path, 0).expect("two complete lines");
+        assert_eq!(chunk, "{\"a\":1}\n{\"b\":2}\n");
+        assert_eq!(offset, chunk.len() as u64);
+
+        // Nothing new past the partial line yet.
+        assert!(read_complete_lines(&path, offset).is_none());
+
+        // The partial line completing is picked up from the held offset.
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":2}\n{\"partial\":3}\n").unwrap();
+        let (chunk, _) = read_complete_lines(&path, offset).expect("completed line");
+        assert_eq!(chunk, "{\"partial\":3}\n");
+
+        // A missing file is a quiet retry, not an error.
+        assert!(read_complete_lines(&dir.join("gone.jsonl"), 0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subagent_scan_is_a_noop_without_graph_memory() {
+        // Every tap scan feeds is mem-gated, so without memory it must not
+        // even track files — and drift_tick must stay silent too (its
+        // "transcripts missing" arm would otherwise be a false constant).
+        let (ctx, _sig) = agent_ctx();
+        let root = std::env::temp_dir().join(format!("oob-subagent-scan-{}", uuid::Uuid::new_v4()));
+        let dir = subagents_dir(&root, "s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent-a.jsonl"), "{\"type\":\"assistant\"}\n").unwrap();
+
+        let mut subs = SubagentState::default();
+        subs.completion_seen = true; // even with a completed agent…
+        subs.scan(&root, "s1", &root, &ctx);
+        assert!(subs.files.is_empty(), "mem is None, so no files are tracked");
+        subs.drift_tick(&root, "s1", &ctx);
+        assert!(!subs.drift_reported && subs.drift_ticks == 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drift_condition_fires_on_missing_transcripts_only_after_real_completion() {
+        let mut subs = SubagentState::default();
+        assert_eq!(subs.drift_condition(), None, "idle session is healthy");
+
+        // Launch alone isn't evidence — the agent may still be running.
+        subs.launch_seen = true;
+        assert_eq!(subs.drift_condition(), None);
+
+        // A completed agent with traffic in neither location is drift.
+        subs.completion_seen = true;
+        assert!(subs.drift_condition().unwrap().contains("transcripts moved"));
+
+        // Inline sidechain lines mean the 1.x contract is live — healthy.
+        subs.sidechain_seen = true;
+        assert_eq!(subs.drift_condition(), None);
+
+        // As does a tracked subagent file under the 2.x contract.
+        subs.sidechain_seen = false;
+        subs.files.insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
+        assert_eq!(subs.drift_condition(), None);
+    }
+
+    #[test]
+    fn drift_condition_fires_on_unrecognized_launcher_tool() {
+        // Transcript files with no recognized launch tool_use ⇒ the launcher
+        // was renamed again (as Task→Agent was).
+        let mut subs = SubagentState::default();
+        subs.files.insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
+        assert!(subs.drift_condition().unwrap().contains("launcher tool renamed"));
+
+        // …unless we attached mid-session: the launches may predate us.
+        subs.skip_backlog = true;
+        assert_eq!(subs.drift_condition(), None);
+
+        // A recognized launch silences it.
+        subs.skip_backlog = false;
+        subs.launch_seen = true;
+        assert_eq!(subs.drift_condition(), None);
+    }
+
+    #[test]
+    fn subagent_reset_clears_state_and_keeps_backlog_flag() {
+        let mut subs = SubagentState::default();
+        subs.launch_seen = true;
+        subs.completion_seen = true;
+        subs.drift_ticks = 2;
+        subs.files.insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
+        subs.reset(true);
+        assert!(subs.skip_backlog);
+        assert!(subs.files.is_empty());
+        assert!(!subs.launch_seen && !subs.completion_seen && subs.drift_ticks == 0);
     }
 }

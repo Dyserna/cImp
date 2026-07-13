@@ -30,9 +30,16 @@ pub fn defs() -> Vec<ToolDef> {
     if g.embed_code_bodies {
         specs.push(crate::graph::semantic_code_spec());
     }
-    specs
+    // V17 Phase E: hide the cold-tail tools from the ADVERTISED worker surface
+    // when `lean_tools` is on. Dispatch (`offload_query` → `run_tool`) is
+    // name-driven and unaffected, so a hidden name still answers.
+    crate::graph::lean_filter(specs, g.lean_tools)
         .into_iter()
-        .map(|s| ToolDef::function(s.name, s.description, s.parameters))
+        // Pure lookups: the code graph is a snapshot built before the run and
+        // not rebuilt mid-run, so an identical `graph_*` query can be served
+        // from the call cache (its answer can't have changed). File/process
+        // tools (read_file/run_command/…) are stateful and re-execute instead.
+        .map(|s| ToolDef::function(s.name, s.description, s.parameters).pure())
         .collect()
 }
 
@@ -52,6 +59,12 @@ mod tests {
 
     #[test]
     fn defs_mirror_the_shared_specs() {
+        // `defs()` reads live settings for its optional semantic tools AND the
+        // V17 `lean_tools` filter; in the test environment settings default to
+        // `lean_tools=false` (no `settings.json` beside the test binary), so the
+        // worker surface here is the full, unfiltered set — the comparison stays
+        // meaningful. The lean-filtering itself is pinned in
+        // `lean_filter_applies_to_worker_defs` below via the pre-filter helper.
         let specs = crate::graph::tool_specs();
         let defs = defs();
         // `defs()` is the shared base set plus an optional semantic tool when
@@ -75,5 +88,21 @@ mod tests {
                 def.function.name
             );
         }
+    }
+
+    /// V17 Phase E: the worker's `defs()` builds its `ToolDef`s through the same
+    /// `lean_filter` as the MCP surface, so `lean_tools=true` drops exactly the
+    /// hidden five from the worker surface too. Pinned via the pre-filter helper
+    /// so it's independent of ambient settings.
+    #[test]
+    fn lean_filter_applies_to_worker_defs() {
+        let names: Vec<String> = crate::graph::lean_filter(crate::graph::tool_specs(), true)
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        for h in crate::graph::LEAN_HIDDEN {
+            assert!(!names.iter().any(|n| n == h), "`{h}` should be hidden from the worker");
+        }
+        assert_eq!(names.len(), crate::graph::tool_specs().len() - crate::graph::LEAN_HIDDEN.len());
     }
 }

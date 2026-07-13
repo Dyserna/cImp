@@ -71,6 +71,7 @@ version edit — `cargo update` will not move them.
 | `cozo` | `0.7.6` | Embedded graph DB (code-knowledge graph) | `default-features = false` + `storage-sqlite,rayon`. **Deliberately omits** `graph-algo` (broken `graph_builder` vs rayon) and `storage-rocksdb` (heavy C++). |
 | `ignore` | `0.4` | Gitignore-aware tree walk (indexer) | ripgrep's walker. |
 | `notify` | `6` | FS watcher (incremental re-index) | `ReadDirectoryChangesW` on Windows. |
+| `similar` | `2` | Line-level unified diff for the read advisor's diff-substitute (V17) | `default-features = false`, `features = ["text"]` (pure Rust, no C-FFI). Single call site: `graph/context.rs::unified_diff`. |
 | `winreg` *(windows only)* | `0.52` | Registry probe for Git Bash detection | `cfg(windows)` target dep. |
 
 ## Frontend / npm (`package.json`)
@@ -708,6 +709,82 @@ without deduping, so a callee name defined N times in one file inflated that
 file's centrality by N×. Fixed in `graph/index.rs::file_centrality`, with a
 regression test alongside it.
 
+## Code Intelligence — Token Efficiency II (V17)
+
+**No schema bump, no new hooks/routes/CLI subcommands.** The read-advisor
+escalation (diff-substitute, shell interception, first-read tier) is all
+in-memory session state on `GraphService` and reuses the V11 `--read-hook` shim
++ `/context/should_read` route; the graduation rules read existing `mem_event`;
+the first-read tier reads the existing `digest` relation. New settings are all
+additive, `#[serde(default)]` (`read_advisor_diffs=true`,
+`read_advisor_shell=true`, `read_advisor_first_read_kb=0`, `lean_tools=false`).
+
+**Snapshot-store constants (not settings), in `graph/service.rs`.** The
+diff-substitute snapshot LRU is bounded by three consts — promote to settings
+only if field data demands:
+- `SNAP_ENTRY_MAX = 512 KiB` — a single file's snapshot is retained only when
+  the content is ≥ `read_advisor_min_lines` lines **and** ≤ this size.
+- `SNAP_TOTAL_MAX = 16 MiB` — whole-store byte budget; on overflow the
+  oldest-touched snapshots are dropped (set `snapshot: None`, hash/turn kept —
+  eviction forgets the *content*, never the *observation*).
+- `READ_SEEN_MAX_ENTRIES = 4096` — a row-count backstop on the `read_seen`
+  map itself (independent of the byte budget; not in the original plan, added
+  during Phase A so an all-tiny-files session can't grow the map unbounded).
+- `READ_REMIND_CAP = 3` — a changed file re-arms an already-reminded slot only
+  while its remind `count` is below this; at cap it passes. An *unchanged*
+  reminded file never re-reminds regardless of count.
+
+**B5 — bypass-canary interplay (shell interception).** `check_bypass`
+(`graph/service.rs`) has a skip-guard: when `read_advisor_shell` is on and
+`shellread::whole_file_read(command)` matches, it returns *before* scoring —
+the command was either intercepted-and-denied (the remind was already recorded
+by `should_read`) or verdict-passed (not a bypass), so without the guard every
+intercepted `cat` would *also* count as a bypass and poison
+`drift.read_bypass.v1`. The canary itself is untouched: with interception live
+its rate should **fall**. A persistently high `drift.read_bypass.v1` now means
+the agent found a **residual escape route** the strict parser deliberately
+rejects — `sed -n`, `head`, `tail` — not the plain `cat`/`Get-Content` the
+overlay now catches. The `RULE_DRIFT_READ_BYPASS` rationale in `advisor.rs`
+says so.
+
+**F2 — `e1_pass` is stricter than `!e1_blocked()`.** The `adopt.read_advisor.v1`
+graduation rule gates on `Signals.e1_pass`, which is
+`harness_versions.e1_status` trimmed/lowercased `== "pass"` — **not** merely
+`!e1_blocked()`. `e1_blocked()` is false for both `"pass"` *and* `"unverified"`
+(it only fails closed on an explicit non-pass/non-unverified value), but
+"verified OK" for auto-graduating a hook we've never seen work means *proven*:
+an `unverified` E1 must not flip `read_advisor` on by itself. This is the one
+intentional bare `"pass"` string comparison outside
+`HarnessVersions::status_blocks`.
+
+**Live-smoke recipes (run a real Claude tab; these are hand-run, like the V16
+E1/D0 spikes above).** With the app running, `graph.enabled` + `read_advisor`
+on, in a project with a large indexed file:
+- **Diff-substitute** — `Read` a large file, `Edit` it (or edit it in another
+  tab), then `Read` it again. The second read should be denied with a unified
+  diff headed ``changed since you read it (turn N) — diff against what you
+  read:``, not the whole file. Activity shows a `remind` marked `(changed —
+  diff substituted)`. Re-editing and re-reading re-arms up to 3×, then passes.
+- **Shell interception** (`read_advisor_shell` on) — after a file is reminded,
+  `cat FILE` (or `Get-Content FILE`) in a Bash tool call should be denied with
+  the reason prefixed `answered without running the command —`. A `head -50
+  FILE` / `sed -n 1,20p FILE` should run untouched (residual routes are the
+  canary's job). Verify the same file through `Read` and through `cat` yields
+  byte-identical advice modulo the prefix.
+- **First-read tier** (`read_advisor_first_read_kb=256`) — first `Read` of a
+  large *non-code* file (a big `.log` / `.lock` / generated `.json`) with a
+  digest already cached is answered with the digest + head/tail sample; the
+  first encounter (no digest) enqueues one and passes.
+- **Test parsers** — add `{ "name": "test", "cmd": "cargo test", "parser":
+  "cargo-test", "timeout_secs": 300 }` to `.cimp/config.json`, break a test,
+  and `run_check(name:"test")` should return the failure with its `file:line`
+  and a counts `Note`, not a raw dump. On a clean run it renders `ok — N
+  passed`.
+- **Tool surface** — the Effectiveness card's "tool surface" row reads the
+  advertised graph-tool size. Note it reads **0 tools** when `graph.enabled` is
+  false (nothing is advertised); toggling `lean_tools` should drop the count by
+  exactly 5 and the chars by the `LEAN_HIDDEN` descriptors' size.
+
 ## Code Intelligence — Agentic Inner Loop (V12)
 
 **No schema bump — every V12 store is additive, create-if-missing.**
@@ -796,6 +873,83 @@ spawn helper into `graph::gitcmd::run_git` (shared by `graph::impact` and
 that module's doc comment) and bounded `graph_recent_changes` at the Datalog
 level (`:order -last_ts :limit`) instead of scanning the whole `commit_touch`
 relation per retrieve.
+
+## Code Intelligence — run_check Generalization (V22)
+
+**No schema involvement.** `CheckDef`'s new fields (`cwd`, `env`, `report_file`,
+`pattern`, `auto`) are all `#[serde(default)]`, so an old `.cimp/config.json`
+overlay deserializes unchanged; detection / auto-configure state is settings +
+in-memory, nothing touches `graph.db`.
+
+**The Rust `ParserKind` enum and the TS `ParserKind` union must stay in
+lockstep — a tripwire enforces it.** `checks/mod.rs`'s tripwire test
+`include_str!`s `src/lib/settings/types.ts` and asserts every `ParserKind` wire
+name (its kebab-case serde rename, *derived* from serde — not a second hand-kept
+list) and every `CheckDef` field key appears in the file. Adding a Rust variant
+or field without mirroring it in `types.ts` fails `cargo test`. `all_parser_kinds()`
+(same test module) is an exhaustive `vec![…]` over every variant, so it's a
+compile error until a new variant is listed — the tripwire can't silently skip
+one.
+
+### Adding a `run_check` parser
+
+Same shape as adding a graph language (above): fixture-first, and the exhaustive
+match forces the wiring.
+
+1. **Capture a fixture** from the *real* tool's output (stdout, or the report
+   file for a file-reading parser), warts and ANSI codes included, into the test
+   module of `checks/parsers.rs` — the existing per-parser tests are the
+   template. Add a truncated/garbage-input case too (must yield zero diags, no
+   panic — the spec requires it).
+2. **Write `parse_<kind>`** in `checks/parsers.rs` (ANSI-strip first via the
+   existing `strip_ansi`; keep severities and the dedup key consistent with the
+   V12 machinery) and add its **`ParserKind` variant** in `checks/mod.rs` with the
+   kebab-case `#[serde(rename)]`. If the parser needs a new `CheckDef` input (as
+   `regex-custom` needs `pattern`, or the file-readers need `report_file`), add
+   that field `#[serde(default)]` too — the tripwire will then require it in
+   `types.ts` as well.
+3. **Extend `all_parser_kinds()`** (`checks/mod.rs` test module) and route the
+   variant through `parsers::parse`. The exhaustive `vec!` / `match` won't
+   compile until the new variant is listed, so this step is forced, not optional.
+4. **Mirror the wire name in `src/lib/settings/types.ts`** (the `ParserKind`
+   union) — the tripwire (above) fails `cargo test` until you do.
+5. **Add it to the editor dropdown.** `PARSER_KINDS` in
+   `src/lib/settings/checksEditor.ts` is a **hand-maintained** ordered list
+   (mainstream → SARIF/long-tail → regex/generic), with a matching `PARSER_LABELS`
+   entry and, if the parser reveals `pattern`/`report_file`, an arm in
+   `showsPattern` / `showsReportFile`. It is **not** derived from the union, and
+   there is **no tripwire on it** (the TS type would still accept the variant), so
+   a new parser is invisible in the UI until you add it here — double-check this
+   step.
+6. **Run `cargo test` (tripwire + fixtures green) and `npm run check` + `npm
+   test`.** The parser then appears in the editor dropdown automatically. Because
+   the detect/preset catalog (`checks/detect.rs`) is a separate data table, wire
+   the new parser into a preset there only if language auto-detection should
+   *propose* it for some ecosystem — otherwise it stays a manual-only choice.
+
+**Parser fixtures rot when the underlying tool changes its output** — the same
+caveat as the V12 parsers above. Each `parse_<kind>` is regex/JSON-shape coupled
+to that tool's *current* format; a tool release that reshapes its diagnostics
+silently degrades `run_check` to zero/garbage groups rather than erroring. Re-run
+the fixtures (and add a fresh one from a real invocation) when bumping a toolchain
+this repo's own `checks:` config points at, and spot-check against the tool's
+changelog.
+
+**`cwd` / `report_file` are confined under the project root, the same way
+offload's `ToolCtx::confine` confines a path.** Absolute or `..`-escaping paths
+are rejected at settings validation *and* at run time; a `report_file` that's
+missing after the run is an explicit error diag, never empty success.
+`report_file` is resolved **relative to the check's working directory** (`cwd`
+if set, else the project root) — matching where a tool run in that dir actually
+writes (so `detect.rs`'s nested-module presets seed an unprefixed
+`target/surefire-reports` correctly). For back-compat with pre-fix configs that
+were written root-relative *with* a `cwd`, resolution tries cwd-relative first
+and falls back to root-relative only when the file exists solely there
+(cwd-relative wins when both exist). `env`
+values are redacted in `CheckDef`'s `Debug`. `regex-custom`'s `pattern` is
+compiled and its mandatory named groups checked at save time
+(`parsers::validate_pattern`, surfaced through the `checks_validate_pattern`
+IPC) so a bad pattern is a UI error, not a silent zero-diagnostics run.
 
 ## Workbench — Vibe-Coding Guardrails (V13)
 
@@ -937,6 +1091,31 @@ in place), and `extract_tool_results` sums `tool_result` content chars,
 attributed to a tool name via a small per-session `tool_use_id → name` ring.
 Unlike `record_tool_events`, this tap does **not** skip sidechain (sub-agent)
 lines — sub-agent token spend counts toward the parent session's totals.
+
+**Sub-agent transcripts live in TWO places across CLI vintages — the tap
+handles both, and a canary watches for a third.** Claude Code 1.x wrote a
+sub-agent's traffic inline in the parent transcript as `isSidechain:true`
+lines (covered by the paragraph above). The 2.x CLIs (observed 2.1.207)
+instead write one file per agent at
+`~/.claude/projects/<slug>/<session_id>/subagents/agent-<id>.jsonl` (plus an
+`agent-<id>.meta.json` we don't read), renamed the launcher tool `Task` →
+`Agent` (`oob/claude.rs::AGENT_TOOL_NAMES` matches both), and the parent
+transcript carries **zero** sidechain lines. `SubagentState` (same file)
+tails those per-agent files each poll tick, feeding ONLY `record_usage` and
+`record_commit_events` under the parent session id — a sub-agent's tokens
+and commits are the parent's spend/output, but its reads/prompts/text stay
+out of the working set, turn clocks, avatar state, and TTS, exactly the
+split the inline contract had. If the contract moves again,
+`SubagentState::drift_tick` records a `subagent_drift` Activity event
+(once per session, after the condition holds ~3 ticks) and the advisor
+surfaces it as `drift.subagent_transcripts.v1`: either "transcripts moved"
+(an agent completed but its traffic showed up in neither location — token
+spend is being dropped) or "launcher tool renamed" (`subagents/*.jsonl`
+exist but no recognized launch `tool_use` — usage still counts, but the
+agents-active avatar hold is blind). A simultaneous rename **and**
+relocation is invisible from this vantage; if sub-agent-heavy sessions ever
+look cheap again with no canary firing, diff a live session's transcript
+dir against these two known layouts first.
 
 **OpenCode usage is `est_only` — `TODO(spike C3)`, resolved as "absent."**
 `oob/opencode.rs`'s module doc records the spike outcome directly: OpenCode's

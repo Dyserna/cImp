@@ -2206,6 +2206,46 @@ mod tests {
     }
 
     #[test]
+    fn checks_suggestion_dismissal_persists_through_the_overlay() {
+        // V22 Phase D: the nudge dismissal (and the auto-configure toggle) are
+        // ordinary per-project fields — they ride the `.cimp/config.json`
+        // overlay diff and reconstitute on load. A pre-Phase-D config (neither
+        // key) defaults both to false.
+        let _shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+
+        let dir = std::env::temp_dir().join(format!("cimp_checks_dismiss_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let overlay = custom_path(&dir);
+
+        let mut customized = global.clone();
+        customized.checks_suggestion_dismissed = true;
+        customized.checks_auto_configure = true;
+        save(&customized, &dir, &global).unwrap();
+
+        // The diff carries both fields (they differ from the default baseline).
+        let text = fs::read_to_string(&overlay).unwrap();
+        assert!(text.contains("checks_suggestion_dismissed"), "overlay: {text}");
+        assert!(text.contains("checks_auto_configure"), "overlay: {text}");
+
+        // Reconstitute: merge the overlay back onto the default baseline.
+        let mut merged = serde_json::to_value(&global).unwrap();
+        let overlay_val: Value = serde_json::from_str(&text).unwrap();
+        deep_merge(&mut merged, overlay_val);
+        let loaded: Settings = serde_json::from_value(merged).unwrap();
+        assert!(loaded.checks_suggestion_dismissed, "dismissal survives a save→merge roundtrip");
+        assert!(loaded.checks_auto_configure);
+
+        // A config predating Phase D (neither key) defaults both to false.
+        let old: Settings = serde_json::from_str(r#"{"schema_version": 21}"#).unwrap();
+        assert!(!old.checks_suggestion_dismissed);
+        assert!(!old.checks_auto_configure);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn save_writes_overlay_inside_cimp_dir() {
         // The per-folder overlay must land at `<cwd>/.cimp/config.json`, not
         // the pre-consolidation loose `<cwd>/.cimp.custom.config.json`.

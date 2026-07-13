@@ -9,6 +9,7 @@ mod compact_hook;
 mod content;
 mod context_hook;
 mod error;
+mod fsutil;
 mod graph;
 mod ipc;
 mod logging;
@@ -51,6 +52,8 @@ use crate::ipc::commands::{
     compose_content_changed,
     compose_templates, compose_templates_global_get, compose_templates_global_set,
     compose_templates_project_get,
+    checks_apply_proposals, checks_detect, checks_dismiss_suggestion, checks_suggestion,
+    checks_test, checks_validate_pattern, open_settings_window_to_section,
     consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
     get_system_stats, graph_cycles, graph_dead_exports, graph_fact_add, graph_fact_update, graph_facts,
     graph_history, graph_impact, graph_path, graph_architecture, graph_viz_snapshot,
@@ -61,7 +64,7 @@ use crate::ipc::commands::{
     graph_status, graph_test_embedder, graph_usage, graph_usage_advice, list_tabs,
     list_voices, llm_pricing_get, llm_pricing_set,
     offload_backend_restart, offload_backend_start, offload_backend_stop,
-    offload_derive_opencode_provider,
+    offload_derive_opencode_provider, offload_enable_readonly_commands,
     offload_server_log, offload_server_metrics, offload_server_restart, offload_server_start,
     offload_server_stop,
     offload_service_status,
@@ -699,6 +702,7 @@ fn main() {
             list_tabs,
             open_settings_window,
             open_settings_window_to_tab,
+            open_settings_window_to_section,
             consume_settings_deep_link,
             close_settings_window,
             request_tab_restart,
@@ -754,6 +758,7 @@ fn main() {
             offload_backend_restart,
             offload_test,
             offload_derive_opencode_provider,
+            offload_enable_readonly_commands,
             offload_service_status,
             offload_reload_mcp,
             offload_server_log,
@@ -761,6 +766,12 @@ fn main() {
             graph_status,
             graph_rebuild,
             graph_rebuild_embeddings,
+            checks_detect,
+            checks_apply_proposals,
+            checks_suggestion,
+            checks_dismiss_suggestion,
+            checks_test,
+            checks_validate_pattern,
             graph_set_watch_paused,
             graph_language_census,
             graph_set_language_enabled,

@@ -14,11 +14,12 @@
 //! surface just happens to be where cloud-agent tools live in this codebase.
 
 pub mod auto;
+pub mod detect;
 pub mod gitls;
 pub mod parsers;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -30,13 +31,16 @@ use crate::error::{AppError, AppResult};
 /// One configured project check (a build/lint/test command + how to parse
 /// its output). Lives in `.cimp/config.json`'s top-level `checks` array —
 /// see `settings::schema::Settings::checks`.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+///
+/// `Debug` is hand-rolled to redact `env` VALUES (they may carry secrets),
+/// matching `McpServerConfig`'s precedent.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct CheckDef {
     /// Short id the `run_check` tool's `name` argument selects (e.g. `"cargo"`).
     pub name: String,
-    /// The full shell command line to run, cwd = the project root (e.g.
-    /// `"cargo check --message-format=json"`).
+    /// The full shell command line to run (cwd = the project root, or `cwd`
+    /// below when set — e.g. `"cargo check --message-format=json"`).
     pub cmd: String,
     /// How to parse its output into diagnostics.
     pub parser: ParserKind,
@@ -44,6 +48,41 @@ pub struct CheckDef {
     /// smaller configured value — a check that can't even attempt in 10s
     /// isn't meaningfully bounded.
     pub timeout_secs: u64,
+    /// V22 Phase B: run `cmd` in this directory instead of the project root — a
+    /// path RELATIVE to the root, confined strictly beneath it (absolute or
+    /// escaping `..` paths are rejected, at [`CheckDef::validate`] and again at
+    /// spawn time in [`run`]). Replaces `--manifest-path`-style workarounds for
+    /// nested manifests (this repo's `src-tauri/`) and monorepos generically.
+    /// Diagnostic `file` paths are re-rooted back to the project root
+    /// ([`reroot_diags`]) so the report stays root-relative regardless.
+    pub cwd: Option<String>,
+    /// V22 Phase B: environment variables forced on the spawned child — the
+    /// same mechanism `CommandPolicy` uses for `run_command`. An ordered list
+    /// (not a map) keeps the settings diff deterministic. Values may carry
+    /// secrets, so [`CheckDef`]'s `Debug` redacts them to their keys.
+    pub env: Vec<(String, String)>,
+    /// V22 Phase B2: when set, the parser reads THIS file's content after the
+    /// run instead of stdout — for tools (junit-xml, sarif) that write a report
+    /// to disk rather than to a pipe. Same root-confinement as `cwd`; a
+    /// missing/unreadable file becomes an explicit error diagnostic, never a
+    /// silent green run. The read is capped at [`MAX_OUTPUT_BYTES`].
+    pub report_file: Option<String>,
+    /// V22 Phase C: the regex for the `regex-custom` parser (ignored by every
+    /// other parser). Named groups `file`/`line`/`message` are mandatory and
+    /// `col`/`severity` optional — validated at settings-save time via
+    /// [`parsers::validate_pattern`] (reached through [`CheckDef::validate`]) so
+    /// a bad pattern is a save error, not a silent zero-diagnostics run.
+    pub pattern: Option<String>,
+    /// V22 Phase D: `true` when this entry was created by language
+    /// auto-detection ([`detect`]) rather than hand-authored. Re-detection
+    /// ([`detect::merge_auto`]) may refresh entries with `auto == true` but must
+    /// NEVER touch a `false` one — a user-created OR user-edited check owns its
+    /// own name. The Phase E editor clears this flag whenever the user edits an
+    /// auto entry, so a later re-detection stops fighting the manual change.
+    /// `serde(default)` (via the struct-level default) ⇒ pre-V22-D configs load
+    /// with `auto == false`, i.e. everything already on disk is treated as
+    /// user-owned and protected.
+    pub auto: bool,
 }
 
 impl Default for CheckDef {
@@ -53,7 +92,64 @@ impl Default for CheckDef {
             cmd: String::new(),
             parser: ParserKind::GenericGcc,
             timeout_secs: 120,
+            cwd: None,
+            env: Vec::new(),
+            report_file: None,
+            pattern: None,
+            auto: false,
         }
+    }
+}
+
+impl std::fmt::Debug for CheckDef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact `env` values — show only which keys are forced (the
+        // `McpServerConfig` precedent), so a stray `?def` log can't leak a
+        // token/key carried in a value.
+        let env_keys: Vec<&String> = self.env.iter().map(|(k, _)| k).collect();
+        f.debug_struct("CheckDef")
+            .field("name", &self.name)
+            .field("cmd", &self.cmd)
+            .field("parser", &self.parser)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("cwd", &self.cwd)
+            .field("env_keys", &env_keys)
+            .field("report_file", &self.report_file)
+            .field("pattern", &self.pattern)
+            .field("auto", &self.auto)
+            .finish()
+    }
+}
+
+impl CheckDef {
+    /// Lexical validation of the path-shaped fields (`cwd`, `report_file`):
+    /// each must be RELATIVE and free of `..` components, so a check can only
+    /// touch the project subtree. Cheap and root-free — the entry point a
+    /// future settings-save layer can call (none validates `checks` today).
+    /// [`run`] additionally applies the full canonical confinement
+    /// ([`confine_under_root`]) at spawn time, which also catches symlink
+    /// escapes the lexical check can't see.
+    pub fn validate(&self) -> AppResult<()> {
+        if let Some(rel) = self.cwd.as_deref().filter(|s| !s.is_empty()) {
+            lexically_confined("cwd", rel)?;
+        }
+        if let Some(rel) = self.report_file.as_deref().filter(|s| !s.is_empty()) {
+            lexically_confined("report_file", rel)?;
+        }
+        // The `regex-custom` parser is inert without a valid pattern — require
+        // one (with its mandatory named groups) here so a misconfigured check
+        // fails at save/run time rather than silently parsing zero diagnostics.
+        if self.parser == ParserKind::RegexCustom {
+            match self.pattern.as_deref().filter(|s| !s.is_empty()) {
+                Some(pat) => parsers::validate_pattern(pat).map_err(AppError::Checks)?,
+                None => {
+                    return Err(AppError::Checks(
+                        "check `regex-custom` parser requires a `pattern`".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -72,6 +168,28 @@ pub enum ParserKind {
     /// `pytest` — the short test-summary section (`FAILED file::test - msg`)
     /// plus the tail counts line.
     Pytest,
+    /// `cargo test` — stable-toolchain text output (JSON is nightly-only).
+    CargoTest,
+    /// `jest --json` / `vitest --reporter=json` (same shape).
+    JestJson,
+    /// SARIF 2.1 JSON (`ruff --output-format sarif`, `clang-tidy`,
+    /// `golangci-lint`, `semgrep`, CodeQL, ...) — the modern-lint long tail in
+    /// one parser (V22 Phase C).
+    Sarif,
+    /// `go build` / `go vet` text (`file:line[:col]: message`).
+    Go,
+    /// `go test -json` event stream (one JSON object per line).
+    GoTestJson,
+    /// MSBuild canonical diagnostics from `dotnet build` —
+    /// `file(line,col): error|warning CODE: message` (C#/F#/VB).
+    Dotnet,
+    /// JUnit XML test report (Surefire/Gradle/pytest/PHPUnit/...), normally
+    /// read via `report_file`.
+    JunitXml,
+    /// The universal escape hatch: a user-supplied regex with named groups
+    /// (`file`, `line`, optional `col`/`severity`, `message`) applied per line.
+    /// Uses [`CheckDef::pattern`].
+    RegexCustom,
     /// `file:line[:col]: error|warning|note: message` — the fallback for
     /// gcc/clang and most other line-oriented CLI checkers.
     #[default]
@@ -133,6 +251,98 @@ pub struct CheckReport {
     /// output captured before the kill, so this run may be incomplete.
     pub timed_out: bool,
     pub groups: Vec<DiagGroup>,
+    /// V22 Phase E: raw captured stdout/stderr byte counts (before parsing).
+    /// The Phase E "Test" button needs the "did the command produce output at
+    /// all?" signal to tell a genuinely clean run apart from a wrong-parser
+    /// config that saw plenty of output and matched zero diagnostics — the
+    /// [`DiagGroup`] list alone can't distinguish them. Ignored by the
+    /// `run_check` MCP renderer (`graph::mcp::fmt_check_report`).
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+}
+
+/// V22 Phase E: the `checks_test` dry-run result the ChecksEditor renders
+/// inline. Built from a [`CheckReport`] (`changed_only = false`) plus the
+/// captured output sizes, or carries a `validate`/spawn `error` message when the
+/// run never produced a report. `diag_count` is the number of deduplicated
+/// diagnostic groups; `diagnostics` is the first few of them (capped) for the
+/// preview. This type is NOT covered by the Rust↔TS field tripwire (that only
+/// pins `CheckDef`/`ParserKind`) — its mirror is `ChecksTestResult` in
+/// `types.ts`, kept in sync by hand.
+#[derive(Clone, Debug, Serialize)]
+pub struct ChecksTestResult {
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
+    /// Number of deduplicated diagnostic groups the parser produced.
+    pub diag_count: usize,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+    /// The first [`TEST_DIAG_CAP`] diagnostic groups, for the inline preview.
+    pub diagnostics: Vec<TestDiag>,
+    /// A validation (bad `regex-custom`, escaping `cwd`/`report_file`) or spawn
+    /// error — present iff the run never yielded a report. `null` on the wire.
+    pub error: Option<String>,
+}
+
+/// V22 Phase E: one diagnostic group summarized for the Test-button preview.
+#[derive(Clone, Debug, Serialize)]
+pub struct TestDiag {
+    pub severity: String,
+    pub message: String,
+    /// `"file:line"` sample locations (already capped to [`MAX_SITES`] by
+    /// [`run`]); a location-less group has an empty list.
+    pub sites: Vec<String>,
+}
+
+/// Cap on diagnostic groups echoed in a [`ChecksTestResult`] preview.
+const TEST_DIAG_CAP: usize = 5;
+
+/// V22 Phase E: dry-run `def` through [`run`] (`changed_only = false`) and shape
+/// the outcome for the Settings "Test" button — exit status, parsed diagnostic
+/// count, the first few diagnostics, and the raw output sizes that let the UI
+/// flag a wrong-parser config (output produced, zero diagnostics). A
+/// validation/spawn failure is captured into `error` rather than propagated, so
+/// the editor can render it inline like any other test outcome.
+pub async fn test_check(root: &Path, def: &CheckDef) -> ChecksTestResult {
+    match run(root, def, false).await {
+        Ok(report) => {
+            let diagnostics = report
+                .groups
+                .iter()
+                .take(TEST_DIAG_CAP)
+                .map(|g| TestDiag {
+                    severity: g.severity.as_str().to_string(),
+                    message: g.message.clone(),
+                    sites: g
+                        .sites
+                        .iter()
+                        .map(|(f, l)| if *l > 0 { format!("{f}:{l}") } else { f.clone() })
+                        .collect(),
+                })
+                .collect();
+            ChecksTestResult {
+                exit_code: report.exit_code,
+                duration_ms: report.duration_ms,
+                timed_out: report.timed_out,
+                diag_count: report.groups.len(),
+                stdout_bytes: report.stdout_bytes,
+                stderr_bytes: report.stderr_bytes,
+                diagnostics,
+                error: None,
+            }
+        }
+        Err(e) => ChecksTestResult {
+            exit_code: None,
+            duration_ms: 0,
+            timed_out: false,
+            diag_count: 0,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            diagnostics: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
 }
 
 /// Cap on sample locations kept per [`DiagGroup`].
@@ -143,19 +353,68 @@ const MAX_SITES: usize = 5;
 /// but bounds memory on a runaway process the way `run_command` does.
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
-/// Run `def.cmd` (via the shell, cwd = `root`) and return its deduplicated
-/// diagnostics. `changed_only` filters the resulting groups to sites in files
-/// touched since HEAD (tracked diff ∪ untracked, via [`gitls::changed_files`]);
-/// a git failure (not a repo, no commits yet, ...) degrades to **unfiltered**
-/// rather than erroring or silently returning nothing, so `run_check` still
-/// works outside git.
+/// Run `def.cmd` (via the shell, cwd = `root`, or the confined `def.cwd` under
+/// it when set) and return its deduplicated diagnostics. `changed_only` filters
+/// the resulting groups to sites in files touched since HEAD (tracked diff ∪
+/// untracked, via [`gitls::changed_files`]); a git failure (not a repo, no
+/// commits yet, ...) degrades to **unfiltered** rather than erroring or
+/// silently returning nothing, so `run_check` still works outside git. When
+/// `def.report_file` is set the parser reads that file's content instead of
+/// stdout; either way diagnostic file paths come back project-root-relative.
 pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<CheckReport> {
+    def.validate()?;
     let started = Instant::now();
     let timeout_secs = def.timeout_secs.max(10);
-    let (exit_code, stdout, stderr, timed_out) = spawn_capture(root, &def.cmd, timeout_secs).await?;
-    let duration_ms = started.elapsed().as_millis() as u64;
 
-    let diags = parsers::parse(def.parser, &stdout, &stderr);
+    // Effective cwd: the confined `def.cwd` under the project root (nested
+    // manifests / monorepos), else the root itself. Kept in `root`-joined
+    // (non-canonical) form so it still textually matches the tool's own
+    // reported paths that `parsers` relativizes (jest/eslint absolutes).
+    let effective_cwd = match def.cwd.as_deref().filter(|s| !s.is_empty()) {
+        Some(rel) => confine_under_root(root, root, "cwd", rel)?,
+        None => root.to_path_buf(),
+    };
+
+    let (exit_code, stdout, stderr, timed_out) =
+        spawn_capture(&effective_cwd, &def.cmd, &def.env, timeout_secs).await?;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    // Raw captured sizes, before parsing — the "did the command produce output?"
+    // signal the Phase E Test button uses (see [`CheckReport::stdout_bytes`]).
+    let (stdout_bytes, stderr_bytes) = (stdout.len(), stderr.len());
+
+    // Parser input: a configured `report_file`'s content (for tools that write
+    // XML/JSON to disk, not to a pipe) else stdout+stderr. A missing/unreadable
+    // report file is an explicit error diagnostic — never a silent green run.
+    let mut report_error: Option<Diag> = None;
+    let mut diags = match def.report_file.as_deref().filter(|s| !s.is_empty()) {
+        Some(rel) => match read_report_file(root, &effective_cwd, rel).await {
+            Ok(content) => parsers::parse(def.parser, &content, "", &effective_cwd, def.pattern.as_deref()),
+            Err(msg) => {
+                report_error = Some(Diag {
+                    severity: Severity::Error,
+                    code: None,
+                    message: msg,
+                    file: rel.to_string(),
+                    line: 0,
+                    col: None,
+                });
+                Vec::new()
+            }
+        },
+        None => parsers::parse(def.parser, &stdout, &stderr, &effective_cwd, def.pattern.as_deref()),
+    };
+    // Diagnostics parsed against the effective cwd are relative to it; re-root
+    // them under the project root so the report — and the `changed_only` git
+    // comparison below — stay project-root-relative even for a nested `cwd`.
+    if let Some(rel) = def.cwd.as_deref().filter(|s| !s.is_empty()) {
+        reroot_diags(&mut diags, rel);
+    }
+    // The `report_file` error diag (if any) carries the raw configured path
+    // (cwd-relative, as the user typed it) — append it after re-rooting so its
+    // path isn't double-prefixed with `cwd`.
+    if let Some(err) = report_error {
+        diags.push(err);
+    }
     // `group` keeps every site (uncapped) so the `changed_only` filter below
     // sees the FULL occurrence list, not just the first `MAX_SITES` in source
     // order — a diagnostic already firing in ≥ `MAX_SITES` other files must
@@ -184,6 +443,8 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
         duration_ms,
         timed_out,
         groups,
+        stdout_bytes,
+        stderr_bytes,
     })
 }
 
@@ -275,26 +536,146 @@ fn normalize_rel(root: &Path, file: &str) -> String {
     forward.trim_start_matches("./").to_string()
 }
 
-/// Spawn `cmd` via the platform shell (cwd = `root`), console-suppressed on
+/// The lexical half of confinement: reject an absolute path or any `..`
+/// component up front, so escaping fails even when the target (or its
+/// ancestors) don't exist on disk yet (a `report_file` the run will write).
+fn lexically_confined(field: &str, rel: &str) -> AppResult<()> {
+    let raw = Path::new(rel);
+    if raw.is_absolute() {
+        return Err(AppError::Checks(format!(
+            "check `{field}` must be relative to the project root, not an absolute path (`{rel}`)"
+        )));
+    }
+    if raw.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(AppError::Checks(format!(
+            "check `{field}` `{rel}` escapes the project root (`..` is not allowed)"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve `rel` (a `cwd`/`report_file`) against `base`, confined strictly
+/// beneath `root` — the `ToolCtx::confine` approach (canonicalize + `starts_with`
+/// the canonical root), extended so the target need not exist yet: a check's
+/// `report_file` is written BY the run, so when the full path doesn't resolve
+/// we canonicalize its nearest existing ancestor and confine that instead. The
+/// lexical `..`/absolute guard ([`lexically_confined`]) runs first. `base` is
+/// the directory `rel` is interpreted relative to (the project `root` for a
+/// `cwd`; the check's effective cwd for a `report_file`), while `root` stays
+/// the confinement boundary — so a nested-`cwd` `report_file` still can't
+/// escape the project even though it joins onto a subdir. Returns the
+/// (non-canonical) `base`-joined path, so it still textually matches the tool's
+/// own reported paths that `parsers` relativizes.
+fn confine_under_root(root: &Path, base: &Path, field: &str, rel: &str) -> AppResult<PathBuf> {
+    lexically_confined(field, rel)?;
+    let joined = base.join(rel);
+    // Canonicalize the deepest existing part of `joined` and confirm it stays
+    // under the canonical `root` — the shared symlink-aware boundary check
+    // ([`crate::fsutil::confine_creatable`]), which also confines a not-yet-
+    // created `report_file` via its nearest existing ancestor. The returned
+    // (non-canonical) `joined` still textually matches the tool's own reported
+    // paths that `parsers` relativizes.
+    match crate::fsutil::confine_creatable(root, &joined) {
+        Ok(_) => Ok(joined),
+        Err(crate::fsutil::ConfineError::Boundary(e)) => {
+            Err(AppError::Checks(format!("cannot resolve project root: {e}")))
+        }
+        Err(crate::fsutil::ConfineError::Escaped) => Err(AppError::Checks(format!(
+            "check `{field}` `{rel}` resolves outside the project root"
+        ))),
+        // `confine_creatable` never reports a missing target as an error.
+        Err(crate::fsutil::ConfineError::NotFound) => Ok(joined),
+    }
+}
+
+/// Read a confined `report_file` (capped at [`MAX_OUTPUT_BYTES`]) for use as
+/// the parser input. `rel` is resolved relative to the check's working
+/// directory — `cwd` (the `root`-joined effective cwd) when the check sets one,
+/// else `root` itself — matching the mental model that a tool documents its
+/// output paths relative to where it runs (`mvn` writes `target/surefire-reports`
+/// under its module dir, not the repo root). Resolution order, deterministic:
+///   1. cwd-relative (`cwd.join(rel)`) — the primary, preferred location;
+///   2. back-compat fallback for configs written before this fix (root-relative
+///      *with* a `cwd` set): only when a `cwd` is set AND the cwd-relative path
+///      does not exist, try `root.join(rel)` and use it if THAT exists.
+///
+/// Whichever exists wins; cwd-relative wins when both do; when neither exists
+/// the error names the cwd-relative (preferred) path. Confinement under the
+/// canonical `root` is enforced for every candidate ([`confine_under_root`]).
+/// `Err` carries a ready-to-surface message; [`run`] turns it into an explicit
+/// error [`Diag`] rather than a silent empty run.
+async fn read_report_file(root: &Path, cwd: &Path, rel: &str) -> Result<String, String> {
+    // Primary: resolve against the effective cwd (== `root` when no cwd).
+    let primary = confine_under_root(root, cwd, "report_file", rel).map_err(|e| e.to_string())?;
+    let path = if cwd != root && !tokio::fs::try_exists(&primary).await.unwrap_or(false) {
+        // Back-compat: an older root-relative config with a `cwd` set. Use the
+        // root-relative location only when it actually exists; otherwise keep
+        // `primary` so the "could not be read" error points at the preferred
+        // (cwd-relative) path the new semantics expect.
+        let fallback = confine_under_root(root, root, "report_file", rel).map_err(|e| e.to_string())?;
+        if tokio::fs::try_exists(&fallback).await.unwrap_or(false) {
+            fallback
+        } else {
+            primary
+        }
+    } else {
+        primary
+    };
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("report_file `{rel}` could not be read: {e}"))?;
+    let end = bytes.len().min(MAX_OUTPUT_BYTES);
+    Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
+/// Prefix relative diagnostic file paths with `cwd_rel` so a check that ran in
+/// a nested `cwd` still reports project-root-relative paths — its tools (and
+/// `parsers::relativize` for jest/eslint's absolutes) report paths relative to
+/// the *run* directory. Absolute paths (a diag `parse` couldn't relativize,
+/// i.e. one outside the effective cwd) are left as-is.
+fn reroot_diags(diags: &mut [Diag], cwd_rel: &str) {
+    let prefix = cwd_rel.replace('\\', "/");
+    let prefix = prefix.trim_matches('/').trim_start_matches("./").trim_end_matches('/');
+    if prefix.is_empty() {
+        return;
+    }
+    for d in diags.iter_mut() {
+        if Path::new(&d.file).is_absolute() {
+            continue;
+        }
+        let f = d.file.replace('\\', "/");
+        let f = f.trim_start_matches("./");
+        d.file = format!("{prefix}/{f}");
+    }
+}
+
+/// Spawn `cmd` via the platform shell (cwd = `cwd`), console-suppressed on
 /// Windows, capturing stdout/stderr separately (reader tasks that outlive the
 /// timeout, so a killed process still yields whatever it had already printed —
-/// the "parse partial output" half of the timeout contract). Returns
-/// `(exit_code, stdout, stderr, timed_out)`; `Err` only for a spawn failure
-/// (bad shell, permissions), never for the checked command's own exit code.
+/// the "parse partial output" half of the timeout contract). `env` is forced
+/// onto the child (V22 Phase B — same shape `CommandPolicy` uses for
+/// `run_command`). Returns `(exit_code, stdout, stderr, timed_out)`; `Err`
+/// only for a spawn failure (bad shell, permissions), never for the checked
+/// command's own exit code.
 async fn spawn_capture(
-    root: &Path,
+    cwd: &Path,
     cmd: &str,
+    env: &[(String, String)],
     timeout_secs: u64,
 ) -> AppResult<(Option<i32>, String, String, bool)> {
     let mut command = shell_command(cmd);
     command
-        .current_dir(root)
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Kill the child if this future is dropped, so an aborted `run` call
         // never leaks an orphaned checker process.
         .kill_on_drop(true);
+    // Force the configured env onto the child (values redacted in `Debug`).
+    for (k, v) in env {
+        command.env(k, v);
+    }
     // Don't flash a console window for each spawned checker on Windows —
     // same CREATE_NO_WINDOW convention as every other spawned subprocess
     // (offload's `llama-server`, MCP host, `run_command`).
@@ -472,6 +853,20 @@ mod tests {
     }
 
     #[test]
+    fn cargo_test_identical_assertions_group_via_normalized_message() {
+        // Two failing tests whose panic blocks differ only in backtick-quoted
+        // values collapse into ONE group — the dedup key normalizes quoted
+        // spans, so `left: `1`` / `left: `3`` don't split the group. Pins that
+        // the cargo-test parser's block-as-message plays nicely with `group`.
+        const OUT: &str = "test tests::a ... FAILED\ntest tests::b ... FAILED\n\nfailures:\n\n---- tests::a stdout ----\nthread 'tests::a' panicked at 'assertion failed: `(left == right)`\n  left: `1`,\n right: `2`', src/helper.rs:5:5\n\n---- tests::b stdout ----\nthread 'tests::b' panicked at 'assertion failed: `(left == right)`\n  left: `3`,\n right: `4`', src/helper.rs:5:5\n\ntest result: FAILED. 0 passed; 2 failed;\n";
+        let diags = parsers::parse(ParserKind::CargoTest, OUT, "", std::path::Path::new("."), None);
+        let groups = group(diags);
+        let errs: Vec<_> = groups.iter().filter(|g| g.severity == Severity::Error).collect();
+        assert_eq!(errs.len(), 1, "identical assertions should group: {groups:?}");
+        assert_eq!(errs[0].count, 2);
+    }
+
+    #[test]
     fn normalize_rel_handles_separators_and_absolute_paths() {
         let dir = std::env::temp_dir().join(format!("checks-normrel-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -506,10 +901,110 @@ mod tests {
     #[tokio::test]
     async fn run_executes_a_real_command() {
         let cmd = format!("{} --version", resolve_quoted("cargo"));
-        let def = CheckDef { name: "sanity".into(), cmd, parser: ParserKind::GenericGcc, timeout_secs: 30 };
+        let def = CheckDef { name: "sanity".into(), cmd, parser: ParserKind::GenericGcc, timeout_secs: 30, ..Default::default() };
         let report = run(&std::env::temp_dir(), &def, false).await.expect("run");
         assert_eq!(report.exit_code, Some(0));
         assert!(!report.timed_out);
+    }
+
+    /// The TS mirror of this module's wire types, embedded at compile time so a
+    /// Rust-side change that isn't reflected in `types.ts` fails `cargo test`
+    /// rather than shipping as silent Rust↔TS drift (V16 tripwire pattern; the
+    /// drift the V22 spec's Phase A found — V17's `cargo-test`/`jest-json`
+    /// missing from the union — is exactly what this catches). Path is relative
+    /// to this file (`src-tauri/src/checks/`), up to the repo root.
+    const TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
+
+    /// Every [`ParserKind`] variant. The exhaustive `match` below is the
+    /// Rust-side half of the tripwire: adding a variant without extending this
+    /// list is a compile error, so it can't reach `cargo test` unnoticed. Wire
+    /// names are then *derived* from serde (not a second hand-kept list), so
+    /// this stays honest about the actual serialized form.
+    fn all_parser_kinds() -> Vec<ParserKind> {
+        let all = vec![
+            ParserKind::CargoJson,
+            ParserKind::Tsc,
+            ParserKind::EslintJson,
+            ParserKind::Pytest,
+            ParserKind::CargoTest,
+            ParserKind::JestJson,
+            ParserKind::Sarif,
+            ParserKind::Go,
+            ParserKind::GoTestJson,
+            ParserKind::Dotnet,
+            ParserKind::JunitXml,
+            ParserKind::RegexCustom,
+            ParserKind::GenericGcc,
+        ];
+        fn _assert_exhaustive(k: ParserKind) {
+            match k {
+                ParserKind::CargoJson
+                | ParserKind::Tsc
+                | ParserKind::EslintJson
+                | ParserKind::Pytest
+                | ParserKind::CargoTest
+                | ParserKind::JestJson
+                | ParserKind::Sarif
+                | ParserKind::Go
+                | ParserKind::GoTestJson
+                | ParserKind::Dotnet
+                | ParserKind::JunitXml
+                | ParserKind::RegexCustom
+                | ParserKind::GenericGcc => {}
+            }
+        }
+        all
+    }
+
+    /// The kebab-case wire name serde emits for `kind` (e.g. `"cargo-test"`).
+    fn wire_name(kind: ParserKind) -> String {
+        serde_json::to_value(kind)
+            .expect("ParserKind serializes")
+            .as_str()
+            .expect("ParserKind serializes to a string")
+            .to_string()
+    }
+
+    #[test]
+    fn parser_kind_wire_names_mirrored_in_types_ts() {
+        for kind in all_parser_kinds() {
+            let wire = wire_name(kind);
+            assert!(
+                TS_TYPES.contains(&format!("'{wire}'")),
+                "ParserKind `{kind:?}` (wire `{wire}`) is missing from the TS `ParserKind` \
+                 union in src/lib/settings/types.ts — add it to keep the mirror in sync",
+            );
+        }
+    }
+
+    #[test]
+    fn check_def_field_names_mirrored_in_types_ts() {
+        // Serialize a fully-populated CheckDef and assert each JSON key appears
+        // in types.ts — so any field added to CheckDef (Phase B's `cwd`/`env`/
+        // `report_file`/`pattern`, ...) must also land in the TS interface.
+        let def = CheckDef {
+            name: "cargo".into(),
+            cmd: "cargo check".into(),
+            parser: ParserKind::CargoJson,
+            timeout_secs: 120,
+            // Populate every optional field so its serialized key is exercised
+            // by the mirror assertion below (Phase B's `cwd`/`env`/`report_file`).
+            cwd: Some("src-tauri".into()),
+            env: vec![("RUSTFLAGS".into(), "-Dwarnings".into())],
+            report_file: Some("target/report.xml".into()),
+            pattern: Some(r"(?<file>\S+):(?<line>\d+): (?<message>.+)".into()),
+            // Populate the Phase D marker too so its serialized key is exercised.
+            auto: true,
+        };
+        let value = serde_json::to_value(&def).expect("CheckDef serializes");
+        let obj = value.as_object().expect("CheckDef serializes to an object");
+        for key in obj.keys() {
+            assert!(
+                TS_TYPES.contains(&format!("{key}:")),
+                "CheckDef field `{key}` is missing from the TS `CheckDef` interface in \
+                 src/lib/settings/types.ts — add it to keep the mirror in sync",
+            );
+        }
     }
 
     /// A real timeout: the spawned command sleeps far longer than the (floored)
@@ -522,7 +1017,7 @@ mod tests {
         let cmd = format!("{} -n 40 127.0.0.1 >NUL", resolve_quoted("ping"));
         #[cfg(not(windows))]
         let cmd = format!("{} 40", resolve_quoted("sleep"));
-        let def = CheckDef { name: "slow".into(), cmd, parser: ParserKind::GenericGcc, timeout_secs: 1 };
+        let def = CheckDef { name: "slow".into(), cmd, parser: ParserKind::GenericGcc, timeout_secs: 1, ..Default::default() };
         let started = Instant::now();
         let report = run(&std::env::temp_dir(), &def, false).await.expect("run");
         assert!(report.timed_out);
@@ -530,5 +1025,325 @@ mod tests {
         // Floored at 10s, generous upper bound for slow CI.
         assert!(started.elapsed() >= Duration::from_secs(9), "elapsed: {:?}", started.elapsed());
         assert!(started.elapsed() < Duration::from_secs(60), "elapsed: {:?}", started.elapsed());
+    }
+
+    // ── V22 Phase B — cwd / env / report_file ────────────────────────────
+
+    #[test]
+    fn validate_rejects_absolute_and_escaping_cwd_and_report_file() {
+        let abs = if cfg!(windows) { "C:\\Windows\\Temp" } else { "/etc" };
+
+        // cwd: escaping (`..`) and absolute are both rejected; a plain
+        // relative subpath is fine.
+        let mut def = CheckDef {
+            cwd: Some("../outside".into()),
+            ..Default::default()
+        };
+        assert!(def.validate().is_err(), "escaping cwd must be rejected");
+        def.cwd = Some("sub/../../escape".into());
+        assert!(def.validate().is_err(), "a `..` mid-path must be rejected");
+        def.cwd = Some(abs.into());
+        assert!(def.validate().is_err(), "absolute cwd must be rejected");
+        def.cwd = Some("src-tauri".into());
+        assert!(def.validate().is_ok(), "a plain relative cwd is allowed");
+
+        // report_file: same confinement.
+        let mut def = CheckDef {
+            report_file: Some("../secrets.xml".into()),
+            ..Default::default()
+        };
+        assert!(def.validate().is_err(), "escaping report_file must be rejected");
+        def.report_file = Some(abs.into());
+        assert!(def.validate().is_err(), "absolute report_file must be rejected");
+        def.report_file = Some("target/surefire/TEST.xml".into());
+        assert!(def.validate().is_ok(), "a plain relative report_file is allowed");
+    }
+
+    #[tokio::test]
+    async fn run_rejects_escaping_cwd_at_run_time() {
+        // Confinement holds at run time too, not just in `validate` — `run`
+        // calls `validate` before it ever spawns.
+        let def = CheckDef {
+            name: "x".into(),
+            cmd: "echo hi".into(),
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 30,
+            cwd: Some("../escape".into()),
+            ..Default::default()
+        };
+        let result = run(&std::env::temp_dir(), &def, false).await;
+        assert!(result.is_err(), "run must reject an escaping cwd: {result:?}");
+    }
+
+    /// `env` entries are forced onto the spawned child — echo the sentinel back
+    /// through the shell and confirm it lands in the captured stdout.
+    #[tokio::test]
+    async fn spawn_capture_forces_env_onto_child() {
+        #[cfg(windows)]
+        let cmd = "echo cimp_env=%CIMP_CHECK_ENV%".to_string();
+        #[cfg(not(windows))]
+        let cmd = "echo cimp_env=$CIMP_CHECK_ENV".to_string();
+        let env = vec![("CIMP_CHECK_ENV".to_string(), "sentinel42".to_string())];
+        let (code, stdout, _stderr, timed_out) =
+            spawn_capture(&std::env::temp_dir(), &cmd, &env, 30).await.expect("spawn");
+        assert_eq!(code, Some(0));
+        assert!(!timed_out);
+        assert!(stdout.contains("cimp_env=sentinel42"), "env not forced onto child; stdout: {stdout:?}");
+    }
+
+    /// A check run in a nested `cwd` must still report project-root-relative
+    /// file paths — the diagnostic's `foo.rs` (relative to the nested run dir)
+    /// comes back as `nested/foo.rs`.
+    #[tokio::test]
+    async fn nested_cwd_diagnostics_are_project_root_relative() {
+        let root = std::env::temp_dir().join(format!("checks-nested-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let def = CheckDef {
+            name: "nested".into(),
+            cmd: "echo foo.rs:1:1: error: boom".into(),
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 30,
+            cwd: Some("nested".into()),
+            ..Default::default()
+        };
+        let report = run(&root, &def, false).await.expect("run");
+        let sites: Vec<_> = report.groups.iter().flat_map(|g| g.sites.iter().cloned()).collect();
+        assert!(
+            sites.iter().any(|(f, _)| f == "nested/foo.rs"),
+            "diagnostic site should be re-rooted under the nested cwd: {sites:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn old_json_without_new_fields_roundtrips_to_defaults() {
+        // A config written before V22 (no cwd/env/report_file) deserializes
+        // with those fields defaulted, and is stable across a re-serialize /
+        // re-deserialize roundtrip.
+        let old = r#"{"name":"cargo","cmd":"cargo check","parser":"cargo-json","timeout_secs":120}"#;
+        let def: CheckDef = serde_json::from_str(old).expect("old JSON deserializes");
+        assert_eq!(def.cwd, None);
+        assert!(def.env.is_empty());
+        assert_eq!(def.report_file, None);
+        assert_eq!(def.pattern, None);
+        // V22 Phase D: the `auto` marker defaults to false, so every check
+        // already on disk is treated as user-owned and protected from
+        // re-detection.
+        assert!(!def.auto);
+        let reserialized = serde_json::to_value(&def).expect("CheckDef serializes");
+        let again: CheckDef = serde_json::from_value(reserialized).expect("re-deserializes");
+        assert_eq!(def, again, "CheckDef must survive a serialize/deserialize roundtrip unchanged");
+    }
+
+    /// `report_file` set ⇒ the parser reads the FILE's content after the run,
+    /// not the command's stdout.
+    #[tokio::test]
+    async fn report_file_content_is_used_as_parser_input() {
+        let root = std::env::temp_dir().join(format!("checks-report-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("report.txt"), "bar.rs:2:3: warning: watch out\n").unwrap();
+        let def = CheckDef {
+            name: "rep".into(),
+            // The command's own stdout must be ignored in favor of the file.
+            cmd: "echo ignored.rs:9:9: error: from_stdout".into(),
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 30,
+            report_file: Some("report.txt".into()),
+            ..Default::default()
+        };
+        let report = run(&root, &def, false).await.expect("run");
+        let msgs: Vec<_> = report.groups.iter().map(|g| g.message.clone()).collect();
+        assert!(msgs.iter().any(|m| m.contains("watch out")), "parser should read report_file: {msgs:?}");
+        assert!(!msgs.iter().any(|m| m.contains("from_stdout")), "stdout must not be parsed when report_file is set: {msgs:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── V22 Phase C — regex-custom validation + dotnet dedup ──────────────
+
+    #[test]
+    fn validate_regex_custom_requires_a_valid_pattern() {
+        // regex-custom with no pattern is inert — rejected at validate time.
+        let mut def = CheckDef { parser: ParserKind::RegexCustom, ..Default::default() };
+        assert!(def.validate().is_err(), "regex-custom without a pattern must be rejected");
+        // A pattern missing the mandatory `line`/`message` groups is rejected.
+        def.pattern = Some(r"(?<file>\S+)".into());
+        assert!(def.validate().is_err(), "missing mandatory named groups must be rejected");
+        // An uncompilable regex is rejected.
+        def.pattern = Some(r"(?<file>[".into());
+        assert!(def.validate().is_err(), "a bad regex must be rejected");
+        // All three mandatory groups present + compiles ⇒ ok.
+        def.pattern = Some(r"^(?<file>\S+):(?<line>\d+): (?<message>.+)$".into());
+        assert!(def.validate().is_ok(), "a valid pattern with all groups is accepted");
+        // The pattern is ignored (not required) for any other parser.
+        let other = CheckDef { parser: ParserKind::GenericGcc, ..Default::default() };
+        assert!(other.validate().is_ok(), "a non-regex-custom parser needs no pattern");
+    }
+
+    #[test]
+    fn regex_custom_pattern_field_roundtrips() {
+        let def = CheckDef {
+            name: "markdownlint".into(),
+            cmd: "markdownlint .".into(),
+            parser: ParserKind::RegexCustom,
+            timeout_secs: 60,
+            pattern: Some(r"^(?<file>\S+):(?<line>\d+) (?<message>.+)$".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&def).expect("CheckDef serializes");
+        let back: CheckDef = serde_json::from_value(value).expect("re-deserializes");
+        assert_eq!(def, back, "pattern must survive a serialize/deserialize roundtrip");
+        assert_eq!(back.pattern.as_deref(), Some(r"^(?<file>\S+):(?<line>\d+) (?<message>.+)$"));
+    }
+
+    #[test]
+    fn dotnet_doubled_lines_dedup_into_one_group() {
+        // MSBuild prints the same diagnostic once per target it built through —
+        // identical lines must collapse in `group` (count reflects both).
+        const OUT: &str = "Program.cs(10,13): error CS0103: boom [C:\\proj\\App.csproj]\nProgram.cs(10,13): error CS0103: boom [C:\\proj\\App.csproj]\n";
+        let diags = parsers::parse(ParserKind::Dotnet, OUT, "", std::path::Path::new("."), None);
+        assert_eq!(diags.len(), 2, "parser itself emits one diag per line: {diags:?}");
+        let groups = group(diags);
+        assert_eq!(groups.len(), 1, "identical MSBuild lines dedup into one group: {groups:?}");
+        assert_eq!(groups[0].count, 2);
+        assert_eq!(groups[0].severity, Severity::Error);
+    }
+
+    /// A configured-but-missing `report_file` is an explicit error diagnostic —
+    /// never an empty, falsely-green run.
+    #[tokio::test]
+    async fn missing_report_file_yields_explicit_error_diag() {
+        let root = std::env::temp_dir().join(format!("checks-report-missing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let def = CheckDef {
+            name: "rep".into(),
+            cmd: "echo hi".into(),
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 30,
+            report_file: Some("does-not-exist.xml".into()),
+            ..Default::default()
+        };
+        let report = run(&root, &def, false).await.expect("run");
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.severity == Severity::Error && g.message.contains("report_file")),
+            "a missing report_file must surface as an explicit error diagnostic: {:?}",
+            report.groups
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `report_file` resolves against the check's *effective cwd* (cwd-relative),
+    /// not the project root — so `detect.rs`'s unprefixed nested-module presets
+    /// (`cwd: "backend"`, `report_file: "target/surefire-reports"`) read from the
+    /// module dir the tool actually wrote to. The cwd-relative copy wins even
+    /// when a decoy sits at the root-relative location.
+    #[tokio::test]
+    async fn report_file_resolves_relative_to_cwd() {
+        let root = std::env::temp_dir().join(format!("checks-rf-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("backend").join("target")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        // The correct (cwd-relative) file, plus a root-relative decoy.
+        std::fs::write(root.join("backend").join("target").join("r.xml"), "CWD_WINS").unwrap();
+        std::fs::write(root.join("target").join("r.xml"), "ROOT_DECOY").unwrap();
+
+        let cwd = root.join("backend");
+        let got = read_report_file(&root, &cwd, "target/r.xml").await.expect("read");
+        assert_eq!(got, "CWD_WINS", "cwd-relative report_file must win over the root-relative decoy");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Back-compat: a pre-fix config wrote `report_file` root-relative *with* a
+    /// `cwd` set. When the cwd-relative path doesn't exist we fall back to the
+    /// root-relative one if THAT exists — so old configs keep working.
+    #[tokio::test]
+    async fn report_file_falls_back_to_root_relative_for_old_configs() {
+        let root = std::env::temp_dir().join(format!("checks-rf-fallback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        // Only the root-relative location exists (no backend/target/r.xml).
+        std::fs::write(root.join("target").join("r.xml"), "ROOT_ONLY").unwrap();
+
+        let cwd = root.join("backend");
+        let got = read_report_file(&root, &cwd, "target/r.xml").await.expect("read");
+        assert_eq!(got, "ROOT_ONLY", "must fall back to root-relative when only that exists");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Confinement still holds: a `..`-escaping `report_file` is rejected before
+    /// any read, whichever base it would resolve against.
+    #[tokio::test]
+    async fn report_file_escape_is_rejected() {
+        let root = std::env::temp_dir().join(format!("checks-rf-escape-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        let cwd = root.join("backend");
+        let err = read_report_file(&root, &cwd, "../../secrets.xml").await.unwrap_err();
+        assert!(err.contains("escapes the project root") || err.contains("not allowed"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── V22 Phase E — Test-button dry run (test_check) ────────────────────
+
+    /// `test_check` shapes a real run into the structured result the Settings
+    /// editor renders: a command that prints one diagnostic comes back with a
+    /// non-zero diag count, the first diagnostics echoed, and non-zero captured
+    /// output size (the wrong-parser signal). Mirrors `run_executes_a_real_command`.
+    #[tokio::test]
+    async fn test_check_returns_structured_result() {
+        let def = CheckDef {
+            name: "t".into(),
+            cmd: "echo foo.rs:3:4: error: boom".into(),
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let result = test_check(&std::env::temp_dir(), &def).await;
+        assert!(result.error.is_none(), "a valid check must not carry an error: {result:?}");
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.timed_out);
+        assert_eq!(result.diag_count, 1, "one diagnostic parsed: {result:?}");
+        assert!(result.stdout_bytes > 0, "the echo produced captured stdout: {result:?}");
+        let first = result.diagnostics.first().expect("one preview diagnostic");
+        assert_eq!(first.severity, "error");
+        assert!(first.message.contains("boom"), "{first:?}");
+        assert_eq!(first.sites, vec!["foo.rs:3".to_string()]);
+    }
+
+    /// The zero-diagnostics-with-output case the UI flags as a wrong parser: a
+    /// command that prints lines the chosen parser can't decode comes back with
+    /// `diag_count == 0` but a non-zero `stdout_bytes`, so the classifier has the
+    /// signal it needs.
+    #[tokio::test]
+    async fn test_check_reports_output_bytes_when_parser_matches_nothing() {
+        let def = CheckDef {
+            name: "t".into(),
+            // Parseable by cargo-json only as JSON lines — plain text yields zero.
+            cmd: "echo this is not json output at all".into(),
+            parser: ParserKind::CargoJson,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let result = test_check(&std::env::temp_dir(), &def).await;
+        assert!(result.error.is_none(), "{result:?}");
+        assert_eq!(result.diag_count, 0, "cargo-json parses plain text to zero diags: {result:?}");
+        assert!(result.stdout_bytes > 0, "output was produced (wrong-parser signal): {result:?}");
+    }
+
+    /// A validation failure (escaping `cwd`) is captured into `error`, not
+    /// propagated — the editor renders it inline like any other outcome.
+    #[tokio::test]
+    async fn test_check_captures_validation_error() {
+        let def = CheckDef {
+            name: "t".into(),
+            cmd: "echo hi".into(),
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 30,
+            cwd: Some("../escape".into()),
+            ..Default::default()
+        };
+        let result = test_check(&std::env::temp_dir(), &def).await;
+        assert!(result.error.is_some(), "an escaping cwd must surface as an error: {result:?}");
+        assert_eq!(result.diag_count, 0);
     }
 }

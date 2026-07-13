@@ -18,7 +18,9 @@ use crate::settings::{CommandPolicy, OffloadToolToggles};
 
 pub mod code_search;
 pub mod graph_tools;
+pub mod list_dir;
 pub mod read_file;
+pub mod run_check;
 pub mod run_command;
 
 /// Shared execution context for native tools: the roots file access is
@@ -74,22 +76,22 @@ impl ToolCtx {
         // Collect every distinct in-root resolution. A relative path can
         // resolve under more than one root when roots overlap/nest; silently
         // returning the first is order-dependent and surprising, so flag the
-        // ambiguity instead. (Escape is still blocked by the canonical
-        // `starts_with` check; an absolute request has a single candidate and
-        // can never be ambiguous here.)
+        // ambiguity instead. The per-root canonicalize + boundary check is the
+        // shared [`crate::fsutil::confine_existing`] core (target must exist —
+        // offload is read-only); the multi-root/ambiguity policy stays here.
+        // (An absolute request has a single candidate and can never be
+        // ambiguous here.)
         let mut matches: Vec<PathBuf> = Vec::new();
         for cand in candidates {
-            let canon = match cand.canonicalize() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let in_root = self.allowed_roots.iter().any(|root| {
-                root.canonicalize()
-                    .map(|rc| canon.starts_with(&rc))
-                    .unwrap_or(false)
-            });
-            if in_root && !matches.contains(&canon) {
-                matches.push(canon);
+            for root in &self.allowed_roots {
+                if let Ok(canon) = crate::fsutil::confine_existing(root, &cand) {
+                    if !matches.contains(&canon) {
+                        matches.push(canon);
+                    }
+                    // This candidate is confined; don't double-count it across
+                    // overlapping roots (it canonicalizes to one real path).
+                    break;
+                }
             }
         }
         match matches.len() {
@@ -108,16 +110,39 @@ impl ToolCtx {
 
 /// The [`ToolDef`]s for the native tools enabled by `toggles`. Fed into
 /// the chat request's `tools` array alongside any MCP-server tools.
+///
+/// `run_check` (V21 F6) additionally requires the project to have configured
+/// `checks` — read live here, gated identically to the MCP surface
+/// (`graph/mcp.rs`), so a fresh project sees no `run_check` on either side.
 pub fn enabled_defs(toggles: &OffloadToolToggles) -> Vec<ToolDef> {
+    let checks_configured = {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        !crate::settings::load_readonly(&cwd).checks.is_empty()
+    };
+    enabled_defs_inner(toggles, checks_configured)
+}
+
+/// The pure toggle→def mapping, split from the live `checks` read so the
+/// `run_check` advertisement gate is testable without touching disk settings.
+fn enabled_defs_inner(toggles: &OffloadToolToggles, checks_configured: bool) -> Vec<ToolDef> {
     let mut defs = Vec::new();
     if toggles.read_file {
         defs.push(read_file::def());
+    }
+    if toggles.list_dir {
+        defs.push(list_dir::def());
     }
     if toggles.code_search {
         defs.push(code_search::def());
     }
     if toggles.run_command {
         defs.push(run_command::def());
+    }
+    // V21 F6: advertised only when checks are configured for the project root —
+    // the tool can't do anything useful otherwise, and the gate matches the MCP
+    // surface so exposure is consistent across both consumers.
+    if toggles.run_check && checks_configured {
+        defs.push(run_check::def());
     }
     defs
 }
@@ -128,8 +153,14 @@ pub fn enabled_defs(toggles: &OffloadToolToggles) -> Vec<ToolDef> {
 pub async fn dispatch(name: &str, args: serde_json::Value, ctx: &ToolCtx) -> Result<String, String> {
     match name {
         "read_file" => read_file::execute(args, ctx).await,
+        "list_dir" => list_dir::execute(args, ctx).await,
         "code_search" => code_search::execute(args, ctx).await,
         "run_command" => run_command::execute(args, ctx).await,
+        // V21 F6: worker-native `run_check` — routes to the SAME checks entry
+        // point the MCP handler uses (via `crate::graph::offload_run_check`),
+        // beside the `graph_` route below because both share the graph module's
+        // project-root resolution + activity recording.
+        "run_check" => run_check::execute(args, ctx).await,
         // V9-01 graph tools (advertised only when the service decided to offer
         // them — feature on + local-or-opted-in remote — and re-gated in the
         // router's `call`).

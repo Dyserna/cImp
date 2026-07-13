@@ -70,7 +70,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 21;
+pub const CURRENT_SCHEMA_VERSION: u8 = 22;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -189,6 +189,22 @@ pub struct Settings {
     /// `run_check` tool call only *selects* a `CheckDef` by name — the command
     /// itself is never model-supplied.
     pub checks: Vec<crate::checks::CheckDef>,
+    /// V22 Phase D: when `true`, validated auto-detection proposals are applied
+    /// automatically the first time a project's code graph finishes indexing
+    /// with an empty `checks` list (for fleet users who want zero-touch setup
+    /// across many projects). Default **false** — a wrong auto-applied check
+    /// burns tokens on every `auto_check` fire, so the propose-then-approve chip
+    /// is the default; this is the opt-in. Applied entries carry
+    /// `CheckDef::auto = true` so a later re-detection can refresh them without
+    /// fighting user edits. Rides the per-project `.cimp/config.json` overlay
+    /// like `checks` itself. Additive `#[serde(default)]` (struct-level) ⇒ old
+    /// configs load with it off.
+    pub checks_auto_configure: bool,
+    /// V22 Phase D: set once the user dismisses the "N suggested checks" nudge
+    /// (Code Intelligence chip) for THIS project, so it doesn't re-appear on
+    /// every index. Per-project via the overlay (a fresh project re-offers the
+    /// nudge). Written by the `checks_dismiss_suggestion` IPC. Additive.
+    pub checks_suggestion_dismissed: bool,
     /// Which AI-tool tabs are enabled. Each id in this list corresponds
     /// to one of the four reserved AI builtins (`claude`, `claude-local`,
     /// `aider`, `aider-local`). Adding an id opens that tab; removing
@@ -302,6 +318,8 @@ impl Default for Settings {
             graph: GraphSettings::default(),
             workbench: WorkbenchSettings::default(),
             checks: Vec::new(),
+            checks_auto_configure: false,
+            checks_suggestion_dismissed: false,
             enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
             prompt_templates: Vec::new(),
@@ -1084,6 +1102,12 @@ pub struct OffloadSettings {
     /// a clear "queue full" error once `n` are already waiting and every slot
     /// is busy — backpressure that fails fast instead of stacking long waits.
     pub max_queue_depth: Option<u32>,
+    /// V21 F5: when `true` (default), a fast-tier offload whose answer comes back
+    /// only partially verified is re-run once on a distinct, ready quality
+    /// backend (the better answer wins). Additive `#[serde(default)]`; inert
+    /// unless a second, quality-tier backend exists, so zero-config setups are
+    /// unaffected.
+    pub escalate_partial: bool,
     /// The OpenCode `local-llama` custom provider, derived from a Local
     /// backend's `server_command` via the Offload settings "Add to OpenCode"
     /// button (or kept in sync when [`opencode_provider_auto`] is on). When
@@ -1131,6 +1155,7 @@ impl std::fmt::Debug for OffloadSettings {
             .field("offload_timeout_secs", &self.offload_timeout_secs)
             .field("global_concurrency", &self.global_concurrency)
             .field("max_queue_depth", &self.max_queue_depth)
+            .field("escalate_partial", &self.escalate_partial)
             // No secrets beyond the (already-cleartext) `--api-key` the user
             // themselves put in the server command; `OpencodeLocalProvider`
             // derives Debug.
@@ -1185,6 +1210,7 @@ impl Default for OffloadSettings {
             offload_timeout_secs: 300,
             global_concurrency: None,
             max_queue_depth: None,
+            escalate_partial: true,
             opencode_provider: None,
             opencode_provider_auto: false,
         }
@@ -1314,6 +1340,43 @@ pub struct GraphSettings {
     /// loss it can't observe: context editing, tool-result truncation).
     /// 0 = off (the pre-V16 behavior: trust for the whole session).
     pub read_advisor_ttl_turns: u32,
+    /// V17 Phase A: when a file the agent already read is re-read *after it
+    /// changed*, answer with a line-level unified diff against the last-read
+    /// snapshot instead of passing the whole file. Exact (a diff versus the
+    /// snapshot can't mislead), so it's safe on the post-edit verify loop that
+    /// dominates real sessions. Default **on** — a strictly-better substitute,
+    /// still master-gated by `read_advisor` and the E1 hard block. Falls back to
+    /// a plain pass whenever no snapshot survives (small file / over-cap /
+    /// LRU-evicted) or the rendered diff exceeds half the new content.
+    pub read_advisor_diffs: bool,
+    /// V17 Phase B: also intercept a whole-file shell read (`cat FILE`,
+    /// `Get-Content FILE`, `type FILE`, `gc FILE`) of an already-read file via a
+    /// second `PreToolUse` **Bash** matcher — the shell equivalent of the `Read`
+    /// advisor. Strict: only a provable pure whole-file read of one file is
+    /// intercepted (anything with a pipe/redirect/glob/second-path/partial-read
+    /// verb runs untouched). Default **on**; master-gated by `read_advisor` and
+    /// the E1 hard block. Off ⇒ a zero overlay delta (the Bash matcher isn't
+    /// installed) and the bypass canary scores shell reads as before.
+    pub read_advisor_shell: bool,
+    /// V17 Phase C: first-read tier — the size (in KiB) at or above which a
+    /// *first* whole-file `Read` of a **non-code** file (log, lockfile, generated
+    /// JSON, data dump — no parsed symbols) is answered with the cached
+    /// local-model digest + a head/tail sample instead of the full content. A
+    /// separate opt-in *within* the advisor: `0` = off (the default). Only fires
+    /// when a digest is already cached for the current content hash — a miss
+    /// enqueues one and passes, so protection begins on the next (cross-session)
+    /// encounter. A deliberate slice (`offset`/`limit`) always passes. Proposed
+    /// starting value when enabled: 256.
+    pub read_advisor_first_read_kb: u32,
+
+    // --- V17 Phase E: lean tool surface ---
+    /// Hide the cold-tail `graph_*` tools (`graph_cycles`, `graph_dead_exports`,
+    /// `graph_struct_search`, `graph_path`, `graph_architecture`) from the tool
+    /// surface advertised to the cloud session and the offload worker, trimming
+    /// the tools block that's cache-written once per session. Advertisement-only:
+    /// the hidden tools still ANSWER if an agent calls them by name — they're
+    /// just not offered. Default off.
+    pub lean_tools: bool,
 
     // --- V11 Phase F: local-model context digests ---
     /// For files with no useful outline (docs/configs/long scripts), have the
@@ -1469,6 +1532,10 @@ impl Default for GraphSettings {
             read_advisor_min_lines: 300,
             read_advisor_mode: "advise".to_string(),
             read_advisor_ttl_turns: 0,
+            read_advisor_diffs: true,
+            read_advisor_shell: true,
+            read_advisor_first_read_kb: 0,
+            lean_tools: false,
             context_llm_digests: false,
             memory_distillation: false,
             promote_pinned_facts: false,
@@ -1620,6 +1687,17 @@ pub struct CommandPolicy {
     pub denied_flags: Vec<String>,
     /// Subcommands (the first non-flag argument) to refuse, e.g. `config`.
     pub denied_subcommands: Vec<String>,
+    /// V21 F7: when non-empty, an *allowlist* over the first non-flag argument —
+    /// only these subcommands may run; every other (and a bare invocation) is
+    /// refused. This is the strict counterpart to `denied_subcommands`: a
+    /// denylist can't safely enumerate an open-ended set (a program's future or
+    /// aliased subcommands would slip through), so a program that must be pinned
+    /// to a few read-only verbs (e.g. `cargo` → `metadata`/`tree`, never
+    /// `run`/`build`) uses this. Combined with denying the program's
+    /// value-taking global flags (so the first non-flag token can't be shifted
+    /// off the real subcommand), it can never reach a code-executing subcommand.
+    /// Empty (the default) disables the allowlist and leaves only the denylist.
+    pub allowed_subcommands: Vec<String>,
     /// Environment variables forced at spawn to neutralize config-driven hooks
     /// (e.g. `GIT_PAGER=cat`, empty `GIT_SSH_COMMAND`).
     pub env: Vec<CommandEnvVar>,
@@ -1659,6 +1737,7 @@ pub fn default_command_policies() -> Vec<CommandPolicy> {
             s("--attr-source"),
         ],
         denied_subcommands: vec![s("config")],
+        allowed_subcommands: vec![],
         env: vec![
             env("GIT_PAGER", "cat"),
             env("PAGER", "cat"),
@@ -1670,6 +1749,59 @@ pub fn default_command_policies() -> Vec<CommandPolicy> {
     }]
 }
 
+/// V21 F7: the program names the curated "safe read-only commands" preset adds
+/// to `command_allowlist` (deduped by the UI's merge action). `git` is already
+/// hardened by [`default_command_policies`] (read probes allowed, exec/escape
+/// vectors blocked); `cargo` is paired with [`readonly_cargo_policy`], which
+/// pins it to `metadata`/`tree` — both resolve/read the dependency graph and
+/// neither runs build scripts or project code. Deliberately excludes anything
+/// that writes, fetches the network by default, or executes project code
+/// (`npm`, `make`, bare `cargo`).
+pub fn readonly_command_preset() -> Vec<String> {
+    vec!["git".to_string(), "cargo".to_string()]
+}
+
+/// V21 F7: the `cargo` policy the read-only preset installs. Allowlists only
+/// `metadata` and `tree`, and denies cargo's value-taking / code-executing
+/// global flags (`--config` can inject a runner/wrapper; `-C` escapes the
+/// working dir; `-Z` enables unstable behavior) — denying the value-taking
+/// globals also keeps the `allowed_subcommands` check sound, since none of them
+/// can shift the first-non-flag token off the real subcommand. `--explain` /
+/// `--color` are denied only to preserve that soundness (both take a value);
+/// their glued short-flag forms (`-Cdir`, `-Zflag`) are caught by the same
+/// flag-denial machinery `git` uses.
+pub fn readonly_cargo_policy() -> CommandPolicy {
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+    CommandPolicy {
+        program: s("cargo"),
+        denied_flags: vec![s("--config"), s("-C"), s("-Z"), s("--explain"), s("--color")],
+        denied_subcommands: vec![],
+        allowed_subcommands: vec![s("metadata"), s("tree")],
+        env: vec![],
+    }
+}
+
+/// V21 F7: merge the curated read-only preset into an existing `allowlist` +
+/// `policies` in place. Idempotent (a merge-into-settings action, not a mode):
+/// preset programs already present are not duplicated, and the `cargo` policy is
+/// installed only if the user has no policy for `cargo` yet — so re-clicking the
+/// button, or clicking it after hand-editing, never grows or resets what's
+/// there. The user can freely prune any of it afterward. `git`'s policy is
+/// seeded by [`default_command_policies`], so this only ever needs to add the
+/// `cargo` one.
+pub fn merge_readonly_preset(allowlist: &mut Vec<String>, policies: &mut Vec<CommandPolicy>) {
+    for prog in readonly_command_preset() {
+        if !allowlist.iter().any(|a| a.eq_ignore_ascii_case(&prog)) {
+            allowlist.push(prog);
+        }
+    }
+    if !policies.iter().any(|p| p.program.eq_ignore_ascii_case("cargo")) {
+        policies.push(readonly_cargo_policy());
+    }
+}
+
 /// On/off toggles for the native baseline offload tools (built into
 /// cImp, zero external deps). All default on so offload works with no
 /// MCP servers installed.
@@ -1678,19 +1810,30 @@ pub fn default_command_policies() -> Vec<CommandPolicy> {
 pub struct OffloadToolToggles {
     /// Bounded line/byte reads within an `allowed_root`.
     pub read_file: bool,
+    /// Directory enumeration within an `allowed_root` — the ground-truth
+    /// answer to "what files exist / how many" (V21).
+    pub list_dir: bool,
     /// `grep`/`glob` across an `allowed_root`; matching paths + snippets.
     pub code_search: bool,
     /// Allowlisted, read-only command execution. Default true, but inert
     /// until `command_allowlist` is populated (deny-by-default).
     pub run_command: bool,
+    /// V21: run one of the project's *configured* check commands (build /
+    /// typecheck / lint / test) and get back deduplicated diagnostics — lets
+    /// the worker prove build/test/lint claims instead of asserting them.
+    /// Default true, but inert until the top-level `checks` array is
+    /// non-empty (gated identically to the `run_check` MCP tool).
+    pub run_check: bool,
 }
 
 impl Default for OffloadToolToggles {
     fn default() -> Self {
         Self {
             read_file: true,
+            list_dir: true,
             code_search: true,
             run_command: true,
+            run_check: true,
         }
     }
 }
@@ -1770,6 +1913,7 @@ impl Default for McpServerConfig {
 /// configured `name`; native tools by their fixed name.)
 pub const LOCAL_DATA_TOOLS: &[&str] = &[
     "read_file",
+    "list_dir",
     "code_search",
     "run_command",
     "filesystem",
@@ -3511,6 +3655,65 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn readonly_preset_merge_is_idempotent() {
+        // V21 F7: merging into empty settings adds git + cargo to the allowlist
+        // and installs the cargo policy (git already has its default policy).
+        let mut allowlist: Vec<String> = vec![];
+        let mut policies = default_command_policies(); // seeds git
+        merge_readonly_preset(&mut allowlist, &mut policies);
+        assert!(allowlist.iter().any(|a| a == "git"));
+        assert!(allowlist.iter().any(|a| a == "cargo"));
+        let cargo_policies = policies.iter().filter(|p| p.program == "cargo").count();
+        assert_eq!(cargo_policies, 1, "cargo policy installed exactly once");
+        let allowlist_after_one = allowlist.clone();
+        let policies_after_one = policies.clone();
+
+        // Re-merging is a no-op: no duplicate allowlist entries, no second cargo
+        // policy — a merge action, not a mode.
+        merge_readonly_preset(&mut allowlist, &mut policies);
+        assert_eq!(allowlist, allowlist_after_one, "allowlist unchanged on re-merge");
+        assert_eq!(policies, policies_after_one, "policies unchanged on re-merge");
+
+        // A hand-added `git` (any case) is not duplicated either.
+        let mut hand = vec!["GIT".to_string()];
+        let mut pol = default_command_policies();
+        merge_readonly_preset(&mut hand, &mut pol);
+        assert_eq!(hand.iter().filter(|a| a.eq_ignore_ascii_case("git")).count(), 1);
+    }
+
+    #[test]
+    fn readonly_preset_respects_a_user_cargo_policy() {
+        // A user who already authored their own `cargo` policy keeps it — the
+        // preset must not clobber or duplicate it.
+        let mut allowlist: Vec<String> = vec![];
+        let mut policies = vec![CommandPolicy {
+            program: "cargo".to_string(),
+            denied_flags: vec!["--frozen".to_string()],
+            denied_subcommands: vec![],
+            allowed_subcommands: vec![],
+            env: vec![],
+        }];
+        merge_readonly_preset(&mut allowlist, &mut policies);
+        assert_eq!(policies.iter().filter(|p| p.program == "cargo").count(), 1);
+        // The kept policy is the user's, not the preset's.
+        assert_eq!(policies[0].denied_flags, vec!["--frozen".to_string()]);
+    }
+
+    #[test]
+    fn command_policy_missing_allowed_subcommands_deserializes() {
+        // Backward compat: a config written before `allowed_subcommands` existed
+        // must load with an empty allowlist (serde default), not fail.
+        let pol: CommandPolicy = serde_json::from_value(json!({
+            "program": "git",
+            "denied_flags": ["-c"],
+            "denied_subcommands": ["config"],
+            "env": [],
+        }))
+        .expect("legacy policy without allowed_subcommands deserializes");
+        assert!(pol.allowed_subcommands.is_empty());
     }
 
     #[test]

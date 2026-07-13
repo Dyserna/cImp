@@ -758,6 +758,26 @@ pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Settings> {
     Ok(state.settings.current())
 }
 
+/// V21 F7: merge the curated read-only command preset (`git` + `cargo`
+/// metadata/tree, with the `cargo` policy that pins it to those verbs) into the
+/// live offload settings, and return the updated `Settings` so the Settings
+/// window can refresh its snapshot. Idempotent — re-invoking adds nothing and
+/// never clobbers a user-authored `cargo` policy (see
+/// [`crate::settings::merge_readonly_preset`]). A merge-into-settings action:
+/// the user sees exactly what got added in the allowlist / policy editors and
+/// can prune it. Mutates atomically under the settings lock (broadcast +
+/// debounced save), like every other settings write.
+#[tauri::command]
+pub async fn offload_enable_readonly_commands(state: State<'_, AppState>) -> AppResult<Settings> {
+    state.settings.mutate(|s| {
+        crate::settings::merge_readonly_preset(
+            &mut s.offload.command_allowlist,
+            &mut s.offload.command_policies,
+        );
+    });
+    Ok(state.settings.current())
+}
+
 /// Per-AI-tab default config. Used by the Settings window's "Reset to
 /// default" buttons so the frontend doesn't have to mirror Rust-side
 /// tab defaults.
@@ -1071,6 +1091,131 @@ pub async fn offload_server_metrics(
     service: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
 ) -> AppResult<Vec<crate::offload::metrics::BackendDashboard>> {
     Ok(service.server_metrics())
+}
+
+/// V22 Phase D: the passive-nudge payload for the Code Intelligence chip.
+/// `count` is the number of VALID detection proposals for a project whose
+/// `checks` is empty; the chip renders only when `count > 0 && !dismissed`.
+#[derive(serde::Serialize)]
+pub struct ChecksSuggestion {
+    pub count: usize,
+    pub dismissed: bool,
+    pub auto_configure: bool,
+}
+
+/// V22 Phase D: `checks_apply_proposals` result — the check names actually
+/// written (added or refreshed) after the `auto`-ownership merge.
+#[derive(serde::Serialize)]
+pub struct ApplySummary {
+    pub applied: Vec<String>,
+}
+
+/// V22 Phase D: detect the project's languages/tooling and return `run_check`
+/// proposals (marker + code-graph evidence, PATH-validated — invalid ones carry
+/// a `reason` for greying). Read-only; the bounded filesystem + PATH scan runs
+/// on a blocking thread so the async reactor (and the UI) stays responsive. No
+/// network.
+#[tauri::command]
+pub async fn checks_detect(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<Vec<crate::checks::detect::Proposal>> {
+    let root = resolve_graph_root(root)?;
+    let stats = service.checks_lang_stats(&root);
+    tokio::task::spawn_blocking(move || crate::checks::detect::detect(&root, &stats))
+        .await
+        .map_err(|e| AppError::Checks(format!("detection task failed: {e}")))
+}
+
+/// V22 Phase D: merge selected proposal checks into the project's `checks`
+/// setting (by `name`, honoring the `auto`-ownership rule — a user-owned
+/// `auto == false` entry is never overwritten) through the normal settings
+/// path, which lands the change as a per-project `.cimp/config.json` overlay
+/// diff. Returns the names actually written. `root` is informational: the write
+/// targets the active project's settings handle (cImp's settings are the launch
+/// project's overlay).
+#[tauri::command]
+pub async fn checks_apply_proposals(
+    state: State<'_, AppState>,
+    root: Option<String>,
+    checks: Vec<crate::checks::CheckDef>,
+) -> AppResult<ApplySummary> {
+    let _ = root;
+    // Defense in depth: reject a malformed selection (bad `regex-custom`,
+    // escaping `cwd`/`report_file`) before it lands in settings.
+    for def in &checks {
+        def.validate()?;
+    }
+    let mut applied = Vec::new();
+    state.settings.mutate(|s| {
+        applied = crate::checks::detect::merge_auto(&mut s.checks, checks);
+    });
+    Ok(ApplySummary { applied })
+}
+
+/// V22 Phase D: the passive nudge. When the project's `checks` is empty and the
+/// user hasn't dismissed it, returns how many VALID proposals detection finds so
+/// the Code Intelligence chip can show "N suggested checks". Chosen as a
+/// queryable command over wiring the count into the `graph-status` event — far
+/// less invasive. Runs the scan off-thread.
+#[tauri::command]
+pub async fn checks_suggestion(
+    state: State<'_, AppState>,
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<ChecksSuggestion> {
+    let snap = state.settings.current();
+    let dismissed = snap.checks_suggestion_dismissed;
+    let auto_configure = snap.checks_auto_configure;
+    // Only offer for a project with no checks configured yet.
+    if !snap.checks.is_empty() {
+        return Ok(ChecksSuggestion { count: 0, dismissed, auto_configure });
+    }
+    let root = resolve_graph_root(root)?;
+    let stats = service.checks_lang_stats(&root);
+    let count = tokio::task::spawn_blocking(move || {
+        crate::checks::detect::detect(&root, &stats)
+            .into_iter()
+            .filter(|p| p.valid)
+            .count()
+    })
+    .await
+    .map_err(|e| AppError::Checks(format!("detection task failed: {e}")))?;
+    Ok(ChecksSuggestion { count, dismissed, auto_configure })
+}
+
+/// V22 Phase D: remember that the user dismissed the suggestion nudge for this
+/// project (persists via the per-project overlay). Idempotent.
+#[tauri::command]
+pub async fn checks_dismiss_suggestion(state: State<'_, AppState>) -> AppResult<()> {
+    state.settings.mutate(|s| s.checks_suggestion_dismissed = true);
+    Ok(())
+}
+
+/// V22 Phase E: dry-run one (possibly unsaved) [`CheckDef`] through the ordinary
+/// `checks::run` path (`changed_only = false`) so the Settings "Test" button can
+/// show exit status, the parsed diagnostic count, the first few diagnostics, and
+/// the captured output sizes — the last of which lets the UI flag a wrong-parser
+/// config (output produced, zero diagnostics). A validation/spawn failure is
+/// folded into the result's `error` field, not returned as an `Err`, so the
+/// editor renders every outcome inline. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn checks_test(
+    root: Option<String>,
+    def: crate::checks::CheckDef,
+) -> AppResult<crate::checks::ChecksTestResult> {
+    let root = resolve_graph_root(root)?;
+    Ok(crate::checks::test_check(&root, &def).await)
+}
+
+/// V22 Phase E: validate a `regex-custom` pattern for the ChecksEditor's live
+/// (debounced) feedback — the exact same check the save path (`CheckDef::validate`
+/// → `parsers::validate_pattern`) applies, so the UI error matches what a save
+/// would reject. `Ok(())` when the pattern compiles and declares the mandatory
+/// `file`/`line`/`message` named groups; the `Err` string is ready to display.
+#[tauri::command]
+pub async fn checks_validate_pattern(pattern: String) -> Result<(), String> {
+    crate::checks::parsers::validate_pattern(&pattern)
 }
 
 /// Resolve an optional `root` IPC argument to a project directory: the given
@@ -1708,6 +1853,10 @@ pub async fn graph_usage(
         .flat_map(|b| b.metrics.runs)
         .filter(|r| r.outcome != "running")
         .count() as u64;
+    // V17 Phase E: the advertised tool-surface size (both consumers), measured
+    // post-`lean_tools`-filter from live settings — another cross-cutting field
+    // GraphService can't fill (it depends on settings, not the index).
+    snap.surface = crate::graph::surface_stats();
     Ok(snap)
 }
 
@@ -1720,6 +1869,25 @@ pub async fn graph_usage(
 pub struct AdvisorSnapshot {
     pub proposals: Vec<crate::advisor::Proposal>,
     pub collecting: bool,
+}
+
+/// Count calls to any `graph::LEAN_HIDDEN` tool in `activity` within the
+/// trailing `window_ms` ending at `now_ms` — the `hideable_tool_calls` signal
+/// feeding `surface.lean.v1`. Zero ⇒ the lean-surface rule may fire.
+/// `now_ms.saturating_sub(window_ms)` is the inclusive cutoff, so entries older
+/// than the window (including ancient residue in the count-capped ring) don't
+/// count. Free function so the window semantics stay unit-testable apart from
+/// the IPC command.
+fn count_hideable_tool_calls(
+    activity: &[crate::activity::ActivityEntry],
+    now_ms: u64,
+    window_ms: u64,
+) -> u64 {
+    let cutoff = now_ms.saturating_sub(window_ms);
+    activity
+        .iter()
+        .filter(|e| e.ts_ms >= cutoff && crate::graph::LEAN_HIDDEN.contains(&e.tool.as_str()))
+        .count() as u64
 }
 
 /// V14 Phase D2: the budget-tuning advisor's current proposals for `root`.
@@ -1774,6 +1942,41 @@ pub async fn graph_usage_advice(
         .filter(|e| e.source == "harness" && e.tool == "contract_drift" && e.ts_ms >= since)
         .map(|e| e.target.clone())
         .collect();
+    // V17.1: sub-agent transcript-contract drift reports from the Claude OOB
+    // tap (see `oob::claude::report_subagent_drift`) — same channel
+    // discipline as the shims' contract_drift events above.
+    let subagent_drift: Vec<String> = activity
+        .iter()
+        .filter(|e| e.source == "harness" && e.tool == "subagent_drift" && e.ts_ms >= since)
+        .map(|e| e.target.clone())
+        .collect();
+
+    // V17 Phase E signals: RECENT calls to any lean-hidden tool in the Activity
+    // ring (zero ⇒ the lean-surface rule may fire) and the measured advertised
+    // surface size for its rationale. Unlike the drift filters above, this uses
+    // a trailing recency window rather than process-start `since`: the ring is
+    // count-capped (GRAPH_CAP/OFFLOAD_CAP), so an all-time scan would let one
+    // cold-tail call weeks ago suppress the suggestion forever, while
+    // process-start would flip a tool to "unused" minutes after every restart.
+    let hideable_tool_calls = count_hideable_tool_calls(
+        &activity,
+        crate::activity::now_ms(),
+        crate::advisor::HIDEABLE_RECENCY_WINDOW_MS,
+    );
+    let surface_chars = crate::graph::surface_stats().mcp_chars as u64;
+
+    // V17 Phase F1/F2 signals. Redundant re-read pairs per session over the
+    // last 10 sessions, sized by the current advisor line floor. `e1_pass` is
+    // STRICTLY the "pass" status (trimmed/lowercased) — NOT `!e1_blocked()`,
+    // so an "unverified" E1 (the default) never auto-graduates a hook we've
+    // never proven works.
+    let (redundant_reads_per_session, redundant_read_sessions) = match graph
+        .redundant_read_candidates(&root, settings.graph.read_advisor_min_lines, 10)
+    {
+        Some((pairs, sessions)) if sessions > 0 => (Some(pairs as f64 / sessions as f64), sessions),
+        _ => (None, 0),
+    };
+    let e1_pass = hv.e1_status.trim().to_ascii_lowercase() == "pass";
 
     // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
     // only THIS root's, so an Apply in one project never mutes another
@@ -1806,8 +2009,14 @@ pub async fn graph_usage_advice(
         claude_sessions,
         claude_tokenless_sessions,
         contract_drift,
+        subagent_drift,
         bypass_rate,
         bypass_samples,
+        hideable_tool_calls,
+        surface_chars,
+        redundant_reads_per_session,
+        redundant_read_sessions,
+        e1_pass,
     };
     let proposals = crate::advisor::evaluate(&sig);
     // "Collecting" = nothing has cleared the cold-start floor yet: not
@@ -2473,6 +2682,30 @@ pub async fn open_settings_window_to_tab(
     Ok(())
 }
 
+/// V22 Phase E: open the Settings window scrolled to a top-level sidebar
+/// section (not a tab). Used by the Code Intelligence "suggested checks" nudge
+/// chip to jump straight to the `checks` editor. Reuses the same cold/hot deep
+/// link plumbing as [`open_settings_window_to_tab`], tagging the stored target
+/// with a `section:` prefix so `SettingsApp`'s consume path routes it to
+/// `activeSection` instead of a tab scroll.
+#[tauri::command]
+pub async fn open_settings_window_to_section(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    section: String,
+) -> AppResult<()> {
+    if let Ok(mut slot) = state.pending_settings_deep_link.lock() {
+        *slot = Some(format!("section:{section}"));
+    }
+    open_or_focus_settings(&app)?;
+    let _ = app.emit_to(
+        EventTarget::webview_window(SETTINGS_LABEL),
+        "settings-deep-link",
+        serde_json::json!({ "kind": "section", "section": section }),
+    );
+    Ok(())
+}
+
 /// V1.4-07 A: pulled by `SettingsApp.svelte` on mount to read+clear any
 /// pending deep-link target stored by `open_settings_window_to_tab`.
 /// Returns `None` when no target is pending.
@@ -2629,5 +2862,62 @@ mod tests {
         assert!(!auto_reply("\t"));
         assert!(!auto_reply("\x1b"));
         assert!(!auto_reply("\x1bf"));
+    }
+
+    // ── V17 Phase E — hideable_tool_calls recency window ────────────────────
+    use super::count_hideable_tool_calls;
+    use crate::activity::{ActivityEntry, ActivityKind};
+    use crate::advisor::HIDEABLE_RECENCY_WINDOW_MS;
+
+    fn hidden_call(ts_ms: u64) -> ActivityEntry {
+        // `graph_cycles` is one of graph::LEAN_HIDDEN.
+        ActivityEntry::new(
+            ActivityKind::Graph,
+            ts_ms,
+            "root".to_string(),
+            "claude".to_string(),
+            "graph_cycles".to_string(),
+            "target".to_string(),
+            0,
+            0,
+            true,
+        )
+    }
+
+    #[test]
+    fn hideable_call_inside_window_counts() {
+        let now = 1_000_000_000_000;
+        // One day inside the trailing window.
+        let recent = now - (HIDEABLE_RECENCY_WINDOW_MS - 24 * 60 * 60 * 1000);
+        let activity = vec![hidden_call(recent)];
+        assert_eq!(
+            count_hideable_tool_calls(&activity, now, HIDEABLE_RECENCY_WINDOW_MS),
+            1
+        );
+    }
+
+    #[test]
+    fn hideable_call_outside_window_is_ignored() {
+        let now = 1_000_000_000_000;
+        // One day OLDER than the window edge — a cold-tail call from long ago
+        // must not suppress the lean suggestion.
+        let ancient = now - (HIDEABLE_RECENCY_WINDOW_MS + 24 * 60 * 60 * 1000);
+        let activity = vec![hidden_call(ancient)];
+        assert_eq!(
+            count_hideable_tool_calls(&activity, now, HIDEABLE_RECENCY_WINDOW_MS),
+            0
+        );
+    }
+
+    #[test]
+    fn non_hidden_tool_never_counts() {
+        let now = 1_000_000_000_000;
+        // A workhorse tool inside the window still doesn't count.
+        let mut e = hidden_call(now - 1000);
+        e.tool = "graph_find_symbol".to_string();
+        assert_eq!(
+            count_hideable_tool_calls(&[e], now, HIDEABLE_RECENCY_WINDOW_MS),
+            0
+        );
     }
 }

@@ -228,6 +228,13 @@
                 <span class="run-id">#{run.id}</span>
                 <span class="run-mode" title="thinking mode">{run.thinking}</span>
                 <span class="run-instr" title={run.instructions}>{run.instructions || '(no instructions)'}</span>
+                {#if run.escalated_from}
+                  <span
+                    class="run-escalated"
+                    title="Re-run on the quality backend after a partial {run.escalated_from}-tier answer"
+                    >↑ escalated</span
+                  >
+                {/if}
                 <span class="run-meta">
                   {run.calls.length} call{run.calls.length === 1 ? '' : 's'}{#if run.ended_ms}
                     · {((run.ended_ms - run.started_ms) / 1000).toFixed(1)}s{/if}
@@ -571,6 +578,16 @@
     /* color set inline from the outcome. */
     font-weight: 600;
   }
+  .run-escalated {
+    flex: none;
+    padding: 0 0.3rem;
+    border-radius: 3px;
+    background: rgba(210, 153, 34, 0.18);
+    color: #d29922;
+    font-size: 0.82em;
+    font-weight: 600;
+    white-space: nowrap;
+  }
   .run-calls {
     border-top: 1px solid var(--border-subtle, #21262d);
     padding: 0.25rem 0.5rem 0.4rem;
@@ -597,6 +614,9 @@
   }
   .ckind.final {
     color: #58a6ff;
+  }
+  .ckind.verify {
+    color: #d29922;
   }
   .cstep {
     flex: 0 0 3.5rem;

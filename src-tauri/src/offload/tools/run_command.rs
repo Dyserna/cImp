@@ -148,6 +148,43 @@ fn dangerous_args(command: &str, args: &[String], policies: &[CommandPolicy]) ->
             }
         }
     }
+    // Allowed-subcommand allowlist (V21 F7): when non-empty, the first non-flag
+    // token MUST be one of these — every other subcommand, and a bare
+    // invocation, is refused. This is the strict counterpart to the denylist
+    // above: it keeps an allowlisted program pinned to a few read-only verbs
+    // (e.g. `cargo metadata`/`cargo tree`) so it can never reach `cargo
+    // run`/`build` — including cargo's built-in aliases (`r`/`b`), which a
+    // denylist of full names would miss. Soundness of "first non-flag token = the
+    // subcommand" relies on the program's value-taking globals being in
+    // `denied_flags` (refused by the loop above), exactly as the `git` policy
+    // requires for its `denied_subcommands`.
+    if !policy.allowed_subcommands.is_empty() {
+        match args.iter().find(|a| !a.starts_with('-')) {
+            Some(sub)
+                if policy
+                    .allowed_subcommands
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(sub)) => {}
+            Some(sub) => {
+                return Some(format!(
+                    "`{} {sub}` is not an allowed subcommand for the `{}` command policy \
+                     (allowed: {}). run_command is for read-only probes only.",
+                    policy.program,
+                    policy.program,
+                    policy.allowed_subcommands.join(", ")
+                ))
+            }
+            None => {
+                return Some(format!(
+                    "`{}` needs one of its allowed subcommands ({}) — a bare `{}` is refused \
+                     by its command policy.",
+                    policy.program,
+                    policy.allowed_subcommands.join(", "),
+                    policy.program
+                ))
+            }
+        }
+    }
     None
 }
 
@@ -406,11 +443,50 @@ mod tests {
             program: "cargo".to_string(),
             denied_flags: vec!["--config".to_string()],
             denied_subcommands: vec!["publish".to_string()],
+            allowed_subcommands: vec![],
             env: vec![],
         }];
         assert!(dangerous_args("cargo", &argv(&["--config", "x=y", "build"]), &policies).is_some());
         assert!(dangerous_args("cargo", &argv(&["publish"]), &policies).is_some());
         assert!(dangerous_args("cargo", &argv(&["build", "--release"]), &policies).is_none());
+    }
+
+    #[test]
+    fn readonly_cargo_policy_allows_only_metadata_and_tree() {
+        // V21 F7: the preset's `cargo` policy pins cargo to read-only verbs.
+        let policies = vec![crate::settings::readonly_cargo_policy()];
+        // The two allowed subcommands (with their own flags) pass.
+        assert!(dangerous_args("cargo", &argv(&["metadata"]), &policies).is_none());
+        assert!(dangerous_args("cargo", &argv(&["metadata", "--format-version", "1"]), &policies).is_none());
+        assert!(dangerous_args("cargo", &argv(&["tree"]), &policies).is_none());
+        assert!(dangerous_args("cargo", &argv(&["tree", "-e", "features"]), &policies).is_none());
+        // Everything that builds/runs/executes project code is refused.
+        assert!(dangerous_args("cargo", &argv(&["run"]), &policies).is_some());
+        assert!(dangerous_args("cargo", &argv(&["build", "--release"]), &policies).is_some());
+        assert!(dangerous_args("cargo", &argv(&["test"]), &policies).is_some());
+        assert!(dangerous_args("cargo", &argv(&["install", "ripgrep"]), &policies).is_some());
+        // Built-in aliases a denylist would miss are refused by the allowlist.
+        assert!(dangerous_args("cargo", &argv(&["r"]), &policies).is_some());
+        assert!(dangerous_args("cargo", &argv(&["b"]), &policies).is_some());
+        // A bare `cargo` (no subcommand) is refused, not silently allowed.
+        assert!(dangerous_args("cargo", &argv(&[]), &policies).is_some());
+    }
+
+    #[test]
+    fn readonly_cargo_policy_blocks_code_exec_and_escape_globals() {
+        // V21 F7: cargo's value-taking / code-executing globals are denied, in
+        // both `--flag value`, `--flag=value`, and glued short-flag forms — so
+        // they can neither inject a runner nor shift the subcommand check.
+        let policies = vec![crate::settings::readonly_cargo_policy()];
+        // `--config` can install a runner/rustc-wrapper → arbitrary exec.
+        assert!(dangerous_args("cargo", &argv(&["--config", "target.x.runner='sh'", "metadata"]), &policies).is_some());
+        assert!(dangerous_args("cargo", &argv(&["--config=build.rustc-wrapper=/x", "tree"]), &policies).is_some());
+        // `-C dir` escapes the working root; glued form must also be blocked.
+        assert!(dangerous_args("cargo", &argv(&["-C", "/etc", "tree"]), &policies).is_some());
+        assert!(dangerous_args("cargo", &argv(&["-C/etc", "tree"]), &policies).is_some());
+        // `-Z` unstable flags, glued too.
+        assert!(dangerous_args("cargo", &argv(&["-Z", "unstable-options", "metadata"]), &policies).is_some());
+        assert!(dangerous_args("cargo", &argv(&["-Zbuild-std", "tree"]), &policies).is_some());
     }
 
     #[test]

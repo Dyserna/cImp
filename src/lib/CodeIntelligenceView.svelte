@@ -64,8 +64,10 @@
   import { fmtDate, fmtTime } from './format';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
-  import { llmPricingGet } from './settings/ipc';
-  import type { LlmPricingModel } from './settings/types';
+  import { llmPricingGet, openSettingsWindowToSection } from './settings/ipc';
+  import type { LlmPricingModel, ChecksSuggestion } from './settings/types';
+  import { checksSuggestion, checksDismissSuggestion } from './checks';
+  import { computeChip } from './settings/checksEditor';
   import { workbenchSessionCommitCounts, openSessionCommits } from './workbench';
   import { revealTab } from './tabs/visibility';
   import { GRAPH_MONITOR_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
@@ -454,9 +456,21 @@
           next.graph.context_turn_budget_chars = val;
           break;
         // V16 drift rules (drift.read_reason.v1 / drift.read_bypass.v1):
-        // the only boolean the advisor can propose — always a disable.
+        // a boolean the advisor can propose — a disable. V17 Phase F
+        // (adopt.read_advisor.v1) reuses the same case to propose ENABLING it,
+        // so parse the proposed bool rather than assuming a disable.
         case 'graph.read_advisor':
           next.graph.read_advisor = p.proposed === 'true';
+          break;
+        // V17 Phase E (surface.lean.v1): hide the cold-tail graph tools.
+        case 'graph.lean_tools':
+          next.graph.lean_tools = p.proposed === 'true';
+          break;
+        // V17 Phase F (adopt.read_advisor_substitute.v1): the first
+        // string-valued proposal — write the proposed mode string as-is
+        // (e.g. "advise" → "substitute"), not the numeric `val` above.
+        case 'graph.read_advisor_mode':
+          next.graph.read_advisor_mode = p.proposed;
           break;
         default:
           // A rule proposing a setting this switch doesn't know is a bug
@@ -553,6 +567,9 @@
     'drift.usage_fields_gone.v1: ≥2 Claude sessions, all without token fields → the transcript usage schema changed.\n' +
     'drift.payload.v1: any shim-reported payload missing required fields.\n' +
     'drift.read_bypass.v1: ≥10 reminders, ≥40% answered via shell reads (est.) → disable read_advisor.\n' +
+    'surface.lean.v1: ≥10 sessions, 0 calls to any cold-tail graph tool (cycles, dead_exports, struct_search, path, architecture) → enable lean_tools (hide them from the advertised surface; they still answer if called).\n' +
+    'adopt.read_advisor.v1: ≥5 sessions, E1 verified (pass), ≥3 redundant large re-reads per session across ≥10 sessions (est.; external tools may have changed the file between reads) → enable read_advisor.\n' +
+    'adopt.read_advisor_substitute.v1: read_advisor on in advise mode, ≥20 reminders, ≤20% re-read anyway, low shell bypass → switch read_advisor_mode to substitute.\n' +
     'After an Apply, that rule stays quiet for 3 further sessions so fresh post-change data can accumulate before it re-evaluates.';
 
   // ── V16 Feature 8: tokens | est. cost toggle ─────────────────────────
@@ -671,6 +688,40 @@
   }
   let paused = $state<boolean>(false);
   let busy = $state<boolean>(false);
+
+  // V22 Phase D/E: the "N suggested checks" passive nudge. Fetched once a graph
+  // index is complete (a `ready` root exists); the chip derives from the
+  // suggestion payload + the current `checks` setting (`computeChip` — either the
+  // propose nudge, or an "auto-configure applied these" report), and a dismiss
+  // is remembered per project. Kept lightweight, consistent with the analyses
+  // "+N" badges elsewhere in this view.
+  let checksSug = $state<ChecksSuggestion | null>(null);
+  let checksSugFetched = false;
+  let checksChipDismissed = $state(false);
+  const checksChip = $derived(
+    checksSug && !checksChipDismissed ? computeChip(checksSug, $settings.checks) : null,
+  );
+
+  async function maybeFetchChecksSuggestion(): Promise<void> {
+    if (checksSugFetched) return;
+    if (!roots.some((r) => r.state === 'ready')) return;
+    checksSugFetched = true;
+    try {
+      checksSug = await checksSuggestion();
+    } catch (e) {
+      console.warn('checks_suggestion failed', e);
+    }
+  }
+
+  async function dismissChecksChip(): Promise<void> {
+    checksChipDismissed = true;
+    try {
+      await checksDismissSuggestion();
+    } catch (e) {
+      console.warn('checks_dismiss_suggestion failed', e);
+    }
+  }
+
   let probe = $state<EmbedderProbe | null>(null);
   let probing = $state<boolean>(false);
   let poll: ReturnType<typeof setInterval> | null = null;
@@ -755,6 +806,9 @@
     // Refresh the per-root language census only on a root's appear/build-done
     // edge (cheap on a steady poll, fresh counts right after a rebuild).
     await maybeRefreshCensus();
+    // V22: fetch the checks suggestion once an index is complete (guarded so it
+    // runs at most once — the chip then recomputes reactively from settings).
+    await maybeFetchChecksSuggestion();
     // Memory is only fetched while its section is visible (opens the warm index).
     if (section === 'memory') {
       await refreshMemory();
@@ -881,6 +935,36 @@
     {/each}
   </nav>
 
+  {#if checksChip}
+    <div class="checks-chip">
+      <button
+        type="button"
+        class="chip-body"
+        onclick={() => void openSettingsWindowToSection('checks')}
+        title="Open Settings → Checks"
+      >
+        <span class="chip-icon" aria-hidden="true">✓</span>
+        {#if checksChip.mode === 'suggest'}
+          <span
+            >run_check: {checksChip.count} suggested check{checksChip.count === 1 ? '' : 's'} for this
+            project</span
+          >
+        {:else}
+          <span
+            >run_check auto-configured: {checksChip.names.join(', ')} — review in Settings</span
+          >
+        {/if}
+      </button>
+      <button
+        type="button"
+        class="chip-x"
+        aria-label="Dismiss"
+        title="Dismiss"
+        onclick={() => void dismissChecksChip()}>×</button
+      >
+    </div>
+  {/if}
+
   {#if section === 'overview'}
   <h3 class="group-head">Usage</h3>
   <div class="usage-sec">
@@ -918,6 +1002,15 @@
           <div>
             <span class="num">{usage.offload_local_tasks.toLocaleString()}</span>
             <span class="lbl">tasks served locally — see the <em>Offload Server</em> tab</span>
+          </div>
+          <div>
+            <span
+              class="num"
+              title="Serialized size of the graph tool descriptors advertised to the cloud session and the offload worker — cache-written once per session. Toggle Settings → Code Graph → lean tool surface to trim the cold-tail tools."
+            >{usage.surface.mcp_tools.toLocaleString()}</span>
+            <span class="lbl">tool surface: {usage.surface.mcp_chars.toLocaleString()} chars, cache-written once per session
+              <span class="est-badge">est. ~{Math.round(usage.surface.mcp_chars / 4).toLocaleString()} tok</span>
+            </span>
           </div>
         </div>
       {/if}
@@ -1843,6 +1936,51 @@
     color: #fff;
     opacity: 1;
     border-color: var(--accent, #3b6ea5);
+  }
+  /* V22: the run_check suggestion nudge — a lightweight, dismissable chip. */
+  .checks-chip {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    margin-bottom: 14px;
+    border: 1px solid var(--accent, #3b6ea5);
+    border-radius: 8px;
+    overflow: hidden;
+    background: rgba(59, 110, 165, 0.12);
+    font-size: 12px;
+    max-width: max-content;
+  }
+  .checks-chip .chip-body {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: transparent;
+    border: none;
+    color: var(--text, #ddd);
+    cursor: pointer;
+    text-align: left;
+  }
+  .checks-chip .chip-body:hover {
+    background: rgba(59, 110, 165, 0.22);
+  }
+  .checks-chip .chip-icon {
+    color: var(--accent, #3b6ea5);
+    font-weight: 700;
+  }
+  .checks-chip .chip-x {
+    padding: 0 10px;
+    background: transparent;
+    border: none;
+    border-left: 1px solid var(--border, #333);
+    color: var(--text, #ddd);
+    opacity: 0.6;
+    cursor: pointer;
+    font-size: 15px;
+  }
+  .checks-chip .chip-x:hover {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.06);
   }
   /* V12 Phase F (6c): "+N since last pass" badge on the Analyses tab + its
      buttons — a small pill, never wraps, doesn't disturb button sizing. */

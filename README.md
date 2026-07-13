@@ -626,6 +626,49 @@ evicts; and opt-in proactive automation (a Claude `PostToolUse` hook) injects
 only new/worsened diagnostics right after an edit, plus a blast-radius note on
 risky changes — all off by default, same posture as the V11 read advisor.
 
+**Token Efficiency II (V17)** pushes the read advisor into the corners V11
+passed on and prices the tool surface itself. Re-reading a file *after it
+changed* is answered with a **unified diff** against what you last read instead
+of the whole file (`read_advisor_diffs`); whole-file **shell reads**
+(`cat` / `Get-Content`) of a reminded file are intercepted the same way a
+`Read` is (`read_advisor_shell`), closing the loop V16 could only detect; and
+the first read of a huge **non-code** file (log, lockfile, generated JSON) can
+be answered with a cached digest + head/tail sample
+(`read_advisor_first_read_kb`, off by default) — all still gated under the
+`read_advisor` opt-in. `run_check` gains **test-run parsers** (`cargo-test`,
+`jest-json` / vitest) so a configured test check returns grouped failures
+instead of a raw dump. The Usage view now prices the advertised graph-tool
+**surface** (cache-written once per session), with an optional `lean_tools`
+lever that hides the cold-tail tools from the advertised set (they still answer
+if called by name). And two **graduation rules** let the Advisor propose
+turning the read advisor on — or switching it to `substitute` mode — from
+measured field data, never silently.
+
+**run_check, generalized (V17→V22)** turns the config-file-only checker into a
+discoverable, multi-language feature. Parser coverage grows from three ecosystems
+to a dozen: alongside `cargo-json`/`cargo-test`, `tsc`, `eslint-json`,
+`jest-json`, `pytest`, and the `generic-gcc` fallback, `run_check` now parses
+**SARIF 2.1** (the modern lint/security long tail — ruff, clang-tidy,
+golangci-lint, semgrep, ESLint's SARIF formatter, CodeQL…), Go (`go build`/`vet`
+text and `go test -json`), .NET / MSBuild (`dotnet build`, covering C#/F#/VB),
+**JUnit XML** test reports (Maven Surefire, Gradle, Kotlin, PHPUnit…), and a
+**`regex-custom`** escape hatch that wires any tool from a regex with named
+`file`/`line`/`message` groups — no cImp release needed. A `CheckDef` gains
+`cwd` (confined under the project root — fixes nested manifests and monorepos
+without `--manifest-path` hacks), forced `env`, and `report_file` (for tools that
+write a report to disk instead of printing to stdout). A first-class **checks
+editor** in *Settings* (add / edit / delete, a parser dropdown with live regex
+validation, and a per-check **Test** dry-run that warns on a zero-diagnostic
+"wrong parser?" result) replaces hand-editing JSON, with an honest exposure
+status line — "run_check exposed: MCP ✓ / offload worker ✓" versus "not exposed —
+no checks configured" (`run_check` stays unadvertised on every surface until a
+project configures `checks`). **Detect & configure** rides the code graph's
+per-language file counts (or marker files when there's no graph) to propose a
+working checks config — apply the PATH-validated candidates with one click, or
+set `checks_auto_configure` to apply them automatically on first index; a Code
+Intelligence nudge chip surfaces the suggestion when a graph finishes indexing a
+project that has no checks yet.
+
 ## Workbench (V13 — vibe-coding guardrails)
 
 A reserved **Workbench** tab (on by default) makes it safe to let agents run

@@ -3453,6 +3453,121 @@ impl GraphIndex {
         Ok(Some((reread as f64 / total as f64, total)))
     }
 
+    /// V17 Phase F1 (`adopt.read_advisor.v1` signal): count redundant
+    /// same-file re-read PAIRS across the most recent `last_sessions` distinct
+    /// sessions, plus how many sessions were actually scanned.
+    ///
+    /// est. — (redundant same-file re-read pairs, distinct sessions scanned)
+    ///
+    /// A "redundant pair" is two consecutive `kind == "read"` events of the
+    /// same `(session_id, path)` (ordered by `ts_ms`) with **no** intervening
+    /// `kind == "edit"` of that path in that session between them — the second
+    /// read learned nothing the first didn't already show, the exact waste the
+    /// read advisor exists to catch. Three consecutive un-edited reads are two
+    /// pairs; a read→edit→read is zero. Size filter: `mem_event` carries no
+    /// line count, so `path` is resolved against the current index's max symbol
+    /// `end_line` (the same proxy [`Self::large_reread_pairs`] uses) and only
+    /// files whose indexed span reaches `min_lines` count — labeled `est.`
+    /// because the file may have changed since those reads. Sessions are
+    /// windowed to the `last_sessions` most recent (by max read `ts_ms` per
+    /// session). Returns `None` only when no `read` events exist at all.
+    pub fn redundant_read_candidates(
+        &self,
+        min_lines: u32,
+        last_sessions: usize,
+    ) -> AppResult<Option<(u64, u64)>> {
+        let reads = self.run(
+            "?[session_id, path, ts_ms] := *mem_event{session_id, kind, path, ts_ms}, kind == \"read\"",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        if reads.rows.is_empty() {
+            return Ok(None);
+        }
+        let edits = self.run(
+            "?[session_id, path, ts_ms] := *mem_event{session_id, kind, path, ts_ms}, kind == \"edit\"",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        // Window: the `last_sessions` sessions with the most recent read.
+        let mut session_max_ts: HashMap<String, i64> = HashMap::new();
+        for r in &reads.rows {
+            let sid = cell_str(r, 0);
+            let ts = cell_i64(r, 2);
+            let e = session_max_ts.entry(sid).or_insert(i64::MIN);
+            if ts > *e {
+                *e = ts;
+            }
+        }
+        // Most recent first; session id breaks ties for a deterministic window.
+        let mut ranked: Vec<(String, i64)> = session_max_ts.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked.truncate(last_sessions);
+        let window: HashSet<String> = ranked.into_iter().map(|(s, _)| s).collect();
+        if window.is_empty() {
+            return Ok(None);
+        }
+
+        // Size proxy: max symbol `end_line` per file (same as `large_reread_pairs`).
+        let spans = self.run(
+            "?[file, l] := *symbol{file, end_line: l}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut max_line: HashMap<String, i64> = HashMap::new();
+        for r in &spans.rows {
+            let file = cell_str(r, 0);
+            let l = cell_i64(r, 1);
+            let e = max_line.entry(file).or_default();
+            if l > *e {
+                *e = l;
+            }
+        }
+        let min = min_lines as i64;
+
+        // Reads/edits grouped by (session, path), restricted to the window.
+        let mut reads_by_key: HashMap<(String, String), Vec<i64>> = HashMap::new();
+        for r in &reads.rows {
+            let sid = cell_str(r, 0);
+            if !window.contains(&sid) {
+                continue;
+            }
+            reads_by_key.entry((sid, cell_str(r, 1))).or_default().push(cell_i64(r, 2));
+        }
+        let mut edits_by_key: HashMap<(String, String), Vec<i64>> = HashMap::new();
+        for r in &edits.rows {
+            let sid = cell_str(r, 0);
+            if !window.contains(&sid) {
+                continue;
+            }
+            edits_by_key.entry((sid, cell_str(r, 1))).or_default().push(cell_i64(r, 2));
+        }
+
+        let mut pairs = 0u64;
+        for (key, ts_list) in reads_by_key.iter_mut() {
+            // Size filter (est.): only files whose indexed span reaches min_lines.
+            if !max_line.get(&key.1).is_some_and(|&l| l >= min) {
+                continue;
+            }
+            if ts_list.len() < 2 {
+                continue;
+            }
+            ts_list.sort_unstable();
+            let edits_here = edits_by_key.get(key);
+            for w in ts_list.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                // An edit STRICTLY between the two reads breaks the redundancy
+                // (the second read may see genuinely changed content).
+                let intervening = edits_here.is_some_and(|es| es.iter().any(|&t| t > a && t < b));
+                if !intervening {
+                    pairs += 1;
+                }
+            }
+        }
+        Ok(Some((pairs, window.len() as u64)))
+    }
+
     /// V16 Feature 2 (`drift.usage_fields_gone.v1` signals): Claude sessions
     /// with at least one message-level `usage_stat` row, and how many of
     /// those carry ZERO tokens across every such row (in/out/cache all 0 —
@@ -5916,6 +6031,90 @@ pub struct Point { x: i32 }
         let (rate, samples) = idx.advisor_reread_rate().unwrap().unwrap();
         assert_eq!(samples, 3);
         assert!((rate - (1.0 / 3.0)).abs() < 1e-9, "rate={rate}");
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V17 Phase F1: redundant_read_candidates ─────────────────────────
+
+    #[test]
+    fn redundant_read_candidates_is_none_without_any_read() {
+        let dir = std::env::temp_dir().join(format!("ckg-redun-none-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        assert_eq!(idx.redundant_read_candidates(3, 10).unwrap(), None);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redundant_read_candidates_counts_unedited_pairs_and_ignores_edited_ones() {
+        let dir = std::env::temp_dir().join(format!("ckg-redun-pairs-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // SRC's max symbol end_line (~5) clears a min_lines of 3.
+        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust)).expect("index");
+
+        // s_two: two consecutive un-edited reads -> 1 pair.
+        idx.record_mem_event("s_two", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s_two", "claude", "read", "src/geo.rs", None, None, 200, None).unwrap();
+        // s_edit: read, edit, read -> the intervening edit breaks the pair (0).
+        idx.record_mem_event("s_edit", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s_edit", "claude", "edit", "src/geo.rs", None, None, 200, None).unwrap();
+        idx.record_mem_event("s_edit", "claude", "read", "src/geo.rs", None, None, 300, None).unwrap();
+        // s_three: three consecutive un-edited reads -> 2 pairs.
+        idx.record_mem_event("s_three", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s_three", "claude", "read", "src/geo.rs", None, None, 200, None).unwrap();
+        idx.record_mem_event("s_three", "claude", "read", "src/geo.rs", None, None, 300, None).unwrap();
+
+        let (pairs, sessions) = idx.redundant_read_candidates(3, 10).unwrap().unwrap();
+        assert_eq!(pairs, 3, "1 (s_two) + 0 (s_edit) + 2 (s_three)");
+        assert_eq!(sessions, 3, "all three read-sessions are in the window");
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redundant_read_candidates_windows_to_the_most_recent_sessions() {
+        let dir = std::env::temp_dir().join(format!("ckg-redun-win-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust)).expect("index");
+        // s_old (oldest, max ts 101), s_new1 (501), s_new2 (601) — each a pair.
+        idx.record_mem_event("s_old", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s_old", "claude", "read", "src/geo.rs", None, None, 101, None).unwrap();
+        idx.record_mem_event("s_new1", "claude", "read", "src/geo.rs", None, None, 500, None).unwrap();
+        idx.record_mem_event("s_new1", "claude", "read", "src/geo.rs", None, None, 501, None).unwrap();
+        idx.record_mem_event("s_new2", "claude", "read", "src/geo.rs", None, None, 600, None).unwrap();
+        idx.record_mem_event("s_new2", "claude", "read", "src/geo.rs", None, None, 601, None).unwrap();
+
+        // Only the 2 most recent sessions (s_new2, s_new1) are scanned.
+        let (pairs, sessions) = idx.redundant_read_candidates(3, 2).unwrap().unwrap();
+        assert_eq!(pairs, 2, "s_old's pair is outside the window");
+        assert_eq!(sessions, 2);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redundant_read_candidates_filters_small_files_but_still_scans_the_session() {
+        let dir = std::env::temp_dir().join(format!("ckg-redun-min-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust)).expect("index");
+        idx.record_mem_event("s1", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s1", "claude", "read", "src/geo.rs", None, None, 200, None).unwrap();
+
+        // min_lines 3: SRC clears it -> 1 pair.
+        let (kept, _) = idx.redundant_read_candidates(3, 10).unwrap().unwrap();
+        assert_eq!(kept, 1);
+        // min_lines 100: SRC's ~5-line span is filtered out -> 0 pairs, but the
+        // session is still counted as scanned (the denominator is honest).
+        let (filtered, sessions) = idx.redundant_read_candidates(100, 10).unwrap().unwrap();
+        assert_eq!(filtered, 0);
+        assert_eq!(sessions, 1);
+
+        // A never-indexed file (no symbols) has no size proxy -> filtered out.
+        idx.record_mem_event("s2", "claude", "read", "src/nope.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s2", "claude", "read", "src/nope.rs", None, None, 200, None).unwrap();
+        let sessions_now = idx.redundant_read_candidates(3, 10).unwrap().unwrap().1;
+        assert_eq!(sessions_now, 2, "s2 is scanned even though its file has no size");
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }

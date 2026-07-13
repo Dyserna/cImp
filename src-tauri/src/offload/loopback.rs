@@ -195,6 +195,10 @@ struct RunBody {
     /// used as the native-tool root when no explicit `allowed_roots` is set.
     #[serde(default)]
     cwd: Option<String>,
+    /// V21 F9: optional JSON Schema — when set, the worker's final answer is
+    /// grammar-constrained to matching JSON. Absent on legacy child requests.
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
 }
 
 /// A `POST /run` response.
@@ -418,6 +422,7 @@ async fn handle_run(
         thinking,
         tier,
         session_cwd,
+        body.schema,
         cancel.clone(),
     );
     tokio::pin!(run_fut);
@@ -743,6 +748,11 @@ struct ShouldReadBody {
     /// 1-based read offset, when the agent asked for a windowed read.
     #[serde(default)]
     offset: Option<u32>,
+    /// V17 Phase B: the `Read` line limit, when the agent asked for a slice.
+    /// Forwarded so the verdict can tell a full read from a head-peek (a
+    /// deliberate slice always passes — Phase C's first-read branch).
+    #[serde(default)]
+    limit: Option<u32>,
 }
 
 /// `POST /context/should_read` (V11 Phase E): the read-advisor verdict for a
@@ -767,7 +777,7 @@ async fn handle_should_read(stream: &mut TcpStream, app: &AppHandle, req: &Reque
     };
     let graph = graph.inner().clone();
     let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    match graph.should_read(&cwd, body.session_id.as_deref(), &body.file_path, body.offset) {
+    match graph.should_read(&cwd, body.session_id.as_deref(), &body.file_path, body.offset, body.limit) {
         Some(text) => {
             write_json(stream, 200, &serde_json::json!({ "ok": true, "verdict": "remind", "text": text })).await
         }

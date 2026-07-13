@@ -45,6 +45,7 @@
     describeBackendStatus,
     offloadServiceStatus,
     offloadReloadMcp,
+    offloadEnableReadonlyCommands,
     describeMcpServerHealth,
     type BackendStatus,
     type ServiceStatus,
@@ -76,6 +77,7 @@
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
+  import ChecksEditor from './lib/settings/ChecksEditor.svelte';
   import { resolveBundledTheme, defaultPalette } from './lib/themes';
   import { themeRegistry, paletteRegistry } from './lib/themes/registry';
   import type { ThemeColorsWire } from './lib/settings/types';
@@ -533,7 +535,7 @@
     patch((s) => {
       s.offload.command_policies = [
         ...s.offload.command_policies,
-        { program: '', denied_flags: [], denied_subcommands: [], env: [] },
+        { program: '', denied_flags: [], denied_subcommands: [], allowed_subcommands: [], env: [] },
       ];
     });
   }
@@ -546,6 +548,16 @@
     patch((s) => {
       fn(s.offload.command_policies[i]);
     });
+  }
+  // V21 F7: one-click "safe read-only commands" preset. The backend merges
+  // `git` + `cargo` (metadata/tree, with its pinning policy) into the live
+  // allowlist/policies atomically and returns the updated settings, which we
+  // fold into the local snapshot. Idempotent + non-destructive — a merge, not a
+  // mode: the user sees exactly what got added in the allowlist / policy
+  // editors below and can prune any of it.
+  async function enableReadonlyCommands(): Promise<void> {
+    const updated = await offloadEnableReadonlyCommands();
+    if (updated) snapshot = updated;
   }
   // ── MCP tool servers (MCP servers section) ─────────────────────────────
   // Add/remove/toggle with live host reload — no cImp restart. Edits persist
@@ -713,6 +725,7 @@
     | 'offload'
     | 'mcp'
     | 'graph'
+    | 'checks'
     | 'pricing'
     | 'workbench'
     | 'advanced'
@@ -730,6 +743,7 @@
     { id: 'offload', label: 'Offload task tools' },
     { id: 'mcp', label: 'MCP servers' },
     { id: 'graph', label: 'Code Intelligence' },
+    { id: 'checks', label: 'Checks' },
     { id: 'pricing', label: 'LLM pricing' },
     { id: 'workbench', label: 'Workbench' },
     { id: 'advanced', label: 'Advanced' },
@@ -816,6 +830,24 @@
   // the listener for the rest of the parent process's life.
   let disposed = false;
 
+  // Every valid sidebar section id, for validating a `section:` deep-link
+  // target before assigning it (a hand-crafted event shouldn't be able to set
+  // `activeSection` to garbage).
+  const SECTION_IDS = new Set<string>(SECTIONS.map((s) => s.id));
+
+  // Route a cold-open deep-link target: a `section:<id>` jumps the sidebar to
+  // that section (V22 Phase E — the Code Intelligence checks nudge chip uses
+  // this); anything else is a tab id for the Tabs section scroll.
+  function applyDeepLinkTarget(target: string): void {
+    const sectionPrefix = 'section:';
+    if (target.startsWith(sectionPrefix)) {
+      const id = target.slice(sectionPrefix.length);
+      if (SECTION_IDS.has(id)) activeSection = id as SectionId;
+      return;
+    }
+    scrollToTabSection(target);
+  }
+
   function scrollToTabSection(tabId: string): void {
     // Sidebar nav + sub-tabs both hide content, so flip both before
     // looking up the inner element — otherwise it wouldn't be in the
@@ -869,7 +901,7 @@
     // tab; we read+clear it and scroll if non-null.
     consumeSettingsDeepLink()
       .then((target) => {
-        if (target) scrollToTabSection(target);
+        if (target) applyDeepLinkTarget(target);
       })
       .catch((e) => console.warn('consume_settings_deep_link failed', e));
 
@@ -878,10 +910,14 @@
     // disposed between the await and now, tear the listener down
     // immediately rather than storing it where onDestroy can no longer
     // reach it.
-    const deepLinkUnlisten = await listen<{ kind: string; tab_id: string }>(
+    const deepLinkUnlisten = await listen<{ kind: string; tab_id?: string; section?: string }>(
       'settings-deep-link',
       (e) => {
-        if (e.payload.kind === 'tab') scrollToTabSection(e.payload.tab_id);
+        if (e.payload.kind === 'tab' && e.payload.tab_id) {
+          scrollToTabSection(e.payload.tab_id);
+        } else if (e.payload.kind === 'section' && e.payload.section) {
+          if (SECTION_IDS.has(e.payload.section)) activeSection = e.payload.section as SectionId;
+        }
       },
     );
     if (disposed) {
@@ -3691,6 +3727,23 @@
               auto-sizes from the summed per-backend slot counts.
             </small>
           </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.escalate_partial}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.escalate_partial = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Escalate partial fast-tier answers to the quality backend</span>
+          </label>
+          <small class="hint">
+            When a fast-tier offload comes back only partially verified, re-run it
+            once on a distinct, ready quality backend and keep the better answer.
+            Inert unless a second, quality-tier backend is configured.
+          </small>
           {:else}
           <h3>Native tools</h3>
           <label class="checkbox">
@@ -3701,6 +3754,15 @@
                 patch((s) => (s.offload.tools.read_file = (e.currentTarget as HTMLInputElement).checked))}
             />
             <span>read_file — bounded file reads</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.list_dir}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.list_dir = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>list_dir — enumerate a directory (what files exist / how many)</span>
           </label>
           <label class="checkbox">
             <input
@@ -3719,6 +3781,18 @@
                 patch((s) => (s.offload.tools.run_command = (e.currentTarget as HTMLInputElement).checked))}
             />
             <span>run_command — allowlisted, read-only commands</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.run_check}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.run_check = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span
+              >run_check — run a configured project check (build/typecheck/lint/test).
+              Inert until the project's <code>checks</code> are configured.</span
+            >
           </label>
 
           <label>
@@ -3761,6 +3835,19 @@
               listed here (deny by default).
             </small>
           </label>
+
+          <div class="button-row">
+            <button type="button" class="secondary" onclick={enableReadonlyCommands}>
+              Enable safe read-only commands
+            </button>
+          </div>
+          <small class="hint">
+            Adds <code>git</code> and <code>cargo</code> to the allowlist and
+            installs a <code>cargo</code> policy that permits only
+            <code>metadata</code> / <code>tree</code> (never
+            <code>run</code>/<code>build</code>). A one-time merge — it never
+            overwrites your own entries, and you can prune anything it adds below.
+          </small>
 
           {#if snapshot.offload.command_allowlist.length > 0}
             <ul class="policy-status">
@@ -3825,6 +3912,21 @@
                     updatePolicy(i, (p) => (p.denied_subcommands = csvToList((e.currentTarget as HTMLInputElement).value)))}
                   placeholder="config"
                 />
+              </label>
+              <label>
+                <span>Allowed subcommands (comma-separated)</span>
+                <input
+                  type="text"
+                  value={policy.allowed_subcommands.join(', ')}
+                  oninput={(e) =>
+                    updatePolicy(i, (p) => (p.allowed_subcommands = csvToList((e.currentTarget as HTMLInputElement).value)))}
+                  placeholder="metadata, tree"
+                />
+                <small class="hint">
+                  When set, ONLY these subcommands may run — every other, and a
+                  bare invocation, is refused. Leave empty to allow all except
+                  the denied ones.
+                </small>
               </label>
               <div class="policy-env">
                 <span class="policy-env-label">Spawn environment (forced)</span>
@@ -4415,6 +4517,74 @@
                 long the agent's memory is trusted across context loss the
                 advisor can't observe (context editing, tool-result truncation).
               </small>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.read_advisor_diffs}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.read_advisor_diffs = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Diff-substitute changed-file re-reads</span>
+              </label>
+              <small class="hint">
+                When you re-read a file <em>after it changed</em>, answer with a
+                line-level unified diff against what you last read instead of the
+                whole file — exact, so it's safe on the edit-then-verify loop.
+                Falls back to a normal read when no snapshot survives or the diff
+                would be more than half the new file.
+              </small>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.read_advisor_shell}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.read_advisor_shell = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Intercept whole-file shell reads</span>
+              </label>
+              <small class="hint">
+                Also advise on a whole-file shell read
+                (<code>cat</code>, <code>Get-Content</code>, <code>type</code>,
+                <code>gc</code>) of an already-read file, the same as a
+                <code>Read</code>. Strict — only a provable whole-file read of one
+                file is intercepted; anything with a pipe, redirect, glob, second
+                path, or a partial-read verb (<code>sed</code>, <code>head</code>)
+                runs untouched.
+              </small>
+              <label>
+                <span>First-read digest tier (KiB, 0 = off)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.read_advisor_first_read_kb}
+                  onchange={(e) =>
+                    patch((s) => {
+                      const n = Number((e.currentTarget as HTMLInputElement).value);
+                      s.graph.read_advisor_first_read_kb = Number.isFinite(n)
+                        ? Math.max(0, Math.trunc(n))
+                        : 0;
+                    })}
+                />
+              </label>
+              <small class="hint">
+                Answer the <em>first</em> read of a large non-code file (log,
+                lockfile, generated JSON, data dump) at or above this size with the
+                cached local-model digest plus a head/tail sample instead of the
+                full content. Source files (anything with a parsed outline) never
+                qualify, and a sliced <code>Read</code> always passes. Needs a
+                cached digest — the first encounter enqueues one and passes, so
+                protection begins on the next. Off by default; try <code>256</code>.
+              </small>
             {/if}
             <label class="checkbox">
               <input
@@ -4440,6 +4610,31 @@
                 <strong>No local offload backend is ready</strong> — start one in
                 Settings → Offload to enable this.
               {/if}
+            </small>
+
+            <h3>Tool surface</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.lean_tools}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.lean_tools = (
+                        e.currentTarget as HTMLInputElement
+                      ).checked),
+                  )}
+              />
+              <span>Lean tool surface (hide cold-tail graph tools)</span>
+            </label>
+            <small class="hint">
+              Drop <code>graph_cycles</code>, <code>graph_dead_exports</code>,
+              <code>graph_struct_search</code>, <code>graph_path</code>, and
+              <code>graph_architecture</code> from the tool list advertised to the
+              cloud session and the offload worker — trimming the descriptors
+              cache-written once per session. Advertisement-only: each hidden tool
+              still answers if an agent calls it by name. The Code Intelligence tab
+              shows the current surface size.
             </small>
 
             <h3>Architecture &amp; path tracing</h3>
@@ -4532,31 +4727,32 @@
               <h3>Graph View tuning</h3>
               <small class="hint">
                 Multipliers on the built-in layout/appearance (1.0 = default;
-                0.2–5). One size doesn't fit every repo — a dense monorepo
-                usually wants smaller nodes and wider spacing than a small
-                project. Changes apply live to an open Graph View tab.
+                0.2–5, folder spacing up to 50). One size doesn't fit every
+                repo — a dense monorepo usually wants smaller nodes and wider
+                spacing than a small project. Changes apply live to an open
+                Graph View tab.
               </small>
               {#each [
-                { key: 'graph_viz_node_scale', label: 'File node size' },
-                { key: 'graph_viz_dir_scale', label: 'Folder cluster size' },
-                { key: 'graph_viz_edge_width', label: 'Edge line width' },
-                { key: 'graph_viz_node_spacing', label: 'Spacing between files' },
-                { key: 'graph_viz_cluster_spacing', label: 'Spacing between folders' },
-                { key: 'graph_viz_cluster_strength', label: 'Folder grouping tightness' },
+                { key: 'graph_viz_node_scale', label: 'File node size', max: 5 },
+                { key: 'graph_viz_dir_scale', label: 'Folder cluster size', max: 5 },
+                { key: 'graph_viz_edge_width', label: 'Edge line width', max: 5 },
+                { key: 'graph_viz_node_spacing', label: 'Spacing between files', max: 5 },
+                { key: 'graph_viz_cluster_spacing', label: 'Spacing between folders', max: 50 },
+                { key: 'graph_viz_cluster_strength', label: 'Folder grouping tightness', max: 5 },
               ] as knob (knob.key)}
                 <label>
                   <span>{knob.label}</span>
                   <input
                     type="number"
                     min="0.2"
-                    max="5"
+                    max={knob.max}
                     step="0.1"
                     value={(snapshot.graph as unknown as Record<string, number>)[knob.key]}
                     onchange={(e) =>
                       patch(
                         (s) =>
                           ((s.graph as unknown as Record<string, number>)[knob.key] = Math.min(
-                            5,
+                            knob.max,
                             Math.max(0.2, Number((e.currentTarget as HTMLInputElement).value) || 1),
                           )),
                       )}
@@ -4614,6 +4810,21 @@
               setting.
             </small>
           {/if}
+        </section>
+      {:else if activeSection === 'checks'}
+        <section>
+          <h2>Checks</h2>
+          <small class="hint">
+            Project checker commands the <code>run_check</code> tool exposes to
+            Claude and the offload worker — a build, typecheck, lint, or test run
+            turned into bounded, deduplicated diagnostics instead of a raw dump.
+            Configured per project; changes land in this project's
+            <code>.cimp/config.json</code> overlay.
+          </small>
+          <ChecksEditor
+            checks={snapshot.checks}
+            onchange={(next) => patch((s) => (s.checks = next))}
+          />
         </section>
       {:else if activeSection === 'pricing'}
         <section>

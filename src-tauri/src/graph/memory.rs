@@ -170,8 +170,12 @@ fn strip_list_marker(line: &str) -> &str {
 
 /// Per-session `usage_stat` ring cap — deeper than [`MAX_EVENTS_PER_SESSION`]
 /// since usage rows are written far more often (every turn AND every tool
-/// result, vs. one `mem_event` per *classified* tool call).
-pub const MAX_USAGE_PER_SESSION: i64 = 2000;
+/// result, vs. one `mem_event` per *classified* tool call), and deeper again
+/// since sub-agent transcripts feed the same session's ring (V17.1): one
+/// orchestration session fanning out to sub-agents can carry several hundred
+/// turn rows plus their tool results (a real 8-agent milestone build measured
+/// ~800 turns), and pruning here silently under-counts the session's spend.
+pub const MAX_USAGE_PER_SESSION: i64 = 6000;
 
 /// One usage/cost event fed to [`super::service::GraphService::record_usage`].
 /// Timestamped internally (same posture as `record_mem_event`'s `ts_ms`
@@ -326,6 +330,12 @@ pub struct UsageSnapshot {
     /// tab. Filled in by the `graph_usage` IPC handler (this module has no
     /// dependency on `OffloadService`), `0` when offload is off/unused.
     pub offload_local_tasks: u64,
+    /// V17 Phase E: the advertised tool-surface size for both consumers
+    /// (MCP + offload worker), measured post-`lean_tools`-filter. Like
+    /// `offload_local_tasks`, this is a cross-cutting field filled in by the
+    /// `graph_usage` IPC handler (`crate::graph::surface_stats`), not by
+    /// `GraphService` — it depends on live settings, not the index.
+    pub surface: super::mcp::SurfaceStats,
 }
 
 /// Map an agent tool name/id to a memory event `kind` + the argument key that

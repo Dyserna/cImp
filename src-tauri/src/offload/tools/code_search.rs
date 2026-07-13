@@ -29,11 +29,6 @@ const MAX_FILES_SCANNED: usize = 50_000;
 const MAX_ENTRIES_VISITED: usize = 1_000_000;
 const SNIPPET_MAX: usize = 240;
 
-const IGNORE_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", "dist", "build", ".venv", "venv",
-    "__pycache__", ".next", ".cache", "vendor", ".svelte-kit",
-];
-
 #[derive(Deserialize)]
 struct Args {
     /// Literal substring to find (case-insensitive).
@@ -119,7 +114,8 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
                     }
                     if file_type.is_dir() {
                         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if IGNORE_DIRS.contains(&name) {
+                        // Shared broad build/vendor/VCS skip set (crate::fsutil).
+                        if crate::fsutil::SKIP_DIRS.contains(&name) {
                             continue;
                         }
                         stack.push(path);

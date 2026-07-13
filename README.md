@@ -626,6 +626,24 @@ evicts; and opt-in proactive automation (a Claude `PostToolUse` hook) injects
 only new/worsened diagnostics right after an edit, plus a blast-radius note on
 risky changes — all off by default, same posture as the V11 read advisor.
 
+**Token Efficiency II (V17)** pushes the read advisor into the corners V11
+passed on and prices the tool surface itself. Re-reading a file *after it
+changed* is answered with a **unified diff** against what you last read instead
+of the whole file (`read_advisor_diffs`); whole-file **shell reads**
+(`cat` / `Get-Content`) of a reminded file are intercepted the same way a
+`Read` is (`read_advisor_shell`), closing the loop V16 could only detect; and
+the first read of a huge **non-code** file (log, lockfile, generated JSON) can
+be answered with a cached digest + head/tail sample
+(`read_advisor_first_read_kb`, off by default) — all still gated under the
+`read_advisor` opt-in. `run_check` gains **test-run parsers** (`cargo-test`,
+`jest-json` / vitest) so a configured test check returns grouped failures
+instead of a raw dump. The Usage view now prices the advertised graph-tool
+**surface** (cache-written once per session), with an optional `lean_tools`
+lever that hides the cold-tail tools from the advertised set (they still answer
+if called by name). And two **graduation rules** let the Advisor propose
+turning the read advisor on — or switching it to `substitute` mode — from
+measured field data, never silently.
+
 ## Workbench (V13 — vibe-coding guardrails)
 
 A reserved **Workbench** tab (on by default) makes it safe to let agents run

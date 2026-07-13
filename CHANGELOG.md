@@ -5,6 +5,71 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.0] — 2026-07-13
+
+### Fixed
+
+- **Usage: sub-agent token spend was invisible under Claude Code 2.x.** The
+  2.x CLIs (observed 2.1.207) moved sub-agent transcripts out of the parent
+  session file (no more inline `isSidechain` lines) into per-agent files at
+  `<session>/subagents/agent-<id>.jsonl`, and renamed the launcher tool
+  `Task` → `Agent` — so the Usage section counted only the orchestrator (in a
+  real V17 build session: 64 Fable messages counted, 731 Opus sub-agent
+  messages with ~289k output tokens dropped) and the agents-active avatar
+  hold never engaged. The OOB tap now tails the per-agent files (usage +
+  commit provenance only, attributed to the parent session — same split the
+  inline contract had) and matches both launcher names. A new
+  `drift.subagent_transcripts.v1` advisor canary fires if the contract moves
+  again (transcripts in neither known location after an agent completes, or
+  transcript files present with no recognized launcher tool).
+
+### Added
+
+- **Read advisor: diff-substitute for changed-file re-reads (V17).** Re-reading
+  a file *after it changed* is now answered with a line-level unified diff
+  against a snapshot of what you last read, instead of the whole file — exact,
+  so it's safe on the edit-then-verify loop. Falls back to a normal read when no
+  snapshot survives (small file / over-cap / evicted) or the diff would be more
+  than half the new file; a content change re-arms the reminder up to 3× per
+  file per session. On by default within the `read_advisor` opt-in
+  (`read_advisor_diffs`).
+- **Read advisor: whole-file shell-read interception (V17).** A second
+  `PreToolUse` Bash matcher intercepts a whole-file shell read
+  (`cat` / `Get-Content` / `type` / `gc -Raw`) of an already-reminded file the
+  same way a `Read` is intercepted — closing the loop V16 could only detect (a
+  bypass used to cost the reminder *plus* the whole file). Strict: only a
+  provable pure whole-file read of one file is caught; anything with a pipe,
+  redirect, glob, second path, or a partial-read verb (`sed`, `head`, `tail`)
+  runs untouched. On by default within the advisor (`read_advisor_shell`);
+  Claude-only for now.
+- **Read advisor: first-read digest tier for huge non-code files (V17).** The
+  first read of a large non-code file (log, lockfile, generated JSON, data
+  dump) can be answered with the cached local-model digest plus a head/tail
+  sample instead of the full content. Off by default; enable by setting a KiB
+  threshold (`read_advisor_first_read_kb`, try 256). Needs a cached digest — the
+  first encounter enqueues one and passes.
+- **`run_check`: test-run parsers (V17).** Two new parsers extend `run_check`'s
+  grouped-diagnostics to test runs: `cargo-test` (stable-toolchain text —
+  failures with resolved `panicked at file:line`, a truncated stdout block, and
+  a passing-count line; a compile error before tests still surfaces) and
+  `jest-json` (`jest --json` / `vitest --reporter=json`). Add a check to
+  `.cimp/config.json`; the agent is nudged to prefer a configured test check
+  over running the test command in Bash.
+- **Usage: tool-surface accounting + lean surface (V17).** The Effectiveness
+  card now prices the advertised graph-tool surface (serialized chars + count,
+  cache-written once per session). A new `lean_tools` toggle (off by default)
+  hides the cold-tail tools (`graph_cycles`, `graph_dead_exports`,
+  `graph_struct_search`, `graph_path`, `graph_architecture`) from the
+  advertised surface — they still answer if an agent calls them by name — and a
+  `surface.lean.v1` advisor rule proposes enabling it after ≥10 sessions with
+  zero calls to any hidden tool. The wordiest tool descriptions were tightened.
+- **Advisor: read-advisor graduation rules (V17).** Two propose-and-confirm
+  rules turn the V11 "graduate from field data" promise into Advisor proposals:
+  `adopt.read_advisor.v1` proposes enabling the advisor when it's off, E1 is
+  verified, and session memory shows repeated redundant large re-reads; and
+  `adopt.read_advisor_substitute.v1` proposes switching to `substitute` mode
+  when reminders are rarely followed by a full re-read. No silent default flips.
+
 ## [0.41.4] — 2026-07-12
 
 ### Added

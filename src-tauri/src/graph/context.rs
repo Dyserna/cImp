@@ -631,6 +631,62 @@ fn substitute_body(
     Some(format!("{}:{}-{} · {}\n{}", hit.file, hit.start_line, hit.end_line, hit.kind, body))
 }
 
+/// V17 Phase A — render a line-level unified diff of `old` → `new`, ~3 lines of
+/// context, with a `-U`-style header naming the file (the two sides tagged "as
+/// read" / "current"). Isolated behind this one signature so the diff backend
+/// (`similar` today; a hand-rolled LCS if the dep is ever dropped) is swappable
+/// without touching the verdict path. Pure — no I/O.
+pub fn unified_diff(old: &str, new: &str, rel: &str) -> String {
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("{rel} (as read)"), &format!("{rel} (current)"))
+        .to_string()
+}
+
+/// V17 Phase A — the reminder text for a re-read of a *changed* already-read
+/// file: a header naming the file and the turn it was last read, the unified
+/// diff (`diff_body`, already rendered by [`unified_diff`]), then the SAME
+/// escape-hatch sentence [`read_advice`] uses. The escape hatch wording is kept
+/// byte-identical on purpose — `drift.read_reason.v1` keys on the reason text.
+pub fn diff_advice(rel: &str, prev_turn: u32, diff_body: &str) -> String {
+    format!(
+        "`{rel}` changed since you read it (turn {prev_turn}) — diff against what you read:\n\n\
+         {diff_body}\n\
+         Re-read with Read({{file, offset, limit}}) if you need the exact text."
+    )
+}
+
+/// V17 Phase C — the reminder for a *first* read of a huge non-code file (a log,
+/// lockfile, generated JSON, data dump the agent has never read this session):
+/// its size (bytes + lines), the cached local-model `digest` (≤3 lines by
+/// construction — `put_digest`'s 400-char validation), a head/tail sample (first
+/// ~40 + last ~40 lines, fenced), and the escape hatch. Unlike the outline/diff
+/// reminders this fires before any read, so it leads with the size + digest to
+/// justify the substitution; the escape hatch states that a sliced read always
+/// passes (offset/limit forwarding, Phase B4). Pure — `content` is in hand.
+pub fn first_read_advice(rel: &str, content: &str, digest: &str) -> String {
+    const SAMPLE: usize = 40;
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let bytes = content.len();
+    let sample = if total_lines > SAMPLE * 2 {
+        let head = lines[..SAMPLE].join("\n");
+        let tail = lines[total_lines - SAMPLE..].join("\n");
+        let omitted = total_lines - SAMPLE * 2;
+        format!("{head}\n… [{omitted} lines omitted] …\n{tail}")
+    } else {
+        // Short enough that head+tail would overlap — show the whole thing.
+        lines.join("\n")
+    };
+    format!(
+        "`{rel}` is a large non-code file ({bytes} bytes, {total_lines} lines) that \
+         you have not read this session. Local digest:\n{digest}\n\n\
+         First/last {SAMPLE} lines:\n```\n{sample}\n```\n\
+         Read({{file, offset, limit}}) always passes if you need the exact text."
+    )
+}
+
 /// V11 Phase D — the block fed to a compaction so the session's working context
 /// survives the summary: the ranked working set (top ~10, one line each), pinned
 /// notes verbatim, and unpinned notes as one-line digests. Hard-capped at ~2000
@@ -1067,5 +1123,69 @@ mod tests {
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unified_diff_names_the_file_and_shows_the_change() {
+        let old = "line one\nline two\nline three\n";
+        let new = "line one\nline TWO\nline three\n";
+        let d = unified_diff(old, new, "src/a.rs");
+        // -U-style header naming the file on both sides.
+        assert!(d.contains("src/a.rs (as read)"), "header names the old side: {d}");
+        assert!(d.contains("src/a.rs (current)"), "header names the new side: {d}");
+        // The changed line shows up as a -/+ pair; the unchanged neighbours as
+        // context, not as edits.
+        assert!(d.contains("-line two"), "removed line present: {d}");
+        assert!(d.contains("+line TWO"), "added line present: {d}");
+        assert!(!d.contains("-line one"), "unchanged line stays context: {d}");
+    }
+
+    #[test]
+    fn diff_advice_carries_header_diff_and_the_escape_hatch() {
+        let body = unified_diff("a\nb\nc\n", "a\nB\nc\n", "pkg/mod.rs");
+        let text = diff_advice("pkg/mod.rs", 7, &body);
+        assert!(
+            text.contains("`pkg/mod.rs` changed since you read it (turn 7)"),
+            "header names the file + last-read turn: {text}"
+        );
+        assert!(text.contains("+B"), "the rendered diff is embedded: {text}");
+        // The escape-hatch sentence must stay byte-identical to `read_advice`'s
+        // (drift.read_reason.v1 keys on the reason text).
+        assert!(
+            text.contains("Re-read with Read({file, offset, limit}) if you need the exact text."),
+            "escape hatch present + unchanged wording: {text}"
+        );
+    }
+
+    #[test]
+    fn first_read_advice_carries_digest_head_tail_and_counts() {
+        // 120 lines ⇒ head (40) + tail (40) shown, middle 40 omitted.
+        let content: String = (0..120).map(|n| format!("line{n}\n")).collect();
+        let text = first_read_advice("data/big.json", &content, "a config blob");
+        // Byte + line counts.
+        assert!(text.contains(&format!("{} bytes", content.len())), "byte count: {text}");
+        assert!(text.contains("120 lines"), "line count: {text}");
+        // The digest.
+        assert!(text.contains("a config blob"), "digest embedded: {text}");
+        // Head + tail present, middle omitted.
+        assert!(text.contains("line0\n"), "first line in head: {text}");
+        assert!(text.contains("line119"), "last line in tail: {text}");
+        assert!(!text.contains("line60"), "the omitted middle is dropped: {text}");
+        assert!(text.contains("lines omitted"), "omission marker: {text}");
+        // The first-read escape hatch (distinct from read_advice's — a slice
+        // always passes here).
+        assert!(
+            text.contains("Read({file, offset, limit}) always passes"),
+            "escape hatch present: {text}"
+        );
+    }
+
+    #[test]
+    fn first_read_advice_short_file_shows_whole_body_no_omission() {
+        // ≤ 80 lines ⇒ head/tail would overlap; show it all, no omission marker.
+        let content: String = (0..10).map(|n| format!("row{n}\n")).collect();
+        let text = first_read_advice("logs/small.log", &content, "tiny log");
+        assert!(text.contains("row0\n") && text.contains("row9"), "whole body shown: {text}");
+        assert!(!text.contains("lines omitted"), "no omission for a short file: {text}");
     }
 }

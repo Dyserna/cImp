@@ -1,6 +1,6 @@
 [package]
 name = "cimp"
-version = "0.41.4"
+version = "0.42.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
@@ -168,6 +168,11 @@ ignore = "0.4"
 # Windows this is ReadDirectoryChangesW under the hood. Debounce + gitignore
 # filtering are done in `graph::watcher`.
 notify = "6"
+# V17 Phase A: line-level unified diffs for the read advisor's diff-substitute
+# branch (a changed-file re-read is answered with a diff against the last-read
+# snapshot, not the whole file). Pure Rust, MIT/Apache; `text` only — we don't
+# use the inline/bytes/serde/unicode features. One call site: `graph::context::unified_diff`.
+similar = { version = "2", default-features = false, features = ["text"] }
 
 # V14 Phase F (Preview tab): official Tauri plugin for "open this URL/path in
 # the user's default browser/file manager" — used for external links clicked

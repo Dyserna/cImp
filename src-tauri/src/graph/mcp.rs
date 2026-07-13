@@ -28,6 +28,37 @@ pub struct GraphToolSpec {
     pub parameters: Value,
 }
 
+/// V17 Phase E: the cold-tail `graph_*` tools hidden from the advertised
+/// surface when `graph.lean_tools` is on. **Advertisement-only** — hiding a
+/// name here removes it from [`tools`] / `graph_tools::defs`, but
+/// [`dispatch_recorded`] / [`run_tool`] / [`offload_query`] still answer it, so
+/// an agent with stale habits gets a real answer rather than an error. Frozen
+/// from the E0 Activity-store check (the proposed cold five; the live store was
+/// empty on this machine, so the proposal stands). Never contains a workhorse
+/// (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_outline`,
+/// `graph_snippet`, `graph_references`, `run_check`, `graph_search_docs`,
+/// `graph_semantic_docs`).
+pub const LEAN_HIDDEN: &[&str] = &[
+    "graph_cycles",
+    "graph_dead_exports",
+    "graph_struct_search",
+    "graph_path",
+    "graph_architecture",
+];
+
+/// Drop the [`LEAN_HIDDEN`] specs when `lean` is on (V17 Phase E). Applied to
+/// the ADVERTISED surface only — [`tools`] and `graph_tools::defs`; never to
+/// [`tool_specs`] itself, which stays the full dispatch source of truth.
+pub fn lean_filter(specs: Vec<GraphToolSpec>, lean: bool) -> Vec<GraphToolSpec> {
+    if !lean {
+        return specs;
+    }
+    specs
+        .into_iter()
+        .filter(|s| !LEAN_HIDDEN.contains(&s.name))
+        .collect()
+}
+
 /// The canonical graph tool set. Adding a tool here surfaces it to BOTH the
 /// MCP descriptors and the offload worker's `ToolDef`s.
 pub fn tool_specs() -> Vec<GraphToolSpec> {
@@ -100,11 +131,10 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
         GraphToolSpec {
             name: "graph_snippet",
             description: "Fetch just a DEFINITION'S BODY instead of reading the whole file — the \
-                token-cheap way to see one function/type in a large file. Give `symbol` (a name; \
-                an ambiguous name returns a disambiguation list, not a body) OR `file`+`line` \
-                (returns the smallest definition whose span encloses that line). Optional \
-                `context_lines` adds N lines above and below. Prefer this (often after \
-                `graph_outline`) over Read for a single definition.",
+                token-cheap way to see one function/type in a large file. Give `symbol` (an \
+                ambiguous name returns a disambiguation list, not a body) OR `file`+`line` (the \
+                smallest definition enclosing that line). Optional `context_lines` adds N lines \
+                around it. Prefer over Read for a single definition, often after `graph_outline`.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -157,14 +187,12 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
         },
         GraphToolSpec {
             name: "graph_path",
-            description: "How is A connected to B? Traces the SHORTEST path between two code \
-                entities through the graph's call/import/containment edges — e.g. 'auth handler → \
-                service → repository → connection pool'. Prefer this over grep for 'how does X talk \
-                to Y' / 'what connects X and Y'. `from`/`to` accept a symbol name, `file:line`, or a \
-                file path. Each hop shows the edge kind and its confidence. Optional `kinds` \
-                (comma-separated subset of call,import,contains) restricts the edge types; \
-                `symmetric: true` walks edges undirected ('are these related at all?'); `max_hops` \
-                bounds the search. Reports plainly when there's no path — it won't invent a link.",
+            description: "Shortest path between two code entities through call/import/containment \
+                edges — e.g. 'auth handler → service → repository → pool'. Use for 'how does X reach \
+                Y' / 'what connects X and Y'. `from`/`to` take a symbol name, `file:line`, or file \
+                path; each hop shows its edge kind and confidence. Optional `kinds` (subset of \
+                call,import,contains) restricts edge types; `symmetric: true` walks undirected; \
+                `max_hops` bounds the search. Says so plainly when there's no path — never invents one.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -179,25 +207,23 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
         },
         GraphToolSpec {
             name: "graph_architecture",
-            description: "A once-per-project, at-a-glance map of the system's shape — for orienting \
-                in an unfamiliar codebase. Reports GOD NODES (the highest-degree hub symbols/files \
-                everything flows through), SUBSYSTEMS (cohesive file communities, each with a \
-                derived name), and SURPRISING CONNECTIONS (edges crossing subsystem boundaries — \
-                candidate accidental coupling). Topology only: no LLM, no embeddings. HEURISTIC \
-                clustering (label propagation) — treat subsystem boundaries as advisory, not \
-                authoritative. Takes no arguments.",
+            description: "A once-per-project map of the system's shape, for orienting in an \
+                unfamiliar codebase: GOD NODES (highest-degree hub symbols/files everything flows \
+                through), SUBSYSTEMS (cohesive file communities, each named), and SURPRISING \
+                CONNECTIONS (edges crossing subsystem boundaries — candidate accidental coupling). \
+                Topology only (no LLM/embeddings); clustering is heuristic (label propagation), so \
+                treat subsystem boundaries as advisory. Takes no arguments.",
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
         },
         GraphToolSpec {
             name: "graph_impact",
-            description: "Blast-radius / impact analysis: what could this change break? With no \
-                `symbols`, analyzes the CURRENT WORKING-TREE DIFF vs HEAD — maps changed line \
-                ranges to indexed symbols, then finds everything that transitively calls them (their \
-                dependents), up to `depth` hops. Pass `symbols` (comma/space-separated names) to \
-                analyze specific symbols instead of the diff. Results are name-keyed and therefore \
-                APPROXIMATE, same honesty convention as `graph_references`. The default diff mode \
-                requires a git repository. `include_tests: true` appends an affected-tests block \
-                (candidate tests reaching the changed symbols) — chain into a filtered test run.",
+            description: "Blast-radius analysis: what could this change break? With no `symbols`, \
+                analyzes the WORKING-TREE DIFF vs HEAD — maps changed lines to indexed symbols, then \
+                finds everything that transitively calls them (their dependents), up to `depth` \
+                hops. Pass `symbols` (comma/space-separated) to analyze specific ones instead of the \
+                diff. Name-keyed, so APPROXIMATE (same convention as `graph_references`); diff mode \
+                needs a git repo. `include_tests: true` appends candidate affected tests — chain \
+                into a filtered test run.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -212,12 +238,11 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
         GraphToolSpec {
             name: "graph_tests_for",
             description: "Which tests (candidates) would exercise a symbol or file if it changed — \
-                the transitive dependents of the given root(s), filtered to definitions a walker \
-                tagged as tests (`#[test]`/pytest `test_*`/`*.test.ts`/etc., language-dependent — \
-                see each language's detection convention). Give `symbol` (one name) OR `file` \
-                (unions every definition in that file as roots). CANDIDATES ONLY: dynamic dispatch, \
-                fixtures, and parametrized runners have no static call edge and won't appear here; \
-                a symbol with no detected test coverage may still be well-tested indirectly.",
+                the transitive dependents filtered to test definitions (`#[test]`/pytest \
+                `test_*`/`*.test.ts`/etc., language-dependent). Give `symbol` (one name) OR `file` \
+                (every definition in it as roots). CANDIDATES ONLY: dynamic dispatch, fixtures, and \
+                parametrized runners have no static call edge and won't appear; a symbol with none \
+                detected may still be well-tested indirectly.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -245,11 +270,10 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
         },
         GraphToolSpec {
             name: "graph_recent_changes",
-            description: "What's been happening in this project lately — files ranked by git churn \
-                (most-touched, then most-recent first), each with its touch count and last commit \
-                subject. Good for orienting at the start of a fresh session. File-level only (no \
-                per-line blame), bounded to a 90-day history window. Reports unavailable when the \
-                project isn't a git repository.",
+            description: "Files ranked by recent git churn (most-touched, then most-recent first), \
+                each with its touch count and last commit subject — good for orienting at the start \
+                of a fresh session. File-level only (no per-line blame), bounded to a 90-day window. \
+                Unavailable when the project isn't a git repository.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -313,7 +337,7 @@ pub fn tools() -> Vec<Value> {
     if !settings.checks.is_empty() {
         specs.push(run_check_spec());
     }
-    specs
+    lean_filter(specs, settings.graph.lean_tools)
         .into_iter()
         .map(|s| {
             json!({
@@ -323,6 +347,35 @@ pub fn tools() -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// V17 Phase E: the measured size of the advertised tool surface, for BOTH
+/// consumers — the cloud Opus / OpenCode session ([`tools`], MCP shape) and the
+/// local offload worker (`graph_tools::defs`, OpenAI shape). `*_chars` is the
+/// serialized-JSON length (what actually rides in the tools block, cache-written
+/// once per session); `*_tools` is the count. Both are computed **after** the
+/// `lean_tools` filter, so toggling the lean surface moves these numbers by the
+/// hidden tools' delta.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct SurfaceStats {
+    pub mcp_tools: usize,
+    pub mcp_chars: usize,
+    pub offload_tools: usize,
+    pub offload_chars: usize,
+}
+
+/// Measure the advertised tool surface for both consumers (V17 Phase E). Reads
+/// live settings (via [`tools`] / `graph_tools::defs`), so it reflects the
+/// current `lean_tools` state.
+pub fn surface_stats() -> SurfaceStats {
+    let mcp = tools();
+    let offload = crate::offload::tools::graph_tools::defs();
+    SurfaceStats {
+        mcp_tools: mcp.len(),
+        mcp_chars: serde_json::to_string(&mcp).map(|s| s.len()).unwrap_or(0),
+        offload_tools: offload.len(),
+        offload_chars: serde_json::to_string(&offload).map(|s| s.len()).unwrap_or(0),
+    }
 }
 
 /// The activity/memory **source** string for a consumer name — the value
@@ -2224,5 +2277,90 @@ mod recall_facts_tests {
         assert!(!out.contains("## Project facts"), "{out}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+    use crate::graph::{parse_file, Lang};
+
+    /// The lean-hidden five must all be real, dispatchable tool names, and none
+    /// may be a workhorse — the guard the E0 decision rests on.
+    #[test]
+    fn lean_hidden_are_real_non_workhorse_tools() {
+        let names: Vec<&str> = tool_specs().iter().map(|s| s.name).collect();
+        for h in LEAN_HIDDEN {
+            assert!(names.contains(h), "LEAN_HIDDEN tool `{h}` is not in tool_specs()");
+        }
+        const WORKHORSES: &[&str] = &[
+            "graph_find_symbol", "graph_callers", "graph_callees", "graph_outline",
+            "graph_snippet", "graph_references", "graph_search_docs",
+        ];
+        for w in WORKHORSES {
+            assert!(!LEAN_HIDDEN.contains(w), "workhorse `{w}` must never be lean-hidden");
+        }
+        assert_eq!(LEAN_HIDDEN.len(), 5);
+    }
+
+    /// `lean_filter(_, true)` removes EXACTLY the hidden five and nothing else;
+    /// `false` is a no-op.
+    #[test]
+    fn lean_filter_hides_exactly_lean_hidden() {
+        let full: Vec<&str> = tool_specs().iter().map(|s| s.name).collect();
+        let passed: Vec<&str> = lean_filter(tool_specs(), false).iter().map(|s| s.name).collect();
+        assert_eq!(full, passed, "lean=false must be a no-op");
+
+        let lean: Vec<String> =
+            lean_filter(tool_specs(), true).iter().map(|s| s.name.to_string()).collect();
+        let expected: Vec<String> = tool_specs()
+            .iter()
+            .filter(|s| !LEAN_HIDDEN.contains(&s.name))
+            .map(|s| s.name.to_string())
+            .collect();
+        assert_eq!(lean, expected);
+        for h in LEAN_HIDDEN {
+            assert!(!lean.iter().any(|n| n == h), "`{h}` should be hidden");
+        }
+        assert_eq!(lean.len(), tool_specs().len() - LEAN_HIDDEN.len());
+    }
+
+    /// `surface_stats()` reports exactly the serialized len + count of what each
+    /// consumer actually advertises.
+    #[test]
+    fn surface_stats_match_the_advertised_json() {
+        let s = surface_stats();
+        let mcp = tools();
+        assert_eq!(s.mcp_tools, mcp.len());
+        assert_eq!(s.mcp_chars, serde_json::to_string(&mcp).unwrap().len());
+        let offload = crate::offload::tools::graph_tools::defs();
+        assert_eq!(s.offload_tools, offload.len());
+        assert_eq!(s.offload_chars, serde_json::to_string(&offload).unwrap().len());
+        assert!(s.mcp_chars >= 2);
+    }
+
+    /// Hiding is advertisement-only: `run_tool` still answers a hidden name —
+    /// the dispatch path is name-driven and never consults `lean_tools`.
+    #[test]
+    fn dispatch_still_answers_a_hidden_name() {
+        let dir = std::env::temp_dir().join(format!("lean-dispatch-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/x.rs", "pub fn lonely() {}\n", Lang::Rust))
+            .expect("index");
+        let out = run_tool(&idx, "graph_dead_exports", &serde_json::json!({}), 50, 200, None)
+            .expect("hidden tool still dispatches");
+        assert!(!out.starts_with("unknown graph tool"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E5 helper: print the measured surface so the before/after editorial
+    /// numbers are recordable via `-- --nocapture`. Always passes.
+    #[test]
+    fn print_surface_stats() {
+        let s = surface_stats();
+        eprintln!(
+            "SURFACE_STATS mcp_tools={} mcp_chars={} offload_tools={} offload_chars={}",
+            s.mcp_tools, s.mcp_chars, s.offload_tools, s.offload_chars
+        );
     }
 }

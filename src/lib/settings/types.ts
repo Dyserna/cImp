@@ -827,6 +827,20 @@ export interface GraphSettings {
   // V16 Feature 5: trust TTL in retrieve turns (0 = off) — after this many
   // turns since the advisor last observed a full read, a Read passes again.
   read_advisor_ttl_turns: number;
+  // V17 Phase A: answer a changed-file re-read with a unified diff against the
+  // last-read snapshot instead of the whole file. Default on.
+  read_advisor_diffs: boolean;
+  // V17 Phase B: also intercept a whole-file shell read (cat/Get-Content/type/gc)
+  // of an already-read file via a second PreToolUse Bash matcher. Default on.
+  read_advisor_shell: boolean;
+  // V17 Phase C: first-read tier — KiB threshold at/above which a first
+  // whole-file read of a non-code file is answered with a cached digest +
+  // head/tail sample instead of the full content. 0 = off (default).
+  read_advisor_first_read_kb: number;
+  // V17 Phase E: hide the cold-tail graph tools (cycles, dead_exports,
+  // struct_search, path, architecture) from the advertised tool surface.
+  // Advertisement-only — they still answer if called by name. Default off.
+  lean_tools: boolean;
   // V11 Phase F: local-model context digests (local-only).
   context_llm_digests: boolean;
   // V12 Phase E: memory distillation (durable project facts, local-only).
@@ -1410,6 +1424,10 @@ export function defaultSettings(): Settings {
       read_advisor_min_lines: 300,
       read_advisor_mode: 'advise',
       read_advisor_ttl_turns: 0,
+      read_advisor_diffs: true,
+      read_advisor_shell: true,
+      read_advisor_first_read_kb: 0,
+      lean_tools: false,
       context_llm_digests: false,
       memory_distillation: false,
       promote_pinned_facts: false,

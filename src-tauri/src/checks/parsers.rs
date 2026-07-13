@@ -5,6 +5,8 @@
 //! should degrade the diagnostic count, not break `run_check` outright.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -16,14 +18,20 @@ use super::{Diag, ParserKind, Severity};
 /// ANSI-stripped input — a user-configured checker command can leak color
 /// (FORCE_COLOR, a tool that doesn't tty-detect), and escape sequences glued
 /// to the file path would otherwise break both the regex match and the
-/// downstream changed-file comparison. The JSON parsers don't need it (JSON
-/// string content never carries raw ESC from these tools).
-pub fn parse(kind: ParserKind, stdout: &str, stderr: &str) -> Vec<Diag> {
+/// downstream changed-file comparison. The JSON parsers don't need it at the
+/// top level (JSON string content never carries raw ESC from these tools —
+/// though `jest` embeds color *inside* its JSON message strings, stripped
+/// there). `cwd` is the run root: `jest`/`vitest` report absolute
+/// `testFilePath`s, and only the parser that consumes them needs it to
+/// relativize (see [`parse_jest_json`]); every other arm ignores it.
+pub fn parse(kind: ParserKind, stdout: &str, stderr: &str, cwd: &Path) -> Vec<Diag> {
     match kind {
         ParserKind::CargoJson => parse_cargo_json(stdout),
         ParserKind::EslintJson => parse_eslint_json(stdout),
         ParserKind::Tsc => parse_tsc(&strip_ansi(stdout), &strip_ansi(stderr)),
         ParserKind::Pytest => parse_pytest(&strip_ansi(stdout), &strip_ansi(stderr)),
+        ParserKind::CargoTest => parse_cargo_test(&strip_ansi(stdout), &strip_ansi(stderr)),
+        ParserKind::JestJson => parse_jest_json(stdout, cwd),
         ParserKind::GenericGcc => parse_generic_gcc(&strip_ansi(stdout), &strip_ansi(stderr)),
     }
 }
@@ -308,6 +316,309 @@ fn parse_generic_gcc(stdout: &str, stderr: &str) -> Vec<Diag> {
         .collect()
 }
 
+// ── cargo test (stable text output) ─────────────────────────────────────
+
+fn cargo_panic_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Newer rustc: `… panicked at src/lib.rs:42:9:`; older single-line form:
+    // `… panicked at 'message', src/lib.rs:42:9`. The optional `'…', ` swallows
+    // the old-form message so the capture is the path in both. The non-greedy
+    // path lets the `:line:col` anchor win past a Windows drive letter's own
+    // colon (`C:\repo\lib.rs:42:9`).
+    RE.get_or_init(|| Regex::new(r"panicked at (?:'.*', )?(.+?):(\d+):(\d+)").expect("valid regex"))
+}
+
+fn cargo_panic_tail_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // The *older multi-line* panic form ends the block with the location on its
+    // own tail: `… right: `2`', src/lib.rs:5:5` — the `panicked at` anchor is
+    // several lines up, so `cargo_panic_re` can't see it. Match the trailing
+    // `', <file>:<line>:<col>` instead.
+    RE.get_or_init(|| Regex::new(r"', (.+?):(\d+):(\d+)\s*$").expect("valid regex"))
+}
+
+fn rustc_header_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // rustc's human diagnostic header: `error[E0308]: mismatched types` /
+    // `warning: unused variable` — the code bracket is optional (lints and
+    // `error: aborting due to …` carry none).
+    RE.get_or_init(|| Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_]+)\])?: (.+)$").expect("valid regex"))
+}
+
+fn rustc_arrow_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // The location line under a rustc header: `  --> src/main.rs:10:5`.
+    RE.get_or_init(|| Regex::new(r"^\s*-->\s+(.+?):(\d+):(\d+)").expect("valid regex"))
+}
+
+/// `test tests::foo ... FAILED` ⇒ `Some("tests::foo")`. Only `FAILED` lines
+/// produce a diagnostic — `ok`/`ignored` don't.
+fn failed_test_name(line: &str) -> Option<&str> {
+    Some(line.strip_prefix("test ")?.strip_suffix(" ... FAILED")?.trim())
+}
+
+/// `---- tests::foo stdout ----` (or `stderr`) ⇒ `Some("tests::foo")`.
+fn stdout_block_name(line: &str) -> Option<&str> {
+    let inner = line.strip_prefix("---- ")?.strip_suffix(" ----")?;
+    let name = inner.strip_suffix(" stdout").or_else(|| inner.strip_suffix(" stderr")).unwrap_or(inner);
+    Some(name.trim())
+}
+
+/// Capture one failure's stdout block starting at `start`, stopping at the next
+/// block header / the `failures:` summary list / the `test result:` tail / EOF.
+/// Returns the block's lines and the index to resume scanning from.
+fn capture_block<'a>(lines: &[&'a str], start: usize) -> (Vec<&'a str>, usize) {
+    let mut block = Vec::new();
+    let mut i = start;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        if (t.starts_with("---- ") && t.ends_with(" ----")) || t == "failures:" || t.starts_with("test result:") {
+            break;
+        }
+        block.push(lines[i]);
+        i += 1;
+    }
+    (block, i)
+}
+
+/// Join the first `max` lines of a block (leading/trailing blank lines
+/// trimmed) — the truncated context that becomes a failure's message.
+fn truncate_lines(block: &[&str], max: usize) -> String {
+    let start = block.iter().position(|l| !l.trim().is_empty()).unwrap_or(block.len());
+    let end = block.iter().rposition(|l| !l.trim().is_empty()).map(|i| i + 1).unwrap_or(start);
+    let trimmed = &block[start..end];
+    let take = trimmed.len().min(max);
+    trimmed[..take].join("\n")
+}
+
+/// Resolve a panic's `file:line:col` from a failure block: the modern anchored
+/// form first (the `panicked at …:line:col` line), then the older multi-line
+/// tail form (`', file:line:col`).
+fn panic_location(block: &[&str]) -> Option<(String, u32, u32)> {
+    let loc = |c: &regex::Captures| Some((c[1].to_string(), c[2].parse().ok()?, c[3].parse().ok()?));
+    for line in block {
+        if let Some(c) = cargo_panic_re().captures(line) {
+            return loc(&c);
+        }
+    }
+    for line in block {
+        if let Some(c) = cargo_panic_tail_re().captures(line) {
+            return loc(&c);
+        }
+    }
+    None
+}
+
+/// rustc's two-line human diagnostic: an `error[E0308]: msg` / `warning: msg`
+/// header followed within a couple of lines by `  --> file:line:col`. The
+/// generic matcher can't see these (the header carries no `file:line`, and the
+/// `-->` line is indented decoration it deliberately rejects), so a
+/// compile-error `run_check` would otherwise report nothing.
+fn parse_rustc_human(lines: &[&str]) -> Vec<Diag> {
+    let header = rustc_header_re();
+    let arrow = rustc_arrow_re();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(caps) = header.captures(line.trim_end()) else { continue };
+        let severity = if &caps[1] == "error" { Severity::Error } else { Severity::Warning };
+        let (mut file, mut line_no, mut col) = (String::new(), 0u32, None);
+        for look in lines.iter().skip(i + 1).take(3) {
+            if let Some(a) = arrow.captures(look) {
+                file = a[1].to_string();
+                line_no = a[2].parse().unwrap_or(0);
+                col = a[3].parse().ok();
+                break;
+            }
+        }
+        out.push(Diag {
+            severity,
+            code: caps.get(2).map(|m| m.as_str().to_string()),
+            message: caps[3].to_string(),
+            file,
+            line: line_no,
+            col,
+        });
+    }
+    out
+}
+
+/// `cargo test`'s stable text output. Each `test <name> ... FAILED` line is one
+/// `Error` diag (`"<name> failed"`), upgraded in place when its
+/// `---- <name> stdout ----` panic block follows: the block (first ~15 lines)
+/// becomes the message and the `panicked at file:line:col` location fills
+/// `file`/`line`/`col`. The tail `test result: …` line folds in as a file-less
+/// `Note` (the pytest tail-line trick) so a clean run still renders its counts
+/// instead of `"No diagnostics."`. When the build never got to running tests (a
+/// compile error aborts first — no `test …` line appears at all) the input is
+/// additionally run through the generic matcher plus a local rustc two-line
+/// pass, so the compile error surfaces instead of nothing.
+fn parse_cargo_test(stdout: &str, stderr: &str) -> Vec<Diag> {
+    let combined: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
+    let mut out: Vec<Diag> = Vec::new();
+    let mut idx_of: HashMap<String, usize> = HashMap::new();
+    let mut saw_test_line = false;
+
+    let mut i = 0;
+    while i < combined.len() {
+        let trimmed = combined[i].trim();
+
+        if let Some(name) = failed_test_name(trimmed) {
+            saw_test_line = true;
+            idx_of.entry(name.to_string()).or_insert_with(|| {
+                out.push(Diag {
+                    severity: Severity::Error,
+                    code: None,
+                    message: format!("{name} failed"),
+                    file: String::new(),
+                    line: 0,
+                    col: None,
+                });
+                out.len() - 1
+            });
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("test ") && trimmed.contains(" ... ") {
+            saw_test_line = true;
+        }
+        if let Some(rest) = trimmed.strip_prefix("test result:") {
+            saw_test_line = true;
+            out.push(Diag {
+                severity: Severity::Note,
+                code: None,
+                message: format!("test result:{rest}"),
+                file: String::new(),
+                line: 0,
+                col: None,
+            });
+            i += 1;
+            continue;
+        }
+        if let Some(name) = stdout_block_name(trimmed) {
+            let (block, next) = capture_block(&combined, i + 1);
+            if let Some(&di) = idx_of.get(name) {
+                let msg = truncate_lines(&block, 15);
+                if !msg.is_empty() {
+                    out[di].message = msg;
+                }
+                if let Some((f, l, c)) = panic_location(&block) {
+                    out[di].file = f;
+                    out[di].line = l;
+                    out[di].col = Some(c);
+                }
+            }
+            i = next;
+            continue;
+        }
+        i += 1;
+    }
+
+    // A compile error aborts before any test line — surface it via the generic
+    // matcher plus the local rustc two-line pass (`parse_rustc_human`).
+    if !saw_test_line {
+        out.extend(parse_generic_gcc(stdout, stderr));
+        out.extend(parse_rustc_human(&combined));
+    }
+    out
+}
+
+// ── jest / vitest --json ────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct JestReport {
+    #[serde(default, rename = "numPassedTests")]
+    num_passed_tests: Option<u64>,
+    #[serde(default, rename = "numFailedTests")]
+    num_failed_tests: Option<u64>,
+    #[serde(default, rename = "testResults")]
+    test_results: Vec<JestFileResult>,
+}
+
+#[derive(Deserialize)]
+struct JestFileResult {
+    #[serde(default, rename = "testFilePath")]
+    test_file_path: String,
+    #[serde(default, rename = "assertionResults")]
+    assertion_results: Vec<JestAssertion>,
+}
+
+#[derive(Deserialize)]
+struct JestAssertion {
+    #[serde(default)]
+    status: String,
+    #[serde(default, rename = "failureMessages")]
+    failure_messages: Vec<String>,
+}
+
+/// Strip `cwd` from an absolute path when it's a textual prefix (after
+/// slash-normalization — no disk `canonicalize`, so this works on the parser's
+/// captured output alone). A path outside `cwd` is left as-is; `checks::run`'s
+/// `normalize_rel` still canonicalizes it for the changed-file comparison,
+/// exactly as it does for eslint's absolute `filePath`s.
+fn relativize(cwd: &Path, abs: &str) -> String {
+    let abs_fwd = abs.replace('\\', "/");
+    let cwd_fwd = cwd.to_string_lossy().replace('\\', "/");
+    let cwd_fwd = cwd_fwd.trim_end_matches('/');
+    if !cwd_fwd.is_empty() {
+        if let Some(rest) = abs_fwd.strip_prefix(cwd_fwd) {
+            let rest = rest.trim_start_matches('/');
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+    }
+    abs_fwd
+}
+
+/// Join the first `max` lines of `s`.
+fn first_lines(s: &str, max: usize) -> String {
+    s.lines().take(max).collect::<Vec<_>>().join("\n")
+}
+
+/// The whole output is one JSON document (`jest --json` / `vitest
+/// --reporter=json`). Malformed/truncated ⇒ no diagnostics (module posture),
+/// never an error. Each failed `assertionResults[]` entry becomes one `Error`
+/// from the first ~5 lines of `failureMessages[0]` (ANSI-stripped — jest embeds
+/// color codes *inside* the JSON string); `testFilePath` is absolute, so it's
+/// relativized against the run `cwd`. Top-level `numPassed/FailedTests` fold in
+/// as the counts `Note`.
+fn parse_jest_json(stdout: &str, cwd: &Path) -> Vec<Diag> {
+    let doc = stdout.trim_start_matches('\u{feff}').trim();
+    let Ok(report) = serde_json::from_str::<JestReport>(doc) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for file in &report.test_results {
+        let rel = relativize(cwd, &file.test_file_path);
+        for a in &file.assertion_results {
+            if a.status != "failed" {
+                continue;
+            }
+            let raw = a.failure_messages.first().map(String::as_str).unwrap_or("");
+            out.push(Diag {
+                severity: Severity::Error,
+                code: None,
+                message: first_lines(strip_ansi(raw).as_ref(), 5),
+                file: rel.clone(),
+                line: 0,
+                col: None,
+            });
+        }
+    }
+    if report.num_passed_tests.is_some() || report.num_failed_tests.is_some() {
+        let (p, f) = (report.num_passed_tests.unwrap_or(0), report.num_failed_tests.unwrap_or(0));
+        out.push(Diag {
+            severity: Severity::Note,
+            code: None,
+            message: format!("{p} passed, {f} failed"),
+            file: String::new(),
+            line: 0,
+            col: None,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,7 +753,7 @@ not json at all
     #[test]
     fn ansi_colored_output_still_parses() {
         let colored = "\x1b[96msrc/app.ts\x1b[0m(\x1b[93m12\x1b[0m,\x1b[93m5\x1b[0m): \x1b[91merror\x1b[0m TS2345: bad arg\n";
-        let diags = parse(ParserKind::Tsc, colored, "");
+        let diags = parse(ParserKind::Tsc, colored, "", Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].file, "src/app.ts");
         assert_eq!(diags[0].line, 12);
@@ -505,5 +816,113 @@ not json at all
         assert_eq!(diags[0].file, r"C:\repo\src\main.c");
         assert_eq!(diags[0].line, 10);
         assert_eq!(diags[0].severity, Severity::Error);
+    }
+
+    // ── cargo test ──────────────────────────────────────────────────────
+
+    const CARGO_TEST_FAIL: &str = "running 2 tests\ntest tests::adds ... FAILED\ntest tests::subs ... FAILED\n\nfailures:\n\n---- tests::adds stdout ----\nthread 'tests::adds' panicked at src/math.rs:12:9:\nassertion `left == right` failed\n  left: 4\n right: 5\n\n---- tests::subs stdout ----\nthread 'tests::subs' panicked at src/math.rs:20:5:\ncalled `Option::unwrap()` on a `None` value\n\nfailures:\n    tests::adds\n    tests::subs\n\ntest result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n";
+
+    #[test]
+    fn cargo_test_failures_with_panic_locations_and_tail() {
+        let diags = parse_cargo_test(CARGO_TEST_FAIL, "");
+        assert_eq!(diags.len(), 3, "2 failures + tail Note: {diags:?}");
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].file, "src/math.rs");
+        assert_eq!(diags[0].line, 12);
+        assert_eq!(diags[0].col, Some(9));
+        assert!(diags[0].message.contains("panicked at"), "block folded in: {}", diags[0].message);
+        assert_eq!(diags[1].severity, Severity::Error);
+        assert_eq!(diags[1].file, "src/math.rs");
+        assert_eq!(diags[1].line, 20);
+        assert_eq!(diags[2].severity, Severity::Note);
+        assert!(diags[2].message.contains("2 failed"));
+    }
+
+    const CARGO_TEST_PASS: &str = "running 3 tests\ntest tests::a ... ok\ntest tests::b ... ok\ntest tests::c ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+
+    #[test]
+    fn cargo_test_clean_run_yields_counts_note_only() {
+        let diags = parse_cargo_test(CARGO_TEST_PASS, "");
+        assert_eq!(diags.len(), 1, "clean run ⇒ just the counts Note: {diags:?}");
+        assert_eq!(diags[0].severity, Severity::Note);
+        assert!(diags[0].message.contains("3 passed"));
+        assert!(diags[0].message.contains("test result: ok"));
+    }
+
+    const CARGO_COMPILE_ERROR: &str = "   Compiling foo v0.1.0 (/repo)\nerror[E0308]: mismatched types\n  --> src/main.rs:10:5\n   |\n10 |     let x: u32 = \"hello\";\n   |                  ^^^^^^^ expected `u32`, found `&str`\n\nerror: aborting due to 1 previous error\n";
+
+    #[test]
+    fn cargo_test_compile_error_before_tests_surfaces_rustc_error() {
+        let diags = parse_cargo_test(CARGO_COMPILE_ERROR, "");
+        let e0308 = diags.iter().find(|d| d.code.as_deref() == Some("E0308")).expect("E0308 surfaced");
+        assert_eq!(e0308.severity, Severity::Error);
+        assert_eq!(e0308.file, "src/main.rs");
+        assert_eq!(e0308.line, 10);
+        assert_eq!(e0308.col, Some(5));
+        assert!(e0308.message.contains("mismatched types"));
+    }
+
+    #[test]
+    fn cargo_test_stdout_block_truncated_to_15_lines() {
+        let mut s = String::from(
+            "test tests::big ... FAILED\n\nfailures:\n\n---- tests::big stdout ----\nthread 'tests::big' panicked at src/x.rs:1:1:\n",
+        );
+        for i in 0..40 {
+            s.push_str(&format!("line {i}\n"));
+        }
+        s.push_str("\ntest result: FAILED. 0 passed; 1 failed;\n");
+        let diags = parse_cargo_test(&s, "");
+        let fail = &diags[0];
+        assert_eq!(fail.severity, Severity::Error);
+        assert!(fail.message.lines().count() <= 15, "block truncated: {}", fail.message.lines().count());
+        assert_eq!(fail.file, "src/x.rs");
+    }
+
+    #[test]
+    fn cargo_test_old_multiline_panic_form_resolves_location() {
+        // Pre-1.73 form: `panicked at 'msg…', file:line:col` with the location
+        // on the block's tail line, not the `panicked at` line.
+        let out = "test tests::t ... FAILED\n\nfailures:\n\n---- tests::t stdout ----\nthread 'tests::t' panicked at 'assertion failed: `(left == right)`\n  left: `1`,\n right: `2`', src/helper.rs:5:5\n\ntest result: FAILED. 0 passed; 1 failed;\n";
+        let diags = parse_cargo_test(out, "");
+        assert_eq!(diags[0].file, "src/helper.rs");
+        assert_eq!(diags[0].line, 5);
+        assert_eq!(diags[0].col, Some(5));
+    }
+
+    // ── jest / vitest ───────────────────────────────────────────────────
+
+    #[test]
+    fn jest_json_failures_relativized_with_counts_note() {
+        // Build the report with a real ESC byte in the failure message, then
+        // serialize it (serde escapes the ESC as a JSON unicode escape, i.e.
+        // valid JSON) so the parser has to strip the embedded color back out.
+        let msg = "\u{1b}[31mError: expected 2 to equal 3\u{1b}[0m\n    at Object.<anonymous> (/repo/src/math.test.js:10:20)\n    at line3\n    at line4\n    at line5\n    at line6";
+        let doc = serde_json::json!({
+            "numPassedTests": 3,
+            "numFailedTests": 1,
+            "testResults": [{
+                "testFilePath": "/repo/src/math.test.js",
+                "assertionResults": [
+                    {"status": "passed", "title": "adds"},
+                    {"status": "failed", "title": "subtracts", "failureMessages": [msg]}
+                ]
+            }]
+        })
+        .to_string();
+        let diags = parse_jest_json(&doc, Path::new("/repo"));
+        assert_eq!(diags.len(), 2, "1 failure + counts Note: {diags:?}");
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].file, "src/math.test.js");
+        assert!(!diags[0].message.contains('\u{1b}'), "ANSI stripped: {:?}", diags[0].message);
+        assert!(diags[0].message.contains("expected 2 to equal 3"));
+        assert!(diags[0].message.lines().count() <= 5, "capped to ~5 lines");
+        assert_eq!(diags[1].severity, Severity::Note);
+        assert!(diags[1].message.contains("3 passed"));
+        assert!(diags[1].message.contains("1 failed"));
+    }
+
+    #[test]
+    fn jest_json_malformed_yields_empty() {
+        assert!(parse_jest_json("not json", Path::new("/repo")).is_empty());
     }
 }

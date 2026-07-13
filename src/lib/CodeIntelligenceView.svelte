@@ -454,9 +454,21 @@
           next.graph.context_turn_budget_chars = val;
           break;
         // V16 drift rules (drift.read_reason.v1 / drift.read_bypass.v1):
-        // the only boolean the advisor can propose — always a disable.
+        // a boolean the advisor can propose — a disable. V17 Phase F
+        // (adopt.read_advisor.v1) reuses the same case to propose ENABLING it,
+        // so parse the proposed bool rather than assuming a disable.
         case 'graph.read_advisor':
           next.graph.read_advisor = p.proposed === 'true';
+          break;
+        // V17 Phase E (surface.lean.v1): hide the cold-tail graph tools.
+        case 'graph.lean_tools':
+          next.graph.lean_tools = p.proposed === 'true';
+          break;
+        // V17 Phase F (adopt.read_advisor_substitute.v1): the first
+        // string-valued proposal — write the proposed mode string as-is
+        // (e.g. "advise" → "substitute"), not the numeric `val` above.
+        case 'graph.read_advisor_mode':
+          next.graph.read_advisor_mode = p.proposed;
           break;
         default:
           // A rule proposing a setting this switch doesn't know is a bug
@@ -553,6 +565,9 @@
     'drift.usage_fields_gone.v1: ≥2 Claude sessions, all without token fields → the transcript usage schema changed.\n' +
     'drift.payload.v1: any shim-reported payload missing required fields.\n' +
     'drift.read_bypass.v1: ≥10 reminders, ≥40% answered via shell reads (est.) → disable read_advisor.\n' +
+    'surface.lean.v1: ≥10 sessions, 0 calls to any cold-tail graph tool (cycles, dead_exports, struct_search, path, architecture) → enable lean_tools (hide them from the advertised surface; they still answer if called).\n' +
+    'adopt.read_advisor.v1: ≥5 sessions, E1 verified (pass), ≥3 redundant large re-reads per session across ≥10 sessions (est.; external tools may have changed the file between reads) → enable read_advisor.\n' +
+    'adopt.read_advisor_substitute.v1: read_advisor on in advise mode, ≥20 reminders, ≤20% re-read anyway, low shell bypass → switch read_advisor_mode to substitute.\n' +
     'After an Apply, that rule stays quiet for 3 further sessions so fresh post-change data can accumulate before it re-evaluates.';
 
   // ── V16 Feature 8: tokens | est. cost toggle ─────────────────────────
@@ -918,6 +933,15 @@
           <div>
             <span class="num">{usage.offload_local_tasks.toLocaleString()}</span>
             <span class="lbl">tasks served locally — see the <em>Offload Server</em> tab</span>
+          </div>
+          <div>
+            <span
+              class="num"
+              title="Serialized size of the graph tool descriptors advertised to the cloud session and the offload worker — cache-written once per session. Toggle Settings → Code Graph → lean tool surface to trim the cold-tail tools."
+            >{usage.surface.mcp_tools.toLocaleString()}</span>
+            <span class="lbl">tool surface: {usage.surface.mcp_chars.toLocaleString()} chars, cache-written once per session
+              <span class="est-badge">est. ~{Math.round(usage.surface.mcp_chars / 4).toLocaleString()} tok</span>
+            </span>
           </div>
         </div>
       {/if}

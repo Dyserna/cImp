@@ -32,6 +32,10 @@ Thumbs.db
 **/.claude/settings.local.json
 **/.claude/scheduled_tasks.lock
 
+# OpenCode local state (plugin node_modules etc., dropped wherever an
+# OpenCode tab ran — e.g. src-tauri/.opencode from a spike session)
+**/.opencode/
+
 # CIMP local custom config (per-machine layout / session / avatar / TTS
 # state). The active overlay now lives at `.cimp/config.json` and is covered
 # by the `**/.cimp/` rule below; these entries ignore the pre-consolidation

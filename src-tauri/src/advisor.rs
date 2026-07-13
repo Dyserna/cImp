@@ -82,6 +82,47 @@ pub const RULE_MIN_SCORE: &str = "advisor.raise_context_min_score.v1";
 pub const RULE_ADVISOR_LINES: &str = "advisor.raise_read_advisor_min_lines.v1";
 pub const RULE_TURN_BUDGET: &str = "advisor.lower_context_turn_budget_chars.v1";
 
+/// V17 Phase E: propose hiding the cold-tail graph tools once enough sessions
+/// have gone by with zero calls to any of them. Standard propose-with-Apply
+/// (writes `graph.lean_tools = true`). Signature is the fixed `"zero-usage"`:
+/// a single call to any hidden tool moves the signal off zero and silences it,
+/// so there's no rate to bucket.
+pub const RULE_SURFACE_LEAN: &str = "surface.lean.v1";
+/// `surface.lean.v1`'s session floor — higher than `MIN_SESSIONS` (5) because
+/// "nobody used these tools" is only convincing after a fair run of sessions.
+pub const SURFACE_LEAN_MIN_SESSIONS: u64 = 10;
+
+// ── V17 Phase F — graduation rules (`adopt.*`) ──────────────────────────
+//
+// These propose ENABLING a token-saving feature once its precondition data
+// says it would help AND (for the advisor) the harness contract it depends on
+// is *proven* (`e1_pass`, not merely unverified). Same versioned-id + dismiss
+// discipline as the tuning rules; behind the same global `MIN_SESSIONS` floor.
+
+/// Propose turning the read advisor ON when the project keeps redundantly
+/// re-reading large files with no edit in between and the E1 deny-reason
+/// contract is verified. Signature = rounded redundant-reads-per-session.
+pub const RULE_ADOPT_ADVISOR: &str = "adopt.read_advisor.v1";
+/// Propose upgrading the advisor from advise-only to substitute mode when
+/// reminders almost never lead to a full re-read (the outline is enough) and
+/// shell bypass is low. Signature = the bucketed reread rate.
+pub const RULE_ADOPT_SUBSTITUTE: &str = "adopt.read_advisor_substitute.v1";
+
+/// `adopt.read_advisor.v1`: redundant same-file re-reads per session at or
+/// above this proposes enabling the advisor.
+const ADOPT_REDUNDANT_HIGH: f64 = 3.0;
+/// `adopt.read_advisor.v1`: distinct sessions of evidence required — a full
+/// window's worth (the caller passes `last_sessions = 10`).
+const ADOPT_MIN_SESSIONS: u64 = 10;
+/// `adopt.read_advisor_substitute.v1`: a remind→full-reread rate at or below
+/// this means the outline is evidently enough — safe to substitute the body.
+/// Deliberately disjoint from `REREAD_HIGH` (0.5), so this rule and
+/// `RULE_ADVISOR_LINES` can never fire on the same rate (pinned by a test).
+const SUBSTITUTE_REREAD_LOW: f64 = 0.2;
+/// `adopt.read_advisor_substitute.v1`: reminders observed before the low
+/// reread rate is trustworthy (same 20 as the tuning rule's `MIN_REMINDS`).
+const SUBSTITUTE_MIN_SAMPLES: u64 = 20;
+
 // ── V16 Feature 1/2/3/4 — drift canary rule class ───────────────────────
 //
 // Same versioned-id + dismiss-memory discipline as the tuning rules, but a
@@ -101,6 +142,7 @@ pub const RULE_DRIFT_INJECTION_UNSEEN: &str = "drift.injection_unseen.v1";
 pub const RULE_DRIFT_USAGE_FIELDS: &str = "drift.usage_fields_gone.v1";
 pub const RULE_DRIFT_PAYLOAD: &str = "drift.payload.v1";
 pub const RULE_DRIFT_READ_BYPASS: &str = "drift.read_bypass.v1";
+pub const RULE_DRIFT_SUBAGENT: &str = "drift.subagent_transcripts.v1";
 
 /// `drift.read_reason.v1`: reminders observed before the ~100%-reread check
 /// can speak. Lower than the tuning rule's `MIN_REMINDS` (20) — this is a
@@ -199,11 +241,42 @@ pub struct Signals {
     /// summaries from `contract_drift` Activity events this run. Empty =
     /// no payload drift observed.
     pub contract_drift: Vec<String>,
+    /// V17.1 (`drift.subagent_transcripts.v1`): summaries of
+    /// `subagent_drift` Activity events this run — the Claude OOB tap
+    /// reporting that the sub-agent transcript contract moved again
+    /// (transcripts neither inline nor under `subagents/*.jsonl`, or the
+    /// launcher tool renamed). Empty = healthy.
+    pub subagent_drift: Vec<String>,
     /// Feature 4 (`drift.read_bypass.v1`): share of reminders answered with
     /// a shell read of the same file within the bypass window, plus the
     /// remind count backing it. `None` when the advisor never reminded.
     pub bypass_rate: Option<f64>,
     pub bypass_samples: u64,
+
+    // ── V17 Phase E — lean tool surface (`surface.lean.v1`) ─────────────
+    /// Total calls to any `graph::LEAN_HIDDEN` tool observed in the Activity
+    /// ring. `0` is the fire condition; any call silences the rule.
+    pub hideable_tool_calls: u64,
+    /// The measured advertised MCP tool-surface size in chars
+    /// (`graph::surface_stats().mcp_chars`) — cited in the rule's rationale so
+    /// the number is honest and current. `evaluate` stays pure: the caller
+    /// measures this, the rule only formats it.
+    pub surface_chars: u64,
+
+    // ── V17 Phase F — graduation rules (`adopt.*`) ──────────────────────
+    /// Phase F1: redundant same-file re-read PAIRS per session over the last
+    /// 10 sessions (pairs ÷ sessions scanned, from
+    /// `GraphIndex::redundant_read_candidates`). `None` when this project has
+    /// recorded no reads. Drives `adopt.read_advisor.v1`.
+    pub redundant_reads_per_session: Option<f64>,
+    /// Phase F1: distinct sessions backing `redundant_reads_per_session` — its
+    /// own sample floor (the rule wants ≥10 sessions of evidence).
+    pub redundant_read_sessions: u64,
+    /// Phase F2: STRICTLY `harness_versions.e1_status` trimmed+lowercased ==
+    /// `"pass"` — NOT merely `!e1_blocked()`. "Verified OK" must mean *proven*:
+    /// an `"unverified"` E1 (the default) must never auto-graduate a hook we've
+    /// never seen work. Gates `adopt.read_advisor.v1`.
+    pub e1_pass: bool,
 }
 
 /// One budget-tuning proposal: a setting, its current and proposed values
@@ -272,7 +345,16 @@ pub fn evaluate(sig: &Signals) -> Vec<Proposal> {
     // how extreme an individual rate looks.
     if sig.session_count >= MIN_SESSIONS {
         out.extend(tuning_rules(sig, advisor_disable_proposed));
+        // V17 Phase F graduation rules share the tuning floor: enabling a
+        // feature project-wide is as consequential as retuning one.
+        out.extend(adopt_rules(sig, advisor_disable_proposed));
     }
+
+    // V17 Phase E — the lean-surface rule carries its OWN session floor
+    // (`SURFACE_LEAN_MIN_SESSIONS`, higher than the tuning floor), so it's
+    // evaluated unconditionally like the drift canaries rather than under the
+    // `MIN_SESSIONS` gate.
+    out.extend(surface_rules(sig));
 
     // Apply cooldown, last so it covers every rule class uniformly: a rule
     // the user just applied doesn't speak again until the root has seen
@@ -509,6 +591,39 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
         }
     }
 
+    // V17.1 — drift.subagent_transcripts.v1: the Claude OOB tap reported
+    // that sub-agent traffic is visible in neither of the two known
+    // transcript locations (or the launcher tool was renamed). One event is
+    // enough — the tap rate-limits itself to one report per session, and a
+    // moved contract is a fact. Signature = the seen Claude version, so a
+    // dismissal holds until the next harness update (same boundary as the
+    // version tripwire — this drift IS a harness-update symptom).
+    if !sig.subagent_drift.is_empty() {
+        let mut what = sig.subagent_drift.clone();
+        what.sort();
+        what.dedup();
+        let signature = version_signature(&sig.claude_last_seen);
+        if !is_dismissed(&sig.dismissed, RULE_DRIFT_SUBAGENT, &signature) {
+            out.push(Proposal {
+                setting: String::new(),
+                current: what.join(", "),
+                proposed: "sub-agent transcripts tailed (usage + agents-active tracked)"
+                    .to_string(),
+                rationale: format!(
+                    "The Claude transcript tap reported sub-agent contract drift this run: \
+                     {}. Until the tail is re-pointed, sub-agent token spend may be missing \
+                     from the Usage section and/or the agents-active avatar hold may be \
+                     dead — verify the transcript layout per MAINTENANCE.md.",
+                    what.join("; ")
+                ),
+                rule_id: RULE_DRIFT_SUBAGENT,
+                signature,
+                warn_only: true,
+                action: None,
+            });
+        }
+    }
+
     // Feature 4 — drift.read_bypass.v1: the agent routes around the advisor
     // with shell reads — same tokens spent, PLUS the remind overhead, MINUS
     // memory's read tracking. Strictly worse than no advisor: propose
@@ -526,11 +641,134 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                             "{:.0}% of read-advisor reminders were answered with a shell read \
                              of the same file (est., n={} reminders) — the agent is routing \
                              around the advisor, which costs the same tokens plus the remind \
-                             overhead and loses memory's read tracking. Better off disabled.",
+                             overhead and loses memory's read tracking. With V17 shell \
+                             interception live, whole-file reads (`cat`, `Get-Content`) are \
+                             already caught, so a persistently high rate points at RESIDUAL \
+                             escape routes (`sed -n`, `head`, `tail`, redirections) the strict \
+                             parser can't intercept — better off disabled.",
                             rate * 100.0,
                             sig.bypass_samples
                         ),
                         rule_id: RULE_DRIFT_READ_BYPASS,
+                        signature,
+                        warn_only: false,
+                        action: None,
+                    });
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// The V17 Phase E lean-surface rule. Carries its own session floor
+/// (`SURFACE_LEAN_MIN_SESSIONS`); a single call to any hidden tool moves
+/// `hideable_tool_calls` off zero and silences it (fixed `"zero-usage"`
+/// signature — no rate to bucket).
+fn surface_rules(sig: &Signals) -> Vec<Proposal> {
+    let mut out = Vec::new();
+    if !sig.graph.lean_tools
+        && sig.session_count >= SURFACE_LEAN_MIN_SESSIONS
+        && sig.hideable_tool_calls == 0
+    {
+        let signature = "zero-usage".to_string();
+        if !is_dismissed(&sig.dismissed, RULE_SURFACE_LEAN, &signature) {
+            out.push(Proposal {
+                setting: "graph.lean_tools".to_string(),
+                current: "false".to_string(),
+                proposed: "true".to_string(),
+                rationale: format!(
+                    "None of the cold-tail graph tools (graph_cycles, graph_dead_exports, \
+                     graph_struct_search, graph_path, graph_architecture) were called across {} \
+                     sessions — hiding them trims the tool descriptors from the ~{} chars (est.) \
+                     cache-written once per session. Advertisement-only: each still answers if \
+                     called by name, so nothing breaks.",
+                    sig.session_count, sig.surface_chars
+                ),
+                rule_id: RULE_SURFACE_LEAN,
+                signature,
+                warn_only: false,
+                action: None,
+            });
+        }
+    }
+    out
+}
+
+/// The V17 Phase F graduation rules (`adopt.*`). Behind the global
+/// cold-start floor (enforced by the caller, same as the tuning rules).
+/// `advisor_disable_proposed` suppresses `adopt.read_advisor.v1` when a drift
+/// rule already proposed turning the advisor off — never propose ENABLING
+/// what drift says is broken.
+fn adopt_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> {
+    let mut out = Vec::new();
+
+    // adopt.read_advisor.v1 — the advisor is off, the project keeps redundantly
+    // re-reading big files (no edit in between), and the E1 deny-reason
+    // contract is PROVEN (not merely unverified): propose turning it on.
+    if !sig.graph.read_advisor && sig.e1_pass && !advisor_disable_proposed {
+        if let Some(rate) = sig.redundant_reads_per_session {
+            if rate >= ADOPT_REDUNDANT_HIGH && sig.redundant_read_sessions >= ADOPT_MIN_SESSIONS {
+                // Signature = rounded redundant-reads-per-session: a materially
+                // changed rate (a different whole number of redundant re-reads
+                // per session) re-fires past a dismissal; within-integer noise
+                // stays suppressed.
+                let signature = (rate.round() as u64).to_string();
+                if !is_dismissed(&sig.dismissed, RULE_ADOPT_ADVISOR, &signature) {
+                    out.push(Proposal {
+                        setting: "graph.read_advisor".to_string(),
+                        current: "false".to_string(),
+                        proposed: "true".to_string(),
+                        rationale: format!(
+                            "This project redundantly re-read the same large files ~{:.1} times \
+                             per session across {} sessions with no edit in between (est. — \
+                             external tools may have changed the file between reads), and the E1 \
+                             deny-reason contract is verified — turning the read advisor on would \
+                             substitute an outline for those repeat full reads.",
+                            rate, sig.redundant_read_sessions
+                        ),
+                        rule_id: RULE_ADOPT_ADVISOR,
+                        signature,
+                        warn_only: false,
+                        action: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // adopt.read_advisor_substitute.v1 — the advisor is on in advise-only mode,
+    // reminders almost never lead to a full re-read (the outline is enough),
+    // and shell bypass is low: propose upgrading to substitute mode (inject the
+    // outline body in place of the repeat read). Mutually exclusive with
+    // `RULE_ADVISOR_LINES` by construction — that rule needs reread_rate ≥
+    // REREAD_HIGH (0.5), this needs ≤ SUBSTITUTE_REREAD_LOW (0.2); the ranges
+    // can't overlap (pinned by `substitute_and_min_lines_rules_never_co_fire`).
+    if sig.graph.read_advisor && sig.graph.read_advisor_mode == "advise" {
+        if let Some(rate) = sig.advisor_reread_rate {
+            // A missing bypass rate (the advisor never bypassed this run) is
+            // "not high", so it doesn't block the upgrade.
+            let bypass_ok = sig.bypass_rate.is_none_or(|b| b < BYPASS_HIGH);
+            if rate <= SUBSTITUTE_REREAD_LOW
+                && sig.advisor_reread_samples >= SUBSTITUTE_MIN_SAMPLES
+                && bypass_ok
+            {
+                let signature = bucket10(rate);
+                if !is_dismissed(&sig.dismissed, RULE_ADOPT_SUBSTITUTE, &signature) {
+                    out.push(Proposal {
+                        setting: "graph.read_advisor_mode".to_string(),
+                        current: sig.graph.read_advisor_mode.clone(),
+                        proposed: "substitute".to_string(),
+                        rationale: format!(
+                            "Only {:.0}% of read-advisor reminders were followed by a full \
+                             re-read (n={} reminders) and shell bypass is low — the outline is \
+                             evidently enough, so switching from advise to substitute mode can \
+                             inject the outline body in place of the repeat read.",
+                            rate * 100.0,
+                            sig.advisor_reread_samples
+                        ),
+                        rule_id: RULE_ADOPT_SUBSTITUTE,
                         signature,
                         warn_only: false,
                         action: None,
@@ -1135,6 +1373,34 @@ mod tests {
     }
 
     #[test]
+    fn subagent_drift_fires_on_any_subagent_drift_event() {
+        let summary = "subagents/*.jsonl present but no Task/Agent launch tool_use recognized";
+        let sig = Signals {
+            subagent_drift: vec![summary.to_string()],
+            claude_last_seen: "2.2.0".to_string(),
+            ..Signals::default()
+        };
+        let props = evaluate(&sig);
+        let p = props.iter().find(|p| p.rule_id == RULE_DRIFT_SUBAGENT).expect("fires");
+        assert!(p.warn_only);
+        assert!(p.rationale.contains(summary));
+        // Version-keyed signature: a dismissal holds until the next harness
+        // update re-fires the rule (same boundary as the version tripwire).
+        assert_eq!(p.signature, "2.2.0");
+
+        // Dismissed for this version ⇒ quiet.
+        let mut sig = sig;
+        sig.dismissed = vec![DismissedRule {
+            rule_id: RULE_DRIFT_SUBAGENT.to_string(),
+            signature: "2.2.0".to_string(),
+        }];
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_SUBAGENT));
+
+        // No events ⇒ silent.
+        assert!(!evaluate(&Signals::default()).iter().any(|p| p.rule_id == RULE_DRIFT_SUBAGENT));
+    }
+
+    #[test]
     fn read_bypass_drift_proposes_disabling_at_the_threshold() {
         let mut graph = GraphSettings::default();
         graph.read_advisor = true;
@@ -1173,5 +1439,267 @@ mod tests {
         g.read_advisor = true;
         g.read_advisor = val;
         assert!(!g.read_advisor);
+    }
+
+    // ── V17 Phase E — surface.lean.v1 ───────────────────────────────────
+
+    /// Signals for the lean-surface rule: enough sessions, zero hideable calls,
+    /// lean off. `surface_chars` non-zero so the rationale reads honestly.
+    fn surface_lean_signals() -> Signals {
+        Signals {
+            session_count: SURFACE_LEAN_MIN_SESSIONS,
+            hideable_tool_calls: 0,
+            surface_chars: 9_000,
+            graph: GraphSettings::default(), // lean_tools = false
+            ..Signals::default()
+        }
+    }
+
+    #[test]
+    fn surface_lean_fires_on_zero_calls_after_enough_sessions() {
+        let props = evaluate(&surface_lean_signals());
+        let p = props.iter().find(|p| p.rule_id == RULE_SURFACE_LEAN).expect("fires");
+        assert_eq!(p.setting, "graph.lean_tools");
+        assert_eq!(p.current, "false");
+        assert_eq!(p.proposed, "true");
+        assert_eq!(p.signature, "zero-usage");
+        assert!(!p.warn_only);
+        assert!(p.rationale.contains("9,000") || p.rationale.contains("9000"));
+
+        // Real, assignable bool field (Apply-switch guard).
+        let val: bool = p.proposed.parse().expect("bool string");
+        let mut g = GraphSettings::default();
+        g.lean_tools = val;
+        assert!(g.lean_tools);
+    }
+
+    #[test]
+    fn surface_lean_silenced_by_a_single_hideable_call() {
+        let mut sig = surface_lean_signals();
+        sig.hideable_tool_calls = 1;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+    }
+
+    #[test]
+    fn surface_lean_respects_its_session_floor() {
+        let mut sig = surface_lean_signals();
+        sig.session_count = SURFACE_LEAN_MIN_SESSIONS - 1;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+    }
+
+    #[test]
+    fn surface_lean_silent_when_already_lean() {
+        let mut sig = surface_lean_signals();
+        sig.graph.lean_tools = true;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+    }
+
+    #[test]
+    fn surface_lean_honors_dismiss_and_apply_cooldown() {
+        // Dismissed at its fixed signature ⇒ silent.
+        let mut sig = surface_lean_signals();
+        sig.dismissed = vec![DismissedRule {
+            rule_id: RULE_SURFACE_LEAN.to_string(),
+            signature: "zero-usage".to_string(),
+        }];
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+
+        // Freshly applied ⇒ quiet until APPLY_COOLDOWN_SESSIONS more sessions.
+        let mut sig = surface_lean_signals();
+        sig.applied = vec![AppliedRule {
+            rule_id: RULE_SURFACE_LEAN.to_string(),
+            root: String::new(),
+            session_count: sig.session_count,
+        }];
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+
+        // Cooldown elapsed ⇒ re-fires.
+        let mut sig = surface_lean_signals();
+        sig.session_count = SURFACE_LEAN_MIN_SESSIONS + APPLY_COOLDOWN_SESSIONS;
+        sig.applied = vec![AppliedRule {
+            rule_id: RULE_SURFACE_LEAN.to_string(),
+            root: String::new(),
+            session_count: SURFACE_LEAN_MIN_SESSIONS,
+        }];
+        assert!(evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+    }
+
+    // ── V17 Phase F — graduation rules (adopt.*) ────────────────────────
+
+    /// Signals for `adopt.read_advisor.v1`: advisor OFF, E1 proven, a high
+    /// redundant-read rate over a full window, past the tuning session floor.
+    fn adopt_advisor_signals() -> Signals {
+        Signals {
+            session_count: MIN_SESSIONS,
+            e1_pass: true,
+            redundant_reads_per_session: Some(5.0),
+            redundant_read_sessions: ADOPT_MIN_SESSIONS,
+            graph: GraphSettings::default(), // read_advisor = false
+            ..Signals::default()
+        }
+    }
+
+    #[test]
+    fn adopt_advisor_fires_and_proposes_enabling_a_real_bool_field() {
+        let props = evaluate(&adopt_advisor_signals());
+        let p = props.iter().find(|p| p.rule_id == RULE_ADOPT_ADVISOR).expect("fires");
+        assert_eq!(p.setting, "graph.read_advisor");
+        assert_eq!(p.current, "false");
+        assert_eq!(p.proposed, "true");
+        assert_eq!(p.signature, "5"); // 5.0 pairs/session rounded
+        assert!(!p.warn_only);
+        assert!(
+            p.rationale.contains("external tools may have changed the file"),
+            "must carry the est. caveat verbatim"
+        );
+        // Real, assignable bool field (Apply-switch guard).
+        let val: bool = p.proposed.parse().expect("bool string");
+        let mut g = GraphSettings::default();
+        g.read_advisor = val;
+        assert!(g.read_advisor);
+    }
+
+    #[test]
+    fn adopt_advisor_respects_each_threshold() {
+        // Rate below 3.0/session.
+        let mut sig = adopt_advisor_signals();
+        sig.redundant_reads_per_session = Some(2.9);
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+
+        // Fewer than 10 sessions of evidence.
+        let mut sig = adopt_advisor_signals();
+        sig.redundant_read_sessions = ADOPT_MIN_SESSIONS - 1;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+
+        // No data at all.
+        let mut sig = adopt_advisor_signals();
+        sig.redundant_reads_per_session = None;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+
+        // Advisor already on.
+        let mut sig = adopt_advisor_signals();
+        sig.graph.read_advisor = true;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+    }
+
+    #[test]
+    fn adopt_advisor_stays_silent_until_e1_is_proven_pass() {
+        // The default (`e1_pass = false`, i.e. "unverified"/"fail") must NOT
+        // auto-graduate a hook we've never seen work — the whole point of the
+        // strict `== "pass"` check rather than `!e1_blocked()`.
+        let mut sig = adopt_advisor_signals();
+        sig.e1_pass = false;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+    }
+
+    #[test]
+    fn adopt_advisor_suppressed_while_a_drift_read_rule_is_firing() {
+        // The full `evaluate` path can't co-occur (drift-disable needs the
+        // advisor ON, adopt needs it OFF), so pin the guard directly on
+        // `adopt_rules`: `advisor_disable_proposed = true` must silence it.
+        let sig = adopt_advisor_signals();
+        assert!(adopt_rules(&sig, false).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(!adopt_rules(&sig, true).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+    }
+
+    #[test]
+    fn adopt_advisor_dismissal_refires_on_a_changed_bucket() {
+        let mut sig = adopt_advisor_signals(); // rate 5.0 -> signature "5"
+        sig.dismissed = vec![DismissedRule {
+            rule_id: RULE_ADOPT_ADVISOR.to_string(),
+            signature: "5".to_string(),
+        }];
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+
+        // A materially higher rate (rounds to a different integer) re-fires.
+        sig.redundant_reads_per_session = Some(8.0);
+        assert!(evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+    }
+
+    #[test]
+    fn adopt_advisor_honors_the_apply_cooldown() {
+        let mut sig = adopt_advisor_signals();
+        sig.applied = vec![AppliedRule {
+            rule_id: RULE_ADOPT_ADVISOR.to_string(),
+            root: String::new(),
+            session_count: sig.session_count,
+        }];
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+    }
+
+    /// Signals for `adopt.read_advisor_substitute.v1`: advisor ON in advise
+    /// mode, reminders rarely lead to a full re-read, no shell bypass.
+    fn adopt_substitute_signals() -> Signals {
+        let mut graph = GraphSettings::default();
+        graph.read_advisor = true; // mode defaults to "advise"
+        Signals {
+            advisor_reread_rate: Some(0.1),
+            advisor_reread_samples: SUBSTITUTE_MIN_SAMPLES,
+            session_count: MIN_SESSIONS,
+            graph,
+            ..Signals::default()
+        }
+    }
+
+    #[test]
+    fn adopt_substitute_fires_and_proposes_the_mode_string() {
+        let props = evaluate(&adopt_substitute_signals());
+        let p = props.iter().find(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE).expect("fires");
+        assert_eq!(p.setting, "graph.read_advisor_mode");
+        assert_eq!(p.current, "advise");
+        assert_eq!(p.proposed, "substitute");
+        assert!(!p.warn_only);
+    }
+
+    #[test]
+    fn adopt_substitute_respects_each_threshold() {
+        // Reread rate above 20% (the outline evidently isn't enough).
+        let mut sig = adopt_substitute_signals();
+        sig.advisor_reread_rate = Some(0.3);
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+
+        // Too few reminders.
+        let mut sig = adopt_substitute_signals();
+        sig.advisor_reread_samples = SUBSTITUTE_MIN_SAMPLES - 1;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+
+        // Shell bypass at/above BYPASS_HIGH ⇒ don't lean harder on the advisor.
+        let mut sig = adopt_substitute_signals();
+        sig.bypass_rate = Some(BYPASS_HIGH);
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+
+        // Advisor off.
+        let mut sig = adopt_substitute_signals();
+        sig.graph.read_advisor = false;
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+
+        // Already in substitute mode.
+        let mut sig = adopt_substitute_signals();
+        sig.graph.read_advisor_mode = "substitute".to_string();
+        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+    }
+
+    #[test]
+    fn substitute_and_min_lines_rules_never_co_fire_across_the_rate_range() {
+        // Structural mutual exclusion: RULE_ADVISOR_LINES needs reread_rate ≥
+        // REREAD_HIGH (0.5); RULE_ADOPT_SUBSTITUTE needs ≤ SUBSTITUTE_REREAD_LOW
+        // (0.2). Sweep the whole [0,1] range with both rules' other conditions
+        // satisfied and assert no single input fires both.
+        let mut graph = GraphSettings::default();
+        graph.read_advisor = true; // mode "advise", so substitute is eligible
+        for i in 0..=20 {
+            let rate = i as f64 * 0.05;
+            let sig = Signals {
+                advisor_reread_rate: Some(rate),
+                advisor_reread_samples: MIN_REMINDS, // clears both sample floors (20)
+                session_count: MIN_SESSIONS,
+                graph: graph.clone(),
+                ..Signals::default()
+            };
+            let ids: Vec<&str> = evaluate(&sig).iter().map(|p| p.rule_id).collect();
+            let both =
+                ids.contains(&RULE_ADOPT_SUBSTITUTE) && ids.contains(&RULE_ADVISOR_LINES);
+            assert!(!both, "rate={rate} fired both rules: {ids:?}");
+        }
     }
 }

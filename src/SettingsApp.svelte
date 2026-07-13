@@ -4415,6 +4415,74 @@
                 long the agent's memory is trusted across context loss the
                 advisor can't observe (context editing, tool-result truncation).
               </small>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.read_advisor_diffs}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.read_advisor_diffs = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Diff-substitute changed-file re-reads</span>
+              </label>
+              <small class="hint">
+                When you re-read a file <em>after it changed</em>, answer with a
+                line-level unified diff against what you last read instead of the
+                whole file — exact, so it's safe on the edit-then-verify loop.
+                Falls back to a normal read when no snapshot survives or the diff
+                would be more than half the new file.
+              </small>
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={snapshot.graph.read_advisor_shell}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.read_advisor_shell = (
+                          e.currentTarget as HTMLInputElement
+                        ).checked),
+                    )}
+                />
+                <span>Intercept whole-file shell reads</span>
+              </label>
+              <small class="hint">
+                Also advise on a whole-file shell read
+                (<code>cat</code>, <code>Get-Content</code>, <code>type</code>,
+                <code>gc</code>) of an already-read file, the same as a
+                <code>Read</code>. Strict — only a provable whole-file read of one
+                file is intercepted; anything with a pipe, redirect, glob, second
+                path, or a partial-read verb (<code>sed</code>, <code>head</code>)
+                runs untouched.
+              </small>
+              <label>
+                <span>First-read digest tier (KiB, 0 = off)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.read_advisor_first_read_kb}
+                  onchange={(e) =>
+                    patch((s) => {
+                      const n = Number((e.currentTarget as HTMLInputElement).value);
+                      s.graph.read_advisor_first_read_kb = Number.isFinite(n)
+                        ? Math.max(0, Math.trunc(n))
+                        : 0;
+                    })}
+                />
+              </label>
+              <small class="hint">
+                Answer the <em>first</em> read of a large non-code file (log,
+                lockfile, generated JSON, data dump) at or above this size with the
+                cached local-model digest plus a head/tail sample instead of the
+                full content. Source files (anything with a parsed outline) never
+                qualify, and a sliced <code>Read</code> always passes. Needs a
+                cached digest — the first encounter enqueues one and passes, so
+                protection begins on the next. Off by default; try <code>256</code>.
+              </small>
             {/if}
             <label class="checkbox">
               <input
@@ -4440,6 +4508,31 @@
                 <strong>No local offload backend is ready</strong> — start one in
                 Settings → Offload to enable this.
               {/if}
+            </small>
+
+            <h3>Tool surface</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.lean_tools}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.lean_tools = (
+                        e.currentTarget as HTMLInputElement
+                      ).checked),
+                  )}
+              />
+              <span>Lean tool surface (hide cold-tail graph tools)</span>
+            </label>
+            <small class="hint">
+              Drop <code>graph_cycles</code>, <code>graph_dead_exports</code>,
+              <code>graph_struct_search</code>, <code>graph_path</code>, and
+              <code>graph_architecture</code> from the tool list advertised to the
+              cloud session and the offload worker — trimming the descriptors
+              cache-written once per session. Advertisement-only: each hidden tool
+              still answers if an agent calls it by name. The Code Intelligence tab
+              shows the current surface size.
             </small>
 
             <h3>Architecture &amp; path tracing</h3>

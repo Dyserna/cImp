@@ -72,6 +72,10 @@ pub enum ParserKind {
     /// `pytest` — the short test-summary section (`FAILED file::test - msg`)
     /// plus the tail counts line.
     Pytest,
+    /// `cargo test` — stable-toolchain text output (JSON is nightly-only).
+    CargoTest,
+    /// `jest --json` / `vitest --reporter=json` (same shape).
+    JestJson,
     /// `file:line[:col]: error|warning|note: message` — the fallback for
     /// gcc/clang and most other line-oriented CLI checkers.
     #[default]
@@ -155,7 +159,7 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
     let (exit_code, stdout, stderr, timed_out) = spawn_capture(root, &def.cmd, timeout_secs).await?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    let diags = parsers::parse(def.parser, &stdout, &stderr);
+    let diags = parsers::parse(def.parser, &stdout, &stderr, root);
     // `group` keeps every site (uncapped) so the `changed_only` filter below
     // sees the FULL occurrence list, not just the first `MAX_SITES` in source
     // order — a diagnostic already firing in ≥ `MAX_SITES` other files must
@@ -469,6 +473,20 @@ mod tests {
         assert_eq!(groups[0].message, "second thing");
         assert_eq!(groups[1].message, "first thing");
         assert_eq!(groups[0].count, 2);
+    }
+
+    #[test]
+    fn cargo_test_identical_assertions_group_via_normalized_message() {
+        // Two failing tests whose panic blocks differ only in backtick-quoted
+        // values collapse into ONE group — the dedup key normalizes quoted
+        // spans, so `left: `1`` / `left: `3`` don't split the group. Pins that
+        // the cargo-test parser's block-as-message plays nicely with `group`.
+        const OUT: &str = "test tests::a ... FAILED\ntest tests::b ... FAILED\n\nfailures:\n\n---- tests::a stdout ----\nthread 'tests::a' panicked at 'assertion failed: `(left == right)`\n  left: `1`,\n right: `2`', src/helper.rs:5:5\n\n---- tests::b stdout ----\nthread 'tests::b' panicked at 'assertion failed: `(left == right)`\n  left: `3`,\n right: `4`', src/helper.rs:5:5\n\ntest result: FAILED. 0 passed; 2 failed;\n";
+        let diags = parsers::parse(ParserKind::CargoTest, OUT, "", std::path::Path::new("."));
+        let groups = group(diags);
+        let errs: Vec<_> = groups.iter().filter(|g| g.severity == Severity::Error).collect();
+        assert_eq!(errs.len(), 1, "identical assertions should group: {groups:?}");
+        assert_eq!(errs[0].count, 2);
     }
 
     #[test]

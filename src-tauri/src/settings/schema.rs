@@ -1314,6 +1314,43 @@ pub struct GraphSettings {
     /// loss it can't observe: context editing, tool-result truncation).
     /// 0 = off (the pre-V16 behavior: trust for the whole session).
     pub read_advisor_ttl_turns: u32,
+    /// V17 Phase A: when a file the agent already read is re-read *after it
+    /// changed*, answer with a line-level unified diff against the last-read
+    /// snapshot instead of passing the whole file. Exact (a diff versus the
+    /// snapshot can't mislead), so it's safe on the post-edit verify loop that
+    /// dominates real sessions. Default **on** — a strictly-better substitute,
+    /// still master-gated by `read_advisor` and the E1 hard block. Falls back to
+    /// a plain pass whenever no snapshot survives (small file / over-cap /
+    /// LRU-evicted) or the rendered diff exceeds half the new content.
+    pub read_advisor_diffs: bool,
+    /// V17 Phase B: also intercept a whole-file shell read (`cat FILE`,
+    /// `Get-Content FILE`, `type FILE`, `gc FILE`) of an already-read file via a
+    /// second `PreToolUse` **Bash** matcher — the shell equivalent of the `Read`
+    /// advisor. Strict: only a provable pure whole-file read of one file is
+    /// intercepted (anything with a pipe/redirect/glob/second-path/partial-read
+    /// verb runs untouched). Default **on**; master-gated by `read_advisor` and
+    /// the E1 hard block. Off ⇒ a zero overlay delta (the Bash matcher isn't
+    /// installed) and the bypass canary scores shell reads as before.
+    pub read_advisor_shell: bool,
+    /// V17 Phase C: first-read tier — the size (in KiB) at or above which a
+    /// *first* whole-file `Read` of a **non-code** file (log, lockfile, generated
+    /// JSON, data dump — no parsed symbols) is answered with the cached
+    /// local-model digest + a head/tail sample instead of the full content. A
+    /// separate opt-in *within* the advisor: `0` = off (the default). Only fires
+    /// when a digest is already cached for the current content hash — a miss
+    /// enqueues one and passes, so protection begins on the next (cross-session)
+    /// encounter. A deliberate slice (`offset`/`limit`) always passes. Proposed
+    /// starting value when enabled: 256.
+    pub read_advisor_first_read_kb: u32,
+
+    // --- V17 Phase E: lean tool surface ---
+    /// Hide the cold-tail `graph_*` tools (`graph_cycles`, `graph_dead_exports`,
+    /// `graph_struct_search`, `graph_path`, `graph_architecture`) from the tool
+    /// surface advertised to the cloud session and the offload worker, trimming
+    /// the tools block that's cache-written once per session. Advertisement-only:
+    /// the hidden tools still ANSWER if an agent calls them by name — they're
+    /// just not offered. Default off.
+    pub lean_tools: bool,
 
     // --- V11 Phase F: local-model context digests ---
     /// For files with no useful outline (docs/configs/long scripts), have the
@@ -1469,6 +1506,10 @@ impl Default for GraphSettings {
             read_advisor_min_lines: 300,
             read_advisor_mode: "advise".to_string(),
             read_advisor_ttl_turns: 0,
+            read_advisor_diffs: true,
+            read_advisor_shell: true,
+            read_advisor_first_read_kb: 0,
+            lean_tools: false,
             context_llm_digests: false,
             memory_distillation: false,
             promote_pinned_facts: false,

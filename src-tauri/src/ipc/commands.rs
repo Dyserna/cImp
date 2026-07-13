@@ -1708,6 +1708,10 @@ pub async fn graph_usage(
         .flat_map(|b| b.metrics.runs)
         .filter(|r| r.outcome != "running")
         .count() as u64;
+    // V17 Phase E: the advertised tool-surface size (both consumers), measured
+    // post-`lean_tools`-filter from live settings — another cross-cutting field
+    // GraphService can't fill (it depends on settings, not the index).
+    snap.surface = crate::graph::surface_stats();
     Ok(snap)
 }
 
@@ -1774,6 +1778,36 @@ pub async fn graph_usage_advice(
         .filter(|e| e.source == "harness" && e.tool == "contract_drift" && e.ts_ms >= since)
         .map(|e| e.target.clone())
         .collect();
+    // V17.1: sub-agent transcript-contract drift reports from the Claude OOB
+    // tap (see `oob::claude::report_subagent_drift`) — same channel
+    // discipline as the shims' contract_drift events above.
+    let subagent_drift: Vec<String> = activity
+        .iter()
+        .filter(|e| e.source == "harness" && e.tool == "subagent_drift" && e.ts_ms >= since)
+        .map(|e| e.target.clone())
+        .collect();
+
+    // V17 Phase E signals: calls to any lean-hidden tool in the Activity ring
+    // (zero ⇒ the lean-surface rule may fire) and the measured advertised
+    // surface size for its rationale.
+    let hideable_tool_calls = activity
+        .iter()
+        .filter(|e| crate::graph::LEAN_HIDDEN.contains(&e.tool.as_str()))
+        .count() as u64;
+    let surface_chars = crate::graph::surface_stats().mcp_chars as u64;
+
+    // V17 Phase F1/F2 signals. Redundant re-read pairs per session over the
+    // last 10 sessions, sized by the current advisor line floor. `e1_pass` is
+    // STRICTLY the "pass" status (trimmed/lowercased) — NOT `!e1_blocked()`,
+    // so an "unverified" E1 (the default) never auto-graduates a hook we've
+    // never proven works.
+    let (redundant_reads_per_session, redundant_read_sessions) = match graph
+        .redundant_read_candidates(&root, settings.graph.read_advisor_min_lines, 10)
+    {
+        Some((pairs, sessions)) if sessions > 0 => (Some(pairs as f64 / sessions as f64), sessions),
+        _ => (None, 0),
+    };
+    let e1_pass = hv.e1_status.trim().to_ascii_lowercase() == "pass";
 
     // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
     // only THIS root's, so an Apply in one project never mutes another
@@ -1806,8 +1840,14 @@ pub async fn graph_usage_advice(
         claude_sessions,
         claude_tokenless_sessions,
         contract_drift,
+        subagent_drift,
         bypass_rate,
         bypass_samples,
+        hideable_tool_calls,
+        surface_chars,
+        redundant_reads_per_session,
+        redundant_read_sessions,
+        e1_pass,
     };
     let proposals = crate::advisor::evaluate(&sig);
     // "Collecting" = nothing has cleared the cold-start floor yet: not

@@ -107,6 +107,158 @@ doesn't pin. V16 adds detection + honest pricing:
 
 ---
 
+## 7. Redundant-read advisor, escalated (V17)
+
+V17 extends the V11 read advisor (§4) into the corners V11 deliberately passed
+on. All three pieces are gated under the same `read_advisor` opt-in and the V16
+E1 hard block; the sub-toggles default **on** *within* that opt-in (the advisor
+itself is still off by default).
+
+- **Diff-substitute for changed-file re-reads** (`read_advisor_diffs`, default
+  on) — V11 passed a re-read unconditionally once the content hash differed,
+  but "changed since last read" is the *dominant* re-read trigger: the agent
+  just edited the file (or `cargo fmt` / a build script / another tab touched
+  it) and re-reads the whole thing to verify. The advisor now retains a
+  **snapshot** of the content it last showed the agent (per-entry ≤ 512 KiB,
+  whole store LRU-bounded to ~16 MiB, in-memory only) and answers a changed
+  re-read with a **line-level unified diff against that snapshot** — exact, not
+  lossy: a diff versus what the agent actually read cannot mislead, so it is
+  safe on the post-edit verify loop. Falls back to a plain pass whenever no
+  snapshot survives (small file / over-cap / evicted) or the rendered diff
+  exceeds half the new content (a near-rewrite isn't worth a denial). A content
+  change **re-arms** an already-reminded file (the old remind's "unchanged"
+  promise is stale), capped at 3 reminders per file per session so the advisor
+  can never fight an insistent agent in a loop; the immediate second ask on
+  *unchanged* content always passes.
+- **Shell-read interception** (`read_advisor_shell`, default on) — V16 *detected*
+  `cat` / `Get-Content` whole-file reads of just-reminded files
+  (`drift.read_bypass.v1`) but did not intercept them, so a bypass cost the
+  remind *plus* the whole file — worse than no advisor. A second `PreToolUse`
+  **Bash** matcher on the same `cimp --read-hook` shim now runs the shell
+  command through a strict parser (`graph/shellread.rs`): only a provable pure
+  whole-file read of one file — verb ∈ {`cat`, `type`, `Get-Content`, `gc`},
+  `-Raw` tolerated, no pipe/redirect/glob/second-path/command-chaining — is
+  routed to the identical `should_read` verdict; anything composite runs
+  untouched. Interception must be provably equivalent to a `Read`, never a
+  guess. The deny reason is the same advice text prefixed `answered without
+  running the command —`. Partial-read verbs (`sed -n`, `head`, `tail`) are
+  deliberately rejected. Feature 1's diff branch applies here too. Claude-only
+  for now (OpenCode rides the pending V16 `tool.execute.before` spike).
+- **First-read digest tier** (`read_advisor_first_read_kb`, default 0 = off) —
+  the advisor only fires on *re*-reads; a first `Read` of a 300 KB
+  log/lockfile/generated JSON is a pure burn. When enabled, the first
+  whole-file read of a **non-code** file (no parsed outline) at or above the
+  KiB threshold is answered with the cached local-model digest (§4) plus a
+  first/last ~40-line sample, with the escape hatch `Read({file, offset,
+  limit}) always passes`. Requires a digest cached for the current content hash
+  (content-hash-keyed, so it survives across sessions); a cache miss enqueues
+  one on the local-only path and passes — protection begins on the second
+  encounter. No snapshot is kept for these (generated-file diffs are useless
+  and would blow the LRU).
+
+**Honest numbers.** Diff and first-read reminds reuse the V11 remind accounting
+path unchanged, so every counter gets truthful numbers for free: `displaced` =
+the **full** new-content chars (what the agent would have received), and
+`advice_chars` = the **remind** text chars (the diff, or the digest + head/tail
+sample). The Activity `request` string is marked `(changed — diff substituted)`
+or `first-read` so the Effectiveness tooltip can split these out from plain
+outline reminds without a new field.
+
+## 8. Test-run parsers for `run_check` (V17)
+
+V12's `run_check` displaced raw compiler/linter dumps with grouped diagnostics;
+V17 extends the same machinery to the remaining big raw dump — test runs — by
+adding two `ParserKind`s. Failures-only by construction, so the existing
+group/dedup/≤5-samples machinery and the auto-check baseline diff work
+unchanged; a test that starts failing surfaces exactly like a new compiler
+error.
+
+- **`cargo-test`** — parses stable-toolchain *text* output (`--format json` is
+  nightly-only): `test <name> ... FAILED` lines, each upgraded when its
+  `---- <name> stdout ----` block follows (truncated to the first ~15 lines,
+  with `panicked at <file>:<line>:<col>` resolved into the diag location), plus
+  the tail counts line (`test result: …`) folded in as a file-less `Note` so a
+  clean run renders `ok — N passed` rather than silence. A compile error that
+  aborts before any test lines is additionally run through the generic rustc
+  matcher and merged, so `run_check(name:"test")` on a broken build still
+  surfaces the compile error.
+- **`jest-json`** — parses `jest --json` / `vitest --reporter=json` (same
+  shape): each `testResults[] × assertionResults[]` with `status == "failed"`
+  yields a diag from the first lines of `failureMessages[0]` (ANSI-stripped —
+  jest embeds color codes inside JSON strings); `testFilePath` is absolute, so
+  it's relativized against the run cwd (the changed-only filter compares
+  git-relative paths); `numPassedTests`/`numFailedTests` become the counts
+  `Note`. Malformed JSON yields an empty result, never an error.
+
+No new settings — `checks` is already the per-project surface. Add to
+`.cimp/config.json`:
+
+```jsonc
+"checks": [
+  { "name": "test", "cmd": "cargo test",             "parser": "cargo-test", "timeout_secs": 300 },
+  { "name": "jest", "cmd": "npx jest --json",         "parser": "jest-json",  "timeout_secs": 300 }
+  // vitest: "cmd": "npx vitest run --reporter=json", "parser": "jest-json"
+]
+```
+
+`GRAPH_GUIDANCE` (and the OpenCode instructions it mirrors) now nudges the agent
+to prefer a configured test check over running the test command in Bash — "it
+returns failures only."
+
+## 9. Tool-surface accounting + lean surface (V17)
+
+The `graph_*` / `run_check` tool descriptors are advertised to the cloud
+session and the offload worker and cache-written **once per session**. V17
+measures that surface and lets you trim its cold tail:
+
+- **Tool-surface line** — the Effectiveness card shows the advertised surface
+  size (`tools()` serialized length + count), labelled `est.` for the
+  chars→tokens estimate.
+- **`graph.lean_tools`** (default off) — hides the cold-tail tools from the
+  **advertised** surface only; each still ANSWERS if an agent calls it by
+  name (dispatch is name-driven). `LEAN_HIDDEN` = `graph_cycles`,
+  `graph_dead_exports`, `graph_struct_search`, `graph_path`,
+  `graph_architecture` (frozen from the E0 Activity-store check; the
+  workhorses — `graph_find_symbol`, `graph_callers`, `graph_callees`,
+  `graph_outline`, `graph_snippet`, `graph_references`, `run_check`,
+  `graph_search_docs`, `graph_semantic_docs` — are never hidden).
+- **`surface.lean.v1` advisor rule** — after ≥10 sessions with zero calls to
+  any hidden tool, the Advisor proposes turning `lean_tools` on (Apply;
+  dismissable; a single call to a hidden tool silences it).
+- **Editorial pass** — the wordiest tool descriptions were tightened (meaning
+  preserved): worker surface ~11,891 → ~11,343 chars (≈137 est. tokens saved
+  per session); the MCP surface mirrors the same descriptions when the graph
+  is enabled.
+
+## 10. Graduation rules — `adopt.*` (V17)
+
+V11 decision 2 deferred `read_advisor`'s default to field data; V14/V16 built
+the evidence (`advisor_reread_rate`, bypass rate, E1 status). V17 turns it into
+two per-project, propose-and-confirm Advisor rules — no silent default flips.
+Both render on the existing Advisor card and use standard per-rule dismiss
+memory + the V16 apply cooldown.
+
+- **`adopt.read_advisor.v1`** — proposes *enabling* `read_advisor` when it is
+  off, E1 is verified (`harness_versions.e1_status == "pass"` — proven, not
+  merely "not failed": an `unverified` hook must never auto-graduate), and
+  session memory shows the waste the advisor exists to stop: ≥ 3 redundant
+  large same-file re-reads per recent session across ≥ 10 sessions. Detection
+  without the hook uses `GraphIndex::redundant_read_candidates` over `mem_event`
+  read rows — same file, same session, read ≥ 2× with no intervening edit,
+  file ≥ `read_advisor_min_lines`. Labelled `est.` (without content hashes
+  this is an approximation — an external tool may have changed the file between
+  reads; the message says so). Suppressed while any `drift.*` read rule is
+  firing (don't propose enabling what drift says is broken).
+- **`adopt.read_advisor_substitute.v1`** — proposes switching
+  `read_advisor_mode` to `substitute` when the advisor is on in `advise` mode,
+  the remind→full-reread rate is low (≤ 0.2 over ≥ 20 samples — reminders are
+  sufficient, the agent rarely follows one with a full re-read) and bypass is
+  below the V16 `BYPASS_HIGH` threshold. Mutually exclusive with the existing
+  high-reread-rate `read_advisor_min_lines` rule by construction (that rule
+  needs reread-rate ≥ 0.5; the ranges can't overlap).
+
+---
+
 ## The Effectiveness card
 
 Location: **Code Intelligence → Overview → Usage**. Design rule, stated in a
@@ -123,6 +275,7 @@ restart,"** not a permanent ledger.
 | **chars displaced by read-advisor** | Sizes of the reminder texts the advisor answered Reads with (Activity events `source: read_advisor`, `tool: remind`), **net of bypasses** (V16: a remind the agent answered with a shell `cat` displaced nothing — the bypassed reminders' *text* chars are subtracted, the same unit as the displaced sum; the whole-file chars the shell re-read appear separately in the tooltip, est.) | Process-wide (Activity store has no per-project key), since process start | **Saving, estimated** — hence the `est.` label |
 | **chars of cache-reads avoided (compounding)** | V16: displaced chars re-counted once per subsequent turn — the API re-sends the whole conversation every turn, so content kept out at turn N is saved again as a cache read on every turn after N. The turn clock is the injection retrieve when context injection is on, or genuine user prompts seen by the transcript tap when it's off (so the readout accrues for read-advisor-only sessions too). Measured turn-by-turn as the session runs, no projection; with a matched price row it also shows an `est. $` at the cache-read rate | This project's sessions, since restart | **Saving, estimated (compounding)** |
 | **tasks served locally** | Count of offload jobs the local llama-server handled instead of the cloud model (filled in from the OffloadService) | Offload host | **Proxy count** — whole subtasks diverted; volume on the Offload Server tab |
+| **tool surface** | Serialized chars + count of the graph tool descriptors advertised to the cloud session (post-`lean_tools` filter), cache-written once per session | Live settings | **Spend** — the fixed per-session cost of offering the tools; `lean_tools` trims the cold tail |
 
 ### How to interpret it
 

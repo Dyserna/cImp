@@ -50,8 +50,14 @@
   const FOCUS_MS = 900;
 
   const MIN_DIST_3D = 80;
-  const MAX_DIST_3D = 4000;
+  const MAX_DIST_3D = 8000;
   const NEAR_3D = 8;
+  // Zoom-out ceiling. The folder-spacing knob (up to 50×) stretches the
+  // layout roughly linearly, so the ceiling stretches with it — otherwise a
+  // spaced-out graph couldn't be framed in one view.
+  function maxDist3d(): number {
+    return MAX_DIST_3D * Math.max(1, tune.clusterSpacing);
+  }
 
   // ── Settings-driven tuning (Settings → Code Intelligence → Graph View
   // tuning). Multipliers on the base constants below — one size doesn't fit
@@ -1124,7 +1130,7 @@
     for (const n of nodes) maxR = Math.max(maxR, Math.hypot(n.x - cx, n.y - cy, n.z - cz));
     camTargetX = cx; camTargetY = cy; camTargetZ = cz;
     camTheta = 0.6; camPhi = 0.35;
-    camDist = clamp(maxR * 2.2 + 80, MIN_DIST_3D, MAX_DIST_3D);
+    camDist = clamp(maxR * 2.2 + 80, MIN_DIST_3D, maxDist3d());
   }
   function resetView(): void {
     // Camera refit only — it does not re-heat the physics. Handing the view
@@ -1162,7 +1168,7 @@
     for (const m of c.members) {
       maxR = Math.max(maxR, Math.hypot(m.x - c.x, m.y - c.y, m.z - c.z));
     }
-    focusDist = clamp(maxR * 2.4 + 60, MIN_DIST_3D, MAX_DIST_3D);
+    focusDist = clamp(maxR * 2.4 + 60, MIN_DIST_3D, maxDist3d());
     if (push) historyPush('dir:' + c.name);
     wake();
   }
@@ -1397,20 +1403,21 @@
   }
 
   // ── Settings tuning ──────────────────────────────────────────────────────
-  // Adopt the settings' Graph View tuning knobs (all clamped to the UI's
-  // 0.2–5 range in case a hand-edited settings file goes wild). Geometry
+  // Adopt the settings' Graph View tuning knobs (clamped to the UI's range —
+  // 0.2–5, except folder spacing which goes to 50 — in case a hand-edited
+  // settings file goes wild). Geometry
   // knobs (spacing / cluster size / tightness) re-heat the sim so the layout
   // re-settles into the new equilibrium; appearance knobs (node size, edge
   // width/color) only need a repaint. Values buildSim baked into the live
   // nodes/clusters (radius, leash) are recomputed in place.
   function applyTuning(g: Settings['graph']): void {
-    const knob = (v: number) => clamp(Number(v) || 1, 0.2, 5);
+    const knob = (v: number, max = 5) => clamp(Number(v) || 1, 0.2, max);
     const next = {
       nodeScale: knob(g.graph_viz_node_scale),
       dirScale: knob(g.graph_viz_dir_scale),
       edgeWidth: knob(g.graph_viz_edge_width),
       nodeSpacing: knob(g.graph_viz_node_spacing),
-      clusterSpacing: knob(g.graph_viz_cluster_spacing),
+      clusterSpacing: knob(g.graph_viz_cluster_spacing, 50),
       clusterStrength: knob(g.graph_viz_cluster_strength),
     };
     const nextCall = g.graph_viz_color_call || EDGE_CALL;
@@ -1598,7 +1605,7 @@
   function onWheel(e: WheelEvent): void {
     if (nodes.length === 0 || !canvasEl) return;
     e.preventDefault();
-    camDist = clamp(camDist * Math.exp(e.deltaY * 0.0015), MIN_DIST_3D, MAX_DIST_3D);
+    camDist = clamp(camDist * Math.exp(e.deltaY * 0.0015), MIN_DIST_3D, maxDist3d());
     focusDist = null; // the wheel takes over any in-flight dolly
     userInteracted = true;
     wake();

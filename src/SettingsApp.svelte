@@ -4727,31 +4727,32 @@
               <h3>Graph View tuning</h3>
               <small class="hint">
                 Multipliers on the built-in layout/appearance (1.0 = default;
-                0.2–5). One size doesn't fit every repo — a dense monorepo
-                usually wants smaller nodes and wider spacing than a small
-                project. Changes apply live to an open Graph View tab.
+                0.2–5, folder spacing up to 50). One size doesn't fit every
+                repo — a dense monorepo usually wants smaller nodes and wider
+                spacing than a small project. Changes apply live to an open
+                Graph View tab.
               </small>
               {#each [
-                { key: 'graph_viz_node_scale', label: 'File node size' },
-                { key: 'graph_viz_dir_scale', label: 'Folder cluster size' },
-                { key: 'graph_viz_edge_width', label: 'Edge line width' },
-                { key: 'graph_viz_node_spacing', label: 'Spacing between files' },
-                { key: 'graph_viz_cluster_spacing', label: 'Spacing between folders' },
-                { key: 'graph_viz_cluster_strength', label: 'Folder grouping tightness' },
+                { key: 'graph_viz_node_scale', label: 'File node size', max: 5 },
+                { key: 'graph_viz_dir_scale', label: 'Folder cluster size', max: 5 },
+                { key: 'graph_viz_edge_width', label: 'Edge line width', max: 5 },
+                { key: 'graph_viz_node_spacing', label: 'Spacing between files', max: 5 },
+                { key: 'graph_viz_cluster_spacing', label: 'Spacing between folders', max: 50 },
+                { key: 'graph_viz_cluster_strength', label: 'Folder grouping tightness', max: 5 },
               ] as knob (knob.key)}
                 <label>
                   <span>{knob.label}</span>
                   <input
                     type="number"
                     min="0.2"
-                    max="5"
+                    max={knob.max}
                     step="0.1"
                     value={(snapshot.graph as unknown as Record<string, number>)[knob.key]}
                     onchange={(e) =>
                       patch(
                         (s) =>
                           ((s.graph as unknown as Record<string, number>)[knob.key] = Math.min(
-                            5,
+                            knob.max,
                             Math.max(0.2, Number((e.currentTarget as HTMLInputElement).value) || 1),
                           )),
                       )}

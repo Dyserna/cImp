@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **19 verified fixes from the V17/V21/V22 code review.** Highlights: a
+  settings v21→v22 migration backfills `list_dir` into persisted "web-only"
+  offload tool scopes (with a tripwire tying future tool growth to a
+  migration); a char-boundary panic in the offload marker stripping on
+  non-ASCII final lines; URL answers now verify fully (`file://` kept as a
+  path claim, other schemes excluded from path verification); stateful tools
+  (everything but pure `graph_*` lookups; MCP tools by default) re-execute on
+  repeated identical calls instead of serving stale cache; `run_check`
+  `report_file` resolves cwd-relative with a root-relative fallback (nested
+  Maven/Gradle auto-detect shipped broken) and SARIF `file://` URIs handle
+  RFC 8089 authority/UNC forms; checks auto-configure also triggers from
+  incremental reindex. Plus a shared `fsutil` path-confinement module
+  replacing three divergent copies, consolidated skip lists, and +32
+  regression tests.
 - **Usage: sub-agent token spend was invisible under Claude Code 2.x.** The
   2.x CLIs (observed 2.1.207) moved sub-agent transcripts out of the parent
   session file (no more inline `isSidechain` lines) into per-agent files at
@@ -25,6 +39,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Offload worker grounding & abilities (V21).** The local offload worker is
+  now grounded and verifiable: a native `list_dir` tool (confined, capped), a
+  verified-facts system prompt, `[Tn]` evidence citations checked by a
+  deterministic answer verifier (one corrective "verify" turn, taint footer on
+  residual violations), and a `verified: fully|partially` marker with an
+  optional one-shot fast→quality escalation on partial verification
+  (`offload.escalate_partial`). It also gains `run_check` as a worker-native
+  tool, a curated read-only command preset (git, cargo metadata/tree) via a
+  new `allowed_subcommands` allowlist, an identical-call short-circuit,
+  a thinking guard (thinking Off still thinks on the final turn of tool-using
+  runs), and grammar-enforced structured output (a `schema` param mapped to
+  llama-server `json_schema` on the final turn only).
+- **`run_check` generalization (V22).** Checks now run for any stack, not
+  just Rust/JS: six new parsers (`sarif`, `go`, `go-test-json`, `dotnet`,
+  `junit-xml`, `regex-custom`), per-check `cwd`/`env`/`report_file` (confined
+  under the project root), language auto-detect with a preset catalog and a
+  `checks_auto_configure` flow, and a ChecksEditor UI in Settings with a
+  dry-run Test button and per-check exposure status.
+- **Graph View: wider zoom-out + folder spacing up to 50.** The "Spacing
+  between folders" tuning knob now goes to 50 (was 5), and the camera's
+  zoom-out ceiling is doubled and stretches with that knob so a spread-out
+  graph can still be framed in one view.
 - **Read advisor: diff-substitute for changed-file re-reads (V17).** Re-reading
   a file *after it changed* is now answered with a line-level unified diff
   against a snapshot of what you last read, instead of the whole file — exact,

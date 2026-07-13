@@ -807,9 +807,14 @@ export interface CheckDef {
   /// V22 Phase B: environment variables forced on the spawned child, as ordered
   /// `[key, value]` pairs (mirror of Rust `Vec<(String, String)>`).
   env: [string, string][];
-  /// V22 Phase B2: when set, the parser reads this file's content (confined like
-  /// `cwd`) after the run instead of stdout — for junit-xml / sarif tools that
-  /// write a report to disk. `null` means "parse stdout".
+  /// V22 Phase B2: when set, the parser reads this file's content after the run
+  /// instead of stdout — for junit-xml / sarif tools that write a report to
+  /// disk. Resolved relative to the check's working directory (`cwd` if set,
+  /// else the project root), confined strictly beneath the root — matching how
+  /// tools document their output paths (e.g. `mvn` writes `target/surefire-reports`
+  /// under its module dir). For back-compat, a `cwd`-set config whose path only
+  /// exists at the old root-relative location falls back to that. `null` means
+  /// "parse stdout".
   report_file: string | null;
   /// V22 Phase C: the regex for the `regex-custom` parser (ignored by every
   /// other parser). Named groups `file`/`line`/`message` are mandatory,

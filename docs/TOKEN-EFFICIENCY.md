@@ -222,9 +222,12 @@ measures that surface and lets you trim its cold tail:
   workhorses — `graph_find_symbol`, `graph_callers`, `graph_callees`,
   `graph_outline`, `graph_snippet`, `graph_references`, `run_check`,
   `graph_search_docs`, `graph_semantic_docs` — are never hidden).
-- **`surface.lean.v1` advisor rule** — after ≥10 sessions with zero calls to
-  any hidden tool, the Advisor proposes turning `lean_tools` on (Apply;
-  dismissable; a single call to a hidden tool silences it).
+- **`surface.lean.v1` advisor rule** — after ≥10 sessions with no calls to any
+  hidden tool **in the last 30 days**, the Advisor proposes turning `lean_tools`
+  on (Apply; dismissable; a single call to a hidden tool within that trailing
+  window silences it). The window is deliberate: the activity ring is
+  count-capped, not time-capped, so an all-time scan would let one cold-tail
+  call weeks ago suppress the suggestion indefinitely.
 - **Editorial pass** — the wordiest tool descriptions were tightened (meaning
   preserved): worker surface ~11,891 → ~11,343 chars (≈137 est. tokens saved
   per session); the MCP surface mirrors the same descriptions when the graph

@@ -267,6 +267,15 @@
   }
 </script>
 
+<!-- The Detect button appears in two mutually-exclusive spots (the exposure
+     banner when nothing is configured, the toolbar once checks exist). Defined
+     once here so label/handler/loading state can't diverge between them. -->
+{#snippet detectButton()}
+  <button type="button" class="detect-btn" onclick={detect} disabled={detecting}>
+    {detecting ? 'Detecting…' : 'Detect & configure'}
+  </button>
+{/snippet}
+
 <div class="checks-editor">
   <!-- Exposure status line: honest about whether run_check is advertised. -->
   <div class="exposure" class:on={exposed} class:off={!exposed}>
@@ -278,17 +287,13 @@
     {:else}
       <span class="exp-dot" aria-hidden="true"></span>
       <span class="exp-text">not exposed — no checks configured</span>
-      <button type="button" class="detect-btn" onclick={detect} disabled={detecting}>
-        {detecting ? 'Detecting…' : 'Detect & configure'}
-      </button>
+      {@render detectButton()}
     {/if}
   </div>
 
   {#if exposed}
     <div class="toolbar">
-      <button type="button" class="detect-btn" onclick={detect} disabled={detecting}>
-        {detecting ? 'Detecting…' : 'Detect & configure'}
-      </button>
+      {@render detectButton()}
     </div>
   {/if}
 
@@ -415,7 +420,7 @@
 
       {#if showsReportFile(row.parser)}
         <label class="field">
-          <span>Report file <small>(the tool writes this; parsed instead of stdout)</small></span>
+          <span>Report file <small>(the tool writes this; parsed instead of stdout; relative to the working directory above, else project root)</small></span>
           <input
             type="text"
             class="mono"

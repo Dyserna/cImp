@@ -74,6 +74,17 @@ pub struct ToolDef {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub function: FunctionDef,
+    /// Whether this tool **observes changing state** — reads the live
+    /// filesystem or runs a process — as opposed to being a pure lookup over
+    /// data that can't change within a single run. Declared here, beside the
+    /// tool definition, so the per-run call cache (`agent::CallCache`) can
+    /// decide whether an identical repeat may be served from cache (pure
+    /// lookup) or must re-execute (stateful) without keeping a hardcoded name
+    /// list — a future stateful tool can't be forgotten. Not sent to the
+    /// model. Defaults to `true` (fail toward fresh execution); pure lookups
+    /// opt out via [`ToolDef::pure`].
+    #[serde(skip)]
+    pub stateful: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -92,7 +103,21 @@ impl ToolDef {
                 description: description.into(),
                 parameters,
             },
+            // Fail-safe default: treat a tool as stateful unless it explicitly
+            // declares itself a pure lookup. MCP-server tools (also built here)
+            // therefore default to stateful — the offload worker can't know a
+            // third-party server won't touch mutable state, so it re-executes.
+            stateful: true,
         }
+    }
+
+    /// Mark this tool as a **pure lookup** over data that is immutable within a
+    /// single run (e.g. the `graph_*` queries against the code-graph snapshot,
+    /// which isn't rebuilt mid-run). Such a tool's identical repeats may be
+    /// served from the call cache; see [`ToolDef::stateful`].
+    pub fn pure(mut self) -> Self {
+        self.stateful = false;
+        self
     }
 }
 

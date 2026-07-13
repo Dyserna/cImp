@@ -1871,6 +1871,25 @@ pub struct AdvisorSnapshot {
     pub collecting: bool,
 }
 
+/// Count calls to any `graph::LEAN_HIDDEN` tool in `activity` within the
+/// trailing `window_ms` ending at `now_ms` — the `hideable_tool_calls` signal
+/// feeding `surface.lean.v1`. Zero ⇒ the lean-surface rule may fire.
+/// `now_ms.saturating_sub(window_ms)` is the inclusive cutoff, so entries older
+/// than the window (including ancient residue in the count-capped ring) don't
+/// count. Free function so the window semantics stay unit-testable apart from
+/// the IPC command.
+fn count_hideable_tool_calls(
+    activity: &[crate::activity::ActivityEntry],
+    now_ms: u64,
+    window_ms: u64,
+) -> u64 {
+    let cutoff = now_ms.saturating_sub(window_ms);
+    activity
+        .iter()
+        .filter(|e| e.ts_ms >= cutoff && crate::graph::LEAN_HIDDEN.contains(&e.tool.as_str()))
+        .count() as u64
+}
+
 /// V14 Phase D2: the budget-tuning advisor's current proposals for `root`.
 /// Assembled fresh on every call from `GraphService`'s D2.1 signal getters —
 /// cheap (bounded Datalog queries + a small in-memory scan), no caching
@@ -1932,13 +1951,18 @@ pub async fn graph_usage_advice(
         .map(|e| e.target.clone())
         .collect();
 
-    // V17 Phase E signals: calls to any lean-hidden tool in the Activity ring
-    // (zero ⇒ the lean-surface rule may fire) and the measured advertised
-    // surface size for its rationale.
-    let hideable_tool_calls = activity
-        .iter()
-        .filter(|e| crate::graph::LEAN_HIDDEN.contains(&e.tool.as_str()))
-        .count() as u64;
+    // V17 Phase E signals: RECENT calls to any lean-hidden tool in the Activity
+    // ring (zero ⇒ the lean-surface rule may fire) and the measured advertised
+    // surface size for its rationale. Unlike the drift filters above, this uses
+    // a trailing recency window rather than process-start `since`: the ring is
+    // count-capped (GRAPH_CAP/OFFLOAD_CAP), so an all-time scan would let one
+    // cold-tail call weeks ago suppress the suggestion forever, while
+    // process-start would flip a tool to "unused" minutes after every restart.
+    let hideable_tool_calls = count_hideable_tool_calls(
+        &activity,
+        crate::activity::now_ms(),
+        crate::advisor::HIDEABLE_RECENCY_WINDOW_MS,
+    );
     let surface_chars = crate::graph::surface_stats().mcp_chars as u64;
 
     // V17 Phase F1/F2 signals. Redundant re-read pairs per session over the
@@ -2838,5 +2862,62 @@ mod tests {
         assert!(!auto_reply("\t"));
         assert!(!auto_reply("\x1b"));
         assert!(!auto_reply("\x1bf"));
+    }
+
+    // ── V17 Phase E — hideable_tool_calls recency window ────────────────────
+    use super::count_hideable_tool_calls;
+    use crate::activity::{ActivityEntry, ActivityKind};
+    use crate::advisor::HIDEABLE_RECENCY_WINDOW_MS;
+
+    fn hidden_call(ts_ms: u64) -> ActivityEntry {
+        // `graph_cycles` is one of graph::LEAN_HIDDEN.
+        ActivityEntry::new(
+            ActivityKind::Graph,
+            ts_ms,
+            "root".to_string(),
+            "claude".to_string(),
+            "graph_cycles".to_string(),
+            "target".to_string(),
+            0,
+            0,
+            true,
+        )
+    }
+
+    #[test]
+    fn hideable_call_inside_window_counts() {
+        let now = 1_000_000_000_000;
+        // One day inside the trailing window.
+        let recent = now - (HIDEABLE_RECENCY_WINDOW_MS - 24 * 60 * 60 * 1000);
+        let activity = vec![hidden_call(recent)];
+        assert_eq!(
+            count_hideable_tool_calls(&activity, now, HIDEABLE_RECENCY_WINDOW_MS),
+            1
+        );
+    }
+
+    #[test]
+    fn hideable_call_outside_window_is_ignored() {
+        let now = 1_000_000_000_000;
+        // One day OLDER than the window edge — a cold-tail call from long ago
+        // must not suppress the lean suggestion.
+        let ancient = now - (HIDEABLE_RECENCY_WINDOW_MS + 24 * 60 * 60 * 1000);
+        let activity = vec![hidden_call(ancient)];
+        assert_eq!(
+            count_hideable_tool_calls(&activity, now, HIDEABLE_RECENCY_WINDOW_MS),
+            0
+        );
+    }
+
+    #[test]
+    fn non_hidden_tool_never_counts() {
+        let now = 1_000_000_000_000;
+        // A workhorse tool inside the window still doesn't count.
+        let mut e = hidden_call(now - 1000);
+        e.tool = "graph_find_symbol".to_string();
+        assert_eq!(
+            count_hideable_tool_calls(&[e], now, HIDEABLE_RECENCY_WINDOW_MS),
+            0
+        );
     }
 }

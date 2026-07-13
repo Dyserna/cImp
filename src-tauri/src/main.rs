@@ -9,6 +9,7 @@ mod compact_hook;
 mod content;
 mod context_hook;
 mod error;
+mod fsutil;
 mod graph;
 mod ipc;
 mod logging;

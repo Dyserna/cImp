@@ -97,6 +97,22 @@ struct CargoSpan {
     is_primary: bool,
 }
 
+/// Scan a JSON-lines stream (`cargo --message-format=json`, `go test -json`, …)
+/// and yield each line that deserializes to `T`: trim the line, skip any that
+/// doesn't start with `{`, and silently skip lines that don't parse — exactly
+/// the lenient contract every parser here follows. Shared so that hardening the
+/// scan (CRLF, a BOM-prefixed first line, a max-line-length guard) lands in one
+/// place instead of being re-copied into each new JSON-lines parser.
+fn json_lines<T: serde::de::DeserializeOwned>(stdout: &str) -> impl Iterator<Item = T> + '_ {
+    stdout.lines().filter_map(|line| {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            return None;
+        }
+        serde_json::from_str::<T>(line).ok()
+    })
+}
+
 /// One JSON object per line (`--message-format=json`); only
 /// `reason == "compiler-message"` lines carry a diagnostic — build-script
 /// output, artifact notifications, etc. are skipped. The primary span (the
@@ -105,12 +121,7 @@ struct CargoSpan {
 /// an empty location rather than being dropped.
 fn parse_cargo_json(stdout: &str) -> Vec<Diag> {
     let mut out = Vec::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_str::<CargoMessage>(line) else { continue };
+    for msg in json_lines::<CargoMessage>(stdout) {
         if msg.reason != "compiler-message" {
             continue;
         }
@@ -393,14 +404,24 @@ fn capture_block<'a>(lines: &[&'a str], start: usize) -> (Vec<&'a str>, usize) {
     (block, i)
 }
 
-/// Join the first `max` lines of a block (leading/trailing blank lines
-/// trimmed) — the truncated context that becomes a failure's message.
-fn truncate_lines(block: &[&str], max: usize) -> String {
+/// Blank-trim `block` (drop leading/trailing empty lines) and join at most
+/// `max` of the surviving lines: the *head* when `from_end` is false, the
+/// *tail* when true. Shared core behind [`truncate_lines`]/[`tail_lines`].
+fn slice_lines(block: &[&str], max: usize, from_end: bool) -> String {
     let start = block.iter().position(|l| !l.trim().is_empty()).unwrap_or(block.len());
     let end = block.iter().rposition(|l| !l.trim().is_empty()).map(|i| i + 1).unwrap_or(start);
     let trimmed = &block[start..end];
-    let take = trimmed.len().min(max);
-    trimmed[..take].join("\n")
+    if from_end {
+        trimmed[trimmed.len().saturating_sub(max)..].join("\n")
+    } else {
+        trimmed[..trimmed.len().min(max)].join("\n")
+    }
+}
+
+/// Join the first `max` lines of a block (leading/trailing blank lines
+/// trimmed) — the truncated context that becomes a failure's message.
+fn truncate_lines(block: &[&str], max: usize) -> String {
+    slice_lines(block, max, false)
 }
 
 /// Resolve a panic's `file:line:col` from a failure block: the modern anchored
@@ -691,24 +712,49 @@ struct SarifRegion {
     start_column: Option<u32>,
 }
 
-/// Turn a SARIF `artifactLocation.uri` into a report path. A `file://` scheme
-/// is stripped (`file:///c:/repo/a.rs` → `c:/repo/a.rs`; `file:///repo/a.rs` →
-/// `/repo/a.rs`, keeping the POSIX leading slash) and the resulting absolute
-/// path relativized against the run `cwd` exactly like the jest parser's
-/// `testFilePath`s. A uri with no scheme is already project-relative and passes
-/// through unchanged.
+/// Turn a SARIF `artifactLocation.uri` into a report path, honouring the RFC
+/// 8089 `file:` forms a producer can emit (dependency-free; no disk access), so
+/// the resulting absolute path relativizes against the run `cwd` exactly like
+/// the jest parser's `testFilePath`s. All output uses forward slashes, the
+/// pipeline's canonical separator (`relativize`/`normalize_rel` both fold `\`
+/// → `/`), so a Windows UNC root `\\server\share` matches a `//server/share/…`
+/// path. Handled forms (`rest` is everything after `file://`):
+///   * `file:///C:/repo/a.rs`  (empty authority, drive)   → `C:/repo/a.rs`
+///   * `file:///repo/a.rs`     (empty authority, POSIX)    → `/repo/a.rs`
+///   * `file:////server/share/a.rs` (empty authority, UNC) → `//server/share/a.rs`
+///   * `file://server/share/a.rs`   (host authority, UNC)  → `//server/share/a.rs`
+///   * `file://localhost/C:/a.rs`   (localhost ≡ no host)  → `C:/a.rs`
+///
+/// A uri with no `file://` scheme is already project-relative and passes
+/// through unchanged. Byte-index-safe and total — it never panics.
 fn sarif_uri_to_path(cwd: &Path, uri: &str) -> String {
     let Some(rest) = uri.strip_prefix("file://") else {
         return uri.to_string();
     };
-    // Drop the leading slash only when a Windows drive letter follows it
-    // (`/c:/…` → `c:/…`); a POSIX `/repo/…` keeps its root slash.
-    let abs = if rest.starts_with('/') && rest.as_bytes().get(2) == Some(&b':') {
-        &rest[1..]
-    } else {
-        rest
+    // Split the authority (host) from the path: the authority is everything
+    // before the first `/`. `file:///…` and `file:////…` start with `/`, so
+    // their authority is empty (the whole `rest` is the path).
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        // `file://host` with no path component.
+        None => (rest, ""),
     };
-    relativize(cwd, abs)
+    // RFC 8089: an empty authority and `localhost` are equivalent.
+    let host = if authority.eq_ignore_ascii_case("localhost") { "" } else { authority };
+    let abs = if host.is_empty() {
+        // Empty authority. `/C:/…` drops its leading slash to a drive path;
+        // a POSIX `/repo/…` root or an empty-authority UNC `//server/share/…`
+        // (path already starts `//`) is kept verbatim.
+        if path.starts_with('/') && path.as_bytes().get(2) == Some(&b':') {
+            path[1..].to_string()
+        } else {
+            path.to_string()
+        }
+    } else {
+        // Non-empty host ⇒ UNC share `//host/share/…`.
+        format!("//{host}{path}")
+    };
+    relativize(cwd, &abs)
 }
 
 /// SARIF 2.1 JSON (`ruff --output-format sarif`, `clang-tidy`, `golangci-lint`,
@@ -813,11 +859,7 @@ struct GoTestEvent {
 /// assertion detail. Mirrors `truncate_lines`, but keeps the END (a Go
 /// failure's signal is at the bottom, not the top).
 fn tail_lines(block: &[&str], max: usize) -> String {
-    let start = block.iter().position(|l| !l.trim().is_empty()).unwrap_or(block.len());
-    let end = block.iter().rposition(|l| !l.trim().is_empty()).map(|i| i + 1).unwrap_or(start);
-    let trimmed = &block[start..end];
-    let skip = trimmed.len().saturating_sub(max);
-    trimmed[skip..].join("\n")
+    slice_lines(block, max, true)
 }
 
 /// One failure `Diag` from a label + the collected `Output` chunks for its
@@ -847,12 +889,7 @@ fn parse_go_test_json(stdout: &str) -> Vec<Diag> {
     let (mut passed, mut failed) = (0u32, 0u32);
     let mut saw_event = false;
 
-    for line in stdout.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(ev) = serde_json::from_str::<GoTestEvent>(line) else { continue };
+    for ev in json_lines::<GoTestEvent>(stdout) {
         saw_event = true;
         let test_key = ev.test.clone().unwrap_or_default();
         if let Some(text) = &ev.output {
@@ -1206,6 +1243,20 @@ not json at all
         assert_eq!(diags[2].line, 0);
     }
 
+    #[test]
+    fn json_lines_yields_only_valid_typed_values() {
+        #[derive(Deserialize, PartialEq, Debug)]
+        struct Row {
+            n: u32,
+        }
+        // Blank line, plain text, a `{`-leading line that isn't valid JSON, a
+        // `{`-leading line that parses but lacks the field, and two good rows —
+        // only the well-typed objects survive, in stream order.
+        let input = "\nnot json\n  {\"n\":1}  \n{ oops\n{\"other\":true}\n{\"n\":2}\n";
+        let rows: Vec<Row> = json_lines(input).collect();
+        assert_eq!(rows, vec![Row { n: 1 }, Row { n: 2 }]);
+    }
+
     const TSC_OUTPUT: &str = "src/app.ts(12,5): error TS2345: Argument of type 'string' is not assignable to parameter of type 'number'.\nsrc/util.ts(3,1): warning TS6133: 'foo' is declared but never used.\nsomething unrelated on stdout\n";
 
     #[test]
@@ -1325,6 +1376,26 @@ not json at all
     fn strip_ansi_borrows_when_clean() {
         assert!(matches!(strip_ansi("no escapes here"), Cow::Borrowed(_)));
         assert_eq!(strip_ansi("\x1b[1;31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn slice_lines_head_tail_and_blank_trim() {
+        let block = ["", "a", "b", "c", "d", ""];
+        // Head vs tail, both blank-trimmed and capped at `max`.
+        assert_eq!(slice_lines(&block, 2, false), "a\nb");
+        assert_eq!(slice_lines(&block, 2, true), "c\nd");
+        assert_eq!(truncate_lines(&block, 2), "a\nb");
+        assert_eq!(tail_lines(&block, 2), "c\nd");
+        // Block shorter than max returns the whole trimmed block, either way.
+        assert_eq!(slice_lines(&block, 99, false), "a\nb\nc\nd");
+        assert_eq!(slice_lines(&block, 99, true), "a\nb\nc\nd");
+        // All-blank block trims to empty (no panic on the empty slice).
+        let blank = ["", "  ", "\t"];
+        assert_eq!(slice_lines(&blank, 5, false), "");
+        assert_eq!(slice_lines(&blank, 5, true), "");
+        // max == 0 yields nothing from a non-empty block.
+        assert_eq!(slice_lines(&block, 0, false), "");
+        assert_eq!(slice_lines(&block, 0, true), "");
     }
 
     #[test]
@@ -1531,6 +1602,55 @@ not json at all
         assert!(parse_sarif("not json at all", Path::new("/repo")).is_empty());
         // A valid-but-empty envelope also yields nothing (no runs/results).
         assert!(parse_sarif(r#"{"version":"2.1.0","runs":[]}"#, Path::new("/repo")).is_empty());
+    }
+
+    #[test]
+    fn sarif_uri_handles_rfc8089_forms() {
+        // Existing empty-authority forms still relativize against cwd.
+        assert_eq!(
+            sarif_uri_to_path(Path::new("/repo"), "file:///repo/src/util.py"),
+            "src/util.py",
+            "POSIX-root file uri"
+        );
+        assert_eq!(
+            sarif_uri_to_path(Path::new(r"c:\repo"), "file:///c:/repo/a.rs"),
+            "a.rs",
+            "drive-letter file uri"
+        );
+        // A relative (schemeless) uri passes through untouched.
+        assert_eq!(sarif_uri_to_path(Path::new("/repo"), "src/app.py"), "src/app.py");
+
+        // 4-slash / empty-authority UNC → `//server/share/…`, matched against a
+        // UNC cwd (`\\server\share` folds to `//server/share`).
+        assert_eq!(
+            sarif_uri_to_path(Path::new(r"\\server\share"), "file:////server/share/src/x.rs"),
+            "src/x.rs",
+            "empty-authority UNC file uri"
+        );
+        // 2-slash host-authority UNC → same canonical `//server/share/…`.
+        assert_eq!(
+            sarif_uri_to_path(Path::new(r"\\server\share"), "file://server/share/src/x.rs"),
+            "src/x.rs",
+            "host-authority UNC file uri"
+        );
+        // `localhost` authority ≡ empty authority ⇒ drive-letter path.
+        assert_eq!(
+            sarif_uri_to_path(Path::new(r"C:\repo"), "file://localhost/C:/repo/a.rs"),
+            "a.rs",
+            "localhost + drive file uri"
+        );
+
+        // Non-matching absolute path (UNC share vs POSIX cwd — different
+        // volumes) is KEPT best-effort, never dropped.
+        assert_eq!(
+            sarif_uri_to_path(Path::new("/repo"), "file:////server/share/x.rs"),
+            "//server/share/x.rs",
+            "non-matching UNC kept as absolute"
+        );
+
+        // Total on degenerate inputs — no panic, no bad byte-indexing.
+        assert_eq!(sarif_uri_to_path(Path::new("/repo"), "file://"), "");
+        assert_eq!(sarif_uri_to_path(Path::new("/repo"), "file://host"), "//host");
     }
 
     // ── go build / go vet ───────────────────────────────────────────────

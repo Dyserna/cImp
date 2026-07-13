@@ -6,27 +6,14 @@
 
 import type { CheckDef, ChecksSuggestion, ChecksTestResult, ParserKind } from './types';
 
-/// Every `ParserKind` wire name, in the order the editor's dropdown lists them
-/// (mainstream first, then SARIF/long-tail, then the regex escape hatch and the
-/// generic fallback). Mirror of the Rust `ParserKind` variants — kept aligned
-/// with the `types.ts` union (which the Rust tripwire pins to the enum).
-export const PARSER_KINDS: readonly ParserKind[] = [
-  'cargo-json',
-  'cargo-test',
-  'tsc',
-  'eslint-json',
-  'jest-json',
-  'pytest',
-  'go',
-  'go-test-json',
-  'dotnet',
-  'junit-xml',
-  'sarif',
-  'regex-custom',
-  'generic-gcc',
-];
-
-/// Short human labels for the parser dropdown.
+/// Short human labels for the parser dropdown, in the order the editor lists
+/// them (mainstream first, then SARIF/long-tail, then the regex escape hatch
+/// and the generic fallback). This `Record<ParserKind, string>` is the single
+/// source of truth: it is exhaustiveness-checked by the compiler, so adding a
+/// `ParserKind` to the `types.ts` union (which the Rust tripwire pins to the
+/// enum) forces a label here — which in turn makes the new parser appear in
+/// both `PARSER_KINDS` and the dropdown. Add the new key in the position you
+/// want it to surface in the UI.
 export const PARSER_LABELS: Record<ParserKind, string> = {
   'cargo-json': 'Cargo (cargo check --message-format=json)',
   'cargo-test': 'Cargo test',
@@ -42,6 +29,15 @@ export const PARSER_LABELS: Record<ParserKind, string> = {
   'regex-custom': 'Custom regex',
   'generic-gcc': 'Generic (file:line:col)',
 };
+
+/// Every `ParserKind` wire name feeding the editor's dropdown, derived from the
+/// exhaustiveness-checked `PARSER_LABELS` so the list can never fall behind the
+/// union: a new `ParserKind` is a compile error until it has a label, and it
+/// then flows into the dropdown automatically. Order follows `PARSER_LABELS`
+/// key order (`Object.keys` preserves insertion order for string keys).
+export const PARSER_KINDS: readonly ParserKind[] = Object.keys(
+  PARSER_LABELS,
+) as ParserKind[];
 
 /// Whether the parser reveals the `pattern` field (the `regex-custom` escape
 /// hatch is the only parser that reads it).

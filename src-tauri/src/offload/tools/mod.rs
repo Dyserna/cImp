@@ -76,22 +76,22 @@ impl ToolCtx {
         // Collect every distinct in-root resolution. A relative path can
         // resolve under more than one root when roots overlap/nest; silently
         // returning the first is order-dependent and surprising, so flag the
-        // ambiguity instead. (Escape is still blocked by the canonical
-        // `starts_with` check; an absolute request has a single candidate and
-        // can never be ambiguous here.)
+        // ambiguity instead. The per-root canonicalize + boundary check is the
+        // shared [`crate::fsutil::confine_existing`] core (target must exist —
+        // offload is read-only); the multi-root/ambiguity policy stays here.
+        // (An absolute request has a single candidate and can never be
+        // ambiguous here.)
         let mut matches: Vec<PathBuf> = Vec::new();
         for cand in candidates {
-            let canon = match cand.canonicalize() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let in_root = self.allowed_roots.iter().any(|root| {
-                root.canonicalize()
-                    .map(|rc| canon.starts_with(&rc))
-                    .unwrap_or(false)
-            });
-            if in_root && !matches.contains(&canon) {
-                matches.push(canon);
+            for root in &self.allowed_roots {
+                if let Ok(canon) = crate::fsutil::confine_existing(root, &cand) {
+                    if !matches.contains(&canon) {
+                        matches.push(canon);
+                    }
+                    // This candidate is confined; don't double-count it across
+                    // overlapping roots (it canonicalizes to one real path).
+                    break;
+                }
             }
         }
         match matches.len() {

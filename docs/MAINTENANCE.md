@@ -938,7 +938,14 @@ changelog.
 **`cwd` / `report_file` are confined under the project root, the same way
 offload's `ToolCtx::confine` confines a path.** Absolute or `..`-escaping paths
 are rejected at settings validation *and* at run time; a `report_file` that's
-missing after the run is an explicit error diag, never empty success. `env`
+missing after the run is an explicit error diag, never empty success.
+`report_file` is resolved **relative to the check's working directory** (`cwd`
+if set, else the project root) — matching where a tool run in that dir actually
+writes (so `detect.rs`'s nested-module presets seed an unprefixed
+`target/surefire-reports` correctly). For back-compat with pre-fix configs that
+were written root-relative *with* a `cwd`, resolution tries cwd-relative first
+and falls back to root-relative only when the file exists solely there
+(cwd-relative wins when both exist). `env`
 values are redacted in `CheckDef`'s `Debug`. `regex-custom`'s `pattern` is
 compiled and its mandatory named groups checked at save time
 (`parsers::validate_pattern`, surfaced through the `checks_validate_pattern`

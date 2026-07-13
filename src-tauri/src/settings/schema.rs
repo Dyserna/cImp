@@ -70,7 +70,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 21;
+pub const CURRENT_SCHEMA_VERSION: u8 = 22;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION

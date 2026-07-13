@@ -364,10 +364,50 @@ pub struct SurfaceStats {
     pub offload_chars: usize,
 }
 
-/// Measure the advertised tool surface for both consumers (V17 Phase E). Reads
-/// live settings (via [`tools`] / `graph_tools::defs`), so it reflects the
-/// current `lean_tools` state.
-pub fn surface_stats() -> SurfaceStats {
+/// The exact settings that move [`surface_stats`] — every input that changes
+/// what [`tools`] / `graph_tools::defs` advertise. Everything else in the specs
+/// (`tool_specs`, the semantic/`run_check` specs, `LEAN_HIDDEN`) is static, so
+/// two equal fingerprints ⇒ byte-identical [`SurfaceStats`]. The specs carry no
+/// project-scoped text either (no paths/roots baked in), so the fingerprint
+/// needs no cwd/root component — the derived booleans below fully determine the
+/// output regardless of which project's settings produced them.
+///
+/// Coverage (read off the gating in [`tools`] and `graph_tools::defs`):
+/// - `graph_enabled`  — gates the whole `graph_*` block in [`tools`].
+/// - `semantic_search`— gates `graph_semantic_docs` in both.
+/// - `embed_code_bodies` — gates `graph_semantic_code` in both.
+/// - `lean_tools`     — drops [`LEAN_HIDDEN`] from both.
+/// - `has_checks`     — gates `run_check` in [`tools`] (only emptiness matters;
+///   the spec text is fixed, independent of the checks' contents).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SurfaceFingerprint {
+    graph_enabled: bool,
+    semantic_search: bool,
+    embed_code_bodies: bool,
+    lean_tools: bool,
+    has_checks: bool,
+}
+
+impl SurfaceFingerprint {
+    fn of(settings: &crate::settings::Settings) -> Self {
+        Self {
+            graph_enabled: settings.graph.enabled,
+            semantic_search: settings.graph.semantic_search,
+            embed_code_bodies: settings.graph.embed_code_bodies,
+            lean_tools: settings.graph.lean_tools,
+            has_checks: !settings.checks.is_empty(),
+        }
+    }
+}
+
+/// Process-wide memo for [`surface_stats`]: `(fingerprint, stats)`. `None` until
+/// the first call; recomputed only when the fingerprint changes.
+static SURFACE_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(SurfaceFingerprint, SurfaceStats)>>> =
+    std::sync::OnceLock::new();
+
+/// Do the actual rebuild+serialize of both advertised surfaces. Only reached on
+/// a cache miss (settings changed) — see [`surface_stats`].
+fn compute_surface_stats() -> SurfaceStats {
     let mcp = tools();
     let offload = crate::offload::tools::graph_tools::defs();
     SurfaceStats {
@@ -376,6 +416,34 @@ pub fn surface_stats() -> SurfaceStats {
         offload_tools: offload.len(),
         offload_chars: serde_json::to_string(&offload).map(|s| s.len()).unwrap_or(0),
     }
+}
+
+/// Measure the advertised tool surface for both consumers (V17 Phase E). Reads
+/// live settings, so it reflects the current `lean_tools` / graph / checks state.
+///
+/// Memoized process-wide behind a [`SurfaceFingerprint`]: the value only changes
+/// when settings toggle tools on/off, but this is polled every ~2 s by the
+/// Overview section (via `graph_usage_advice`). So on the steady poll we compute
+/// only the cheap fingerprint (a settings read that already happens) and reuse
+/// the cached `SurfaceStats` instead of rebuilding + `serde_json::to_string`-ing
+/// both full tool lists. A settings change flips the fingerprint and forces a
+/// one-shot recompute, so the cache can never serve stale numbers.
+pub fn surface_stats() -> SurfaceStats {
+    let settings = current_settings();
+    let fp = SurfaceFingerprint::of(&settings);
+    let cell = SURFACE_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    // Poisoning is harmless here (the cached value is immutable data), so recover
+    // the guard rather than propagating a panic from an unrelated caller.
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_fp, stats)) = guard.as_ref() {
+        if *cached_fp == fp {
+            return stats.clone();
+        }
+    }
+    // Miss: recompute under the lock (rare — only on a settings toggle) and cache.
+    let stats = compute_surface_stats();
+    *guard = Some((fp, stats.clone()));
+    stats
 }
 
 /// The activity/memory **source** string for a consumer name — the value
@@ -1888,15 +1956,18 @@ fn cap_bytes(s: &str, max: usize) -> (String, bool) {
 /// and trusted, but `graph_snippet` reads arbitrary disk, so this is defense in
 /// depth (same posture as the `read_file` native tool's confinement).
 fn confine_to_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let canon_root = root.canonicalize().map_err(|e| format!("cannot resolve project root: {e}"))?;
-    let canon = canon_root
-        .join(rel)
-        .canonicalize()
-        .map_err(|_| format!("{rel} not found on disk"))?;
-    if !canon.starts_with(&canon_root) {
-        return Err(format!("refusing to read {rel} — outside the project root"));
+    // Shared symlink-aware boundary check ([`crate::fsutil::confine_existing`]);
+    // the target must exist (`graph_snippet` only reads indexed files).
+    match crate::fsutil::confine_existing(root, &root.join(rel)) {
+        Ok(canon) => Ok(canon),
+        Err(crate::fsutil::ConfineError::Boundary(e)) => {
+            Err(format!("cannot resolve project root: {e}"))
+        }
+        Err(crate::fsutil::ConfineError::NotFound) => Err(format!("{rel} not found on disk")),
+        Err(crate::fsutil::ConfineError::Escaped) => {
+            Err(format!("refusing to read {rel} — outside the project root"))
+        }
     }
-    Ok(canon)
 }
 
 /// Walk up from `start` looking for an ancestor containing `<sub>/graph.db`.
@@ -2386,6 +2457,61 @@ mod surface_tests {
             .expect("hidden tool still dispatches");
         assert!(!out.starts_with("unknown graph tool"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same ambient settings → repeated `surface_stats()` calls agree. The
+    /// second call is served from the memo (can't observe the skipped rebuild
+    /// directly), and must be byte-identical to the first.
+    #[test]
+    fn surface_stats_is_stable_across_calls() {
+        let a = surface_stats();
+        let b = surface_stats();
+        assert_eq!(a, b, "cached surface stats must equal the first computation");
+    }
+
+    /// The fingerprint must move when — and only when — a gating input changes,
+    /// so the memo can never serve stale numbers past a settings toggle. Toggling
+    /// each of the five gates flips the fingerprint; a non-gating field does not.
+    #[test]
+    fn fingerprint_covers_every_gating_input() {
+        use crate::settings::Settings;
+        let base = Settings::default();
+        let base_fp = SurfaceFingerprint::of(&base);
+
+        // Each gating toggle must produce a distinct fingerprint.
+        let mut s = base.clone();
+        s.graph.enabled = !s.graph.enabled;
+        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "graph.enabled must be in the fingerprint");
+
+        let mut s = base.clone();
+        s.graph.semantic_search = !s.graph.semantic_search;
+        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "semantic_search must be in the fingerprint");
+
+        let mut s = base.clone();
+        s.graph.embed_code_bodies = !s.graph.embed_code_bodies;
+        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "embed_code_bodies must be in the fingerprint");
+
+        let mut s = base.clone();
+        s.graph.lean_tools = !s.graph.lean_tools;
+        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "lean_tools must be in the fingerprint");
+
+        let mut s = base.clone();
+        s.checks = vec![crate::checks::CheckDef {
+            name: "cargo".to_string(),
+            cmd: "cargo check".to_string(),
+            ..Default::default()
+        }];
+        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "checks emptiness must be in the fingerprint");
+
+        // A field that does NOT change the advertised surface must NOT move it —
+        // otherwise the cache would recompute needlessly on unrelated edits.
+        let mut s = base.clone();
+        s.graph.max_rows_per_query = s.graph.max_rows_per_query.wrapping_add(1);
+        assert_eq!(
+            SurfaceFingerprint::of(&s),
+            base_fp,
+            "a non-gating setting must not change the fingerprint"
+        );
     }
 
     /// E5 helper: print the measured surface so the before/after editorial

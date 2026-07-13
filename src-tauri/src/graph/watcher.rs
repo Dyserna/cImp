@@ -54,11 +54,14 @@ pub fn start(
             // `reindex_paths`, which respects gitignore) keeps a `cargo build`
             // or `npm install` writing thousands of files from flooding the
             // bounded channel and forcing back-to-back full rebuilds mid-build.
-            const SKIP_DIRS: [&str; 3] = [".git", "target", "node_modules"];
+            // The deliberately minimal hot-path subset (see the const's docs):
+            // skipping build/vendor dirs here could drop events for source that
+            // legitimately lives under them, so this is NOT the broad SKIP_DIRS.
             if !ev.paths.is_empty()
                 && ev.paths.iter().all(|p| {
-                    p.components()
-                        .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_str().unwrap_or("")))
+                    p.components().any(|c| {
+                        crate::fsutil::WATCH_SKIP_DIRS.contains(&c.as_os_str().to_str().unwrap_or(""))
+                    })
                 })
             {
                 return;

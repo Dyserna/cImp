@@ -551,9 +551,37 @@ fn has_extension(last_segment: &str) -> bool {
     }
 }
 
+/// Whether `tok` begins with a URL scheme (`scheme://`), where scheme matches
+/// `[a-zA-Z][a-zA-Z0-9+.-]*`. This is the guard that keeps a legitimate URL
+/// string value (e.g. `https://ci.example.com/build/42/output.log`) — which no
+/// tool ever touches — out of the path-grounding verifier, where it would
+/// otherwise read as an unobserved path mention and falsely taint the answer.
+///
+/// `file://` is deliberately EXCLUDED from this exclusion: a `file://` URI names
+/// a filesystem location, so it is a genuine path claim and should still be
+/// grounding-checked. Windows drive paths (`C:\…`, `C:/…`) and UNC paths
+/// (`\\host\share`) are unaffected — they use `:\`, `:/`, or `\\`, none of which
+/// contain the `://` this test requires.
+fn has_url_scheme(tok: &str) -> bool {
+    let Some(idx) = tok.find("://") else {
+        return false;
+    };
+    let scheme = &tok[..idx];
+    if scheme.is_empty() || scheme.eq_ignore_ascii_case("file") {
+        return false;
+    }
+    let mut chars = scheme.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+}
+
 /// A path-like token: contains a `/` or `\` separator AND its final segment has
-/// a file extension. Both POSIX and Windows separators count.
+/// a file extension. Both POSIX and Windows separators count. A URL (`scheme://…`,
+/// e.g. an `https` build-log link) is NOT a filesystem path — see [`has_url_scheme`].
 fn looks_like_path(tok: &str) -> bool {
+    if has_url_scheme(tok) {
+        return false;
+    }
     if !tok.contains('/') && !tok.contains('\\') {
         return false;
     }
@@ -789,7 +817,11 @@ fn split_marker(answer: &str) -> (String, VerifiedLevel, Option<String>) {
 /// marker.
 fn strip_marker_prefix(line: &str) -> Option<&str> {
     let n = MARKER_PREFIX.len();
-    (line.len() >= n && line[..n].eq_ignore_ascii_case(MARKER_PREFIX)).then(|| &line[n..])
+    // `is_char_boundary(n)` guards against a multi-byte char straddling offset
+    // `n` (e.g. 8 ASCII bytes + an emoji) — slicing there would panic. A line
+    // whose prefix can't be the ASCII marker simply carries no marker.
+    (line.len() >= n && line.is_char_boundary(n) && line[..n].eq_ignore_ascii_case(MARKER_PREFIX))
+        .then(|| &line[n..])
 }
 
 /// Parse a marker value (`fully` / `partially — <note>`), case-insensitively.
@@ -823,6 +855,37 @@ fn marker_footer(level: VerifiedLevel, note: Option<&str>) -> String {
 /// Re-attach the grounding marker as a trailing footer on `body`.
 fn append_marker(body: &str, level: VerifiedLevel, note: Option<&str>) -> String {
     format!("{}\n\n{}", body.trim_end(), marker_footer(level, note))
+}
+
+/// V21 F4/F5: the shared grounding-verification tail applied to a free-prose
+/// final answer on both the natural-answer path (`run`) and the forced-final
+/// path (`force_final`). Strips the model's `[Tn]` citations, splits its
+/// self-reported `verified:` marker off, then deterministically checks every
+/// path mention against the observed set. Returns `(marked, unverified)`:
+///   * `unverified` empty ⇒ `marked` is the clean body carrying the model's own
+///     marker (`self_level` / `self_note`);
+///   * otherwise `marked` is the body with a taint footer appended and a
+///     verifier-forced `partially` marker (F5: the verifier overrides the
+///     self-report), and `unverified` lists the offending mentions (first-seen,
+///     raw).
+///
+/// `run` layers its one-shot corrective turn on the `unverified` list before
+/// falling back to this `marked` string; `force_final` — a hard-exhausted path
+/// with no corrective turn — returns `marked` directly.
+fn verify_and_mark(
+    answer: &str,
+    observed: &HashSet<String>,
+    ctx: Option<&ToolCtx>,
+) -> (String, Vec<String>) {
+    let (body, self_level, self_note) = split_marker(&strip_citations(answer));
+    let unverified = unverified_mentions(&body, observed, ctx);
+    if unverified.is_empty() {
+        (append_marker(&body, self_level, self_note.as_deref()), unverified)
+    } else {
+        let tainted = append_taint(&body, &unverified);
+        let marked = append_marker(&tainted, VerifiedLevel::Partially, Some(&unverified.join(", ")));
+        (marked, unverified)
+    }
 }
 
 /// Parse just the grounding level off an answer carrying a trailing `verified:`
@@ -897,18 +960,43 @@ fn canonical_json(v: &serde_json::Value) -> String {
 enum CacheProbe {
     /// Not seen — the caller must execute the tool, then [`CallCache::record`].
     Fresh,
-    /// Second identical call — serve this (nudge-prefixed) cached result without
-    /// executing.
+    /// Second identical call to a **pure-lookup** tool — serve this
+    /// (nudge-prefixed) cached result without executing.
     Repeat(String),
-    /// Third-or-later identical call — serve a short error, no result body.
+    /// Third-or-later identical call to a **pure-lookup** tool — serve a short
+    /// error, no result body.
     Exhausted,
+    /// Identical repeat of a **stateful** tool (reads the live filesystem or
+    /// runs a process). The caller must **re-execute** so the result reflects
+    /// on-disk truth even if another tool mutated the tree since the first
+    /// call (V21 F4 grounding), then prefix `REPEAT_NUDGE` to the fresh result
+    /// so the anti-loop signal survives without serving stale bytes.
+    RepeatStateful,
 }
 
 /// Per-run identical-call short-circuit. Keyed on `(tool name, canonical args)`;
-/// bounded by `max_steps` so no size management is needed. `run_check` is
-/// exempt (it re-executes) — its whole point is observing change.
-#[derive(Default)]
+/// bounded by `max_steps` so no size management is needed.
+///
+/// Two behaviors, chosen per tool by [`ToolDef::stateful`] (declared beside the
+/// tool definitions — never a hardcoded list here, so a new stateful tool can't
+/// be forgotten):
+/// - **Pure lookups** (the `graph_*` queries over the immutable-within-run code
+///   graph): an identical repeat is *served from cache* — 2nd call → the nudged
+///   cached body, 3rd+ → a short error. Nothing re-runs; the answer can't have
+///   changed.
+/// - **Stateful tools** (read_file / code_search / list_dir / run_command /
+///   run_check, and every MCP tool by default — anything reading the live FS or
+///   running a process): a repeat *re-executes* and the fresh result is
+///   returned, nudge-prefixed. This keeps the anti-loop signal while never
+///   feeding the model stale filesystem/process output. `run_check`'s former
+///   hardcoded exemption is exactly this case now — it re-executes as before.
+///
+/// Names not present in `pure_lookup` (unlisted / hallucinated) default to
+/// stateful — fail toward fresh execution.
 struct CallCache {
+    /// Tool names that may be served from cache (those whose `ToolDef.stateful`
+    /// is false). Every other name is treated as stateful.
+    pure_lookup: HashSet<String>,
     seen: HashMap<(String, String), CacheEntry>,
 }
 
@@ -918,21 +1006,30 @@ struct CacheEntry {
 }
 
 impl CallCache {
-    /// Whether `name` is cached at all (`run_check` never is).
-    fn cacheable(name: &str) -> bool {
-        name != "run_check"
+    /// Build from the advertised tool surface, recording which tools are pure
+    /// lookups (cache-servable). Any name absent from this set is stateful.
+    fn new(defs: &[ToolDef]) -> Self {
+        Self {
+            pure_lookup: defs
+                .iter()
+                .filter(|d| !d.stateful)
+                .map(|d| d.function.name.clone())
+                .collect(),
+            seen: HashMap::new(),
+        }
     }
 
     /// Probe for a repeat. Increments the hit count for a known key.
     fn probe(&mut self, name: &str, args: &serde_json::Value) -> CacheProbe {
-        if !Self::cacheable(name) {
-            return CacheProbe::Fresh;
-        }
         let key = (name.to_string(), canonical_json(args));
         match self.seen.get_mut(&key) {
             None => CacheProbe::Fresh,
             Some(entry) => {
                 entry.hits += 1;
+                // Stateful tools always re-execute (see [`CacheProbe::RepeatStateful`]).
+                if !self.pure_lookup.contains(name) {
+                    return CacheProbe::RepeatStateful;
+                }
                 if entry.hits == 2 {
                     CacheProbe::Repeat(format!("{REPEAT_NUDGE}\n\n{}", entry.result))
                 } else {
@@ -942,11 +1039,11 @@ impl CallCache {
         }
     }
 
-    /// Record the first result for a fresh key (idempotent — never overwrites).
+    /// Record a key so future identical calls are detected as repeats
+    /// (idempotent — never overwrites). For stateful tools the stored body is
+    /// never served (they always re-execute); it's kept only to keep `record`
+    /// uniform and cheap.
     fn record(&mut self, name: &str, args: &serde_json::Value, result: String) {
-        if !Self::cacheable(name) {
-            return;
-        }
         let key = (name.to_string(), canonical_json(args));
         self.seen.entry(key).or_insert(CacheEntry { result, hits: 1 });
     }
@@ -996,8 +1093,10 @@ pub async fn run(
     let mut obs_id: u32 = 0;
     let mut correction_used = false;
     let mut verify_turn = false;
-    // V21 F8 loop breaker: per-run identical-call short-circuit.
-    let mut call_cache = CallCache::default();
+    // V21 F8 loop breaker: per-run identical-call short-circuit. Built from the
+    // advertised tool surface so pure lookups (cache-servable) and stateful
+    // tools (re-execute) are classified from their `ToolDef.stateful` flag.
+    let mut call_cache = CallCache::new(&tools);
 
     for step in 0..cfg.max_steps {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1102,23 +1201,21 @@ pub async fn run(
                 .await;
             }
             if !answer.trim().is_empty() && !looks_like_leaked_tool_call(&answer) {
-                // V21 F4/F5: strip the model's citations (downstream sees clean
-                // prose), split its self-reported `verified:` marker off (so the
-                // verifier can override it and it re-emits as a trailing footer),
-                // then deterministically verify every path mention is in the
-                // observed set. A clean answer returns immediately, carrying the
-                // model's own marker.
-                let (body, self_level, self_note) = split_marker(&strip_citations(&answer));
-                let unverified = unverified_mentions(&body, &observed, obs_ctx);
+                // V21 F4/F5: run the shared grounding verifier (strip citations,
+                // split the self-reported `verified:` marker off, check every path
+                // mention against the observed set). A clean answer's `marked`
+                // carries the model's own marker; a dirty one's `marked` is
+                // pre-composed with a taint footer + forced `partially`, returned
+                // unless a corrective turn is still possible.
+                let (marked, unverified) = verify_and_mark(&answer, &observed, obs_ctx);
                 if unverified.is_empty() {
-                    return Ok(append_marker(&body, self_level, self_note.as_deref()));
+                    return Ok(marked);
                 }
                 // Dirty. Attempt ONE corrective turn while the loop can still
                 // take another step (deadline not spent, steps remain); the turn
                 // gets tools so the model can actually verify, and is labeled
                 // "verify" in the run log. Otherwise (or if already corrected)
-                // return the answer with a taint footer and a verifier-forced
-                // `partially` marker (F5: the verifier overrides the self-report).
+                // return the pre-marked taint answer.
                 let deadline_spent =
                     deadline.saturating_duration_since(Instant::now()).is_zero();
                 if !correction_used && !deadline_spent && step + 1 < cfg.max_steps {
@@ -1130,12 +1227,7 @@ pub async fn run(
                     ]);
                     continue;
                 }
-                let tainted = append_taint(&body, &unverified);
-                return Ok(append_marker(
-                    &tainted,
-                    VerifiedLevel::Partially,
-                    Some(&unverified.join(", ")),
-                ));
+                return Ok(marked);
             }
             // The model ended its turn with no usable answer. Either it spent
             // the whole turn inside a <think> block that strip_think removed
@@ -1188,6 +1280,21 @@ pub async fn run(
                     // V21 F4: harvest the paths this tool revealed.
                     collect_observed(&mut observed, obs_ctx, name, &args, &capped);
                     capped
+                }
+                // Stateful tool repeated: re-execute so the result reflects
+                // current on-disk truth (another tool may have mutated the tree
+                // mid-run), then nudge-prefix it so the anti-loop signal
+                // survives without serving stale bytes (V21 F4 grounding).
+                CacheProbe::RepeatStateful => {
+                    repeated_in_turn = true;
+                    let r = match router.call(name, args.clone()).await {
+                        Ok(r) => r,
+                        Err(e) => format!("ERROR: {e}"),
+                    };
+                    let capped = cap_result(r, cfg.per_tool_result_token_cap);
+                    // Fresh output — re-harvest any paths it reveals.
+                    collect_observed(&mut observed, obs_ctx, name, &args, &capped);
+                    format!("{REPEAT_NUDGE}\n\n{capped}")
                 }
                 CacheProbe::Repeat(cached) => {
                     repeated_in_turn = true;
@@ -1518,23 +1625,14 @@ async fn force_final(
     } else if schema.is_some() {
         finalize_schema_answer(&stripped, observed, obs_ctx).map_err(AppError::Offload)
     } else {
-        // V21 F4/F5: strip citations, split the self-reported marker off, and run
-        // the same grounding verifier. This is a hard-exhausted path
-        // (deadline/max_steps already spent), so there is no corrective turn — a
-        // still-dirty answer gets the taint footer and a verifier-forced
-        // `partially` marker; a clean one keeps the model's self-report.
-        let (body, self_level, self_note) = split_marker(&strip_citations(&stripped));
-        let unverified = unverified_mentions(&body, observed, obs_ctx);
-        if unverified.is_empty() {
-            Ok(append_marker(&body, self_level, self_note.as_deref()))
-        } else {
-            let tainted = append_taint(&body, &unverified);
-            Ok(append_marker(
-                &tainted,
-                VerifiedLevel::Partially,
-                Some(&unverified.join(", ")),
-            ))
-        }
+        // V21 F4/F5: run the shared grounding verifier (strip citations, split
+        // the self-reported marker off, check path mentions). Unlike `run`'s
+        // natural-answer path, this is a hard-exhausted path (deadline/max_steps
+        // already spent), so there is deliberately no corrective turn — the
+        // pre-marked answer (clean self-report, or taint footer + verifier-forced
+        // `partially`) is returned as-is.
+        let (marked, _unverified) = verify_and_mark(&stripped, observed, obs_ctx);
+        Ok(marked)
     }
 }
 
@@ -2075,6 +2173,26 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_path_excludes_urls_but_keeps_drive_and_file_uris() {
+        // A URL with a path + extension is NOT a filesystem path mention — no tool
+        // ever touched it, so it must not taint the answer as "unverified".
+        assert!(!looks_like_path("https://ci.example.com/build/42/output.log"));
+        assert!(!looks_like_path("http://host/a/b.txt"));
+        assert!(!looks_like_path("ftp://host/pub/file.zip"));
+        assert!(!looks_like_path("ws://host/socket.io"));
+        assert!(!looks_like_path("wss://host/live/stream.ts"));
+        assert!(has_url_scheme("git+ssh://host/repo.git")); // general scheme grammar
+        // Real paths still count.
+        assert!(looks_like_path("src/main.rs")); // relative
+        assert!(looks_like_path("C:\\proj\\x.rs")); // windows absolute, backslash
+        assert!(looks_like_path("C:/proj/x.rs")); // windows absolute, forward slash
+        assert!(looks_like_path("\\\\host\\share\\x.rs")); // UNC
+        // `file://` URIs ARE path claims — kept in the verifier's scope.
+        assert!(!has_url_scheme("file:///c:/proj/x.rs"));
+        assert!(looks_like_path("file:///c:/proj/x.rs"));
+    }
+
+    #[test]
     fn extract_path_mentions_finds_backticks_and_bare_tokens() {
         let answer = "The bug is in `src/offload/agent.rs` and also docs/plan.md, not README.";
         let m = extract_path_mentions(answer, None);
@@ -2154,6 +2272,31 @@ mod tests {
     }
 
     #[test]
+    fn verify_and_mark_composes_the_shared_grounding_tail() {
+        let mut obs = HashSet::new();
+        obs.insert("src/real.rs".to_string());
+        // Clean answer: citations stripped, the model's own marker preserved,
+        // no taint footer, empty unverified list.
+        let (marked, unverified) =
+            verify_and_mark("Fixed [T2] `src/real.rs`.\n\nverified: fully", &obs, None);
+        assert!(unverified.is_empty());
+        assert!(!marked.contains("[T2]"), "citations stripped");
+        assert!(!marked.contains("worker note"), "clean answer has no taint footer");
+        assert!(marked.ends_with("verified: fully"), "model's own marker kept");
+        // Dirty answer: an unobserved mention is flagged, a taint footer is
+        // appended, and the self-report is downgraded to a forced `partially`
+        // marker listing the offending mention.
+        let (marked, unverified) =
+            verify_and_mark("See `src/ghost.rs`.\n\nverified: fully", &obs, None);
+        assert_eq!(unverified, vec!["src/ghost.rs".to_string()]);
+        assert!(marked.contains(
+            "[worker note: the following mentions were not verified by any tool call: src/ghost.rs]"
+        ));
+        assert!(marked.ends_with("verified: partially — src/ghost.rs"), "verifier overrides self-report");
+        assert_eq!(answer_verified_level(&marked), VerifiedLevel::Partially);
+    }
+
+    #[test]
     fn norm_path_uses_confinement_to_collapse_variants() {
         let root = std::env::temp_dir().join(format!("cimp-obs-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("docs")).unwrap();
@@ -2184,28 +2327,35 @@ mod tests {
         assert_eq!(canonical_json(&a), r#"{"a":{"x":3,"y":2},"b":1}"#);
     }
 
+    /// A pure-lookup tool def (cache-servable) for the cache tests.
+    fn pure_def(name: &str) -> ToolDef {
+        ToolDef::function(name, "", json!({ "type": "object" })).pure()
+    }
+
     #[test]
-    fn call_cache_serves_cached_repeat_without_executing() {
-        let mut cache = CallCache::default();
+    fn call_cache_serves_cached_repeat_without_executing_for_pure_lookup() {
+        // A pure lookup (immutable-within-run) keeps the serve-from-cache
+        // short-circuit: 2nd call → nudged cached body, 3rd+ → short error.
+        let mut cache = CallCache::new(&[pure_def("graph_outline")]);
         let args = json!({ "path": "a.rs" });
         let mut executions = 0u32;
         // Mirror the loop's execute-on-Fresh decision, counting real executions.
         let mut step = |cache: &mut CallCache| -> String {
-            match cache.probe("read_file", &args) {
+            match cache.probe("graph_outline", &args) {
                 CacheProbe::Fresh => {
                     executions += 1;
                     let r = "RESULT".to_string();
-                    cache.record("read_file", &args, r.clone());
+                    cache.record("graph_outline", &args, r.clone());
                     r
                 }
                 CacheProbe::Repeat(r) => r,
                 CacheProbe::Exhausted => REPEAT_EXHAUSTED.to_string(),
+                CacheProbe::RepeatStateful => panic!("pure lookup must not re-execute"),
             }
         };
         let first = step(&mut cache);
         let second = step(&mut cache);
         let third = step(&mut cache);
-        drop(step);
         assert_eq!(first, "RESULT");
         assert!(second.starts_with(REPEAT_NUDGE) && second.contains("RESULT"), "second: {second}");
         assert_eq!(third, REPEAT_EXHAUSTED);
@@ -2213,19 +2363,60 @@ mod tests {
     }
 
     #[test]
-    fn call_cache_exempts_run_check_and_misses_on_distinct_args() {
-        let mut cache = CallCache::default();
-        // run_check always re-executes — never cached.
+    fn call_cache_reexecutes_stateful_tool_with_nudge() {
+        // A stateful tool (reads the live FS / runs a process) must re-execute
+        // on an identical repeat so the result reflects on-disk truth, but is
+        // still flagged as a repeat via the nudge prefix. read_file has no
+        // ToolDef in this cache, so it defaults to stateful (fail-fresh).
+        let mut cache = CallCache::new(&[pure_def("graph_outline")]);
+        let args = json!({ "path": "a.rs" });
+        // Simulate the tree changing between calls: the executor returns fresh
+        // bytes each time; the cache must never mask that.
+        let mut disk = vec!["v1", "v2", "v3"].into_iter();
+        let mut executions = 0u32;
+        let mut step = |cache: &mut CallCache| -> String {
+            match cache.probe("read_file", &args) {
+                CacheProbe::Fresh => {
+                    executions += 1;
+                    let r = disk.next().unwrap().to_string();
+                    cache.record("read_file", &args, r.clone());
+                    r
+                }
+                CacheProbe::RepeatStateful => {
+                    executions += 1;
+                    let fresh = disk.next().unwrap().to_string();
+                    format!("{REPEAT_NUDGE}\n\n{fresh}")
+                }
+                CacheProbe::Repeat(_) | CacheProbe::Exhausted => {
+                    panic!("stateful tool must not be served from cache")
+                }
+            }
+        };
+        let first = step(&mut cache);
+        let second = step(&mut cache);
+        let third = step(&mut cache);
+        assert_eq!(first, "v1");
+        // Re-executed → fresh on-disk value, plus the repeat nudge.
+        assert!(second.starts_with(REPEAT_NUDGE) && second.contains("v2"), "second: {second}");
+        assert!(third.starts_with(REPEAT_NUDGE) && third.contains("v3"), "third: {third}");
+        assert_eq!(executions, 3, "the stateful tool re-executed every time");
+    }
+
+    #[test]
+    fn call_cache_run_check_stays_stateful_and_misses_on_distinct_args() {
+        // run_check keeps its exemption: it is stateful (not in pure_lookup), so
+        // it re-executes on repeat rather than serving a stale cached report.
+        let mut cache = CallCache::new(&[pure_def("graph_outline")]);
         let rc = json!({ "name": "test" });
+        assert!(matches!(cache.probe("run_check", &rc), CacheProbe::Fresh));
         cache.record("run_check", &rc, "report".into());
-        assert!(matches!(cache.probe("run_check", &rc), CacheProbe::Fresh));
-        assert!(matches!(cache.probe("run_check", &rc), CacheProbe::Fresh));
-        // Distinct arguments miss; the identical one is a repeat.
+        assert!(matches!(cache.probe("run_check", &rc), CacheProbe::RepeatStateful));
+        // Distinct arguments miss; an identical stateful call re-executes.
         let a = json!({ "path": "a" });
         let b = json!({ "path": "b" });
         cache.record("read_file", &a, "one".into());
         assert!(matches!(cache.probe("read_file", &b), CacheProbe::Fresh));
-        assert!(matches!(cache.probe("read_file", &a), CacheProbe::Repeat(_)));
+        assert!(matches!(cache.probe("read_file", &a), CacheProbe::RepeatStateful));
     }
 
     // ── V21 F9 — grammar-enforced structured output ────────────────────────
@@ -2339,6 +2530,20 @@ mod tests {
         assert!(serde_json::from_str::<serde_json::Value>(body).is_ok());
     }
 
+    #[test]
+    fn finalize_schema_answer_url_value_is_fully_verified() {
+        // A schema answer whose only path-shaped string value is a URL (never
+        // touched by a tool) must come out `fully` verified — the URL is not a
+        // filesystem-path mention, so it cannot downgrade the answer to
+        // `partially` and trip an unwarranted F5 escalation.
+        let obs = HashSet::new();
+        let jsonish = r#"{"log": "https://ci.example.com/build/42/output.log"}"#;
+        let out = finalize_schema_answer(jsonish, &obs, None).unwrap();
+        assert!(out.starts_with(jsonish), "JSON body verbatim: {out}");
+        assert!(out.trim_end().ends_with("verified: fully"), "URL value ⇒ fully, not partial: {out}");
+        assert!(!out.contains("verified: partially"), "no false unverified taint: {out}");
+    }
+
     // ── V21 F5 — confidence marker parse/emit ──────────────────────────────
 
     #[test]
@@ -2373,6 +2578,21 @@ mod tests {
         let (_, lvl, note) = split_marker("x\nVerified: Partially");
         assert_eq!(lvl, VerifiedLevel::Partially);
         assert!(note.is_none());
+    }
+
+    #[test]
+    fn split_marker_multibyte_at_prefix_boundary_does_not_panic() {
+        // Final answer line with a multi-byte char straddling byte offset
+        // MARKER_PREFIX.len() (== 9): "réponse:" is 9 bytes only if the é sits
+        // across the boundary — this used to panic on the `line[..9]` slice.
+        let (body, lvl, note) = split_marker("réponse: fini ✓");
+        assert_eq!(body, "réponse: fini ✓"); // not a marker ⇒ kept as body
+        assert_eq!(lvl, VerifiedLevel::Partially);
+        assert!(note.is_none());
+        // 8 ASCII bytes then an emoji at the boundary — also no marker, no panic.
+        let (body, lvl, _) = split_marker("verified\u{1F600}");
+        assert_eq!(body, "verified\u{1F600}");
+        assert_eq!(lvl, VerifiedLevel::Partially);
     }
 
     #[test]

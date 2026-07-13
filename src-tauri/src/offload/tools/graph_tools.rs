@@ -35,7 +35,11 @@ pub fn defs() -> Vec<ToolDef> {
     // name-driven and unaffected, so a hidden name still answers.
     crate::graph::lean_filter(specs, g.lean_tools)
         .into_iter()
-        .map(|s| ToolDef::function(s.name, s.description, s.parameters))
+        // Pure lookups: the code graph is a snapshot built before the run and
+        // not rebuilt mid-run, so an identical `graph_*` query can be served
+        // from the call cache (its answer can't have changed). File/process
+        // tools (read_file/run_command/…) are stateful and re-execute instead.
+        .map(|s| ToolDef::function(s.name, s.description, s.parameters).pure())
         .collect()
 }
 

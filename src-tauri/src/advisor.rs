@@ -91,6 +91,17 @@ pub const RULE_SURFACE_LEAN: &str = "surface.lean.v1";
 /// `surface.lean.v1`'s session floor — higher than `MIN_SESSIONS` (5) because
 /// "nobody used these tools" is only convincing after a fair run of sessions.
 pub const SURFACE_LEAN_MIN_SESSIONS: u64 = 10;
+/// Trailing window over which a call to a `graph::LEAN_HIDDEN` tool counts as
+/// recent usage for `surface.lean.v1` (see `hideable_tool_calls`). The activity
+/// ring is COUNT-capped, not time-capped, so scanning it all-time lets a single
+/// cold-tail call weeks ago suppress the lean suggestion forever; process-start
+/// (the drift signals' `since`) is the opposite extreme — it would call a tool
+/// "unused" minutes after every restart, flapping the advice. A month of
+/// evidence is the middle ground: long enough to be meaningful, short enough to
+/// forget stale one-off calls. Cited literally in the rule's rationale, so keep
+/// the two in step.
+pub const HIDEABLE_RECENCY_WINDOW_DAYS: u64 = 30;
+pub const HIDEABLE_RECENCY_WINDOW_MS: u64 = HIDEABLE_RECENCY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
 
 // ── V17 Phase F — graduation rules (`adopt.*`) ──────────────────────────
 //
@@ -254,8 +265,10 @@ pub struct Signals {
     pub bypass_samples: u64,
 
     // ── V17 Phase E — lean tool surface (`surface.lean.v1`) ─────────────
-    /// Total calls to any `graph::LEAN_HIDDEN` tool observed in the Activity
-    /// ring. `0` is the fire condition; any call silences the rule.
+    /// Calls to any `graph::LEAN_HIDDEN` tool observed in the Activity ring
+    /// within the trailing `HIDEABLE_RECENCY_WINDOW_MS` (NOT all-time — the ring
+    /// is count-capped, so an ancient one-off call must not suppress the rule
+    /// forever). `0` is the fire condition; any recent call silences the rule.
     pub hideable_tool_calls: u64,
     /// The measured advertised MCP tool-surface size in chars
     /// (`graph::surface_stats().mcp_chars`) — cited in the rule's rationale so
@@ -663,9 +676,9 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
 }
 
 /// The V17 Phase E lean-surface rule. Carries its own session floor
-/// (`SURFACE_LEAN_MIN_SESSIONS`); a single call to any hidden tool moves
-/// `hideable_tool_calls` off zero and silences it (fixed `"zero-usage"`
-/// signature — no rate to bucket).
+/// (`SURFACE_LEAN_MIN_SESSIONS`); a single call to any hidden tool WITHIN THE
+/// last `HIDEABLE_RECENCY_WINDOW_DAYS` moves `hideable_tool_calls` off zero and
+/// silences it (fixed `"zero-usage"` signature — no rate to bucket).
 fn surface_rules(sig: &Signals) -> Vec<Proposal> {
     let mut out = Vec::new();
     if !sig.graph.lean_tools
@@ -680,11 +693,11 @@ fn surface_rules(sig: &Signals) -> Vec<Proposal> {
                 proposed: "true".to_string(),
                 rationale: format!(
                     "None of the cold-tail graph tools (graph_cycles, graph_dead_exports, \
-                     graph_struct_search, graph_path, graph_architecture) were called across {} \
-                     sessions — hiding them trims the tool descriptors from the ~{} chars (est.) \
-                     cache-written once per session. Advertisement-only: each still answers if \
-                     called by name, so nothing breaks.",
-                    sig.session_count, sig.surface_chars
+                     graph_struct_search, graph_path, graph_architecture) were called in the last \
+                     {} days (over {} sessions of use) — hiding them trims the tool descriptors \
+                     from the ~{} chars (est.) cache-written once per session. \
+                     Advertisement-only: each still answers if called by name, so nothing breaks.",
+                    HIDEABLE_RECENCY_WINDOW_DAYS, sig.session_count, sig.surface_chars
                 ),
                 rule_id: RULE_SURFACE_LEAN,
                 signature,

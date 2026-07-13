@@ -215,7 +215,10 @@ pub struct GraphService {
     /// answered with a diff. LRU-bounded (snapshots by [`SNAP_TOTAL_MAX`] bytes,
     /// rows by [`READ_SEEN_MAX_ENTRIES`]); eviction drops content, never the
     /// hash/turn observation.
-    read_seen: StdMutex<HashMap<(String, String), ReadSeen>>,
+    /// V22 efficiency: wrapped in a [`ReadSeenStore`] that carries a running sum
+    /// of live snapshot bytes, so the per-Read insert path enforces the
+    /// [`SNAP_TOTAL_MAX`] budget without re-summing the whole map each time.
+    read_seen: StdMutex<ReadSeenStore>,
     /// V17 Phase A: monotonic touch counter driving the `read_seen` LRU. Bumped
     /// on every observation; the smallest value is evicted first.
     read_seen_touch: AtomicU64,
@@ -402,54 +405,113 @@ fn capture_snapshot(content: &str, min_lines: u32) -> Option<Arc<str>> {
     }
 }
 
-/// V17 Phase A: total bytes of all live snapshots in the store.
+/// V17 Phase A: total bytes of all live snapshots in the store. O(n) over the
+/// map — the GROUND TRUTH the incremental [`ReadSeenStore::snap_bytes`] running
+/// total must always equal (asserted in tests). Test-only since V22 — the hot
+/// path now trusts the incremental running total instead of re-summing.
+#[cfg(test)]
 fn snapshot_bytes(seen: &HashMap<(String, String), ReadSeen>) -> usize {
     seen.values()
         .filter_map(|v| v.snapshot.as_ref().map(|s| s.len()))
         .sum()
 }
 
-/// V17 Phase A: insert/replace `key`'s observation and enforce both bounds —
-/// the [`READ_SEEN_MAX_ENTRIES`] entry backstop (evicts whole oldest rows) and
-/// the [`SNAP_TOTAL_MAX`] snapshot byte budget (drops oldest-touched snapshots
-/// but keeps their `hash`/`turn`). Pure over the map (no locks/I/O) so the
-/// eviction invariants are unit-tested directly. `touch` is a fresh monotonic
-/// value from the service's counter.
-fn read_seen_insert(
-    seen: &mut HashMap<(String, String), ReadSeen>,
-    key: (String, String),
-    hash: String,
-    turn: u32,
-    snapshot: Option<Arc<str>>,
-    touch: u64,
-) {
-    seen.insert(key, ReadSeen { hash, turn, snapshot, touch });
-    // Entry backstop: drop whole oldest-touched rows past the cap.
-    while seen.len() > READ_SEEN_MAX_ENTRIES {
-        let victim = seen.iter().min_by_key(|(_, v)| v.touch).map(|(k, _)| k.clone());
-        match victim {
-            Some(k) => {
-                seen.remove(&k);
+/// V22 efficiency: the read-advisor's snapshot store — the
+/// `(session, file) → ReadSeen` map plus a running sum of live snapshot bytes.
+///
+/// `snap_bytes` is maintained INCREMENTALLY at every mutation (insert, replace,
+/// eviction, session/whole clear), so the per-Read [`Self::insert`] path enforces
+/// the [`SNAP_TOTAL_MAX`] byte budget without the old unconditional O(n)
+/// `snapshot_bytes` re-sum. Its value always equals `snapshot_bytes(&self.map)`.
+///
+/// The O(n) `min_by_key` victim scans remain — but only inside the eviction
+/// loops, which run solely when a cap is actually exceeded (rare, and each drop
+/// is bounded by one over-budget insert's contribution), so they stay off the
+/// common path. Left as-is: a heap/priority index over `touch` would be a
+/// disproportionate rebuild for a scan that no longer runs per insert.
+#[derive(Default)]
+struct ReadSeenStore {
+    map: HashMap<(String, String), ReadSeen>,
+    /// Running sum of `snapshot.len()` across all live rows. Invariant:
+    /// `snap_bytes == snapshot_bytes(&map)` after every method returns.
+    snap_bytes: usize,
+}
+
+/// Bytes a `ReadSeen`'s snapshot contributes to the running total (0 if none).
+fn snap_len(v: &ReadSeen) -> usize {
+    v.snapshot.as_ref().map(|s| s.len()).unwrap_or(0)
+}
+
+impl ReadSeenStore {
+    /// V17 Phase A / V22: insert/replace `key`'s observation and enforce both
+    /// bounds — the [`READ_SEEN_MAX_ENTRIES`] entry backstop (evicts whole oldest
+    /// rows) and the [`SNAP_TOTAL_MAX`] snapshot byte budget (drops oldest-touched
+    /// snapshots but keeps their `hash`/`turn`). Keeps `snap_bytes` consistent at
+    /// each step. `touch` is a fresh monotonic value from the service's counter.
+    fn insert(
+        &mut self,
+        key: (String, String),
+        hash: String,
+        turn: u32,
+        snapshot: Option<Arc<str>>,
+        touch: u64,
+    ) {
+        let added = snapshot.as_ref().map(|s| s.len()).unwrap_or(0);
+        // A replace drops the old row's snapshot bytes before adding the new.
+        if let Some(old) = self.map.insert(key, ReadSeen { hash, turn, snapshot, touch }) {
+            self.snap_bytes -= snap_len(&old);
+        }
+        self.snap_bytes += added;
+        // Entry backstop: drop whole oldest-touched rows past the cap.
+        while self.map.len() > READ_SEEN_MAX_ENTRIES {
+            let victim = self.map.iter().min_by_key(|(_, v)| v.touch).map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    if let Some(v) = self.map.remove(&k) {
+                        self.snap_bytes -= snap_len(&v);
+                    }
+                }
+                None => break,
             }
-            None => break,
+        }
+        // Snapshot byte budget: drop oldest-touched SNAPSHOTS (keep hash/turn).
+        while self.snap_bytes > SNAP_TOTAL_MAX {
+            let victim = self
+                .map
+                .iter()
+                .filter(|(_, v)| v.snapshot.is_some())
+                .min_by_key(|(_, v)| v.touch)
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    if let Some(v) = self.map.get_mut(&k) {
+                        self.snap_bytes -= snap_len(v);
+                        v.snapshot = None;
+                    }
+                }
+                None => break,
+            }
         }
     }
-    // Snapshot byte budget: drop oldest-touched SNAPSHOTS (keep hash/turn).
-    let mut total = snapshot_bytes(seen);
-    while total > SNAP_TOTAL_MAX {
-        let victim = seen
-            .iter()
-            .filter(|(_, v)| v.snapshot.is_some())
-            .min_by_key(|(_, v)| v.touch)
-            .map(|(k, _)| k.clone());
-        match victim {
-            Some(k) => {
-                if let Some(v) = seen.get_mut(&k) {
-                    total -= v.snapshot.as_ref().map(|s| s.len()).unwrap_or(0);
-                    v.snapshot = None;
-                }
+
+    /// V22: drop rows for one session (`Some`) or all (`None`), keeping
+    /// `snap_bytes` consistent — the read-advisor half of [`GraphService::mem_clear`].
+    fn clear_session(&mut self, session_id: Option<&str>) {
+        match session_id {
+            Some(s) => {
+                let dropped = &mut self.snap_bytes;
+                self.map.retain(|(sid, _), v| {
+                    let keep = sid != s;
+                    if !keep {
+                        *dropped -= snap_len(v);
+                    }
+                    keep
+                });
             }
-            None => break,
+            None => {
+                self.map.clear();
+                self.snap_bytes = 0;
+            }
         }
     }
 }
@@ -616,7 +678,7 @@ impl GraphService {
             reminded: StdMutex::new(HashMap::new()),
             drift_signals: StdMutex::new(HashMap::new()),
             bypassed_advice_chars: AtomicU64::new(0),
-            read_seen: StdMutex::new(HashMap::new()),
+            read_seen: StdMutex::new(ReadSeenStore::default()),
             read_seen_touch: AtomicU64::new(0),
             digest_inflight: StdMutex::new(HashSet::new()),
             auto_check_sessions: StdMutex::new(HashMap::new()),
@@ -1313,10 +1375,7 @@ impl GraphService {
             }
         }
         if let Ok(mut seen) = self.read_seen.lock() {
-            match session_id {
-                Some(s) => seen.retain(|(sid, _), _| sid != s),
-                None => seen.clear(),
-            }
+            seen.clear_session(session_id);
         }
         // V12 review: `auto_check_sessions` (debounce/baseline/pending state
         // for `/context/post_edit`) grows per session and was never evicted —
@@ -1852,7 +1911,7 @@ impl GraphService {
         // filesystem clock skew (network shares, WSL2 bind-mounts) can't mislead.
         let prev = {
             let seen = self.read_seen.lock().ok()?;
-            seen.get(&key).map(|v| (v.hash.clone(), v.turn, v.snapshot.clone()))
+            seen.map.get(&key).map(|v| (v.hash.clone(), v.turn, v.snapshot.clone()))
         };
         let (seen, unchanged, prev_turn, prev_snapshot) = match &prev {
             Some((h, t, snap)) => (true, *h == cur_hash, *t, snap.clone()),
@@ -1948,7 +2007,7 @@ impl GraphService {
                                 // CHANGED re-read has no snapshot, so it just passes.
                                 let touch = self.read_seen_touch.fetch_add(1, Ordering::Relaxed);
                                 if let Ok(mut seen_map) = self.read_seen.lock() {
-                                    read_seen_insert(&mut seen_map, key, cur_hash, cur_turn, None, touch);
+                                    seen_map.insert(key, cur_hash, cur_turn, None, touch);
                                 }
                                 return out;
                             }
@@ -1966,7 +2025,7 @@ impl GraphService {
                     let snap = capture_snapshot(&content, g.read_advisor_min_lines);
                     let touch = self.read_seen_touch.fetch_add(1, Ordering::Relaxed);
                     if let Ok(mut seen) = self.read_seen.lock() {
-                        read_seen_insert(&mut seen, key, cur_hash, cur_turn, snap, touch);
+                        seen.insert(key, cur_hash, cur_turn, snap, touch);
                     }
                 }
                 None
@@ -1999,7 +2058,7 @@ impl GraphService {
                 let snap = capture_snapshot(&content, g.read_advisor_min_lines);
                 let touch = self.read_seen_touch.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut seen) = self.read_seen.lock() {
-                    read_seen_insert(&mut seen, key, cur_hash, cur_turn, snap, touch);
+                    seen.insert(key, cur_hash, cur_turn, snap, touch);
                 }
                 out
             }
@@ -2574,8 +2633,11 @@ impl GraphService {
 
     /// V22 Phase D: when `checks_auto_configure` is on and the project has no
     /// checks yet, apply the validated detection proposals once the graph is
-    /// built — opt-in zero-touch setup. Runs inline on the index worker thread
-    /// like [`run_analyses_trigger`](Self::run_analyses_trigger); detection is
+    /// built — opt-in zero-touch setup. Called at the end of every completed
+    /// index pass ([`Self::spawn_rebuild`]'s success handler and
+    /// [`Self::reindex_paths`]'s "changed > 0" branch), inline on the index
+    /// worker thread like [`run_analyses_trigger`](Self::run_analyses_trigger);
+    /// detection is
     /// bounded filesystem + PATH work (no network). The settings `mutate`
     /// broadcasts and persists (per-project overlay), so the UI reflects the
     /// applied set — the entries carry `CheckDef::auto = true`.
@@ -2932,6 +2994,11 @@ impl GraphService {
             // V12 Phase F (6c): same analyses-auto trigger as a full rebuild —
             // cheap on the just-updated index, already on the watcher thread.
             self.run_analyses_trigger(root);
+            // V22 Phase D: same auto-configure trigger as a full rebuild so a
+            // user who enables `checks_auto_configure` mid-session gets set up
+            // on the next incremental reindex, not only on restart/rebuild
+            // (no-op unless the setting is on and `checks` is empty).
+            self.checks_auto_configure_trigger(root);
         }
     }
 
@@ -4068,7 +4135,7 @@ mod tests {
     //
     // `should_read` itself needs an `AppHandle` (unmockable in a unit test), so
     // its verdict/re-arm/TTL/diff-threshold logic is factored into the pure
-    // `read_verdict` and the snapshot store into `read_seen_insert`; both are
+    // `read_verdict` and the snapshot store into `ReadSeenStore`; both are
     // exercised directly here. The post-compaction pass is an early return at
     // the top of `should_read` (unchanged from V11) and isn't re-tested.
 
@@ -4184,21 +4251,24 @@ mod tests {
 
     #[test]
     fn read_seen_lru_bounds_snapshot_bytes_and_keeps_the_observation() {
-        let mut seen: HashMap<(String, String), ReadSeen> = HashMap::new();
+        let mut store = ReadSeenStore::default();
         // ~1 MiB per snapshot; 20 of them (~20 MiB) overruns SNAP_TOTAL_MAX (16 MiB).
         let blob: Arc<str> = Arc::from("y".repeat(1024 * 1024));
         let n = 20u64;
         for k in 0..n {
             let key = ("s".to_string(), format!("f{k}.rs"));
-            read_seen_insert(&mut seen, key, format!("h{k}"), k as u32, Some(blob.clone()), k);
+            store.insert(key, format!("h{k}"), k as u32, Some(blob.clone()), k);
         }
+        let seen = &store.map;
         // All observations survive (nothing forgot the hash/turn); only content evicted.
         assert_eq!(seen.len() as u64, n, "every observation is retained");
         assert!(
-            snapshot_bytes(&seen) <= SNAP_TOTAL_MAX,
+            snapshot_bytes(seen) <= SNAP_TOTAL_MAX,
             "snapshot bytes held under budget: {}",
-            snapshot_bytes(&seen)
+            snapshot_bytes(seen)
         );
+        // Running total matches the O(n) ground truth.
+        assert_eq!(store.snap_bytes, snapshot_bytes(seen), "running total tracks snapshot_bytes");
         // The oldest-touched entry lost its snapshot but kept its hash/turn.
         let oldest = seen.get(&("s".to_string(), "f0.rs".to_string())).expect("oldest present");
         assert!(oldest.snapshot.is_none(), "oldest snapshot evicted");
@@ -4211,12 +4281,13 @@ mod tests {
 
     #[test]
     fn read_seen_entry_backstop_bounds_row_count() {
-        let mut seen: HashMap<(String, String), ReadSeen> = HashMap::new();
+        let mut store = ReadSeenStore::default();
         // Snapshot-less rows: only the entry backstop bounds these.
         for k in 0..(READ_SEEN_MAX_ENTRIES as u64 + 50) {
             let key = ("s".to_string(), format!("f{k}.rs"));
-            read_seen_insert(&mut seen, key, format!("h{k}"), k as u32, None, k);
+            store.insert(key, format!("h{k}"), k as u32, None, k);
         }
+        let seen = &store.map;
         assert!(
             seen.len() <= READ_SEEN_MAX_ENTRIES,
             "row count bounded by the backstop: {}",
@@ -4226,6 +4297,71 @@ mod tests {
         let last = READ_SEEN_MAX_ENTRIES as u64 + 49;
         assert!(seen.contains_key(&("s".to_string(), format!("f{last}.rs"))));
         assert!(!seen.contains_key(&("s".to_string(), "f0.rs".to_string())));
+    }
+
+    #[test]
+    fn read_seen_running_total_matches_ground_truth_across_all_mutations() {
+        // Drives the store through insert / replace / entry-cap eviction /
+        // byte-budget eviction / session clear / whole clear and asserts the
+        // incrementally-maintained `snap_bytes` equals the O(n) `snapshot_bytes`
+        // ground truth at every step (V22: the running total must never drift).
+        let mut store = ReadSeenStore::default();
+        let mut touch = 0u64;
+        let mut bump = || {
+            let t = touch;
+            touch += 1;
+            t
+        };
+        let check = |store: &ReadSeenStore| {
+            assert_eq!(
+                store.snap_bytes,
+                snapshot_bytes(&store.map),
+                "running total drifted from snapshot_bytes"
+            );
+        };
+
+        // Small (no snapshot) and large (snapshot) inserts across two sessions.
+        let small: Arc<str> = Arc::from("x".repeat(64));
+        let big: Arc<str> = Arc::from("y".repeat(2 * 1024 * 1024)); // 2 MiB each
+        for k in 0..8u64 {
+            let sid = if k % 2 == 0 { "a" } else { "b" };
+            let snap = if k % 3 == 0 { Some(big.clone()) } else { Some(small.clone()) };
+            store.insert((sid.to_string(), format!("f{k}.rs")), format!("h{k}"), k as u32, snap, bump());
+            check(&store);
+        }
+        assert!(store.snap_bytes > 0, "snapshots were recorded");
+
+        // Replace an existing key: with a bigger snapshot, then with none.
+        store.insert(("a".to_string(), "f0.rs".to_string()), "h0b".into(), 99, Some(big.clone()), bump());
+        check(&store);
+        store.insert(("a".to_string(), "f0.rs".to_string()), "h0c".into(), 100, None, bump());
+        check(&store);
+
+        // Force the byte-budget eviction path: pile on enough 2 MiB snapshots to
+        // cross SNAP_TOTAL_MAX (16 MiB).
+        for k in 100..120u64 {
+            store.insert(("c".to_string(), format!("f{k}.rs")), format!("h{k}"), k as u32, Some(big.clone()), bump());
+            check(&store);
+        }
+        assert!(store.snap_bytes <= SNAP_TOTAL_MAX, "byte budget enforced");
+
+        // Force the entry-cap eviction path: cross READ_SEEN_MAX_ENTRIES rows.
+        for k in 0..(READ_SEEN_MAX_ENTRIES as u64 + 20) {
+            store.insert(("d".to_string(), format!("g{k}.rs")), format!("h{k}"), k as u32, None, bump());
+        }
+        check(&store);
+        assert!(store.map.len() <= READ_SEEN_MAX_ENTRIES, "entry cap enforced");
+
+        // Session clear (drops one session's rows, some snapshotted).
+        store.clear_session(Some("c"));
+        check(&store);
+        assert!(!store.map.keys().any(|(sid, _)| sid == "c"), "session c cleared");
+
+        // Whole clear.
+        store.clear_session(None);
+        check(&store);
+        assert_eq!(store.snap_bytes, 0, "whole clear zeroes the running total");
+        assert!(store.map.is_empty(), "whole clear empties the map");
     }
 
     // ── V17 Phase C: first-read tier eligibility (pure gate) ──────────────

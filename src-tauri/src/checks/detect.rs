@@ -109,22 +109,6 @@ impl Eco {
     }
 }
 
-/// Directories the bounded marker walk never descends into — build outputs,
-/// vendored deps, VCS metadata. Hidden dirs (`.git`, `.venv`, `.svelte-kit`, …)
-/// are skipped separately by the leading-dot rule in [`scan_dir`].
-const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    "out",
-    "bin",
-    "obj",
-    "vendor",
-    "__pycache__",
-    "venv",
-];
-
 /// How deep the marker walk recurses: root (depth 0) plus up to two nested
 /// levels — enough to catch this repo's `src-tauri/Cargo.toml` and typical
 /// monorepo `packages/*/` layouts, without an unbounded tree walk.
@@ -174,11 +158,12 @@ fn anchor_cwd(anchor: &Option<String>) -> Option<String> {
     }
 }
 
-/// Walk `root` (bounded to [`MAX_DEPTH`], skipping [`SKIP_DIRS`] and hidden
-/// dirs) recording every ecosystem marker. Cheap and dependency-free — a
-/// depth-first `read_dir` recursion rather than pulling in the graph's
-/// gitignore-aware walker, since markers are never gitignored and the fixed
-/// skip set is deterministic for the tempdir test fixtures.
+/// Walk `root` (bounded to [`MAX_DEPTH`], skipping the shared
+/// [`crate::fsutil::SKIP_DIRS`] build/vendor set and hidden dirs) recording
+/// every ecosystem marker. Cheap and dependency-free — a depth-first `read_dir`
+/// recursion rather than pulling in the graph's gitignore-aware walker, since
+/// markers are never gitignored and the fixed skip set is deterministic for the
+/// tempdir test fixtures.
 fn scan_markers(root: &Path) -> Markers {
     let mut m = Markers::default();
     scan_dir(root, root, 0, &mut m);
@@ -201,7 +186,7 @@ fn scan_dir(root: &Path, dir: &Path, depth: usize, m: &mut Markers) {
             if name == "tests" {
                 m.pytest = true;
             }
-            if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
+            if !name.starts_with('.') && !crate::fsutil::SKIP_DIRS.contains(&name.as_str()) {
                 subdirs.push(entry.path());
             }
             continue;
@@ -322,7 +307,7 @@ pub fn detect_with(
             if let Some(note) = &graph_note {
                 evidence = format!("{evidence} + {note}");
             }
-            let (valid, reason) = validate(&cand.marker_present, &cand.binary, resolves);
+            let (valid, reason) = validate(&cand.binary, resolves);
             out.push(Proposal {
                 check: cand.check,
                 ecosystem: eco.label().to_string(),
@@ -359,16 +344,13 @@ pub fn detect_with(
     out
 }
 
-/// `(binary_name, marker_present, evidence)` bundle for one candidate before
-/// graph annotation / validation.
+/// `(binary_name, evidence)` bundle for one candidate before graph annotation /
+/// validation. A candidate is only ever constructed once its gating marker was
+/// found (presets emit nothing otherwise), so marker presence is implicit and
+/// isn't carried on the struct.
 struct Candidate {
     check: CheckDef,
     binary: String,
-    /// The specific marker this candidate needs (for the greyed reason). `true`
-    /// once its manifest/config was found — a candidate whose gate is absent is
-    /// simply never produced, so this is `true` for every emitted candidate but
-    /// kept explicit for the validation call.
-    marker_present: bool,
     evidence: String,
 }
 
@@ -556,7 +538,6 @@ fn cand(
             ..Default::default()
         },
         binary: binary.to_string(),
-        marker_present: true,
         evidence: evidence.to_string(),
     }
 }
@@ -578,16 +559,10 @@ fn cand_report(
     c
 }
 
-/// Validate a candidate: its marker must be present and its binary must resolve.
-/// Returns `(valid, reason)` — `reason` is `Some` only when invalid.
-fn validate(
-    marker_present: &bool,
-    binary: &str,
-    resolves: &dyn Fn(&str) -> bool,
-) -> (bool, Option<String>) {
-    if !marker_present {
-        return (false, Some("marker file not found".to_string()));
-    }
+/// Validate a candidate: its binary must resolve on PATH. (Marker presence is
+/// already guaranteed — a candidate is only emitted once its gating marker was
+/// found.) Returns `(valid, reason)` — `reason` is `Some` only when invalid.
+fn validate(binary: &str, resolves: &dyn Fn(&str) -> bool) -> (bool, Option<String>) {
     if !resolves(binary) {
         return (false, Some(format!("{binary} not found on PATH")));
     }
@@ -817,6 +792,29 @@ mod tests {
         let mvn = find(&props, "mvn-test").expect("mvn test proposed");
         assert_eq!(mvn.check.parser, ParserKind::JunitXml);
         assert_eq!(mvn.check.report_file.as_deref(), Some("target/surefire-reports"));
+    }
+
+    #[test]
+    fn jvm_nested_maven_module_pairs_cwd_and_report_file_consistently() {
+        // A pom.xml in a nested module (`backend/pom.xml`) ⇒ cwd="backend" and
+        // the report dir is left UNPREFIXED ("target/surefire-reports"). Under
+        // the cwd-relative `report_file` semantics that pairing is now correct:
+        // the effective location is backend/target/surefire-reports — exactly
+        // where `mvn` (run in `backend`) writes Surefire XML. Before the fix,
+        // run() read the root's `target/surefire-reports` and always errored.
+        let fx = Fixture::new();
+        fx.file("backend/pom.xml", "<project></project>");
+        let props = detect_with(&fx.root, &[], &all_present);
+        let mvn = find(&props, "mvn-test").expect("mvn test proposed for nested module");
+        assert_eq!(mvn.check.cwd.as_deref(), Some("backend"), "cwd anchors to the nested module dir");
+        assert_eq!(
+            mvn.check.report_file.as_deref(),
+            Some("target/surefire-reports"),
+            "report_file stays cwd-relative (unprefixed), not root-prefixed"
+        );
+        // Effective (cwd-joined) location is the module's own report dir.
+        let effective = format!("{}/{}", mvn.check.cwd.as_deref().unwrap(), mvn.check.report_file.as_deref().unwrap());
+        assert_eq!(effective, "backend/target/surefire-reports");
     }
 
     #[test]

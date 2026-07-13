@@ -187,6 +187,7 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep { from_version: "v18", detect: looks_v18, transform: migrate_v18_to_v19_step },
     MigrationStep { from_version: "v19", detect: looks_v19, transform: migrate_v19_to_v20_step },
     MigrationStep { from_version: "v20", detect: looks_v20, transform: migrate_v20_to_v21_step },
+    MigrationStep { from_version: "v21", detect: looks_v21, transform: migrate_v21_to_v22_step },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -1789,7 +1790,8 @@ fn migrate_v20_to_v21_step(value: &mut Value, _shell: &ShellSpec) {
 /// no knowledge of the new root fields) round-trips unchanged. This step
 /// exists purely to advance the version marker so the migration cascade's
 /// fixpoint guard (`migrate_if_needed`) doesn't flag a v20 file as
-/// under-migrated.
+/// under-migrated. Stamps a *literal* 21; the v21→v22 step runs next in the
+/// same cascade pass and must still detect this file.
 fn migrate_v20_to_v21(value: &mut Value) {
     let Some(root) = value.as_object_mut() else {
         return;
@@ -1798,6 +1800,100 @@ fn migrate_v20_to_v21(value: &mut Value) {
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(21u8)),
     );
+}
+
+/// The local-data tool set as it stood BEFORE schema v22 — the five names a
+/// pre-v22 "web/docs only" cloud backend persisted as its `AllExcept`
+/// exclusion (native `read_file`/`code_search`/`run_command` + the
+/// `filesystem`/`git` MCP servers). Frozen literal on purpose: this is the
+/// fingerprint the v21→v22 backfill matches on, so it must NOT track the live
+/// `schema::LOCAL_DATA_TOOLS` (which has since grown `list_dir`).
+const LOCAL_DATA_TOOLS_PRE_V22: &[&str] =
+    &["read_file", "code_search", "run_command", "filesystem", "git"];
+
+/// The local-data tool set as of schema v22 — the pre-v22 five plus `list_dir`
+/// (added in the V21 milestone WITHOUT a migration; this step backfills it).
+/// Frozen literal for the same reason as [`LOCAL_DATA_TOOLS_PRE_V22`]: any
+/// future addition to `schema::LOCAL_DATA_TOOLS` needs its own migration step,
+/// not a silent retroactive change to this one.
+const LOCAL_DATA_TOOLS_V22: &[&str] =
+    &["read_file", "list_dir", "code_search", "run_command", "filesystem", "git"];
+
+fn looks_v21(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 21)
+}
+
+fn migrate_v21_to_v22_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v21_to_v22(value)
+}
+
+/// V21 → V22: backfill `list_dir` into any offload backend scoped "web/docs
+/// only".
+///
+/// The V21 milestone added `list_dir` to `LOCAL_DATA_TOOLS` (the set a cloud
+/// backend denies by default) but shipped no migration. A user who, on a
+/// pre-V21 build, scoped a cloud backend to web/docs only persisted
+/// `AllExcept { tools: [the old five] }` — so after upgrading, `list_dir`
+/// (absent from that list) became *allowed*, silently handing a cloud backend
+/// a local-data tool the user had explicitly opted out of. This step closes
+/// that hole for every backend whose exclusion list is recognizably the
+/// local-data preset.
+///
+/// Idempotent: a second pass finds `schema_version == 22` so `looks_v21` is
+/// false, and the backfill only ever adds already-absent names.
+fn migrate_v21_to_v22(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Object(offload)) = root.get_mut("offload") {
+        if let Some(Value::Array(backends)) = offload.get_mut("backends") {
+            for backend in backends.iter_mut() {
+                backfill_local_data_scope(backend);
+            }
+        }
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (22).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(22u8)),
+    );
+}
+
+/// Fail-closed backfill for one backend's `tool_scope`. If the scope is an
+/// `AllExcept` whose exclusion list already denies the *entire* pre-v22
+/// local-data preset (the "web/docs only" fingerprint), add any v22 local-data
+/// tool missing from it. Any other shape is left untouched: `all`/`only`
+/// scopes carry no privacy regression, and an `allexcept` list that denies
+/// only a subset of the preset is a deliberate custom selection we must not
+/// silently widen.
+fn backfill_local_data_scope(backend: &mut Value) {
+    let Some(scope) = backend.get_mut("tool_scope").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if scope.get("mode").and_then(Value::as_str) != Some("allexcept") {
+        return;
+    }
+    let Some(Value::Array(tools)) = scope.get_mut("tools") else {
+        return;
+    };
+    // Intent check: only widen when the exclusion already covers the whole
+    // pre-v22 preset — that's the unambiguous "exclude local-data tools" signal.
+    let covers_preset = LOCAL_DATA_TOOLS_PRE_V22
+        .iter()
+        .all(|name| tools.iter().any(|t| t.as_str() == Some(name)));
+    if !covers_preset {
+        return;
+    }
+    for name in LOCAL_DATA_TOOLS_V22 {
+        if !tools.iter().any(|t| t.as_str() == Some(name)) {
+            tools.push(Value::String((*name).to_string()));
+        }
+    }
 }
 
 /// Walk layout-tree-shaped JSON inside the settings root and rewrite any
@@ -2204,6 +2300,169 @@ mod tests {
         assert_eq!(v, once);
     }
 
+    // --- v21 → v22 (list_dir scope backfill) --------------------------------
+
+    #[test]
+    fn looks_v21_detects_v21_and_not_others() {
+        assert!(looks_v21(&json!({ "schema_version": 21 })));
+        assert!(!looks_v21(&json!({ "schema_version": 20 })));
+        assert!(!looks_v21(&json!({ "schema_version": 22 })));
+        assert!(!looks_v21(&json!({})));
+    }
+
+    /// The security fix: a backend scoped to the pre-v22 local-data preset (the
+    /// old five names) gains `list_dir` so V21's new local-data tool stays
+    /// denied on a cloud backend the user opted out of.
+    #[test]
+    fn v21_to_v22_backfills_list_dir_into_web_scoped_backend() {
+        let mut v = json!({
+            "schema_version": 21,
+            "offload": {
+                "backends": [{
+                    "name": "cloud",
+                    "kind": { "type": "remote", "is_cloud": true },
+                    "tool_scope": {
+                        "mode": "allexcept",
+                        "tools": ["read_file", "code_search", "run_command", "filesystem", "git"]
+                    }
+                }]
+            }
+        });
+        migrate_v21_to_v22(&mut v);
+
+        assert_eq!(v["schema_version"], json!(22));
+        let tools = v.pointer("/offload/backends/0/tool_scope/tools").unwrap();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        assert!(names.contains(&"list_dir"), "list_dir must be backfilled: {names:?}");
+        // Every pre-existing exclusion is preserved.
+        for name in LOCAL_DATA_TOOLS_PRE_V22 {
+            assert!(names.contains(name), "dropped pre-existing exclusion {name}");
+        }
+        assert!(!looks_v21(&v));
+    }
+
+    /// A custom `AllExcept` list that is NOT the local-data preset (only denies
+    /// a subset) is a deliberate user selection and must stay untouched.
+    #[test]
+    fn v21_to_v22_leaves_non_preset_scopes_untouched() {
+        let mut v = json!({
+            "schema_version": 21,
+            "offload": {
+                "backends": [
+                    {
+                        "name": "partial-custom",
+                        // Denies only `git` — not the full preset ⇒ leave alone.
+                        "tool_scope": { "mode": "allexcept", "tools": ["git"] }
+                    },
+                    {
+                        "name": "whitelist",
+                        // `only` scope carries no privacy regression ⇒ leave alone.
+                        "tool_scope": { "mode": "only", "tools": ["duckduckgo"] }
+                    },
+                    {
+                        "name": "trusted-lan",
+                        "tool_scope": { "mode": "all" }
+                    }
+                ]
+            }
+        });
+        migrate_v21_to_v22(&mut v);
+
+        assert_eq!(
+            v.pointer("/offload/backends/0/tool_scope/tools").unwrap(),
+            &json!(["git"]),
+            "partial custom allexcept list must not be widened"
+        );
+        assert_eq!(
+            v.pointer("/offload/backends/1/tool_scope/tools").unwrap(),
+            &json!(["duckduckgo"]),
+            "only-scope must not be touched"
+        );
+        assert_eq!(v.pointer("/offload/backends/2/tool_scope/mode").unwrap(), "all");
+    }
+
+    #[test]
+    fn v21_to_v22_is_idempotent() {
+        let mut v = json!({
+            "schema_version": 21,
+            "offload": {
+                "backends": [{
+                    "tool_scope": {
+                        "mode": "allexcept",
+                        "tools": ["read_file", "code_search", "run_command", "filesystem", "git"]
+                    }
+                }]
+            }
+        });
+        migrate_v21_to_v22(&mut v);
+        let once = v.clone();
+        migrate_v21_to_v22(&mut v);
+        assert_eq!(v, once, "second pass must not add duplicate list_dir");
+    }
+
+    /// A v21 file with no offload block (feature never configured) just gets
+    /// its version marker advanced.
+    #[test]
+    fn v21_to_v22_no_offload_only_stamps_version() {
+        let mut v = json!({ "schema_version": 21, "tabs": [] });
+        migrate_v21_to_v22(&mut v);
+        assert_eq!(v["schema_version"], json!(22));
+    }
+
+    /// Altitude tripwire: if `schema::LOCAL_DATA_TOOLS` ever gains a member,
+    /// migrating a settings file whose cloud backend carries the historical
+    /// five-item "web/docs only" exclusion must still yield an exclusion list
+    /// that denies EVERY current local-data tool. This fails the moment a new
+    /// local-data tool is added without a matching migration step to backfill
+    /// it (exactly the V21 `list_dir` regression this fix addresses) — forcing
+    /// the author to add the migration rather than silently re-opening the hole.
+    #[test]
+    fn local_data_tools_growth_requires_a_backfilling_migration() {
+        let shell = fake_default_shell();
+        // The pristine pre-v22 web-scope fingerprint at the schema version it
+        // was persisted under.
+        let mut v = json!({
+            "schema_version": 21,
+            "offload": {
+                "backends": [{
+                    "name": "cloud",
+                    "tool_scope": {
+                        "mode": "allexcept",
+                        "tools": ["read_file", "code_search", "run_command", "filesystem", "git"]
+                    }
+                }]
+            }
+        });
+        // Drive the whole cascade the way `migrate_if_needed` does (minus the
+        // backup write), so any future schema-bumping step also runs.
+        for step in MIGRATION_STEPS {
+            if (step.detect)(&v) {
+                (step.transform)(&mut v, &shell);
+            }
+        }
+
+        let tools: Vec<String> = v
+            .pointer("/offload/backends/0/tool_scope/tools")
+            .and_then(Value::as_array)
+            .expect("web-scoped backend keeps an exclusion list")
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect();
+
+        for tool in crate::settings::schema::LOCAL_DATA_TOOLS {
+            assert!(
+                tools.contains(&tool.to_string()),
+                "LOCAL_DATA_TOOLS member `{tool}` is not denied after migrating a pre-existing \
+                 web/docs-only cloud backend — a new local-data tool was added to \
+                 schema::LOCAL_DATA_TOOLS without a migration step backfilling it into existing \
+                 `AllExcept` scopes. Add a v{}→v{} (or later) step that extends the local-data \
+                 preset, mirroring migrate_v21_to_v22.",
+                crate::settings::schema::CURRENT_SCHEMA_VERSION - 1,
+                crate::settings::schema::CURRENT_SCHEMA_VERSION,
+            );
+        }
+    }
+
     #[test]
     fn v1_1_to_v1_2_collapses_extra_flags_into_args() {
         let mut v: Value = serde_json::from_str(
@@ -2291,7 +2550,7 @@ mod tests {
         // the whole cascade and write a fresh `.v1.2.bak` on every launch.
         let v: Value = serde_json::from_str(
             r#"{
-                "schema_version": 21,
+                "schema_version": 22,
                 "tabs": [
                     { "kind": "ai_tool", "id": "claude", "name": "Claude" }
                 ]

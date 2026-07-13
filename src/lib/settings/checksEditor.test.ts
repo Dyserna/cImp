@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest';
 import type { CheckDef, ChecksSuggestion, ChecksTestResult } from './types';
 import {
   PARSER_KINDS,
+  PARSER_LABELS,
   classifyTestResult,
   clearAutoOnEdit,
   computeChip,
@@ -49,9 +50,13 @@ describe('conditional fields', () => {
     }
   });
 
-  test('PARSER_KINDS covers the same wire names as the ParserKind union', () => {
-    // A quick guard that the dropdown list stays complete: 13 parsers.
-    expect(new Set(PARSER_KINDS).size).toBe(13);
+  test('PARSER_KINDS is exactly the PARSER_LABELS keys, in order (no magic count)', () => {
+    // PARSER_KINDS is derived from PARSER_LABELS, which is an exhaustiveness-
+    // checked Record<ParserKind, string> — so this guards the derivation (and
+    // its order), not a hand-bumped literal. A new ParserKind can't slip past:
+    // the compiler forces a label, which flows into both here and the dropdown.
+    expect([...PARSER_KINDS]).toEqual(Object.keys(PARSER_LABELS));
+    expect(new Set(PARSER_KINDS).size).toBe(PARSER_KINDS.length); // no dupes
     expect(PARSER_KINDS).toContain('cargo-test');
     expect(PARSER_KINDS).toContain('jest-json');
   });

@@ -89,6 +89,9 @@ fn walk(root: &Path, max_depth: u32, glob: Option<&str>) -> Result<Vec<Entry>, S
         return Err(format!("`{}` is not a directory", root.display()));
     }
     let mut out: Vec<Entry> = Vec::new();
+    // The glob pattern is constant for the whole walk — lowercase + collect it
+    // once here rather than re-deriving it for every entry inside the loop.
+    let glob_pat: Option<Vec<char>> = glob.map(|g| g.to_lowercase().chars().collect());
     // (dir, level) where `level` is the 1-based depth of that dir's children.
     let mut stack: Vec<(PathBuf, u32)> = vec![(root.to_path_buf(), 1)];
     while let Some((dir, level)) = stack.pop() {
@@ -116,8 +119,8 @@ fn walk(root: &Path, max_depth: u32, glob: Option<&str>) -> Result<Vec<Entry>, S
             if !is_dir && !file_type.is_file() {
                 continue; // sockets/fifos/etc.
             }
-            let listed = match glob {
-                Some(g) => glob_match(g, &leaf),
+            let listed = match &glob_pat {
+                Some(p) => glob_match_chars(p, &leaf),
                 None => true,
             };
             if listed {
@@ -191,8 +194,11 @@ fn render(root: &Path, entries: Vec<Entry>) -> String {
 /// `?` (exactly one char). Filename-only — no path separators or char classes;
 /// it matches an entry's leaf name. Standard two-pointer wildcard match with
 /// backtracking on `*`.
-fn glob_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+///
+/// `pattern` is expected already lowercased (so a walk can lowercase + collect
+/// it once, not per entry); only the `name` side is lowered here.
+fn glob_match_chars(pattern: &[char], name: &str) -> bool {
+    let p = pattern;
     let n: Vec<char> = name.to_lowercase().chars().collect();
     let (mut pi, mut ni) = (0usize, 0usize);
     let mut star: Option<usize> = None;
@@ -217,6 +223,15 @@ fn glob_match(pattern: &str, name: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// Convenience `&str`-pattern wrapper over [`glob_match_chars`] — lowercases and
+/// collects the pattern for one-shot callers (tests). The walk path uses
+/// [`glob_match_chars`] directly with a pattern hoisted out of the entry loop.
+#[cfg(test)]
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    glob_match_chars(&p, name)
 }
 
 #[cfg(test)]

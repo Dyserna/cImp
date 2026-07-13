@@ -371,7 +371,7 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
     // (non-canonical) form so it still textually matches the tool's own
     // reported paths that `parsers` relativizes (jest/eslint absolutes).
     let effective_cwd = match def.cwd.as_deref().filter(|s| !s.is_empty()) {
-        Some(rel) => confine_under_root(root, "cwd", rel)?,
+        Some(rel) => confine_under_root(root, root, "cwd", rel)?,
         None => root.to_path_buf(),
     };
 
@@ -387,7 +387,7 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
     // report file is an explicit error diagnostic — never a silent green run.
     let mut report_error: Option<Diag> = None;
     let mut diags = match def.report_file.as_deref().filter(|s| !s.is_empty()) {
-        Some(rel) => match read_report_file(root, rel).await {
+        Some(rel) => match read_report_file(root, &effective_cwd, rel).await {
             Ok(content) => parsers::parse(def.parser, &content, "", &effective_cwd, def.pattern.as_deref()),
             Err(msg) => {
                 report_error = Some(Diag {
@@ -409,8 +409,9 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
     if let Some(rel) = def.cwd.as_deref().filter(|s| !s.is_empty()) {
         reroot_diags(&mut diags, rel);
     }
-    // The `report_file` error diag (if any) is already root-relative — append
-    // it after re-rooting so its path isn't prefixed with `cwd`.
+    // The `report_file` error diag (if any) carries the raw configured path
+    // (cwd-relative, as the user typed it) — append it after re-rooting so its
+    // path isn't double-prefixed with `cwd`.
     if let Some(err) = report_error {
         diags.push(err);
     }
@@ -553,38 +554,73 @@ fn lexically_confined(field: &str, rel: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Resolve `rel` (a `cwd`/`report_file`) under `root`, confined strictly
-/// beneath it — the `ToolCtx::confine` approach (canonicalize + `starts_with`
+/// Resolve `rel` (a `cwd`/`report_file`) against `base`, confined strictly
+/// beneath `root` — the `ToolCtx::confine` approach (canonicalize + `starts_with`
 /// the canonical root), extended so the target need not exist yet: a check's
 /// `report_file` is written BY the run, so when the full path doesn't resolve
 /// we canonicalize its nearest existing ancestor and confine that instead. The
-/// lexical `..`/absolute guard ([`lexically_confined`]) runs first. Returns the
-/// (non-canonical) `root`-joined path, so it still textually matches the tool's
+/// lexical `..`/absolute guard ([`lexically_confined`]) runs first. `base` is
+/// the directory `rel` is interpreted relative to (the project `root` for a
+/// `cwd`; the check's effective cwd for a `report_file`), while `root` stays
+/// the confinement boundary — so a nested-`cwd` `report_file` still can't
+/// escape the project even though it joins onto a subdir. Returns the
+/// (non-canonical) `base`-joined path, so it still textually matches the tool's
 /// own reported paths that `parsers` relativizes.
-fn confine_under_root(root: &Path, field: &str, rel: &str) -> AppResult<PathBuf> {
+fn confine_under_root(root: &Path, base: &Path, field: &str, rel: &str) -> AppResult<PathBuf> {
     lexically_confined(field, rel)?;
-    let joined = root.join(rel);
-    let canon_root = root
-        .canonicalize()
-        .map_err(|e| AppError::Checks(format!("cannot resolve project root: {e}")))?;
+    let joined = base.join(rel);
     // Canonicalize the deepest existing part of `joined` and confirm it stays
-    // under the canonical root — catches a symlink escape the lexical check
-    // can't see (and confines a not-yet-created `report_file` via its parent).
-    if let Some(existing) = joined.ancestors().find_map(|a| a.canonicalize().ok()) {
-        if !existing.starts_with(&canon_root) {
-            return Err(AppError::Checks(format!(
-                "check `{field}` `{rel}` resolves outside the project root"
-            )));
+    // under the canonical `root` — the shared symlink-aware boundary check
+    // ([`crate::fsutil::confine_creatable`]), which also confines a not-yet-
+    // created `report_file` via its nearest existing ancestor. The returned
+    // (non-canonical) `joined` still textually matches the tool's own reported
+    // paths that `parsers` relativizes.
+    match crate::fsutil::confine_creatable(root, &joined) {
+        Ok(_) => Ok(joined),
+        Err(crate::fsutil::ConfineError::Boundary(e)) => {
+            Err(AppError::Checks(format!("cannot resolve project root: {e}")))
         }
+        Err(crate::fsutil::ConfineError::Escaped) => Err(AppError::Checks(format!(
+            "check `{field}` `{rel}` resolves outside the project root"
+        ))),
+        // `confine_creatable` never reports a missing target as an error.
+        Err(crate::fsutil::ConfineError::NotFound) => Ok(joined),
     }
-    Ok(joined)
 }
 
 /// Read a confined `report_file` (capped at [`MAX_OUTPUT_BYTES`]) for use as
-/// the parser input. `Err` carries a ready-to-surface message; [`run`] turns it
-/// into an explicit error [`Diag`] rather than a silent empty run.
-async fn read_report_file(root: &Path, rel: &str) -> Result<String, String> {
-    let path = confine_under_root(root, "report_file", rel).map_err(|e| e.to_string())?;
+/// the parser input. `rel` is resolved relative to the check's working
+/// directory — `cwd` (the `root`-joined effective cwd) when the check sets one,
+/// else `root` itself — matching the mental model that a tool documents its
+/// output paths relative to where it runs (`mvn` writes `target/surefire-reports`
+/// under its module dir, not the repo root). Resolution order, deterministic:
+///   1. cwd-relative (`cwd.join(rel)`) — the primary, preferred location;
+///   2. back-compat fallback for configs written before this fix (root-relative
+///      *with* a `cwd` set): only when a `cwd` is set AND the cwd-relative path
+///      does not exist, try `root.join(rel)` and use it if THAT exists.
+///
+/// Whichever exists wins; cwd-relative wins when both do; when neither exists
+/// the error names the cwd-relative (preferred) path. Confinement under the
+/// canonical `root` is enforced for every candidate ([`confine_under_root`]).
+/// `Err` carries a ready-to-surface message; [`run`] turns it into an explicit
+/// error [`Diag`] rather than a silent empty run.
+async fn read_report_file(root: &Path, cwd: &Path, rel: &str) -> Result<String, String> {
+    // Primary: resolve against the effective cwd (== `root` when no cwd).
+    let primary = confine_under_root(root, cwd, "report_file", rel).map_err(|e| e.to_string())?;
+    let path = if cwd != root && !tokio::fs::try_exists(&primary).await.unwrap_or(false) {
+        // Back-compat: an older root-relative config with a `cwd` set. Use the
+        // root-relative location only when it actually exists; otherwise keep
+        // `primary` so the "could not be read" error points at the preferred
+        // (cwd-relative) path the new semantics expect.
+        let fallback = confine_under_root(root, root, "report_file", rel).map_err(|e| e.to_string())?;
+        if tokio::fs::try_exists(&fallback).await.unwrap_or(false) {
+            fallback
+        } else {
+            primary
+        }
+    } else {
+        primary
+    };
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("report_file `{rel}` could not be read: {e}"))?;
@@ -1195,6 +1231,55 @@ mod tests {
             "a missing report_file must surface as an explicit error diagnostic: {:?}",
             report.groups
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `report_file` resolves against the check's *effective cwd* (cwd-relative),
+    /// not the project root — so `detect.rs`'s unprefixed nested-module presets
+    /// (`cwd: "backend"`, `report_file: "target/surefire-reports"`) read from the
+    /// module dir the tool actually wrote to. The cwd-relative copy wins even
+    /// when a decoy sits at the root-relative location.
+    #[tokio::test]
+    async fn report_file_resolves_relative_to_cwd() {
+        let root = std::env::temp_dir().join(format!("checks-rf-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("backend").join("target")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        // The correct (cwd-relative) file, plus a root-relative decoy.
+        std::fs::write(root.join("backend").join("target").join("r.xml"), "CWD_WINS").unwrap();
+        std::fs::write(root.join("target").join("r.xml"), "ROOT_DECOY").unwrap();
+
+        let cwd = root.join("backend");
+        let got = read_report_file(&root, &cwd, "target/r.xml").await.expect("read");
+        assert_eq!(got, "CWD_WINS", "cwd-relative report_file must win over the root-relative decoy");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Back-compat: a pre-fix config wrote `report_file` root-relative *with* a
+    /// `cwd` set. When the cwd-relative path doesn't exist we fall back to the
+    /// root-relative one if THAT exists — so old configs keep working.
+    #[tokio::test]
+    async fn report_file_falls_back_to_root_relative_for_old_configs() {
+        let root = std::env::temp_dir().join(format!("checks-rf-fallback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        // Only the root-relative location exists (no backend/target/r.xml).
+        std::fs::write(root.join("target").join("r.xml"), "ROOT_ONLY").unwrap();
+
+        let cwd = root.join("backend");
+        let got = read_report_file(&root, &cwd, "target/r.xml").await.expect("read");
+        assert_eq!(got, "ROOT_ONLY", "must fall back to root-relative when only that exists");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Confinement still holds: a `..`-escaping `report_file` is rejected before
+    /// any read, whichever base it would resolve against.
+    #[tokio::test]
+    async fn report_file_escape_is_rejected() {
+        let root = std::env::temp_dir().join(format!("checks-rf-escape-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        let cwd = root.join("backend");
+        let err = read_report_file(&root, &cwd, "../../secrets.xml").await.unwrap_err();
+        assert!(err.contains("escapes the project root") || err.contains("not allowed"), "got: {err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

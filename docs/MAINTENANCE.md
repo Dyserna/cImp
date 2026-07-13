@@ -874,6 +874,76 @@ that module's doc comment) and bounded `graph_recent_changes` at the Datalog
 level (`:order -last_ts :limit`) instead of scanning the whole `commit_touch`
 relation per retrieve.
 
+## Code Intelligence — run_check Generalization (V22)
+
+**No schema involvement.** `CheckDef`'s new fields (`cwd`, `env`, `report_file`,
+`pattern`, `auto`) are all `#[serde(default)]`, so an old `.cimp/config.json`
+overlay deserializes unchanged; detection / auto-configure state is settings +
+in-memory, nothing touches `graph.db`.
+
+**The Rust `ParserKind` enum and the TS `ParserKind` union must stay in
+lockstep — a tripwire enforces it.** `checks/mod.rs`'s tripwire test
+`include_str!`s `src/lib/settings/types.ts` and asserts every `ParserKind` wire
+name (its kebab-case serde rename, *derived* from serde — not a second hand-kept
+list) and every `CheckDef` field key appears in the file. Adding a Rust variant
+or field without mirroring it in `types.ts` fails `cargo test`. `all_parser_kinds()`
+(same test module) is an exhaustive `vec![…]` over every variant, so it's a
+compile error until a new variant is listed — the tripwire can't silently skip
+one.
+
+### Adding a `run_check` parser
+
+Same shape as adding a graph language (above): fixture-first, and the exhaustive
+match forces the wiring.
+
+1. **Capture a fixture** from the *real* tool's output (stdout, or the report
+   file for a file-reading parser), warts and ANSI codes included, into the test
+   module of `checks/parsers.rs` — the existing per-parser tests are the
+   template. Add a truncated/garbage-input case too (must yield zero diags, no
+   panic — the spec requires it).
+2. **Write `parse_<kind>`** in `checks/parsers.rs` (ANSI-strip first via the
+   existing `strip_ansi`; keep severities and the dedup key consistent with the
+   V12 machinery) and add its **`ParserKind` variant** in `checks/mod.rs` with the
+   kebab-case `#[serde(rename)]`. If the parser needs a new `CheckDef` input (as
+   `regex-custom` needs `pattern`, or the file-readers need `report_file`), add
+   that field `#[serde(default)]` too — the tripwire will then require it in
+   `types.ts` as well.
+3. **Extend `all_parser_kinds()`** (`checks/mod.rs` test module) and route the
+   variant through `parsers::parse`. The exhaustive `vec!` / `match` won't
+   compile until the new variant is listed, so this step is forced, not optional.
+4. **Mirror the wire name in `src/lib/settings/types.ts`** (the `ParserKind`
+   union) — the tripwire (above) fails `cargo test` until you do.
+5. **Add it to the editor dropdown.** `PARSER_KINDS` in
+   `src/lib/settings/checksEditor.ts` is a **hand-maintained** ordered list
+   (mainstream → SARIF/long-tail → regex/generic), with a matching `PARSER_LABELS`
+   entry and, if the parser reveals `pattern`/`report_file`, an arm in
+   `showsPattern` / `showsReportFile`. It is **not** derived from the union, and
+   there is **no tripwire on it** (the TS type would still accept the variant), so
+   a new parser is invisible in the UI until you add it here — double-check this
+   step.
+6. **Run `cargo test` (tripwire + fixtures green) and `npm run check` + `npm
+   test`.** The parser then appears in the editor dropdown automatically. Because
+   the detect/preset catalog (`checks/detect.rs`) is a separate data table, wire
+   the new parser into a preset there only if language auto-detection should
+   *propose* it for some ecosystem — otherwise it stays a manual-only choice.
+
+**Parser fixtures rot when the underlying tool changes its output** — the same
+caveat as the V12 parsers above. Each `parse_<kind>` is regex/JSON-shape coupled
+to that tool's *current* format; a tool release that reshapes its diagnostics
+silently degrades `run_check` to zero/garbage groups rather than erroring. Re-run
+the fixtures (and add a fresh one from a real invocation) when bumping a toolchain
+this repo's own `checks:` config points at, and spot-check against the tool's
+changelog.
+
+**`cwd` / `report_file` are confined under the project root, the same way
+offload's `ToolCtx::confine` confines a path.** Absolute or `..`-escaping paths
+are rejected at settings validation *and* at run time; a `report_file` that's
+missing after the run is an explicit error diag, never empty success. `env`
+values are redacted in `CheckDef`'s `Debug`. `regex-custom`'s `pattern` is
+compiled and its mandatory named groups checked at save time
+(`parsers::validate_pattern`, surfaced through the `checks_validate_pattern`
+IPC) so a bad pattern is a UI error, not a silent zero-diagnostics run.
+
 ## Workbench — Vibe-Coding Guardrails (V13)
 
 **No graph-schema change, no new MCP tool.** The whole feature is a reserved

@@ -77,6 +77,7 @@
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
+  import ChecksEditor from './lib/settings/ChecksEditor.svelte';
   import { resolveBundledTheme, defaultPalette } from './lib/themes';
   import { themeRegistry, paletteRegistry } from './lib/themes/registry';
   import type { ThemeColorsWire } from './lib/settings/types';
@@ -724,6 +725,7 @@
     | 'offload'
     | 'mcp'
     | 'graph'
+    | 'checks'
     | 'pricing'
     | 'workbench'
     | 'advanced'
@@ -741,6 +743,7 @@
     { id: 'offload', label: 'Offload task tools' },
     { id: 'mcp', label: 'MCP servers' },
     { id: 'graph', label: 'Code Intelligence' },
+    { id: 'checks', label: 'Checks' },
     { id: 'pricing', label: 'LLM pricing' },
     { id: 'workbench', label: 'Workbench' },
     { id: 'advanced', label: 'Advanced' },
@@ -827,6 +830,24 @@
   // the listener for the rest of the parent process's life.
   let disposed = false;
 
+  // Every valid sidebar section id, for validating a `section:` deep-link
+  // target before assigning it (a hand-crafted event shouldn't be able to set
+  // `activeSection` to garbage).
+  const SECTION_IDS = new Set<string>(SECTIONS.map((s) => s.id));
+
+  // Route a cold-open deep-link target: a `section:<id>` jumps the sidebar to
+  // that section (V22 Phase E — the Code Intelligence checks nudge chip uses
+  // this); anything else is a tab id for the Tabs section scroll.
+  function applyDeepLinkTarget(target: string): void {
+    const sectionPrefix = 'section:';
+    if (target.startsWith(sectionPrefix)) {
+      const id = target.slice(sectionPrefix.length);
+      if (SECTION_IDS.has(id)) activeSection = id as SectionId;
+      return;
+    }
+    scrollToTabSection(target);
+  }
+
   function scrollToTabSection(tabId: string): void {
     // Sidebar nav + sub-tabs both hide content, so flip both before
     // looking up the inner element — otherwise it wouldn't be in the
@@ -880,7 +901,7 @@
     // tab; we read+clear it and scroll if non-null.
     consumeSettingsDeepLink()
       .then((target) => {
-        if (target) scrollToTabSection(target);
+        if (target) applyDeepLinkTarget(target);
       })
       .catch((e) => console.warn('consume_settings_deep_link failed', e));
 
@@ -889,10 +910,14 @@
     // disposed between the await and now, tear the listener down
     // immediately rather than storing it where onDestroy can no longer
     // reach it.
-    const deepLinkUnlisten = await listen<{ kind: string; tab_id: string }>(
+    const deepLinkUnlisten = await listen<{ kind: string; tab_id?: string; section?: string }>(
       'settings-deep-link',
       (e) => {
-        if (e.payload.kind === 'tab') scrollToTabSection(e.payload.tab_id);
+        if (e.payload.kind === 'tab' && e.payload.tab_id) {
+          scrollToTabSection(e.payload.tab_id);
+        } else if (e.payload.kind === 'section' && e.payload.section) {
+          if (SECTION_IDS.has(e.payload.section)) activeSection = e.payload.section as SectionId;
+        }
       },
     );
     if (disposed) {
@@ -4784,6 +4809,21 @@
               setting.
             </small>
           {/if}
+        </section>
+      {:else if activeSection === 'checks'}
+        <section>
+          <h2>Checks</h2>
+          <small class="hint">
+            Project checker commands the <code>run_check</code> tool exposes to
+            Claude and the offload worker — a build, typecheck, lint, or test run
+            turned into bounded, deduplicated diagnostics instead of a raw dump.
+            Configured per project; changes land in this project's
+            <code>.cimp/config.json</code> overlay.
+          </small>
+          <ChecksEditor
+            checks={snapshot.checks}
+            onchange={(next) => patch((s) => (s.checks = next))}
+          />
         </section>
       {:else if activeSection === 'pricing'}
         <section>

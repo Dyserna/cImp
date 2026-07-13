@@ -2553,6 +2553,59 @@ impl GraphService {
     /// completed index pass ([`Self::spawn_rebuild`]'s success handler and
     /// [`Self::reindex_paths`]'s "changed > 0" branch), same spot as the
     /// distillation sweep. No-op when `analyses_auto` is off.
+    /// V22 Phase D: per-language indexed file counts for `root`, as
+    /// [`crate::checks::detect::LangStat`]s (the last successful build's
+    /// `langs`, empty before a first build). Decoupled from [`LangCount`] so the
+    /// `checks` module needn't depend on the graph crate. Feeds detection's
+    /// code-graph evidence source.
+    pub fn checks_lang_stats(&self, root: &Path) -> Vec<crate::checks::detect::LangStat> {
+        self.status
+            .lock()
+            .unwrap()
+            .get(root)
+            .map(|s| {
+                s.langs
+                    .iter()
+                    .map(|l| crate::checks::detect::LangStat { lang: l.lang.clone(), files: l.files })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// V22 Phase D: when `checks_auto_configure` is on and the project has no
+    /// checks yet, apply the validated detection proposals once the graph is
+    /// built — opt-in zero-touch setup. Runs inline on the index worker thread
+    /// like [`run_analyses_trigger`](Self::run_analyses_trigger); detection is
+    /// bounded filesystem + PATH work (no network). The settings `mutate`
+    /// broadcasts and persists (per-project overlay), so the UI reflects the
+    /// applied set — the entries carry `CheckDef::auto = true`.
+    fn checks_auto_configure_trigger(&self, root: &Path) {
+        let snap = self.settings.current();
+        if !snap.checks_auto_configure || !snap.checks.is_empty() {
+            return;
+        }
+        let stats = self.checks_lang_stats(root);
+        let valid: Vec<crate::checks::CheckDef> = crate::checks::detect::detect(root, &stats)
+            .into_iter()
+            .filter(|p| p.valid)
+            .map(|p| p.check)
+            .collect();
+        if valid.is_empty() {
+            return;
+        }
+        let mut applied: Vec<String> = Vec::new();
+        self.settings.mutate(|s| {
+            // Re-check under the lock: a concurrent apply may have populated
+            // `checks` (or the toggle flipped) between the snapshot and here.
+            if s.checks_auto_configure && s.checks.is_empty() {
+                applied = crate::checks::detect::merge_auto(&mut s.checks, valid);
+            }
+        });
+        if !applied.is_empty() {
+            info!(root = %root.display(), applied = ?applied, "checks: auto-configured run_check from detection");
+        }
+    }
+
     fn run_analyses_trigger(&self, root: &Path) {
         if !self.settings.current().graph.analyses_auto {
             return;
@@ -2644,6 +2697,11 @@ impl GraphService {
                         // on the just-built index; runs inline on this worker
                         // thread like the status bookkeeping above.
                         this.run_analyses_trigger(&root);
+                        // V22 Phase D: opt-in auto-configure of `run_check` from
+                        // language detection (no-op unless `checks_auto_configure`
+                        // is on and `checks` is empty). Inline like the analyses
+                        // trigger above — bounded fs + PATH work.
+                        this.checks_auto_configure_trigger(&root);
                     }
                     Err(e) => {
                         warn!(root = %root.display(), error = %e, "graph: rebuild failed");

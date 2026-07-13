@@ -64,8 +64,10 @@
   import { fmtDate, fmtTime } from './format';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
-  import { llmPricingGet } from './settings/ipc';
-  import type { LlmPricingModel } from './settings/types';
+  import { llmPricingGet, openSettingsWindowToSection } from './settings/ipc';
+  import type { LlmPricingModel, ChecksSuggestion } from './settings/types';
+  import { checksSuggestion, checksDismissSuggestion } from './checks';
+  import { computeChip } from './settings/checksEditor';
   import { workbenchSessionCommitCounts, openSessionCommits } from './workbench';
   import { revealTab } from './tabs/visibility';
   import { GRAPH_MONITOR_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
@@ -686,6 +688,40 @@
   }
   let paused = $state<boolean>(false);
   let busy = $state<boolean>(false);
+
+  // V22 Phase D/E: the "N suggested checks" passive nudge. Fetched once a graph
+  // index is complete (a `ready` root exists); the chip derives from the
+  // suggestion payload + the current `checks` setting (`computeChip` — either the
+  // propose nudge, or an "auto-configure applied these" report), and a dismiss
+  // is remembered per project. Kept lightweight, consistent with the analyses
+  // "+N" badges elsewhere in this view.
+  let checksSug = $state<ChecksSuggestion | null>(null);
+  let checksSugFetched = false;
+  let checksChipDismissed = $state(false);
+  const checksChip = $derived(
+    checksSug && !checksChipDismissed ? computeChip(checksSug, $settings.checks) : null,
+  );
+
+  async function maybeFetchChecksSuggestion(): Promise<void> {
+    if (checksSugFetched) return;
+    if (!roots.some((r) => r.state === 'ready')) return;
+    checksSugFetched = true;
+    try {
+      checksSug = await checksSuggestion();
+    } catch (e) {
+      console.warn('checks_suggestion failed', e);
+    }
+  }
+
+  async function dismissChecksChip(): Promise<void> {
+    checksChipDismissed = true;
+    try {
+      await checksDismissSuggestion();
+    } catch (e) {
+      console.warn('checks_dismiss_suggestion failed', e);
+    }
+  }
+
   let probe = $state<EmbedderProbe | null>(null);
   let probing = $state<boolean>(false);
   let poll: ReturnType<typeof setInterval> | null = null;
@@ -770,6 +806,9 @@
     // Refresh the per-root language census only on a root's appear/build-done
     // edge (cheap on a steady poll, fresh counts right after a rebuild).
     await maybeRefreshCensus();
+    // V22: fetch the checks suggestion once an index is complete (guarded so it
+    // runs at most once — the chip then recomputes reactively from settings).
+    await maybeFetchChecksSuggestion();
     // Memory is only fetched while its section is visible (opens the warm index).
     if (section === 'memory') {
       await refreshMemory();
@@ -895,6 +934,36 @@
       >{s.label}{#if s.id === 'analyses' && analysesBadgeTotal > 0}<span class="badge" title="New since last pass">+{analysesBadgeTotal}</span>{/if}</button>
     {/each}
   </nav>
+
+  {#if checksChip}
+    <div class="checks-chip">
+      <button
+        type="button"
+        class="chip-body"
+        onclick={() => void openSettingsWindowToSection('checks')}
+        title="Open Settings → Checks"
+      >
+        <span class="chip-icon" aria-hidden="true">✓</span>
+        {#if checksChip.mode === 'suggest'}
+          <span
+            >run_check: {checksChip.count} suggested check{checksChip.count === 1 ? '' : 's'} for this
+            project</span
+          >
+        {:else}
+          <span
+            >run_check auto-configured: {checksChip.names.join(', ')} — review in Settings</span
+          >
+        {/if}
+      </button>
+      <button
+        type="button"
+        class="chip-x"
+        aria-label="Dismiss"
+        title="Dismiss"
+        onclick={() => void dismissChecksChip()}>×</button
+      >
+    </div>
+  {/if}
 
   {#if section === 'overview'}
   <h3 class="group-head">Usage</h3>
@@ -1867,6 +1936,51 @@
     color: #fff;
     opacity: 1;
     border-color: var(--accent, #3b6ea5);
+  }
+  /* V22: the run_check suggestion nudge — a lightweight, dismissable chip. */
+  .checks-chip {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    margin-bottom: 14px;
+    border: 1px solid var(--accent, #3b6ea5);
+    border-radius: 8px;
+    overflow: hidden;
+    background: rgba(59, 110, 165, 0.12);
+    font-size: 12px;
+    max-width: max-content;
+  }
+  .checks-chip .chip-body {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: transparent;
+    border: none;
+    color: var(--text, #ddd);
+    cursor: pointer;
+    text-align: left;
+  }
+  .checks-chip .chip-body:hover {
+    background: rgba(59, 110, 165, 0.22);
+  }
+  .checks-chip .chip-icon {
+    color: var(--accent, #3b6ea5);
+    font-weight: 700;
+  }
+  .checks-chip .chip-x {
+    padding: 0 10px;
+    background: transparent;
+    border: none;
+    border-left: 1px solid var(--border, #333);
+    color: var(--text, #ddd);
+    opacity: 0.6;
+    cursor: pointer;
+    font-size: 15px;
+  }
+  .checks-chip .chip-x:hover {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.06);
   }
   /* V12 Phase F (6c): "+N since last pass" badge on the Analyses tab + its
      buttons — a small pill, never wraps, doesn't disturb button sizing. */

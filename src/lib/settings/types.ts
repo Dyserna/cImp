@@ -601,9 +601,17 @@ export interface Settings {
   workbench: WorkbenchSettings;
   /// V12 Phase A: project checker commands the `run_check` MCP tool can run
   /// (mirror of Rust `Vec<CheckDef>`). Lives at the root, not inside
-  /// `GraphSettings` — independent of the code graph. Empty by default; set
-  /// via the `.cimp/config.json` overlay.
+  /// `GraphSettings` — independent of the code graph. Empty by default. Edited
+  /// in Settings → Checks (V22 Phase E ChecksEditor), which lands the change as
+  /// a per-project `.cimp/config.json` overlay diff like any other setting.
   checks: CheckDef[];
+  /// V22 Phase D: auto-apply validated detection proposals on first index for a
+  /// project with empty `checks`. Default false (propose-then-approve is the
+  /// default; this is the fleet opt-in). Rides the per-project overlay.
+  checks_auto_configure: boolean;
+  /// V22 Phase D: set once the user dismisses the "N suggested checks" nudge for
+  /// this project. Per-project (overlay); written by `checks_dismiss_suggestion`.
+  checks_suggestion_dismissed: boolean;
   /// Which AI-tool tabs are enabled. The checkbox group in
   /// Settings → Tabs is the canonical way to flip this; the backend's
   /// `set_enabled_ai_tabs` IPC opens / closes the corresponding AI
@@ -767,7 +775,20 @@ export interface LoggingSettings {
 
 /// Which built-in parser decodes a check's output (mirror of Rust
 /// `ParserKind`). Wire format is kebab-case.
-export type ParserKind = 'cargo-json' | 'tsc' | 'eslint-json' | 'pytest' | 'generic-gcc';
+export type ParserKind =
+  | 'cargo-json'
+  | 'tsc'
+  | 'eslint-json'
+  | 'pytest'
+  | 'cargo-test'
+  | 'jest-json'
+  | 'sarif'
+  | 'go'
+  | 'go-test-json'
+  | 'dotnet'
+  | 'junit-xml'
+  | 'regex-custom'
+  | 'generic-gcc';
 
 /// One configured project check the `run_check` MCP tool can run (mirror of
 /// Rust `CheckDef`). `cmd` is the full shell command line (cwd = project
@@ -777,6 +798,95 @@ export interface CheckDef {
   cmd: string;
   parser: ParserKind;
   timeout_secs: number;
+  /// V22 Phase B: run `cmd` in this directory instead of the project root — a
+  /// path relative to the root, confined strictly beneath it (absolute/escaping
+  /// paths rejected). Diagnostic file paths are re-rooted back to the project
+  /// root, so the report stays root-relative. Always present on the wire
+  /// (Rust serializes it unconditionally); `null` means "run at the root".
+  cwd: string | null;
+  /// V22 Phase B: environment variables forced on the spawned child, as ordered
+  /// `[key, value]` pairs (mirror of Rust `Vec<(String, String)>`).
+  env: [string, string][];
+  /// V22 Phase B2: when set, the parser reads this file's content (confined like
+  /// `cwd`) after the run instead of stdout — for junit-xml / sarif tools that
+  /// write a report to disk. `null` means "parse stdout".
+  report_file: string | null;
+  /// V22 Phase C: the regex for the `regex-custom` parser (ignored by every
+  /// other parser). Named groups `file`/`line`/`message` are mandatory,
+  /// `col`/`severity` optional; validated at save time (see the Rust
+  /// `parsers::validate_pattern`). Always present on the wire; `null` when
+  /// unused. Mirror of Rust `Option<String>`.
+  pattern: string | null;
+  /// V22 Phase D: `true` when this entry was created by language auto-detection
+  /// (`checks/detect.rs`) rather than hand-authored. Re-detection may refresh
+  /// `auto === true` entries but never touches a `false` one. The ChecksEditor
+  /// (Phase E) MUST clear this flag (set `false`) whenever the user edits an
+  /// auto entry, so a later re-detection stops fighting the manual change.
+  /// Mirror of Rust `CheckDef::auto`; always present on the wire.
+  auto: boolean;
+}
+
+/// V22 Phase D: one auto-detection proposal (mirror of Rust
+/// `checks::detect::Proposal`). Returned by the `checks_detect` IPC; the Phase E
+/// editor renders `check` with a checkbox, greying items where `valid === false`
+/// and showing `reason`.
+export interface ChecksProposal {
+  check: CheckDef;
+  /// Human ecosystem label (`"Rust"`, `"Go"`, `"TypeScript/JavaScript"`, … ).
+  ecosystem: string;
+  /// What triggered it — the marker file(s) and/or the code-graph stat.
+  evidence: string;
+  /// Whether the machine could validate it (marker present + binary on PATH).
+  valid: boolean;
+  /// Why an invalid proposal can't run; `null` when `valid`.
+  reason: string | null;
+}
+
+/// V22 Phase D: the passive-nudge payload (mirror of Rust
+/// `ChecksSuggestion`). `count` is how many VALID proposals detection found for
+/// a project whose `checks` is empty; `dismissed` reflects the per-project
+/// `checks_suggestion_dismissed` flag. The chip shows only when
+/// `count > 0 && !dismissed`.
+export interface ChecksSuggestion {
+  count: number;
+  dismissed: boolean;
+  /// Mirror of `checks_auto_configure` — the chip notes when auto-apply is on.
+  auto_configure: boolean;
+}
+
+/// V22 Phase D: the `checks_apply_proposals` result — the names actually written
+/// (added or refreshed) after the `auto`-ownership merge. Mirror of Rust
+/// `ApplySummary`.
+export interface ChecksApplySummary {
+  applied: string[];
+}
+
+/// V22 Phase E: the `checks_test` dry-run result the ChecksEditor renders inline
+/// (mirror of Rust `checks::ChecksTestResult`). `diag_count` is the number of
+/// deduplicated diagnostic groups; `diagnostics` is the first few of them.
+/// `stdout_bytes`/`stderr_bytes` are the raw captured output sizes — the
+/// "did the command produce output at all?" signal `classifyTestResult`
+/// (`checksEditor.ts`) uses to flag a wrong-parser config (output produced, zero
+/// diagnostics) apart from a genuinely clean run. `error` is set (and the rest
+/// zeroed) when validation/spawn failed before a report was produced.
+export interface ChecksTestResult {
+  exit_code: number | null;
+  duration_ms: number;
+  timed_out: boolean;
+  diag_count: number;
+  stdout_bytes: number;
+  stderr_bytes: number;
+  diagnostics: ChecksTestDiag[];
+  error: string | null;
+}
+
+/// V22 Phase E: one diagnostic group summarized for the Test-button preview
+/// (mirror of Rust `checks::TestDiag`).
+export interface ChecksTestDiag {
+  severity: string;
+  message: string;
+  /// `"file:line"` sample locations; a location-less group has an empty list.
+  sites: string[];
 }
 
 /// V9-01: per-project code-knowledge-graph config. Mirror of Rust
@@ -1484,6 +1594,8 @@ export function defaultSettings(): Settings {
       checkpoint_min_gap_s: 120,
     },
     checks: [],
+    checks_auto_configure: false,
+    checks_suggestion_dismissed: false,
     enabled_ai_tabs: ['claude'],
     logging: {
       level: 'info',

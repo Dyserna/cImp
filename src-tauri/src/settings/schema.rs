@@ -189,6 +189,22 @@ pub struct Settings {
     /// `run_check` tool call only *selects* a `CheckDef` by name — the command
     /// itself is never model-supplied.
     pub checks: Vec<crate::checks::CheckDef>,
+    /// V22 Phase D: when `true`, validated auto-detection proposals are applied
+    /// automatically the first time a project's code graph finishes indexing
+    /// with an empty `checks` list (for fleet users who want zero-touch setup
+    /// across many projects). Default **false** — a wrong auto-applied check
+    /// burns tokens on every `auto_check` fire, so the propose-then-approve chip
+    /// is the default; this is the opt-in. Applied entries carry
+    /// `CheckDef::auto = true` so a later re-detection can refresh them without
+    /// fighting user edits. Rides the per-project `.cimp/config.json` overlay
+    /// like `checks` itself. Additive `#[serde(default)]` (struct-level) ⇒ old
+    /// configs load with it off.
+    pub checks_auto_configure: bool,
+    /// V22 Phase D: set once the user dismisses the "N suggested checks" nudge
+    /// (Code Intelligence chip) for THIS project, so it doesn't re-appear on
+    /// every index. Per-project via the overlay (a fresh project re-offers the
+    /// nudge). Written by the `checks_dismiss_suggestion` IPC. Additive.
+    pub checks_suggestion_dismissed: bool,
     /// Which AI-tool tabs are enabled. Each id in this list corresponds
     /// to one of the four reserved AI builtins (`claude`, `claude-local`,
     /// `aider`, `aider-local`). Adding an id opens that tab; removing
@@ -302,6 +318,8 @@ impl Default for Settings {
             graph: GraphSettings::default(),
             workbench: WorkbenchSettings::default(),
             checks: Vec::new(),
+            checks_auto_configure: false,
+            checks_suggestion_dismissed: false,
             enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
             prompt_templates: Vec::new(),

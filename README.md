@@ -644,6 +644,31 @@ if called by name). And two **graduation rules** let the Advisor propose
 turning the read advisor on — or switching it to `substitute` mode — from
 measured field data, never silently.
 
+**run_check, generalized (V17→V22)** turns the config-file-only checker into a
+discoverable, multi-language feature. Parser coverage grows from three ecosystems
+to a dozen: alongside `cargo-json`/`cargo-test`, `tsc`, `eslint-json`,
+`jest-json`, `pytest`, and the `generic-gcc` fallback, `run_check` now parses
+**SARIF 2.1** (the modern lint/security long tail — ruff, clang-tidy,
+golangci-lint, semgrep, ESLint's SARIF formatter, CodeQL…), Go (`go build`/`vet`
+text and `go test -json`), .NET / MSBuild (`dotnet build`, covering C#/F#/VB),
+**JUnit XML** test reports (Maven Surefire, Gradle, Kotlin, PHPUnit…), and a
+**`regex-custom`** escape hatch that wires any tool from a regex with named
+`file`/`line`/`message` groups — no cImp release needed. A `CheckDef` gains
+`cwd` (confined under the project root — fixes nested manifests and monorepos
+without `--manifest-path` hacks), forced `env`, and `report_file` (for tools that
+write a report to disk instead of printing to stdout). A first-class **checks
+editor** in *Settings* (add / edit / delete, a parser dropdown with live regex
+validation, and a per-check **Test** dry-run that warns on a zero-diagnostic
+"wrong parser?" result) replaces hand-editing JSON, with an honest exposure
+status line — "run_check exposed: MCP ✓ / offload worker ✓" versus "not exposed —
+no checks configured" (`run_check` stays unadvertised on every surface until a
+project configures `checks`). **Detect & configure** rides the code graph's
+per-language file counts (or marker files when there's no graph) to propose a
+working checks config — apply the PATH-validated candidates with one click, or
+set `checks_auto_configure` to apply them automatically on first index; a Code
+Intelligence nudge chip surfaces the suggestion when a graph finishes indexing a
+project that has no checks yet.
+
 ## Workbench (V13 — vibe-coding guardrails)
 
 A reserved **Workbench** tab (on by default) makes it safe to let agents run

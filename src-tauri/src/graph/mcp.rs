@@ -1917,7 +1917,7 @@ mod run_check_tests {
     use serde_json::json;
 
     fn def(name: &str, cmd: &str) -> CheckDef {
-        CheckDef { name: name.to_string(), cmd: cmd.to_string(), parser: ParserKind::GenericGcc, timeout_secs: 30 }
+        CheckDef { name: name.to_string(), cmd: cmd.to_string(), parser: ParserKind::GenericGcc, timeout_secs: 30, ..Default::default() }
     }
 
     #[test]
@@ -1985,6 +1985,8 @@ mod run_check_tests {
                 },
                 DiagGroup { key: "k2".into(), severity: Severity::Warning, message: "unused import".into(), count: 1, sites: vec![("src/c.rs".into(), 1)] },
             ],
+            stdout_bytes: 0,
+            stderr_bytes: 0,
         };
         let out = fmt_check_report(&report, 1);
         assert!(out.starts_with("cargo — exit 1 · 42 ms"), "{out}");
@@ -1997,14 +1999,14 @@ mod run_check_tests {
 
     #[test]
     fn fmt_check_report_no_diagnostics() {
-        let report = CheckReport { name: "cargo".into(), exit_code: Some(0), duration_ms: 5, timed_out: false, groups: vec![] };
+        let report = CheckReport { name: "cargo".into(), exit_code: Some(0), duration_ms: 5, timed_out: false, groups: vec![], stdout_bytes: 0, stderr_bytes: 0 };
         let out = fmt_check_report(&report, 50);
         assert!(out.contains("No diagnostics."), "{out}");
     }
 
     #[test]
     fn fmt_check_report_flags_timeout() {
-        let report = CheckReport { name: "slow".into(), exit_code: None, duration_ms: 10_000, timed_out: true, groups: vec![] };
+        let report = CheckReport { name: "slow".into(), exit_code: None, duration_ms: 10_000, timed_out: true, groups: vec![], stdout_bytes: 0, stderr_bytes: 0 };
         let out = fmt_check_report(&report, 50);
         assert!(out.contains("TIMED OUT"), "{out}");
         // V21 F6: a timed-out check must carry the "unverified" cue so the

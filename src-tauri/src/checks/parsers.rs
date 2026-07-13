@@ -5,10 +5,12 @@
 //! should degrade the diagnostic count, not break `run_check` outright.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::reader::Reader;
 use regex::Regex;
 use serde::Deserialize;
 
@@ -23,8 +25,11 @@ use super::{Diag, ParserKind, Severity};
 /// though `jest` embeds color *inside* its JSON message strings, stripped
 /// there). `cwd` is the run root: `jest`/`vitest` report absolute
 /// `testFilePath`s, and only the parser that consumes them needs it to
-/// relativize (see [`parse_jest_json`]); every other arm ignores it.
-pub fn parse(kind: ParserKind, stdout: &str, stderr: &str, cwd: &Path) -> Vec<Diag> {
+/// relativize (see [`parse_jest_json`]); every other arm ignores it. `pattern`
+/// is only read by [`parse_regex_custom`] (the `regex-custom` escape hatch) —
+/// it's `CheckDef::pattern`, threaded through from [`super::run`]; every other
+/// arm ignores it.
+pub fn parse(kind: ParserKind, stdout: &str, stderr: &str, cwd: &Path, pattern: Option<&str>) -> Vec<Diag> {
     match kind {
         ParserKind::CargoJson => parse_cargo_json(stdout),
         ParserKind::EslintJson => parse_eslint_json(stdout),
@@ -32,6 +37,13 @@ pub fn parse(kind: ParserKind, stdout: &str, stderr: &str, cwd: &Path) -> Vec<Di
         ParserKind::Pytest => parse_pytest(&strip_ansi(stdout), &strip_ansi(stderr)),
         ParserKind::CargoTest => parse_cargo_test(&strip_ansi(stdout), &strip_ansi(stderr)),
         ParserKind::JestJson => parse_jest_json(stdout, cwd),
+        // JSON / XML formats carry no top-level ANSI (see the note above).
+        ParserKind::Sarif => parse_sarif(stdout, cwd),
+        ParserKind::GoTestJson => parse_go_test_json(stdout),
+        ParserKind::JunitXml => parse_junit_xml(stdout),
+        ParserKind::Go => parse_go(&strip_ansi(stdout), &strip_ansi(stderr)),
+        ParserKind::Dotnet => parse_dotnet(&strip_ansi(stdout), &strip_ansi(stderr)),
+        ParserKind::RegexCustom => parse_regex_custom(&strip_ansi(stdout), &strip_ansi(stderr), pattern),
         ParserKind::GenericGcc => parse_generic_gcc(&strip_ansi(stdout), &strip_ansi(stderr)),
     }
 }
@@ -619,6 +631,555 @@ fn parse_jest_json(stdout: &str, cwd: &Path) -> Vec<Diag> {
     out
 }
 
+// ── SARIF 2.1 (sarif) ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SarifLog {
+    #[serde(default)]
+    runs: Vec<SarifRun>,
+}
+
+#[derive(Deserialize)]
+struct SarifRun {
+    #[serde(default)]
+    results: Vec<SarifResult>,
+}
+
+#[derive(Deserialize)]
+struct SarifResult {
+    #[serde(default, rename = "ruleId")]
+    rule_id: Option<String>,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    message: SarifMessage,
+    #[serde(default)]
+    locations: Vec<SarifLocation>,
+}
+
+#[derive(Deserialize, Default)]
+struct SarifMessage {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct SarifLocation {
+    #[serde(default, rename = "physicalLocation")]
+    physical_location: Option<SarifPhysicalLocation>,
+}
+
+#[derive(Deserialize)]
+struct SarifPhysicalLocation {
+    #[serde(default, rename = "artifactLocation")]
+    artifact_location: Option<SarifArtifactLocation>,
+    #[serde(default)]
+    region: Option<SarifRegion>,
+}
+
+#[derive(Deserialize)]
+struct SarifArtifactLocation {
+    #[serde(default)]
+    uri: String,
+}
+
+#[derive(Deserialize)]
+struct SarifRegion {
+    #[serde(default, rename = "startLine")]
+    start_line: u32,
+    #[serde(default, rename = "startColumn")]
+    start_column: Option<u32>,
+}
+
+/// Turn a SARIF `artifactLocation.uri` into a report path. A `file://` scheme
+/// is stripped (`file:///c:/repo/a.rs` → `c:/repo/a.rs`; `file:///repo/a.rs` →
+/// `/repo/a.rs`, keeping the POSIX leading slash) and the resulting absolute
+/// path relativized against the run `cwd` exactly like the jest parser's
+/// `testFilePath`s. A uri with no scheme is already project-relative and passes
+/// through unchanged.
+fn sarif_uri_to_path(cwd: &Path, uri: &str) -> String {
+    let Some(rest) = uri.strip_prefix("file://") else {
+        return uri.to_string();
+    };
+    // Drop the leading slash only when a Windows drive letter follows it
+    // (`/c:/…` → `c:/…`); a POSIX `/repo/…` keeps its root slash.
+    let abs = if rest.starts_with('/') && rest.as_bytes().get(2) == Some(&b':') {
+        &rest[1..]
+    } else {
+        rest
+    };
+    relativize(cwd, abs)
+}
+
+/// SARIF 2.1 JSON (`ruff --output-format sarif`, `clang-tidy`, `golangci-lint`,
+/// `semgrep`, CodeQL, ...) — the modern-lint long tail in one parser. One
+/// `Diag` per `runs[].results[]`: `level` → `Severity` (`error`→Error,
+/// `note`/`none`→Note, `warning` **and a missing level** → Warning, per the
+/// SARIF default), the first physical location's `artifactLocation.uri` +
+/// `region.startLine/startColumn`, and `ruleId` → code. A location-less result
+/// gets an empty location (the `tsc_global` posture) rather than being dropped.
+/// Every optional field tolerates absence (serde defaults); a malformed or
+/// truncated document ⇒ no diagnostics (the whole-document JSON posture).
+fn parse_sarif(stdout: &str, cwd: &Path) -> Vec<Diag> {
+    let doc = stdout.trim_start_matches('\u{feff}').trim();
+    let Ok(log) = serde_json::from_str::<SarifLog>(doc) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for run in &log.runs {
+        for r in &run.results {
+            let severity = match r.level.as_deref() {
+                Some("error") => Severity::Error,
+                Some("note") | Some("none") => Severity::Note,
+                // `warning`, or a missing level (SARIF's spec default), → Warning.
+                _ => Severity::Warning,
+            };
+            let (file, line, col) = match r.locations.iter().find_map(|l| l.physical_location.as_ref()) {
+                Some(p) => {
+                    let uri = p.artifact_location.as_ref().map(|a| a.uri.as_str()).unwrap_or("");
+                    let (line, col) = match &p.region {
+                        Some(reg) => (reg.start_line, reg.start_column),
+                        None => (0, None),
+                    };
+                    (sarif_uri_to_path(cwd, uri), line, col)
+                }
+                None => (String::new(), 0, None),
+            };
+            out.push(Diag { severity, code: r.rule_id.clone(), message: r.message.text.clone(), file, line, col });
+        }
+    }
+    out
+}
+
+// ── go build / go vet (go) ────────────────────────────────────────────────
+
+fn go_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // `file:line[:col]: message`. The non-greedy `.+?` lets the `:line` anchor
+    // win past a Windows drive letter's own colon (`C:\pkg\main.go:10:5: …`),
+    // the `generic_gcc` trick; `col` is optional (`go build` sometimes omits it).
+    RE.get_or_init(|| Regex::new(r"^(.+?):(\d+)(?::(\d+))?:\s+(.+)$").expect("valid regex"))
+}
+
+/// `go build` / `go vet` text: `file:line[:col]: message`. Go prints no
+/// severity token on these lines, and Go shops gate merges on `vet`, so every
+/// matched line is `Error` (spec decision 4). `# package/path` stanza headers
+/// (which carry no location) are skipped, as is any non-matching line. The
+/// all-digit-"file" (a `12:34:56` timestamp) and indented-decoration guards
+/// mirror `generic_gcc`.
+fn parse_go(stdout: &str, stderr: &str) -> Vec<Diag> {
+    let re = go_re();
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter_map(|line| {
+            // `# example.com/foo` stanza headers carry no diagnostic location.
+            if line.starts_with('#') {
+                return None;
+            }
+            let caps = re.captures(line)?;
+            let file = &caps[1];
+            if file.bytes().all(|b| b.is_ascii_digit()) || file.starts_with(char::is_whitespace) {
+                return None;
+            }
+            Some(Diag {
+                severity: Severity::Error,
+                code: None,
+                message: caps[4].trim().to_string(),
+                file: file.to_string(),
+                line: caps[2].parse().ok()?,
+                col: caps.get(3).and_then(|m| m.as_str().parse().ok()),
+            })
+        })
+        .collect()
+}
+
+// ── go test -json (go-test-json) ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GoTestEvent {
+    #[serde(default, rename = "Action")]
+    action: String,
+    #[serde(default, rename = "Package")]
+    package: String,
+    #[serde(default, rename = "Test")]
+    test: Option<String>,
+    #[serde(default, rename = "Output")]
+    output: Option<String>,
+}
+
+/// Join the last `max` non-blank-trimmed lines of `block` — the *tail* of a Go
+/// test's captured output, where `go test` prints the `--- FAIL` marker and the
+/// assertion detail. Mirrors `truncate_lines`, but keeps the END (a Go
+/// failure's signal is at the bottom, not the top).
+fn tail_lines(block: &[&str], max: usize) -> String {
+    let start = block.iter().position(|l| !l.trim().is_empty()).unwrap_or(block.len());
+    let end = block.iter().rposition(|l| !l.trim().is_empty()).map(|i| i + 1).unwrap_or(start);
+    let trimmed = &block[start..end];
+    let skip = trimmed.len().saturating_sub(max);
+    trimmed[skip..].join("\n")
+}
+
+/// One failure `Diag` from a label + the collected `Output` chunks for its
+/// `(Package, Test)` key: the label plus the output tail (~15 lines, the
+/// cargo-test cap), or just `"<label> failed"` when no output was captured.
+fn go_test_diag(label: &str, collected: Option<&Vec<String>>) -> Diag {
+    let joined = collected.map(|v| v.concat()).unwrap_or_default();
+    let lines: Vec<&str> = joined.lines().collect();
+    let tail = tail_lines(&lines, 15);
+    let message = if tail.is_empty() { format!("{label} failed") } else { format!("{label}\n{tail}") };
+    Diag { severity: Severity::Error, code: None, message, file: String::new(), line: 0, col: None }
+}
+
+/// `go test -json` event stream (one JSON object per line: `Action`, `Package`,
+/// `Test`, `Output`, `Elapsed`). `Output` events are collected per
+/// `(Package, Test)` as the stream is read; each `Action == "fail"` with a
+/// `Test` becomes one `Error` whose message is the test name plus its output
+/// tail. A package-level `fail` (no `Test` — a build failure) surfaces the
+/// package's own collected output, but only when no per-test failure was
+/// already recorded for that package (so an ordinary test failure isn't
+/// double-reported). A pass/fail counts `Note` folds in like `parse_cargo_test`
+/// — but only once at least one event parsed, so garbage ⇒ zero diagnostics.
+fn parse_go_test_json(stdout: &str) -> Vec<Diag> {
+    let mut output: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut failed_pkgs: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    let (mut passed, mut failed) = (0u32, 0u32);
+    let mut saw_event = false;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_str::<GoTestEvent>(line) else { continue };
+        saw_event = true;
+        let test_key = ev.test.clone().unwrap_or_default();
+        if let Some(text) = &ev.output {
+            output.entry((ev.package.clone(), test_key.clone())).or_default().push(text.clone());
+        }
+        match ev.action.as_str() {
+            "pass" if ev.test.is_some() => passed += 1,
+            "fail" => match &ev.test {
+                Some(name) => {
+                    failed += 1;
+                    failed_pkgs.insert(ev.package.clone());
+                    let collected = output.get(&(ev.package.clone(), name.clone()));
+                    out.push(go_test_diag(name, collected));
+                }
+                // A build failure surfaces the package's output — unless a
+                // per-test failure already reported for the same package.
+                None if !failed_pkgs.contains(&ev.package) => {
+                    let collected = output.get(&(ev.package.clone(), String::new()));
+                    out.push(go_test_diag(&format!("package {}", ev.package), collected));
+                }
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
+    if saw_event {
+        out.push(Diag {
+            severity: Severity::Note,
+            code: None,
+            message: format!("{passed} passed, {failed} failed"),
+            file: String::new(),
+            line: 0,
+            col: None,
+        });
+    }
+    out
+}
+
+// ── dotnet build / MSBuild (dotnet) ───────────────────────────────────────
+
+fn dotnet_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // MSBuild canonical: `file(line,col): error|warning CODE: message`. The
+    // non-greedy `.+?` up to `(line,col)` tolerates a Windows drive-letter path;
+    // the code token is `\w+` (`CS0103`, `MSB3202`, `FS0001`, ...).
+    RE.get_or_init(|| Regex::new(r"^(.+?)\((\d+),(\d+)\): (error|warning) (\w+): (.+)$").expect("valid regex"))
+}
+
+fn dotnet_project_suffix_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // MSBuild appends the owning project in brackets: ` [C:\src\App.csproj]`.
+    RE.get_or_init(|| Regex::new(r"\s*\[[^\]]*\.(?:csproj|fsproj|vbproj|proj|sln)\]\s*$").expect("valid regex"))
+}
+
+/// MSBuild canonical diagnostics from `dotnet build --nologo`:
+/// `file(line,col): error|warning CODE: message` — one regex family covering
+/// C#/F#/VB. MSBuild appends the owning project (` [C:\src\App.csproj]`) to
+/// each line; it's stripped from the message. MSBuild also prints the same
+/// diagnostic once per target it built through — those identical lines collapse
+/// in `checks::run`'s `group`/dedup, so no dedup is done here.
+fn parse_dotnet(stdout: &str, stderr: &str) -> Vec<Diag> {
+    let re = dotnet_re();
+    let suffix = dotnet_project_suffix_re();
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter_map(|line| {
+            let caps = re.captures(line.trim_end())?;
+            let severity = if &caps[4] == "error" { Severity::Error } else { Severity::Warning };
+            let message = suffix.replace(&caps[6], "").trim().to_string();
+            if message.is_empty() {
+                return None;
+            }
+            Some(Diag {
+                severity,
+                code: Some(caps[5].to_string()),
+                message,
+                file: caps[1].to_string(),
+                line: caps[2].parse().ok()?,
+                col: caps[3].parse().ok(),
+            })
+        })
+        .collect()
+}
+
+// ── JUnit XML (junit-xml) ─────────────────────────────────────────────────
+
+/// One `<testcase>`'s accumulated state while its element is open.
+struct JunitCase {
+    classname: String,
+    name: String,
+    file: String,
+    line: u32,
+    failed: bool,
+    fail_message: Option<String>,
+    fail_text: String,
+}
+
+/// The value of `e`'s attribute named `key` (local name, namespace-insensitive),
+/// entity-unescaped. `None` when the attribute is absent.
+fn junit_attr(e: &BytesStart, key: &[u8]) -> Option<String> {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.local_name().as_ref() == key)
+        .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()))
+}
+
+/// `e`'s numeric attribute `key` (a `<testsuite>` count), defaulting to 0.
+fn junit_num(e: &BytesStart, key: &[u8]) -> u64 {
+    junit_attr(e, key).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Build the failure `Diag` for a failed `<testcase>`: `classname.name` (each
+/// omitted when empty) plus the failure detail — the `<failure>`/`<error>`
+/// `message` attribute, else the first non-blank line of its text content.
+fn junit_diag(c: &JunitCase) -> Diag {
+    let mut label = match (c.classname.is_empty(), c.name.is_empty()) {
+        (false, false) => format!("{}.{}", c.classname, c.name),
+        (true, false) => c.name.clone(),
+        (false, true) => c.classname.clone(),
+        (true, true) => "test".to_string(),
+    };
+    let detail = c
+        .fail_message
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| c.fail_text.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string));
+    if let Some(d) = detail {
+        label.push_str(": ");
+        label.push_str(&d);
+    }
+    Diag { severity: Severity::Error, code: None, message: label, file: c.file.clone(), line: c.line, col: None }
+}
+
+/// Streaming state for [`parse_junit_xml`]. Totals are summed across every
+/// `<testsuite>` (a `<testsuites>` wrapper's own totals are a fallback used only
+/// when no `<testsuite>` was seen — normally its children carry the real
+/// counts).
+#[derive(Default)]
+struct JunitState {
+    out: Vec<Diag>,
+    suite_total: u64,
+    suite_failures: u64,
+    suite_errors: u64,
+    wrapper: Option<(u64, u64, u64)>,
+    saw_element: bool,
+    saw_suite: bool,
+    cur: Option<JunitCase>,
+    in_failure: bool,
+}
+
+impl JunitState {
+    fn open(&mut self, e: &BytesStart, empty: bool) {
+        match e.local_name().as_ref() {
+            b"testsuites" => {
+                self.saw_element = true;
+                self.wrapper = Some((junit_num(e, b"tests"), junit_num(e, b"failures"), junit_num(e, b"errors")));
+            }
+            b"testsuite" => {
+                self.saw_element = true;
+                self.saw_suite = true;
+                self.suite_total += junit_num(e, b"tests");
+                self.suite_failures += junit_num(e, b"failures");
+                self.suite_errors += junit_num(e, b"errors");
+            }
+            b"testcase" => {
+                // A self-closing `<testcase/>` is a passing test — nothing to
+                // open (no `<failure>`/`<error>` child can follow it).
+                if empty {
+                    return;
+                }
+                self.cur = Some(JunitCase {
+                    classname: junit_attr(e, b"classname").unwrap_or_default(),
+                    name: junit_attr(e, b"name").unwrap_or_default(),
+                    file: junit_attr(e, b"file").unwrap_or_default(),
+                    line: junit_attr(e, b"line").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+                    failed: false,
+                    fail_message: None,
+                    fail_text: String::new(),
+                });
+            }
+            b"failure" | b"error" => {
+                if let Some(cur) = &mut self.cur {
+                    cur.failed = true;
+                    if cur.fail_message.is_none() {
+                        cur.fail_message = junit_attr(e, b"message");
+                    }
+                }
+                // A non-empty `<failure>…</failure>` has text to capture until
+                // its `End`; a self-closing one carries all it has in `message`.
+                if !empty {
+                    self.in_failure = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn close(&mut self, name: &[u8]) {
+        match name {
+            b"failure" | b"error" => self.in_failure = false,
+            b"testcase" => {
+                if let Some(c) = self.cur.take() {
+                    if c.failed {
+                        self.out.push(junit_diag(&c));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn text(&mut self, t: &str) {
+        if self.in_failure {
+            if let Some(cur) = &mut self.cur {
+                cur.fail_text.push_str(t);
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<Diag> {
+        if self.saw_element {
+            let (total, failures, errors) = if self.saw_suite {
+                (self.suite_total, self.suite_failures, self.suite_errors)
+            } else {
+                self.wrapper.unwrap_or((0, 0, 0))
+            };
+            self.out.push(Diag {
+                severity: Severity::Note,
+                code: None,
+                message: format!("{total} tests, {failures} failures, {errors} errors"),
+                file: String::new(),
+                line: 0,
+                col: None,
+            });
+        }
+        self.out
+    }
+}
+
+/// A JUnit XML test report (Maven Surefire, Gradle, pytest `--junit-xml`,
+/// PHPUnit, ...), normally read via Phase B's `report_file` (these runners
+/// write XML to disk, not stdout). One failed `<testcase>` (a `<failure>` or
+/// `<error>` child) ⇒ one `Error`; a passing (self-closing) testcase is
+/// ignored. A counts `Note` folds in the `<testsuite>` `tests`/`failures`/
+/// `errors` totals. Both a `<testsuites>` wrapper and a bare `<testsuite>` are
+/// tolerated. Malformed XML ⇒ whatever parsed before the error — and, since no
+/// `<testsuite>`/`<testcase>` element is seen in non-JUnit input, that's zero
+/// diagnostics (the module's lenient posture).
+fn parse_junit_xml(input: &str) -> Vec<Diag> {
+    let mut reader = Reader::from_str(input);
+    let mut st = JunitState::default();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => st.open(&e, false),
+            Ok(Event::Empty(e)) => st.open(&e, true),
+            Ok(Event::End(e)) => st.close(e.local_name().as_ref()),
+            Ok(Event::Text(e)) => {
+                if let Ok(t) = e.decode() {
+                    st.text(&t);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    st.finish()
+}
+
+// ── regex-custom (the universal escape hatch) ─────────────────────────────
+
+/// Validate a `regex-custom` pattern at settings-save time: it must compile and
+/// declare the mandatory named capture groups `file`, `line`, and `message` — so
+/// a bad pattern surfaces as a save/validation error, not a silent
+/// zero-diagnostics run. The optional `col`/`severity` groups aren't required.
+pub fn validate_pattern(pattern: &str) -> Result<(), String> {
+    let re = Regex::new(pattern).map_err(|e| format!("invalid regex: {e}"))?;
+    let names: Vec<&str> = re.capture_names().flatten().collect();
+    for required in ["file", "line", "message"] {
+        if !names.contains(&required) {
+            return Err(format!("regex-custom pattern must define a named group `(?<{required}>…)`"));
+        }
+    }
+    Ok(())
+}
+
+/// The universal escape hatch: apply a user-supplied regex (from
+/// [`super::CheckDef::pattern`]) per line to stdout+stderr. Named groups: `file`
+/// and `line` and `message` are required (a line missing any is skipped);
+/// `col` is optional; `severity` maps case-insensitively (`warning`→Warning,
+/// `note`→Note, anything else — including absence — → Error, per spec). A
+/// missing pattern, or one that fails to compile (already rejected at save time
+/// by [`validate_pattern`], but guarded here too), yields no diagnostics rather
+/// than a panic.
+fn parse_regex_custom(stdout: &str, stderr: &str, pattern: Option<&str>) -> Vec<Diag> {
+    let Some(pat) = pattern else { return Vec::new() };
+    let Ok(re) = Regex::new(pat) else { return Vec::new() };
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter_map(|line| {
+            let caps = re.captures(line)?;
+            let file = caps.name("file")?.as_str();
+            let line_no: u32 = caps.name("line")?.as_str().parse().ok()?;
+            let message = caps.name("message")?.as_str().trim();
+            if file.is_empty() || message.is_empty() {
+                return None;
+            }
+            let severity = match caps.name("severity").map(|m| m.as_str().to_ascii_lowercase()).as_deref() {
+                Some("warning") => Severity::Warning,
+                Some("note") => Severity::Note,
+                _ => Severity::Error,
+            };
+            Some(Diag {
+                severity,
+                code: None,
+                message: message.to_string(),
+                file: file.to_string(),
+                line: line_no,
+                col: caps.name("col").and_then(|m| m.as_str().parse().ok()),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,7 +1314,7 @@ not json at all
     #[test]
     fn ansi_colored_output_still_parses() {
         let colored = "\x1b[96msrc/app.ts\x1b[0m(\x1b[93m12\x1b[0m,\x1b[93m5\x1b[0m): \x1b[91merror\x1b[0m TS2345: bad arg\n";
-        let diags = parse(ParserKind::Tsc, colored, "", Path::new("."));
+        let diags = parse(ParserKind::Tsc, colored, "", Path::new("."), None);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].file, "src/app.ts");
         assert_eq!(diags[0].line, 12);
@@ -924,5 +1485,251 @@ not json at all
     #[test]
     fn jest_json_malformed_yields_empty() {
         assert!(parse_jest_json("not json", Path::new("/repo")).is_empty());
+    }
+
+    // ── SARIF ───────────────────────────────────────────────────────────
+
+    const SARIF: &str = r#"{
+      "version": "2.1.0",
+      "runs": [
+        {
+          "results": [
+            {"ruleId":"E501","level":"error","message":{"text":"line too long"},
+             "locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/app.py"},"region":{"startLine":10,"startColumn":80}}}]},
+            {"ruleId":"W605","message":{"text":"invalid escape sequence"},
+             "locations":[{"physicalLocation":{"artifactLocation":{"uri":"file:///repo/src/util.py"},"region":{"startLine":3}}}]},
+            {"ruleId":"INFO1","level":"note","message":{"text":"informational only"},"locations":[]}
+          ]
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn sarif_maps_levels_locations_and_rule_ids() {
+        let diags = parse_sarif(SARIF, Path::new("/repo"));
+        assert_eq!(diags.len(), 3, "{diags:?}");
+        // error level, relative uri, file:line:col + ruleId.
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].code.as_deref(), Some("E501"));
+        assert_eq!(diags[0].file, "src/app.py");
+        assert_eq!(diags[0].line, 10);
+        assert_eq!(diags[0].col, Some(80));
+        // Missing level defaults to Warning; `file://` uri relativized to cwd.
+        assert_eq!(diags[1].severity, Severity::Warning);
+        assert_eq!(diags[1].code.as_deref(), Some("W605"));
+        assert_eq!(diags[1].file, "src/util.py");
+        assert_eq!(diags[1].line, 3);
+        assert_eq!(diags[1].col, None);
+        // `note` level, and a location-less result ⇒ empty location.
+        assert_eq!(diags[2].severity, Severity::Note);
+        assert_eq!(diags[2].file, "");
+        assert_eq!(diags[2].line, 0);
+    }
+
+    #[test]
+    fn sarif_malformed_yields_empty() {
+        assert!(parse_sarif("not json at all", Path::new("/repo")).is_empty());
+        // A valid-but-empty envelope also yields nothing (no runs/results).
+        assert!(parse_sarif(r#"{"version":"2.1.0","runs":[]}"#, Path::new("/repo")).is_empty());
+    }
+
+    // ── go build / go vet ───────────────────────────────────────────────
+
+    const GO_OUTPUT: &str = "# example.com/foo\n./main.go:10:6: undefined: bar\nmain.go:20: missing return at end of function\nok  \texample.com/foo\t0.02s\n";
+
+    #[test]
+    fn go_parses_file_line_col_and_skips_stanza_headers() {
+        let diags = parse_go(GO_OUTPUT, "");
+        assert_eq!(diags.len(), 2, "stanza header + `ok` line skipped: {diags:?}");
+        assert_eq!(diags[0].file, "./main.go");
+        assert_eq!(diags[0].line, 10);
+        assert_eq!(diags[0].col, Some(6));
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].message, "undefined: bar");
+        // A col-less `go build` line still parses.
+        assert_eq!(diags[1].line, 20);
+        assert_eq!(diags[1].col, None);
+        assert_eq!(diags[1].severity, Severity::Error, "severity-less go lines stay Error");
+    }
+
+    #[test]
+    fn go_windows_drive_letter_path_parses() {
+        let diags = parse_go(r"C:\pkg\main.go:10:5: undefined: fmt", "");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file, r"C:\pkg\main.go");
+        assert_eq!(diags[0].line, 10);
+        assert_eq!(diags[0].col, Some(5));
+    }
+
+    #[test]
+    fn go_garbage_input_yields_empty() {
+        assert!(parse_go("Compiling...\nno diagnostics here\n", "").is_empty());
+    }
+
+    // ── go test -json ───────────────────────────────────────────────────
+
+    const GO_TEST_JSON: &str = concat!(
+        r#"{"Action":"run","Package":"example/pkg","Test":"TestAdd"}"#, "\n",
+        r#"{"Action":"output","Package":"example/pkg","Test":"TestAdd","Output":"=== RUN   TestAdd\n"}"#, "\n",
+        r#"{"Action":"pass","Package":"example/pkg","Test":"TestAdd","Elapsed":0}"#, "\n",
+        r#"{"Action":"run","Package":"example/pkg","Test":"TestSub"}"#, "\n",
+        r#"{"Action":"output","Package":"example/pkg","Test":"TestSub","Output":"    sub_test.go:12: got 1 want 2\n"}"#, "\n",
+        r#"{"Action":"output","Package":"example/pkg","Test":"TestSub","Output":"--- FAIL: TestSub (0.00s)\n"}"#, "\n",
+        r#"{"Action":"fail","Package":"example/pkg","Test":"TestSub","Elapsed":0}"#, "\n",
+        r#"{"Action":"output","Package":"example/pkg","Output":"FAIL\texample/pkg\t0.01s\n"}"#, "\n",
+        r#"{"Action":"fail","Package":"example/pkg","Elapsed":0.01}"#, "\n",
+    );
+
+    #[test]
+    fn go_test_json_failed_test_with_output_tail_and_counts() {
+        let diags = parse_go_test_json(GO_TEST_JSON);
+        // One per-test failure (the package-level fail is suppressed) + counts Note.
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert!(diags[0].message.starts_with("TestSub"), "name leads: {:?}", diags[0].message);
+        assert!(diags[0].message.contains("--- FAIL: TestSub"), "output tail folded in: {:?}", diags[0].message);
+        assert_eq!(diags[1].severity, Severity::Note);
+        assert_eq!(diags[1].message, "1 passed, 1 failed");
+    }
+
+    const GO_TEST_JSON_BUILD_FAIL: &str = concat!(
+        r##"{"Action":"output","Package":"example/bad","Output":"# example/bad\n"}"##, "\n",
+        r##"{"Action":"output","Package":"example/bad","Output":"./bad.go:5:2: undefined: foo\n"}"##, "\n",
+        r##"{"Action":"fail","Package":"example/bad","Elapsed":0}"##, "\n",
+    );
+
+    #[test]
+    fn go_test_json_package_build_failure_surfaces_output() {
+        let diags = parse_go_test_json(GO_TEST_JSON_BUILD_FAIL);
+        assert_eq!(diags.len(), 2, "package build failure + counts Note: {diags:?}");
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert!(diags[0].message.contains("undefined: foo"), "build error surfaced: {:?}", diags[0].message);
+        assert_eq!(diags[1].message, "0 passed, 0 failed");
+    }
+
+    #[test]
+    fn go_test_json_garbage_yields_empty() {
+        // No parseable event ⇒ not even a counts Note.
+        assert!(parse_go_test_json("not json\n{ broken\n").is_empty());
+    }
+
+    // ── dotnet / MSBuild ────────────────────────────────────────────────
+
+    const DOTNET_OUTPUT: &str = "Program.cs(10,13): error CS0103: The name 'x' does not exist in the current context [C:\\proj\\App.csproj]\nProgram.cs(15,9): warning CS0219: The variable 'y' is assigned but its value is never used [C:\\proj\\App.csproj]\n";
+
+    #[test]
+    fn dotnet_parses_and_strips_project_suffix() {
+        let diags = parse_dotnet(DOTNET_OUTPUT, "");
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].code.as_deref(), Some("CS0103"));
+        assert_eq!(diags[0].file, "Program.cs");
+        assert_eq!(diags[0].line, 10);
+        assert_eq!(diags[0].col, Some(13));
+        assert!(diags[0].message.ends_with("current context"), "project suffix stripped: {:?}", diags[0].message);
+        assert!(!diags[0].message.contains(".csproj"), "no leftover suffix: {:?}", diags[0].message);
+        assert_eq!(diags[1].severity, Severity::Warning);
+        assert_eq!(diags[1].code.as_deref(), Some("CS0219"));
+    }
+
+    #[test]
+    fn dotnet_garbage_input_yields_empty() {
+        assert!(parse_dotnet("Build succeeded.\n    0 Warning(s)\n", "").is_empty());
+    }
+
+    // ── junit-xml ───────────────────────────────────────────────────────
+
+    const JUNIT_BARE: &str = r#"<testsuite name="suite" tests="3" failures="1" errors="1">
+      <testcase classname="pkg.Foo" name="test_ok" time="0.01"/>
+      <testcase classname="pkg.Foo" name="test_bad" file="tests/foo.py" line="10">
+        <failure message="assert 1 == 2">AssertionError: assert 1 == 2</failure>
+      </testcase>
+      <testcase classname="pkg.Bar" name="test_boom">
+        <error message="RuntimeError: boom">Traceback (most recent call last): ...</error>
+      </testcase>
+    </testsuite>"#;
+
+    #[test]
+    fn junit_bare_testsuite_failure_and_error_children() {
+        let diags = parse_junit_xml(JUNIT_BARE);
+        assert_eq!(diags.len(), 3, "2 failed testcases + counts Note: {diags:?}");
+        // <failure> child, with file/line attributes (pytest emits them).
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].file, "tests/foo.py");
+        assert_eq!(diags[0].line, 10);
+        assert_eq!(diags[0].message, "pkg.Foo.test_bad: assert 1 == 2");
+        // <error> child, no file/line attrs ⇒ empty location.
+        assert_eq!(diags[1].message, "pkg.Bar.test_boom: RuntimeError: boom");
+        assert_eq!(diags[1].file, "");
+        assert_eq!(diags[1].line, 0);
+        // Counts Note from the testsuite attributes.
+        assert_eq!(diags[2].severity, Severity::Note);
+        assert_eq!(diags[2].message, "3 tests, 1 failures, 1 errors");
+    }
+
+    const JUNIT_WRAPPED: &str = r#"<testsuites tests="2" failures="1" errors="0">
+      <testsuite name="s1" tests="2" failures="1" errors="0">
+        <testcase classname="C" name="a"/>
+        <testcase classname="C" name="b"><failure message="nope, wrong value"/></testcase>
+      </testsuite>
+    </testsuites>"#;
+
+    #[test]
+    fn junit_testsuites_wrapper_and_self_closing_failure() {
+        let diags = parse_junit_xml(JUNIT_WRAPPED);
+        assert_eq!(diags.len(), 2, "one failure (self-closing) + counts Note: {diags:?}");
+        assert_eq!(diags[0].severity, Severity::Error);
+        // Self-closing `<failure message=.../>` — detail from the message attr.
+        assert_eq!(diags[0].message, "C.b: nope, wrong value");
+        assert_eq!(diags[1].severity, Severity::Note);
+        assert_eq!(diags[1].message, "2 tests, 1 failures, 0 errors");
+    }
+
+    #[test]
+    fn junit_non_junit_xml_yields_empty() {
+        assert!(parse_junit_xml("not xml at all").is_empty());
+        assert!(parse_junit_xml("<html><body>hi</body></html>").is_empty());
+    }
+
+    // ── regex-custom ────────────────────────────────────────────────────
+
+    #[test]
+    fn regex_custom_severity_mapping_and_default_error() {
+        let pat = r"^(?<file>[^:\s]+):(?<line>\d+): (?<severity>\w+): (?<message>.+)$";
+        let input = "tool.py:10: warning: something suspicious\ntool.py:20: error: it broke\ntool.py:30: bananas: unknown severity word\n";
+        let diags = parse_regex_custom(input, "", Some(pat));
+        assert_eq!(diags.len(), 3, "{diags:?}");
+        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[0].file, "tool.py");
+        assert_eq!(diags[0].line, 10);
+        assert_eq!(diags[0].col, None);
+        assert_eq!(diags[1].severity, Severity::Error);
+        // An unrecognized severity word defaults to Error.
+        assert_eq!(diags[2].severity, Severity::Error);
+        assert_eq!(diags[2].message, "unknown severity word");
+    }
+
+    #[test]
+    fn regex_custom_optional_col_and_no_pattern() {
+        let pat = r"^(?<file>\S+):(?<line>\d+):(?<col>\d+): (?<message>.+)$";
+        let diags = parse_regex_custom("a.rs:3:7: boom\n", "", Some(pat));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].col, Some(7));
+        assert_eq!(diags[0].severity, Severity::Error, "absent severity group ⇒ Error");
+        // No pattern ⇒ no diagnostics (and no panic).
+        assert!(parse_regex_custom("a.rs:3:7: boom\n", "", None).is_empty());
+        // Non-matching input ⇒ empty.
+        assert!(parse_regex_custom("nothing here matches\n", "", Some(pat)).is_empty());
+    }
+
+    #[test]
+    fn validate_pattern_requires_groups_and_valid_regex() {
+        assert!(validate_pattern(r"^(?<file>\S+):(?<line>\d+): (?<message>.+)$").is_ok());
+        // Missing `line`.
+        assert!(validate_pattern(r"^(?<file>\S+): (?<message>.+)$").is_err());
+        // Missing `message`.
+        assert!(validate_pattern(r"^(?<file>\S+):(?<line>\d+)$").is_err());
+        // Uncompilable regex.
+        assert!(validate_pattern(r"(?<file>[").is_err());
     }
 }

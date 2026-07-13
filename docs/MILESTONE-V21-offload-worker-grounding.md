@@ -278,7 +278,9 @@ plausible text.
   already implemented). The discoverability fix — a checks editor,
   exposure-status line, and language auto-detection — is specced separately
   as **V22** (`MILESTONE-V22-run-check-generalization.md`); F6 here only
-  needs the gate itself.
+  needs the gate itself. **(V22 implements that discoverability fix — checks
+  editor, exposure-status line, and language auto-detection — see its Phase E,
+  which renders this exact "run_check exposed: MCP ✓ / offload worker ✓" line.)**
 - Long checks vs. slot deadlines: `run_check` inherits the checks module's
   own timeout; the tool result on timeout says so explicitly ("check timed
   out — report as unverified"), which composes with Feature 2's

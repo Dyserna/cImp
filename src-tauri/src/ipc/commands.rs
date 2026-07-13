@@ -1093,6 +1093,131 @@ pub async fn offload_server_metrics(
     Ok(service.server_metrics())
 }
 
+/// V22 Phase D: the passive-nudge payload for the Code Intelligence chip.
+/// `count` is the number of VALID detection proposals for a project whose
+/// `checks` is empty; the chip renders only when `count > 0 && !dismissed`.
+#[derive(serde::Serialize)]
+pub struct ChecksSuggestion {
+    pub count: usize,
+    pub dismissed: bool,
+    pub auto_configure: bool,
+}
+
+/// V22 Phase D: `checks_apply_proposals` result — the check names actually
+/// written (added or refreshed) after the `auto`-ownership merge.
+#[derive(serde::Serialize)]
+pub struct ApplySummary {
+    pub applied: Vec<String>,
+}
+
+/// V22 Phase D: detect the project's languages/tooling and return `run_check`
+/// proposals (marker + code-graph evidence, PATH-validated — invalid ones carry
+/// a `reason` for greying). Read-only; the bounded filesystem + PATH scan runs
+/// on a blocking thread so the async reactor (and the UI) stays responsive. No
+/// network.
+#[tauri::command]
+pub async fn checks_detect(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<Vec<crate::checks::detect::Proposal>> {
+    let root = resolve_graph_root(root)?;
+    let stats = service.checks_lang_stats(&root);
+    tokio::task::spawn_blocking(move || crate::checks::detect::detect(&root, &stats))
+        .await
+        .map_err(|e| AppError::Checks(format!("detection task failed: {e}")))
+}
+
+/// V22 Phase D: merge selected proposal checks into the project's `checks`
+/// setting (by `name`, honoring the `auto`-ownership rule — a user-owned
+/// `auto == false` entry is never overwritten) through the normal settings
+/// path, which lands the change as a per-project `.cimp/config.json` overlay
+/// diff. Returns the names actually written. `root` is informational: the write
+/// targets the active project's settings handle (cImp's settings are the launch
+/// project's overlay).
+#[tauri::command]
+pub async fn checks_apply_proposals(
+    state: State<'_, AppState>,
+    root: Option<String>,
+    checks: Vec<crate::checks::CheckDef>,
+) -> AppResult<ApplySummary> {
+    let _ = root;
+    // Defense in depth: reject a malformed selection (bad `regex-custom`,
+    // escaping `cwd`/`report_file`) before it lands in settings.
+    for def in &checks {
+        def.validate()?;
+    }
+    let mut applied = Vec::new();
+    state.settings.mutate(|s| {
+        applied = crate::checks::detect::merge_auto(&mut s.checks, checks);
+    });
+    Ok(ApplySummary { applied })
+}
+
+/// V22 Phase D: the passive nudge. When the project's `checks` is empty and the
+/// user hasn't dismissed it, returns how many VALID proposals detection finds so
+/// the Code Intelligence chip can show "N suggested checks". Chosen as a
+/// queryable command over wiring the count into the `graph-status` event — far
+/// less invasive. Runs the scan off-thread.
+#[tauri::command]
+pub async fn checks_suggestion(
+    state: State<'_, AppState>,
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+) -> AppResult<ChecksSuggestion> {
+    let snap = state.settings.current();
+    let dismissed = snap.checks_suggestion_dismissed;
+    let auto_configure = snap.checks_auto_configure;
+    // Only offer for a project with no checks configured yet.
+    if !snap.checks.is_empty() {
+        return Ok(ChecksSuggestion { count: 0, dismissed, auto_configure });
+    }
+    let root = resolve_graph_root(root)?;
+    let stats = service.checks_lang_stats(&root);
+    let count = tokio::task::spawn_blocking(move || {
+        crate::checks::detect::detect(&root, &stats)
+            .into_iter()
+            .filter(|p| p.valid)
+            .count()
+    })
+    .await
+    .map_err(|e| AppError::Checks(format!("detection task failed: {e}")))?;
+    Ok(ChecksSuggestion { count, dismissed, auto_configure })
+}
+
+/// V22 Phase D: remember that the user dismissed the suggestion nudge for this
+/// project (persists via the per-project overlay). Idempotent.
+#[tauri::command]
+pub async fn checks_dismiss_suggestion(state: State<'_, AppState>) -> AppResult<()> {
+    state.settings.mutate(|s| s.checks_suggestion_dismissed = true);
+    Ok(())
+}
+
+/// V22 Phase E: dry-run one (possibly unsaved) [`CheckDef`] through the ordinary
+/// `checks::run` path (`changed_only = false`) so the Settings "Test" button can
+/// show exit status, the parsed diagnostic count, the first few diagnostics, and
+/// the captured output sizes — the last of which lets the UI flag a wrong-parser
+/// config (output produced, zero diagnostics). A validation/spawn failure is
+/// folded into the result's `error` field, not returned as an `Err`, so the
+/// editor renders every outcome inline. `root` defaults to the launch directory.
+#[tauri::command]
+pub async fn checks_test(
+    root: Option<String>,
+    def: crate::checks::CheckDef,
+) -> AppResult<crate::checks::ChecksTestResult> {
+    let root = resolve_graph_root(root)?;
+    Ok(crate::checks::test_check(&root, &def).await)
+}
+
+/// V22 Phase E: validate a `regex-custom` pattern for the ChecksEditor's live
+/// (debounced) feedback — the exact same check the save path (`CheckDef::validate`
+/// → `parsers::validate_pattern`) applies, so the UI error matches what a save
+/// would reject. `Ok(())` when the pattern compiles and declares the mandatory
+/// `file`/`line`/`message` named groups; the `Err` string is ready to display.
+#[tauri::command]
+pub async fn checks_validate_pattern(pattern: String) -> Result<(), String> {
+    crate::checks::parsers::validate_pattern(&pattern)
+}
+
 /// Resolve an optional `root` IPC argument to a project directory: the given
 /// path when non-blank, else the app's launch directory. Shared by the graph
 /// commands so the fallback lives in one place.
@@ -2529,6 +2654,30 @@ pub async fn open_settings_window_to_tab(
         EventTarget::webview_window(SETTINGS_LABEL),
         "settings-deep-link",
         serde_json::json!({ "kind": "tab", "tab_id": tab }),
+    );
+    Ok(())
+}
+
+/// V22 Phase E: open the Settings window scrolled to a top-level sidebar
+/// section (not a tab). Used by the Code Intelligence "suggested checks" nudge
+/// chip to jump straight to the `checks` editor. Reuses the same cold/hot deep
+/// link plumbing as [`open_settings_window_to_tab`], tagging the stored target
+/// with a `section:` prefix so `SettingsApp`'s consume path routes it to
+/// `activeSection` instead of a tab scroll.
+#[tauri::command]
+pub async fn open_settings_window_to_section(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    section: String,
+) -> AppResult<()> {
+    if let Ok(mut slot) = state.pending_settings_deep_link.lock() {
+        *slot = Some(format!("section:{section}"));
+    }
+    open_or_focus_settings(&app)?;
+    let _ = app.emit_to(
+        EventTarget::webview_window(SETTINGS_LABEL),
+        "settings-deep-link",
+        serde_json::json!({ "kind": "section", "section": section }),
     );
     Ok(())
 }

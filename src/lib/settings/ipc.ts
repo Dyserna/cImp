@@ -37,6 +37,13 @@ export async function closeSettingsWindow(): Promise<void> {
   await invoke('close_settings_window');
 }
 
+/// V22 Phase E: open the Settings window scrolled to a top-level sidebar
+/// section (not a tab). The Code Intelligence "suggested checks" nudge chip
+/// uses this to jump straight to the `checks` editor.
+export async function openSettingsWindowToSection(section: string): Promise<void> {
+  await invoke('open_settings_window_to_section', { section });
+}
+
 export async function requestTabRestart(tab: TabId): Promise<void> {
   await invoke('request_tab_restart', { tab });
 }

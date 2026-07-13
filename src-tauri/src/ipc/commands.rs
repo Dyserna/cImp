@@ -758,6 +758,26 @@ pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Settings> {
     Ok(state.settings.current())
 }
 
+/// V21 F7: merge the curated read-only command preset (`git` + `cargo`
+/// metadata/tree, with the `cargo` policy that pins it to those verbs) into the
+/// live offload settings, and return the updated `Settings` so the Settings
+/// window can refresh its snapshot. Idempotent — re-invoking adds nothing and
+/// never clobbers a user-authored `cargo` policy (see
+/// [`crate::settings::merge_readonly_preset`]). A merge-into-settings action:
+/// the user sees exactly what got added in the allowlist / policy editors and
+/// can prune it. Mutates atomically under the settings lock (broadcast +
+/// debounced save), like every other settings write.
+#[tauri::command]
+pub async fn offload_enable_readonly_commands(state: State<'_, AppState>) -> AppResult<Settings> {
+    state.settings.mutate(|s| {
+        crate::settings::merge_readonly_preset(
+            &mut s.offload.command_allowlist,
+            &mut s.offload.command_policies,
+        );
+    });
+    Ok(state.settings.current())
+}
+
 /// Per-AI-tab default config. Used by the Settings window's "Reset to
 /// default" buttons so the frontend doesn't have to mirror Rust-side
 /// tab defaults.

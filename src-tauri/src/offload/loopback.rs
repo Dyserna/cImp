@@ -195,6 +195,10 @@ struct RunBody {
     /// used as the native-tool root when no explicit `allowed_roots` is set.
     #[serde(default)]
     cwd: Option<String>,
+    /// V21 F9: optional JSON Schema — when set, the worker's final answer is
+    /// grammar-constrained to matching JSON. Absent on legacy child requests.
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
 }
 
 /// A `POST /run` response.
@@ -418,6 +422,7 @@ async fn handle_run(
         thinking,
         tier,
         session_cwd,
+        body.schema,
         cancel.clone(),
     );
     tokio::pin!(run_fut);

@@ -576,6 +576,7 @@ impl OffloadSupervisor {
             instructions,
             context: None,
             thinking,
+            schema: None,
         };
         let deadline = std::time::Instant::now() + timeout;
         // Self-test path: no external cancel source.
@@ -622,6 +623,7 @@ impl OffloadSupervisor {
             stream: Some(false),
             stream_options: None,
             max_tokens: Some(max_tokens),
+            response_format: None,
         };
         let url = format!("{}/v1/chat/completions", server.base_url());
         let resp = server

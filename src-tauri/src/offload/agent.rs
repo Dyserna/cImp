@@ -12,6 +12,7 @@
 //! budget. On any cap the loop forces a final-synthesis turn ("answer
 //! from what you have now") rather than truncating mid-thought.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -40,7 +41,10 @@ pub struct RunTrace {
 }
 
 /// Classify a turn for the run log: step 0 is the plan, the forced-final
-/// synthesis is `"final"`, everything else is tool `"ingestion"`.
+/// synthesis is `"final"`, everything else is tool `"ingestion"`. The V21 F4
+/// grounding verifier's corrective turn is labeled `"verify"` at its call site
+/// (not derivable from `step`/`is_final`), so it shows in the Offload Server
+/// tab's run log when the guard fires.
 fn call_kind(step: u32, is_final: bool) -> &'static str {
     if is_final {
         "final"
@@ -86,6 +90,15 @@ pub trait ToolRouter: Send + Sync {
     /// Execute `name(args)`; errors become a `role: tool` error message
     /// (the loop continues — a tool failure is not fatal).
     async fn call(&self, name: &str, args: serde_json::Value) -> Result<String, String>;
+    /// The confinement context the file tools use, for the grounding verifier's
+    /// observed-set normalization (V21 F4): both the observed paths and the
+    /// mentions scanned out of the final answer are resolved through the same
+    /// [`ToolCtx::confine`] so spelling variants can't trip a false alarm.
+    /// `None` for a router with no local filesystem context; the verifier then
+    /// falls back to lexical normalization.
+    fn tool_ctx(&self) -> Option<&ToolCtx> {
+        None
+    }
 }
 
 /// Native-only router: the `read_file`/`code_search`/`run_command`
@@ -129,6 +142,9 @@ impl ToolRouter for NativeRouter {
             ));
         }
         tools::dispatch(name, args, &self.ctx).await
+    }
+    fn tool_ctx(&self) -> Option<&ToolCtx> {
+        Some(&self.ctx)
     }
 }
 
@@ -201,6 +217,9 @@ impl ToolRouter for HostRouter {
             tools::dispatch(name, args, &self.ctx).await
         }
     }
+    fn tool_ctx(&self) -> Option<&ToolCtx> {
+        Some(&self.ctx)
+    }
 }
 
 /// Static loop configuration derived from `OffloadSettings` + the
@@ -247,14 +266,109 @@ pub struct OffloadTask {
     pub instructions: String,
     pub context: Option<String>,
     pub thinking: ThinkingMode,
+    /// V21 F9: optional JSON Schema. When set, the final-synthesis turn is
+    /// grammar-constrained to emit JSON matching it (see [`schema_response_format`]),
+    /// and the loop returns that JSON verbatim after a belt-and-braces parse.
+    /// `None` (the common case) leaves the answer as free-form prose.
+    pub schema: Option<serde_json::Value>,
+}
+
+/// V21 F9: wrap a caller-supplied JSON Schema in the `response_format` envelope
+/// llama-server understands, so the sampler constrains generation to matching
+/// JSON. The inner `name`/`strict` keys are OpenAI-compat niceties llama.cpp
+/// ignores; it reads `json_schema.schema`.
+fn schema_response_format(schema: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "offload_result",
+            "strict": true,
+            "schema": schema,
+        }
+    })
+}
+
+/// V21 F9: belt-and-braces validation of a schema run's final text. The grammar
+/// should make failure impossible, but a parse failure must surface as an
+/// explicit error string — never a half-JSON blob the orchestrator would try to
+/// parse. On success returns the JSON text verbatim.
+fn validate_json_output(text: &str) -> Result<String, String> {
+    let trimmed = text.trim();
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(_) => Ok(trimmed.to_string()),
+        Err(e) => Err(format!(
+            "offload schema run: the worker did not return valid JSON matching the requested \
+             schema (parse error: {e}). No partial output is returned."
+        )),
+    }
+}
+
+/// V21 F9: finalize a schema run's answer. The caller is owed JSON verbatim, so
+/// this **skips** citation stripping (the cite-nothing prompt kept `[T…]` markers
+/// out, and stripping could corrupt a JSON string value) and belt-and-braces
+/// validates the JSON — a parse failure is an explicit error, never a half-JSON
+/// blob. The grounding verifier still runs on the JSON text, but its findings
+/// must NOT contaminate the JSON body: Feature 5's confidence marker is
+/// synthesized loop-side (the model can't emit it inside grammar-constrained
+/// JSON) and appended as a trailing footer OUTSIDE the JSON, so the JSON body
+/// stays verbatim-parseable while the orchestrator still sees the grounding
+/// level. Clean ⇒ `verified: fully`; any unobserved mention ⇒ `partially`.
+fn finalize_schema_answer(
+    stripped: &str,
+    observed: &HashSet<String>,
+    obs_ctx: Option<&ToolCtx>,
+) -> Result<String, String> {
+    let json = validate_json_output(stripped)?;
+    let unverified = unverified_mentions(&json, observed, obs_ctx);
+    if unverified.is_empty() {
+        Ok(append_marker(&json, VerifiedLevel::Fully, None))
+    } else {
+        warn!(
+            target: "offload",
+            unverified = %unverified.join(", "),
+            "offload: schema-run answer mentions paths not observed this run \
+             (kept out of the JSON; surfaced as an F5 partial marker footer)"
+        );
+        Ok(append_marker(
+            &json,
+            VerifiedLevel::Partially,
+            Some(&unverified.join(", ")),
+        ))
+    }
 }
 
 const SYSTEM_PROMPT: &str = "You are a local offload worker. You are given a self-contained subtask \
 by a more capable orchestrator. Use the available tools to gather what you need, then return a \
 single concise, complete answer — the orchestrator sees ONLY your final message, not your \
 intermediate tool calls or reasoning. Be specific and include concrete references (file paths, \
-line numbers, names) when relevant. Do not ask clarifying questions; make reasonable assumptions \
-and state them.";
+line numbers, names) when relevant. Only state filesystem or code facts (paths, file lists, \
+counts, contents, versions) that you verified with a tool call in this run. Never reconstruct \
+file lists, contents, or counts from memory or from search snippets. If your tools cannot answer \
+part of the task, say so explicitly in your answer instead of guessing. Do not ask clarifying \
+questions; make reasonable assumptions about the task's intent and state them — this licence \
+covers interpretation, never facts. Cite the observation supporting each factual claim by \
+appending its bracketed id (for example [T3]) — each tool result is labeled with an observation \
+id ([T1], [T2], …) — and cite nothing you did not observe. Your final message must be only the \
+synthesized answer — no running narration of tool steps. End your final message with a single line \
+stating how grounded it is: `verified: fully` if every factual claim was confirmed by a tool call \
+this run, or `verified: partially — <what you could not verify>` otherwise.";
+
+/// V21 F9: the system prompt for a schema (grammar-constrained) run. The
+/// grounding rules are identical to [`SYSTEM_PROMPT`], but the citation
+/// instruction is dropped — bracketed `[T…]` markers would violate the JSON
+/// grammar — and the model is told its final message must be JSON only, citing
+/// nothing. (Kept in lockstep with `SYSTEM_PROMPT`'s grounding half; both are
+/// pinned by tripwire tests.)
+const SCHEMA_SYSTEM_PROMPT: &str = "You are a local offload worker. You are given a self-contained \
+subtask by a more capable orchestrator. Use the available tools to gather what you need, then \
+return a single complete answer — the orchestrator sees ONLY your final message, not your \
+intermediate tool calls or reasoning. Only state filesystem or code facts (paths, file lists, \
+counts, contents, versions) that you verified with a tool call in this run. Never reconstruct \
+file lists, contents, or counts from memory or from search snippets. If your tools cannot answer \
+part of the task, say so explicitly. Do not ask clarifying questions; make reasonable assumptions \
+about the task's intent — this licence covers interpretation, never facts. Your final message \
+must be a single JSON value matching the requested schema and nothing else: no prose, no \
+narration, no citation markers, and cite nothing — the JSON is the whole answer.";
 
 /// Cap a tool result to `cap_tokens`, appending a truncation marker so
 /// the model knows it was cut and narrows/paginates.
@@ -273,10 +387,18 @@ fn cap_result(result: String, cap_tokens: u32) -> String {
 }
 
 /// Whether to think on a given turn under the policy.
-fn think_on_turn(mode: ThinkingMode, is_planning: bool, is_final: bool) -> bool {
+///
+/// `used_tools` is whether any tool call happened this run. Under `Off` the
+/// worker normally skips reasoning entirely (cheap transforms), but if the run
+/// actually used tools we grant one bounded thinking pass on the FINAL turn —
+/// the turn where evidence is reconciled and the answer synthesized, and where
+/// the V21 wrong-count and scratch-narration leaks occurred. Planning stays
+/// non-thinking under `Off` (the orchestrator asked for cheap; we spend only
+/// where the damage is). `Auto`/`On` are unaffected by `used_tools`.
+fn think_on_turn(mode: ThinkingMode, is_planning: bool, is_final: bool, used_tools: bool) -> bool {
     match mode {
         ThinkingMode::On => true,
-        ThinkingMode::Off => false,
+        ThinkingMode::Off => is_final && used_tools,
         ThinkingMode::Auto => is_planning || is_final,
     }
 }
@@ -369,6 +491,467 @@ fn looks_like_leaked_tool_call(answer: &str) -> bool {
     t.starts_with("<tool_call>") || t.starts_with("<function=")
 }
 
+// ── V21 F4 — evidence citations + mechanical answer verifier ───────────────
+//
+// The loop labels each tool result with an observation id ([T1], [T2], …) and
+// accumulates an *observed set* of the paths those tools actually revealed. On
+// the final answer we strip the model's citations back out (downstream sees
+// clean prose) and deterministically scan the answer for path mentions: any
+// path the model names that isn't in the observed set is a grounding violation
+// the model can't talk its way past — the same guard family as the
+// leaked-tool-call check and the out-of-budget nudge.
+
+/// The nudge prefixed to a corrective turn when the answer names paths that no
+/// tool observed this run. Kept as a constant so tests pin the wording.
+const CORRECTIVE_PREFIX: &str = "your answer mentions";
+
+/// Prefix a tool result with its observation id, so the model can cite it
+/// (`[T3]`) and the verifier's stripping has a stable marker to remove.
+fn label_observation(id: u32, content: &str) -> String {
+    format!("[T{id}] {content}")
+}
+
+/// Remove observation-citation markers (`[T3]`, `[T12]`) from the final answer,
+/// leaving clean prose for the orchestrator. Hand-rolled (no `regex` in the
+/// answer path) — matches `[T` + one-or-more ASCII digits + `]`, and re-flows
+/// the surrounding spacing so a stripped citation leaves no double space.
+fn strip_citations(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("[T") {
+        let after = &rest[pos + 2..];
+        let digits = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits > 0 && after.as_bytes().get(digits) == Some(&b']') {
+            // A real citation — drop it, and trim a trailing space left dangling
+            // before it, re-adding one only if the following text is a word.
+            out.push_str(rest[..pos].trim_end_matches(' '));
+            rest = &after[digits + 1..];
+            if rest.starts_with(|c: char| c.is_alphanumeric()) {
+                out.push(' ');
+            }
+        } else {
+            // Not a citation (e.g. `[Tool]`) — keep the `[T` and move on.
+            out.push_str(&rest[..pos + 2]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Whether the last path segment carries a plausible file extension: a dot
+/// (not the leading char) followed by 1–8 alphanumeric characters.
+fn has_extension(last_segment: &str) -> bool {
+    match last_segment.rfind('.') {
+        Some(dot) if dot > 0 => {
+            let ext = &last_segment[dot + 1..];
+            !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        _ => false,
+    }
+}
+
+/// A path-like token: contains a `/` or `\` separator AND its final segment has
+/// a file extension. Both POSIX and Windows separators count.
+fn looks_like_path(tok: &str) -> bool {
+    if !tok.contains('/') && !tok.contains('\\') {
+        return false;
+    }
+    let last = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+    has_extension(last)
+}
+
+/// Strip markdown/quote wrappers and trailing punctuation from a token, plus
+/// any trailing `:line[:col]` reference (grep / `code_search` style), leaving
+/// the bare path candidate.
+fn clean_token(raw: &str) -> String {
+    let t = raw.trim();
+    let t = t.trim_matches(|c: char| "`\"'*()[]{}<>".contains(c));
+    let mut t = t.trim_end_matches([',', ';', ':', '!', '?', '.']).to_string();
+    // Peel trailing `:123` (and `:123:45`) location suffixes.
+    loop {
+        if let Some(idx) = t.rfind(':') {
+            let after = &t[idx + 1..];
+            if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+                t.truncate(idx);
+                continue;
+            }
+        }
+        break;
+    }
+    t
+}
+
+/// Contents of each single-backtick span in `text`, in order.
+fn backtick_spans(text: &str) -> Vec<String> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('`') {
+            spans.push(after[..end].to_string());
+            rest = &after[end + 1..];
+        } else {
+            break;
+        }
+    }
+    spans
+}
+
+/// Lexical path normalization: forward slashes, no leading `./`, lowercased.
+/// The fallback when confinement can't resolve a path (it doesn't exist, or the
+/// router has no filesystem context) — applied identically to observed paths
+/// and answer mentions, so consistent spelling still matches.
+fn lexical_norm(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("./")
+        .replace('\\', "/")
+        .to_lowercase()
+}
+
+/// Normalize a path for observed-set comparison: through [`ToolCtx::confine`]
+/// when a context is available and the path resolves (canonical, lowercased),
+/// else lexically. Both sides of the verifier use this, so a real observed path
+/// and a matching mention collapse to the same key.
+fn norm_path(ctx: Option<&ToolCtx>, raw: &str) -> String {
+    if let Some(c) = ctx {
+        if let Ok(p) = c.confine(raw) {
+            return p.to_string_lossy().replace('\\', "/").to_lowercase();
+        }
+    }
+    lexical_norm(raw)
+}
+
+/// Entry names from a `list_dir` result: skip the header line, take the part
+/// before a `<TAB>` (files carry `NAME<TAB>SIZE`), drop a directory's trailing
+/// `/`, and ignore the truncation marker line.
+fn list_dir_entry_names(result: &str) -> Vec<String> {
+    result
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('[') {
+                return None;
+            }
+            let name = line.split('\t').next().unwrap_or(line).trim_end_matches('/');
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// Path-like tokens harvested from arbitrary tool output (`code_search` hits,
+/// graph-tool and `run_check` reports).
+fn path_tokens_in(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(clean_token)
+        .filter(|t| looks_like_path(t))
+        .collect()
+}
+
+/// Accumulate the paths a tool call revealed into the run's observed set,
+/// normalized through `ctx`. `read_file`/`list_dir` contribute their `path`
+/// argument; `list_dir` also contributes each listed entry (joined to the dir
+/// and bare); every other tool contributes the path-like tokens in its result
+/// (`code_search` match paths, graph-tool and `run_check` paths).
+fn collect_observed(
+    observed: &mut HashSet<String>,
+    ctx: Option<&ToolCtx>,
+    name: &str,
+    args: &serde_json::Value,
+    result: &str,
+) {
+    let mut add = |raw: &str| {
+        let n = norm_path(ctx, raw);
+        if !n.is_empty() {
+            observed.insert(n);
+        }
+    };
+    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+        add(p);
+    }
+    if name == "list_dir" {
+        let dir = args.get("path").and_then(|v| v.as_str());
+        for entry in list_dir_entry_names(result) {
+            if let Some(d) = dir {
+                add(&format!("{}/{}", d.trim_end_matches(['/', '\\']), entry));
+            }
+            add(&entry);
+        }
+    } else {
+        for tok in path_tokens_in(result) {
+            add(&tok);
+        }
+    }
+}
+
+/// Path mentions in `answer`: path-like bare tokens, plus backtick spans that
+/// are path-like or resolve under an allowed root. Deduped, in first-seen order.
+fn extract_path_mentions(answer: &str, ctx: Option<&ToolCtx>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for span in backtick_spans(answer) {
+        let cleaned = clean_token(&span);
+        let is_path = looks_like_path(&cleaned)
+            || (!cleaned.is_empty() && ctx.map(|c| c.confine(&cleaned).is_ok()).unwrap_or(false));
+        if is_path && seen.insert(cleaned.clone()) {
+            out.push(cleaned);
+        }
+    }
+    for tok in answer.split_whitespace() {
+        let cleaned = clean_token(tok);
+        if looks_like_path(&cleaned) && seen.insert(cleaned.clone()) {
+            out.push(cleaned);
+        }
+    }
+    out
+}
+
+/// The path mentions in `answer` that no tool observed this run — the grounding
+/// violations. Empty ⇒ the answer is clean (or names no paths; the feature is
+/// inert). Returned in first-seen order, raw (pre-normalization) for the
+/// human-readable corrective/taint message.
+fn unverified_mentions(
+    answer: &str,
+    observed: &HashSet<String>,
+    ctx: Option<&ToolCtx>,
+) -> Vec<String> {
+    extract_path_mentions(answer, ctx)
+        .into_iter()
+        .filter(|raw| !observed.contains(&norm_path(ctx, raw)))
+        .collect()
+}
+
+/// The corrective-turn nudge listing the unobserved mentions.
+fn corrective_message(unverified: &[String]) -> String {
+    format!(
+        "{CORRECTIVE_PREFIX} {} which you never observed with a tool call this run. Verify each \
+         with a tool call, or remove it and mark it explicitly as unverified. Then give your \
+         final answer.",
+        unverified.join(", ")
+    )
+}
+
+/// Append the taint footer for mentions still unverified after the corrective
+/// turn, so the orchestrator sees the taint rather than silently trusting it.
+fn append_taint(answer: &str, unverified: &[String]) -> String {
+    format!(
+        "{answer}\n\n[worker note: the following mentions were not verified by any tool call: {}]",
+        unverified.join(", ")
+    )
+}
+
+// ── V21 F5 — confidence marker (grounding self-report) ─────────────────────
+
+/// The worker's grounding self-report, parsed off the final answer's trailing
+/// `verified: …` line and re-emitted as a footer the orchestrator sees. Drives
+/// the router-side tier escalation: a `Partially` fast-tier answer is retried on
+/// the quality backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifiedLevel {
+    /// Every factual claim was confirmed by a tool call this run.
+    Fully,
+    /// Something could not be verified — the model said so, the F4 taint path
+    /// fired, or the marker was missing (all fail-safe to `Partially`).
+    Partially,
+}
+
+/// The marker line prefix the model is asked to end its answer with, and that
+/// [`split_marker`] / [`answer_verified_level`] parse back off.
+const MARKER_PREFIX: &str = "verified:";
+
+/// Split the model's self-reported `verified: …` line off the end of `answer`.
+/// Returns `(body, level, note)` where `body` is the answer with that line
+/// removed. The marker is required to be the final line, so only the last
+/// non-empty line is inspected: a missing or unparseable marker ⇒ `(answer,
+/// Partially, None)` (fail-safe — an unmarked answer is treated as
+/// not-fully-grounded so the router can still escalate).
+fn split_marker(answer: &str) -> (String, VerifiedLevel, Option<String>) {
+    let lines: Vec<&str> = answer.lines().collect();
+    if let Some(i) = lines.iter().rposition(|l| !l.trim().is_empty()) {
+        if let Some(rest) = strip_marker_prefix(lines[i].trim()) {
+            let (level, note) = parse_marker_value(rest.trim());
+            let body = lines
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, l)| *l)
+                .collect::<Vec<_>>()
+                .join("\n");
+            return (body.trim_end().to_string(), level, note);
+        }
+    }
+    (answer.trim_end().to_string(), VerifiedLevel::Partially, None)
+}
+
+/// Case-insensitive `verified:` prefix strip (the model may capitalize the
+/// keyword). Returns the value after the colon, or `None` if the line isn't a
+/// marker.
+fn strip_marker_prefix(line: &str) -> Option<&str> {
+    let n = MARKER_PREFIX.len();
+    (line.len() >= n && line[..n].eq_ignore_ascii_case(MARKER_PREFIX)).then(|| &line[n..])
+}
+
+/// Parse a marker value (`fully` / `partially — <note>`), case-insensitively.
+/// Anything that isn't a clear `fully` fails safe to `Partially`, keeping any
+/// trailing text as the note.
+fn parse_marker_value(value: &str) -> (VerifiedLevel, Option<String>) {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("fully") {
+        (VerifiedLevel::Fully, None)
+    } else if lower.starts_with("partially") {
+        let rest = value["partially".len()..]
+            .trim_start_matches(|c: char| c == '—' || c == '-' || c == ':' || c.is_whitespace())
+            .trim();
+        (VerifiedLevel::Partially, (!rest.is_empty()).then(|| rest.to_string()))
+    } else {
+        (VerifiedLevel::Partially, (!value.is_empty()).then(|| value.to_string()))
+    }
+}
+
+/// Render the grounding marker footer line.
+fn marker_footer(level: VerifiedLevel, note: Option<&str>) -> String {
+    match level {
+        VerifiedLevel::Fully => format!("{MARKER_PREFIX} fully"),
+        VerifiedLevel::Partially => match note.filter(|n| !n.is_empty()) {
+            Some(n) => format!("{MARKER_PREFIX} partially — {n}"),
+            None => format!("{MARKER_PREFIX} partially"),
+        },
+    }
+}
+
+/// Re-attach the grounding marker as a trailing footer on `body`.
+fn append_marker(body: &str, level: VerifiedLevel, note: Option<&str>) -> String {
+    format!("{}\n\n{}", body.trim_end(), marker_footer(level, note))
+}
+
+/// Parse just the grounding level off an answer carrying a trailing `verified:`
+/// footer (as produced by [`append_marker`]). Used by the router-side
+/// escalation. A missing marker ⇒ [`VerifiedLevel::Partially`].
+pub fn answer_verified_level(answer: &str) -> VerifiedLevel {
+    split_marker(answer).1
+}
+
+/// V21 F5: label an answer that was re-run on the quality backend after the fast
+/// backend returned a partial result, so the extra cost is visible to the
+/// orchestrator. Appended after the quality answer's own `verified:` footer.
+pub fn append_escalation_note(answer: &str) -> String {
+    format!(
+        "{}\n\n[escalated: the fast backend returned a partially-verified answer → \
+         re-ran on the quality backend]",
+        answer.trim_end()
+    )
+}
+
+// ── V21 F8 — identical-call short-circuit (loop breaker) ───────────────────
+
+/// Served when a tool call repeats with identical arguments a second time: the
+/// cached result, prefixed with a nudge to change course.
+const REPEAT_NUDGE: &str = "[repeat call — identical to an earlier call this run; result \
+                            unchanged. Try a different tool, different arguments, or answer with \
+                            what you have.]";
+
+/// Served on the third and later identical call: a short error only (no result
+/// body), keeping the pressure to move on without wedging the loop.
+const REPEAT_EXHAUSTED: &str = "[repeat call — identical arguments seen again this run; not \
+                                re-run. Change tool or arguments, or answer with what you have.]";
+
+/// A canonical string for a `serde_json` value with object keys sorted
+/// recursively, so key-order and whitespace variants produce the same key.
+/// Robust whether `serde_json`'s map is `BTreeMap`- or (with `preserve_order`)
+/// `IndexMap`-backed — we sort here regardless.
+fn canonical_json(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut s = String::from("{");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&serde_json::to_string(k).unwrap_or_default());
+                s.push(':');
+                s.push_str(&canonical_json(&map[*k]));
+            }
+            s.push('}');
+            s
+        }
+        Value::Array(arr) => {
+            let mut s = String::from("[");
+            for (i, e) in arr.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&canonical_json(e));
+            }
+            s.push(']');
+            s
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The outcome of probing the per-run call cache for a `(tool, args)` pair.
+enum CacheProbe {
+    /// Not seen — the caller must execute the tool, then [`CallCache::record`].
+    Fresh,
+    /// Second identical call — serve this (nudge-prefixed) cached result without
+    /// executing.
+    Repeat(String),
+    /// Third-or-later identical call — serve a short error, no result body.
+    Exhausted,
+}
+
+/// Per-run identical-call short-circuit. Keyed on `(tool name, canonical args)`;
+/// bounded by `max_steps` so no size management is needed. `run_check` is
+/// exempt (it re-executes) — its whole point is observing change.
+#[derive(Default)]
+struct CallCache {
+    seen: HashMap<(String, String), CacheEntry>,
+}
+
+struct CacheEntry {
+    result: String,
+    hits: u32,
+}
+
+impl CallCache {
+    /// Whether `name` is cached at all (`run_check` never is).
+    fn cacheable(name: &str) -> bool {
+        name != "run_check"
+    }
+
+    /// Probe for a repeat. Increments the hit count for a known key.
+    fn probe(&mut self, name: &str, args: &serde_json::Value) -> CacheProbe {
+        if !Self::cacheable(name) {
+            return CacheProbe::Fresh;
+        }
+        let key = (name.to_string(), canonical_json(args));
+        match self.seen.get_mut(&key) {
+            None => CacheProbe::Fresh,
+            Some(entry) => {
+                entry.hits += 1;
+                if entry.hits == 2 {
+                    CacheProbe::Repeat(format!("{REPEAT_NUDGE}\n\n{}", entry.result))
+                } else {
+                    CacheProbe::Exhausted
+                }
+            }
+        }
+    }
+
+    /// Record the first result for a fresh key (idempotent — never overwrites).
+    fn record(&mut self, name: &str, args: &serde_json::Value, result: String) {
+        if !Self::cacheable(name) {
+            return;
+        }
+        let key = (name.to_string(), canonical_json(args));
+        self.seen.entry(key).or_insert(CacheEntry { result, hits: 1 });
+    }
+}
+
 /// Run the agent loop and return the synthesized final answer (with
 /// `<think>` stripped). `deadline` bounds the loop wall-clock; on expiry
 /// (or `max_steps`/budget) it forces a final-synthesis turn.
@@ -388,10 +971,33 @@ pub async fn run(
         Some(c) if !c.is_empty() => format!("{}\n\n# Context\n{}", task.instructions, c),
         _ => task.instructions.clone(),
     };
-    let mut convo = Convo::new(SYSTEM_PROMPT, user);
+    // V21 F9: a schema run uses the cite-nothing/JSON-only system prompt (the
+    // JSON grammar can't carry `[T…]` citation markers) and constrains only the
+    // final-synthesis turn (tool-call turns stay free-form).
+    let sys_prompt = if task.schema.is_some() {
+        SCHEMA_SYSTEM_PROMPT
+    } else {
+        SYSTEM_PROMPT
+    };
+    let mut convo = Convo::new(sys_prompt, user);
     // Measured generation rate (tokens/sec), refreshed from each response's
     // server `timings` and used to size the next request's output budget.
     let mut gen_tps = DEFAULT_GEN_TPS;
+    // Whether any tool call has been made this run. Threaded into
+    // `think_on_turn`/`force_final` so an `Off` run that actually used tools
+    // still gets one bounded thinking pass on its final synthesis (V21 F3).
+    let mut used_tools = false;
+    // V21 F4 grounding: the confinement context (for observed-set
+    // normalization), the accumulated observed paths, the running observation
+    // id, and single-corrective-turn state. `verify_turn` labels the next call
+    // `"verify"` in the run log when the corrective turn fires.
+    let obs_ctx = router.tool_ctx();
+    let mut observed: HashSet<String> = HashSet::new();
+    let mut obs_id: u32 = 0;
+    let mut correction_used = false;
+    let mut verify_turn = false;
+    // V21 F8 loop breaker: per-run identical-call short-circuit.
+    let mut call_cache = CallCache::default();
 
     for step in 0..cfg.max_steps {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -401,13 +1007,13 @@ pub async fn run(
                 convo.compact(budget);
             }
             return force_final(
-                client, &url, cfg, convo.flatten(), task.thinking, gen_tps, step,
-                trace.as_deref_mut(), cancel,
+                client, &url, cfg, convo.flatten(), task.thinking, used_tools, gen_tps, step,
+                &observed, obs_ctx, task.schema.as_ref(), trace.as_deref_mut(), cancel,
             )
             .await;
         }
         let is_planning = step == 0;
-        let enable_thinking = think_on_turn(task.thinking, is_planning, false);
+        let enable_thinking = think_on_turn(task.thinking, is_planning, false, used_tools);
 
         // Each call gets the full, fixed `per_call_timeout` — the loop no longer
         // shrinks it toward the deadline. `deadline` above gates whether a *new*
@@ -418,8 +1024,10 @@ pub async fn run(
         // a fixed window is safe (see `loopback.rs` / `mcp.rs`).
         convo.mark_sent();
         let call_started = Instant::now();
+        // V21 F9: tool-call turns are always free-form (`None`) — grammar
+        // enforcement is reserved for the final-synthesis turn in `force_final`.
         let resp = post_chat(
-            client, &url, cfg, &convo.flatten(), &tools, enable_thinking, true,
+            client, &url, cfg, &convo.flatten(), &tools, enable_thinking, true, None,
             cfg.per_call_timeout, gen_tps, cancel,
         )
         .await?;
@@ -452,10 +1060,14 @@ pub async fn run(
                 "answer".to_string()
             }
         };
+        // V21 F4: the turn immediately after a corrective nudge is the
+        // "verify" turn in the run log (not derivable from `step`/`is_final`).
+        let this_kind: &str = if verify_turn { "verify" } else { call_kind(step, false) };
+        verify_turn = false;
         if let Some(t) = trace.as_deref_mut() {
             t.calls.push(CallRecord {
                 step,
-                kind: call_kind(step, false).into(),
+                kind: this_kind.into(),
                 thinking: enable_thinking,
                 prompt_tokens: usage.map(|u| u.prompt_tokens).unwrap_or(0),
                 output_tokens: usage.map(|u| u.completion_tokens).unwrap_or(0),
@@ -467,9 +1079,63 @@ pub async fn run(
 
         // Final answer: no tool calls.
         if msg.tool_calls.is_empty() {
-            let answer = strip_think(&msg.content.unwrap_or_default());
+            let answer = strip_think(msg.content.as_deref().unwrap_or_default());
+            // V21 F9: for a schema run the caller is owed JSON, which this
+            // natural free-form turn is not — a request that comes back with no
+            // tool_calls is only discovered to be the final turn post-hoc, after
+            // it was issued unconstrained. Take one additional constrained
+            // synthesis turn: `force_final` sets `response_format`, validates the
+            // JSON, and skips citation stripping. Keep a usable free-form answer
+            // as context so the JSON turn reformats it rather than re-deriving;
+            // an unusable one (empty/leaked) is just dropped.
+            if task.schema.is_some() {
+                if !answer.trim().is_empty() && !looks_like_leaked_tool_call(&answer) {
+                    convo.push_turn(vec![msg]);
+                }
+                if let Some(budget) = compaction_budget(cfg) {
+                    convo.compact(budget);
+                }
+                return force_final(
+                    client, &url, cfg, convo.flatten(), task.thinking, used_tools, gen_tps, step,
+                    &observed, obs_ctx, task.schema.as_ref(), trace.as_deref_mut(), cancel,
+                )
+                .await;
+            }
             if !answer.trim().is_empty() && !looks_like_leaked_tool_call(&answer) {
-                return Ok(answer);
+                // V21 F4/F5: strip the model's citations (downstream sees clean
+                // prose), split its self-reported `verified:` marker off (so the
+                // verifier can override it and it re-emits as a trailing footer),
+                // then deterministically verify every path mention is in the
+                // observed set. A clean answer returns immediately, carrying the
+                // model's own marker.
+                let (body, self_level, self_note) = split_marker(&strip_citations(&answer));
+                let unverified = unverified_mentions(&body, &observed, obs_ctx);
+                if unverified.is_empty() {
+                    return Ok(append_marker(&body, self_level, self_note.as_deref()));
+                }
+                // Dirty. Attempt ONE corrective turn while the loop can still
+                // take another step (deadline not spent, steps remain); the turn
+                // gets tools so the model can actually verify, and is labeled
+                // "verify" in the run log. Otherwise (or if already corrected)
+                // return the answer with a taint footer and a verifier-forced
+                // `partially` marker (F5: the verifier overrides the self-report).
+                let deadline_spent =
+                    deadline.saturating_duration_since(Instant::now()).is_zero();
+                if !correction_used && !deadline_spent && step + 1 < cfg.max_steps {
+                    correction_used = true;
+                    verify_turn = true;
+                    convo.push_turn(vec![
+                        msg,
+                        ChatMessage::user(corrective_message(&unverified)),
+                    ]);
+                    continue;
+                }
+                let tainted = append_taint(&body, &unverified);
+                return Ok(append_marker(
+                    &tainted,
+                    VerifiedLevel::Partially,
+                    Some(&unverified.join(", ")),
+                ));
             }
             // The model ended its turn with no usable answer. Either it spent
             // the whole turn inside a <think> block that strip_think removed
@@ -490,31 +1156,62 @@ pub async fn run(
                 convo.compact(budget);
             }
             return force_final(
-                client, &url, cfg, convo.flatten(), task.thinking, gen_tps, step,
-                trace.as_deref_mut(), cancel,
+                client, &url, cfg, convo.flatten(), task.thinking, used_tools, gen_tps, step,
+                &observed, obs_ctx, task.schema.as_ref(), trace.as_deref_mut(), cancel,
             )
             .await;
         }
 
         // Append the assistant turn (carrying the tool_calls) plus each tool
         // result as one droppable turn.
+        used_tools = true;
         let tool_calls = msg.tool_calls.clone();
         let mut turn = vec![msg];
+        let mut repeated_in_turn = false;
         for call in &tool_calls {
+            let name = &call.function.name;
             let args: serde_json::Value = if call.function.arguments.trim().is_empty() {
                 serde_json::json!({})
             } else {
                 serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "_raw": call.function.arguments }))
             };
-            let result = match router.call(&call.function.name, args).await {
-                Ok(r) => r,
-                Err(e) => format!("ERROR: {e}"),
+            // V21 F8: short-circuit an identical repeat before executing.
+            let result = match call_cache.probe(name, &args) {
+                CacheProbe::Fresh => {
+                    let r = match router.call(name, args.clone()).await {
+                        Ok(r) => r,
+                        Err(e) => format!("ERROR: {e}"),
+                    };
+                    let capped = cap_result(r, cfg.per_tool_result_token_cap);
+                    call_cache.record(name, &args, capped.clone());
+                    // V21 F4: harvest the paths this tool revealed.
+                    collect_observed(&mut observed, obs_ctx, name, &args, &capped);
+                    capped
+                }
+                CacheProbe::Repeat(cached) => {
+                    repeated_in_turn = true;
+                    cached
+                }
+                CacheProbe::Exhausted => {
+                    repeated_in_turn = true;
+                    REPEAT_EXHAUSTED.to_string()
+                }
             };
-            let capped = cap_result(result, cfg.per_tool_result_token_cap);
-            turn.push(ChatMessage::tool(&call.id, capped));
+            // V21 F4: label each tool result with an observation id the model
+            // can cite ([T1], [T2], …).
+            obs_id += 1;
+            turn.push(ChatMessage::tool(&call.id, label_observation(obs_id, &result)));
         }
         convo.push_turn(turn);
+        // V21 F8: mark the run-log record for this step so repeats are visible.
+        if repeated_in_turn {
+            if let Some(t) = trace.as_deref_mut() {
+                if let Some(rec) = t.calls.last_mut() {
+                    rec.result.push_str(" ⟳repeat");
+                }
+            }
+        }
 
         // Budget policing — driven solely by what the server reports. This
         // response's `prompt_tokens` is the *real* token count of the prefix we
@@ -551,10 +1248,39 @@ pub async fn run(
         convo.compact(budget);
     }
     force_final(
-        client, &url, cfg, convo.flatten(), task.thinking, gen_tps, cfg.max_steps,
-        trace.as_deref_mut(), cancel,
+        client, &url, cfg, convo.flatten(), task.thinking, used_tools, gen_tps, cfg.max_steps,
+        &observed, obs_ctx, task.schema.as_ref(), trace.as_deref_mut(), cancel,
     )
     .await
+}
+
+/// Assemble the `ChatRequest` for one turn. Extracted from [`post_chat`] so the
+/// tool-turn (`with_tools == true`, `response_format == None`) and final-turn
+/// (`with_tools == false`, `response_format == Some`) request shapes are unit
+/// testable without a live server.
+#[allow(clippy::too_many_arguments)]
+fn build_chat_request(
+    cfg: &AgentConfig,
+    messages: &[ChatMessage],
+    tools: &[ToolDef],
+    enable_thinking: bool,
+    with_tools: bool,
+    response_format: Option<serde_json::Value>,
+    req_timeout: Duration,
+    gen_tps: f32,
+) -> ChatRequest {
+    ChatRequest {
+        messages: messages.to_vec(),
+        tools: if with_tools { tools.to_vec() } else { Vec::new() },
+        tool_choice: if with_tools { Some("auto".into()) } else { Some("none".into()) },
+        model: cfg.model.clone(),
+        temperature: Some(0.2),
+        chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": enable_thinking })),
+        stream: Some(true),
+        stream_options: Some(serde_json::json!({ "include_usage": true })),
+        max_tokens: output_token_cap(cfg, req_timeout, gen_tps),
+        response_format,
+    }
 }
 
 /// One streaming chat-completions POST. `with_tools` lets the forced-final
@@ -566,6 +1292,7 @@ pub async fn run(
 /// which closes the connection — llama-server detects the disconnect on its
 /// next token and aborts, freeing the slot instead of running an orphan to
 /// completion.
+#[allow(clippy::too_many_arguments)]
 async fn post_chat(
     client: &reqwest::Client,
     url: &str,
@@ -574,21 +1301,17 @@ async fn post_chat(
     tools: &[ToolDef],
     enable_thinking: bool,
     with_tools: bool,
+    // V21 F9: only ever `Some` on the final-synthesis request (`with_tools ==
+    // false`); the loop's tool-call turns always pass `None` so tool calling
+    // stays free-form.
+    response_format: Option<serde_json::Value>,
     req_timeout: Duration,
     gen_tps: f32,
     cancel: &CancellationToken,
 ) -> AppResult<ChatResponse> {
-    let req = ChatRequest {
-        messages: messages.to_vec(),
-        tools: if with_tools { tools.to_vec() } else { Vec::new() },
-        tool_choice: if with_tools { Some("auto".into()) } else { Some("none".into()) },
-        model: cfg.model.clone(),
-        temperature: Some(0.2),
-        chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": enable_thinking })),
-        stream: Some(true),
-        stream_options: Some(serde_json::json!({ "include_usage": true })),
-        max_tokens: output_token_cap(cfg, req_timeout, gen_tps),
-    };
+    let req = build_chat_request(
+        cfg, messages, tools, enable_thinking, with_tools, response_format, req_timeout, gen_tps,
+    );
 
     // Send and consume with one retry on a transient transport failure —
     // either a connect/send error (a stale pooled keep-alive socket the local
@@ -710,16 +1433,35 @@ async fn force_final(
     cfg: &AgentConfig,
     mut messages: Vec<ChatMessage>,
     thinking: ThinkingMode,
+    used_tools: bool,
     gen_tps: f32,
     step: u32,
+    observed: &HashSet<String>,
+    obs_ctx: Option<&ToolCtx>,
+    // V21 F9: `Some` on a schema run — the final turn is grammar-constrained to
+    // JSON matching this schema, and the result is validated + returned verbatim.
+    schema: Option<&serde_json::Value>,
     mut trace: Option<&mut RunTrace>,
     cancel: &CancellationToken,
 ) -> AppResult<String> {
-    messages.push(ChatMessage::user(
+    // V21 F9: for a schema run the grammar (not the wording) guarantees JSON, so
+    // steer toward reformatting-into-schema rather than the free-prose nudge.
+    messages.push(ChatMessage::user(if schema.is_some() {
+        "Stop using tools and produce the final answer now, as a single JSON value matching the \
+         requested schema, from what you already have. Include only facts you verified with a \
+         tool call; omit or null out anything you could not verify rather than guessing."
+    } else {
         "You are out of budget. Stop using tools and answer now, as completely as you can, \
-         from what you already have. If your information is partial, say so explicitly.",
-    ));
-    let enable_thinking = think_on_turn(thinking, false, true);
+         from what you already have. If your information is partial, say so explicitly. State \
+         explicitly anything you could not verify with a tool call rather than guessing."
+    }));
+    // V21 F9: constrain generation to the caller's schema. `enable_thinking`
+    // stays under the normal policy for now; if the pinned llama-server build is
+    // found to strangle `<think>` under a JSON grammar (spike, see milestone
+    // F9), force it off for schema runs here — a one-line change:
+    //   `let enable_thinking = if schema.is_some() { false } else { … };`
+    let response_format = schema.map(schema_response_format);
+    let enable_thinking = think_on_turn(thinking, false, true, used_tools);
     // The synthesis gets the same full per-call window as any other request.
     // It runs *after* the loop's `deadline` (often triggered early, by an
     // empty/all-thinking turn or `max_steps`) and must prefill the whole
@@ -736,6 +1478,7 @@ async fn force_final(
         &[],
         enable_thinking,
         false,
+        response_format,
         req_timeout,
         gen_tps,
         cancel,
@@ -772,8 +1515,26 @@ async fn force_final(
         Err(AppError::OffloadNoAnswer(
             "offload produced no answer within its budget".into(),
         ))
+    } else if schema.is_some() {
+        finalize_schema_answer(&stripped, observed, obs_ctx).map_err(AppError::Offload)
     } else {
-        Ok(stripped)
+        // V21 F4/F5: strip citations, split the self-reported marker off, and run
+        // the same grounding verifier. This is a hard-exhausted path
+        // (deadline/max_steps already spent), so there is no corrective turn — a
+        // still-dirty answer gets the taint footer and a verifier-forced
+        // `partially` marker; a clean one keeps the model's self-report.
+        let (body, self_level, self_note) = split_marker(&strip_citations(&stripped));
+        let unverified = unverified_mentions(&body, observed, obs_ctx);
+        if unverified.is_empty() {
+            Ok(append_marker(&body, self_level, self_note.as_deref()))
+        } else {
+            let tainted = append_taint(&body, &unverified);
+            Ok(append_marker(
+                &tainted,
+                VerifiedLevel::Partially,
+                Some(&unverified.join(", ")),
+            ))
+        }
     }
 }
 
@@ -1026,9 +1787,25 @@ mod tests {
 
     #[test]
     fn thinking_policy_auto() {
-        assert!(think_on_turn(ThinkingMode::Auto, true, false)); // planning
-        assert!(think_on_turn(ThinkingMode::Auto, false, true)); // final
-        assert!(!think_on_turn(ThinkingMode::Auto, false, false)); // ingestion
+        // Auto/On are unaffected by `used_tools` — assert both values.
+        for used in [false, true] {
+            assert!(think_on_turn(ThinkingMode::Auto, true, false, used)); // planning
+            assert!(think_on_turn(ThinkingMode::Auto, false, true, used)); // final
+            assert!(!think_on_turn(ThinkingMode::Auto, false, false, used)); // ingestion
+        }
+    }
+
+    #[test]
+    fn thinking_policy_off_thinks_on_final_only_when_tools_used() {
+        // V21 F3: `Off` grants one thinking pass on the FINAL turn iff the run
+        // actually used tools; planning stays non-thinking; a no-tool run never
+        // thinks at all.
+        assert!(think_on_turn(ThinkingMode::Off, false, true, true)); // final + used_tools ⇒ true
+        assert!(!think_on_turn(ThinkingMode::Off, false, true, false)); // final, no tools ⇒ false
+        assert!(!think_on_turn(ThinkingMode::Off, true, false, false)); // planning, no tools
+        assert!(!think_on_turn(ThinkingMode::Off, false, false, false)); // ingestion, no tools
+        assert!(!think_on_turn(ThinkingMode::Off, true, false, true)); // planning stays off even with tools
+        assert!(!think_on_turn(ThinkingMode::Off, false, false, true)); // mid-run turn stays off
     }
 
     #[test]
@@ -1052,8 +1829,20 @@ mod tests {
 
     #[test]
     fn thinking_policy_overrides() {
-        assert!(think_on_turn(ThinkingMode::On, false, false));
-        assert!(!think_on_turn(ThinkingMode::Off, true, true));
+        assert!(think_on_turn(ThinkingMode::On, false, false, false));
+        // `Off` + planning + final-flag but no tools ⇒ still off (planning is
+        // never a thinking turn under Off, and the run used no tools).
+        assert!(!think_on_turn(ThinkingMode::Off, true, true, false));
+    }
+
+    #[test]
+    fn system_prompt_pins_verified_facts_rule() {
+        // Tripwire: the epistemic guardrail is load-bearing (V21 F2). A reword
+        // that drops it re-opens the guess-a-file-list failure — fail loudly.
+        assert!(
+            SYSTEM_PROMPT.contains("verified with a tool call"),
+            "SYSTEM_PROMPT lost the verified-facts rule"
+        );
     }
 
     #[test]
@@ -1240,5 +2029,377 @@ mod tests {
         assert_eq!(ThinkingMode::parse("on"), ThinkingMode::On);
         assert_eq!(ThinkingMode::parse("auto"), ThinkingMode::Auto);
         assert_eq!(ThinkingMode::parse("garbage"), ThinkingMode::Auto);
+    }
+
+    // ── V21 F4 — citations + mechanical verifier ───────────────────────────
+
+    use serde_json::json;
+
+    #[test]
+    fn system_prompt_pins_citation_rule() {
+        // Tripwire (V21 F4): the citation instruction is load-bearing — the
+        // verifier strips `[T…]` markers, so the prompt must ask for them.
+        assert!(
+            SYSTEM_PROMPT.contains("cite nothing you did not observe"),
+            "SYSTEM_PROMPT lost the citation rule"
+        );
+    }
+
+    #[test]
+    fn strip_citations_removes_observation_markers() {
+        assert_eq!(strip_citations("The file exists [T3]."), "The file exists.");
+        assert_eq!(strip_citations("A [T1] and B [T22] done"), "A and B done");
+        // Non-citations (no digits, or a different word) are preserved.
+        assert_eq!(strip_citations("see [Tool] and [T] here"), "see [Tool] and [T] here");
+        assert_eq!(strip_citations("plain text"), "plain text");
+    }
+
+    #[test]
+    fn label_observation_is_stripped_by_the_verifier() {
+        let labeled = label_observation(7, "some result");
+        assert!(labeled.starts_with("[T7] "), "labeled: {labeled}");
+        // The citation the model echoes back is removed from the answer.
+        assert_eq!(strip_citations("grounded claim [T7]"), "grounded claim");
+    }
+
+    #[test]
+    fn looks_like_path_needs_separator_and_extension() {
+        assert!(looks_like_path("src/offload/agent.rs"));
+        assert!(looks_like_path("docs\\README.md")); // windows separator
+        assert!(!looks_like_path("agent.rs")); // no separator
+        assert!(!looks_like_path("src/offload")); // no extension
+        assert!(!looks_like_path("plain-words"));
+        assert!(has_extension("agent.rs"));
+        assert!(!has_extension(".gitignore")); // leading dot is not an extension
+        assert!(!has_extension("noext"));
+    }
+
+    #[test]
+    fn extract_path_mentions_finds_backticks_and_bare_tokens() {
+        let answer = "The bug is in `src/offload/agent.rs` and also docs/plan.md, not README.";
+        let m = extract_path_mentions(answer, None);
+        assert!(m.contains(&"src/offload/agent.rs".to_string()));
+        assert!(m.contains(&"docs/plan.md".to_string()), "trailing comma not cleaned: {m:?}");
+        assert!(!m.iter().any(|x| x == "README"));
+        // A `path:line:` reference cleans down to the bare path.
+        let m2 = extract_path_mentions("hit at src/foo.rs:42: bar", None);
+        assert!(m2.contains(&"src/foo.rs".to_string()), "{m2:?}");
+    }
+
+    #[test]
+    fn collect_observed_accumulates_across_tool_kinds() {
+        let mut obs = HashSet::new();
+        // read_file — the path argument.
+        collect_observed(&mut obs, None, "read_file", &json!({ "path": "src/main.rs" }), "fn main(){}");
+        // list_dir — the listed dir plus each entry (joined and bare).
+        let listing = "/proj/docs (2 entries)\nguide.md\t100\nsub/";
+        collect_observed(&mut obs, None, "list_dir", &json!({ "path": "docs" }), listing);
+        // code_search — match paths from `path:line: snippet`.
+        collect_observed(&mut obs, None, "code_search", &json!({ "query": "x" }), "src/util.rs:5: let x = 1;");
+        // graph tool — path-like tokens in the report.
+        collect_observed(
+            &mut obs,
+            None,
+            "graph_references",
+            &json!({ "symbol": "Foo" }),
+            "Foo referenced in src/foo.rs and lib/bar.rs",
+        );
+        // V21 F6: run_check — the diagnostic report's site paths (`file:line`)
+        // flow through the same path-token harvest and land in the observed set,
+        // so an answer citing a checked file counts as grounded.
+        collect_observed(
+            &mut obs,
+            None,
+            "run_check",
+            &json!({ "name": "cargo" }),
+            "cargo — exit 1 · 42 ms\nerror · E0425 · ×1 · src/broken.rs:10",
+        );
+
+        assert!(obs.contains("src/main.rs"));
+        assert!(obs.contains("docs")); // the listed dir arg
+        assert!(obs.contains("docs/guide.md")); // joined entry
+        assert!(obs.contains("guide.md")); // bare entry
+        assert!(obs.contains("src/util.rs")); // code_search hit
+        assert!(obs.contains("src/foo.rs")); // graph tool
+        assert!(obs.contains("lib/bar.rs"));
+        assert!(obs.contains("src/broken.rs")); // run_check site path
+    }
+
+    #[test]
+    fn unverified_mentions_flags_only_unobserved_paths() {
+        let mut obs = HashSet::new();
+        obs.insert("src/real.rs".to_string());
+        // Clean — the only path mentioned is observed.
+        assert!(unverified_mentions("The change is in `src/real.rs`.", &obs, None).is_empty());
+        // Dirty — a baited path no tool observed.
+        assert_eq!(
+            unverified_mentions("Also see `src/nonexistent.rs` for the fix.", &obs, None),
+            vec!["src/nonexistent.rs".to_string()]
+        );
+        // No paths at all — the feature is inert.
+        assert!(unverified_mentions("just prose, no paths here", &obs, None).is_empty());
+    }
+
+    #[test]
+    fn taint_and_corrective_messages_list_the_mentions() {
+        let m = vec!["a/b.rs".to_string(), "c/d.md".to_string()];
+        let taint = append_taint("answer body", &m);
+        assert!(taint.starts_with("answer body"));
+        assert!(taint.contains(
+            "[worker note: the following mentions were not verified by any tool call: a/b.rs, c/d.md]"
+        ));
+        let corr = corrective_message(&m);
+        assert!(corr.starts_with(CORRECTIVE_PREFIX));
+        assert!(corr.contains("a/b.rs, c/d.md"));
+    }
+
+    #[test]
+    fn norm_path_uses_confinement_to_collapse_variants() {
+        let root = std::env::temp_dir().join(format!("cimp-obs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/x.rs"), "").unwrap();
+        let ctx = ToolCtx::new(vec![root.clone()], vec![], vec![], &root);
+        // Two spellings of the same real file normalize to the same key.
+        assert_eq!(norm_path(Some(&ctx), "docs/x.rs"), norm_path(Some(&ctx), "./docs/x.rs"));
+        let mut obs = HashSet::new();
+        obs.insert(norm_path(Some(&ctx), "docs/x.rs"));
+        // The observed real path matches a mention of it, even a spelling variant.
+        assert!(unverified_mentions("edit `./docs/x.rs`", &obs, Some(&ctx)).is_empty());
+        // A nonexistent sibling is flagged.
+        assert_eq!(
+            unverified_mentions("also `docs/ghost.rs`", &obs, Some(&ctx)),
+            vec!["docs/ghost.rs".to_string()]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── V21 F8 — identical-call short-circuit ──────────────────────────────
+
+    #[test]
+    fn canonical_json_is_key_order_and_whitespace_invariant() {
+        let a: serde_json::Value = serde_json::from_str(r#"{"b":1,"a":{"y":2,"x":3}}"#).unwrap();
+        let b: serde_json::Value =
+            serde_json::from_str("{ \"a\" : { \"x\" : 3, \"y\":2 } , \"b\" : 1 }").unwrap();
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+        assert_eq!(canonical_json(&a), r#"{"a":{"x":3,"y":2},"b":1}"#);
+    }
+
+    #[test]
+    fn call_cache_serves_cached_repeat_without_executing() {
+        let mut cache = CallCache::default();
+        let args = json!({ "path": "a.rs" });
+        let mut executions = 0u32;
+        // Mirror the loop's execute-on-Fresh decision, counting real executions.
+        let mut step = |cache: &mut CallCache| -> String {
+            match cache.probe("read_file", &args) {
+                CacheProbe::Fresh => {
+                    executions += 1;
+                    let r = "RESULT".to_string();
+                    cache.record("read_file", &args, r.clone());
+                    r
+                }
+                CacheProbe::Repeat(r) => r,
+                CacheProbe::Exhausted => REPEAT_EXHAUSTED.to_string(),
+            }
+        };
+        let first = step(&mut cache);
+        let second = step(&mut cache);
+        let third = step(&mut cache);
+        drop(step);
+        assert_eq!(first, "RESULT");
+        assert!(second.starts_with(REPEAT_NUDGE) && second.contains("RESULT"), "second: {second}");
+        assert_eq!(third, REPEAT_EXHAUSTED);
+        assert_eq!(executions, 1, "the executor ran only for the fresh call");
+    }
+
+    #[test]
+    fn call_cache_exempts_run_check_and_misses_on_distinct_args() {
+        let mut cache = CallCache::default();
+        // run_check always re-executes — never cached.
+        let rc = json!({ "name": "test" });
+        cache.record("run_check", &rc, "report".into());
+        assert!(matches!(cache.probe("run_check", &rc), CacheProbe::Fresh));
+        assert!(matches!(cache.probe("run_check", &rc), CacheProbe::Fresh));
+        // Distinct arguments miss; the identical one is a repeat.
+        let a = json!({ "path": "a" });
+        let b = json!({ "path": "b" });
+        cache.record("read_file", &a, "one".into());
+        assert!(matches!(cache.probe("read_file", &b), CacheProbe::Fresh));
+        assert!(matches!(cache.probe("read_file", &a), CacheProbe::Repeat(_)));
+    }
+
+    // ── V21 F9 — grammar-enforced structured output ────────────────────────
+
+    #[test]
+    fn schema_response_format_wraps_for_llama_server() {
+        let schema = json!({ "type": "object", "properties": { "count": { "type": "integer" } } });
+        let rf = schema_response_format(&schema);
+        // The llama-server envelope: {"type":"json_schema","json_schema":{…schema…}}.
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["schema"], schema);
+        // OpenAI-compat niceties llama.cpp tolerates.
+        assert_eq!(rf["json_schema"]["strict"], json!(true));
+        assert!(rf["json_schema"]["name"].is_string());
+    }
+
+    #[test]
+    fn validate_json_output_passes_valid_and_rejects_garbage() {
+        // Valid JSON is returned verbatim (trimmed), never re-serialized.
+        let ok = validate_json_output("  {\"count\": 3, \"files\": [\"a.md\"]}  ").unwrap();
+        assert_eq!(ok, "{\"count\": 3, \"files\": [\"a.md\"]}");
+        // A half-JSON blob (grammar somehow bypassed) becomes an explicit error,
+        // never a partial payload the orchestrator would try to parse.
+        let err = validate_json_output("{\"count\": 3, \"files\": [").unwrap_err();
+        assert!(err.contains("did not return valid JSON"), "err: {err}");
+        assert!(err.contains("No partial output"), "err: {err}");
+        // Prose leakage is likewise rejected.
+        assert!(validate_json_output("Here is the answer: {\"count\":3}").is_err());
+    }
+
+    #[test]
+    fn schema_run_final_request_carries_response_format_tool_turns_do_not() {
+        let cfg = test_cfg(Some(50_000), Some(90_112), 8000);
+        let msgs = vec![ChatMessage::user("task")];
+        let tools: Vec<ToolDef> = Vec::new();
+        let rf = schema_response_format(&json!({ "type": "object" }));
+
+        // Tool-call / planning turn: `with_tools == true`, response_format None.
+        // Tool calling stays free-form; no grammar constraint on the wire.
+        let tool_turn = build_chat_request(
+            &cfg, &msgs, &tools, false, true, None, Duration::from_secs(300), 50.0,
+        );
+        assert!(tool_turn.response_format.is_none(), "tool turns must not constrain output");
+        assert_eq!(tool_turn.tool_choice.as_deref(), Some("auto"));
+
+        // Final-synthesis / forced-final turn: `with_tools == false`, schema set.
+        let final_turn = build_chat_request(
+            &cfg, &msgs, &tools, false, false, Some(rf.clone()), Duration::from_secs(300), 50.0,
+        );
+        assert_eq!(final_turn.response_format.as_ref(), Some(&rf), "final turn carries the schema");
+        assert_eq!(final_turn.tool_choice.as_deref(), Some("none"));
+        assert!(final_turn.tools.is_empty(), "the final turn suppresses tools");
+    }
+
+    #[test]
+    fn schema_system_prompt_pins_json_only_and_no_citations() {
+        // Tripwire: a schema run must NOT ask for `[T…]` citation markers (they
+        // would violate the JSON grammar) and must demand JSON-only output.
+        assert!(
+            SCHEMA_SYSTEM_PROMPT.contains("single JSON value matching the requested schema"),
+            "SCHEMA_SYSTEM_PROMPT lost its JSON-only instruction"
+        );
+        assert!(
+            SCHEMA_SYSTEM_PROMPT.contains("cite nothing"),
+            "SCHEMA_SYSTEM_PROMPT must tell the model to cite nothing"
+        );
+        // And it keeps the shared grounding guardrail.
+        assert!(SCHEMA_SYSTEM_PROMPT.contains("verified with a tool call"));
+    }
+
+    #[test]
+    fn finalize_schema_answer_returns_json_verbatim_then_marker_footer() {
+        let obs = HashSet::new();
+        // A JSON string value that happens to contain a `[T1]`-shaped token must
+        // survive: the schema path does NOT run strip_citations (which would
+        // mutate it and break the "verbatim JSON" contract). F5 appends a marker
+        // footer AFTER the JSON, never inside it.
+        let jsonish = r#"{"note": "see marker [T1] here", "count": 2}"#;
+        let out = finalize_schema_answer(jsonish, &obs, None).unwrap();
+        assert!(out.starts_with(jsonish), "JSON must lead verbatim, citations intact: {out}");
+        assert!(out.contains("[T1]"), "strip_citations must not have run");
+        assert!(out.trim_end().ends_with("verified: fully"), "clean schema run ⇒ fully footer: {out}");
+        // The leading JSON portion (before the footer) still parses verbatim.
+        let body = out.split("\n\nverified:").next().unwrap();
+        assert_eq!(body, jsonish);
+        assert!(serde_json::from_str::<serde_json::Value>(body).is_ok());
+    }
+
+    #[test]
+    fn finalize_schema_answer_rejects_non_json() {
+        let obs = HashSet::new();
+        let err = finalize_schema_answer("Sure! Here you go: {\"count\": 2}", &obs, None).unwrap_err();
+        assert!(err.contains("did not return valid JSON"), "err: {err}");
+    }
+
+    #[test]
+    fn finalize_schema_answer_marker_footer_stays_out_of_json_body() {
+        // When the verifier finds an unobserved path in a JSON string value, the
+        // JSON body stays pure (no F4 `[worker note: …]` footer inside/after it);
+        // F5 instead appends a `partially` marker footer that names the mention.
+        let obs = HashSet::new();
+        let jsonish = r#"{"file": "src/ghost.rs"}"#;
+        let out = finalize_schema_answer(jsonish, &obs, None).unwrap();
+        assert!(out.starts_with(jsonish), "JSON body stays verbatim: {out}");
+        assert!(!out.contains("worker note"), "no F4 taint footer for schema runs");
+        assert!(out.contains("verified: partially"), "unobserved mention ⇒ partial marker");
+        assert!(out.contains("src/ghost.rs"), "partial note names the unverified mention");
+        // The JSON portion alone is still verbatim-parseable.
+        let body = out.split("\n\nverified:").next().unwrap();
+        assert_eq!(body, jsonish);
+        assert!(serde_json::from_str::<serde_json::Value>(body).is_ok());
+    }
+
+    // ── V21 F5 — confidence marker parse/emit ──────────────────────────────
+
+    #[test]
+    fn system_prompt_pins_confidence_marker_rule() {
+        // Tripwire: the marker requirement is load-bearing (V21 F5 feeds tier
+        // escalation). A reword that drops it silently disables escalation.
+        assert!(
+            SYSTEM_PROMPT.contains("verified: fully")
+                && SYSTEM_PROMPT.contains("verified: partially"),
+            "SYSTEM_PROMPT lost the confidence-marker requirement"
+        );
+    }
+
+    #[test]
+    fn split_marker_parses_fully_partially_and_missing() {
+        // Fully.
+        let (body, lvl, note) = split_marker("The answer.\n\nverified: fully");
+        assert_eq!(body, "The answer.");
+        assert_eq!(lvl, VerifiedLevel::Fully);
+        assert!(note.is_none());
+        // Partially with a note (em-dash separator).
+        let (body, lvl, note) = split_marker("Count is 3.\nverified: partially — could not open Q:\\x");
+        assert_eq!(body, "Count is 3.");
+        assert_eq!(lvl, VerifiedLevel::Partially);
+        assert_eq!(note.as_deref(), Some("could not open Q:\\x"));
+        // Missing marker ⇒ treated as partially, whole text kept as body.
+        let (body, lvl, note) = split_marker("Just an answer, no marker.");
+        assert_eq!(body, "Just an answer, no marker.");
+        assert_eq!(lvl, VerifiedLevel::Partially);
+        assert!(note.is_none());
+        // Case-insensitive keyword, plain `partially` (no note).
+        let (_, lvl, note) = split_marker("x\nVerified: Partially");
+        assert_eq!(lvl, VerifiedLevel::Partially);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn answer_verified_level_reads_the_footer() {
+        assert_eq!(answer_verified_level("body\n\nverified: fully"), VerifiedLevel::Fully);
+        assert_eq!(
+            answer_verified_level("body\n\nverified: partially — x"),
+            VerifiedLevel::Partially
+        );
+        // A JSON schema answer with a marker footer parses too (last line wins).
+        assert_eq!(
+            answer_verified_level("{\"count\": 2}\n\nverified: fully"),
+            VerifiedLevel::Fully
+        );
+        // Missing marker ⇒ partially (fail-safe).
+        assert_eq!(answer_verified_level("no marker here"), VerifiedLevel::Partially);
+    }
+
+    #[test]
+    fn append_marker_round_trips_through_split() {
+        let full = append_marker("some body", VerifiedLevel::Fully, None);
+        assert!(full.ends_with("verified: fully"));
+        assert_eq!(split_marker(&full), ("some body".to_string(), VerifiedLevel::Fully, None));
+        let part = append_marker("body", VerifiedLevel::Partially, Some("a.rs, b.rs"));
+        assert!(part.ends_with("verified: partially — a.rs, b.rs"));
+        let (b, l, n) = split_marker(&part);
+        assert_eq!((b.as_str(), l), ("body", VerifiedLevel::Partially));
+        assert_eq!(n.as_deref(), Some("a.rs, b.rs"));
     }
 }

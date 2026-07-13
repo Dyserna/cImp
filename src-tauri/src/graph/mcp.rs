@@ -873,7 +873,15 @@ fn fmt_check_report(report: &crate::checks::CheckReport, max_rows: usize) -> Str
         report.name,
         report.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string()),
         report.duration_ms,
-        if report.timed_out { " · TIMED OUT (partial output parsed)" } else { "" },
+        // V21 F6: an explicit "unverified" cue on timeout, so the worker (and
+        // Claude) treat an incomplete check as a non-result — composes with F2's
+        // say-what-you-couldn't-verify rule rather than reading the partial
+        // groups as the whole picture.
+        if report.timed_out {
+            " · TIMED OUT — the check did not finish; report this result as UNVERIFIED (only the partial output before the timeout was parsed)"
+        } else {
+            ""
+        },
     );
     if report.groups.is_empty() {
         out.push_str("No diagnostics.");
@@ -1036,6 +1044,28 @@ pub async fn offload_query(
         }
     }
     Err(last_err)
+}
+
+/// V21 F6: the worker-native `run_check`. Resolves the project root from the
+/// offload confinement `roots` (the same posture as [`offload_query`]) and runs
+/// the configured check through the **same** entry point the MCP surface uses
+/// ([`run_check_tool`], source `"offload"`) — identical `CheckDef` resolution,
+/// parser/dedup machinery, bounded report, and activity-ring recording. No new
+/// execution surface: it only runs the project's user-vetted `checks` commands,
+/// and returns the "not configured" guidance when the top-level `checks` array
+/// is empty (the same gate that hides the tool from `enabled_defs`).
+pub async fn offload_run_check(roots: &[PathBuf], args: &Value) -> Result<String, String> {
+    let settings = current_settings();
+    let sub = db_subdir(&settings);
+    // A check needs a project root but not a built graph. Prefer the first root
+    // that already has a graph.db (so a mixed setup agrees on "the project
+    // root"), else fall back to the first configured root as-is.
+    let root = roots
+        .iter()
+        .find_map(|r| find_graph_root(r, &sub))
+        .or_else(|| roots.first().cloned())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    run_check_tool(&root, &settings, "offload", args).await
 }
 
 // ── result formatting (compact, token-bounded text for the model) ────────
@@ -1977,6 +2007,9 @@ mod run_check_tests {
         let report = CheckReport { name: "slow".into(), exit_code: None, duration_ms: 10_000, timed_out: true, groups: vec![] };
         let out = fmt_check_report(&report, 50);
         assert!(out.contains("TIMED OUT"), "{out}");
+        // V21 F6: a timed-out check must carry the "unverified" cue so the
+        // worker reports it as a non-result (composes with F2).
+        assert!(out.to_uppercase().contains("UNVERIFIED"), "{out}");
     }
 }
 

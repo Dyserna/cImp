@@ -932,8 +932,14 @@ export interface ExternalToolsSettings {
 /// `OffloadToolToggles`).
 export interface OffloadToolToggles {
   read_file: boolean;
+  /// V21: directory enumeration — the ground-truth "what files exist / how many".
+  list_dir: boolean;
   code_search: boolean;
   run_command: boolean;
+  /// V21: run a configured project check (build/typecheck/lint/test) and get
+  /// back deduplicated diagnostics. Inert until the top-level `checks` array is
+  /// non-empty (gated identically to the `run_check` MCP tool).
+  run_check: boolean;
 }
 
 /// V8-01: one user-installed MCP tool server (mirror of Rust
@@ -971,7 +977,7 @@ export type ToolScope =
 
 /// V8-02: native + MCP tool names treated as local-data (denied to cloud
 /// backends by default). Mirrors Rust `LOCAL_DATA_TOOLS`.
-export const LOCAL_DATA_TOOLS = ['read_file', 'code_search', 'run_command', 'filesystem', 'git'];
+export const LOCAL_DATA_TOOLS = ['read_file', 'list_dir', 'code_search', 'run_command', 'filesystem', 'git'];
 
 /// V8-02: kind-specific config for one backend (mirror of Rust
 /// `OffloadBackendKind`). Local = cImp owns the process; Remote = a
@@ -1018,6 +1024,11 @@ export interface CommandPolicy {
   program: string;
   denied_flags: string[];
   denied_subcommands: string[];
+  /// V21 F7: when non-empty, an allowlist over the first non-flag argument —
+  /// only these subcommands may run, every other (and a bare invocation) is
+  /// refused. The strict counterpart to `denied_subcommands`, used to pin a
+  /// program to a few read-only verbs (e.g. `cargo` → `metadata`/`tree`).
+  allowed_subcommands: string[];
   env: CommandEnvVar[];
 }
 
@@ -1068,6 +1079,11 @@ export interface OffloadSettings {
   /// = unbounded blocking queue; a number fast-rejects once that many are
   /// already waiting on busy slots.
   max_queue_depth: number | null;
+  /// V21 F5: when true (default), a fast-tier offload that comes back only
+  /// partially verified is re-run once on a distinct, ready quality backend
+  /// (the better answer wins). Inert unless a second quality-tier backend
+  /// exists, so zero-config setups are unaffected.
+  escalate_partial: boolean;
   /// V21: the OpenCode `local-llama` custom provider, derived from a Local
   /// backend's server command via the Offload "Add to OpenCode" button (or
   /// auto-sync). When set, the OpenCode tab gets a `provider.local-llama` block
@@ -1342,8 +1358,10 @@ export function defaultSettings(): Settings {
       server_command: '',
       tools: {
         read_file: true,
+        list_dir: true,
         code_search: true,
         run_command: true,
+        run_check: true,
       },
       allowed_roots: [],
       command_allowlist: [],
@@ -1364,6 +1382,7 @@ export function defaultSettings(): Settings {
             '--attr-source',
           ],
           denied_subcommands: ['config'],
+          allowed_subcommands: [],
           env: [
             { key: 'GIT_PAGER', value: 'cat' },
             { key: 'PAGER', value: 'cat' },
@@ -1384,6 +1403,7 @@ export function defaultSettings(): Settings {
       offload_timeout_secs: 300,
       global_concurrency: null,
       max_queue_depth: null,
+      escalate_partial: true,
       opencode_provider: null,
       opencode_provider_auto: false,
     },

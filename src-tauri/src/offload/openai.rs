@@ -126,6 +126,12 @@ pub struct ChatRequest {
     /// the stream. `None` leaves generation unbounded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// V21 F9: grammar-enforced structured output. When set, carries
+    /// llama-server's `{"type": "json_schema", "json_schema": {…}}` so the
+    /// sampler constrains generation to JSON matching the caller's schema. Only
+    /// ever set on the final-synthesis request (tool-call turns stay free-form).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -409,5 +415,34 @@ mod tests {
         let tc: ToolCall = serde_json::from_str(json).unwrap();
         assert_eq!(tc.function.name, "read_file");
         assert_eq!(tc.id, "call_1");
+    }
+
+    #[test]
+    fn response_format_serializes_only_when_present() {
+        // V21 F9: `response_format` follows its `Option` siblings —
+        // `skip_serializing_if` means it never appears on the wire unless set.
+        let base = ChatRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+            tool_choice: None,
+            model: None,
+            temperature: None,
+            chat_template_kwargs: None,
+            stream: None,
+            stream_options: None,
+            max_tokens: None,
+            response_format: None,
+        };
+        let v = serde_json::to_value(&base).unwrap();
+        assert!(v.get("response_format").is_none(), "None must be omitted from the request body");
+
+        let mut with = base.clone();
+        with.response_format = Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": { "schema": { "type": "object" } }
+        }));
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["response_format"]["type"], "json_schema");
+        assert_eq!(v["response_format"]["json_schema"]["schema"]["type"], "object");
     }
 }

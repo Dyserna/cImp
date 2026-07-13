@@ -45,6 +45,7 @@
     describeBackendStatus,
     offloadServiceStatus,
     offloadReloadMcp,
+    offloadEnableReadonlyCommands,
     describeMcpServerHealth,
     type BackendStatus,
     type ServiceStatus,
@@ -533,7 +534,7 @@
     patch((s) => {
       s.offload.command_policies = [
         ...s.offload.command_policies,
-        { program: '', denied_flags: [], denied_subcommands: [], env: [] },
+        { program: '', denied_flags: [], denied_subcommands: [], allowed_subcommands: [], env: [] },
       ];
     });
   }
@@ -546,6 +547,16 @@
     patch((s) => {
       fn(s.offload.command_policies[i]);
     });
+  }
+  // V21 F7: one-click "safe read-only commands" preset. The backend merges
+  // `git` + `cargo` (metadata/tree, with its pinning policy) into the live
+  // allowlist/policies atomically and returns the updated settings, which we
+  // fold into the local snapshot. Idempotent + non-destructive — a merge, not a
+  // mode: the user sees exactly what got added in the allowlist / policy
+  // editors below and can prune any of it.
+  async function enableReadonlyCommands(): Promise<void> {
+    const updated = await offloadEnableReadonlyCommands();
+    if (updated) snapshot = updated;
   }
   // ── MCP tool servers (MCP servers section) ─────────────────────────────
   // Add/remove/toggle with live host reload — no cImp restart. Edits persist
@@ -3691,6 +3702,23 @@
               auto-sizes from the summed per-backend slot counts.
             </small>
           </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.escalate_partial}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.escalate_partial = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Escalate partial fast-tier answers to the quality backend</span>
+          </label>
+          <small class="hint">
+            When a fast-tier offload comes back only partially verified, re-run it
+            once on a distinct, ready quality backend and keep the better answer.
+            Inert unless a second, quality-tier backend is configured.
+          </small>
           {:else}
           <h3>Native tools</h3>
           <label class="checkbox">
@@ -3701,6 +3729,15 @@
                 patch((s) => (s.offload.tools.read_file = (e.currentTarget as HTMLInputElement).checked))}
             />
             <span>read_file — bounded file reads</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.list_dir}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.list_dir = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>list_dir — enumerate a directory (what files exist / how many)</span>
           </label>
           <label class="checkbox">
             <input
@@ -3719,6 +3756,18 @@
                 patch((s) => (s.offload.tools.run_command = (e.currentTarget as HTMLInputElement).checked))}
             />
             <span>run_command — allowlisted, read-only commands</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.run_check}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.run_check = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span
+              >run_check — run a configured project check (build/typecheck/lint/test).
+              Inert until the project's <code>checks</code> are configured.</span
+            >
           </label>
 
           <label>
@@ -3761,6 +3810,19 @@
               listed here (deny by default).
             </small>
           </label>
+
+          <div class="button-row">
+            <button type="button" class="secondary" onclick={enableReadonlyCommands}>
+              Enable safe read-only commands
+            </button>
+          </div>
+          <small class="hint">
+            Adds <code>git</code> and <code>cargo</code> to the allowlist and
+            installs a <code>cargo</code> policy that permits only
+            <code>metadata</code> / <code>tree</code> (never
+            <code>run</code>/<code>build</code>). A one-time merge — it never
+            overwrites your own entries, and you can prune anything it adds below.
+          </small>
 
           {#if snapshot.offload.command_allowlist.length > 0}
             <ul class="policy-status">
@@ -3825,6 +3887,21 @@
                     updatePolicy(i, (p) => (p.denied_subcommands = csvToList((e.currentTarget as HTMLInputElement).value)))}
                   placeholder="config"
                 />
+              </label>
+              <label>
+                <span>Allowed subcommands (comma-separated)</span>
+                <input
+                  type="text"
+                  value={policy.allowed_subcommands.join(', ')}
+                  oninput={(e) =>
+                    updatePolicy(i, (p) => (p.allowed_subcommands = csvToList((e.currentTarget as HTMLInputElement).value)))}
+                  placeholder="metadata, tree"
+                />
+                <small class="hint">
+                  When set, ONLY these subcommands may run — every other, and a
+                  bare invocation, is refused. Leave empty to allow all except
+                  the denied ones.
+                </small>
               </label>
               <div class="policy-env">
                 <span class="policy-env-label">Spawn environment (forced)</span>

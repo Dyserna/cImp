@@ -249,12 +249,16 @@ fn offload_task_tool() -> Value {
                 "thinking": {
                     "type": "string",
                     "enum": ["auto", "off", "on"],
-                    "description": "Reasoning effort. 'off' for cheap deterministic work (extract/list/lookup), 'on' for genuine analysis, 'auto' (default) to let the worker decide per step."
+                    "description": "Reasoning effort. 'off' is only for pure transforms of the PROVIDED context (summarize/extract/reformat from the `context` arg) — it skips reasoning. Any task that needs tool calls (file reads, searches, counting files, web) should use 'auto' (default) or 'on', or the worker may guess instead of verifying. 'on' forces genuine analysis; 'auto' lets the worker decide per step."
                 },
                 "tier": {
                     "type": "string",
                     "enum": ["auto", "fast", "quality"],
                     "description": "Backend bias when multiple offload backends are configured. 'fast' routes trivial single-pass work (summarize/extract/classify) to the small/fast backend; 'quality' forces the large/capable one for real reasoning or big context; 'auto' (default) lets the router decide by task size. Local-file tasks always run on a backend with file access (never a cloud backend)."
+                },
+                "schema": {
+                    "type": "object",
+                    "description": "Optional JSON Schema. When provided, the worker's final answer is grammar-constrained (llama.cpp sampler) to a single JSON value matching it — guaranteed-parseable, no prose, composable into scripts. The worker still uses tools normally; only its final message is constrained. Omit for a normal prose answer."
                 }
             },
             "required": ["instructions"]
@@ -302,7 +306,9 @@ fn offload_task_description(settings: &OffloadSettings) -> String {
     format!(
         "Delegate a token-heavy subtask (broad codebase search, large-file/log summarization, web \
          research) to a local/remote model to conserve this session's context. Pass a \
-         self-contained instruction; you get back only the synthesized result. You can run \
+         self-contained instruction; you get back only the synthesized result. Use `thinking: off` \
+         only for pure transforms of context you provide; any task that needs tool calls (file \
+         reads, searches, counting files) should use `auto` (default) or `on`. You can run \
          offloads in parallel — issue multiple offload_task calls at once to fan out independent \
          subtasks; they queue if all slots are busy. Backends: {}.{}",
         parts.join("; "),
@@ -396,7 +402,8 @@ async fn handle_tools_call(params: Value) -> Result<Value, (i64, String)> {
         .and_then(|v| v.as_str())
         .unwrap_or("auto")
         .to_string();
-    match run_one(instructions, context, thinking_str, tier_str).await {
+    let schema = schema_arg(&args);
+    match run_one(instructions, context, thinking_str, tier_str, schema).await {
         Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
         // A "not ready/busy" condition is returned as a tool result (not a
         // protocol error) so Opus can read it and retry/adapt.
@@ -415,12 +422,15 @@ async fn run_one(
     context: Option<String>,
     thinking_str: String,
     tier_str: String,
+    // V21 F9: optional JSON Schema — forwarded to the warm app (`/run`) or run
+    // in the self-contained fallback; constrains the worker's final output.
+    schema: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let thinking = ThinkingMode::parse(&thinking_str);
     let tier = TierHint::parse(&tier_str);
-    match proxy_run(&instructions, context.as_deref(), &thinking_str, &tier_str).await {
+    match proxy_run(&instructions, context.as_deref(), &thinking_str, &tier_str, schema.as_ref()).await {
         Some(r) => r,
-        None => run_offload(instructions, context, thinking, tier).await,
+        None => run_offload(instructions, context, thinking, tier, schema).await,
     }
 }
 
@@ -475,11 +485,13 @@ async fn handle_batch_tool(params: Value) -> Result<Value, (i64, String)> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("auto")
                 .to_string();
+            // V21 F9: per-subtask JSON Schema (object only).
+            let schema = schema_arg(t);
             tokio::spawn(async move {
                 if instructions.trim().is_empty() {
                     return Err("subtask requires non-empty `instructions`".to_string());
                 }
-                run_one(instructions, context, thinking_str, tier_str).await
+                run_one(instructions, context, thinking_str, tier_str, schema).await
             })
         })
         .collect();
@@ -511,6 +523,16 @@ fn tool_error(message: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": message }], "isError": true })
 }
 
+/// V21 F9: extract an optional JSON-Schema `schema` argument from an
+/// `offload_task` / `offload_batch`-subtask arguments object. Only a JSON object
+/// is accepted (a schema must be an object); a string/array/null/absent value
+/// yields `None`, so a malformed hint degrades to a normal prose run rather than
+/// an error. Shared by the single-task and per-subtask parse paths so both
+/// thread schemas identically.
+fn schema_arg(args: &Value) -> Option<Value> {
+    args.get("schema").filter(|v| v.is_object()).cloned()
+}
+
 /// The `offload_batch` tool descriptor.
 fn offload_batch_tool() -> Value {
     json!({
@@ -536,12 +558,16 @@ fn offload_batch_tool() -> Value {
                             "thinking": {
                                 "type": "string",
                                 "enum": ["auto", "off", "on"],
-                                "description": "Reasoning effort for this subtask. 'off' for deterministic extract/list, 'on' for genuine analysis, 'auto' (default) to let the worker decide."
+                                "description": "Reasoning effort for this subtask. 'off' is only for pure transforms of the PROVIDED context (summarize/extract/reformat from `context`); any subtask needing tool calls (file reads, searches, counting files, web) should use 'auto' (default) or 'on', else the worker may guess instead of verifying. 'on' forces analysis; 'auto' lets the worker decide."
                             },
                             "tier": {
                                 "type": "string",
                                 "enum": ["auto", "fast", "quality"],
                                 "description": "Backend bias for this subtask: 'fast', 'quality', or 'auto' (default)."
+                            },
+                            "schema": {
+                                "type": "object",
+                                "description": "Optional JSON Schema for THIS subtask. When set, the worker's final answer is grammar-constrained to a single JSON value matching it (guaranteed-parseable, no prose). Omit for a normal prose answer."
                             }
                         },
                         "required": ["instructions"]
@@ -595,6 +621,7 @@ async fn proxy_run(
     context: Option<&str>,
     thinking: &str,
     tier: &str,
+    schema: Option<&serde_json::Value>,
 ) -> Option<Result<String, String>> {
     let (base, token) = proxy_base()?;
     // Short connect timeout to fast-detect "app not listening" (→ `None` →
@@ -621,6 +648,9 @@ async fn proxy_run(
         "thinking": thinking,
         "tier": tier,
         "cwd": cwd,
+        // V21 F9: forward the JSON Schema so the warm app constrains the final
+        // turn. Omitted (null, `serde(default)` on the app side) when unset.
+        "schema": schema,
     });
     let mut resp = match client
         .post(format!("{base}/run"))
@@ -1050,6 +1080,7 @@ async fn run_offload(
     context: Option<String>,
     thinking: ThinkingMode,
     tier: TierHint,
+    schema: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let settings = current_offload_settings();
@@ -1116,6 +1147,7 @@ async fn run_offload(
         .enumerate()
         .map(|(i, b)| BackendView {
             name: b.name.clone(),
+            base_url: b.base_url.clone(),
             ready: probed[i].0,
             cloud_blocked: b.cloud_blocked,
             n_ctx: probed[i].1,
@@ -1143,14 +1175,16 @@ async fn run_offload(
 
     let result = run_on_backend(
         &client, &settings, &cwd, &resolved[chosen], &views[chosen], &instructions,
-        context.clone(), thinking,
+        context.clone(), thinking, schema.clone(),
     )
     .await;
 
     // Single re-route on a connection-class failure: drop the failed
-    // backend and re-select among the rest (fail-over).
-    match result {
-        Ok(text) => Ok(text),
+    // backend and re-select among the rest (fail-over). `active` tracks which
+    // backend actually served the run, so F5 escalation reasons about the right
+    // tier.
+    let (result, active) = match result {
+        Ok(text) => (Ok(text), chosen),
         Err(e) if is_connection_error(&e) && views.len() > 1 => {
             let mut alt_views = views.clone();
             alt_views[chosen].ready = false; // exclude the failed backend
@@ -1161,17 +1195,48 @@ async fn run_offload(
                         reroute = %resolved[next].name,
                         "offload: re-routing after connection failure"
                     );
-                    run_on_backend(
+                    let r = run_on_backend(
                         &client, &settings, &cwd, &resolved[next], &views[next],
-                        &instructions, context, thinking,
+                        &instructions, context.clone(), thinking, schema.clone(),
                     )
-                    .await
+                    .await;
+                    (r, next)
                 }
-                _ => Err(e),
+                _ => (Err(e), chosen),
             }
         }
-        Err(e) => Err(e),
+        Err(e) => (Err(e), chosen),
+    };
+
+    // V21 F5 — tier escalation (fallback path): mirrors the app service. A
+    // fast-tier run that came back only partially verified re-runs once on a
+    // distinct, ready quality backend; quality wins, a failed escalation keeps
+    // the fast answer. Inert without a second, quality-tier backend and gated by
+    // `escalate_partial`; `escalation_target` blocks quality→quality and
+    // same-instance re-runs, and the single call bounds it to one escalation.
+    let want_escalate = settings.escalate_partial
+        && result
+            .as_ref()
+            .map(|t| agent::answer_verified_level(t) == agent::VerifiedLevel::Partially)
+            .unwrap_or(false);
+    if want_escalate {
+        if let Some(q) = router::escalation_target(&views, &req, active) {
+            tracing::info!(
+                from = %resolved[active].name,
+                to = %resolved[q].name,
+                "offload: escalating partially-verified fast-tier answer to the quality backend"
+            );
+            let esc = run_on_backend(
+                &client, &settings, &cwd, &resolved[q], &views[q],
+                &instructions, context.clone(), thinking, schema.clone(),
+            )
+            .await;
+            if let Ok(q_text) = esc {
+                return Ok(agent::append_escalation_note(&q_text));
+            }
+        }
     }
+    result
 }
 
 /// Run the agent loop against one chosen backend with its tool scope, auth,
@@ -1186,6 +1251,7 @@ async fn run_on_backend(
     instructions: &str,
     context: Option<String>,
     thinking: ThinkingMode,
+    schema: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let ctx = ToolCtx::new(
         settings.allowed_roots.clone(),
@@ -1213,6 +1279,7 @@ async fn run_on_backend(
         instructions: instructions.to_string(),
         context: context.clone(),
         thinking,
+        schema: schema.clone(),
     };
     let secs = settings.offload_timeout_secs.max(30);
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -1234,6 +1301,7 @@ async fn run_on_backend(
                 instructions: instructions.to_string(),
                 context,
                 thinking: ThinkingMode::Auto,
+                schema,
             };
             let deadline = Instant::now() + Duration::from_secs(secs);
             agent::run(client, &cfg, &router, task, deadline, None, &cancel).await
@@ -1286,6 +1354,50 @@ mod tests {
         assert_eq!(
             parse_run_line(b"{\"ok\":false}"),
             Some(Err("offload failed".to_string()))
+        );
+    }
+
+    #[test]
+    fn schema_arg_accepts_objects_only() {
+        // An object schema is threaded through verbatim.
+        let obj = json!({ "type": "object", "properties": { "count": { "type": "integer" } } });
+        let args = json!({ "instructions": "x", "schema": obj });
+        assert_eq!(schema_arg(&args), Some(obj));
+        // Non-object hints (string/array/null) or an absent key degrade to None
+        // (a normal prose run), never an error.
+        assert_eq!(schema_arg(&json!({ "schema": "not-a-schema" })), None);
+        assert_eq!(schema_arg(&json!({ "schema": [1, 2, 3] })), None);
+        assert_eq!(schema_arg(&json!({ "schema": null })), None);
+        assert_eq!(schema_arg(&json!({ "instructions": "x" })), None);
+    }
+
+    #[test]
+    fn batch_threads_per_subtask_schemas() {
+        // Mirror `handle_batch_tool`'s per-subtask parse: each subtask carries
+        // its own (independent) schema, and one without a schema stays prose.
+        let tasks = json!([
+            { "instructions": "count", "schema": { "type": "object" } },
+            { "instructions": "summarize" },
+            { "instructions": "list", "schema": { "type": "array" } },
+        ]);
+        let arr = tasks.as_array().unwrap();
+        let schemas: Vec<Option<Value>> = arr.iter().map(schema_arg).collect();
+        assert_eq!(schemas[0], Some(json!({ "type": "object" })));
+        assert_eq!(schemas[1], None);
+        assert_eq!(schemas[2], Some(json!({ "type": "array" })));
+    }
+
+    #[test]
+    fn tool_descriptors_advertise_schema_param() {
+        let single = offload_task_tool();
+        assert!(
+            single["inputSchema"]["properties"]["schema"].is_object(),
+            "offload_task must advertise the optional schema param"
+        );
+        let batch = offload_batch_tool();
+        assert!(
+            batch["inputSchema"]["properties"]["tasks"]["items"]["properties"]["schema"].is_object(),
+            "offload_batch subtasks must advertise the optional schema param"
         );
     }
 }

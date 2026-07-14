@@ -82,6 +82,10 @@ pub const SKIP_DIRS: &[&str] = &[
 /// `target`, `node_modules` — and lets the gitignore-aware `reindex_paths` pass
 /// filter everything else. Kept beside [`SKIP_DIRS`] so the two sets' divergence
 /// is an intentional, reviewable decision rather than accidental drift.
+///
+/// The watcher additionally skips the graph's own store subdir (`.cimp` by
+/// default — a runtime setting, so it can't live in this const); see
+/// `graph::watcher::all_paths_skippable` for why that filter is load-bearing.
 pub const WATCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
 /// Why a confinement check failed.

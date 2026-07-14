@@ -810,7 +810,7 @@ impl GraphService {
     }
 
     /// The configured per-project db subdirectory (default `.cimp`).
-    fn db_subdir(&self) -> String {
+    pub(super) fn db_subdir(&self) -> String {
         self.settings.current().graph.effective_db_subdir()
     }
 
@@ -2807,6 +2807,78 @@ impl GraphService {
         Ok(stats)
     }
 
+    /// Kick a non-blocking `graph.ignore` resync of every known root (one
+    /// worker thread per root). Called by `settings_update` when the effective
+    /// glob list changes: newly-excluded files are dropped from the index,
+    /// newly-included ones are indexed. A full rebuild would also converge,
+    /// but its in-flight guard SKIPS (not queues) a second trigger, so rapid
+    /// edits could leave the final list unapplied — these passes instead
+    /// serialize on the store write-lock and each reads the settings fresh,
+    /// so the last edit always wins.
+    pub fn spawn_ignore_resync(self: &Arc<Self>) {
+        let roots: Vec<PathBuf> = self.status.lock().unwrap().keys().cloned().collect();
+        for root in roots {
+            let this = self.clone();
+            let spawned = std::thread::Builder::new()
+                .name("cimp-graph-ignore".into())
+                .spawn(move || match this.ignore_resync_blocking(&root) {
+                    Ok((removed, added)) => {
+                        if removed > 0 || added > 0 {
+                            info!(
+                                root = %root.display(),
+                                removed,
+                                added,
+                                "graph: ignore resync applied"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(root = %root.display(), error = %e, "graph: ignore resync failed");
+                    }
+                });
+            if let Err(e) = spawned {
+                warn!(error = %e, "graph: failed to spawn ignore-resync thread");
+            }
+        }
+    }
+
+    /// Synchronous body of the ignore resync: [`resync_tree`] under the store
+    /// write-lock, then the same post-index bookkeeping as a watcher batch
+    /// (churn refresh, status counts, embedding backfill).
+    fn ignore_resync_blocking(self: &Arc<Self>, root: &Path) -> AppResult<(u64, u64)> {
+        let snap = self.settings.current().graph;
+        if !snap.enabled {
+            return Ok((0, 0));
+        }
+        let idx = self.index_for(root)?;
+        let w = self.write_guard();
+        let (removed, added, added_rels) = resync_tree(&idx, root, &snap, &self.db_subdir())?;
+        if !added_rels.is_empty() {
+            if let Ok(churn) = super::gitmeta::collect_for(root, &added_rels) {
+                let _ = idx.put_commit_touches(&churn);
+            }
+        }
+        drop(w);
+
+        if removed > 0 || added > 0 {
+            if let Ok(stats) = idx.stats() {
+                self.patch_status(root, |s| {
+                    // Same discipline as `reindex_paths`: a concurrent full
+                    // rebuild owns the final `building` → `ready` transition.
+                    if !s.building {
+                        s.state = "ready".into();
+                    }
+                    s.files = stats.files;
+                    s.symbols = stats.symbols;
+                    s.edges = stats.edges;
+                    s.langs = stats.by_lang.clone();
+                });
+            }
+            self.spawn_backfill(root.to_path_buf());
+        }
+        Ok((removed, added))
+    }
+
     /// Start the Phase-D fs-watcher for `root` (idempotent; a no-op if already
     /// watching or the feature is disabled). Incremental re-indexes flow
     /// through [`reindex_paths`](Self::reindex_paths). Independent of the
@@ -2862,7 +2934,7 @@ impl GraphService {
         };
         let sub = self.db_subdir();
         let max_bytes = snap.max_file_bytes.max(1);
-        let gi = build_gitignore(root, &paths);
+        let gi = build_gitignore(root, &paths, &snap.ignore);
 
         let _w = self.write_guard();
         let mut changed = 0u64;
@@ -3587,6 +3659,85 @@ fn build_walker(root: &Path, snap: &GraphSettings) -> ignore::Walk {
     wb.build()
 }
 
+/// Reconcile the store with the CURRENT `graph.ignore` globs without a full
+/// rebuild: drop every indexed file the globs now exclude, then (hash-skip)
+/// index every eligible file they no longer exclude. Unlike [`build_tree`]
+/// there's no `reset()`, so unchanged files keep their rows and vectors.
+/// Returns `(removed, added, added_rels)`.
+///
+/// Two passes because they answer different questions: the walker below can
+/// only visit files that exist OUTSIDE ignored trees — it can never say "this
+/// stored row is now ignored" — so pass 1 tests each stored path against the
+/// glob matcher directly, and pass 2 is the same walk as a full rebuild
+/// (which honors the new globs via its overrides) with a stored-hash check so
+/// an already-indexed unchanged file costs one read+hash, not a re-parse.
+fn resync_tree(
+    idx: &GraphIndex,
+    root: &Path,
+    snap: &GraphSettings,
+    db_subdir: &str,
+) -> AppResult<(u64, u64, Vec<String>)> {
+    let matcher = gitignore_from_globs(root, &snap.ignore);
+    let mut removed = 0u64;
+    for rel in idx.all_file_paths()? {
+        let abs = root.join(&rel);
+        if matcher.matched_path_or_any_parents(&abs, false).is_ignore()
+            && idx.remove_file(&rel).is_ok()
+        {
+            removed += 1;
+        }
+    }
+
+    let max_bytes = snap.max_file_bytes.max(1);
+    let mut added = 0u64;
+    let mut added_rels: Vec<String> = Vec::new();
+    for entry in build_walker(root, snap) {
+        let Ok(entry) = entry else { continue };
+        if entry.file_type().map(|t| !t.is_file()).unwrap_or(true) {
+            continue;
+        }
+        let path = entry.path();
+        if path.components().any(|c| c.as_os_str() == db_subdir) {
+            continue;
+        }
+        let Some(lang) = lang_for(path, &snap.languages) else {
+            continue;
+        };
+        if lang == Lang::Markdown && !snap.index_docs {
+            continue;
+        }
+        match entry.metadata() {
+            Ok(m) if m.len() > max_bytes => continue,
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let rel = rel_path(root, path);
+        if idx.stored_file_hash(&rel).ok().flatten().as_deref()
+            == Some(super::model::fnv1a_hex(&src).as_str())
+        {
+            continue;
+        }
+        let fg = parse_file(&rel, &src, lang);
+        if let Err(e) = idx.index_file_graph(&fg) {
+            debug!(file = %rel, error = %e, "graph: ignore-resync index failed (skipped)");
+            continue;
+        }
+        added += 1;
+        added_rels.push(rel);
+    }
+
+    if removed > 0 || added > 0 {
+        let _ = idx.prune_orphan_vectors();
+        let _ = idx.prune_orphan_code_vectors();
+        let _ = idx.prune_orphan_digests();
+    }
+    Ok((removed, added, added_rels))
+}
+
 /// Outcome of [`index_dir_tree`] for one moved-in/created directory.
 enum DirWalk {
     /// Walked and indexed inline: how many files changed, and their rel paths
@@ -3843,7 +3994,13 @@ fn lang_for(path: &Path, languages: &[String]) -> Option<Lang> {
 /// `src/gen/.gitignore`) is honored, not just the root one. Only the dirs
 /// touched by this batch are scanned, so it stays cheap. An empty matcher
 /// (missing/invalid files) simply ignores nothing.
-fn build_gitignore(root: &Path, paths: &[PathBuf]) -> Gitignore {
+///
+/// `extra` is the settings `graph.ignore` globs, appended AFTER the
+/// `.gitignore` files (so, per last-match-wins, they take precedence).
+/// Without them the watcher path disagreed with `build_walker`: a file
+/// excluded only by the settings globs was re-indexed on its next save,
+/// silently undoing the exclusion until the next full rebuild.
+fn build_gitignore(root: &Path, paths: &[PathBuf], extra: &[String]) -> Gitignore {
     let mut b = ignore::gitignore::GitignoreBuilder::new(root);
     let mut dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     dirs.insert(root.to_path_buf());
@@ -3865,6 +4022,30 @@ fn build_gitignore(root: &Path, paths: &[PathBuf]) -> Gitignore {
         if gi.is_file() {
             let _ = b.add(gi);
         }
+    }
+    for pat in extra {
+        let pat = pat.trim();
+        if pat.is_empty() {
+            continue;
+        }
+        let _ = b.add_line(None, pat);
+    }
+    b.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+/// A gitignore-semantics matcher built from the settings `graph.ignore` globs
+/// alone (rooted at `root`) — the same lines `build_walker` feeds its
+/// overrides, so the resync drop-pass and the walk agree on what's excluded.
+/// `!` re-includes work natively (whitelist lines); invalid or empty globs are
+/// skipped like everywhere else.
+fn gitignore_from_globs(root: &Path, globs: &[String]) -> Gitignore {
+    let mut b = ignore::gitignore::GitignoreBuilder::new(root);
+    for pat in globs {
+        let pat = pat.trim();
+        if pat.is_empty() {
+            continue;
+        }
+        let _ = b.add_line(None, pat);
     }
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
@@ -3912,6 +4093,42 @@ mod tests {
         let (_, stats2) = build_tree(&idx, &dir, &snap, sub).expect("rebuild2");
         assert_eq!(stats2.files, 1);
         assert!(idx.find_symbol("gamma").unwrap().is_empty());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `graph.ignore` resync (a Settings edit) in both directions: adding
+    /// a glob drops the matching indexed file WITHOUT a reset (the untouched
+    /// neighbor's rows survive), removing the glob indexes the file again —
+    /// and only it, since the hash-skip spares the unchanged neighbor.
+    #[test]
+    fn ignore_resync_drops_and_restores() {
+        let dir = std::env::temp_dir().join(format!("ckg-ign-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("gen")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(dir.join("gen/out.rs"), "pub fn generated() {}\n").unwrap();
+
+        let sub = ".ckg-test";
+        let mut snap = GraphSettings::default();
+        let idx = GraphIndex::open(&dir, sub).expect("open");
+        build_tree(&idx, &dir, &snap, sub).expect("build");
+        assert!(!idx.find_symbol("generated").unwrap().is_empty());
+
+        // Ignore `/gen/`: its file's rows drop, the neighbor's survive.
+        snap.ignore = vec!["/gen/".to_string()];
+        let (removed, added, _) = resync_tree(&idx, &dir, &snap, sub).expect("resync drop");
+        assert_eq!((removed, added), (1, 0));
+        assert!(idx.find_symbol("generated").unwrap().is_empty());
+        assert!(!idx.find_symbol("alpha").unwrap().is_empty());
+
+        // Un-ignore: the file is indexed again — and ONLY it (hash-skip).
+        snap.ignore.clear();
+        let (removed2, added2, rels) = resync_tree(&idx, &dir, &snap, sub).expect("resync add");
+        assert_eq!((removed2, added2), (0, 1));
+        assert_eq!(rels, vec!["gen/out.rs".to_string()]);
+        assert!(!idx.find_symbol("generated").unwrap().is_empty());
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3982,7 +4199,7 @@ mod tests {
         let idx = GraphIndex::open(&dir, sub).expect("open");
 
         // Same matcher construction as `reindex_paths` for this batch.
-        let gi = build_gitignore(&dir, &[dir.join("dist/assets")]);
+        let gi = build_gitignore(&dir, &[dir.join("dist/assets")], &[]);
 
         // The dir itself and any subdir of it must both be no-ops.
         for target in ["dist", "dist/assets"] {

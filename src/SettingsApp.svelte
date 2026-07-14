@@ -50,7 +50,8 @@
     type BackendStatus,
     type ServiceStatus,
   } from './lib/offload';
-  import { graphRebuild, graphStatus, type GraphStatus } from './lib/graph';
+  import { graphIgnorePick, graphRebuild, graphStatus, type GraphStatus } from './lib/graph';
+  import ArrayEditor from './lib/settings/ArrayEditor.svelte';
   import type {
     OffloadBackend,
     ToolScope,
@@ -150,6 +151,27 @@
       graphStatuses = await graphStatus();
     } catch {
       graphStatuses = [];
+    }
+  }
+  // Ignore-list editing: keystrokes only mutate the local snapshot (via
+  // ArrayEditor's bind), and the backend save happens on commit boundaries
+  // (blur/Enter/row-remove) — the same edit-vs-commit split the MCP servers
+  // editor uses, so per-keystroke saves can't fire an index resync per char.
+  function commitGraphIgnore(): void {
+    if (!snapshot) return;
+    void applySettings($state.snapshot(snapshot));
+  }
+  // "Add file…" / "Add folder…": native picker → project-relative glob,
+  // appended and committed in one step. Cancel (null) changes nothing.
+  async function addGraphIgnorePick(folder: boolean): Promise<void> {
+    try {
+      const glob = await graphIgnorePick(folder);
+      if (!glob) return;
+      patch((s) => {
+        if (!s.graph.ignore.includes(glob)) s.graph.ignore.push(glob);
+      });
+    } catch (e) {
+      console.error('graph_ignore_pick failed', e);
     }
   }
   async function runGraphRebuild(): Promise<void> {
@@ -4217,6 +4239,29 @@
                   )}
               />
             </label>
+
+            <h3>Ignored files & folders</h3>
+            <small class="hint">
+              Gitignore-style globs, relative to the project root (e.g.
+              <code>/docs/generated/</code>, <code>*.snap</code>,
+              <code>!keep-this.md</code>). Applied on top of your
+              <code>.gitignore</code>. Changes take effect immediately: newly
+              ignored files are dropped from the index, un-ignored ones are
+              indexed.
+            </small>
+            <ArrayEditor
+              bind:items={snapshot.graph.ignore}
+              placeholder="e.g. /vendor/ or *.gen.ts"
+              oncommit={commitGraphIgnore}
+            />
+            <div class="button-row">
+              <button type="button" class="secondary" onclick={() => addGraphIgnorePick(false)}>
+                Add file…
+              </button>
+              <button type="button" class="secondary" onclick={() => addGraphIgnorePick(true)}>
+                Add folder…
+              </button>
+            </div>
 
             <h3>Semantic search</h3>
             <label class="checkbox">

@@ -5,6 +5,36 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.1] — 2026-07-15
+
+### Fixed
+
+- **Graph stuck in "building": the index's own store writes re-triggered
+  rebuilds forever.** A full rebuild commits one transaction per indexed file
+  into `<root>/.cimp/graph.db`, and the SQLite journal churn from a large
+  project (observed: 885 files ≈ >4096 fs events) overflowed the watcher's
+  bounded channel while the debounce thread sat blocked on the store
+  write-lock the rebuild itself held — and the overflow "recovery" is a full
+  rebuild, whose writes overflowed the channel again, looping indefinitely
+  (~75 s per cycle, status pinned at `building`). The watcher callback now
+  drops events under the graph's store subdir at the source (like `.git`/
+  `target`/`node_modules`), and an overflow-triggered rebuild is logged at
+  INFO so the next such loop is visible in default logs.
+
+### Added
+
+- **Settings → Code Intelligence: "Ignored files & folders" editor.** The
+  `graph.ignore` globs (previously config-file-only) are now editable in the
+  Settings UI: add/edit/remove gitignore-style rows manually, or pick a file/
+  folder via the native explorer dialog ("Add file…"/"Add folder…", new
+  `graph_ignore_pick` command on `rfd`) — picks land as root-relative anchored
+  globs (`/docs/gen/`). Changes apply to the live index immediately without a
+  full rebuild: a resync pass drops newly-ignored files' rows and (hash-skip)
+  indexes newly un-ignored ones, converging on the last edit even under rapid
+  changes. Also fixed on the way: the incremental watcher path now honors
+  `graph.ignore` (previously only `.gitignore`), so saving an ignored file no
+  longer silently re-indexes it.
+
 ## [0.42.0] — 2026-07-13
 
 ### Fixed

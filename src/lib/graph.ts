@@ -60,6 +60,13 @@ export function graphRebuildEmbeddings(root?: string): Promise<void> {
   return invoke<void>('graph_rebuild_embeddings', { root: root ?? null });
 }
 
+/// Open a native file/folder picker and return a project-relative
+/// gitignore-style glob for the selection (anchored `/…`, trailing `/` for
+/// folders), or null when the user cancels.
+export function graphIgnorePick(folder: boolean): Promise<string | null> {
+  return invoke<string | null>('graph_ignore_pick', { folder });
+}
+
 /// Pause/resume the incremental fs-watcher re-indexing. Returns the new state.
 export function graphSetWatchPaused(paused: boolean): Promise<boolean> {
   return invoke<boolean>('graph_set_watch_paused', { paused });

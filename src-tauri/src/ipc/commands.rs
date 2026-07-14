@@ -847,6 +847,7 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
 #[tauri::command]
 pub async fn settings_update(
     state: State<'_, AppState>,
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     mut settings: Settings,
 ) -> AppResult<()> {
     // Re-point bundled avatar videos at the (possibly just-changed) theme's
@@ -869,11 +870,12 @@ pub async fn settings_update(
     ];
 
     // Snapshot the pre-update flags (reserved tabs via the table, plus the
-    // STT pair handled separately below).
-    let (was_reserved, was_stt, was_stt_device) = {
+    // STT pair handled separately below) and the effective `graph.ignore`
+    // list for the resync edge at the bottom.
+    let (was_reserved, was_stt, was_stt_device, was_graph_ignore) = {
         let old = state.settings.current();
         let was: Vec<bool> = RESERVED_TAB_FLAGS.iter().map(|(_, flag)| flag(&old)).collect();
-        (was, old.stt.enabled, old.stt.device)
+        (was, old.stt.enabled, old.stt.device, normalized_ignore(&old.graph.ignore))
     };
 
     // The Settings window holds a full snapshot and replaces wholesale, but it
@@ -934,7 +936,27 @@ pub async fn settings_update(
             }
         }
     }
+
+    // On an effective `graph.ignore` edge, reconcile the live index: drop
+    // newly-excluded files, index newly-included ones. Compared normalized
+    // (trimmed, empties out) but ORDER-SENSITIVE — gitignore semantics are
+    // last-match-wins, so reordering `!` re-includes is a real change. The
+    // resync is a no-op walk when the edit doesn't affect any indexed file.
+    if now.graph.enabled && normalized_ignore(&now.graph.ignore) != was_graph_ignore {
+        graph.spawn_ignore_resync();
+    }
     Ok(())
+}
+
+/// `graph.ignore` as the backend effectively applies it: trimmed, empty lines
+/// dropped (the Settings editor's just-added blank row is not a change).
+fn normalized_ignore(globs: &[String]) -> Vec<String> {
+    globs
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 // ── V8-01 local task offload ────────────────────────────────────────────
@@ -1255,6 +1277,70 @@ pub async fn graph_rebuild(
     };
     service.spawn_rebuild(root);
     Ok(())
+}
+
+/// Open a native file/folder picker for the Settings "Ignore" editor and
+/// return a gitignore-style glob for the selection: project-relative and
+/// anchored with a leading `/` when the pick lies under a known graph root
+/// (longest root wins), with a trailing `/` for folders. `None` when the user
+/// cancels. A pick outside every root falls back to the absolute path
+/// (forward slashes) — it won't match anything, but it lands visibly in the
+/// editor where the user can correct it, rather than being silently dropped.
+#[tauri::command]
+pub async fn graph_ignore_pick(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    folder: bool,
+) -> AppResult<Option<String>> {
+    let start = std::env::current_dir().ok();
+    // rfd's sync dialog blocks its thread (native message pump) — keep it off
+    // the async runtime's core threads.
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        let mut d = rfd::FileDialog::new().set_title(if folder {
+            "Choose a folder for the graph to ignore"
+        } else {
+            "Choose a file for the graph to ignore"
+        });
+        if let Some(s) = start {
+            d = d.set_directory(s);
+        }
+        if folder {
+            d.pick_folder()
+        } else {
+            d.pick_file()
+        }
+    })
+    .await
+    .map_err(|e| AppError::Settings(format!("picker task: {e}")))?;
+    let Some(path) = picked else { return Ok(None) };
+
+    let mut roots: Vec<std::path::PathBuf> =
+        service.statuses().iter().map(|s| std::path::PathBuf::from(&s.root)).collect();
+    // The launch dir is the primary project even before its first build.
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    Ok(Some(to_ignore_glob(&path, folder, &roots)))
+}
+
+/// Turn a picked absolute path into the `graph.ignore` glob `graph_ignore_pick`
+/// returns (see its doc for the shape). Split out for testability.
+fn to_ignore_glob(path: &std::path::Path, is_dir: bool, roots: &[std::path::PathBuf]) -> String {
+    // Longest matching root wins so a nested root maps to the shorter rel.
+    let rel = roots
+        .iter()
+        .filter(|r| path.starts_with(r))
+        .max_by_key(|r| r.components().count())
+        .and_then(|r| path.strip_prefix(r).ok());
+    let mut glob = match rel {
+        // Leading `/` anchors to the project root: the user picked THIS
+        // `docs/`, not every directory named `docs` at any depth.
+        Some(rel) => format!("/{}", rel.to_string_lossy().replace('\\', "/")),
+        None => path.to_string_lossy().replace('\\', "/"),
+    };
+    if is_dir && !glob.ends_with('/') {
+        glob.push('/');
+    }
+    glob
 }
 
 /// V9-01 Phase G: force a full re-embed of the project's doc chunks (drops the
@@ -2760,6 +2846,43 @@ mod tests {
     use super::is_automatic_terminal_response as auto_reply;
     use super::apply_incoming_settings;
     use crate::settings::{PromptTemplate, Settings};
+
+    /// `graph_ignore_pick`'s glob shaping: root-relative + `/`-anchored with
+    /// forward slashes, trailing `/` for folders, longest root wins, and an
+    /// out-of-root pick falls back to the absolute path. Built with `join` so
+    /// the separators are the platform's, like a real picker result.
+    #[test]
+    fn to_ignore_glob_relativizes_and_anchors() {
+        let root = std::env::temp_dir().join("ckg-pick-proj");
+        let nested = root.join("nested");
+        let roots = vec![root.clone(), nested.clone()];
+
+        let file = root.join("src").join("a.rs");
+        assert_eq!(super::to_ignore_glob(&file, false, &roots), "/src/a.rs");
+
+        let dir = root.join("docs").join("gen");
+        assert_eq!(super::to_ignore_glob(&dir, true, &roots), "/docs/gen/");
+
+        // Under BOTH roots → the longer (nested) one wins.
+        let in_nested = nested.join("x.md");
+        assert_eq!(super::to_ignore_glob(&in_nested, false, &roots), "/x.md");
+
+        // Outside every root → absolute fallback with forward slashes.
+        let outside = std::env::temp_dir().join("ckg-pick-other").join("f.txt");
+        assert_eq!(
+            super::to_ignore_glob(&outside, false, &roots),
+            outside.to_string_lossy().replace('\\', "/")
+        );
+    }
+
+    /// The resync edge fires on real changes only: trimming and blank rows
+    /// (the editor's just-added empty line) don't count, order does.
+    #[test]
+    fn normalized_ignore_drops_blanks_keeps_order() {
+        let norm = |v: &[&str]| super::normalized_ignore(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(norm(&["/gen/", "", "  ", " *.snap "]), vec!["/gen/", "*.snap"]);
+        assert_ne!(norm(&["/gen/", "!keep"]), norm(&["!keep", "/gen/"]));
+    }
 
     // V14 code-review FIX 1 (HIGH, data loss): `prompt_templates` /
     // `templates_seeded` are written out-of-band by

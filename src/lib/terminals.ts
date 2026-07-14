@@ -353,7 +353,8 @@ function installAiMouseControl(
     // tab): let xterm scroll its own scrollback as usual.
     if (appModes.size === 0) return true;
     if (e.deltaY === 0) return true;
-    const seq = wheelSequence(e.deltaY < 0, appModes);
+    const { col, row } = wheelCell(term, e);
+    const seq = wheelSequence(e.deltaY < 0, appModes, col, row);
     // One notch per DOM wheel event for a mouse; for high-resolution (pixel)
     // deltas — trackpads — send a few proportional notches, capped so a fast
     // flick can't flood the PTY.
@@ -373,22 +374,43 @@ function installAiMouseControl(
 }
 
 /**
- * V20: encode a single mouse-wheel notch the way a TUI expects it. Wheel-up is
- * button 64, wheel-down 65. We report a fixed cell (1;1) — Claude/OpenCode
- * scroll the transcript regardless of the wheel's grid coordinate. Uses the SGR
- * (1006) encoding when the app enabled it, else the legacy X10 form (each byte
- * offset by 32).
+ * V20: the terminal cell under a wheel event, 1-based. TUIs that hit-test the
+ * wheel by coordinate (OpenCode routes it to the pane under the pointer;
+ * a fixed (1;1) lands on chrome that doesn't scroll) need the real cell.
+ * Falls back to (1;1) when the screen element isn't measurable.
  */
-function wheelSequence(up: boolean, appModes: Set<number>): string {
+function wheelCell(term: Terminal, e: WheelEvent): { col: number; row: number } {
+  const screen = term.element?.querySelector('.xterm-screen');
+  const rect = screen?.getBoundingClientRect();
+  if (!rect || rect.width <= 0 || rect.height <= 0) return { col: 1, row: 1 };
+  const clamp = (v: number, max: number): number => Math.min(max, Math.max(1, v));
+  return {
+    col: clamp(Math.ceil(((e.clientX - rect.left) / rect.width) * term.cols), term.cols),
+    row: clamp(Math.ceil(((e.clientY - rect.top) / rect.height) * term.rows), term.rows),
+  };
+}
+
+/**
+ * V20: encode a single mouse-wheel notch the way a TUI expects it. Wheel-up is
+ * button 64, wheel-down 65, reported at the given cell — OpenCode scrolls the
+ * pane under the pointer, so the coordinate matters (Claude scrolls the
+ * transcript regardless). Uses the SGR (1006) encoding when the app enabled
+ * it, else the legacy X10 form (each byte offset by 32, coords capped at its
+ * 223 maximum).
+ */
+function wheelSequence(
+  up: boolean,
+  appModes: Set<number>,
+  col: number,
+  row: number,
+): string {
   const button = up ? 64 : 65;
-  const col = 1;
-  const row = 1;
   if (appModes.has(1006)) {
     return `\x1b[<${button};${col};${row}M`;
   }
   return `\x1b[M${String.fromCharCode(32 + button)}${String.fromCharCode(
-    32 + col,
-  )}${String.fromCharCode(32 + row)}`;
+    32 + Math.min(col, 223),
+  )}${String.fromCharCode(32 + Math.min(row, 223))}`;
 }
 
 function fitAndResize(entry: TerminalEntry): void {

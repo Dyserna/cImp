@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecursiveMode, Watcher};
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::service::GraphService;
 
@@ -43,6 +43,7 @@ pub fn start(
     let (tx, rx) = sync_channel::<notify::Result<notify::Event>>(CHANNEL_CAP);
     let overflow = Arc::new(AtomicBool::new(false));
     let cb_overflow = overflow.clone();
+    let store_subdir = service.db_subdir();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = &res {
             // Drop events that can never change indexed content, at the source.
@@ -57,13 +58,7 @@ pub fn start(
             // The deliberately minimal hot-path subset (see the const's docs):
             // skipping build/vendor dirs here could drop events for source that
             // legitimately lives under them, so this is NOT the broad SKIP_DIRS.
-            if !ev.paths.is_empty()
-                && ev.paths.iter().all(|p| {
-                    p.components().any(|c| {
-                        crate::fsutil::WATCH_SKIP_DIRS.contains(&c.as_os_str().to_str().unwrap_or(""))
-                    })
-                })
-            {
+            if all_paths_skippable(&ev.paths, &store_subdir) {
                 return;
             }
         }
@@ -123,6 +118,7 @@ pub fn start(
                 // risk a silently stale index. The rebuild covers everything, so
                 // the incremental batch is redundant this round.
                 if overflow.swap(false, Ordering::Relaxed) {
+                    info!(root = %root.display(), "graph: watch channel overflowed — full rebuild to recover");
                     service.spawn_rebuild(root.clone());
                 } else if !paths.is_empty() {
                     service.reindex_paths(&root, paths.into_iter().collect());
@@ -134,6 +130,28 @@ pub fn start(
         .map_err(|e| notify::Error::generic(&format!("spawn graph watch thread: {e}")))?;
 
     Ok(watcher)
+}
+
+/// True when every path in the event lies inside a directory the watcher must
+/// never react to: the hot-path skip set ([`crate::fsutil::WATCH_SKIP_DIRS`])
+/// or the graph's own store subdir (`.cimp` by default). The store filter is
+/// load-bearing, not an optimization: a full rebuild commits one transaction
+/// per indexed file into `<root>/<subdir>/graph.db`, and SQLite's journal
+/// create/write/delete cycle turns that into thousands of fs events *inside
+/// the watched root*. On a large project those events overflow the bounded
+/// channel while the debounce thread sits blocked on the store write-lock the
+/// rebuild itself holds — and the overflow "recovery" then spawns the next
+/// full rebuild, whose writes overflow the channel again: an endless
+/// `building` loop. (`reindex_paths` skipping store paths later can't help;
+/// the overflow fires before any batch-level filtering.)
+fn all_paths_skippable(paths: &[PathBuf], store_subdir: &str) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|p| {
+            p.components().any(|c| {
+                let name = c.as_os_str().to_str().unwrap_or("");
+                name == store_subdir || crate::fsutil::WATCH_SKIP_DIRS.contains(&name)
+            })
+        })
 }
 
 /// Fold one fs event's paths into the pending set, skipping pure access
@@ -157,5 +175,53 @@ fn collect(res: notify::Result<notify::Event>, into: &mut HashSet<PathBuf>) {
             }
         }
         Err(e) => debug!(error = %e, "graph: watch event error (ignored)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// Regression (2026-07-14): the graph store's own writes must be dropped at
+    /// the callback. An 885-file project's rebuild emitted >4096 journal events
+    /// under `.cimp\`, overflowed the channel, and re-triggered a full rebuild
+    /// forever ("stuck in building").
+    #[test]
+    fn store_subdir_events_are_skippable() {
+        assert!(all_paths_skippable(
+            &[p(r"P:\proj\.cimp\graph.db"), p(r"P:\proj\.cimp\graph.db-journal")],
+            ".cimp"
+        ));
+        // A renamed subdir setting is honored.
+        assert!(all_paths_skippable(&[p(r"P:\proj\.mygraph\graph.db")], ".mygraph"));
+        // ...and the default name is NOT special-cased once renamed.
+        assert!(!all_paths_skippable(&[p(r"P:\proj\.cimp\graph.db")], ".mygraph"));
+    }
+
+    #[test]
+    fn source_and_mixed_events_are_kept() {
+        // Plain source edit: must reach the channel.
+        assert!(!all_paths_skippable(&[p(r"P:\proj\src\main.rs")], ".cimp"));
+        // Mixed event (rename across a skip boundary): keep it — one indexable
+        // path makes the event relevant.
+        assert!(!all_paths_skippable(
+            &[p(r"P:\proj\.cimp\graph.db"), p(r"P:\proj\src\lib.rs")],
+            ".cimp"
+        ));
+        // Empty path list carries no skippable evidence.
+        assert!(!all_paths_skippable(&[], ".cimp"));
+    }
+
+    #[test]
+    fn hot_path_skip_dirs_still_apply() {
+        assert!(all_paths_skippable(&[p(r"P:\proj\.git\objects\ab\cd")], ".cimp"));
+        assert!(all_paths_skippable(&[p(r"P:\proj\target\debug\foo.d")], ".cimp"));
+        assert!(all_paths_skippable(&[p(r"P:\proj\node_modules\x\y.js")], ".cimp"));
+        // The broad SKIP_DIRS entries deliberately do NOT apply here.
+        assert!(!all_paths_skippable(&[p(r"P:\proj\dist\app.js")], ".cimp"));
     }
 }

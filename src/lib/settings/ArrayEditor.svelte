@@ -7,10 +7,16 @@
     items = $bindable<string[]>([]),
     placeholder = '',
     onchange,
+    oncommit,
   }: {
     items: string[];
     placeholder?: string;
     onchange?: () => void;
+    /// Fired on discrete edit boundaries only — input blur/Enter and row
+    /// removal (NOT per keystroke, and not on adding an empty row). Lets a
+    /// consumer persist on commit while `bind:items` tracks keystrokes
+    /// locally; consumers that persist via `onchange` are unaffected.
+    oncommit?: () => void;
   } = $props();
 
   function updateAt(index: number, value: string) {
@@ -23,6 +29,7 @@
   function removeAt(index: number) {
     items = items.filter((_, i) => i !== index);
     onchange?.();
+    oncommit?.();
   }
 
   function addRow() {
@@ -39,6 +46,10 @@
         value={item}
         {placeholder}
         oninput={(e) => updateAt(i, (e.currentTarget as HTMLInputElement).value)}
+        onblur={() => oncommit?.()}
+        onkeydown={(e) => {
+          if (e.key === 'Enter') oncommit?.();
+        }}
       />
       <button
         type="button"

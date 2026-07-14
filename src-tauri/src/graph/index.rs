@@ -983,6 +983,18 @@ impl GraphIndex {
         Ok(rows.rows.first().map(|r| cell_str(r, 0)))
     }
 
+    /// Every indexed file's rel path. Feeds the ignore-resync pass
+    /// (`GraphService::spawn_ignore_resync`), which must test each stored file
+    /// against the new `graph.ignore` globs to drop the now-excluded ones.
+    pub fn all_file_paths(&self) -> AppResult<Vec<String>> {
+        let rows = self.run(
+            "?[path] := *file{path}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.iter().map(|r| cell_str(r, 0)).collect())
+    }
+
     /// Files ranked by inbound-call centrality (how many call sites target a
     /// symbol defined in the file), most-central first, capped at `max`. Feeds
     /// the V11 Phase B project map. Name-keyed like the other call queries, so a

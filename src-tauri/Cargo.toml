@@ -172,6 +172,11 @@ ignore = "0.4"
 # Windows this is ReadDirectoryChangesW under the hood. Debounce + gitignore
 # filtering are done in `graph::watcher`.
 notify = "6"
+# Native file/folder picker for the Settings graph-ignore editor
+# (`graph_ignore_pick`). Win32 IFileDialog on Windows; `xdg-portal` (not gtk3)
+# on Linux so we don't link a second GTK next to Tauri's, with `tokio` as the
+# portal's async backend to match the app runtime.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 # V17 Phase A: line-level unified diffs for the read advisor's diff-substitute
 # branch (a changed-file re-read is answered with a diff against the last-read
 # snapshot, not the whole file). Pure Rust, MIT/Apache; `text` only — we don't

@@ -5,6 +5,20 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.2] — 2026-07-15
+
+### Fixed
+
+- **OpenCode tab: mouse-wheel scrolling worked only while holding Alt.** The
+  wheel forwarded to a fullscreen AI TUI was synthesized at a fixed cell
+  (1;1); OpenCode (≥1.18) hit-tests the wheel by coordinate and scrolls the
+  pane under the pointer, so top-left-corner wheels landed on non-scrolling
+  chrome and were dropped (only the hold-Alt passthrough, which encodes real
+  coordinates, scrolled). The synthesized sequence now reports the terminal
+  cell under the pointer (legacy X10 encoding capped at its 223-coordinate
+  maximum). Claude, which scrolls the transcript regardless of coordinate,
+  is unaffected.
+
 ## [0.42.1] — 2026-07-15
 
 ### Fixed

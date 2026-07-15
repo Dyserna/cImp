@@ -60,6 +60,12 @@ pub const TOOL_ACTIVITY_TAB_ID: &str = "tool-activity";
 /// integrity check, exactly like the Code Graph monitor tab). App-rendered like
 /// the monitor — no PTY.
 pub const CODE_AUDIT_TAB_ID: &str = "code-audit";
+/// V25: reserved id of the read-only, app-rendered Code Quality tab
+/// (language-gated linters / dead-code / spell-check — the Quality half of the
+/// audit registry). Materialized iff `code_audit.enabled` — one feature flag
+/// covers both audit tabs in v1 (reconciled by the integrity check, exactly
+/// like the Code Audit tab). App-rendered like the monitor — no PTY.
+pub const CODE_QUALITY_TAB_ID: &str = "code-quality";
 /// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
 /// longer a persistent builtin — it (like rustnet) launches on demand from
 /// the bottom-bar tool buttons into ordinary closable Shell tabs (uuid ids).
@@ -1002,11 +1008,16 @@ pub struct ExternalToolsSettings {
     pub broot: String,
 }
 
-/// V23 Phase A: closed set of built-in audit tools. Wire names are kebab-case
-/// (`osv-scanner` | `gitleaks` | `semgrep`). Closed — not free-form — because
-/// each id binds to a built-in adapter (Phase B); an unknown id in a settings
-/// file is *dropped* (see [`deserialize_lenient_audit_tools`]), never an error,
-/// which keeps forward-compat if a future version removes a tool.
+/// V23 Phase A / V25 Phase B: closed set of built-in audit tools. Wire names
+/// are kebab-case (`osv-scanner`, `golangci-lint`, `dotnet-analyzers`, …).
+/// Closed — not free-form — because each id binds to a built-in adapter
+/// ([`crate::audit::adapters`]); an unknown id in a settings file is *dropped*
+/// (see [`deserialize_lenient_audit_tools`]), never an error, which keeps
+/// forward-compat if a future version removes a tool.
+///
+/// The V23 trio (`osv-scanner`/`gitleaks`/`semgrep`) is the Security category;
+/// V25 adds eleven Quality-category ids (ten linters + a separate
+/// `semgrep-quality` so quality rulesets never pollute the Security section).
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuditToolId {
@@ -1016,16 +1027,56 @@ pub enum AuditToolId {
     Gitleaks,
     /// semgrep — SAST (requires Python; Windows support is beta).
     Semgrep,
+    /// oxlint — Rust-based JS/TS linter (SARIF, zero-config).
+    Oxlint,
+    /// golangci-lint — Go meta-linter (SARIF via v2 `--output.*` flags).
+    GolangciLint,
+    /// ruff — Rust-based Python linter (SARIF).
+    Ruff,
+    /// cppcheck — C/C++ static analysis (SARIF to a report file, ≥ 2.16).
+    Cppcheck,
+    /// typos — source spell checker (JSONL; the only tool valuable everywhere).
+    Typos,
+    /// ESLint — JS/TS linter, resolved project-local-first (JSON reporter).
+    Eslint,
+    /// PMD — Java static analysis (SARIF; `pmd.bat` on Windows, needs a JRE).
+    Pmd,
+    /// Roslyn analyzers via `dotnet build` (SARIF report file). Runs a real
+    /// build, so default-disabled.
+    DotnetAnalyzers,
+    /// knip — unused files/exports/dependencies for JS/TS (JSON reporter),
+    /// resolved project-local-first like ESLint.
+    Knip,
+    /// cargo-machete — unused Rust dependencies (text output).
+    CargoMachete,
+    /// semgrep with a quality ruleset (`p/best-practices`). Separate id from the
+    /// Security `semgrep`; default-disabled (registry configs need network).
+    SemgrepQuality,
 }
 
 impl AuditToolId {
     /// The bare command name resolved via `pty::resolve` (ebin → PATH) when the
-    /// per-tool `path` override is empty. Matches the wire id for all v1 tools.
+    /// per-tool `path` override is empty. Matches the wire id for most tools;
+    /// `dotnet-analyzers` invokes `dotnet` and `semgrep-quality` reuses the
+    /// `semgrep` binary.
     pub fn command_name(&self) -> &'static str {
         match self {
             AuditToolId::OsvScanner => "osv-scanner",
             AuditToolId::Gitleaks => "gitleaks",
             AuditToolId::Semgrep => "semgrep",
+            AuditToolId::Oxlint => "oxlint",
+            AuditToolId::GolangciLint => "golangci-lint",
+            AuditToolId::Ruff => "ruff",
+            AuditToolId::Cppcheck => "cppcheck",
+            AuditToolId::Typos => "typos",
+            AuditToolId::Eslint => "eslint",
+            AuditToolId::Pmd => "pmd",
+            // Roslyn analyzers run through the .NET SDK driver.
+            AuditToolId::DotnetAnalyzers => "dotnet",
+            AuditToolId::Knip => "knip",
+            AuditToolId::CargoMachete => "cargo-machete",
+            // Same binary as the Security `semgrep`, different ruleset.
+            AuditToolId::SemgrepQuality => "semgrep",
         }
     }
 }
@@ -1046,13 +1097,28 @@ pub struct AuditToolConfig {
     pub path: String,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// V25 Phase C: per-tool wall-clock timeout override in seconds. `None` (the
+    /// default) falls back to the global [`CodeAuditSettings::timeout_secs`]. A
+    /// tool that runs a real build wants a longer budget than a linter —
+    /// `dotnet-analyzers` (restores packages + compiles) is the motivating case;
+    /// a value around **1200** is recommended for it. Additive `#[serde(default)]`
+    /// so old settings files round-trip with `None` (global timeout).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 impl AuditToolConfig {
     /// A tool entry with defaults: enabled, no path override (resolve normally),
-    /// no extra args.
+    /// no extra args, global timeout.
     fn new(id: AuditToolId) -> Self {
-        Self { id, enabled: true, path: String::new(), extra_args: Vec::new() }
+        Self { id, enabled: true, path: String::new(), extra_args: Vec::new(), timeout_secs: None }
+    }
+
+    /// Same as [`new`](Self::new) but `enabled: false` — the default-disabled
+    /// tools (`dotnet-analyzers` runs a real build; `semgrep-quality` needs
+    /// network to fetch its ruleset).
+    fn disabled(id: AuditToolId) -> Self {
+        Self { id, enabled: false, path: String::new(), extra_args: Vec::new(), timeout_secs: None }
     }
 }
 
@@ -1095,14 +1161,33 @@ impl Default for CodeAuditSettings {
     }
 }
 
-/// The three v1 audit tools, all enabled and resolving ebin → PATH (empty
-/// `path`). Seeded via serde/`Default` so a fresh install lists all three; a
-/// file that carries the `tools` key (even as `[]`) keeps exactly what it has.
-fn default_audit_tools() -> Vec<AuditToolConfig> {
+/// The built-in audit tools seeded on a fresh install: the V23 Security trio
+/// plus the V25 Quality set. All resolve ebin → PATH (empty `path`). Every tool
+/// is `enabled` except `dotnet-analyzers` (runs a real build) and
+/// `semgrep-quality` (needs network for its ruleset). Seeded via serde/`Default`
+/// so a fresh install lists them all; a file that carries the `tools` key (even
+/// as `[]`) keeps exactly what it has — no schema-version bump (V23 precedent),
+/// so an existing config that already persisted the trio simply doesn't gain
+/// the Quality ids until re-seeded, which the applicability gate makes harmless.
+pub(crate) fn default_audit_tools() -> Vec<AuditToolConfig> {
     vec![
+        // Security (V23).
         AuditToolConfig::new(AuditToolId::OsvScanner),
         AuditToolConfig::new(AuditToolId::Gitleaks),
         AuditToolConfig::new(AuditToolId::Semgrep),
+        // Quality (V25) — enabled by default.
+        AuditToolConfig::new(AuditToolId::Oxlint),
+        AuditToolConfig::new(AuditToolId::GolangciLint),
+        AuditToolConfig::new(AuditToolId::Ruff),
+        AuditToolConfig::new(AuditToolId::Cppcheck),
+        AuditToolConfig::new(AuditToolId::Typos),
+        AuditToolConfig::new(AuditToolId::Eslint),
+        AuditToolConfig::new(AuditToolId::Pmd),
+        AuditToolConfig::new(AuditToolId::Knip),
+        AuditToolConfig::new(AuditToolId::CargoMachete),
+        // Quality — default-disabled.
+        AuditToolConfig::disabled(AuditToolId::DotnetAnalyzers),
+        AuditToolConfig::disabled(AuditToolId::SemgrepQuality),
     ]
 }
 
@@ -2707,6 +2792,25 @@ pub fn default_code_audit_tab() -> TabConfig {
     })
 }
 
+/// V25: the reserved, non-closable Code Quality tab. Same shape as the Code
+/// Audit tab — Shell-kind with no command (app-rendered, no PTY).
+/// Materialized/removed by the integrity check per `code_audit.enabled` (the
+/// same flag that gates the Code Audit tab).
+pub fn default_code_quality_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: CODE_QUALITY_TAB_ID.to_string(),
+        builtin: true,
+        name: "Code Quality".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
+}
+
 /// Default Shell-1 entry. Takes the resolved platform default shell so the
 /// `command` and `args` fields land on the right binary for the host. The
 /// reserved id is just the seed value for the first shell tab on a fresh
@@ -3834,10 +3938,38 @@ mod tests {
     /// half of the tripwire: adding a variant without extending this list is a
     /// compile error, so it can't reach `cargo test` unnoticed.
     fn all_audit_tool_ids() -> Vec<AuditToolId> {
-        let all = vec![AuditToolId::OsvScanner, AuditToolId::Gitleaks, AuditToolId::Semgrep];
+        let all = vec![
+            AuditToolId::OsvScanner,
+            AuditToolId::Gitleaks,
+            AuditToolId::Semgrep,
+            AuditToolId::Oxlint,
+            AuditToolId::GolangciLint,
+            AuditToolId::Ruff,
+            AuditToolId::Cppcheck,
+            AuditToolId::Typos,
+            AuditToolId::Eslint,
+            AuditToolId::Pmd,
+            AuditToolId::DotnetAnalyzers,
+            AuditToolId::Knip,
+            AuditToolId::CargoMachete,
+            AuditToolId::SemgrepQuality,
+        ];
         fn _assert_exhaustive(id: AuditToolId) {
             match id {
-                AuditToolId::OsvScanner | AuditToolId::Gitleaks | AuditToolId::Semgrep => {}
+                AuditToolId::OsvScanner
+                | AuditToolId::Gitleaks
+                | AuditToolId::Semgrep
+                | AuditToolId::Oxlint
+                | AuditToolId::GolangciLint
+                | AuditToolId::Ruff
+                | AuditToolId::Cppcheck
+                | AuditToolId::Typos
+                | AuditToolId::Eslint
+                | AuditToolId::Pmd
+                | AuditToolId::DotnetAnalyzers
+                | AuditToolId::Knip
+                | AuditToolId::CargoMachete
+                | AuditToolId::SemgrepQuality => {}
             }
         }
         all
@@ -3871,6 +4003,7 @@ mod tests {
                 enabled: true,
                 path: "C:/tools/semgrep.exe".into(),
                 extra_args: vec!["--config".into(), "auto".into()],
+                timeout_secs: Some(1200),
             }],
             timeout_secs: 600,
         };
@@ -3895,16 +4028,36 @@ mod tests {
     #[test]
     fn code_audit_defaults_present_when_block_absent() {
         // An old settings file with no `code_audit` key round-trips to the
-        // feature-disabled defaults with all three v1 tools present.
+        // feature-disabled defaults with the Security trio + Quality set present.
         let s: Settings = serde_json::from_value(json!({})).expect("empty settings deserialize");
         assert!(!s.code_audit.enabled);
         assert_eq!(s.code_audit.timeout_secs, 600);
         let ids: Vec<AuditToolId> = s.code_audit.tools.iter().map(|t| t.id).collect();
         assert_eq!(
             ids,
-            vec![AuditToolId::OsvScanner, AuditToolId::Gitleaks, AuditToolId::Semgrep]
+            vec![
+                AuditToolId::OsvScanner,
+                AuditToolId::Gitleaks,
+                AuditToolId::Semgrep,
+                AuditToolId::Oxlint,
+                AuditToolId::GolangciLint,
+                AuditToolId::Ruff,
+                AuditToolId::Cppcheck,
+                AuditToolId::Typos,
+                AuditToolId::Eslint,
+                AuditToolId::Pmd,
+                AuditToolId::Knip,
+                AuditToolId::CargoMachete,
+                AuditToolId::DotnetAnalyzers,
+                AuditToolId::SemgrepQuality,
+            ]
         );
-        assert!(s.code_audit.tools.iter().all(|t| t.enabled && t.path.is_empty()));
+        // Every tool resolves normally (empty path); all enabled except the two
+        // default-disabled ones.
+        assert!(s.code_audit.tools.iter().all(|t| t.path.is_empty()));
+        let disabled: Vec<AuditToolId> =
+            s.code_audit.tools.iter().filter(|t| !t.enabled).map(|t| t.id).collect();
+        assert_eq!(disabled, vec![AuditToolId::DotnetAnalyzers, AuditToolId::SemgrepQuality]);
     }
 
     #[test]
@@ -3942,6 +4095,8 @@ mod tests {
         assert!(ca.tools[0].enabled);
         assert!(ca.tools[0].path.is_empty());
         assert!(ca.tools[0].extra_args.is_empty());
+        // V25: the per-tool timeout override defaults to None (global timeout).
+        assert!(ca.tools[0].timeout_secs.is_none());
     }
 
     #[test]

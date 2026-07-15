@@ -838,6 +838,10 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // Keep the reserved feature tabs (Offload Server / Code Graph monitor /
     // Workbench) present-iff-enabled in the persisted list.
     crate::settings::reconcile_reserved_tabs(cur);
+    // V25: keep `code_audit.tools` complete — a pre-V25 snapshot (three Security
+    // tools) gains the eleven Quality tools here, mirroring the load-path
+    // reconcile in `integrity_check`. Existing entries are untouched; idempotent.
+    crate::settings::reconcile_audit_tools(cur);
     // V21: when OpenCode local-llama auto-sync is on and the local server is
     // enabled, re-derive the provider snapshot if the primary Local command
     // changed (no-op otherwise), so the OpenCode tab tracks command edits.
@@ -868,6 +872,7 @@ pub async fn settings_update(
         (TabId::GraphView, |s| s.graph.graph_viz),
         (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
         (TabId::CodeAudit, |s| s.code_audit.enabled),
+        (TabId::CodeQuality, |s| s.code_audit.enabled),
     ];
 
     // Snapshot the pre-update flags (reserved tabs via the table, plus the

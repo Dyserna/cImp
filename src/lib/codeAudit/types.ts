@@ -21,8 +21,23 @@ export type AuditSeverity = 'error' | 'warning' | 'note';
 /// Per-tool lifecycle status within a scan (mirror of Rust `ToolStatus`,
 /// kebab-case): `idle` (configured but not part of this scan), `running`,
 /// `done` (ran to completion — `findings` authoritative even when empty),
-/// `failed` (tool error / timeout / cancel), `not-installed` (unresolvable).
-export type AuditToolStatus = 'idle' | 'running' | 'done' | 'failed' | 'not-installed';
+/// `failed` (tool error / timeout / cancel), `not-installed` (unresolvable),
+/// `skipped-not-applicable` (V25: enabled but the project's census doesn't
+/// match this tool — e.g. no PMD in a Rust repo; the split UI hides it in the
+/// tab while Settings still lists it).
+export type AuditToolStatus =
+  | 'idle'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'not-installed'
+  | 'skipped-not-applicable';
+
+/// V25 Phase C: which tab/section a tool belongs to (mirror of Rust
+/// `audit::adapters::Category`, serde lowercase). A scan runs one category; the
+/// `audit_start_scan` command takes it and every `AuditToolState` is tagged with
+/// it, so the two tabs filter the one shared snapshot to their own tools.
+export type AuditCategory = 'security' | 'quality';
 
 /// One diagnostic (mirror of Rust `checks::Diag`). `code` is the SARIF rule id;
 /// `line` is 0 when the tool reported no line; `col` is `null` when absent.
@@ -47,6 +62,9 @@ export interface AuditFinding {
 /// resolved binary path (a Windows backslash string) once resolution succeeds.
 export interface AuditToolState {
   id: AuditToolId;
+  /// V25 Phase C: the tool's category. Every state in one snapshot shares it
+  /// (a scan runs one category); the split UI filters the shared snapshot by it.
+  category: AuditCategory;
   status: AuditToolStatus;
   findings: AuditFinding[];
   duration_ms: number;
@@ -60,6 +78,19 @@ export interface AuditToolState {
   scanned_artifacts: string[];
 }
 
+/// V25 Phase C: the scanned root's language census (mirror of Rust
+/// `CensusBlock`) — the extensions/markers seen. Drives split-UI chip visibility
+/// (gate a tool out of a project it doesn't apply to) off the one snapshot,
+/// without a second IPC. Both lists empty before the first scan; the last scan's
+/// census is retained afterward.
+export interface AuditCensus {
+  /// Lowercase, dot-less file extensions seen (sorted).
+  extensions: string[];
+  /// Marker tokens seen — `go.mod`, `Cargo.toml`, `package.json`, `*.sln`,
+  /// `*.csproj`, `eslint.config`, `.eslintrc` (sorted).
+  markers: string[];
+}
+
 /// The whole runner snapshot (mirror of Rust `AuditSnapshot`) — the
 /// `audit_snapshot` return and the `audit-status` event payload.
 export interface AuditSnapshot {
@@ -69,9 +100,13 @@ export interface AuditSnapshot {
   scanning: boolean;
   /// Epoch millis when the last scan started; `null` before the first scan.
   last_scan_at: number | null;
-  /// Per-tool state, in configured order. Empty before the first scan (render
-  /// the configured tool list from settings until runtime state exists).
+  /// Per-tool state, in configured order. Contains only the LAST scanned
+  /// category's tools (a scan runs one category); empty before the first scan.
+  /// The split UI filters by `AuditToolState.category` and renders from settings
+  /// until its own category's tools appear here.
   tools: AuditToolState[];
+  /// V25 Phase C: the scanned root's language census — drives chip visibility.
+  census: AuditCensus;
   /// True total findings across all tools, BEFORE any wire cap.
   total_findings: number;
   /// Set when the event dropped findings to the per-tool cap; fetch the full

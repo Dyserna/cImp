@@ -5,6 +5,42 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Code Quality — language-gated linters (V25).** A new reserved **Code
+  Quality** dashboard tab splits the audit surface in two: **Code Audit** keeps
+  the three security tools (osv-scanner / gitleaks / semgrep), Code Quality
+  hosts eleven quality tools — **oxlint**, **golangci-lint**, **ruff**,
+  **cppcheck**, **typos**, **eslint**, **PMD**, **Roslyn analyzers**
+  (`dotnet-analyzers`), **knip**, **cargo-machete**, and **semgrep (quality)**.
+  Both tabs share the one `code_audit.enabled` flag, run one scan at a time
+  globally (the idle tab's Scan shows "waiting — <other> scan running"), and
+  reuse V23's findings table, filters, Graph ⌖ jump, and copy-to-agent. Nothing
+  is bundled — each tool resolves an override → project-local
+  `node_modules/.bin` (eslint / knip) → ebin → PATH, and the four non-SARIF
+  tools get small audit-local parsers (typos JSONL, eslint/knip JSON, cargo-
+  machete text). `dotnet-analyzers` and `semgrep (quality)` are
+  **default-disabled** (a real build / network-fetched rulesets).
+- **Language gating.** A bounded, `.gitignore`-respecting census of the project
+  root (20 000 entries / 2 s, cached ~60 s) decides which tools apply — no PMD
+  chip in a Rust repo. Each tab shows only applicable tools with a muted
+  "n tools hidden — not applicable to this project" line; Settings always lists
+  all eleven (split into Security / Quality groups) and, after a scan, marks the
+  gated-off ones with a "not applicable to the current project" hint.
+- **Per-tool timeout override** (`AuditToolConfig.timeout_secs`, blank = the
+  global scan timeout) — a longer budget for tools that run a real build
+  (~1200 s recommended for `dotnet-analyzers`).
+
+### Fixed
+
+- **Upgraded installs gain the Quality tools.** A settings file persisted before
+  V25 carried only the three security entries; a load-path reconcile now appends
+  any missing built-in audit tool (preserving every existing entry — enabled /
+  path / extra_args / timeout — verbatim and in order), so the Code Quality tab
+  and its Settings group are populated on first launch instead of staying empty.
+
 ## [0.44.0] — 2026-07-15
 
 ### Security

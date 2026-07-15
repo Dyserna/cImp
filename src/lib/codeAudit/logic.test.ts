@@ -3,6 +3,9 @@ import { describe, expect, test } from 'vitest';
 import type { CodeAuditSettings } from '../settings/types';
 import type { AuditSnapshot, AuditToolState } from './types';
 import {
+  AUDIT_TOOL_CATEGORY,
+  categoryFindingsCount,
+  censusIsEmpty,
   chipToolStates,
   configuredToolStates,
   defaultFilters,
@@ -12,13 +15,17 @@ import {
   formatCoverageLine,
   formatFindingsMarkdown,
   formatScanTimestamp,
+  isToolApplicable,
   mergeAuditSnapshot,
+  partitionChips,
+  scanLock,
   scannedArtifacts,
   selectAllVisible,
   selectedRows,
   sortFindings,
   toggleSelected,
   toolChip,
+  toolsInCategory,
   visibleFindings,
 } from './logic';
 
@@ -26,6 +33,7 @@ import {
 
 function tool(overrides: Partial<AuditToolState> & Pick<AuditToolState, 'id'>): AuditToolState {
   return {
+    category: 'security',
     status: 'done',
     findings: [],
     duration_ms: 0,
@@ -42,6 +50,7 @@ function snapshot(overrides: Partial<AuditSnapshot> = {}): AuditSnapshot {
     scanning: false,
     last_scan_at: 1752600000000,
     tools: [],
+    census: { extensions: [], markers: [] },
     total_findings: 0,
     truncated: false,
     ...overrides,
@@ -264,25 +273,32 @@ describe('configuredToolStates / chipToolStates', () => {
     enabled: true,
     timeout_secs: 600,
     tools: [
-      { id: 'semgrep', enabled: false, path: '', extra_args: [] },
-      { id: 'osv-scanner', enabled: true, path: '', extra_args: [] },
-      { id: 'gitleaks', enabled: true, path: '', extra_args: [] },
+      { id: 'semgrep', enabled: false, path: '', extra_args: [], timeout_secs: null },
+      { id: 'osv-scanner', enabled: true, path: '', extra_args: [], timeout_secs: null },
+      { id: 'gitleaks', enabled: true, path: '', extra_args: [], timeout_secs: null },
     ],
   };
 
   test('renders configured tools as idle, in canonical order (incl. disabled)', () => {
-    const states = configuredToolStates(settings);
+    const states = configuredToolStates(settings, 'security');
     expect(states.map((s) => s.id)).toEqual(['osv-scanner', 'gitleaks', 'semgrep']);
     expect(states.every((s) => s.status === 'idle')).toBe(true);
+    expect(states.every((s) => s.category === 'security')).toBe(true);
   });
 
-  test('chipToolStates prefers the runtime snapshot once it has tools', () => {
-    expect(chipToolStates(snapshot({ tools: [] }), settings).map((s) => s.id)).toEqual([
+  test('chipToolStates prefers the runtime snapshot once it has tools of the category', () => {
+    expect(chipToolStates(snapshot({ tools: [] }), settings, 'security').map((s) => s.id)).toEqual([
       'osv-scanner',
       'gitleaks',
       'semgrep',
     ]);
-    expect(chipToolStates(FULL, settings)).toBe(FULL.tools);
+    // FULL has only security tools, so the (filtered) list is the same array
+    // contents — chipToolStates filters by category, so it is a new array.
+    expect(chipToolStates(FULL, settings, 'security').map((s) => s.id)).toEqual([
+      'osv-scanner',
+      'gitleaks',
+      'semgrep',
+    ]);
   });
 });
 
@@ -394,5 +410,203 @@ describe('formatScanTimestamp', () => {
   });
   test('formats as YYYY-MM-DD HH:MM', () => {
     expect(formatScanTimestamp(1752600000000)).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+  });
+});
+
+// ── V25 Phase D: category mapping + language gating ───────────────────────────
+
+const OXLINT = tool({
+  id: 'oxlint',
+  category: 'quality',
+  status: 'done',
+  findings: [
+    {
+      tool: 'oxlint',
+      diag: { severity: 'warning', code: 'no-unused-vars', message: 'unused x', file: 'src/a.ts', line: 3, col: 1 },
+    },
+  ],
+});
+
+const TYPOS = tool({
+  id: 'typos',
+  category: 'quality',
+  status: 'done',
+  findings: [
+    {
+      tool: 'typos',
+      diag: { severity: 'note', code: null, message: '`teh` should be `the`', file: 'README.md', line: 1, col: null },
+    },
+  ],
+});
+
+// A merged snapshot carrying BOTH categories at once — the state each tab sees
+// after a Security scan then a Quality scan (mergeAuditSnapshot merges by id).
+const MIXED = snapshot({
+  tools: [OSV, GITLEAKS, OXLINT, TYPOS],
+  total_findings: 2, // wire total reflects only the last-scanned category
+  census: { extensions: ['ts'], markers: ['package.json'] },
+});
+
+describe('AUDIT_TOOL_CATEGORY / toolsInCategory', () => {
+  test('the security trio is security; every other tool is quality', () => {
+    expect(toolsInCategory('security')).toEqual(['osv-scanner', 'gitleaks', 'semgrep']);
+    const quality = toolsInCategory('quality');
+    expect(quality).toContain('oxlint');
+    expect(quality).toContain('typos');
+    expect(quality).toContain('semgrep-quality');
+    expect(quality).not.toContain('semgrep'); // the SAST semgrep stays security
+    for (const id of quality) expect(AUDIT_TOOL_CATEGORY[id]).toBe('quality');
+  });
+});
+
+describe('isToolApplicable / censusIsEmpty', () => {
+  test('empty census reads as empty', () => {
+    expect(censusIsEmpty({ extensions: [], markers: [] })).toBe(true);
+    expect(censusIsEmpty({ extensions: ['ts'], markers: [] })).toBe(false);
+  });
+
+  test('always-applicable tools apply against any census', () => {
+    const empty = { extensions: [], markers: [] };
+    expect(isToolApplicable('typos', empty)).toBe(true);
+    expect(isToolApplicable('osv-scanner', empty)).toBe(true);
+    expect(isToolApplicable('semgrep-quality', empty)).toBe(true);
+  });
+
+  test('extension gate: pmd needs .java, ruff needs .py', () => {
+    const rustJs = { extensions: ['rs', 'ts'], markers: ['Cargo.toml'] };
+    expect(isToolApplicable('pmd', rustJs)).toBe(false);
+    expect(isToolApplicable('ruff', rustJs)).toBe(false);
+    expect(isToolApplicable('oxlint', rustJs)).toBe(true); // ts
+    expect(isToolApplicable('cargo-machete', rustJs)).toBe(true); // Cargo.toml marker
+  });
+
+  test('marker gate: eslint / knip / dotnet key off markers', () => {
+    expect(isToolApplicable('eslint', { extensions: [], markers: ['eslint.config'] })).toBe(true);
+    expect(isToolApplicable('knip', { extensions: [], markers: ['package.json'] })).toBe(true);
+    expect(isToolApplicable('dotnet-analyzers', { extensions: [], markers: ['*.csproj'] })).toBe(true);
+    expect(isToolApplicable('knip', { extensions: ['ts'], markers: [] })).toBe(false);
+  });
+});
+
+describe('flattenFindings by category', () => {
+  test('filters a mixed snapshot to one tab', () => {
+    expect(flattenFindings(MIXED, 'security').map((r) => r.tool).sort()).toEqual([
+      'gitleaks',
+      'osv-scanner',
+    ]);
+    expect(flattenFindings(MIXED, 'quality').map((r) => r.tool).sort()).toEqual(['oxlint', 'typos']);
+    // No category arg → everything (back-compat with the un-split callers/tests).
+    expect(flattenFindings(MIXED).length).toBe(4);
+  });
+});
+
+describe('categoryFindingsCount', () => {
+  test('counts only the category tools, independent of wire total_findings', () => {
+    expect(categoryFindingsCount(MIXED, 'security')).toBe(2);
+    expect(categoryFindingsCount(MIXED, 'quality')).toBe(2);
+  });
+});
+
+describe('chipToolStates falls back per category', () => {
+  const settings: CodeAuditSettings = {
+    enabled: true,
+    timeout_secs: 600,
+    tools: [
+      { id: 'oxlint', enabled: true, path: '', extra_args: [], timeout_secs: null },
+      { id: 'ruff', enabled: true, path: '', extra_args: [], timeout_secs: null },
+      { id: 'typos', enabled: true, path: '', extra_args: [], timeout_secs: null },
+    ],
+  };
+
+  test('a quality tab over a security-only snapshot renders configured quality idle chips', () => {
+    const secOnly = snapshot({ tools: [OSV, GITLEAKS] });
+    const states = chipToolStates(secOnly, settings, 'quality');
+    expect(states.map((s) => s.id)).toEqual(['oxlint', 'ruff', 'typos']);
+    expect(states.every((s) => s.status === 'idle' && s.category === 'quality')).toBe(true);
+  });
+
+  test('prefers the snapshot once the category has scanned tools', () => {
+    expect(chipToolStates(MIXED, settings, 'quality').map((s) => s.id)).toEqual(['oxlint', 'typos']);
+  });
+});
+
+describe('partitionChips (chip gating + hidden count)', () => {
+  test('empty census hides nothing', () => {
+    const states = configuredToolStates(
+      { enabled: true, timeout_secs: 600, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
+      'quality',
+    );
+    const p = partitionChips(states, { extensions: [], markers: [] });
+    expect(p.hiddenCount).toBe(0);
+    expect(p.visible.length).toBe(states.length);
+  });
+
+  test('known census hides not-applicable idle chips and counts them', () => {
+    // A Rust + JS project: no .py, no .java, no .go, no .cs, no .c.
+    const census = { extensions: ['rs', 'ts'], markers: ['Cargo.toml', 'package.json'] };
+    const states = configuredToolStates(
+      { enabled: true, timeout_secs: 600, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
+      'quality',
+    );
+    const p = partitionChips(states, census);
+    const visibleIds = p.visible.map((s) => s.id);
+    // oxlint (ts), typos (always), cargo-machete (Cargo.toml), knip (package.json),
+    // semgrep-quality (always) apply; ruff/cppcheck/pmd/golangci-lint/dotnet do not.
+    expect(visibleIds).toContain('oxlint');
+    expect(visibleIds).toContain('typos');
+    expect(visibleIds).toContain('cargo-machete');
+    expect(visibleIds).toContain('knip');
+    expect(visibleIds).not.toContain('ruff');
+    expect(visibleIds).not.toContain('pmd');
+    expect(p.hiddenCount).toBe(states.length - p.visible.length);
+    expect(p.hiddenCount).toBeGreaterThan(0);
+  });
+
+  test('a skipped-not-applicable status chip is always hidden', () => {
+    const skipped = tool({ id: 'pmd', category: 'quality', status: 'skipped-not-applicable' });
+    const p = partitionChips([OXLINT, skipped], { extensions: ['ts', 'java'], markers: [] });
+    // Even though .java is present, the backend already gated pmd out.
+    expect(p.visible.map((s) => s.id)).toEqual(['oxlint']);
+    expect(p.hiddenCount).toBe(1);
+  });
+});
+
+describe('scanLock (cross-tab one-scan-at-a-time)', () => {
+  test('idle: both actions available', () => {
+    expect(scanLock(false, null, 'security')).toEqual({ showCancel: false, scanDisabled: false, waiting: null });
+  });
+
+  test('own category running → show Cancel', () => {
+    expect(scanLock(true, 'security', 'security')).toEqual({ showCancel: true, scanDisabled: false, waiting: null });
+  });
+
+  test('other category running → disabled Scan + waiting note naming the other', () => {
+    expect(scanLock(true, 'security', 'quality')).toEqual({
+      showCancel: false,
+      scanDisabled: true,
+      waiting: 'waiting — security scan running',
+    });
+    expect(scanLock(true, 'quality', 'security').waiting).toBe('waiting — quality scan running');
+  });
+
+  test('scanning but unknown active category → generic waiting', () => {
+    expect(scanLock(true, null, 'security')).toEqual({
+      showCancel: false,
+      scanDisabled: true,
+      waiting: 'waiting — scan running',
+    });
+  });
+});
+
+describe('formatFindingsMarkdown label', () => {
+  test('quality label swaps the heading', () => {
+    const md = formatFindingsMarkdown({
+      rows: [{ id: 'oxlint#0', tool: 'oxlint', severity: 'warning', code: 'no-unused-vars', message: 'unused x', file: 'src/a.ts', line: 3, col: 1 }],
+      totalFindings: 1,
+      root: '/r',
+      scannedAt: 'T',
+      label: 'Code quality',
+    });
+    expect(md.startsWith('## Code quality findings (1 of 1 selected) — /r, scanned T')).toBe(true);
   });
 });

@@ -1,6 +1,10 @@
 # V25 — Code Quality (language-gated linters + Security/Quality split)
 
-**Status:** SPEC (2026-07-15). Not yet coded.
+**Status:** IMPLEMENTED (2026-07-16) — all phases A–E coded on develop; live
+verification per MAINTENANCE.md V25 recipes pending. Spec deviations found at
+implementation (cppcheck report-file transport + exit-0-with-findings,
+cargo-machete real output shape, typos JSONL fields) are documented inline in
+`audit/adapters.rs` / `audit/parsers.rs` and in FEATURES.md.
 **Builds on:** V23 Code Audit (adapter registry `audit/adapters.rs`, runner
 `audit/runner.rs`, `CodeAuditView.svelte`, `Settings.code_audit` with the
 lenient closed-enum `AuditToolId` + tripwire), V22 checks parsers

@@ -83,7 +83,14 @@
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
   import ChecksEditor from './lib/settings/ChecksEditor.svelte';
-  import { AUDIT_TOOL_META, formatDetect } from './lib/settings/codeAudit';
+  import {
+    auditToolGroups,
+    formatDetect,
+    toolNotApplicable,
+    type AuditToolRow,
+  } from './lib/settings/codeAudit';
+  import { auditSnapshot } from './lib/codeAudit/ipc';
+  import type { AuditCensus } from './lib/codeAudit/types';
   import { resolveBundledTheme, defaultPalette } from './lib/themes';
   import { themeRegistry, paletteRegistry } from './lib/themes/registry';
   import type { ThemeColorsWire } from './lib/settings/types';
@@ -914,6 +921,11 @@
       .catch((e) => console.warn('stt_list_input_devices failed', e));
     void loadComposeTemplates();
     void loadLlmPricing();
+    // Best-effort: the audit census drives the Code Audit section's per-tool
+    // "not applicable" hints. Absent (empty) before any scan — no hint shown.
+    auditSnapshot()
+      .then((s) => (auditCensus = s.census))
+      .catch(() => {});
     harnessVersionsGet()
       .then((hv) => (harnessFresh = hv))
       .catch((e) => console.warn('harness_versions_get failed', e));
@@ -1291,6 +1303,17 @@
   // `path` field, so the stored config stays "resolve normally" unless the user
   // browses to an exe.
   let auditDetect = $state<Record<string, AuditDetectResult | 'probing' | undefined>>({});
+
+  // V25 Phase D: the latest scan's language census, read once from the runner so
+  // the tool rows can flag those the current project gates off ("not applicable
+  // to the current project"). Empty (both lists) before any scan — no hint then.
+  let auditCensus = $state<AuditCensus>({ extensions: [], markers: [] });
+
+  // V25 Phase D: the tool rows split into the Security / Quality groups the
+  // section renders under separate headers.
+  let auditGroups = $derived(
+    snapshot ? auditToolGroups(snapshot) : { security: [], quality: [] },
+  );
 
   // Mutate one audit tool's config (by id) in place through the normal patch
   // path. No-op if the id isn't present (e.g. dropped by a future migration).
@@ -4950,85 +4973,114 @@
             <span>Enable Code Audit (show the tab)</span>
           </label>
 
-          <h3>Tools</h3>
-          {#each AUDIT_TOOL_META as meta (meta.id)}
-            {@const idx = snapshot.code_audit.tools.findIndex(
-              (t) => t.id === meta.id,
-            )}
-            {#if idx >= 0}
-              {@const tool = snapshot.code_audit.tools[idx]}
-              {@const det = auditDetect[meta.id]}
-              {@const disp = formatDetect(det)}
-              <div class="audit-tool">
-                <label class="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={tool.enabled}
-                    onchange={(e) =>
-                      patchAuditTool(
-                        meta.id,
-                        (t) =>
-                          (t.enabled = (
-                            e.currentTarget as HTMLInputElement
-                          ).checked),
-                      )}
-                  />
-                  <span class="audit-name">{meta.name}</span>
-                  <span class="audit-role">{meta.role}</span>
-                </label>
-                <div class="input-with-action">
-                  <input
-                    type="text"
-                    placeholder="(use ebin / PATH)"
-                    value={tool.path}
-                    oninput={(e) =>
-                      patchAuditTool(
-                        meta.id,
-                        (t) =>
-                          (t.path = (e.currentTarget as HTMLInputElement).value),
-                      )}
-                  />
-                  <button
-                    type="button"
-                    class="secondary"
-                    onclick={() => void detectAuditTool(meta.id)}
-                  >
-                    Detect
-                  </button>
-                  <button
-                    type="button"
-                    class="secondary"
-                    onclick={() => void pickAuditToolExe(meta.id)}
-                  >
-                    Browse…
-                  </button>
-                  <button
-                    type="button"
-                    class="secondary"
-                    onclick={() => patchAuditTool(meta.id, (t) => (t.path = ''))}
-                  >
-                    Clear
-                  </button>
-                </div>
-                {#if disp.kind !== 'idle'}
-                  <small
-                    class="hint audit-detect"
-                    class:ok={disp.kind === 'found'}
-                    class:bad={disp.kind === 'not-found'}
-                  >
-                    {disp.text}
-                  </small>
-                {/if}
-                <small class="hint">
-                  Extra arguments (appended after the tool's fixed argv):
-                </small>
-                <ArrayEditor
-                  bind:items={snapshot.code_audit.tools[idx].extra_args}
-                  placeholder="e.g. --config auto"
-                  oncommit={commitAudit}
+          {#snippet auditToolRow(row: AuditToolRow)}
+            {@const det = auditDetect[row.meta.id]}
+            {@const disp = formatDetect(det)}
+            <div class="audit-tool">
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={row.tool.enabled}
+                  onchange={(e) =>
+                    patchAuditTool(
+                      row.meta.id,
+                      (t) =>
+                        (t.enabled = (e.currentTarget as HTMLInputElement).checked),
+                    )}
                 />
+                <span class="audit-name">{row.meta.name}</span>
+                <span class="audit-role">{row.meta.role}</span>
+              </label>
+              {#if toolNotApplicable(row.meta.id, auditCensus)}
+                <small class="hint audit-na">
+                  not applicable to the current project
+                </small>
+              {/if}
+              <div class="input-with-action">
+                <input
+                  type="text"
+                  placeholder="(use ebin / PATH)"
+                  value={row.tool.path}
+                  oninput={(e) =>
+                    patchAuditTool(
+                      row.meta.id,
+                      (t) =>
+                        (t.path = (e.currentTarget as HTMLInputElement).value),
+                    )}
+                />
+                <button
+                  type="button"
+                  class="secondary"
+                  onclick={() => void detectAuditTool(row.meta.id)}
+                >
+                  Detect
+                </button>
+                <button
+                  type="button"
+                  class="secondary"
+                  onclick={() => void pickAuditToolExe(row.meta.id)}
+                >
+                  Browse…
+                </button>
+                <button
+                  type="button"
+                  class="secondary"
+                  onclick={() => patchAuditTool(row.meta.id, (t) => (t.path = ''))}
+                >
+                  Clear
+                </button>
               </div>
-            {/if}
+              {#if disp.kind !== 'idle'}
+                <small
+                  class="hint audit-detect"
+                  class:ok={disp.kind === 'found'}
+                  class:bad={disp.kind === 'not-found'}
+                >
+                  {disp.text}
+                </small>
+              {/if}
+              <label class="audit-timeout">
+                <span>Timeout override (seconds — blank uses the global)</span>
+                <input
+                  type="number"
+                  min="1"
+                  placeholder="(global)"
+                  value={row.tool.timeout_secs ?? ''}
+                  oninput={(e) =>
+                    patchAuditTool(row.meta.id, (t) => {
+                      const raw = (e.currentTarget as HTMLInputElement).value.trim();
+                      const v = Number(raw);
+                      t.timeout_secs =
+                        raw !== '' && Number.isFinite(v) && v >= 1 ? Math.floor(v) : null;
+                    })}
+                />
+              </label>
+              <small class="hint">
+                Extra arguments (appended after the tool's fixed argv):
+              </small>
+              <ArrayEditor
+                bind:items={snapshot!.code_audit.tools[row.index].extra_args}
+                placeholder="e.g. --config auto"
+                oncommit={commitAudit}
+              />
+            </div>
+          {/snippet}
+
+          <h3>Security tools</h3>
+          <small class="hint">Shown in the <strong>Code Audit</strong> tab.</small>
+          {#each auditGroups.security as row (row.meta.id)}
+            {@render auditToolRow(row)}
+          {/each}
+
+          <h3>Quality tools</h3>
+          <small class="hint">
+            Shown in the <strong>Code Quality</strong> tab. Language-gated — a
+            tool only appears there (and only runs) when the project contains
+            files it applies to. All tools are listed here regardless of the
+            current project.
+          </small>
+          {#each auditGroups.quality as row (row.meta.id)}
+            {@render auditToolRow(row)}
           {/each}
 
           <h3>Scan settings</h3>
@@ -6086,6 +6138,22 @@
   }
   small.hint.audit-detect.bad {
     color: var(--danger, #e06c75);
+  }
+  small.hint.audit-na {
+    margin: 0;
+    font-style: italic;
+    color: var(--warning, #e3b341);
+    opacity: 0.85;
+  }
+  .audit-timeout {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: 0.85em;
+    opacity: 0.85;
+  }
+  .audit-timeout input {
+    width: 7rem;
   }
   .input-with-action > button {
     flex-shrink: 0;

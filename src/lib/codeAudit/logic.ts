@@ -7,6 +7,8 @@
 
 import type { CodeAuditSettings } from '../settings/types';
 import type {
+  AuditCategory,
+  AuditCensus,
   AuditFinding,
   AuditSeverity,
   AuditSnapshot,
@@ -15,11 +17,106 @@ import type {
   AuditToolStatus,
 } from './types';
 
-// ── Tool + severity ordering ──────────────────────────────────────────────
+// ── Tool → category / order / applicability ───────────────────────────────
+//
+// SINGLE frontend source of truth for the tool metadata the split UI needs,
+// mirroring the Rust adapter registry (`src-tauri/src/audit/adapters.rs`):
+//   - `Adapter.category` → `AUDIT_TOOL_CATEGORY`
+//   - `Adapter.applicability` → `AUDIT_TOOL_APPLICABILITY`
+//   - the default `code_audit.tools` order → `AUDIT_TOOL_ORDER`
+// The Rust↔TS category / status / wire tripwire in `audit/runner.rs` guards the
+// enums; these maps must be kept in lockstep with the registry by hand.
 
-/// Canonical display order for the tools (matches `AUDIT_TOOL_META` in
-/// `../settings/codeAudit`). Used for the chip list and the sort tiebreak.
-export const AUDIT_TOOL_ORDER: readonly AuditToolId[] = ['osv-scanner', 'gitleaks', 'semgrep'];
+/// Which tab each tool belongs to. Security = the V23 trio (Code Audit tab);
+/// Quality = the V25 linters (Code Quality tab).
+export const AUDIT_TOOL_CATEGORY: Record<AuditToolId, AuditCategory> = {
+  'osv-scanner': 'security',
+  gitleaks: 'security',
+  semgrep: 'security',
+  oxlint: 'quality',
+  'golangci-lint': 'quality',
+  ruff: 'quality',
+  cppcheck: 'quality',
+  typos: 'quality',
+  eslint: 'quality',
+  pmd: 'quality',
+  'dotnet-analyzers': 'quality',
+  knip: 'quality',
+  'cargo-machete': 'quality',
+  'semgrep-quality': 'quality',
+};
+
+/// Canonical display order across BOTH categories — security first, then the
+/// quality tools in settings-configured order (matches the default
+/// `code_audit.tools`). Drives the chip list, the sort tiebreak, and the merge
+/// re-order; each tab renders only its own category's slice (`toolsInCategory`).
+export const AUDIT_TOOL_ORDER: readonly AuditToolId[] = [
+  // Security (V23) — the Code Audit tab.
+  'osv-scanner',
+  'gitleaks',
+  'semgrep',
+  // Quality (V25) — the Code Quality tab.
+  'oxlint',
+  'golangci-lint',
+  'ruff',
+  'cppcheck',
+  'typos',
+  'eslint',
+  'pmd',
+  'knip',
+  'cargo-machete',
+  'dotnet-analyzers',
+  'semgrep-quality',
+];
+
+/// The tools of one category, in canonical order — the per-tab chip list and
+/// tool-toggle set.
+export function toolsInCategory(category: AuditCategory): AuditToolId[] {
+  return AUDIT_TOOL_ORDER.filter((id) => AUDIT_TOOL_CATEGORY[id] === category);
+}
+
+/// A tool's language gate (mirror of Rust `Applicability`): the file extensions
+/// and marker tokens the project must contain for the tool to apply. BOTH lists
+/// empty = always applicable (the security trio, typos, semgrep-quality).
+export const AUDIT_TOOL_APPLICABILITY: Record<
+  AuditToolId,
+  { extensions: readonly string[]; markers: readonly string[] }
+> = {
+  'osv-scanner': { extensions: [], markers: [] },
+  gitleaks: { extensions: [], markers: [] },
+  semgrep: { extensions: [], markers: [] },
+  oxlint: { extensions: ['js', 'ts', 'jsx', 'tsx', 'mjs', 'cjs'], markers: [] },
+  'golangci-lint': { extensions: ['go'], markers: ['go.mod'] },
+  ruff: { extensions: ['py'], markers: [] },
+  cppcheck: { extensions: ['c', 'cc', 'cpp', 'cxx', 'h', 'hpp'], markers: [] },
+  typos: { extensions: [], markers: [] },
+  eslint: { extensions: [], markers: ['eslint.config', '.eslintrc'] },
+  pmd: { extensions: ['java'], markers: [] },
+  'dotnet-analyzers': { extensions: [], markers: ['*.sln', '*.csproj'] },
+  knip: { extensions: [], markers: ['package.json'] },
+  'cargo-machete': { extensions: [], markers: ['Cargo.toml'] },
+  'semgrep-quality': { extensions: [], markers: [] },
+};
+
+/// A census with neither extensions nor markers — the pre-first-scan state.
+/// Treated as "unknown, hide nothing" by the chip-gating logic.
+export function censusIsEmpty(census: AuditCensus): boolean {
+  return census.extensions.length === 0 && census.markers.length === 0;
+}
+
+/// Whether `id` applies to a project with the given census (mirror of Rust
+/// `Adapter::applicable`): always true for an unguarded tool, else true iff ANY
+/// gate extension OR ANY gate marker was seen. Callers must special-case an
+/// empty census (`censusIsEmpty`) — with nothing seen a guarded tool reads as
+/// not-applicable, which for chip visibility means "unknown", not "hide".
+export function isToolApplicable(id: AuditToolId, census: AuditCensus): boolean {
+  const a = AUDIT_TOOL_APPLICABILITY[id];
+  if (a.extensions.length === 0 && a.markers.length === 0) return true;
+  return (
+    a.extensions.some((e) => census.extensions.includes(e)) ||
+    a.markers.some((m) => census.markers.includes(m))
+  );
+}
 
 /// Severity ordering for the default sort + the threshold filter: error is the
 /// most severe. A row passes a threshold iff its rank is ≥ the threshold's.
@@ -55,10 +152,14 @@ export interface FindingRow {
 
 /// Flatten every tool's findings into one list of rows (unsorted, unfiltered),
 /// with stable ids. Tools are visited in snapshot order; each tool's findings
-/// keep their original index in the id.
-export function flattenFindings(snapshot: AuditSnapshot): FindingRow[] {
+/// keep their original index in the id. When `category` is given, only that
+/// category's tools contribute — the split UI passes its own category so a
+/// merged snapshot carrying BOTH categories (see `mergeAuditSnapshot`) renders
+/// only this tab's findings.
+export function flattenFindings(snapshot: AuditSnapshot, category?: AuditCategory): FindingRow[] {
   const rows: FindingRow[] = [];
   for (const tool of snapshot.tools) {
+    if (category && tool.category !== category) continue;
     tool.findings.forEach((f: AuditFinding, i: number) => {
       rows.push({
         id: `${tool.id}#${i}`,
@@ -202,6 +303,17 @@ export function toolChip(tool: AuditToolState): ChipDisplay {
         spinner: false,
         tooltip: tool.error ?? 'not found on PATH or ebin',
       };
+    case 'skipped-not-applicable':
+      // V25 Phase C: enabled but gated off by the project census. The Security
+      // trio is always applicable so this never arises in this tab; Phase D's
+      // Quality tab hides these chips outright. A neutral display keeps the
+      // mapping total meanwhile.
+      return {
+        kind: 'skipped-not-applicable',
+        label: 'not applicable',
+        spinner: false,
+        tooltip: 'this tool does not apply to the current project',
+      };
   }
 }
 
@@ -226,18 +338,22 @@ export function formatCoverageLine(paths: readonly string[]): string {
 
 // ── Pre-scan configured tool list ────────────────────────────────────────────
 
-/// Before the first scan the backend snapshot has `tools: []`; render the
-/// configured tool list from settings as idle chips (in canonical order,
-/// including disabled tools — spec). Once a scan starts the backend's `tools`
-/// is authoritative and this is unused.
-export function configuredToolStates(settings: CodeAuditSettings): AuditToolState[] {
+/// Before the first scan of `category` the backend snapshot has no tools of it;
+/// render that category's configured tool list from settings as idle chips (in
+/// canonical order, including disabled tools — spec). Once a scan of the
+/// category starts the backend's `tools` is authoritative and this is unused.
+export function configuredToolStates(
+  settings: CodeAuditSettings,
+  category: AuditCategory,
+): AuditToolState[] {
   const byId = new Map<AuditToolId, boolean>();
   for (const t of settings.tools) byId.set(t.id, t.enabled);
   const out: AuditToolState[] = [];
-  for (const id of AUDIT_TOOL_ORDER) {
+  for (const id of toolsInCategory(category)) {
     if (!byId.has(id)) continue;
     out.push({
       id,
+      category,
       status: 'idle',
       findings: [],
       duration_ms: 0,
@@ -249,13 +365,78 @@ export function configuredToolStates(settings: CodeAuditSettings): AuditToolStat
   return out;
 }
 
-/// The tool states to render as chips: the snapshot's own list once a scan has
-/// produced one, else the configured fallback.
+/// The `category` tool states to render as chips: the snapshot's OWN
+/// (category-filtered) list once a scan of this category has produced one, else
+/// the configured fallback. A merged snapshot may carry both categories' tools
+/// (see `mergeAuditSnapshot`), so this always filters by category first.
 export function chipToolStates(
   snapshot: AuditSnapshot,
   settings: CodeAuditSettings,
+  category: AuditCategory,
 ): AuditToolState[] {
-  return snapshot.tools.length > 0 ? snapshot.tools : configuredToolStates(settings);
+  const own = snapshot.tools.filter((t) => t.category === category);
+  return own.length > 0 ? own : configuredToolStates(settings, category);
+}
+
+/// The chip-visibility split for one tab. A tool is HIDDEN when it's
+/// `skipped-not-applicable` (the backend gated it out during a scan) or, for a
+/// pre-scan idle fallback against a KNOWN census, when it doesn't apply to the
+/// project. An empty census (`censusIsEmpty`) hides nothing — before the first
+/// scan every configured tool shows. `hiddenCount` drives the muted "n tools
+/// hidden — not applicable to this project" line.
+export interface ChipPartition {
+  visible: AuditToolState[];
+  hiddenCount: number;
+}
+
+export function partitionChips(
+  states: readonly AuditToolState[],
+  census: AuditCensus,
+): ChipPartition {
+  const known = !censusIsEmpty(census);
+  const visible: AuditToolState[] = [];
+  let hiddenCount = 0;
+  for (const s of states) {
+    const gatedOff =
+      s.status === 'skipped-not-applicable' || (known && !isToolApplicable(s.id, census));
+    if (gatedOff) hiddenCount++;
+    else visible.push(s);
+  }
+  return { visible, hiddenCount };
+}
+
+/// Total findings across one category's tools in a (possibly merged, both-
+/// category) snapshot. The wire `total_findings` reflects only the LAST scanned
+/// category, so each tab computes its own from its filtered tools.
+export function categoryFindingsCount(snapshot: AuditSnapshot, category: AuditCategory): number {
+  return snapshot.tools
+    .filter((t) => t.category === category)
+    .reduce((n, t) => n + t.findings.length, 0);
+}
+
+/// The cross-tab scan-lock state for one tab, from the GLOBAL scanning flag and
+/// which category's scan is in flight (`activeCategory`, tracked from the raw
+/// event/snapshot whose tools all share one category). One scan runs at a time
+/// globally, so while the OTHER tab scans this tab's Scan button is disabled
+/// with a "waiting — <other> scan running" note.
+export interface ScanLock {
+  /// Show the Cancel button (this category's own scan is running).
+  showCancel: boolean;
+  /// Disable the Scan button (the other category is running).
+  scanDisabled: boolean;
+  /// The muted status-line note while waiting, or `null`.
+  waiting: string | null;
+}
+
+export function scanLock(
+  scanning: boolean,
+  activeCategory: AuditCategory | null,
+  myCategory: AuditCategory,
+): ScanLock {
+  if (!scanning) return { showCancel: false, scanDisabled: false, waiting: null };
+  if (activeCategory === myCategory) return { showCancel: true, scanDisabled: false, waiting: null };
+  const other = activeCategory ? `${activeCategory} scan running` : 'scan running';
+  return { showCancel: false, scanDisabled: true, waiting: `waiting — ${other}` };
 }
 
 // ── Event-merge reducer ─────────────────────────────────────────────────────
@@ -284,6 +465,8 @@ export function mergeAuditSnapshot(
     scanning: next.scanning,
     last_scan_at: next.last_scan_at ?? prev.last_scan_at,
     tools: orderToolStates([...byId.values()]),
+    // V25 Phase C: `next` is authoritative for the census (taken at scan start).
+    census: next.census,
     total_findings: next.total_findings,
     truncated: next.truncated,
   };
@@ -321,9 +504,12 @@ export function formatFindingsMarkdown(opts: {
   totalFindings: number;
   root: string;
   scannedAt: string;
+  /// Heading prefix — `'Code audit'` (default, Security tab) / `'Code quality'`
+  /// (Quality tab). Renders as `## <label> findings (…)`.
+  label?: string;
 }): string {
-  const { rows, totalFindings, root, scannedAt } = opts;
-  const header = `## Code audit findings (${rows.length} of ${totalFindings} selected) — ${root}, scanned ${scannedAt}`;
+  const { rows, totalFindings, root, scannedAt, label = 'Code audit' } = opts;
+  const header = `## ${label} findings (${rows.length} of ${totalFindings} selected) — ${root}, scanned ${scannedAt}`;
   const bullets = rows.map((r) => {
     const rule = r.code ? `${r.tool} ${r.code}` : r.tool;
     return `- [${r.severity}] ${rule}: ${r.message}${locationSuffix(r)}`;

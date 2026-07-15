@@ -43,13 +43,15 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
-    default_ai_tab, default_code_audit_tab, default_graph_monitor_tab, default_graph_view_tab,
+    default_ai_tab, default_audit_tools, default_code_audit_tab, default_code_quality_tab,
+    default_graph_monitor_tab,
+    default_graph_view_tab,
     default_offload_server_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
     starter_prompt_templates,
     AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings,
     TabConfig,
-    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID,
+    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
@@ -1070,6 +1072,17 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
         default_tab: default_code_audit_tab,
         sync_name: true,
     },
+    // V25: the Code Quality tab shares the `code_audit.enabled` flag with Code
+    // Audit — enabling the feature materializes both tabs, contiguous and in
+    // this order (Code Audit then Code Quality).
+    ReservedTabSpec {
+        id: CODE_QUALITY_TAB_ID,
+        log_name: "Code Quality",
+        flag: "code_audit",
+        enabled: |s| s.code_audit.enabled,
+        default_tab: default_code_quality_tab,
+        sync_name: true,
+    },
 ];
 
 /// Keep one reserved feature tab present iff its gating flag is on. Inserts
@@ -1150,6 +1163,36 @@ pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
     let mut changed = false;
     for spec in RESERVED_TAB_SPECS {
         changed |= reconcile_reserved_tab(settings, spec);
+    }
+    changed
+}
+
+/// V25: reconcile `code_audit.tools` with the built-in adapter set. A config
+/// persisted by v0.43/v0.44 (before the Quality tools existed) carries only the
+/// three Security entries; the lenient `tools` deserializer keeps a present
+/// array verbatim, so those installs would never gain the eleven Quality tools
+/// and the Code Quality tab / Settings section would stay empty. This appends a
+/// default entry (per [`default_audit_tools`]: enabled except `dotnet-analyzers`
+/// and `semgrep-quality`) for every [`AuditToolId`] missing from the array,
+/// **preserving every existing entry verbatim and in its current order** —
+/// the user's `enabled`/`path`/`extra_args`/`timeout_secs` and any customization
+/// survive untouched. Stale/unknown ids were already dropped by the lenient
+/// deserializer, and that stays: this only ever *adds* the missing built-ins.
+/// Idempotent (a second call finds every id present and is a no-op). Runs on
+/// both the load path ([`integrity_check`]) and the live settings-update
+/// round-trip (`apply_incoming_settings`), exactly like
+/// [`reconcile_reserved_tabs`]. Returns `true` if anything was appended.
+pub fn reconcile_audit_tools(settings: &mut Settings) -> bool {
+    let tools = &mut settings.code_audit.tools;
+    let mut changed = false;
+    for def in default_audit_tools() {
+        if !tools.iter().any(|t| t.id == def.id) {
+            tools.push(def);
+            changed = true;
+        }
+    }
+    if changed {
+        tracing::info!("integrity: appended missing built-in code_audit tools");
     }
     changed
 }
@@ -1282,6 +1325,14 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
     //     orphan placement drops it into a pane); a removed one is pruned
     //     from the layout by step 5.
     if reconcile_reserved_tabs(settings) {
+        changed = true;
+    }
+
+    // 4c. Reconcile `code_audit.tools` with the built-in adapter set so a
+    //     pre-V25 config (three Security tools only) gains the eleven Quality
+    //     tools on load. Existing entries are preserved verbatim; only missing
+    //     built-ins are appended. Idempotent.
+    if reconcile_audit_tools(settings) {
         changed = true;
     }
 
@@ -1641,6 +1692,135 @@ mod tests {
         s.ui.tool_activity_tab = true;
         assert!(reconcile_reserved_tabs(&mut s));
         assert!(s.tabs.iter().any(|t| t.id() == TOOL_ACTIVITY_TAB_ID));
+    }
+
+    #[test]
+    fn reconcile_audit_tools_appends_missing_quality_tools() {
+        use crate::settings::schema::{AuditToolConfig, AuditToolId};
+        // A v0.43/v0.44 persisted config: only the three Security tools, one of
+        // them customized (disabled + custom path + extra args + timeout).
+        let mut s = base_test_settings();
+        s.code_audit.tools = vec![
+            AuditToolConfig {
+                id: AuditToolId::OsvScanner,
+                enabled: false,
+                path: r"C:\tools\osv.exe".to_string(),
+                extra_args: vec!["--offline".to_string()],
+                timeout_secs: Some(42),
+            },
+            AuditToolConfig {
+                id: AuditToolId::Gitleaks,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+            AuditToolConfig {
+                id: AuditToolId::Semgrep,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+        ];
+
+        let changed = reconcile_audit_tools(&mut s);
+        assert!(changed);
+        let tools = &s.code_audit.tools;
+        assert_eq!(tools.len(), 14);
+
+        // The three Security entries are preserved verbatim, in order — the
+        // customized osv-scanner survives untouched.
+        assert_eq!(tools[0].id, AuditToolId::OsvScanner);
+        assert!(!tools[0].enabled);
+        assert_eq!(tools[0].path, r"C:\tools\osv.exe");
+        assert_eq!(tools[0].extra_args, vec!["--offline".to_string()]);
+        assert_eq!(tools[0].timeout_secs, Some(42));
+        assert_eq!(tools[1].id, AuditToolId::Gitleaks);
+        assert_eq!(tools[2].id, AuditToolId::Semgrep);
+
+        // The eleven Quality ids are appended with correct enabled defaults:
+        // enabled except dotnet-analyzers and semgrep-quality.
+        let by_id = |id| tools.iter().find(|t| t.id == id).unwrap();
+        for id in [
+            AuditToolId::Oxlint,
+            AuditToolId::GolangciLint,
+            AuditToolId::Ruff,
+            AuditToolId::Cppcheck,
+            AuditToolId::Typos,
+            AuditToolId::Eslint,
+            AuditToolId::Pmd,
+            AuditToolId::Knip,
+            AuditToolId::CargoMachete,
+        ] {
+            assert!(by_id(id).enabled, "{id:?} enabled by default");
+            assert!(by_id(id).path.is_empty(), "{id:?} no path override");
+            assert!(by_id(id).timeout_secs.is_none(), "{id:?} global timeout");
+        }
+        assert!(!by_id(AuditToolId::DotnetAnalyzers).enabled);
+        assert!(!by_id(AuditToolId::SemgrepQuality).enabled);
+    }
+
+    #[test]
+    fn reconcile_audit_tools_leaves_full_config_untouched() {
+        // A fresh install already carries all fourteen tools — nothing to add.
+        let mut s = base_test_settings();
+        let before = s.code_audit.tools.clone();
+        assert_eq!(before.len(), 14);
+        assert!(!reconcile_audit_tools(&mut s));
+        assert_eq!(s.code_audit.tools, before);
+    }
+
+    #[test]
+    fn reconcile_audit_tools_is_idempotent() {
+        use crate::settings::schema::{AuditToolConfig, AuditToolId};
+        let mut s = base_test_settings();
+        s.code_audit.tools = vec![AuditToolConfig {
+            id: AuditToolId::Gitleaks,
+            enabled: true,
+            path: String::new(),
+            extra_args: vec![],
+            timeout_secs: None,
+        }];
+        assert!(reconcile_audit_tools(&mut s));
+        let after_first = s.code_audit.tools.clone();
+        assert_eq!(after_first.len(), 14);
+        // A second pass finds every id present and changes nothing.
+        assert!(!reconcile_audit_tools(&mut s));
+        assert_eq!(s.code_audit.tools, after_first);
+    }
+
+    #[test]
+    fn integrity_reconciles_pre_v25_audit_tools() {
+        use crate::settings::schema::{AuditToolConfig, AuditToolId};
+        // The load-path integrity pass performs the same reconcile, so an
+        // upgraded install gains the Quality tools on first load.
+        let mut s = base_test_settings();
+        s.code_audit.tools = vec![
+            AuditToolConfig {
+                id: AuditToolId::OsvScanner,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+            AuditToolConfig {
+                id: AuditToolId::Gitleaks,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+            AuditToolConfig {
+                id: AuditToolId::Semgrep,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+        ];
+        integrity_check(&mut s);
+        assert_eq!(s.code_audit.tools.len(), 14);
     }
 
     #[test]

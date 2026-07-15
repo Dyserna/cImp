@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Session Usage Insights (V24).** The Code Intelligence Usage group now
+  answers *who* spent the tokens and *what a session actually cost*. Every
+  recorded turn carries an `origin` (main **session** vs sub-**agent**; graph
+  store schema 4 → 5 with a crash-safe stage-and-swap migration of
+  `usage_stat` — existing usage history is preserved, old rows read
+  `session`), tagged at the Claude tap from the sub-agent transcript drain and
+  `isSidechain` lines. The "This session" bar chart grows an **S/A grouping
+  lane** (contiguous same-origin runs, labeled when wide enough) plus a subtle
+  accent outline/desaturation on agent bars, in both tokens and est-cost
+  modes. **Clicking a session row now drills in** instead of opening the old
+  cost popup: the card swaps to that session's turn series and top consumers
+  (new `graph_session_usage` command — the data was always persisted, only
+  the current session was ever queried), the title shows
+  `agent · date time · id` with a copy-id button (session ids are directly
+  resumable: `claude --resume <id>` / `opencode -s <id>`, shown as a hint),
+  and a **Live** pill returns to the current session.
+- **Per-model Cost card (V24).** A collapsible **Cost** card under "This
+  session" prices each model in the session separately (a Fable main session
+  with Opus agents shows two rows), each row with its token totals, an S/A
+  share line, and a what-if pricing select — auto-matched from the pricing
+  table by `model_prefix`, with **Custom…** rates and a **Free ($0)** option.
+  Selections are stored as stable provider+model keys (never table positions),
+  so Settings pricing edits can't silently repoint a row; a vanished row falls
+  back to auto-match. Live mode tracks the session as turns accumulate; the
+  grand total sums per-model costs, fixing the old popup's mixed-model
+  single-rate mispricing. The cost popup is gone.
+- **Active-session markers (V24).** Session rows that are live right now —
+  an open Claude/OpenCode tab (tap-registered, RAII-cleared on close) or any
+  session with activity in the last 5 minutes — get a theme-accent edge and a
+  pulsing dot (reduced-motion honored), all of them at once, coexisting with
+  the selected highlight.
+- **Real OpenCode token usage (V24).** The generated OpenCode plugin now
+  forwards per-assistant-message token usage (input/output+reasoning/cache
+  read/write, model id) from the `message.updated` event into the loopback
+  `/memory/event` ingress as real Turn rows — OpenCode session rows stop
+  showing all-zero totals and price like Claude ones. Task-tool child
+  sessions roll up to their parent with `origin: agent` (mirroring the Claude
+  sub-agent contract), and child tool events no longer fabricate phantom
+  token-less session rows. The `est` badge is now data-driven: it marks
+  sessions with no recorded turns at all (pre-V24 OpenCode history keeps it;
+  plugin-reporting sessions lose it). Note: the plugin regenerates on app
+  launch, so OpenCode tabs report tokens after the next restart.
+
 - **Code Audit — aggregated security scanning (V23).** A new opt-in
   (`code_audit.enabled`, off by default) reserved **Code Audit** dashboard tab
   and a **Settings → Code Audit** category run three unbundled security

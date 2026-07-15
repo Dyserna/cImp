@@ -10,6 +10,24 @@ import {
   fmtUsd,
   matchPricing,
   turnCost,
+  laneSegments,
+  laneLabelVisible,
+  resumeCommand,
+  agentBarClass,
+  sessionRowState,
+  LANE_LABEL_MIN_PX,
+  matchPricingIndex,
+  resolveRates,
+  pricingRowKey,
+  costSelIdx,
+  costRowState,
+  costOverrideForIdx,
+  isEmptyDetailRow,
+  costGrandTotal,
+  originShareLine,
+  FREE_RATES,
+  type PriceRates,
+  type CostOverride,
 } from './usageMath';
 
 function turn(
@@ -191,6 +209,298 @@ describe('turnCost (V16 Feature 8)', () => {
     expect(
       turnCost({ in_tok: 0, cache_read: 0, cache_make: 0, out_tok: 0, tool_chars: 0 }, rates).total,
     ).toBe(0);
+  });
+});
+
+describe('laneSegments (V24 Phase C)', () => {
+  const o = (...origins: ('session' | 'agent')[]) => origins.map((origin) => ({ origin }));
+
+  test('merges contiguous same-origin runs into segments', () => {
+    // S S A A A S  ->  S×2, A×3, S×1
+    expect(laneSegments(o('session', 'session', 'agent', 'agent', 'agent', 'session'))).toEqual([
+      { origin: 'session', label: 'S', count: 2 },
+      { origin: 'agent', label: 'A', count: 3 },
+      { origin: 'session', label: 'S', count: 1 },
+    ]);
+  });
+
+  test('a single-origin session collapses to exactly one segment', () => {
+    expect(laneSegments(o('session', 'session', 'session'))).toEqual([
+      { origin: 'session', label: 'S', count: 3 },
+    ]);
+    expect(laneSegments(o('agent', 'agent'))).toEqual([{ origin: 'agent', label: 'A', count: 2 }]);
+  });
+
+  test('labels: session -> S, agent -> A', () => {
+    const segs = laneSegments(o('agent', 'session'));
+    expect(segs.map((s) => s.label)).toEqual(['A', 'S']);
+  });
+
+  test('alternating origins yield one segment per turn', () => {
+    expect(laneSegments(o('session', 'agent', 'session')).map((s) => s.count)).toEqual([1, 1, 1]);
+  });
+
+  test('no turns -> no segments', () => {
+    expect(laneSegments([])).toEqual([]);
+  });
+});
+
+describe('laneLabelVisible (V24 Phase C)', () => {
+  test('shows the label once the segment is at least ~2 chars wide', () => {
+    // 4 turns across a 400px lane => 100px each; a 1-turn segment clears the
+    // threshold, so any segment does.
+    expect(laneLabelVisible(1, 4, 400)).toBe(true);
+    // A wide, cramped lane: 200 turns across 400px => 2px each; a 5-turn
+    // segment is 10px < LANE_LABEL_MIN_PX (14) => hidden (tooltip only).
+    expect(laneLabelVisible(5, 200, 400)).toBe(false);
+    // ...but a 7-turn run at the same density is 14px => shown.
+    expect(laneLabelVisible(7, 200, 400)).toBe(true);
+  });
+
+  test('hidden before the lane has measured (width 0) or with no turns', () => {
+    expect(laneLabelVisible(3, 10, 0)).toBe(false);
+    expect(laneLabelVisible(3, 0, 400)).toBe(false);
+  });
+
+  test('threshold constant is ~2 characters', () => {
+    expect(LANE_LABEL_MIN_PX).toBe(14);
+  });
+});
+
+describe('resumeCommand (V24 Phase C)', () => {
+  test('opencode sessions resume with -s', () => {
+    expect(resumeCommand('opencode', 'ses_abc')).toBe('opencode -s ses_abc');
+  });
+
+  test('claude (and anything else) resume with --resume', () => {
+    expect(resumeCommand('claude', 'uuid-123')).toBe('claude --resume uuid-123');
+    expect(resumeCommand('other', 'x')).toBe('claude --resume x');
+  });
+});
+
+describe('agentBarClass (V24 Phase C)', () => {
+  test('agent turns get the "agent" class, session turns none', () => {
+    expect(agentBarClass('agent')).toBe('agent');
+    expect(agentBarClass('session')).toBe('');
+  });
+});
+
+describe('sessionRowState (V24 Phase E)', () => {
+  const active = ['s1', 's2'];
+  test('active when the id is in active_session_ids', () => {
+    expect(sessionRowState('s1', null, active)).toEqual({ active: true, selected: false });
+    expect(sessionRowState('s2', null, active)).toEqual({ active: true, selected: false });
+  });
+  test('selected when the id is the selected one', () => {
+    expect(sessionRowState('s9', 's9', active)).toEqual({ active: false, selected: true });
+  });
+  test('active and selected coexist on the same row', () => {
+    expect(sessionRowState('s1', 's1', active)).toEqual({ active: true, selected: true });
+  });
+  test('neither when unmatched', () => {
+    expect(sessionRowState('other', 's1', active)).toEqual({ active: false, selected: false });
+  });
+  test('missing/empty inputs are safe (no active ids, no selection)', () => {
+    expect(sessionRowState('s1', null, [])).toEqual({ active: false, selected: false });
+    expect(sessionRowState('s1', undefined, undefined)).toEqual({ active: false, selected: false });
+    expect(sessionRowState('s1', null, null)).toEqual({ active: false, selected: false });
+  });
+});
+
+describe('isEmptyDetailRow (V24 Phase C — vanished-session guard)', () => {
+  test('the backend empty sentinel (blank agent + zero started_ms) is detected', () => {
+    expect(isEmptyDetailRow({ agent: '', started_ms: 0 })).toBe(true);
+  });
+  test('a real row is never treated as empty', () => {
+    expect(isEmptyDetailRow({ agent: 'claude', started_ms: 1_700_000_000_000 })).toBe(false);
+  });
+  test('only-one-field-set is not the sentinel (needs BOTH blank agent and zero ts)', () => {
+    // A live session started exactly at epoch 0 would still carry an agent;
+    // an agent-less row with a real timestamp shouldn't be a real session.
+    expect(isEmptyDetailRow({ agent: 'claude', started_ms: 0 })).toBe(false);
+    expect(isEmptyDetailRow({ agent: '', started_ms: 1 })).toBe(false);
+  });
+});
+
+describe('Cost card pricing (V24 Phase D)', () => {
+  const rates = { input: 5, cache_write: 10, cache_read: 0.5, output: 25 };
+  // Identified rows (provider + model give each a stable key) — the shape the
+  // stable-identity resolver keys overrides against.
+  const rows = [
+    { provider: 'anthropic', model: 'opus-4-family', model_prefix: 'claude-opus-4', ...rates },
+    { provider: 'anthropic', model: 'opus-4-8', model_prefix: 'claude-opus-4-8', ...rates },
+    { provider: 'anthropic', model: 'manual-only', model_prefix: '', ...rates },
+  ];
+
+  describe('matchPricingIndex', () => {
+    test('returns the index of the longest-prefix match', () => {
+      expect(matchPricingIndex('claude-opus-4-8-20260115', rows)).toBe(1); // exact
+      expect(matchPricingIndex('claude-opus-4-7', rows)).toBe(0); // family
+    });
+    test('-1 when nothing matches (unknown model, empty/blank prefixes only)', () => {
+      expect(matchPricingIndex('gpt-5.5', rows)).toBe(-1);
+      expect(matchPricingIndex(null, rows)).toBe(-1);
+      expect(matchPricingIndex('anything', [{ model_prefix: '', ...rates }])).toBe(-1);
+    });
+  });
+
+  describe('matchPricing (row form ≡ index form)', () => {
+    test('returns the same row matchPricingIndex points at', () => {
+      expect(matchPricing('claude-opus-4-8-20260115', rows)).toBe(rows[1]);
+      expect(matchPricing('claude-opus-4-7', rows)).toBe(rows[0]);
+    });
+    test('null when the index form returns -1', () => {
+      expect(matchPricing('gpt-5.5', rows)).toBeNull();
+      expect(matchPricing(null, rows)).toBeNull();
+    });
+  });
+
+  describe('pricingRowKey (stable identity)', () => {
+    test('is provider + " " + model', () => {
+      expect(pricingRowKey(rows[1])).toBe('anthropic opus-4-8');
+    });
+  });
+
+  describe('costSelIdx (stable-key resolution against the CURRENT table)', () => {
+    const CUSTOM = rows.length;
+    const FREE = rows.length + 1;
+    test('no override → auto-match by longest prefix', () => {
+      expect(costSelIdx('claude-opus-4-8-x', undefined, rows)).toBe(1);
+      expect(costSelIdx('claude-opus-4-7', undefined, rows)).toBe(0);
+    });
+    test('no override + no match → Custom sentinel (never a made-up cost)', () => {
+      expect(costSelIdx('gpt-5.5', undefined, rows)).toBe(CUSTOM);
+      expect(costSelIdx(null, undefined, rows)).toBe(CUSTOM);
+    });
+    test('a row override resolves to that row\'s CURRENT index', () => {
+      const ov: CostOverride = { kind: 'row', key: pricingRowKey(rows[0]) };
+      expect(costSelIdx('claude-opus-4-8-x', ov, rows)).toBe(0); // wins over auto-match
+    });
+    test('a row override survives table REORDER (keyed, not positional)', () => {
+      const ov: CostOverride = { kind: 'row', key: pricingRowKey(rows[1]) };
+      const reordered = [rows[2], rows[1], rows[0]];
+      expect(costSelIdx('claude-opus-4-8-x', ov, reordered)).toBe(1); // still the opus-4-8 row
+    });
+    test('a VANISHED row key falls back to auto-match, not silently Free', () => {
+      const ov: CostOverride = { kind: 'row', key: 'anthropic gone' };
+      // auto-match still finds opus-4-8 for this model:
+      expect(costSelIdx('claude-opus-4-8-x', ov, rows)).toBe(1);
+      // and Custom when the model itself no longer matches anything:
+      expect(costSelIdx('gpt-5.5', ov, rows)).toBe(CUSTOM);
+    });
+    test('custom / free overrides map to their sentinels', () => {
+      expect(costSelIdx('claude-opus-4-8-x', { kind: 'custom' }, rows)).toBe(CUSTOM);
+      expect(costSelIdx('claude-opus-4-8-x', { kind: 'free' }, rows)).toBe(FREE);
+    });
+  });
+
+  describe('costRowState (selIdx + rates + matchedRow)', () => {
+    const custom: PriceRates = { input: 1, cache_write: 2, cache_read: 3, output: 4 };
+    test('auto-matched row: rates are that row, matchedRow set', () => {
+      const st = costRowState('claude-opus-4-8-x', undefined, rows, custom);
+      expect(st.selIdx).toBe(1);
+      expect(st.rates).toBe(rows[1]);
+      expect(st.matchedRow).toBe(rows[1]);
+    });
+    test('unmatched model: Custom rates, matchedRow null', () => {
+      const st = costRowState('gpt-5.5', undefined, rows, custom);
+      expect(st.selIdx).toBe(rows.length);
+      expect(st.rates).toBe(custom);
+      expect(st.matchedRow).toBeNull();
+    });
+    test('free override: all-zero rates regardless of the model', () => {
+      const st = costRowState('claude-opus-4-8-x', { kind: 'free' }, rows, custom);
+      expect(st.rates).toEqual(FREE_RATES);
+      // matchedRow still reflects the auto-match (for the provider label):
+      expect(st.matchedRow).toBe(rows[1]);
+    });
+    test('vanished row key: rates fall back to the auto-matched row', () => {
+      const st = costRowState('claude-opus-4-8-x', { kind: 'row', key: 'gone gone' }, rows, custom);
+      expect(st.rates).toBe(rows[1]);
+    });
+  });
+
+  describe('costOverrideForIdx (chosen index → stable override)', () => {
+    test('a table-row index records the row by its stable key', () => {
+      expect(costOverrideForIdx(1, rows)).toEqual({ kind: 'row', key: pricingRowKey(rows[1]) });
+    });
+    test('the trailing indices record the Custom / Free sentinels', () => {
+      expect(costOverrideForIdx(rows.length, rows)).toEqual({ kind: 'custom' });
+      expect(costOverrideForIdx(rows.length + 1, rows)).toEqual({ kind: 'free' });
+    });
+    test('round-trips through costSelIdx', () => {
+      for (let i = 0; i < rows.length + 2; i++) {
+        expect(costSelIdx('anything', costOverrideForIdx(i, rows), rows)).toBe(i);
+      }
+    });
+  });
+
+  describe('resolveRates (row / custom / free precedence)', () => {
+    const custom: PriceRates = { input: 1, cache_write: 2, cache_read: 3, output: 4 };
+    test('an in-range index resolves to that table row', () => {
+      expect(resolveRates(1, rows, custom)).toBe(rows[1]);
+    });
+    test('the Custom sentinel resolves to the hand-typed rates', () => {
+      expect(resolveRates(rows.length, rows, custom)).toBe(custom);
+    });
+    test('the Free option is all-zero rates', () => {
+      expect(resolveRates(rows.length + 1, rows, custom)).toEqual(FREE_RATES);
+      expect(resolveRates(rows.length + 1, rows, custom)).toEqual({
+        input: 0,
+        cache_write: 0,
+        cache_read: 0,
+        output: 0,
+      });
+    });
+    test('a stale/out-of-range index falls back to Free, never a wrong row', () => {
+      expect(resolveRates(99, rows, custom)).toEqual(FREE_RATES);
+      expect(resolveRates(-1, rows, custom)).toEqual(FREE_RATES);
+    });
+    test('Free rates price any session at $0', () => {
+      const c = sessionCost(
+        { in_tok: 5_000_000, cache_make: 5_000_000, cache_read: 5_000_000, out_tok: 5_000_000 },
+        resolveRates(rows.length + 1, rows, custom),
+      );
+      expect(c.total).toBe(0);
+    });
+  });
+
+  describe('costGrandTotal (per-model rows sum)', () => {
+    // A Fable-main + Opus-agents session: two model rows, priced independently.
+    const opus: PriceRates = { input: 15, cache_write: 18.75, cache_read: 1.5, output: 75 };
+    const fable: PriceRates = { input: 1, cache_write: 1.25, cache_read: 0.1, output: 5 };
+    const perModel = [
+      { model: 'claude-opus-4-8', totals: { in_tok: 1_000_000, out_tok: 1_000_000, cache_read: 0, cache_make: 0 } },
+      { model: 'claude-fable-2', totals: { in_tok: 2_000_000, out_tok: 0, cache_read: 0, cache_make: 0 } },
+    ];
+
+    test('sums each model row at its own rates', () => {
+      const total = costGrandTotal(perModel, (i) => (i === 0 ? opus : fable));
+      // opus: 1M*15 + 1M*75 = 90 ; fable: 2M*1 = 2 ; grand = 92
+      expect(total).toBe(92);
+      // ...and the per-row math each row renders is just sessionCost:
+      expect(sessionCost(perModel[0].totals, opus).total).toBe(90);
+      expect(sessionCost(perModel[1].totals, fable).total).toBe(2);
+    });
+
+    test('a single-model session is just that row (Free → $0)', () => {
+      expect(costGrandTotal([perModel[0]], () => FREE_RATES)).toBe(0);
+    });
+
+    test('no models → $0', () => {
+      expect(costGrandTotal([], () => opus)).toBe(0);
+    });
+  });
+
+  describe('originShareLine (S/A share formatting)', () => {
+    test('formats both origins with fmtTok', () => {
+      expect(originShareLine({ session_tok: 12_300, agent_tok: 4_100 })).toBe(
+        'session 12k · agents 4.1k tok',
+      );
+    });
+    test('a session with no agent fan-out still shows both sides', () => {
+      expect(originShareLine({ session_tok: 500, agent_tok: 0 })).toBe('session 500 · agents 0 tok');
+    });
   });
 });
 

@@ -1947,6 +1947,23 @@ pub async fn graph_usage(
     Ok(snap)
 }
 
+/// V24 Phase B: full drill-in detail for ONE session under `root` — its totals
+/// row, per-turn series, top-tools ranking, and per-model token totals with the
+/// session/agent origin split. Unlike `graph_usage` (which only surfaces the
+/// current session at full detail), this works for any session id, so the Usage
+/// card can render a clicked historical session. An unknown session id returns
+/// an empty detail (no error, no panic). `root` defaults to the launch
+/// directory.
+#[tauri::command]
+pub async fn graph_session_usage(
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    session_id: String,
+) -> AppResult<crate::graph::SessionUsageDetail> {
+    let root = resolve_graph_root(root)?;
+    Ok(graph.session_usage_detail(&root, &session_id))
+}
+
 /// V14 Phase D2: the `graph_usage_advice` response. Wraps `advisor::evaluate`'s
 /// `Vec<Proposal>` with a `collecting` flag — NOT part of the milestone's
 /// literal `Vec<Proposal>` pseudocode, added because the Advisor card (D2.4)

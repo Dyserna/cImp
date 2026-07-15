@@ -32,8 +32,8 @@ use crate::settings::{GraphSettings, SettingsHandle};
 use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
 use super::memory::{
-    Effectiveness, MemorySnapshot, ProjectFact, SessionUsage, SessionUsageRow, ToolUsage,
-    TurnUsage, UsageEvent, UsageSnapshot, UsageTotals, WorkingSetEntry,
+    Effectiveness, MemorySnapshot, ModelUsage, ProjectFact, SessionUsage, SessionUsageDetail,
+    SessionUsageRow, ToolUsage, TurnUsage, UsageEvent, UsageSnapshot, UsageTotals, WorkingSetEntry,
 };
 use super::model::Lang;
 use super::parse_file;
@@ -149,6 +149,32 @@ pub struct EmbedderProbe {
     pub message: String,
 }
 
+/// V24 Phase B: a registry entry marks a session live within
+/// [`LIVE_SESSION_TTL_MS`] of its last refresh (a still-ticking Claude drain
+/// tick, or a still-reporting OpenCode session). The Claude drain polls every
+/// ~200ms, so even an idle-but-open tab refreshes well inside this window; the
+/// generous margin only tolerates a slow drain of a large transcript.
+const LIVE_SESSION_TTL_MS: i64 = 90_000;
+
+/// V24 Phase B: the recency half of the decided "open tabs + recency"
+/// semantics — a session whose last recorded activity falls within this window
+/// also counts as active, catching a live session the registry missed (a
+/// pre-existing tab from before this process, or the gap before the first
+/// drain tick).
+const LIVE_SESSION_RECENCY_MS: i64 = 5 * 60_000;
+
+/// V24 Phase B: one live-session registry entry. `session_id` is the value (not
+/// the key) so a Claude tab keyed by its stable tab id can rotate the session
+/// it reports without leaking a stale key; OpenCode keys by the reporting
+/// session id itself (no tab binding on the loopback path).
+#[derive(Clone, Debug)]
+struct LiveSession {
+    #[allow(dead_code)] // recorded for future per-agent filtering; not read yet.
+    agent: String,
+    session_id: String,
+    last_seen_ms: i64,
+}
+
 /// The app-owned graph service. Held in `AppState` beside the offload service.
 pub struct GraphService {
     app: AppHandle,
@@ -251,6 +277,14 @@ pub struct GraphService {
     /// Process-wide + since-restart, matching the Activity-based sums in
     /// [`Self::effectiveness_totals`].
     bypassed_advice_chars: AtomicU64,
+    /// V24 Phase B: the live-session registry — which agent sessions are active
+    /// right now. Keyed by a stable key (a Claude tab id, or the reporting
+    /// session id on the OpenCode loopback path), value = [`LiveSession`].
+    /// Process-wide (one service serves every project), so `usage_snapshot`
+    /// intersects it with the queried root's own sessions before reporting
+    /// `active_session_ids`. Claude clears its entry on tab cancel; every entry
+    /// also expires by [`LIVE_SESSION_TTL_MS`].
+    live_sessions: StdMutex<HashMap<String, LiveSession>>,
 }
 
 /// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
@@ -614,6 +648,54 @@ fn first_read_eligible(i: &FirstReadIn) -> bool {
         && !i.is_code
 }
 
+/// V24 Phase B (pure): the "open tabs + recency" active-session set — a session
+/// is active when it has recent activity (`last_ms` within
+/// [`LIVE_SESSION_RECENCY_MS`]) OR a fresh registry entry (`last_seen_ms` within
+/// [`LIVE_SESSION_TTL_MS`]). The registry (`live`) is process-wide, so its
+/// contribution is intersected with `sessions` (the queried root's known
+/// sessions) to avoid leaking another project's live session into this
+/// snapshot — a fresh entry whose session isn't in `sessions` has no row to
+/// mark here anyway. Deduped; sorted for a stable payload. Free-standing so it's
+/// unit-testable without an `AppHandle`.
+fn compute_active_session_ids(
+    live: &HashMap<String, LiveSession>,
+    sessions: &[SessionUsageRow],
+    now: i64,
+) -> Vec<String> {
+    let known: HashSet<&str> = sessions.iter().map(|r| r.session_id.as_str()).collect();
+    let mut active: HashSet<String> = HashSet::new();
+    // Recency half: any known session touched within the window.
+    for r in sessions {
+        if now.saturating_sub(r.last_ms) <= LIVE_SESSION_RECENCY_MS {
+            active.insert(r.session_id.clone());
+        }
+    }
+    // Registry half: fresh entries whose session belongs to this root.
+    for e in live.values() {
+        if now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS
+            && known.contains(e.session_id.as_str())
+        {
+            active.insert(e.session_id.clone());
+        }
+    }
+    let mut out: Vec<String> = active.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// V24 Phase B: drop live-session registry entries older than
+/// [`LIVE_SESSION_TTL_MS`] — the registry half's cutoff. Called opportunistically
+/// from [`GraphService::mark_live_session`] so the map doesn't grow without bound
+/// (OpenCode keys have no cancel signal on the loopback path, so TTL is their
+/// only reclamation). Safe because a TTL-stale entry is already ignored by
+/// [`compute_active_session_ids`]'s registry half, and the recency half (the
+/// younger [`LIVE_SESSION_RECENCY_MS`] window over recorded activity) covers any
+/// session that is still genuinely active — so eviction can never change an
+/// active-set result. Free-standing so it's unit-testable without an `AppHandle`.
+fn evict_stale_live_sessions(live: &mut HashMap<String, LiveSession>, now: i64) {
+    live.retain(|_, e| now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS);
+}
+
 /// V16 drift signals that need full-relation scans (`large_reread_pairs`
 /// walks every read event + every symbol span; `claude_tokenless_sessions`
 /// walks every usage row). The Overview's advice poll asks every 2s, but
@@ -684,6 +766,7 @@ impl GraphService {
             auto_check_sessions: StdMutex::new(HashMap::new()),
             auto_check_runner: crate::checks::auto::RootRunner::new(),
             distilling: StdMutex::new(HashSet::new()),
+            live_sessions: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -1117,6 +1200,7 @@ impl GraphService {
                 effectiveness,
                 offload_local_tasks: 0,
                 surface: Default::default(),
+                active_session_ids: Vec::new(),
             };
         };
         // Reuses the per-root wrapper methods above (not `idx` directly) so
@@ -1131,7 +1215,97 @@ impl GraphService {
             }
         });
         let sessions = self.usage_all_sessions(root);
-        UsageSnapshot { current, sessions, effectiveness, offload_local_tasks: 0, surface: Default::default() }
+        let active_session_ids =
+            self.active_session_ids(&sessions, crate::activity::now_ms() as i64);
+        UsageSnapshot {
+            current,
+            sessions,
+            effectiveness,
+            offload_local_tasks: 0,
+            surface: Default::default(),
+            active_session_ids,
+        }
+    }
+
+    /// V24 Phase B: full drill-in detail for `session_id` under `root` — the
+    /// same shape `graph_usage` gives the current session, but for ANY session.
+    /// An unknown session (no `session` row, or the graph is off) yields
+    /// [`SessionUsageDetail::empty`]. Best-effort: a store error yields empties,
+    /// never an error (matches the other usage wrappers). Reuses the per-root
+    /// wrapper methods, same posture as [`Self::usage_snapshot`].
+    pub fn session_usage_detail(&self, root: &Path, session_id: &str) -> SessionUsageDetail {
+        let Some(row) = self.usage_session_row(root, session_id) else {
+            return SessionUsageDetail::empty(session_id);
+        };
+        SessionUsageDetail {
+            row,
+            turns: self.usage_turn_series(root, session_id),
+            top_tools: self.usage_tool_ranking(root, session_id),
+            per_model: self.usage_session_model_totals(root, session_id),
+        }
+    }
+
+    /// V24 Phase B: the single totals row for `session_id`, or `None` when the
+    /// session is unknown (or the graph is off / a store error). Same shape as
+    /// one entry of [`Self::usage_all_sessions`].
+    pub fn usage_session_row(&self, root: &Path, session_id: &str) -> Option<SessionUsageRow> {
+        let idx = self.index_for(root).ok()?;
+        idx.usage_session_row(session_id).ok().flatten()
+    }
+
+    /// V24 Phase B: per-model token totals + session/agent origin split for
+    /// `session_id`, ordered by tokens desc. Empty on any store error.
+    pub fn usage_session_model_totals(&self, root: &Path, session_id: &str) -> Vec<ModelUsage> {
+        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        idx.usage_session_model_totals(session_id).unwrap_or_default()
+    }
+
+    /// V24 Phase B: upsert a live-session registry entry, keyed by `key` (a
+    /// Claude tab id, or the reporting session id on the OpenCode loopback
+    /// path), stamping `last_seen_ms` to now. Called on every Claude drain tick
+    /// and every OpenCode `/memory/event` — cheap and idempotent.
+    pub fn mark_live_session(&self, key: &str, agent: &str, session_id: &str) {
+        let now = crate::activity::now_ms() as i64;
+        if let Ok(mut m) = self.live_sessions.lock() {
+            // Entry API so the steady-state 200ms Claude drain tick only stamps
+            // `last_seen_ms` in place — no per-tick allocation of a fresh entry.
+            m.entry(key.to_string())
+                .and_modify(|e| {
+                    e.last_seen_ms = now;
+                    // The reported session/agent can rotate under a stable key
+                    // (a Claude tab keyed by its tab id) — keep them current.
+                    e.session_id = session_id.to_string();
+                    e.agent = agent.to_string();
+                })
+                .or_insert_with(|| LiveSession {
+                    agent: agent.to_string(),
+                    session_id: session_id.to_string(),
+                    last_seen_ms: now,
+                });
+            // Opportunistic eviction so OpenCode session keys — which have no
+            // cancel signal on the loopback path — can't accumulate forever.
+            evict_stale_live_sessions(&mut m, now);
+        }
+    }
+
+    /// V24 Phase B: drop a live-session registry entry by `key` — the Claude
+    /// tap calls this on tab cancel so a closed tab stops being reported active
+    /// before its TTL lapses. OpenCode has no tab binding on the loopback path,
+    /// so its entries rely on TTL expiry alone.
+    pub fn clear_live_session(&self, key: &str) {
+        if let Ok(mut m) = self.live_sessions.lock() {
+            m.remove(key);
+        }
+    }
+
+    /// V24 Phase B: the "open tabs + recency" active set for `sessions` at
+    /// `now`, from the live-session registry. Locks the registry and delegates
+    /// the decision to [`compute_active_session_ids`] (pure, unit-tested).
+    fn active_session_ids(&self, sessions: &[SessionUsageRow], now: i64) -> Vec<String> {
+        match self.live_sessions.lock() {
+            Ok(m) => compute_active_session_ids(&m, sessions, now),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// V14 Phase D: sum of the honest injected/deduped-char counters
@@ -4622,5 +4796,87 @@ mod tests {
     fn first_read_slice_passes() {
         // offset OR limit present ⇒ deliberate slice ⇒ never substituted.
         assert!(!first_read_eligible(&FirstReadIn { slice: true, ..fin() }));
+    }
+
+    // ── V24 Phase B: live-session registry → active_session_ids ─────────────
+
+    /// A minimal session row carrying just the id + `last_ms` the active-set
+    /// logic reads (the rest is irrelevant to the decision).
+    fn urow(id: &str, last_ms: i64) -> SessionUsageRow {
+        SessionUsageRow {
+            session_id: id.to_string(),
+            agent: "claude".to_string(),
+            totals: UsageTotals::default(),
+            tool_chars: 0,
+            cache_hit_ratio: 0.0,
+            est_only: false,
+            started_ms: 0,
+            last_ms,
+            models: Vec::new(),
+        }
+    }
+
+    fn live(session_id: &str, last_seen_ms: i64) -> LiveSession {
+        LiveSession { agent: "claude".to_string(), session_id: session_id.to_string(), last_seen_ms }
+    }
+
+    #[test]
+    fn active_session_ids_unions_registry_and_recency_and_dedups() {
+        let now = 10_000_000i64;
+        let sessions = vec![
+            urow("recent", now - 1_000), // recency-fresh
+            urow("idle-but-open", now - LIVE_SESSION_RECENCY_MS - 60_000), // stale activity
+            urow("stale", now - LIVE_SESSION_RECENCY_MS - 60_000), // stale, no live entry
+        ];
+        let mut reg = HashMap::new();
+        // A still-ticking tab whose last activity fell out of the recency window
+        // — the registry keeps it active (the point of the union).
+        reg.insert("tabA".to_string(), live("idle-but-open", now - 1_000));
+        // An expired registry entry does NOT keep its session active.
+        reg.insert("tabB".to_string(), live("stale", now - LIVE_SESSION_TTL_MS - 1_000));
+        // A fresh entry whose session isn't in THIS root's list is ignored
+        // (the registry is process-wide; the output is root-scoped).
+        reg.insert("tabC".to_string(), live("other-project", now));
+        // "recent" is BOTH recency-fresh and registry-fresh → appears once.
+        reg.insert("tabD".to_string(), live("recent", now));
+
+        let active = compute_active_session_ids(&reg, &sessions, now);
+        assert_eq!(
+            active,
+            vec!["idle-but-open".to_string(), "recent".to_string()],
+            "sorted, deduped, TTL-gated and root-scoped"
+        );
+    }
+
+    #[test]
+    fn active_session_ids_registry_ttl_boundary() {
+        let now = 10_000_000i64;
+        // A single session with stale activity, so only the registry can mark it.
+        let sessions = vec![urow("s", now - LIVE_SESSION_RECENCY_MS - 1)];
+        // Exactly at the TTL edge is still live...
+        let mut at_edge = HashMap::new();
+        at_edge.insert("t".to_string(), live("s", now - LIVE_SESSION_TTL_MS));
+        assert_eq!(compute_active_session_ids(&at_edge, &sessions, now), vec!["s".to_string()]);
+        // ...one ms past it has expired.
+        let mut past = HashMap::new();
+        past.insert("t".to_string(), live("s", now - LIVE_SESSION_TTL_MS - 1));
+        assert!(compute_active_session_ids(&past, &sessions, now).is_empty());
+    }
+
+    #[test]
+    fn evict_stale_live_sessions_drops_only_ttl_stale_entries() {
+        // V24 code-review: the opportunistic eviction `mark_live_session` runs
+        // keeps entries within the registry TTL (which the registry half still
+        // uses) and drops only those past it, so OpenCode keys can't accumulate.
+        let now = 10_000_000i64;
+        let mut reg = HashMap::new();
+        reg.insert("fresh".to_string(), live("s_fresh", now - 1_000));
+        reg.insert("edge".to_string(), live("s_edge", now - LIVE_SESSION_TTL_MS));
+        reg.insert("stale".to_string(), live("s_stale", now - LIVE_SESSION_TTL_MS - 1));
+        evict_stale_live_sessions(&mut reg, now);
+        assert!(reg.contains_key("fresh"), "within TTL kept");
+        assert!(reg.contains_key("edge"), "exactly at TTL kept");
+        assert!(!reg.contains_key("stale"), "past TTL evicted");
+        assert_eq!(reg.len(), 2);
     }
 }

@@ -26,6 +26,7 @@
     graphFactAdd,
     graphContextPreview,
     graphUsage,
+    graphSessionUsage,
     graphUsageAdvice,
     advisorDismiss,
     advisorMarkApplied,
@@ -48,6 +49,8 @@
     type PathNodeRow,
     type ArchResult,
     type SessionUsageRow,
+    type SessionUsageDetail,
+    type ModelUsage,
   } from './graph';
   import {
     turnTotal,
@@ -59,8 +62,22 @@
     fmtUsd,
     matchPricing,
     turnCost,
+    laneSegments,
+    laneLabelVisible,
+    resumeCommand,
+    agentBarClass,
+    sessionRowState,
+    costRowState,
+    costOverrideForIdx,
+    isEmptyDetailRow,
+    costGrandTotal,
+    originShareLine,
+    FREE_RATES,
     type PriceRates,
+    type CostOverride,
+    type CostRowState,
   } from './usageMath';
+  import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
   import { fmtDate, fmtTime } from './format';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
@@ -387,52 +404,212 @@
     revealTab(WORKBENCH_TAB_ID);
   }
 
-  // Session-cost popup: clicking a row in the Sessions card opens a modal
-  // that prices that session's token totals against a provider/model entry
-  // from the global LLM price table (Settings → LLM pricing), or against
-  // hand-typed custom rates. The table is fetched fresh on every open so
-  // edits made in the Settings window apply without reopening the tab.
-  let costSession = $state<SessionUsageRow | null>(null);
-  let costPricing = $state<LlmPricingModel[]>([]);
-  // Index into `costPricing`; `costPricing.length` is the sentinel for the
-  // trailing "Custom" option. Remembered across opens within this tab.
-  let costSelIdx = $state(0);
-  let costCustom = $state<PriceRates>({ input: 0, cache_write: 0, cache_read: 0, output: 0 });
+  // ── V24 Phase C: session drill-in ────────────────────────────────────
+  // Clicking a Sessions row selects that session — the "This session" card
+  // then renders its fetched detail (turns / top-tools) instead of
+  // `usage.current`. Null = live mode (current session). `selectedId` guards
+  // against a slow response landing after the user clicked another row.
+  let selectedSession = $state<SessionUsageDetail | null>(null);
+  // The CLICKED row — always fully populated (agent/date/id), so the selected
+  // card title is robust even if the fetched detail's `row` is the empty
+  // sentinel. Set/cleared alongside `selectedSession`.
+  let selectedRow = $state<SessionUsageRow | null>(null);
+  let selectedId = $state<string | null>(null);
+  let copiedId = $state(false);
+  // Transient inline notice under the Sessions list (e.g. a vanished session).
+  let sessionNotice = $state<string | null>(null);
+  let sessionNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+  function flashSessionNotice(msg: string): void {
+    sessionNotice = msg;
+    if (sessionNoticeTimer) clearTimeout(sessionNoticeTimer);
+    sessionNoticeTimer = setTimeout(() => (sessionNotice = null), 4000);
+  }
 
-  async function openCostPopup(s: SessionUsageRow): Promise<void> {
-    costSession = s;
+  async function selectSession(s: SessionUsageRow): Promise<void> {
+    selectedId = s.session_id;
+    // Reveal the card so the freshly selected session is actually visible.
+    sessionCardOpen = true;
+    // Cost mode needs the price table in the selected view too.
+    if (costMode === 'cost' && pricingTable === null) void refreshPricingTable();
     try {
-      costPricing = await llmPricingGet();
+      const detail = await graphSessionUsage(undefined, s.session_id);
+      if (selectedId !== s.session_id) return; // superseded by a later click
+      // The session vanished or the graph is off → the backend returns an
+      // empty-sentinel detail. Don't enter selected mode (its title would read
+      // "Session ·  · 1970-01-01…"); stay live and surface a transient notice.
+      if (isEmptyDetailRow(detail.row)) {
+        clearSelection();
+        flashSessionNotice('Session data no longer available.');
+        return;
+      }
+      selectedRow = s;
+      selectedSession = detail;
+      seedCostCustom(detail.per_model); // Cost card rows for this session.
+    } catch (e) {
+      console.warn('graph_session_usage failed', e);
+      if (selectedId === s.session_id) clearSelection();
+    }
+  }
+
+  function clearSelection(): void {
+    selectedSession = null;
+    selectedRow = null;
+    selectedId = null;
+  }
+
+  // Return to the live current-session view. Lives on a button inside the
+  // card <summary>, so it must not also toggle the <details>.
+  function goLive(e: Event): void {
+    e.preventDefault();
+    e.stopPropagation();
+    clearSelection();
+  }
+
+  // Copy the FULL selected session id (the <summary> only shows an 8-char
+  // prefix). WebView2 denies `navigator.clipboard`, so use the Tauri
+  // clipboard plugin (project_webview_clipboard_wheel).
+  async function copySessionId(e: Event): Promise<void> {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!selectedRow) return;
+    try {
+      await clipboardWriteText(selectedRow.session_id);
+      copiedId = true;
+      setTimeout(() => (copiedId = false), 1200);
+    } catch (err) {
+      console.warn('copy session id failed', err);
+    }
+  }
+
+  // ── V24 Phase D: Cost card — per-model what-if pricing ───────────────
+  // The collapsible Cost card (replacing the old single-rate cost popup)
+  // prices each model in the session separately, each row picking its own
+  // rates. It shares the ONE `pricingTable` declared here (also feeding the
+  // tokens|cost toggle and the Sessions-row costs), refreshed on both cost-mode
+  // entry and Cost-card open, so a Settings → LLM pricing edit propagates to
+  // every consumer consistently.
+  //   Live mode  = the current session's `per_model` (lazy-fetched on open).
+  //   Selected   = the already-fetched `selectedSession.per_model`.
+  let costCardOpen = $state(loadCardOpen('code-intelligence', 'usage-cost'));
+  $effect(() => saveCardOpen('code-intelligence', 'usage-cost', costCardOpen));
+  // The ONE LLM price table for every Usage-section consumer. `null` = not
+  // fetched yet (fetch on first need); `[]` = fetched, empty.
+  let pricingTable = $state<LlmPricingModel[] | null>(null);
+  const pricingRows = $derived(pricingTable ?? []);
+  async function refreshPricingTable(): Promise<void> {
+    try {
+      pricingTable = await llmPricingGet();
     } catch (e) {
       console.warn('llm_pricing_get failed', e);
-      costPricing = [];
-    }
-    // A shrunken table can strand the remembered index past the Custom
-    // sentinel — clamp back to the first provider (or Custom when empty).
-    if (costSelIdx > costPricing.length) costSelIdx = 0;
-  }
-  function closeCostPopup(): void {
-    costSession = null;
-  }
-  function onCostKeydown(e: KeyboardEvent): void {
-    if (e.key === 'Escape' && costSession) {
-      e.stopPropagation();
-      closeCostPopup();
+      pricingTable = [];
     }
   }
-  const costRates = $derived<PriceRates>(
-    costSelIdx < costPricing.length ? costPricing[costSelIdx] : costCustom,
+  // The current session's full detail, lazy-fetched for live-mode pricing, plus
+  // the snapshot it was fetched at (session id + turn count) so live mode
+  // refetches when the session ADVANCES rather than freezing for its lifetime.
+  let liveDetail = $state<SessionUsageDetail | null>(null);
+  let liveDetailAt = $state<{ sid: string; turns: number } | null>(null);
+  // Non-reactive in-flight guard: the `sid:turns` snapshot being fetched, so
+  // the live effect fires at most once per poll tick.
+  let liveFetchKey = '';
+  // Per-model pricing OVERRIDES (user picks only), keyed by model id — no entry
+  // means "follow the live auto-match against the current table" (see
+  // `costRowByModel`). Values are stable across table edits (row key / custom /
+  // free), never a positional index. Custom rate objects are seeded eagerly so
+  // the number-input binds below always have an lvalue.
+  let costOverrideByModel = $state<Record<string, CostOverride>>({});
+  let costCustomByModel = $state<Record<string, PriceRates>>({});
+
+  // The per_model list driving the card: selected session's, else the live
+  // current session's (empty until fetched).
+  const costPerModel = $derived(
+    selectedSession ? selectedSession.per_model : (liveDetail?.per_model ?? []),
   );
-  const costRows = $derived(costSession ? sessionCost(costSession.totals, costRates) : null);
-  // Which model ran the session: the single model when there's one, or
-  // "mixed (<top model>)" when several — `models` arrives ranked by tokens
-  // desc, so [0] is the top consumer. Empty when no turn carried a model.
-  const costModel = $derived(
-    !costSession || costSession.models.length === 0
-      ? ''
-      : costSession.models.length === 1
-        ? costSession.models[0]
-        : `mixed (${costSession.models[0]})`,
+
+  async function fetchLiveDetail(sid: string, atTurns: number): Promise<void> {
+    try {
+      const d = await graphSessionUsage(undefined, sid);
+      // Guard against the current session having rotated mid-flight.
+      if (usage?.current?.session_id === sid) {
+        liveDetail = d;
+        liveDetailAt = { sid, turns: atTurns };
+        seedCostCustom(d.per_model);
+      }
+    } catch (e) {
+      console.warn('graph_session_usage (cost card) failed', e);
+    }
+  }
+
+  // Ensure every model has a custom-rates object so `bind:value` on the custom
+  // inputs always targets a real field (called synchronously at each data-set
+  // point, before the card renders those rows).
+  function seedCostCustom(models: ModelUsage[]): void {
+    for (const m of models) {
+      if (!costCustomByModel[m.model]) {
+        costCustomByModel[m.model] = { input: 0, cache_write: 0, cache_read: 0, output: 0 };
+      }
+    }
+  }
+
+  // Refresh the shared price table each time the Cost card opens (Settings edits
+  // keep applying — the popup's freshness contract, now shared with the toggle
+  // + Sessions rows).
+  $effect(() => {
+    if (costCardOpen) void refreshPricingTable();
+  });
+
+  // Live mode: lazy-fetch the current session's detail when the card is open,
+  // refetch when its turn count advances, and drop it when the card CLOSES so a
+  // reopen refetches. No fetch while closed or in selected mode; the turn-count
+  // + in-flight guards keep it to at most one fetch per poll tick.
+  $effect(() => {
+    if (!costCardOpen || selectedSession) {
+      // Card closed → clear so a reopen refetches. (Selected mode just parks
+      // the live detail; it isn't shown, so leave it.)
+      if (!costCardOpen && (liveDetail || liveDetailAt)) {
+        liveDetail = null;
+        liveDetailAt = null;
+        liveFetchKey = '';
+      }
+      return;
+    }
+    const cur = usage?.current;
+    const sid = cur?.session_id;
+    if (!sid) return;
+    const turns = cur.turns.length;
+    // Already hold this exact snapshot → nothing to do.
+    if (liveDetailAt && liveDetailAt.sid === sid && liveDetailAt.turns === turns) return;
+    const key = `${sid}:${turns}`;
+    if (liveFetchKey === key) return; // this snapshot is already being fetched
+    liveFetchKey = key;
+    void fetchLiveDetail(sid, turns);
+  });
+
+  // Keep every row's custom-rates object present (lvalue for the Custom inputs).
+  $effect(() => {
+    seedCostCustom(costPerModel);
+  });
+
+  // Per-model resolved select state (selIdx / rates / matchedRow), recomputed
+  // against the CURRENT table on every render-relevant change — the single
+  // source of truth for the card's selects and cost figures. An override whose
+  // named row no longer exists falls back to auto-match, never a wrong row and
+  // never a silent Free.
+  const costRowByModel = $derived.by(() => {
+    const rows = pricingRows;
+    const out: Record<string, CostRowState<LlmPricingModel>> = {};
+    for (const m of costPerModel) {
+      out[m.model] = costRowState(
+        m.model,
+        costOverrideByModel[m.model],
+        rows,
+        costCustomByModel[m.model] ?? FREE_RATES,
+      );
+    }
+    return out;
+  });
+  const costGrand = $derived(
+    costGrandTotal(costPerModel, (i) => costRowByModel[costPerModel[i].model].rates),
   );
 
   // Applies a proposal by writing the ONE named `graph.*` field it targets
@@ -514,7 +691,14 @@
   // The chart shows the newest turns that FIT the card's width (each bar
   // needs ~5px: 2px min column + 3px gap) — an unbounded session used to
   // push the flex row right out of the card on narrow panes.
-  let usageTurns = $derived(usage?.current?.turns ?? []);
+  // V24 Phase C: source the card from the selected session when one is
+  // picked, else the live current session — so `shownTurns`, `currentModel`,
+  // the cost toggle, and the top-tools list all follow the selection with no
+  // further branching.
+  let usageTurns = $derived(selectedSession ? selectedSession.turns : (usage?.current?.turns ?? []));
+  let cardTopTools = $derived(
+    selectedSession ? selectedSession.top_tools : (usage?.current?.top_tools ?? []),
+  );
   let ubarsWidth = $state(0);
   const BAR_MIN_PX = 5;
   let shownTurns = $derived.by(() => {
@@ -522,6 +706,16 @@
     return usageTurns.length > cap ? usageTurns.slice(-cap) : usageTurns;
   });
   let usageMax = $derived(maxTurnTotal(shownTurns));
+  // V24 Phase C: merged same-origin runs for the S/A lane under the bars.
+  let laneSegs = $derived(laneSegments(shownTurns));
+
+  // V24 Phase C: the current session's totals row (agent + start time for the
+  // live card title) — matched out of the Sessions list by `current`'s id.
+  let currentSessionRow = $derived.by(() => {
+    const cur = usage?.current;
+    if (!cur) return null;
+    return usage?.sessions.find((s) => s.session_id === cur.session_id) ?? null;
+  });
 
   // Chart segment colors: each legend dot is a native color input. The
   // committed value lives in settings (`graph.usage_color_*`, persisted by
@@ -583,16 +777,9 @@
     loadViewString('code-intelligence', 'usage-cost-mode') === 'cost' ? 'cost' : 'tokens',
   );
   $effect(() => saveViewString('code-intelligence', 'usage-cost-mode', costMode));
-  // `null` = not fetched yet (fetch on first need); `[]` = fetched, empty.
-  let pricingTable = $state<LlmPricingModel[] | null>(null);
-  async function refreshPricingTable(): Promise<void> {
-    try {
-      pricingTable = await llmPricingGet();
-    } catch (e) {
-      console.warn('llm_pricing_get failed', e);
-      pricingTable = [];
-    }
-  }
+  // `pricingTable` / `refreshPricingTable` are the ONE shared price table,
+  // declared with the Cost card above (unified so a Settings edit propagates to
+  // the toggle, the Sessions rows, and the Cost card together).
   function setCostMode(mode: 'tokens' | 'cost'): void {
     costMode = mode;
     if (mode === 'cost' && pricingTable === null) void refreshPricingTable();
@@ -908,8 +1095,6 @@
   }
 </script>
 
-<svelte:window onkeydown={onCostKeydown} />
-
 <div class="graph-monitor">
   <header>
     <h2>Code Intelligence</h2>
@@ -1025,14 +1210,52 @@
       style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-write: {chartColors.write}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}"
     >
       <summary class="history-head">
-        This session
+        {#if selectedRow}
+          <!-- Selected mode: identify the session well enough to resume it by
+               hand — agent, start time, an 8-char id prefix, a copy-full-id
+               button, and a Live pill back to the current session. Title fields
+               come from the CLICKED row (always populated), not the fetched
+               detail, so they're robust regardless of the detail's `row`. -->
+          <span class="card-title"
+            >Session · {selectedRow.agent} · {fmtDate(selectedRow.started_ms)}
+            {fmtTime(selectedRow.started_ms)} ·
+            <code>{selectedRow.session_id.slice(0, 8)}</code>…</span
+          >
+          <button
+            type="button"
+            class="mini secondary"
+            title="Copy the full session id"
+            onclick={copySessionId}>{copiedId ? 'copied' : 'copy id'}</button
+          >
+          <button
+            type="button"
+            class="mini live-pill"
+            title="Return to the live current session"
+            onclick={goLive}>Live</button
+          >
+        {:else}
+          <span class="card-title"
+            >This session{#if currentSessionRow} · {currentSessionRow.agent} · {fmtDate(
+                currentSessionRow.started_ms,
+              )} {fmtTime(currentSessionRow.started_ms)}{/if}</span
+          >
+        {/if}
         {#if shownTurns.length < usageTurns.length}
           <span class="muted">(last {shownTurns.length} of {usageTurns.length} turns)</span>
         {/if}
       </summary>
-      {#if !usage || !usage.current || usage.current.turns.length === 0}
-        <p class="placeholder">No usage recorded yet this session.</p>
+      {#if usageTurns.length === 0 && cardTopTools.length === 0}
+        <p class="placeholder">
+          {selectedSession ? 'No usage recorded for this session.' : 'No usage recorded yet this session.'}
+        </p>
       {:else}
+        {#if selectedRow}
+          <!-- Resume-by-hand hint (the deferred Resume button's future home). -->
+          <div class="resume-hint muted">
+            resume:
+            <code>{resumeCommand(selectedRow.agent, selectedRow.session_id)}</code>
+          </div>
+        {/if}
         <!-- V16 Feature 8: tokens | est. cost. Cost mode reprices the same
              segments by $/MTok (auto-matched on the session's model);
              tokens stays the default. -->
@@ -1071,6 +1294,10 @@
               {s.label}
             </span>
           {/each}
+          <!-- V24 Phase C: S/A lane key. Colors track the lane (muted track /
+               theme accent), not the per-segment settings pickers. -->
+          <span class="sa-key"><span class="sa-swatch session"></span>S session</span>
+          <span class="sa-key"><span class="sa-swatch agent"></span>A agent</span>
         </div>
         <div class="ubars" bind:clientWidth={ubarsWidth}>
           {#each shownTurns as t, i (i)}
@@ -1081,7 +1308,7 @@
             {@const turnNo = usageTurns.length - shownTurns.length + i + 1}
             <div class="ubar-col">
               <div
-                class="ubar"
+                class="ubar {agentBarClass(t.origin)}"
                 style="height: {barHeightPct(total, max)}%"
                 title={cost
                   ? `turn ${turnNo} (est.): ${fmtUsd(cost.input)} in / ${fmtUsd(cost.cache_read)} cache-read / ${fmtUsd(cost.cache_write)} cache-write / ${fmtUsd(cost.output)} out / ${fmtUsd(cost.tool)} est. tool — ${fmtUsd(cost.total)}`
@@ -1106,12 +1333,32 @@
           {/each}
         </div>
 
+        <!-- V24 Phase C: S/A lane — one segment per contiguous same-origin
+             run, width proportional to the turns it spans (same per-bar width
+             logic as the chart). The letter shows only when the segment is
+             ≥~2 chars wide; otherwise the tooltip carries it. -->
+        {#if shownTurns.length > 0}
+          <div class="salane">
+            {#each laneSegs as seg, i (i)}
+              <span
+                class="saseg {seg.origin}"
+                style="flex-grow: {seg.count}"
+                title="{seg.origin === 'agent' ? 'sub-agent' : 'main session'} · {seg.count} turn{seg.count ===
+                1
+                  ? ''
+                  : 's'}"
+                >{#if laneLabelVisible(seg.count, shownTurns.length, ubarsWidth)}{seg.label}{/if}</span
+              >
+            {/each}
+          </div>
+        {/if}
+
         <div class="history-head">Top consumers</div>
-        {#if usage.current.top_tools.length === 0}
+        {#if cardTopTools.length === 0}
           <p class="placeholder">No tool-result usage recorded yet.</p>
         {:else}
           <div class="rows scroll5">
-            {#each usage.current.top_tools as t (t.tool)}
+            {#each cardTopTools as t (t.tool)}
               <div class="arow tool">
                 <span class="aname">{t.tool}</span>
                 <span class="akind">~{t.est_tokens.toLocaleString()} tok <span class="est-badge">est</span></span>
@@ -1120,6 +1367,107 @@
             {/each}
           </div>
         {/if}
+      {/if}
+    </details>
+
+    <!-- V24 Phase D: Cost card — per-model what-if pricing. One row per model
+         (tokens-desc as delivered), each priced by its own select: an
+         auto-matched table row, hand-typed Custom rates, or Free ($0). The
+         popup this replaces priced the whole session at ONE rate set. -->
+    <details class="card" bind:open={costCardOpen}>
+      <summary class="history-head">
+        Cost
+        {#if selectedRow}
+          <span class="muted">· {selectedRow.agent} · <code>{selectedRow.session_id.slice(0, 8)}</code>…</span>
+        {:else}
+          <span class="muted">· this session</span>
+        {/if}
+      </summary>
+      {#if costPerModel.length === 0}
+        <p class="placeholder">
+          {selectedSession
+            ? 'No per-model usage recorded for this session.'
+            : 'No per-model usage recorded yet this session.'}
+        </p>
+      {:else}
+        <div class="costrows">
+          {#each costPerModel as m (m.model)}
+            {@const st = costRowByModel[m.model]}
+            {@const rates = st.rates}
+            {@const c = sessionCost(m.totals, rates)}
+            <div class="costrow">
+              <div class="costrow-head">
+                <span class="cm-model">
+                  <code>{m.model || '(no model id)'}</code>
+                  {#if st.matchedRow}<span class="cm-provider">{st.matchedRow.provider}</span>{/if}
+                </span>
+                <select
+                  class="cm-pick"
+                  aria-label="Pricing for {m.model || 'this model'}"
+                  value={st.selIdx}
+                  onchange={(e) =>
+                    (costOverrideByModel[m.model] = costOverrideForIdx(+e.currentTarget.value, pricingRows))}
+                >
+                  {#each pricingRows as p, i (i)}
+                    <option value={i}>{p.provider} — {p.model}</option>
+                  {/each}
+                  <option value={pricingRows.length}>Custom…</option>
+                  <option value={pricingRows.length + 1}>Free ($0)</option>
+                </select>
+              </div>
+              <!-- Secondary line: the main-session vs sub-agent token share. -->
+              <div class="cm-share muted">{originShareLine(m.origins)}</div>
+              {#if st.selIdx === pricingRows.length && costCustomByModel[m.model]}
+                <div class="cost-custom">
+                  <label><span>Input $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustomByModel[m.model].input} /></label>
+                  <label><span>Cache write $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustomByModel[m.model].cache_write} /></label>
+                  <label><span>Cache read $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustomByModel[m.model].cache_read} /></label>
+                  <label><span>Output $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustomByModel[m.model].output} /></label>
+                </div>
+              {/if}
+              <table class="cost-table tnum">
+                <thead>
+                  <tr>
+                    <th></th>
+                    <th>Input</th>
+                    <th>Cache write</th>
+                    <th>Cache read</th>
+                    <th>Output</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <th>Tokens</th>
+                    <td title={m.totals.in_tok.toLocaleString()}>{fmtTok(m.totals.in_tok)}</td>
+                    <td title={m.totals.cache_make.toLocaleString()}>{fmtTok(m.totals.cache_make)}</td>
+                    <td title={m.totals.cache_read.toLocaleString()}>{fmtTok(m.totals.cache_read)}</td>
+                    <td title={m.totals.out_tok.toLocaleString()}>{fmtTok(m.totals.out_tok)}</td>
+                  </tr>
+                  <tr>
+                    <th>$ / MTok</th>
+                    <td>{rates.input}</td>
+                    <td>{rates.cache_write}</td>
+                    <td>{rates.cache_read}</td>
+                    <td>{rates.output}</td>
+                  </tr>
+                  <tr>
+                    <th>Cost</th>
+                    <td>{fmtUsd(c.input)}</td>
+                    <td>{fmtUsd(c.cache_write)}</td>
+                    <td>{fmtUsd(c.cache_read)}</td>
+                    <td>{fmtUsd(c.output)}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="cm-subtotal">Subtotal <b>{fmtUsd(c.total)}</b></div>
+            </div>
+          {/each}
+        </div>
+        <div class="cost-foot">
+          <span>Total across {costPerModel.length} model{costPerModel.length === 1 ? '' : 's'}</span>
+          <b>{fmtUsd(costGrand)}</b>
+        </div>
+        <small class="cost-hint">Prices are editable in Settings → LLM pricing.</small>
       {/if}
     </details>
 
@@ -1180,20 +1528,26 @@
     <!-- Sessions: project-wide totals table. -->
     <details class="card" bind:open={sessionsCardOpen}>
       <summary class="history-head">Sessions <span class="muted">({usage?.sessions.length ?? 0})</span></summary>
+      {#if sessionNotice}
+        <!-- Transient notice, e.g. a clicked session whose data has since
+             vanished (empty-detail guard) — clears itself after a few seconds. -->
+        <p class="placeholder notice">{sessionNotice}</p>
+      {/if}
       {#if !usage || usage.sessions.length === 0}
         <p class="placeholder">No sessions recorded yet.</p>
       {:else}
         <div class="rows scroll10">
           {#each usage.sessions as s (s.session_id)}
             {@const nCommits = commitCounts[s.session_id] ?? 0}
+            {@const rowState = sessionRowState(s.session_id, selectedId, usage.active_session_ids)}
             <div class="sessrow-wrap">
               <button
                 type="button"
-                class="arow sessrow"
-                title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.cache_make.toLocaleString()} cache-write · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.out_tok.toLocaleString()} output tokens — click for cost`}
-                onclick={() => void openCostPopup(s)}
+                class="arow sessrow {rowState.selected ? 'selected' : ''} {rowState.active ? 'active' : ''}"
+                title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.cache_make.toLocaleString()} cache-write · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.out_tok.toLocaleString()} output tokens — click to view this session's usage`}
+                onclick={() => void selectSession(s)}
               >
-                <span class="aname">{s.agent}{#if s.est_only}<span class="est-badge" title="No exact usage data for this agent — chars-only estimate">est</span>{/if}<span class="sess-date">{fmtDate(s.started_ms)}</span></span>
+                <span class="aname">{#if rowState.active}<span class="active-dot" title="active now" aria-label="active now"></span>{/if}{s.agent}{#if s.est_only}<span class="est-badge" title="No real token data for this session — chars-only estimate">est</span>{/if}<span class="sess-date">{fmtDate(s.started_ms)}</span></span>
                 {#if costMode === 'cost'}
                   {@const rowRates = matchPricing(s.models[0] ?? null, pricingTable ?? [])}
                   {#if rowRates}
@@ -1206,12 +1560,12 @@
                       <span><b>{fmtUsd(sessionCost(s.totals, rowRates).total)}</b> total <span
                           class="est-badge"
                           title={s.models.length > 1
-                            ? `Mixed models — the whole session is priced at ${s.models[0]}'s rates (its top consumer by tokens); the other models' tokens are mispriced. Click for the manual cost popup.`
+                            ? `Mixed models — this whole-session estimate is priced at ${s.models[0]}'s rates (its top consumer by tokens); the other models' tokens are mispriced. Click the row, then open the Cost card for exact per-model pricing.`
                             : 'Estimated from the auto-matched price row'}
                         >{s.models.length > 1 ? 'est · mixed' : 'est'}</span></span>
                     </span>
                   {:else}
-                    <span class="sess-stats tnum muted" title="No price row auto-matches this session's model — add a model_prefix in Settings → LLM pricing, or click for the manual cost popup">
+                    <span class="sess-stats tnum muted" title="No price row auto-matches this session's model — add a model_prefix in Settings → LLM pricing, or click the row and open the Cost card to price it by hand">
                       no price match{#if s.models[0]}&nbsp;(<code>{s.models[0]}</code>){/if}
                     </span>
                   {/if}
@@ -1770,89 +2124,6 @@
     </div>
   {/if}
 
-  <!-- Session-cost popup: tokens × $/MTok for the clicked Sessions row. -->
-  {#if costSession && costRows}
-    <div class="cost-backdrop" onclick={closeCostPopup} role="presentation"></div>
-    <div class="cost-dialog" role="dialog" aria-modal="true" aria-label="Session cost">
-      <div class="cost-title">
-        <span>
-          Session cost <span class="muted">· {costSession.agent}</span>
-          {#if costSession.est_only}
-            <span class="est-badge" title="No exact usage data for this agent — chars-only estimate; the cost below is an estimate too">est</span>
-          {/if}
-        </span>
-        <button type="button" class="cost-close" aria-label="Close" onclick={closeCostPopup}>×</button>
-      </div>
-
-      <div class="cost-when muted">
-        {fmtDate(costSession.started_ms)} · {fmtTime(costSession.started_ms)} – {fmtTime(costSession.last_ms)}
-        {#if costModel}
-          <span title={costSession.models.length > 1 ? `All models: ${costSession.models.join(', ')}` : undefined}>· {costModel}</span>
-        {/if}
-      </div>
-
-      <label class="cost-provider">
-        <span>Pricing</span>
-        <select bind:value={costSelIdx}>
-          {#each costPricing as p, i (i)}
-            <option value={i}>{p.provider} — {p.model}</option>
-          {/each}
-          <option value={costPricing.length}>Custom…</option>
-        </select>
-      </label>
-
-      {#if costSelIdx >= costPricing.length}
-        <div class="cost-custom">
-          <label><span>Input $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.input} /></label>
-          <label><span>Cache write $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.cache_write} /></label>
-          <label><span>Cache read $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.cache_read} /></label>
-          <label><span>Output $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustom.output} /></label>
-        </div>
-      {/if}
-
-      <table class="cost-table tnum">
-        <thead>
-          <tr>
-            <th></th>
-            <th>Input</th>
-            <th>Cache write</th>
-            <th>Cache read</th>
-            <th>Output</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <th>Session tokens</th>
-            <td title={costSession.totals.in_tok.toLocaleString()}>{fmtTok(costSession.totals.in_tok)}</td>
-            <td title={costSession.totals.cache_make.toLocaleString()}>{fmtTok(costSession.totals.cache_make)}</td>
-            <td title={costSession.totals.cache_read.toLocaleString()}>{fmtTok(costSession.totals.cache_read)}</td>
-            <td title={costSession.totals.out_tok.toLocaleString()}>{fmtTok(costSession.totals.out_tok)}</td>
-          </tr>
-          <tr>
-            <th>$ / MTok</th>
-            <td>{costRates.input}</td>
-            <td>{costRates.cache_write}</td>
-            <td>{costRates.cache_read}</td>
-            <td>{costRates.output}</td>
-          </tr>
-          <tr>
-            <th>Cost</th>
-            <td>{fmtUsd(costRows.input)}</td>
-            <td>{fmtUsd(costRows.cache_write)}</td>
-            <td>{fmtUsd(costRows.cache_read)}</td>
-            <td>{fmtUsd(costRows.output)}</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <div class="cost-total">
-        Total session cost <b>{fmtUsd(costRows.total)}</b>
-      </div>
-      <small class="cost-hint">
-        Prices are editable in Settings → LLM pricing.
-      </small>
-    </div>
-  {/if}
 </div>
 
 <style>
@@ -1907,6 +2178,12 @@
     opacity: 0.6;
     font-style: italic;
     padding: 8px 2px;
+  }
+  /* Transient inline notice (e.g. a vanished session) — a touch more present
+     than a plain placeholder, accent-tinted so it reads as a status message. */
+  .placeholder.notice {
+    opacity: 0.85;
+    color: var(--accent, #e0a060);
   }
   /* Segmented section nav under the header. */
   nav.sections {
@@ -2599,6 +2876,81 @@
     flex-basis: 0;
     min-height: 0;
   }
+  /* V24 Phase C: agent turns get a subtle accent outline + desaturated
+     segment colors so sub-agent spend reads even when the lane is cramped.
+     The stacked-segment structure is unchanged. */
+  .ubar.agent {
+    outline: 1px solid var(--accent, #3b6ea5);
+    outline-offset: -1px;
+    filter: saturate(0.55);
+  }
+
+  /* V24 Phase C: S/A grouping lane. Same flex rhythm as `.ubars` (gap 3px,
+     proportional widths) so segments line up under the bar groups. */
+  .salane {
+    display: flex;
+    gap: 3px;
+    height: 13px;
+    margin: -10px 0 12px;
+  }
+  .saseg {
+    flex-basis: 0;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border-radius: 2px;
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: 0.5px;
+  }
+  /* Session = muted track color; agent = theme accent (matches the legend). */
+  .saseg.session {
+    background: var(--surface-raised, rgba(255, 255, 255, 0.08));
+    color: var(--text-subtle, #999);
+  }
+  .saseg.agent {
+    background: var(--accent, #3b6ea5);
+    color: #fff;
+  }
+  .ubars-legend .sa-key {
+    gap: 4px;
+  }
+  .ubars-legend .sa-swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 2px;
+    border: 1px solid var(--border, #444);
+  }
+  .ubars-legend .sa-swatch.session {
+    background: var(--surface-raised, rgba(255, 255, 255, 0.08));
+  }
+  .ubars-legend .sa-swatch.agent {
+    background: var(--accent, #3b6ea5);
+  }
+
+  /* V24 Phase C: card title + selected-session controls. */
+  .history-head .card-title {
+    font-weight: inherit;
+  }
+  .history-head .card-title code {
+    font-size: 0.9em;
+    opacity: 0.85;
+  }
+  .live-pill {
+    border-color: var(--accent, #3b6ea5) !important;
+    color: var(--accent, #3b6ea5) !important;
+  }
+  .resume-hint {
+    font-size: 11px;
+    margin: -2px 0 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .resume-hint code {
+    user-select: all;
+  }
 
   .arow.tool {
     grid-template-columns: 1fr 1fr auto;
@@ -2607,7 +2959,7 @@
   .arow.sessrow {
     grid-template-columns: minmax(6rem, 1fr) auto auto;
   }
-  /* Each row is a flex wrapper holding TWO buttons (the cost-popup row and
+  /* Each row is a flex wrapper holding TWO buttons (the session-select row and
      the Workbench commits jump) — nesting them would be invalid HTML. The
      row divider lives on the wrapper so it spans both. */
   .sessrow-wrap {
@@ -2616,8 +2968,9 @@
     gap: 6px;
     border-bottom: 1px solid var(--border, #2a2a2a);
   }
-  /* The main row area is a <button> (it opens the cost popup) — strip the UA
-     button chrome so it keeps rendering as a plain grid row. */
+  /* The main row area is a <button> (it selects the session — drilling the
+     "This session" + Cost cards into it) — strip the UA button chrome so it
+     keeps rendering as a plain grid row. */
   button.arow.sessrow {
     background: none;
     border: none;
@@ -2631,68 +2984,118 @@
   button.arow.sessrow:hover {
     background: var(--surface-raised, rgba(255, 255, 255, 0.04));
   }
+  /* V24 Phase C: the drilled-in session (distinct from Phase E's active
+     marker) — a filled row background. */
+  button.arow.sessrow.selected {
+    background: var(--surface-raised, rgba(255, 255, 255, 0.09));
+    box-shadow: inset 2px 0 0 var(--accent, #3b6ea5);
+  }
+  /* V24 Phase E: a live session (open tab ∪ recency). The accent left edge
+     matches `.selected`'s bar, but the two states stay distinguishable when
+     they coexist: `.active` carries the pulsing `.active-dot` (below) and no
+     fill, `.selected` carries the fill and no dot, and a row that is BOTH shows
+     fill + edge + dot. ALL active rows get this — many can be live at once. */
+  button.arow.sessrow.active {
+    box-shadow: inset 2px 0 0 var(--accent, #3b6ea5);
+  }
+  /* Pulsing dot before the agent label — the primary "active now" signal. */
+  .active-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-right: 5px;
+    vertical-align: middle;
+    border-radius: 50%;
+    background: var(--accent, #3b6ea5);
+    animation: sess-active-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes sess-active-pulse {
+    0%,
+    100% {
+      opacity: 0.35;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  /* Honor reduced-motion (theme.css sets the precedent): drop the pulse but
+     keep the dot at a steady, legible opacity so the marker still reads. */
+  @media (prefers-reduced-motion: reduce) {
+    .active-dot {
+      animation: none;
+      opacity: 0.85;
+    }
+  }
   .commits-btn {
     flex: 0 0 auto;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
 
-  /* Session-cost popup. Fixed-position so it centers on the window even
-     though this tab's root is its own absolutely-positioned scroll box. */
-  .cost-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 100;
+  /* V24 Phase D: Cost card — per-model rows. Each row stacks a head (model id
+     + provider chip + pricing select), the S/A share line, an optional Custom
+     rate grid, the tokens/$-per-MTok/cost table, and a subtotal. The
+     `.cost-custom` + `.cost-table` rules below are shared with (were the) the
+     old popup's markup. */
+  .costrow {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border, #2a2a2a);
   }
-  .cost-dialog {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    z-index: 101;
-    min-width: 30rem;
-    max-width: min(44rem, calc(100vw - 2rem));
-    background: var(--surface-3, #1d1d1d);
-    border: 1px solid var(--border, #333);
-    border-radius: 8px;
-    padding: 14px 16px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-    font-size: 13px;
+  .costrow:last-child {
+    border-bottom: none;
   }
-  .cost-when {
-    font-size: 12px;
-    margin: -6px 0 10px;
-    font-variant-numeric: tabular-nums;
-  }
-  .cost-title {
+  .costrow-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    font-weight: 600;
-    margin-bottom: 10px;
+    margin-bottom: 4px;
   }
-  .cost-close {
-    background: none;
-    border: none;
-    color: inherit;
-    font-size: 16px;
-    line-height: 1;
-    cursor: pointer;
-    padding: 2px 6px;
-  }
-  .cost-close:hover {
-    color: var(--text, #fff);
-  }
-  .cost-provider {
+  .cm-model {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-bottom: 10px;
+    gap: 6px;
+    min-width: 0;
+    font-size: 12px;
   }
-  .cost-provider select {
-    flex: 1;
+  .cm-model code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cm-provider {
+    flex: 0 0 auto;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: var(--surface-raised, rgba(255, 255, 255, 0.08));
+    color: var(--text-subtle, #999);
+  }
+  .cm-pick {
+    flex: 0 0 auto;
+    max-width: 16rem;
+  }
+  .cm-share {
+    font-size: 11px;
+    margin-bottom: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .cm-subtotal {
+    text-align: right;
+    font-size: 12px;
+  }
+  .cm-subtotal b {
+    margin-left: 6px;
+  }
+  .cost-foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 14px;
+    margin: 10px 0 4px;
+  }
+  .cost-foot b {
+    font-size: 16px;
   }
   .cost-custom {
     display: grid;
@@ -2739,16 +3142,6 @@
   .cost-table tbody tr:last-child td {
     font-weight: 600;
     color: var(--text, #ddd);
-  }
-  .cost-total {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    font-size: 14px;
-    margin-bottom: 6px;
-  }
-  .cost-total b {
-    font-size: 16px;
   }
   .cost-hint {
     color: var(--text-subtle, #999);

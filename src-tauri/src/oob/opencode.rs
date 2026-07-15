@@ -17,26 +17,27 @@
 //! the avatar Thinking/Idle state (V20 Phase E folds in here since it shares the
 //! connection).
 //!
-//! ## V14 Phase C spike (C3): no usage/token fields on this stream
-//! `message.updated`'s `properties.info` object was captured exhaustively
-//! live in spike 0a (the vocabulary above is the complete shape observed) and
-//! carries only `{id, role, time}` — no `tokens`/`usage`/cost fields on the
-//! pinned OpenCode version. So unlike Claude's transcript (which embeds exact
-//! `usage` on every assistant message), OpenCode gives this SSE consumer
-//! nothing to build an exact token count from, and this file adds no usage
-//! tap. Per the milestone's "absent ⇒ tool_result-class events only" fallback,
-//! the actual OpenCode usage tap lives at `offload::loopback::handle_memory_event`
-//! (`POST /memory/event`) instead — already the sole memory ingress for
-//! OpenCode (see that function's doc comment) and the only place that has
-//! both a `cwd`/session AND a tool name to record against; this SSE consumer
-//! has neither. It estimates chars from the tool's INPUT args (its output
-//! isn't visible to that hook either), which is why every OpenCode session
-//! reports `est_only: true` in [`crate::graph::GraphIndex::usage_all_sessions`]
-//! (derived from `session.agent != "claude"`, not a separately tracked flag).
-//! TODO(spike C3): re-check `message.updated`'s `info` shape against a newer
-//! pinned OpenCode release — if a future version adds token/usage fields
-//! there, wire a `record_usage` call into this file's `Tracker` directly
-//! (it would need a `root`/session context this struct doesn't carry today).
+//! ## Token/usage path (V14 spike C3 → V24 Phase F)
+//! This SSE stream carries no token fields: `message.updated`'s
+//! `properties.info` on the OOB stream shows only `{id, role, time}` (captured
+//! exhaustively live in spike 0a — the vocabulary above is the complete shape),
+//! so this consumer, which anyway has neither a `cwd`/session nor a tool name
+//! to record against, adds no usage tap of its own.
+//!
+//! The real token path lives elsewhere. **V24 Phase F** (spike-confirmed on
+//! OpenCode 1.18.1): the injected plugin's `event` hook forwards each COMPLETED
+//! assistant turn's exact token totals — the plugin sees a richer
+//! `message.updated.properties.info` (with `tokens`/`cost`/`modelID`) than this
+//! SSE does — as a `kind: "usage"` body to
+//! [`crate::offload::loopback::handle_memory_event`] (`POST /memory/event`),
+//! which records a `UsageEvent::Turn` (rolled up to the parent session with
+//! `origin: Agent` when a sub-agent reports). Before that, OpenCode's only
+//! usage ingress was that same handler's tool-event arm, which estimates chars
+//! from a tool call's INPUT args (its output isn't visible either) — a session
+//! with only those and no Phase F turns reads `est_only: true` in
+//! [`crate::graph::GraphIndex::usage_all_sessions`] (V24 Phase E derives
+//! `est_only` from zero Turn-token totals, not the agent name, so a
+//! plugin-reporting session loses the est badge).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;

@@ -166,13 +166,6 @@ export function laneLabelVisible(count: number, totalTurns: number, laneWidthPx:
   return (laneWidthPx * count) / totalTurns >= LANE_LABEL_MIN_PX;
 }
 
-/// V24 Phase C: the copy-pasteable resume command for a session — `opencode
-/// -s <id>` for OpenCode sessions, `claude --resume <id>` for everything else
-/// (Claude and the default). Shown as the selected card's hint line.
-export function resumeCommand(agent: string, sessionId: string): string {
-  return agent === 'opencode' ? `opencode -s ${sessionId}` : `claude --resume ${sessionId}`;
-}
-
 /// V24 Phase C: the extra class on a chart bar for its turn's origin — the
 /// accent-outline + desaturation treatment applies only to sub-agent turns.
 export function agentBarClass(origin: 'session' | 'agent'): '' | 'agent' {

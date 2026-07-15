@@ -64,7 +64,6 @@
     turnCost,
     laneSegments,
     laneLabelVisible,
-    resumeCommand,
     agentBarClass,
     sessionRowState,
     costRowState,
@@ -717,6 +716,15 @@
     return usage?.sessions.find((s) => s.session_id === cur.session_id) ?? null;
   });
 
+  // Whether a session is actually live right now (open tab ∪ recency, per
+  // `active_session_ids`). A fresh empty session has recorded nothing yet, so
+  // `usage.current` / `memory.current_session` still point at the PREVIOUS
+  // session — the live card and Working-set labels say "last session" then
+  // instead of claiming it's this one.
+  function isActiveSession(sid?: string | null): boolean {
+    return !!sid && (usage?.active_session_ids ?? []).includes(sid);
+  }
+
   // Chart segment colors: each legend dot is a native color input. The
   // committed value lives in settings (`graph.usage_color_*`, persisted by
   // the backend); `chartPreview` holds the live value while a picker is open
@@ -1211,9 +1219,9 @@
     >
       <summary class="history-head">
         {#if selectedRow}
-          <!-- Selected mode: identify the session well enough to resume it by
-               hand — agent, start time, an 8-char id prefix, a copy-full-id
-               button, and a Live pill back to the current session. Title fields
+          <!-- Selected mode: identify the session — agent, start time, an
+               8-char id prefix, a copy-full-id button, and a Live pill back
+               to the current session. Title fields
                come from the CLICKED row (always populated), not the fetched
                detail, so they're robust regardless of the detail's `row`. -->
           <span class="card-title"
@@ -1235,7 +1243,9 @@
           >
         {:else}
           <span class="card-title"
-            >This session{#if currentSessionRow} · {currentSessionRow.agent} · {fmtDate(
+            >{usage?.current && !isActiveSession(usage.current.session_id)
+              ? 'Last session'
+              : 'This session'}{#if currentSessionRow} · {currentSessionRow.agent} · {fmtDate(
                 currentSessionRow.started_ms,
               )} {fmtTime(currentSessionRow.started_ms)}{/if}</span
           >
@@ -1250,10 +1260,11 @@
         </p>
       {:else}
         {#if selectedRow}
-          <!-- Resume-by-hand hint (the deferred Resume button's future home). -->
-          <div class="resume-hint muted">
-            resume:
-            <code>{resumeCommand(selectedRow.agent, selectedRow.session_id)}</code>
+          <!-- Full session id, select-all for easy copying (the title shows
+               only an 8-char prefix). -->
+          <div class="session-id-hint muted">
+            session id:
+            <code>{selectedRow.session_id}</code>
           </div>
         {/if}
         <!-- V16 Feature 8: tokens | est. cost. Cost mode reprices the same
@@ -1753,7 +1764,9 @@
         <div class="history-head">
           Working set
           <span class="muted">
-            {#if memory.current_session}(current session){/if}
+            {#if memory.current_session}({isActiveSession(memory.current_session)
+                ? 'current session'
+                : 'last session'}){/if}
           </span>
           <button
             class="mini danger"
@@ -2943,12 +2956,12 @@
     border-color: var(--accent, #3b6ea5) !important;
     color: var(--accent, #3b6ea5) !important;
   }
-  .resume-hint {
+  .session-id-hint {
     font-size: 11px;
     margin: -2px 0 8px;
     font-variant-numeric: tabular-nums;
   }
-  .resume-hint code {
+  .session-id-hint code {
     user-select: all;
   }
 

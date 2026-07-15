@@ -47,7 +47,8 @@ pub fn def() -> ToolDef {
 }
 
 pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, String> {
-    let args: Args = serde_json::from_value(args).map_err(|e| format!("invalid read_file args: {e}"))?;
+    let args: Args =
+        serde_json::from_value(args).map_err(|e| format!("invalid read_file args: {e}"))?;
     let path = ctx.confine(&args.path)?;
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let start = args.offset.saturating_sub(1); // 1-based → 0-based; offset 0 or 1 → start 0

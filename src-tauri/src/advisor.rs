@@ -337,7 +337,9 @@ fn bucket10(rate: f64) -> String {
 
 /// Whether `(rule_id, signature)` is in the dismissed list.
 fn is_dismissed(dismissed: &[DismissedRule], rule_id: &str, signature: &str) -> bool {
-    dismissed.iter().any(|d| d.rule_id == rule_id && d.signature == signature)
+    dismissed
+        .iter()
+        .any(|d| d.rule_id == rule_id && d.signature == signature)
 }
 
 /// Evaluate the static rule list over `sig`, returning the proposals that
@@ -557,7 +559,10 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
         if !is_dismissed(&sig.dismissed, RULE_DRIFT_USAGE_FIELDS, &signature) {
             out.push(Proposal {
                 setting: String::new(),
-                current: format!("{} Claude sessions without token fields", sig.claude_sessions),
+                current: format!(
+                    "{} Claude sessions without token fields",
+                    sig.claude_sessions
+                ),
                 proposed: "usage_stat rows with token counts".to_string(),
                 rationale: format!(
                     "All {} recent Claude sessions recorded zero token-bearing usage rows — \
@@ -837,7 +842,10 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
     // "broken contract", and proposing a floor tweak beside "turn it off"
     // would be incoherent.
     if let Some(rate) = sig.advisor_reread_rate {
-        if !advisor_disable_proposed && sig.advisor_reread_samples >= MIN_REMINDS && rate >= REREAD_HIGH {
+        if !advisor_disable_proposed
+            && sig.advisor_reread_samples >= MIN_REMINDS
+            && rate >= REREAD_HIGH
+        {
             let signature = bucket10(rate);
             if !is_dismissed(&sig.dismissed, RULE_ADVISOR_LINES, &signature) {
                 let proposed = sig.graph.read_advisor_min_lines.saturating_add(100);
@@ -866,8 +874,7 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
     // ⇒ lower context_turn_budget_chars (the budget is spending on files
     // that aren't helping).
     if let (Some(follow), Some(maxed)) = (sig.injection_follow_rate, sig.budget_maxed_rate) {
-        if sig.injection_follow_samples >= MIN_INJECTIONS && sig.budget_maxed_samples >= MIN_TURNS
-        {
+        if sig.injection_follow_samples >= MIN_INJECTIONS && sig.budget_maxed_samples >= MIN_TURNS {
             let unused = 1.0 - follow;
             if unused >= UNUSED_HIGH && maxed >= BUDGET_MAXED_HIGH {
                 let signature = bucket10(unused);
@@ -934,7 +941,10 @@ mod tests {
     fn all_three_rules_fire_when_every_signal_is_extreme_and_sampled_enough() {
         let proposals = evaluate(&extreme_signals());
         let ids: Vec<&str> = proposals.iter().map(|p| p.rule_id).collect();
-        assert_eq!(ids, vec![RULE_MIN_SCORE, RULE_ADVISOR_LINES, RULE_TURN_BUDGET]);
+        assert_eq!(
+            ids,
+            vec![RULE_MIN_SCORE, RULE_ADVISOR_LINES, RULE_TURN_BUDGET]
+        );
     }
 
     #[test]
@@ -969,11 +979,15 @@ mod tests {
     fn rule2_respects_its_own_sample_floor_and_threshold() {
         let mut sig = extreme_signals();
         sig.advisor_reread_samples = MIN_REMINDS - 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADVISOR_LINES));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADVISOR_LINES));
 
         let mut sig = extreme_signals();
         sig.advisor_reread_rate = Some(0.1); // below REREAD_HIGH
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADVISOR_LINES));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADVISOR_LINES));
     }
 
     #[test]
@@ -998,7 +1012,9 @@ mod tests {
 
         let mut sig = extreme_signals();
         sig.advisor_reread_rate = None;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADVISOR_LINES));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADVISOR_LINES));
 
         let mut sig = extreme_signals();
         sig.budget_maxed_rate = None;
@@ -1015,7 +1031,10 @@ mod tests {
             session_count: sig.session_count,
         }];
         let ids: Vec<&str> = evaluate(&sig).iter().map(|p| p.rule_id).collect();
-        assert!(!ids.contains(&RULE_MIN_SCORE), "freshly applied rule must stay quiet");
+        assert!(
+            !ids.contains(&RULE_MIN_SCORE),
+            "freshly applied rule must stay quiet"
+        );
         // Other rules are untouched by another rule's cooldown.
         assert!(ids.contains(&RULE_ADVISOR_LINES));
         assert!(ids.contains(&RULE_TURN_BUDGET));
@@ -1028,7 +1047,9 @@ mod tests {
             root: String::new(),
             session_count: MIN_SESSIONS,
         }];
-        assert!(!evaluate(&sig_short).iter().any(|p| p.rule_id == RULE_MIN_SCORE));
+        assert!(!evaluate(&sig_short)
+            .iter()
+            .any(|p| p.rule_id == RULE_MIN_SCORE));
 
         // Cooldown elapsed: re-fires (any bucket — an apply is not a dismissal).
         let mut sig_done = extreme_signals();
@@ -1038,7 +1059,9 @@ mod tests {
             root: String::new(),
             session_count: MIN_SESSIONS,
         }];
-        assert!(evaluate(&sig_done).iter().any(|p| p.rule_id == RULE_MIN_SCORE));
+        assert!(evaluate(&sig_done)
+            .iter()
+            .any(|p| p.rule_id == RULE_MIN_SCORE));
     }
 
     #[test]
@@ -1052,7 +1075,9 @@ mod tests {
             root: String::new(),
             session_count: sig.session_count,
         }];
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
     }
 
     #[test]
@@ -1063,7 +1088,10 @@ mod tests {
             signature: "10".to_string(),
         }];
         let ids: Vec<&str> = evaluate(&sig).iter().map(|p| p.rule_id).collect();
-        assert!(!ids.contains(&RULE_MIN_SCORE), "same-bucket dismissal must suppress");
+        assert!(
+            !ids.contains(&RULE_MIN_SCORE),
+            "same-bucket dismissal must suppress"
+        );
         // Rule 3 shares the signal but is a DIFFERENT rule_id — its own
         // dismissal list is empty, so it still fires.
         assert!(ids.contains(&RULE_TURN_BUDGET));
@@ -1094,7 +1122,10 @@ mod tests {
             g.context_turn_budget_chars,
         );
         for p in &proposals {
-            let val: u32 = p.proposed.parse().expect("proposed value must be a u32 string");
+            let val: u32 = p
+                .proposed
+                .parse()
+                .expect("proposed value must be a u32 string");
             match p.setting.as_str() {
                 "graph.context_min_score" => g.context_min_score = val,
                 "graph.read_advisor_min_lines" => g.read_advisor_min_lines = val,
@@ -1103,7 +1134,11 @@ mod tests {
             }
         }
         assert_ne!(
-            (g.context_min_score, g.read_advisor_min_lines, g.context_turn_budget_chars),
+            (
+                g.context_min_score,
+                g.read_advisor_min_lines,
+                g.context_turn_budget_chars
+            ),
             before,
             "the round-trip must actually change the settings"
         );
@@ -1128,11 +1163,15 @@ mod tests {
         // here), also not a real reduction, so still must not propose.
         let mut sig_eq = extreme_signals();
         sig_eq.graph.context_turn_budget_chars = 1000;
-        assert!(!evaluate(&sig_eq).iter().any(|p| p.rule_id == RULE_TURN_BUDGET));
+        assert!(!evaluate(&sig_eq)
+            .iter()
+            .any(|p| p.rule_id == RULE_TURN_BUDGET));
 
         // A comfortably large current still gets a real reduction proposed.
         let sig_large = extreme_signals(); // default context_turn_budget_chars = 6_000
-        assert!(evaluate(&sig_large).iter().any(|p| p.rule_id == RULE_TURN_BUDGET));
+        assert!(evaluate(&sig_large)
+            .iter()
+            .any(|p| p.rule_id == RULE_TURN_BUDGET));
     }
 
     #[test]
@@ -1149,12 +1188,16 @@ mod tests {
         // value higher than the ceiling itself).
         let mut sig_above = extreme_signals();
         sig_above.graph.context_min_score = MIN_SCORE_CEILING + 5;
-        assert!(!evaluate(&sig_above).iter().any(|p| p.rule_id == RULE_MIN_SCORE));
+        assert!(!evaluate(&sig_above)
+            .iter()
+            .any(|p| p.rule_id == RULE_MIN_SCORE));
 
         // Just below the ceiling: one more raise is still reasonable.
         let mut sig_below = extreme_signals();
         sig_below.graph.context_min_score = MIN_SCORE_CEILING - 1;
-        assert!(evaluate(&sig_below).iter().any(|p| p.rule_id == RULE_MIN_SCORE));
+        assert!(evaluate(&sig_below)
+            .iter()
+            .any(|p| p.rule_id == RULE_MIN_SCORE));
     }
 
     #[test]
@@ -1193,17 +1236,23 @@ mod tests {
             claude_last_seen: "2.2.0".to_string(),
             ..Signals::default()
         };
-        assert!(evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_VERSION));
+        assert!(evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_VERSION));
 
         let sig_ok = Signals {
             claude_last_seen: "2.2.0".to_string(),
             claude_last_verified: "2.2.0".to_string(),
             ..Signals::default()
         };
-        assert!(!evaluate(&sig_ok).iter().any(|p| p.rule_id == RULE_DRIFT_VERSION));
+        assert!(!evaluate(&sig_ok)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_VERSION));
 
         // Never-seen (no Claude tab yet): nothing to trip on.
-        assert!(!evaluate(&Signals::default()).iter().any(|p| p.rule_id == RULE_DRIFT_VERSION));
+        assert!(!evaluate(&Signals::default())
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_VERSION));
     }
 
     #[test]
@@ -1217,11 +1266,15 @@ mod tests {
             }],
             ..Signals::default()
         };
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_VERSION));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_VERSION));
 
         // The NEXT version change re-fires despite the old dismissal.
         sig.claude_last_seen = "2.3.0".to_string();
-        assert!(evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_VERSION));
+        assert!(evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_VERSION));
     }
 
     /// Signals for the read-reason drift: advisor ON, ~100% reread at the
@@ -1242,7 +1295,10 @@ mod tests {
     #[test]
     fn read_reason_drift_proposes_disabling_the_advisor() {
         let props = evaluate(&read_reason_signals());
-        let p = props.iter().find(|p| p.rule_id == RULE_DRIFT_READ_REASON).expect("fires");
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_DRIFT_READ_REASON)
+            .expect("fires");
         assert_eq!(p.setting, "graph.read_advisor");
         assert_eq!(p.proposed, "false");
         assert!(!p.warn_only);
@@ -1252,15 +1308,21 @@ mod tests {
     fn read_reason_drift_needs_the_advisor_on_and_its_own_floors() {
         let mut sig = read_reason_signals();
         sig.graph.read_advisor = false;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
 
         let mut sig = read_reason_signals();
         sig.advisor_reread_samples = DRIFT_MIN_REMINDS - 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
 
         let mut sig = read_reason_signals();
         sig.advisor_reread_rate = Some(0.8); // high for tuning, below drift's 0.9
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
     }
 
     #[test]
@@ -1272,7 +1334,10 @@ mod tests {
         sig.advisor_reread_samples = MIN_REMINDS; // 20 ≥ both floors
         let ids: Vec<&str> = evaluate(&sig).iter().map(|p| p.rule_id).collect();
         assert!(ids.contains(&RULE_DRIFT_READ_REASON));
-        assert!(!ids.contains(&RULE_ADVISOR_LINES), "tuning rule must be suppressed");
+        assert!(
+            !ids.contains(&RULE_ADVISOR_LINES),
+            "tuning rule must be suppressed"
+        );
     }
 
     #[test]
@@ -1288,26 +1353,37 @@ mod tests {
             ..Signals::default()
         };
         let props = evaluate(&base);
-        let p = props.iter().find(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT).expect("fires");
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT)
+            .expect("fires");
         assert!(p.warn_only);
         assert!(p.setting.is_empty());
         assert_eq!(p.signature, "2.2.0"); // re-fires per harness version
 
         let mut sig = base.clone();
         sig.remind_count = 1; // one remind reached the loopback ⇒ hook alive
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
 
         let mut sig = base.clone();
         sig.large_reread_pairs = DRIFT_SILENT_MIN_REREADS - 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
 
         let mut sig = base.clone();
         sig.session_count = DRIFT_SILENT_MIN_SESSIONS - 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
 
         let mut sig = base;
         sig.graph.read_advisor = false;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
     }
 
     #[test]
@@ -1322,18 +1398,25 @@ mod tests {
             ..Signals::default()
         };
         let props = evaluate(&base);
-        let p = props.iter().find(|p| p.rule_id == RULE_DRIFT_INJECTION_UNSEEN).expect("fires");
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_DRIFT_INJECTION_UNSEEN)
+            .expect("fires");
         assert!(p.warn_only);
 
         // 10% follow is unhealthy but NOT "never reaches the model" — the
         // tuning rule's territory, not the drift rule's.
         let mut sig = base.clone();
         sig.injection_follow_rate = Some(0.10);
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_INJECTION_UNSEEN));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_INJECTION_UNSEEN));
 
         let mut sig = base;
         sig.graph.context_injection = false;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_INJECTION_UNSEEN));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_INJECTION_UNSEEN));
     }
 
     #[test]
@@ -1344,19 +1427,25 @@ mod tests {
             claude_last_seen: "2.2.0".to_string(),
             ..Signals::default()
         };
-        assert!(evaluate(&base).iter().any(|p| p.rule_id == RULE_DRIFT_USAGE_FIELDS));
+        assert!(evaluate(&base)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_USAGE_FIELDS));
 
         // One healthy session ⇒ the schema didn't change, that session is
         // just odd.
         let mut sig = base.clone();
         sig.claude_tokenless_sessions = 2;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_USAGE_FIELDS));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_USAGE_FIELDS));
 
         // Below the floor a single tokenless session could be a fluke.
         let mut sig = base;
         sig.claude_sessions = DRIFT_MIN_TOKENLESS - 1;
         sig.claude_tokenless_sessions = DRIFT_MIN_TOKENLESS - 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_USAGE_FIELDS));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_USAGE_FIELDS));
     }
 
     #[test]
@@ -1366,7 +1455,10 @@ mod tests {
             ..Signals::default()
         };
         let props = evaluate(&sig);
-        let p = props.iter().find(|p| p.rule_id == RULE_DRIFT_PAYLOAD).expect("fires");
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_DRIFT_PAYLOAD)
+            .expect("fires");
         assert!(p.warn_only);
         assert!(p.rationale.contains("read_hook: session_id"));
 
@@ -1394,7 +1486,10 @@ mod tests {
             ..Signals::default()
         };
         let props = evaluate(&sig);
-        let p = props.iter().find(|p| p.rule_id == RULE_DRIFT_SUBAGENT).expect("fires");
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_DRIFT_SUBAGENT)
+            .expect("fires");
         assert!(p.warn_only);
         assert!(p.rationale.contains(summary));
         // Version-keyed signature: a dismissal holds until the next harness
@@ -1407,10 +1502,14 @@ mod tests {
             rule_id: RULE_DRIFT_SUBAGENT.to_string(),
             signature: "2.2.0".to_string(),
         }];
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_SUBAGENT));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_SUBAGENT));
 
         // No events ⇒ silent.
-        assert!(!evaluate(&Signals::default()).iter().any(|p| p.rule_id == RULE_DRIFT_SUBAGENT));
+        assert!(!evaluate(&Signals::default())
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_SUBAGENT));
     }
 
     #[test]
@@ -1424,17 +1523,24 @@ mod tests {
             ..Signals::default()
         };
         let p = evaluate(&base);
-        let p = p.iter().find(|p| p.rule_id == RULE_DRIFT_READ_BYPASS).expect("fires");
+        let p = p
+            .iter()
+            .find(|p| p.rule_id == RULE_DRIFT_READ_BYPASS)
+            .expect("fires");
         assert_eq!(p.setting, "graph.read_advisor");
         assert_eq!(p.proposed, "false");
 
         let mut sig = base.clone();
         sig.bypass_rate = Some(0.3); // below BYPASS_HIGH
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_READ_BYPASS));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_READ_BYPASS));
 
         let mut sig = base;
         sig.bypass_samples = DRIFT_MIN_BYPASS_REMINDS - 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_DRIFT_READ_BYPASS));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_DRIFT_READ_BYPASS));
     }
 
     #[test]
@@ -1445,7 +1551,10 @@ mod tests {
         let mut sig = read_reason_signals();
         sig.advisor_reread_rate = Some(1.0);
         let props = evaluate(&sig);
-        let p = props.iter().find(|p| p.rule_id == RULE_DRIFT_READ_REASON).unwrap();
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_DRIFT_READ_REASON)
+            .unwrap();
         assert_eq!(p.setting, "graph.read_advisor");
         let val: bool = p.proposed.parse().expect("proposed must be a bool string");
         let mut g = GraphSettings::default();
@@ -1471,7 +1580,10 @@ mod tests {
     #[test]
     fn surface_lean_fires_on_zero_calls_after_enough_sessions() {
         let props = evaluate(&surface_lean_signals());
-        let p = props.iter().find(|p| p.rule_id == RULE_SURFACE_LEAN).expect("fires");
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_SURFACE_LEAN)
+            .expect("fires");
         assert_eq!(p.setting, "graph.lean_tools");
         assert_eq!(p.current, "false");
         assert_eq!(p.proposed, "true");
@@ -1490,21 +1602,27 @@ mod tests {
     fn surface_lean_silenced_by_a_single_hideable_call() {
         let mut sig = surface_lean_signals();
         sig.hideable_tool_calls = 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_SURFACE_LEAN));
     }
 
     #[test]
     fn surface_lean_respects_its_session_floor() {
         let mut sig = surface_lean_signals();
         sig.session_count = SURFACE_LEAN_MIN_SESSIONS - 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_SURFACE_LEAN));
     }
 
     #[test]
     fn surface_lean_silent_when_already_lean() {
         let mut sig = surface_lean_signals();
         sig.graph.lean_tools = true;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_SURFACE_LEAN));
     }
 
     #[test]
@@ -1515,7 +1633,9 @@ mod tests {
             rule_id: RULE_SURFACE_LEAN.to_string(),
             signature: "zero-usage".to_string(),
         }];
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_SURFACE_LEAN));
 
         // Freshly applied ⇒ quiet until APPLY_COOLDOWN_SESSIONS more sessions.
         let mut sig = surface_lean_signals();
@@ -1524,7 +1644,9 @@ mod tests {
             root: String::new(),
             session_count: sig.session_count,
         }];
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_SURFACE_LEAN));
 
         // Cooldown elapsed ⇒ re-fires.
         let mut sig = surface_lean_signals();
@@ -1534,7 +1656,9 @@ mod tests {
             root: String::new(),
             session_count: SURFACE_LEAN_MIN_SESSIONS,
         }];
-        assert!(evaluate(&sig).iter().any(|p| p.rule_id == RULE_SURFACE_LEAN));
+        assert!(evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_SURFACE_LEAN));
     }
 
     // ── V17 Phase F — graduation rules (adopt.*) ────────────────────────
@@ -1555,14 +1679,18 @@ mod tests {
     #[test]
     fn adopt_advisor_fires_and_proposes_enabling_a_real_bool_field() {
         let props = evaluate(&adopt_advisor_signals());
-        let p = props.iter().find(|p| p.rule_id == RULE_ADOPT_ADVISOR).expect("fires");
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_ADOPT_ADVISOR)
+            .expect("fires");
         assert_eq!(p.setting, "graph.read_advisor");
         assert_eq!(p.current, "false");
         assert_eq!(p.proposed, "true");
         assert_eq!(p.signature, "5"); // 5.0 pairs/session rounded
         assert!(!p.warn_only);
         assert!(
-            p.rationale.contains("external tools may have changed the file"),
+            p.rationale
+                .contains("external tools may have changed the file"),
             "must carry the est. caveat verbatim"
         );
         // Real, assignable bool field (Apply-switch guard).
@@ -1577,22 +1705,30 @@ mod tests {
         // Rate below 3.0/session.
         let mut sig = adopt_advisor_signals();
         sig.redundant_reads_per_session = Some(2.9);
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
 
         // Fewer than 10 sessions of evidence.
         let mut sig = adopt_advisor_signals();
         sig.redundant_read_sessions = ADOPT_MIN_SESSIONS - 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
 
         // No data at all.
         let mut sig = adopt_advisor_signals();
         sig.redundant_reads_per_session = None;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
 
         // Advisor already on.
         let mut sig = adopt_advisor_signals();
         sig.graph.read_advisor = true;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
     }
 
     #[test]
@@ -1602,7 +1738,9 @@ mod tests {
         // strict `== "pass"` check rather than `!e1_blocked()`.
         let mut sig = adopt_advisor_signals();
         sig.e1_pass = false;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
     }
 
     #[test]
@@ -1611,8 +1749,12 @@ mod tests {
         // advisor ON, adopt needs it OFF), so pin the guard directly on
         // `adopt_rules`: `advisor_disable_proposed = true` must silence it.
         let sig = adopt_advisor_signals();
-        assert!(adopt_rules(&sig, false).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
-        assert!(!adopt_rules(&sig, true).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(adopt_rules(&sig, false)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(!adopt_rules(&sig, true)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
     }
 
     #[test]
@@ -1622,11 +1764,15 @@ mod tests {
             rule_id: RULE_ADOPT_ADVISOR.to_string(),
             signature: "5".to_string(),
         }];
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
 
         // A materially higher rate (rounds to a different integer) re-fires.
         sig.redundant_reads_per_session = Some(8.0);
-        assert!(evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
     }
 
     #[test]
@@ -1637,7 +1783,9 @@ mod tests {
             root: String::new(),
             session_count: sig.session_count,
         }];
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_ADVISOR));
     }
 
     /// Signals for `adopt.read_advisor_substitute.v1`: advisor ON in advise
@@ -1657,7 +1805,10 @@ mod tests {
     #[test]
     fn adopt_substitute_fires_and_proposes_the_mode_string() {
         let props = evaluate(&adopt_substitute_signals());
-        let p = props.iter().find(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE).expect("fires");
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE)
+            .expect("fires");
         assert_eq!(p.setting, "graph.read_advisor_mode");
         assert_eq!(p.current, "advise");
         assert_eq!(p.proposed, "substitute");
@@ -1669,27 +1820,37 @@ mod tests {
         // Reread rate above 20% (the outline evidently isn't enough).
         let mut sig = adopt_substitute_signals();
         sig.advisor_reread_rate = Some(0.3);
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
 
         // Too few reminders.
         let mut sig = adopt_substitute_signals();
         sig.advisor_reread_samples = SUBSTITUTE_MIN_SAMPLES - 1;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
 
         // Shell bypass at/above BYPASS_HIGH ⇒ don't lean harder on the advisor.
         let mut sig = adopt_substitute_signals();
         sig.bypass_rate = Some(BYPASS_HIGH);
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
 
         // Advisor off.
         let mut sig = adopt_substitute_signals();
         sig.graph.read_advisor = false;
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
 
         // Already in substitute mode.
         let mut sig = adopt_substitute_signals();
         sig.graph.read_advisor_mode = "substitute".to_string();
-        assert!(!evaluate(&sig).iter().any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
+        assert!(!evaluate(&sig)
+            .iter()
+            .any(|p| p.rule_id == RULE_ADOPT_SUBSTITUTE));
     }
 
     #[test]
@@ -1710,8 +1871,7 @@ mod tests {
                 ..Signals::default()
             };
             let ids: Vec<&str> = evaluate(&sig).iter().map(|p| p.rule_id).collect();
-            let both =
-                ids.contains(&RULE_ADOPT_SUBSTITUTE) && ids.contains(&RULE_ADVISOR_LINES);
+            let both = ids.contains(&RULE_ADOPT_SUBSTITUTE) && ids.contains(&RULE_ADVISOR_LINES);
             assert!(!both, "rate={rate} fired both rules: {ids:?}");
         }
     }

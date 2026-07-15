@@ -17,7 +17,9 @@
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::graph::builder::{char_col, emit_symbol, language_for};
-use crate::graph::model::{symbol_id, Confidence, Edge, EdgeKind, FileGraph, Lang, Reference, SymbolKind, Visibility};
+use crate::graph::model::{
+    symbol_id, Confidence, Edge, EdgeKind, FileGraph, Lang, Reference, SymbolKind, Visibility,
+};
 
 /// A grammar + its vendored tags query.
 pub(crate) struct TagSpec {
@@ -53,7 +55,11 @@ pub(crate) fn tag_spec(lang: Lang) -> Option<TagSpec> {
         _ => return None,
     };
     let language = language_for(lang)?;
-    Some(TagSpec { lang, language, tags_query })
+    Some(TagSpec {
+        lang,
+        language,
+        tags_query,
+    })
 }
 
 /// V12 Phase C **fallback** test detection for the generic tags engine: no
@@ -185,7 +191,11 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
                     let name = node_text(src, nn);
                     let name = name.trim();
                     if !name.is_empty() {
-                        defs.push(Def { node: dn, name: name.to_string(), kind });
+                        defs.push(Def {
+                            node: dn,
+                            name: name.to_string(),
+                            kind,
+                        });
                     }
                 }
             }
@@ -222,7 +232,10 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
         .iter()
         .map(|d| symbol_id(file, &d.name, d.node.start_position().row as u32 + 1))
         .collect();
-    let spans: Vec<(usize, usize)> = defs.iter().map(|d| (d.node.start_byte(), d.node.end_byte())).collect();
+    let spans: Vec<(usize, usize)> = defs
+        .iter()
+        .map(|d| (d.node.start_byte(), d.node.end_byte()))
+        .collect();
 
     // Emit each symbol with its parent = the smallest *other* definition whose
     // span strictly contains it. Dedup ids so a def captured by two patterns
@@ -235,9 +248,11 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
         }
         let parent_id = parent.map(|p| ids[p].as_str());
         let vis = tags_visibility(spec.lang, &d.name);
-        let is_test =
-            matches!(d.kind, SymbolKind::Function | SymbolKind::Method) && tags_is_test_path(spec.lang, file);
-        emit_symbol(src, file, d.node, &d.name, d.kind, parent_id, None, vis, is_test, fg);
+        let is_test = matches!(d.kind, SymbolKind::Function | SymbolKind::Method)
+            && tags_is_test_path(spec.lang, file);
+        emit_symbol(
+            src, file, d.node, &d.name, d.kind, parent_id, None, vis, is_test, fg,
+        );
     }
 
     // Record every call as a reference (so `find references` sees it), then add
@@ -258,7 +273,8 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
             matches!(defs[j].kind, SymbolKind::Function | SymbolKind::Method)
         });
         if let Some(j) = caller {
-            fg.edges.push(Edge::new(EdgeKind::Call, ids[j].clone(), c.name.clone()));
+            fg.edges
+                .push(Edge::new(EdgeKind::Call, ids[j].clone(), c.name.clone()));
         }
     }
 }
@@ -274,10 +290,24 @@ mod tests {
     #[test]
     fn every_vendored_query_compiles() {
         let langs = [
-            Lang::Go, Lang::Java, Lang::C, Lang::Cpp, Lang::CSharp, Lang::Php,
-            Lang::Bash, Lang::Scala, Lang::Ocaml, Lang::Ruby, Lang::Haskell,
-            Lang::Kotlin, Lang::Swift, Lang::Sql, Lang::R, Lang::Perl,
-            Lang::Ada, Lang::Erlang,
+            Lang::Go,
+            Lang::Java,
+            Lang::C,
+            Lang::Cpp,
+            Lang::CSharp,
+            Lang::Php,
+            Lang::Bash,
+            Lang::Scala,
+            Lang::Ocaml,
+            Lang::Ruby,
+            Lang::Haskell,
+            Lang::Kotlin,
+            Lang::Swift,
+            Lang::Sql,
+            Lang::R,
+            Lang::Perl,
+            Lang::Ada,
+            Lang::Erlang,
         ];
         for lang in langs {
             let spec = tag_spec(lang).unwrap_or_else(|| panic!("no tag_spec for {lang:?}"));
@@ -287,10 +317,18 @@ mod tests {
     }
 
     fn names_of(fg: &FileGraph, kind: SymbolKind) -> Vec<String> {
-        fg.symbols.iter().filter(|s| s.kind == kind).map(|s| s.name.clone()).collect()
+        fg.symbols
+            .iter()
+            .filter(|s| s.kind == kind)
+            .map(|s| s.name.clone())
+            .collect()
     }
     fn call_targets(fg: &FileGraph) -> Vec<String> {
-        fg.edges.iter().filter(|e| e.kind == EdgeKind::Call).map(|e| e.dst.clone()).collect()
+        fg.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Call)
+            .map(|e| e.dst.clone())
+            .collect()
     }
 
     #[test]
@@ -338,10 +376,21 @@ end
         assert!(names_of(&fg, SymbolKind::Class).contains(&"Greeter".to_string()));
         assert!(names_of(&fg, SymbolKind::Method).contains(&"greet".to_string()));
         // `greet` should be Contained by `Greeter`.
-        let class_id = symbol_id("x.rb", "Greeter", fg.symbols.iter()
-            .find(|s| s.name == "Greeter").unwrap().start_line);
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Contains && e.src == class_id),
-            "expected Greeter to contain a method");
+        let class_id = symbol_id(
+            "x.rb",
+            "Greeter",
+            fg.symbols
+                .iter()
+                .find(|s| s.name == "Greeter")
+                .unwrap()
+                .start_line,
+        );
+        assert!(
+            fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Contains && e.src == class_id),
+            "expected Greeter to contain a method"
+        );
         assert!(call_targets(&fg).contains(&"format".to_string()));
     }
 
@@ -393,17 +442,34 @@ func run() {
         // excluded the body and dropped all C/C++ call edges).
         const SRC: &str = "int add(int a, int b) {\n    return helper(a) + b;\n}\n";
         let fg = parse_file("x.c", SRC, Lang::C);
-        let add = fg.symbols.iter().find(|s| s.name == "add").expect("add symbol");
-        assert!(add.end_line >= 3, "end_line should cover the body, got {}", add.end_line);
-        assert!(call_targets(&fg).contains(&"helper".to_string()), "calls: {:?}", call_targets(&fg));
+        let add = fg
+            .symbols
+            .iter()
+            .find(|s| s.name == "add")
+            .expect("add symbol");
+        assert!(
+            add.end_line >= 3,
+            "end_line should cover the body, got {}",
+            add.end_line
+        );
+        assert!(
+            call_targets(&fg).contains(&"helper".to_string()),
+            "calls: {:?}",
+            call_targets(&fg)
+        );
     }
 
     #[test]
     fn cpp_fixture_symbols_and_calls() {
-        const SRC: &str = "struct Shape { int n; };\nint area(Shape s) {\n    return compute(s.n);\n}\n";
+        const SRC: &str =
+            "struct Shape { int n; };\nint area(Shape s) {\n    return compute(s.n);\n}\n";
         let fg = parse_file("x.cpp", SRC, Lang::Cpp);
         assert!(names_of(&fg, SymbolKind::Function).contains(&"area".to_string()));
-        assert!(call_targets(&fg).contains(&"compute".to_string()), "calls: {:?}", call_targets(&fg));
+        assert!(
+            call_targets(&fg).contains(&"compute".to_string()),
+            "calls: {:?}",
+            call_targets(&fg)
+        );
     }
 
     #[test]
@@ -412,8 +478,10 @@ func run() {
         // just without a caller edge.
         const SRC: &str = "helper()\n";
         let fg = parse_file("x.rb", SRC, Lang::Ruby);
-        assert!(fg.references.iter().any(|r| r.name == "helper"),
-            "top-level call should be a reference");
+        assert!(
+            fg.references.iter().any(|r| r.name == "helper"),
+            "top-level call should be a reference"
+        );
     }
 
     #[test]

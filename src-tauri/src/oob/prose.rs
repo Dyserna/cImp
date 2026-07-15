@@ -34,10 +34,7 @@ pub fn to_speakable(md: &str) -> String {
                     // has nothing else on the line (CommonMark). Anything else
                     // — e.g. a ```python line inside a ````-fenced example —
                     // is code-block content and stays skipped.
-                    if ch == open_ch
-                        && len >= open_len
-                        && trimmed[len..].trim().is_empty()
-                    {
+                    if ch == open_ch && len >= open_len && trimmed[len..].trim().is_empty() {
                         fence = None;
                     }
                 }

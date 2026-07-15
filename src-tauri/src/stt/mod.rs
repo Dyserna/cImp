@@ -166,7 +166,12 @@ pub fn spawn(app: AppHandle, settings: SettingsHandle, runtime: SttRuntime) {
     // in, touching whisper/ggml symbols here triggers GPU backend init
     // (device enumeration) and stalls setup, so the main window never gets
     // shown or titled. Keep this function to channel/thread wiring only.
-    worker::spawn_stt_worker(app.clone(), settings.clone(), runtime.jobs_rx, runtime.state.clone());
+    worker::spawn_stt_worker(
+        app.clone(),
+        settings.clone(),
+        runtime.jobs_rx,
+        runtime.state.clone(),
+    );
     spawn_mic_streamer(app.clone(), runtime.recording.clone(), runtime.mic.clone());
     capture::spawn_capture_thread(
         app,
@@ -183,11 +188,7 @@ pub fn spawn(app: AppHandle, settings: SettingsHandle, runtime: SttRuntime) {
 /// recording, push recent capture samples to the frontend `mic-amplitude`
 /// event at ~60 Hz so the recording waveform animates. Idle (not recording)
 /// → no read, no emit, keeping the IPC quiet.
-fn spawn_mic_streamer(
-    app: AppHandle,
-    recording: Arc<AtomicBool>,
-    mic: Arc<RwLock<RingBuffer>>,
-) {
+fn spawn_mic_streamer(app: AppHandle, recording: Arc<AtomicBool>, mic: Arc<RwLock<RingBuffer>>) {
     use std::time::Duration;
     const SAMPLE_WINDOW: usize = 1024;
     let tap = AmplitudeTap::from_arc(mic);

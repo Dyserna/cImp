@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::ipc::AppState;
 use crate::settings::{
-    default_ai_tab, AiTabId, Settings, ShellNotificationConfig,
-    ShellTabConfig as ShellTabSettings, TabConfig,
+    default_ai_tab, AiTabId, Settings, ShellNotificationConfig, ShellTabConfig as ShellTabSettings,
+    TabConfig,
 };
 use crate::shell::detect;
 use crate::state::{StateSignal, TabId, TabKind, TabMeta};
@@ -66,7 +66,9 @@ pub enum TabLifecycleError {
 
 impl TabLifecycleError {
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self::Internal { message: msg.into() }
+        Self::Internal {
+            message: msg.into(),
+        }
     }
 }
 
@@ -116,11 +118,17 @@ async fn validate_inputs(
                 .map_err(|_| TabLifecycleError::CommandNotFound { tried: raw.clone() })?
         };
 
-        let cwd_path = match cwd_string.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let cwd_path = match cwd_string
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(s) => {
                 let p = PathBuf::from(s);
                 if !p.is_dir() {
-                    return Err(TabLifecycleError::CwdNotFound { path: s.to_string() });
+                    return Err(TabLifecycleError::CwdNotFound {
+                        path: s.to_string(),
+                    });
                 }
                 Some(p)
             }
@@ -251,7 +259,9 @@ pub async fn create_shell_tab(
         // Roll back the committed settings + registry entries so a phantom tab
         // doesn't persist (and resurrect on next launch) with no frontend view.
         let id = tab.as_str().to_string();
-        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
+        state
+            .settings
+            .mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
         state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
@@ -335,7 +345,9 @@ pub async fn create_preview_tab(
     {
         warn!(error = %e, "create_preview_tab: state-signal channel closed");
         let id = tab.as_str().to_string();
-        state.settings.mutate(move |s| s.tabs.retain(|t| t.id() != id));
+        state
+            .settings
+            .mutate(move |s| s.tabs.retain(|t| t.id() != id));
         state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
@@ -357,8 +369,7 @@ pub async fn create_preview_tab(
 /// pre-existing instance to collide with, so the FIRST one is plain
 /// "Preview".
 fn unique_preview_tab_name(settings: &Settings) -> String {
-    let taken: std::collections::HashSet<&str> =
-        settings.tabs.iter().map(|t| t.name()).collect();
+    let taken: std::collections::HashSet<&str> = settings.tabs.iter().map(|t| t.name()).collect();
     if !taken.contains("Preview") {
         return "Preview".to_string();
     }
@@ -376,8 +387,7 @@ fn unique_preview_tab_name(settings: &Settings) -> String {
 /// "Claude 2", "Claude 3"). Falls back to a uuid suffix in the
 /// (practically impossible) event the first thousand are all taken.
 fn unique_tab_name(settings: &Settings, base: &str) -> String {
-    let taken: std::collections::HashSet<&str> =
-        settings.tabs.iter().map(|t| t.name()).collect();
+    let taken: std::collections::HashSet<&str> = settings.tabs.iter().map(|t| t.name()).collect();
     for n in 2..1000 {
         let candidate = format!("{base} {n}");
         if !taken.contains(candidate.as_str()) {
@@ -408,14 +418,16 @@ pub async fn create_ai_tab(
     // a missing entry or a Shell template is a malformed request.
     let mut cfg = {
         let snap = state.settings.current();
-        let entry = snap.find_tab(template.as_str()).ok_or_else(|| {
-            TabLifecycleError::TabNotFound {
-                tab: template.as_str().to_string(),
-            }
-        })?;
+        let entry =
+            snap.find_tab(template.as_str())
+                .ok_or_else(|| TabLifecycleError::TabNotFound {
+                    tab: template.as_str().to_string(),
+                })?;
         match entry {
             TabConfig::AiTool(ai) => ai.clone(),
-            TabConfig::Shell(_) | TabConfig::Preview(_) => return Err(TabLifecycleError::WrongKind),
+            TabConfig::Shell(_) | TabConfig::Preview(_) => {
+                return Err(TabLifecycleError::WrongKind)
+            }
         }
     };
 
@@ -455,7 +467,9 @@ pub async fn create_ai_tab(
         warn!(error = %e, "create_ai_tab: state-signal channel closed");
         // Roll back the committed settings + registry entries (see create_shell_tab).
         let id = tab.as_str().to_string();
-        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
+        state
+            .settings
+            .mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
         state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
@@ -515,14 +529,16 @@ pub async fn create_ai_tab_in_worktree(
     // `worktree_create` below still don't roll back — see the doc comment.)
     let mut cfg = {
         let snap = state.settings.current();
-        let entry = snap.find_tab(template.as_str()).ok_or_else(|| {
-            TabLifecycleError::TabNotFound {
-                tab: template.as_str().to_string(),
-            }
-        })?;
+        let entry =
+            snap.find_tab(template.as_str())
+                .ok_or_else(|| TabLifecycleError::TabNotFound {
+                    tab: template.as_str().to_string(),
+                })?;
         match entry {
             TabConfig::AiTool(ai) => ai.clone(),
-            TabConfig::Shell(_) | TabConfig::Preview(_) => return Err(TabLifecycleError::WrongKind),
+            TabConfig::Shell(_) | TabConfig::Preview(_) => {
+                return Err(TabLifecycleError::WrongKind)
+            }
         }
     };
 
@@ -565,7 +581,9 @@ pub async fn create_ai_tab_in_worktree(
     {
         warn!(error = %e, "create_ai_tab_in_worktree: state-signal channel closed");
         let id = tab.as_str().to_string();
-        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
+        state
+            .settings
+            .mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
         state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
@@ -634,7 +652,9 @@ pub async fn close_tab(
             // non-builtin can legitimately be at index 0 once AI builtins are
             // disabled), fall back to the right neighbor so `active` never
             // dangles at the just-removed tab.
-            let target = registry.previous_tab(&tab).or_else(|| registry.next_tab(&tab));
+            let target = registry
+                .previous_tab(&tab)
+                .or_else(|| registry.next_tab(&tab));
             if let Some(target) = target {
                 if let Err(e) = registry.activate(target).await {
                     warn!(error = %e, "close_tab: activate neighbor failed");
@@ -757,7 +777,9 @@ pub(crate) async fn sync_reserved_feature_tab(state: &AppState, tab: TabId, enab
             // If the tab being removed is active, hand focus to a neighbor first
             // so `active` never dangles at the removed tab (mirrors close_tab).
             if registry.active() == tab {
-                let target = registry.previous_tab(&tab).or_else(|| registry.next_tab(&tab));
+                let target = registry
+                    .previous_tab(&tab)
+                    .or_else(|| registry.next_tab(&tab));
                 if let Some(target) = target {
                     if let Err(e) = registry.activate(target).await {
                         warn!(error = %e, "sync_reserved_feature_tab: activate neighbor failed");
@@ -1021,10 +1043,7 @@ pub async fn set_enabled_ai_tabs(
     // produce duplicates.
     let mut seen: std::collections::HashSet<AiTabId> =
         std::collections::HashSet::with_capacity(value.len());
-    let want_ordered: Vec<AiTabId> = value
-        .into_iter()
-        .filter(|id| seen.insert(*id))
-        .collect();
+    let want_ordered: Vec<AiTabId> = value.into_iter().filter(|id| seen.insert(*id)).collect();
     let want: std::collections::HashSet<AiTabId> = want_ordered.iter().copied().collect();
 
     // Serialize with all other lifecycle commands so concurrent
@@ -1068,11 +1087,7 @@ pub async fn set_enabled_ai_tabs(
 
     // Canonical add order: claude → claude-local → opencode so insertions
     // land in the right relative slot.
-    let canonical = [
-        AiTabId::Claude,
-        AiTabId::ClaudeLocal,
-        AiTabId::OpenCode,
-    ];
+    let canonical = [AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode];
 
     // 1. Add any newly-enabled tabs.
     for &id in &canonical {
@@ -1246,7 +1261,9 @@ pub async fn open_tool_tab(
         warn!(error = %e, "open_tool_tab: state-signal channel closed");
         // Roll back the committed settings + registry entries (see create_shell_tab).
         let id = tab.as_str().to_string();
-        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
+        state
+            .settings
+            .mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
         state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }
@@ -1419,7 +1436,9 @@ async fn add_ai_builtin_tab(
         warn!(error = %e, "set_enabled_ai_tabs: state-signal channel closed (add)");
         // Roll back the committed settings + registry entries.
         let id_str = tab.as_str().to_string();
-        state.settings.mutate(move |snap| snap.tabs.retain(|t| t.id() != id_str));
+        state
+            .settings
+            .mutate(move |snap| snap.tabs.retain(|t| t.id() != id_str));
         state.tabs.lock().await.remove_tab(&tab).await;
         return Err(TabLifecycleError::internal("state signal channel closed"));
     }

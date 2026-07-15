@@ -50,7 +50,9 @@ pub enum FileStatus {
     Modified,
     Added,
     Deleted,
-    Renamed { from: String },
+    Renamed {
+        from: String,
+    },
     /// Not yet under version control at all (`git status`'s `??`). Never
     /// produced by [`parse_unified`] itself — only [`diff_file`]'s synthesis
     /// path sets this, since a real `git diff` never emits an entry for an
@@ -131,8 +133,18 @@ pub struct FileDiffMeta {
 /// git-backed `summary`'s `--numstat` value, but this function only ever
 /// runs on an already-parsed diff, so the count is free).
 pub fn file_diff_meta_from_parsed(file: &FileDiff) -> FileDiffMeta {
-    let added = file.hunks.iter().flat_map(|h| h.lines.iter()).filter(|(m, _)| *m == '+').count() as u32;
-    let removed = file.hunks.iter().flat_map(|h| h.lines.iter()).filter(|(m, _)| *m == '-').count() as u32;
+    let added = file
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .filter(|(m, _)| *m == '+')
+        .count() as u32;
+    let removed = file
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .filter(|(m, _)| *m == '-')
+        .count() as u32;
     FileDiffMeta {
         path: file.path.clone(),
         status: file.status.clone(),
@@ -234,7 +246,10 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
                 Some(l) if l.starts_with("old mode") || l.starts_with("new mode") => {
                     lines.next();
                 }
-                Some(l) if l.starts_with("similarity index") || l.starts_with("dissimilarity index") => {
+                Some(l)
+                    if l.starts_with("similarity index")
+                        || l.starts_with("dissimilarity index") =>
+                {
                     lines.next();
                 }
                 Some(l) if l.starts_with("rename from ") => {
@@ -333,7 +348,8 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
                 }
                 let marker = bl.chars().next().unwrap_or(' ');
                 if marker == '+' || marker == '-' || marker == ' ' {
-                    hunk.lines.push((marker, bl[marker.len_utf8()..].to_string()));
+                    hunk.lines
+                        .push((marker, bl[marker.len_utf8()..].to_string()));
                     lines.next();
                 } else {
                     // Unexpected content (shouldn't happen with real `git`
@@ -350,7 +366,13 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
         // `Y` otherwise — which is the file's current path in every case
         // (modify/add/delete/rename); deletions still show the original name
         // there (only the `+++` line says `/dev/null`).
-        files.push(FileDiff { path: new_path, status, binary, hunks, too_large: false });
+        files.push(FileDiff {
+            path: new_path,
+            status,
+            binary,
+            hunks,
+            too_large: false,
+        });
     }
 
     files
@@ -365,7 +387,10 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
 /// "mechanical, no exotic edge cases" scope of this milestone).
 fn parse_diff_git_line(rest: &str) -> Option<(String, String)> {
     let idx = rest.find(" b/")?;
-    let old = rest[..idx].strip_prefix("a/").unwrap_or(&rest[..idx]).to_string();
+    let old = rest[..idx]
+        .strip_prefix("a/")
+        .unwrap_or(&rest[..idx])
+        .to_string();
     let new = rest[idx + 3..].to_string();
     Some((old, new))
 }
@@ -613,7 +638,11 @@ fn parse_numstat_z(raw: &str) -> std::collections::HashMap<String, (Option<u32>,
 /// caller has confirmed the shadow fallback doesn't apply either.
 pub async fn summary(root: &Path) -> AppResult<DiffSummary> {
     if !git::is_repo(root).await {
-        return Ok(DiffSummary { files: Vec::new(), readonly: false, source: None });
+        return Ok(DiffSummary {
+            files: Vec::new(),
+            readonly: false,
+            source: None,
+        });
     }
     let ctx = GitCtx::discover(root);
 
@@ -662,7 +691,11 @@ pub async fn summary(root: &Path) -> AppResult<DiffSummary> {
     .await
     .map_err(|e| AppError::Workbench(format!("diff summary worker panicked: {e}")))?;
 
-    Ok(DiffSummary { files, readonly, source: Some(DiffSource::Git) })
+    Ok(DiffSummary {
+        files,
+        readonly,
+        source: Some(DiffSource::Git),
+    })
 }
 
 /// Best-effort line-count for an untracked file (not present in `git diff
@@ -747,7 +780,13 @@ pub async fn diff_file_ctx(root: &Path, path: &str, context: u32) -> AppResult<F
         .map(|m| m.len() > MAX_DIFF_FILE_BYTES)
         .unwrap_or(false);
     if too_large {
-        return Ok(FileDiff { path: path.to_string(), status: entry.status, binary: false, hunks: Vec::new(), too_large: true });
+        return Ok(FileDiff {
+            path: path.to_string(),
+            status: entry.status,
+            binary: false,
+            hunks: Vec::new(),
+            too_large: true,
+        });
     }
 
     let unified = format!("--unified={}", context.min(MAX_CONTEXT));
@@ -756,16 +795,45 @@ pub async fn diff_file_ctx(root: &Path, path: &str, context: u32) -> AppResult<F
         // for `git diff`) has the old content to compare against; `-M` makes
         // that explicit rather than relying on the ambient `diff.renames`
         // config.
-        git::run(&ctx, &[
-            "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-color",
-            "--src-prefix=a/", "--dst-prefix=b/", &unified, "-M", "HEAD", "--",
-            from.as_str(), path,
-        ], None).await?
+        git::run(
+            &ctx,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                &unified,
+                "-M",
+                "HEAD",
+                "--",
+                from.as_str(),
+                path,
+            ],
+            None,
+        )
+        .await?
     } else {
-        git::run(&ctx, &[
-            "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-color",
-            "--src-prefix=a/", "--dst-prefix=b/", &unified, "HEAD", "--", path,
-        ], None).await?
+        git::run(
+            &ctx,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                &unified,
+                "HEAD",
+                "--",
+                path,
+            ],
+            None,
+        )
+        .await?
     };
 
     let mut parsed = parse_unified(&diff_out.stdout);
@@ -793,7 +861,13 @@ pub async fn diff_file_ctx(root: &Path, path: &str, context: u32) -> AppResult<F
         None => parsed.pop(),
     };
     let Some(mut file) = picked else {
-        return Ok(FileDiff { path: path.to_string(), status: entry.status, binary: false, hunks: Vec::new(), too_large: false });
+        return Ok(FileDiff {
+            path: path.to_string(),
+            status: entry.status,
+            binary: false,
+            hunks: Vec::new(),
+            too_large: false,
+        });
     };
     file.status = entry.status;
     file.path = path.to_string();
@@ -809,11 +883,24 @@ fn synthesize_untracked(root: &Path, path: &str) -> AppResult<FileDiff> {
     let meta = std::fs::metadata(&abs)
         .map_err(|e| AppError::Workbench(format!("stat {}: {e}", abs.display())))?;
     if meta.len() > MAX_DIFF_FILE_BYTES {
-        return Ok(FileDiff { path: path.to_string(), status: FileStatus::Untracked, binary: false, hunks: Vec::new(), too_large: true });
+        return Ok(FileDiff {
+            path: path.to_string(),
+            status: FileStatus::Untracked,
+            binary: false,
+            hunks: Vec::new(),
+            too_large: true,
+        });
     }
-    let bytes = std::fs::read(&abs).map_err(|e| AppError::Workbench(format!("read {}: {e}", abs.display())))?;
+    let bytes = std::fs::read(&abs)
+        .map_err(|e| AppError::Workbench(format!("read {}: {e}", abs.display())))?;
     if looks_binary(&bytes) {
-        return Ok(FileDiff { path: path.to_string(), status: FileStatus::Untracked, binary: true, hunks: Vec::new(), too_large: false });
+        return Ok(FileDiff {
+            path: path.to_string(),
+            status: FileStatus::Untracked,
+            binary: true,
+            hunks: Vec::new(),
+            too_large: false,
+        });
     }
     let text = String::from_utf8_lossy(&bytes);
     // Preserve trailing `\r` (see `parse_unified`): a CRLF untracked file must
@@ -823,7 +910,13 @@ fn synthesize_untracked(root: &Path, path: &str) -> AppResult<FileDiff> {
         .map(|l| ('+', l.strip_suffix('\n').unwrap_or(l).to_string()))
         .collect();
     if body.is_empty() {
-        return Ok(FileDiff { path: path.to_string(), status: FileStatus::Untracked, binary: false, hunks: Vec::new(), too_large: false });
+        return Ok(FileDiff {
+            path: path.to_string(),
+            status: FileStatus::Untracked,
+            binary: false,
+            hunks: Vec::new(),
+            too_large: false,
+        });
     }
     let n = body.len() as u32;
     let mut hunk = Hunk {
@@ -837,7 +930,13 @@ fn synthesize_untracked(root: &Path, path: &str) -> AppResult<FileDiff> {
         hash: String::new(),
     };
     hunk.hash = hunk_hash(&hunk);
-    Ok(FileDiff { path: path.to_string(), status: FileStatus::Untracked, binary: false, hunks: vec![hunk], too_large: false })
+    Ok(FileDiff {
+        path: path.to_string(),
+        status: FileStatus::Untracked,
+        binary: false,
+        hunks: vec![hunk],
+        too_large: false,
+    })
 }
 
 /// `true` when `root`'s repo is mid-merge/mid-rebase — re-exported for
@@ -855,8 +954,16 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git").args(args).current_dir(dir).output().expect("git");
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn setup_repo(tag: &str) -> std::path::PathBuf {
@@ -898,12 +1005,15 @@ index e4a1e5d..76bfa7d 100644
         assert_eq!(f.hunks.len(), 2);
         assert_eq!(f.hunks[0].old_start, 1);
         assert_eq!(f.hunks[0].new_start, 1);
-        assert_eq!(f.hunks[0].lines, vec![
-            (' ', "line1".to_string()),
-            ('-', "line2".to_string()),
-            ('+', "line2X".to_string()),
-            (' ', "line3".to_string()),
-        ]);
+        assert_eq!(
+            f.hunks[0].lines,
+            vec![
+                (' ', "line1".to_string()),
+                ('-', "line2".to_string()),
+                ('+', "line2X".to_string()),
+                (' ', "line3".to_string()),
+            ]
+        );
         assert_eq!(f.hunks[1].old_start, 10);
         assert_eq!(f.hunks[1].lines[1], ('-', "line11".to_string()));
     }
@@ -988,7 +1098,12 @@ index e4a1e5d..b77e620 100644
         let files = parse_unified(diff);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "new.txt");
-        assert_eq!(files[0].status, FileStatus::Renamed { from: "old.txt".to_string() });
+        assert_eq!(
+            files[0].status,
+            FileStatus::Renamed {
+                from: "old.txt".to_string()
+            }
+        );
         assert_eq!(files[0].hunks.len(), 1);
     }
 
@@ -1003,7 +1118,12 @@ rename to new.txt
 ";
         let files = parse_unified(diff);
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].status, FileStatus::Renamed { from: "old.txt".to_string() });
+        assert_eq!(
+            files[0].status,
+            FileStatus::Renamed {
+                from: "old.txt".to_string()
+            }
+        );
         assert!(files[0].hunks.is_empty());
     }
 
@@ -1061,11 +1181,14 @@ index 0a207c0..2d3cebd 100644
 ";
         let files = parse_unified(diff);
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].hunks[0].lines, vec![
-            (' ', "a".to_string()),
-            ('-', "b".to_string()),
-            ('+', "bX".to_string()),
-        ]);
+        assert_eq!(
+            files[0].hunks[0].lines,
+            vec![
+                (' ', "a".to_string()),
+                ('-', "b".to_string()),
+                ('+', "bX".to_string()),
+            ]
+        );
     }
 
     /// FIX 3 / V13 code review: a genuinely empty line in the hunk body
@@ -1077,12 +1200,16 @@ index 0a207c0..2d3cebd 100644
     /// pre-fix code and passes cleanly against the fix.
     #[test]
     fn parse_unified_empty_line_in_hunk_body_does_not_panic() {
-        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ a/a.rs\n@@ -1,3 +1,3 @@\n line1\n\n+line2\n";
+        let diff =
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ a/a.rs\n@@ -1,3 +1,3 @@\n line1\n\n+line2\n";
         let files = parse_unified(diff);
         assert_eq!(files.len(), 1);
         // The blank line is treated as an empty context line rather than
         // dropped or misparsed as something else.
-        assert!(files[0].hunks[0].lines.iter().any(|(m, t)| *m == ' ' && t.is_empty()));
+        assert!(files[0].hunks[0]
+            .lines
+            .iter()
+            .any(|(m, t)| *m == ' ' && t.is_empty()));
     }
 
     #[test]
@@ -1098,7 +1225,10 @@ diff --git a/a.rs b/a.rs
         let files = parse_unified(diff);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].hunks[0].lines.len(), 2);
-        assert_eq!(files[0].hunks[0].lines[0], ('+', "++ looks like a header but isn't".to_string()));
+        assert_eq!(
+            files[0].hunks[0].lines[0],
+            ('+', "++ looks like a header but isn't".to_string())
+        );
     }
 
     // ── file_diff_meta_from_parsed (FIX 7 shadow-repo fallback) ─────────
@@ -1156,7 +1286,16 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn hunk_hash_changes_when_content_changes_stable_otherwise() {
-        let h1 = Hunk { header: "@@ -1,1 +1,1 @@".into(), old_start: 1, old_lines: 1, new_start: 1, new_lines: 1, lines: vec![('-', "a".into()), ('+', "b".into())], no_newline_at: vec![], hash: String::new() };
+        let h1 = Hunk {
+            header: "@@ -1,1 +1,1 @@".into(),
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+            lines: vec![('-', "a".into()), ('+', "b".into())],
+            no_newline_at: vec![],
+            hash: String::new(),
+        };
         let h1_again = h1.clone();
         let mut h2 = h1.clone();
         h2.lines[1] = ('+', "c".into());
@@ -1174,14 +1313,20 @@ diff --git a/a.rs b/a.rs
         let files = parse_unified(diff);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].hunks.len(), 1);
-        assert_eq!(files[0].hunks[0].lines, vec![
-            (' ', "context\r".to_string()),
-            ('-', "old\r".to_string()),
-            ('+', "new\r".to_string()),
-        ]);
+        assert_eq!(
+            files[0].hunks[0].lines,
+            vec![
+                (' ', "context\r".to_string()),
+                ('-', "old\r".to_string()),
+                ('+', "new\r".to_string()),
+            ]
+        );
         // The rebuilt patch reproduces the `\r\n` terminators verbatim.
         let patch = String::from_utf8(build_hunk_patch(&files[0], &files[0].hunks[0])).unwrap();
-        assert!(patch.ends_with(" context\r\n-old\r\n+new\r\n"), "patch: {patch:?}");
+        assert!(
+            patch.ends_with(" context\r\n-old\r\n+new\r\n"),
+            "patch: {patch:?}"
+        );
     }
 
     #[test]
@@ -1197,7 +1342,9 @@ diff --git a/a.rs b/a.rs
         assert_eq!(hunk.no_newline_at, vec![0, 1]);
         let patch = String::from_utf8(build_hunk_patch(&files[0], hunk)).unwrap();
         assert!(
-            patch.ends_with("-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"),
+            patch.ends_with(
+                "-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
+            ),
             "patch: {patch:?}"
         );
     }
@@ -1208,7 +1355,11 @@ diff --git a/a.rs b/a.rs
         // Added; a pathless 3-byte `"XY "` record must be skipped.
         let raw = "AD gone.txt\0 M \0 M kept.txt\0";
         let entries = parse_status_z(raw);
-        assert_eq!(entries.len(), 2, "the empty-path ` M ` record must be dropped");
+        assert_eq!(
+            entries.len(),
+            2,
+            "the empty-path ` M ` record must be dropped"
+        );
         assert_eq!(entries[0].path, "gone.txt");
         assert_eq!(entries[0].status, FileStatus::Deleted);
         assert_eq!(entries[1].path, "kept.txt");
@@ -1217,16 +1368,46 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn build_hunk_patch_modified_file_shape() {
-        let file = FileDiff { path: "f.txt".into(), status: FileStatus::Modified, binary: false, hunks: vec![], too_large: false };
-        let hunk = Hunk { header: "x".into(), old_start: 2, old_lines: 1, new_start: 2, new_lines: 1, lines: vec![('-', "old".into()), ('+', "new".into())], no_newline_at: vec![], hash: String::new() };
+        let file = FileDiff {
+            path: "f.txt".into(),
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![],
+            too_large: false,
+        };
+        let hunk = Hunk {
+            header: "x".into(),
+            old_start: 2,
+            old_lines: 1,
+            new_start: 2,
+            new_lines: 1,
+            lines: vec![('-', "old".into()), ('+', "new".into())],
+            no_newline_at: vec![],
+            hash: String::new(),
+        };
         let patch = String::from_utf8(build_hunk_patch(&file, &hunk)).unwrap();
         assert!(patch.starts_with("--- a/f.txt\n+++ b/f.txt\n@@ -2,1 +2,1 @@\n-old\n+new\n"));
     }
 
     #[test]
     fn build_hunk_patch_added_file_routes_old_side_through_dev_null() {
-        let file = FileDiff { path: "new.txt".into(), status: FileStatus::Added, binary: false, hunks: vec![], too_large: false };
-        let hunk = Hunk { header: "x".into(), old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec![('+', "hi".into())], no_newline_at: vec![], hash: String::new() };
+        let file = FileDiff {
+            path: "new.txt".into(),
+            status: FileStatus::Added,
+            binary: false,
+            hunks: vec![],
+            too_large: false,
+        };
+        let hunk = Hunk {
+            header: "x".into(),
+            old_start: 0,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 1,
+            lines: vec![('+', "hi".into())],
+            no_newline_at: vec![],
+            hash: String::new(),
+        };
         let patch = String::from_utf8(build_hunk_patch(&file, &hunk)).unwrap();
         assert!(patch.starts_with("--- /dev/null\n+++ b/new.txt\n"));
     }
@@ -1241,7 +1422,12 @@ diff --git a/a.rs b/a.rs
         assert_eq!(entries[0].path, "added.txt");
         assert_eq!(entries[0].status, FileStatus::Added);
         assert_eq!(entries[1].path, "new.txt");
-        assert_eq!(entries[1].status, FileStatus::Renamed { from: "old.txt".to_string() });
+        assert_eq!(
+            entries[1].status,
+            FileStatus::Renamed {
+                from: "old.txt".to_string()
+            }
+        );
         assert_eq!(entries[2].path, "u.txt");
         assert_eq!(entries[2].status, FileStatus::Untracked);
         assert_eq!(entries[3].path, "gone.txt");
@@ -1250,7 +1436,8 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn parse_numstat_z_plain_and_binary_and_rename() {
-        let raw = "0\t1\tadded.txt\0-\t-\tbin.dat\01\t1\tnonewline.txt\02\t0\t\0new.txt\0renamed.txt\0";
+        let raw =
+            "0\t1\tadded.txt\0-\t-\tbin.dat\01\t1\tnonewline.txt\02\t0\t\0new.txt\0renamed.txt\0";
         let map = parse_numstat_z(raw);
         assert_eq!(map.get("added.txt"), Some(&(Some(0), Some(1))));
         assert_eq!(map.get("bin.dat"), Some(&(None, None)));
@@ -1287,19 +1474,31 @@ diff --git a/a.rs b/a.rs
         let s = summary(&dir).await.expect("summary");
         assert_eq!(s.source, Some(DiffSource::Git));
         assert!(!s.readonly);
-        let tracked = s.files.iter().find(|f| f.path == "tracked.txt").expect("tracked row");
+        let tracked = s
+            .files
+            .iter()
+            .find(|f| f.path == "tracked.txt")
+            .expect("tracked row");
         assert_eq!(tracked.status, FileStatus::Modified);
         assert_eq!(tracked.added, 1);
         assert_eq!(tracked.removed, 1);
-        let fresh = s.files.iter().find(|f| f.path == "fresh.txt").expect("fresh row");
+        let fresh = s
+            .files
+            .iter()
+            .find(|f| f.path == "fresh.txt")
+            .expect("fresh row");
         assert_eq!(fresh.status, FileStatus::Untracked);
         assert_eq!(fresh.added, 2);
 
-        let fd = diff_file(&dir, "tracked.txt").await.expect("diff_file tracked");
+        let fd = diff_file(&dir, "tracked.txt")
+            .await
+            .expect("diff_file tracked");
         assert_eq!(fd.status, FileStatus::Modified);
         assert_eq!(fd.hunks.len(), 1);
 
-        let fd2 = diff_file(&dir, "fresh.txt").await.expect("diff_file untracked");
+        let fd2 = diff_file(&dir, "fresh.txt")
+            .await
+            .expect("diff_file untracked");
         assert_eq!(fd2.status, FileStatus::Untracked);
         assert_eq!(fd2.hunks.len(), 1);
         assert_eq!(fd2.hunks[0].lines.len(), 2);
@@ -1322,11 +1521,21 @@ diff --git a/a.rs b/a.rs
         std::fs::write(dir.join("new.txt"), "a\nb\nc\nd\n").unwrap();
 
         let fd = diff_file(&dir, "new.txt").await.expect("diff_file rename");
-        assert_eq!(fd.status, FileStatus::Renamed { from: "old.txt".to_string() });
+        assert_eq!(
+            fd.status,
+            FileStatus::Renamed {
+                from: "old.txt".to_string()
+            }
+        );
         // Content diff (not a from-scratch add): exactly the appended line,
         // not the whole file.
         assert_eq!(fd.hunks.len(), 1);
-        let added: Vec<&str> = fd.hunks[0].lines.iter().filter(|(m, _)| *m == '+').map(|(_, t)| t.as_str()).collect();
+        let added: Vec<&str> = fd.hunks[0]
+            .lines
+            .iter()
+            .filter(|(m, _)| *m == '+')
+            .map(|(_, t)| t.as_str())
+            .collect();
         assert_eq!(added, vec!["d"]);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1361,7 +1570,9 @@ diff --git a/a.rs b/a.rs
         let big = vec![b'x'; (MAX_DIFF_FILE_BYTES + 1) as usize];
         std::fs::write(dir.join("big.txt"), &big).unwrap();
 
-        let fd = diff_file(&dir, "big.txt").await.expect("diff_file too_large");
+        let fd = diff_file(&dir, "big.txt")
+            .await
+            .expect("diff_file too_large");
         assert!(fd.too_large);
         assert!(fd.hunks.is_empty());
 
@@ -1393,7 +1604,10 @@ diff --git a/a.rs b/a.rs
         git(&dir, &["commit", "-qam", "main change"]);
         // This merge conflicts (both sides touched the same line) and
         // leaves MERGE_HEAD set — exactly the state the guard detects.
-        let _ = std::process::Command::new("git").args(["merge", "side"]).current_dir(&dir).output();
+        let _ = std::process::Command::new("git")
+            .args(["merge", "side"])
+            .current_dir(&dir)
+            .output();
 
         let s = summary(&dir).await.expect("summary mid-merge");
         assert!(s.readonly);

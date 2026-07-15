@@ -16,16 +16,13 @@ pub fn open_or_focus_settings(app: &AppHandle) -> AppResult<()> {
         return Ok(());
     }
 
-    let built = WebviewWindowBuilder::new(
-        app,
-        SETTINGS_LABEL,
-        WebviewUrl::App("settings.html".into()),
-    )
-    .title("cImp — Settings")
-    .inner_size(970.0, 750.0)
-    .min_inner_size(560.0, 480.0)
-    .resizable(true)
-    .build();
+    let built =
+        WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
+            .title("cImp — Settings")
+            .inner_size(970.0, 750.0)
+            .min_inner_size(560.0, 480.0)
+            .resizable(true)
+            .build();
 
     if let Err(e) = built {
         // A concurrent open (gear click + `open_settings` shortcut firing

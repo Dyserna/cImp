@@ -104,7 +104,10 @@ pub fn changed_symbols(root: &Path, index: &GraphIndex) -> AppResult<ChangedSet>
     // with no quoting, so we split on `\0`, not lines, and never strip
     // quotes — same fix as `checks::gitls::changed_files`.
     let mut whole_file: BTreeSet<String> = BTreeSet::new();
-    if let Ok(status) = run_git(root, &["status", "--porcelain", "-z", "--untracked-files=all"]) {
+    if let Ok(status) = run_git(
+        root,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    ) {
         for part in status.split('\0') {
             if let Some(rest) = part.strip_prefix("?? ") {
                 whole_file.insert(rest.replace('\\', "/"));
@@ -123,7 +126,9 @@ pub fn changed_symbols(root: &Path, index: &GraphIndex) -> AppResult<ChangedSet>
             continue;
         }
         for s in outline {
-            if file_ranges.iter().any(|r| r.intersects(s.start_line, s.end_line))
+            if file_ranges
+                .iter()
+                .any(|r| r.intersects(s.start_line, s.end_line))
                 && seen_ids.insert(s.id.clone())
             {
                 changed.push(s);
@@ -144,7 +149,10 @@ pub fn changed_symbols(root: &Path, index: &GraphIndex) -> AppResult<ChangedSet>
     }
 
     changed.sort_by(|a, b| a.file.cmp(&b.file).then(a.start_line.cmp(&b.start_line)));
-    Ok(ChangedSet { changed, unindexed: unindexed.into_iter().collect() })
+    Ok(ChangedSet {
+        changed,
+        unindexed: unindexed.into_iter().collect(),
+    })
 }
 
 /// Parse `git diff --unified=0 HEAD` output into per-file new-side changed
@@ -192,7 +200,9 @@ fn parse_unified_diff(diff: &str, out: &mut HashMap<String, Vec<LineRange>>) {
         }
         if let Some(rest) = line.strip_prefix("@@ ") {
             in_header_block = false;
-            let Some(file) = current.as_ref() else { continue };
+            let Some(file) = current.as_ref() else {
+                continue;
+            };
             if let Some((start, len)) = parse_hunk_new_range(rest) {
                 if len > 0 {
                     // Saturating so a malformed/corrupt hunk header with
@@ -255,7 +265,10 @@ mod tests {
     #[test]
     fn parse_hunk_new_range_handles_shapes() {
         // Multi-line addition.
-        assert_eq!(parse_hunk_new_range("-12,3 +15,4 @@ fn foo() {"), Some((15, 4)));
+        assert_eq!(
+            parse_hunk_new_range("-12,3 +15,4 @@ fn foo() {"),
+            Some((15, 4))
+        );
         // Comma-less = a single new-side line.
         assert_eq!(parse_hunk_new_range("-1 +1 @@"), Some((1, 1)));
         // Pure deletion: new-side length 0 (insertion point, no surviving lines).
@@ -266,7 +279,10 @@ mod tests {
 
     #[test]
     fn parse_diff_new_path_strips_b_prefix_and_flags_deletion() {
-        assert_eq!(parse_diff_new_path("b/src/foo.rs"), Some("src/foo.rs".to_string()));
+        assert_eq!(
+            parse_diff_new_path("b/src/foo.rs"),
+            Some("src/foo.rs".to_string())
+        );
         assert_eq!(parse_diff_new_path("/dev/null"), None);
     }
 
@@ -296,10 +312,16 @@ diff --git a/src/c.rs b/src/c.rs
         parse_unified_diff(diff, &mut out);
 
         // a.rs: a 3-line addition starting at new-side line 2.
-        assert_eq!(out.get("src/a.rs"), Some(&vec![LineRange { start: 2, end: 4 }]));
+        assert_eq!(
+            out.get("src/a.rs"),
+            Some(&vec![LineRange { start: 2, end: 4 }])
+        );
         // b.rs: F18 — a delete-only hunk (`+9,0`) anchors a small range at the
         // deletion point so the enclosing symbol is still flagged.
-        assert_eq!(out.get("src/b.rs"), Some(&vec![LineRange { start: 9, end: 10 }]));
+        assert_eq!(
+            out.get("src/b.rs"),
+            Some(&vec![LineRange { start: 9, end: 10 }])
+        );
         // c.rs: a deleted FILE (+++ /dev/null) still contributes nothing —
         // there's no surviving symbol to map to.
         assert!(!out.contains_key("src/c.rs"));
@@ -319,7 +341,10 @@ diff --git a/src/d.rs b/src/d.rs
 ";
         let mut out: HashMap<String, Vec<LineRange>> = HashMap::new();
         parse_unified_diff(diff, &mut out);
-        assert_eq!(out.get("src/d.rs"), Some(&vec![LineRange { start: 1, end: 2 }]));
+        assert_eq!(
+            out.get("src/d.rs"),
+            Some(&vec![LineRange { start: 1, end: 2 }])
+        );
     }
 
     #[test]
@@ -343,15 +368,26 @@ diff --git a/src/a.rs b/src/a.rs
         // Both hunks still map to src/a.rs — `current` was never clobbered.
         assert_eq!(
             out.get("src/a.rs"),
-            Some(&vec![LineRange { start: 2, end: 3 }, LineRange { start: 12, end: 12 }])
+            Some(&vec![
+                LineRange { start: 2, end: 3 },
+                LineRange { start: 12, end: 12 }
+            ])
         );
     }
 
     // ── git plumbing + changed_symbols ─────────────────────────────────
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = StdCommand::new("git").args(args).current_dir(dir).output().expect("git");
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = StdCommand::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A throwaway git repo + graph index, with `commit_src` committed as
@@ -373,7 +409,8 @@ diff --git a/src/a.rs b/src/a.rs
         git(&dir, &["commit", "-q", "-m", "init"]);
 
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.index_file_graph(&parse_file("src/lib.rs", commit_src, Lang::Rust)).expect("index");
+        idx.index_file_graph(&parse_file("src/lib.rs", commit_src, Lang::Rust))
+            .expect("index");
         (dir, idx)
     }
 
@@ -397,8 +434,16 @@ diff --git a/src/a.rs b/src/a.rs
         std::fs::write(dir.join("src/lib.rs"), edited).unwrap();
 
         let set = changed_symbols(&dir, &idx).expect("changed_symbols");
-        assert!(set.changed.iter().any(|s| s.name == "b"), "{:?}", set.changed);
-        assert!(!set.changed.iter().any(|s| s.name == "a"), "{:?}", set.changed);
+        assert!(
+            set.changed.iter().any(|s| s.name == "b"),
+            "{:?}",
+            set.changed
+        );
+        assert!(
+            !set.changed.iter().any(|s| s.name == "a"),
+            "{:?}",
+            set.changed
+        );
         assert!(set.unindexed.is_empty());
 
         drop(idx);
@@ -412,12 +457,21 @@ diff --git a/src/a.rs b/src/a.rs
         // graph doesn't index by symbol (markdown has no `outline` rows here
         // since it wasn't indexed at all).
         std::fs::write(dir.join("src/new.rs"), "pub fn n() {}\n").unwrap();
-        idx.index_file_graph(&parse_file("src/new.rs", "pub fn n() {}\n", Lang::Rust)).expect("index new");
+        idx.index_file_graph(&parse_file("src/new.rs", "pub fn n() {}\n", Lang::Rust))
+            .expect("index new");
         std::fs::write(dir.join("NOTES.md"), "# notes\n").unwrap();
 
         let set = changed_symbols(&dir, &idx).expect("changed_symbols");
-        assert!(set.changed.iter().any(|s| s.name == "n"), "{:?}", set.changed);
-        assert!(set.unindexed.iter().any(|f| f == "NOTES.md"), "{:?}", set.unindexed);
+        assert!(
+            set.changed.iter().any(|s| s.name == "n"),
+            "{:?}",
+            set.changed
+        );
+        assert!(
+            set.unindexed.iter().any(|f| f == "NOTES.md"),
+            "{:?}",
+            set.unindexed
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -433,12 +487,30 @@ diff --git a/src/a.rs b/src/a.rs
         std::fs::create_dir_all(dir.join("src/newmod")).unwrap();
         std::fs::write(dir.join("src/newmod/x.rs"), "pub fn x() {}\n").unwrap();
         std::fs::write(dir.join("src/newmod/y.rs"), "pub fn y() {}\n").unwrap();
-        idx.index_file_graph(&parse_file("src/newmod/x.rs", "pub fn x() {}\n", Lang::Rust)).expect("index x");
-        idx.index_file_graph(&parse_file("src/newmod/y.rs", "pub fn y() {}\n", Lang::Rust)).expect("index y");
+        idx.index_file_graph(&parse_file(
+            "src/newmod/x.rs",
+            "pub fn x() {}\n",
+            Lang::Rust,
+        ))
+        .expect("index x");
+        idx.index_file_graph(&parse_file(
+            "src/newmod/y.rs",
+            "pub fn y() {}\n",
+            Lang::Rust,
+        ))
+        .expect("index y");
 
         let set = changed_symbols(&dir, &idx).expect("changed_symbols");
-        assert!(set.changed.iter().any(|s| s.name == "x"), "{:?}", set.changed);
-        assert!(set.changed.iter().any(|s| s.name == "y"), "{:?}", set.changed);
+        assert!(
+            set.changed.iter().any(|s| s.name == "x"),
+            "{:?}",
+            set.changed
+        );
+        assert!(
+            set.changed.iter().any(|s| s.name == "y"),
+            "{:?}",
+            set.changed
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

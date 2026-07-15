@@ -193,13 +193,22 @@ mod tests {
     #[test]
     fn store_subdir_events_are_skippable() {
         assert!(all_paths_skippable(
-            &[p(r"P:\proj\.cimp\graph.db"), p(r"P:\proj\.cimp\graph.db-journal")],
+            &[
+                p(r"P:\proj\.cimp\graph.db"),
+                p(r"P:\proj\.cimp\graph.db-journal")
+            ],
             ".cimp"
         ));
         // A renamed subdir setting is honored.
-        assert!(all_paths_skippable(&[p(r"P:\proj\.mygraph\graph.db")], ".mygraph"));
+        assert!(all_paths_skippable(
+            &[p(r"P:\proj\.mygraph\graph.db")],
+            ".mygraph"
+        ));
         // ...and the default name is NOT special-cased once renamed.
-        assert!(!all_paths_skippable(&[p(r"P:\proj\.cimp\graph.db")], ".mygraph"));
+        assert!(!all_paths_skippable(
+            &[p(r"P:\proj\.cimp\graph.db")],
+            ".mygraph"
+        ));
     }
 
     #[test]
@@ -218,9 +227,18 @@ mod tests {
 
     #[test]
     fn hot_path_skip_dirs_still_apply() {
-        assert!(all_paths_skippable(&[p(r"P:\proj\.git\objects\ab\cd")], ".cimp"));
-        assert!(all_paths_skippable(&[p(r"P:\proj\target\debug\foo.d")], ".cimp"));
-        assert!(all_paths_skippable(&[p(r"P:\proj\node_modules\x\y.js")], ".cimp"));
+        assert!(all_paths_skippable(
+            &[p(r"P:\proj\.git\objects\ab\cd")],
+            ".cimp"
+        ));
+        assert!(all_paths_skippable(
+            &[p(r"P:\proj\target\debug\foo.d")],
+            ".cimp"
+        ));
+        assert!(all_paths_skippable(
+            &[p(r"P:\proj\node_modules\x\y.js")],
+            ".cimp"
+        ));
         // The broad SKIP_DIRS entries deliberately do NOT apply here.
         assert!(!all_paths_skippable(&[p(r"P:\proj\dist\app.js")], ".cimp"));
     }

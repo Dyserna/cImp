@@ -117,8 +117,14 @@ impl GitOutput {
 fn env_overrides(ctx: &GitCtx) -> [(&'static str, Option<PathBuf>); 3] {
     [
         ("GIT_DIR", ctx.git_dir.as_deref().map(subprocess_path)),
-        ("GIT_WORK_TREE", ctx.work_tree.as_deref().map(subprocess_path)),
-        ("GIT_INDEX_FILE", ctx.index_file.as_deref().map(subprocess_path)),
+        (
+            "GIT_WORK_TREE",
+            ctx.work_tree.as_deref().map(subprocess_path),
+        ),
+        (
+            "GIT_INDEX_FILE",
+            ctx.index_file.as_deref().map(subprocess_path),
+        ),
     ]
 }
 
@@ -206,7 +212,11 @@ async fn run_inner(
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(subprocess_path(&ctx.root))
-        .stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Kill the child if the timeout below drops this future — without
@@ -393,11 +403,20 @@ mod tests {
             index_file: Some(PathBuf::from("/project/.cimp/shadow.git/index")),
         };
         let overrides = env_overrides(&ctx);
-        assert_eq!(overrides[0], ("GIT_DIR", Some(PathBuf::from("/project/.cimp/shadow.git"))));
-        assert_eq!(overrides[1], ("GIT_WORK_TREE", Some(PathBuf::from("/project"))));
+        assert_eq!(
+            overrides[0],
+            ("GIT_DIR", Some(PathBuf::from("/project/.cimp/shadow.git")))
+        );
+        assert_eq!(
+            overrides[1],
+            ("GIT_WORK_TREE", Some(PathBuf::from("/project")))
+        );
         assert_eq!(
             overrides[2],
-            ("GIT_INDEX_FILE", Some(PathBuf::from("/project/.cimp/shadow.git/index")))
+            (
+                "GIT_INDEX_FILE",
+                Some(PathBuf::from("/project/.cimp/shadow.git/index"))
+            )
         );
     }
 
@@ -409,14 +428,23 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn subprocess_path_strips_verbatim_prefixes() {
-        assert_eq!(subprocess_path(Path::new(r"\\?\C:\proj\sub")), PathBuf::from(r"C:\proj\sub"));
+        assert_eq!(
+            subprocess_path(Path::new(r"\\?\C:\proj\sub")),
+            PathBuf::from(r"C:\proj\sub")
+        );
         assert_eq!(
             subprocess_path(Path::new(r"\\?\UNC\srv\share\proj")),
             PathBuf::from(r"\\srv\share\proj")
         );
         // Non-verbatim spellings pass through untouched.
-        assert_eq!(subprocess_path(Path::new(r"C:\proj")), PathBuf::from(r"C:\proj"));
-        assert_eq!(subprocess_path(Path::new(r"\\srv\share\proj")), PathBuf::from(r"\\srv\share\proj"));
+        assert_eq!(
+            subprocess_path(Path::new(r"C:\proj")),
+            PathBuf::from(r"C:\proj")
+        );
+        assert_eq!(
+            subprocess_path(Path::new(r"\\srv\share\proj")),
+            PathBuf::from(r"\\srv\share\proj")
+        );
     }
 
     #[test]
@@ -437,8 +465,14 @@ mod tests {
 
     #[test]
     fn subprocess_path_passes_through_prefixless_paths() {
-        assert_eq!(subprocess_path(Path::new("/project/sub")), PathBuf::from("/project/sub"));
-        assert_eq!(subprocess_path(Path::new("relative/path")), PathBuf::from("relative/path"));
+        assert_eq!(
+            subprocess_path(Path::new("/project/sub")),
+            PathBuf::from("/project/sub")
+        );
+        assert_eq!(
+            subprocess_path(Path::new("relative/path")),
+            PathBuf::from("relative/path")
+        );
     }
 
     #[test]
@@ -450,9 +484,15 @@ mod tests {
             PathBuf::from(r"\\?\C:\proj\.cimp\shadow.git\index"),
         );
         let overrides = env_overrides(&ctx);
-        assert_eq!(overrides[0].1, Some(PathBuf::from(r"C:\proj\.cimp\shadow.git")));
+        assert_eq!(
+            overrides[0].1,
+            Some(PathBuf::from(r"C:\proj\.cimp\shadow.git"))
+        );
         assert_eq!(overrides[1].1, Some(PathBuf::from(r"C:\proj")));
-        assert_eq!(overrides[2].1, Some(PathBuf::from(r"C:\proj\.cimp\shadow.git\index")));
+        assert_eq!(
+            overrides[2].1,
+            Some(PathBuf::from(r"C:\proj\.cimp\shadow.git\index"))
+        );
     }
 
     /// The safety property: a `GitCtx::discover` (all `None`) must produce
@@ -474,7 +514,10 @@ mod tests {
         );
         assert_eq!(ctx.root, PathBuf::from("/project"));
         assert_eq!(ctx.work_tree, Some(PathBuf::from("/project")));
-        assert_eq!(ctx.git_dir, Some(PathBuf::from("/project/.cimp/shadow.git")));
+        assert_eq!(
+            ctx.git_dir,
+            Some(PathBuf::from("/project/.cimp/shadow.git"))
+        );
     }
 
     #[tokio::test]
@@ -499,7 +542,9 @@ mod tests {
         // proves the exact bytes we wrote were what git hashed, not an
         // empty/truncated stream.
         std::fs::write(dir.join("hello.txt"), b"hello\n").unwrap();
-        let via_file = run(&ctx, &["hash-object", "hello.txt"], None).await.expect("hash-object file");
+        let via_file = run(&ctx, &["hash-object", "hello.txt"], None)
+            .await
+            .expect("hash-object file");
         assert_eq!(out.stdout.trim(), via_file.stdout.trim());
         let _ = std::fs::remove_dir_all(&dir);
     }

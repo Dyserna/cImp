@@ -256,7 +256,8 @@ impl WorkbenchService {
             }
         };
         if fire {
-            self.maybe_snapshot(&root, "activity".to_string(), shadow::Trigger::Burst, None).await;
+            self.maybe_snapshot(&root, "activity".to_string(), shadow::Trigger::Burst, None)
+                .await;
         }
     }
 
@@ -276,7 +277,13 @@ impl WorkbenchService {
     /// background task so the caller (a prompt hook, an fs-batch handler)
     /// never blocks on it — per the milestone's "never block a prompt or the
     /// UI thread" contract (C2). No-op entirely when checkpoints are off.
-    async fn maybe_snapshot(&self, root: &Path, label: String, trigger: shadow::Trigger, agent: Option<String>) {
+    async fn maybe_snapshot(
+        &self,
+        root: &Path,
+        label: String,
+        trigger: shadow::Trigger,
+        agent: Option<String>,
+    ) {
         if !self.checkpoints_enabled() {
             return;
         }
@@ -287,7 +294,10 @@ impl WorkbenchService {
         // the caller spelled `root`.
         let root = git::canonical_path(root);
         {
-            let mut last = self.checkpoint_last.lock().unwrap_or_else(|e| e.into_inner());
+            let mut last = self
+                .checkpoint_last
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(prev) = last.get(&root) {
                 if prev.elapsed() < min_gap {
                     return;
@@ -300,13 +310,25 @@ impl WorkbenchService {
         let checkpoint_max = cfg.workbench.checkpoint_max;
         let checkpoint_max_age_days = cfg.workbench.checkpoint_max_age_days;
         tauri::async_runtime::spawn(async move {
-            match shadow::snapshot(&root, &label, trigger, agent.as_deref(), &extra_ignore, max_file_bytes).await {
+            match shadow::snapshot(
+                &root,
+                &label,
+                trigger,
+                agent.as_deref(),
+                &extra_ignore,
+                max_file_bytes,
+            )
+            .await
+            {
                 Ok(_) => {
-                    if let Err(e) = shadow::gc(&root, checkpoint_max, checkpoint_max_age_days).await {
+                    if let Err(e) = shadow::gc(&root, checkpoint_max, checkpoint_max_age_days).await
+                    {
                         warn!(root = %root.display(), error = %e, "workbench: checkpoint gc failed");
                     }
                 }
-                Err(e) => warn!(root = %root.display(), error = %e, "workbench: automatic checkpoint failed"),
+                Err(e) => {
+                    warn!(root = %root.display(), error = %e, "workbench: automatic checkpoint failed")
+                }
             }
         });
     }
@@ -324,7 +346,8 @@ impl WorkbenchService {
     /// [`truncate_label`](shadow) is a hard backstop, not the primary cut).
     pub async fn on_prompt(&self, root: &Path, agent: Option<String>, prompt_head: &str) {
         let label = format!("prompt: {prompt_head}");
-        self.maybe_snapshot(root, label, shadow::Trigger::Prompt, agent).await;
+        self.maybe_snapshot(root, label, shadow::Trigger::Prompt, agent)
+            .await;
     }
 
     /// Phase C `workbench_checkpoint_now`: the manual trigger. Unlike the
@@ -335,7 +358,11 @@ impl WorkbenchService {
     /// not something to silently throttle or defer. It still updates
     /// `checkpoint_last` so a subsequent AUTOMATIC trigger's cooldown counts
     /// from this snapshot too (no back-to-back auto + manual spam).
-    pub async fn checkpoint_now(&self, root: &Path, label: Option<String>) -> AppResult<shadow::CheckpointId> {
+    pub async fn checkpoint_now(
+        &self,
+        root: &Path,
+        label: Option<String>,
+    ) -> AppResult<shadow::CheckpointId> {
         let cfg = self.settings.current();
         let label = label.unwrap_or_else(|| "manual checkpoint".to_string());
         let id = shadow::snapshot(
@@ -347,8 +374,17 @@ impl WorkbenchService {
             cfg.graph.max_file_bytes,
         )
         .await?;
-        self.checkpoint_last.lock().unwrap_or_else(|e| e.into_inner()).insert(git::canonical_path(root), Instant::now());
-        if let Err(e) = shadow::gc(root, cfg.workbench.checkpoint_max, cfg.workbench.checkpoint_max_age_days).await {
+        self.checkpoint_last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(git::canonical_path(root), Instant::now());
+        if let Err(e) = shadow::gc(
+            root,
+            cfg.workbench.checkpoint_max,
+            cfg.workbench.checkpoint_max_age_days,
+        )
+        .await
+        {
             warn!(root = %root.display(), error = %e, "workbench: checkpoint gc failed after manual checkpoint");
         }
         Ok(id)
@@ -363,9 +399,21 @@ impl WorkbenchService {
     /// working tree, parsed into the same [`diff::FileDiff`] shape the B4
     /// `DiffView` already renders — powers both the Timeline's "Diff vs now"
     /// action and the restore confirmation dialog's dry-run file list.
-    pub async fn checkpoint_diff(&self, root: &Path, id: &str, context: u32) -> AppResult<Vec<diff::FileDiff>> {
+    pub async fn checkpoint_diff(
+        &self,
+        root: &Path,
+        id: &str,
+        context: u32,
+    ) -> AppResult<Vec<diff::FileDiff>> {
         let cfg = self.settings.current();
-        let text = shadow::diff_vs_now(root, id, &cfg.graph.ignore, cfg.graph.max_file_bytes, context).await?;
+        let text = shadow::diff_vs_now(
+            root,
+            id,
+            &cfg.graph.ignore,
+            cfg.graph.max_file_bytes,
+            context,
+        )
+        .await?;
         Ok(diff::parse_unified(&text))
     }
 
@@ -375,10 +423,25 @@ impl WorkbenchService {
     /// `shadow::restore`'s doc comment for the full sequence and every
     /// safety invariant it upholds. Updates `checkpoint_last` for the same
     /// reason [`checkpoint_now`](Self::checkpoint_now) does.
-    pub async fn restore(&self, root: &Path, id: &str, delete_new: bool) -> AppResult<shadow::RestoreReport> {
+    pub async fn restore(
+        &self,
+        root: &Path,
+        id: &str,
+        delete_new: bool,
+    ) -> AppResult<shadow::RestoreReport> {
         let cfg = self.settings.current();
-        let report = shadow::restore(root, id, delete_new, &cfg.graph.ignore, cfg.graph.max_file_bytes).await?;
-        self.checkpoint_last.lock().unwrap_or_else(|e| e.into_inner()).insert(git::canonical_path(root), Instant::now());
+        let report = shadow::restore(
+            root,
+            id,
+            delete_new,
+            &cfg.graph.ignore,
+            cfg.graph.max_file_bytes,
+        )
+        .await?;
+        self.checkpoint_last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(git::canonical_path(root), Instant::now());
         Ok(report)
     }
 
@@ -461,11 +524,24 @@ impl WorkbenchService {
             return Ok(summary);
         };
         let cfg = self.settings.current();
-        let text = shadow::diff_vs_now(root, &latest.id, &cfg.graph.ignore, cfg.graph.max_file_bytes, diff::DEFAULT_CONTEXT).await?;
-        let mut files: Vec<diff::FileDiffMeta> =
-            diff::parse_unified(&text).iter().map(diff::file_diff_meta_from_parsed).collect();
+        let text = shadow::diff_vs_now(
+            root,
+            &latest.id,
+            &cfg.graph.ignore,
+            cfg.graph.max_file_bytes,
+            diff::DEFAULT_CONTEXT,
+        )
+        .await?;
+        let mut files: Vec<diff::FileDiffMeta> = diff::parse_unified(&text)
+            .iter()
+            .map(diff::file_diff_meta_from_parsed)
+            .collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(diff::DiffSummary { files, readonly: false, source: Some(diff::DiffSource::Shadow) })
+        Ok(diff::DiffSummary {
+            files,
+            readonly: false,
+            source: Some(diff::DiffSource::Shadow),
+        })
     }
 
     /// Phase B `workbench_diff_file`: one file's full parsed diff. Mirrors
@@ -475,7 +551,12 @@ impl WorkbenchService {
     /// `path`'s entry. A `path` with no entry in that diff (already clean, or
     /// the caller raced a refresh) gets the same "clean, no changes" shape
     /// [`diff::diff_file`] returns for that case.
-    pub async fn diff_file(&self, root: &Path, path: &str, context: u32) -> AppResult<diff::FileDiff> {
+    pub async fn diff_file(
+        &self,
+        root: &Path,
+        path: &str,
+        context: u32,
+    ) -> AppResult<diff::FileDiff> {
         if git::is_repo(root).await || !self.checkpoints_enabled() {
             return diff::diff_file_ctx(root, path, context).await;
         }
@@ -490,8 +571,18 @@ impl WorkbenchService {
             return diff::diff_file_ctx(root, path, context).await;
         };
         let cfg = self.settings.current();
-        let text = shadow::diff_vs_now(root, &latest.id, &cfg.graph.ignore, cfg.graph.max_file_bytes, context).await?;
-        if let Some(file) = diff::parse_unified(&text).into_iter().find(|f| f.path == path) {
+        let text = shadow::diff_vs_now(
+            root,
+            &latest.id,
+            &cfg.graph.ignore,
+            cfg.graph.max_file_bytes,
+            context,
+        )
+        .await?;
+        if let Some(file) = diff::parse_unified(&text)
+            .into_iter()
+            .find(|f| f.path == path)
+        {
             return Ok(file);
         }
         Ok(diff::FileDiff {
@@ -564,7 +655,12 @@ impl WorkbenchService {
     /// branch it was cut from, via [`worktree::diff_against_base`]. Read-only
     /// (a diff between two commits, not the working tree) — no revert action
     /// applies here.
-    pub async fn worktree_diff(&self, root: &Path, slug: &str, context: u32) -> AppResult<Vec<diff::FileDiff>> {
+    pub async fn worktree_diff(
+        &self,
+        root: &Path,
+        slug: &str,
+        context: u32,
+    ) -> AppResult<Vec<diff::FileDiff>> {
         worktree::diff_against_base(root, slug, context).await
     }
 
@@ -601,7 +697,10 @@ impl WorkbenchService {
     ) -> AppResult<HashMap<String, u32>> {
         let key = git::canonical_path(root);
         let cached = {
-            let cache = self.commit_times_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .commit_times_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             cache
                 .get(&key)
                 .filter(|(at, _)| at.elapsed() < Self::COMMIT_TIMES_TTL)
@@ -624,7 +723,12 @@ impl WorkbenchService {
 
     /// One commit vs. its first parent, in the shared [`diff::FileDiff`]
     /// shape. Read-only.
-    pub async fn commit_diff(&self, root: &Path, hash: &str, context: u32) -> AppResult<Vec<diff::FileDiff>> {
+    pub async fn commit_diff(
+        &self,
+        root: &Path,
+        hash: &str,
+        context: u32,
+    ) -> AppResult<Vec<diff::FileDiff>> {
         history::commit_diff(root, hash, context).await
     }
 
@@ -645,7 +749,11 @@ impl WorkbenchService {
     /// `worktree::merge`'s doc comment: this either fully merges or leaves
     /// the main tree exactly as it was; there is no partial/half-merged
     /// outcome from this call.
-    pub async fn worktree_merge(&self, root: &Path, slug: &str) -> AppResult<worktree::MergeReport> {
+    pub async fn worktree_merge(
+        &self,
+        root: &Path,
+        slug: &str,
+    ) -> AppResult<worktree::MergeReport> {
         worktree::merge(root, slug).await
     }
 
@@ -666,7 +774,10 @@ impl WorkbenchService {
             }
         }
         worktree::discard(root, slug).await?;
-        self.worktree_check_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(&(root.to_path_buf(), slug.to_string()));
+        self.worktree_check_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(root.to_path_buf(), slug.to_string()));
         Ok(())
     }
 
@@ -689,7 +800,11 @@ impl WorkbenchService {
     /// the frontend is expected to render "no checks configured" rather than
     /// a green chip in that case, using `reports.is_empty()` to tell the two
     /// apart.
-    pub async fn worktree_run_checks(&self, root: &Path, slug: &str) -> AppResult<WorktreeCheckStatus> {
+    pub async fn worktree_run_checks(
+        &self,
+        root: &Path,
+        slug: &str,
+    ) -> AppResult<WorktreeCheckStatus> {
         let wt_path = worktree::resolve_path(root, slug)?;
         let checks = self.settings.current().checks.clone();
         let mut reports = Vec::with_capacity(checks.len());
@@ -697,7 +812,11 @@ impl WorkbenchService {
         for def in &checks {
             match crate::checks::run(&wt_path, def, false).await {
                 Ok(report) => {
-                    if report.groups.iter().any(|g| g.severity == crate::checks::Severity::Error) {
+                    if report
+                        .groups
+                        .iter()
+                        .any(|g| g.severity == crate::checks::Severity::Error)
+                    {
                         pass = false;
                     }
                     reports.push(report);
@@ -712,13 +831,21 @@ impl WorkbenchService {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let status = WorktreeCheckStatus { pass, checked_at_unix, reports };
+        let status = WorktreeCheckStatus {
+            pass,
+            checked_at_unix,
+            reports,
+        };
         {
-            let mut cache = self.worktree_check_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self
+                .worktree_check_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             // FIX 8: opportunistic age-based eviction — see
             // `WORKTREE_CHECK_CACHE_MAX_AGE_SECS`'s doc comment.
             cache.retain(|_, v| {
-                checked_at_unix.saturating_sub(v.checked_at_unix) < Self::WORKTREE_CHECK_CACHE_MAX_AGE_SECS
+                checked_at_unix.saturating_sub(v.checked_at_unix)
+                    < Self::WORKTREE_CHECK_CACHE_MAX_AGE_SECS
             });
             cache.insert((root.to_path_buf(), slug.to_string()), status.clone());
         }
@@ -729,7 +856,11 @@ impl WorkbenchService {
     /// check has ever been run for it this session — `None` renders as
     /// "not checked yet" rather than a stale/default value.
     pub fn worktree_check_status(&self, root: &Path, slug: &str) -> Option<WorktreeCheckStatus> {
-        self.worktree_check_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&(root.to_path_buf(), slug.to_string())).cloned()
+        self.worktree_check_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(root.to_path_buf(), slug.to_string()))
+            .cloned()
     }
 }
 
@@ -799,8 +930,13 @@ pub async fn revert_hunk(
     }
     let patch = diff::build_hunk_patch(&file, hunk);
     let ctx = git::GitCtx::discover(root);
-    let out =
-        git::run_with_stdin(&ctx, &["apply", "--reverse", "--unidiff-zero", "-"], &patch, None).await?;
+    let out = git::run_with_stdin(
+        &ctx,
+        &["apply", "--reverse", "--unidiff-zero", "-"],
+        &patch,
+        None,
+    )
+    .await?;
     if !out.success() {
         return Err(AppError::Workbench(format!(
             "git apply --reverse failed: {}",
@@ -819,8 +955,16 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git").args(args).current_dir(dir).output().expect("git");
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn setup_repo(tag: &str) -> std::path::PathBuf {
@@ -854,8 +998,13 @@ mod tests {
         assert_eq!(before.hunks.len(), 1);
         let hash = diff::hunk_hash(&before.hunks[0]);
 
-        let after = revert_hunk(&dir, "f.txt", 0, &hash).await.expect("revert_hunk");
-        assert!(after.hunks.is_empty(), "expected a clean file after revert: {after:?}");
+        let after = revert_hunk(&dir, "f.txt", 0, &hash)
+            .await
+            .expect("revert_hunk");
+        assert!(
+            after.hunks.is_empty(),
+            "expected a clean file after revert: {after:?}"
+        );
         let content = std::fs::read_to_string(dir.join("f.txt")).unwrap();
         assert_eq!(content, "line1\nline2\nline3\n");
 
@@ -885,8 +1034,13 @@ mod tests {
         assert_eq!(before.hunks.len(), 1);
         let hash = diff::hunk_hash(&before.hunks[0]);
 
-        let after = revert_hunk(&dir, "f.txt", 0, &hash).await.expect("revert_hunk on CRLF file");
-        assert!(after.hunks.is_empty(), "expected a clean file after revert: {after:?}");
+        let after = revert_hunk(&dir, "f.txt", 0, &hash)
+            .await
+            .expect("revert_hunk on CRLF file");
+        assert!(
+            after.hunks.is_empty(),
+            "expected a clean file after revert: {after:?}"
+        );
         // Byte-exact: the CRLF endings must be restored, not silently
         // normalized to LF.
         let content = std::fs::read(dir.join("f.txt")).unwrap();
@@ -915,11 +1069,20 @@ mod tests {
 
         let before = diff::diff_file(&dir, name).await.expect("diff before");
         assert_eq!(before.path, name, "path must round-trip unquoted");
-        assert_eq!(before.hunks.len(), 1, "non-ASCII file must produce a hunk, not be dropped");
+        assert_eq!(
+            before.hunks.len(),
+            1,
+            "non-ASCII file must produce a hunk, not be dropped"
+        );
         let hash = diff::hunk_hash(&before.hunks[0]);
 
-        let after = revert_hunk(&dir, name, 0, &hash).await.expect("revert_hunk on unicode-named file");
-        assert!(after.hunks.is_empty(), "expected a clean file after revert: {after:?}");
+        let after = revert_hunk(&dir, name, 0, &hash)
+            .await
+            .expect("revert_hunk on unicode-named file");
+        assert!(
+            after.hunks.is_empty(),
+            "expected a clean file after revert: {after:?}"
+        );
         let content = std::fs::read_to_string(dir.join(name)).unwrap();
         assert_eq!(content, "a\nb\nc\n");
 
@@ -947,8 +1110,13 @@ mod tests {
         assert_eq!(before.hunks.len(), 1);
         let hash = diff::hunk_hash(&before.hunks[0]);
 
-        let after = revert_hunk(&dir, "f.txt", 0, &hash).await.expect("revert_hunk on no-newline file");
-        assert!(after.hunks.is_empty(), "expected a clean file after revert: {after:?}");
+        let after = revert_hunk(&dir, "f.txt", 0, &hash)
+            .await
+            .expect("revert_hunk on no-newline file");
+        assert!(
+            after.hunks.is_empty(),
+            "expected a clean file after revert: {after:?}"
+        );
         // Byte-exact: the file must NOT have gained a trailing newline.
         let content = std::fs::read(dir.join("f.txt")).unwrap();
         assert_eq!(content, b"a\nb\nc");
@@ -971,10 +1139,15 @@ mod tests {
         git(&dir, &["commit", "-q", "-m", "init"]);
         std::fs::write(dir.join("f.txt"), "line1\nline2-CHANGED\nline3\n").unwrap();
 
-        let err = revert_hunk(&dir, "f.txt", 0, "not-the-real-hash").await.unwrap_err();
+        let err = revert_hunk(&dir, "f.txt", 0, "not-the-real-hash")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Workbench(_)));
         let content = std::fs::read_to_string(dir.join("f.txt")).unwrap();
-        assert_eq!(content, "line1\nline2-CHANGED\nline3\n", "stale-hash refusal must not touch the file");
+        assert_eq!(
+            content, "line1\nline2-CHANGED\nline3\n",
+            "stale-hash refusal must not touch the file"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -994,7 +1167,9 @@ mod tests {
         git(&dir, &["commit", "-q", "-m", "init"]);
         std::fs::write(dir.join("f.txt"), "line1\nline2-CHANGED\nline3\n").unwrap();
 
-        let err = revert_hunk(&dir, "f.txt", 5, "irrelevant").await.unwrap_err();
+        let err = revert_hunk(&dir, "f.txt", 5, "irrelevant")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Workbench(_)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1019,10 +1194,18 @@ mod tests {
         git(&dir, &["checkout", "-q", "trunk"]);
         std::fs::write(dir.join("f.txt"), "main\n").unwrap();
         git(&dir, &["commit", "-qam", "main change"]);
-        let _ = std::process::Command::new("git").args(["merge", "side"]).current_dir(&dir).output();
-        assert!(diff::readonly(&dir).await, "expected the merge to leave a special state");
+        let _ = std::process::Command::new("git")
+            .args(["merge", "side"])
+            .current_dir(&dir)
+            .output();
+        assert!(
+            diff::readonly(&dir).await,
+            "expected the merge to leave a special state"
+        );
 
-        let err = revert_hunk(&dir, "f.txt", 0, "irrelevant").await.unwrap_err();
+        let err = revert_hunk(&dir, "f.txt", 0, "irrelevant")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Workbench(_)));
 
         let _ = std::fs::remove_dir_all(&dir);

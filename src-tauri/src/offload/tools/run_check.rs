@@ -60,7 +60,11 @@ mod tests {
         assert_eq!(d.function.name, spec.name);
         assert_eq!(d.function.parameters, spec.parameters);
         // The worker description steers toward verification-before-assertion.
-        assert!(d.function.description.contains("VERIFY"), "{}", d.function.description);
+        assert!(
+            d.function.description.contains("VERIFY"),
+            "{}",
+            d.function.description
+        );
     }
 
     #[test]
@@ -109,6 +113,9 @@ mod tests {
             !out.contains("unknown native tool"),
             "dispatch did not route run_check: {out}"
         );
-        assert!(out.contains("not configured"), "expected the not-configured guidance: {out}");
+        assert!(
+            out.contains("not configured"),
+            "expected the not-configured guidance: {out}"
+        );
     }
 }

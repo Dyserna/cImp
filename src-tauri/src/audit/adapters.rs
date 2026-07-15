@@ -148,7 +148,9 @@ impl Adapter {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
                 Arg::ReportIn(tpl) => {
-                    let path = report.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                    let path = report
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
                     tpl.replace("{report}", &path)
                 }
             })
@@ -610,7 +612,14 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "scan", "--config", "auto", "--sarif", "--quiet", "/proj/root", "--config", "p/ci",
+                "scan",
+                "--config",
+                "auto",
+                "--sarif",
+                "--quiet",
+                "/proj/root",
+                "--config",
+                "p/ci",
             ]
         );
         assert_eq!(a.env, &[("PYTHONUTF8", "1")]);
@@ -711,7 +720,11 @@ mod tests {
 
     #[test]
     fn exit_code_classification_per_tool() {
-        for id in [AuditToolId::OsvScanner, AuditToolId::Gitleaks, AuditToolId::Semgrep] {
+        for id in [
+            AuditToolId::OsvScanner,
+            AuditToolId::Gitleaks,
+            AuditToolId::Semgrep,
+        ] {
             let a = adapter(id);
             assert_eq!(a.classify_exit(Some(0)), ExitClass::Clean, "{id:?} 0");
             assert_eq!(a.classify_exit(Some(1)), ExitClass::Findings, "{id:?} 1");
@@ -750,7 +763,10 @@ mod tests {
 
         // typos passes the root and uses the JSONL parser.
         let typos = adapter(AuditToolId::Typos);
-        assert_eq!(typos.resolve_argv(&root(), None, true), vec!["--format", "json", "/proj/root"]);
+        assert_eq!(
+            typos.resolve_argv(&root(), None, true),
+            vec!["--format", "json", "/proj/root"]
+        );
         assert_eq!(typos.parser, AuditParser::TyposJsonl);
     }
 
@@ -759,12 +775,18 @@ mod tests {
         let eslint = adapter(AuditToolId::Eslint);
         assert_eq!(eslint.project_local_bin, Some("eslint"));
         assert_eq!(eslint.parser, AuditParser::EslintJson);
-        assert_eq!(eslint.resolve_argv(&root(), None, true), vec!["--format", "json", "/proj/root"]);
+        assert_eq!(
+            eslint.resolve_argv(&root(), None, true),
+            vec!["--format", "json", "/proj/root"]
+        );
 
         let knip = adapter(AuditToolId::Knip);
         assert_eq!(knip.project_local_bin, Some("knip"));
         assert_eq!(knip.parser, AuditParser::KnipJson);
-        assert_eq!(knip.resolve_argv(&root(), None, true), vec!["--reporter", "json"]);
+        assert_eq!(
+            knip.resolve_argv(&root(), None, true),
+            vec!["--reporter", "json"]
+        );
     }
 
     #[test]
@@ -772,7 +794,15 @@ mod tests {
         let pmd = adapter(AuditToolId::Pmd);
         assert_eq!(
             pmd.resolve_argv(&root(), None, true),
-            vec!["check", "-d", "/proj/root", "-R", "rulesets/java/quickstart.xml", "-f", "sarif"]
+            vec![
+                "check",
+                "-d",
+                "/proj/root",
+                "-R",
+                "rulesets/java/quickstart.xml",
+                "-f",
+                "sarif"
+            ]
         );
     }
 
@@ -799,7 +829,11 @@ mod tests {
         let report = PathBuf::from(r"C:/tmp/roslyn.sarif");
         assert_eq!(
             a.resolve_argv(&root(), Some(&report), true),
-            vec!["build", "/p:ErrorLog=C:/tmp/roslyn.sarif,version=2.1", "-nologo"]
+            vec![
+                "build",
+                "/p:ErrorLog=C:/tmp/roslyn.sarif,version=2.1",
+                "-nologo"
+            ]
         );
         // No report path ⇒ the `{report}` placeholder renders empty.
         assert_eq!(
@@ -814,7 +848,10 @@ mod tests {
         assert_eq!(a.parser, AuditParser::MacheteText);
         assert!(a.resolve_argv(&root(), None, true).is_empty());
         // Extra args still append after the (empty) fixed argv.
-        assert_eq!(a.full_argv(&root(), None, true, &["--with-metadata".into()]), vec!["--with-metadata"]);
+        assert_eq!(
+            a.full_argv(&root(), None, true, &["--with-metadata".into()]),
+            vec!["--with-metadata"]
+        );
     }
 
     #[test]
@@ -822,7 +859,14 @@ mod tests {
         let a = adapter(AuditToolId::SemgrepQuality);
         assert_eq!(
             a.resolve_argv(&root(), None, true),
-            vec!["scan", "--config", "p/best-practices", "--sarif", "--quiet", "/proj/root"]
+            vec![
+                "scan",
+                "--config",
+                "p/best-practices",
+                "--sarif",
+                "--quiet",
+                "/proj/root"
+            ]
         );
         assert_eq!(a.env, &[("PYTHONUTF8", "1")]);
         assert_eq!(a.category, Category::Quality);
@@ -881,7 +925,10 @@ mod tests {
             AuditToolId::Knip,
             AuditToolId::CargoMachete,
         ] {
-            assert!(!adapter(id).applicable(&empty), "{id:?} gated off on empty census");
+            assert!(
+                !adapter(id).applicable(&empty),
+                "{id:?} gated off on empty census"
+            );
             assert_eq!(adapter(id).category, Category::Quality, "{id:?}");
         }
         // typos + semgrep-quality are always applicable.
@@ -894,14 +941,20 @@ mod tests {
         assert!(adapter(AuditToolId::Cppcheck).applicable(&Census::from_parts(&["hpp"], &[])));
         assert!(adapter(AuditToolId::Pmd).applicable(&Census::from_parts(&["java"], &[])));
         // golangci-lint via either the marker or the extension.
-        assert!(adapter(AuditToolId::GolangciLint).applicable(&Census::from_parts(&[], &["go.mod"])));
+        assert!(
+            adapter(AuditToolId::GolangciLint).applicable(&Census::from_parts(&[], &["go.mod"]))
+        );
         assert!(adapter(AuditToolId::GolangciLint).applicable(&Census::from_parts(&["go"], &[])));
         // eslint via either config marker.
-        assert!(adapter(AuditToolId::Eslint).applicable(&Census::from_parts(&[], &["eslint.config"])));
+        assert!(
+            adapter(AuditToolId::Eslint).applicable(&Census::from_parts(&[], &["eslint.config"]))
+        );
         assert!(adapter(AuditToolId::Eslint).applicable(&Census::from_parts(&[], &[".eslintrc"])));
         // marker-only tools.
         assert!(adapter(AuditToolId::Knip).applicable(&Census::from_parts(&[], &["package.json"])));
-        assert!(adapter(AuditToolId::CargoMachete).applicable(&Census::from_parts(&[], &["Cargo.toml"])));
-        assert!(adapter(AuditToolId::DotnetAnalyzers).applicable(&Census::from_parts(&[], &["*.csproj"])));
+        assert!(adapter(AuditToolId::CargoMachete)
+            .applicable(&Census::from_parts(&[], &["Cargo.toml"])));
+        assert!(adapter(AuditToolId::DotnetAnalyzers)
+            .applicable(&Census::from_parts(&[], &["*.csproj"])));
     }
 }

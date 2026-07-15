@@ -129,7 +129,9 @@ pub fn read(tab: &TabId) -> Option<Vec<u8>> {
 /// duplicate seed at most re-prepends the same history (bounded by the
 /// ring cap) rather than corrupting order.
 pub fn consume_after_read(tab: &TabId) {
-    let Ok(path) = scrollback_file_for(tab) else { return };
+    let Ok(path) = scrollback_file_for(tab) else {
+        return;
+    };
     if let Err(e) = fs::remove_file(&path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(error = %e, path = %path.display(), "scrollback delete failed");

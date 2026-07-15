@@ -17,10 +17,10 @@ mod schema;
 
 pub use broadcaster::SettingsHandle;
 pub use persistence::{
-    apply_portable_avatar_paths, load_readonly, reconcile_audit_tools, reconcile_reserved_tabs,
-    mutate_global_harness_versions, note_harness_version, read_global_harness_versions,
-    read_global_llm_pricing, read_global_prompt_templates, read_project_prompt_templates,
-    write_global_llm_pricing, write_global_prompt_templates,
+    apply_portable_avatar_paths, load_readonly, mutate_global_harness_versions,
+    note_harness_version, read_global_harness_versions, read_global_llm_pricing,
+    read_global_prompt_templates, read_project_prompt_templates, reconcile_audit_tools,
+    reconcile_reserved_tabs, write_global_llm_pricing, write_global_prompt_templates,
 };
 pub use schema::*;
 
@@ -55,7 +55,12 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
             tmp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
             path.with_file_name(tmp_name)
         }
-        None => return Err(AppError::Settings(format!("path has no file name: {}", path.display()))),
+        None => {
+            return Err(AppError::Settings(format!(
+                "path has no file name: {}",
+                path.display()
+            )))
+        }
     };
 
     // Create/write/sync in a closure so any failure removes the temp before

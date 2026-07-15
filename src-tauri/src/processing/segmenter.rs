@@ -6,8 +6,7 @@
 //! verbatim because we only slice the source string at ASCII boundaries.
 
 const ABBREVS: &[&str] = &[
-    "Dr", "Mr", "Mrs", "Ms", "Jr", "Sr", "St", "Inc", "Ltd", "Co", "Corp",
-    "vs", "etc", "Mt",
+    "Dr", "Mr", "Mrs", "Ms", "Jr", "Sr", "St", "Inc", "Ltd", "Co", "Corp", "vs", "etc", "Mt",
     // Internal-dot abbreviations: when we hit the *second* dot of "e.g."
     // the preceding word (read alpha + dot back) is "e.g" — the list below
     // matches that form.
@@ -110,7 +109,8 @@ fn push_trim(sentences: &mut Vec<String>, s: &str) {
 fn sanitize_for_tts(text: &str) -> String {
     text.chars()
         .filter_map(|c| {
-            if c.is_alphanumeric() || c.is_ascii_punctuation() || c == ' ' || c == '\n' || c == '\t' {
+            if c.is_alphanumeric() || c.is_ascii_punctuation() || c == ' ' || c == '\n' || c == '\t'
+            {
                 Some(c)
             } else if c == '\r' {
                 // Drop rather than space out: a `\r` between the two newlines
@@ -149,7 +149,10 @@ fn is_abbreviation(text: &str, dot_idx: usize) -> bool {
     if ABBREVS.iter().any(|a| word.eq_ignore_ascii_case(a)) {
         return true;
     }
-    if ABBREVS_BEFORE_DIGIT.iter().any(|a| word.eq_ignore_ascii_case(a)) {
+    if ABBREVS_BEFORE_DIGIT
+        .iter()
+        .any(|a| word.eq_ignore_ascii_case(a))
+    {
         // "No. 5" is an abbreviation; "No. It doesn't." is a sentence end.
         let mut j = dot_idx + 1;
         while j < bytes.len() && bytes[j] == b' ' {

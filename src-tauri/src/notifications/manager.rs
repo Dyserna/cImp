@@ -269,7 +269,10 @@ impl NotificationManager {
                         // this is not a "Claude finished your task" event.
                         // Stay silent until the tab has been interacted with.
                         if !self.interacted.contains(&tab) {
-                            debug!(?tab, "notifications: suppressing Idle (no user interaction yet)");
+                            debug!(
+                                ?tab,
+                                "notifications: suppressing Idle (no user interaction yet)"
+                            );
                             return;
                         }
                         // Suppress Idle when this tab currently has a
@@ -280,13 +283,21 @@ impl NotificationManager {
                         // user hears "awaiting permission" followed by
                         // "idle" for the same logical event.
                         if self.last_awaiting.get(&tab).copied().unwrap_or(false) {
-                            debug!(?tab, "notifications: suppressing Idle (awaiting permission)");
+                            debug!(
+                                ?tab,
+                                "notifications: suppressing Idle (awaiting permission)"
+                            );
                             return;
                         }
                         // Symmetric guard for a pending question: the avatar also
                         // drops to Idle just before a question prompt, so without
                         // this the user hears "idle" instead of "awaiting question".
-                        if self.last_awaiting_question.get(&tab).copied().unwrap_or(false) {
+                        if self
+                            .last_awaiting_question
+                            .get(&tab)
+                            .copied()
+                            .unwrap_or(false)
+                        {
                             debug!(?tab, "notifications: suppressing Idle (awaiting question)");
                             return;
                         }
@@ -298,7 +309,10 @@ impl NotificationManager {
                 self.try_enqueue(tab, nev)
             }
             StateEvent::AwaitingPermissionChanged { tab, awaiting } => {
-                let prev = self.last_awaiting.insert(tab.clone(), awaiting).unwrap_or(false);
+                let prev = self
+                    .last_awaiting
+                    .insert(tab.clone(), awaiting)
+                    .unwrap_or(false);
                 if prev == awaiting || !awaiting {
                     return;
                 }
@@ -341,7 +355,9 @@ impl NotificationManager {
                 // AwaitingPermissionChanged / AwaitingQuestionChanged event
                 // compares against an explicit baseline instead of relying
                 // on `unwrap_or` fallbacks. Idempotent.
-                self.last_avatar.entry(tab.clone()).or_insert(AvatarState::Idle);
+                self.last_avatar
+                    .entry(tab.clone())
+                    .or_insert(AvatarState::Idle);
                 self.last_awaiting.entry(tab.clone()).or_insert(false);
                 self.last_awaiting_question.entry(tab).or_insert(false);
                 return;
@@ -537,9 +553,7 @@ fn notification_text(
         (TabConfig::AiTool(c), NotificationEvent::AwaitingPermission) => {
             &c.notifications.awaiting_permission
         }
-        (TabConfig::AiTool(c), NotificationEvent::AwaitingQuestion) => {
-            &c.notifications.question
-        }
+        (TabConfig::AiTool(c), NotificationEvent::AwaitingQuestion) => &c.notifications.question,
         (TabConfig::AiTool(c), NotificationEvent::Error) => &c.notifications.error,
         // AI tabs don't fire Exited; defensive empty.
         (TabConfig::AiTool(_), NotificationEvent::Exited) => return String::new(),
@@ -623,7 +637,12 @@ mod tests {
     fn dedup_keeps_only_latest_per_single_tab() {
         let queue = vec![
             q(TabId::Claude, NotificationEvent::Idle, "first", 0),
-            q(TabId::Claude, NotificationEvent::AwaitingPermission, "second", 10),
+            q(
+                TabId::Claude,
+                NotificationEvent::AwaitingPermission,
+                "second",
+                10,
+            ),
             q(TabId::Claude, NotificationEvent::Error, "third", 20),
         ];
         let out = dedup_per_tab(&queue);
@@ -636,7 +655,12 @@ mod tests {
         let queue = vec![
             q(TabId::ClaudeLocal, NotificationEvent::Idle, "local-old", 0),
             q(TabId::Claude, NotificationEvent::Idle, "claude-old", 5),
-            q(TabId::ClaudeLocal, NotificationEvent::Error, "local-new", 10),
+            q(
+                TabId::ClaudeLocal,
+                NotificationEvent::Error,
+                "local-new",
+                10,
+            ),
             q(TabId::Claude, NotificationEvent::Error, "claude-new", 15),
         ];
         let out = dedup_per_tab(&queue);
@@ -698,26 +722,17 @@ mod tests {
     fn interpolate_handles_negative_code() {
         // SIGSEGV-style synthesized negatives can flow through on Unix when
         // a child is killed by signal — verify we render them faithfully.
-        assert_eq!(
-            interpolate_code("exit {code}", Some(-1)),
-            "exit -1"
-        );
+        assert_eq!(interpolate_code("exit {code}", Some(-1)), "exit -1");
     }
 
     #[test]
     fn interpolate_replaces_all_occurrences() {
-        assert_eq!(
-            interpolate_code("{code} {code}", Some(2)),
-            "2 2"
-        );
+        assert_eq!(interpolate_code("{code} {code}", Some(2)), "2 2");
     }
 
     #[test]
     fn interpolate_falls_back_to_question_mark_when_code_missing() {
-        assert_eq!(
-            interpolate_code("exit {code}", None),
-            "exit ?"
-        );
+        assert_eq!(interpolate_code("exit {code}", None), "exit ?");
     }
 
     #[test]

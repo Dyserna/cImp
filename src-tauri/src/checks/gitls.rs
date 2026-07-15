@@ -37,8 +37,11 @@ pub async fn changed_files(root: &Path) -> AppResult<HashSet<String>> {
             set.insert(part.replace('\\', "/"));
         }
     }
-    let status_out =
-        run_git(root, &["status", "--porcelain", "-z", "--untracked-files=all"]).await?;
+    let status_out = run_git(
+        root,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )
+    .await?;
     for part in status_out.split('\0') {
         // Porcelain format: a 2-char status code, a space, then the path.
         // `??` marks untracked; everything else (tracked modifications) is
@@ -92,8 +95,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("checks-gitls-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
-            let out = StdCommand::new("git").args(args).current_dir(&dir).output().expect("git");
-            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            let out = StdCommand::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "test@example.com"]);
@@ -122,11 +133,20 @@ mod tests {
     /// --untracked-files=all` fixes).
     #[tokio::test]
     async fn untracked_new_directory_lists_individual_files() {
-        let dir = std::env::temp_dir().join(format!("checks-gitls-newdir-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("checks-gitls-newdir-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("newmod")).unwrap();
         let git = |args: &[&str]| {
-            let out = StdCommand::new("git").args(args).current_dir(&dir).output().expect("git");
-            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            let out = StdCommand::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "test@example.com"]);
@@ -149,7 +169,8 @@ mod tests {
 
     #[tokio::test]
     async fn not_a_repo_errors() {
-        let dir = std::env::temp_dir().join(format!("checks-gitls-norepo-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("checks-gitls-norepo-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(changed_files(&dir).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);

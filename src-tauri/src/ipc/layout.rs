@@ -25,10 +25,7 @@ use crate::settings::{LayoutNodePersisted, LayoutPersisted, LayoutPreset};
 /// splitter drags. The backend's settings handle does its own 500ms
 /// debounce on the disk write, so a fast burst writes the file once.
 #[tauri::command]
-pub async fn save_layout(
-    state: State<'_, AppState>,
-    layout: LayoutPersisted,
-) -> AppResult<()> {
+pub async fn save_layout(state: State<'_, AppState>, layout: LayoutPersisted) -> AppResult<()> {
     // Atomic mutate so a concurrent tab create/close or settings_update can't
     // clobber the layout with a stale whole-struct snapshot (lost-update).
     state.settings.mutate(move |snap| {
@@ -71,13 +68,16 @@ pub async fn save_layout_preset(
 /// don't need to know — the popover refreshes from the next
 /// `settings-changed` broadcast).
 #[tauri::command]
-pub async fn delete_layout_preset(
-    state: State<'_, AppState>,
-    name: String,
-) -> AppResult<()> {
+pub async fn delete_layout_preset(state: State<'_, AppState>, name: String) -> AppResult<()> {
     // Skip the broadcast/save when the name doesn't exist; the real delete is
     // an atomic mutate so it can't clobber a concurrent settings write.
-    if state.settings.current().layout_presets.iter().any(|p| p.name == name) {
+    if state
+        .settings
+        .current()
+        .layout_presets
+        .iter()
+        .any(|p| p.name == name)
+    {
         state.settings.mutate(move |snap| {
             snap.layout_presets.retain(|p| p.name != name);
         });
@@ -165,7 +165,11 @@ fn epoch_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let second = (tod % 60) as u32;
 
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;

@@ -60,9 +60,7 @@ pub fn patterns_path() -> Option<PathBuf> {
 /// declared.
 pub fn load_or_seed() -> Vec<PermissionPattern> {
     let Some(path) = patterns_path() else {
-        tracing::warn!(
-            "patterns: cannot resolve exe dir; using built-in defaults in memory"
-        );
+        tracing::warn!("patterns: cannot resolve exe dir; using built-in defaults in memory");
         return default_patterns();
     };
 
@@ -112,8 +110,7 @@ fn write_file(path: &Path, body: &PatternsFile) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
-    let text =
-        serde_json::to_string_pretty(body).map_err(|e| format!("serialize: {e}"))?;
+    let text = serde_json::to_string_pretty(body).map_err(|e| format!("serialize: {e}"))?;
     fs::write(path, text).map_err(|e| format!("write: {e}"))
 }
 
@@ -145,10 +142,7 @@ mod tests {
 
     #[test]
     fn missing_file_seeds_with_defaults() {
-        let dir = std::env::temp_dir().join(format!(
-            "cimp_patterns_seed_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("cimp_patterns_seed_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(PATTERNS_FILE_NAME);
         assert!(!path.exists());
@@ -164,10 +158,8 @@ mod tests {
 
     #[test]
     fn corrupt_file_returns_err() {
-        let dir = std::env::temp_dir().join(format!(
-            "cimp_patterns_corrupt_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cimp_patterns_corrupt_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(PATTERNS_FILE_NAME);
         fs::write(&path, b"{ not valid json").unwrap();
@@ -186,8 +178,7 @@ mod tests {
             .join("..")
             .join("scripts")
             .join("patterns.default.json");
-        let text = fs::read_to_string(&path)
-            .expect("read scripts/patterns.default.json");
+        let text = fs::read_to_string(&path).expect("read scripts/patterns.default.json");
         let shipped: PatternsFile =
             serde_json::from_str(&text).expect("parse scripts/patterns.default.json");
         // Compare semantically (re-serialize both) so on-disk whitespace
@@ -205,10 +196,7 @@ mod tests {
     fn bom_prefixed_file_still_parses() {
         // Windows editors may save the hand-edited file as UTF-8 with BOM;
         // that must not silently revert the user's patterns to defaults.
-        let dir = std::env::temp_dir().join(format!(
-            "cimp_patterns_bom_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("cimp_patterns_bom_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(PATTERNS_FILE_NAME);
         let body = serde_json::to_string(&default_file()).unwrap();

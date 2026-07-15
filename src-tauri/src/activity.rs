@@ -233,7 +233,9 @@ impl ActivityStore {
     pub fn record(&self, mut rec: ActivityRecord) {
         rec.request = truncate_chars(&rec.request, REQUEST_CAP_CHARS);
         rec.response = truncate_chars(&rec.response, RESPONSE_CAP_CHARS);
-        let Ok(mut inner) = self.inner.lock() else { return };
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
         self.load_locked(&mut inner);
         if rec.entry.id == 0 {
             rec.entry.id = next_id(&mut inner);
@@ -306,7 +308,9 @@ impl ActivityStore {
     /// from disk first: the user asked for the history to be wiped, and that
     /// includes lines appended by another process.
     pub fn clear(&self) {
-        let Ok(mut inner) = self.inner.lock() else { return };
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
         self.load_locked(&mut inner);
         inner.ring.clear();
         self.rewrite_locked(&mut inner);
@@ -342,10 +346,7 @@ impl ActivityStore {
         }
         // File append order is usually time order, but two writers make no
         // guarantee — restore the sorted invariant explicitly.
-        inner
-            .ring
-            .make_contiguous()
-            .sort_by_key(|r| r.entry.ts_ms);
+        inner.ring.make_contiguous().sort_by_key(|r| r.entry.ts_ms);
         // Assign missing ids and repair duplicates (two processes can — very
         // rarely — mint the same id; `delete`'s retain would then drop both).
         let mut seen = HashSet::new();
@@ -720,7 +721,9 @@ mod tests {
 
         store.clear();
         assert!(store.snapshot_since(0).is_empty());
-        assert!(ActivityStore::new(store.path.clone()).snapshot_since(0).is_empty());
+        assert!(ActivityStore::new(store.path.clone())
+            .snapshot_since(0)
+            .is_empty());
         let _ = fs::remove_file(&store.path);
     }
 
@@ -771,7 +774,10 @@ mod tests {
         foreign.entry.id = mine + 7; // a distinct, non-zero foreign id
         let line = serde_json::to_string(&foreign).unwrap();
         {
-            let mut f = fs::OpenOptions::new().append(true).open(&store.path).unwrap();
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&store.path)
+                .unwrap();
             writeln!(f, "{line}").unwrap();
         }
 

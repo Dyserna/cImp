@@ -15,8 +15,8 @@ mod graph;
 mod ipc;
 mod logging;
 mod notifications;
-mod oob;
 mod offload;
+mod oob;
 mod postedit_hook;
 mod preview;
 mod process_guard;
@@ -30,8 +30,8 @@ mod state;
 mod statusline;
 mod stt;
 mod sysmon;
-mod theming;
 mod tabs;
+mod theming;
 mod tts;
 mod usage;
 mod workbench;
@@ -48,44 +48,34 @@ use tracing::{info, warn};
 use crate::audio::{spawn_amplitude_streamer, AudioOutput};
 use crate::ipc::commands::{
     acknowledge_error, activity_clear, activity_delete, activity_detail, activity_list,
-    advisor_dismiss, advisor_mark_applied, ai_tool_tab_defaults, close_settings_window,
-    harness_mark_verified, harness_versions_get,
-    compose_attach_image,
-    compose_content_changed,
+    advisor_dismiss, advisor_mark_applied, ai_tool_tab_defaults, checks_apply_proposals,
+    checks_detect, checks_dismiss_suggestion, checks_suggestion, checks_test,
+    checks_validate_pattern, close_settings_window, compose_attach_image, compose_content_changed,
     compose_templates, compose_templates_global_get, compose_templates_global_set,
-    compose_templates_project_get,
-    checks_apply_proposals, checks_detect, checks_dismiss_suggestion, checks_suggestion,
-    checks_test, checks_validate_pattern, open_settings_window_to_section,
-    consume_settings_deep_link, content_clear, content_open_folder, get_claude_usage,
-    get_system_stats, graph_cycles, graph_dead_exports, graph_fact_add, graph_fact_update, graph_facts,
-    graph_history, graph_impact, graph_path, graph_architecture, graph_viz_snapshot,
-    graph_viz_file_status, graph_viz_ego,
-    graph_language_census,
-    graph_context_preview, graph_ignore_pick, graph_memory, graph_memory_clear,
-    graph_note_set_pinned, graph_rebuild,
-    graph_rebuild_embeddings, graph_set_language_enabled, graph_set_watch_paused,
-    graph_session_usage, graph_status, graph_test_embedder, graph_usage, graph_usage_advice,
-    list_tabs,
-    list_voices, llm_pricing_get, llm_pricing_set,
-    offload_backend_restart, offload_backend_start, offload_backend_stop,
-    offload_derive_opencode_provider, offload_enable_readonly_commands,
-    offload_server_log, offload_server_metrics, offload_server_restart, offload_server_start,
-    offload_server_stop,
-    offload_service_status,
-    offload_reload_mcp,
-    offload_status,
-    offload_statuses, offload_test, open_settings_window, open_settings_window_to_tab,
-    pty_get_scrollback,
-    pty_rebind_channel, pty_resize, pty_restart, pty_start, pty_write, request_tab_restart,
-    restart_shell_tab, set_active_tab, set_window_square_corners, settings_get, settings_update,
-    stt_cancel, stt_list_input_devices, stt_list_models, stt_start_recording, stt_stop_recording,
-    tab_activate, tts_speak, tts_set_paused, tts_speak_selection, tts_stop, tts_test,
-    workbench_checkpoint_diff, workbench_checkpoint_now, workbench_checkpoints,
-    workbench_commit_diff, workbench_diff_file, workbench_diff_summary, workbench_git_graph,
-    workbench_restore, workbench_revert_hunk, workbench_send_hunk, workbench_session_commit_counts,
-    workbench_session_commits, workbench_status, workbench_worktree_check_status,
-    workbench_worktree_create, workbench_worktree_diff, workbench_worktree_discard,
-    workbench_worktree_merge, workbench_worktree_run_checks, workbench_worktrees,
+    compose_templates_project_get, consume_settings_deep_link, content_clear, content_open_folder,
+    get_claude_usage, get_system_stats, graph_architecture, graph_context_preview, graph_cycles,
+    graph_dead_exports, graph_fact_add, graph_fact_update, graph_facts, graph_history,
+    graph_ignore_pick, graph_impact, graph_language_census, graph_memory, graph_memory_clear,
+    graph_note_set_pinned, graph_path, graph_rebuild, graph_rebuild_embeddings,
+    graph_session_usage, graph_set_language_enabled, graph_set_watch_paused, graph_status,
+    graph_test_embedder, graph_usage, graph_usage_advice, graph_viz_ego, graph_viz_file_status,
+    graph_viz_snapshot, harness_mark_verified, harness_versions_get, list_tabs, list_voices,
+    llm_pricing_get, llm_pricing_set, offload_backend_restart, offload_backend_start,
+    offload_backend_stop, offload_derive_opencode_provider, offload_enable_readonly_commands,
+    offload_reload_mcp, offload_server_log, offload_server_metrics, offload_server_restart,
+    offload_server_start, offload_server_stop, offload_service_status, offload_status,
+    offload_statuses, offload_test, open_settings_window, open_settings_window_to_section,
+    open_settings_window_to_tab, pty_get_scrollback, pty_rebind_channel, pty_resize, pty_restart,
+    pty_start, pty_write, request_tab_restart, restart_shell_tab, set_active_tab,
+    set_window_square_corners, settings_get, settings_update, stt_cancel, stt_list_input_devices,
+    stt_list_models, stt_start_recording, stt_stop_recording, tab_activate, tts_set_paused,
+    tts_speak, tts_speak_selection, tts_stop, tts_test, workbench_checkpoint_diff,
+    workbench_checkpoint_now, workbench_checkpoints, workbench_commit_diff, workbench_diff_file,
+    workbench_diff_summary, workbench_git_graph, workbench_restore, workbench_revert_hunk,
+    workbench_send_hunk, workbench_session_commit_counts, workbench_session_commits,
+    workbench_status, workbench_worktree_check_status, workbench_worktree_create,
+    workbench_worktree_diff, workbench_worktree_discard, workbench_worktree_merge,
+    workbench_worktree_run_checks, workbench_worktrees,
 };
 use crate::ipc::layout::{
     delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
@@ -93,20 +83,20 @@ use crate::ipc::layout::{
 use crate::ipc::note::{read_note, write_note};
 use crate::ipc::tab_lifecycle::{
     close_tab, create_ai_tab, create_ai_tab_in_worktree, create_preview_tab, create_shell_tab,
-    default_shell_spec, get_shell_tab_config, open_note_tab, open_tool_tab,
-    reconfigure_shell_tab, rename_tab, set_enabled_ai_tabs,
+    default_shell_spec, get_shell_tab_config, open_note_tab, open_tool_tab, reconfigure_shell_tab,
+    rename_tab, set_enabled_ai_tabs,
 };
 use crate::ipc::{AppState, LaunchContext};
+use crate::preview::{
+    preview_capture, preview_close, preview_hide, preview_navigate, preview_open, preview_reload,
+    preview_set_rect, preview_show, preview_update_config,
+};
 use crate::settings::{
     LayoutNodePersisted, LayoutPersisted, LogLevel, LogRetention, Settings, SettingsHandle,
     TabConfig,
 };
 use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::stt::SttHandle;
-use crate::preview::{
-    preview_capture, preview_close, preview_hide, preview_navigate, preview_open,
-    preview_reload, preview_set_rect, preview_show, preview_update_config,
-};
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
 
@@ -312,12 +302,11 @@ fn main() {
     //   2. session.active_tab_id (legacy / fresh-install path).
     //   3. First tab in order (post-integrity that's always Claude).
     let snap = settings_handle.current();
-    let layout_active_id: Option<String> = snap
-        .layout
-        .as_ref()
-        .and_then(layout_focused_active_tab_id);
+    let layout_active_id: Option<String> =
+        snap.layout.as_ref().and_then(layout_focused_active_tab_id);
     let session_active_id: Option<&str> = snap.session.active_tab_id.as_deref();
-    let resolved_id: Option<String> = layout_active_id.or_else(|| session_active_id.map(String::from));
+    let resolved_id: Option<String> =
+        layout_active_id.or_else(|| session_active_id.map(String::from));
     let initial_active = resolved_id
         .as_deref()
         .and_then(|id| {
@@ -1024,8 +1013,7 @@ fn layout_focused_active_tab_id(layout: &LayoutPersisted) -> Option<String> {
             }
         }
     }
-    find(&layout.tree, &layout.focused_pane_id)
-        .and_then(|opt| opt.clone())
+    find(&layout.tree, &layout.focused_pane_id).and_then(|opt| opt.clone())
 }
 
 /// Build the launch-seed `Vec<TabMeta>` from a settings snapshot.
@@ -1069,7 +1057,9 @@ fn init_tts_pipeline(
         Ok(a) => Arc::new(a),
         Err(e) => {
             warn!(error = %e, "audio output unavailable; TTS will be silent");
-            let _ = state_signals.try_send(StateSignal::AudioError { tab: initial_active.clone() });
+            let _ = state_signals.try_send(StateSignal::AudioError {
+                tab: initial_active.clone(),
+            });
             drop(tts_rx);
             return;
         }

@@ -400,10 +400,7 @@ async fn load_engine(
         }
         Err(e) => {
             warn!(error = %e, "tts engine init failed; TTS disabled");
-            let tab = active
-                .read()
-                .map(|g| g.clone())
-                .unwrap_or(TabId::Claude);
+            let tab = active.read().map(|g| g.clone()).unwrap_or(TabId::Claude);
             let _ = state_signals.try_send(StateSignal::TtsError { tab });
             None
         }

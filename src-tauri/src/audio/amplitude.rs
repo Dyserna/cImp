@@ -66,7 +66,6 @@ impl RingBuffer {
         }
         out
     }
-
 }
 
 #[derive(Clone)]
@@ -85,7 +84,6 @@ impl AmplitudeTap {
             .map(|b| b.recent(count))
             .unwrap_or_default()
     }
-
 }
 
 #[cfg(test)]
@@ -126,5 +124,4 @@ mod tests {
         assert_eq!(r.recent(4), vec![2.0, 3.0, 4.0, 5.0]);
         assert_eq!(r.recent(2), vec![4.0, 5.0]);
     }
-
 }

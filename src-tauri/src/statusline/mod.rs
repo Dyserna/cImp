@@ -103,7 +103,11 @@ fn short_path(p: &Path) -> Option<String> {
         ) -> u32;
     }
 
-    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = p
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     // First call with a null buffer returns the required length (incl. NUL).
     let needed = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
     if needed == 0 {
@@ -115,7 +119,11 @@ fn short_path(p: &Path) -> Option<String> {
         return None;
     }
     buf.truncate(written as usize);
-    Some(std::ffi::OsString::from_wide(&buf).to_string_lossy().into_owned())
+    Some(
+        std::ffi::OsString::from_wide(&buf)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 // ---- render side (`cimp --statusline` child process) --------------------
@@ -263,10 +271,10 @@ impl Palette {
     /// way leaves the corresponding fallback in place.
     fn load() -> Self {
         let mut p = Palette {
-            model: (57, 197, 207),   // cyan
-            filled: (63, 185, 80),   // green
-            empty: (110, 118, 129),  // brightBlack
-            text: (201, 209, 217),   // foreground
+            model: (57, 197, 207),  // cyan
+            filled: (63, 185, 80),  // green
+            empty: (110, 118, 129), // brightBlack
+            text: (201, 209, 217),  // foreground
         };
         let colors = active_palette_colors();
         if let Some(c) = parse_hex(colors.get("cyan")) {
@@ -503,7 +511,10 @@ mod tests {
         assert_eq!(parse_hex(Some(&"#fff".to_string())), Some((255, 255, 255)));
         assert_eq!(parse_hex(Some(&"#3fb950".to_string())), Some((63, 185, 80)));
         // Alpha form: read the RGB, ignore alpha.
-        assert_eq!(parse_hex(Some(&"#3fb95080".to_string())), Some((63, 185, 80)));
+        assert_eq!(
+            parse_hex(Some(&"#3fb95080".to_string())),
+            Some((63, 185, 80))
+        );
         assert_eq!(parse_hex(Some(&"notacolor".to_string())), None);
         assert_eq!(parse_hex(None), None);
     }

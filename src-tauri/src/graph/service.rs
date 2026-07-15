@@ -492,13 +492,25 @@ impl ReadSeenStore {
     ) {
         let added = snapshot.as_ref().map(|s| s.len()).unwrap_or(0);
         // A replace drops the old row's snapshot bytes before adding the new.
-        if let Some(old) = self.map.insert(key, ReadSeen { hash, turn, snapshot, touch }) {
+        if let Some(old) = self.map.insert(
+            key,
+            ReadSeen {
+                hash,
+                turn,
+                snapshot,
+                touch,
+            },
+        ) {
             self.snap_bytes -= snap_len(&old);
         }
         self.snap_bytes += added;
         // Entry backstop: drop whole oldest-touched rows past the cap.
         while self.map.len() > READ_SEEN_MAX_ENTRIES {
-            let victim = self.map.iter().min_by_key(|(_, v)| v.touch).map(|(k, _)| k.clone());
+            let victim = self
+                .map
+                .iter()
+                .min_by_key(|(_, v)| v.touch)
+                .map(|(k, _)| k.clone());
             match victim {
                 Some(k) => {
                     if let Some(v) = self.map.remove(&k) {
@@ -988,7 +1000,11 @@ impl GraphService {
         } else {
             idx.dependents_transitive(&names, 3, max, None)?
         };
-        Ok(super::impact::ImpactReport { changed: set.changed, dependents, unindexed: set.unindexed })
+        Ok(super::impact::ImpactReport {
+            changed: set.changed,
+            dependents,
+            unindexed: set.unindexed,
+        })
     }
 
     /// V15 Feature 1: the shortest path between two entities across the code
@@ -1003,7 +1019,8 @@ impl GraphService {
         symmetric: bool,
     ) -> AppResult<Option<super::index::PathHit>> {
         let hops = (self.settings.current().graph.path_max_hops.max(1) as usize).min(32);
-        self.index_for(root)?.shortest_path(from, to, kinds, hops, symmetric)
+        self.index_for(root)?
+            .shortest_path(from, to, kinds, hops, symmetric)
     }
 
     /// V15 Feature 2: the architecture overview (god nodes, subsystems,
@@ -1104,14 +1121,21 @@ impl GraphService {
     /// Every commit hash recorded for `session_id` (git-printed, usually
     /// short — match by prefix), oldest first. Empty on any store error.
     pub fn session_commit_hashes(&self, root: &Path, session_id: &str) -> Vec<String> {
-        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        let Ok(idx) = self.index_for(root) else {
+            return Vec::new();
+        };
         idx.session_commit_hashes(session_id).unwrap_or_default()
     }
 
     /// Recorded commit hashes for every session (session_id → hashes) in one
     /// scan. Empty on any store error.
-    pub fn session_commit_hashes_all(&self, root: &Path) -> std::collections::HashMap<String, Vec<String>> {
-        let Ok(idx) = self.index_for(root) else { return Default::default() };
+    pub fn session_commit_hashes_all(
+        &self,
+        root: &Path,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        let Ok(idx) = self.index_for(root) else {
+            return Default::default();
+        };
         idx.session_commit_hashes_all().unwrap_or_default()
     }
 
@@ -1119,7 +1143,9 @@ impl GraphService {
     /// the CANONICAL session windows (the `session` relation), fresher than
     /// any frontend snapshot for the live session. Empty on any store error.
     pub fn session_windows(&self, root: &Path) -> std::collections::HashMap<String, (i64, i64)> {
-        let Ok(idx) = self.index_for(root) else { return Default::default() };
+        let Ok(idx) = self.index_for(root) else {
+            return Default::default();
+        };
         idx.mem_sessions()
             .unwrap_or_default()
             .into_iter()
@@ -1156,13 +1182,17 @@ impl GraphService {
     /// Summed token totals for `session_id` ("turn" rows only). Empty
     /// defaults on any store error (graph disabled, session unknown, etc.).
     pub fn usage_session_totals(&self, root: &Path, session_id: &str) -> UsageTotals {
-        let Ok(idx) = self.index_for(root) else { return UsageTotals::default() };
+        let Ok(idx) = self.index_for(root) else {
+            return UsageTotals::default();
+        };
         idx.usage_session_totals(session_id).unwrap_or_default()
     }
 
     /// Per-turn token/tool-char series for `session_id`, oldest → newest.
     pub fn usage_turn_series(&self, root: &Path, session_id: &str) -> Vec<TurnUsage> {
-        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        let Ok(idx) = self.index_for(root) else {
+            return Vec::new();
+        };
         idx.usage_turn_series(session_id).unwrap_or_default()
     }
 
@@ -1170,18 +1200,26 @@ impl GraphService {
     /// known session under `root` (drives the Usage section's project
     /// totals table).
     pub fn usage_all_sessions(&self, root: &Path) -> Vec<SessionUsageRow> {
-        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        let Ok(idx) = self.index_for(root) else {
+            return Vec::new();
+        };
         idx.usage_all_sessions().unwrap_or_default()
     }
 
     /// V14 Phase D: per-tool ranking (est. tokens + call count) for
     /// `session_id`, descending.
     pub fn usage_tool_ranking(&self, root: &Path, session_id: &str) -> Vec<ToolUsage> {
-        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        let Ok(idx) = self.index_for(root) else {
+            return Vec::new();
+        };
         idx.usage_tool_ranking(session_id)
             .unwrap_or_default()
             .into_iter()
-            .map(|(tool, chars, calls)| ToolUsage { tool, est_tokens: chars / 4, calls })
+            .map(|(tool, chars, calls)| ToolUsage {
+                tool,
+                est_tokens: chars / 4,
+                calls,
+            })
             .collect()
     }
 
@@ -1206,14 +1244,16 @@ impl GraphService {
         // Reuses the per-root wrapper methods above (not `idx` directly) so
         // this is the one place that consumes them — same "one caller,
         // exercised for real" posture the rest of the service follows.
-        let current = idx.mem_current_session().ok().flatten().map(|sid| {
-            SessionUsage {
+        let current = idx
+            .mem_current_session()
+            .ok()
+            .flatten()
+            .map(|sid| SessionUsage {
                 turns: self.usage_turn_series(root, &sid),
                 totals: self.usage_session_totals(root, &sid),
                 top_tools: self.usage_tool_ranking(root, &sid),
                 session_id: sid,
-            }
-        });
+            });
         let sessions = self.usage_all_sessions(root);
         let active_session_ids =
             self.active_session_ids(&sessions, crate::activity::now_ms() as i64);
@@ -1256,8 +1296,11 @@ impl GraphService {
     /// V24 Phase B: per-model token totals + session/agent origin split for
     /// `session_id`, ordered by tokens desc. Empty on any store error.
     pub fn usage_session_model_totals(&self, root: &Path, session_id: &str) -> Vec<ModelUsage> {
-        let Ok(idx) = self.index_for(root) else { return Vec::new() };
-        idx.usage_session_model_totals(session_id).unwrap_or_default()
+        let Ok(idx) = self.index_for(root) else {
+            return Vec::new();
+        };
+        idx.usage_session_model_totals(session_id)
+            .unwrap_or_default()
     }
 
     /// V24 Phase B: upsert a live-session registry entry, keyed by `key` (a
@@ -1365,7 +1408,11 @@ impl GraphService {
             .iter()
             .filter(|(sid, _)| root_sessions.contains(sid.as_str()))
             .fold((0u64, 0u64, 0u64), |(i, d, c), (_, st)| {
-                (i + st.injected_chars, d + st.deduped_chars, c + st.compounded_chars)
+                (
+                    i + st.injected_chars,
+                    d + st.deduped_chars,
+                    c + st.compounded_chars,
+                )
             });
         Effectiveness {
             injected_chars,
@@ -1388,8 +1435,12 @@ impl GraphService {
     /// root yet (context injection never fired, or the graph is off).
     pub fn injection_follow_rate(&self, root: &Path) -> Option<(f64, u64)> {
         let idx = self.index_for(root).ok()?;
-        let root_sessions: HashSet<String> =
-            idx.mem_sessions().ok()?.into_iter().map(|s| s.session_id).collect();
+        let root_sessions: HashSet<String> = idx
+            .mem_sessions()
+            .ok()?
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
         // Snapshot (session, injected paths) under the lock, then release it
         // before the per-session DB round trips — holding `injected` across
         // `mem_touched_paths` serializes all injection-map access behind SQLite
@@ -1412,7 +1463,11 @@ impl GraphService {
                 }
             }
         }
-        if total == 0 { None } else { Some((followed as f64 / total as f64, total)) }
+        if total == 0 {
+            None
+        } else {
+            Some((followed as f64 / total as f64, total))
+        }
     }
 
     /// V14 Phase D2: fraction of retrieval turns whose injected digest filled
@@ -1422,8 +1477,12 @@ impl GraphService {
     /// [`Self::injection_follow_rate`].
     pub fn budget_maxed_rate(&self, root: &Path) -> Option<(f64, u64)> {
         let idx = self.index_for(root).ok()?;
-        let root_sessions: HashSet<String> =
-            idx.mem_sessions().ok()?.into_iter().map(|s| s.session_id).collect();
+        let root_sessions: HashSet<String> = idx
+            .mem_sessions()
+            .ok()?
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
         let map = self.injected.lock().unwrap();
         let mut seen = 0u64;
         let mut maxed = 0u64;
@@ -1434,14 +1493,22 @@ impl GraphService {
             seen += st.turns_seen as u64;
             maxed += st.turns_maxed as u64;
         }
-        if seen == 0 { None } else { Some((maxed as f64 / seen as f64, seen)) }
+        if seen == 0 {
+            None
+        } else {
+            Some((maxed as f64 / seen as f64, seen))
+        }
     }
 
     /// V14 Phase D2: wraps [`GraphIndex::advisor_reread_rate`] — this query
     /// is already fully root+session scoped (it reads `mem_event` from
     /// `root`'s own index), unlike the two signals above.
     pub fn advisor_reread_rate(&self, root: &Path) -> Option<(f64, u64)> {
-        self.index_for(root).ok()?.advisor_reread_rate().ok().flatten()
+        self.index_for(root)
+            .ok()?
+            .advisor_reread_rate()
+            .ok()
+            .flatten()
     }
 
     /// V17 Phase F1: wraps [`GraphIndex::redundant_read_candidates`] — root+
@@ -1464,7 +1531,9 @@ impl GraphService {
     /// V14 Phase D2: how many distinct sessions this root's memory knows
     /// about — the advisor's "≥5 sessions" half of the cold-start floor.
     pub fn advisor_session_count(&self, root: &Path) -> u64 {
-        let Ok(idx) = self.index_for(root) else { return 0 };
+        let Ok(idx) = self.index_for(root) else {
+            return 0;
+        };
         idx.mem_sessions().map(|v| v.len() as u64).unwrap_or(0)
     }
 
@@ -1475,7 +1544,9 @@ impl GraphService {
         session_id: Option<&str>,
         max: usize,
     ) -> Vec<WorkingSetEntry> {
-        let Ok(idx) = self.index_for(root) else { return Vec::new() };
+        let Ok(idx) = self.index_for(root) else {
+            return Vec::new();
+        };
         // Treat an empty session id as "unspecified" so a hook/plugin that sends
         // "" (rather than omitting the field) still falls back to the current
         // session instead of querying a session literally named "".
@@ -1510,9 +1581,16 @@ impl GraphService {
             .map(|s| idx.mem_working_set(s, 50).unwrap_or_default())
             .unwrap_or_default();
         // With a current session, notes = its notes + pinned; without, just pinned.
-        let notes = idx.mem_notes(current.as_deref().unwrap_or("")).unwrap_or_default();
+        let notes = idx
+            .mem_notes(current.as_deref().unwrap_or(""))
+            .unwrap_or_default();
         let sessions = idx.mem_sessions().unwrap_or_default();
-        MemorySnapshot { current_session: current, working_set, notes, sessions }
+        MemorySnapshot {
+            current_session: current,
+            working_set,
+            notes,
+            sessions,
+        }
     }
 
     /// Clear one session's memory (`Some`) or the whole project's (`None`).
@@ -1581,9 +1659,17 @@ impl GraphService {
 
     /// Live (non-archived) project facts for `root`'s Facts UI list — pinned
     /// first, then newest. `root` defaults handled by the caller (IPC).
-    pub fn list_project_facts(&self, root: &Path, include_archived: bool, max: usize) -> Vec<ProjectFact> {
-        let Ok(idx) = self.index_for(root) else { return Vec::new() };
-        idx.list_project_facts(include_archived, max).unwrap_or_default()
+    pub fn list_project_facts(
+        &self,
+        root: &Path,
+        include_archived: bool,
+        max: usize,
+    ) -> Vec<ProjectFact> {
+        let Ok(idx) = self.index_for(root) else {
+            return Vec::new();
+        };
+        idx.list_project_facts(include_archived, max)
+            .unwrap_or_default()
     }
 
     /// Pin/unpin a fact.
@@ -1626,9 +1712,13 @@ impl GraphService {
         if !self.settings.current().graph.memory_distillation {
             return;
         }
-        let Ok(idx) = self.index_for(&root) else { return };
+        let Ok(idx) = self.index_for(&root) else {
+            return;
+        };
         let cutoff = crate::activity::now_ms() as i64 - Self::DISTILL_IDLE_MS;
-        let Ok(candidates) = idx.sessions_idle_undistilled(cutoff) else { return };
+        let Ok(candidates) = idx.sessions_idle_undistilled(cutoff) else {
+            return;
+        };
         if candidates.is_empty() {
             return;
         }
@@ -1653,7 +1743,10 @@ impl GraphService {
         if !self.settings.current().graph.memory_distillation {
             return;
         }
-        let Some(sup) = self.app.try_state::<Arc<crate::offload::OffloadSupervisor>>() else {
+        let Some(sup) = self
+            .app
+            .try_state::<Arc<crate::offload::OffloadSupervisor>>()
+        else {
             return;
         };
         let sup = sup.inner().clone();
@@ -1671,9 +1764,14 @@ impl GraphService {
                 return;
             }
         }
-        let _guard = DistillGuard { svc: self, session_id: session_id.to_string() };
+        let _guard = DistillGuard {
+            svc: self,
+            session_id: session_id.to_string(),
+        };
 
-        let Ok(idx) = self.index_for(root) else { return };
+        let Ok(idx) = self.index_for(root) else {
+            return;
+        };
         // Idempotency guard: `spawn_distillation_sweep`'s candidate query
         // already filters to undistilled sessions, but this also protects a
         // future direct caller (e.g. an eviction-time trigger) from
@@ -1694,7 +1792,10 @@ impl GraphService {
 
         let mut body = String::new();
         for e in &working_set {
-            body.push_str(&format!("- {} ({}x, last {})\n", e.path, e.touches, e.last_kind));
+            body.push_str(&format!(
+                "- {} ({}x, last {})\n",
+                e.path, e.touches, e.last_kind
+            ));
         }
         for n in &notes {
             body.push_str(&format!("- note: {}\n", n.text));
@@ -1720,7 +1821,10 @@ impl GraphService {
                 }
             }
             None => {
-                debug!(session_id, "graph: distiller output failed validation, skipping insert");
+                debug!(
+                    session_id,
+                    "graph: distiller output failed validation, skipping insert"
+                );
             }
         }
         let _ = idx.mark_session_distilled(session_id, ts);
@@ -1812,8 +1916,9 @@ impl GraphService {
             // base, and everything displaced SO FAR is re-counted once per
             // retrieve turn — content kept out of context is saved again as
             // a cache read on every later turn.
-            st.displaced_chars_total =
-                st.displaced_chars_total.saturating_add(result.deduped_chars as u64);
+            st.displaced_chars_total = st
+                .displaced_chars_total
+                .saturating_add(result.deduped_chars as u64);
             st.compounded_chars = st.compounded_chars.saturating_add(st.displaced_chars_total);
             let budget = g.context_turn_budget_chars as u64;
             // "Maxed" = this turn's injected chars reached ≥90% of the
@@ -1873,7 +1978,11 @@ impl GraphService {
     /// when this is reached — via the loopback/IPC async handlers).
     fn enqueue_digest(&self, root: &Path, file: &str, content_hash: &str) {
         const MAX_INFLIGHT: usize = 32;
-        let key = (root.to_path_buf(), file.to_string(), content_hash.to_string());
+        let key = (
+            root.to_path_buf(),
+            file.to_string(),
+            content_hash.to_string(),
+        );
         {
             let mut inflight = match self.digest_inflight.lock() {
                 Ok(g) => g,
@@ -1890,7 +1999,10 @@ impl GraphService {
         let me = me.inner().clone();
         tokio::spawn(async move {
             // Guard removes the key on Drop — even if the compute panics.
-            let _guard = InflightGuard { svc: me.clone(), key: key.clone() };
+            let _guard = InflightGuard {
+                svc: me.clone(),
+                key: key.clone(),
+            };
             me.compute_and_cache_digest(&key.0, &key.1, &key.2).await;
         });
     }
@@ -1899,14 +2011,18 @@ impl GraphService {
     /// Silent on any failure (no local backend, read error, bad output) — the
     /// fallback digest keeps working and the item is simply not cached.
     async fn compute_and_cache_digest(&self, root: &Path, file: &str, content_hash: &str) {
-        let Some(sup) = self.app.try_state::<Arc<crate::offload::OffloadSupervisor>>() else {
+        let Some(sup) = self
+            .app
+            .try_state::<Arc<crate::offload::OffloadSupervisor>>()
+        else {
             return;
         };
         let sup = sup.inner().clone();
         // Read off the async worker — file I/O would otherwise block a tokio
         // thread for the duration.
         let path = root.join(file);
-        let content = match tokio::task::spawn_blocking(move || std::fs::read_to_string(path)).await {
+        let content = match tokio::task::spawn_blocking(move || std::fs::read_to_string(path)).await
+        {
             Ok(Ok(c)) => c,
             _ => return,
         };
@@ -2012,7 +2128,10 @@ impl GraphService {
     /// advisor passes reads while this holds). Cleared on the next prompt's
     /// `retrieve_context`, so the recovery window is "until the next user turn".
     pub fn is_post_compaction(&self, session_id: &str) -> bool {
-        self.post_compaction.lock().map(|s| s.contains(session_id)).unwrap_or(false)
+        self.post_compaction
+            .lock()
+            .map(|s| s.contains(session_id))
+            .unwrap_or(false)
     }
 
     /// V11 Phase E / V17 Phase A — the read advisor's verdict for a `Read` of
@@ -2085,7 +2204,9 @@ impl GraphService {
         // filesystem clock skew (network shares, WSL2 bind-mounts) can't mislead.
         let prev = {
             let seen = self.read_seen.lock().ok()?;
-            seen.map.get(&key).map(|v| (v.hash.clone(), v.turn, v.snapshot.clone()))
+            seen.map
+                .get(&key)
+                .map(|v| (v.hash.clone(), v.turn, v.snapshot.clone()))
         };
         let (seen, unchanged, prev_turn, prev_snapshot) = match &prev {
             Some((h, t, snap)) => (true, *h == cur_hash, *t, snap.clone()),
@@ -2155,7 +2276,8 @@ impl GraphService {
                 // never on the common tiny-first-read path or when the tier is off.
                 let slice = offset.is_some() || limit.is_some();
                 let big = g.read_advisor_first_read_kb > 0
-                    && content.len() >= (g.read_advisor_first_read_kb as usize).saturating_mul(1024);
+                    && content.len()
+                        >= (g.read_advisor_first_read_kb as usize).saturating_mul(1024);
                 if !seen && big && !slice {
                     let outline_empty = idx.outline(&rel).map(|o| o.is_empty()).unwrap_or(false);
                     let fin = FirstReadIn {
@@ -2167,7 +2289,8 @@ impl GraphService {
                     if first_read_eligible(&fin) {
                         match idx.get_digest(&rel, &cur_hash) {
                             Ok(Some(digest)) => {
-                                let text = super::context::first_read_advice(&rel, &content, &digest);
+                                let text =
+                                    super::context::first_read_advice(&rel, &content, &digest);
                                 let displaced = content.chars().count() as u64;
                                 let request = format!(
                                     "agent read of `{rel}` (huge non-code — digest substituted, first-read)"
@@ -2208,12 +2331,28 @@ impl GraphService {
                 // Unchanged, first remind: outline (+ body in substitute mode).
                 let substitute = g.read_advisor_mode.eq_ignore_ascii_case("substitute");
                 let text = super::context::read_advice(
-                    &idx, root, &rel, offset, substitute, g.max_body_bytes as usize,
+                    &idx,
+                    root,
+                    &rel,
+                    offset,
+                    substitute,
+                    g.max_body_bytes as usize,
                 );
                 let displaced = content.chars().count() as u64;
-                let request = format!("agent re-read of `{rel}` (the trigger — no explicit request)");
+                let request =
+                    format!("agent re-read of `{rel}` (the trigger — no explicit request)");
                 // read_seen stays as-is (content is unchanged).
-                self.record_remind(root, &idx, sid, &rel, text, request, displaced, prev_count.saturating_add(1), cur_turn)
+                self.record_remind(
+                    root,
+                    &idx,
+                    sid,
+                    &rel,
+                    text,
+                    request,
+                    displaced,
+                    prev_count.saturating_add(1),
+                    cur_turn,
+                )
             }
             ReadAdvice::Diff => {
                 // Changed: answer with a diff against the last-read snapshot.
@@ -2222,8 +2361,15 @@ impl GraphService {
                 let displaced = content.chars().count() as u64;
                 let request = format!("agent re-read of `{rel}` (changed — diff substituted)");
                 let out = self.record_remind(
-                    root, &idx, sid, &rel, text, request, displaced,
-                    prev_count.saturating_add(1), cur_turn,
+                    root,
+                    &idx,
+                    sid,
+                    &rel,
+                    text,
+                    request,
+                    displaced,
+                    prev_count.saturating_add(1),
+                    cur_turn,
                 );
                 // After a diff remind the agent holds the CURRENT content: update
                 // read_seen to (new hash, cur turn, new snapshot) so a further
@@ -2294,7 +2440,11 @@ impl GraphService {
         // agent has already read this file at least once this session
         // (`read_seen` held its prior hash), so the session row normally exists;
         // `"claude"` is a safe default if the lookup somehow misses.
-        let agent = idx.session_agent(sid).ok().flatten().unwrap_or_else(|| "claude".to_string());
+        let agent = idx
+            .session_agent(sid)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "claude".to_string());
         let _ = idx.record_mem_event(sid, &agent, "remind", rel, None, None, ts, None);
         // Activity: `chars` is the reminder's actual size (what we returned),
         // consistent with every other graph tool's honest response-size figure —
@@ -2400,7 +2550,8 @@ impl GraphService {
             // bypass out of it in the same unit (`effectiveness_totals`),
             // not in whole-file chars (which would let one big-file bypass
             // zero the entire metric).
-            self.bypassed_advice_chars.fetch_add(advice_chars, Ordering::Relaxed);
+            self.bypassed_advice_chars
+                .fetch_add(advice_chars, Ordering::Relaxed);
             crate::activity::record_bg(crate::activity::ActivityRecord {
                 request: format!("shell read of `{rel}` after a read-advisor reminder (est.)"),
                 response: String::new(),
@@ -2664,8 +2815,10 @@ impl GraphService {
             // Update the baseline to this run's full result regardless of what
             // was surfaced — the session has now effectively "seen" it.
             for report in &reports {
-                st.baseline
-                    .insert(report.name.clone(), crate::checks::auto::to_baseline(&report.groups));
+                st.baseline.insert(
+                    report.name.clone(),
+                    crate::checks::auto::to_baseline(&report.groups),
+                );
             }
         }
         let per_check_refs: Vec<(&str, Vec<&crate::checks::DiagGroup>)> = per_check
@@ -2762,7 +2915,13 @@ impl GraphService {
         let dependents = idx.dependents_transitive(&names, 3, max, None).ok()?;
         let files: HashSet<&str> = dependents.iter().map(|d| d.symbol.file.as_str()).collect();
         let tests = idx.tests_for(&names, 3, max).unwrap_or_default();
-        crate::checks::auto::impact_note(max_callers, dependents.len(), files.len(), tests.len(), min_dependents)
+        crate::checks::auto::impact_note(
+            max_callers,
+            dependents.len(),
+            files.len(),
+            tests.len(),
+            min_dependents,
+        )
     }
 
     /// Drain (take) `session_id`'s parked auto-check block, if any — called
@@ -2799,7 +2958,10 @@ impl GraphService {
             .map(|s| {
                 s.langs
                     .iter()
-                    .map(|l| crate::checks::detect::LangStat { lang: l.lang.clone(), files: l.files })
+                    .map(|l| crate::checks::detect::LangStat {
+                        lang: l.lang.clone(),
+                        files: l.files,
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -2846,7 +3008,9 @@ impl GraphService {
         if !self.settings.current().graph.analyses_auto {
             return;
         }
-        let Ok(idx) = self.index_for(root) else { return };
+        let Ok(idx) = self.index_for(root) else {
+            return;
+        };
         let max = self.settings.current().graph.max_rows_per_query.max(1) as usize;
         let dead = idx.dead_exports(max).map(|v| v.len()).unwrap_or(0);
         let cycles = idx.import_cycles(max).map(|v| v.len()).unwrap_or(0);
@@ -3091,7 +3255,10 @@ impl GraphService {
         // and `workbench` don't need to know about each other's lifecycle;
         // `WorkbenchService` self-gates on `workbench.enabled`, so this is a
         // cheap no-op when the feature is off.
-        if let Some(workbench) = self.app.try_state::<Arc<crate::workbench::WorkbenchService>>() {
+        if let Some(workbench) = self
+            .app
+            .try_state::<Arc<crate::workbench::WorkbenchService>>()
+        {
             workbench.publish_fs_batch(root, &paths);
         }
 
@@ -3340,7 +3507,8 @@ impl GraphService {
             s.semantic_enabled = true;
             s.embedder_configured = configured;
         });
-        let Some(mut embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model) else {
+        let Some(mut embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model)
+        else {
             self.patch_status(root, |s| {
                 s.embed_state = "degraded".into();
                 s.embedder_ready = false;
@@ -3641,7 +3809,9 @@ fn intercepted_whole_file_read(shell_on: bool, command: &str) -> bool {
 fn path_like_tokens(command: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |t: &str| {
-        let t = t.trim().trim_matches(|c| c == ',' || c == ';' || c == ')' || c == '(');
+        let t = t
+            .trim()
+            .trim_matches(|c| c == ',' || c == ';' || c == ')' || c == '(');
         if t.len() > 1 && out.iter().all(|p| p != t) {
             out.push(t.to_string());
         }
@@ -3950,7 +4120,10 @@ fn index_dir_tree(
 ) -> DirWalk {
     const MAX_DIR_WALK: usize = 4096;
     if gi.matched_path_or_any_parents(dir, true).is_ignore() {
-        return DirWalk::Indexed { indexed: 0, rels: Vec::new() };
+        return DirWalk::Indexed {
+            indexed: 0,
+            rels: Vec::new(),
+        };
     }
     let mut eligible = 0usize;
     let mut indexed = 0u64;
@@ -4332,7 +4505,15 @@ mod tests {
         assert!(idx.find_symbol("alpha").unwrap().is_empty());
 
         // ...and the walk must index the new side.
-        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX, &Gitignore::empty()) {
+        match index_dir_tree(
+            &idx,
+            &dir,
+            &dir.join("srcnew"),
+            &snap,
+            sub,
+            u64::MAX,
+            &Gitignore::empty(),
+        ) {
             DirWalk::Indexed { indexed, rels } => {
                 assert_eq!(indexed, 1, "one child file indexed");
                 assert_eq!(rels, vec!["srcnew/lib.rs".to_string()]);
@@ -4346,7 +4527,15 @@ mod tests {
         );
 
         // Idempotence: unchanged children are hash-skipped on a repeat event.
-        match index_dir_tree(&idx, &dir, &dir.join("srcnew"), &snap, sub, u64::MAX, &Gitignore::empty()) {
+        match index_dir_tree(
+            &idx,
+            &dir,
+            &dir.join("srcnew"),
+            &snap,
+            sub,
+            u64::MAX,
+            &Gitignore::empty(),
+        ) {
             DirWalk::Indexed { indexed, .. } => assert_eq!(indexed, 0, "nothing re-indexed"),
             DirWalk::TooBig => panic!("one file is not too big"),
         }
@@ -4366,7 +4555,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ckg-igdir-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("dist/assets")).unwrap();
         std::fs::write(dir.join(".gitignore"), "dist\n").unwrap();
-        std::fs::write(dir.join("dist/assets/app.js"), "export function bundled() {}\n").unwrap();
+        std::fs::write(
+            dir.join("dist/assets/app.js"),
+            "export function bundled() {}\n",
+        )
+        .unwrap();
 
         let sub = ".ckg-test";
         let snap = GraphSettings::default();
@@ -4385,7 +4578,10 @@ mod tests {
                 DirWalk::TooBig => panic!("{target}: ignored dir must not be walked at all"),
             }
         }
-        assert!(idx.find_symbol("bundled").unwrap().is_empty(), "bundle symbol never indexed");
+        assert!(
+            idx.find_symbol("bundled").unwrap().is_empty(),
+            "bundle symbol never indexed"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4491,7 +4687,10 @@ mod tests {
         // `total` from `code_embedding_coverage` is epoch-independent (a plain
         // `count(*code_chunk{id})`), so any epoch string works here.
         let (_, total) = idx.code_embedding_coverage("any").expect("coverage");
-        assert_eq!(total, 1, "the project-wide cap trims to the configured budget");
+        assert_eq!(
+            total, 1,
+            "the project-wide cap trims to the configured budget"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4507,7 +4706,10 @@ mod tests {
         // A recognized language that the user didn't opt into is filtered out.
         let only_rust = vec!["rust".to_string()];
         assert_eq!(lang_for(&PathBuf::from("a.py"), &only_rust), None);
-        assert_eq!(lang_for(&PathBuf::from("a.rs"), &only_rust), Some(Lang::Rust));
+        assert_eq!(
+            lang_for(&PathBuf::from("a.rs"), &only_rust),
+            Some(Lang::Rust)
+        );
     }
 
     /// V12 Phase F (6c): the `graph-analyses` event only fires when the
@@ -4516,10 +4718,22 @@ mod tests {
     /// identical repeat does not, and any different count does.
     #[test]
     fn analyses_changed_only_on_first_seen_or_different_counts() {
-        assert!(analyses_changed(None, "3,1"), "first pass is always new information");
-        assert!(!analyses_changed(Some("3,1"), "3,1"), "identical counts: no event");
-        assert!(analyses_changed(Some("3,1"), "4,1"), "dead-export count grew");
-        assert!(analyses_changed(Some("3,1"), "3,0"), "cycle count shrank — still a change");
+        assert!(
+            analyses_changed(None, "3,1"),
+            "first pass is always new information"
+        );
+        assert!(
+            !analyses_changed(Some("3,1"), "3,1"),
+            "identical counts: no event"
+        );
+        assert!(
+            analyses_changed(Some("3,1"), "4,1"),
+            "dead-export count grew"
+        );
+        assert!(
+            analyses_changed(Some("3,1"), "3,0"),
+            "cycle count shrank — still a change"
+        );
     }
 
     // ── V17 Phase A: read-advisor verdict + snapshot LRU ────────────────────
@@ -4547,48 +4761,86 @@ mod tests {
 
     #[test]
     fn verdict_never_seen_records_and_passes() {
-        let i = VerdictIn { seen: false, ..vin() };
+        let i = VerdictIn {
+            seen: false,
+            ..vin()
+        };
         assert_eq!(read_verdict(&i), ReadAdvice::Pass { restamp: true });
     }
 
     #[test]
     fn verdict_unchanged_first_ask_reminds_with_outline() {
-        let i = VerdictIn { unchanged: true, reminded: false, big_enough: true, ..vin() };
+        let i = VerdictIn {
+            unchanged: true,
+            reminded: false,
+            big_enough: true,
+            ..vin()
+        };
         assert_eq!(read_verdict(&i), ReadAdvice::Outline);
     }
 
     #[test]
     fn verdict_unchanged_small_or_reminded_passes_without_restamp() {
         // Below the min-lines floor.
-        let small = VerdictIn { unchanged: true, big_enough: false, ..vin() };
+        let small = VerdictIn {
+            unchanged: true,
+            big_enough: false,
+            ..vin()
+        };
         assert_eq!(read_verdict(&small), ReadAdvice::Pass { restamp: false });
         // The immediate-second-ask hatch: same file, same content, already reminded.
-        let reasked = VerdictIn { unchanged: true, reminded: true, remind_count: 1, ..vin() };
+        let reasked = VerdictIn {
+            unchanged: true,
+            reminded: true,
+            remind_count: 1,
+            ..vin()
+        };
         assert_eq!(read_verdict(&reasked), ReadAdvice::Pass { restamp: false });
     }
 
     #[test]
     fn verdict_unchanged_ttl_expired_restamps_and_passes() {
-        let i = VerdictIn { unchanged: true, ttl_expired: true, ..vin() };
+        let i = VerdictIn {
+            unchanged: true,
+            ttl_expired: true,
+            ..vin()
+        };
         assert_eq!(read_verdict(&i), ReadAdvice::Pass { restamp: true });
     }
 
     #[test]
     fn verdict_changed_with_snapshot_and_small_diff_reminds_with_diff() {
-        let i = VerdictIn { unchanged: false, have_snapshot: true, diff_worth_it: true, ..vin() };
+        let i = VerdictIn {
+            unchanged: false,
+            have_snapshot: true,
+            diff_worth_it: true,
+            ..vin()
+        };
         assert_eq!(read_verdict(&i), ReadAdvice::Diff);
     }
 
     #[test]
     fn verdict_changed_but_diff_unusable_passes() {
         // Diff over 50% of the new content.
-        let big = VerdictIn { unchanged: false, diff_worth_it: false, ..vin() };
+        let big = VerdictIn {
+            unchanged: false,
+            diff_worth_it: false,
+            ..vin()
+        };
         assert_eq!(read_verdict(&big), ReadAdvice::Pass { restamp: true });
         // Snapshot evicted.
-        let gone = VerdictIn { unchanged: false, have_snapshot: false, ..vin() };
+        let gone = VerdictIn {
+            unchanged: false,
+            have_snapshot: false,
+            ..vin()
+        };
         assert_eq!(read_verdict(&gone), ReadAdvice::Pass { restamp: true });
         // Feature off.
-        let off = VerdictIn { unchanged: false, diffs_on: false, ..vin() };
+        let off = VerdictIn {
+            unchanged: false,
+            diffs_on: false,
+            ..vin()
+        };
         assert_eq!(read_verdict(&off), ReadAdvice::Pass { restamp: true });
     }
 
@@ -4597,8 +4849,17 @@ mod tests {
         // A changed re-read of an already-reminded file re-arms while under the
         // cap, then passes once at it.
         for count in 0..READ_REMIND_CAP {
-            let i = VerdictIn { unchanged: false, reminded: true, remind_count: count, ..vin() };
-            assert_eq!(read_verdict(&i), ReadAdvice::Diff, "count {count} still re-arms");
+            let i = VerdictIn {
+                unchanged: false,
+                reminded: true,
+                remind_count: count,
+                ..vin()
+            };
+            assert_eq!(
+                read_verdict(&i),
+                ReadAdvice::Diff,
+                "count {count} still re-arms"
+            );
         }
         let at_cap = VerdictIn {
             unchanged: false,
@@ -4606,7 +4867,11 @@ mod tests {
             remind_count: READ_REMIND_CAP,
             ..vin()
         };
-        assert_eq!(read_verdict(&at_cap), ReadAdvice::Pass { restamp: true }, "at cap ⇒ pass");
+        assert_eq!(
+            read_verdict(&at_cap),
+            ReadAdvice::Pass { restamp: true },
+            "at cap ⇒ pass"
+        );
     }
 
     /// V17 Phase B5: the bypass tap's skip-guard. A provable whole-file shell
@@ -4659,14 +4924,22 @@ mod tests {
             snapshot_bytes(seen)
         );
         // Running total matches the O(n) ground truth.
-        assert_eq!(store.snap_bytes, snapshot_bytes(seen), "running total tracks snapshot_bytes");
+        assert_eq!(
+            store.snap_bytes,
+            snapshot_bytes(seen),
+            "running total tracks snapshot_bytes"
+        );
         // The oldest-touched entry lost its snapshot but kept its hash/turn.
-        let oldest = seen.get(&("s".to_string(), "f0.rs".to_string())).expect("oldest present");
+        let oldest = seen
+            .get(&("s".to_string(), "f0.rs".to_string()))
+            .expect("oldest present");
         assert!(oldest.snapshot.is_none(), "oldest snapshot evicted");
         assert_eq!(oldest.hash, "h0", "evicted entry keeps its hash");
         assert_eq!(oldest.turn, 0, "evicted entry keeps its turn");
         // The newest still has its snapshot.
-        let newest = seen.get(&("s".to_string(), format!("f{}.rs", n - 1))).unwrap();
+        let newest = seen
+            .get(&("s".to_string(), format!("f{}.rs", n - 1)))
+            .unwrap();
         assert!(newest.snapshot.is_some(), "newest snapshot retained");
     }
 
@@ -4716,37 +4989,77 @@ mod tests {
         let big: Arc<str> = Arc::from("y".repeat(2 * 1024 * 1024)); // 2 MiB each
         for k in 0..8u64 {
             let sid = if k % 2 == 0 { "a" } else { "b" };
-            let snap = if k % 3 == 0 { Some(big.clone()) } else { Some(small.clone()) };
-            store.insert((sid.to_string(), format!("f{k}.rs")), format!("h{k}"), k as u32, snap, bump());
+            let snap = if k % 3 == 0 {
+                Some(big.clone())
+            } else {
+                Some(small.clone())
+            };
+            store.insert(
+                (sid.to_string(), format!("f{k}.rs")),
+                format!("h{k}"),
+                k as u32,
+                snap,
+                bump(),
+            );
             check(&store);
         }
         assert!(store.snap_bytes > 0, "snapshots were recorded");
 
         // Replace an existing key: with a bigger snapshot, then with none.
-        store.insert(("a".to_string(), "f0.rs".to_string()), "h0b".into(), 99, Some(big.clone()), bump());
+        store.insert(
+            ("a".to_string(), "f0.rs".to_string()),
+            "h0b".into(),
+            99,
+            Some(big.clone()),
+            bump(),
+        );
         check(&store);
-        store.insert(("a".to_string(), "f0.rs".to_string()), "h0c".into(), 100, None, bump());
+        store.insert(
+            ("a".to_string(), "f0.rs".to_string()),
+            "h0c".into(),
+            100,
+            None,
+            bump(),
+        );
         check(&store);
 
         // Force the byte-budget eviction path: pile on enough 2 MiB snapshots to
         // cross SNAP_TOTAL_MAX (16 MiB).
         for k in 100..120u64 {
-            store.insert(("c".to_string(), format!("f{k}.rs")), format!("h{k}"), k as u32, Some(big.clone()), bump());
+            store.insert(
+                ("c".to_string(), format!("f{k}.rs")),
+                format!("h{k}"),
+                k as u32,
+                Some(big.clone()),
+                bump(),
+            );
             check(&store);
         }
         assert!(store.snap_bytes <= SNAP_TOTAL_MAX, "byte budget enforced");
 
         // Force the entry-cap eviction path: cross READ_SEEN_MAX_ENTRIES rows.
         for k in 0..(READ_SEEN_MAX_ENTRIES as u64 + 20) {
-            store.insert(("d".to_string(), format!("g{k}.rs")), format!("h{k}"), k as u32, None, bump());
+            store.insert(
+                ("d".to_string(), format!("g{k}.rs")),
+                format!("h{k}"),
+                k as u32,
+                None,
+                bump(),
+            );
         }
         check(&store);
-        assert!(store.map.len() <= READ_SEEN_MAX_ENTRIES, "entry cap enforced");
+        assert!(
+            store.map.len() <= READ_SEEN_MAX_ENTRIES,
+            "entry cap enforced"
+        );
 
         // Session clear (drops one session's rows, some snapshotted).
         store.clear_session(Some("c"));
         check(&store);
-        assert!(!store.map.keys().any(|(sid, _)| sid == "c"), "session c cleared");
+        assert!(
+            !store.map.keys().any(|(sid, _)| sid == "c"),
+            "session c cleared"
+        );
 
         // Whole clear.
         store.clear_session(None);
@@ -4765,7 +5078,12 @@ mod tests {
     /// A `FirstReadIn` that qualifies (300 KiB non-code whole-file read, tier at
     /// 256 KiB) — override one field per case.
     fn fin() -> FirstReadIn {
-        FirstReadIn { first_read_kb: 256, content_len: 300 * 1024, slice: false, is_code: false }
+        FirstReadIn {
+            first_read_kb: 256,
+            content_len: 300 * 1024,
+            slice: false,
+            is_code: false,
+        }
     }
 
     #[test]
@@ -4776,26 +5094,41 @@ mod tests {
     #[test]
     fn first_read_disabled_short_circuits() {
         // kb == 0 ⇒ tier off, regardless of everything else.
-        assert!(!first_read_eligible(&FirstReadIn { first_read_kb: 0, ..fin() }));
+        assert!(!first_read_eligible(&FirstReadIn {
+            first_read_kb: 0,
+            ..fin()
+        }));
     }
 
     #[test]
     fn first_read_under_threshold_passes() {
         // 200 KiB content vs a 256 KiB floor.
-        assert!(!first_read_eligible(&FirstReadIn { content_len: 200 * 1024, ..fin() }));
+        assert!(!first_read_eligible(&FirstReadIn {
+            content_len: 200 * 1024,
+            ..fin()
+        }));
         // Exactly at the threshold qualifies (>=).
-        assert!(first_read_eligible(&FirstReadIn { content_len: 256 * 1024, ..fin() }));
+        assert!(first_read_eligible(&FirstReadIn {
+            content_len: 256 * 1024,
+            ..fin()
+        }));
     }
 
     #[test]
     fn first_read_code_file_passes() {
-        assert!(!first_read_eligible(&FirstReadIn { is_code: true, ..fin() }));
+        assert!(!first_read_eligible(&FirstReadIn {
+            is_code: true,
+            ..fin()
+        }));
     }
 
     #[test]
     fn first_read_slice_passes() {
         // offset OR limit present ⇒ deliberate slice ⇒ never substituted.
-        assert!(!first_read_eligible(&FirstReadIn { slice: true, ..fin() }));
+        assert!(!first_read_eligible(&FirstReadIn {
+            slice: true,
+            ..fin()
+        }));
     }
 
     // ── V24 Phase B: live-session registry → active_session_ids ─────────────
@@ -4817,7 +5150,11 @@ mod tests {
     }
 
     fn live(session_id: &str, last_seen_ms: i64) -> LiveSession {
-        LiveSession { agent: "claude".to_string(), session_id: session_id.to_string(), last_seen_ms }
+        LiveSession {
+            agent: "claude".to_string(),
+            session_id: session_id.to_string(),
+            last_seen_ms,
+        }
     }
 
     #[test]
@@ -4833,7 +5170,10 @@ mod tests {
         // — the registry keeps it active (the point of the union).
         reg.insert("tabA".to_string(), live("idle-but-open", now - 1_000));
         // An expired registry entry does NOT keep its session active.
-        reg.insert("tabB".to_string(), live("stale", now - LIVE_SESSION_TTL_MS - 1_000));
+        reg.insert(
+            "tabB".to_string(),
+            live("stale", now - LIVE_SESSION_TTL_MS - 1_000),
+        );
         // A fresh entry whose session isn't in THIS root's list is ignored
         // (the registry is process-wide; the output is root-scoped).
         reg.insert("tabC".to_string(), live("other-project", now));
@@ -4856,7 +5196,10 @@ mod tests {
         // Exactly at the TTL edge is still live...
         let mut at_edge = HashMap::new();
         at_edge.insert("t".to_string(), live("s", now - LIVE_SESSION_TTL_MS));
-        assert_eq!(compute_active_session_ids(&at_edge, &sessions, now), vec!["s".to_string()]);
+        assert_eq!(
+            compute_active_session_ids(&at_edge, &sessions, now),
+            vec!["s".to_string()]
+        );
         // ...one ms past it has expired.
         let mut past = HashMap::new();
         past.insert("t".to_string(), live("s", now - LIVE_SESSION_TTL_MS - 1));
@@ -4871,8 +5214,14 @@ mod tests {
         let now = 10_000_000i64;
         let mut reg = HashMap::new();
         reg.insert("fresh".to_string(), live("s_fresh", now - 1_000));
-        reg.insert("edge".to_string(), live("s_edge", now - LIVE_SESSION_TTL_MS));
-        reg.insert("stale".to_string(), live("s_stale", now - LIVE_SESSION_TTL_MS - 1));
+        reg.insert(
+            "edge".to_string(),
+            live("s_edge", now - LIVE_SESSION_TTL_MS),
+        );
+        reg.insert(
+            "stale".to_string(),
+            live("s_stale", now - LIVE_SESSION_TTL_MS - 1),
+        );
         evict_stale_live_sessions(&mut reg, now);
         assert!(reg.contains_key("fresh"), "within TTL kept");
         assert!(reg.contains_key("edge"), "exactly at TTL kept");

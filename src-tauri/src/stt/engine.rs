@@ -69,7 +69,11 @@ impl SttEngine {
             match Self::load_ctx(model_path, true) {
                 Ok(ctx) => {
                     tracing::info!(target: "stt", model = %model_file, backend = GPU_BACKEND, "STT engine ready");
-                    return Ok(Self { ctx, model_file, device });
+                    return Ok(Self {
+                        ctx,
+                        model_file,
+                        device,
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(target: "stt", error = %e, "STT GPU init failed; falling back to CPU");
@@ -84,7 +88,11 @@ impl SttEngine {
             "CPU"
         };
         tracing::info!(target: "stt", model = %model_file, backend, "STT engine ready");
-        Ok(Self { ctx, model_file, device })
+        Ok(Self {
+            ctx,
+            model_file,
+            device,
+        })
     }
 
     fn load_ctx(model_path: &Path, use_gpu: bool) -> AppResult<WhisperContext> {
@@ -170,8 +178,17 @@ impl SttEngine {
 /// literally says "parenthesize this" → "(parenthesize this)", or "[TODO]") is
 /// NOT discarded — only whisper's actual non-speech annotations are.
 const NON_SPEECH_MARKERS: &[&str] = &[
-    "blank_audio", "blank audio", "silence", "music", "inaudible", "no speech",
-    "noise", "applause", "laughter", "background", "sound",
+    "blank_audio",
+    "blank audio",
+    "silence",
+    "music",
+    "inaudible",
+    "no speech",
+    "noise",
+    "applause",
+    "laughter",
+    "background",
+    "sound",
 ];
 
 /// True when `text` is a single fully-bracketed/parenthesized group whose inner
@@ -183,8 +200,8 @@ fn is_non_speech(text: &str) -> bool {
     if t.is_empty() {
         return true;
     }
-    let bracketed = (t.starts_with('[') && t.ends_with(']'))
-        || (t.starts_with('(') && t.ends_with(')'));
+    let bracketed =
+        (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('(') && t.ends_with(')'));
     if !bracketed {
         return false;
     }
@@ -202,7 +219,14 @@ mod tests {
 
     #[test]
     fn non_speech_markers_are_dropped() {
-        for m in ["[BLANK_AUDIO]", "[ Silence ]", "(music)", "[Inaudible]", "  ", ""] {
+        for m in [
+            "[BLANK_AUDIO]",
+            "[ Silence ]",
+            "(music)",
+            "[Inaudible]",
+            "  ",
+            "",
+        ] {
             assert!(is_non_speech(m), "{m:?} should be non-speech");
         }
     }

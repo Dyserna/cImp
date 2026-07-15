@@ -163,7 +163,11 @@ fn project_local_candidates(name: &str) -> Vec<String> {
 /// `State`. `override_path` is the tool's configured `path` (empty = resolve via
 /// project-local `node_modules/.bin` then ebin → PATH; non-empty = used
 /// verbatim). `root` scopes the project-local lookup (`None` = skip it).
-async fn detect_tool(id: AuditToolId, override_path: &str, root: Option<&Path>) -> AuditDetectResult {
+async fn detect_tool(
+    id: AuditToolId,
+    override_path: &str,
+    root: Option<&Path>,
+) -> AuditDetectResult {
     let resolved = match resolve_audit_binary(id, override_path, root) {
         Ok(p) => p,
         Err(_) => {
@@ -212,7 +216,11 @@ async fn detect_tool(id: AuditToolId, override_path: &str, root: Option<&Path>) 
             version: None,
             error: Some(format!(
                 "--version probe exited with code {}{}",
-                output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()),
+                output
+                    .status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
                 parse_version(&output.stderr, &output.stdout)
                     .map(|l| format!(": {l}"))
                     .unwrap_or_default()
@@ -297,15 +305,22 @@ mod tests {
             Some("gitleaks 8.18.0".to_string())
         );
         // Skips leading blank lines.
-        assert_eq!(parse_version(b"\n  \n", b"fallback 1.0"), Some("fallback 1.0".to_string()));
+        assert_eq!(
+            parse_version(b"\n  \n", b"fallback 1.0"),
+            Some("fallback 1.0".to_string())
+        );
         assert_eq!(parse_version(b"", b""), None);
     }
 
     #[tokio::test]
     async fn detect_missing_tool_reports_not_found() {
         // A bare name that is neither in ebin nor on PATH.
-        let r =
-            detect_tool(AuditToolId::OsvScanner, "cimp-definitely-not-a-real-tool-xyz", None).await;
+        let r = detect_tool(
+            AuditToolId::OsvScanner,
+            "cimp-definitely-not-a-real-tool-xyz",
+            None,
+        )
+        .await;
         assert!(!r.found);
         assert!(r.path.is_none());
         assert_eq!(r.error.as_deref(), Some("not found on PATH or ebin"));
@@ -327,7 +342,13 @@ mod tests {
         assert!(!r.found, "{r:?}");
         assert!(r.path.is_some());
         assert!(r.version.is_none());
-        assert!(r.error.as_deref().unwrap_or("").contains("exited with code"), "{r:?}");
+        assert!(
+            r.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("exited with code"),
+            "{r:?}"
+        );
     }
 
     #[tokio::test]
@@ -339,6 +360,9 @@ mod tests {
         let r = detect_tool(AuditToolId::Semgrep, &cargo.display().to_string(), None).await;
         assert!(r.found, "cargo override should resolve + probe: {r:?}");
         assert!(r.path.is_some());
-        assert!(r.version.is_some(), "cargo --version should yield a line: {r:?}");
+        assert!(
+            r.version.is_some(),
+            "cargo --version should yield a line: {r:?}"
+        );
     }
 }

@@ -130,7 +130,8 @@ impl Embedder {
     /// Embed a single text (the query path).
     pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, String> {
         let mut v = self.embed(&[text.to_string()]).await?;
-        v.pop().ok_or_else(|| "empty embedding response".to_string())
+        v.pop()
+            .ok_or_else(|| "empty embedding response".to_string())
     }
 
     /// Probe reachability + the live vector dimension (one tiny embed). Used to
@@ -207,9 +208,18 @@ mod tests {
 
     #[test]
     fn endpoint_normalization() {
-        assert_eq!(normalize_endpoint("http://h:8081"), "http://h:8081/v1/embeddings");
-        assert_eq!(normalize_endpoint("http://h:8081/"), "http://h:8081/v1/embeddings");
-        assert_eq!(normalize_endpoint("http://h:8081/v1"), "http://h:8081/v1/embeddings");
+        assert_eq!(
+            normalize_endpoint("http://h:8081"),
+            "http://h:8081/v1/embeddings"
+        );
+        assert_eq!(
+            normalize_endpoint("http://h:8081/"),
+            "http://h:8081/v1/embeddings"
+        );
+        assert_eq!(
+            normalize_endpoint("http://h:8081/v1"),
+            "http://h:8081/v1/embeddings"
+        );
         assert_eq!(
             normalize_endpoint("http://h:8081/v1/embeddings"),
             "http://h:8081/v1/embeddings"
@@ -230,7 +240,10 @@ mod tests {
     }
 
     fn datum(index: usize, tag: f32) -> EmbedDatum {
-        EmbedDatum { embedding: vec![tag], index }
+        EmbedDatum {
+            embedding: vec![tag],
+            index,
+        }
     }
 
     #[test]

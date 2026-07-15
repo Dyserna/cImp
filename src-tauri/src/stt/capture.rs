@@ -173,10 +173,20 @@ fn start_capture(
     };
 
     let stream = match sample_format {
-        SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, accumulator.clone(), mic, err_fn),
-        SampleFormat::I16 => build_stream::<i16>(&device, &config, channels, accumulator.clone(), mic, err_fn),
-        SampleFormat::U16 => build_stream::<u16>(&device, &config, channels, accumulator.clone(), mic, err_fn),
-        other => return Err(AppError::Stt(format!("unsupported input sample format: {other:?}"))),
+        SampleFormat::F32 => {
+            build_stream::<f32>(&device, &config, channels, accumulator.clone(), mic, err_fn)
+        }
+        SampleFormat::I16 => {
+            build_stream::<i16>(&device, &config, channels, accumulator.clone(), mic, err_fn)
+        }
+        SampleFormat::U16 => {
+            build_stream::<u16>(&device, &config, channels, accumulator.clone(), mic, err_fn)
+        }
+        other => {
+            return Err(AppError::Stt(format!(
+                "unsupported input sample format: {other:?}"
+            )))
+        }
     }?;
 
     stream

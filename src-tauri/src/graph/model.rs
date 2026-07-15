@@ -71,8 +71,8 @@ impl Lang {
             // `.h` is ambiguous C/C++; the C++ grammar is a near-superset that
             // parses C headers fine while also handling class/template/namespace
             // in C++ headers, so it's the safer default for mixed projects.
-            Some("cc") | Some("cpp") | Some("cxx") | Some("hpp") | Some("hh")
-            | Some("hxx") | Some("h") => Lang::Cpp,
+            Some("cc") | Some("cpp") | Some("cxx") | Some("hpp") | Some("hh") | Some("hxx")
+            | Some("h") => Lang::Cpp,
             Some("cs") => Lang::CSharp,
             Some("php") | Some("phtml") => Lang::Php,
             Some("sh") | Some("bash") | Some("zsh") => Lang::Bash,
@@ -221,7 +221,10 @@ impl Lang {
 /// programming languages are named here on purpose — everything else stays
 /// "Other" rather than sprouting a chip per stray extension.
 pub fn unsupported_lang_name(path: &Path) -> Option<(&'static str, &'static str)> {
-    let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
     let named = match ext.as_str() {
         "lua" => ("lua", "Lua"),
         "zig" => ("zig", "Zig"),
@@ -433,12 +436,20 @@ impl Confidence {
     /// The weaker (less certain) of two confidences — a chain of edges is only
     /// as trustworthy as its least-certain link.
     pub fn weaker(self, other: Confidence) -> Confidence {
-        if self.rank() <= other.rank() { self } else { other }
+        if self.rank() <= other.rank() {
+            self
+        } else {
+            other
+        }
     }
 
     /// The stronger (more certain) of two confidences.
     pub fn stronger(self, other: Confidence) -> Confidence {
-        if self.rank() >= other.rank() { self } else { other }
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
+        }
     }
 
     /// The natural default confidence for an edge of `kind` at parse time.
@@ -512,7 +523,12 @@ impl Edge {
     /// ([`Confidence::default_for`]). Structural/import/doc edges are
     /// `Extracted`; `Call` edges start `Inferred`.
     pub fn new(kind: EdgeKind, src: impl Into<String>, dst: impl Into<String>) -> Self {
-        Edge { kind, src: src.into(), dst: dst.into(), confidence: Confidence::default_for(kind) }
+        Edge {
+            kind,
+            src: src.into(),
+            dst: dst.into(),
+            confidence: Confidence::default_for(kind),
+        }
     }
 }
 
@@ -682,7 +698,13 @@ mod tests {
         assert_eq!(Lang::Asm.label(), "Assembly");
         // Every supported tag must round-trip tag → from_tag → same variant, so
         // the census can rebuild a Lang from a stored tag to get its label.
-        for l in [Lang::Rust, Lang::TypeScript, Lang::Cpp, Lang::CSharp, Lang::Ada] {
+        for l in [
+            Lang::Rust,
+            Lang::TypeScript,
+            Lang::Cpp,
+            Lang::CSharp,
+            Lang::Ada,
+        ] {
             assert_eq!(Lang::from_tag(l.tag()).label(), l.label());
         }
     }
@@ -706,24 +728,53 @@ mod tests {
         // structural containment edge.
         fg.edges.push(Edge::new(EdgeKind::Call, "caller", "foo")); // same-file → Extracted
         fg.edges.push(Edge::new(EdgeKind::Call, "caller", "bar")); // cross-file → stays Inferred
-        fg.edges.push(Edge::new(EdgeKind::Contains, "caller", "foo")); // structural → Extracted
+        fg.edges
+            .push(Edge::new(EdgeKind::Contains, "caller", "foo")); // structural → Extracted
         fg.references.push(Reference {
-            name: "foo".into(), file: "m.rs".into(), line: 3, col: 1,
-            resolved_id: None, confidence: Confidence::Inferred,
+            name: "foo".into(),
+            file: "m.rs".into(),
+            line: 3,
+            col: 1,
+            resolved_id: None,
+            confidence: Confidence::Inferred,
         });
         fg.references.push(Reference {
-            name: "bar".into(), file: "m.rs".into(), line: 4, col: 1,
-            resolved_id: None, confidence: Confidence::Inferred,
+            name: "bar".into(),
+            file: "m.rs".into(),
+            line: 4,
+            col: 1,
+            resolved_id: None,
+            confidence: Confidence::Inferred,
         });
 
         fg.classify_confidence();
 
-        let call_foo = fg.edges.iter().find(|e| e.kind == EdgeKind::Call && e.dst == "foo").unwrap();
-        let call_bar = fg.edges.iter().find(|e| e.kind == EdgeKind::Call && e.dst == "bar").unwrap();
-        assert_eq!(call_foo.confidence, Confidence::Extracted, "same-file call is Extracted");
-        assert_eq!(call_bar.confidence, Confidence::Inferred, "cross-file call stays Inferred");
+        let call_foo = fg
+            .edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Call && e.dst == "foo")
+            .unwrap();
+        let call_bar = fg
+            .edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Call && e.dst == "bar")
+            .unwrap();
+        assert_eq!(
+            call_foo.confidence,
+            Confidence::Extracted,
+            "same-file call is Extracted"
+        );
+        assert_eq!(
+            call_bar.confidence,
+            Confidence::Inferred,
+            "cross-file call stays Inferred"
+        );
         // Structural edges are Extracted from construction and untouched.
-        let contains = fg.edges.iter().find(|e| e.kind == EdgeKind::Contains).unwrap();
+        let contains = fg
+            .edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Contains)
+            .unwrap();
         assert_eq!(contains.confidence, Confidence::Extracted);
         // References mirror the same rule.
         assert_eq!(fg.references[0].confidence, Confidence::Extracted);
@@ -734,18 +785,36 @@ mod tests {
     fn confidence_rank_orders_and_combines() {
         assert!(Confidence::Extracted.rank() > Confidence::Inferred.rank());
         assert!(Confidence::Inferred.rank() > Confidence::Ambiguous.rank());
-        assert_eq!(Confidence::Extracted.weaker(Confidence::Inferred), Confidence::Inferred);
-        assert_eq!(Confidence::Inferred.weaker(Confidence::Ambiguous), Confidence::Ambiguous);
-        assert_eq!(Confidence::Inferred.stronger(Confidence::Ambiguous), Confidence::Inferred);
+        assert_eq!(
+            Confidence::Extracted.weaker(Confidence::Inferred),
+            Confidence::Inferred
+        );
+        assert_eq!(
+            Confidence::Inferred.weaker(Confidence::Ambiguous),
+            Confidence::Ambiguous
+        );
+        assert_eq!(
+            Confidence::Inferred.stronger(Confidence::Ambiguous),
+            Confidence::Inferred
+        );
         assert_eq!(Confidence::from_tag("extracted"), Confidence::Extracted);
         assert_eq!(Confidence::from_tag("nonsense"), Confidence::Inferred);
     }
 
     #[test]
     fn unsupported_lang_name_maps_known_and_ignores_the_rest() {
-        assert_eq!(unsupported_lang_name(&PathBuf::from("a/b.zig")), Some(("zig", "Zig")));
-        assert_eq!(unsupported_lang_name(&PathBuf::from("m.exs")), Some(("elixir", "Elixir")));
-        assert_eq!(unsupported_lang_name(&PathBuf::from("a.fsx")), Some(("fsharp", "F#")));
+        assert_eq!(
+            unsupported_lang_name(&PathBuf::from("a/b.zig")),
+            Some(("zig", "Zig"))
+        );
+        assert_eq!(
+            unsupported_lang_name(&PathBuf::from("m.exs")),
+            Some(("elixir", "Elixir"))
+        );
+        assert_eq!(
+            unsupported_lang_name(&PathBuf::from("a.fsx")),
+            Some(("fsharp", "F#"))
+        );
         // Data/config/unknown extensions are NOT named — they fold into "other".
         assert_eq!(unsupported_lang_name(&PathBuf::from("data.bin")), None);
         assert_eq!(unsupported_lang_name(&PathBuf::from("noext")), None);

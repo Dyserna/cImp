@@ -477,14 +477,54 @@ pub fn default_llm_pricing() -> Vec<LlmPricingModel> {
         }
     }
     vec![
-        row("Anthropic", "Claude Fable 5", "claude-fable-5", [10.0, 20.0, 1.0, 50.0]),
-        row("Anthropic", "Claude Opus 4.8", "claude-opus-4-8", [5.0, 10.0, 0.5, 25.0]),
-        row("Anthropic", "Claude Opus 4.7", "claude-opus-4-7", [5.0, 10.0, 0.5, 25.0]),
-        row("Anthropic", "Claude Opus 4.6", "claude-opus-4-6", [5.0, 10.0, 0.5, 25.0]),
-        row("Anthropic", "Claude Sonnet 5", "claude-sonnet-5", [3.0, 6.0, 0.3, 15.0]),
-        row("Anthropic", "Claude Sonnet 4.6", "claude-sonnet-4-6", [3.0, 6.0, 0.3, 15.0]),
-        row("Anthropic", "Claude Haiku 4.5", "claude-haiku-4-5", [1.0, 2.0, 0.1, 5.0]),
-        row("Copilot", "Claude Sonnet 5 (promo)", "", [2.0, 2.5, 0.2, 10.0]),
+        row(
+            "Anthropic",
+            "Claude Fable 5",
+            "claude-fable-5",
+            [10.0, 20.0, 1.0, 50.0],
+        ),
+        row(
+            "Anthropic",
+            "Claude Opus 4.8",
+            "claude-opus-4-8",
+            [5.0, 10.0, 0.5, 25.0],
+        ),
+        row(
+            "Anthropic",
+            "Claude Opus 4.7",
+            "claude-opus-4-7",
+            [5.0, 10.0, 0.5, 25.0],
+        ),
+        row(
+            "Anthropic",
+            "Claude Opus 4.6",
+            "claude-opus-4-6",
+            [5.0, 10.0, 0.5, 25.0],
+        ),
+        row(
+            "Anthropic",
+            "Claude Sonnet 5",
+            "claude-sonnet-5",
+            [3.0, 6.0, 0.3, 15.0],
+        ),
+        row(
+            "Anthropic",
+            "Claude Sonnet 4.6",
+            "claude-sonnet-4-6",
+            [3.0, 6.0, 0.3, 15.0],
+        ),
+        row(
+            "Anthropic",
+            "Claude Haiku 4.5",
+            "claude-haiku-4-5",
+            [1.0, 2.0, 0.1, 5.0],
+        ),
+        row(
+            "Copilot",
+            "Claude Sonnet 5 (promo)",
+            "",
+            [2.0, 2.5, 0.2, 10.0],
+        ),
         row("Copilot", "Claude Sonnet 4.6", "", [3.0, 3.75, 0.3, 15.0]),
         row("Copilot", "Claude Opus 4.8", "", [5.0, 6.25, 0.5, 25.0]),
         row("Copilot", "Claude Haiku 4.5", "", [1.0, 1.25, 0.1, 5.0]),
@@ -682,7 +722,6 @@ impl Settings {
     pub fn find_tab_mut(&mut self, id: &str) -> Option<&mut TabConfig> {
         self.tabs.iter_mut().find(|t| t.id() == id)
     }
-
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -1111,14 +1150,26 @@ impl AuditToolConfig {
     /// A tool entry with defaults: enabled, no path override (resolve normally),
     /// no extra args, global timeout.
     fn new(id: AuditToolId) -> Self {
-        Self { id, enabled: true, path: String::new(), extra_args: Vec::new(), timeout_secs: None }
+        Self {
+            id,
+            enabled: true,
+            path: String::new(),
+            extra_args: Vec::new(),
+            timeout_secs: None,
+        }
     }
 
     /// Same as [`new`](Self::new) but `enabled: false` — the default-disabled
     /// tools (`dotnet-analyzers` runs a real build; `semgrep-quality` needs
     /// network to fetch its ruleset).
     fn disabled(id: AuditToolId) -> Self {
-        Self { id, enabled: false, path: String::new(), extra_args: Vec::new(), timeout_secs: None }
+        Self {
+            id,
+            enabled: false,
+            path: String::new(),
+            extra_args: Vec::new(),
+            timeout_secs: None,
+        }
     }
 }
 
@@ -1727,10 +1778,29 @@ impl Default for GraphSettings {
             // Tier-1 code languages are on by default; markup/data languages
             // (html/css/json) stay opt-in to keep a fresh index lean (V9-02).
             languages: [
-                "rust", "typescript", "javascript", "python", "markdown",
-                "go", "java", "c", "cpp", "csharp", "php", "bash", "scala",
-                "ocaml", "ruby", "haskell", "kotlin", "swift", "sql", "erlang",
-                "r", "perl", "ada",
+                "rust",
+                "typescript",
+                "javascript",
+                "python",
+                "markdown",
+                "go",
+                "java",
+                "c",
+                "cpp",
+                "csharp",
+                "php",
+                "bash",
+                "scala",
+                "ocaml",
+                "ruby",
+                "haskell",
+                "kotlin",
+                "swift",
+                "sql",
+                "erlang",
+                "r",
+                "perl",
+                "ada",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -1887,7 +1957,11 @@ impl std::fmt::Debug for RemoteBackendTemplate {
             .field("base_url", &self.base_url)
             .field(
                 "auth_token",
-                &if self.auth_token.is_empty() { "<empty>" } else { "<redacted>" },
+                &if self.auth_token.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
             )
             .finish()
     }
@@ -1942,7 +2016,10 @@ pub struct CommandPolicy {
 /// the `command_policies` key inherit this automatically (no migration).
 pub fn default_command_policies() -> Vec<CommandPolicy> {
     fn env(key: &str, value: &str) -> CommandEnvVar {
-        CommandEnvVar { key: key.to_string(), value: value.to_string() }
+        CommandEnvVar {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
     }
     fn s(v: &str) -> String {
         v.to_string()
@@ -2008,7 +2085,13 @@ pub fn readonly_cargo_policy() -> CommandPolicy {
     }
     CommandPolicy {
         program: s("cargo"),
-        denied_flags: vec![s("--config"), s("-C"), s("-Z"), s("--explain"), s("--color")],
+        denied_flags: vec![
+            s("--config"),
+            s("-C"),
+            s("-Z"),
+            s("--explain"),
+            s("--color"),
+        ],
         denied_subcommands: vec![],
         allowed_subcommands: vec![s("metadata"), s("tree")],
         env: vec![],
@@ -2029,7 +2112,10 @@ pub fn merge_readonly_preset(allowlist: &mut Vec<String>, policies: &mut Vec<Com
             allowlist.push(prog);
         }
     }
-    if !policies.iter().any(|p| p.program.eq_ignore_ascii_case("cargo")) {
+    if !policies
+        .iter()
+        .any(|p| p.program.eq_ignore_ascii_case("cargo"))
+    {
         policies.push(readonly_cargo_policy());
     }
 }
@@ -2406,14 +2492,16 @@ impl OffloadSettings {
     ///
     /// [`effective_backends`]: Self::effective_backends
     pub fn primary_local_command(&self) -> Option<String> {
-        self.effective_backends().into_iter().find_map(|b| match b.kind {
-            OffloadBackendKind::Local { server_command, .. }
-                if b.enabled && !server_command.trim().is_empty() =>
-            {
-                Some(server_command)
-            }
-            _ => None,
-        })
+        self.effective_backends()
+            .into_iter()
+            .find_map(|b| match b.kind {
+                OffloadBackendKind::Local { server_command, .. }
+                    if b.enabled && !server_command.trim().is_empty() =>
+                {
+                    Some(server_command)
+                }
+                _ => None,
+            })
     }
 
     /// The effective `local-llama` provider to inject into an OpenCode session,
@@ -2608,7 +2696,8 @@ pub fn default_claude_tab() -> TabConfig {
         first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
-        use_local_provider: false,    })
+        use_local_provider: false,
+    })
 }
 
 /// V1.4-07: second Claude tab, preconfigured to talk to a local LLM
@@ -2626,16 +2715,15 @@ pub fn default_claude_local_tab() -> TabConfig {
         tts_injection: TtsInjection { enabled: true },
         notifications: AiNotificationConfig {
             idle: NotificationSlot::enabled("Claude (local) is idle"),
-            awaiting_permission: NotificationSlot::enabled(
-                "Claude (local) is awaiting permission",
-            ),
+            awaiting_permission: NotificationSlot::enabled("Claude (local) is awaiting permission"),
             question: NotificationSlot::enabled("Claude (local) has a question"),
             error: NotificationSlot::enabled("Claude (local) encountered an error"),
         },
         first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
-        use_local_provider: true,    })
+        use_local_provider: true,
+    })
 }
 
 /// V19: OpenCode AI-tool tab using whatever provider OpenCode's own config
@@ -2665,7 +2753,8 @@ pub fn default_opencode_tab() -> TabConfig {
         first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
-        use_local_provider: false,    })
+        use_local_provider: false,
+    })
 }
 
 /// Look up the default `TabConfig` for a reserved AI tab id. Used by
@@ -3172,8 +3261,7 @@ pub struct DisplaySettings {
 impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
-            terminal_font_family: "Consolas, Menlo, \"DejaVu Sans Mono\", monospace"
-                .to_string(),
+            terminal_font_family: "Consolas, Menlo, \"DejaVu Sans Mono\", monospace".to_string(),
             terminal_font_size: 14,
         }
     }
@@ -4055,9 +4143,17 @@ mod tests {
         // Every tool resolves normally (empty path); all enabled except the two
         // default-disabled ones.
         assert!(s.code_audit.tools.iter().all(|t| t.path.is_empty()));
-        let disabled: Vec<AuditToolId> =
-            s.code_audit.tools.iter().filter(|t| !t.enabled).map(|t| t.id).collect();
-        assert_eq!(disabled, vec![AuditToolId::DotnetAnalyzers, AuditToolId::SemgrepQuality]);
+        let disabled: Vec<AuditToolId> = s
+            .code_audit
+            .tools
+            .iter()
+            .filter(|t| !t.enabled)
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            disabled,
+            vec![AuditToolId::DotnetAnalyzers, AuditToolId::SemgrepQuality]
+        );
     }
 
     #[test]
@@ -4078,10 +4174,17 @@ mod tests {
         let ids: Vec<AuditToolId> = ca.tools.iter().map(|t| t.id).collect();
         assert_eq!(ids, vec![AuditToolId::Gitleaks, AuditToolId::Semgrep]);
         // Field values on the surviving entries are preserved.
-        let semgrep = ca.tools.iter().find(|t| t.id == AuditToolId::Semgrep).unwrap();
+        let semgrep = ca
+            .tools
+            .iter()
+            .find(|t| t.id == AuditToolId::Semgrep)
+            .unwrap();
         assert!(!semgrep.enabled);
         assert_eq!(semgrep.path, "sg.exe");
-        assert_eq!(semgrep.extra_args, vec!["--config".to_string(), "auto".to_string()]);
+        assert_eq!(
+            semgrep.extra_args,
+            vec!["--config".to_string(), "auto".to_string()]
+        );
     }
 
     #[test]
@@ -4116,14 +4219,25 @@ mod tests {
         // Re-merging is a no-op: no duplicate allowlist entries, no second cargo
         // policy — a merge action, not a mode.
         merge_readonly_preset(&mut allowlist, &mut policies);
-        assert_eq!(allowlist, allowlist_after_one, "allowlist unchanged on re-merge");
-        assert_eq!(policies, policies_after_one, "policies unchanged on re-merge");
+        assert_eq!(
+            allowlist, allowlist_after_one,
+            "allowlist unchanged on re-merge"
+        );
+        assert_eq!(
+            policies, policies_after_one,
+            "policies unchanged on re-merge"
+        );
 
         // A hand-added `git` (any case) is not duplicated either.
         let mut hand = vec!["GIT".to_string()];
         let mut pol = default_command_policies();
         merge_readonly_preset(&mut hand, &mut pol);
-        assert_eq!(hand.iter().filter(|a| a.eq_ignore_ascii_case("git")).count(), 1);
+        assert_eq!(
+            hand.iter()
+                .filter(|a| a.eq_ignore_ascii_case("git"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -4172,7 +4286,10 @@ mod tests {
             OffloadBackendKind::Local {
                 show_command_on_start,
                 ..
-            } => assert!(!show_command_on_start, "missing field must default to false"),
+            } => assert!(
+                !show_command_on_start,
+                "missing field must default to false"
+            ),
             _ => panic!("expected Local kind"),
         }
     }
@@ -4230,7 +4347,11 @@ mod tests {
             (AiTabId::ClaudeLocal, "claude-local"),
             (AiTabId::OpenCode, "opencode"),
         ] {
-            assert_eq!(serde_json::to_value(variant).unwrap(), json!(id), "serialize {id}");
+            assert_eq!(
+                serde_json::to_value(variant).unwrap(),
+                json!(id),
+                "serialize {id}"
+            );
             assert_eq!(
                 serde_json::from_value::<AiTabId>(json!(id)).unwrap(),
                 variant,
@@ -4259,7 +4380,10 @@ mod tests {
             }
         });
         let parsed: Settings = serde_json::from_value(v).unwrap();
-        assert!(parsed.layout.is_none(), "malformed layout should drop to None");
+        assert!(
+            parsed.layout.is_none(),
+            "malformed layout should drop to None"
+        );
         assert_eq!(parsed.session.active_tab_id.as_deref(), Some("claude"));
     }
 
@@ -4331,8 +4455,14 @@ mod tests {
     fn processing_device_serializes_snake_case() {
         // The wire form must be lowercase to match the frontend union type
         // `'gpu' | 'cpu'`.
-        assert_eq!(serde_json::to_value(ProcessingDevice::Gpu).unwrap(), json!("gpu"));
-        assert_eq!(serde_json::to_value(ProcessingDevice::Cpu).unwrap(), json!("cpu"));
+        assert_eq!(
+            serde_json::to_value(ProcessingDevice::Gpu).unwrap(),
+            json!("gpu")
+        );
+        assert_eq!(
+            serde_json::to_value(ProcessingDevice::Cpu).unwrap(),
+            json!("cpu")
+        );
     }
 
     #[test]
@@ -4376,7 +4506,10 @@ mod tests {
         };
         let custom = Some(BackgroundOverride::Custom(cfg.clone()));
         let v = serde_json::to_value(&custom).unwrap();
-        assert!(v.is_object(), "custom override should serialize as an object");
+        assert!(
+            v.is_object(),
+            "custom override should serialize as an object"
+        );
         let parsed: Option<BackgroundOverride> = serde_json::from_value(v).unwrap();
         match parsed {
             Some(BackgroundOverride::Custom(out)) => {
@@ -4498,17 +4631,33 @@ mod tests {
     #[test]
     fn resolve_prompt_templates_project_shadows_global_by_name() {
         let global = vec![
-            PromptTemplate { name: "a".to_string(), body: "global-a".to_string() },
-            PromptTemplate { name: "b".to_string(), body: "global-b".to_string() },
+            PromptTemplate {
+                name: "a".to_string(),
+                body: "global-a".to_string(),
+            },
+            PromptTemplate {
+                name: "b".to_string(),
+                body: "global-b".to_string(),
+            },
         ];
         let project = vec![
             // Shadows global "a" — project body wins, global "a" is dropped.
-            PromptTemplate { name: "a".to_string(), body: "project-a".to_string() },
+            PromptTemplate {
+                name: "a".to_string(),
+                body: "project-a".to_string(),
+            },
             // Project-only entry, appended after the (filtered) global list.
-            PromptTemplate { name: "c".to_string(), body: "project-c".to_string() },
+            PromptTemplate {
+                name: "c".to_string(),
+                body: "project-c".to_string(),
+            },
         ];
         let resolved = resolve_prompt_templates(global, project);
-        assert_eq!(resolved.len(), 3, "shadowed global \"a\" must not appear twice");
+        assert_eq!(
+            resolved.len(),
+            3,
+            "shadowed global \"a\" must not appear twice"
+        );
 
         let a = resolved.iter().find(|t| t.name == "a").unwrap();
         assert_eq!(a.body, "project-a");
@@ -4525,7 +4674,10 @@ mod tests {
 
     #[test]
     fn resolve_prompt_templates_empty_project_passes_global_through() {
-        let global = vec![PromptTemplate { name: "a".to_string(), body: "x".to_string() }];
+        let global = vec![PromptTemplate {
+            name: "a".to_string(),
+            body: "x".to_string(),
+        }];
         let resolved = resolve_prompt_templates(global, Vec::new());
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].scope, "global");

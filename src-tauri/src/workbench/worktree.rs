@@ -99,10 +99,14 @@ pub struct MergeReport {
 pub fn sanitize_slug(input: &str) -> AppResult<String> {
     let s = input.trim();
     if s.is_empty() {
-        return Err(AppError::Workbench("worktree name cannot be empty".to_string()));
+        return Err(AppError::Workbench(
+            "worktree name cannot be empty".to_string(),
+        ));
     }
     if s.len() > 60 {
-        return Err(AppError::Workbench("worktree name is too long (max 60 characters)".to_string()));
+        return Err(AppError::Workbench(
+            "worktree name is too long (max 60 characters)".to_string(),
+        ));
     }
     let mut chars = s.chars();
     let first = chars.next().unwrap();
@@ -111,7 +115,10 @@ pub fn sanitize_slug(input: &str) -> AppResult<String> {
             "worktree name must start with a letter or digit".to_string(),
         ));
     }
-    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(AppError::Workbench(
             "worktree name can only contain letters, digits, '-', and '_'".to_string(),
         ));
@@ -121,9 +128,8 @@ pub fn sanitize_slug(input: &str) -> AppResult<String> {
     // worktree add` with an opaque OS error. Reject it up front (case-
     // insensitive) with a clear message. Harmless to enforce on all platforms.
     const RESERVED: &[&str] = &[
-        "con", "prn", "aux", "nul",
-        "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
-        "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
     ];
     if RESERVED.contains(&s.to_ascii_lowercase().as_str()) {
         return Err(AppError::Workbench(format!(
@@ -158,8 +164,9 @@ fn branch_name(slug: &str) -> String {
 
 fn read_meta(root: &Path, slug: &str) -> AppResult<WorktreeMeta> {
     let path = meta_path(root, slug);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| AppError::Workbench(format!("unknown worktree '{slug}' (no meta file: {e})")))?;
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        AppError::Workbench(format!("unknown worktree '{slug}' (no meta file: {e})"))
+    })?;
     serde_json::from_str(&text)
         .map_err(|e| AppError::Workbench(format!("worktree '{slug}' has a corrupt meta file: {e}")))
 }
@@ -172,7 +179,8 @@ fn write_meta(root: &Path, slug: &str, meta: &WorktreeMeta) -> AppResult<()> {
     }
     let text = serde_json::to_string_pretty(meta)
         .map_err(|e| AppError::Workbench(format!("serialize worktree meta: {e}")))?;
-    std::fs::write(&path, text).map_err(|e| AppError::Workbench(format!("write {}: {e}", path.display())))
+    std::fs::write(&path, text)
+        .map_err(|e| AppError::Workbench(format!("write {}: {e}", path.display())))
 }
 
 fn to_forward_slash(p: &Path) -> String {
@@ -241,7 +249,13 @@ async fn refuse_if_nested(root: &Path) -> AppResult<()> {
         }
     }
 
-    if let Ok(super_wt) = git::run(&ctx, &["rev-parse", "--show-superproject-working-tree"], None).await {
+    if let Ok(super_wt) = git::run(
+        &ctx,
+        &["rev-parse", "--show-superproject-working-tree"],
+        None,
+    )
+    .await
+    {
         if super_wt.success() && !super_wt.stdout.trim().is_empty() {
             return Err(AppError::Workbench(
                 "this project is a git submodule — cImp's worktree manager isn't supported inside a submodule.".to_string(),
@@ -308,7 +322,8 @@ pub async fn create(root: &Path, slug: &str) -> AppResult<PathBuf> {
     let base = head.stdout.trim().to_string();
     if base.is_empty() || base == "HEAD" {
         return Err(AppError::Workbench(
-            "cannot create a worktree while HEAD is detached — checkout a branch first.".to_string(),
+            "cannot create a worktree while HEAD is detached — checkout a branch first."
+                .to_string(),
         ));
     }
 
@@ -318,7 +333,17 @@ pub async fn create(root: &Path, slug: &str) -> AppResult<PathBuf> {
     // exists" — surface it as instructions instead, since dir+meta absence
     // alone doesn't prove the slug is free.
     let branch = branch_name(&slug);
-    let existing = git::run(&ctx, &["rev-parse", "-q", "--verify", &format!("refs/heads/{branch}")], None).await?;
+    let existing = git::run(
+        &ctx,
+        &[
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("refs/heads/{branch}"),
+        ],
+        None,
+    )
+    .await?;
     if existing.success() {
         return Err(AppError::Workbench(format!(
             "branch '{branch}' already exists (likely left over from an earlier worktree) — delete it with `git branch -D {branch}` or pick a different name."
@@ -331,7 +356,12 @@ pub async fn create(root: &Path, slug: &str) -> AppResult<PathBuf> {
     }
 
     let path_str = path.to_string_lossy().into_owned();
-    let add = git::run(&ctx, &["worktree", "add", &path_str, "-b", &branch], Some(BULK_TIMEOUT)).await?;
+    let add = git::run(
+        &ctx,
+        &["worktree", "add", &path_str, "-b", &branch],
+        Some(BULK_TIMEOUT),
+    )
+    .await?;
     if !add.success() {
         return Err(AppError::Workbench(format!(
             "git worktree add failed: {}",
@@ -345,7 +375,12 @@ pub async fn create(root: &Path, slug: &str) -> AppResult<PathBuf> {
         // meta write would otherwise wedge the slug as an orphan only a manual
         // `git worktree remove` could clear. Best-effort cleanup; the original
         // write error is what we surface.
-        let _ = git::run(&ctx, &["worktree", "remove", "--force", &path_str], Some(BULK_TIMEOUT)).await;
+        let _ = git::run(
+            &ctx,
+            &["worktree", "remove", "--force", &path_str],
+            Some(BULK_TIMEOUT),
+        )
+        .await;
         let _ = git::run(&ctx, &["branch", "-D", &branch], None).await;
         return Err(e);
     }
@@ -370,12 +405,16 @@ fn parse_worktree_porcelain(raw: &str) -> Vec<RawWorktree> {
     let mut path: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
 
-    let flush = |path: &mut Option<PathBuf>, branch: &mut Option<String>, out: &mut Vec<RawWorktree>| {
-        if let Some(p) = path.take() {
-            out.push(RawWorktree { path: p, branch: branch.take() });
-        }
-        *branch = None;
-    };
+    let flush =
+        |path: &mut Option<PathBuf>, branch: &mut Option<String>, out: &mut Vec<RawWorktree>| {
+            if let Some(p) = path.take() {
+                out.push(RawWorktree {
+                    path: p,
+                    branch: branch.take(),
+                });
+            }
+            *branch = None;
+        };
 
     for line in raw.lines() {
         if line.is_empty() {
@@ -386,7 +425,10 @@ fn parse_worktree_porcelain(raw: &str) -> Vec<RawWorktree> {
             flush(&mut path, &mut branch, &mut out);
             path = Some(PathBuf::from(p));
         } else if let Some(b) = line.strip_prefix("branch ") {
-            branch = b.strip_prefix("refs/heads/").map(str::to_string).or_else(|| Some(b.to_string()));
+            branch = b
+                .strip_prefix("refs/heads/")
+                .map(str::to_string)
+                .or_else(|| Some(b.to_string()));
         }
     }
     flush(&mut path, &mut branch, &mut out);
@@ -440,16 +482,22 @@ pub async fn list(root: &Path) -> AppResult<Vec<WorktreeInfo>> {
     let worktrees_root = git::canonical_path(&root.join(WORKTREES_DIR));
     let mut infos = Vec::new();
     for raw in parse_worktree_porcelain(&out.stdout) {
-        let Some(parent) = raw.path.parent() else { continue };
+        let Some(parent) = raw.path.parent() else {
+            continue;
+        };
         if git::canonical_path(parent) != worktrees_root {
             continue; // not one of ours
         }
-        let Some(slug) = raw.path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(slug) = raw.path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         let Some(branch) = &raw.branch else { continue }; // detached — never ours
         if branch != &branch_name(slug) {
             continue; // a directory here that isn't the branch we'd have created
         }
-        let Ok(meta) = read_meta(root, slug) else { continue }; // not cImp-managed (no meta)
+        let Ok(meta) = read_meta(root, slug) else {
+            continue;
+        }; // not cImp-managed (no meta)
         let (ahead, behind) = ahead_behind(&ctx, &meta.base, branch).await;
         infos.push(WorktreeInfo {
             slug: slug.to_string(),
@@ -516,7 +564,12 @@ pub async fn merge(root: &Path, slug: &str) -> AppResult<MergeReport> {
     // surfaces through the conflict path below) — without it, one stray build
     // artifact or agent-written scratch file in the main tree would block
     // every merge with a misleading "uncommitted changes" error.
-    let status = git::run(&ctx, &["status", "--porcelain", "--untracked-files=no"], None).await?;
+    let status = git::run(
+        &ctx,
+        &["status", "--porcelain", "--untracked-files=no"],
+        None,
+    )
+    .await?;
     if !status.success() {
         return Err(AppError::Workbench(format!(
             "couldn't check the main tree's status: {}",
@@ -577,9 +630,16 @@ pub async fn merge(root: &Path, slug: &str) -> AppResult<MergeReport> {
 
     let fast_forward = merge_out.stdout.contains("Fast-forward");
     let head = git::run(&ctx, &["rev-parse", "HEAD"], None).await?;
-    let commit = if head.success() { head.stdout.trim().to_string() } else { String::new() };
+    let commit = if head.success() {
+        head.stdout.trim().to_string()
+    } else {
+        String::new()
+    };
 
-    Ok(MergeReport { fast_forward, commit })
+    Ok(MergeReport {
+        fast_forward,
+        commit,
+    })
 }
 
 // ── diff (D3's Diff row action) ─────────────────────────────────────────
@@ -592,14 +652,23 @@ pub async fn merge(root: &Path, slug: &str) -> AppResult<MergeReport> {
 /// render this with the same file/hunk shapes. Read-only: this is a diff
 /// between two commits, not a working-tree diff, so there is no revert
 /// action here (unlike Phase B's `DiffView`).
-pub async fn diff_against_base(root: &Path, slug: &str, context: u32) -> AppResult<Vec<super::diff::FileDiff>> {
+pub async fn diff_against_base(
+    root: &Path,
+    slug: &str,
+    context: u32,
+) -> AppResult<Vec<super::diff::FileDiff>> {
     let slug = sanitize_slug(slug)?;
     let meta = read_meta(root, &slug)?;
     let ctx = GitCtx::discover(root);
     let branch = branch_name(&slug);
     let spec = format!("{}...{}", meta.base, branch);
     let unified = format!("--unified={}", context.min(super::diff::MAX_CONTEXT));
-    let out = git::run(&ctx, &["diff", "--no-color", "--no-renames", &unified, &spec], Some(BULK_TIMEOUT)).await?;
+    let out = git::run(
+        &ctx,
+        &["diff", "--no-color", "--no-renames", &unified, &spec],
+        Some(BULK_TIMEOUT),
+    )
+    .await?;
     if !out.success() {
         return Err(AppError::Workbench(format!(
             "git diff {spec} failed: {}",
@@ -636,7 +705,12 @@ pub async fn discard(root: &Path, slug: &str) -> AppResult<()> {
     let path_str = path.to_string_lossy().into_owned();
     let branch = branch_name(&slug);
 
-    let remove = git::run(&ctx, &["worktree", "remove", "--force", &path_str], Some(BULK_TIMEOUT)).await?;
+    let remove = git::run(
+        &ctx,
+        &["worktree", "remove", "--force", &path_str],
+        Some(BULK_TIMEOUT),
+    )
+    .await?;
     if !remove.success() {
         // If the directory is simply already gone, `worktree remove` fails
         // but there's nothing left to clean up on that front — `prune` (or
@@ -693,8 +767,16 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git").args(args).current_dir(dir).output().expect("git");
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn user_repo(tag: &str) -> PathBuf {
@@ -730,8 +812,13 @@ mod tests {
 
     #[test]
     fn sanitize_slug_rejects_windows_reserved_names() {
-        for name in ["con", "CON", "nul", "Aux", "prn", "com1", "COM9", "lpt1", "LPT9"] {
-            assert!(sanitize_slug(name).is_err(), "{name} should be rejected as reserved");
+        for name in [
+            "con", "CON", "nul", "Aux", "prn", "com1", "COM9", "lpt1", "LPT9",
+        ] {
+            assert!(
+                sanitize_slug(name).is_err(),
+                "{name} should be rejected as reserved"
+            );
         }
         // A reserved stem with extra characters is a normal, allowed name.
         assert!(sanitize_slug("console").is_ok());
@@ -753,9 +840,10 @@ mod tests {
         assert!(wt_path.exists());
         assert_eq!(wt_path, dir.join(".cimp/worktrees/my-task"));
 
-        let meta: WorktreeMeta =
-            serde_json::from_str(&std::fs::read_to_string(dir.join(".cimp/worktrees/my-task.meta.json")).unwrap())
-                .unwrap();
+        let meta: WorktreeMeta = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".cimp/worktrees/my-task.meta.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(meta.base, "main");
 
         // One commit ahead in the worktree, zero behind.
@@ -847,7 +935,9 @@ mod tests {
         let dir = user_repo("exclude");
         create(&dir, "task").await.expect("create");
 
-        let status = git::run(&GitCtx::discover(&dir), &["status", "--porcelain"], None).await.unwrap();
+        let status = git::run(&GitCtx::discover(&dir), &["status", "--porcelain"], None)
+            .await
+            .unwrap();
         assert!(
             status.stdout.trim().is_empty(),
             "the main tree must stay clean after creating a worktree, got: {:?}",
@@ -857,7 +947,11 @@ mod tests {
         // Idempotent: creating a second worktree doesn't duplicate the line.
         create(&dir, "task2").await.expect("create 2");
         let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap();
-        assert_eq!(exclude.matches(".cimp/").count(), 1, "the exclude line must not be duplicated");
+        assert_eq!(
+            exclude.matches(".cimp/").count(),
+            1,
+            "the exclude line must not be duplicated"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -927,7 +1021,9 @@ mod tests {
         git(&dir, &["add", "main_only.txt"]);
         git(&dir, &["commit", "-q", "-m", "main commit"]);
 
-        let files = diff_against_base(&dir, "feature", 3).await.expect("diff_against_base");
+        let files = diff_against_base(&dir, "feature", 3)
+            .await
+            .expect("diff_against_base");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "feat.txt");
 
@@ -966,7 +1062,10 @@ mod tests {
             .current_dir(&dir)
             .output()
             .unwrap();
-        assert!(!merge_head.status.success(), "MERGE_HEAD must not exist after an aborted merge");
+        assert!(
+            !merge_head.status.success(),
+            "MERGE_HEAD must not exist after an aborted merge"
+        );
 
         let head_after = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -974,7 +1073,10 @@ mod tests {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap();
-        assert_eq!(head_before, head_after, "HEAD must be unchanged after an aborted merge");
+        assert_eq!(
+            head_before, head_after,
+            "HEAD must be unchanged after an aborted merge"
+        );
 
         let status = std::process::Command::new("git")
             .args(["status", "--porcelain"])
@@ -982,9 +1084,15 @@ mod tests {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap();
-        assert!(status.is_empty(), "main tree must be clean after an aborted merge, got: {status:?}");
+        assert!(
+            status.is_empty(),
+            "main tree must be clean after an aborted merge, got: {status:?}"
+        );
 
-        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "main edit\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "main edit\n"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1027,10 +1135,15 @@ mod tests {
         // An untracked scratch file in the main tree, unrelated to the merge.
         std::fs::write(dir.join("scratch.log"), "build noise\n").unwrap();
 
-        let report = merge(&dir, "feature").await.expect("merge with untracked file present");
+        let report = merge(&dir, "feature")
+            .await
+            .expect("merge with untracked file present");
         assert!(report.fast_forward);
         assert!(dir.join("feat.txt").exists());
-        assert!(dir.join("scratch.log").exists(), "the untracked file must be left alone");
+        assert!(
+            dir.join("scratch.log").exists(),
+            "the untracked file must be left alone"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1049,8 +1162,14 @@ mod tests {
 
         let err = create(&dir, "feature").await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("cimp/feature"), "error should name the branch: {msg}");
-        assert!(msg.contains("already exists"), "error should say it exists: {msg}");
+        assert!(
+            msg.contains("cimp/feature"),
+            "error should name the branch: {msg}"
+        );
+        assert!(
+            msg.contains("already exists"),
+            "error should say it exists: {msg}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1086,10 +1205,17 @@ mod tests {
         discard(&dir, "throwaway").await.expect("discard");
 
         assert!(!wt_path.exists(), "worktree directory must be removed");
-        assert!(!meta_path(&dir, "throwaway").exists(), "meta file must be removed");
-        let branch = git::run(&GitCtx::discover(&dir), &["branch", "--list", "cimp/throwaway"], None)
-            .await
-            .unwrap();
+        assert!(
+            !meta_path(&dir, "throwaway").exists(),
+            "meta file must be removed"
+        );
+        let branch = git::run(
+            &GitCtx::discover(&dir),
+            &["branch", "--list", "cimp/throwaway"],
+            None,
+        )
+        .await
+        .unwrap();
         assert!(branch.stdout.trim().is_empty(), "branch must be deleted");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1123,8 +1249,17 @@ mod tests {
 
         prune(&dir).await.expect("prune");
 
-        let out = git::run(&GitCtx::discover(&dir), &["worktree", "list", "--porcelain"], None).await.unwrap();
-        assert!(!out.stdout.contains("gone"), "pruned worktree must no longer be listed");
+        let out = git::run(
+            &GitCtx::discover(&dir),
+            &["worktree", "list", "--porcelain"],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.stdout.contains("gone"),
+            "pruned worktree must no longer be listed"
+        );
 
         let _ = std::fs::remove_file(meta_path(&dir, "gone"));
         let _ = std::fs::remove_dir_all(&dir);

@@ -241,7 +241,14 @@ async fn drain_new_lines(
             record_tool_events(&obj, project_dir, session_id, ctx);
             // Parent transcript: Session by default; `record_usage` upgrades an
             // inline `isSidechain:true` line to Agent (1.x sub-agent contract).
-            record_usage(&obj, tool_names, project_dir, session_id, ctx, crate::graph::UsageOrigin::Session);
+            record_usage(
+                &obj,
+                tool_names,
+                project_dir,
+                session_id,
+                ctx,
+                crate::graph::UsageOrigin::Session,
+            );
             record_commit_events(&obj, commit_calls, project_dir, session_id, ctx);
             for (key, text) in assistant_texts(&obj) {
                 if seen.insert(key) {
@@ -457,25 +464,45 @@ fn record_tool_events(obj: &Value, project_dir: &Path, session_id: &str, ctx: &O
     if obj.get("type").and_then(Value::as_str) != Some("assistant") {
         return;
     }
-    let Some(parts) = message_parts(obj) else { return };
+    let Some(parts) = message_parts(obj) else {
+        return;
+    };
     for part in parts {
         if part.get("type").and_then(Value::as_str) != Some("tool_use") {
             continue;
         }
-        let Some(name) = part.get("name").and_then(Value::as_str) else { continue };
+        let Some(name) = part.get("name").and_then(Value::as_str) else {
+            continue;
+        };
         // V16 Feature 4: every Bash command is also tested against the
         // session's recent read-advisor reminders — a `cat`/`Get-Content`
         // of a just-reminded file is the advisor's blind spot, and this tap
         // already sees the full command string for free.
         if name == "Bash" {
-            if let Some(cmd) = part.get("input").and_then(|i| i.get("command")).and_then(Value::as_str)
+            if let Some(cmd) = part
+                .get("input")
+                .and_then(|i| i.get("command"))
+                .and_then(Value::as_str)
             {
                 ctx.check_bypass(project_dir, session_id, cmd);
             }
         }
-        let Some((kind, arg)) = crate::graph::classify_tool(name) else { continue };
-        let Some((path, detail)) = mem_target(arg, part.get("input")) else { continue };
-        ctx.record_mem(project_dir, session_id, "claude", kind, &path, None, None, detail.as_deref());
+        let Some((kind, arg)) = crate::graph::classify_tool(name) else {
+            continue;
+        };
+        let Some((path, detail)) = mem_target(arg, part.get("input")) else {
+            continue;
+        };
+        ctx.record_mem(
+            project_dir,
+            session_id,
+            "claude",
+            kind,
+            &path,
+            None,
+            None,
+            detail.as_deref(),
+        );
     }
 }
 
@@ -494,11 +521,17 @@ fn mem_target(
         // Read/Edit key the target as `file_path`; NotebookRead/NotebookEdit
         // key it as `notebook_path`.
         crate::graph::MemArg::Path => (
-            get("file_path").or_else(|| get("notebook_path")).unwrap_or("").to_string(),
+            get("file_path")
+                .or_else(|| get("notebook_path"))
+                .unwrap_or("")
+                .to_string(),
             None,
         ),
         crate::graph::MemArg::Pattern => (
-            get("pattern").or_else(|| get("path")).unwrap_or("").to_string(),
+            get("pattern")
+                .or_else(|| get("path"))
+                .unwrap_or("")
+                .to_string(),
             None,
         ),
         crate::graph::MemArg::Command => (
@@ -580,15 +613,26 @@ fn usage_origin(obj: &Value, base_origin: crate::graph::UsageOrigin) -> crate::g
 /// numbers overwrites this one in place rather than leaving a duplicate zero
 /// row. `None` for any non-assistant line or an assistant line with no
 /// `message.id`.
-fn parse_usage_line(obj: &Value, origin: crate::graph::UsageOrigin) -> Option<crate::graph::UsageEvent> {
+fn parse_usage_line(
+    obj: &Value,
+    origin: crate::graph::UsageOrigin,
+) -> Option<crate::graph::UsageEvent> {
     if obj.get("type").and_then(Value::as_str) != Some("assistant") {
         return None;
     }
     let message = obj.get("message")?;
     let msg_id = message.get("id").and_then(Value::as_str)?.to_string();
-    let model = message.get("model").and_then(Value::as_str).map(str::to_string);
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let usage = message.get("usage");
-    let tok = |k: &str| -> u32 { usage.and_then(|u| u.get(k)).and_then(Value::as_u64).unwrap_or(0) as u32 };
+    let tok = |k: &str| -> u32 {
+        usage
+            .and_then(|u| u.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32
+    };
     Some(crate::graph::UsageEvent::Turn {
         msg_id,
         model,
@@ -608,13 +652,17 @@ fn extract_tool_results(obj: &Value) -> Vec<(String, usize)> {
     if obj.get("type").and_then(Value::as_str) != Some("user") {
         return Vec::new();
     }
-    let Some(parts) = message_parts(obj) else { return Vec::new() };
+    let Some(parts) = message_parts(obj) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for part in parts {
         if part.get("type").and_then(Value::as_str) != Some("tool_result") {
             continue;
         }
-        let Some(id) = part.get("tool_use_id").and_then(Value::as_str) else { continue };
+        let Some(id) = part.get("tool_use_id").and_then(Value::as_str) else {
+            continue;
+        };
         let chars = tool_result_chars(part.get("content").unwrap_or(&Value::Null));
         out.push((id.to_string(), chars));
     }
@@ -642,7 +690,10 @@ fn tool_result_text_blocks(content: &Value) -> Vec<&str> {
 /// Character length of a `tool_result` block's `content` — the estimated-
 /// token proxy for usage accounting.
 fn tool_result_chars(content: &Value) -> usize {
-    tool_result_text_blocks(content).iter().map(|t| t.chars().count()).sum()
+    tool_result_text_blocks(content)
+        .iter()
+        .map(|t| t.chars().count())
+        .sum()
 }
 
 // ── Session→commit provenance tap ─────────────────────────────────────────
@@ -663,7 +714,14 @@ fn tool_result_is_error(part: &Value) -> bool {
 
 /// Git global flags that take their value as a SEPARATE token (the `=`
 /// forms are single tokens and skipped by the leading-`-` rule).
-const GIT_VALUE_FLAGS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"];
+const GIT_VALUE_FLAGS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+];
 
 /// Token-level check for "this shell command actually invokes `git commit`":
 /// finds a `git` token (bare, path-suffixed, or `git.exe`), skips global
@@ -759,9 +817,15 @@ fn parse_commit_hashes(output: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in output.lines() {
         let line = line.trim_start();
-        let Some(rest) = line.strip_prefix('[') else { continue };
-        let Some(close) = rest.find(']') else { continue };
-        let Some(tok) = rest[..close].split_whitespace().last() else { continue };
+        let Some(rest) = line.strip_prefix('[') else {
+            continue;
+        };
+        let Some(close) = rest.find(']') else {
+            continue;
+        };
+        let Some(tok) = rest[..close].split_whitespace().last() else {
+            continue;
+        };
         let is_hash = (7..=40).contains(&tok.len()) && tok.bytes().all(|b| b.is_ascii_hexdigit());
         if is_hash && !out.iter().any(|h| h == tok) {
             out.push(tok.to_string());
@@ -794,7 +858,9 @@ fn record_commit_events(
     if ctx.mem.is_none() {
         return;
     }
-    let Some(parts) = message_parts(obj) else { return };
+    let Some(parts) = message_parts(obj) else {
+        return;
+    };
     match obj.get("type").and_then(Value::as_str) {
         // Mark candidate commit commands (assistant lines). `--dry-run`
         // never creates a commit and prints no summary, so tracking it
@@ -804,7 +870,9 @@ fn record_commit_events(
                 if part.get("type").and_then(Value::as_str) != Some("tool_use") {
                     continue;
                 }
-                let Some(id) = part.get("id").and_then(Value::as_str) else { continue };
+                let Some(id) = part.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
                 let Some(cmd) = part
                     .get("input")
                     .and_then(|i| i.get("command"))
@@ -823,7 +891,9 @@ fn record_commit_events(
                 if part.get("type").and_then(Value::as_str) != Some("tool_result") {
                     continue;
                 }
-                let Some(id) = part.get("tool_use_id").and_then(Value::as_str) else { continue };
+                let Some(id) = part.get("tool_use_id").and_then(Value::as_str) else {
+                    continue;
+                };
                 if !commit_calls.contains(id) {
                     continue;
                 }
@@ -909,9 +979,10 @@ fn record_usage(
     if let Some(parts) = message_parts(obj) {
         for part in parts {
             if part.get("type").and_then(Value::as_str) == Some("tool_use") {
-                if let (Some(id), Some(name)) =
-                    (part.get("id").and_then(Value::as_str), part.get("name").and_then(Value::as_str))
-                {
+                if let (Some(id), Some(name)) = (
+                    part.get("id").and_then(Value::as_str),
+                    part.get("name").and_then(Value::as_str),
+                ) {
                     tool_names.insert(id.to_string(), name.to_string());
                 }
             }
@@ -928,7 +999,10 @@ fn record_usage(
             project_dir,
             session_id,
             "claude",
-            crate::graph::UsageEvent::ToolResult { tool, chars: chars as u32 },
+            crate::graph::UsageEvent::ToolResult {
+                tool,
+                chars: chars as u32,
+            },
         );
     }
 }
@@ -982,7 +1056,10 @@ impl SubagentState {
     /// Fresh state for a new session file. `skip_backlog` is the parent
     /// tail's first-attach flag at rotation time.
     fn reset(&mut self, skip_backlog: bool) {
-        *self = SubagentState { skip_backlog, ..SubagentState::default() };
+        *self = SubagentState {
+            skip_backlog,
+            ..SubagentState::default()
+        };
     }
 
     /// One poll tick: discover and drain `<root>/<sid>/subagents/*.jsonl`,
@@ -1010,10 +1087,13 @@ impl SubagentState {
                 continue;
             }
             let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            let tail = self.files.entry(path.clone()).or_insert_with(|| SubagentFile {
-                offset: if seek_to_eof { len } else { 0 },
-                ..SubagentFile::default()
-            });
+            let tail = self
+                .files
+                .entry(path.clone())
+                .or_insert_with(|| SubagentFile {
+                    offset: if seek_to_eof { len } else { 0 },
+                    ..SubagentFile::default()
+                });
             if len <= tail.offset {
                 continue; // nothing new — skip the open entirely.
             }
@@ -1083,7 +1163,10 @@ impl SubagentState {
             return;
         }
         self.drift_reported = true;
-        debug!(session = session_id, summary, "Claude OOB: sub-agent contract drift");
+        debug!(
+            session = session_id,
+            summary, "Claude OOB: sub-agent contract drift"
+        );
         report_subagent_drift(project_dir, session_id, summary);
     }
 
@@ -1154,7 +1237,11 @@ fn read_complete_lines(path: &Path, offset: u64) -> Option<(String, u64)> {
 /// `~/.claude/projects/<slug>/` for `project_dir`. `None` if no home dir.
 fn project_root(project_dir: &Path) -> Option<PathBuf> {
     let home = home_dir()?;
-    Some(home.join(".claude").join("projects").join(slug_for(project_dir)))
+    Some(
+        home.join(".claude")
+            .join("projects")
+            .join(slug_for(project_dir)),
+    )
 }
 
 /// Claude Code's project-dir slug: every path separator and `:` becomes `-`.
@@ -1162,7 +1249,13 @@ fn project_root(project_dir: &Path) -> Option<PathBuf> {
 fn slug_for(dir: &Path) -> String {
     dir.to_string_lossy()
         .chars()
-        .map(|c| if c == '\\' || c == '/' || c == ':' { '-' } else { c })
+        .map(|c| {
+            if c == '\\' || c == '/' || c == ':' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -1240,18 +1333,28 @@ mod tests {
 
     #[test]
     fn parse_commit_hashes_reads_git_summary_lines() {
-        let out = "[develop 337bc57] feat(code-intel): session dates\n 5 files changed, 60 insertions(+)";
+        let out =
+            "[develop 337bc57] feat(code-intel): session dates\n 5 files changed, 60 insertions(+)";
         assert_eq!(parse_commit_hashes(out), vec!["337bc57"]);
         // Root-commit and detached-HEAD decorations still end with the hash.
-        assert_eq!(parse_commit_hashes("[main (root-commit) abc1234] initial"), vec!["abc1234"]);
-        assert_eq!(parse_commit_hashes("[detached HEAD 1a2b3c4] fixup"), vec!["1a2b3c4"]);
+        assert_eq!(
+            parse_commit_hashes("[main (root-commit) abc1234] initial"),
+            vec!["abc1234"]
+        );
+        assert_eq!(
+            parse_commit_hashes("[detached HEAD 1a2b3c4] fixup"),
+            vec!["1a2b3c4"]
+        );
         // Two commits from one chained command; duplicates collapse.
         let two = "[develop aaa1111] one\nnoise\n[develop bbb2222] two\n[develop bbb2222] two";
         assert_eq!(parse_commit_hashes(two), vec!["aaa1111", "bbb2222"]);
         // An all-digit token is still a legitimate short hash (~4% of them
         // are); bogus ones are filtered at query time by prefix-matching
         // against the real log.
-        assert_eq!(parse_commit_hashes("[develop 1234567] all-digit hash"), vec!["1234567"]);
+        assert_eq!(
+            parse_commit_hashes("[develop 1234567] all-digit hash"),
+            vec!["1234567"]
+        );
         // Non-hex or short tokens are not hashes.
         assert!(parse_commit_hashes("[branch xyzzy99] not hex").is_empty());
         assert!(parse_commit_hashes("[short ab12] too short").is_empty());
@@ -1264,7 +1367,9 @@ mod tests {
         assert!(is_git_commit_invocation("git -C sub commit --amend"));
         assert!(is_git_commit_invocation("git -c user.name=x commit"));
         assert!(is_git_commit_invocation("git add . && git commit -m 'y'"));
-        assert!(is_git_commit_invocation(r#"& "C:\Program Files\Git\bin\git.exe" commit -m z"#));
+        assert!(is_git_commit_invocation(
+            r#"& "C:\Program Files\Git\bin\git.exe" commit -m z"#
+        ));
         assert!(!is_git_commit_invocation("git status"));
         assert!(!is_git_commit_invocation("git log --grep=commit"));
         assert!(!is_git_commit_invocation("git log --grep commit"));
@@ -1393,12 +1498,10 @@ mod tests {
         let mut agents = HashSet::new();
 
         // Two agents launched in one assistant message → single active edge.
-        let both = obj(
-            r#"{"type":"assistant","message":{"id":"a1","content":[
+        let both = obj(r#"{"type":"assistant","message":{"id":"a1","content":[
                 {"type":"tool_use","id":"toolu_1","name":"Task","input":{}},
                 {"type":"tool_use","id":"toolu_2","name":"Task","input":{}}
-            ]}}"#,
-        );
+            ]}}"#);
         update_agents(&both, &mut agents, &ctx);
         assert!(matches!(
             sig.try_recv(),
@@ -1422,13 +1525,14 @@ mod tests {
     fn non_task_tool_use_is_ignored() {
         let (ctx, mut sig) = agent_ctx();
         let mut agents = HashSet::new();
-        let bash = obj(
-            r#"{"type":"assistant","message":{"id":"a1","content":[
+        let bash = obj(r#"{"type":"assistant","message":{"id":"a1","content":[
                 {"type":"tool_use","id":"toolu_b","name":"Bash","input":{}}
-            ]}}"#,
-        );
+            ]}}"#);
         update_agents(&bash, &mut agents, &ctx);
-        assert!(sig.try_recv().is_err(), "non-Task tool must not mark agents active");
+        assert!(
+            sig.try_recv().is_err(),
+            "non-Task tool must not mark agents active"
+        );
         assert!(agents.is_empty());
     }
 
@@ -1517,9 +1621,13 @@ mod tests {
         ));
 
         // Plain-string user prompt.
-        let prompt = obj(r#"{"type":"user","message":{"role":"user","content":"try again please"}}"#);
+        let prompt =
+            obj(r#"{"type":"user","message":{"role":"user","content":"try again please"}}"#);
         update_agents(&prompt, &mut agents, &ctx);
-        assert!(agents.is_empty(), "turn boundary must clear orphaned agents");
+        assert!(
+            agents.is_empty(),
+            "turn boundary must clear orphaned agents"
+        );
         assert!(matches!(
             sig.try_recv(),
             Ok(StateSignal::AgentsActiveChanged { active: false, .. })
@@ -1534,9 +1642,8 @@ mod tests {
         let mut agents = HashSet::new();
         update_agents(&launch("toolu_x"), &mut agents, &ctx);
         let _ = sig.try_recv();
-        let prompt = obj(
-            r#"{"type":"user","message":{"content":[{"type":"text","text":"next"}]}}"#,
-        );
+        let prompt =
+            obj(r#"{"type":"user","message":{"content":[{"type":"text","text":"next"}]}}"#);
         update_agents(&prompt, &mut agents, &ctx);
         assert!(agents.is_empty());
         assert!(matches!(
@@ -1552,14 +1659,15 @@ mod tests {
         // remove just its own id, leaving other agents outstanding.
         let (ctx, mut sig) = agent_ctx();
         let mut agents = HashSet::new();
-        let both = obj(
-            r#"{"type":"assistant","message":{"id":"a1","content":[
+        let both = obj(r#"{"type":"assistant","message":{"id":"a1","content":[
                 {"type":"tool_use","id":"toolu_1","name":"Task","input":{}},
                 {"type":"tool_use","id":"toolu_2","name":"Task","input":{}}
-            ]}}"#,
-        );
+            ]}}"#);
         update_agents(&both, &mut agents, &ctx);
-        assert!(matches!(sig.try_recv(), Ok(StateSignal::AgentsActiveChanged { active: true, .. })));
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+        ));
 
         // tool_result for one — is_user_prompt is false (only tool_result
         // parts), so it removes toolu_1 and leaves toolu_2 running: no edge.
@@ -1591,14 +1699,26 @@ mod tests {
         let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session)
             .expect("assistant line with usage yields an event");
         match ev {
-            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make, origin } => {
+            crate::graph::UsageEvent::Turn {
+                msg_id,
+                model,
+                in_tok,
+                out_tok,
+                cache_read,
+                cache_make,
+                origin,
+            } => {
                 assert_eq!(msg_id, "m1");
                 assert_eq!(model.as_deref(), Some("claude-x"));
                 assert_eq!(in_tok, 100);
                 assert_eq!(out_tok, 20);
                 assert_eq!(cache_read, 50);
                 assert_eq!(cache_make, 5);
-                assert_eq!(origin, crate::graph::UsageOrigin::Session, "origin flows through from the caller");
+                assert_eq!(
+                    origin,
+                    crate::graph::UsageOrigin::Session,
+                    "origin flows through from the caller"
+                );
             }
             other => panic!("expected Turn, got {other:?}"),
         }
@@ -1613,7 +1733,15 @@ mod tests {
         let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session)
             .expect("absent usage still yields an event");
         match ev {
-            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make, .. } => {
+            crate::graph::UsageEvent::Turn {
+                msg_id,
+                model,
+                in_tok,
+                out_tok,
+                cache_read,
+                cache_make,
+                ..
+            } => {
                 assert_eq!(msg_id, "m2");
                 assert_eq!(model, None);
                 assert_eq!((in_tok, out_tok, cache_read, cache_make), (0, 0, 0, 0));
@@ -1626,12 +1754,16 @@ mod tests {
     fn parse_usage_line_partial_usage_defaults_missing_fields() {
         // A usage block with only some fields present (a plausible partial
         // stream update) — present fields are read, absent ones default to 0.
-        let line = obj(
-            r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7}}}"#,
-        );
+        let line = obj(r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7}}}"#);
         let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session).unwrap();
         match ev {
-            crate::graph::UsageEvent::Turn { in_tok, out_tok, cache_read, cache_make, .. } => {
+            crate::graph::UsageEvent::Turn {
+                in_tok,
+                out_tok,
+                cache_read,
+                cache_make,
+                ..
+            } => {
                 assert_eq!(in_tok, 7);
                 assert_eq!((out_tok, cache_read, cache_make), (0, 0, 0));
             }
@@ -1656,53 +1788,65 @@ mod tests {
         use crate::graph::UsageOrigin;
         // Parent-transcript line (no sidechain flag) → the caller's Session.
         let parent = obj(r#"{"type":"assistant","message":{"id":"m1"}}"#);
-        assert_eq!(usage_origin(&parent, UsageOrigin::Session), UsageOrigin::Session);
+        assert_eq!(
+            usage_origin(&parent, UsageOrigin::Session),
+            UsageOrigin::Session
+        );
         // Inline `isSidechain:true` line (1.x sub-agent) → Agent even from the
         // parent drain's Session default.
-        let sidechain =
-            obj(r#"{"type":"assistant","isSidechain":true,"message":{"id":"m2"}}"#);
-        assert_eq!(usage_origin(&sidechain, UsageOrigin::Session), UsageOrigin::Agent);
+        let sidechain = obj(r#"{"type":"assistant","isSidechain":true,"message":{"id":"m2"}}"#);
+        assert_eq!(
+            usage_origin(&sidechain, UsageOrigin::Session),
+            UsageOrigin::Agent
+        );
         // Sub-agent transcript FILE line (2.x) → the drain passes Agent; a plain
         // line there (no sidechain flag) stays Agent.
-        assert_eq!(usage_origin(&parent, UsageOrigin::Agent), UsageOrigin::Agent);
+        assert_eq!(
+            usage_origin(&parent, UsageOrigin::Agent),
+            UsageOrigin::Agent
+        );
     }
 
     #[test]
     fn extract_tool_results_reads_string_content() {
-        let line = obj(
-            r#"{"type":"user","message":{"content":[
+        let line = obj(r#"{"type":"user","message":{"content":[
                 {"type":"tool_result","tool_use_id":"toolu_1","content":"hello world"}
-            ]}}"#,
-        );
+            ]}}"#);
         let got = extract_tool_results(&line);
-        assert_eq!(got, vec![("toolu_1".to_string(), "hello world".chars().count())]);
+        assert_eq!(
+            got,
+            vec![("toolu_1".to_string(), "hello world".chars().count())]
+        );
     }
 
     #[test]
     fn extract_tool_results_sums_text_blocks_and_skips_non_text() {
-        let line = obj(
-            r#"{"type":"user","message":{"content":[
+        let line = obj(r#"{"type":"user","message":{"content":[
                 {"type":"tool_result","tool_use_id":"toolu_2","content":[
                     {"type":"text","text":"abc"},
                     {"type":"image","source":{}},
                     {"type":"text","text":"de"}
                 ]}
-            ]}}"#,
-        );
+            ]}}"#);
         let got = extract_tool_results(&line);
-        assert_eq!(got, vec![("toolu_2".to_string(), 5)], "only the two text blocks (3+2 chars) count");
+        assert_eq!(
+            got,
+            vec![("toolu_2".to_string(), 5)],
+            "only the two text blocks (3+2 chars) count"
+        );
     }
 
     #[test]
     fn extract_tool_results_handles_multiple_parallel_results() {
-        let line = obj(
-            r#"{"type":"user","message":{"content":[
+        let line = obj(r#"{"type":"user","message":{"content":[
                 {"type":"tool_result","tool_use_id":"toolu_a","content":"aa"},
                 {"type":"tool_result","tool_use_id":"toolu_b","content":"bbbb"}
-            ]}}"#,
-        );
+            ]}}"#);
         let got = extract_tool_results(&line);
-        assert_eq!(got, vec![("toolu_a".to_string(), 2), ("toolu_b".to_string(), 4)]);
+        assert_eq!(
+            got,
+            vec![("toolu_a".to_string(), 2), ("toolu_b".to_string(), 4)]
+        );
     }
 
     #[test]
@@ -1727,8 +1871,15 @@ mod tests {
         for i in 0..TOOL_NAME_RING_CAP {
             ring.insert(format!("toolu_gen_{i}"), "Bash".to_string());
         }
-        assert_eq!(ring.get("toolu_1"), None, "oldest entry evicted beyond the cap");
-        assert_eq!(ring.get(&format!("toolu_gen_{}", TOOL_NAME_RING_CAP - 1)), Some("Bash"));
+        assert_eq!(
+            ring.get("toolu_1"),
+            None,
+            "oldest entry evicted beyond the cap"
+        );
+        assert_eq!(
+            ring.get(&format!("toolu_gen_{}", TOOL_NAME_RING_CAP - 1)),
+            Some("Bash")
+        );
     }
 
     #[test]
@@ -1758,7 +1909,10 @@ mod tests {
             Some((String::new(), Some("cargo test".to_string())))
         );
         let read = obj(r#"{"file_path":"src/main.rs"}"#);
-        assert_eq!(mem_target(MemArg::Path, Some(&read)), Some(("src/main.rs".to_string(), None)));
+        assert_eq!(
+            mem_target(MemArg::Path, Some(&read)),
+            Some(("src/main.rs".to_string(), None))
+        );
     }
 
     #[test]
@@ -1769,13 +1923,22 @@ mod tests {
         let (ctx, _sig) = agent_ctx();
         let mut ring = ToolNameRing::default();
         let dir = std::env::temp_dir();
-        let line = obj(
-            r#"{"type":"assistant","message":{"id":"m1","content":[
+        let line = obj(r#"{"type":"assistant","message":{"id":"m1","content":[
                 {"type":"tool_use","id":"toolu_1","name":"Read","input":{}}
-            ],"usage":{"input_tokens":10,"output_tokens":2}}}"#,
+            ],"usage":{"input_tokens":10,"output_tokens":2}}}"#);
+        record_usage(
+            &line,
+            &mut ring,
+            &dir,
+            "s1",
+            &ctx,
+            crate::graph::UsageOrigin::Session,
         );
-        record_usage(&line, &mut ring, &dir, "s1", &ctx, crate::graph::UsageOrigin::Session);
-        assert_eq!(ring.get("toolu_1"), None, "mem is None, so the tap is a full no-op");
+        assert_eq!(
+            ring.get("toolu_1"),
+            None,
+            "mem is None, so the tap is a full no-op"
+        );
     }
 
     // ── Sub-agent transcript tail + drift canary ──────────────────────────
@@ -1818,7 +1981,10 @@ mod tests {
         let mut subs = SubagentState::default();
         subs.completion_seen = true; // even with a completed agent…
         subs.scan(&root, "s1", &root, &ctx);
-        assert!(subs.files.is_empty(), "mem is None, so no files are tracked");
+        assert!(
+            subs.files.is_empty(),
+            "mem is None, so no files are tracked"
+        );
         subs.drift_tick(&root, "s1", &ctx);
         assert!(!subs.drift_reported && subs.drift_ticks == 0);
         let _ = std::fs::remove_dir_all(&root);
@@ -1835,7 +2001,10 @@ mod tests {
 
         // A completed agent with traffic in neither location is drift.
         subs.completion_seen = true;
-        assert!(subs.drift_condition().unwrap().contains("transcripts moved"));
+        assert!(subs
+            .drift_condition()
+            .unwrap()
+            .contains("transcripts moved"));
 
         // Inline sidechain lines mean the 1.x contract is live — healthy.
         subs.sidechain_seen = true;
@@ -1843,7 +2012,8 @@ mod tests {
 
         // As does a tracked subagent file under the 2.x contract.
         subs.sidechain_seen = false;
-        subs.files.insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
+        subs.files
+            .insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
         assert_eq!(subs.drift_condition(), None);
     }
 
@@ -1852,8 +2022,12 @@ mod tests {
         // Transcript files with no recognized launch tool_use ⇒ the launcher
         // was renamed again (as Task→Agent was).
         let mut subs = SubagentState::default();
-        subs.files.insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
-        assert!(subs.drift_condition().unwrap().contains("launcher tool renamed"));
+        subs.files
+            .insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
+        assert!(subs
+            .drift_condition()
+            .unwrap()
+            .contains("launcher tool renamed"));
 
         // …unless we attached mid-session: the launches may predate us.
         subs.skip_backlog = true;
@@ -1871,7 +2045,8 @@ mod tests {
         subs.launch_seen = true;
         subs.completion_seen = true;
         subs.drift_ticks = 2;
-        subs.files.insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
+        subs.files
+            .insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
         subs.reset(true);
         assert!(subs.skip_backlog);
         assert!(subs.files.is_empty());

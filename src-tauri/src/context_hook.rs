@@ -36,7 +36,10 @@ pub fn run() {
     // a payload broken enough to make this shim bail still gets counted.
     report_contract_drift(
         "context_hook",
-        &missing_fields(&[("session_id", !session_id.is_empty()), ("cwd", !cwd_raw.is_empty())]),
+        &missing_fields(&[
+            ("session_id", !session_id.is_empty()),
+            ("cwd", !cwd_raw.is_empty()),
+        ]),
         session_id,
     );
     if prompt.trim().is_empty() {
@@ -55,7 +58,9 @@ pub fn run() {
     })
     .to_string();
 
-    let Some(text) = post_loopback("/context/retrieve", &body) else { return };
+    let Some(text) = post_loopback("/context/retrieve", &body) else {
+        return;
+    };
     if text.trim().is_empty() {
         return;
     }
@@ -97,7 +102,11 @@ pub(crate) fn resolve_cwd(cwd_raw: &str) -> String {
 /// `(name, present-and-non-empty)` pairs in, missing names out. Split from
 /// the reporter so the check is unit-testable without a socket.
 pub(crate) fn missing_fields(checks: &[(&'static str, bool)]) -> Vec<&'static str> {
-    checks.iter().filter(|(_, present)| !present).map(|(name, _)| *name).collect()
+    checks
+        .iter()
+        .filter(|(_, present)| !present)
+        .map(|(name, _)| *name)
+        .collect()
 }
 
 /// V16 Feature 3: report a hook payload that is missing required fields to
@@ -143,10 +152,16 @@ fn post_context(port: u16, token: &str, path: &str, body: &str) -> Option<String
     // Only parse a 2xx body — a 401 (bad token) or 4xx/5xx carries a non-JSON or
     // error body we must not treat as injectable context.
     let status_line = resp.lines().next().unwrap_or("");
-    if !status_line.split(' ').nth(1).is_some_and(|c| c.starts_with('2')) {
+    if !status_line
+        .split(' ')
+        .nth(1)
+        .is_some_and(|c| c.starts_with('2'))
+    {
         return None;
     }
     let start = resp.find("\r\n\r\n")? + 4;
     let json: serde_json::Value = serde_json::from_str(resp[start..].trim()).ok()?;
-    json.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+    json.get("text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
 }

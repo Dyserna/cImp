@@ -256,7 +256,11 @@ impl AuditState {
     /// Built under the lock, emitted after dropping it (the graph-service
     /// discipline — a same-thread listener must not re-lock `inner`).
     fn emit_event(&self) {
-        let snap = self.inner.lock().unwrap().snapshot(Some(EVENT_FINDINGS_PER_TOOL_CAP));
+        let snap = self
+            .inner
+            .lock()
+            .unwrap()
+            .snapshot(Some(EVENT_FINDINGS_PER_TOOL_CAP));
         let _ = self.app.emit(AUDIT_STATUS_EVENT, &snap);
     }
 
@@ -293,7 +297,10 @@ impl AuditState {
             .filter(|t| adapters::adapter(t.id).category == category)
             .collect();
         if !in_category.iter().any(|t| t.enabled) {
-            return Err(format!("no {} audit tools are enabled", category_label(category)));
+            return Err(format!(
+                "no {} audit tools are enabled",
+                category_label(category)
+            ));
         }
 
         // Take the census ONCE per scan, off the lock (the walk can take up to a
@@ -384,7 +391,8 @@ impl AuditState {
                     let cancel = cancel.clone();
                     let root = root.clone();
                     handles.push(tauri::async_runtime::spawn(async move {
-                        this.run_one(tool, resolved, root, git_repo, timeout, cancel).await;
+                        this.run_one(tool, resolved, root, git_repo, timeout, cancel)
+                            .await;
                     }));
                 }
             }
@@ -436,14 +444,22 @@ impl AuditState {
         // SARIF; for report-file tools it merely truncates captured logs.
         let sarif_truncated = adapter.transport == Transport::Stdout && cap.stdout_truncated;
         let (status, findings, error) = finalize_outcome(
-            tool.id, adapter, cap.outcome, &sarif, sarif_truncated, &cap.stdout, &cap.stderr,
-            &root, timeout,
+            tool.id,
+            adapter,
+            cap.outcome,
+            &sarif,
+            sarif_truncated,
+            &cap.stdout,
+            &cap.stderr,
+            &root,
+            timeout,
         );
 
         // Scan-coverage: the lockfiles/manifests osv-scanner reports scanning,
         // pulled from the same SARIF in a second best-effort pass (osv-scanner
         // only — its `runs[].artifacts` are the audit-only coverage signal).
-        let scanned_artifacts = if tool.id == AuditToolId::OsvScanner && status == ToolStatus::Done {
+        let scanned_artifacts = if tool.id == AuditToolId::OsvScanner && status == ToolStatus::Done
+        {
             parsers::sarif_scanned_artifacts(&sarif, &root)
         } else {
             Vec::new()
@@ -474,7 +490,11 @@ impl AuditState {
 fn temp_report_path(id: AuditToolId) -> PathBuf {
     let dir = std::env::temp_dir().join("cimp-audit");
     let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("{}-{}.sarif", id.command_name(), uuid::Uuid::new_v4()))
+    dir.join(format!(
+        "{}-{}.sarif",
+        id.command_name(),
+        uuid::Uuid::new_v4()
+    ))
 }
 
 /// Read the tool's SARIF from wherever its adapter delivers it.
@@ -534,7 +554,11 @@ fn finalize_outcome(
             Vec::new(),
             Some(format!("failed to launch: {e}")),
         ),
-        Outcome::Cancelled => (ToolStatus::Failed, Vec::new(), Some("scan cancelled".to_string())),
+        Outcome::Cancelled => (
+            ToolStatus::Failed,
+            Vec::new(),
+            Some("scan cancelled".to_string()),
+        ),
         Outcome::TimedOut => (
             ToolStatus::Failed,
             Vec::new(),
@@ -568,8 +592,9 @@ fn finalize_outcome(
                     // JSON) — the one thing this feature must not present as a
                     // clean pass.
                     if class == ExitClass::Findings && findings.is_empty() {
-                        let code_str =
-                            code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string());
+                        let code_str = code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
                         let tail = diag_tail(stderr, stdout);
                         let mut msg = format!(
                             "exit code {code_str} reports findings, but the SARIF report was empty or unreadable — findings were lost"
@@ -607,7 +632,9 @@ fn parse_findings(id: AuditToolId, output: &str, root: &Path) -> Vec<AuditFindin
 /// (clamped to ≥ 1s) wins; `None` falls back to the global
 /// `code_audit.timeout_secs` (`global`, already clamped ≥ 1s by the caller).
 fn effective_tool_timeout(tool_secs: Option<u64>, global: Duration) -> Duration {
-    tool_secs.map(|s| Duration::from_secs(s.max(1))).unwrap_or(global)
+    tool_secs
+        .map(|s| Duration::from_secs(s.max(1)))
+        .unwrap_or(global)
 }
 
 /// The lowercase category word used in the "no … tools are enabled" error.
@@ -636,7 +663,10 @@ fn plan_scan(
 ) -> (Vec<ToolState>, Vec<AuditToolConfig>) {
     let mut chips = Vec::new();
     let mut to_run = Vec::new();
-    for t in tools.iter().filter(|t| adapters::adapter(t.id).category == category) {
+    for t in tools
+        .iter()
+        .filter(|t| adapters::adapter(t.id).category == category)
+    {
         if !t.enabled {
             chips.push(ToolState::idle(t.id, category));
         } else if adapters::adapter(t.id).applicable(census) {
@@ -653,7 +683,9 @@ fn plan_scan(
 /// the tool's own diagnostics (stderr preferred, else stdout) so an offline /
 /// misconfigured run surfaces the tool's reason, not a bare code.
 fn exit_error_message(code: Option<i32>, stderr: &str, stdout: &str) -> String {
-    let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let code_str = code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     let tail = diag_tail(stderr, stdout);
     if tail.is_empty() {
         format!("exited with code {code_str}")
@@ -665,7 +697,11 @@ fn exit_error_message(code: Option<i32>, stderr: &str, stdout: &str) -> String {
 /// The last 3 lines of the tool's own diagnostics (stderr preferred, else
 /// stdout) — the short "why" tail appended to failure messages.
 fn diag_tail(stderr: &str, stdout: &str) -> String {
-    let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
     let lines: Vec<&str> = detail.lines().collect();
     lines[lines.len().saturating_sub(3)..].join("\n")
 }
@@ -755,8 +791,14 @@ async fn spawn_and_capture(
     // Backstop reaper if cImp dies hard before kill_on_drop fires.
     crate::process_guard::guard_child(&child);
 
-    let out_task = tokio::spawn(crate::procutil::read_capped(child.stdout.take(), MAX_OUTPUT_BYTES));
-    let err_task = tokio::spawn(crate::procutil::read_capped(child.stderr.take(), MAX_OUTPUT_BYTES));
+    let out_task = tokio::spawn(crate::procutil::read_capped(
+        child.stdout.take(),
+        MAX_OUTPUT_BYTES,
+    ));
+    let err_task = tokio::spawn(crate::procutil::read_capped(
+        child.stderr.take(),
+        MAX_OUTPUT_BYTES,
+    ));
 
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
@@ -778,7 +820,12 @@ async fn spawn_and_capture(
 
     let (stdout, stdout_truncated) = crate::procutil::drain_capture(out_task).await;
     let (stderr, _) = crate::procutil::drain_capture(err_task).await;
-    Capture { stdout, stdout_truncated, stderr, outcome }
+    Capture {
+        stdout,
+        stdout_truncated,
+        stderr,
+        outcome,
+    }
 }
 
 #[cfg(test)]
@@ -923,7 +970,10 @@ mod tests {
     #[test]
     fn osv_artifacts_extract_relative_deduped() {
         let a = parsers::sarif_scanned_artifacts(OSV_ARTIFACTS_SARIF, &root());
-        assert_eq!(a, vec!["Cargo.lock".to_string(), "package-lock.json".to_string()]);
+        assert_eq!(
+            a,
+            vec!["Cargo.lock".to_string(), "package-lock.json".to_string()]
+        );
     }
 
     #[test]
@@ -1052,7 +1102,15 @@ mod tests {
         let a = adapters::adapter(AuditToolId::Semgrep);
         let f = |o: Outcome| {
             finalize_outcome(
-                AuditToolId::Semgrep, a, o, "", false, "", "", &root(), Duration::from_secs(5),
+                AuditToolId::Semgrep,
+                a,
+                o,
+                "",
+                false,
+                "",
+                "",
+                &root(),
+                Duration::from_secs(5),
             )
         };
         let (s, _, e) = f(Outcome::TimedOut);
@@ -1150,7 +1208,11 @@ mod tests {
     /// clean bill.
     #[test]
     fn clean_exit_with_empty_output_is_done_no_findings() {
-        for id in [AuditToolId::Cppcheck, AuditToolId::Eslint, AuditToolId::Oxlint] {
+        for id in [
+            AuditToolId::Cppcheck,
+            AuditToolId::Eslint,
+            AuditToolId::Oxlint,
+        ] {
             let a = adapters::adapter(id);
             let (status, findings, error) = finalize_outcome(
                 id,
@@ -1226,7 +1288,10 @@ mod tests {
         assert!(chips.iter().all(|c| c.category == Category::Security));
         assert!(!chips.iter().any(|c| c.id == AuditToolId::Oxlint));
         let run_ids: Vec<AuditToolId> = to_run.iter().map(|t| t.id).collect();
-        assert_eq!(run_ids, vec![AuditToolId::OsvScanner, AuditToolId::Gitleaks]);
+        assert_eq!(
+            run_ids,
+            vec![AuditToolId::OsvScanner, AuditToolId::Gitleaks]
+        );
     }
 
     /// V25 Phase C: a per-tool `timeout_secs` override wins over the global; a
@@ -1235,9 +1300,15 @@ mod tests {
     fn effective_tool_timeout_prefers_override_else_global() {
         let global = Duration::from_secs(600);
         assert_eq!(effective_tool_timeout(None, global), global);
-        assert_eq!(effective_tool_timeout(Some(1200), global), Duration::from_secs(1200));
+        assert_eq!(
+            effective_tool_timeout(Some(1200), global),
+            Duration::from_secs(1200)
+        );
         // A 0 override is clamped to ≥ 1s (never an instant timeout).
-        assert_eq!(effective_tool_timeout(Some(0), global), Duration::from_secs(1));
+        assert_eq!(
+            effective_tool_timeout(Some(0), global),
+            Duration::from_secs(1)
+        );
     }
 
     // ── snapshot wire cap ───────────────────────────────────────────────────
@@ -1257,7 +1328,9 @@ mod tests {
                 col: None,
             },
         };
-        ts.findings = (0..EVENT_FINDINGS_PER_TOOL_CAP + 10).map(|_| one()).collect();
+        ts.findings = (0..EVENT_FINDINGS_PER_TOOL_CAP + 10)
+            .map(|_| one())
+            .collect();
         let inner = Inner {
             root: root(),
             scanning: false,
@@ -1270,7 +1343,10 @@ mod tests {
         let full = inner.snapshot(None);
         assert_eq!(full.total_findings, EVENT_FINDINGS_PER_TOOL_CAP + 10);
         assert!(!full.truncated);
-        assert_eq!(full.tools[0].findings.len(), EVENT_FINDINGS_PER_TOOL_CAP + 10);
+        assert_eq!(
+            full.tools[0].findings.len(),
+            EVENT_FINDINGS_PER_TOOL_CAP + 10
+        );
         // Event snapshot: capped, truncated flag set, total still true.
         let evt = inner.snapshot(Some(EVENT_FINDINGS_PER_TOOL_CAP));
         assert!(evt.truncated);
@@ -1295,7 +1371,10 @@ mod tests {
         };
         for cap in [None, Some(EVENT_FINDINGS_PER_TOOL_CAP)] {
             let snap = inner.snapshot(cap);
-            assert_eq!(snap.census.extensions, vec!["rs".to_string(), "ts".to_string()]);
+            assert_eq!(
+                snap.census.extensions,
+                vec!["rs".to_string(), "ts".to_string()]
+            );
             assert_eq!(snap.census.markers, vec!["Cargo.toml".to_string()]);
             assert_eq!(snap.tools[0].category, Category::Quality);
         }
@@ -1362,7 +1441,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert_keys(&serde_json::to_value(&snap).expect("snapshot serializes"), AUDIT_RUNTIME_TS);
+        assert_keys(
+            &serde_json::to_value(&snap).expect("snapshot serializes"),
+            AUDIT_RUNTIME_TS,
+        );
     }
 
     #[test]
@@ -1388,7 +1470,11 @@ mod tests {
             }
         }
         for s in statuses {
-            let wire = serde_json::to_value(s).unwrap().as_str().unwrap().to_string();
+            let wire = serde_json::to_value(s)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
             assert!(
                 AUDIT_RUNTIME_TS.contains(&format!("'{wire}'")),
                 "ToolStatus wire `{wire}` is missing from the TS `AuditToolStatus` union",
@@ -1405,7 +1491,11 @@ mod tests {
             }
         }
         for c in categories {
-            let wire = serde_json::to_value(c).unwrap().as_str().unwrap().to_string();
+            let wire = serde_json::to_value(c)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
             assert!(
                 AUDIT_RUNTIME_TS.contains(&format!("'{wire}'")),
                 "Category wire `{wire}` is missing from the TS `AuditCategory` union",
@@ -1419,7 +1509,11 @@ mod tests {
             }
         }
         for sev in severities {
-            let wire = serde_json::to_value(sev).unwrap().as_str().unwrap().to_string();
+            let wire = serde_json::to_value(sev)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
             assert!(
                 AUDIT_RUNTIME_TS.contains(&format!("'{wire}'")),
                 "Severity wire `{wire}` is missing from the TS `AuditSeverity` union",
@@ -1457,8 +1551,14 @@ mod tests {
         )
         .await;
         // Returns promptly (child killed), not after the ~30s sleep.
-        assert!(started.elapsed() < Duration::from_secs(10), "child was not killed on timeout");
-        assert!(matches!(cap.outcome, Outcome::TimedOut), "expected TimedOut");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "child was not killed on timeout"
+        );
+        assert!(
+            matches!(cap.outcome, Outcome::TimedOut),
+            "expected TimedOut"
+        );
     }
 
     #[tokio::test]
@@ -1481,8 +1581,14 @@ mod tests {
             &cancel,
         )
         .await;
-        assert!(started.elapsed() < Duration::from_secs(10), "child was not killed on cancel");
-        assert!(matches!(cap.outcome, Outcome::Cancelled), "expected Cancelled");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "child was not killed on cancel"
+        );
+        assert!(
+            matches!(cap.outcome, Outcome::Cancelled),
+            "expected Cancelled"
+        );
     }
 
     #[tokio::test]

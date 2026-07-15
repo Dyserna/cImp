@@ -288,7 +288,10 @@ fn offload_task_description(settings: &OffloadSettings) -> String {
             .to_string();
     }
 
-    let parts: Vec<String> = backends.iter().map(|b| backend_label(b, settings)).collect();
+    let parts: Vec<String> = backends
+        .iter()
+        .map(|b| backend_label(b, settings))
+        .collect();
     let any_local_file = backends
         .iter()
         .any(|b| !b.cloud_blocked() && b.tool_scope.allows("read_file"));
@@ -428,7 +431,15 @@ async fn run_one(
 ) -> Result<String, String> {
     let thinking = ThinkingMode::parse(&thinking_str);
     let tier = TierHint::parse(&tier_str);
-    match proxy_run(&instructions, context.as_deref(), &thinking_str, &tier_str, schema.as_ref()).await {
+    match proxy_run(
+        &instructions,
+        context.as_deref(),
+        &thinking_str,
+        &tier_str,
+        schema.as_ref(),
+    )
+    .await
+    {
         Some(r) => r,
         None => run_offload(instructions, context, thinking, tier, schema).await,
     }
@@ -452,7 +463,9 @@ async fn handle_batch_tool(params: Value) -> Result<Value, (i64, String)> {
         .cloned()
         .unwrap_or_default();
     if tasks.is_empty() {
-        return Ok(tool_error("offload_batch requires a non-empty `tasks` array"));
+        return Ok(tool_error(
+            "offload_batch requires a non-empty `tasks` array",
+        ));
     }
     if tasks.len() > MAX_TASKS {
         return Ok(tool_error(&format!(
@@ -1097,9 +1110,7 @@ async fn run_offload(
         .filter_map(ResolvedBackend::from_config)
         .collect();
     if resolved.is_empty() {
-        return Err(
-            "no offload backend is configured — add one in cImp Settings → Offload".into(),
-        );
+        return Err("no offload backend is configured — add one in cImp Settings → Offload".into());
     }
 
     let client = reqwest::Client::builder()
@@ -1174,8 +1185,15 @@ async fn run_offload(
     );
 
     let result = run_on_backend(
-        &client, &settings, &cwd, &resolved[chosen], &views[chosen], &instructions,
-        context.clone(), thinking, schema.clone(),
+        &client,
+        &settings,
+        &cwd,
+        &resolved[chosen],
+        &views[chosen],
+        &instructions,
+        context.clone(),
+        thinking,
+        schema.clone(),
     )
     .await;
 
@@ -1196,8 +1214,15 @@ async fn run_offload(
                         "offload: re-routing after connection failure"
                     );
                     let r = run_on_backend(
-                        &client, &settings, &cwd, &resolved[next], &views[next],
-                        &instructions, context.clone(), thinking, schema.clone(),
+                        &client,
+                        &settings,
+                        &cwd,
+                        &resolved[next],
+                        &views[next],
+                        &instructions,
+                        context.clone(),
+                        thinking,
+                        schema.clone(),
                     )
                     .await;
                     (r, next)
@@ -1227,8 +1252,15 @@ async fn run_offload(
                 "offload: escalating partially-verified fast-tier answer to the quality backend"
             );
             let esc = run_on_backend(
-                &client, &settings, &cwd, &resolved[q], &views[q],
-                &instructions, context.clone(), thinking, schema.clone(),
+                &client,
+                &settings,
+                &cwd,
+                &resolved[q],
+                &views[q],
+                &instructions,
+                context.clone(),
+                thinking,
+                schema.clone(),
             )
             .await;
             if let Ok(q_text) = esc {
@@ -1396,7 +1428,8 @@ mod tests {
         );
         let batch = offload_batch_tool();
         assert!(
-            batch["inputSchema"]["properties"]["tasks"]["items"]["properties"]["schema"].is_object(),
+            batch["inputSchema"]["properties"]["tasks"]["items"]["properties"]["schema"]
+                .is_object(),
             "offload_batch subtasks must advertise the optional schema param"
         );
     }

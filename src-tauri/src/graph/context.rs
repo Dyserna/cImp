@@ -64,8 +64,30 @@ pub fn est_tokens(chars: usize) -> usize {
 pub fn extract_terms(prompt: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for raw in prompt.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '"' | '\'' | '`' | '=' | '<' | '>' | '{' | '}' | '[' | ']' | '!' | '?' | ':')) {
-        let tok = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.');
+    for raw in prompt.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ',' | ';'
+                    | '('
+                    | ')'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | '='
+                    | '<'
+                    | '>'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '!'
+                    | '?'
+                    | ':'
+            )
+    }) {
+        let tok =
+            raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.');
         if tok.len() < 3 {
             continue;
         }
@@ -91,12 +113,60 @@ pub fn extract_terms(prompt: &str) -> Vec<String> {
 fn is_stopword(w: &str) -> bool {
     matches!(
         w,
-        "the" | "and" | "for" | "with" | "this" | "that" | "what" | "where" | "when" | "how"
-            | "why" | "does" | "did" | "can" | "could" | "would" | "should" | "are" | "was"
-            | "were" | "you" | "your" | "please" | "have" | "has" | "into" | "from"
-            | "code" | "file" | "files" | "function" | "class" | "add" | "fix" | "make" | "use"
-            | "using" | "them" | "then" | "there" | "here" | "about" | "which" | "some" | "any"
-            | "all" | "get" | "set" | "not" | "but" | "out" | "run" | "let" | "new"
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "this"
+            | "that"
+            | "what"
+            | "where"
+            | "when"
+            | "how"
+            | "why"
+            | "does"
+            | "did"
+            | "can"
+            | "could"
+            | "would"
+            | "should"
+            | "are"
+            | "was"
+            | "were"
+            | "you"
+            | "your"
+            | "please"
+            | "have"
+            | "has"
+            | "into"
+            | "from"
+            | "code"
+            | "file"
+            | "files"
+            | "function"
+            | "class"
+            | "add"
+            | "fix"
+            | "make"
+            | "use"
+            | "using"
+            | "them"
+            | "then"
+            | "there"
+            | "here"
+            | "about"
+            | "which"
+            | "some"
+            | "any"
+            | "all"
+            | "get"
+            | "set"
+            | "not"
+            | "but"
+            | "out"
+            | "run"
+            | "let"
+            | "new"
     )
 }
 
@@ -140,9 +210,17 @@ fn word_in_lower(fact_l: &str, stem_l: &str) -> bool {
     }
     let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
     fact_l.match_indices(stem_l).any(|(idx, matched)| {
-        let before_ok = fact_l[..idx].chars().next_back().map(|c| !is_word_char(c)).unwrap_or(true);
+        let before_ok = fact_l[..idx]
+            .chars()
+            .next_back()
+            .map(|c| !is_word_char(c))
+            .unwrap_or(true);
         let end = idx + matched.len();
-        let after_ok = fact_l[end..].chars().next().map(|c| !is_word_char(c)).unwrap_or(true);
+        let after_ok = fact_l[end..]
+            .chars()
+            .next()
+            .map(|c| !is_word_char(c))
+            .unwrap_or(true);
         before_ok && after_ok
     })
 }
@@ -344,7 +422,8 @@ pub fn build_context(
                     let unchanged = cur.as_deref() == Some(prev_hash.as_str());
                     // `current_turn < prev_turn` only after a restart reset the
                     // in-memory counter — treat that as expired (re-inject).
-                    let within = current_turn >= *prev_turn && current_turn - *prev_turn <= dedup_ttl;
+                    let within =
+                        current_turn >= *prev_turn && current_turn - *prev_turn <= dedup_ttl;
                     (unchanged && within, !unchanged)
                 }
                 None => (false, false),
@@ -401,7 +480,10 @@ pub fn build_context(
             continue;
         }
         if digest.chars().count() > room {
-            digest = digest.chars().take(room.saturating_sub(1)).collect::<String>();
+            digest = digest
+                .chars()
+                .take(room.saturating_sub(1))
+                .collect::<String>();
             digest.push('…');
         }
         let line = format!("- `{file}` — {digest}{tag}");
@@ -448,7 +530,9 @@ pub fn build_context(
 /// A one-line digest of `file`: its top outline signatures, joined and capped at
 /// `max_chars`. Empty when the file has no indexed symbols.
 fn file_digest(idx: &GraphIndex, file: &str, max_chars: usize) -> String {
-    let Ok(syms) = idx.outline(file) else { return String::new() };
+    let Ok(syms) = idx.outline(file) else {
+        return String::new();
+    };
     if syms.is_empty() {
         return String::new();
     }
@@ -480,7 +564,10 @@ fn file_digest(idx: &GraphIndex, file: &str, max_chars: usize) -> String {
     // already filled the budget overran it by the trailer's ~90 chars, letting
     // the assembled block exceed `turn_budget_chars`. Char-boundary safe.
     if joined.chars().count() > max_chars {
-        joined = joined.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+        joined = joined
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
         joined.push('…');
     }
     joined
@@ -509,8 +596,10 @@ pub fn repo_map(idx: &GraphIndex, budget_chars: usize, session_boost: &[(String,
     let ranked: Vec<String> = if session_boost.is_empty() {
         central.into_iter().map(|(f, _)| f).collect()
     } else {
-        let boost: HashMap<&str, f64> =
-            session_boost.iter().map(|(p, w)| (p.as_str(), *w)).collect();
+        let boost: HashMap<&str, f64> = session_boost
+            .iter()
+            .map(|(p, w)| (p.as_str(), *w))
+            .collect();
         let mut scored: Vec<(String, f64)> = central
             .into_iter()
             .map(|(f, c)| {
@@ -628,7 +717,10 @@ fn substitute_body(
         body.truncate(end);
         body.push_str("\n… [truncated]");
     }
-    Some(format!("{}:{}-{} · {}\n{}", hit.file, hit.start_line, hit.end_line, hit.kind, body))
+    Some(format!(
+        "{}:{}-{} · {}\n{}",
+        hit.file, hit.start_line, hit.end_line, hit.kind, body
+    ))
 }
 
 /// V17 Phase A — render a line-level unified diff of `old` → `new`, ~3 lines of
@@ -710,11 +802,22 @@ pub fn compaction_block(idx: &GraphIndex, session_id: Option<&str>) -> String {
             } else {
                 format!(" [{}]", e.top_symbols.join(", "))
             };
-            out.push_str(&format!("- {} — {}× (last {}){}\n", e.path, e.touches, e.last_kind, syms));
+            out.push_str(&format!(
+                "- {} — {}× (last {}){}\n",
+                e.path, e.touches, e.last_kind, syms
+            ));
         }
     }
-    let pinned: Vec<&str> = notes.iter().filter(|n| n.pinned).map(|n| n.text.as_str()).collect();
-    let unpinned: Vec<&str> = notes.iter().filter(|n| !n.pinned).map(|n| n.text.as_str()).collect();
+    let pinned: Vec<&str> = notes
+        .iter()
+        .filter(|n| n.pinned)
+        .map(|n| n.text.as_str())
+        .collect();
+    let unpinned: Vec<&str> = notes
+        .iter()
+        .filter(|n| !n.pinned)
+        .map(|n| n.text.as_str())
+        .collect();
     if !pinned.is_empty() {
         out.push_str("\n## Pinned notes (keep verbatim)\n");
         for t in &pinned {
@@ -749,7 +852,9 @@ fn public_signatures(idx: &GraphIndex, file: &str, max_chars: usize) -> String {
     syms.sort_by(|a, b| {
         let pub_a = a.visibility == "public";
         let pub_b = b.visibility == "public";
-        pub_b.cmp(&pub_a).then_with(|| a.start_line.cmp(&b.start_line))
+        pub_b
+            .cmp(&pub_a)
+            .then_with(|| a.start_line.cmp(&b.start_line))
     });
     let mut parts: Vec<String> = Vec::new();
     let mut total = 0usize;
@@ -768,7 +873,10 @@ fn public_signatures(idx: &GraphIndex, file: &str, max_chars: usize) -> String {
     }
     let mut joined = parts.join("; ");
     if joined.chars().count() > max_chars {
-        joined = joined.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+        joined = joined
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
         joined.push('…');
     }
     joined
@@ -783,7 +891,9 @@ mod tests {
         let terms = extract_terms("How does GraphService handle the retrieve() path?");
         assert!(terms.iter().any(|t| t == "GraphService"));
         assert!(terms.iter().any(|t| t == "retrieve"));
-        assert!(!terms.iter().any(|t| t == "the" || t == "how" || t == "does"));
+        assert!(!terms
+            .iter()
+            .any(|t| t == "the" || t == "how" || t == "does"));
     }
 
     #[test]
@@ -817,22 +927,43 @@ mod tests {
     #[test]
     fn fact_mentions_stem_is_whole_word_only() {
         // Substring inside a longer identifier: no match.
-        assert!(!fact_mentions_stem("see retry_backoff_v2 for details", "retry_backoff"));
+        assert!(!fact_mentions_stem(
+            "see retry_backoff_v2 for details",
+            "retry_backoff"
+        ));
         // Exact whole-word occurrence: matches.
-        assert!(fact_mentions_stem("see retry_backoff for details", "retry_backoff"));
+        assert!(fact_mentions_stem(
+            "see retry_backoff for details",
+            "retry_backoff"
+        ));
         // At string start/end (no surrounding non-word char needed there).
-        assert!(fact_mentions_stem("retry_backoff is fragile", "retry_backoff"));
-        assert!(fact_mentions_stem("fragile: retry_backoff", "retry_backoff"));
+        assert!(fact_mentions_stem(
+            "retry_backoff is fragile",
+            "retry_backoff"
+        ));
+        assert!(fact_mentions_stem(
+            "fragile: retry_backoff",
+            "retry_backoff"
+        ));
     }
 
     #[test]
     fn fact_mentions_stem_is_case_insensitive() {
         // F6: a fact naming a type in its own casing boosts the lowercase-stem
         // file (the common natural form the case-sensitive matcher missed).
-        assert!(fact_mentions_stem("the Watcher debounces fs events", "watcher"));
-        assert!(fact_mentions_stem("Supervisor owns the warm pool", "supervisor"));
+        assert!(fact_mentions_stem(
+            "the Watcher debounces fs events",
+            "watcher"
+        ));
+        assert!(fact_mentions_stem(
+            "Supervisor owns the warm pool",
+            "supervisor"
+        ));
         // Still whole-word: a sub-word of a compound identifier does not match.
-        assert!(!fact_mentions_stem("GraphSupervisor is central", "supervisor"));
+        assert!(!fact_mentions_stem(
+            "GraphSupervisor is central",
+            "supervisor"
+        ));
     }
 
     #[test]
@@ -841,7 +972,9 @@ mod tests {
             assert!(is_generic_stem(s), "{s} should be excluded");
         }
         // F7: common generic stems that clear the ≥4-char bar are excluded too.
-        for s in ["main", "test", "tests", "utils", "types", "error", "data", "core", "node"] {
+        for s in [
+            "main", "test", "tests", "utils", "types", "error", "data", "core", "node",
+        ] {
             assert!(is_generic_stem(s), "{s} should be excluded (F7)");
         }
         // Distinctive names still boost.
@@ -865,13 +998,35 @@ mod tests {
 
         let no_dedup = HashMap::new();
         // A prompt mentioning an indexed symbol injects a digest.
-        let r = build_context(&idx, "please refactor build_widget", &[], 800, 6000, 3.0, &no_dedup, 0, 0, false);
+        let r = build_context(
+            &idx,
+            "please refactor build_widget",
+            &[],
+            800,
+            6000,
+            3.0,
+            &no_dedup,
+            0,
+            0,
+            false,
+        );
         assert!(r.chars > 0, "matching prompt injects context");
         assert!(r.files_used.contains(&"src/widget.rs".to_string()));
         assert!(r.context_md.contains("src/widget.rs"));
 
         // A meta prompt with no matching terms injects nothing (below threshold).
-        let empty = build_context(&idx, "hi there, thanks!", &[], 800, 6000, 3.0, &no_dedup, 0, 0, false);
+        let empty = build_context(
+            &idx,
+            "hi there, thanks!",
+            &[],
+            800,
+            6000,
+            3.0,
+            &no_dedup,
+            0,
+            0,
+            false,
+        );
         assert_eq!(empty.chars, 0);
         assert!(empty.files_used.is_empty());
 
@@ -904,7 +1059,18 @@ mod tests {
         // Floor between the two scores: the turn passes (top file scores 3)
         // but the below-floor tail file must be dropped, not ride in under
         // the strong top match.
-        let r = build_context(&idx, "refactor build_widget", &[], 800, 6000, 2.0, &no_dedup, 0, 0, false);
+        let r = build_context(
+            &idx,
+            "refactor build_widget",
+            &[],
+            800,
+            6000,
+            2.0,
+            &no_dedup,
+            0,
+            0,
+            false,
+        );
         assert!(r.files_used.contains(&"src/definer.rs".to_string()));
         assert!(
             !r.files_used.contains(&"src/caller.rs".to_string()),
@@ -913,7 +1079,18 @@ mod tests {
 
         // Floor below both: both inject (the old behavior for genuinely
         // above-floor files is unchanged).
-        let both = build_context(&idx, "refactor build_widget", &[], 800, 6000, 1.0, &no_dedup, 0, 0, false);
+        let both = build_context(
+            &idx,
+            "refactor build_widget",
+            &[],
+            800,
+            6000,
+            1.0,
+            &no_dedup,
+            0,
+            0,
+            false,
+        );
         assert!(both.files_used.contains(&"src/definer.rs".to_string()));
         assert!(both.files_used.contains(&"src/caller.rs".to_string()));
 
@@ -928,10 +1105,18 @@ mod tests {
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // Two files, each defining a same-named symbol — `find_symbol("widget")`
         // hits both, so their base term-match score is identical.
-        idx.index_file_graph(&parse_file("src/hot.rs", "pub fn widget() {}\n", Lang::Rust))
-            .expect("index hot");
-        idx.index_file_graph(&parse_file("src/cold.rs", "pub fn widget() {}\n", Lang::Rust))
-            .expect("index cold");
+        idx.index_file_graph(&parse_file(
+            "src/hot.rs",
+            "pub fn widget() {}\n",
+            Lang::Rust,
+        ))
+        .expect("index hot");
+        idx.index_file_graph(&parse_file(
+            "src/cold.rs",
+            "pub fn widget() {}\n",
+            Lang::Rust,
+        ))
+        .expect("index cold");
 
         // Only hot.rs has recent git history (within the 7-day boost tier).
         let now = super::super::gitmeta::now_ts();
@@ -949,10 +1134,22 @@ mod tests {
         // file must come first despite an identical base term-match score.
         let pos_hot = r.files_used.iter().position(|f| f == "src/hot.rs");
         let pos_cold = r.files_used.iter().position(|f| f == "src/cold.rs");
-        assert!(pos_hot.is_some() && pos_cold.is_some(), "{:?}", r.files_used);
-        assert!(pos_hot < pos_cold, "churned file should rank first: {:?}", r.files_used);
+        assert!(
+            pos_hot.is_some() && pos_cold.is_some(),
+            "{:?}",
+            r.files_used
+        );
+        assert!(
+            pos_hot < pos_cold,
+            "churned file should rank first: {:?}",
+            r.files_used
+        );
         // The digest trailer surfaces the commit subject + a relative age.
-        assert!(r.context_md.contains("fix: widget cache"), "{}", r.context_md);
+        assert!(
+            r.context_md.contains("fix: widget cache"),
+            "{}",
+            r.context_md
+        );
         assert!(r.context_md.contains("1d ago"), "{}", r.context_md);
 
         drop(idx);
@@ -968,21 +1165,43 @@ mod tests {
         // term-match score, same as the churn-boost test's fixture. Stems
         // are ≥ 4 chars and not in the generic-stem denylist (V12 review's
         // fact-boost false-positive fix) so the boost actually applies.
-        idx.index_file_graph(&parse_file("src/hotpath.rs", "pub fn widget() {}\n", Lang::Rust))
-            .expect("index hotpath");
-        idx.index_file_graph(&parse_file("src/cold.rs", "pub fn widget() {}\n", Lang::Rust))
-            .expect("index cold");
+        idx.index_file_graph(&parse_file(
+            "src/hotpath.rs",
+            "pub fn widget() {}\n",
+            Lang::Rust,
+        ))
+        .expect("index hotpath");
+        idx.index_file_graph(&parse_file(
+            "src/cold.rs",
+            "pub fn widget() {}\n",
+            Lang::Rust,
+        ))
+        .expect("index cold");
 
         // A fact naming "hotpath" (hotpath.rs's stem) should boost only that file.
-        idx.add_project_fact("f1", "hotpath handles the retry-cache gotcha", "s1", 1, false)
-            .expect("add fact");
+        idx.add_project_fact(
+            "f1",
+            "hotpath handles the retry-cache gotcha",
+            "s1",
+            1,
+            false,
+        )
+        .expect("add fact");
 
         let no_dedup = HashMap::new();
         let r = build_context(&idx, "widget", &[], 800, 6000, 0.5, &no_dedup, 0, 0, false);
         let pos_hot = r.files_used.iter().position(|f| f == "src/hotpath.rs");
         let pos_cold = r.files_used.iter().position(|f| f == "src/cold.rs");
-        assert!(pos_hot.is_some() && pos_cold.is_some(), "{:?}", r.files_used);
-        assert!(pos_hot < pos_cold, "the fact-mentioned file should rank first: {:?}", r.files_used);
+        assert!(
+            pos_hot.is_some() && pos_cold.is_some(),
+            "{:?}",
+            r.files_used
+        );
+        assert!(
+            pos_hot < pos_cold,
+            "the fact-mentioned file should rank first: {:?}",
+            r.files_used
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -994,12 +1213,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ckg-map-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // `hub` is called from two files; `leaf` from none → hub outranks leaf.
-        idx.index_file_graph(&parse_file("src/hub.rs", "pub fn hub() {}\npub fn leaf() {}\n", Lang::Rust))
-            .expect("index hub");
-        idx.index_file_graph(&parse_file("src/a.rs", "pub fn a() { hub() }\n", Lang::Rust))
-            .expect("index a");
-        idx.index_file_graph(&parse_file("src/b.rs", "pub fn b() { hub() }\n", Lang::Rust))
-            .expect("index b");
+        idx.index_file_graph(&parse_file(
+            "src/hub.rs",
+            "pub fn hub() {}\npub fn leaf() {}\n",
+            Lang::Rust,
+        ))
+        .expect("index hub");
+        idx.index_file_graph(&parse_file(
+            "src/a.rs",
+            "pub fn a() { hub() }\n",
+            Lang::Rust,
+        ))
+        .expect("index a");
+        idx.index_file_graph(&parse_file(
+            "src/b.rs",
+            "pub fn b() { hub() }\n",
+            Lang::Rust,
+        ))
+        .expect("index b");
 
         let central = idx.file_centrality(10).expect("centrality");
         assert_eq!(central.first().map(|(f, _)| f.as_str()), Some("src/hub.rs"));
@@ -1044,7 +1275,10 @@ mod tests {
         let mut snap = HashMap::new();
         snap.insert("src/widget.rs".to_string(), (hash.clone(), 1u32));
         let r2 = build_context(&idx, prompt, &[], 800, 6000, 3.0, &snap, 2, 10, false);
-        assert!(!r2.files_used.contains(&"src/widget.rs".to_string()), "not re-sent in full");
+        assert!(
+            !r2.files_used.contains(&"src/widget.rs".to_string()),
+            "not re-sent in full"
+        );
         assert!(r2.deduped_chars > 0, "measured suppression");
         assert!(r2.context_md.contains("unchanged"));
 
@@ -1059,7 +1293,18 @@ mod tests {
         // Changed file (snapshot hash differs) → re-injected, tagged (updated).
         let mut snap_changed = HashMap::new();
         snap_changed.insert("src/widget.rs".to_string(), ("deadbeef".to_string(), 1u32));
-        let r5 = build_context(&idx, prompt, &[], 800, 6000, 3.0, &snap_changed, 2, 10, false);
+        let r5 = build_context(
+            &idx,
+            prompt,
+            &[],
+            800,
+            6000,
+            3.0,
+            &snap_changed,
+            2,
+            10,
+            false,
+        );
         assert!(r5.files_used.contains(&"src/widget.rs".to_string()));
         assert!(r5.context_md.contains("(updated)"));
 
@@ -1075,16 +1320,34 @@ mod tests {
         idx.index_file_graph(&parse_file("src/a.rs", "pub fn f() {}\n", Lang::Rust))
             .expect("index");
         let sid = "sess-compact";
-        idx.record_mem_event(sid, "claude", "edit", "src/a.rs", Some("f"), Some(1), 1_000, None)
-            .expect("event");
+        idx.record_mem_event(
+            sid,
+            "claude",
+            "edit",
+            "src/a.rs",
+            Some("f"),
+            Some(1),
+            1_000,
+            None,
+        )
+        .expect("event");
         idx.mem_add_note("n1", sid, "chose FNV hashing for stability", 1_001, true)
             .expect("pinned note");
-        idx.mem_add_note("n2", sid, "todo: revisit the cache eviction later", 1_002, false)
-            .expect("note");
+        idx.mem_add_note(
+            "n2",
+            sid,
+            "todo: revisit the cache eviction later",
+            1_002,
+            false,
+        )
+        .expect("note");
 
         let block = compaction_block(&idx, Some(sid));
         assert!(block.contains("src/a.rs"), "working set: {block}");
-        assert!(block.contains("chose FNV hashing for stability"), "pinned verbatim: {block}");
+        assert!(
+            block.contains("chose FNV hashing for stability"),
+            "pinned verbatim: {block}"
+        );
         assert!(block.contains("Pinned notes"));
         assert!(block.chars().count() <= 2000, "hard cap respected");
 
@@ -1093,8 +1356,14 @@ mod tests {
         // An unknown session has no working set, but pinned notes are
         // project-wide and are still carried through — that's intended.
         let unknown = compaction_block(&idx, Some("nope"));
-        assert!(!unknown.contains("src/a.rs"), "no working set for an unknown session");
-        assert!(unknown.contains("chose FNV hashing for stability"), "pinned notes still carried");
+        assert!(
+            !unknown.contains("src/a.rs"),
+            "no working set for an unknown session"
+        );
+        assert!(
+            unknown.contains("chose FNV hashing for stability"),
+            "pinned notes still carried"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1108,18 +1377,28 @@ mod tests {
         let src = "pub fn alpha() -> i32 {\n    let x = 1;\n    x + 1\n}\npub fn beta() {}\n";
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.rs"), src).unwrap();
-        idx.index_file_graph(&parse_file("src/a.rs", src, Lang::Rust)).expect("index");
+        idx.index_file_graph(&parse_file("src/a.rs", src, Lang::Rust))
+            .expect("index");
 
         // Advise mode: outline + escape hatch, and never a raw body.
         let advise = read_advice(&idx, &dir, "src/a.rs", None, false, 16_384);
         assert!(advise.contains("unchanged since you read it"), "{advise}");
-        assert!(advise.contains("Re-read with Read"), "escape hatch: {advise}");
+        assert!(
+            advise.contains("Re-read with Read"),
+            "escape hatch: {advise}"
+        );
         assert!(advise.contains("alpha"), "outline signature: {advise}");
-        assert!(!advise.contains("let x = 1;"), "no body in advise mode: {advise}");
+        assert!(
+            !advise.contains("let x = 1;"),
+            "no body in advise mode: {advise}"
+        );
 
         // Substitute mode with an offset inside alpha: carries the body too.
         let sub = read_advice(&idx, &dir, "src/a.rs", Some(2), true, 16_384);
-        assert!(sub.contains("let x = 1;"), "substitute includes the body: {sub}");
+        assert!(
+            sub.contains("let x = 1;"),
+            "substitute includes the body: {sub}"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1131,13 +1410,22 @@ mod tests {
         let new = "line one\nline TWO\nline three\n";
         let d = unified_diff(old, new, "src/a.rs");
         // -U-style header naming the file on both sides.
-        assert!(d.contains("src/a.rs (as read)"), "header names the old side: {d}");
-        assert!(d.contains("src/a.rs (current)"), "header names the new side: {d}");
+        assert!(
+            d.contains("src/a.rs (as read)"),
+            "header names the old side: {d}"
+        );
+        assert!(
+            d.contains("src/a.rs (current)"),
+            "header names the new side: {d}"
+        );
         // The changed line shows up as a -/+ pair; the unchanged neighbours as
         // context, not as edits.
         assert!(d.contains("-line two"), "removed line present: {d}");
         assert!(d.contains("+line TWO"), "added line present: {d}");
-        assert!(!d.contains("-line one"), "unchanged line stays context: {d}");
+        assert!(
+            !d.contains("-line one"),
+            "unchanged line stays context: {d}"
+        );
     }
 
     #[test]
@@ -1163,14 +1451,20 @@ mod tests {
         let content: String = (0..120).map(|n| format!("line{n}\n")).collect();
         let text = first_read_advice("data/big.json", &content, "a config blob");
         // Byte + line counts.
-        assert!(text.contains(&format!("{} bytes", content.len())), "byte count: {text}");
+        assert!(
+            text.contains(&format!("{} bytes", content.len())),
+            "byte count: {text}"
+        );
         assert!(text.contains("120 lines"), "line count: {text}");
         // The digest.
         assert!(text.contains("a config blob"), "digest embedded: {text}");
         // Head + tail present, middle omitted.
         assert!(text.contains("line0\n"), "first line in head: {text}");
         assert!(text.contains("line119"), "last line in tail: {text}");
-        assert!(!text.contains("line60"), "the omitted middle is dropped: {text}");
+        assert!(
+            !text.contains("line60"),
+            "the omitted middle is dropped: {text}"
+        );
         assert!(text.contains("lines omitted"), "omission marker: {text}");
         // The first-read escape hatch (distinct from read_advice's — a slice
         // always passes here).
@@ -1185,7 +1479,13 @@ mod tests {
         // ≤ 80 lines ⇒ head/tail would overlap; show it all, no omission marker.
         let content: String = (0..10).map(|n| format!("row{n}\n")).collect();
         let text = first_read_advice("logs/small.log", &content, "tiny log");
-        assert!(text.contains("row0\n") && text.contains("row9"), "whole body shown: {text}");
-        assert!(!text.contains("lines omitted"), "no omission for a short file: {text}");
+        assert!(
+            text.contains("row0\n") && text.contains("row9"),
+            "whole body shown: {text}"
+        );
+        assert!(
+            !text.contains("lines omitted"),
+            "no omission for a short file: {text}"
+        );
     }
 }

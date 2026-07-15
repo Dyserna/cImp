@@ -105,7 +105,12 @@ pub fn collect(root: &Path) -> AppResult<Vec<FileChurn>> {
     // argv on any platform.
     let out = match run_git(
         root,
-        &["log", "--since=90.days", "--name-only", "--format=%x01%ct%x09%s"],
+        &[
+            "log",
+            "--since=90.days",
+            "--name-only",
+            "--format=%x01%ct%x09%s",
+        ],
     ) {
         Ok(text) => text,
         // No commits yet, or some other transient failure — degrade to
@@ -159,7 +164,14 @@ pub fn collect_for(root: &Path, files: &[String]) -> AppResult<Vec<FileChurn>> {
         // itself. The full `collect` pass uses no pathspec and is unaffected.
         let Ok(text) = run_git(
             root,
-            &["--literal-pathspecs", "log", "-1", "--format=%ct%x09%s", "--", &file],
+            &[
+                "--literal-pathspecs",
+                "log",
+                "-1",
+                "--format=%ct%x09%s",
+                "--",
+                &file,
+            ],
         ) else {
             continue;
         };
@@ -194,7 +206,9 @@ pub fn parse_log_output(output: &str) -> Vec<(i64, String, Vec<String>)> {
         }
         let mut lines = record.lines();
         let Some(header) = lines.next() else { continue };
-        let Some((ts, subject)) = parse_header_line(header) else { continue };
+        let Some((ts, subject)) = parse_header_line(header) else {
+            continue;
+        };
         let files: Vec<String> = lines
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
@@ -283,7 +297,10 @@ mod tests {
         assert_eq!(records[0].1, "newer commit");
         assert_eq!(records[0].2, vec!["src/a.rs".to_string()]);
         assert_eq!(records[1].0, 1700000100);
-        assert_eq!(records[1].2, vec!["src/b.rs".to_string(), "src/c.rs".to_string()]);
+        assert_eq!(
+            records[1].2,
+            vec!["src/b.rs".to_string(), "src/c.rs".to_string()]
+        );
     }
 
     #[test]
@@ -305,8 +322,16 @@ mod tests {
     #[test]
     fn aggregate_counts_touches_and_keeps_newest_subject() {
         let records = vec![
-            (200, "second touch".to_string(), vec!["src/a.rs".to_string()]),
-            (100, "first touch".to_string(), vec!["src/a.rs".to_string(), "src/b.rs".to_string()]),
+            (
+                200,
+                "second touch".to_string(),
+                vec!["src/a.rs".to_string()],
+            ),
+            (
+                100,
+                "first touch".to_string(),
+                vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            ),
         ];
         let churn = aggregate(records);
         let a = churn.iter().find(|c| c.file == "src/a.rs").unwrap();
@@ -355,8 +380,16 @@ mod tests {
     // ── real-git integration (collect / collect_for / non-repo degrade) ───
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = StdCommand::new("git").args(args).current_dir(dir).output().expect("git");
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = StdCommand::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
@@ -386,10 +419,16 @@ mod tests {
         git(&dir, &["commit", "-q", "-m", "fix: a returns 1"]);
 
         let churn = collect(&dir).expect("collect");
-        let a = churn.iter().find(|c| c.file == "a.rs").expect("a.rs present");
+        let a = churn
+            .iter()
+            .find(|c| c.file == "a.rs")
+            .expect("a.rs present");
         assert_eq!(a.touches_90d, 2, "{churn:?}");
         assert_eq!(a.last_subject, "fix: a returns 1");
-        let b = churn.iter().find(|c| c.file == "b.rs").expect("b.rs present");
+        let b = churn
+            .iter()
+            .find(|c| c.file == "b.rs")
+            .expect("b.rs present");
         assert_eq!(b.touches_90d, 1);
         assert_eq!(b.last_subject, "init: a and b");
 
@@ -411,7 +450,10 @@ mod tests {
         assert_eq!(churn.len(), 1);
         assert_eq!(churn[0].file, "a.rs");
         assert_eq!(churn[0].last_subject, "init: a");
-        assert_eq!(churn[0].touches_90d, 1, "incremental is a best-effort count of 1");
+        assert_eq!(
+            churn[0].touches_90d, 1,
+            "incremental is a best-effort count of 1"
+        );
 
         // A file with no history at all is silently skipped, not an error.
         let none = collect_for(&dir, &["never-committed.rs".to_string()]).expect("collect_for");
@@ -459,9 +501,12 @@ mod tests {
         assert!(collect_for(&dir, &[]).expect("collect_for").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
 
-        let norepo = std::env::temp_dir().join(format!("gitmeta-incr-norepo-{}", uuid::Uuid::new_v4()));
+        let norepo =
+            std::env::temp_dir().join(format!("gitmeta-incr-norepo-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&norepo).unwrap();
-        assert!(collect_for(&norepo, &["a.rs".to_string()]).expect("collect_for").is_empty());
+        assert!(collect_for(&norepo, &["a.rs".to_string()])
+            .expect("collect_for")
+            .is_empty());
         let _ = std::fs::remove_dir_all(&norepo);
     }
 }

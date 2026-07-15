@@ -20,10 +20,7 @@ mod tests {
     #[test]
     fn normalizes_whitespace_runs() {
         assert_eq!(normalize_for_dedup("  hello   world \n"), "hello world");
-        assert_eq!(
-            normalize_for_dedup("a\tb\nc  d"),
-            "a b c d"
-        );
+        assert_eq!(normalize_for_dedup("a\tb\nc  d"), "a b c d");
     }
 
     #[test]

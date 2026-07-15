@@ -48,17 +48,65 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// set is filtered out — the offload worker stays read-only even when a
 /// server advertises mutating tools (`filesystem` write, `git` commit).
 const WRITE_VERBS: &[&str] = &[
-    "write", "delete", "remove", "rm", "create", "make", "mkdir", "put", "post",
-    "update", "edit", "move", "mv", "rename", "append", "commit", "push", "merge",
-    "reset", "drop", "truncate", "insert", "modify", "patch", "set", "unlink",
-    "kill", "exec", "execute", "run", "spawn", "install", "uninstall", "publish",
-    "send", "add", "copy", "cp", "save", "store", "upload", "mutate", "destroy",
-    "clear", "purge", "apply", "checkout", "clone", "stage", "restore", "revert",
+    "write",
+    "delete",
+    "remove",
+    "rm",
+    "create",
+    "make",
+    "mkdir",
+    "put",
+    "post",
+    "update",
+    "edit",
+    "move",
+    "mv",
+    "rename",
+    "append",
+    "commit",
+    "push",
+    "merge",
+    "reset",
+    "drop",
+    "truncate",
+    "insert",
+    "modify",
+    "patch",
+    "set",
+    "unlink",
+    "kill",
+    "exec",
+    "execute",
+    "run",
+    "spawn",
+    "install",
+    "uninstall",
+    "publish",
+    "send",
+    "add",
+    "copy",
+    "cp",
+    "save",
+    "store",
+    "upload",
+    "mutate",
+    "destroy",
+    "clear",
+    "purge",
+    "apply",
+    "checkout",
+    "clone",
+    "stage",
+    "restore",
+    "revert",
     // Common mutating verbs that previously slipped through as "read-class"
     // because they led with no listed verb (e.g. `task_cancel`, `job_abort`,
     // `branch_force`, `repo_sync`). Kept first-two-only because each can also
     // read-ishly appear later in a name.
-    "cancel", "abort", "force", "sync",
+    "cancel",
+    "abort",
+    "force",
+    "sync",
 ];
 
 /// Unambiguously-mutating leading verbs that essentially never appear as a noun
@@ -69,20 +117,42 @@ const WRITE_VERBS: &[&str] = &[
 /// (`commit`, `merge`, `add`, `copy`, …) are deliberately NOT here — they stay
 /// first-two-only so reads like `get_latest_commit` aren't over-dropped.
 const ANYSEG_WRITE_VERBS: &[&str] = &[
-    "create", "mkdir", "update", "edit", "insert", "modify", "patch", "apply",
-    "append", "rename", "reset", "install", "uninstall", "publish", "upload",
-    "mutate", "set", "put",
+    "create",
+    "mkdir",
+    "update",
+    "edit",
+    "insert",
+    "modify",
+    "patch",
+    "apply",
+    "append",
+    "rename",
+    "reset",
+    "install",
+    "uninstall",
+    "publish",
+    "upload",
+    "mutate",
+    "set",
+    "put",
     // Unambiguous mutators that never legitimately name a read tool — caught
     // in any segment so `cache_evict`, `state_flush`, `db_upsert`, `git_amend`,
     // `config_persist` can't pass as read-class.
-    "evict", "flush", "upsert", "amend", "persist",
+    "evict",
+    "flush",
+    "upsert",
+    "amend",
+    "persist",
 ];
 
 /// The leading verb of one name segment: the leading lowercase run so
 /// camelCase (`searchWeb` → `search`) resolves, else the whole lowercased
 /// segment (`Get` → `get`).
 fn token_verb(token: &str) -> String {
-    let lead: String = token.chars().take_while(|c| c.is_ascii_lowercase()).collect();
+    let lead: String = token
+        .chars()
+        .take_while(|c| c.is_ascii_lowercase())
+        .collect();
     if lead.is_empty() {
         token.to_ascii_lowercase()
     } else {
@@ -118,9 +188,29 @@ fn leading_verb(name: &str) -> String {
 /// (e.g. a CI `getRunStatus`) over ever exposing an executor — a dropped read
 /// tool is harmless; an exposed executor is not.
 const HARD_WRITE_VERBS: &[&str] = &[
-    "write", "delete", "remove", "rm", "unlink", "destroy", "truncate",
-    "drop", "purge", "replace", "overwrite", "rename", "uninstall", "kill",
-    "wipe", "exec", "execute", "eval", "run", "spawn", "shell", "bash", "sh",
+    "write",
+    "delete",
+    "remove",
+    "rm",
+    "unlink",
+    "destroy",
+    "truncate",
+    "drop",
+    "purge",
+    "replace",
+    "overwrite",
+    "rename",
+    "uninstall",
+    "kill",
+    "wipe",
+    "exec",
+    "execute",
+    "eval",
+    "run",
+    "spawn",
+    "shell",
+    "bash",
+    "sh",
 ];
 
 /// Split one name segment into lowercased word tokens, breaking on camelCase
@@ -232,7 +322,12 @@ struct StdioConn {
 
 impl StdioConn {
     /// Send a request and await its response (by id) up to `timeout`.
-    async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         if !self.alive.load(Ordering::Relaxed) {
             return Err("server connection is closed".into());
         }
@@ -276,7 +371,10 @@ impl StdioConn {
             Ok(Err(_)) => Err("server connection closed before responding".into()),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(format!("server did not respond within {}s", timeout.as_secs()))
+                Err(format!(
+                    "server did not respond within {}s",
+                    timeout.as_secs()
+                ))
             }
         }
     }
@@ -418,10 +516,21 @@ impl McpServer {
         let params = json!({ "name": raw_name, "arguments": args });
         let result = match &self.conn {
             Some(Conn::Stdio(c)) => c.request("tools/call", params, REQUEST_TIMEOUT).await,
-            Some(Conn::Http { url, client, session_id }) => {
+            Some(Conn::Http {
+                url,
+                client,
+                session_id,
+            }) => {
                 let current = session_id.lock().unwrap().clone();
-                match http_request(client, url, "tools/call", params, current.as_deref(), REQUEST_TIMEOUT)
-                    .await
+                match http_request(
+                    client,
+                    url,
+                    "tools/call",
+                    params,
+                    current.as_deref(),
+                    REQUEST_TIMEOUT,
+                )
+                .await
                 {
                     Ok((new_session, v)) => {
                         // Refresh the stored id if the server rotated/assigned
@@ -626,12 +735,14 @@ impl McpHost {
     /// Route a Claude-exposed namespaced call. Claude must never reach an
     /// offload-only server's tools.
     pub async fn call_for_claude(&self, namespaced: &str, args: Value) -> Result<String, String> {
-        self.call_for_consumer(Consumer::Claude, namespaced, args).await
+        self.call_for_consumer(Consumer::Claude, namespaced, args)
+            .await
     }
 
     /// V19: route an OpenCode-exposed namespaced call.
     pub async fn call_for_opencode(&self, namespaced: &str, args: Value) -> Result<String, String> {
-        self.call_for_consumer(Consumer::Opencode, namespaced, args).await
+        self.call_for_consumer(Consumer::Opencode, namespaced, args)
+            .await
     }
 
     /// Route a namespaced `<server>__<tool>` call to its owning server.
@@ -651,7 +762,10 @@ impl McpHost {
             return Err(format!("no MCP server owns tool `{namespaced}`"));
         };
         let Some(raw) = server.raw_name(namespaced).map(|s| s.to_string()) else {
-            return Err(format!("server `{}` no longer offers `{namespaced}`", server.name));
+            return Err(format!(
+                "server `{}` no longer offers `{namespaced}`",
+                server.name
+            ));
         };
         let was_healthy = server.is_healthy();
         let result = server.call(&raw, args).await;
@@ -878,7 +992,9 @@ async fn connect_stdio(
     conn.request("initialize", init, CONNECT_TIMEOUT).await?;
     conn.notify("notifications/initialized", json!({})).await;
 
-    let list = conn.request("tools/list", json!({}), CONNECT_TIMEOUT).await?;
+    let list = conn
+        .request("tools/list", json!({}), CONNECT_TIMEOUT)
+        .await?;
     let tools = parse_tools(&cfg.name, &list);
     Ok((Conn::Stdio(conn), tools))
 }
@@ -909,9 +1025,23 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
         http_request(&client, &url, "initialize", init, None, CONNECT_TIMEOUT).await?;
     // The transport requires the client to confirm initialization before
     // issuing further requests; send it (best-effort) carrying the session id.
-    http_notify(&client, &url, "notifications/initialized", json!({}), session_id.as_deref()).await;
-    let (list_session, list) =
-        http_request(&client, &url, "tools/list", json!({}), session_id.as_deref(), CONNECT_TIMEOUT).await?;
+    http_notify(
+        &client,
+        &url,
+        "notifications/initialized",
+        json!({}),
+        session_id.as_deref(),
+    )
+    .await;
+    let (list_session, list) = http_request(
+        &client,
+        &url,
+        "tools/list",
+        json!({}),
+        session_id.as_deref(),
+        CONNECT_TIMEOUT,
+    )
+    .await?;
     // Fall back to a session id assigned on the tools/list response if the
     // initialize response carried none (some servers assign it late).
     if session_id.is_none() {
@@ -1026,7 +1156,9 @@ async fn http_notify(
 /// case-insensitive, so a server sending `Text/Event-Stream` must still be
 /// routed through the SSE decoder rather than parsed as plain JSON.
 fn is_event_stream(content_type: &str) -> bool {
-    content_type.to_ascii_lowercase().contains("text/event-stream")
+    content_type
+        .to_ascii_lowercase()
+        .contains("text/event-stream")
 }
 
 /// A single SSE `data:` frame parsed to JSON, kept only if it carries a
@@ -1133,8 +1265,7 @@ async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, String> 
 #[cfg(test)]
 fn decode_jsonrpc_body(content_type: &str, body: &str) -> Result<Value, String> {
     if !is_event_stream(content_type) {
-        return serde_json::from_str::<Value>(body)
-            .map_err(|e| format!("http parse failed: {e}"));
+        return serde_json::from_str::<Value>(body).map_err(|e| format!("http parse failed: {e}"));
     }
     let mut asm = SseAssembler::default();
     for line in body.lines() {
@@ -1192,7 +1323,10 @@ fn parse_tools(server: &str, list: &Value) -> Vec<HostTool> {
 /// the agent loop feeds back to the model. Concatenates text parts; notes
 /// non-text parts; honors `isError`.
 fn render_tool_result(result: &Value) -> String {
-    let is_error = result.get("isError").and_then(|b| b.as_bool()).unwrap_or(false);
+    let is_error = result
+        .get("isError")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
     let mut text = String::new();
     if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
         for part in content {
@@ -1269,7 +1403,11 @@ mod tests {
         opencode: bool,
         namespaced: &str,
     ) -> McpServer {
-        let raw = namespaced.split("__").nth(1).unwrap_or(namespaced).to_string();
+        let raw = namespaced
+            .split("__")
+            .nth(1)
+            .unwrap_or(namespaced)
+            .to_string();
         McpServer {
             name: name.into(),
             sig: String::new(),
@@ -1309,10 +1447,16 @@ mod tests {
         assert_eq!(opencode[0].function.name, "gamma__z");
 
         // Claude must not be able to invoke the offload-only server's tool.
-        let err = host.call_for_claude("beta__y", json!({})).await.unwrap_err();
+        let err = host
+            .call_for_claude("beta__y", json!({}))
+            .await
+            .unwrap_err();
         assert!(err.contains("not available to Claude"), "got: {err}");
         // OpenCode must not reach the Claude-only server's tool.
-        let err2 = host.call_for_opencode("alpha__x", json!({})).await.unwrap_err();
+        let err2 = host
+            .call_for_opencode("alpha__x", json!({}))
+            .await
+            .unwrap_err();
         assert!(err2.contains("not available to OpenCode"), "got: {err2}");
     }
 
@@ -1326,10 +1470,27 @@ mod tests {
 
     #[test]
     fn read_class_keeps_reads_drops_writes() {
-        for ok in ["read_file", "search", "list_directory", "git_log", "fetch", "get_info", "show_diff", "blame"] {
+        for ok in [
+            "read_file",
+            "search",
+            "list_directory",
+            "git_log",
+            "fetch",
+            "get_info",
+            "show_diff",
+            "blame",
+        ] {
             assert!(is_read_class(ok), "{ok} should be read-class");
         }
-        for bad in ["write_file", "create_directory", "git_commit", "delete_path", "move_file", "git_push", "run_shell"] {
+        for bad in [
+            "write_file",
+            "create_directory",
+            "git_commit",
+            "delete_path",
+            "move_file",
+            "git_push",
+            "run_shell",
+        ] {
             assert!(!is_read_class(bad), "{bad} should be filtered");
         }
     }
@@ -1337,23 +1498,43 @@ mod tests {
     #[test]
     fn read_class_catches_buried_destructive_verbs() {
         // A hard-destructive verb past the second segment must still drop.
-        for bad in ["search_and_replace", "find_and_delete", "list_then_remove", "scan_and_wipe"] {
+        for bad in [
+            "search_and_replace",
+            "find_and_delete",
+            "list_then_remove",
+            "scan_and_wipe",
+        ] {
             assert!(!is_read_class(bad), "{bad} should be filtered");
         }
         // ...but a noun-ish verb in the 3rd+ segment must NOT over-drop a read
         // (these are only checked in the first two segments, unchanged).
-        for ok in ["get_latest_commit", "get_repo_merge_status", "list_all_user_sets"] {
+        for ok in [
+            "get_latest_commit",
+            "get_repo_merge_status",
+            "list_all_user_sets",
+        ] {
             assert!(is_read_class(ok), "{ok} should be read-class");
         }
         // An unambiguous mutation verb past the second segment must drop, even
         // though it isn't destructive enough to be a HARD verb.
-        for bad in ["repo_data_set_value", "config_apply_patch", "db_record_update", "file_meta_rename"] {
+        for bad in [
+            "repo_data_set_value",
+            "config_apply_patch",
+            "db_record_update",
+            "file_meta_rename",
+        ] {
             assert!(!is_read_class(bad), "{bad} should be filtered");
         }
         // camelCase mutators must drop too: the ANYSEG/WRITE tiers split
         // camelCase sub-words (not just the leading lowercase run), so these
         // can't evade the way `configSet` once did.
-        for bad in ["configSet", "userDataSet", "applyPatch", "recordUpdate", "metaRename"] {
+        for bad in [
+            "configSet",
+            "userDataSet",
+            "applyPatch",
+            "recordUpdate",
+            "metaRename",
+        ] {
             assert!(!is_read_class(bad), "{bad} should be filtered");
         }
         // ...without over-dropping a camelCase read whose noun merely contains a
@@ -1370,10 +1551,17 @@ mod tests {
             command: "npx".into(),
             ..Default::default()
         };
-        let args = vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()];
+        let args = vec![
+            "-y".to_string(),
+            "@modelcontextprotocol/server-filesystem".to_string(),
+        ];
         assert!(is_filesystem_server(&cfg, &args));
         // A genuinely unrelated server is not confined.
-        let git = McpServerConfig { name: "git".into(), command: "uvx".into(), ..Default::default() };
+        let git = McpServerConfig {
+            name: "git".into(),
+            command: "uvx".into(),
+            ..Default::default()
+        };
         assert!(!is_filesystem_server(&git, &["mcp-server-git".to_string()]));
     }
 
@@ -1392,7 +1580,14 @@ mod tests {
         assert!(names.contains(&"ddg__fetch_content"));
         assert!(!names.iter().any(|n| n.contains("write_file")));
         // raw name is preserved for the call.
-        assert_eq!(tools.iter().find(|t| t.def.function.name == "ddg__search").unwrap().raw_name, "search");
+        assert_eq!(
+            tools
+                .iter()
+                .find(|t| t.def.function.name == "ddg__search")
+                .unwrap()
+                .raw_name,
+            "search"
+        );
     }
 
     #[test]
@@ -1402,7 +1597,10 @@ mod tests {
             command: "npx".into(),
             ..Default::default()
         };
-        let mut args = vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()];
+        let mut args = vec![
+            "-y".to_string(),
+            "@modelcontextprotocol/server-filesystem".to_string(),
+        ];
         let roots = vec![PathBuf::from("/work"), PathBuf::from("/data")];
         confine_filesystem(&cfg, &mut args, &roots);
         assert!(args.contains(&"/work".to_string()));
@@ -1415,7 +1613,11 @@ mod tests {
 
     #[test]
     fn confine_skips_non_filesystem() {
-        let cfg = McpServerConfig { name: "git".into(), command: "uvx".into(), ..Default::default() };
+        let cfg = McpServerConfig {
+            name: "git".into(),
+            command: "uvx".into(),
+            ..Default::default()
+        };
         let mut args = vec!["mcp-server-git".to_string()];
         confine_filesystem(&cfg, &mut args, &[PathBuf::from("/work")]);
         assert_eq!(args, vec!["mcp-server-git".to_string()]);
@@ -1445,7 +1647,8 @@ mod tests {
     fn decode_sse_body_extracts_jsonrpc() {
         // The exact shape ddg-search / Context7 return: an `event:` line then a
         // single `data:` line carrying the JSON-RPC response, ended by a blank.
-        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let sse =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
         let v = decode_jsonrpc_body("text/event-stream", sse).unwrap();
         assert_eq!(v["result"]["ok"], json!(true));
     }
@@ -1521,7 +1724,10 @@ mod tests {
         // Stable for identical input (the warm_host skip relies on this).
         assert_eq!(s1, host_config_sig(std::slice::from_ref(&a), &roots));
         // Changes when a server field changes (access toggle, url, …).
-        let b = McpServerConfig { offload_access: false, ..a.clone() };
+        let b = McpServerConfig {
+            offload_access: false,
+            ..a.clone()
+        };
         assert_ne!(s1, host_config_sig(std::slice::from_ref(&b), &roots));
         // Changes when the allowed roots change.
         assert_ne!(

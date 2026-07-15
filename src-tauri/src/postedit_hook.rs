@@ -45,15 +45,25 @@ pub fn run() {
     if !matches!(tool_name, "Edit" | "Write" | "MultiEdit") {
         return;
     }
-    let tool_input = v.get("tool_input").cloned().unwrap_or(serde_json::Value::Null);
-    let file_path = tool_input.get("file_path").and_then(|p| p.as_str()).unwrap_or("");
+    let tool_input = v
+        .get("tool_input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let file_path = tool_input
+        .get("file_path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
     let session_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
     let cwd = v
         .get("cwd")
         .and_then(|s| s.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
         .unwrap_or_default();
 
     let body = serde_json::json!({
@@ -64,7 +74,9 @@ pub fn run() {
     })
     .to_string();
 
-    let Some(text) = post_loopback("/context/post_edit", &body) else { return };
+    let Some(text) = post_loopback("/context/post_edit", &body) else {
+        return;
+    };
     if text.trim().is_empty() {
         return;
     }

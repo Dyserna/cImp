@@ -83,7 +83,8 @@ mod tests {
             // V10 adds the `context_*` memory tools to the shared spec set
             // alongside the `graph_*` tools.
             assert!(
-                def.function.name.starts_with("graph_") || def.function.name.starts_with("context_"),
+                def.function.name.starts_with("graph_")
+                    || def.function.name.starts_with("context_"),
                 "unexpected tool name `{}`",
                 def.function.name
             );
@@ -101,8 +102,14 @@ mod tests {
             .map(|s| s.name.to_string())
             .collect();
         for h in crate::graph::LEAN_HIDDEN {
-            assert!(!names.iter().any(|n| n == h), "`{h}` should be hidden from the worker");
+            assert!(
+                !names.iter().any(|n| n == h),
+                "`{h}` should be hidden from the worker"
+            );
         }
-        assert_eq!(names.len(), crate::graph::tool_specs().len() - crate::graph::LEAN_HIDDEN.len());
+        assert_eq!(
+            names.len(),
+            crate::graph::tool_specs().len() - crate::graph::LEAN_HIDDEN.len()
+        );
     }
 }

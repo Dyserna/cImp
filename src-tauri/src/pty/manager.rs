@@ -487,7 +487,6 @@ impl PtyManager {
         }
         Ok(())
     }
-
 }
 
 impl Default for PtyManager {
@@ -531,15 +530,13 @@ mod tests {
         let a_buf = received_a.clone();
         let channel_a: Channel<String> = Channel::new(move |body| {
             // `body` is the encoded base64 string the processor sends.
-            let s = String::from_utf8(body.deserialize().unwrap_or_default())
-                .unwrap_or_default();
+            let s = String::from_utf8(body.deserialize().unwrap_or_default()).unwrap_or_default();
             a_buf.lock().unwrap().push(s);
             Ok(())
         });
         let b_buf = received_b.clone();
         let channel_b: Channel<String> = Channel::new(move |body| {
-            let s = String::from_utf8(body.deserialize().unwrap_or_default())
-                .unwrap_or_default();
+            let s = String::from_utf8(body.deserialize().unwrap_or_default()).unwrap_or_default();
             b_buf.lock().unwrap().push(s);
             Ok(())
         });
@@ -552,11 +549,7 @@ mod tests {
         // SettingsHandle uses defaults; no `.set()` is ever called so the
         // debounced saver task stays idle and never touches disk.
         let defaults = crate::settings::Settings::default();
-        let settings = SettingsHandle::new(
-            defaults.clone(),
-            defaults,
-            std::env::temp_dir(),
-        );
+        let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
 
         let tab = TabId::Shell("shell-test".to_string());
         let patterns = Arc::new(Vec::new());
@@ -596,8 +589,14 @@ mod tests {
         // The processor base64-encodes terminal bytes. We don't decode
         // here — just assert the routing: A got something, B got
         // something, and nothing crossed.
-        assert!(!a.is_empty(), "channel A should have received pre-swap bytes");
-        assert!(!b.is_empty(), "channel B should have received post-swap bytes");
+        assert!(
+            !a.is_empty(),
+            "channel A should have received pre-swap bytes"
+        );
+        assert!(
+            !b.is_empty(),
+            "channel B should have received post-swap bytes"
+        );
     }
 
     /// V1.4-03: confirms the processor handles three rapid rebinds
@@ -613,11 +612,7 @@ mod tests {
         let (state_tx, _state_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let defaults = crate::settings::Settings::default();
-        let settings = SettingsHandle::new(
-            defaults.clone(),
-            defaults,
-            std::env::temp_dir(),
-        );
+        let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
 
         let initial: Channel<String> = Channel::new(|_| Ok(()));
 
@@ -646,8 +641,7 @@ mod tests {
         }
         let final_clone = final_buf.clone();
         let final_channel: Channel<String> = Channel::new(move |body| {
-            let s = String::from_utf8(body.deserialize().unwrap_or_default())
-                .unwrap_or_default();
+            let s = String::from_utf8(body.deserialize().unwrap_or_default()).unwrap_or_default();
             final_clone.lock().unwrap().push(s);
             Ok(())
         });

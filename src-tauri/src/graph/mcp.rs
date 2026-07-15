@@ -66,7 +66,10 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
         for (key, desc) in params {
-            props.insert((*key).to_string(), json!({ "type": "string", "description": desc }));
+            props.insert(
+                (*key).to_string(),
+                json!({ "type": "string", "description": desc }),
+            );
             required.push(Value::String((*key).to_string()));
         }
         GraphToolSpec {
@@ -402,8 +405,9 @@ impl SurfaceFingerprint {
 
 /// Process-wide memo for [`surface_stats`]: `(fingerprint, stats)`. `None` until
 /// the first call; recomputed only when the fingerprint changes.
-static SURFACE_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(SurfaceFingerprint, SurfaceStats)>>> =
-    std::sync::OnceLock::new();
+static SURFACE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(SurfaceFingerprint, SurfaceStats)>>,
+> = std::sync::OnceLock::new();
 
 /// Do the actual rebuild+serialize of both advertised surfaces. Only reached on
 /// a cache miss (settings changed) — see [`surface_stats`].
@@ -414,7 +418,9 @@ fn compute_surface_stats() -> SurfaceStats {
         mcp_tools: mcp.len(),
         mcp_chars: serde_json::to_string(&mcp).map(|s| s.len()).unwrap_or(0),
         offload_tools: offload.len(),
-        offload_chars: serde_json::to_string(&offload).map(|s| s.len()).unwrap_or(0),
+        offload_chars: serde_json::to_string(&offload)
+            .map(|s| s.len())
+            .unwrap_or(0),
     }
 }
 
@@ -549,7 +555,13 @@ pub(crate) async fn dispatch_recorded(
     } else if name == "graph_struct_search" {
         run_struct_search(root, idx, args, max_rows, max_snippet)
     } else if name == "graph_snippet" {
-        run_snippet(root, idx, args, max_rows, settings.graph.max_body_bytes as usize)
+        run_snippet(
+            root,
+            idx,
+            args,
+            max_rows,
+            settings.graph.max_body_bytes as usize,
+        )
     } else if name == "graph_repo_map" {
         run_repo_map(idx, settings, args, mem_agent(source))
     } else if name == "graph_impact" {
@@ -600,17 +612,27 @@ fn arg_summary(name: &str, args: &Value) -> String {
         if !sym.is_empty() {
             return sym.to_string();
         }
-        return args.get("file").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        return args
+            .get("file")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
     }
     let key = match name {
         "graph_imports" | "graph_outline" => "file",
-        "graph_search_docs" | "graph_semantic_docs" | "graph_semantic_code" | "graph_struct_search" => "query",
+        "graph_search_docs"
+        | "graph_semantic_docs"
+        | "graph_semantic_code"
+        | "graph_struct_search" => "query",
         "context_note" => "text",
         "graph_impact" => "symbols",
         "graph_path" => "from",
         _ => "name",
     };
-    args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Run one graph tool against an open index and format its result as compact,
@@ -642,7 +664,10 @@ pub fn run_tool(
     agent: Option<&str>,
 ) -> Result<String, String> {
     let arg = |key: &str| -> String {
-        args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     };
     let req = |key: &str| require_str(args, name, key);
     match name {
@@ -721,22 +746,32 @@ pub fn run_tool(
                 .map(|n| n as u32)
                 .unwrap_or(14)
                 .clamp(1, 90);
-            let prefix_owned = args.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+            let prefix_owned = args
+                .get("path_prefix")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
             let prefix = prefix_owned.as_deref().filter(|s| !s.is_empty());
             idx.recent_changes(days, prefix, max_rows)
                 .map(|v| fmt_recent_changes(&v, max_rows))
                 .map_err(|e| e.to_string())
         }
         "context_recall" => {
-            let Some(sid) = idx.mem_current_session_for(agent).map_err(|e| e.to_string())? else {
+            let Some(sid) = idx
+                .mem_current_session_for(agent)
+                .map_err(|e| e.to_string())?
+            else {
                 return Ok("No session activity recorded yet.".to_string());
             };
-            let ws = idx.mem_working_set(&sid, max_rows).map_err(|e| e.to_string())?;
+            let ws = idx
+                .mem_working_set(&sid, max_rows)
+                .map_err(|e| e.to_string())?;
             let mut out = fmt_working_set(&ws, max_rows);
             // V12 Phase E: a trailing project-facts section (pinned first,
             // capped separately from the working set) — durable knowledge
             // that outlived the sessions it came from.
-            let facts = idx.list_project_facts(false, 15).map_err(|e| e.to_string())?;
+            let facts = idx
+                .list_project_facts(false, 15)
+                .map_err(|e| e.to_string())?;
             if !facts.is_empty() {
                 out.push_str("\n\n## Project facts\n");
                 out.push_str(&fmt_facts(&facts, 15));
@@ -744,7 +779,10 @@ pub fn run_tool(
             Ok(out)
         }
         "context_notes" => {
-            let sid = idx.mem_current_session_for(agent).map_err(|e| e.to_string())?.unwrap_or_default();
+            let sid = idx
+                .mem_current_session_for(agent)
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
             idx.mem_notes(&sid)
                 .map(|v| fmt_notes(&v, max_rows))
                 .map_err(|e| e.to_string())
@@ -757,20 +795,34 @@ pub fn run_tool(
             // working set the model reloads, yet the old code still said "Noted."
             // A PINNED note is global (surfaces regardless of session), so accept
             // it; otherwise refuse honestly instead of silently orphaning it.
-            let sid = match idx.mem_current_session_for(agent).map_err(|e| e.to_string())? {
+            let sid = match idx
+                .mem_current_session_for(agent)
+                .map_err(|e| e.to_string())?
+            {
                 Some(s) => s,
                 None if pin => String::new(),
                 None => {
-                    return Ok("No active session to attach this note to yet — retry once the \
+                    return Ok(
+                        "No active session to attach this note to yet — retry once the \
                                session has activity, or pass `pin: true` to save it as a durable \
                                pinned note."
-                        .to_string())
+                            .to_string(),
+                    )
                 }
             };
             let note_id = uuid::Uuid::new_v4().to_string();
             let ts = crate::activity::now_ms() as i64;
             idx.mem_add_note(&note_id, &sid, &text, ts, pin)
-                .map(|_| format!("Noted{}.", if pin { " (pinned, kept across sessions)" } else { "" }))
+                .map(|_| {
+                    format!(
+                        "Noted{}.",
+                        if pin {
+                            " (pinned, kept across sessions)"
+                        } else {
+                            ""
+                        }
+                    )
+                })
                 .map_err(|e| e.to_string())
         }
         // Sync path / no-embedder fallback for semantic search: degrade to
@@ -882,7 +934,10 @@ pub(crate) async fn run_check_tool(
             crate::activity::root_key(root),
             source.to_string(),
             "run_check".to_string(),
-            args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            args.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
             crate::activity::now_ms().saturating_sub(started),
             result.is_ok(),
@@ -893,7 +948,11 @@ pub(crate) async fn run_check_tool(
     result
 }
 
-async fn run_check_inner(root: &Path, settings: &crate::settings::Settings, args: &Value) -> Result<String, String> {
+async fn run_check_inner(
+    root: &Path,
+    settings: &crate::settings::Settings,
+    args: &Value,
+) -> Result<String, String> {
     if settings.checks.is_empty() {
         return Ok(
             "run_check is not configured for this project — add entries to the top-level `checks` \
@@ -901,8 +960,19 @@ async fn run_check_inner(root: &Path, settings: &crate::settings::Settings, args
                 .to_string(),
         );
     }
-    let requested = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let names = || settings.checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
+    let requested = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let names = || {
+        settings
+            .checks
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let def = if requested.is_empty() {
         match settings.checks.as_slice() {
             [only] => only,
@@ -917,10 +987,18 @@ async fn run_check_inner(root: &Path, settings: &crate::settings::Settings, args
     } else {
         match settings.checks.iter().find(|c| c.name == requested) {
             Some(c) => c,
-            None => return Err(format!("run_check: no configured check named `{requested}` — configured: {}", names())),
+            None => {
+                return Err(format!(
+                    "run_check: no configured check named `{requested}` — configured: {}",
+                    names()
+                ))
+            }
         }
     };
-    let changed_only = args.get("changed_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let changed_only = args
+        .get("changed_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let max_rows = limits(settings).0;
     crate::checks::run(root, def, changed_only)
         .await
@@ -939,7 +1017,10 @@ fn fmt_check_report(report: &crate::checks::CheckReport, max_rows: usize) -> Str
     let mut out = format!(
         "{} — exit {} · {} ms{}\n",
         report.name,
-        report.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string()),
+        report
+            .exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".to_string()),
         report.duration_ms,
         // V21 F6: an explicit "unverified" cue on timeout, so the worker (and
         // Claude) treat an incomplete check as a non-result — composes with F2's
@@ -961,11 +1042,20 @@ fn fmt_check_report(report: &crate::checks::CheckReport, max_rows: usize) -> Str
         .take(max_rows)
         .map(|g| {
             let sites: Vec<String> = g.sites.iter().map(|(f, l)| format!("{f}:{l}")).collect();
-            format!("{} · {} · ×{} · {}", g.severity.as_str(), g.message, g.count, sites.join(", "))
+            format!(
+                "{} · {} · ×{} · {}",
+                g.severity.as_str(),
+                g.message,
+                g.count,
+                sites.join(", ")
+            )
         })
         .collect();
     if report.groups.len() > max_rows {
-        lines.push(format!("… (+{} more groups)", report.groups.len() - max_rows));
+        lines.push(format!(
+            "… (+{} more groups)",
+            report.groups.len() - max_rows
+        ));
     }
     out.push_str(&lines.join("\n"));
     out
@@ -1010,13 +1100,20 @@ async fn semantic_query(
             let mut lines: Vec<String> = hits
                 .iter()
                 .take(max_rows)
-                .map(|(d, dist)| format!("{} [{}] (distance {:.3}): {}", d.source_path, d.anchor, dist, d.snippet))
+                .map(|(d, dist)| {
+                    format!(
+                        "{} [{}] (distance {:.3}): {}",
+                        d.source_path, d.anchor, dist, d.snippet
+                    )
+                })
                 .collect();
             if hits.len() > max_rows {
                 lines.push(format!("… (+{} more)", hits.len() - max_rows));
             }
             let body = lines.join("\n");
-            Ok(format!("(semantic — nearest first; lower distance = more similar)\n{body}"))
+            Ok(format!(
+                "(semantic — nearest first; lower distance = more similar)\n{body}"
+            ))
         }
         // No vectors matched yet (mid-backfill) or a query error → full-text.
         _ => fallback(idx),
@@ -1071,7 +1168,10 @@ async fn semantic_code_query(
                 .iter()
                 .take(k)
                 .map(|(s, dist)| {
-                    format!("{}:{} · {} · {} · distance {:.3}", s.file, s.start_line, s.kind, s.signature, dist)
+                    format!(
+                        "{}:{} · {} · {} · distance {:.3}",
+                        s.file, s.start_line, s.kind, s.signature, dist
+                    )
                 })
                 .collect();
             if hits.len() > k {
@@ -1090,11 +1190,7 @@ async fn semantic_code_query(
 /// (the worker's confinement roots), open it read-only, and run `name`. `Err`
 /// is fed back to the worker's model as a tool result. The caller is
 /// responsible for the local/remote opt-in gate — this just executes.
-pub async fn offload_query(
-    roots: &[PathBuf],
-    name: &str,
-    args: &Value,
-) -> Result<String, String> {
+pub async fn offload_query(roots: &[PathBuf], name: &str, args: &Value) -> Result<String, String> {
     let settings = current_settings();
     let sub = db_subdir(&settings);
 
@@ -1149,7 +1245,13 @@ fn fmt_symbols(syms: &[SymbolHit], max_rows: usize) -> String {
             let tag = if s.is_test { " [test]" } else { "" };
             format!(
                 "{} ({}) — {}:{}  {}{}{}",
-                s.name, s.kind, s.file, s.start_line, s.signature, tag, conf_badge(s.confidence)
+                s.name,
+                s.kind,
+                s.file,
+                s.start_line,
+                s.signature,
+                tag,
+                conf_badge(s.confidence)
             )
         })
         .collect();
@@ -1252,7 +1354,10 @@ fn fmt_working_set(ws: &[WorkingSetEntry], max_rows: usize) -> String {
     if ws.len() > max_rows {
         lines.push(format!("… (+{} more)", ws.len() - max_rows));
     }
-    format!("Current session working set (most active first):\n{}", lines.join("\n"))
+    format!(
+        "Current session working set (most active first):\n{}",
+        lines.join("\n")
+    )
 }
 
 fn fmt_notes(notes: &[MemNote], max_rows: usize) -> String {
@@ -1294,7 +1399,15 @@ fn fmt_refs(refs: &[RefHit], max_rows: usize) -> String {
     let mut lines: Vec<String> = refs
         .iter()
         .take(max_rows)
-        .map(|r| format!("{}:{}:{}{}", r.file, r.line, r.col, conf_badge(Some(r.confidence))))
+        .map(|r| {
+            format!(
+                "{}:{}:{}{}",
+                r.file,
+                r.line,
+                r.col,
+                conf_badge(Some(r.confidence))
+            )
+        })
         .collect();
     if refs.len() > max_rows {
         lines.push(format!("… (+{} more)", refs.len() - max_rows));
@@ -1448,8 +1561,16 @@ fn run_snippet(
     max_rows: usize,
     max_body_bytes: usize,
 ) -> Result<String, String> {
-    let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let file_arg = args.get("file").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let symbol = args
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let file_arg = args
+        .get("file")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     let context_lines = args
         .get("context_lines")
         .and_then(|v| v.as_u64())
@@ -1493,7 +1614,8 @@ fn run_snippet(
 
     // Read the file from disk, confined to the project root.
     let abs = confine_to_root(root, &hit.file)?;
-    let content = std::fs::read_to_string(&abs).map_err(|e| format!("cannot read {}: {e}", hit.file))?;
+    let content =
+        std::fs::read_to_string(&abs).map_err(|e| format!("cannot read {}: {e}", hit.file))?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
 
@@ -1514,9 +1636,15 @@ fn run_snippet(
     }
 
     // Slice [start_line, end_line] ± context_lines (1-based → 0-based indices).
-    let first = (hit.start_line as usize).saturating_sub(1).saturating_sub(context_lines);
+    let first = (hit.start_line as usize)
+        .saturating_sub(1)
+        .saturating_sub(context_lines);
     let last = ((hit.end_line as usize) + context_lines).min(total); // exclusive
-    let slice = if first < last { lines[first..last].join("\n") } else { String::new() };
+    let slice = if first < last {
+        lines[first..last].join("\n")
+    } else {
+        String::new()
+    };
     let (body, truncated) = cap_bytes(&slice, max_body_bytes);
 
     // Staleness: on-disk content hash vs the stored one.
@@ -1579,14 +1707,23 @@ fn run_repo_map(
 /// changed-but-unindexed files. `include_tests: true` (V12 Phase C) appends a
 /// candidate affected-tests block below, computed with the same roots/depth
 /// via [`GraphIndex::tests_for`].
-fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> Result<String, String> {
+fn run_impact(
+    root: &Path,
+    idx: &GraphIndex,
+    args: &Value,
+    max_rows: usize,
+) -> Result<String, String> {
     let depth = args
         .get("depth")
         .and_then(|v| v.as_u64())
         .map(|n| n as u32)
         .unwrap_or(3)
         .clamp(1, 6);
-    let symbols_arg = args.get("symbols").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let symbols_arg = args
+        .get("symbols")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
 
     let (root_names, changed_syms, unindexed): (Vec<String>, Vec<SymbolHit>, Vec<String>) =
         if !symbols_arg.is_empty() {
@@ -1633,7 +1770,12 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
     // overshoot row is the only way to distinguish "exactly max_rows
     // dependents" from "capped — the true blast radius is larger".
     let mut dependents = idx
-        .dependents_transitive(&root_names, depth, max_rows.saturating_add(1), min_confidence)
+        .dependents_transitive(
+            &root_names,
+            depth,
+            max_rows.saturating_add(1),
+            min_confidence,
+        )
         .map_err(|e| e.to_string())?;
     let capped = dependents.len() > max_rows;
     dependents.truncate(max_rows);
@@ -1644,13 +1786,19 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
             .iter()
             .map(|s| format!("{} ({}:{})", s.name, s.file, s.start_line))
             .collect();
-        out.push_str(&format!("Changed symbols ({}): {}\n\n", changed_syms.len(), list.join(", ")));
+        out.push_str(&format!(
+            "Changed symbols ({}): {}\n\n",
+            changed_syms.len(),
+            list.join(", ")
+        ));
     } else {
         out.push_str(&format!("Roots: {}\n\n", root_names.join(", ")));
     }
 
     if dependents.is_empty() {
-        out.push_str("No dependents found (nothing in the index transitively calls the changed symbol(s)).");
+        out.push_str(
+            "No dependents found (nothing in the index transitively calls the changed symbol(s)).",
+        );
     } else {
         let mut lines: Vec<String> = dependents
             .iter()
@@ -1690,7 +1838,11 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
              (approximate — call edges are name-keyed, not id-resolved).",
             dependents.len(),
             if capped { "+" } else { "" },
-            if dependents.len() == 1 && !capped { "" } else { "s" },
+            if dependents.len() == 1 && !capped {
+                ""
+            } else {
+                "s"
+            },
             ex,
             inf,
             amb,
@@ -1708,8 +1860,14 @@ fn run_impact(root: &Path, idx: &GraphIndex, args: &Value, max_rows: usize) -> R
         ));
     }
 
-    if args.get("include_tests").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let tests = idx.tests_for(&root_names, depth, max_rows).map_err(|e| e.to_string())?;
+    if args
+        .get("include_tests")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let tests = idx
+            .tests_for(&root_names, depth, max_rows)
+            .map_err(|e| e.to_string())?;
         out.push_str("\n\n");
         out.push_str(&fmt_affected_tests(&tests, max_rows));
     }
@@ -1725,16 +1883,17 @@ fn parse_edge_kinds(s: Option<&str>) -> Result<Vec<EdgeKind>, String> {
         return Ok(all());
     };
     let mut out = Vec::new();
-    for tok in s.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
+    for tok in s
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+    {
         match tok.to_ascii_lowercase().as_str() {
             "call" | "calls" => out.push(EdgeKind::Call),
             "import" | "imports" => out.push(EdgeKind::Import),
             "contains" | "containment" => out.push(EdgeKind::Contains),
-            other => {
-                return Err(format!(
-                    "graph_path `kinds` has unknown edge kind `{other}` (use call, import, contains)"
-                ))
-            }
+            other => return Err(format!(
+                "graph_path `kinds` has unknown edge kind `{other}` (use call, import, contains)"
+            )),
         }
     }
     Ok(if out.is_empty() { all() } else { out })
@@ -1742,11 +1901,18 @@ fn parse_edge_kinds(s: Option<&str>) -> Result<Vec<EdgeKind>, String> {
 
 /// Execute `graph_path` (V15 Feature 1): trace the shortest connection between
 /// two entities. `max_hops` defaults to the configured `path_max_hops`.
-fn run_path(idx: &GraphIndex, settings: &crate::settings::Settings, args: &Value) -> Result<String, String> {
+fn run_path(
+    idx: &GraphIndex,
+    settings: &crate::settings::Settings,
+    args: &Value,
+) -> Result<String, String> {
     let from = require_str(args, "graph_path", "from")?;
     let to = require_str(args, "graph_path", "to")?;
     let kinds = parse_edge_kinds(args.get("kinds").and_then(|v| v.as_str()))?;
-    let symmetric = args.get("symmetric").and_then(|v| v.as_bool()).unwrap_or(false);
+    let symmetric = args
+        .get("symmetric")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let default_hops = settings.graph.path_max_hops.max(1) as usize;
     let max_hops = args
         .get("max_hops")
@@ -1754,7 +1920,10 @@ fn run_path(idx: &GraphIndex, settings: &crate::settings::Settings, args: &Value
         .map(|n| n as usize)
         .unwrap_or(default_hops)
         .clamp(1, 32);
-    match idx.shortest_path(&from, &to, &kinds, max_hops, symmetric).map_err(|e| e.to_string())? {
+    match idx
+        .shortest_path(&from, &to, &kinds, max_hops, symmetric)
+        .map_err(|e| e.to_string())?
+    {
         Some(hit) => Ok(fmt_path(&from, &to, &hit)),
         None => Ok(format!(
             "No path from `{from}` to `{to}` within {max_hops} hops (or an endpoint isn't indexed)."
@@ -1782,12 +1951,19 @@ fn fmt_path(from: &str, to: &str, hit: &PathHit) -> String {
         } else {
             let prev = &hit.nodes[i - 1];
             let k = prev.edge_to_next.as_deref().unwrap_or("?");
-            let cb = prev.confidence.map(|c| format!(" [{}]", c.tag())).unwrap_or_default();
+            let cb = prev
+                .confidence
+                .map(|c| format!(" [{}]", c.tag()))
+                .unwrap_or_default();
             lines.push(format!("  ──{k}{cb}──▶ {}", loc(n)));
         }
     }
     let mut out = lines.join("\n");
-    out.push_str(&format!("\n\n{} hop{}", hit.hops, if hit.hops == 1 { "" } else { "s" }));
+    out.push_str(&format!(
+        "\n\n{} hop{}",
+        hit.hops,
+        if hit.hops == 1 { "" } else { "s" }
+    ));
     if hit.equal_alternatives > 0 {
         out.push_str(&format!(
             " (+{} other path{} of equal length)",
@@ -1827,7 +2003,10 @@ fn fmt_architecture(r: &ArchReport, max_rows: usize) -> String {
         out.push_str("(none)\n");
     } else {
         for g in r.god_nodes.iter().take(max_rows) {
-            out.push_str(&format!("{} ({}) — {} · degree {}\n", g.label, g.kind, g.file, g.degree));
+            out.push_str(&format!(
+                "{} ({}) — {} · degree {}\n",
+                g.label, g.kind, g.file, g.degree
+            ));
         }
     }
     out.push_str("\n## Subsystems — heuristic file communities (advisory, not authoritative)\n");
@@ -1868,8 +2047,16 @@ fn fmt_architecture(r: &ArchReport, max_rows: usize) -> String {
 /// it exercises (a `#[cfg(test)] mod`, very common) would otherwise
 /// self-exclude from its own result.
 fn run_tests_for(idx: &GraphIndex, args: &Value, max_rows: usize) -> Result<String, String> {
-    let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let symbol = args
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let file = args
+        .get("file")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     let depth = args
         .get("depth")
         .and_then(|v| v.as_u64())
@@ -1884,18 +2071,26 @@ fn run_tests_for(idx: &GraphIndex, args: &Value, max_rows: usize) -> Result<Stri
         if syms.is_empty() {
             return Ok(format!("No indexed definitions in {file}."));
         }
-        let mut names: Vec<String> = syms.iter().filter(|s| !s.is_test).map(|s| s.name.clone()).collect();
+        let mut names: Vec<String> = syms
+            .iter()
+            .filter(|s| !s.is_test)
+            .map(|s| s.name.clone())
+            .collect();
         names.sort();
         names.dedup();
         if names.is_empty() {
-            return Ok(format!("{file} has no non-test definitions to find tests for."));
+            return Ok(format!(
+                "{file} has no non-test definitions to find tests for."
+            ));
         }
         names
     } else {
         return Err("graph_tests_for needs either `symbol` or `file`".into());
     };
 
-    let tests = idx.tests_for(&roots, depth, max_rows).map_err(|e| e.to_string())?;
+    let tests = idx
+        .tests_for(&roots, depth, max_rows)
+        .map_err(|e| e.to_string())?;
     Ok(fmt_affected_tests(&tests, max_rows))
 }
 
@@ -1988,7 +2183,13 @@ mod run_check_tests {
     use serde_json::json;
 
     fn def(name: &str, cmd: &str) -> CheckDef {
-        CheckDef { name: name.to_string(), cmd: cmd.to_string(), parser: ParserKind::GenericGcc, timeout_secs: 30, ..Default::default() }
+        CheckDef {
+            name: name.to_string(),
+            cmd: cmd.to_string(),
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 30,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -2002,7 +2203,9 @@ mod run_check_tests {
     async fn empty_config_reports_not_configured() {
         let settings = Settings::default();
         assert!(settings.checks.is_empty());
-        let out = run_check_inner(&std::env::temp_dir(), &settings, &json!({})).await.expect("ok result");
+        let out = run_check_inner(&std::env::temp_dir(), &settings, &json!({}))
+            .await
+            .expect("ok result");
         assert!(out.contains("not configured"), "{out}");
         assert!(out.contains("checks"), "{out}");
     }
@@ -2034,7 +2237,9 @@ mod run_check_tests {
         let cargo = which::which("cargo").expect("cargo on PATH");
         let mut settings = Settings::default();
         settings.checks = vec![def("only", &format!("\"{}\" --version", cargo.display()))];
-        let out = run_check_inner(&std::env::temp_dir(), &settings, &json!({})).await.expect("ok result");
+        let out = run_check_inner(&std::env::temp_dir(), &settings, &json!({}))
+            .await
+            .expect("ok result");
         assert!(out.contains("only"), "{out}");
         assert!(out.contains("exit 0"), "{out}");
     }
@@ -2054,7 +2259,13 @@ mod run_check_tests {
                     count: 3,
                     sites: vec![("src/a.rs".into(), 10), ("src/b.rs".into(), 20)],
                 },
-                DiagGroup { key: "k2".into(), severity: Severity::Warning, message: "unused import".into(), count: 1, sites: vec![("src/c.rs".into(), 1)] },
+                DiagGroup {
+                    key: "k2".into(),
+                    severity: Severity::Warning,
+                    message: "unused import".into(),
+                    count: 1,
+                    sites: vec![("src/c.rs".into(), 1)],
+                },
             ],
             stdout_bytes: 0,
             stderr_bytes: 0,
@@ -2070,14 +2281,30 @@ mod run_check_tests {
 
     #[test]
     fn fmt_check_report_no_diagnostics() {
-        let report = CheckReport { name: "cargo".into(), exit_code: Some(0), duration_ms: 5, timed_out: false, groups: vec![], stdout_bytes: 0, stderr_bytes: 0 };
+        let report = CheckReport {
+            name: "cargo".into(),
+            exit_code: Some(0),
+            duration_ms: 5,
+            timed_out: false,
+            groups: vec![],
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        };
         let out = fmt_check_report(&report, 50);
         assert!(out.contains("No diagnostics."), "{out}");
     }
 
     #[test]
     fn fmt_check_report_flags_timeout() {
-        let report = CheckReport { name: "slow".into(), exit_code: None, duration_ms: 10_000, timed_out: true, groups: vec![], stdout_bytes: 0, stderr_bytes: 0 };
+        let report = CheckReport {
+            name: "slow".into(),
+            exit_code: None,
+            duration_ms: 10_000,
+            timed_out: true,
+            groups: vec![],
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        };
         let out = fmt_check_report(&report, 50);
         assert!(out.contains("TIMED OUT"), "{out}");
         // V21 F6: a timed-out check must carry the "unverified" cue so the
@@ -2093,7 +2320,8 @@ mod snippet_tests {
     use serde_json::json;
     use std::path::PathBuf;
 
-    const SRC: &str = "pub fn alpha() -> i32 {\n    let x = 1;\n    x + 1\n}\npub fn beta() -> i32 { alpha() }\n";
+    const SRC: &str =
+        "pub fn alpha() -> i32 {\n    let x = 1;\n    x + 1\n}\npub fn beta() -> i32 { alpha() }\n";
 
     /// Build a temp project on disk (real source files) + its graph index.
     fn setup(tag: &str, files: &[(&str, &str)]) -> (PathBuf, GraphIndex) {
@@ -2103,7 +2331,8 @@ mod snippet_tests {
             let abs = dir.join(rel);
             std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
             std::fs::write(&abs, src).unwrap();
-            idx.index_file_graph(&parse_file(rel, src, Lang::Rust)).expect("index");
+            idx.index_file_graph(&parse_file(rel, src, Lang::Rust))
+                .expect("index");
         }
         (dir, idx)
     }
@@ -2114,7 +2343,10 @@ mod snippet_tests {
         let out = run_snippet(&dir, &idx, &json!({ "symbol": "alpha" }), 50, 16_384).unwrap();
         assert!(out.contains("src/geo.rs:"), "header present: {out}");
         assert!(out.contains("let x = 1;"), "body present: {out}");
-        assert!(!out.contains("fn beta"), "did not dump the rest of the file: {out}");
+        assert!(
+            !out.contains("fn beta"),
+            "did not dump the rest of the file: {out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2122,7 +2354,10 @@ mod snippet_tests {
     fn ambiguous_name_lists_without_a_body() {
         let (dir, idx) = setup(
             "amb",
-            &[("src/a.rs", "pub fn dup() -> i32 { 1 }\n"), ("src/b.rs", "pub fn dup() -> i32 { 2 }\n")],
+            &[
+                ("src/a.rs", "pub fn dup() -> i32 { 1 }\n"),
+                ("src/b.rs", "pub fn dup() -> i32 { 2 }\n"),
+            ],
         );
         let out = run_snippet(&dir, &idx, &json!({ "symbol": "dup" }), 50, 16_384).unwrap();
         assert!(out.contains("defined in 2 places"), "disambiguation: {out}");
@@ -2133,7 +2368,14 @@ mod snippet_tests {
     fn file_line_resolves_enclosing_symbol() {
         let (dir, idx) = setup("fl", &[("src/geo.rs", SRC)]);
         // Line 2 sits inside alpha's body.
-        let out = run_snippet(&dir, &idx, &json!({ "file": "src/geo.rs", "line": 2 }), 50, 16_384).unwrap();
+        let out = run_snippet(
+            &dir,
+            &idx,
+            &json!({ "file": "src/geo.rs", "line": 2 }),
+            50,
+            16_384,
+        )
+        .unwrap();
         assert!(out.contains("let x = 1;"), "resolved alpha's body: {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2183,8 +2425,16 @@ mod impact_tool_tests {
         let dir = std::env::temp_dir().join(format!("impact-tool-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         let git = |args: &[&str]| {
-            let out = StdCommand::new("git").args(args).current_dir(&dir).output().expect("git");
-            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            let out = StdCommand::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "test@example.com"]);
@@ -2198,7 +2448,8 @@ mod impact_tool_tests {
         git(&["commit", "-q", "-m", "init"]);
 
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust)).expect("index");
+        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust))
+            .expect("index");
         (dir, idx)
     }
 
@@ -2219,7 +2470,8 @@ mod impact_tool_tests {
     #[test]
     fn symbols_arg_respects_depth() {
         let (dir, idx) = setup("depth");
-        let out = run_impact(&dir, &idx, &json!({ "symbols": "a", "depth": 1 }), 50).expect("run_impact");
+        let out =
+            run_impact(&dir, &idx, &json!({ "symbols": "a", "depth": 1 }), 50).expect("run_impact");
         assert!(out.contains("· b · depth 1"), "{out}");
         assert!(!out.contains("· c ·"), "depth=1 must not reach c: {out}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2234,7 +2486,10 @@ mod impact_tool_tests {
         let (dir, idx) = setup("cap");
         // The chain has 2 dependents (b, c); a cap of 1 must be flagged.
         let out = run_impact(&dir, &idx, &json!({ "symbols": "a" }), 1).expect("run_impact");
-        assert!(out.contains("capped at 1 — the true blast radius is larger"), "{out}");
+        assert!(
+            out.contains("capped at 1 — the true blast radius is larger"),
+            "{out}"
+        );
         assert!(out.contains("1+ dependents"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2243,7 +2498,11 @@ mod impact_tool_tests {
     fn diff_mode_maps_the_edit_to_its_symbol() {
         let (dir, idx) = setup("diff");
         // Edit a()'s body — still empty braces content-wise but touches its line.
-        std::fs::write(dir.join("src/chain.rs"), "pub fn a() { /* changed */ }\npub fn b() { a() }\npub fn c() { b() }\n").unwrap();
+        std::fs::write(
+            dir.join("src/chain.rs"),
+            "pub fn a() { /* changed */ }\npub fn b() { a() }\npub fn c() { b() }\n",
+        )
+        .unwrap();
 
         let out = run_impact(&dir, &idx, &json!({}), 50).expect("run_impact");
         assert!(out.contains("Changed symbols"), "{out}");
@@ -2259,7 +2518,10 @@ mod impact_tool_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         let err = run_impact(&dir, &idx, &json!({}), 50).expect_err("not a git repo");
-        assert!(err.contains("not a git repository") || err.to_lowercase().contains("git"), "{err}");
+        assert!(
+            err.contains("not a git repository") || err.to_lowercase().contains("git"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2278,10 +2540,18 @@ mod impact_tool_tests {
         let dir = std::env::temp_dir().join(format!("impact-tool-tests-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        let src = "pub fn a() {}\npub fn b() { a() }\npub fn c() { b() }\n#[test]\nfn test_c() { c() }\n";
-        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust)).expect("index");
+        let src =
+            "pub fn a() {}\npub fn b() { a() }\npub fn c() { b() }\n#[test]\nfn test_c() { c() }\n";
+        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust))
+            .expect("index");
 
-        let out = run_impact(&dir, &idx, &json!({ "symbols": "a", "include_tests": true }), 50).expect("run_impact");
+        let out = run_impact(
+            &dir,
+            &idx,
+            &json!({ "symbols": "a", "include_tests": true }),
+            50,
+        )
+        .expect("run_impact");
         assert!(out.contains("Candidate affected tests"), "{out}");
         assert!(out.contains("test_c"), "{out}");
 
@@ -2304,10 +2574,12 @@ mod tests_for_tool_tests {
     /// one() <- two() <- test_it() (a #[test] fn), all in one file — the
     /// fixture that exercises the file-mode self-exclusion fix.
     fn setup(tag: &str) -> (PathBuf, GraphIndex) {
-        let dir = std::env::temp_dir().join(format!("tests-for-tool-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("tests-for-tool-{tag}-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         let src = "pub fn one() {}\npub fn two() { one() }\n#[test]\nfn test_it() { two() }\n";
-        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust)).expect("index");
+        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust))
+            .expect("index");
         (dir, idx)
     }
 
@@ -2324,7 +2596,8 @@ mod tests_for_tool_tests {
         // The file's own test (test_it) must NOT self-exclude — file mode
         // roots on {one, two} only, so test_it still surfaces as depth-1.
         let (dir, idx) = setup("file");
-        let out = run_tests_for(&idx, &json!({ "file": "src/chain.rs" }), 50).expect("run_tests_for");
+        let out =
+            run_tests_for(&idx, &json!({ "file": "src/chain.rs" }), 50).expect("run_tests_for");
         assert!(out.contains("test_it"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2338,9 +2611,11 @@ mod tests_for_tool_tests {
 
     #[test]
     fn no_tests_found_is_a_clear_message() {
-        let dir = std::env::temp_dir().join(format!("tests-for-tool-none-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("tests-for-tool-none-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.index_file_graph(&parse_file("src/x.rs", "pub fn lonely() {}\n", Lang::Rust)).expect("index");
+        idx.index_file_graph(&parse_file("src/x.rs", "pub fn lonely() {}\n", Lang::Rust))
+            .expect("index");
         let out = run_tests_for(&idx, &json!({ "symbol": "lonely" }), 50).expect("run_tests_for");
         assert!(out.contains("No candidate tests"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2356,11 +2631,15 @@ mod recall_facts_tests {
     fn context_recall_appends_a_project_facts_section() {
         let dir = std::env::temp_dir().join(format!("recall-facts-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
-        idx.add_project_fact("f1", "we chose FNV hashing for stability", "s1", 50, true).unwrap();
-        idx.add_project_fact("f2", "the retry cap is 30s by design", "s1", 60, false).unwrap();
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None)
+            .unwrap();
+        idx.add_project_fact("f1", "we chose FNV hashing for stability", "s1", 50, true)
+            .unwrap();
+        idx.add_project_fact("f2", "the retry cap is 30s by design", "s1", 60, false)
+            .unwrap();
 
-        let out = run_tool(&idx, "context_recall", &json!({}), 50, 200, Some("claude")).expect("run_tool");
+        let out = run_tool(&idx, "context_recall", &json!({}), 50, 200, Some("claude"))
+            .expect("run_tool");
         assert!(out.contains("## Project facts"), "{out}");
         assert!(out.contains("we chose FNV hashing for stability"), "{out}");
         assert!(out.contains("the retry cap is 30s by design"), "{out}");
@@ -2377,9 +2656,11 @@ mod recall_facts_tests {
     fn context_recall_omits_the_facts_section_when_there_are_none() {
         let dir = std::env::temp_dir().join(format!("recall-nofacts-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None)
+            .unwrap();
 
-        let out = run_tool(&idx, "context_recall", &json!({}), 50, 200, Some("claude")).expect("run_tool");
+        let out = run_tool(&idx, "context_recall", &json!({}), 50, 200, Some("claude"))
+            .expect("run_tool");
         assert!(!out.contains("## Project facts"), "{out}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2397,14 +2678,25 @@ mod surface_tests {
     fn lean_hidden_are_real_non_workhorse_tools() {
         let names: Vec<&str> = tool_specs().iter().map(|s| s.name).collect();
         for h in LEAN_HIDDEN {
-            assert!(names.contains(h), "LEAN_HIDDEN tool `{h}` is not in tool_specs()");
+            assert!(
+                names.contains(h),
+                "LEAN_HIDDEN tool `{h}` is not in tool_specs()"
+            );
         }
         const WORKHORSES: &[&str] = &[
-            "graph_find_symbol", "graph_callers", "graph_callees", "graph_outline",
-            "graph_snippet", "graph_references", "graph_search_docs",
+            "graph_find_symbol",
+            "graph_callers",
+            "graph_callees",
+            "graph_outline",
+            "graph_snippet",
+            "graph_references",
+            "graph_search_docs",
         ];
         for w in WORKHORSES {
-            assert!(!LEAN_HIDDEN.contains(w), "workhorse `{w}` must never be lean-hidden");
+            assert!(
+                !LEAN_HIDDEN.contains(w),
+                "workhorse `{w}` must never be lean-hidden"
+            );
         }
         assert_eq!(LEAN_HIDDEN.len(), 5);
     }
@@ -2414,11 +2706,16 @@ mod surface_tests {
     #[test]
     fn lean_filter_hides_exactly_lean_hidden() {
         let full: Vec<&str> = tool_specs().iter().map(|s| s.name).collect();
-        let passed: Vec<&str> = lean_filter(tool_specs(), false).iter().map(|s| s.name).collect();
+        let passed: Vec<&str> = lean_filter(tool_specs(), false)
+            .iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(full, passed, "lean=false must be a no-op");
 
-        let lean: Vec<String> =
-            lean_filter(tool_specs(), true).iter().map(|s| s.name.to_string()).collect();
+        let lean: Vec<String> = lean_filter(tool_specs(), true)
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
         let expected: Vec<String> = tool_specs()
             .iter()
             .filter(|s| !LEAN_HIDDEN.contains(&s.name))
@@ -2441,7 +2738,10 @@ mod surface_tests {
         assert_eq!(s.mcp_chars, serde_json::to_string(&mcp).unwrap().len());
         let offload = crate::offload::tools::graph_tools::defs();
         assert_eq!(s.offload_tools, offload.len());
-        assert_eq!(s.offload_chars, serde_json::to_string(&offload).unwrap().len());
+        assert_eq!(
+            s.offload_chars,
+            serde_json::to_string(&offload).unwrap().len()
+        );
         assert!(s.mcp_chars >= 2);
     }
 
@@ -2453,8 +2753,15 @@ mod surface_tests {
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         idx.index_file_graph(&parse_file("src/x.rs", "pub fn lonely() {}\n", Lang::Rust))
             .expect("index");
-        let out = run_tool(&idx, "graph_dead_exports", &serde_json::json!({}), 50, 200, None)
-            .expect("hidden tool still dispatches");
+        let out = run_tool(
+            &idx,
+            "graph_dead_exports",
+            &serde_json::json!({}),
+            50,
+            200,
+            None,
+        )
+        .expect("hidden tool still dispatches");
         assert!(!out.starts_with("unknown graph tool"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2466,7 +2773,10 @@ mod surface_tests {
     fn surface_stats_is_stable_across_calls() {
         let a = surface_stats();
         let b = surface_stats();
-        assert_eq!(a, b, "cached surface stats must equal the first computation");
+        assert_eq!(
+            a, b,
+            "cached surface stats must equal the first computation"
+        );
     }
 
     /// The fingerprint must move when — and only when — a gating input changes,
@@ -2481,19 +2791,35 @@ mod surface_tests {
         // Each gating toggle must produce a distinct fingerprint.
         let mut s = base.clone();
         s.graph.enabled = !s.graph.enabled;
-        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "graph.enabled must be in the fingerprint");
+        assert_ne!(
+            SurfaceFingerprint::of(&s),
+            base_fp,
+            "graph.enabled must be in the fingerprint"
+        );
 
         let mut s = base.clone();
         s.graph.semantic_search = !s.graph.semantic_search;
-        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "semantic_search must be in the fingerprint");
+        assert_ne!(
+            SurfaceFingerprint::of(&s),
+            base_fp,
+            "semantic_search must be in the fingerprint"
+        );
 
         let mut s = base.clone();
         s.graph.embed_code_bodies = !s.graph.embed_code_bodies;
-        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "embed_code_bodies must be in the fingerprint");
+        assert_ne!(
+            SurfaceFingerprint::of(&s),
+            base_fp,
+            "embed_code_bodies must be in the fingerprint"
+        );
 
         let mut s = base.clone();
         s.graph.lean_tools = !s.graph.lean_tools;
-        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "lean_tools must be in the fingerprint");
+        assert_ne!(
+            SurfaceFingerprint::of(&s),
+            base_fp,
+            "lean_tools must be in the fingerprint"
+        );
 
         let mut s = base.clone();
         s.checks = vec![crate::checks::CheckDef {
@@ -2501,7 +2827,11 @@ mod surface_tests {
             cmd: "cargo check".to_string(),
             ..Default::default()
         }];
-        assert_ne!(SurfaceFingerprint::of(&s), base_fp, "checks emptiness must be in the fingerprint");
+        assert_ne!(
+            SurfaceFingerprint::of(&s),
+            base_fp,
+            "checks emptiness must be in the fingerprint"
+        );
 
         // A field that does NOT change the advertised surface must NOT move it —
         // otherwise the cache would recompute needlessly on unrelated edits.

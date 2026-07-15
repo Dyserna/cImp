@@ -283,7 +283,9 @@ mod tests {
         // phonemes, failing the whole g2p call; the retry without symbol-only
         // tokens must still voice the real words.
         let p = Phonemizer::new();
-        let toks = p.phonemize("see ### here").expect("sentence should survive");
+        let toks = p
+            .phonemize("see ### here")
+            .expect("sentence should survive");
         assert!(toks.raw_count > 0);
     }
 
@@ -318,7 +320,11 @@ mod tests {
     fn espeak_fallback_engages_on_oov() {
         // Point espeak-rs at the data dir copied by build.rs.
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
         let data = manifest.join("target").join(profile).join("espeak-ng-data");
         assert!(
             data.is_dir(),

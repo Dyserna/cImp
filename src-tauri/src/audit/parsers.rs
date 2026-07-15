@@ -194,7 +194,13 @@ fn parse_knip_json(output: &str, root: &Path) -> Vec<Diag> {
         let file = relativize(root, &entry.file);
         // The whole file is unused (its `files` bucket is non-empty).
         if !entry.files.is_empty() {
-            out.push(knip_diag(&file, "unused-file", "unused file".to_string(), 0, None));
+            out.push(knip_diag(
+                &file,
+                "unused-file",
+                "unused file".to_string(),
+                0,
+                None,
+            ));
         }
         for it in &entry.exports {
             out.push(knip_item_diag(&file, "unused-export", "unused export", it));
@@ -203,13 +209,28 @@ fn parse_knip_json(output: &str, root: &Path) -> Vec<Diag> {
             out.push(knip_item_diag(&file, "unused-type", "unused type", it));
         }
         for it in &entry.dependencies {
-            out.push(knip_item_diag(&file, "unused-dependency", "unused dependency", it));
+            out.push(knip_item_diag(
+                &file,
+                "unused-dependency",
+                "unused dependency",
+                it,
+            ));
         }
         for it in &entry.dev_dependencies {
-            out.push(knip_item_diag(&file, "unused-dependency", "unused devDependency", it));
+            out.push(knip_item_diag(
+                &file,
+                "unused-dependency",
+                "unused devDependency",
+                it,
+            ));
         }
         for it in &entry.unlisted {
-            out.push(knip_item_diag(&file, "unlisted-dependency", "unlisted dependency", it));
+            out.push(knip_item_diag(
+                &file,
+                "unlisted-dependency",
+                "unlisted dependency",
+                it,
+            ));
         }
         for it in &entry.unresolved {
             out.push(knip_item_diag(&file, "unresolved", "unresolved import", it));
@@ -393,7 +414,7 @@ mod tests {
         assert_eq!(d[0].file, "src/main.rs");
         assert_eq!(d[0].line, 42);
         assert_eq!(d[0].col, Some(12)); // byte_offset 11 → 1-based 12
-        // A typo with no correction still surfaces.
+                                        // A typo with no correction still surfaces.
         assert_eq!(d[1].message, "`asdfg` is misspelled");
         assert_eq!(d[1].file, "README.md");
     }
@@ -427,17 +448,29 @@ mod tests {
         let unused_file = &d[0];
         assert_eq!(unused_file.code.as_deref(), Some("unused-file"));
         assert_eq!(unused_file.file, "src/legacy.ts");
-        let export = d.iter().find(|x| x.code.as_deref() == Some("unused-export")).unwrap();
+        let export = d
+            .iter()
+            .find(|x| x.code.as_deref() == Some("unused-export"))
+            .unwrap();
         assert_eq!(export.message, "unused export `factorial`");
         assert_eq!(export.file, "src/math.ts");
         assert_eq!(export.line, 12);
         assert_eq!(export.col, Some(14));
-        let ty = d.iter().find(|x| x.code.as_deref() == Some("unused-type")).unwrap();
+        let ty = d
+            .iter()
+            .find(|x| x.code.as_deref() == Some("unused-type"))
+            .unwrap();
         assert_eq!(ty.message, "unused type `Radians`");
-        let dep = d.iter().find(|x| x.code.as_deref() == Some("unused-dependency")).unwrap();
+        let dep = d
+            .iter()
+            .find(|x| x.code.as_deref() == Some("unused-dependency"))
+            .unwrap();
         assert_eq!(dep.message, "unused dependency `lodash`");
         assert_eq!(dep.file, "package.json");
-        let unlisted = d.iter().find(|x| x.code.as_deref() == Some("unlisted-dependency")).unwrap();
+        let unlisted = d
+            .iter()
+            .find(|x| x.code.as_deref() == Some("unlisted-dependency"))
+            .unwrap();
         assert_eq!(unlisted.message, "unlisted dependency `rimraf`");
     }
 
@@ -445,7 +478,9 @@ mod tests {
     #[test]
     fn knip_json_malformed_is_empty() {
         assert!(AuditParser::KnipJson.parse("not json", &root()).is_empty());
-        assert!(AuditParser::KnipJson.parse(r#"{"issues":[]}"#, &root()).is_empty());
+        assert!(AuditParser::KnipJson
+            .parse(r#"{"issues":[]}"#, &root())
+            .is_empty());
     }
 
     // ── MacheteText ─────────────────────────────────────────────────────────
@@ -489,6 +524,8 @@ mod tests {
     #[test]
     fn machete_text_clean_is_empty() {
         assert!(AuditParser::MacheteText.parse("", &root()).is_empty());
-        assert!(AuditParser::MacheteText.parse("Analyzing your crate...\n", &root()).is_empty());
+        assert!(AuditParser::MacheteText
+            .parse("Analyzing your crate...\n", &root())
+            .is_empty());
     }
 }

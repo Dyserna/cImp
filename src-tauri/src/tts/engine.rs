@@ -5,13 +5,13 @@
 
 use std::path::Path;
 
+#[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
+use ort::execution_providers::CUDAExecutionProvider;
+#[cfg(feature = "tts-webgpu")]
+use ort::execution_providers::WebGPUExecutionProvider;
 use ort::execution_providers::{CPUExecutionProvider, ExecutionProvider};
 use ort::session::{builder::GraphOptimizationLevel, builder::SessionBuilder, Session};
 use ort::value::Tensor;
-#[cfg(feature = "tts-webgpu")]
-use ort::execution_providers::WebGPUExecutionProvider;
-#[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
-use ort::execution_providers::CUDAExecutionProvider;
 
 use crate::error::{AppError, AppResult};
 use crate::settings::ProcessingDevice;
@@ -86,11 +86,7 @@ impl TtsEngine {
             .map_err(|e| AppError::Tts(format!("load {}: {e}", model_path.display())))?;
         let voice = VoicePack::load(voice_path)?;
         let phonemizer = Phonemizer::new();
-        tracing::info!(
-            voice = voice.name(),
-            bound = bound_ep,
-            "TTS engine ready"
-        );
+        tracing::info!(voice = voice.name(), bound = bound_ep, "TTS engine ready");
         Ok(Self {
             session,
             voice,
@@ -263,7 +259,10 @@ mod tests {
         // long-lived engine warms once, so this also exercises that path.
         let t = std::time::Instant::now();
         let resp = engine
-            .synthesize(SynthesisRequest { text: text.into(), request_id: 1 })
+            .synthesize(SynthesisRequest {
+                text: text.into(),
+                request_id: 1,
+            })
             .expect("synthesis");
         let synth_ms = t.elapsed().as_millis();
 
@@ -281,5 +280,4 @@ mod tests {
         assert!(peak > 0.05, "output peak too low ({peak}) — likely silence");
         assert!(rms > 0.005, "output rms too low ({rms}) — likely silence");
     }
-
 }

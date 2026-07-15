@@ -54,7 +54,10 @@ pub struct Discovery {
 /// back to the cwd if `current_exe()` is unavailable (mirrors
 /// `settings::global_path`).
 pub fn discovery_path() -> PathBuf {
-    match std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+    match std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+    {
         Some(dir) => dir.join(DISCOVERY_FILE),
         None => PathBuf::from(DISCOVERY_FILE),
     }
@@ -284,7 +287,12 @@ async fn read_request(stream: &mut TcpStream) -> AppResult<Request> {
     }
     body.truncate(content_length);
 
-    Ok(Request { method, path, auth, body })
+    Ok(Request {
+        method,
+        path,
+        auth,
+        body,
+    })
 }
 
 /// Find the first index of `needle` in `hay`.
@@ -358,7 +366,13 @@ async fn handle_conn(
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
         ("GET", "/describe") => {
             let text = service.describe().await;
-            write_simple(&mut stream, 200, "text/plain; charset=utf-8", text.as_bytes()).await
+            write_simple(
+                &mut stream,
+                200,
+                "text/plain; charset=utf-8",
+                text.as_bytes(),
+            )
+            .await
         }
         ("GET", "/events") => handle_events(stream, service).await,
         ("GET", "/health") => write_simple(&mut stream, 200, "text/plain", b"ok").await,
@@ -491,9 +505,8 @@ async fn handle_run(
     // Final line: one JSON object (serde emits no embedded newlines) + `\n`,
     // then the connection closes. `ok:false` here too is a task-level error the
     // child renders as a tool result so Claude can read + adapt.
-    let mut line = serde_json::to_vec(&r).unwrap_or_else(|_| {
-        br#"{"ok":false,"error":"failed to serialize result"}"#.to_vec()
-    });
+    let mut line = serde_json::to_vec(&r)
+        .unwrap_or_else(|_| br#"{"ok":false,"error":"failed to serialize result"}"#.to_vec());
     line.push(b'\n');
     wr.write_all(&line)
         .await
@@ -535,11 +548,7 @@ struct McpCallBody {
 /// (single shared connection — no second cross-process open of the SQLite store)
 /// and return its text. The `GraphService` is resolved from managed state at
 /// request time, so this is robust against the graph-vs-loopback startup order.
-async fn handle_graph_run(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
+async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
     let body: GraphRunBody = match serde_json::from_slice(&req.body) {
         Ok(b) => b,
         Err(e) => {
@@ -567,7 +576,10 @@ async fn handle_graph_run(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let consumer = body.consumer.as_deref().unwrap_or("claude");
-    let r = match graph.run_graph_tool(&cwd, &body.name, &body.args, consumer).await {
+    let r = match graph
+        .run_graph_tool(&cwd, &body.name, &body.args, consumer)
+        .await
+    {
         Ok(text) => RunResult {
             ok: true,
             text: Some(text),
@@ -624,7 +636,11 @@ async fn handle_context_retrieve(
             .await;
         }
     };
-    let cwd = body.cwd.clone().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let cwd = body
+        .cwd
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     // V13 Phase C: fire the prompt-tap checkpoint trigger for EVERY prompt
     // that reaches this route, BEFORE the `context_injection` gate below —
@@ -667,14 +683,22 @@ async fn handle_context_retrieve(
     // also calls `retrieve_context` — never consumes the once-per-session flag.
     let mut text = r.context_md;
     if let Some(map) = graph.session_greeting(&cwd, body.session_id.as_deref()) {
-        text = if text.is_empty() { map } else { format!("{map}\n\n{text}") };
+        text = if text.is_empty() {
+            map
+        } else {
+            format!("{map}\n\n{text}")
+        };
     }
     // V12 Phase F: drain any auto-check block a slow post-edit run parked for
     // this session (see `GraphService::post_edit`'s budget/park path) — a
     // turn is never blocked waiting for a check, but its result still reaches
     // the model on the very next opportunity.
     if let Some(pending) = graph.drain_auto_check(body.session_id.as_deref()) {
-        text = if text.is_empty() { pending } else { format!("{text}\n\n{pending}") };
+        text = if text.is_empty() {
+            pending
+        } else {
+            format!("{text}\n\n{pending}")
+        };
     }
     // Same char→token estimate as the retrieval core (shared divisor so the two
     // can't drift). Estimated from the FULL injected text (digest + greeting +
@@ -726,7 +750,10 @@ async fn handle_context_compaction(
         return write_json(stream, 200, &empty).await;
     };
     let graph = graph.inner().clone();
-    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let cwd = body
+        .cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     let block = graph.compaction_context(&cwd, body.session_id.as_deref());
     write_json(
         stream,
@@ -759,7 +786,11 @@ struct ShouldReadBody {
 /// `Read`. Returns `{ ok, verdict: "pass" }` to let the read through, or
 /// `{ ok, verdict: "remind", text }` to deny-with-content. Fails open to `pass`
 /// on any missing state — the advisor must never block a legitimate read.
-async fn handle_should_read(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
+async fn handle_should_read(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
     let pass = serde_json::json!({ "ok": true, "verdict": "pass" });
     let body: ShouldReadBody = match serde_json::from_slice(&req.body) {
         Ok(b) => b,
@@ -776,10 +807,24 @@ async fn handle_should_read(stream: &mut TcpStream, app: &AppHandle, req: &Reque
         return write_json(stream, 200, &pass).await;
     };
     let graph = graph.inner().clone();
-    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    match graph.should_read(&cwd, body.session_id.as_deref(), &body.file_path, body.offset, body.limit) {
+    let cwd = body
+        .cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    match graph.should_read(
+        &cwd,
+        body.session_id.as_deref(),
+        &body.file_path,
+        body.offset,
+        body.limit,
+    ) {
         Some(text) => {
-            write_json(stream, 200, &serde_json::json!({ "ok": true, "verdict": "remind", "text": text })).await
+            write_json(
+                stream,
+                200,
+                &serde_json::json!({ "ok": true, "verdict": "remind", "text": text }),
+            )
+            .await
         }
         None => write_json(stream, 200, &pass).await,
     }
@@ -843,7 +888,10 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
                 0,
                 false, // a drift report is never "ok" — it flags the entry in the feed
             ),
-            request: format!("shim {} payload missing required fields (session {session})", body.shim),
+            request: format!(
+                "shim {} payload missing required fields (session {session})",
+                body.shim
+            ),
             response: missing,
         });
     }
@@ -889,12 +937,20 @@ async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request
         return write_json(stream, 200, &empty).await;
     };
     let graph = graph.inner().clone();
-    let cwd = body.cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let cwd = body
+        .cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     let text = graph
         .post_edit(&cwd, body.session_id.as_deref(), &body.file_path)
         .await
         .unwrap_or_default();
-    write_json(stream, 200, &serde_json::json!({ "ok": true, "text": text })).await
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({ "ok": true, "text": text }),
+    )
+    .await
 }
 
 /// A `POST /memory/event` request body (the OpenCode plugin's tool hook — the
@@ -980,7 +1036,10 @@ fn usage_event_from_body(body: &MemoryEventBody) -> Option<(String, crate::graph
 /// they are dropped rather than recorded against the child, and only the parent
 /// is marked live. Pure, so the routing is unit-tested without a live handler.
 fn tool_event_parent(body: &MemoryEventBody) -> Option<String> {
-    body.parent_session_id.as_deref().filter(|p| !p.is_empty()).map(str::to_string)
+    body.parent_session_id
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
 }
 
 /// `POST /memory/event`: classify an agent tool call and record it as a memory
@@ -1009,7 +1068,11 @@ async fn handle_memory_event(
         return write_json(stream, 200, &ok).await;
     };
     let graph = graph.inner().clone();
-    let cwd = body.cwd.as_deref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let cwd = body
+        .cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     let agent = body.agent.as_deref().unwrap_or("opencode");
 
     // V24 Phase F: the usage arm — a completed assistant turn's real token
@@ -1053,11 +1116,26 @@ async fn handle_memory_event(
         let get = |k: &str| body.args.get(k).and_then(Value::as_str);
         let (path, detail) = match arg {
             crate::graph::MemArg::Path => (
-                get("file_path").or_else(|| get("filePath")).or_else(|| get("notebook_path")).or_else(|| get("path")).unwrap_or("").to_string(),
+                get("file_path")
+                    .or_else(|| get("filePath"))
+                    .or_else(|| get("notebook_path"))
+                    .or_else(|| get("path"))
+                    .unwrap_or("")
+                    .to_string(),
                 None,
             ),
-            crate::graph::MemArg::Pattern => (get("pattern").or_else(|| get("path")).or_else(|| get("query")).unwrap_or("").to_string(), None),
-            crate::graph::MemArg::Command => (String::new(), get("command").map(|c| c.chars().take(200).collect::<String>())),
+            crate::graph::MemArg::Pattern => (
+                get("pattern")
+                    .or_else(|| get("path"))
+                    .or_else(|| get("query"))
+                    .unwrap_or("")
+                    .to_string(),
+                None,
+            ),
+            crate::graph::MemArg::Command => (
+                String::new(),
+                get("command").map(|c| c.chars().take(200).collect::<String>()),
+            ),
         };
         // Skip an event with no usable target: an empty path (Path/Pattern) or a
         // Command whose `command` arg was absent (detail is None) — recording it
@@ -1067,7 +1145,16 @@ async fn handle_memory_event(
             _ => !path.is_empty(),
         };
         if recordable {
-            graph.record_mem_event(&cwd, &body.session_id, agent, kind, &path, None, None, detail.as_deref());
+            graph.record_mem_event(
+                &cwd,
+                &body.session_id,
+                agent,
+                kind,
+                &path,
+                None,
+                None,
+                detail.as_deref(),
+            );
         }
     }
 
@@ -1082,12 +1169,17 @@ async fn handle_memory_event(
     // never Turn tokens, so a session that never got a real usage event stays
     // est-only in the X-ray (V24 Phase E derives `est_only` from zero token
     // totals — see `usage_row_for_session`).
-    let chars = serde_json::to_string(&body.args).map(|s| s.chars().count()).unwrap_or(0) as u32;
+    let chars = serde_json::to_string(&body.args)
+        .map(|s| s.chars().count())
+        .unwrap_or(0) as u32;
     graph.record_usage(
         &cwd,
         &body.session_id,
         agent,
-        crate::graph::UsageEvent::ToolResult { tool: Some(tool_name.clone()), chars },
+        crate::graph::UsageEvent::ToolResult {
+            tool: Some(tool_name.clone()),
+            chars,
+        },
     );
 
     // V24 Phase B: OpenCode has no tab binding on this path, so the live-session
@@ -1134,9 +1226,20 @@ async fn handle_mcp_call(
             return write_json(stream, 400, &r).await;
         }
     };
-    let r = match service.mcp_call(consumer_of(req), &body.name, body.arguments).await {
-        Ok(text) => RunResult { ok: true, text: Some(text), error: None },
-        Err(e) => RunResult { ok: false, text: None, error: Some(e) },
+    let r = match service
+        .mcp_call(consumer_of(req), &body.name, body.arguments)
+        .await
+    {
+        Ok(text) => RunResult {
+            ok: true,
+            text: Some(text),
+            error: None,
+        },
+        Err(e) => RunResult {
+            ok: false,
+            text: None,
+            error: Some(e),
+        },
     };
     write_json(stream, 200, &r).await
 }
@@ -1147,10 +1250,7 @@ fn consumer_of(req: &Request) -> Consumer {
     let raw = req
         .path
         .split_once('?')
-        .and_then(|(_, q)| {
-            q.split('&')
-                .find_map(|kv| kv.strip_prefix("consumer="))
-        })
+        .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("consumer=")))
         .unwrap_or("claude");
     Consumer::parse(raw)
 }
@@ -1294,13 +1394,25 @@ mod tests {
             "session_id": "ses_main", "msg_id": "msg_1", "model": "qwen3-coder",
             "in_tok": 100, "out_tok": 40, "cache_read": 20, "cache_make": 5,
         }));
-        let (target, event) = usage_event_from_body(&body).expect("well-formed body yields an event");
+        let (target, event) =
+            usage_event_from_body(&body).expect("well-formed body yields an event");
         assert_eq!(target, "ses_main");
         match &event {
-            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make, origin } => {
+            crate::graph::UsageEvent::Turn {
+                msg_id,
+                model,
+                in_tok,
+                out_tok,
+                cache_read,
+                cache_make,
+                origin,
+            } => {
                 assert_eq!(msg_id, "msg_1");
                 assert_eq!(model.as_deref(), Some("qwen3-coder"));
-                assert_eq!((*in_tok, *out_tok, *cache_read, *cache_make), (100, 40, 20, 5));
+                assert_eq!(
+                    (*in_tok, *out_tok, *cache_read, *cache_make),
+                    (100, 40, 20, 5)
+                );
                 assert_eq!(*origin, crate::graph::UsageOrigin::Session);
             }
             _ => panic!("expected a Turn event"),
@@ -1309,7 +1421,8 @@ mod tests {
         // Recording it lands a real turn row (est_only clears).
         let dir = std::env::temp_dir().join(format!("cimp-usage-sess-{}", uuid::Uuid::new_v4()));
         let idx = crate::graph::GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.record_usage_event(&target, "opencode", &event, 100).unwrap();
+        idx.record_usage_event(&target, "opencode", &event, 100)
+            .unwrap();
         let series = idx.usage_turn_series("ses_main").unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].msg_id, "msg_1");
@@ -1339,7 +1452,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("cimp-usage-parent-{}", uuid::Uuid::new_v4()));
         let idx = crate::graph::GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.record_usage_event(&target, "opencode", &event, 100).unwrap();
+        idx.record_usage_event(&target, "opencode", &event, 100)
+            .unwrap();
         // The turn lives on the parent, not the child.
         assert_eq!(idx.usage_turn_series("ses_parent").unwrap().len(), 1);
         assert!(idx.usage_turn_series("ses_child").unwrap().is_empty());
@@ -1383,7 +1497,8 @@ mod tests {
         let idx = crate::graph::GraphIndex::open(&dir, ".ckg").expect("open");
         for out in [10u64, 20u64] {
             let (target, event) = usage_event_from_body(&mk(out)).expect("event");
-            idx.record_usage_event(&target, "opencode", &event, 100).unwrap();
+            idx.record_usage_event(&target, "opencode", &event, 100)
+                .unwrap();
         }
         let series = idx.usage_turn_series("ses").unwrap();
         assert_eq!(series.len(), 1, "duplicate msg_id upserts, not appends");
@@ -1400,20 +1515,36 @@ mod tests {
         let own = usage_body(serde_json::json!({
             "session_id": "s", "tool": "read", "args": {}
         }));
-        assert_eq!(tool_event_parent(&own), None, "no parent field → own session");
+        assert_eq!(
+            tool_event_parent(&own),
+            None,
+            "no parent field → own session"
+        );
         let empty_parent = usage_body(serde_json::json!({
             "session_id": "s", "tool": "read", "args": {}, "parent_session_id": ""
         }));
-        assert_eq!(tool_event_parent(&empty_parent), None, "empty parent → own session");
+        assert_eq!(
+            tool_event_parent(&empty_parent),
+            None,
+            "empty parent → own session"
+        );
         let child = usage_body(serde_json::json!({
             "session_id": "ses_child", "tool": "read", "args": {}, "parent_session_id": "ses_parent"
         }));
-        assert_eq!(tool_event_parent(&child), Some("ses_parent".to_string()), "child → parent");
+        assert_eq!(
+            tool_event_parent(&child),
+            Some("ses_parent".to_string()),
+            "child → parent"
+        );
     }
 
     #[test]
     fn discovery_round_trips() {
-        let d = Discovery { port: 8123, token: "tok".into(), pid: 42 };
+        let d = Discovery {
+            port: 8123,
+            token: "tok".into(),
+            pid: 42,
+        };
         let s = serde_json::to_string(&d).unwrap();
         let back: Discovery = serde_json::from_str(&s).unwrap();
         assert_eq!(back.port, 8123);

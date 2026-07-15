@@ -46,9 +46,7 @@ struct ServerLogLine {
 }
 
 use crate::error::{AppError, AppResult};
-use crate::settings::{
-    BackendTier, OffloadBackend, OffloadBackendKind, SettingsHandle, ToolScope,
-};
+use crate::settings::{BackendTier, OffloadBackend, OffloadBackendKind, SettingsHandle, ToolScope};
 
 use super::server::{LlamaServer, ServerCommand};
 use super::Backend;
@@ -183,7 +181,11 @@ impl OffloadSupervisor {
     ///
     /// [`OffloadService`]: super::OffloadService
     pub async fn running_server(&self, name: &str) -> Option<Arc<LlamaServer>> {
-        self.running.lock().await.get(name).map(|r| r.server.clone())
+        self.running
+            .lock()
+            .await
+            .get(name)
+            .map(|r| r.server.clone())
     }
 
     /// The primary backend name (first enabled Local backend), or `None`
@@ -581,7 +583,16 @@ impl OffloadSupervisor {
         let deadline = std::time::Instant::now() + timeout;
         // Self-test path: no external cancel source.
         let cancel = tokio_util::sync::CancellationToken::new();
-        super::agent::run(server.client(), &cfg, &router, task, deadline, None, &cancel).await
+        super::agent::run(
+            server.client(),
+            &cfg,
+            &router,
+            task,
+            deadline,
+            None,
+            &cancel,
+        )
+        .await
     }
 
     /// V11 Phase F — a single plain completion against a ready **local** backend:

@@ -1,6 +1,6 @@
 [package]
 name = "cimp"
-version = "0.43.0"
+version = "0.44.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
@@ -77,7 +77,7 @@ regex = "1"
 # V22 Phase C: the `junit-xml` check parser streams a JUnit report with a
 # real XML reader rather than a fragile regex. Pure Rust, already in the tree
 # transitively (promoted to a direct dep here). Default features.
-quick-xml = "0.39"
+quick-xml = "0.41"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

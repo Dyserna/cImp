@@ -5,6 +5,29 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.0] — 2026-07-15
+
+### Security
+
+- **Audit-fix pass over the v0.43.0 Code Audit findings.** Frontend: vite
+  5 → 8.1.4 (three CVEs; also drops the vulnerable esbuild 0.21.5 entirely
+  and dedupes vitest's nested vite 8.0.10), svelte → 5.56.5 (four CVEs),
+  devalue → 5.8.1, with `@sveltejs/vite-plugin-svelte` → 7.2.0 and a
+  regenerated `package-lock.json` (`npm audit`: 0 vulnerabilities). Rust:
+  tauri → 2.11.1 (origin-confusion IPC CVE), openssl → 0.10.81 (three
+  CVEs), quick-xml → 0.41.0 (two DoS advisories; junit parser moved to the
+  new `normalized_value` API), plus quinn-proto/anyhow/crossbeam-epoch
+  patch bumps. Release workflow: the "Resolve tag" step now reads
+  `inputs.tag`/`github.ref_name` through `env:` indirection
+  (shell-injection hardening) and every action `uses:` is pinned to a full
+  commit SHA. New root `.gitleaks.toml` allowlists `cimp.<name>.v<N>`
+  storage-key constants (the one false-positive "secret"). Accepted, with
+  reasons: `lz4_flex` 0.10 / `bincode` 1.x (pinned by cozo's `swapvec ^0.3`
+  chain — local disk-swap of our own data), wayland-scanner's quick-xml
+  0.39 copy (Linux-only build-time macro, trusted input), the gtk 0.18
+  family + `unic-*`/`adler`/`fxhash`/`proc-macro-error`/`serial`
+  unmaintained-only advisories (transitive, no fixes exist).
+
 ## [0.43.0] — 2026-07-15
 
 ### Added

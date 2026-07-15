@@ -12,7 +12,6 @@ import {
   turnCost,
   laneSegments,
   laneLabelVisible,
-  resumeCommand,
   agentBarClass,
   sessionRowState,
   LANE_LABEL_MIN_PX,
@@ -264,17 +263,6 @@ describe('laneLabelVisible (V24 Phase C)', () => {
 
   test('threshold constant is ~2 characters', () => {
     expect(LANE_LABEL_MIN_PX).toBe(14);
-  });
-});
-
-describe('resumeCommand (V24 Phase C)', () => {
-  test('opencode sessions resume with -s', () => {
-    expect(resumeCommand('opencode', 'ses_abc')).toBe('opencode -s ses_abc');
-  });
-
-  test('claude (and anything else) resume with --resume', () => {
-    expect(resumeCommand('claude', 'uuid-123')).toBe('claude --resume uuid-123');
-    expect(resumeCommand('other', 'x')).toBe('claude --resume x');
   });
 });
 

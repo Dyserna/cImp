@@ -96,6 +96,13 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     // launch; skip it by seeking to EOF. Files that appear *later* (a new
     // session) are read from the start.
     let mut first_attach = true;
+    // Whether the attached transcript is demonstrably THIS tab's live session.
+    // The first file we attach to is usually a finished session from a previous
+    // run (a fresh tab hasn't written its transcript yet), so marking it live
+    // would report the OLD session as "current" until the new one begins.
+    // Confirmed by growth: any new bytes since attach. Files that appear after
+    // launch are new sessions and confirmed immediately (rotation branch).
+    let mut live_confirmed = false;
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -104,7 +111,11 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
 
         match newest_jsonl(&root) {
             Some(path) if Some(&path) != cur.as_ref() => {
-                // Rotated to a new (or first) transcript file.
+                // Rotated to a new (or first) transcript file. A file that
+                // appears AFTER launch is a freshly-started session — live by
+                // construction; the pre-existing first file must prove itself
+                // by growing (see `live_confirmed`'s doc above).
+                live_confirmed = !first_attach;
                 offset = if first_attach {
                     std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
                 } else {
@@ -150,10 +161,7 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            // V24 Phase B: this tab is live on `session_id` right now — refresh
-            // its registry entry (keyed by the stable tab id) so the Usage
-            // snapshot marks it active.
-            ctx.mark_live_session(&session_id, "claude");
+            let before = offset;
             offset = drain_new_lines(
                 &path,
                 offset,
@@ -168,6 +176,17 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 &ctx,
             )
             .await;
+            // V24 Phase B: refresh this tab's live-session registry entry
+            // (keyed by the stable tab id) so the Usage snapshot marks the
+            // session active — but only once the file is confirmed to be this
+            // tab's own session, so a dead previous-run transcript is never
+            // reported as the current one.
+            if offset != before {
+                live_confirmed = true;
+            }
+            if live_confirmed {
+                ctx.mark_live_session(&session_id, "claude");
+            }
             // Sub-agent transcripts (2.x contract): drain usage/commits from
             // `<sid>/subagents/*.jsonl`, then tick the drift canary. Both are
             // mem-gated inside — pure TTS setups skip the extra IO entirely.

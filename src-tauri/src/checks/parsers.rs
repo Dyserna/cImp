@@ -1045,7 +1045,11 @@ fn junit_attr(e: &BytesStart, key: &[u8]) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.local_name().as_ref() == key)
-        .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()))
+        .and_then(|a| {
+            a.normalized_value(quick_xml::XmlVersion::default())
+                .ok()
+                .map(|v| v.into_owned())
+        })
 }
 
 /// `e`'s numeric attribute `key` (a `<testsuite>` count), defaulting to 0.

@@ -1,0 +1,9 @@
+# Gitleaks config, auto-loaded from the repo root by the Code Audit tab's
+# gitleaks run (and manual runs). Extends the default ruleset; entries here
+# only silence known false positives.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "App-internal storage/settings key-name constants (cimp.<name>.v<N>) are identifiers, not credentials"
+regexes = ['''cimp\.[a-z0-9-]+(\.[a-z0-9-]+)*\.v\d+''']

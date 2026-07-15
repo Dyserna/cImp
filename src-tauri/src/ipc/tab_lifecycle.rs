@@ -1143,7 +1143,7 @@ pub enum ToolKind {
 
 impl ToolKind {
     /// `(display name, command, args)` for the tool. The command is resolved
-    /// at spawn time (bundled `ebin/` first, then PATH — see `pty::resolve`),
+    /// at spawn time (drop-in `ebin/` first, then PATH — see `pty::resolve`),
     /// exactly like a user-typed Shell-tab command.
     fn spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
         match self {

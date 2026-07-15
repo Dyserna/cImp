@@ -45,8 +45,8 @@ What is bundled
                                      then restart to pick it up
   bin\palettes\<name>.json           terminal color palettes (one file each);
                                      edit or add files, then restart
-  ebin\broot.exe                     bundled CLI tools (see "Bundled tools")
-  ebin\rustnet.exe
+  ebin\                              drop-in folder for external CLI tools
+                                     (see "External tools"); empty by default
   models\kokoro-v1.0.onnx            Kokoro 82M TTS model
   models\voices\af_heart.bin         default voice
   avatars\Idle.mp4 / Listening.mp4 / Thinking.mp4 / Speaking.mp4 / Error.mp4
@@ -75,41 +75,38 @@ Until a state is overridden it keeps using the embedded default. Clear
 an override to fall back to the bundled video.
 
 
-Bundled tools (ebin\)
----------------------
+External tools (ebin\)
+----------------------
 
 The `ebin\` folder ("external binaries") holds CLI tools cImp can launch
 from its bottom-bar quick-launch buttons and shell tabs. When cImp
 resolves a command it looks in `ebin\` FIRST, then falls back to your
-PATH — so a copy you install yourself can be overridden by the bundled
-one, and you can add new tools just by dropping an executable in here.
+PATH — so you can make a tool available to cImp just by dropping its
+executable in here, without touching your PATH.
 
-  ebin\broot.exe     broot — a file browser with git info (MIT licensed).
-  ebin\rustnet.exe   rustnet — a terminal network monitor (Apache-2.0).
-                     NOTE: to actually capture traffic, rustnet needs
-                     Npcap installed with "WinPcap API-compatible Mode"
-                     enabled — https://npcap.com/. Without it rustnet
-                     launches but can't see packets.
+No tools are bundled. The quick-launch buttons cover:
 
-Prefer your own build of a tool? Settings -> Bottom bar -> External tools
-lets you point rustnet or broot at a specific exe in any folder; that
-path overrides the ebin\ / PATH lookup. Leave it blank to resolve
-normally.
+  broot.exe     broot — a file browser with git info
+                (https://github.com/Canop/broot)
+  rustnet.exe   rustnet — a terminal network monitor
+                (https://github.com/domcyrus/rustnet)
+                NOTE: to actually capture traffic, rustnet needs
+                Npcap installed with "WinPcap API-compatible Mode"
+                enabled — https://npcap.com/. Without it rustnet
+                launches but can't see packets.
 
-Aider is NOT bundled: its Windows launcher hardcodes the install
-machine's Python path and isn't portable. If you want the Aider tab,
-install it yourself (`pip install aider-chat`) and make sure `aider` is
-on your PATH — cImp checks for it before letting you enable the tab, and
-will refuse (with a message) if it can't find it. You can also drop a
-working `aider` into `ebin\` and cImp will pick it up.
+Install a tool yourself (drop it in `ebin\` or put it on PATH), or use
+Settings -> Bottom bar -> External tools to point rustnet or broot at a
+specific exe in any folder; that path overrides the ebin\ / PATH lookup.
+Leave it blank to resolve normally.
 
 
 Customizing prompt detection
 ----------------------------
 
 cImp watches the terminal for prompts it should react to — Claude Code
-tool-use approvals, AskUserQuestion-style questions, and a few Aider
-prompts. The substrings it matches live in:
+tool-use approvals and AskUserQuestion-style questions. The substrings
+it matches live in:
 
   bin\patterns.json
 

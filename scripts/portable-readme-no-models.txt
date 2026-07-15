@@ -11,10 +11,11 @@ Compared to the full zip:
   bin\cimp.exe                      <- updated
   bin\onnxruntime*.dll               <- updated (matched to the new exe)
   LICENSE / NOTICE / README.txt      <- updated
-  ebin\broot.exe / rustnet.exe       <- updated (bundled CLI tools; see the
-                                        full README's "Bundled tools").
-                                        rustnet needs Npcap (npcap.com) to
-                                        capture traffic.
+  ebin\                              <- drop-in folder for external CLI
+                                        tools (see the full README's
+                                        "External tools"). No tools are
+                                        bundled; anything you put here is
+                                        left untouched by this update.
   avatars\ / sprites\                <- NOT INCLUDED (the canonical avatar
                                         videos and sprite sets are embedded
                                         in cimp.exe, so the app still shows

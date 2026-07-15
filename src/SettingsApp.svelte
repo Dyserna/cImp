@@ -2553,17 +2553,18 @@
           <h2>External tools</h2>
           <small class="hint top">
             The quick-launch buttons (and shell tabs) run these tools by name,
-            resolved from the bundled <code>ebin\</code> folder first, then your
-            PATH. To use a specific build instead — e.g. one in a folder that
-            isn't on PATH — point cImp at the exe here. Leave blank to resolve
-            normally. Takes effect the next time you launch the tool.
+            resolved from the <code>ebin\</code> drop-in folder first, then your
+            PATH. Tools are not bundled — install them yourself, or drop the
+            exe into <code>ebin\</code>. To use a specific build, point cImp at
+            the exe here; leave blank to resolve normally. Takes effect the
+            next time you launch the tool.
           </small>
           <label>
             <span>rustnet</span>
             <div class="input-with-action">
               <input
                 type="text"
-                placeholder="(use bundled ebin / PATH)"
+                placeholder="(use ebin / PATH)"
                 value={snapshot.external_tools.rustnet}
                 oninput={(e) =>
                   patch(
@@ -2594,7 +2595,7 @@
             <div class="input-with-action">
               <input
                 type="text"
-                placeholder="(use bundled ebin / PATH)"
+                placeholder="(use ebin / PATH)"
                 value={snapshot.external_tools.broot}
                 oninput={(e) =>
                   patch(
@@ -4929,7 +4930,7 @@
           <small class="hint top">
             Aggregated security scanning. cImp runs external scanners against the
             project root and merges their findings into one table. Nothing is
-            bundled — each tool resolves from the bundled <code>ebin\</code>
+            bundled — each tool resolves from the <code>ebin\</code> drop-in
             folder first, then your PATH; point cImp at a specific build with
             Browse, or check availability with Detect. Enable the feature to show
             the Code Audit tab.
@@ -4978,7 +4979,7 @@
                 <div class="input-with-action">
                   <input
                     type="text"
-                    placeholder="(use bundled ebin / PATH)"
+                    placeholder="(use ebin / PATH)"
                     value={tool.path}
                     oninput={(e) =>
                       patchAuditTool(

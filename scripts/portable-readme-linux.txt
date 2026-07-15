@@ -49,8 +49,8 @@ What is bundled
   bin/patterns.json         editable prompt-detection patterns
   bin/themes/<id>/          UI chrome themes (edit / add, then restart)
   bin/palettes/<name>.json  terminal color palettes (edit / add, restart)
-  ebin/broot                bundled CLI tools (see "Bundled tools")
-  ebin/rustnet
+  ebin/                     drop-in folder for external CLI tools (see
+                            "External tools"); empty by default
   models/kokoro-v1.0.onnx   Kokoro 82M TTS model
   models/voices/*.bin       voicepacks (default: af_heart)
   models/ggml-small.bin     Whisper STT model (if present)
@@ -71,22 +71,24 @@ Settings -> Audio -> TTS and Settings -> Speech-to-text; effective
 immediately, no restart.
 
 
-Bundled tools (ebin/)
----------------------
+External tools (ebin/)
+----------------------
 
 The `ebin/` folder ("external binaries") holds CLI tools cImp launches
 from its quick-launch buttons and shell tabs. cImp resolves a command
-from `ebin/` FIRST, then your PATH.
+from `ebin/` FIRST, then your PATH — drop an executable in here to make
+it available without touching your PATH.
 
-  ebin/broot     broot — a file browser with git info (MIT).
-  ebin/rustnet   rustnet — a terminal network monitor (Apache-2.0).
-                 NOTE: capturing packets needs raw-socket capability.
-                 Grant it once with:
-                     sudo setcap cap_net_raw,cap_net_admin+ep ebin/rustnet
-                 Without it rustnet launches but sees no packets.
+No tools are bundled. The quick-launch buttons cover:
 
-Aider is NOT bundled. Install it yourself (`pip install aider-chat`,
-ensure `aider` is on PATH) or drop a working `aider` into `ebin/`.
+  broot     a file browser with git info
+            (https://github.com/Canop/broot)
+  rustnet   a terminal network monitor
+            (https://github.com/domcyrus/rustnet)
+            NOTE: capturing packets needs raw-socket capability.
+            Grant it once with:
+                sudo setcap cap_net_raw,cap_net_admin+ep ebin/rustnet
+            Without it rustnet launches but sees no packets.
 
 
 Updating

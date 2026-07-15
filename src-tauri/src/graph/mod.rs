@@ -39,15 +39,17 @@ mod watcher;
 pub use builder::parse_file;
 pub use context::{est_tokens, RetrieveResult};
 pub use index::GraphIndex;
-pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent};
+pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent, UsageOrigin};
 // V14 Phase D: only `UsageSnapshot` itself is named by qualified path outside
 // this module (the `graph_usage` IPC handler's return type). Its nested
 // field types (`Effectiveness`/`SessionUsage`/`SessionUsageRow`/`ToolUsage`/
 // `TurnUsage`/`UsageTotals`) are used structurally, never referenced by their
 // own `crate::graph::…` path — same posture as `MemorySnapshot`'s own nested
 // `WorkingSetEntry`/`MemNote`/`SessionInfo`, which aren't re-exported here
-// either.
-pub use memory::UsageSnapshot;
+// either. V24 Phase B: `SessionUsageDetail` is likewise named by qualified
+// path (the `graph_session_usage` handler's return type); its own nested
+// `ModelUsage`/`OriginSplit` stay structural.
+pub use memory::{SessionUsageDetail, UsageSnapshot};
 pub use mcp::{
     handle_call as handle_mcp_call, lean_filter, offload_query, offload_run_check, run_check_spec,
     semantic_code_spec, semantic_spec, surface_stats, tool_specs, tools as mcp_tools, LEAN_HIDDEN,

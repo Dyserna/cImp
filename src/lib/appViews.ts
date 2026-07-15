@@ -17,6 +17,7 @@
 
 import { mount, unmount, type Component } from 'svelte';
 import {
+  CODE_AUDIT_TAB_ID,
   GRAPH_MONITOR_TAB_ID,
   GRAPH_VIEW_TAB_ID,
   NOTE_TAB_ID,
@@ -32,6 +33,7 @@ import NoteView from './NoteView.svelte';
 import WorkbenchView from './WorkbenchView.svelte';
 import GraphView from './GraphView.svelte';
 import ToolActivityView from './ToolActivityView.svelte';
+import CodeAuditView from './CodeAuditView.svelte';
 
 const COMPONENTS = new Map<TabId, Component>([
   [OFFLOAD_SERVER_TAB_ID, OffloadServerView as Component],
@@ -40,6 +42,7 @@ const COMPONENTS = new Map<TabId, Component>([
   [WORKBENCH_TAB_ID, WorkbenchView as Component],
   [GRAPH_VIEW_TAB_ID, GraphView as Component],
   [TOOL_ACTIVITY_TAB_ID, ToolActivityView as Component],
+  [CODE_AUDIT_TAB_ID, CodeAuditView as Component],
 ]);
 
 interface Host {

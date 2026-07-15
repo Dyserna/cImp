@@ -588,15 +588,19 @@ struct JestAssertion {
 /// captured output alone). A path outside `cwd` is left as-is; `checks::run`'s
 /// `normalize_rel` still canonicalizes it for the changed-file comparison,
 /// exactly as it does for eslint's absolute `filePath`s.
-fn relativize(cwd: &Path, abs: &str) -> String {
+pub(crate) fn relativize(cwd: &Path, abs: &str) -> String {
     let abs_fwd = abs.replace('\\', "/");
     let cwd_fwd = cwd.to_string_lossy().replace('\\', "/");
     let cwd_fwd = cwd_fwd.trim_end_matches('/');
     if !cwd_fwd.is_empty() {
         if let Some(rest) = abs_fwd.strip_prefix(cwd_fwd) {
-            let rest = rest.trim_start_matches('/');
-            if !rest.is_empty() {
-                return rest.to_string();
+            // Only a real child path: the byte after the prefix must be a
+            // separator, else a sibling like `<cwd>-tests/x` would relativize.
+            if rest.starts_with('/') {
+                let rest = rest.trim_start_matches('/');
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
             }
         }
     }
@@ -664,6 +668,16 @@ struct SarifLog {
 struct SarifRun {
     #[serde(default)]
     results: Vec<SarifResult>,
+    /// The files the tool reported *scanning* — findings parsing ignores these;
+    /// [`sarif_scanned_artifacts`] reads them for the audit coverage line.
+    #[serde(default)]
+    artifacts: Vec<SarifArtifact>,
+}
+
+#[derive(Deserialize)]
+struct SarifArtifact {
+    #[serde(default)]
+    location: Option<SarifArtifactLocation>,
 }
 
 #[derive(Deserialize)]
@@ -727,7 +741,7 @@ struct SarifRegion {
 ///
 /// A uri with no `file://` scheme is already project-relative and passes
 /// through unchanged. Byte-index-safe and total — it never panics.
-fn sarif_uri_to_path(cwd: &Path, uri: &str) -> String {
+pub(crate) fn sarif_uri_to_path(cwd: &Path, uri: &str) -> String {
     let Some(rest) = uri.strip_prefix("file://") else {
         return uri.to_string();
     };
@@ -755,6 +769,42 @@ fn sarif_uri_to_path(cwd: &Path, uri: &str) -> String {
         format!("//{host}{path}")
     };
     relativize(cwd, &abs)
+}
+
+/// Extract the files a SARIF report says it *scanned* (`runs[].artifacts[]
+/// .location.uri`), project-relative and deduped (order-preserving). The V23
+/// audit runner reads this for its scan-coverage line — findings parsing
+/// ignores artifacts entirely. Paths normalize through the exact same
+/// [`sarif_uri_to_path`]/[`relativize`] pair as findings paths, so coverage
+/// and finding entries for the same file always spell it identically.
+/// Best-effort: malformed / artifact-less SARIF yields an empty list, never an
+/// error.
+pub(crate) fn sarif_scanned_artifacts(sarif: &str, cwd: &Path) -> Vec<String> {
+    let doc = sarif.trim_start_matches('\u{feff}').trim();
+    let Ok(log) = serde_json::from_str::<SarifLog>(doc) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for run in &log.runs {
+        for a in &run.artifacts {
+            let uri = a.location.as_ref().map(|l| l.uri.as_str()).unwrap_or("");
+            if uri.is_empty() {
+                continue;
+            }
+            // `file://` forms normalize through the RFC 8089 path; a schemeless
+            // uri (osv-scanner's usual `Cargo.lock`, or a bare absolute path)
+            // just gets separator-folding + root-stripping.
+            let rel = if uri.starts_with("file://") {
+                sarif_uri_to_path(cwd, uri)
+            } else {
+                relativize(cwd, uri)
+            };
+            if !rel.is_empty() && !out.contains(&rel) {
+                out.push(rel);
+            }
+        }
+    }
+    out
 }
 
 /// SARIF 2.1 JSON (`ruff --output-format sarif`, `clang-tidy`, `golangci-lint`,
@@ -1602,6 +1652,19 @@ not json at all
         assert!(parse_sarif("not json at all", Path::new("/repo")).is_empty());
         // A valid-but-empty envelope also yields nothing (no runs/results).
         assert!(parse_sarif(r#"{"version":"2.1.0","runs":[]}"#, Path::new("/repo")).is_empty());
+    }
+
+    /// A sibling path that merely shares the cwd's name prefix must not be
+    /// relativized: cwd `/proj/app` + `/proj/app-tests/x` stays absolute.
+    #[test]
+    fn relativize_requires_separator_after_prefix() {
+        assert_eq!(
+            relativize(Path::new("/proj/app"), "/proj/app-tests/Cargo.lock"),
+            "/proj/app-tests/Cargo.lock"
+        );
+        // A real child still relativizes; the cwd itself passes through whole.
+        assert_eq!(relativize(Path::new("/proj/app"), "/proj/app/Cargo.lock"), "Cargo.lock");
+        assert_eq!(relativize(Path::new("/proj/app"), "/proj/app"), "/proj/app");
     }
 
     #[test]

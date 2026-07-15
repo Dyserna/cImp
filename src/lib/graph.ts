@@ -510,6 +510,9 @@ export interface TurnUsage {
   cache_make: number;
   tool_chars: number;
   ts_ms: number;
+  /// V24 Phase A: whether this turn was the main session or a sub-agent.
+  /// Pre-V24 rows read 'session'. Mirror of Rust `graph::memory::UsageOrigin`.
+  origin: 'session' | 'agent';
 }
 
 /// Summed token totals across a session's turns. Mirror of Rust
@@ -538,8 +541,9 @@ export interface SessionUsageRow {
   totals: UsageTotals;
   tool_chars: number;
   cache_hit_ratio: number;
-  /// True when this session has no exact `usage` data (currently every
-  /// non-Claude agent) — the table's "est" badge.
+  /// True when this session recorded no real Turn tokens (all four token
+  /// totals are zero) — the table's "est" badge. V24 Phase E: token-less
+  /// sessions (pre-V24 OpenCode) keep it; any session with real tokens loses it.
   est_only: boolean;
   /// Session start / last-activity timestamps (epoch ms).
   started_ms: number;
@@ -547,6 +551,34 @@ export interface SessionUsageRow {
   /// Distinct model ids seen across the session's turns, descending by
   /// tokens attributed to each; empty when no turn carried a model.
   models: string[];
+}
+
+/// V24 Phase B: total tokens (all four categories summed) per usage origin —
+/// how much of a model's session spend was the main session vs. sub-agents.
+/// Mirror of Rust `graph::memory::OriginSplit`.
+export interface OriginSplit {
+  session_tok: number;
+  agent_tok: number;
+}
+
+/// V24 Phase B: one model's contribution to a session — summed totals plus the
+/// session/agent origin split, ordered by tokens desc in
+/// `SessionUsageDetail.per_model`. Mirror of Rust `graph::memory::ModelUsage`.
+export interface ModelUsage {
+  model: string;
+  totals: UsageTotals;
+  origins: OriginSplit;
+}
+
+/// V24 Phase B: full drill-in detail for one session (any session, not just the
+/// current one) — the `graph_session_usage` payload. Mirror of Rust
+/// `graph::memory::SessionUsageDetail`. An unknown session id returns an empty
+/// detail (all-zero `row`, empty arrays).
+export interface SessionUsageDetail {
+  row: SessionUsageRow;
+  turns: TurnUsage[];
+  top_tools: ToolUsage[];
+  per_model: ModelUsage[];
 }
 
 /// The Effectiveness panel's measured counters — all exact chars, no
@@ -586,12 +618,24 @@ export interface UsageSnapshot {
   offload_local_tasks: number;
   /// V17 Phase E: measured tool-surface size (est. tokens ≈ chars / 4).
   surface: SurfaceStats;
+  /// V24 Phase B: session ids live right now (open tabs + recency) — the
+  /// Sessions list's active markers. Deduped; marks EVERY live session, not
+  /// just the single most-recent `current`.
+  active_session_ids: string[];
 }
 
 /// The Usage section's token X-ray for `root` (defaults to the launch
 /// directory).
 export function graphUsage(root?: string): Promise<UsageSnapshot> {
   return invoke<UsageSnapshot>('graph_usage', { root: root ?? null });
+}
+
+/// V24 Phase B: full drill-in detail for one session under `root` (defaults to
+/// the launch directory) — totals row, per-turn series, top-tools, and
+/// per-model totals with the S/A origin split. An unknown `sessionId` resolves
+/// to an empty detail.
+export function graphSessionUsage(root: string | undefined, sessionId: string): Promise<SessionUsageDetail> {
+  return invoke<SessionUsageDetail>('graph_session_usage', { root: root ?? null, sessionId });
 }
 
 /// One budget-tuning proposal. Mirror of Rust `advisor::Proposal`.

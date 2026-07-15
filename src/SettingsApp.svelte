@@ -9,6 +9,7 @@
   } from './lib/settings/store';
   import {
     aiToolTabDefaults,
+    auditDetectTool,
     consumeSettingsDeepLink,
     harnessVersionsGet,
     listVoices,
@@ -19,6 +20,9 @@
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
+    AuditDetectResult,
+    AuditToolConfig,
+    AuditToolId,
     HarnessVersions,
     ProcessingDevice,
     Settings,
@@ -79,6 +83,7 @@
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
   import ChecksEditor from './lib/settings/ChecksEditor.svelte';
+  import { AUDIT_TOOL_META, formatDetect } from './lib/settings/codeAudit';
   import { resolveBundledTheme, defaultPalette } from './lib/themes';
   import { themeRegistry, paletteRegistry } from './lib/themes/registry';
   import type { ThemeColorsWire } from './lib/settings/types';
@@ -748,6 +753,7 @@
     | 'mcp'
     | 'graph'
     | 'checks'
+    | 'code-audit'
     | 'pricing'
     | 'workbench'
     | 'advanced'
@@ -766,6 +772,7 @@
     { id: 'mcp', label: 'MCP servers' },
     { id: 'graph', label: 'Code Intelligence' },
     { id: 'checks', label: 'Checks' },
+    { id: 'code-audit', label: 'Code Audit' },
     { id: 'pricing', label: 'LLM pricing' },
     { id: 'workbench', label: 'Workbench' },
     { id: 'advanced', label: 'Advanced' },
@@ -1276,6 +1283,51 @@
   async function pickToolExe(tool: keyof Settings['external_tools']) {
     const p = await pickFile('Executable', ['exe']);
     if (p) patch((s) => (s.external_tools[tool] = p));
+  }
+
+  // ── V23 Phase A: Code Audit tools ──────────────────────────────────────
+  // Per-tool Detect probe result, keyed by tool id. `'probing'` while the IPC
+  // is in flight. Display-only — the probe never writes back into the tool's
+  // `path` field, so the stored config stays "resolve normally" unless the user
+  // browses to an exe.
+  let auditDetect = $state<Record<string, AuditDetectResult | 'probing' | undefined>>({});
+
+  // Mutate one audit tool's config (by id) in place through the normal patch
+  // path. No-op if the id isn't present (e.g. dropped by a future migration).
+  function patchAuditTool(id: AuditToolId, updater: (t: AuditToolConfig) => void): void {
+    patch((s) => {
+      const t = s.code_audit.tools.find((x) => x.id === id);
+      if (t) updater(t);
+    });
+  }
+
+  async function detectAuditTool(id: AuditToolId): Promise<void> {
+    auditDetect = { ...auditDetect, [id]: 'probing' };
+    try {
+      // Probe the LIVE editing value, not the persisted setting — a just-typed
+      // path would otherwise race the fire-and-forget applySettings push.
+      const path = snapshot?.code_audit.tools.find((t) => t.id === id)?.path ?? '';
+      const r = await auditDetectTool(id, path);
+      auditDetect = { ...auditDetect, [id]: r };
+    } catch (e) {
+      auditDetect = {
+        ...auditDetect,
+        [id]: { found: false, path: null, version: null, error: String(e) },
+      };
+    }
+  }
+
+  // Browse for an audit tool exe and store it as that tool's `path` override.
+  async function pickAuditToolExe(id: AuditToolId): Promise<void> {
+    const p = await pickFile('Executable', ['exe']);
+    if (p) patchAuditTool(id, (t) => (t.path = p));
+  }
+
+  // Persist after an in-place `bind:` edit of an audit tool's extra_args
+  // (mirrors `commitGraphIgnore`). Fired on ArrayEditor commit boundaries.
+  function commitAudit(): void {
+    if (!snapshot) return;
+    void applySettings($state.snapshot(snapshot));
   }
 
   function imagePicker(state: keyof Settings['avatar']['images']) {
@@ -4871,6 +4923,129 @@
             onchange={(next) => patch((s) => (s.checks = next))}
           />
         </section>
+      {:else if activeSection === 'code-audit'}
+        <section>
+          <h2>Code Audit</h2>
+          <small class="hint top">
+            Aggregated security scanning. cImp runs external scanners against the
+            project root and merges their findings into one table. Nothing is
+            bundled — each tool resolves from the bundled <code>ebin\</code>
+            folder first, then your PATH; point cImp at a specific build with
+            Browse, or check availability with Detect. Enable the feature to show
+            the Code Audit tab.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.code_audit.enabled}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.code_audit.enabled = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Enable Code Audit (show the tab)</span>
+          </label>
+
+          <h3>Tools</h3>
+          {#each AUDIT_TOOL_META as meta (meta.id)}
+            {@const idx = snapshot.code_audit.tools.findIndex(
+              (t) => t.id === meta.id,
+            )}
+            {#if idx >= 0}
+              {@const tool = snapshot.code_audit.tools[idx]}
+              {@const det = auditDetect[meta.id]}
+              {@const disp = formatDetect(det)}
+              <div class="audit-tool">
+                <label class="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={tool.enabled}
+                    onchange={(e) =>
+                      patchAuditTool(
+                        meta.id,
+                        (t) =>
+                          (t.enabled = (
+                            e.currentTarget as HTMLInputElement
+                          ).checked),
+                      )}
+                  />
+                  <span class="audit-name">{meta.name}</span>
+                  <span class="audit-role">{meta.role}</span>
+                </label>
+                <div class="input-with-action">
+                  <input
+                    type="text"
+                    placeholder="(use bundled ebin / PATH)"
+                    value={tool.path}
+                    oninput={(e) =>
+                      patchAuditTool(
+                        meta.id,
+                        (t) =>
+                          (t.path = (e.currentTarget as HTMLInputElement).value),
+                      )}
+                  />
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => void detectAuditTool(meta.id)}
+                  >
+                    Detect
+                  </button>
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => void pickAuditToolExe(meta.id)}
+                  >
+                    Browse…
+                  </button>
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => patchAuditTool(meta.id, (t) => (t.path = ''))}
+                  >
+                    Clear
+                  </button>
+                </div>
+                {#if disp.kind !== 'idle'}
+                  <small
+                    class="hint audit-detect"
+                    class:ok={disp.kind === 'found'}
+                    class:bad={disp.kind === 'not-found'}
+                  >
+                    {disp.text}
+                  </small>
+                {/if}
+                <small class="hint">
+                  Extra arguments (appended after the tool's fixed argv):
+                </small>
+                <ArrayEditor
+                  bind:items={snapshot.code_audit.tools[idx].extra_args}
+                  placeholder="e.g. --config auto"
+                  oncommit={commitAudit}
+                />
+              </div>
+            {/if}
+          {/each}
+
+          <h3>Scan settings</h3>
+          <label>
+            <span>Per-tool timeout (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              value={snapshot.code_audit.timeout_secs}
+              oninput={(e) =>
+                patch((s) => {
+                  const v = Number((e.currentTarget as HTMLInputElement).value);
+                  if (Number.isFinite(v) && v >= 1)
+                    s.code_audit.timeout_secs = Math.floor(v);
+                })}
+            />
+          </label>
+        </section>
       {:else if activeSection === 'pricing'}
         <section>
           <h2>LLM pricing</h2>
@@ -5883,6 +6058,33 @@
   .input-with-action > input {
     flex: 1;
     min-width: 0;
+  }
+  /* V23 Phase A: Code Audit per-tool row. */
+  .audit-tool {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3) 0;
+    border-top: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+  }
+  .audit-tool .audit-name {
+    font-weight: 600;
+  }
+  .audit-tool .audit-role {
+    margin-left: var(--space-2);
+    opacity: 0.7;
+    font-size: 0.85em;
+  }
+  small.hint.audit-detect {
+    margin: 0;
+    font-family: var(--font-mono, monospace);
+    word-break: break-all;
+  }
+  small.hint.audit-detect.ok {
+    color: var(--success, #4caf50);
+  }
+  small.hint.audit-detect.bad {
+    color: var(--danger, #e06c75);
   }
   .input-with-action > button {
     flex-shrink: 0;

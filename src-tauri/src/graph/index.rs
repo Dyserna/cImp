@@ -15,7 +15,8 @@ use cozo::{DataValue, DbInstance, MultiTransaction, Num, ScriptMutability};
 use crate::error::{AppError, AppResult};
 
 use super::memory::{
-    MemNote, ProjectFact, SessionInfo, SessionUsageRow, TurnUsage, UsageEvent, UsageTotals,
+    MemNote, ModelUsage, OriginSplit, ProjectFact, SessionInfo, SessionUsageRow, TurnUsage,
+    UsageEvent, UsageOrigin, UsageTotals,
     WorkingSetEntry, MAX_EVENTS_PER_SESSION, MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT,
     MAX_USAGE_PER_SESSION,
 };
@@ -316,6 +317,10 @@ impl GraphIndex {
             // after the reset (flag it); a fresh/empty store is filled by the
             // normal enable/index flow, so a stray touch of it isn't auto-indexed.
             let had_data = index.count_files()? > 0;
+            // `usage_stat` (a memory relation) survives `reset()`, so its V24
+            // `origin` column is added by a bespoke recreate-and-copy rather than
+            // the derived-relation reset — no usage data is lost across the bump.
+            index.migrate_usage_stat_origin()?;
             index.reset()?;
             index.write_schema_version(GRAPH_SCHEMA_VERSION)?;
             if had_data {
@@ -2889,18 +2894,6 @@ impl GraphIndex {
                 "meta",
                 ":create meta {key: String => value: String}",
             ),
-            // V14 Phase C: token/cost accounting ring (the X-ray backend).
-            // Additive, survives a graph rebuild, ring-bounded + evicted with
-            // its session exactly like `mem_event` (see `record_usage_event`
-            // and `prune_sessions_in_tx`). NOT part of a schema-version bump
-            // — same posture as every other memory relation in this list.
-            (
-                "usage_stat",
-                ":create usage_stat {session_id: String, seq: Int => \
-                    kind: String, model: String?, msg_id: String?, \
-                    in_tok: Int, out_tok: Int, cache_read: Int, cache_make: Int, \
-                    tool: String?, chars: Int, ts_ms: Int}",
-            ),
             // Session→commit provenance: git commits caught live from the
             // agent transcript (the OOB tap sees the `git commit` tool call
             // and parses the produced hash from its output). `hash` is
@@ -2917,7 +2910,163 @@ impl GraphIndex {
                 self.run_mut(create, BTreeMap::new())?;
             }
         }
+        // V14 Phase C: token/cost accounting ring (the X-ray backend). Additive,
+        // survives a graph rebuild, ring-bounded + evicted with its session
+        // exactly like `mem_event` (see `record_usage_event` and
+        // `prune_sessions_in_tx`); NOT a schema-version bump. Its DDL lives in
+        // the shared [`Self::usage_stat_create_ddl`] so this def and the V24
+        // migration stage (`migrate_usage_stat_origin`) can never drift.
+        if !existing.contains("usage_stat") {
+            self.run_mut(&Self::usage_stat_create_ddl("usage_stat"), BTreeMap::new())?;
+        }
         Ok(())
+    }
+
+    /// The `usage_stat` relation's `:create` DDL, parameterized by relation
+    /// `name` so the live relation ([`Self::ensure_memory_relations`]) and the
+    /// V24 migration stage ([`Self::migrate_usage_stat_origin`]) share one
+    /// source of truth — the V24 shape, carrying the `origin` column. The body
+    /// stays byte-identical across both call sites; only the name differs.
+    fn usage_stat_create_ddl(name: &str) -> String {
+        format!(
+            ":create {name} {{session_id: String, seq: Int => \
+                kind: String, model: String?, msg_id: String?, \
+                in_tok: Int, out_tok: Int, cache_read: Int, cache_make: Int, \
+                tool: String?, chars: Int, ts_ms: Int, origin: String}}"
+        )
+    }
+
+    /// The migration stage relation used by [`Self::migrate_usage_stat_origin`]
+    /// — a fully-populated new-shape copy built (atomically, `:create … <- $rows`)
+    /// before the old `usage_stat` is ever dropped, so its presence on open
+    /// always means "a prior migration was interrupted mid-swap; adopt me".
+    const USAGE_STAT_STAGE: &'static str = "usage_stat_v24";
+
+    /// V24 Phase A: add the `origin` column to a pre-V24 `usage_stat` relation,
+    /// defaulting existing rows to `"session"` (forward-only S/A attribution).
+    /// Recreate-and-copy because CozoDB has no `ALTER`. A no-op when the
+    /// relation is absent (a brand-new store — `ensure_memory_relations` already
+    /// made the new shape) or already carries `origin` (re-run / fresh store),
+    /// detected by column introspection so calling it is always safe. Called
+    /// from the writable [`Self::open`] migration path; NOT a `RELATIONS` reset
+    /// (that never touches memory relations).
+    ///
+    /// Crash-safe stage-and-swap: CozoDB autocommits each script, so a naive
+    /// read → `::remove` → `:create` → `:put` sequence has a window where a kill
+    /// after the remove loses all usage history. Instead the old relation stays
+    /// the source of truth until a fully-populated new-shape STAGE
+    /// ([`Self::USAGE_STAT_STAGE`]) is durable and verified; only then is the
+    /// original dropped and the stage promoted. The stage is built with a single
+    /// atomic `:create … <- $rows`, so it is never partial — its mere presence
+    /// on a later open (the recovery branch) means the migrated data is safe and
+    /// should be adopted, even though `ensure_memory_relations` runs first on
+    /// open and may have recreated `usage_stat` empty in the meantime.
+    fn migrate_usage_stat_origin(&self) -> AppResult<()> {
+        let existing = self.existing_relations()?;
+        // Recovery: a leftover stage means a prior migration was interrupted
+        // after the stage was durably populated (possibly mid-swap, after
+        // `usage_stat` was dropped and recreated empty by
+        // `ensure_memory_relations`). Adopt the stage over whatever `usage_stat`
+        // currently is — never the reverse, so no rows are lost.
+        if existing.contains(Self::USAGE_STAT_STAGE) {
+            return self.promote_usage_stat_stage();
+        }
+        if !existing.contains("usage_stat") {
+            return Ok(());
+        }
+        if self.usage_stat_has_origin()? {
+            return Ok(());
+        }
+        // Forward migration. Read every old-shape row (no `origin`), then build a
+        // fully-populated new-shape stage, verify it captured every row, and only
+        // THEN drop the original and promote the stage.
+        let rows = self.run(
+            "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms] := \
+                *usage_stat{session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let expected = rows.rows.len();
+        let migrated: Vec<DataValue> = rows
+            .rows
+            .into_iter()
+            .map(|mut r| {
+                r.push(DataValue::Str("session".into()));
+                DataValue::List(r)
+            })
+            .collect();
+        // Build the stage as a single atomic create-and-populate so it is either
+        // absent or complete — the invariant the recovery branch relies on. An
+        // empty source has no rows to lose, so create the stage empty in that
+        // case (avoids feeding `<- $rows` an empty list).
+        if migrated.is_empty() {
+            self.run_mut(&Self::usage_stat_create_ddl(Self::USAGE_STAT_STAGE), BTreeMap::new())?;
+        } else {
+            let mut p = BTreeMap::new();
+            p.insert("rows".to_string(), DataValue::List(migrated));
+            self.run_mut(
+                &format!(
+                    "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin] <- $rows\n{}",
+                    Self::usage_stat_create_ddl(Self::USAGE_STAT_STAGE)
+                ),
+                p,
+            )?;
+        }
+        // Verify the stage captured every old row before dropping the original.
+        // A short copy means something went wrong; drop the suspect stage and
+        // fail loudly rather than promote it over the still-intact live data.
+        let staged = self.usage_stat_row_count(Self::USAGE_STAT_STAGE)?;
+        if staged != expected {
+            self.run_mut(&format!("::remove {}", Self::USAGE_STAT_STAGE), BTreeMap::new())?;
+            return Err(AppError::Graph(format!(
+                "usage_stat migration stage captured {staged} of {expected} rows; aborting"
+            )));
+        }
+        self.promote_usage_stat_stage()
+    }
+
+    /// Promote a fully-populated migration stage ([`Self::USAGE_STAT_STAGE`]) to
+    /// `usage_stat`: drop whatever `usage_stat` currently is (a stale old-shape
+    /// relation, or the empty new-shape one `ensure_memory_relations` recreates
+    /// after an interrupted swap) and rename the stage over it. Idempotent on
+    /// retry — a crash between the drop and the rename leaves the durable stage,
+    /// which the next open re-promotes.
+    fn promote_usage_stat_stage(&self) -> AppResult<()> {
+        if self.existing_relations()?.contains("usage_stat") {
+            self.run_mut("::remove usage_stat", BTreeMap::new())?;
+        }
+        self.run_mut(
+            &format!("::rename {} -> usage_stat", Self::USAGE_STAT_STAGE),
+            BTreeMap::new(),
+        )?;
+        Ok(())
+    }
+
+    /// The number of stored `usage_stat`-shaped rows in `name`, counted by its
+    /// `(session_id, seq)` primary key so CozoScript's set-projection semantics
+    /// can't dedupe distinct rows into an undercount (the `seq`-keeps-rows-
+    /// distinct reasoning on [`Self::usage_session_totals`]). Only used for
+    /// migration verification.
+    fn usage_stat_row_count(&self, name: &str) -> AppResult<usize> {
+        let rows = self.run(
+            &format!("?[session_id, seq] := *{name}{{session_id, seq}}"),
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.len())
+    }
+
+    /// Whether the on-disk `usage_stat` relation carries the V24 `origin`
+    /// column. Introspects via `::columns` (its column-name header is `column`),
+    /// failing loudly if that shape ever changes rather than mis-migrating.
+    fn usage_stat_has_origin(&self) -> AppResult<bool> {
+        let rows = self.run("::columns usage_stat", BTreeMap::new(), ScriptMutability::Immutable)?;
+        let col = rows
+            .headers
+            .iter()
+            .position(|h| h == "column")
+            .ok_or_else(|| AppError::Graph("::columns result has no 'column' column".to_string()))?;
+        Ok(rows.rows.iter().any(|r| r.get(col).map(dv_string).as_deref() == Some("origin")))
     }
 
     /// Append one memory event for `session_id`, upserting the session's
@@ -3091,7 +3240,10 @@ impl GraphIndex {
                 }
             };
 
-            let (kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars): (
+            // `origin` is meaningful only for a "turn" row; a "tool_result" row
+            // is sized in chars and not per-turn attributed, so it stores the
+            // neutral `"session"` (the column is non-nullable).
+            let (kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, origin): (
                 &str,
                 Option<String>,
                 Option<String>,
@@ -3101,8 +3253,9 @@ impl GraphIndex {
                 i64,
                 Option<String>,
                 i64,
+                &str,
             ) = match &event {
-                UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make } => (
+                UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make, origin } => (
                     "turn",
                     model.clone(),
                     Some(msg_id.clone()),
@@ -3112,9 +3265,10 @@ impl GraphIndex {
                     *cache_make as i64,
                     None,
                     0,
+                    origin.as_str(),
                 ),
                 UsageEvent::ToolResult { tool, chars } => {
-                    ("tool_result", None, None, 0, 0, 0, 0, tool.clone(), *chars as i64)
+                    ("tool_result", None, None, 0, 0, 0, 0, tool.clone(), *chars as i64, "session")
                 }
             };
 
@@ -3131,11 +3285,12 @@ impl GraphIndex {
                 tool.as_deref().map(|s| DataValue::Str(s.into())).unwrap_or(DataValue::Null),
                 DataValue::Num(Num::Int(chars)),
                 DataValue::Num(Num::Int(ts_ms)),
+                DataValue::Str(origin.into()),
             ]);
             tx_put(
                 tx,
-                "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms] <- $rows\n\
-                 :put usage_stat {session_id, seq => kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms}",
+                "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin] <- $rows\n\
+                 :put usage_stat {session_id, seq => kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin}",
                 vec![row],
             )?;
 
@@ -3157,6 +3312,22 @@ impl GraphIndex {
             prune_sessions_in_tx(tx)?;
             Ok(())
         })
+    }
+
+    /// Whether `session_id` has any recorded `turn` usage row — the V24 Phase E
+    /// signal that exact token accounting exists (see the `est_only` derivation
+    /// in [`Self::usage_row_for_session`]). A `:limit 1` existence probe, so it
+    /// stays cheap even on a long session's ring, and detects a recorded turn
+    /// even when its tokens are all zero (unlike summing `usage_session_totals`).
+    fn usage_session_has_turn(&self, session_id: &str) -> AppResult<bool> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[seq] := *usage_stat{session_id, seq, kind}, session_id == $sid, kind == \"turn\"\n:limit 1",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(!rows.rows.is_empty())
     }
 
     /// Summed token totals for `session_id` across its "turn" rows
@@ -3217,6 +3388,64 @@ impl GraphIndex {
         Ok(out.into_iter().map(|(m, _)| m).collect())
     }
 
+    /// V24 Phase B: per-model token totals for `session_id` with the
+    /// session/agent origin split, ordered by total tokens (in + out + both
+    /// cache categories) descending, model id breaking ties. Like
+    /// [`Self::usage_session_models`] but keeps the sums it discards — the Cost
+    /// card prices each model in a mixed-model session separately, and the
+    /// `SessionUsageRow` cost badge sums per-model auto-matched rates. Same
+    /// `"<synthetic>"` exclusion and no-model skip as `usage_session_models`,
+    /// and the same `seq`-keeps-rows-distinct reasoning as
+    /// [`Self::usage_session_totals`].
+    pub fn usage_session_model_totals(&self, session_id: &str) -> AppResult<Vec<ModelUsage>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[seq, model, in_tok, out_tok, cache_read, cache_make, origin] := \
+                *usage_stat{session_id, seq, kind, model, in_tok, out_tok, cache_read, cache_make, origin}, \
+                session_id == $sid, kind == \"turn\"",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        struct Agg {
+            totals: UsageTotals,
+            origins: OriginSplit,
+        }
+        let mut map: HashMap<String, Agg> = HashMap::new();
+        for r in &rows.rows {
+            let Some(model) = cell_str_opt(r, 1) else { continue };
+            if model == "<synthetic>" {
+                continue;
+            }
+            let in_tok = cell_i64(r, 2).max(0) as u64;
+            let out_tok = cell_i64(r, 3).max(0) as u64;
+            let cache_read = cell_i64(r, 4).max(0) as u64;
+            let cache_make = cell_i64(r, 5).max(0) as u64;
+            let e = map
+                .entry(model)
+                .or_insert_with(|| Agg { totals: UsageTotals::default(), origins: OriginSplit::default() });
+            e.totals.in_tok += in_tok;
+            e.totals.out_tok += out_tok;
+            e.totals.cache_read += cache_read;
+            e.totals.cache_make += cache_make;
+            let tok = in_tok + out_tok + cache_read + cache_make;
+            match UsageOrigin::from_wire(&cell_str(r, 6)) {
+                UsageOrigin::Session => e.origins.session_tok += tok,
+                UsageOrigin::Agent => e.origins.agent_tok += tok,
+            }
+        }
+        let mut out: Vec<ModelUsage> = map
+            .into_iter()
+            .map(|(model, a)| ModelUsage { model, totals: a.totals, origins: a.origins })
+            .collect();
+        out.sort_by(|a, b| {
+            let ta = a.totals.in_tok + a.totals.out_tok + a.totals.cache_read + a.totals.cache_make;
+            let tb = b.totals.in_tok + b.totals.out_tok + b.totals.cache_read + b.totals.cache_make;
+            tb.cmp(&ta).then(a.model.cmp(&b.model))
+        });
+        Ok(out)
+    }
+
     /// Estimated tool-result characters for `session_id`, grouped by tool
     /// name (`"unknown"` when the id → name join missed — see the claude
     /// tap's `ToolNameRing`), descending by chars.
@@ -3254,8 +3483,8 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         let rows = self.run(
-            "?[seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms] := \
-                *usage_stat{session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms}, \
+            "?[seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin] := \
+                *usage_stat{session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin}, \
                 session_id == $sid\n:order seq",
             p,
             ScriptMutability::Immutable,
@@ -3276,6 +3505,7 @@ impl GraphIndex {
                 cache_make: cell_i64(r, 7).max(0) as u64,
                 tool_chars: pending_tool_chars,
                 ts_ms: cell_i64(r, 10),
+                origin: UsageOrigin::from_wire(&cell_str(r, 11)),
             });
             pending_tool_chars = 0;
         }
@@ -3291,26 +3521,56 @@ impl GraphIndex {
         let sessions = self.mem_sessions()?;
         let mut out = Vec::with_capacity(sessions.len());
         for s in sessions {
-            let totals = self.usage_session_totals(&s.session_id)?;
-            let per_tool = self.usage_per_tool(&s.session_id)?;
-            let models = self.usage_session_models(&s.session_id)?;
-            let tool_chars: u64 = per_tool.iter().map(|(_, c)| *c).sum();
-            let denom = totals.cache_read + totals.in_tok;
-            let cache_hit_ratio =
-                if denom > 0 { totals.cache_read as f64 / denom as f64 } else { 0.0 };
-            out.push(SessionUsageRow {
-                est_only: s.agent != "claude",
-                session_id: s.session_id,
-                agent: s.agent,
-                totals,
-                tool_chars,
-                cache_hit_ratio,
-                started_ms: s.started_ms,
-                last_ms: s.last_ms,
-                models,
-            });
+            out.push(self.usage_row_for_session(s)?);
         }
         Ok(out)
+    }
+
+    /// The single [`SessionUsageRow`] for `session_id`, or `None` when no
+    /// `session` row exists for that id (unknown session — V24 Phase B
+    /// drill-in). Same shape as one entry of [`Self::usage_all_sessions`],
+    /// built for one id so the `graph_session_usage` command doesn't scan every
+    /// session to render one.
+    pub fn usage_session_row(&self, session_id: &str) -> AppResult<Option<SessionUsageRow>> {
+        let Some(info) = self.mem_sessions()?.into_iter().find(|s| s.session_id == session_id)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.usage_row_for_session(info)?))
+    }
+
+    /// Build one session's totals row from its [`SessionInfo`] — the shared
+    /// body of [`Self::usage_all_sessions`] and [`Self::usage_session_row`].
+    fn usage_row_for_session(&self, s: SessionInfo) -> AppResult<SessionUsageRow> {
+        let totals = self.usage_session_totals(&s.session_id)?;
+        let per_tool = self.usage_per_tool(&s.session_id)?;
+        let models = self.usage_session_models(&s.session_id)?;
+        let tool_chars: u64 = per_tool.iter().map(|(_, c)| *c).sum();
+        let denom = totals.cache_read + totals.in_tok;
+        let cache_hit_ratio =
+            if denom > 0 { totals.cache_read as f64 / denom as f64 } else { 0.0 };
+        // V24 Phase E: "est" means "no real token accounting", derived from
+        // whether ANY turn was recorded — not from the summed token totals. A
+        // recorded turn (Claude, or OpenCode once its plugin forwards usage in
+        // Phase F) means exact accounting exists even when that turn's tokens are
+        // all zero: a Claude API-error line lands a tolerant zero-token turn (see
+        // `parse_usage_line`), and summing-to-zero would have mis-flagged it as
+        // est. Only a session with no turn rows at all (pre-V24 OpenCode,
+        // tool-result chars only) keeps the badge. Both `usage_all_sessions` and
+        // `usage_session_row` go through here, so the two paths derive it
+        // identically.
+        let est_only = !self.usage_session_has_turn(&s.session_id)?;
+        Ok(SessionUsageRow {
+            est_only,
+            session_id: s.session_id,
+            agent: s.agent,
+            totals,
+            tool_chars,
+            cache_hit_ratio,
+            started_ms: s.started_ms,
+            last_ms: s.last_ms,
+            models,
+        })
     }
 
     /// Record one commit caught live from an agent transcript for
@@ -3589,9 +3849,10 @@ impl GraphIndex {
     /// counting it in the denominator would let one idle session suppress
     /// the canary (the advisor fires on `tokenless == claude_sessions`).
     ///
-    /// (Deliberately NOT `SessionUsageRow.est_only` — that flag means "this
-    /// AGENT never reports exact usage" (`agent != "claude"`), which is
-    /// tautologically false for every Claude session.)
+    /// (Deliberately NOT `SessionUsageRow.est_only` — that flag now means "this
+    /// session recorded no real Turn tokens at all", so it's false for a Claude
+    /// session that spoke even once, whereas this counts Claude sessions whose
+    /// turns landed but carried a zeroed/dropped `usage` block.)
     ///
     /// Datalog's set semantics may collapse identical projected rows, but
     /// that can't change a zero-vs-nonzero verdict or row presence, which is
@@ -5681,11 +5942,14 @@ pub struct Point { x: i32 }
                 out_tok: 0,
                 cache_read: 0,
                 cache_make: 0,
+                origin: UsageOrigin::Session,
             },
             100,
         )
         .unwrap();
-        // ... then the SAME message id with the real numbers.
+        // ... then the SAME message id with the real numbers AND a firmed-up
+        // origin (a sub-agent line whose sidechain flag the first partial lacked
+        // — the upsert must carry the new origin, not keep the stale one).
         idx.record_usage_event(
             "s1",
             "claude",
@@ -5696,6 +5960,7 @@ pub struct Point { x: i32 }
                 out_tok: 30,
                 cache_read: 40,
                 cache_make: 5,
+                origin: UsageOrigin::Agent,
             },
             110,
         )
@@ -5709,11 +5974,133 @@ pub struct Point { x: i32 }
         assert_eq!(series[0].out_tok, 30);
         assert_eq!(series[0].cache_read, 40);
         assert_eq!(series[0].cache_make, 5);
+        assert_eq!(series[0].origin, UsageOrigin::Agent, "upsert carries the updated origin");
 
         let totals = idx.usage_session_totals("s1").unwrap();
         assert_eq!(totals.in_tok, 120, "totals reflect the upserted (last) value, not both writes summed");
 
         drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_stat_origin_migrates_from_a_pre_v24_store() {
+        // V24 Phase A: a store whose `usage_stat` predates the `origin` column
+        // must open cleanly, and its old turn rows must read `Session`.
+        let dir = std::env::temp_dir().join(format!("ckg-usage-migr-{}", uuid::Uuid::new_v4()));
+        {
+            let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+            // Recreate `usage_stat` in the OLD (no-`origin`) shape and seed one
+            // pre-V24 turn row directly, then stamp an older schema version so
+            // the next `open()` takes the migration path.
+            idx.run_mut("::remove usage_stat", BTreeMap::new()).unwrap();
+            idx.run_mut(
+                ":create usage_stat {session_id: String, seq: Int => \
+                    kind: String, model: String?, msg_id: String?, \
+                    in_tok: Int, out_tok: Int, cache_read: Int, cache_make: Int, \
+                    tool: String?, chars: Int, ts_ms: Int}",
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let old_row = DataValue::List(vec![
+                DataValue::Str("s1".into()),
+                DataValue::Num(Num::Int(0)),
+                DataValue::Str("turn".into()),
+                DataValue::Null,
+                DataValue::Str("m1".into()),
+                DataValue::Num(Num::Int(100)),
+                DataValue::Num(Num::Int(10)),
+                DataValue::Num(Num::Int(0)),
+                DataValue::Num(Num::Int(0)),
+                DataValue::Null,
+                DataValue::Num(Num::Int(0)),
+                DataValue::Num(Num::Int(100)),
+            ]);
+            let mut p = BTreeMap::new();
+            p.insert("rows".to_string(), DataValue::List(vec![old_row]));
+            idx.run_mut(
+                "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms] <- $rows\n\
+                 :put usage_stat {session_id, seq => kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms}",
+                p,
+            )
+            .unwrap();
+            idx.write_schema_version(1).unwrap();
+        }
+
+        // The writable path migrates the column in place, no data loss.
+        let idx2 = GraphIndex::open(&dir, ".ckg").expect("reopen");
+        let series = idx2.usage_turn_series("s1").unwrap();
+        assert_eq!(series.len(), 1, "the pre-V24 turn row survives migration");
+        assert_eq!(series[0].msg_id, "m1");
+        assert_eq!(series[0].in_tok, 100, "token counts are preserved");
+        assert_eq!(series[0].origin, UsageOrigin::Session, "old rows default to session");
+        // The relation now carries `origin`, so a re-open is a clean no-op.
+        assert!(idx2.usage_stat_has_origin().unwrap());
+
+        drop(idx2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_stat_migration_recovers_from_an_interrupted_swap() {
+        // V24 code-review: simulate a crash mid-swap — the migration stage was
+        // fully populated, the original `usage_stat` was dropped and recreated
+        // EMPTY in the new shape by `ensure_memory_relations`, and the process
+        // died before the stage was promoted. The next open must adopt the stage
+        // (its rows), not the empty `usage_stat`, so no usage history is lost.
+        let dir = std::env::temp_dir().join(format!("ckg-usage-recover-{}", uuid::Uuid::new_v4()));
+        {
+            let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+            // Build the fully-populated stage (new shape, origin already set) —
+            // exactly what the atomic create-and-populate would have durably left.
+            idx.run_mut(&GraphIndex::usage_stat_create_ddl(GraphIndex::USAGE_STAT_STAGE), BTreeMap::new())
+                .unwrap();
+            let staged_row = DataValue::List(vec![
+                DataValue::Str("s1".into()),
+                DataValue::Num(Num::Int(0)),
+                DataValue::Str("turn".into()),
+                DataValue::Null,
+                DataValue::Str("m1".into()),
+                DataValue::Num(Num::Int(100)),
+                DataValue::Num(Num::Int(10)),
+                DataValue::Num(Num::Int(0)),
+                DataValue::Num(Num::Int(0)),
+                DataValue::Null,
+                DataValue::Num(Num::Int(0)),
+                DataValue::Num(Num::Int(100)),
+                DataValue::Str("session".into()),
+            ]);
+            let mut p = BTreeMap::new();
+            p.insert("rows".to_string(), DataValue::List(vec![staged_row]));
+            idx.run_mut(
+                "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin] <- $rows\n\
+                 :put usage_stat_v24 {session_id, seq => kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin}",
+                p,
+            )
+            .unwrap();
+            // Leave `usage_stat` EMPTY in the new shape (what the interrupted swap
+            // + the next `ensure_memory_relations` would have produced) and stamp
+            // an older schema version so the reopen takes the migration path.
+            idx.run_mut("::remove usage_stat", BTreeMap::new()).unwrap();
+            idx.run_mut(&GraphIndex::usage_stat_create_ddl("usage_stat"), BTreeMap::new()).unwrap();
+            idx.write_schema_version(1).unwrap();
+        }
+
+        let idx2 = GraphIndex::open(&dir, ".ckg").expect("reopen");
+        // The staged row was adopted into `usage_stat` — nothing lost.
+        let series = idx2.usage_turn_series("s1").unwrap();
+        assert_eq!(series.len(), 1, "staged rows recovered without loss");
+        assert_eq!(series[0].msg_id, "m1");
+        assert_eq!(series[0].in_tok, 100, "token counts preserved through recovery");
+        assert_eq!(series[0].origin, UsageOrigin::Session);
+        // The stage was consumed (renamed over `usage_stat`), leaving no leftover.
+        assert!(
+            !idx2.existing_relations().unwrap().contains("usage_stat_v24"),
+            "the stage is gone after promotion"
+        );
+        assert!(idx2.usage_stat_has_origin().unwrap());
+
+        drop(idx2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5733,6 +6120,7 @@ pub struct Point { x: i32 }
                 out_tok: 5,
                 cache_read: 0,
                 cache_make: 0,
+                origin: UsageOrigin::Session,
             },
             100,
         )
@@ -5763,6 +6151,7 @@ pub struct Point { x: i32 }
                 out_tok: 20,
                 cache_read: 0,
                 cache_make: 0,
+                origin: UsageOrigin::Session,
             },
             120,
         )
@@ -5808,6 +6197,7 @@ pub struct Point { x: i32 }
                 out_tok: 10,
                 cache_read: 50,
                 cache_make: 0,
+                origin: UsageOrigin::Session,
             },
             100,
         )
@@ -5824,6 +6214,7 @@ pub struct Point { x: i32 }
                 out_tok: 5,
                 cache_read: 0,
                 cache_make: 0,
+                origin: UsageOrigin::Session,
             },
             110,
         )
@@ -5838,6 +6229,7 @@ pub struct Point { x: i32 }
                 out_tok: 20,
                 cache_read: 0,
                 cache_make: 0,
+                origin: UsageOrigin::Session,
             },
             120,
         )
@@ -5852,6 +6244,7 @@ pub struct Point { x: i32 }
                 out_tok: 1,
                 cache_read: 0,
                 cache_make: 0,
+                origin: UsageOrigin::Session,
             },
             130,
         )
@@ -5861,6 +6254,51 @@ pub struct Point { x: i32 }
             "opencode",
             &UsageEvent::ToolResult { tool: Some("edit".to_string()), chars: 20 },
             200,
+        )
+        .unwrap();
+        // V24 Phase E: `est_only` keys off the token totals, not the agent.
+        // An OpenCode session WITH real Turn tokens (Phase F plugin-reported)
+        // is exact; a Claude session that only produced tool-result chars (no
+        // turn ever landed) is est-only despite being Claude.
+        idx.record_usage_event(
+            "o2",
+            "opencode",
+            &UsageEvent::Turn {
+                msg_id: "om1".to_string(),
+                model: Some("anthropic/claude-opus-4-8".to_string()),
+                in_tok: 42,
+                out_tok: 7,
+                cache_read: 0,
+                cache_make: 0,
+                origin: UsageOrigin::Session,
+            },
+            210,
+        )
+        .unwrap();
+        idx.record_usage_event(
+            "c2",
+            "claude",
+            &UsageEvent::ToolResult { tool: Some("read".to_string()), chars: 12 },
+            220,
+        )
+        .unwrap();
+        // V24 code-review: a Claude session whose ONLY turn is a zero-token line
+        // (an API-error turn — `parse_usage_line`'s tolerant default) is NOT
+        // est-only. A recorded turn means exact accounting exists, even at zero
+        // tokens; the old summed-totals rule mis-flagged this as est.
+        idx.record_usage_event(
+            "c3",
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: "cz1".to_string(),
+                model: None,
+                in_tok: 0,
+                out_tok: 0,
+                cache_read: 0,
+                cache_make: 0,
+                origin: UsageOrigin::Session,
+            },
+            230,
         )
         .unwrap();
 
@@ -5877,11 +6315,25 @@ pub struct Point { x: i32 }
         );
 
         let opencode = rows.iter().find(|r| r.session_id == "o1").expect("o1 present");
-        assert!(opencode.est_only, "opencode sessions have no exact usage — always est-only");
+        assert!(opencode.est_only, "a tool_result-only session has zero token totals ⇒ est-only");
         assert_eq!(opencode.totals.in_tok, 0, "a tool_result-only session has zero token totals");
         assert_eq!(opencode.tool_chars, 20);
         assert_eq!(opencode.cache_hit_ratio, 0.0, "no denominator ⇒ 0.0, not NaN");
         assert!(opencode.models.is_empty(), "tool_result-only session has no models");
+
+        // OpenCode WITH real tokens → NOT est-only (agent name is irrelevant).
+        let oc_tokens = rows.iter().find(|r| r.session_id == "o2").expect("o2 present");
+        assert!(!oc_tokens.est_only, "an OpenCode session with real Turn tokens is exact");
+        assert_eq!(oc_tokens.totals.in_tok, 42);
+        // Claude with NO turn rows (tool-result chars only) → est-only (derived
+        // from turn presence, not agent).
+        let claude_notoks = rows.iter().find(|r| r.session_id == "c2").expect("c2 present");
+        assert!(claude_notoks.est_only, "a Claude session with no turn rows is est-only");
+        // Claude WITH a zero-token turn → NOT est-only: the recorded turn is
+        // exact accounting even though every token count is zero.
+        let claude_ztok = rows.iter().find(|r| r.session_id == "c3").expect("c3 present");
+        assert!(!claude_ztok.est_only, "a recorded zero-token turn is exact, not est");
+        assert_eq!(claude_ztok.totals.in_tok, 0, "the turn carries zero tokens");
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5989,6 +6441,113 @@ pub struct Point { x: i32 }
         .unwrap();
         let ranking = idx.usage_tool_ranking("s1").unwrap();
         assert_eq!(ranking, vec![("Read".to_string(), 300, 2), ("Bash".to_string(), 50, 1)]);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V24 Phase B: session drill-in query surface ────────────────────────
+
+    /// Seed one turn with the given model/tokens/origin — the drill-in tests'
+    /// shared helper.
+    fn seed_turn(
+        idx: &GraphIndex,
+        sid: &str,
+        msg: &str,
+        model: Option<&str>,
+        toks: (u32, u32, u32, u32),
+        origin: UsageOrigin,
+        ts: i64,
+    ) {
+        idx.record_usage_event(
+            sid,
+            "claude",
+            &UsageEvent::Turn {
+                msg_id: msg.to_string(),
+                model: model.map(str::to_string),
+                in_tok: toks.0,
+                out_tok: toks.1,
+                cache_read: toks.2,
+                cache_make: toks.3,
+                origin,
+            },
+            ts,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn usage_session_model_totals_orders_by_tokens_and_splits_origin() {
+        let dir = std::env::temp_dir().join(format!("ckg-permodel-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        // model-a: a Session turn (150 tok) + an Agent turn (10 tok) = 160.
+        seed_turn(&idx, "s1", "m1", Some("model-a"), (100, 20, 30, 0), UsageOrigin::Session, 100);
+        seed_turn(&idx, "s1", "m2", Some("model-a"), (10, 0, 0, 0), UsageOrigin::Agent, 110);
+        // model-b: one Session turn (5 tok) — fewer tokens, ranks after model-a.
+        seed_turn(&idx, "s1", "m3", Some("model-b"), (5, 0, 0, 0), UsageOrigin::Session, 120);
+        // `<synthetic>` and no-model rows are excluded (parity with
+        // `usage_session_models`), even carrying large token counts.
+        seed_turn(&idx, "s1", "m4", Some("<synthetic>"), (999, 0, 0, 0), UsageOrigin::Session, 130);
+        seed_turn(&idx, "s1", "m5", None, (999, 0, 0, 0), UsageOrigin::Session, 140);
+
+        let per_model = idx.usage_session_model_totals("s1").unwrap();
+        assert_eq!(per_model.len(), 2, "synthetic + no-model rows are excluded");
+        // Ordered by total tokens desc.
+        assert_eq!(per_model[0].model, "model-a");
+        assert_eq!(
+            per_model[0].totals,
+            UsageTotals { in_tok: 110, out_tok: 20, cache_read: 30, cache_make: 0 }
+        );
+        assert_eq!(per_model[0].origins.session_tok, 150, "the Session turn's 150 tok");
+        assert_eq!(per_model[0].origins.agent_tok, 10, "the Agent turn's 10 tok");
+        assert_eq!(per_model[1].model, "model-b");
+        assert_eq!(per_model[1].origins.session_tok, 5);
+        assert_eq!(per_model[1].origins.agent_tok, 0);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_session_model_totals_sum_matches_session_totals() {
+        // The Cost-card honesty invariant: with every turn carrying a real
+        // model, the per-model totals sum back to the whole-session totals.
+        let dir = std::env::temp_dir().join(format!("ckg-permodel-sum-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        seed_turn(&idx, "s1", "m1", Some("model-a"), (100, 20, 30, 5), UsageOrigin::Session, 100);
+        seed_turn(&idx, "s1", "m2", Some("model-b"), (7, 3, 1, 0), UsageOrigin::Agent, 110);
+
+        let per_model = idx.usage_session_model_totals("s1").unwrap();
+        let mut summed = UsageTotals::default();
+        for m in &per_model {
+            summed.in_tok += m.totals.in_tok;
+            summed.out_tok += m.totals.out_tok;
+            summed.cache_read += m.totals.cache_read;
+            summed.cache_make += m.totals.cache_make;
+        }
+        assert_eq!(summed, idx.usage_session_totals("s1").unwrap());
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_session_row_is_none_for_unknown_but_present_for_a_seeded_session() {
+        let dir = std::env::temp_dir().join(format!("ckg-sessrow-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        assert!(idx.usage_session_row("nope").unwrap().is_none(), "unknown session → None");
+
+        seed_turn(&idx, "s1", "m1", Some("model-a"), (100, 20, 30, 0), UsageOrigin::Session, 100);
+        let row = idx.usage_session_row("s1").unwrap().expect("seeded session has a row");
+        assert_eq!(row.session_id, "s1");
+        assert_eq!(row.agent, "claude");
+        assert!(!row.est_only, "a claude session is not est-only");
+        assert_eq!(row.totals, idx.usage_session_totals("s1").unwrap());
+        assert_eq!(row.models, vec!["model-a".to_string()]);
+        // Same row the whole-project scan would produce for this id.
+        let from_all =
+            idx.usage_all_sessions().unwrap().into_iter().find(|r| r.session_id == "s1").unwrap();
+        assert_eq!(row, from_all);
+
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }

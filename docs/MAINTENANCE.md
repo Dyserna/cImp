@@ -951,6 +951,73 @@ compiled and its mandatory named groups checked at save time
 (`parsers::validate_pattern`, surfaced through the `checks_validate_pattern`
 IPC) so a bad pattern is a UI error, not a silent zero-diagnostics run.
 
+## Code Audit — Aggregated Security Scanning (V23)
+
+**No schema involvement, nothing bundled.** `CodeAuditSettings` is additive
+(`#[serde(default)]`, feature off by default), the tab is a reserved
+app-rendered dashboard gated on `code_audit.enabled`, and every tool resolves
+ebin → PATH → per-tool override at scan time — the release ships no scanner
+binaries. The runner (`src-tauri/src/audit/`) normalizes each tool's SARIF
+through the V22 `checks::parsers` `sarif` parser, so the audit path grows no new
+diagnostic parsing; the one audit-only extra is the scan-coverage line, a second
+best-effort pass (`runner::parse_scanned_artifacts`) over osv-scanner's raw SARIF
+`runs[].artifacts` that deliberately does *not* extend the shared parser.
+
+**Adapters are exit-code-inverted vs `run_check`.** For all three tools `0` =
+clean, `1` = findings present (a SUCCESS), anything else = a genuine tool error —
+`adapters::Adapter::classify_exit` owns this, and it's the one place V22's
+checks model (non-zero = failure) doesn't fit. Adding GuardDog/Trivy later is a
+new `Adapter` row + `AuditToolId` variant, not new control flow.
+
+**The Phase B SARIF fixtures are constructed, not captured.** osv-scanner /
+gitleaks / semgrep were not installed when the runner was written, so the
+per-tool fixtures in `audit/runner.rs`'s test module (incl. the osv `artifacts`
+coverage fixture) are faithful hand-built SARIF 2.1.0, not real tool output.
+**Live capture of real output is part of the verification below** — replace or
+augment the fixtures from a real run once the binaries are dropped in `ebin/`,
+and spot-check each tool's current SARIF shape (rule id → `Diag.code`, level →
+`Diag.severity`, `runs[].artifacts[].location.uri` for coverage) the same way
+the V22 parser fixtures are maintained.
+
+### Live-verify recipe (run by hand before release)
+
+With a build of the app running and `code_audit.enabled` on:
+
+1. **Fresh clone, no tools on PATH** → the Code Audit tab shows all three chips
+   `not installed`; **Settings → Code Audit → Detect** on each agrees (not found
+   on PATH or ebin).
+2. **Drop `osv-scanner.exe` + `gitleaks.exe` in `ebin/`** → Detect finds each
+   (`✓ <version> — <path>`); **Scan** produces findings against this repo's
+   `Cargo.lock` plus a planted test secret on a scratch branch. Confirm the
+   findings-present **exit code 1 is classified as findings, not an error**
+   (chip reads `✓ N findings`, not `✗ error`), and the scan-coverage line lists
+   `Cargo.lock ✓` (and any other lockfile osv-scanner reports).
+3. **Verify the `MAL-*` claim** → point osv-scanner at a scratch
+   `package.json` + lockfile pinning a known-malicious package version from the
+   OpenSSF malicious-packages set; the malicious-package finding must appear via
+   osv-scanner in the default scan (this was high-confidence but unverified in
+   the research).
+4. **`pipx install semgrep`** → the semgrep chip lights up on the next scan and
+   its SARIF findings merge into the table. The adapter forces `PYTHONUTF8=1`
+   in the child env (semgrep's beta Windows support mangles output otherwise) —
+   confirm the merged rows aren't mojibake.
+5. **Copy-to-agent** → select 2 findings → **Copy selected** → paste into a real
+   Claude tab prompt; the markdown formatting is intact and the paths are
+   project-relative (so the agent can click/act on them).
+6. **Cancel mid-scan** → start a scan with semgrep running, hit **Cancel**; the
+   running children are killed and already-completed tools keep their findings
+   (partial results retained).
+7. **Timeout path** → set the scan timeout to 5s and run semgrep on a large repo;
+   semgrep's chip goes `✗ error` with a "timed out after 5s" message while the
+   other tools are unaffected (the timeout is per-tool, not per-scan).
+
+**Offline degrades — and the failed chip must say why.** osv-scanner queries the
+OSV API / deps.dev and semgrep downloads its rules on first run, so an offline
+scan can fail. `runner::exit_error_message` appends a trimmed tail of the tool's
+own stderr (falling back to stdout) to the `exited with code N` message, surfaced
+as the failed chip's tooltip — a bare `exited with code N` with no tail means the
+tool printed nothing, not that the excerpt was dropped.
+
 ## Workbench — Vibe-Coding Guardrails (V13)
 
 **No graph-schema change, no new MCP tool.** The whole feature is a reserved

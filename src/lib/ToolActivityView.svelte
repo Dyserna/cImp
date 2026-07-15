@@ -205,7 +205,14 @@
   // Agent sources with a dedicated accent class; anything else (offload
   // backend names are user-chosen) falls back to the default row color rather
   // than leaking arbitrary strings into the class attribute.
-  const KNOWN_SOURCES = new Set(['claude', 'opencode', 'offload', 'read_advisor', 'auto_check']);
+  const KNOWN_SOURCES = new Set([
+    'claude',
+    'opencode',
+    'offload',
+    'read_advisor',
+    'auto_check',
+    'audit',
+  ]);
   function srcClass(source: string): string {
     return KNOWN_SOURCES.has(source) ? ` ${source}` : '';
   }
@@ -217,7 +224,10 @@
 
   function rowMeta(e: ActivityEntry): string {
     const dur = e.ms >= 10_000 ? `${(e.ms / 1000).toFixed(1)}s` : `${e.ms}ms`;
-    return `${dur} · ${fmtTok(e.chars)} chars`;
+    // For audit entries `chars` carries the finding count, not a payload size.
+    return e.kind === 'audit'
+      ? `${dur} · ${e.chars} findings`
+      : `${dur} · ${fmtTok(e.chars)} chars`;
   }
 </script>
 
@@ -237,11 +247,11 @@
     {/each}
   </nav>
 
-  {#if !$settings.graph.enabled && !$settings.offload.enabled}
+  {#if !$settings.graph.enabled && !$settings.offload.enabled && !$settings.code_audit.enabled}
     <div class="feature-note">
-      The code graph and offload are both disabled (Settings → Code Graph /
-      Offload), so none of these tools are registered with any agent and no
-      activity will be recorded here.
+      The code graph, offload, and Code Audit are all disabled (Settings →
+      Code Graph / Offload / Code Audit), so none of these tools are registered
+      with any agent and no new activity will be recorded here.
     </div>
   {/if}
 
@@ -259,9 +269,9 @@
         {/if}
       </div>
       <p class="caveat">
-        Code-intelligence graph calls and offload runs, merged into one
-        chronological feed that survives restarts. Click a row to see the
-        actual request and response; × deletes a single entry.
+        Code-intelligence graph calls, offload runs, and Code Audit scans,
+        merged into one chronological feed that survives restarts. Click a row
+        to see the actual request and response; × deletes a single entry.
       </p>
       {#if entries.length === 0}
         <div class="history-empty">
@@ -538,14 +548,17 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* Feed-kind accents: graph = blue, offload = green. Hardcoded hex (not
-     --text-*, which follow the terminal palette) so they stay legible in any
-     theme — same rationale as ToolsReference's tool names. */
+  /* Feed-kind accents: graph = blue, offload = green, audit = orange.
+     Hardcoded hex (not --text-*, which follow the terminal palette) so they
+     stay legible in any theme — same rationale as ToolsReference's tool names. */
   .hkind.graph {
     color: #58a6ff;
   }
   .hkind.offload {
     color: #3fb950;
+  }
+  .hkind.audit {
+    color: #f0883e;
   }
   /* Agent-source accents for graph rows (claude/opencode/offload, plus the
      backend-internal read_advisor/auto_check services), matching the palette
@@ -563,6 +576,9 @@
     color: #e3b341;
   }
   .hsrc.auto_check {
+    color: #f0883e;
+  }
+  .hsrc.audit {
     color: #f0883e;
   }
   .hmain {

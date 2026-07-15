@@ -908,9 +908,79 @@ struct MemoryEventBody {
     session_id: String,
     #[serde(default)]
     agent: Option<String>,
-    tool: String,
+    // Tool-event shape (V10): present on `tool.execute.after` POSTs. Optional
+    // now that the same route also carries usage bodies (V24 Phase F), which
+    // have no `tool`.
+    #[serde(default)]
+    tool: Option<String>,
     #[serde(default)]
     args: Value,
+    // V24 Phase F usage shape: `kind == "usage"`, emitted by the plugin's
+    // `event` hook on a completed assistant turn.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    parent_session_id: Option<String>,
+    #[serde(default)]
+    msg_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    in_tok: u32,
+    #[serde(default)]
+    out_tok: u32,
+    #[serde(default)]
+    cache_read: u32,
+    #[serde(default)]
+    cache_make: u32,
+}
+
+/// V24 Phase F: from an OpenCode usage POST body, the target session id and the
+/// [`crate::graph::UsageEvent::Turn`] to record — or `None` when the body has no
+/// usable data (missing/empty `msg_id`, or all four token totals are zero).
+///
+/// When `parent_session_id` is present the spend rolls up to the PARENT session
+/// with `origin: Agent` (sub-agent spend is the parent's spend — mirrors the
+/// Claude sub-agent contract); otherwise it's the reporting session with
+/// `origin: Session`. A model id that is absent/empty maps to `None` (unknown
+/// model), matching the Claude tap. Pure, so the mapping is unit-tested without
+/// a live handler.
+fn usage_event_from_body(body: &MemoryEventBody) -> Option<(String, crate::graph::UsageEvent)> {
+    let msg_id = body.msg_id.clone().filter(|m| !m.is_empty())?;
+    // The plugin only forwards COMPLETED turns, so an all-zero body is a
+    // degenerate/creation emit — skip it rather than plant an empty turn row.
+    // `est_only` is unaffected either way (it's derived from the summed token
+    // totals, which a zero row doesn't move), so skipping only keeps the turn
+    // series free of noise; it never resurrects real data.
+    if body.in_tok == 0 && body.out_tok == 0 && body.cache_read == 0 && body.cache_make == 0 {
+        return None;
+    }
+    let (target, origin) = match body.parent_session_id.as_deref() {
+        Some(p) if !p.is_empty() => (p.to_string(), crate::graph::UsageOrigin::Agent),
+        _ => (body.session_id.clone(), crate::graph::UsageOrigin::Session),
+    };
+    Some((
+        target,
+        crate::graph::UsageEvent::Turn {
+            msg_id,
+            model: body.model.clone().filter(|m| !m.is_empty()),
+            in_tok: body.in_tok,
+            out_tok: body.out_tok,
+            cache_read: body.cache_read,
+            cache_make: body.cache_make,
+            origin,
+        },
+    ))
+}
+
+/// V24 Phase F: for a tool-event body (`tool.execute.after`), the parent
+/// session id when the reporting session is a task-tool CHILD (sub-agent), else
+/// `None`. A child's tool events mirror the Claude sidechain contract (see
+/// `oob/claude.rs` `record_tool_events`, which early-returns on `isSidechain`):
+/// they are dropped rather than recorded against the child, and only the parent
+/// is marked live. Pure, so the routing is unit-tested without a live handler.
+fn tool_event_parent(body: &MemoryEventBody) -> Option<String> {
+    body.parent_session_id.as_deref().filter(|p| !p.is_empty()).map(str::to_string)
 }
 
 /// `POST /memory/event`: classify an agent tool call and record it as a memory
@@ -942,7 +1012,44 @@ async fn handle_memory_event(
     let cwd = body.cwd.as_deref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let agent = body.agent.as_deref().unwrap_or("opencode");
 
-    if let Some((kind, arg)) = crate::graph::classify_tool(&body.tool) {
+    // V24 Phase F: the usage arm — a completed assistant turn's real token
+    // totals (OpenCode's only exact-token ingress; see the spike note atop
+    // `oob/opencode.rs`). Distinct body shape (`kind == "usage"`, no `tool`),
+    // so it short-circuits the tool-event path below.
+    if body.kind.as_deref() == Some("usage") {
+        if let Some((target, event)) = usage_event_from_body(&body) {
+            // Roll-up target = the parent when a child (sub-agent) session
+            // reported, else the reporting session itself. `record_usage`
+            // upserts by `msg_id`, so the plugin's duplicate final emit is
+            // harmless.
+            graph.record_usage(&cwd, &target, agent, event);
+            // Mark the SAME id live: the target is the session row that exists
+            // / gets the spend attributed (the parent when a child reports),
+            // so that's the row the Sessions list should flag active.
+            graph.mark_live_session(&target, agent, &target);
+        }
+        return write_json(stream, 200, &ok).await;
+    }
+
+    // Tool-event path (V10): requires a `tool` name. A body without one and not
+    // a usage event has nothing to record.
+    let Some(tool_name) = body.tool.clone() else {
+        return write_json(stream, 200, &ok).await;
+    };
+
+    // V24 Phase F: a task-tool CHILD (sub-agent) session's tool events are the
+    // sub-agent's own working set, not the parent's — mirror the Claude sidechain
+    // contract (oob/claude.rs `record_tool_events` early-returns on isSidechain)
+    // and drop them entirely: no mem event, no tool-result chars against the
+    // child, and the child is never marked live. The child's real token spend
+    // still reaches the parent via the usage arm above; mark the PARENT live so
+    // the sub-agent's activity keeps the parent's row active.
+    if let Some(parent) = tool_event_parent(&body) {
+        graph.mark_live_session(&parent, agent, &parent);
+        return write_json(stream, 200, &ok).await;
+    }
+
+    if let Some((kind, arg)) = crate::graph::classify_tool(&tool_name) {
         let get = |k: &str| body.args.get(k).and_then(Value::as_str);
         let (path, detail) = match arg {
             crate::graph::MemArg::Path => (
@@ -971,15 +1078,23 @@ async fn handle_memory_event(
     // this runs for EVERY tool call, not just ones `classify_tool` maps to a
     // filesystem/query target — usage wants the full picture. `chars` is
     // estimated from the tool's serialized INPUT args (its actual output
-    // isn't visible to this hook), which is exactly why OpenCode sessions
-    // report `est_only` in the X-ray.
+    // isn't visible to this hook). This path records only tool-result chars,
+    // never Turn tokens, so a session that never got a real usage event stays
+    // est-only in the X-ray (V24 Phase E derives `est_only` from zero token
+    // totals — see `usage_row_for_session`).
     let chars = serde_json::to_string(&body.args).map(|s| s.chars().count()).unwrap_or(0) as u32;
     graph.record_usage(
         &cwd,
         &body.session_id,
         agent,
-        crate::graph::UsageEvent::ToolResult { tool: Some(body.tool.clone()), chars },
+        crate::graph::UsageEvent::ToolResult { tool: Some(tool_name.clone()), chars },
     );
+
+    // V24 Phase B: OpenCode has no tab binding on this path, so the live-session
+    // registry is keyed by the reporting session id itself; the entry expires by
+    // TTL (there is no cancel signal to clear it — see the C3 spike note atop
+    // `oob/opencode.rs`).
+    graph.mark_live_session(&body.session_id, agent, &body.session_id);
 
     write_json(stream, 200, &ok).await
 }
@@ -1163,6 +1278,137 @@ mod tests {
         let b = make_token();
         assert_ne!(a, b);
         assert!(a.len() >= 32);
+    }
+
+    // ── V24 Phase F: OpenCode usage-event arm ──────────────────────────────
+
+    fn usage_body(json: serde_json::Value) -> MemoryEventBody {
+        serde_json::from_value(json).expect("usage body deserializes")
+    }
+
+    #[test]
+    fn usage_body_well_formed_records_session_turn() {
+        // No parent → recorded against the reporting session with origin Session.
+        let body = usage_body(serde_json::json!({
+            "cwd": ".", "agent": "opencode", "kind": "usage",
+            "session_id": "ses_main", "msg_id": "msg_1", "model": "qwen3-coder",
+            "in_tok": 100, "out_tok": 40, "cache_read": 20, "cache_make": 5,
+        }));
+        let (target, event) = usage_event_from_body(&body).expect("well-formed body yields an event");
+        assert_eq!(target, "ses_main");
+        match &event {
+            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make, origin } => {
+                assert_eq!(msg_id, "msg_1");
+                assert_eq!(model.as_deref(), Some("qwen3-coder"));
+                assert_eq!((*in_tok, *out_tok, *cache_read, *cache_make), (100, 40, 20, 5));
+                assert_eq!(*origin, crate::graph::UsageOrigin::Session);
+            }
+            _ => panic!("expected a Turn event"),
+        }
+
+        // Recording it lands a real turn row (est_only clears).
+        let dir = std::env::temp_dir().join(format!("cimp-usage-sess-{}", uuid::Uuid::new_v4()));
+        let idx = crate::graph::GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.record_usage_event(&target, "opencode", &event, 100).unwrap();
+        let series = idx.usage_turn_series("ses_main").unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].msg_id, "msg_1");
+        assert_eq!(series[0].origin, crate::graph::UsageOrigin::Session);
+        assert_eq!(series[0].in_tok, 100);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_body_with_parent_rolls_up_as_agent() {
+        // A child (sub-agent) session's spend is attributed to the PARENT with
+        // origin Agent — mirrors the Claude sub-agent contract.
+        let body = usage_body(serde_json::json!({
+            "kind": "usage", "session_id": "ses_child", "parent_session_id": "ses_parent",
+            "msg_id": "msg_a", "model": "qwen3-coder",
+            "in_tok": 7, "out_tok": 3, "cache_read": 0, "cache_make": 0,
+        }));
+        let (target, event) = usage_event_from_body(&body).expect("child body yields an event");
+        assert_eq!(target, "ses_parent", "spend rolls up to the parent");
+        match &event {
+            crate::graph::UsageEvent::Turn { origin, .. } => {
+                assert_eq!(*origin, crate::graph::UsageOrigin::Agent);
+            }
+            _ => panic!("expected a Turn event"),
+        }
+
+        let dir = std::env::temp_dir().join(format!("cimp-usage-parent-{}", uuid::Uuid::new_v4()));
+        let idx = crate::graph::GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.record_usage_event(&target, "opencode", &event, 100).unwrap();
+        // The turn lives on the parent, not the child.
+        assert_eq!(idx.usage_turn_series("ses_parent").unwrap().len(), 1);
+        assert!(idx.usage_turn_series("ses_child").unwrap().is_empty());
+        let series = idx.usage_turn_series("ses_parent").unwrap();
+        assert_eq!(series[0].origin, crate::graph::UsageOrigin::Agent);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_body_malformed_or_empty_is_ignored() {
+        // Missing msg_id → no event.
+        let no_msg = usage_body(serde_json::json!({
+            "kind": "usage", "session_id": "s", "in_tok": 10,
+        }));
+        assert!(usage_event_from_body(&no_msg).is_none());
+        // Empty msg_id → no event.
+        let empty_msg = usage_body(serde_json::json!({
+            "kind": "usage", "session_id": "s", "msg_id": "", "in_tok": 10,
+        }));
+        assert!(usage_event_from_body(&empty_msg).is_none());
+        // All-zero token totals (degenerate/creation emit) → skipped.
+        let all_zero = usage_body(serde_json::json!({
+            "kind": "usage", "session_id": "s", "msg_id": "m",
+            "in_tok": 0, "out_tok": 0, "cache_read": 0, "cache_make": 0,
+        }));
+        assert!(usage_event_from_body(&all_zero).is_none());
+    }
+
+    #[test]
+    fn usage_upsert_by_msg_id_does_not_duplicate() {
+        // The plugin emits the final turn twice (spike-confirmed) — same msg_id,
+        // so the second overwrites the first in place rather than appending.
+        let mk = |out: u64| {
+            usage_body(serde_json::json!({
+                "kind": "usage", "session_id": "ses", "msg_id": "dup",
+                "in_tok": 50, "out_tok": out, "cache_read": 0, "cache_make": 0,
+            }))
+        };
+        let dir = std::env::temp_dir().join(format!("cimp-usage-dup-{}", uuid::Uuid::new_v4()));
+        let idx = crate::graph::GraphIndex::open(&dir, ".ckg").expect("open");
+        for out in [10u64, 20u64] {
+            let (target, event) = usage_event_from_body(&mk(out)).expect("event");
+            idx.record_usage_event(&target, "opencode", &event, 100).unwrap();
+        }
+        let series = idx.usage_turn_series("ses").unwrap();
+        assert_eq!(series.len(), 1, "duplicate msg_id upserts, not appends");
+        assert_eq!(series[0].out_tok, 20, "last emit wins");
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_event_parent_flags_child_sessions_only() {
+        // V24 code-review: a tool event with no parent is the reporting session's
+        // own event (recorded normally); one carrying a non-empty parent is a
+        // task-tool child whose events are dropped and rolled up to the parent.
+        let own = usage_body(serde_json::json!({
+            "session_id": "s", "tool": "read", "args": {}
+        }));
+        assert_eq!(tool_event_parent(&own), None, "no parent field → own session");
+        let empty_parent = usage_body(serde_json::json!({
+            "session_id": "s", "tool": "read", "args": {}, "parent_session_id": ""
+        }));
+        assert_eq!(tool_event_parent(&empty_parent), None, "empty parent → own session");
+        let child = usage_body(serde_json::json!({
+            "session_id": "ses_child", "tool": "read", "args": {}, "parent_session_id": "ses_parent"
+        }));
+        assert_eq!(tool_event_parent(&child), Some("ses_parent".to_string()), "child → parent");
     }
 
     #[test]

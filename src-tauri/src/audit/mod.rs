@@ -1,0 +1,273 @@
+//! V23 Code Audit — aggregated security scanning.
+//!
+//! Phase A ships only tool *detection*: [`audit_detect_tool`] resolves a
+//! configured audit tool via [`crate::pty::resolve_command`] (honoring the
+//! per-tool `path` override in [`crate::settings::AuditToolConfig`]) and probes
+//! `<tool> --version`. The result is display-only — the Settings "Detect" button
+//! shows it inline and never writes it back into the stored `path` field, so the
+//! config stays "resolve normally" unless the user browses to an exe.
+//!
+//! Phase B extends this module with the full concurrent runner, per-tool SARIF
+//! adapters, and the `audit-status` progress events.
+
+pub mod adapters;
+pub mod runner;
+
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tauri::State;
+
+use crate::error::{AppError, AppResult};
+use crate::ipc::AppState;
+use crate::settings::AuditToolId;
+
+pub use runner::{AuditSnapshot, AuditState};
+
+/// How long the `--version` probe may run before it's abandoned as
+/// "not found / unresponsive". Short — this backs an interactive button.
+const DETECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// V23 Phase A: result of a Detect probe. Display-only — the frontend renders it
+/// inline (`✓ <version> — <path>` / the error) and NEVER writes it back into the
+/// tool's `path` field.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditDetectResult {
+    /// Whether the tool resolved AND its `--version` probe ran successfully.
+    pub found: bool,
+    /// The resolved path — an ebin/PATH hit, or the verbatim override. Present
+    /// even on a probe failure once the binary itself resolved.
+    pub path: Option<String>,
+    /// The tool's reported version line, when found and parseable.
+    pub version: Option<String>,
+    /// Why detection failed (not on PATH/ebin, spawn error, timeout), when not
+    /// found.
+    pub error: Option<String>,
+}
+
+/// V23 Phase A: resolve one audit tool honoring the per-tool `path` override and
+/// probe `<tool> --version`. Read-only and side-effect-free w.r.t. settings —
+/// the Detect button shows the result inline but never mutates the stored path.
+/// Always returns `Ok`: a not-found tool is a normal result (`found = false`),
+/// not an error.
+///
+/// `path` is the LIVE override from the Settings input (empty = resolve the
+/// bare command name). The frontend passes it explicitly so a just-typed value
+/// can't race the fire-and-forget `settings_update` push; `None` falls back to
+/// the persisted setting.
+#[tauri::command]
+pub async fn audit_detect_tool(
+    state: State<'_, AppState>,
+    id: AuditToolId,
+    path: Option<String>,
+) -> AppResult<AuditDetectResult> {
+    let override_path = match path {
+        Some(p) => p,
+        // The persisted per-tool override (empty = resolve ebin → PATH).
+        None => state
+            .settings
+            .current()
+            .code_audit
+            .tools
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.path.clone())
+            .unwrap_or_default(),
+    };
+    Ok(detect_tool(id, &override_path).await)
+}
+
+/// The command to resolve for a tool: the per-tool `path` override verbatim
+/// (trimmed), or the bare command name when the override is empty. The single
+/// definition of the override contract — the Detect probe AND the scan runner
+/// both go through here, so a ✓ from Detect can't disagree with what a scan
+/// actually launches.
+fn effective_command(id: AuditToolId, override_path: &str) -> String {
+    let p = override_path.trim();
+    if p.is_empty() {
+        id.command_name().to_string()
+    } else {
+        p.to_string()
+    }
+}
+
+/// The detection core, split out so tests can exercise it without a Tauri
+/// `State`. `override_path` is the tool's configured `path` (empty = resolve the
+/// bare command name via ebin → PATH; non-empty = used verbatim).
+async fn detect_tool(id: AuditToolId, override_path: &str) -> AuditDetectResult {
+    let name = effective_command(id, override_path);
+
+    let resolved = match crate::pty::resolve_command(&name) {
+        Ok(p) => p,
+        Err(_) => {
+            return AuditDetectResult {
+                found: false,
+                path: None,
+                version: None,
+                error: Some("not found on PATH or ebin".to_string()),
+            };
+        }
+    };
+    let path_str = resolved.display().to_string();
+
+    let mut cmd = tokio::process::Command::new(&resolved);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Don't flash a console window for the probe on Windows.
+    #[cfg(windows)]
+    cmd.creation_flags(crate::procutil::CREATE_NO_WINDOW);
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return AuditDetectResult {
+                found: false,
+                path: Some(path_str),
+                version: None,
+                error: Some(format!("failed to run --version: {e}")),
+            };
+        }
+    };
+    // Backstop reaper if cImp dies hard mid-probe before kill_on_drop fires —
+    // the same job-object guard every other spawn site applies.
+    crate::process_guard::guard_child(&child);
+
+    match tokio::time::timeout(DETECT_TIMEOUT, child.wait_with_output()).await {
+        // A binary that runs but rejects `--version` (wrong exe, or a build
+        // wanting a `version` subcommand) is NOT "found" — otherwise its usage/
+        // error line would be presented as a version string.
+        Ok(Ok(output)) if !output.status.success() => AuditDetectResult {
+            found: false,
+            path: Some(path_str),
+            version: None,
+            error: Some(format!(
+                "--version probe exited with code {}{}",
+                output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()),
+                parse_version(&output.stderr, &output.stdout)
+                    .map(|l| format!(": {l}"))
+                    .unwrap_or_default()
+            )),
+        },
+        Ok(Ok(output)) => AuditDetectResult {
+            found: true,
+            path: Some(path_str),
+            version: parse_version(&output.stdout, &output.stderr),
+            error: None,
+        },
+        Ok(Err(e)) => AuditDetectResult {
+            found: false,
+            path: Some(path_str),
+            version: None,
+            error: Some(format!("failed to run --version: {e}")),
+        },
+        Err(_) => AuditDetectResult {
+            found: false,
+            path: Some(path_str),
+            version: None,
+            error: Some(format!("timed out after {}s", DETECT_TIMEOUT.as_secs())),
+        },
+    }
+}
+
+/// Best-effort version string: the first non-empty trimmed line of stdout,
+/// falling back to stderr (some tools print `--version` to stderr).
+fn parse_version(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    fn first_line(bytes: &[u8]) -> Option<String> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+    }
+    first_line(stdout).or_else(|| first_line(stderr))
+}
+
+/// V23 Phase B: start a scan of the project root with all enabled + resolvable
+/// tools, concurrently. Returns immediately; progress streams via the
+/// [`AUDIT_STATUS_EVENT`] event and can be re-fetched with [`audit_snapshot`].
+/// Rejected (a typed error the UI surfaces) when a scan is already in flight or
+/// no tool is enabled.
+#[tauri::command]
+pub async fn audit_start_scan(state: State<'_, Arc<AuditState>>) -> AppResult<()> {
+    state.inner().start_scan().map_err(AppError::Audit)
+}
+
+/// V23 Phase B: cancel the in-flight scan (kills the running tool children;
+/// already-completed tools keep their findings). Errors when none is running.
+#[tauri::command]
+pub async fn audit_cancel_scan(state: State<'_, Arc<AuditState>>) -> AppResult<()> {
+    state.cancel_scan().map_err(AppError::Audit)
+}
+
+/// V23 Phase B: the full (uncapped) runner snapshot — what the Code Audit tab
+/// reads on mount and to fetch the complete findings set after a truncated
+/// event.
+#[tauri::command]
+pub fn audit_snapshot(state: State<'_, Arc<AuditState>>) -> AuditSnapshot {
+    state.snapshot()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_version_prefers_stdout_then_stderr() {
+        assert_eq!(
+            parse_version(b"osv-scanner v1.9.2\n", b""),
+            Some("osv-scanner v1.9.2".to_string())
+        );
+        // Falls back to stderr when stdout is blank.
+        assert_eq!(
+            parse_version(b"", b"gitleaks 8.18.0\n"),
+            Some("gitleaks 8.18.0".to_string())
+        );
+        // Skips leading blank lines.
+        assert_eq!(parse_version(b"\n  \n", b"fallback 1.0"), Some("fallback 1.0".to_string()));
+        assert_eq!(parse_version(b"", b""), None);
+    }
+
+    #[tokio::test]
+    async fn detect_missing_tool_reports_not_found() {
+        // A bare name that is neither in ebin nor on PATH.
+        let r = detect_tool(AuditToolId::OsvScanner, "cimp-definitely-not-a-real-tool-xyz").await;
+        assert!(!r.found);
+        assert!(r.path.is_none());
+        assert_eq!(r.error.as_deref(), Some("not found on PATH or ebin"));
+        assert!(r.version.is_none());
+    }
+
+    /// A binary that spawns but exits non-zero on `--version` (wrong exe, or a
+    /// build wanting a `version` subcommand) must not be reported as installed
+    /// with its usage/error line shown as the version.
+    #[tokio::test]
+    async fn detect_probe_failure_is_not_found() {
+        // A real binary guaranteed to reject `--version` with a non-zero exit:
+        // `where`(Windows) treats it as an unmatched pattern; `false` ignores it.
+        #[cfg(windows)]
+        let exe = which::which("where").expect("where on PATH");
+        #[cfg(not(windows))]
+        let exe = which::which("false").expect("false on PATH");
+        let r = detect_tool(AuditToolId::Gitleaks, &exe.display().to_string()).await;
+        assert!(!r.found, "{r:?}");
+        assert!(r.path.is_some());
+        assert!(r.version.is_none());
+        assert!(r.error.as_deref().unwrap_or("").contains("exited with code"), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn detect_with_override_runs_version_probe() {
+        // Use a real binary present in the build/test env (`cargo`) as the
+        // verbatim override so the version probe actually runs end to end. The
+        // adapter id is irrelevant to detection — only the resolved exe is run.
+        let cargo = which::which("cargo").expect("cargo on PATH in the test env");
+        let r = detect_tool(AuditToolId::Semgrep, &cargo.display().to_string()).await;
+        assert!(r.found, "cargo override should resolve + probe: {r:?}");
+        assert!(r.path.is_some());
+        assert!(r.version.is_some(), "cargo --version should yield a line: {r:?}");
+    }
+}

@@ -188,6 +188,26 @@ impl OobContext {
         }
     }
 
+    /// V24 Phase B: mark this tab's session live in the graph's live-session
+    /// registry, keyed by the stable tab id (so a session rotation on the same
+    /// tab doesn't leak a stale key). Called on every Claude drain tick. A
+    /// no-op when memory isn't wired (mirrors [`Self::record_mem`]).
+    pub fn mark_live_session(&self, session_id: &str, agent: &str) {
+        if let Some(mem) = self.mem.as_ref() {
+            mem.mark_live_session(self.tab.as_str(), agent, session_id);
+        }
+    }
+
+    /// V24 Phase B: drop this tab's live-session registry entry — the Claude
+    /// tap calls this when its transcript tail exits (tab cancel / source end),
+    /// so a closed tab stops being reported active before its TTL lapses. A
+    /// no-op when memory isn't wired.
+    pub fn clear_live_session(&self) {
+        if let Some(mem) = self.mem.as_ref() {
+            mem.clear_live_session(self.tab.as_str());
+        }
+    }
+
     /// V14 Phase C: record one usage/cost event via the graph service — a
     /// no-op when memory isn't wired or the graph is disabled (mirrors
     /// [`Self::record_mem`]). Never blocks or errors the tap.

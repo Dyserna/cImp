@@ -16,7 +16,12 @@
 /// V15 == 4: `ref.confidence` and `edge.confidence` (edge-confidence layer,
 /// Feature 3) add a value column to two relations, forcing one rebuild — every
 /// row is re-derivable from source, so the reset-migration repopulates it.
-pub const GRAPH_SCHEMA_VERSION: i64 = 4;
+/// V24 == 5: the `usage_stat` memory relation gains an `origin` column (S/A
+/// attribution). Unlike the derived `RELATIONS`, `usage_stat` survives
+/// `reset()`, so the bump *triggers* the open path but the actual column add is
+/// a bespoke recreate-and-copy (`GraphIndex::migrate_usage_stat_origin`) that
+/// defaults existing rows to `"session"` — no usage data is lost.
+pub const GRAPH_SCHEMA_VERSION: i64 = 5;
 
 /// `(name, create-script)` for every stored relation. Order matters only in
 /// that all are ensured before any write.

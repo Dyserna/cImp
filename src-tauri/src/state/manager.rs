@@ -72,6 +72,11 @@ pub enum TabId {
     /// [`Self::GraphMonitor`] — Shell-kind, reserved identity, no PTY,
     /// app-rendered.
     ToolActivity,
+    /// V23: the read-only, non-closable Code Audit tab (aggregated security
+    /// scanning — user-triggered scan, per-tool progress, one findings table).
+    /// Same shape as [`Self::GraphMonitor`] — Shell-kind, reserved identity, no
+    /// PTY, app-rendered. Materialized iff `code_audit.enabled`.
+    CodeAudit,
     /// V14 Phase F: a user-created Preview tab (embedded localhost browser).
     /// Unlike the reserved app-rendered tabs above, this is a genuinely new
     /// [`TabKind`] (not a Shell-kind reserved id) because it's repeatable —
@@ -94,6 +99,7 @@ impl TabId {
             TabId::Workbench => "workbench-1",
             TabId::GraphView => "graph-view",
             TabId::ToolActivity => "tool-activity",
+            TabId::CodeAudit => "code-audit",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
             TabId::Preview(s) => s.as_str(),
@@ -110,6 +116,7 @@ impl TabId {
             "workbench-1" => TabId::Workbench,
             "graph-view" => TabId::GraphView,
             "tool-activity" => TabId::ToolActivity,
+            "code-audit" => TabId::CodeAudit,
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
             // `Shell`, so they keep AI-kind behavior on relaunch. The
@@ -146,7 +153,8 @@ impl TabId {
             | TabId::GraphMonitor
             | TabId::Workbench
             | TabId::GraphView
-            | TabId::ToolActivity => TabKind::Shell,
+            | TabId::ToolActivity
+            | TabId::CodeAudit => TabKind::Shell,
             // V14 Phase F: unlike the reserved dashboards above, Preview is a
             // real kind of its own — it's repeatable (a user may open several),
             // so the frontend needs a wire-visible discriminator rather than
@@ -172,6 +180,7 @@ impl TabId {
                 | TabId::Workbench
                 | TabId::GraphView
                 | TabId::ToolActivity
+                | TabId::CodeAudit
         )
     }
 
@@ -1543,11 +1552,28 @@ mod tests {
             TabId::Ai("ai-1234".to_string()),
             TabId::Shell("shell-1".to_string()),
             TabId::Shell("user-bash".to_string()),
+            TabId::CodeAudit,
         ] {
             let s = serde_json::to_string(&id).unwrap();
             let back: TabId = serde_json::from_str(&s).unwrap();
             assert_eq!(id, back);
         }
+    }
+
+    #[test]
+    fn code_audit_tab_is_a_reserved_dashboard() {
+        // V23: the Code Audit tab round-trips through its wire string, maps to
+        // Shell-kind (like the other reserved dashboards), and is a
+        // reserved/non-closable builtin.
+        assert_eq!(TabId::from_str("code-audit"), TabId::CodeAudit);
+        assert_eq!(TabId::CodeAudit.as_str(), "code-audit");
+        assert_eq!(
+            serde_json::to_string(&TabId::CodeAudit).unwrap(),
+            "\"code-audit\""
+        );
+        assert_eq!(TabId::CodeAudit.kind(), TabKind::Shell);
+        assert!(TabId::CodeAudit.is_reserved_dashboard());
+        assert!(TabId::CodeAudit.is_builtin());
     }
 
     #[test]

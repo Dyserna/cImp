@@ -36,6 +36,19 @@ use crate::state::StateSignal;
 
 const POLL: Duration = Duration::from_millis(200);
 
+/// V24 Phase B: RAII cleanup of a Claude tab's live-session registry entry.
+/// Created once at the top of [`run`], it clears the entry (keyed by the stable
+/// tab id, via [`OobContext::clear_live_session`]) on `Drop` — i.e. on every one
+/// of `run`'s cancel/return paths — so a closed tab stops being reported active
+/// without waiting for its TTL. Mirrors `service`'s other RAII guards.
+struct LiveSessionGuard<'a>(&'a OobContext);
+
+impl Drop for LiveSessionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.clear_live_session();
+    }
+}
+
 /// Tail the active transcript for `project_dir`, speaking new assistant text
 /// until the tab's cancel token fires. Resilient: if the project dir or any
 /// file is missing it simply waits; transient read/parse errors are skipped.
@@ -48,6 +61,12 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
         }
     };
     debug!(tab = ?ctx.tab, root = %root.display(), "Claude OOB: watching transcripts");
+
+    // V24 Phase B: keep this tab's live-session registry entry current while the
+    // tail runs, and clear it (via the guard's `Drop`) on any exit path — tab
+    // cancel or the source ending — so a closed tab drops out of the "active
+    // now" set before its TTL lapses.
+    let _live_guard = LiveSessionGuard(&ctx);
 
     let mut seen: HashSet<String> = HashSet::new();
     // Tool-use IDs of `Task` sub-agents launched but not yet resolved. Non-
@@ -131,6 +150,10 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
+            // V24 Phase B: this tab is live on `session_id` right now — refresh
+            // its registry entry (keyed by the stable tab id) so the Usage
+            // snapshot marks it active.
+            ctx.mark_live_session(&session_id, "claude");
             offset = drain_new_lines(
                 &path,
                 offset,
@@ -197,7 +220,9 @@ async fn drain_new_lines(
             subs.completion_seen |= delta.completed;
             note_user_turn(&obj, session_id, ctx);
             record_tool_events(&obj, project_dir, session_id, ctx);
-            record_usage(&obj, tool_names, project_dir, session_id, ctx);
+            // Parent transcript: Session by default; `record_usage` upgrades an
+            // inline `isSidechain:true` line to Agent (1.x sub-agent contract).
+            record_usage(&obj, tool_names, project_dir, session_id, ctx, crate::graph::UsageOrigin::Session);
             record_commit_events(&obj, commit_calls, project_dir, session_id, ctx);
             for (key, text) in assistant_texts(&obj) {
                 if seen.insert(key) {
@@ -515,15 +540,28 @@ impl ToolNameRing {
     }
 }
 
+/// Pure: the origin to attribute one transcript line's turn to. `base_origin`
+/// is the caller's default (Session for the parent drain, Agent for a sub-agent
+/// file drain); an inline `isSidechain:true` line — the 1.x sub-agent contract
+/// carried in the parent transcript — is upgraded to Agent regardless.
+fn usage_origin(obj: &Value, base_origin: crate::graph::UsageOrigin) -> crate::graph::UsageOrigin {
+    if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        crate::graph::UsageOrigin::Agent
+    } else {
+        base_origin
+    }
+}
+
 /// Pure: extract a [`crate::graph::UsageEvent::Turn`] from an assistant
-/// transcript line's `message.usage` block. Tolerant of absent fields
-/// (older transcript lines, or a partial line mid-stream before the block
-/// firms up) — missing token counts default to 0, which is exactly right for
-/// the UPSERT-by-`msg_id` semantics in `record_usage_event`: a later line
-/// carrying the SAME `msg_id` with the real numbers overwrites this one in
-/// place rather than leaving a duplicate zero row. `None` for any
-/// non-assistant line or an assistant line with no `message.id`.
-fn parse_usage_line(obj: &Value) -> Option<crate::graph::UsageEvent> {
+/// transcript line's `message.usage` block, tagged with `origin` (from
+/// [`usage_origin`]). Tolerant of absent fields (older transcript lines, or a
+/// partial line mid-stream before the block firms up) — missing token counts
+/// default to 0, which is exactly right for the UPSERT-by-`msg_id` semantics in
+/// `record_usage_event`: a later line carrying the SAME `msg_id` with the real
+/// numbers overwrites this one in place rather than leaving a duplicate zero
+/// row. `None` for any non-assistant line or an assistant line with no
+/// `message.id`.
+fn parse_usage_line(obj: &Value, origin: crate::graph::UsageOrigin) -> Option<crate::graph::UsageEvent> {
     if obj.get("type").and_then(Value::as_str) != Some("assistant") {
         return None;
     }
@@ -539,6 +577,7 @@ fn parse_usage_line(obj: &Value) -> Option<crate::graph::UsageEvent> {
         out_tok: tok("output_tokens"),
         cache_read: tok("cache_read_input_tokens"),
         cache_make: tok("cache_creation_input_tokens"),
+        origin,
     })
 }
 
@@ -828,7 +867,20 @@ fn spawn_head_fallback(ctx: &OobContext, project_dir: &Path, session_id: &str) {
 /// arrive inline through the parent drain; under the 2.x contract the same
 /// lines live in `subagents/*.jsonl` and reach this function via
 /// [`SubagentState::scan`] instead.
-fn record_usage(obj: &Value, tool_names: &mut ToolNameRing, project_dir: &Path, session_id: &str, ctx: &OobContext) {
+/// `base_origin` is the caller's default attribution for the turn: the parent
+/// drain passes [`UsageOrigin::Session`], [`SubagentState::scan`] passes
+/// [`UsageOrigin::Agent`]. Either way an inline `isSidechain:true` line (the
+/// 1.x sub-agent contract, which arrives through the parent drain) is forced to
+/// `Agent` — a sub-agent's tokens are the parent session's spend, tagged as
+/// agent so the S/A chart can split them out. Tool-result rows carry no origin.
+fn record_usage(
+    obj: &Value,
+    tool_names: &mut ToolNameRing,
+    project_dir: &Path,
+    session_id: &str,
+    ctx: &OobContext,
+    base_origin: crate::graph::UsageOrigin,
+) {
     if ctx.mem.is_none() {
         return;
     }
@@ -847,7 +899,7 @@ fn record_usage(obj: &Value, tool_names: &mut ToolNameRing, project_dir: &Path, 
         }
     }
 
-    if let Some(event) = parse_usage_line(obj) {
+    if let Some(event) = parse_usage_line(obj, usage_origin(obj, base_origin)) {
         ctx.record_usage(project_dir, session_id, "claude", event);
     }
 
@@ -956,7 +1008,16 @@ impl SubagentState {
                     continue;
                 }
                 if let Ok(obj) = serde_json::from_str::<Value>(line) {
-                    record_usage(&obj, &mut tail.tool_names, project_dir, session_id, ctx);
+                    // Sub-agent transcript file (2.x contract): every turn here
+                    // is Agent spend against the parent session.
+                    record_usage(
+                        &obj,
+                        &mut tail.tool_names,
+                        project_dir,
+                        session_id,
+                        ctx,
+                        crate::graph::UsageOrigin::Agent,
+                    );
                     record_commit_events(
                         &obj,
                         &mut tail.commit_calls,
@@ -1508,15 +1569,17 @@ mod tests {
                 "input_tokens":100,"output_tokens":20,
                 "cache_read_input_tokens":50,"cache_creation_input_tokens":5}}}"#,
         );
-        let ev = parse_usage_line(&line).expect("assistant line with usage yields an event");
+        let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session)
+            .expect("assistant line with usage yields an event");
         match ev {
-            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make } => {
+            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make, origin } => {
                 assert_eq!(msg_id, "m1");
                 assert_eq!(model.as_deref(), Some("claude-x"));
                 assert_eq!(in_tok, 100);
                 assert_eq!(out_tok, 20);
                 assert_eq!(cache_read, 50);
                 assert_eq!(cache_make, 5);
+                assert_eq!(origin, crate::graph::UsageOrigin::Session, "origin flows through from the caller");
             }
             other => panic!("expected Turn, got {other:?}"),
         }
@@ -1528,9 +1591,10 @@ mod tests {
         // `usage` block at all: still a Turn event (so the msg_id UPSERT can
         // later overwrite it with real numbers), just with zeroed tokens.
         let line = obj(r#"{"type":"assistant","message":{"id":"m2"}}"#);
-        let ev = parse_usage_line(&line).expect("absent usage still yields an event");
+        let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session)
+            .expect("absent usage still yields an event");
         match ev {
-            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make } => {
+            crate::graph::UsageEvent::Turn { msg_id, model, in_tok, out_tok, cache_read, cache_make, .. } => {
                 assert_eq!(msg_id, "m2");
                 assert_eq!(model, None);
                 assert_eq!((in_tok, out_tok, cache_read, cache_make), (0, 0, 0, 0));
@@ -1546,7 +1610,7 @@ mod tests {
         let line = obj(
             r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7}}}"#,
         );
-        let ev = parse_usage_line(&line).unwrap();
+        let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session).unwrap();
         match ev {
             crate::graph::UsageEvent::Turn { in_tok, out_tok, cache_read, cache_make, .. } => {
                 assert_eq!(in_tok, 7);
@@ -1559,13 +1623,29 @@ mod tests {
     #[test]
     fn parse_usage_line_none_for_non_assistant() {
         let line = obj(r#"{"type":"user","message":{"content":"hi"}}"#);
-        assert!(parse_usage_line(&line).is_none());
+        assert!(parse_usage_line(&line, crate::graph::UsageOrigin::Session).is_none());
     }
 
     #[test]
     fn parse_usage_line_none_without_message_id() {
         let line = obj(r#"{"type":"assistant","message":{"usage":{"input_tokens":1}}}"#);
-        assert!(parse_usage_line(&line).is_none());
+        assert!(parse_usage_line(&line, crate::graph::UsageOrigin::Session).is_none());
+    }
+
+    #[test]
+    fn usage_origin_tags_the_three_line_forms() {
+        use crate::graph::UsageOrigin;
+        // Parent-transcript line (no sidechain flag) → the caller's Session.
+        let parent = obj(r#"{"type":"assistant","message":{"id":"m1"}}"#);
+        assert_eq!(usage_origin(&parent, UsageOrigin::Session), UsageOrigin::Session);
+        // Inline `isSidechain:true` line (1.x sub-agent) → Agent even from the
+        // parent drain's Session default.
+        let sidechain =
+            obj(r#"{"type":"assistant","isSidechain":true,"message":{"id":"m2"}}"#);
+        assert_eq!(usage_origin(&sidechain, UsageOrigin::Session), UsageOrigin::Agent);
+        // Sub-agent transcript FILE line (2.x) → the drain passes Agent; a plain
+        // line there (no sidechain flag) stays Agent.
+        assert_eq!(usage_origin(&parent, UsageOrigin::Agent), UsageOrigin::Agent);
     }
 
     #[test]
@@ -1675,7 +1755,7 @@ mod tests {
                 {"type":"tool_use","id":"toolu_1","name":"Read","input":{}}
             ],"usage":{"input_tokens":10,"output_tokens":2}}}"#,
         );
-        record_usage(&line, &mut ring, &dir, "s1", &ctx);
+        record_usage(&line, &mut ring, &dir, "s1", &ctx, crate::graph::UsageOrigin::Session);
         assert_eq!(ring.get("toolu_1"), None, "mem is None, so the tap is a full no-op");
     }
 

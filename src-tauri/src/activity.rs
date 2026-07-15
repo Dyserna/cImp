@@ -55,6 +55,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// (currently just `"graph"`) uses the graph cap.
 const GRAPH_CAP: usize = 400;
 const OFFLOAD_CAP: usize = 100;
+/// V23: Code Audit scan runs are rare (user-triggered) and comparatively
+/// valuable — its own window so a graph-heavy session can't evict them.
+const AUDIT_CAP: usize = 100;
 /// Payload caps (chars) applied at record time — a request is typically a
 /// small JSON args object or an offload instruction; responses can be large
 /// tool output. Anything past the cap is cut with an explicit marker.
@@ -78,6 +81,9 @@ pub enum ActivityKind {
     Graph,
     /// One completed `offload_task` run.
     Offload,
+    /// V23: one completed audit tool run (a scanned tool within a Code Audit
+    /// scan).
+    Audit,
 }
 
 impl ActivityKind {
@@ -85,6 +91,7 @@ impl ActivityKind {
         match self {
             ActivityKind::Graph => "graph",
             ActivityKind::Offload => "offload",
+            ActivityKind::Audit => "audit",
         }
     }
 }
@@ -94,6 +101,8 @@ impl ActivityKind {
 fn kind_cap(kind: &str) -> usize {
     if kind == ActivityKind::Offload.as_str() {
         OFFLOAD_CAP
+    } else if kind == ActivityKind::Audit.as_str() {
+        AUDIT_CAP
     } else {
         GRAPH_CAP
     }

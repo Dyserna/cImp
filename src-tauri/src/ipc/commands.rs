@@ -867,6 +867,7 @@ pub async fn settings_update(
         (TabId::Workbench, |s| s.workbench.enabled),
         (TabId::GraphView, |s| s.graph.graph_viz),
         (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
+        (TabId::CodeAudit, |s| s.code_audit.enabled),
     ];
 
     // Snapshot the pre-update flags (reserved tabs via the table, plus the
@@ -1944,6 +1945,23 @@ pub async fn graph_usage(
     // GraphService can't fill (it depends on settings, not the index).
     snap.surface = crate::graph::surface_stats();
     Ok(snap)
+}
+
+/// V24 Phase B: full drill-in detail for ONE session under `root` — its totals
+/// row, per-turn series, top-tools ranking, and per-model token totals with the
+/// session/agent origin split. Unlike `graph_usage` (which only surfaces the
+/// current session at full detail), this works for any session id, so the Usage
+/// card can render a clicked historical session. An unknown session id returns
+/// an empty detail (no error, no panic). `root` defaults to the launch
+/// directory.
+#[tauri::command]
+pub async fn graph_session_usage(
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    session_id: String,
+) -> AppResult<crate::graph::SessionUsageDetail> {
+    let root = resolve_graph_root(root)?;
+    Ok(graph.session_usage_detail(&root, &session_id))
 }
 
 /// V14 Phase D2: the `graph_usage_advice` response. Wraps `advisor::evaluate`'s

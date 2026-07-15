@@ -76,6 +76,17 @@ export function isToolActivityTab(id: TabId): boolean {
   return id === TOOL_ACTIVITY_TAB_ID;
 }
 
+/// V23: the reserved id of the read-only, app-rendered Code Audit tab
+/// (aggregated security scanning). Shell-kind on the backend — no PTY — same
+/// pattern as the Code Graph monitor tab. Materialized while `code_audit.enabled`
+/// is on (default false).
+export const CODE_AUDIT_TAB_ID = 'code-audit';
+
+/// True for the Code Audit tab.
+export function isCodeAuditTab(id: TabId): boolean {
+  return id === CODE_AUDIT_TAB_ID;
+}
+
 /// True for a Preview tab's id (`"preview-<uuid>"` — see `create_preview_tab`
 /// / `TabId::Preview` on the backend). Unlike the reserved dashboards above,
 /// there's no single constant to compare against (Preview is repeatable),
@@ -99,6 +110,7 @@ export function isAppRenderedTab(id: TabId): boolean {
     isWorkbenchTab(id) ||
     isGraphViewTab(id) ||
     isToolActivityTab(id) ||
+    isCodeAuditTab(id) ||
     isPreviewTabId(id)
   );
 }

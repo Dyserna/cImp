@@ -1,5 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AiToolTabConfig, HarnessVersions, LlmPricingModel, Settings } from './types';
+import type {
+  AiToolTabConfig,
+  AuditDetectResult,
+  AuditToolId,
+  HarnessVersions,
+  LlmPricingModel,
+  Settings,
+} from './types';
 import type { TabId } from '../tabs/types';
 
 export async function settingsGet(): Promise<Settings> {
@@ -84,4 +91,14 @@ export async function llmPricingSet(pricing: LlmPricingModel[]): Promise<void> {
 /// hard block reflects a just-recorded outcome without an app restart.
 export async function harnessVersionsGet(): Promise<HarnessVersions> {
   return invoke('harness_versions_get');
+}
+
+/// V23 Phase A: resolve one Code Audit tool and probe `<tool> --version`.
+/// `path` is the LIVE override from the Settings input (empty = resolve the
+/// bare command name) — passed explicitly so a just-typed value can't race the
+/// fire-and-forget settings push. Display-only — the Detect button renders the
+/// result inline and never writes the resolved path back into the stored
+/// config, so it stays "resolve normally" unless the user browses.
+export async function auditDetectTool(id: AuditToolId, path: string): Promise<AuditDetectResult> {
+  return invoke('audit_detect_tool', { id, path });
 }

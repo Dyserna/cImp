@@ -43,12 +43,13 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::write_atomic;
 use crate::settings::schema::{
-    default_ai_tab, default_graph_monitor_tab, default_graph_view_tab, default_offload_server_tab,
+    default_ai_tab, default_code_audit_tab, default_graph_monitor_tab, default_graph_view_tab,
+    default_offload_server_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
     starter_prompt_templates,
     AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings,
     TabConfig,
-    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
+    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
@@ -1059,6 +1060,14 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
         flag: "tool_activity_tab",
         enabled: |s| s.ui.tool_activity_tab,
         default_tab: default_tool_activity_tab,
+        sync_name: true,
+    },
+    ReservedTabSpec {
+        id: CODE_AUDIT_TAB_ID,
+        log_name: "Code Audit",
+        flag: "code_audit",
+        enabled: |s| s.code_audit.enabled,
+        default_tab: default_code_audit_tab,
         sync_name: true,
     },
 ];

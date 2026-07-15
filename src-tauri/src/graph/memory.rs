@@ -177,6 +177,41 @@ fn strip_list_marker(line: &str) -> &str {
 /// ~800 turns), and pruning here silently under-counts the session's spend.
 pub const MAX_USAGE_PER_SESSION: i64 = 6000;
 
+/// V24 Phase A: whether a recorded turn came from the main session transcript
+/// (`Session`) or a sub-agent transcript (`Agent`) — the tap knows which
+/// (sub-agent lines arrive via `<sid>/subagents/*.jsonl` or as inline
+/// `isSidechain:true` lines), and this preserves that fact so the Usage chart
+/// can show where agent fan-out spend went. Serialized as the wire strings
+/// `"session"` / `"agent"` (the `usage_stat.origin` column and the `TurnUsage`
+/// IPC mirror in `graph.ts`). Forward-only: pre-V24 rows migrate as `Session`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageOrigin {
+    Session,
+    Agent,
+}
+
+impl UsageOrigin {
+    /// The wire string stored in `usage_stat.origin` and read back on load.
+    /// Kept in lockstep with the `Serialize` `rename_all = "lowercase"` above
+    /// (both feed the same `"session"`/`"agent"` contract).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsageOrigin::Session => "session",
+            UsageOrigin::Agent => "agent",
+        }
+    }
+
+    /// Parse the stored column back. Anything unexpected — including a legacy
+    /// row that the migration defaulted to `"session"` — reads as `Session`.
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "agent" => UsageOrigin::Agent,
+            _ => UsageOrigin::Session,
+        }
+    }
+}
+
 /// One usage/cost event fed to [`super::service::GraphService::record_usage`].
 /// Timestamped internally (same posture as `record_mem_event`'s `ts_ms`
 /// argument — callers don't carry a clock through the tap).
@@ -192,6 +227,10 @@ pub enum UsageEvent {
         out_tok: u32,
         cache_read: u32,
         cache_make: u32,
+        /// Session (parent transcript) vs. Agent (sub-agent transcript / an
+        /// inline `isSidechain:true` line). Set at the tap; `ToolResult` rows
+        /// carry no origin (they're sized in chars, not attributed per turn).
+        origin: UsageOrigin,
     },
     /// One resolved tool call's result size, in characters (estimated tokens
     /// = chars / 4 is a UI-layer concern, not stored here). `tool` is `None`
@@ -223,6 +262,9 @@ pub struct TurnUsage {
     pub cache_make: u64,
     pub tool_chars: u64,
     pub ts_ms: i64,
+    /// Whether this turn was the main session or a sub-agent (V24 Phase A).
+    /// Pre-V24 rows read `Session` (migrated default).
+    pub origin: UsageOrigin,
 }
 
 /// One session's row for the project-wide usage totals table.
@@ -237,8 +279,10 @@ pub struct SessionUsageRow {
     /// `cache_read / (cache_read + in_tok)`; `0.0` when there's no
     /// denominator (no turns recorded yet).
     pub cache_hit_ratio: f64,
-    /// True when this session has no exact `usage` data — currently every
-    /// non-Claude agent (see the OpenCode C3 spike note atop `oob/opencode.rs`).
+    /// True when this session recorded no real Turn tokens at all (all four
+    /// token totals are zero) — the table's "est" badge. V24 Phase E: derived
+    /// from the totals, not the agent name, so a token-less pre-V24 OpenCode
+    /// session keeps the badge while any session with real tokens loses it.
     pub est_only: bool,
     /// Session start / last-activity timestamps (epoch ms), from the
     /// `session` relation via [`SessionInfo`].
@@ -280,6 +324,67 @@ pub struct SessionUsage {
     pub turns: Vec<TurnUsage>,
     pub totals: UsageTotals,
     pub top_tools: Vec<ToolUsage>,
+}
+
+/// V24 Phase B: total tokens (all four categories summed) attributed to each
+/// [`UsageOrigin`] within one model's spend in a session — how much was the
+/// main session vs. sub-agent fan-out. Feeds the Cost card's per-model S/A
+/// share line.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct OriginSplit {
+    pub session_tok: u64,
+    pub agent_tok: u64,
+}
+
+/// V24 Phase B: one model's contribution to a session — its summed token
+/// totals plus the session/agent origin split. Ordered by total tokens
+/// descending in [`SessionUsageDetail::per_model`], so a mixed-model session
+/// (e.g. a Fable main + Opus sub-agents) is priced per model instead of at one
+/// blended rate.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ModelUsage {
+    pub model: String,
+    pub totals: UsageTotals,
+    pub origins: OriginSplit,
+}
+
+/// V24 Phase B: full drill-in detail for ONE session (the `graph_session_usage`
+/// command) — ANY session, not just the current one. `row` is the same shape
+/// the Sessions list shows; `turns`/`top_tools` reuse the current-session
+/// queries parameterized by id; `per_model` prices mixed-model sessions
+/// honestly. An unknown session id yields [`Self::empty`] (all-zero row, no
+/// turns/tools/models) — never an error.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct SessionUsageDetail {
+    pub row: SessionUsageRow,
+    pub turns: Vec<TurnUsage>,
+    pub top_tools: Vec<ToolUsage>,
+    pub per_model: Vec<ModelUsage>,
+}
+
+impl SessionUsageDetail {
+    /// The empty detail for an unknown/absent session: an all-zero row that
+    /// echoes the requested `session_id` (the IPC contract keeps `row`
+    /// non-optional), no turns, no tools, no models. Callers read emptiness
+    /// from the zero totals + empty vecs.
+    pub fn empty(session_id: &str) -> Self {
+        SessionUsageDetail {
+            row: SessionUsageRow {
+                session_id: session_id.to_string(),
+                agent: String::new(),
+                totals: UsageTotals::default(),
+                tool_chars: 0,
+                cache_hit_ratio: 0.0,
+                est_only: true,
+                started_ms: 0,
+                last_ms: 0,
+                models: Vec::new(),
+            },
+            turns: Vec::new(),
+            top_tools: Vec::new(),
+            per_model: Vec::new(),
+        }
+    }
 }
 
 /// The Effectiveness panel's three measured counters. `injected_chars` /
@@ -336,6 +441,15 @@ pub struct UsageSnapshot {
     /// `graph_usage` IPC handler (`crate::graph::surface_stats`), not by
     /// `GraphService` — it depends on live settings, not the index.
     pub surface: super::mcp::SurfaceStats,
+    /// V24 Phase B: session ids that are live right now — the decided "open
+    /// tabs + recency" set. A session qualifies when a live-session registry
+    /// entry for it was refreshed within the registry TTL (a Claude tab still
+    /// ticking, an OpenCode session still reporting) OR its last recorded
+    /// activity falls within the recency window. Deduped. Drives the Sessions
+    /// list's active markers; unlike `current` (a single most-recent session),
+    /// this marks EVERY live session (a Claude tab and an OpenCode tab on the
+    /// same project both show).
+    pub active_session_ids: Vec<String>,
 }
 
 /// Map an agent tool name/id to a memory event `kind` + the argument key that
@@ -485,5 +599,46 @@ mod tests {
         );
         // …but 4 real facts still exceed the cap.
         assert_eq!(parse_distilled_facts("- a\n- b\n- c\n- d"), None);
+    }
+
+    // ── V24 Phase A: origin wire-string tripwire ──────────────────────────
+    // The `usage_stat.origin` column, the `UsageOrigin` serde form, and the TS
+    // `TurnUsage.origin: 'session' | 'agent'` mirror (`src/lib/graph.ts`) must
+    // all agree on these exact strings. Pin them so a rename can't silently
+    // desync the wire.
+    #[test]
+    fn usage_origin_wire_strings_are_stable() {
+        // Exhaustive match: adding a variant forces this test to be revisited.
+        fn _exhaustive(o: UsageOrigin) {
+            match o {
+                UsageOrigin::Session | UsageOrigin::Agent => {}
+            }
+        }
+        // serde (the `Turn` payload / `TurnUsage` IPC) and `as_str` (the stored
+        // column) must produce the same strings.
+        assert_eq!(serde_json::to_value(UsageOrigin::Session).unwrap(), serde_json::json!("session"));
+        assert_eq!(serde_json::to_value(UsageOrigin::Agent).unwrap(), serde_json::json!("agent"));
+        assert_eq!(UsageOrigin::Session.as_str(), "session");
+        assert_eq!(UsageOrigin::Agent.as_str(), "agent");
+        // Column round-trip; anything unexpected (incl. a migrated legacy row)
+        // reads as `Session`.
+        assert_eq!(UsageOrigin::from_wire("session"), UsageOrigin::Session);
+        assert_eq!(UsageOrigin::from_wire("agent"), UsageOrigin::Agent);
+        assert_eq!(UsageOrigin::from_wire("whatever"), UsageOrigin::Session);
+
+        // `TurnUsage` serializes the origin under the `origin` key.
+        let tu = TurnUsage {
+            msg_id: "m".into(),
+            model: None,
+            in_tok: 1,
+            out_tok: 0,
+            cache_read: 0,
+            cache_make: 0,
+            tool_chars: 0,
+            ts_ms: 0,
+            origin: UsageOrigin::Agent,
+        };
+        let v = serde_json::to_value(&tu).unwrap();
+        assert_eq!(v.get("origin").unwrap(), &serde_json::json!("agent"));
     }
 }

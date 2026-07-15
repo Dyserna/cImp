@@ -623,6 +623,13 @@ const CIMP_INJECT_ENABLED = {inject};
 const CIMP_AUTO_CHECK_ENABLED = {auto_check};
 const CIMP_EDIT_TOOLS = new Set(["edit", "write", "patch"]);
 
+// V24 Phase F: child session id -> parent session id, learned from
+// `session.created` events. Sub-agent (task-tool) sessions are always created
+// while this plugin is running, so a session-lifetime Map is sufficient; usage
+// POSTs from a session in this map carry `parent_session_id` so the backend can
+// roll the spend up to the parent (mirrors the Claude sub-agent contract).
+const CIMP_PARENTS = new Map();
+
 export default async (input) => ({{
   // V13 Phase C: this POST always fires (not gated on CIMP_INJECT_ENABLED)
   // so the app-side prompt-tap checkpoint trigger sees every prompt even
@@ -644,16 +651,23 @@ export default async (input) => ({{
   }},
   "tool.execute.after": async (inp) => {{
     try {{
+      const body = {{
+        cwd: input.directory,
+        session_id: inp.sessionID,
+        agent: "opencode",
+        tool: inp.tool,
+        args: inp.args,
+      }};
+      // V24 Phase F: a task-tool CHILD (sub-agent) session stamps its parent so
+      // the backend mirrors the Claude sidechain contract — the child's tool
+      // events are dropped and only the parent is marked live (the child's real
+      // token spend rolls up to the parent via the `event` usage hook below).
+      const parent = CIMP_PARENTS.get(inp.sessionID);
+      if (parent) body.parent_session_id = parent;
       await fetch(CIMP_LOOPBACK + "/memory/event", {{
         method: "POST",
         headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
-        body: JSON.stringify({{
-          cwd: input.directory,
-          session_id: inp.sessionID,
-          agent: "opencode",
-          tool: inp.tool,
-          args: inp.args,
-        }}),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(600),
       }});
     }} catch (_e) {{}}
@@ -676,6 +690,51 @@ export default async (input) => ({{
         signal: AbortSignal.timeout(600),
       }}).catch((_e) => {{}});
     }}
+  }},
+  // V24 Phase F: OpenCode's real per-turn token tap (spike-confirmed against
+  // 1.18.1). `chat.message` fires on the USER prompt and carries no tokens, so
+  // forwarding happens here on the assistant `message.updated` event once the
+  // turn has completed. The message is emitted first with zero tokens, then
+  // re-emitted (duplicated) with final tokens — gate on `time.completed` and
+  // let the backend upsert-by-msg_id absorb the duplicate. Never gated on the
+  // inject/auto-check flags (usage is always recorded); best-effort, non-blocking.
+  event: async ({{ event }}) => {{
+    try {{
+      if (!event) return;
+      const info = event.properties && event.properties.info;
+      if (event.type === "session.created") {{
+        // A sub-agent (task-tool) child session announces its parent here.
+        if (info && info.id && info.parentID) CIMP_PARENTS.set(info.id, info.parentID);
+        return;
+      }}
+      if (event.type !== "message.updated") return;
+      if (!info || info.role !== "assistant" || !info.time || !info.time.completed) return;
+      const tok = info.tokens || {{}};
+      const cache = tok.cache || {{}};
+      const body = {{
+        cwd: input.directory,
+        agent: "opencode",
+        kind: "usage",
+        session_id: info.sessionID,
+        msg_id: info.id,
+        // Bare modelID (no providerID) — consistent with how Claude sessions
+        // store bare model ids and with matchPricing's model_prefix semantics.
+        model: info.modelID,
+        in_tok: (tok.input || 0),
+        // reasoning folds into output (priced as output everywhere it matters).
+        out_tok: ((tok.output || 0) + (tok.reasoning || 0)),
+        cache_read: (cache.read || 0),
+        cache_make: (cache.write || 0),
+      }};
+      const parent = CIMP_PARENTS.get(info.sessionID);
+      if (parent) body.parent_session_id = parent;
+      await fetch(CIMP_LOOPBACK + "/memory/event", {{
+        method: "POST",
+        headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(600),
+      }});
+    }} catch (_e) {{}}
   }},
 }});
 "#,
@@ -1154,9 +1213,67 @@ mod tests {
         assert!(js.contains("/context/post_edit"));
         assert!(js.contains("chat.message"));
         assert!(js.contains("tool.execute.after"));
+        // V24 Phase F: the usage-forwarding `event` hook + its POST body shape.
+        assert!(js.contains("event: async"));
+        assert!(js.contains(r#"kind: "usage""#));
         let off = opencode_plugin_source(1, "x", false, false);
         assert!(off.contains("CIMP_INJECT_ENABLED = false"));
         assert!(off.contains("CIMP_AUTO_CHECK_ENABLED = false"));
+    }
+
+    /// V24 Phase F: the `event` hook forwards a completed assistant turn's real
+    /// token totals as a `kind: "usage"` body, maps the token fields per the
+    /// spike (reasoning folds into output, bare `modelID`), learns parent
+    /// sessions from `session.created`, and is NOT gated on the inject/auto-check
+    /// flags (usage is always recorded).
+    #[test]
+    fn opencode_plugin_source_forwards_usage_on_completed_turn() {
+        let js = opencode_plugin_source(54321, "tok", true, true);
+        // Gates on an assistant turn that has completed.
+        assert!(js.contains(r#"info.role !== "assistant""#), "role filter: {js}");
+        assert!(js.contains("info.time.completed"), "completed-turn gate: {js}");
+        assert!(js.contains(r#"event.type !== "message.updated""#));
+        // Body field mapping (spike-confirmed).
+        assert!(js.contains("session_id: info.sessionID"));
+        assert!(js.contains("msg_id: info.id"));
+        assert!(js.contains("model: info.modelID"), "bare modelID: {js}");
+        assert!(js.contains("in_tok: (tok.input || 0)"));
+        // reasoning folds into output.
+        assert!(js.contains("out_tok: ((tok.output || 0) + (tok.reasoning || 0))"));
+        assert!(js.contains("cache_read: (cache.read || 0)"));
+        assert!(js.contains("cache_make: (cache.write || 0)"));
+        // parentID map: populated from session.created, stamped on child POSTs.
+        assert!(js.contains("const CIMP_PARENTS = new Map()"));
+        assert!(js.contains(r#"event.type === "session.created""#));
+        assert!(js.contains("CIMP_PARENTS.set(info.id, info.parentID)"));
+        assert!(js.contains("CIMP_PARENTS.get(info.sessionID)"));
+        assert!(js.contains("body.parent_session_id = parent"));
+
+        // The usage `event` hook must NOT be gated on the inject/auto-check
+        // flags — usage is recorded regardless. The hook body (from `event:`
+        // to the end) references neither flag.
+        let off = opencode_plugin_source(1, "x", false, false);
+        let event_start = off.find("event: async").expect("event hook present");
+        let hook = &off[event_start..];
+        assert!(
+            !hook.contains("CIMP_INJECT_ENABLED") && !hook.contains("CIMP_AUTO_CHECK_ENABLED"),
+            "usage event hook must not depend on the gating flags: {hook}"
+        );
+    }
+
+    /// V24 code-review: the `tool.execute.after` POST also stamps
+    /// `parent_session_id` for a task-tool child session (not only the usage
+    /// `event` hook), so the backend can drop the child's tool events (Claude
+    /// sidechain parity) and roll activity up to the parent.
+    #[test]
+    fn opencode_tool_event_stamps_parent_session_for_children() {
+        let js = opencode_plugin_source(1, "x", true, true);
+        let start = js.find(r#""tool.execute.after""#).expect("tool hook present");
+        // Scope to the tool hook body — up to the next top-level hook (`event:`).
+        let end = js[start..].find("event: async").map(|e| start + e).expect("event hook after");
+        let hook = &js[start..end];
+        assert!(hook.contains("CIMP_PARENTS.get(inp.sessionID)"), "child lookup in tool hook: {hook}");
+        assert!(hook.contains("body.parent_session_id = parent"), "parent stamp in tool hook: {hook}");
     }
 
     /// V13 Phase C: the `/context/retrieve` POST inside `chat.message` must

@@ -113,6 +113,12 @@ pub enum AppError {
     /// Windows).
     #[error("preview error: {0}")]
     Preview(String),
+
+    /// V23 Code Audit: a scan couldn't be started or cancelled (already in
+    /// flight, no tools enabled, nothing to cancel). The tool run failures
+    /// themselves are per-tool `failed` states, not this variant.
+    #[error("audit error: {0}")]
+    Audit(String),
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;

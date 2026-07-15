@@ -64,7 +64,7 @@ async fn run_git(root: &Path, args: &[&str]) -> AppResult<String> {
         .stderr(Stdio::null())
         .kill_on_drop(true);
     #[cfg(windows)]
-    cmd.creation_flags(0x0800_0000);
+    cmd.creation_flags(crate::procutil::CREATE_NO_WINDOW);
 
     let output = cmd
         .output()

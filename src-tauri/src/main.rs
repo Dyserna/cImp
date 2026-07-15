@@ -4,6 +4,7 @@ mod activity;
 mod advisor;
 mod attach;
 mod audio;
+mod audit;
 mod checks;
 mod compact_hook;
 mod content;
@@ -20,6 +21,7 @@ mod postedit_hook;
 mod preview;
 mod process_guard;
 mod processing;
+mod procutil;
 mod pty;
 mod read_hook;
 mod settings;
@@ -610,6 +612,21 @@ fn main() {
                 );
                 app.manage(graph_service.clone());
 
+                // V23 Code Audit: the concurrent scan runner. Managed
+                // unconditionally (the IPC reaches it either way); a scan only
+                // runs when the user triggers one from the enabled tab. Root =
+                // the launch project directory every scan runs against.
+                {
+                    let audit_root =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let audit_state = crate::audit::AuditState::new(
+                        app.handle().clone(),
+                        settings_for_graph.clone(),
+                        audit_root,
+                    );
+                    app.manage(audit_state);
+                }
+
                 // Build the launch project's graph in the background on startup
                 // so a session opened immediately after launch finds an index.
                 // Runtime enable (false→true) also kicks one build via the
@@ -826,6 +843,10 @@ fn main() {
             workbench_git_graph,
             theming::themes_list,
             theming::palettes_list,
+            audit::audit_detect_tool,
+            audit::audit_start_scan,
+            audit::audit_cancel_scan,
+            audit::audit_snapshot,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

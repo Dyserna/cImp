@@ -5,6 +5,36 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Code Audit — aggregated security scanning (V23).** A new opt-in
+  (`code_audit.enabled`, off by default) reserved **Code Audit** dashboard tab
+  and a **Settings → Code Audit** category run three unbundled security
+  scanners against the project root and merge their output into one findings
+  table. **osv-scanner** covers dependency CVEs *and* known-malicious packages
+  (OSV `MAL-*`) across 19+ lockfiles/manifests, **gitleaks** covers secrets in
+  the working tree + git history, and **semgrep** (detect-if-present — Python,
+  Windows support beta) covers first-party SAST. Nothing is bundled: each tool
+  resolves ebin → PATH → an explicit per-tool path override, with a **Detect**
+  button (`<tool> --version` probe) and Browse in Settings. All three emit
+  SARIF, normalized through the V22 `sarif` parser into a merged table
+  (severity · tool · rule · `file:line` · message) with severity/tool/text
+  filters. Findings-present is a non-zero exit for all three, so the runner
+  classifies exit 0 = clean, 1 = findings (a success), anything else = a tool
+  error; tools run concurrently with a per-tool timeout, Cancel kills the
+  children, and progress streams via the `audit-status` event. Findings are
+  selected and **copied as agent-ready markdown** (severity, rule id,
+  project-relative `file:line`, message) to paste straight into a Claude Code /
+  OpenCode prompt. A **scan-coverage line** lists the lockfiles/manifests
+  osv-scanner reported actually scanning (from its SARIF `runs[].artifacts`) so
+  a "0 findings" run over an unscannable ecosystem isn't read as a clean bill
+  of health, and a network-reality hint plus the failed chip's own stderr tail
+  make offline degradation self-explanatory. Scans are recorded in the
+  tool-activity store (kind `audit`); results live in managed state and are not
+  persisted across restarts in v1.
+
 ## [0.42.2] — 2026-07-15
 
 ### Fixed

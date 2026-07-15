@@ -24,7 +24,6 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::{AppError, AppResult};
 
@@ -216,7 +215,11 @@ impl Severity {
 }
 
 /// One raw diagnostic as parsed from a checker's output, before dedup.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Serialize` (V23) lets the audit runner ship raw `Diag`s to the Code Audit
+/// tab verbatim (wrapped in `audit::AuditFinding`) without a second DTO — the
+/// checks pipeline itself only ever serializes the deduplicated [`DiagGroup`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Diag {
     pub severity: Severity,
     pub code: Option<String>,
@@ -680,7 +683,7 @@ async fn spawn_capture(
     // same CREATE_NO_WINDOW convention as every other spawned subprocess
     // (offload's `llama-server`, MCP host, `run_command`).
     #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
+    command.creation_flags(crate::procutil::CREATE_NO_WINDOW);
 
     let mut child = command
         .spawn()
@@ -693,23 +696,26 @@ async fn spawn_capture(
     // on `child.wait()` below — killing the child for a timeout only closes
     // its pipes (which cleanly EOFs these readers), it doesn't discard what
     // was already captured.
-    let out_task = tokio::spawn(read_capped(child.stdout.take(), MAX_OUTPUT_BYTES));
-    let err_task = tokio::spawn(read_capped(child.stderr.take(), MAX_OUTPUT_BYTES));
+    let out_task = tokio::spawn(crate::procutil::read_capped(child.stdout.take(), MAX_OUTPUT_BYTES));
+    let err_task = tokio::spawn(crate::procutil::read_capped(child.stderr.take(), MAX_OUTPUT_BYTES));
 
     let (exit_code, timed_out) = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
         Ok(Ok(status)) => (status.code(), false),
         Ok(Err(e)) => return Err(AppError::Checks(format!("check `{cmd}` failed: {e}"))),
         Err(_) => {
-            // Timed out: kill (kill_on_drop is a backstop, not a guarantee the
-            // process is gone by the time we read the buffers below) and reap.
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            // Timed out: kill the whole tree (kill_on_drop is a backstop, not a
+            // guarantee the process is gone by the time we read the buffers
+            // below — and a checker's own children must not survive it) and reap.
+            crate::procutil::kill_tree(&mut child).await;
             (None, true)
         }
     };
 
-    let stdout = out_task.await.unwrap_or_default();
-    let stderr = err_task.await.unwrap_or_default();
+    // Bounded: a checker grandchild still holding a pipe write end must not
+    // hang the check run forever (truncation is irrelevant here — parsers
+    // treat output as best-effort text).
+    let (stdout, _) = crate::procutil::drain_capture(out_task).await;
+    let (stderr, _) = crate::procutil::drain_capture(err_task).await;
     Ok((exit_code, stdout, stderr, timed_out))
 }
 
@@ -742,29 +748,6 @@ fn shell_command(cmd: &str) -> tokio::process::Command {
         c.arg("-c").arg(cmd);
         c
     }
-}
-
-/// Read `reader` to EOF, retaining at most `cap` bytes but continuing to
-/// drain (and discard) the rest so the child isn't blocked on a full pipe.
-/// `None` (a stream that wasn't piped) yields an empty string. Lossy UTF-8 —
-/// checker output is text, and a stray invalid byte shouldn't drop the run.
-async fn read_capped<R: AsyncRead + Unpin>(reader: Option<R>, cap: usize) -> String {
-    let mut bytes = Vec::new();
-    if let Some(mut reader) = reader {
-        let mut chunk = [0u8; 8192];
-        loop {
-            match reader.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if bytes.len() < cap {
-                        let take = n.min(cap - bytes.len());
-                        bytes.extend_from_slice(&chunk[..take]);
-                    }
-                }
-            }
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]

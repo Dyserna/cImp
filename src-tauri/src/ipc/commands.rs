@@ -867,6 +867,7 @@ pub async fn settings_update(
         (TabId::Workbench, |s| s.workbench.enabled),
         (TabId::GraphView, |s| s.graph.graph_viz),
         (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
+        (TabId::CodeAudit, |s| s.code_audit.enabled),
     ];
 
     // Snapshot the pre-update flags (reserved tabs via the table, plus the

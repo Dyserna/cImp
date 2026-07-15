@@ -664,6 +664,10 @@ export interface Settings {
   /// like `llm_pricing` (global-only; preserved against stale snapshots by
   /// `apply_incoming_settings`); kept here for schema fidelity.
   harness_versions: HarnessVersions;
+  /// V23 Phase A: Code Audit (aggregated security scanning) config. Off by
+  /// default; `enabled` gates the reserved Code Audit dashboard tab and the
+  /// bottom-bar entry point.
+  code_audit: CodeAuditSettings;
 }
 
 /// One provider/model price row: USD per million tokens for the four billing
@@ -1041,6 +1045,40 @@ export interface ClaudeLocalSettings {
 export interface ExternalToolsSettings {
   rustnet: string;
   broot: string;
+}
+
+/// V23 Phase A: closed set of built-in audit tools (mirror of Rust
+/// `AuditToolId`). Wire format is kebab-case; an unknown id in a settings file
+/// is dropped backend-side (forward compat), never an error.
+export type AuditToolId = 'osv-scanner' | 'gitleaks' | 'semgrep';
+
+/// V23 Phase A: one configured audit tool (mirror of Rust `AuditToolConfig`).
+/// `path` empty = resolve `ebin` → PATH; non-empty = used as the command
+/// verbatim. `extra_args` are appended after the adapter's fixed argv.
+export interface AuditToolConfig {
+  id: AuditToolId;
+  enabled: boolean;
+  path: string;
+  extra_args: string[];
+}
+
+/// V23 Phase A: Code Audit (aggregated security scanning) config (mirror of
+/// Rust `CodeAuditSettings`). Off by default; `enabled` gates the reserved Code
+/// Audit dashboard tab (like `ui.tool_activity_tab`) and the bottom-bar entry.
+export interface CodeAuditSettings {
+  enabled: boolean;
+  tools: AuditToolConfig[];
+  timeout_secs: number;
+}
+
+/// V23 Phase A: the `audit_detect_tool` IPC result (mirror of Rust
+/// `AuditDetectResult`). Display-only — the Detect button renders it inline and
+/// never writes the resolved path back into the tool's `path` field.
+export interface AuditDetectResult {
+  found: boolean;
+  path: string | null;
+  version: string | null;
+  error: string | null;
 }
 
 /// V8-01: native baseline offload tool toggles (mirror of Rust
@@ -1623,6 +1661,15 @@ export function defaultSettings(): Settings {
       opencode_last_seen: '',
       e1_status: 'unverified',
       d0_status: 'unverified',
+    },
+    code_audit: {
+      enabled: false,
+      tools: [
+        { id: 'osv-scanner', enabled: true, path: '', extra_args: [] },
+        { id: 'gitleaks', enabled: true, path: '', extra_args: [] },
+        { id: 'semgrep', enabled: true, path: '', extra_args: [] },
+      ],
+      timeout_secs: 600,
     },
   };
 }

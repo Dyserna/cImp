@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Graph index dashboard moved to Tool Activity.** The Code Intelligence
+  tab's Overview → Index group (Rebuild index / Rebuild embeddings / Test
+  connection / Pause watch, the embedder probe, and the per-root index cards
+  with language census + semantic-search status) now renders as a "Graph
+  index" sub-tab of Tool Activity, next to Graph tools. The Code Intelligence
+  Overview keeps the Usage cards; Memory / Context / Analyses / Trace path /
+  Architecture are unchanged.
 - **Offload Server tab retired — the dashboard is now an "Offload server"
   sub-tab of Tool Activity.** The separate V8-03 reserved tab is gone; the
   live per-backend dashboard (Local Start/Stop/Reset, slots, throughput,

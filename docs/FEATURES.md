@@ -86,7 +86,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Structural AST pattern search; FS watcher for incremental re-index
 - MCP graph tools: `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`, `graph_struct_search`
 - Symbol visibility bit (Rust `pub`/`pub(crate)`, JS/TS `export`, Python `_` convention, Go capitalization)
-- Reserved **Code Intelligence** tab (renamed from Code Graph): five sections — Index / Activity / Memory / Context / Analyses
+- Reserved **Code Intelligence** tab (renamed from Code Graph): Overview (usage) / Memory / Context / Analyses / Trace path / Architecture; the index dashboard + rebuild actions moved to **Tool Activity → Graph index**, the activity feed to **Tool Activity → Activities**
 
 ## Code Intelligence — Context Engine (V10)
 - Session/action memory: per-project record of files each session read/edited/queried + agent notes; `context_recall` / `context_note` (pinnable) / `context_notes`; survives index rebuilds; Memory tab section (working set, notes, sessions, clear)

@@ -1,12 +1,14 @@
 <script lang="ts">
   // The read-only, app-rendered Tool Activity tab — one place to see what
-  // tools the agents are using and which tools are available. Four sections:
+  // tools the agents are using and which tools are available. Five sections:
   // Activities (the unified, newest-first feed from the backend's persistent
   // activity store — graph/context tool calls plus completed offload_task
   // runs, surviving app restarts), Graph tools, and Offload tools (the two
   // reference lists, moved here from the Code Intelligence and Offload Server
-  // tabs), plus Offload server (the live backend dashboard — formerly the
-  // reserved Offload Server tab, retired in schema v25). Rows are clickable
+  // tabs), Graph index (the graph indexer dashboard + rebuild actions, moved
+  // here from the Code Intelligence tab's Overview), plus Offload server (the
+  // live backend dashboard — formerly the reserved Offload Server tab,
+  // retired in schema v25). Rows are clickable
   // (a popup shows the captured request/response), individually deletable,
   // and the whole history can be cleared. Same reserved/no-PTY pattern as
   // CodeIntelligenceView; rendered by Pane.svelte for the `tool-activity`
@@ -25,6 +27,7 @@
   import { fmtTok } from './usageMath';
   import ToolsReference from './ToolsReference.svelte';
   import OffloadServerView from './OffloadServerView.svelte';
+  import GraphIndexView from './GraphIndexView.svelte';
   import { TOOL_ACTIVITY_TAB_ID } from './tabs/types';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
   import { loadViewSection, saveViewSection } from './viewSection';
@@ -71,10 +74,11 @@
     { name: 'run_check', desc: "Worker runs one of the project's configured checks (build/typecheck/lint/test) to verify a claim before stating it. Inert until checks are configured.", example: 'Does the test suite pass? Prove it with run_check.' },
   ];
 
-  type Section = 'activities' | 'graph-tools' | 'offload-tools' | 'offload-server';
+  type Section = 'activities' | 'graph-tools' | 'graph-index' | 'offload-tools' | 'offload-server';
   const SECTIONS: { id: Section; label: string }[] = [
     { id: 'activities', label: 'Activities' },
     { id: 'graph-tools', label: 'Graph tools' },
+    { id: 'graph-index', label: 'Graph index' },
     { id: 'offload-tools', label: 'Offload tools' },
     { id: 'offload-server', label: 'Offload server' },
   ];
@@ -325,6 +329,10 @@
       note="MCP tools exposed to Claude (and the offload worker) while the graph is enabled. Ask in natural language — Claude picks the tool."
       persistKey="tool-activity.graph-tools"
     />
+  {:else if section === 'graph-index'}
+    <!-- The graph indexer dashboard (status cards + rebuild/pause actions),
+         in normal flow so this container keeps owning the scroll. -->
+    <GraphIndexView />
   {:else if section === 'offload-tools'}
     <ToolsReference
       title="Offload tools"

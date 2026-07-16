@@ -4443,8 +4443,8 @@
               </label>
               <small class="hint">
                 Changing the model or dimensions starts a background re-embed.
-                Use <strong>Rebuild embeddings</strong> on the Code Graph tab
-                after a silent model swap behind the same name.
+                Use <strong>Rebuild embeddings</strong> in Tool Activity →
+                Graph index after a silent model swap behind the same name.
               </small>
             {/if}
 

@@ -575,8 +575,10 @@ tree-sitter `tags.scm` engine); HTML, CSS, JSON, YAML, XML, and assembly are
 struct-searchable; Markdown feeds docs — with symbol/call/import edges,
 transitive reachability, full-text and
 (optionally) embedding-based semantic doc search, and a filesystem watcher for
-incremental re-index. A reserved **Code Intelligence** tab shows build status,
-node/edge counts, embedder health, and recent-query history.
+incremental re-index. Build status, node/edge counts, the language census, and
+embedder health — plus the rebuild / pause-watch actions — live in the **Tool
+Activity** tab's **Graph index** sub-tab; recent-query history is its
+Activities feed.
 
 Beyond structural search, Code Intelligence adds three capabilities (**Memory**,
 **Context**, and **Analyses** sections of the same tab):

@@ -84,7 +84,7 @@ export interface LangCensus {
   enabled: boolean;
 }
 
-/// The project's language census for the Code Graph tab's language buttons.
+/// The project's language census for the Graph index sub-tab's language buttons (Tool Activity).
 /// Walks the tree fresh, so call it on tab open and after a rebuild — not on a
 /// tight poll. `root` defaults (backend side) to the launch directory.
 export function graphLanguageCensus(root?: string): Promise<LangCensus[]> {
@@ -111,7 +111,7 @@ export interface EmbedderProbe {
 }
 
 /// Probe the configured embedding endpoint without running a backfill — drives
-/// the monitor tab's "Test connection" action. Always resolves; `ok` is false
+/// the Graph index sub-tab's "Test connection" action. Always resolves; `ok` is false
 /// (with `message` set) when the endpoint is unreachable or misconfigured.
 export function graphTestEmbedder(): Promise<EmbedderProbe> {
   return invoke<EmbedderProbe>('graph_test_embedder');

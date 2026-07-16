@@ -60,11 +60,11 @@ pub const TOOL_ACTIVITY_TAB_ID: &str = "tool-activity";
 /// integrity check, exactly like the Code Graph monitor tab). App-rendered like
 /// the monitor — no PTY.
 pub const CODE_AUDIT_TAB_ID: &str = "code-audit";
-/// V25: reserved id of the read-only, app-rendered Code Quality tab
-/// (language-gated linters / dead-code / spell-check — the Quality half of the
-/// audit registry). Materialized iff `code_audit.enabled` — one feature flag
-/// covers both audit tabs in v1 (reconciled by the integrity check, exactly
-/// like the Code Audit tab). App-rendered like the monitor — no PTY.
+/// Legacy id of the V25 reserved Code Quality tab. Retired in schema v23: the
+/// Quality view moved INSIDE the Code Audit tab as a sub-tab (Security |
+/// Quality), so there is no separate reserved tab anymore. This constant
+/// survives only so the v22 → v23 migration can find and drop the old
+/// materialized `code-quality` entry from existing settings files.
 pub const CODE_QUALITY_TAB_ID: &str = "code-quality";
 /// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
 /// longer a persistent builtin — it (like rustnet) launches on demand from
@@ -81,7 +81,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 22;
+pub const CURRENT_SCHEMA_VERSION: u8 = 23;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -1200,6 +1200,16 @@ pub struct CodeAuditSettings {
     /// Per-tool wall-clock timeout in seconds. A tool that exceeds it is killed
     /// and reported `failed` (Phase B); the other tools are unaffected.
     pub timeout_secs: u64,
+    /// Keep the QUALITY tools' `enabled` flags following the project's language
+    /// census automatically: whenever a census is (re)taken — scan start, tab
+    /// open, Settings open — each quality tool is selected iff it's factory-
+    /// default-enabled AND applicable to the project (see
+    /// `audit::runner::auto_select_quality`; the default-disabled heavyweights
+    /// `dotnet-analyzers`/`semgrep-quality` stay opt-in). On by default; any
+    /// manual quality-checkbox edit in Settings flips this to `false` (manual
+    /// mode) so user choices stick, and the Settings section's "Auto-select for
+    /// this project" button turns it back on. Security tools are never touched.
+    pub quality_auto_select: bool,
 }
 
 impl Default for CodeAuditSettings {
@@ -1208,6 +1218,7 @@ impl Default for CodeAuditSettings {
             enabled: false,
             tools: default_audit_tools(),
             timeout_secs: 600,
+            quality_auto_select: true,
         }
     }
 }
@@ -2888,25 +2899,6 @@ pub fn default_code_audit_tab() -> TabConfig {
     })
 }
 
-/// V25: the reserved, non-closable Code Quality tab. Same shape as the Code
-/// Audit tab — Shell-kind with no command (app-rendered, no PTY).
-/// Materialized/removed by the integrity check per `code_audit.enabled` (the
-/// same flag that gates the Code Audit tab).
-pub fn default_code_quality_tab() -> TabConfig {
-    TabConfig::Shell(ShellTabConfig {
-        id: CODE_QUALITY_TAB_ID.to_string(),
-        builtin: true,
-        name: "Code Quality".to_string(),
-        command: String::new(),
-        args: Vec::new(),
-        cwd: None,
-        env: HashMap::new(),
-        notifications: ShellNotificationConfig::default(),
-        theme_override: None,
-        background_override: None,
-    })
-}
-
 /// Default Shell-1 entry. Takes the resolved platform default shell so the
 /// `command` and `args` fields land on the right binary for the host. The
 /// reserved id is just the seed value for the first shell tab on a fresh
@@ -4101,6 +4093,7 @@ mod tests {
                 timeout_secs: Some(1200),
             }],
             timeout_secs: 600,
+            quality_auto_select: true,
         };
         let top = serde_json::to_value(&s).expect("CodeAuditSettings serializes");
         for key in top.as_object().expect("object").keys() {
@@ -4127,6 +4120,10 @@ mod tests {
         let s: Settings = serde_json::from_value(json!({})).expect("empty settings deserialize");
         assert!(!s.code_audit.enabled);
         assert_eq!(s.code_audit.timeout_secs, 600);
+        // Quality auto-selection ships on: a pre-existing file without the key
+        // (and every fresh install) follows the project's language census until
+        // the user edits a quality checkbox.
+        assert!(s.code_audit.quality_auto_select);
         let ids: Vec<AuditToolId> = s.code_audit.tools.iter().map(|t| t.id).collect();
         assert_eq!(
             ids,

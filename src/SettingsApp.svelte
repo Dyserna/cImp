@@ -89,7 +89,12 @@
     toolNotApplicable,
     type AuditToolRow,
   } from './lib/settings/codeAudit';
-  import { auditSnapshot } from './lib/codeAudit/ipc';
+  import { auditRefreshCensus } from './lib/codeAudit/ipc';
+  import {
+    AUDIT_TOOL_CATEGORY,
+    autoSelectQuality,
+    censusIsEmpty,
+  } from './lib/codeAudit/logic';
   import type { AuditCensus } from './lib/codeAudit/types';
   import { resolveBundledTheme, defaultPalette } from './lib/themes';
   import { themeRegistry, paletteRegistry } from './lib/themes/registry';
@@ -922,8 +927,11 @@
     void loadComposeTemplates();
     void loadLlmPricing();
     // Best-effort: the audit census drives the Code Audit section's per-tool
-    // "not applicable" hints. Absent (empty) before any scan — no hint shown.
-    auditSnapshot()
+    // "not applicable" hints and quality auto-selection. The refresh variant
+    // has the backend take (or reuse, ≤60s cache) a real census — and apply
+    // auto-selection — so both work before the first scan; while the feature
+    // is disabled it's a plain snapshot read (empty census, no hints).
+    auditRefreshCensus()
       .then((s) => (auditCensus = s.census))
       .catch(() => {});
     harnessVersionsGet()
@@ -1321,6 +1329,29 @@
     patch((s) => {
       const t = s.code_audit.tools.find((x) => x.id === id);
       if (t) updater(t);
+    });
+  }
+
+  // The enabled checkbox goes through here (not the generic patchAuditTool):
+  // a manual QUALITY edit flips auto-selection to manual mode, so the choice
+  // sticks across census refreshes instead of being re-derived at next scan.
+  function toggleAuditToolEnabled(id: AuditToolId, enabled: boolean): void {
+    patch((s) => {
+      const t = s.code_audit.tools.find((x) => x.id === id);
+      if (t) t.enabled = enabled;
+      if (AUDIT_TOOL_CATEGORY[id] === 'quality') s.code_audit.quality_auto_select = false;
+    });
+  }
+
+  // The "Auto-select for this project" button: back to automatic mode, and —
+  // when a census is already known — apply the project-language selection
+  // immediately rather than waiting for the next census refresh/scan.
+  function applyQualityAutoSelect(): void {
+    patch((s) => {
+      s.code_audit.quality_auto_select = true;
+      if (!censusIsEmpty(auditCensus)) {
+        s.code_audit.tools = autoSelectQuality(s.code_audit.tools, auditCensus);
+      }
     });
   }
 
@@ -4982,10 +5013,9 @@
                   type="checkbox"
                   checked={row.tool.enabled}
                   onchange={(e) =>
-                    patchAuditTool(
+                    toggleAuditToolEnabled(
                       row.meta.id,
-                      (t) =>
-                        (t.enabled = (e.currentTarget as HTMLInputElement).checked),
+                      (e.currentTarget as HTMLInputElement).checked,
                     )}
                 />
                 <span class="audit-name">{row.meta.name}</span>
@@ -5067,18 +5097,37 @@
           {/snippet}
 
           <h3>Security tools</h3>
-          <small class="hint">Shown in the <strong>Code Audit</strong> tab.</small>
+          <small class="hint">
+            Shown in the Code Audit tab's <strong>Security</strong> sub-tab.
+          </small>
           {#each auditGroups.security as row (row.meta.id)}
             {@render auditToolRow(row)}
           {/each}
 
           <h3>Quality tools</h3>
           <small class="hint">
-            Shown in the <strong>Code Quality</strong> tab. Language-gated — a
-            tool only appears there (and only runs) when the project contains
-            files it applies to. All tools are listed here regardless of the
-            current project.
+            Shown in the Code Audit tab's <strong>Quality</strong> sub-tab.
+            Language-gated — a tool only appears there (and only runs) when the
+            project contains files it applies to. All tools are listed here
+            regardless of the current project.
           </small>
+          {#if snapshot.code_audit.quality_auto_select}
+            <small class="hint audit-auto-note">
+              Selection: <strong>automatic</strong> — follows the project's
+              languages (heavyweight opt-ins stay off); editing a checkbox
+              switches to manual.
+            </small>
+          {:else}
+            <div class="audit-auto-row">
+              <button type="button" class="secondary" onclick={applyQualityAutoSelect}>
+                Auto-select for this project
+              </button>
+              <small class="hint">
+                re-select the tools matching the project's languages and keep
+                them in sync automatically
+              </small>
+            </div>
+          {/if}
           {#each auditGroups.quality as row (row.meta.id)}
             {@render auditToolRow(row)}
           {/each}
@@ -6144,6 +6193,20 @@
     font-style: italic;
     color: var(--warning, #e3b341);
     opacity: 0.85;
+  }
+  /* Quality auto-selection: the mode note (automatic) / re-apply row (manual). */
+  small.hint.audit-auto-note {
+    display: block;
+    margin: var(--space-2) 0 0;
+  }
+  .audit-auto-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: var(--space-2);
+  }
+  .audit-auto-row small.hint {
+    margin: 0;
   }
   .audit-timeout {
     display: flex;

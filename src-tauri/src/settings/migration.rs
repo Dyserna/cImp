@@ -276,6 +276,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v21,
         transform: migrate_v21_to_v22_step,
     },
+    MigrationStep {
+        from_version: "v22",
+        detect: looks_v22,
+        transform: migrate_v22_to_v23_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -1968,10 +1973,54 @@ fn migrate_v21_to_v22(value: &mut Value) {
         }
     }
 
-    // Final cascade step ⇒ stamp CURRENT (22).
+    // Stamp a *literal* 22 (not CURRENT_SCHEMA_VERSION): the v22 → v23 step
+    // gates on `schema_version == 22`, so this step must leave that concrete
+    // value for the next detector to match.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(22u8)),
+    );
+}
+
+fn looks_v22(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 22)
+}
+
+fn migrate_v22_to_v23_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v22_to_v23(value)
+}
+
+/// V22 → V23: drop the retired `code-quality` reserved tab.
+///
+/// The V25 milestone shipped Quality as a SECOND reserved tab next to Code
+/// Audit; it's now a sub-tab inside the Code Audit view (Security | Quality),
+/// so the separate tab entry must go. Without this step the old materialized
+/// entry would deserialize as a plain closable Shell tab named "Code Quality"
+/// (the `TabId::CodeQuality` variant no longer exists) with no view behind it.
+/// Layout-tree references to the id don't need scrubbing here — the frontend's
+/// `validateAndRepairLayout` drops any pane tab id absent from `tabs`.
+///
+/// Idempotent: a second pass finds `schema_version == 23` so `looks_v22` is
+/// false, and the retain is a no-op once the entry is gone.
+fn migrate_v22_to_v23(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
+        tabs.retain(|t| {
+            t.get("id").and_then(Value::as_str)
+                != Some(crate::settings::schema::CODE_QUALITY_TAB_ID)
+        });
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (23).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(23u8)),
     );
 }
 
@@ -2535,6 +2584,42 @@ mod tests {
         assert_eq!(v["schema_version"], json!(22));
     }
 
+    /// v22 → v23: the retired `code-quality` reserved tab entry is dropped;
+    /// every other tab (including Code Audit) survives untouched.
+    #[test]
+    fn v22_to_v23_drops_retired_code_quality_tab() {
+        let mut v = json!({
+            "schema_version": 22,
+            "tabs": [
+                { "kind": "ai_tool", "id": "claude", "builtin": true },
+                { "kind": "shell", "id": "code-audit", "builtin": true, "name": "Code Audit" },
+                { "kind": "shell", "id": "code-quality", "builtin": true, "name": "Code Quality" },
+                { "kind": "shell", "id": "shell-default-1", "builtin": false }
+            ]
+        });
+        migrate_v22_to_v23(&mut v);
+        assert_eq!(v["schema_version"], json!(23));
+        let ids: Vec<&str> = v["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["claude", "code-audit", "shell-default-1"]);
+    }
+
+    /// A v22 file that never materialized the audit tabs (feature off) just
+    /// gets its version marker advanced; running the step twice is a no-op.
+    #[test]
+    fn v22_to_v23_is_idempotent_and_stamps_version() {
+        let mut v = json!({ "schema_version": 22, "tabs": [] });
+        migrate_v22_to_v23(&mut v);
+        assert_eq!(v["schema_version"], json!(23));
+        let once = v.clone();
+        migrate_v22_to_v23(&mut v);
+        assert_eq!(v, once);
+    }
+
     /// Altitude tripwire: if `schema::LOCAL_DATA_TOOLS` ever gains a member,
     /// migrating a settings file whose cloud backend carries the historical
     /// five-item "web/docs only" exclusion must still yield an exclusion list
@@ -2674,15 +2759,14 @@ mod tests {
         // happens to lack the `layout` key must NOT trip the pre-v1.10
         // archaeology detectors, which would otherwise drag it back through
         // the whole cascade and write a fresh `.v1.2.bak` on every launch.
-        let v: Value = serde_json::from_str(
-            r#"{
-                "schema_version": 22,
-                "tabs": [
-                    { "kind": "ai_tool", "id": "claude", "name": "Claude" }
-                ]
-            }"#,
-        )
-        .unwrap();
+        // Tracks CURRENT_SCHEMA_VERSION so a schema bump can't silently turn
+        // this fixture into a stale (migration-needing) file.
+        let v = json!({
+            "schema_version": crate::settings::schema::CURRENT_SCHEMA_VERSION,
+            "tabs": [
+                { "kind": "ai_tool", "id": "claude", "name": "Claude" }
+            ]
+        });
         assert!(
             !looks_v1_2(&v),
             "schema_version-bearing file matched looks_v1_2"

@@ -290,7 +290,29 @@ impl AuditState {
         if !cfg.enabled {
             return Err("Code Audit is disabled — enable it in cImp settings".to_string());
         }
-        // Only this category's tools; the other category belongs to the other tab.
+
+        // Take the census ONCE per scan, off the lock (the walk can take up to a
+        // couple seconds) — the root is fixed for the runner's lifetime, so a
+        // quick read to fetch it and then walk is safe. Taken BEFORE the
+        // enabled check below: quality auto-selection may flip flags.
+        let root = self.inner.lock().unwrap().root.clone();
+        let census = census::cached(&root);
+        let census_block = CensusBlock {
+            extensions: census.extensions(),
+            markers: census.markers(),
+        };
+
+        // Auto mode: sync the quality tools' enabled flags to the fresh census
+        // (no-op in manual mode), then re-read the config so the plan below
+        // uses the synced flags.
+        let cfg = if self.apply_quality_auto_select(&census) {
+            self.settings.current().code_audit
+        } else {
+            cfg
+        };
+
+        // Only this category's tools; the other category belongs to the other
+        // sub-tab.
         let in_category: Vec<&AuditToolConfig> = cfg
             .tools
             .iter()
@@ -302,16 +324,6 @@ impl AuditState {
                 category_label(category)
             ));
         }
-
-        // Take the census ONCE per scan, off the lock (the walk can take up to a
-        // couple seconds) — the root is fixed for the runner's lifetime, so a
-        // quick read to fetch it and then walk is safe.
-        let root = self.inner.lock().unwrap().root.clone();
-        let census = census::cached(&root);
-        let census_block = CensusBlock {
-            extensions: census.extensions(),
-            markers: census.markers(),
-        };
 
         // The chips (one per this-category tool) and the enabled+applicable
         // subset to launch — pure, so the filter is unit-tested directly.
@@ -338,6 +350,70 @@ impl AuditState {
             this.run(to_run, root, global_timeout, cancel).await;
         });
         Ok(())
+    }
+
+    /// Sync every QUALITY tool's persisted `enabled` flag to `census` when
+    /// `quality_auto_select` is on (see [`auto_select_quality`] for the rule).
+    /// The write goes through the settings handle by id (broadcast + debounced
+    /// save), so the Settings checkboxes follow live. Returns whether anything
+    /// changed. No-op in manual mode.
+    fn apply_quality_auto_select(&self, census: &census::Census) -> bool {
+        let cfg = self.settings.current().code_audit;
+        if !cfg.quality_auto_select {
+            return false;
+        }
+        let mut tools = cfg.tools;
+        if !auto_select_quality(&mut tools, census) {
+            return false;
+        }
+        // Copy the recomputed flags back BY ID under the settings lock — the
+        // live struct may have moved since the snapshot above, so never
+        // replace the whole vec.
+        self.settings.mutate(|s| {
+            for t in &tools {
+                if let Some(cur) = s.code_audit.tools.iter_mut().find(|c| c.id == t.id) {
+                    cur.enabled = t.enabled;
+                }
+            }
+        });
+        true
+    }
+
+    /// Take the project census outside a scan (the ≤60s cache makes repeat
+    /// calls cheap): apply quality auto-selection, store the census block so
+    /// chip gating and the Settings "not applicable" hints work before the
+    /// first scan, then emit and return the snapshot. Called from the
+    /// `audit_refresh_census` IPC on tab mount and Settings open. While the
+    /// feature is disabled, or a scan is in flight (whose start just did all
+    /// of this), the state is returned untouched.
+    pub fn refresh_census(self: &Arc<Self>) -> AuditSnapshot {
+        let cfg = self.settings.current().code_audit;
+        {
+            let inner = self.inner.lock().unwrap();
+            if !cfg.enabled || inner.scanning {
+                return inner.snapshot(None);
+            }
+        }
+        let root = self.inner.lock().unwrap().root.clone();
+        let census = census::cached(&root);
+        self.apply_quality_auto_select(&census);
+        let stored = {
+            let mut inner = self.inner.lock().unwrap();
+            // A scan that started mid-walk owns the census/tools state now.
+            if inner.scanning {
+                false
+            } else {
+                inner.census = CensusBlock {
+                    extensions: census.extensions(),
+                    markers: census.markers(),
+                };
+                true
+            }
+        };
+        if stored {
+            self.emit_event();
+        }
+        self.snapshot()
     }
 
     /// Cancel the in-flight scan (kills running children). Errors if none.
@@ -643,6 +719,39 @@ fn category_label(category: Category) -> &'static str {
         Category::Security => "security",
         Category::Quality => "quality",
     }
+}
+
+/// Recompute each QUALITY tool's `enabled` flag to its automatic value:
+/// factory-default-enabled AND applicable to `census`. Deriving from
+/// [`crate::settings::default_audit_tools`] keeps the default-disabled
+/// heavyweights (dotnet-analyzers — runs a real build; semgrep-quality —
+/// network rulesets) opt-in even when applicable, and security tools are
+/// never in scope. Returns whether any flag changed. Pure — the settings
+/// write and the auto/manual mode gate live in
+/// [`AuditState::apply_quality_auto_select`].
+pub(crate) fn auto_select_quality(
+    tools: &mut [AuditToolConfig],
+    census: &census::Census,
+) -> bool {
+    let defaults = crate::settings::default_audit_tools();
+    let default_enabled = |id: AuditToolId| {
+        defaults
+            .iter()
+            .find(|d| d.id == id)
+            .is_some_and(|d| d.enabled)
+    };
+    let mut changed = false;
+    for t in tools.iter_mut() {
+        if adapters::adapter(t.id).category != Category::Quality {
+            continue;
+        }
+        let want = default_enabled(t.id) && adapters::adapter(t.id).applicable(census);
+        if t.enabled != want {
+            t.enabled = want;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// V25 Phase C: pure scan planning. From the configured tools, the target
@@ -1292,6 +1401,47 @@ mod tests {
             run_ids,
             vec![AuditToolId::OsvScanner, AuditToolId::Gitleaks]
         );
+    }
+
+    /// Quality auto-selection: each quality tool's `enabled` becomes
+    /// factory-default-enabled AND census-applicable; the default-disabled
+    /// heavyweights stay opt-in even when applicable; security tools are
+    /// never touched; a second pass is a no-op.
+    #[test]
+    fn auto_select_quality_follows_census_and_keeps_heavyweights_opt_in() {
+        // A Rust + TS project: no `.py` / `.go` / `.java` / C / eslint config.
+        let census = census::Census::from_parts(&["ts", "rs"], &["Cargo.toml", "package.json"]);
+        // Start from an everything-flipped manual state so every rule below
+        // proves auto-select actually rewrote (or deliberately skipped) it.
+        let mut tools = crate::settings::default_audit_tools();
+        for t in tools.iter_mut() {
+            t.enabled = !t.enabled;
+        }
+        assert!(auto_select_quality(&mut tools, &census));
+        let enabled = |id: AuditToolId| tools.iter().find(|t| t.id == id).unwrap().enabled;
+
+        // Default-on + applicable → selected.
+        assert!(enabled(AuditToolId::Oxlint)); // .ts
+        assert!(enabled(AuditToolId::CargoMachete)); // Cargo.toml
+        assert!(enabled(AuditToolId::Knip)); // package.json
+        assert!(enabled(AuditToolId::Typos)); // ungated
+        // Default-on but not applicable → deselected.
+        assert!(!enabled(AuditToolId::Ruff));
+        assert!(!enabled(AuditToolId::GolangciLint));
+        assert!(!enabled(AuditToolId::Cppcheck));
+        assert!(!enabled(AuditToolId::Pmd));
+        assert!(!enabled(AuditToolId::Eslint));
+        // Default-disabled heavyweights stay opt-in — semgrep-quality is
+        // ungated (always applicable) and still must NOT be auto-enabled.
+        assert!(!enabled(AuditToolId::SemgrepQuality));
+        assert!(!enabled(AuditToolId::DotnetAnalyzers));
+        // Security tools keep their (flipped-off) state — out of scope.
+        assert!(!enabled(AuditToolId::OsvScanner));
+        assert!(!enabled(AuditToolId::Gitleaks));
+        assert!(!enabled(AuditToolId::Semgrep));
+
+        // Idempotent: the flags now ARE the automatic values.
+        assert!(!auto_select_quality(&mut tools, &census));
     }
 
     /// V25 Phase C: a per-tool `timeout_secs` override wins over the global; a

@@ -42,13 +42,13 @@ use serde_json::{Map, Value};
 use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
-    default_ai_tab, default_audit_tools, default_code_audit_tab, default_code_quality_tab,
-    default_graph_monitor_tab, default_graph_view_tab, default_offload_server_tab,
-    default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
-    starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
-    PromptTemplate, Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID,
-    CODE_QUALITY_TAB_ID, GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID,
-    OPENCODE_TAB_ID, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
+    default_ai_tab, default_audit_tools, default_code_audit_tab, default_graph_monitor_tab,
+    default_graph_view_tab, default_offload_server_tab, default_shell_1_tab,
+    default_tool_activity_tab, default_workbench_tab, starter_prompt_templates, AiTabId,
+    HarnessVersions, LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings, TabConfig,
+    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, GRAPH_MONITOR_TAB_ID,
+    GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID, SHELL_DEFAULT_TAB_ID,
+    TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
 use crate::settings::write_atomic;
 use crate::shell::ShellSpec;
@@ -1070,17 +1070,9 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
         default_tab: default_code_audit_tab,
         sync_name: true,
     },
-    // V25: the Code Quality tab shares the `code_audit.enabled` flag with Code
-    // Audit — enabling the feature materializes both tabs, contiguous and in
-    // this order (Code Audit then Code Quality).
-    ReservedTabSpec {
-        id: CODE_QUALITY_TAB_ID,
-        log_name: "Code Quality",
-        flag: "code_audit",
-        enabled: |s| s.code_audit.enabled,
-        default_tab: default_code_quality_tab,
-        sync_name: true,
-    },
+    // The V25 "Code Quality" reserved tab is retired (schema v23) — the
+    // Quality view lives inside the Code Audit tab as a sub-tab now; the
+    // v22 → v23 migration drops old persisted entries.
 ];
 
 /// Keep one reserved feature tab present iff its gating flag is on. Inserts
@@ -1169,7 +1161,7 @@ pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
 /// persisted by v0.43/v0.44 (before the Quality tools existed) carries only the
 /// three Security entries; the lenient `tools` deserializer keeps a present
 /// array verbatim, so those installs would never gain the eleven Quality tools
-/// and the Code Quality tab / Settings section would stay empty. This appends a
+/// and the Quality sub-tab / Settings section would stay empty. This appends a
 /// default entry (per [`default_audit_tools`]: enabled except `dotnet-analyzers`
 /// and `semgrep-quality`) for every [`AuditToolId`] missing from the array,
 /// **preserving every existing entry verbatim and in its current order** —

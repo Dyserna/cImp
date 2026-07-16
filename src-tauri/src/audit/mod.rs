@@ -289,6 +289,23 @@ pub fn audit_snapshot(state: State<'_, Arc<AuditState>>) -> AuditSnapshot {
     state.snapshot()
 }
 
+/// Take (or reuse, ≤60s cache) the project's language census outside a scan,
+/// apply quality auto-selection when it's on, and return the full snapshot —
+/// so tab mount and the Settings section know applicability (chip gating,
+/// "not applicable" hints, auto-selected checkboxes) before the first scan.
+/// The walk is bounded but can take a couple of seconds cold, hence the
+/// blocking-task hop. No-op passthrough while the feature is disabled or a
+/// scan is in flight.
+#[tauri::command]
+pub async fn audit_refresh_census(
+    state: State<'_, Arc<AuditState>>,
+) -> AppResult<AuditSnapshot> {
+    let audit = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || audit.refresh_census())
+        .await
+        .map_err(|e| AppError::Audit(format!("census task failed: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

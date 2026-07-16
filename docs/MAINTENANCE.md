@@ -1053,12 +1053,31 @@ tools; the lenient `tools` deserializer keeps a present array verbatim, so
 existing entry and its order. Unknown/stale ids are still dropped by the lenient
 enum.
 
+**Post-release redesign (2026-07-16): ONE tab, two sub-tabs.** The separate
+`TabId::CodeQuality` reserved tab is retired — `CodeAuditView.svelte` hosts
+**Security | Quality** sub-tabs (Code Intelligence section pattern; both
+`AuditPanel` instances stay mounted, the inactive one is display-hidden so a
+running scan keeps streaming). Settings **schema v22 → v23** drops any persisted
+`code-quality` tab entry (`migrate_v22_to_v23`); the wire id now parses as a
+plain Shell id and never reaches the runtime.
+
+**Quality auto-selection (`code_audit.quality_auto_select`, default on).** Each
+QUALITY tool's `enabled` checkbox follows the census automatically:
+factory-default-enabled AND applicable (`audit::runner::auto_select_quality` —
+the default-disabled heavyweights dotnet-analyzers/semgrep-quality stay opt-in;
+security tools untouched). Applied at every scan start and by the
+`audit_refresh_census` IPC (tab mount + Settings open take a real census, ≤60s
+cache, so gating/hints/selection work before the first scan). A manual quality
+checkbox edit flips the setting to manual mode; the **Auto-select for this
+project** button (Settings → Quality tools, shown in manual mode) re-applies and
+re-enables auto. Frontend mirror: `autoSelectQuality` in `codeAudit/logic.ts`.
+
 ### Live-verify recipe (run by hand before release)
 
-With a build running and `code_audit.enabled` on. The **Code Quality** tab is
-separate from **Code Audit**; each tool's install hint, then Detect in
+With a build running and `code_audit.enabled` on. Security and Quality are
+**sub-tabs of the one Code Audit tab**; each tool's install hint, then Detect in
 **Settings → Code Audit → Quality tools**, then scan a small fixture project of
-that language and confirm the finding lands in the **Code Quality** tab:
+that language and confirm the finding lands in the **Quality** sub-tab:
 
 1. **oxlint** (`npm i -g oxlint`) → scan a JS/TS fixture with an obvious lint
    error (`==` / unused var); SARIF findings appear.
@@ -1089,33 +1108,54 @@ that language and confirm the finding lands in the **Code Quality** tab:
     report merges. Confirm it does **not** run when left disabled.
 11. **semgrep (quality)** (default-disabled; enable it, `pipx install semgrep`,
     online) → scans with `--config p/best-practices`; findings show under the
-    **Code Quality** tab only — the Security semgrep entry stays pure SAST.
+    **Quality** sub-tab only — the Security semgrep entry stays pure SAST.
 
 **Gating checks (this repo has no Java/Go/Python):**
 
-12. Open the **Code Quality** tab in *this* repo and run a scan → the **PMD /
+12. Open the Code Audit tab's **Quality** sub-tab in *this* repo → the **PMD /
     golangci-lint / ruff** chips are **absent** (census sees no `.java`/`.go`/`.py`),
     and the muted "**n tools hidden — not applicable to this project**" line
     accounts for them. oxlint/eslint/knip/cargo-machete/typos DO show (this repo
-    has `.ts`, `package.json`, `Cargo.toml`).
-13. In **Settings → Code Audit → Quality tools**, after that scan, the gated-off
-    tools (PMD/golangci-lint/ruff) show the "**not applicable to the current
-    project**" hint — Settings never hides them (global config). The hint appears
-    **only after at least one scan**; a fresh window (empty census) shows no hint.
+    has `.ts`, `package.json`, `Cargo.toml`). This holds **before any scan** —
+    tab mount takes a census via `audit_refresh_census`.
+13. In **Settings → Code Audit → Quality tools**, the gated-off tools
+    (PMD/golangci-lint/ruff) show the "**not applicable to the current
+    project**" hint — Settings never hides them (global config). Like the chips,
+    the hints appear without a scan (Settings open refreshes the census; with
+    the feature disabled the census stays empty and no hint shows).
 
-**Upgrade check:**
+**Quality auto-selection:**
 
-14. Take a pre-V25 config (`code_audit.tools` with only the three security ids —
-    e.g. a v0.43/v0.44 `settings.json`), launch → the **Code Quality** tab and the
+14. Fresh config (auto mode on): open Settings → Code Audit in *this* repo →
+    the Quality group reads "Selection: **automatic**" and the checkboxes match
+    the project: oxlint/eslint/knip/cargo-machete/typos ON;
+    ruff/golangci-lint/cppcheck/PMD OFF; dotnet-analyzers/semgrep-quality OFF
+    (heavyweights stay opt-in).
+15. Untick one quality tool (e.g. typos) → the group flips to manual mode (the
+    "Auto-select for this project" button appears) and a later scan does NOT
+    revert the edit. Press the button → selection snaps back to step 14's state
+    and the automatic note returns. Security checkboxes are never touched.
+
+**Upgrade checks:**
+
+16. Take a pre-V25 config (`code_audit.tools` with only the three security ids —
+    e.g. a v0.43/v0.44 `settings.json`), launch → the Quality sub-tab and the
     Settings Quality group are populated with all eleven tools on first load (the
     reconcile), and any customized security entry (disabled / custom path / extra
     args / timeout) is preserved verbatim.
+17. Take a v0.45.0 config that has the old separate `code-quality` tab entry in
+    `tabs` (schema 22), launch → the migration stamps schema 23 and the entry is
+    gone: ONE Code Audit tab with Security | Quality sub-tabs, no stray closable
+    "Code Quality" shell tab.
 
-**Cross-tab lock:**
+**Cross-sub-tab lock + toggle stability:**
 
-15. Start a scan in the **Code Quality** tab; switch to **Code Audit** → its Scan
-    button is disabled and shows "**waiting — quality scan running**" (one scan at
-    a time globally). The reverse holds too.
+18. Start a scan in the **Quality** sub-tab; switch to **Security** → its Scan
+    button is disabled and shows "**waiting — quality scan running**" (one scan
+    at a time globally). The reverse holds too.
+19. Toggle `code_audit.enabled` off and on a few times in Settings → the Code
+    Audit tab disappears/reappears cleanly with **no rapid active-tab flapping**
+    (the 2026-07-16 echo-suppression fix in App.svelte's active-tab back-sync).
 
 ## Workbench — Vibe-Coding Guardrails (V13)
 

@@ -28,7 +28,7 @@ import type {
 // enums; these maps must be kept in lockstep with the registry by hand.
 
 /// Which tab each tool belongs to. Security = the V23 trio (Code Audit tab);
-/// Quality = the V25 linters (Code Quality tab).
+/// Quality = the V25 linters (the Code Audit tab's Quality sub-tab).
 export const AUDIT_TOOL_CATEGORY: Record<AuditToolId, AuditCategory> = {
   'osv-scanner': 'security',
   gitleaks: 'security',
@@ -51,11 +51,11 @@ export const AUDIT_TOOL_CATEGORY: Record<AuditToolId, AuditCategory> = {
 /// `code_audit.tools`). Drives the chip list, the sort tiebreak, and the merge
 /// re-order; each tab renders only its own category's slice (`toolsInCategory`).
 export const AUDIT_TOOL_ORDER: readonly AuditToolId[] = [
-  // Security (V23) — the Code Audit tab.
+  // Security (V23) — the Security sub-tab.
   'osv-scanner',
   'gitleaks',
   'semgrep',
-  // Quality (V25) — the Code Quality tab.
+  // Quality (V25) — the Quality sub-tab.
   'oxlint',
   'golangci-lint',
   'ruff',
@@ -97,6 +97,34 @@ export const AUDIT_TOOL_APPLICABILITY: Record<
   'cargo-machete': { extensions: [], markers: ['Cargo.toml'] },
   'semgrep-quality': { extensions: [], markers: [] },
 };
+
+/// The quality tools whose FACTORY default is disabled (mirror of
+/// `default_audit_tools()` in Rust `settings/schema.rs` — `dotnet-analyzers`
+/// runs a real build, `semgrep-quality` downloads network rulesets). Quality
+/// auto-selection keeps these opt-in even when applicable.
+export const AUDIT_TOOL_DEFAULT_OFF: ReadonlySet<AuditToolId> = new Set([
+  'dotnet-analyzers',
+  'semgrep-quality',
+]);
+
+/// Recompute each QUALITY tool's `enabled` to its automatic value —
+/// factory-default-enabled AND applicable to `census` — returning a NEW tools
+/// array (input untouched; unchanged entries are reused by reference).
+/// Security tools are never in scope. Mirror of Rust
+/// `audit::runner::auto_select_quality`; the Settings button uses this for an
+/// instant client-side apply, the backend re-applies on every census refresh.
+/// Callers should skip an empty census (`censusIsEmpty`) — "no languages seen
+/// yet" must not deselect everything.
+export function autoSelectQuality<T extends { id: AuditToolId; enabled: boolean }>(
+  tools: readonly T[],
+  census: AuditCensus,
+): T[] {
+  return tools.map((t) => {
+    if (AUDIT_TOOL_CATEGORY[t.id] !== 'quality') return t;
+    const want = !AUDIT_TOOL_DEFAULT_OFF.has(t.id) && isToolApplicable(t.id, census);
+    return t.enabled === want ? t : { ...t, enabled: want };
+  });
+}
 
 /// A census with neither extensions nor markers — the pre-first-scan state.
 /// Treated as "unknown, hide nothing" by the chip-gating logic.

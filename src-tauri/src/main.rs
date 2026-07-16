@@ -838,6 +838,7 @@ fn main() {
             audit::audit_start_scan,
             audit::audit_cancel_scan,
             audit::audit_snapshot,
+            audit::audit_refresh_census,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

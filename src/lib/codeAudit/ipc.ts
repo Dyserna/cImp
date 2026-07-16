@@ -25,3 +25,11 @@ export async function auditCancelScan(): Promise<void> {
 export async function auditSnapshot(): Promise<AuditSnapshot> {
   return invoke('audit_snapshot');
 }
+
+/// Take (or reuse, ≤60s cache) the project's language census outside a scan,
+/// apply quality auto-selection when it's on, and return the full snapshot —
+/// so tab mount and the Settings section know applicability before the first
+/// scan. Passthrough (no walk) while the feature is disabled or a scan runs.
+export async function auditRefreshCensus(): Promise<AuditSnapshot> {
+  return invoke('audit_refresh_census');
+}

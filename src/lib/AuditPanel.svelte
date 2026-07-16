@@ -1,25 +1,28 @@
 <script lang="ts">
-  // V25 Phase D: the shared, category-parameterized core behind the two reserved
-  // audit dashboards. `CodeAuditView.svelte` mounts it with `category="security"`
-  // (the V23 Code Audit tab — osv-scanner / gitleaks / semgrep, unchanged
-  // behavior); `CodeQualityView.svelte` mounts it with `category="quality"` (the
-  // V25 Code Quality tab — language-gated linters / dead-code / spell-check).
+  // V25 Phase D: the shared, category-parameterized core behind the Code Audit
+  // tab's two sub-tabs. `CodeAuditView.svelte` mounts it twice: with
+  // `category="security"` (osv-scanner / gitleaks / semgrep — the V23
+  // behavior) and with `category="quality"` (language-gated linters /
+  // dead-code / spell-check). Both instances stay mounted; the inactive one is
+  // just display-hidden, so a scan keeps streaming into a hidden sub-tab.
   //
-  // Both tabs subscribe to the ONE `audit-status` event stream and filter every
-  // snapshot to their own category (a merged snapshot can carry both — see
-  // `mergeAuditSnapshot`). Only one scan runs at a time globally, so while the
-  // other tab scans this one's Scan button shows a "waiting — <other> scan
-  // running" note (`scanLock`). All testable logic lives in `./codeAudit/logic`.
+  // Both panels subscribe to the ONE `audit-status` event stream and filter
+  // every snapshot to their own category (a merged snapshot can carry both —
+  // see `mergeAuditSnapshot`). Only one scan runs at a time globally, so while
+  // the other sub-tab scans this one's Scan button shows a "waiting — <other>
+  // scan running" note (`scanLock`). All testable logic lives in
+  // `./codeAudit/logic`.
   import { onMount, onDestroy } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
   import { settings } from './settings/store';
   import { openSettingsWindowToSection } from './settings/ipc';
-  import { GRAPH_VIEW_TAB_ID } from './tabs/types';
+  import { CODE_AUDIT_TAB_ID, GRAPH_VIEW_TAB_ID } from './tabs/types';
+  import { onAppViewShown } from './appViewVisibility';
   import { revealTab } from './tabs/visibility';
   import { revealFileInGraph } from './graphReveal';
   import { loadViewString, saveViewString, loadViewSet, saveViewSet } from './viewSection';
-  import { auditStartScan, auditCancelScan, auditSnapshot } from './codeAudit/ipc';
+  import { auditStartScan, auditCancelScan, auditSnapshot, auditRefreshCensus } from './codeAudit/ipc';
   import type { AuditCategory, AuditSeverity, AuditSnapshot, AuditToolId } from './codeAudit/types';
   import {
     SEVERITIES,
@@ -47,14 +50,15 @@
 
   // ── Props ─────────────────────────────────────────────────────────────────
   // `category` selects which tools/findings this instance owns; `view` is the
-  // localStorage key for its persisted filters (distinct per tab). Both are
-  // fixed for the lifetime of an instance (a tab mounts once), so reading their
-  // initial value to seed persisted filters below is intentional.
+  // localStorage key for its persisted filters (distinct per sub-tab). Both are
+  // fixed for the lifetime of an instance (mounted once per sub-tab), so
+  // reading their initial value to seed persisted filters below is intentional.
   let { category, view }: { category: AuditCategory; view: string } = $props();
 
   const isSecurity = $derived(category === 'security');
-  const heading = $derived(isSecurity ? 'Code Audit' : 'Code Quality');
-  const mdLabel = $derived(isSecurity ? 'Code audit' : 'Code quality');
+  // Sub-tab heading — the enclosing view carries the "Code Audit" title.
+  const heading = $derived(isSecurity ? 'Security' : 'Quality');
+  const mdLabel = $derived(isSecurity ? 'Code audit (security)' : 'Code audit (quality)');
   const categoryTools = $derived(toolsInCategory(category));
 
   function emptySnapshot(): AuditSnapshot {
@@ -134,9 +138,12 @@
     activeCategory = inc.scanning ? (inc.tools[0]?.category ?? activeCategory) : null;
   }
 
-  async function pullFull(): Promise<void> {
+  /// `refreshCensus` (mount only): have the backend take the project census —
+  /// bounded walk, ≤60s cache — so chip gating and quality auto-selection are
+  /// live before the first scan; later pulls read the plain snapshot.
+  async function pullFull(refreshCensus = false): Promise<void> {
     try {
-      const full = await auditSnapshot();
+      const full = refreshCensus ? await auditRefreshCensus() : await auditSnapshot();
       if (alive) {
         snapshot = mergeAuditSnapshot(snapshot, full);
         noteActive(full);
@@ -146,8 +153,18 @@
     }
   }
 
+  // Keep-alive (appViews.ts): this component mounts ONCE per app lifetime, so
+  // the mount-time census would go stale as the project gains/loses languages.
+  // Re-take it on every hidden→visible transition of the Code Audit tab —
+  // fresh files (a new `.py`, a `package.json`) re-gate the chips and, in auto
+  // mode, re-select the quality tools. The ≤60s backend cache makes rapid tab
+  // switching free, and the backend skips the walk while a scan runs.
+  const unsubShown = onAppViewShown(CODE_AUDIT_TAB_ID, () => {
+    void pullFull(true);
+  });
+
   onMount(() => {
-    void pullFull();
+    void pullFull(true);
     void (async () => {
       const un = await listen<AuditSnapshot>('audit-status', (e) => {
         if (!alive) return;
@@ -164,6 +181,7 @@
 
   onDestroy(() => {
     alive = false;
+    unsubShown();
     if (unlisten) unlisten();
     if (copyTimer) clearTimeout(copyTimer);
   });
@@ -261,7 +279,7 @@
     </div>
     <div class="head-actions">
       {#if lock.waiting}
-        <span class="waiting" title="One scan runs at a time across both tabs">{lock.waiting}</span>
+        <span class="waiting" title="One scan runs at a time across both sub-tabs">{lock.waiting}</span>
       {/if}
       <span class="scanned">
         {snapshot.last_scan_at !== null
@@ -435,9 +453,11 @@
     gap: 10px;
     min-width: 0;
   }
+  /* Subsection size — the enclosing CodeAuditView's "Code Audit" h2 (15px)
+     is the tab title; this heading names the active sub-tab's panel. */
   .title h2 {
     margin: 0;
-    font-size: 15px;
+    font-size: 14px;
   }
   .root {
     font-size: 11px;

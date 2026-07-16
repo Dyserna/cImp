@@ -77,26 +77,14 @@ export function isToolActivityTab(id: TabId): boolean {
 }
 
 /// V23: the reserved id of the read-only, app-rendered Code Audit tab
-/// (aggregated security scanning). Shell-kind on the backend — no PTY — same
-/// pattern as the Code Graph monitor tab. Materialized while `code_audit.enabled`
-/// is on (default false).
+/// (aggregated security + quality scanning, as Security | Quality sub-tabs).
+/// Shell-kind on the backend — no PTY — same pattern as the Code Graph
+/// monitor tab. Materialized while `code_audit.enabled` is on (default false).
 export const CODE_AUDIT_TAB_ID = 'code-audit';
 
 /// True for the Code Audit tab.
 export function isCodeAuditTab(id: TabId): boolean {
   return id === CODE_AUDIT_TAB_ID;
-}
-
-/// V25: the reserved id of the read-only, app-rendered Code Quality tab
-/// (language-gated linters / dead-code / spell-check — the Quality half of the
-/// audit registry). Shell-kind on the backend — no PTY — same pattern as the
-/// Code Audit tab. Materialized while `code_audit.enabled` is on (the same flag
-/// that gates Code Audit; one flag covers both audit tabs in v1).
-export const CODE_QUALITY_TAB_ID = 'code-quality';
-
-/// True for the Code Quality tab.
-export function isCodeQualityTab(id: TabId): boolean {
-  return id === CODE_QUALITY_TAB_ID;
 }
 
 /// True for a Preview tab's id (`"preview-<uuid>"` — see `create_preview_tab`
@@ -123,7 +111,6 @@ export function isAppRenderedTab(id: TabId): boolean {
     isGraphViewTab(id) ||
     isToolActivityTab(id) ||
     isCodeAuditTab(id) ||
-    isCodeQualityTab(id) ||
     isPreviewTabId(id)
   );
 }

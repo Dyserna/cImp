@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'vitest';
 
 import type { CodeAuditSettings } from '../settings/types';
-import type { AuditSnapshot, AuditToolState } from './types';
+import type { AuditSnapshot, AuditToolId, AuditToolState } from './types';
 import {
   AUDIT_TOOL_CATEGORY,
+  autoSelectQuality,
   categoryFindingsCount,
   censusIsEmpty,
   chipToolStates,
@@ -272,6 +273,7 @@ describe('configuredToolStates / chipToolStates', () => {
   const settings: CodeAuditSettings = {
     enabled: true,
     timeout_secs: 600,
+    quality_auto_select: true,
     tools: [
       { id: 'semgrep', enabled: false, path: '', extra_args: [], timeout_secs: null },
       { id: 'osv-scanner', enabled: true, path: '', extra_args: [], timeout_secs: null },
@@ -488,6 +490,43 @@ describe('isToolApplicable / censusIsEmpty', () => {
   });
 });
 
+describe('autoSelectQuality', () => {
+  const rustTs = { extensions: ['ts', 'rs'], markers: ['Cargo.toml', 'package.json'] };
+  const cfg = (id: AuditToolId, enabled: boolean) => ({ id, enabled });
+
+  test('quality enabled follows applicability; heavyweights stay opt-in; security untouched', () => {
+    // Everything flipped from its automatic value, so each rule below proves
+    // the function rewrote (or deliberately skipped) it.
+    const tools = [
+      cfg('osv-scanner', false), // security — out of scope, stays false
+      cfg('oxlint', false), // applicable (.ts) → on
+      cfg('ruff', true), // not applicable → off
+      cfg('cargo-machete', false), // applicable (Cargo.toml) → on
+      cfg('typos', false), // ungated → on
+      cfg('semgrep-quality', true), // ungated BUT default-off heavyweight → off
+      cfg('dotnet-analyzers', true), // default-off heavyweight → off
+    ];
+    const out = autoSelectQuality(tools, rustTs);
+    const enabled = (id: AuditToolId) => out.find((t) => t.id === id)!.enabled;
+    expect(enabled('osv-scanner')).toBe(false);
+    expect(enabled('oxlint')).toBe(true);
+    expect(enabled('ruff')).toBe(false);
+    expect(enabled('cargo-machete')).toBe(true);
+    expect(enabled('typos')).toBe(true);
+    expect(enabled('semgrep-quality')).toBe(false);
+    expect(enabled('dotnet-analyzers')).toBe(false);
+    // Input untouched (patch-path safety: the caller assigns the new array).
+    expect(tools.find((t) => t.id === 'oxlint')!.enabled).toBe(false);
+  });
+
+  test('already-automatic flags come back unchanged by reference', () => {
+    const tools = [cfg('oxlint', true), cfg('ruff', false)];
+    const out = autoSelectQuality(tools, rustTs);
+    expect(out[0]).toBe(tools[0]);
+    expect(out[1]).toBe(tools[1]);
+  });
+});
+
 describe('flattenFindings by category', () => {
   test('filters a mixed snapshot to one tab', () => {
     expect(flattenFindings(MIXED, 'security').map((r) => r.tool).sort()).toEqual([
@@ -511,6 +550,7 @@ describe('chipToolStates falls back per category', () => {
   const settings: CodeAuditSettings = {
     enabled: true,
     timeout_secs: 600,
+    quality_auto_select: true,
     tools: [
       { id: 'oxlint', enabled: true, path: '', extra_args: [], timeout_secs: null },
       { id: 'ruff', enabled: true, path: '', extra_args: [], timeout_secs: null },
@@ -533,7 +573,7 @@ describe('chipToolStates falls back per category', () => {
 describe('partitionChips (chip gating + hidden count)', () => {
   test('empty census hides nothing', () => {
     const states = configuredToolStates(
-      { enabled: true, timeout_secs: 600, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
+      { enabled: true, timeout_secs: 600, quality_auto_select: true, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
       'quality',
     );
     const p = partitionChips(states, { extensions: [], markers: [] });
@@ -545,7 +585,7 @@ describe('partitionChips (chip gating + hidden count)', () => {
     // A Rust + JS project: no .py, no .java, no .go, no .cs, no .c.
     const census = { extensions: ['rs', 'ts'], markers: ['Cargo.toml', 'package.json'] };
     const states = configuredToolStates(
-      { enabled: true, timeout_secs: 600, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
+      { enabled: true, timeout_secs: 600, quality_auto_select: true, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
       'quality',
     );
     const p = partitionChips(states, census);

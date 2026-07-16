@@ -1094,6 +1094,11 @@ export interface CodeAuditSettings {
   enabled: boolean;
   tools: AuditToolConfig[];
   timeout_secs: number;
+  /// Keep the QUALITY tools' `enabled` flags following the project's language
+  /// census automatically (default true). Editing a quality checkbox flips
+  /// this to false (manual mode); the Settings section's "Auto-select for this
+  /// project" button turns it back on. Security tools are never touched.
+  quality_auto_select: boolean;
 }
 
 /// V23 Phase A: the `audit_detect_tool` IPC result (mirror of Rust
@@ -1691,6 +1696,7 @@ export function defaultSettings(): Settings {
     },
     code_audit: {
       enabled: false,
+      quality_auto_select: true,
       tools: [
         // Security (V23).
         { id: 'osv-scanner', enabled: true, path: '', extra_args: [], timeout_secs: null },

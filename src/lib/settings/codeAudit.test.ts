@@ -16,7 +16,7 @@ function tool(id: AuditToolId, over: Partial<AuditToolConfig> = {}): AuditToolCo
 
 function settingsWith(tools: AuditToolConfig[]): Settings {
   const s = defaultSettings();
-  s.code_audit = { enabled: false, tools, timeout_secs: 600 };
+  s.code_audit = { enabled: false, tools, timeout_secs: 600, quality_auto_select: true };
   return s;
 }
 

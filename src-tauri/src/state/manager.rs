@@ -77,12 +77,6 @@ pub enum TabId {
     /// Same shape as [`Self::GraphMonitor`] — Shell-kind, reserved identity, no
     /// PTY, app-rendered. Materialized iff `code_audit.enabled`.
     CodeAudit,
-    /// V25: the read-only, non-closable Code Quality tab (language-gated
-    /// linters / dead-code / spell-check — the Quality half of the audit
-    /// registry). Same shape as [`Self::CodeAudit`] — Shell-kind, reserved
-    /// identity, no PTY, app-rendered. Materialized iff `code_audit.enabled`
-    /// (one feature flag covers both audit tabs in v1).
-    CodeQuality,
     /// V14 Phase F: a user-created Preview tab (embedded localhost browser).
     /// Unlike the reserved app-rendered tabs above, this is a genuinely new
     /// [`TabKind`] (not a Shell-kind reserved id) because it's repeatable —
@@ -106,7 +100,6 @@ impl TabId {
             TabId::GraphView => "graph-view",
             TabId::ToolActivity => "tool-activity",
             TabId::CodeAudit => "code-audit",
-            TabId::CodeQuality => "code-quality",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
             TabId::Preview(s) => s.as_str(),
@@ -124,7 +117,10 @@ impl TabId {
             "graph-view" => TabId::GraphView,
             "tool-activity" => TabId::ToolActivity,
             "code-audit" => TabId::CodeAudit,
-            "code-quality" => TabId::CodeQuality,
+            // "code-quality" (the retired V25 reserved tab — its Quality view
+            // now lives inside Code Audit as a sub-tab) intentionally falls
+            // through to `Shell` below; the settings integrity pass prunes any
+            // persisted entry before the id ever reaches the runtime.
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
             // `Shell`, so they keep AI-kind behavior on relaunch. The
@@ -159,8 +155,7 @@ impl TabId {
             | TabId::Workbench
             | TabId::GraphView
             | TabId::ToolActivity
-            | TabId::CodeAudit
-            | TabId::CodeQuality => TabKind::Shell,
+            | TabId::CodeAudit => TabKind::Shell,
             // V14 Phase F: unlike the reserved dashboards above, Preview is a
             // real kind of its own — it's repeatable (a user may open several),
             // so the frontend needs a wire-visible discriminator rather than
@@ -187,7 +182,6 @@ impl TabId {
                 | TabId::GraphView
                 | TabId::ToolActivity
                 | TabId::CodeAudit
-                | TabId::CodeQuality
         )
     }
 
@@ -1708,7 +1702,6 @@ mod tests {
             TabId::Shell("shell-1".to_string()),
             TabId::Shell("user-bash".to_string()),
             TabId::CodeAudit,
-            TabId::CodeQuality,
         ] {
             let s = serde_json::to_string(&id).unwrap();
             let back: TabId = serde_json::from_str(&s).unwrap();
@@ -1733,19 +1726,15 @@ mod tests {
     }
 
     #[test]
-    fn code_quality_tab_is_a_reserved_dashboard() {
-        // V25: the Code Quality tab mirrors Code Audit — round-trips through its
-        // wire string, maps to Shell-kind, and is a reserved/non-closable
-        // builtin.
-        assert_eq!(TabId::from_str("code-quality"), TabId::CodeQuality);
-        assert_eq!(TabId::CodeQuality.as_str(), "code-quality");
-        assert_eq!(
-            serde_json::to_string(&TabId::CodeQuality).unwrap(),
-            "\"code-quality\""
-        );
-        assert_eq!(TabId::CodeQuality.kind(), TabKind::Shell);
-        assert!(TabId::CodeQuality.is_reserved_dashboard());
-        assert!(TabId::CodeQuality.is_builtin());
+    fn retired_code_quality_id_routes_to_shell() {
+        // The V25 Code Quality reserved tab was folded into Code Audit as a
+        // sub-tab; its wire id no longer maps to a reserved variant. A stray
+        // persisted id parses as a plain Shell (closable, not a dashboard) —
+        // and the settings integrity pass prunes it before it's ever seeded.
+        let id = TabId::from_str("code-quality");
+        assert_eq!(id, TabId::Shell("code-quality".to_string()));
+        assert!(!id.is_reserved_dashboard());
+        assert!(!id.is_builtin());
     }
 
     #[test]

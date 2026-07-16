@@ -31,7 +31,7 @@ use super::openai::{
 use super::tools::{self, ToolCtx};
 
 /// Accumulates a [`CallRecord`] per LLM call as the loop runs, for the Offload
-/// Server tab's run log. The caller owns it and passes `&mut` in, so the calls
+/// server dashboard's run log. The caller owns it and passes `&mut` in, so the calls
 /// survive even when the run ends in an error; the service then finalizes a
 /// `RunRecord` from it. `None` is passed by the headless child / self-test
 /// paths that don't feed the dashboard.
@@ -43,8 +43,8 @@ pub struct RunTrace {
 /// Classify a turn for the run log: step 0 is the plan, the forced-final
 /// synthesis is `"final"`, everything else is tool `"ingestion"`. The V21 F4
 /// grounding verifier's corrective turn is labeled `"verify"` at its call site
-/// (not derivable from `step`/`is_final`), so it shows in the Offload Server
-/// tab's run log when the guard fires.
+/// (not derivable from `step`/`is_final`), so it shows in the Offload server
+/// dashboard's run log when the guard fires.
 fn call_kind(step: u32, is_final: bool) -> &'static str {
     if is_final {
         "final"

@@ -151,7 +151,7 @@
 <style>
   .workbench {
     /* Sit ABOVE the pane's absolutely-positioned (empty) terminal slot —
-       same convention as CodeIntelligenceView/OffloadServerView, otherwise
+       same convention as CodeIntelligenceView, otherwise
        that transparent slot paints on top of this static content and
        swallows every button click. */
     position: absolute;

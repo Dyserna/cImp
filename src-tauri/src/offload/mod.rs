@@ -12,7 +12,8 @@
 //!   [`Backend`] impl. Parses the user's `server_command`, tracks HTTP
 //!   health + the discovered context window, and gates concurrent loops
 //!   to the server's slot count. The process itself is owned by the
-//!   read-only Offload Server *tab* (its PTY *is* `llama-server`).
+//!   supervisor (surfaced in the read-only Offload server dashboard,
+//!   Tool Activity tab).
 //! - `agent` (Phase B) — the OpenAI-compatible agent loop.
 //! - `tools` (Phase B/C) — native baseline tools (`read_file`,
 //!   `code_search`, `run_command`).

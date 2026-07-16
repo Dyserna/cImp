@@ -723,7 +723,7 @@ pub async fn close_tab(
 }
 
 /// V8-03/V9-01: materialize or tear down a reserved, app-rendered feature tab
-/// (Offload Server / Code Graph monitor) **live** when its feature flag is
+/// (Code Graph monitor / Workbench / ...) **live** when its feature flag is
 /// toggled in Settings, so the tab appears/disappears without an app restart.
 ///
 /// The persisted `settings.tabs` list is kept consistent separately by

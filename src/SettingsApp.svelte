@@ -3432,9 +3432,9 @@
                   <span>Show command on start</span>
                 </label>
                 <small class="hint">
-                  The Offload Server tab's Start button opens the command in an
-                  editable popup first — edits apply to that launch only and are
-                  not saved here.
+                  The Start button in Tool Activity → Offload server opens the
+                  command in an editable popup first — edits apply to that
+                  launch only and are not saved here.
                 </small>
                 <div class="button-row template-actions">
                   <button
@@ -4125,9 +4125,9 @@
             {/if}
           </label>
           <small class="hint">
-            Watch the local model load + server logs live in the read-only
-            <strong>Offload Server</strong> tab (appears when offload is
-            enabled).
+            Watch the local model load + server logs live in the
+            <strong>Tool Activity</strong> tab's <strong>Offload server</strong>
+            section.
           </small>
         </section>
       {:else if activeSection === 'mcp'}

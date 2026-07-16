@@ -286,6 +286,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v23,
         transform: migrate_v23_to_v24_step,
     },
+    MigrationStep {
+        from_version: "v24",
+        detect: looks_v24,
+        transform: migrate_v24_to_v25_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2051,7 +2056,9 @@ fn migrate_v23_to_v24_step(value: &mut Value, _shell: &ShellSpec) {
 /// `code_audit_v23_json_without_expose_flags_loads_true`), so no data
 /// transform is needed. This step exists purely to advance the version marker
 /// so the cascade's fixpoint guard (`migrate_if_needed`) doesn't flag a v23
-/// file as under-migrated. Final cascade step ⇒ stamp CURRENT (24).
+/// file as under-migrated. Stamps a *literal* 24 (not
+/// `CURRENT_SCHEMA_VERSION`): the v24 → v25 step runs next in the same
+/// cascade pass and gates on `schema_version == 24`.
 ///
 /// Idempotent: a second pass finds `schema_version == 24` so `looks_v23` is
 /// false.
@@ -2062,6 +2069,49 @@ fn migrate_v23_to_v24(value: &mut Value) {
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(24u8)),
+    );
+}
+
+fn looks_v24(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 24)
+}
+
+fn migrate_v24_to_v25_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v24_to_v25(value)
+}
+
+/// V24 → V25: drop the retired `offload-server` reserved tab.
+///
+/// The V8-03 milestone shipped the Offload Server dashboard as its own
+/// reserved tab (materialized iff `offload.enabled`); it's now the "Offload
+/// server" section inside the Tool Activity tab, so the separate tab entry
+/// must go. Without this step the old materialized entry would deserialize as
+/// a plain closable Shell tab named "Offload Server" (the
+/// `TabId::OffloadServer` variant no longer exists) with no view behind it.
+/// Layout-tree references to the id don't need scrubbing here — the frontend's
+/// `validateAndRepairLayout` drops any pane tab id absent from `tabs`.
+///
+/// Idempotent: a second pass finds `schema_version == 25` so `looks_v24` is
+/// false, and the retain is a no-op once the entry is gone.
+fn migrate_v24_to_v25(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
+        tabs.retain(|t| {
+            t.get("id").and_then(Value::as_str)
+                != Some(crate::settings::schema::OFFLOAD_SERVER_TAB_ID)
+        });
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (25).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(25u8)),
     );
 }
 
@@ -2688,6 +2738,51 @@ mod tests {
         assert_eq!(v["code_audit"], json!({ "enabled": true, "tools": [] }));
         let once = v.clone();
         migrate_v23_to_v24(&mut v);
+        assert_eq!(v, once);
+    }
+
+    #[test]
+    fn looks_v24_detects_v24_and_not_others() {
+        assert!(looks_v24(&json!({ "schema_version": 24 })));
+        assert!(!looks_v24(&json!({ "schema_version": 23 })));
+        assert!(!looks_v24(&json!({ "schema_version": 25 })));
+        assert!(!looks_v24(&json!({})));
+    }
+
+    /// v24 → v25: the retired `offload-server` reserved tab entry is dropped;
+    /// every other tab survives untouched.
+    #[test]
+    fn v24_to_v25_drops_retired_offload_server_tab() {
+        let mut v = json!({
+            "schema_version": 24,
+            "tabs": [
+                { "kind": "ai_tool", "id": "claude", "builtin": true },
+                { "kind": "shell", "id": "offload-server", "builtin": true, "name": "Offload Server" },
+                { "kind": "shell", "id": "tool-activity", "builtin": true, "name": "Tool Activity" },
+                { "kind": "shell", "id": "shell-default-1", "builtin": false }
+            ]
+        });
+        migrate_v24_to_v25(&mut v);
+        assert_eq!(v["schema_version"], json!(25));
+        let ids: Vec<&str> = v["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["claude", "tool-activity", "shell-default-1"]);
+    }
+
+    /// A v24 file that never materialized the Offload Server tab (offload off)
+    /// just gets its version marker advanced; running the step twice is a
+    /// no-op.
+    #[test]
+    fn v24_to_v25_is_idempotent_and_stamps_version() {
+        let mut v = json!({ "schema_version": 24, "tabs": [] });
+        migrate_v24_to_v25(&mut v);
+        assert_eq!(v["schema_version"], json!(25));
+        let once = v.clone();
+        migrate_v24_to_v25(&mut v);
         assert_eq!(v, once);
     }
 

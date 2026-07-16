@@ -451,8 +451,9 @@ subordinate worker, exposed as an `offload_task` MCP tool.
    window from the running server.
 3. Optionally enable **Start the server on launch** (otherwise click **Start**, or
    it starts on the first offload). Use **Test offload** to confirm it works. The
-   **Offload Server** tab shows the live server log and a per-backend dashboard
-   (slots busy/total, queue depth, throughput, context-fill, request history).
+   **Offload server** section of the **Tool Activity** tab shows the live server
+   log and a per-backend dashboard (slots busy/total, queue depth, throughput,
+   context-fill, request history).
 4. **Re-launch a Claude tab** so it picks up the injected `offload_task` tool. With
    *Inject offload guidance* on, cImp also nudges Opus on when to offload.
 

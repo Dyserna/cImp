@@ -1,5 +1,6 @@
-// Keep-alive registry for the reserved app-rendered views (Offload Server,
-// Code Intelligence, Note, Workbench, Graph View, Tool Activity). Mirrors
+// Keep-alive registry for the reserved app-rendered views (Code
+// Intelligence, Note, Workbench, Graph View, Tool Activity, Code Audit).
+// Mirrors
 // the terminal registry (terminals.ts): each view is mounted ONCE into a
 // registry-owned host element (lazily, on first activation) and panes just
 // attach/detach that host — so switching tabs, hiding/un-hiding, or moving
@@ -21,13 +22,11 @@ import {
   GRAPH_MONITOR_TAB_ID,
   GRAPH_VIEW_TAB_ID,
   NOTE_TAB_ID,
-  OFFLOAD_SERVER_TAB_ID,
   TOOL_ACTIVITY_TAB_ID,
   WORKBENCH_TAB_ID,
   type TabId,
 } from './tabs/types';
 import { setAppViewVisible } from './appViewVisibility';
-import OffloadServerView from './OffloadServerView.svelte';
 import CodeIntelligenceView from './CodeIntelligenceView.svelte';
 import NoteView from './NoteView.svelte';
 import WorkbenchView from './WorkbenchView.svelte';
@@ -36,7 +35,6 @@ import ToolActivityView from './ToolActivityView.svelte';
 import CodeAuditView from './CodeAuditView.svelte';
 
 const COMPONENTS = new Map<TabId, Component>([
-  [OFFLOAD_SERVER_TAB_ID, OffloadServerView as Component],
   [GRAPH_MONITOR_TAB_ID, CodeIntelligenceView as Component],
   [NOTE_TAB_ID, NoteView as Component],
   [WORKBENCH_TAB_ID, WorkbenchView as Component],

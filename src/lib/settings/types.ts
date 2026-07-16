@@ -1182,7 +1182,7 @@ export type OffloadBackendKind =
       type: 'local';
       server_command: string;
       autostart: boolean;
-      /// When true, the Offload Server tab's Start button opens an editable
+      /// When true, the Offload server dashboard's Start button opens an editable
       /// confirm popup with the command; edits apply to that launch only.
       show_command_on_start: boolean;
     }

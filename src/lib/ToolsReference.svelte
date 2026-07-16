@@ -1,8 +1,9 @@
 <script lang="ts">
   // A collapsible reference panel listing the tools a feature exposes, each
   // with a one-line description and a short example prompt. Styled to match the
-  // "Raw server log" collapsible in the Offload Server tab (caret toggle + a
-  // bordered, sunken panel). Reused by the Code Graph and Offload Server tabs.
+  // "Raw server log" collapsible in the Offload server dashboard (caret toggle
+  // + a bordered, sunken panel). Reused by the Tool Activity tab's reference
+  // sections.
   import { loadCardOpen, saveCardOpen } from './viewSection';
 
   interface ToolRef {

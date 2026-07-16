@@ -1273,7 +1273,7 @@ impl OffloadService {
     }
 
     /// The latest per-backend dashboard snapshot (initial fill for the Offload
-    /// Server tab; live updates arrive via the `offload-server-metrics`
+    /// server dashboard; live updates arrive via the `offload-server-metrics`
     /// event). One row per enabled backend, Local first then Remote.
     pub fn server_metrics(&self) -> Vec<BackendDashboard> {
         self.latest_metrics.lock().unwrap().clone()

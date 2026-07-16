@@ -11,19 +11,14 @@ export type TabId =
   | 'opencode'
   | (string & {});
 
-/// V8-03: the reserved id of the read-only Offload Server tab. Internally a
-/// Shell-kind tab, but the frontend keys off this id to render read-only,
-/// log-fed content (no PTY) and suppress shell-tab affordances.
-export const OFFLOAD_SERVER_TAB_ID = 'offload-server';
-
-/// True for the read-only Offload Server tab.
-export function isOffloadTab(id: TabId): boolean {
-  return id === OFFLOAD_SERVER_TAB_ID;
-}
+// The V8-03 "offload-server" reserved tab is retired (schema v25) — the
+// dashboard lives inside the Tool Activity tab as the "Offload server"
+// section now (ToolActivityView.svelte); the v24 → v25 migration drops old
+// persisted entries.
 
 /// V9-01: the reserved id of the read-only, app-rendered Code Graph monitor
-/// tab. Like the Offload Server tab it's Shell-kind on the backend but the
-/// frontend keys off this id to render a dashboard (no PTY).
+/// tab. Shell-kind on the backend, but the frontend keys off this id to
+/// render a dashboard (no PTY).
 export const GRAPH_MONITOR_TAB_ID = 'graph-monitor';
 
 /// True for the read-only Code Graph monitor tab.
@@ -33,7 +28,7 @@ export function isGraphMonitorTab(id: TabId): boolean {
 
 /// The reserved id of the singleton Note scratchpad tab. Shell-kind on the
 /// backend (an ordinary closable tab), but the frontend keys off this id to
-/// render the `NoteView` editor with no PTY — like the Offload/Graph tabs, its
+/// render the `NoteView` editor with no PTY — like the Graph monitor tab, its
 /// behavior is decided by the id, not the kind.
 export const NOTE_TAB_ID = 'note';
 
@@ -97,14 +92,13 @@ export function isPreviewTabId(id: TabId): boolean {
 }
 
 /// THE single source of truth for "app-rendered, no-PTY" tabs: the reserved
-/// dashboards (Offload Server, Code Graph monitor, Note, Workbench, Graph
-/// View, Tool Activity) plus Preview tabs (an embedded webview). Every guard
+/// dashboards (Code Graph monitor, Note, Workbench, Graph View, Tool
+/// Activity, Code Audit) plus Preview tabs (an embedded webview). Every guard
 /// that used to hand-enumerate these must call this instead — a new
 /// app-rendered tab is added HERE (plus its own isXTab predicate above) and
 /// nowhere else. Mirrors the Rust side's reserved-tab set.
 export function isAppRenderedTab(id: TabId): boolean {
   return (
-    isOffloadTab(id) ||
     isGraphMonitorTab(id) ||
     isNoteTab(id) ||
     isWorkbenchTab(id) ||

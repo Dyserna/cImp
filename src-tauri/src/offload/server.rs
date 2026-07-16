@@ -9,9 +9,8 @@
 //! It owns the HTTP *view* of the server — readiness, the discovered
 //! context window (`n_ctx` from `/props`), and the in-flight/slot
 //! accounting — and a concurrency gate sized to `parallel`. It does
-//! **not** spawn the process: the read-only Offload Server tab's PTY
-//! *is* `llama-server`; this type coordinates that lifecycle and reads
-//! its health over HTTP.
+//! **not** spawn the process: the supervisor owns `llama-server`; this
+//! type coordinates that lifecycle and reads its health over HTTP.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};

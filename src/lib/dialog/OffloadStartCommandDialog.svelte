@@ -1,5 +1,5 @@
 <script lang="ts">
-  // "Show command on start" confirm dialog (Offload Server tab's Start
+  // "Show command on start" confirm dialog (the Offload server dashboard's Start
   // button, gated by the Local backend's setting). Mounted alongside the
   // other modal dialogs in App.svelte; renders only when the discriminator
   // is 'offload-start-command'. The command is editable but applies to this

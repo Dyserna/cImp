@@ -73,7 +73,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Native tools `read_file` / `code_search` / `run_command` with command security policies
 - Loopback endpoint + discovery file with per-launch bearer token; self-contained fallback for headless runs
 - `offload_task` + graph tools exposed to both Claude and OpenCode tabs (OpenCode via a `--consumer opencode` child)
-- Read-only Offload Server dashboard tab: per-backend metrics, queue depth, throughput, request history
+- Read-only Offload server dashboard (an "Offload server" sub-tab of the Tool Activity tab): per-backend metrics, queue depth, throughput, request history
 
 ## Code Knowledge Graph (V9-01)
 - Per-project incremental graph in `.cimp/graph.db` (CozoDB + SQLite)

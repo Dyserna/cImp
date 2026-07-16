@@ -277,7 +277,7 @@ restart,"** not a permanent ledger.
 | **chars suppressed by dedup** | Chars of digests that *would* have been re-injected but were demoted/dropped because the file was unchanged since its last injection | This project's sessions, since restart | **Direct measured saving** |
 | **chars displaced by read-advisor** | Sizes of the reminder texts the advisor answered Reads with (Activity events `source: read_advisor`, `tool: remind`), **net of bypasses** (V16: a remind the agent answered with a shell `cat` displaced nothing — the bypassed reminders' *text* chars are subtracted, the same unit as the displaced sum; the whole-file chars the shell re-read appear separately in the tooltip, est.) | Process-wide (Activity store has no per-project key), since process start | **Saving, estimated** — hence the `est.` label |
 | **chars of cache-reads avoided (compounding)** | V16: displaced chars re-counted once per subsequent turn — the API re-sends the whole conversation every turn, so content kept out at turn N is saved again as a cache read on every turn after N. The turn clock is the injection retrieve when context injection is on, or genuine user prompts seen by the transcript tap when it's off (so the readout accrues for read-advisor-only sessions too). Measured turn-by-turn as the session runs, no projection; with a matched price row it also shows an `est. $` at the cache-read rate | This project's sessions, since restart | **Saving, estimated (compounding)** |
-| **tasks served locally** | Count of offload jobs the local llama-server handled instead of the cloud model (filled in from the OffloadService) | Offload host | **Proxy count** — whole subtasks diverted; volume on the Offload Server tab |
+| **tasks served locally** | Count of offload jobs the local llama-server handled instead of the cloud model (filled in from the OffloadService) | Offload host | **Proxy count** — whole subtasks diverted; volume on the Offload server dashboard (Tool Activity tab) |
 | **tool surface** | Serialized chars + count of the graph tool descriptors advertised to the cloud session (post-`lean_tools` filter), cache-written once per session | Live settings | **Spend** — the fixed per-session cost of offering the tools; `lean_tools` trims the cold tail |
 
 ### How to interpret it
@@ -290,7 +290,7 @@ restart,"** not a permanent ledger.
   session?) and proposes raising `context_min_score` when they go unused.
 - **Tasks served locally** is a count, not a token figure — each one
   represents an entire subtask's tokens kept off the cloud bill; the actual
-  local token volume lives on the Offload Server tab.
+  local token volume lives on the Offload server dashboard (Tool Activity tab).
 
 A healthy readout is dedup/advisor chars growing relative to injected chars
 over a session. When they don't (injections unused, reminders always followed

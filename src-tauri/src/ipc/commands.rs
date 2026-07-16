@@ -835,8 +835,8 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // diff/merge. Keep both in mind when adding an out-of-band field.)
     incoming.harness_versions = cur.harness_versions.clone();
     *cur = incoming;
-    // Keep the reserved feature tabs (Offload Server / Code Graph monitor /
-    // Workbench) present-iff-enabled in the persisted list.
+    // Keep the reserved feature tabs (Code Graph monitor / Workbench / ...)
+    // present-iff-enabled in the persisted list.
     crate::settings::reconcile_reserved_tabs(cur);
     // V25: keep `code_audit.tools` complete — a pre-V25 snapshot (three Security
     // tools) gains the eleven Quality tools here, mirroring the load-path
@@ -867,7 +867,6 @@ pub async fn settings_update(
     // these tabs only runs at load.
     const RESERVED_TAB_FLAGS: &[(TabId, fn(&Settings) -> bool)] = &[
         (TabId::GraphMonitor, |s| s.graph.enabled),
-        (TabId::OffloadServer, |s| s.offload.enabled),
         (TabId::Workbench, |s| s.workbench.enabled),
         (TabId::GraphView, |s| s.graph.graph_viz),
         (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
@@ -1002,7 +1001,7 @@ pub async fn offload_statuses(
 }
 
 /// V8-02: start one named Local backend (idempotent). `command_override`
-/// (the Offload Server tab's "show command on start" popup) launches with
+/// (the Offload server dashboard's "show command on start" popup) launches with
 /// that command instead of the configured one for this start only — it goes
 /// through the same parse/validation and is never persisted.
 #[tauri::command]

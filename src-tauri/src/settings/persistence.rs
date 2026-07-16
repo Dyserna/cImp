@@ -43,12 +43,12 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
     default_ai_tab, default_audit_tools, default_code_audit_tab, default_graph_monitor_tab,
-    default_graph_view_tab, default_offload_server_tab, default_shell_1_tab,
-    default_tool_activity_tab, default_workbench_tab, starter_prompt_templates, AiTabId,
-    HarnessVersions, LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings, TabConfig,
+    default_graph_view_tab, default_shell_1_tab, default_tool_activity_tab,
+    default_workbench_tab, starter_prompt_templates, AiTabId, HarnessVersions,
+    LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, GRAPH_MONITOR_TAB_ID,
-    GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID, SHELL_DEFAULT_TAB_ID,
-    TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
+    GRAPH_VIEW_TAB_ID, OPENCODE_TAB_ID, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID,
+    WORKBENCH_TAB_ID,
 };
 use crate::settings::write_atomic;
 use crate::shell::ShellSpec;
@@ -242,7 +242,7 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // This `global` is what the long-lived saver task (broadcaster) and every
     // later `set()` diff the live (integrity-checked) settings against. Without
     // it, repairs enforced only on `settings` (restored AI builtins, the
-    // materialized offload-server tab, canonical flags) read as user
+    // materialized reserved feature tabs, canonical flags) read as user
     // customizations on every save and leak into the portable per-folder
     // overlay. The load-time post-repair save below relies on this too.
     let _ = integrity_check(&mut global);
@@ -1016,20 +1016,15 @@ struct ReservedTabSpec {
     /// Re-force the display name to the default on every reconcile — how a
     /// rename reaches existing installs (the tab is persisted and never
     /// re-materialized; the V10 Code Graph → Code Intelligence rename shipped
-    /// this way). The older Offload Server / Workbench tabs predate the
-    /// mechanism and keep whatever name the file carries.
+    /// this way). The older Workbench tab predates the mechanism and keeps
+    /// whatever name the file carries.
     sync_name: bool,
 }
 
 const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
-    ReservedTabSpec {
-        id: OFFLOAD_SERVER_TAB_ID,
-        log_name: "Offload Server",
-        flag: "offload",
-        enabled: |s| s.offload.enabled,
-        default_tab: default_offload_server_tab,
-        sync_name: false,
-    },
+    // The V8-03 "Offload Server" reserved tab is retired (schema v25) — the
+    // dashboard lives inside the Tool Activity tab as the "Offload server"
+    // section now; the v24 → v25 migration drops old persisted entries.
     ReservedTabSpec {
         id: GRAPH_MONITOR_TAB_ID,
         log_name: "Code Graph monitor",
@@ -1527,57 +1522,57 @@ mod tests {
     }
 
     #[test]
-    fn integrity_no_offload_tab_when_disabled() {
-        let mut s = base_test_settings(); // offload disabled by default
+    fn integrity_no_graph_monitor_tab_when_disabled() {
+        let mut s = base_test_settings(); // graph disabled by default
         integrity_check(&mut s);
-        assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
+        assert!(s.tabs.iter().all(|t| t.id() != GRAPH_MONITOR_TAB_ID));
     }
 
     #[test]
-    fn integrity_materializes_offload_tab_after_ai_builtins() {
+    fn integrity_materializes_graph_monitor_tab_after_ai_builtins() {
         let mut s = base_test_settings();
         s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
-        s.offload.enabled = true;
+        s.graph.enabled = true;
         integrity_check(&mut s);
         // Lands right after the two AI builtins, before any shell tab.
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
         assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
-        assert_eq!(s.tabs[2].id(), OFFLOAD_SERVER_TAB_ID);
+        assert_eq!(s.tabs[2].id(), GRAPH_MONITOR_TAB_ID);
         // Non-closable: builtin flag forced on.
         assert!(s.tabs[2].builtin());
     }
 
     #[test]
-    fn integrity_removes_offload_tab_when_disabled() {
+    fn integrity_removes_graph_monitor_tab_when_disabled() {
         let mut s = base_test_settings();
-        s.offload.enabled = true;
+        s.graph.enabled = true;
         integrity_check(&mut s);
-        assert!(s.tabs.iter().any(|t| t.id() == OFFLOAD_SERVER_TAB_ID));
+        assert!(s.tabs.iter().any(|t| t.id() == GRAPH_MONITOR_TAB_ID));
         // Disable and re-run: the tab is pruned.
-        s.offload.enabled = false;
+        s.graph.enabled = false;
         let changed = integrity_check(&mut s);
         assert!(changed);
-        assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
+        assert!(s.tabs.iter().all(|t| t.id() != GRAPH_MONITOR_TAB_ID));
     }
 
     #[test]
     fn reconcile_reserved_tabs_materializes_and_removes_both_live() {
         let mut s = base_test_settings();
-        s.offload.enabled = true;
         s.graph.enabled = true;
+        s.graph.graph_viz = true;
         // The live toggle path uses reconcile_reserved_tabs (not the full
         // integrity pass) to materialize both reserved tabs at once.
         assert!(reconcile_reserved_tabs(&mut s));
-        assert!(s.tabs.iter().any(|t| t.id() == OFFLOAD_SERVER_TAB_ID));
         assert!(s.tabs.iter().any(|t| t.id() == GRAPH_MONITOR_TAB_ID));
+        assert!(s.tabs.iter().any(|t| t.id() == GRAPH_VIEW_TAB_ID));
         // Idempotent: no flag change → no tab change.
         assert!(!reconcile_reserved_tabs(&mut s));
         // Disabling both prunes both.
-        s.offload.enabled = false;
         s.graph.enabled = false;
+        s.graph.graph_viz = false;
         assert!(reconcile_reserved_tabs(&mut s));
-        assert!(s.tabs.iter().all(|t| t.id() != OFFLOAD_SERVER_TAB_ID));
         assert!(s.tabs.iter().all(|t| t.id() != GRAPH_MONITOR_TAB_ID));
+        assert!(s.tabs.iter().all(|t| t.id() != GRAPH_VIEW_TAB_ID));
     }
 
     #[test]
@@ -1604,18 +1599,12 @@ mod tests {
 
     #[test]
     fn workbench_tab_lands_after_graph_monitor_tab() {
-        // Ordering: AI builtins, then Offload Server, then Code Graph
-        // monitor, then Workbench, then user shells — mirrors the other two
-        // reserved feature tabs' contiguous-leftmost placement.
+        // Ordering: AI builtins, then Code Graph monitor, then Workbench,
+        // then user shells — mirrors the reserved feature tabs'
+        // contiguous-leftmost placement in RESERVED_TAB_SPECS order.
         let mut s = Settings::default();
-        s.offload.enabled = true;
         s.graph.enabled = true;
         integrity_check(&mut s);
-        let offload_pos = s
-            .tabs
-            .iter()
-            .position(|t| t.id() == OFFLOAD_SERVER_TAB_ID)
-            .unwrap();
         let graph_pos = s
             .tabs
             .iter()
@@ -1626,7 +1615,6 @@ mod tests {
             .iter()
             .position(|t| t.id() == WORKBENCH_TAB_ID)
             .unwrap();
-        assert!(offload_pos < graph_pos);
         assert!(graph_pos < workbench_pos);
     }
 

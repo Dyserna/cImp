@@ -63,7 +63,7 @@ export function openNewWorktreeTabDialog(template: TabId, paneId: PaneId): void 
   dialogState.set({ kind: 'new-worktree-tab', template, paneId });
 }
 
-/// Opened by the Offload Server tab's Start button when the Local backend's
+/// Opened by the Offload server dashboard's Start button when the Local backend's
 /// "Show command on start" setting is on. `command` seeds the editable
 /// textarea with the configured `server_command`; the dialog launches with
 /// the (possibly edited) command as a one-shot override — never persisted.

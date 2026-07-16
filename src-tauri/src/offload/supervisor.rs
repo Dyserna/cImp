@@ -18,8 +18,7 @@
 //! existing single-server Settings controls keep working unchanged.
 //!
 //! Local servers run as plain managed children (output piped to the tracing
-//! log). Rendering each as a read-only "Offload Server" tab is still the
-//! tracked follow-up.
+//! log) and surface in the Offload server dashboard (Tool Activity tab).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -347,7 +346,7 @@ impl OffloadSupervisor {
     /// an error (silently ignoring the edited command would let the popup
     /// report success while the old process keeps running).
     ///
-    /// `command_override` (the Offload Server tab's "show command on start"
+    /// `command_override` (the Offload server dashboard's "show command on start"
     /// popup) replaces the backend's configured `server_command` for this
     /// launch only — it is never persisted, and goes through the exact same
     /// parse/validation as the configured command.

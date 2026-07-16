@@ -1899,7 +1899,7 @@
 <style>
   .graph-view {
     /* Sit ABOVE the pane's absolutely-positioned (empty) terminal slot —
-       same convention as WorkbenchView/CodeIntelligenceView/OffloadServerView. */
+       same convention as WorkbenchView/CodeIntelligenceView. */
     position: absolute;
     inset: 0;
     display: flex;

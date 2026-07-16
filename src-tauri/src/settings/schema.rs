@@ -28,16 +28,16 @@ pub const CLAUDE_LOCAL_TAB_ID: &str = "claude-local";
 /// them into this one id).
 pub const OPENCODE_TAB_ID: &str = "opencode";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
-/// V8-03: the read-only, non-closable Offload Server tab. Materialized only
-/// while `offload.enabled` (integrity check), it shows the local
-/// `llama-server`'s live output (model-load progress + logs). Internally a
-/// Shell-kind tab with `builtin: true` (so it can't be closed) and a reserved
-/// id the frontend keys off to render read-only, log-fed content with no PTY.
+/// Legacy id of the V8-03 reserved Offload Server tab. Retired in schema v25:
+/// the live backend dashboard moved INSIDE the Tool Activity tab as the
+/// "Offload server" section (ToolActivityView.svelte), so there is no separate
+/// reserved tab anymore. This constant survives only so the v24 → v25
+/// migration can find and drop the old materialized `offload-server` entry
+/// from existing settings files.
 pub const OFFLOAD_SERVER_TAB_ID: &str = "offload-server";
 /// V9-01: reserved id of the read-only, non-closable "Code Graph" monitor
-/// tab. Materialized iff `graph.enabled` (reconciled by the integrity check,
-/// like the Offload Server tab). Unlike the other reserved tabs it is
-/// app-rendered, not PTY-backed.
+/// tab. Materialized iff `graph.enabled` (reconciled by the integrity
+/// check). App-rendered, not PTY-backed.
 pub const GRAPH_MONITOR_TAB_ID: &str = "graph-monitor";
 /// V13 Phase A: reserved id of the read-only, app-rendered Workbench tab
 /// (live diff / checkpoint timeline / worktrees). Materialized iff
@@ -81,7 +81,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 24;
+pub const CURRENT_SCHEMA_VERSION: u8 = 25;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -1334,7 +1334,7 @@ where
 #[serde(default)]
 pub struct OffloadSettings {
     /// Master switch. Off = no server, no `--mcp-config` injection into
-    /// Claude tabs, `offload_task` not exposed, no Offload Server tab.
+    /// Claude tabs, `offload_task` not exposed.
     pub enabled: bool,
     /// When `enabled`, spawn `llama-server` at app launch and keep it
     /// warm. When off, the server starts lazily on the first
@@ -2382,14 +2382,15 @@ impl ToolScope {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum OffloadBackendKind {
     /// cImp owns the process: the V8-01 `server_command` + `autostart` +
-    /// read-only Offload Server tab + Start/Stop/Reset.
+    /// the read-only Offload server dashboard (Tool Activity tab) with
+    /// Start/Stop/Reset.
     Local {
         /// The single source-of-truth `llama-server` command (shlex-parsed
         /// to spawn; host/port/`-np`/`--jinja` parsed from it).
         server_command: String,
         /// Spawn at app launch and keep warm (else lazy on first offload).
         autostart: bool,
-        /// When true, the Offload Server tab's Start button shows the
+        /// When true, the Offload server dashboard's Start button shows the
         /// command in an editable confirm popup first; an edited command is
         /// used for that launch only and never persisted.
         #[serde(default)]
@@ -2819,32 +2820,10 @@ pub fn default_ai_tab(id: AiTabId) -> TabConfig {
     }
 }
 
-/// V8-03: the read-only Offload Server tab config. A Shell-kind tab with the
-/// reserved id and `builtin: true` so the close `×` is suppressed and
-/// `close_tab` refuses it. `command`/`args` carry the parsed `llama-server`
-/// program for display only — the tab spawns no PTY (the frontend renders its
-/// content from the live `offload-server-output` stream), so they are never
-/// executed here. Materialized/removed by the integrity check per
-/// `offload.enabled`.
-pub fn default_offload_server_tab() -> TabConfig {
-    TabConfig::Shell(ShellTabConfig {
-        id: OFFLOAD_SERVER_TAB_ID.to_string(),
-        builtin: true,
-        name: "Offload Server".to_string(),
-        command: String::new(),
-        args: Vec::new(),
-        cwd: None,
-        env: HashMap::new(),
-        notifications: ShellNotificationConfig::default(),
-        theme_override: None,
-        background_override: None,
-    })
-}
-
-/// V9-01: the reserved, non-closable Code Graph monitor tab. Like the Offload
-/// Server tab it's a Shell-kind entry with no command (never PTY-backed — its
-/// content is an app-rendered dashboard of the graph indexer/embedder).
-/// Materialized/removed by the integrity check per `graph.enabled`.
+/// V9-01: the reserved, non-closable Code Graph monitor tab. A Shell-kind
+/// entry with no command (never PTY-backed — its content is an app-rendered
+/// dashboard of the graph indexer/embedder). Materialized/removed by the
+/// integrity check per `graph.enabled`.
 pub fn default_graph_monitor_tab() -> TabConfig {
     TabConfig::Shell(ShellTabConfig {
         id: GRAPH_MONITOR_TAB_ID.to_string(),

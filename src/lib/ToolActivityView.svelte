@@ -1,14 +1,16 @@
 <script lang="ts">
   // The read-only, app-rendered Tool Activity tab — one place to see what
-  // tools the agents are using and which tools are available. Three sections:
+  // tools the agents are using and which tools are available. Four sections:
   // Activities (the unified, newest-first feed from the backend's persistent
   // activity store — graph/context tool calls plus completed offload_task
   // runs, surviving app restarts), Graph tools, and Offload tools (the two
   // reference lists, moved here from the Code Intelligence and Offload Server
-  // tabs). Rows are clickable (a popup shows the captured request/response),
-  // individually deletable, and the whole history can be cleared. Same
-  // reserved/no-PTY pattern as CodeIntelligenceView; rendered by Pane.svelte
-  // for the `tool-activity` tab id.
+  // tabs), plus Offload server (the live backend dashboard — formerly the
+  // reserved Offload Server tab, retired in schema v25). Rows are clickable
+  // (a popup shows the captured request/response), individually deletable,
+  // and the whole history can be cleared. Same reserved/no-PTY pattern as
+  // CodeIntelligenceView; rendered by Pane.svelte for the `tool-activity`
+  // tab id.
   import { onMount, onDestroy } from 'svelte';
   import {
     activityClear,
@@ -22,6 +24,7 @@
   import { fmtTime } from './format';
   import { fmtTok } from './usageMath';
   import ToolsReference from './ToolsReference.svelte';
+  import OffloadServerView from './OffloadServerView.svelte';
   import { TOOL_ACTIVITY_TAB_ID } from './tabs/types';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
   import { loadViewSection, saveViewSection } from './viewSection';
@@ -68,11 +71,12 @@
     { name: 'run_check', desc: "Worker runs one of the project's configured checks (build/typecheck/lint/test) to verify a claim before stating it. Inert until checks are configured.", example: 'Does the test suite pass? Prove it with run_check.' },
   ];
 
-  type Section = 'activities' | 'graph-tools' | 'offload-tools';
+  type Section = 'activities' | 'graph-tools' | 'offload-tools' | 'offload-server';
   const SECTIONS: { id: Section; label: string }[] = [
     { id: 'activities', label: 'Activities' },
     { id: 'graph-tools', label: 'Graph tools' },
     { id: 'offload-tools', label: 'Offload tools' },
+    { id: 'offload-server', label: 'Offload server' },
   ];
   // The selection survives the component's destroy/recreate cycle (tab
   // switch, hide/un-hide) and app restarts — see viewSection.ts.
@@ -328,6 +332,10 @@
       note="offload_task is the tool Claude calls to delegate; the rest are the tools the local worker uses to complete the task."
       persistKey="tool-activity.offload-tools"
     />
+  {:else if section === 'offload-server'}
+    <!-- The live backend dashboard (event-driven, remount-cheap), in normal
+         flow so this container keeps owning the scroll. -->
+    <OffloadServerView />
   {/if}
 </div>
 
@@ -381,8 +389,8 @@
 <style>
   .tool-activity {
     /* Sit ABOVE the pane's absolutely-positioned (empty) terminal slot, the
-       same convention as CodeIntelligenceView/OffloadServerView — otherwise
-       that transparent slot paints on top and swallows every click. */
+       same convention as CodeIntelligenceView — otherwise that transparent
+       slot paints on top and swallows every click. */
     position: absolute;
     inset: 0;
     overflow-y: auto;

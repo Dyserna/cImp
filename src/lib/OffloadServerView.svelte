@@ -1,10 +1,12 @@
 <script lang="ts">
-  // V8-03 / V8-04: the read-only Offload Server tab's content — a live
-  // dashboard with one card per enabled backend, grouped into Local and
-  // Remote sections. Driven by the backend metrics poller via the
-  // `offload-server-metrics` event (one row per backend). Each card renders
-  // its own slots/throughput/history (and, for Local backends, a collapsible
-  // raw server log).
+  // V8-03 / V8-04: the Offload server dashboard — a live view with one card
+  // per enabled backend, grouped into Local and Remote sections. Formerly the
+  // reserved Offload Server tab's content; it now renders as the "Offload
+  // server" section INSIDE the Tool Activity tab (ToolActivityView.svelte),
+  // which mounts it while the section is selected. Driven by the backend
+  // metrics poller via the `offload-server-metrics` event (one row per
+  // backend). Each card renders its own slots/throughput/history (and, for
+  // Local backends, a collapsible raw server log).
   import { onMount } from 'svelte';
   import BackendDashboardCard from './BackendDashboardCard.svelte';
   import {
@@ -123,15 +125,13 @@
 </div>
 
 <style>
+  /* In normal flow: the host section (ToolActivityView) owns scrolling,
+     padding, and the backdrop — the cards carry their own surfaces. */
   .dash {
-    position: absolute;
-    inset: 0;
-    overflow: auto;
-    padding: 0.8rem 1rem;
+    position: relative;
     font-family: var(--font-sans, system-ui, sans-serif);
     font-size: var(--font-size-md, 13px);
     color: var(--text-primary, #c9d1d9);
-    background: var(--surface-0, #0d1117);
   }
   .offline {
     display: flex;

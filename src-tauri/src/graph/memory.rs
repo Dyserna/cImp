@@ -435,8 +435,8 @@ pub struct UsageSnapshot {
     pub sessions: Vec<SessionUsageRow>,
     pub effectiveness: Effectiveness,
     /// Completed `offload_task` runs served by a **local** backend — the
-    /// milestone's "N tasks served locally" pointer to the Offload Server
-    /// tab. Filled in by the `graph_usage` IPC handler (this module has no
+    /// milestone's "N tasks served locally" pointer to the Offload server
+    /// dashboard. Filled in by the `graph_usage` IPC handler (this module has no
     /// dependency on `OffloadService`), `0` when offload is off/unused.
     pub offload_local_tasks: u64,
     /// V17 Phase E: the advertised tool-surface size for both consumers

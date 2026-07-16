@@ -49,15 +49,11 @@ pub enum TabId {
     /// tab at spawn time — so this variant carries no template marker.
     Ai(String),
     Shell(String),
-    /// V8-03: the read-only, non-closable Offload Server tab. Shell-kind
+    /// V9-01: the read-only, non-closable Code Graph monitor tab. Shell-kind
     /// (see [`Self::kind`]) but a distinct, reserved identity so it never
-    /// collides with a user shell and the close guard can refuse it. Renders
-    /// the local `llama-server`'s live output; spawns no PTY of its own.
-    OffloadServer,
-    /// V9-01: the read-only, non-closable Code Graph monitor tab. Like
-    /// [`Self::OffloadServer`] it's Shell-kind with a reserved identity and no
-    /// PTY, but it is app-rendered (an in-process dashboard of the graph
-    /// indexer/embedder), not a mirror of a child process's output.
+    /// collides with a user shell and the close guard can refuse it.
+    /// App-rendered (an in-process dashboard of the graph indexer/embedder);
+    /// spawns no PTY of its own.
     GraphMonitor,
     /// V13 Phase A: the read-only, non-closable Workbench tab (live diff /
     /// checkpoint timeline / worktrees). Same shape as [`Self::GraphMonitor`]
@@ -94,7 +90,6 @@ impl TabId {
             TabId::Claude => "claude",
             TabId::ClaudeLocal => "claude-local",
             TabId::OpenCode => "opencode",
-            TabId::OffloadServer => "offload-server",
             TabId::GraphMonitor => "graph-monitor",
             TabId::Workbench => "workbench-1",
             TabId::GraphView => "graph-view",
@@ -111,15 +106,16 @@ impl TabId {
             "claude" => TabId::Claude,
             "claude-local" => TabId::ClaudeLocal,
             "opencode" => TabId::OpenCode,
-            "offload-server" => TabId::OffloadServer,
             "graph-monitor" => TabId::GraphMonitor,
             "workbench-1" => TabId::Workbench,
             "graph-view" => TabId::GraphView,
             "tool-activity" => TabId::ToolActivity,
             "code-audit" => TabId::CodeAudit,
             // "code-quality" (the retired V25 reserved tab — its Quality view
-            // now lives inside Code Audit as a sub-tab) intentionally falls
-            // through to `Shell` below; the settings integrity pass prunes any
+            // now lives inside Code Audit as a sub-tab) and "offload-server"
+            // (the retired V8-03 reserved tab — its dashboard now lives inside
+            // Tool Activity as the "Offload server" section) intentionally
+            // fall through to `Shell` below; the settings migrations prune any
             // persisted entry before the id ever reaches the runtime.
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
@@ -145,12 +141,11 @@ impl TabId {
     pub fn kind(&self) -> TabKind {
         match self {
             TabId::Claude | TabId::ClaudeLocal | TabId::OpenCode | TabId::Ai(_) => TabKind::AiTool,
-            // The Offload Server tab reuses Shell-kind for processing/state
-            // purposes (it never runs a PTY, so this is inert), keeping it off
-            // the per-kind match explosion. Its read-only behavior is keyed
-            // off the reserved id, not the kind.
+            // The reserved dashboards reuse Shell-kind for processing/state
+            // purposes (they never run a PTY, so this is inert), keeping them
+            // off the per-kind match explosion. Their read-only behavior is
+            // keyed off the reserved id, not the kind.
             TabId::Shell(_)
-            | TabId::OffloadServer
             | TabId::GraphMonitor
             | TabId::Workbench
             | TabId::GraphView
@@ -165,8 +160,8 @@ impl TabId {
     }
 
     /// THE single enumeration of the reserved app-rendered dashboard tabs:
-    /// Shell-kind with a reserved identity and NO PTY (Offload Server, Code
-    /// Graph monitor, Workbench, Graph View, Tool Activity). Every guard
+    /// Shell-kind with a reserved identity and NO PTY (Code Graph monitor,
+    /// Workbench, Graph View, Tool Activity, Code Audit). Every guard
     /// that needs "is this one of the reserved dashboards?" — the pty-write
     /// swallow, the close refusal, the builtin flag — derives from this
     /// predicate, so a new reserved dashboard is added HERE (plus `as_str`/
@@ -176,8 +171,7 @@ impl TabId {
     pub fn is_reserved_dashboard(&self) -> bool {
         matches!(
             self,
-            TabId::OffloadServer
-                | TabId::GraphMonitor
+            TabId::GraphMonitor
                 | TabId::Workbench
                 | TabId::GraphView
                 | TabId::ToolActivity
@@ -1733,6 +1727,19 @@ mod tests {
         // and the settings integrity pass prunes it before it's ever seeded.
         let id = TabId::from_str("code-quality");
         assert_eq!(id, TabId::Shell("code-quality".to_string()));
+        assert!(!id.is_reserved_dashboard());
+        assert!(!id.is_builtin());
+    }
+
+    #[test]
+    fn retired_offload_server_id_routes_to_shell() {
+        // The V8-03 Offload Server reserved tab was folded into Tool Activity
+        // as the "Offload server" section (schema v25); its wire id no longer
+        // maps to a reserved variant. A stray persisted id parses as a plain
+        // Shell (closable, not a dashboard) — and the v24 → v25 migration
+        // prunes it before it's ever seeded.
+        let id = TabId::from_str("offload-server");
+        assert_eq!(id, TabId::Shell("offload-server".to_string()));
         assert!(!id.is_reserved_dashboard());
         assert!(!id.is_builtin());
     }

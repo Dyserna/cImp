@@ -1,5 +1,6 @@
 //! V8-03 Offload Server metrics — a structured, live view of the local
-//! `llama-server` for the read-only Offload Server tab's dashboard.
+//! `llama-server` for the read-only Offload server dashboard (the "Offload
+//! server" section of the Tool Activity tab).
 //!
 //! Rather than parse the verbose server log, we poll the server's HTTP
 //! endpoints (robust, structured):
@@ -149,7 +150,7 @@ pub struct ServerMetrics {
     pub runs: Vec<RunRecord>,
 }
 
-/// One backend's dashboard card for the Offload Server tab. Wraps the live
+/// One backend's dashboard card for the Offload server dashboard. Wraps the live
 /// [`ServerMetrics`] with the backend's identity and a coarse lifecycle
 /// `state` so the frontend can group rows (Local vs Remote) and render an
 /// accurate header even when the backend isn't being polled (stopped, cloud,

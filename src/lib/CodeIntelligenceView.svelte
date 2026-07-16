@@ -1,7 +1,7 @@
 <script lang="ts">
   // V9-01 Phase I: the read-only Code Graph monitor tab — an app-rendered
   // dashboard (no PTY) of the per-project graph indexer and embedder. Mirrors
-  // the Offload Server tab's reserved/feature-gated nature but is fed by the
+  // the other reserved dashboards' feature-gated nature but is fed by the
   // in-process GraphService rather than a child process's output: it seeds from
   // the `graph_status` IPC, then tracks live transitions via the `graph-status`
   // event, and offers the same actions as Settings (rebuild / rebuild
@@ -1337,7 +1337,7 @@
           </div>
           <div>
             <span class="num">{usage.offload_local_tasks.toLocaleString()}</span>
-            <span class="lbl">tasks served locally — see the <em>Offload Server</em> tab</span>
+            <span class="lbl">tasks served locally — see <em>Tool Activity → Offload server</em></span>
           </div>
           <div>
             <span
@@ -2312,9 +2312,9 @@
 
 <style>
   .graph-monitor {
-    /* Sit ABOVE the pane's absolutely-positioned (empty) terminal slot, the
-       same way OffloadServerView does — otherwise that transparent slot paints
-       on top of this static content and swallows every button click. */
+    /* Sit ABOVE the pane's absolutely-positioned (empty) terminal slot —
+       otherwise that transparent slot paints on top of this static content
+       and swallows every button click. */
     position: absolute;
     inset: 0;
     overflow-y: auto;

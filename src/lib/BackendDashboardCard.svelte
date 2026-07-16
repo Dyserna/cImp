@@ -1,5 +1,6 @@
 <script lang="ts">
-  // One backend's card in the Offload Server tab. Local owned servers and
+  // One backend's card in the Offload server dashboard (Tool Activity →
+  // Offload server). Local owned servers and
   // reachable LAN llama-servers render the full live dashboard (slots,
   // throughput, queue, context); cloud/down backends render a compact status
   // line. The per-request History feed lives in the Tool Activity tab. The

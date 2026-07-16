@@ -399,6 +399,16 @@
         const pane = get(focusedPane);
         if (!pane.tab_ids.includes(t)) return;
         if (pane.active_tab_id === t) return;
+        // Echo suppression: applying a backend broadcast changes
+        // focusedActiveTabId, which would re-push the same id through the
+        // forward-sync above — and when TWO set_active_tab calls are in
+        // flight at once (e.g. a settings toggle materializing a tab while
+        // the user is elsewhere, or a tab removed out from under the
+        // active one), each stale broadcast then re-arms the other and the
+        // active tab flaps across the pane for many seconds. Marking the
+        // id as already-synced makes a broadcast application terminal:
+        // reflect it locally, never answer it.
+        lastSyncedActive = t;
         setPaneActiveTab(pane.id, t);
       });
 

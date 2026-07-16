@@ -1298,10 +1298,13 @@
     }
   }
 
-  // Browse for an external-tool exe and store its path (Settings → Bottom
-  // bar). Cancelling the dialog leaves the current value untouched.
+  // Browse for an external-tool executable and store its path (Settings →
+  // Bottom bar). Cancelling the dialog leaves the current value untouched.
+  // `.cmd`/`.bat` are included because many tools ship as launcher shims (npm
+  // bins, PMD's pmd.bat) rather than real .exes — the spawn path runs them
+  // through cmd.exe, so they work anywhere an .exe does.
   async function pickToolExe(tool: keyof Settings['external_tools']) {
-    const p = await pickFile('Executable', ['exe']);
+    const p = await pickFile('Executable', ['exe', 'cmd', 'bat', 'com']);
     if (p) patch((s) => (s.external_tools[tool] = p));
   }
 
@@ -1371,9 +1374,11 @@
     }
   }
 
-  // Browse for an audit tool exe and store it as that tool's `path` override.
+  // Browse for an audit tool executable and store it as that tool's `path`
+  // override. Includes `.cmd`/`.bat` — the node tools (eslint, knip) only
+  // exist as npm launcher shims, never as standalone .exes.
   async function pickAuditToolExe(id: AuditToolId): Promise<void> {
-    const p = await pickFile('Executable', ['exe']);
+    const p = await pickFile('Executable', ['exe', 'cmd', 'bat', 'com']);
     if (p) patchAuditTool(id, (t) => (t.path = p));
   }
 

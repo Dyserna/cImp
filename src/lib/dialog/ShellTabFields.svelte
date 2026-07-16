@@ -27,8 +27,10 @@
     showGitBashBanner?: boolean;
   } = $props();
 
-  // Windows uses .exe to filter the executable picker. Linux executables
-  // have no extension convention, so the picker stays unfiltered there.
+  // Windows filters the executable picker to the runnable extensions —
+  // including .cmd/.bat launcher shims (npm bins, pmd.bat), which spawn fine
+  // through cmd.exe. Linux executables have no extension convention, so the
+  // picker stays unfiltered there.
   // We can't reliably check platform from the renderer without a Tauri
   // helper; the file dialog takes filters as a hint anyway.
   const isWindows = typeof navigator !== 'undefined'
@@ -40,7 +42,7 @@
         directory: false,
         multiple: false,
         filters: isWindows
-          ? [{ name: 'Executable', extensions: ['exe'] }]
+          ? [{ name: 'Executable', extensions: ['exe', 'cmd', 'bat', 'com'] }]
           : undefined,
       });
       if (typeof picked === 'string') {
